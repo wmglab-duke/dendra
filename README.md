@@ -1,93 +1,191 @@
-# axonml
-
-
-
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://gitlab.oit.duke.edu/mah148/axonml.git
-git branch -M main
-git push -uf origin main
-```
-
-## Integrate with your tools
-
-- [ ] [Set up project integrations](https://gitlab.oit.duke.edu/mah148/axonml/-/settings/integrations)
-
-## Collaborate with your team
-
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
-
-## Test and Deploy
-
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+<div align="center">
+  <img src="docs/banner.png">
+</div>
 
 ***
+Implement and train high-throughput GPU-compatible neural fiber models.
 
-# Editing this README
+## ❗Requirements
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+### Hardware requirements
+`axonml` requires a standard computer with an NVIDIA GPU (we ran all our simulations using an RTX A5000) and enough RAM to support the in-memory operations (loading data for training, constructing input voltage arrays, etc.).
 
-## Suggestions for a good README
+### OS requirements
+`axonml` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+### Python dependencies
+`axonml` requires Python 3.9+ (tested with 3.9, 3.10) and PyTorch 2.0+ with GPU support (tested with PyTorch 2.0.0 & CUDA 12.1). See `requirements.txt` for additional package dependencies.
 
-## Name
-Choose a self-explaining name for your project.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## 🖥️ Installation
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+> [!TIP]
+> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.9`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+1.  Install PyTorch (with GPU support, check which CUDA version you have / is compatible with your GPU) - follow the installation instructions [on the PyTorch homepage](https://pytorch.org/).
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+2.  Clone this repository.
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+3.  Install requirements : `pip install requirements.txt`
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+4.  Add the cloned `axonml` directory to your `PYTHONPATH`.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+🥳 You're all set! 
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+> [!NOTE]
+> Installation of all dependencies should not take more time than a couple of minutes. Installation of `axonml` itself takes only the time required to clone the repository.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+> [!IMPORTANT]
+> The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, use the data generation algorithms, run high-throughput surrogate simulations of kHz stimulation, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal).
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+## :rocket: Training a model
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+By default, `axonml` trains approximations to the MRG[^2] myelinated fiber model. Check `axonml/models/README.md` for instructions on how to implement approximations of other fiber models. 
 
-## License
-For open source projects, say how it is licensed.
+Training configurations can be modified by changing the relevant values in `config.py`:
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+|Variable|Description|
+|---|---|
+|`model`|Surrogate fiber model `class` to train. **Default: `axonml.models.MRG`**.|
+|`cuda`|Whether to use GPU. **Default: True if GPU is available, False otherwise**.|
+|`fp32`|Whether to use single-precision floating point arithmetic. If not, double precision is used. **Default: False**.|
+|`nodes`|Nodes of Ranvier per axon. **Default: 53**.|
+|`dt`|Simulation timestep [ms]. **Default: 0.005**.|
+|`train_dset`|Path to training dataset.|
+|`valid_dset`|Path to validation dataset.|
+|`states`|The state variables in the training / validations dataset(s) and the order in which they will be concatenated. Must agree with the order in which states are concatenated when recorded from the surrogate model. **Default: ['m', 'h', 'p', 's', 'v']**.|
+|`epochs`|Number of training epochs. **Default: 5**.|
+|`truncation_length`|Sequence length over which to perform truncated backpropagation through time. **Default: 50**.|
+|`lr`|Adam optimizer learning rate. **Default: $3\times10^{-5}$**.|
+|`grad_accumulation`|Whether to use gradient accumulation over disjoint chunks in truncated backpropagation through time. **Default: False**.|
+|`train_n_idx`|Total # training set batches to use per training epoch (see `./axonml/data/generate_data.py` - `n_batches`). **Default: 64**.|
+|`val_n_idx`| # validation set batches to use per round of validation. **Default: 8**.|
+|`train_chunk_size`| # training set batches to use per gradient-descent step. (Should be a factor of `train_n_idx`). **Default: 2**.|
+|`val_chunk_size`| # validation set batches to use per validation step. **Default: 8**.|
+|`sampling`|Whether to downsample training set in time, and by how much (sample every `sampling` timesteps). **Default: None**.|
+|`postfix`|List of model parameters to display in progressbar as training progresses. **Default: None**.|
+|`save_every`|Save model parameters every `save_every` minibatch iterations. **Default: 32**.|
+|`save_dir`|Location into which to save model parameters. **Default: `./checkpoints/`**.|
+
+Once you've set variables appropriately in `config.py`, you can initiate training:
+
+```bash
+(base) foo@bar : ~ $ cd /path/to/cloned/repository
+(base) foo@bar : /path/to/cloned/repository $ conda activate axonml
+(axonml) foo@bar : /path/to/cloned/repository $ python train.py
+```
+
+## 🗄️ Loading a model
+Trained `axonml.models.Axon` models can be loaded using the `load` method. We have included a trained version of the MRG fiber:
+
+```python
+# import MRG class
+from axonml.models import MRG
+
+# instantiate model and load pre-rained parameters
+mrg = MRG().cuda().load('MRG2023')
+
+# ... use mrg for thresholding, modeling, stimulus optimization, etc.
+```
+
+To load from checkpoints generated by `train.py`:
+
+```python
+# import pytorch
+import torch
+
+# import MRG class
+from axonml.models import MRG
+
+# load checkpoint
+checkpoint_path = '/path/to/checkpoint'
+checkpoint_params = torch.load(checkpoint_path)['model_state_dict']
+
+# instantiate model and load trained parameters
+mrg = MRG().cuda().load(checkpoint_params)
+
+... etc.
+```
+
+## 🤖 Running simulations
+
+You need to supply an extracellular potential boundary condition to run simulations. This must be a `torch.Tensor` of shape `(n_timesteps, n_axons, 1, n_nodes)`; for example, if your goal is to simulate the response of 50 axons each with 51 nodes of Ranvier to extracellular stimulation over 5 ms with a timestep of 0.005 ms, the input `ve` should be shape `(1000, 50, 1, 51)`. `ve[100, 0, 0, 4]` is then $V_e$ in mV at node 5 for the 1st axon you're simulating at time t=0.5 ms.
+
+You must also specify the diameters of the fibers being simulated; this must be a 1D `torch.Tensor` of shape `n_axons`.
+
+Optionally, you can supply an array representing intracellular current simulation (in mA), e.g. to simulate synaptic input; this must also be a `torch.Tensor` of shape `(n_timesteps, n_axons, 1, n_nodes)`.
+
+You can specify `dt`; by default, this is 0.005 ms. You can also set `dt` glablly using the Backend.
+
+You can then run simulations:
+
+```python
+# set dt globally
+from axonml import Backend as A
+A.dt = 0.001
+
+n_axons, n_nodes = 50, 51
+ve = build_ve(50, 51)             # implement this function yourself
+intra = build_intra()             # or None
+diams = 5.7 * torch.ones(n_axons) # we're simulation 5.7 um fibers
+
+model.run(ve=ve, diameters=diams, intra=intra)
+```
+
+You can continue running from where you left off, e.g. run without any extracellular stim for a further 1 ms:
+
+```python
+ve = torch.zeros(1000, n_axons, 1, n_nodes)
+model.run(ve, diameters=diams)
+```
+
+or you can reinitialize and run from steady-state:
+```python
+ve = torch.zeros(1000, n_axons, 1, n_nodes)
+model.run(ve, diameters=diams, reinit=True)
+```
+
+### Callbacks
+To extract information from these simulations, use `Callback`s. We have implemented `Recorder`, `Active`, `APCount`, and `Raster`.
+
+**`Recorder`** records the system state at every timestep of simulation:
+```python
+from axonml.models.callbacks import Recorder
+rec = Recorder()
+model.run(ve, diams, callbacks=[rec])
+
+record = rec.stack()
+```
+
+**`Active`** checks if any action potentials have occurred. You can specify threshold (by default 0 mV), time after which to start checking for activation (by default 0 ms), and node indices to monitor (by default [5, -5]). For example, to check if any APs exceeding $V_m$ = 20 mV arrived 10 internodal lengths from the proximal end of each fiber at least 5 ms after t=0 ms :
+```python
+from axonml.models.callbacks import Active
+
+active = Active(threshold=20.0, t_start_check=5, node_check=[10])
+model.run(ve, diams, callbacks=[active])
+print(active.record)
+```
+
+**APCount** counts the number of action potentials and **Raster** records when they occured. For both of these, you can also specify threshold (by default 0 mV), time after which to start checking (by default 0 ms), and node indices to monitor (by default [5, -5]).
+
+You can use multiple callbacks at once.
+
+## 🌍 Other functionality
+Further instructions on how to estimate thresholds, perform selective stimulus parameter optimization, and run other simulations can be found in the relevant subdirectories of `axonml` (along with examples).
+
+## 📜 License
+The copyrights of this software are owned by Duke University. As such, two licenses for this software are offered:
+
+1. An open-source license under the GPLv2 license for non-commercial use (See LICENSE).
+
+2. A custom license with Duke University, for commercial use or for use without the GPLv2 license restrictions.
+
+As a recipient of this software, you may choose which license to receive the code under. Outside contributions to the Duke-owned code base cannot be accepted unless the contributor transfers the copyright to those changes over to Duke University.
+
+To enter a custom license agreement without the GPLv2 license restrictions, please contact the Digital Innovations department at Duke Office for Translation & Commercialization (https://olv.duke.edu/software/) at olvquestions@duke.edu.
+
+Please note that this software is distributed AS IS, WITHOUT ANY WARRANTY; and without the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+[^1]: Storn, Rainer, and Kenneth Price. 1997. “Differential Evolution – A Simple and Efficient Heuristic for Global Optimization over Continuous Spaces.” Journal of Global Optimization 11 (4): 341–59. https://doi.org/10.1023/A:1008202821328.
+
+[^2]: McIntyre, Cameron C., Andrew G. Richardson, and Warren M. Grill. 2002. “Modeling the Excitability of Mammalian Nerve Fibers: Influence of Afterpotentials on the Recovery Cycle.” Journal of Neurophysiology 87 (2): 995–1006. https://doi.org/10.1152/jn.00353.2001.
