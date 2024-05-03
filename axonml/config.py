@@ -32,7 +32,7 @@ to_train: List[str] = [
     "node_d",
     "aq10_1",
     "pq10_1",
-    "q10_2",
+    "aq10_2",
     "aq10_3",
     "ssd",
 ]

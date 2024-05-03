@@ -200,7 +200,7 @@ def calc_loss(
         Scalar loss.
     """
 
-    rec.clear()
+    rec.reset()
     reinit = j == 0
     ve = x[j * truncation_length : (j + 1) * truncation_length]
     model.run(ve, diams, reinit=reinit, dt=dt, callbacks=[rec])
@@ -237,7 +237,7 @@ def validate(model: Axon, rec: Recorder, dset: DataLoader, loss: _Loss) -> float
         model.eval()
         with torch.no_grad():
             for _, (x, y, diams) in enumerate(pbar):
-                rec.clear()
+                rec.reset()
                 model.run(x, diams, dt=0.005, reinit=True, callbacks=[rec])
                 l_ = loss(rec.stack()[:-1], y[:, :, :, :].permute(2, 0, 1, 3))
                 if not torch.isnan(l_):
