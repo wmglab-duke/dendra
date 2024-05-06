@@ -170,6 +170,9 @@ class GDProblemArbitrary(GDProblem):
 class GD:
     rec = Recorder()
 
+    xs = []
+    preds = []
+
     def __init__(self, problems: List[GDProblem], lr, lr_decay):
         self.problems = problems
         self.lr = lr
@@ -178,6 +181,7 @@ class GD:
         self.best_loss = [None] * len(problems)
         self.best_torch_loss = [None] * len(problems)
         self.best_xs = [[] for _ in range(len(problems))]
+        self.best_preds = [[] for _ in range(len(problems))]
 
         self.loss_fns = [
             WeightedQuotient(
@@ -217,7 +221,7 @@ class GD:
 
         rec = self.rec
 
-        for _ in trange(steps):
+        for step in trange(steps):
             rec.reset()
 
             inputs = []
@@ -232,6 +236,8 @@ class GD:
             all_losses = []
             all_out = torch.split(out, n_axon_list, dim=1)
 
+            pred_act = []
+
             for j, (out, p, loss_np, loss_fn, n_axons) in enumerate(
                 zip(all_out, problems, self.loss_nps, self.loss_fns, n_axon_list)
             ):
@@ -240,6 +246,7 @@ class GD:
                         torch.any((out[:, :, -1, [10, 90]] > 0), dim=2), dim=0
                     )
                     active = active.cpu().numpy().reshape(1, n_axons)
+                pred_act.append(active)
                 np_loss = loss_np.loss(p.target, active)
 
                 loss = loss_fn(out)
@@ -250,21 +257,27 @@ class GD:
                     self.best_torch_loss[j] = loss.item()
                     best_x = x_list[j].detach().cpu().numpy()
                     self.best_xs[j].append(best_x)
+                    self.best_preds[j].append(active)
                 if np_loss < self.best_loss[j]:
                     self.best_loss[j] = np_loss
                     best_x = x_list[j].detach().cpu().numpy()
                     self.best_xs[j].append(best_x)
+                    self.best_preds[j].append(active)
                 if np_loss == self.best_loss[j]:
                     if loss.item() < self.best_torch_loss[j]:
                         self.best_torch_loss[j] = loss.item()
                         self.best_loss[j] = np_loss
                         best_x = x_list[j].detach().cpu().numpy()
                         self.best_xs[j].append(best_x)
+                        self.best_preds[j].append(active)
                         if self.best_loss[j] < 1:
                             self.schedulers[j].step()
 
+            if (step == 0) or ((step + 1) % 10 == 0):
+                self.preds.append([p[-1] for p in self.best_preds])
+                self.xs.append([b[-1] for b in self.best_xs])
             loss = sum(all_losses)
-            loss.backward(retain_graph=True)
+            loss.backward()
             for x, n in zip(x_list, n_axon_list):
                 torch.nn.utils.clip_grad_norm_(x, 200 / n)
 

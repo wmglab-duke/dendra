@@ -410,6 +410,7 @@ class Axon(jit.ScriptModule):
                 callbacks.post_step_hook(self.state)
 
             callbacks.post_loop_hook(self.state)
+            self.state = self.state.detach()
 
         return 1
 

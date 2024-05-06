@@ -95,7 +95,7 @@ def tbptt(
                             model, loss_fn, x, y, diams, dt, rec, truncation_length, j
                         )
                         if not torch.isnan(loss):
-                            loss.backward(retain_graph=True)
+                            loss.backward()
                             for p in model.parameters():
                                 if p.requires_grad:
                                     p.grad = torch.where(
