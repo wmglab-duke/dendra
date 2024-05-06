@@ -273,9 +273,6 @@ class GD:
                         if self.best_loss[j] < 1:
                             self.schedulers[j].step()
 
-            if (step == 0) or ((step + 1) % 10 == 0):
-                self.preds.append([p[-1] for p in self.best_preds])
-                self.xs.append([b[-1] for b in self.best_xs])
             loss = sum(all_losses)
             loss.backward()
             for x, n in zip(x_list, n_axon_list):
