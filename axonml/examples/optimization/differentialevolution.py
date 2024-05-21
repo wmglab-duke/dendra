@@ -10,7 +10,7 @@ from cajal.nrn.sources import PreComputedInterpolate1D
 from cajal.opt.differentialevolution import DEBASE
 from cajal.opt.differentialevolution.callbacks import Logger, EarlyStopping, Timer
 
-from axonml.models import MRG
+from axonml.models import SMF
 from axonml.models.callbacks import Active
 
 import de_config as config
@@ -117,7 +117,7 @@ bases = torch.Tensor(all_bases).float().cuda()
 
 # -- model --
 
-mrg = MRG().cuda().load("MRG2023").compile(nodes=nodes)
+mrg = SMF().cuda().load("MRG2023").compile(nodes=nodes)
 
 
 # -- stim --

@@ -1,5 +1,7 @@
 from typing import List, Tuple
 
+import numpy as np
+
 import torch
 from torch import Tensor
 
@@ -23,20 +25,28 @@ class Thresholder:
         node_check: List[int] = [5, -5],
         t_start_check=0.0,
     ):
-        if isinstance(diams, Tensor):
-            assert len(diams) == bases.shape[1]
+        if isinstance(diams, Tensor) or isinstance(diams, np.ndarray):
+            assert len(diams) == bases.shape[0]
 
-        self.model = model.compile(bases.shape[-1], bases.shape[1])
+        self.model = model.compile(bases.shape[-1], bases.shape[0])
+
+        bases = torch.as_tensor(bases)
+        diams = torch.as_tensor(diams)
+
+        bases = bases.permute(1, 0, 2).unsqueeze(2)
+
         self.bases = bases.to(model.device())
         self.diams = diams.to(model.device())
+
+        self.threshold = threshold
 
         self.ignore = None
 
         with torch.no_grad():
             if ub is not None:
-                self.ub = ub * torch.ones_like(diams, device=model.device())
+                self.ub = ub * torch.ones_like(self.diams, device=model.device())
             else:
-                self.ub = 0.2 * torch.ones_like(diams) / (diams / 5) ** 2
+                self.ub = 0.2 * torch.ones_like(self.diams) / (self.diams / 5) ** 2
             self.ub_initial = self.ub.clone()
             self.lb = torch.zeros_like(self.ub)
 
@@ -48,6 +58,26 @@ class Thresholder:
 
         self.active = Active(threshold, t_start_check, node_check)
         self.rec = Recorder(max_only=True)
+
+    def float(self):
+        self.fp32 = True
+        self.model = self.model.float()
+        self.bases = self.bases.float()
+        self.diams = self.diams.float()
+        self.ub = self.ub.float()
+        self.ub_initial = self.ub.clone()
+        self.lb = self.lb.float()
+        return self
+    
+    def double(self):
+        self.fp32 = False
+        self.model = self.model.double()
+        self.bases = self.bases.double()
+        self.diams = self.diams.double()
+        self.ub = self.ub.double()
+        self.ub_initial = self.ub.clone()
+        self.lb = self.lb.double()
+        return self
 
     def check_active(self, bound: Tensor):
         """Check whether stimulus amplitudes generates APs.
@@ -74,7 +104,7 @@ class Thresholder:
         self.model.run(ve, self.diams, callbacks=[self.active, self.rec], reinit=True)
         return self.active.record, self.rec.stack()
 
-    def fix_bounds(self):
+    def fix_bounds(self, block_possible=True):
         """Make sure upper bound generates AP."""
 
         with torch.no_grad():
@@ -87,8 +117,11 @@ class Thresholder:
                     break
                 mask, rec = self.check_active_with_rec(self.ub)
                 inactive = ~mask
-                self.ub[(rec[:, -1] < -20) & inactive] *= 10
-                self.ub[(rec[:, -1] >= -20) & inactive] *= 0.2
+                if block_possible:
+                    self.ub[(rec[:, -1] < self.threshold) & inactive] *= self.fix_bound_up
+                    self.ub[(rec[:, -1] >= self.threshold) & inactive] *= self.fix_bound_down
+                else:
+                    self.ub[inactive] *= self.fix_bound_up
                 tries += 1
             else:
                 print("Done.")
@@ -111,6 +144,7 @@ class Thresholder:
         """
         self.fix_bounds()
         self.rec.reset()
+        self.active.reset()
 
         with torch.no_grad():
             ub = self.ub

@@ -7,13 +7,13 @@ import matplotlib
 import matplotlib.pyplot as plt
 
 from axonml.instruments.thresholder import Thresholder
-from axonml.models import MRG
+from axonml.models import SMF
 
 matplotlib.use("TKAgg")
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("-f", "--field", choices=["imthera", "livanova"], help="Cuff.")
+parser.add_argument("-f", "--field", choices=["imthera", "livanova"], help="Cuff.", required=True)
 
 parser.add_argument(
     "-p", "--preload", action="store_true", help="Preload bases array into memory."
@@ -60,7 +60,7 @@ if __name__ == "__main__":
     nrn_thresh_path = f"{directory}/example_thresholds_{field}.npy"
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
-    mrg = MRG(handle_nan=True).cuda().load("MRG2023")
+    mrg = SMF(handle_nan=True).cuda().load("MRG2023")
     thresholder = Thresholder(mrg, fp, diams)
     thresh, _ = thresholder.calculate_thresholds(verbose=False, splits=args.splits)
 

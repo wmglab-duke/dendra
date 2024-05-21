@@ -26,7 +26,7 @@ Implement and train high-throughput GPU-compatible neural fiber models.
 
 2.  Clone this repository.
 
-3.  Install requirements : `pip install requirements.txt`
+3.  Install requirements : `pip install -r requirements.txt`
 
 4.  Add the cloned `axonml` directory to your `PYTHONPATH`.
 

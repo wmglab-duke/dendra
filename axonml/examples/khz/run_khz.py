@@ -4,7 +4,7 @@ import numpy as np
 
 from cajal.nrn.sources import FEMInterpolate1D
 
-from axonml.models import MRG
+from axonml.models import SMF
 from axonml.models.callbacks import APCount
 
 
@@ -174,7 +174,7 @@ def longrun(
 
 # run
 
-mrg = MRG(handle_nan=True).cuda().load("MRG2023")
+mrg = SMF(handle_nan=True).cuda().load("MRG2023")
 
 frequencies = [1, 2, 5, 10]
 stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]

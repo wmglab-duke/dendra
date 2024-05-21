@@ -8,7 +8,7 @@ from cajal.common.logging import tic, toc
 from cajal.nrn.stimuli import SymmetricBiphasic
 from cajal.nrn.sources import PreComputedInterpolate1D
 
-from axonml.models import MRG
+from axonml.models import SMF
 from axonml.opt.gd import AxonSpec, FieldSpec, GDProblemUniform, GD
 
 from gd_parser import parser
@@ -56,7 +56,7 @@ for sample in all_samples:
 
 # -- model --
 
-mrg = MRG(fp32=False).cuda().load(args.model).compile(nodes=nodes).train().double()
+mrg = SMF(fp32=False).cuda().load(args.model).compile(nodes=nodes).train().double()
 
 
 # -- run optimization --
