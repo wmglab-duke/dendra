@@ -1,5 +1,8 @@
 # Simulate kHz frequency sinusoidal stimulation
 
+> [!IMPORTANT]
+> Visualization requires `pandas` and `seaborn`. Install with `pip install pandas seaborn`.
+
 We provide an example script for simulating high frequency stimulation. Execute with:
 
 ```bash

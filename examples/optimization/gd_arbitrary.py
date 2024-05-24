@@ -131,6 +131,8 @@ if __name__ == "__main__":
             x_cb = x_test - (np.sum(x_test * mask[:, None, None], 0) / np.sum(mask))
             x_cb = x_cb * mask[:, None, None]
 
+            print(x_cb.squeeze().reshape(6, -1).max(axis=1))
+
             model.run(x_cb.squeeze().T)
             pred = model.activations[0]
 

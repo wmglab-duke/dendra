@@ -270,7 +270,7 @@ class GD:
                         best_x = x_list[j].detach().cpu().numpy()
                         self.best_xs[j].append(best_x)
                         self.best_preds[j].append(active)
-                        if self.best_loss[j] < 1:
+                        if self.best_loss[j] < 1.0:
                             self.schedulers[j].step()
 
             loss = sum(all_losses)

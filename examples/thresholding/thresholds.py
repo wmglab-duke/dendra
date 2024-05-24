@@ -16,7 +16,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-f", "--field", choices=["imthera", "livanova"], help="Cuff.", required=True)
 
 parser.add_argument(
-    "-p", "--preload", action="store_true", help="Preload bases array into memory."
+    "-p", "--preload", action="store_true", help="Preload bases array into memory.", default=True
 )
 
 parser.add_argument(
@@ -61,13 +61,13 @@ if __name__ == "__main__":
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
     mrg = SMF(handle_nan=True).cuda().load("MRG2023")
-    thresholder = Thresholder(mrg, fp, diams)
-    thresh, _ = thresholder.calculate_thresholds(verbose=False, splits=args.splits)
+    thresholder = Thresholder(mrg, fp, diams).float()
+    thresh, _ = thresholder.calculate_thresholds()
 
     err = 100 * (thresh - thresh_nrn) / thresh_nrn
 
     print(f"mean % threshold error: {err.mean()}%")
-    print(f"mean abosulte % threshold error: {np.abs(err).mean()}%")
+    print(f"mean absolute % threshold error: {np.abs(err).mean()}%")
     print(f"min error: {err.min()}%, max error: {err.max()}%")
 
     # visualize ?

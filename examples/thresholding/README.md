@@ -33,10 +33,10 @@ threshold, lb = thresholder.calculate_thresholds()
 thresholder = Thresholder(model, field_arrays, fiber_diameters, resolution=0.05)
 ```
 
-`thresholds.py` provides a full example that you can run. You can run monopolar ImThera or bipolar Livanova stimulation, which you can specify with the `-f` command-line flag. Use the `-p` flag if you want to preload the field arrays and `-v` if you want to visualize results with `matplotlib`. E.g., :
+`thresholds.py` provides a full example that you can run. You can run monopolar ImThera or bipolar Livanova stimulation, which you can specify with the `-f` command-line flag. Use the `-v` flag if you want to visualize results with `matplotlib`. E.g., :
 
 ```
-> python thresholds.py -f imthera (or livanonva) -p -v
+> python thresholds.py -f imthera (or livanonva) -v
 ```
 
 Expected output, for Imthera cuff:

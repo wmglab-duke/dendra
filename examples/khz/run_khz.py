@@ -278,7 +278,7 @@ custom_lines = [
 ]
 plt.gca().legend(
     custom_lines,
-    ["NEURON", "Surrogate"],
+    ["NEURON", "S-MF"],
     loc="upper center",
     bbox_to_anchor=(0.5, -0.12),
     ncols=2,

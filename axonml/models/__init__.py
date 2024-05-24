@@ -1,6 +1,6 @@
-__all__ = ["Backend", "Axon", "MRG"]
+__all__ = ["Backend", "Axon", "SMF"]
 
 from .backend import Backend
 
 from .core import Axon
-from .implementations import MRG
+from .implementations import SMF

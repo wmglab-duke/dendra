@@ -177,4 +177,4 @@ class Thresholder:
                 ub[self.ignore] = torch.nan
                 lb[self.ignore] = torch.nan
 
-            return ub, lb
+            return ub.cpu().numpy(), lb.cpu().numpy()
