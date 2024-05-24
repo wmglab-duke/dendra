@@ -130,5 +130,5 @@ dmypy.json
 
 # checkpoints
 checkpoints/
-examples/*.png
-examples/*.pkl
+examples/*/*.png
+examples/*/*.pkl
