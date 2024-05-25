@@ -28,6 +28,12 @@ class Thresholder:
         if isinstance(diams, Tensor) or isinstance(diams, np.ndarray):
             assert len(diams) == bases.shape[0]
 
+        if fix_bound_down >= 1 or fix_bound_up <= 0:
+            raise ValueError('fix_bound_down should be < 1 and > 0.')
+        
+        if fix_bound_up <= 1:
+            raise ValueError('fix_bound_up should be > 1.')
+
         self.model = model.compile(bases.shape[-1], bases.shape[0])
 
         bases = torch.as_tensor(bases)

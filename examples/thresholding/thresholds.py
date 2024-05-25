@@ -3,13 +3,9 @@ import argparse
 import numpy as np
 import torch
 
-import matplotlib
-import matplotlib.pyplot as plt
-
 from axonml.instruments.thresholder import Thresholder
 from axonml.models import SMF
 
-matplotlib.use("TKAgg")
 
 parser = argparse.ArgumentParser()
 
@@ -25,13 +21,6 @@ parser.add_argument(
     action="store_true",
     help="Plot predicted thresholds & error histogram.",
 )
-
-split_txt = """
-    Number of chunks into which to split the bases array when
-    calculating thresholds.
-"""
-
-parser.add_argument("-s", "--splits", type=int, default=None, help=split_txt)
 
 args = parser.parse_args()
 
@@ -72,6 +61,11 @@ if __name__ == "__main__":
 
     # visualize ?
     if args.visualize:
+        import matplotlib
+        import matplotlib.pyplot as plt
+
+        matplotlib.use("TKAgg")
+
         lim = np.linspace(0, max(thresh), 100)
         plt.plot(lim, lim, color="grey", alpha=0.6)
         plt.scatter(thresh, thresh_nrn, s=2)

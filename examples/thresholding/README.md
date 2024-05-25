@@ -7,7 +7,7 @@ The basic procedure for running thresholds is:
 2. Load / calculate the set of spatiotemporal extracellular potentials corresponding to 'unit' stimulation under each condition you're interested in (fiber diameter x field x stimulus waveform)
 
 > [!IMPORTANT]
-> The resulting set of spatiotemporal extracellular potentials must be an array of shape `(n_conditions, n_timesteps, n_nodes)`. For example, if you were calculating thresholds for the same extracellular field distribution for 50 different pulse-widths of monophasic extracelular cathodic stimulation, with a simulation duration of 5 ms and dt=0.005 ms and each fiber has 51 nodes, the array would have dimensions `(50, 1000, 51)`. If you we're doing the same but for two fiber diameters, the resulting array would have dimensions `(100, 1000, 51)`, etc.
+> The resulting set of spatiotemporal extracellular potentials must be an array of shape `(n_conditions, n_timesteps, n_nodes)`. For example, if you were calculating thresholds for the same extracellular field distribution for 50 different pulse-widths of monophasic extracellular cathodic stimulation, with a simulation duration of 5 ms and dt=0.005 ms and each fiber has 51 nodes, the array would have dimensions `(50, 1000, 51)`. If you were doing the same but for two fiber diameters, the resulting array would have dimensions `(100, 1000, 51)`, etc.
 
 3. Construct an `axonml.instruments.thresholder.Thresholder` object.
 
