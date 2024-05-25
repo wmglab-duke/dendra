@@ -39,7 +39,7 @@ Config parameters can be also be set using command line arguments. For example, 
 Command line arguments take precedence over values set in `config.py`.
 
 > [!IMPORTANT]
-> Generating large datasets will take a **very** long on a single CPU core. We have included an example bash script (`dgen.sh`) illustrating how to distribute this operation across several cores on an MPI-enabled cluster using `SLURM` (only change is executing `mpirun -n $N_CORES python generate_data.py` instead of just `python generate_data.py`).
+> Generating large datasets will take a **very** long on a single CPU core. We have included an example bash script (`dgen.sh`) illustrating how to distribute this operation across several cores on an MPI-enabled cluster using `SLURM` (the only change is executing `mpirun -n $N_CORES python generate_data.py` instead of just `python generate_data.py`). Note that depending on your MPI installation, you may need to use `mpiexec` instead of `mpirun`.
 
 > [!IMPORTANT]
 > To generate data in parallel, you **must** have `h5py` built against parallel HDF5. See [here](https://docs.h5py.org/en/latest/mpi.html) and [here](https://accserv.lepp.cornell.edu/svn/packages/hdf5/release_docs/INSTALL_parallel) for instructions.
