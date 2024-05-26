@@ -123,7 +123,6 @@ if __name__ == "__main__":
 
             # build model
             model = NeuronModel(axons, extra_spec=extra, load_balancing="dynamic")
-            print(best_x[-1])
             model.run(best_x[-1])
             pred = model.activations[0]
             predictions.append(pred)

@@ -117,7 +117,7 @@ bases = torch.Tensor(all_bases).float().cuda()
 
 # -- model --
 
-mrg = SMF().cuda().load("MRG2023").compile(nodes=nodes)
+mrg = SMF().cuda().load("MRG").compile(nodes=nodes)
 
 
 # -- stim --

@@ -174,7 +174,7 @@ def longrun(
 
 # run
 
-mrg = SMF(handle_nan=True).cuda().load("MRG2023")
+mrg = SMF(handle_nan=True).cuda().load("MRG")
 
 frequencies = [1, 2, 5, 10]
 stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]

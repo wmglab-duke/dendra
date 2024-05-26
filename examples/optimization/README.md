@@ -81,7 +81,7 @@ Set these in `gd_config.py`.
 
 |Variable|Description|
 |---|---|
-|`model`|Name of saved model. **Default: 'MRG2023'**|
+|`model`|Name of saved model. **Default: 'MRG'**|
 |`samples`|Which optimization problems to attempt solving, supplied as a list, e.g. ['H5', 'P5']. **Default: 'all'** (all optimization problems in `'./samples/` will be attempted simultaneously).|
 |`lr`|Learning rate for Ranger optimizer. **Default: 2.0**|
 |`lr_decay`|Learning rate decay. **Default: 0.6**|

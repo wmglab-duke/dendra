@@ -25,7 +25,7 @@ Implement and train high-throughput GPU-compatible neural fiber models.
 1.  Install PyTorch (with GPU support, check which CUDA version you have / is compatible with your GPU) - follow the installation instructions [on the PyTorch homepage](https://pytorch.org/).
 
 > [!IMPORTANT]
-> Differences in GPU hardware and PyTorch / CUDA version may affect the performance and numerical outcomes of simulations / optimizations. We have tested with PyTorch v2.0.0 and CUDA v11.7 (and all presented results use those versions).
+> Differences in GPU hardware and PyTorch / CUDA version may affect the performance and numerical outcomes of simulations / optimizations. All presented results use PyTorch 2.0.0 and CUDA 11.7).
 
 2.  Clone this repository.
 
@@ -39,7 +39,7 @@ Implement and train high-throughput GPU-compatible neural fiber models.
 > Installation of all dependencies should not take more time than a couple of minutes. Installation of `axonml` itself takes only the time required to clone the repository.
 
 > [!IMPORTANT]
-> The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, use the data generation algorithms, run high-throughput surrogate simulations of kHz stimulation, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal).
+> The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, use the data generation algorithms, run high-throughput surrogate simulations of kHz stimulation, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal) (however do not create a separate `conda` environment for `cajal` - install all dependencies into `axonml`).
 
 ## :rocket: Training a model
 
@@ -86,7 +86,7 @@ Trained `axonml.models.Axon` models can be loaded using the `load` method. We ha
 from axonml.models import SMF
 
 # instantiate model and load pre-rained parameters
-mrg = SMF().cuda().load('MRG2023')
+mrg = SMF().cuda().load('MRG')
 
 # ... use mrg for thresholding, modeling, stimulus optimization, etc.
 ```
@@ -174,7 +174,7 @@ print(active.record)
 You can use multiple callbacks at once.
 
 ## 🌍 Other functionality
-Further instructions on how to estimate thresholds, perform selective stimulus parameter optimization, and run other simulations can be found in the relevant subdirectories of `axonml` (along with examples).
+Further instructions and examples of how to estimate thresholds, perform selective stimulus parameter optimization, and run other simulations can be found in `./examples`.
 
 ## 📜 License
 The copyrights of this software are owned by Duke University. As such, two licenses for this software are offered:

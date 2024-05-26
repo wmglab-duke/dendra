@@ -1,7 +1,7 @@
 """GD config"""
 
 # model
-model = "MRG2023"
+model = "MRG"
 
 # samples
 samples = "all"
