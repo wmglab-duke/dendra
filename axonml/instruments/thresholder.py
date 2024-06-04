@@ -28,6 +28,12 @@ class Thresholder:
         if isinstance(diams, Tensor) or isinstance(diams, np.ndarray):
             assert len(diams) == bases.shape[0]
 
+        elif isinstance(diams, float):
+            diams = np.full(bases.shape[0], diams)
+
+        else:
+            raise TypeError('diams must be a NumPy array / PyTorch tensor with same length as bases or a float.')
+
         if fix_bound_down >= 1 or fix_bound_up <= 0:
             raise ValueError('fix_bound_down should be < 1 and > 0.')
         
