@@ -29,7 +29,7 @@ class Thresholder:
             assert len(diams) == bases.shape[0]
 
         elif isinstance(diams, float):
-            diams = np.full(bases.shape[0], diams)
+            diams = np.atleast_1d(np.full(bases.shape[0], diams))
 
         else:
             raise TypeError('diams must be a NumPy array / PyTorch tensor with same length as bases or a float.')
