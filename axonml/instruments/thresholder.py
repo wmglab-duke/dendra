@@ -15,6 +15,7 @@ class Thresholder:
         model: Axon,
         bases: Tensor,
         diams: Tensor,
+        dt=0.005,
         ub=None,
         fix_bound_up=5.0,
         fix_bound_down=0.1,
@@ -44,6 +45,8 @@ class Thresholder:
 
         bases = torch.as_tensor(bases)
         diams = torch.as_tensor(diams)
+
+        self.dt = dt
 
         bases = bases.permute(1, 0, 2).unsqueeze(2)
 
@@ -106,14 +109,14 @@ class Thresholder:
         """
         self.active.reset()
         ve = self.bases * bound[None, :, None, None]
-        self.model.run(ve, self.diams, callbacks=[self.active], reinit=True)
+        self.model.run(ve, self.diams, callbacks=[self.active], reinit=True, dt=self.dt)
         return self.active.record
 
     def check_active_with_rec(self, bound: Tensor):
         self.active.reset()
         self.rec.reset()
         ve = self.bases * bound[None, :, None, None]
-        self.model.run(ve, self.diams, callbacks=[self.active, self.rec], reinit=True)
+        self.model.run(ve, self.diams, callbacks=[self.active, self.rec], reinit=True, dt=self.dt)
         return self.active.record, self.rec.stack()
 
     def fix_bounds(self, block_possible=True):
