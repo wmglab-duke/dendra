@@ -177,15 +177,11 @@ You can use multiple callbacks at once.
 Further instructions and examples of how to estimate thresholds, perform selective stimulus parameter optimization, and run other simulations can be found in `./examples`.
 
 ## 📜 License
-The copyrights of this software are owned by Duke University. As such, two licenses for this software are offered:
+The copyrights of this software are owned by Duke University. As such, it is offered under a custom license (see LICENSE.md) whereby:
 
-1. An open-source license under the GPLv2 license for non-commercial use (See LICENSE).
+1. DUKE grants YOU a royalty-free, non-transferable, non-exclusive, worldwide license under its copyright to use, reproduce, modify, publicly display, and perform the PROGRAM solely for non-commercial research and/or academic testing purposes.  
 
-2. A custom license with Duke University, for commercial use or for use without the GPLv2 license restrictions.
-
-As a recipient of this software, you may choose which license to receive the code under. Outside contributions to the Duke-owned code base cannot be accepted unless the contributor transfers the copyright to those changes over to Duke University.
-
-To enter a custom license agreement without the GPLv2 license restrictions, please contact the Digital Innovations department at Duke Office for Translation & Commercialization (https://olv.duke.edu/software/) at olvquestions@duke.edu.
+2. In order to obtain any further license rights, including the right to use the PROGRAM, any modifications or derivatives made by YOU, and/or PATENT RIGHTS for commercial purposes, (including using modifications as part of an industrially sponsored research project), YOU must contact DUKE’s Office for Translation and Commercialization (Digital Innovations Team) about additional commercial license agreements.
 
 Please note that this software is distributed AS IS, WITHOUT ANY WARRANTY; and without the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
 
