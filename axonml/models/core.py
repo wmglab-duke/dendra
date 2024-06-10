@@ -415,7 +415,7 @@ class Axon(jit.ScriptModule):
         return 1
 
     def compile(self, nodes=16, axons=1):
-        ve = torch.rand(1, axons, 1, nodes, device=self.device())
+        ve = torch.ones(1, axons, 1, nodes, device=self.device())
         d = 10 * torch.ones(axons, device=self.device())
         for _ in range(5):
             self.run(ve, d, reinit=True)
