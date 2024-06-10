@@ -71,7 +71,7 @@ class Thresholder:
         self.max_tries_thresh = max_tries_thresh
         self.resolution = resolution
 
-        self.active = Active(threshold, t_start_check, node_check)
+        self.active = Active(threshold, t_start_check, node_check, dt=dt)
         self.rec = Recorder(max_only=True)
 
     def float(self):
