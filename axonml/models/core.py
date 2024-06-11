@@ -434,5 +434,5 @@ class Axon(jit.ScriptModule):
     def cache_state(self):
         self._state_cache = self.state.detach().clone()
 
-    def restore_state_from_cache(self):
+    def restore_state(self):
         self.state = self._state_cache
