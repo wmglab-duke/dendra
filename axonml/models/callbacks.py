@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 
 import torch
 from torch import Tensor
@@ -128,18 +128,35 @@ class APCount(ThresholdCallback):
             self.record = torch.zeros(
                 states.shape[0],
                 len(self.node_check),
-                dtype=torch.int,
+                dtype=torch.int16,
                 device=states.device,
             )
-        self.state_cache = states
+        self.state_cache = torch.ones(states.shape[0], len(self.node_check),
+                                      dtype=torch.bool, device=states.device)
 
     def post_step_hook(self, states):
         if self.i * self.dt >= self.t_start_check:
             vm_new = states[:, -1, self.node_check]
-            vm = self.state_cache[:, -1, self.node_check]
-            increment_count(vm, vm_new, self.record, self.threshold)
-        self.state_cache = states
+            vm = self.state_cache
+            self.state_cache = increment_count_(vm, vm_new, self.record, self.threshold)
+        # self.state_cache = states
         self.i += 1
+
+
+class ActiveAL(APCount):
+    def __init__(self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None, at_least=1):
+        super().__init__(threshold, t_start_check, node_check, dt)
+        self.at_least = at_least
+
+    def is_active(self):
+        if self.record is not None:
+            return is_active(self.record, self.at_least)
+        return self.record
+        
+    def numpy(self):
+        if self.record is not None:
+            return self.is_active().detach().cpu().numpy()
+        return self.record
 
 
 class Active(ThresholdCallback):
@@ -151,15 +168,23 @@ class Active(ThresholdCallback):
             self.record = torch.zeros(
                 states.shape[0], dtype=torch.bool, device=states.device
             )
-        self.state_cache = states
+        self.state_cache = torch.ones(states.shape[0], len(self.node_check),
+                                      dtype=torch.bool, device=states.device)
 
     def post_step_hook(self, states):
         if self.i * self.dt >= self.t_start_check:
             vm_new = states[:, -1, self.node_check]
-            vm = self.state_cache[:, -1, self.node_check]
-            update_active(vm, vm_new, self.record, self.threshold)
-        self.state_cache = states
+            vm = self.state_cache
+            self.state_cache, la = update_active(vm, vm_new, self.threshold)
+            self.record[la] = True
+        # self.state_cache = states
         self.i += 1
+
+    def is_active(self):
+        return self.record
+        
+    def numpy(self):
+        return self.record.detach().cpu().numpy()
 
 
 class Raster(ThresholdCallback):
@@ -171,17 +196,16 @@ class Raster(ThresholdCallback):
     def pre_loop_hook(self, states):
         if self.record is None:
             self.record = []
-        self.state_cache = states
+        self.state_cache = torch.ones(states.shape[0], len(self.node_check),
+                                      dtype=torch.bool, device=states.device)
 
     def post_step_hook(self, states):
         if self.i * self.dt >= self.t_start_check:
             vm_new = states[:, -1, self.node_check]
-            vm = self.state_cache[:, -1, self.node_check]
-            l_and = torch.logical_and(
-                torch.ge(vm_new, self.threshold), torch.lt(vm, self.threshold)
-            )
-            self.record.append(l_and)
-        self.state_cache = states
+            vm = self.state_cache
+            self.state_cache, la = increment_count(vm, vm_new, self.threshold)
+            self.record.append(la)
+        # self.state_cache = states
         self.i += 1
 
     def stack(self):
@@ -192,14 +216,27 @@ class Raster(ThresholdCallback):
 
 
 @torch.jit.script
-def increment_count(vm, vm_new, record, threshold: float) -> None:
-    l_and = torch.logical_and(torch.ge(vm_new, threshold), torch.lt(vm, threshold))
-    record[l_and] += 1
+def increment_count(vm, vm_new, threshold: float) -> Tuple[Tensor, Tensor]:
+    ge = vm_new >= threshold
+    l_and = torch.logical_and(ge, vm)
+    return ~ge, l_and
 
 
 @torch.jit.script
-def update_active(vm, vm_new, record, threshold: float) -> None:
-    l_and = torch.any(
-        torch.logical_and(torch.ge(vm_new, threshold), torch.lt(vm, threshold)), dim=1
-    )
-    record[l_and] = True
+def increment_count_(vm, vm_new, record, threshold: float) -> Tensor:
+    ge = vm_new >= threshold
+    l_and = torch.logical_and(ge, vm)
+    record[l_and] += 1
+    return ~ge
+
+
+@torch.jit.script
+def update_active(vm, vm_new, threshold: float) -> Tuple[Tensor, Tensor]:
+    ge = vm_new >= threshold
+    l_and = torch.any(torch.logical_and(ge, vm), dim=1)
+    return ~ge, l_and
+
+
+@torch.jit.script
+def is_active(record, at_least: int) -> Tensor:
+    return torch.count_nonzero(record, dim=1) >= at_least

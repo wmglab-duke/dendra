@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from axonml.models import Axon
-from axonml.models.callbacks import Active, Recorder
+from axonml.models.callbacks import Active, ActiveAL, Recorder
 
 
 class Thresholder:
@@ -25,6 +25,7 @@ class Thresholder:
         threshold=0.0,
         node_check: List[int] = [5, -5],
         t_start_check=0.0,
+        at_least=1
     ):
         if isinstance(diams, Tensor) or isinstance(diams, np.ndarray):
             assert len(diams) == bases.shape[0]
@@ -34,6 +35,9 @@ class Thresholder:
 
         else:
             raise TypeError('diams must be a NumPy array / PyTorch tensor with same length as bases or a float.')
+        
+        if at_least < 1:
+            raise ValueError('at_least must be >= 1.')
 
         if fix_bound_down >= 1 or fix_bound_up <= 0:
             raise ValueError('fix_bound_down should be < 1 and > 0.')
@@ -71,7 +75,11 @@ class Thresholder:
         self.max_tries_thresh = max_tries_thresh
         self.resolution = resolution
 
-        self.active = Active(threshold, t_start_check, node_check, dt=dt)
+
+        if at_least > 1:
+            self.active = ActiveAL(threshold, t_start_check, node_check, dt=dt, at_least=at_least)
+        else:
+            self.active = Active(threshold, t_start_check, node_check, dt=dt)
         self.rec = Recorder(max_only=True)
 
     def float(self):
@@ -110,14 +118,14 @@ class Thresholder:
         self.active.reset()
         ve = self.bases * bound[None, :, None, None]
         self.model.run(ve, self.diams, callbacks=[self.active], reinit=True, dt=self.dt)
-        return self.active.record
+        return self.active.is_active()
 
     def check_active_with_rec(self, bound: Tensor):
         self.active.reset()
         self.rec.reset()
         ve = self.bases * bound[None, :, None, None]
         self.model.run(ve, self.diams, callbacks=[self.active, self.rec], reinit=True, dt=self.dt)
-        return self.active.record, self.rec.stack()
+        return self.active.is_active(), self.rec.stack()
 
     def fix_bounds(self, block_possible=True):
         """Make sure upper bound generates AP."""
