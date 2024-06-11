@@ -42,12 +42,12 @@ thresholder = Thresholder(model, field_arrays, fiber_diameters, resolution=0.05)
 Expected output, for Imthera cuff:
 
 <div align="center">
-  <img src="../../../docs/imthera_thresholds_example.png">
+  <img src="../../docs/imthera_thresholds_example.png">
 </div>
 
 and for Livanova (helical) cuff:
 
 
 <div align="center">
-  <img src="../../../docs/livanova_thresholds_example.png">
+  <img src="../../docs/livanova_thresholds_example.png">
 </div>

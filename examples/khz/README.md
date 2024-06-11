@@ -12,7 +12,7 @@ We provide an example script for simulating high frequency stimulation. Execute 
 After a few minutes you should see:
 
 <div align="center">
-  <img src="../../../docs/khz_stim_example.png">
+  <img src="../../docs/khz_stim_example.png">
 </div>
 
 Congratulations, you have successfully simulated ~50,000 axons, a cumulative simulated time of ~1.5 hrs that may otherwise have taken a few months!
