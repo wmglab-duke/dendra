@@ -154,7 +154,7 @@ class Axon(jit.ScriptModule):
                 ).reshape(1, 2, 3)
 
             elif name in self.__class__.params:
-                for pname, pval in self.__class__.params[name]:
+                for pname, pval in self.__class__.params[name].items():
                     p = getattr(self, pname)
                     p.data = torch.tensor(pval, device=p.device)
 
