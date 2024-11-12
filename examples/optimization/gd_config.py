@@ -14,4 +14,8 @@ n_steps = 200
 # models params
 diameter = 5.7
 nodes = 101
+ends_only = True
+n_end_nodes = 10
+node_check = [10, 91]
+
 nc = 6

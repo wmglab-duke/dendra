@@ -18,16 +18,23 @@ from axonml.models.callbacks import Recorder
 
 
 class WeightedQuotient(torch.nn.Module):
-    def __init__(self, target, weights, scale=1):
+    def __init__(self, target, weights, scale=1, ends_only=True, n_end_nodes=10, nodes=101):
         super(WeightedQuotient, self).__init__()
         self.target = torch.nn.Parameter(target, requires_grad=False)
         self.off_target = torch.nn.Parameter(1 - self.target, requires_grad=True)
         self.weights = torch.nn.Parameter(weights, requires_grad=False)
         self.scale = scale
+        self.ends_only = ends_only
+        self.nodes = nodes
+        self.n_lb = n_end_nodes
+        self.n_ub = nodes - n_end_nodes
 
     def forward(self, x):
         x = x[:, :, 0, :]
-        x = torch.sum(x[:, :, :10], (0, 2)) + torch.sum(x[:, :, 90:], (0, 2))
+        if self.ends_only:
+            x = torch.sum(x[:, :, :self.n_lb], (0, 2)) + torch.sum(x[:, :, self.n_ub:], (0, 2))
+        else:
+            x = torch.sum(x, (0, 2))
         x = x * self.weights
         return self.scale * (x @ self.off_target / x @ self.target)
 
@@ -173,10 +180,13 @@ class GD:
     xs = []
     preds = []
 
-    def __init__(self, problems: List[GDProblem], lr, lr_decay):
+    def __init__(self, problems: List[GDProblem], lr, lr_decay, ends_only=True, n_end_nodes=10, nodes=101, node_check=[10, 90]):
+        assert max(node_check) < nodes, "maximum node check index must be < nodes"
+        assert min(node_check) > 0, "minimum node check index must be > 0"
         self.problems = problems
         self.lr = lr
         self.lr_decay = lr_decay
+        self.node_check = node_check
 
         self.best_loss = [None] * len(problems)
         self.best_torch_loss = [None] * len(problems)
@@ -185,7 +195,8 @@ class GD:
 
         self.loss_fns = [
             WeightedQuotient(
-                torch.Tensor(p.target), torch.Tensor(p.weights), np.sqrt(p.ndim / p.nc)
+                torch.Tensor(p.target), torch.Tensor(p.weights), np.sqrt(p.ndim / p.nc),
+                ends_only,n_end_nodes, nodes
             )
             .cuda()
             .double()
@@ -243,7 +254,7 @@ class GD:
             ):
                 with torch.no_grad():
                     active = torch.any(
-                        torch.any((out[:, :, -1, [10, 90]] > 0), dim=2), dim=0
+                        torch.any((out[:, :, -1, self.node_check] > 0), dim=2), dim=0
                     )
                     active = active.cpu().numpy().reshape(1, n_axons)
                 pred_act.append(active)
