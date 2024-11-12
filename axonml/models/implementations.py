@@ -8,6 +8,7 @@ from .core import Axon
 
 class SMF(Axon):
     """Surrogate Myelinated Fiber"""
+
     params = {
         "conductances": {
             "gnabar": 3.0,  # S/cm2
@@ -318,7 +319,7 @@ class SMF(Axon):
             1, -1, 1
         )
         return ic
-    
+
 
 class Sundt(Axon):
     params = {
@@ -332,10 +333,7 @@ class Sundt(Axon):
             "cm": 1e-3,  # mF / cm2
             "rhoa": 100.0,  # ohm-cm
         },
-        "shifts": {
-            "mshift": -6,
-            "hshift": 6
-        },
+        "shifts": {"mshift": -6, "hshift": 6},
         "rate_constants": {
             "am1": 0.32,
             "am2": 13.1,
@@ -357,7 +355,7 @@ class Sundt(Axon):
             "vhalfn": -32.0,
             "vhalfl": -61.0,
             "a0l": 0.001,
-            "a0n": 0.03
+            "a0n": 0.03,
         },
         "axon_d": {"axond1": 0.0, "axond2": 1.0, "axond3": 0.0},
         "node_d": {
@@ -453,7 +451,7 @@ class Sundt(Axon):
         torch.Tensor
             Axon internodal distances (cm)
         """
-        #deltax = self.deltax1 * self.deltax_**2 + self.deltax2 * self.deltax_ + self.deltax3
+        # deltax = self.deltax1 * self.deltax_**2 + self.deltax2 * self.deltax_ + self.deltax3
         return self.dx * torch.ones_like(diameters) / 10000
 
     def q10_1(self):
@@ -464,7 +462,7 @@ class Sundt(Axon):
 
     def q10_3(self):
         return self.aq10_3 ** ((self.temp - self.bq10_3) / self.cq10_3)
-    
+
     def q10_4(self):
         return self.aq10_4 ** ((self.temp - self.bq10_4) / self.cq10_4)
 
@@ -488,7 +486,7 @@ class Sundt(Axon):
         q10 = self.q10_3()
         an = self.alphan(vm)
         bn = self.betan(vm)
-        an_ = (1 + an)
+        an_ = 1 + an
         inf = 1 / an_
         tau_in = (q10 * self.a0n * an_) / bn
         return self.cnexp(n, inf, tau_in, dt)
@@ -497,19 +495,19 @@ class Sundt(Axon):
         q10 = self.q10_4()
         al = self.alphal(vm)
         bl = self.betal(vm)
-        al_ = (1 + al)
+        al_ = 1 + al
         inf = 1 / al_
         tau_in = (q10 * self.a0l * al_) / bl
         return self.cnexp(l, inf, tau_in, dt)
-    
+
     def expM1(self, x, y):
-        b = x / (torch.exp(x/y) - 1)
+        b = x / (torch.exp(x / y) - 1)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
-                b = torch.where(torch.isnan(b), y*(1 - x/y/2), b)
+                b = torch.where(torch.isnan(b), y * (1 - x / y / 2), b)
                 b = torch.nan_to_num(b)
         return b
-    
+
     def handle_(self, b):
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
@@ -518,38 +516,64 @@ class Sundt(Axon):
 
     def alpham(self, vm):
         vm = vm + 65 + self.mshift
-        return self.am1 * self.expM1(self.am2-vm, self.am3)
+        return self.am1 * self.expM1(self.am2 - vm, self.am3)
 
     def betam(self, vm):
         vm = vm + 65 + self.mshift
-        return self.bm1 * self.expM1(vm-self.bm2, self.bm3)
+        return self.bm1 * self.expM1(vm - self.bm2, self.bm3)
 
     def alphah(self, vm):
         vm = vm + 65 + self.hshift
-        b = self.ah1 * torch.exp((self.ah2-vm) / self.ah3)
+        b = self.ah1 * torch.exp((self.ah2 - vm) / self.ah3)
         return self.handle_(b)
 
     def betah(self, vm):
         vm = vm + 65 + self.hshift
-        b = self.bh1 / (torch.exp((self.bh2-vm) / self.bh3) + self.bh4)
+        b = self.bh1 / (torch.exp((self.bh2 - vm) / self.bh3) + self.bh4)
         return self.handle_(b)
-    
+
     def alphan(self, vm):
-        b = torch.exp(1e-3*self.zetan*(vm-self.vhalfn)*9.648e4/(8.315*(273.16+self.temp)))
+        b = torch.exp(
+            1e-3
+            * self.zetan
+            * (vm - self.vhalfn)
+            * 9.648e4
+            / (8.315 * (273.16 + self.temp))
+        )
         return self.handle_(b)
-    
+
     def betan(self, vm):
-        b = torch.exp(1e-3*self.zetan*self.gmn*(vm-self.vhalfn)*9.648e4/(8.315*(273.16+self.temp)))
-        return self.handle_(b) 
+        b = torch.exp(
+            1e-3
+            * self.zetan
+            * self.gmn
+            * (vm - self.vhalfn)
+            * 9.648e4
+            / (8.315 * (273.16 + self.temp))
+        )
+        return self.handle_(b)
 
     def alphal(self, vm):
-        b = torch.exp(1e-3*self.zetal*(vm-self.vhalfl)*9.648e4/(8.315*(273.16+self.temp))) 
+        b = torch.exp(
+            1e-3
+            * self.zetal
+            * (vm - self.vhalfl)
+            * 9.648e4
+            / (8.315 * (273.16 + self.temp))
+        )
         return self.handle_(b)
 
     def betal(self, vm):
-        b = torch.exp(1e-3*self.zetal*self.gml*(vm-self.vhalfl)*9.648e4/(8.315*(273.16+self.temp))) 
+        b = torch.exp(
+            1e-3
+            * self.zetal
+            * self.gml
+            * (vm - self.vhalfl)
+            * 9.648e4
+            / (8.315 * (273.16 + self.temp))
+        )
         return self.handle_(b)
-    
+
     def ionic_currents(self, states: List[Tensor], gbar: List[Tensor]):
         m, h, n, l, vm = states
         gnabar, gkbar, gl = gbar

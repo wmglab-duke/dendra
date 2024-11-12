@@ -18,7 +18,9 @@ from axonml.models.callbacks import Recorder
 
 
 class WeightedQuotient(torch.nn.Module):
-    def __init__(self, target, weights, scale=1, ends_only=True, n_end_nodes=10, nodes=101):
+    def __init__(
+        self, target, weights, scale=1, ends_only=True, n_end_nodes=10, nodes=101
+    ):
         super(WeightedQuotient, self).__init__()
         self.target = torch.nn.Parameter(target, requires_grad=False)
         self.off_target = torch.nn.Parameter(1 - self.target, requires_grad=True)
@@ -32,7 +34,9 @@ class WeightedQuotient(torch.nn.Module):
     def forward(self, x):
         x = x[:, :, 0, :]
         if self.ends_only:
-            x = torch.sum(x[:, :, :self.n_lb], (0, 2)) + torch.sum(x[:, :, self.n_ub:], (0, 2))
+            x = torch.sum(x[:, :, : self.n_lb], (0, 2)) + torch.sum(
+                x[:, :, self.n_ub :], (0, 2)
+            )
         else:
             x = torch.sum(x, (0, 2))
         x = x * self.weights
@@ -180,7 +184,16 @@ class GD:
     xs = []
     preds = []
 
-    def __init__(self, problems: List[GDProblem], lr, lr_decay, ends_only=True, n_end_nodes=10, nodes=101, node_check=[10, 90]):
+    def __init__(
+        self,
+        problems: List[GDProblem],
+        lr,
+        lr_decay,
+        ends_only=True,
+        n_end_nodes=10,
+        nodes=101,
+        node_check=[10, 90],
+    ):
         assert max(node_check) < nodes, "maximum node check index must be < nodes"
         assert min(node_check) > 0, "minimum node check index must be > 0"
         self.problems = problems
@@ -195,8 +208,12 @@ class GD:
 
         self.loss_fns = [
             WeightedQuotient(
-                torch.Tensor(p.target), torch.Tensor(p.weights), np.sqrt(p.ndim / p.nc),
-                ends_only,n_end_nodes, nodes
+                torch.Tensor(p.target),
+                torch.Tensor(p.weights),
+                np.sqrt(p.ndim / p.nc),
+                ends_only,
+                n_end_nodes,
+                nodes,
             )
             .cuda()
             .double()

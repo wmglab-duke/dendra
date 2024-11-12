@@ -384,7 +384,7 @@ class Axon(jit.ScriptModule):
 
         with torch.set_grad_enabled(self.training):
             dt = dt if dt is not None else A.dt
-            
+
             if callbacks:
                 for c in callbacks:
                     c.dt = dt
@@ -430,7 +430,7 @@ class Axon(jit.ScriptModule):
             state_dict = torch.load(state_dict, map_location=self.device())
         self.load_state_dict(state_dict)
         return self
-    
+
     def cache_state(self):
         self._state_cache = self.state.detach().clone()
 

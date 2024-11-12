@@ -286,4 +286,4 @@ plt.gca().legend(
 
 plt.show()
 
-fig.savefig('khz_stim_example.png', bbox_inches='tight')
+fig.savefig("khz_stim_example.png", bbox_inches="tight")

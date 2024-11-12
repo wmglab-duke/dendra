@@ -9,10 +9,16 @@ from axonml.models import SMF
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("-f", "--field", choices=["imthera", "livanova"], help="Cuff.", required=True)
+parser.add_argument(
+    "-f", "--field", choices=["imthera", "livanova"], help="Cuff.", required=True
+)
 
 parser.add_argument(
-    "-p", "--preload", action="store_true", help="Preload bases array into memory.", default=True
+    "-p",
+    "--preload",
+    action="store_true",
+    help="Preload bases array into memory.",
+    default=True,
 )
 
 parser.add_argument(

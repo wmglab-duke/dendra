@@ -140,8 +140,12 @@ class APCount(ThresholdCallback):
                 device=states.device,
             )
         if self.state_cache is None:
-            self.state_cache = torch.ones(states.shape[0], len(self.node_check),
-                                          dtype=torch.bool, device=states.device)
+            self.state_cache = torch.ones(
+                states.shape[0],
+                len(self.node_check),
+                dtype=torch.bool,
+                device=states.device,
+            )
 
     def post_step_hook(self, states):
         if self.i * self.dt >= self.t_start_check:
@@ -153,7 +157,9 @@ class APCount(ThresholdCallback):
 
 
 class ActiveAL(APCount):
-    def __init__(self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None, at_least=1):
+    def __init__(
+        self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None, at_least=1
+    ):
         super().__init__(threshold, t_start_check, node_check, dt)
         self.at_least = at_least
 
@@ -161,7 +167,7 @@ class ActiveAL(APCount):
         if self.record is not None:
             return is_active(self.record, self.at_least)
         return self.record
-        
+
     def numpy(self):
         if self.record is not None:
             return self.is_active().detach().cpu().numpy()
@@ -178,8 +184,12 @@ class Active(ThresholdCallback):
                 states.shape[0], dtype=torch.bool, device=states.device
             )
         if self.state_cache is None:
-            self.state_cache = torch.ones(states.shape[0], len(self.node_check),
-                                        dtype=torch.bool, device=states.device)
+            self.state_cache = torch.ones(
+                states.shape[0],
+                len(self.node_check),
+                dtype=torch.bool,
+                device=states.device,
+            )
 
     def post_step_hook(self, states):
         if self.i * self.dt >= self.t_start_check:
@@ -192,7 +202,7 @@ class Active(ThresholdCallback):
 
     def is_active(self):
         return self.record
-        
+
     def numpy(self):
         return self.record.detach().cpu().numpy()
 
@@ -207,8 +217,12 @@ class Raster(ThresholdCallback):
         if self.record is None:
             self.record = []
         if self.state_cache is None:
-            self.state_cache = torch.ones(states.shape[0], len(self.node_check),
-                                        dtype=torch.bool, device=states.device)
+            self.state_cache = torch.ones(
+                states.shape[0],
+                len(self.node_check),
+                dtype=torch.bool,
+                device=states.device,
+            )
 
     def post_step_hook(self, states):
         if self.i * self.dt >= self.t_start_check:

@@ -62,7 +62,15 @@ mrg = SMF(fp32=False).cuda().load(args.model).compile(nodes=nodes).train().doubl
 # -- run optimization --
 
 if __name__ == "__main__":
-    gd = GD(problems, args.lr, args.lr_decay, args.ends_only, args.n_end_nodes, args.nodes, args.node_check)
+    gd = GD(
+        problems,
+        args.lr,
+        args.lr_decay,
+        args.ends_only,
+        args.n_end_nodes,
+        args.nodes,
+        args.node_check,
+    )
 
     tic()
     gd.solve(mrg, args.n_steps)

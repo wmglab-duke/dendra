@@ -25,7 +25,7 @@ class Thresholder:
         threshold=0.0,
         node_check: List[int] = [5, -5],
         t_start_check=0.0,
-        at_least=1
+        at_least=1,
     ):
         if isinstance(diams, Tensor) or isinstance(diams, np.ndarray):
             assert len(diams) == bases.shape[0]
@@ -34,16 +34,18 @@ class Thresholder:
             diams = np.atleast_1d(np.full(bases.shape[0], diams))
 
         else:
-            raise TypeError('diams must be a NumPy array / PyTorch tensor with same length as bases or a float.')
-        
+            raise TypeError(
+                "diams must be a NumPy array / PyTorch tensor with same length as bases or a float."
+            )
+
         if at_least < 1:
-            raise ValueError('at_least must be >= 1.')
+            raise ValueError("at_least must be >= 1.")
 
         if fix_bound_down >= 1 or fix_bound_up <= 0:
-            raise ValueError('fix_bound_down should be < 1 and > 0.')
-        
+            raise ValueError("fix_bound_down should be < 1 and > 0.")
+
         if fix_bound_up <= 1:
-            raise ValueError('fix_bound_up should be > 1.')
+            raise ValueError("fix_bound_up should be > 1.")
 
         self.model = model.compile(bases.shape[-1], bases.shape[0])
 
@@ -75,9 +77,10 @@ class Thresholder:
         self.max_tries_thresh = max_tries_thresh
         self.resolution = resolution
 
-
         if at_least > 1:
-            self.active = ActiveAL(threshold, t_start_check, node_check, dt=dt, at_least=at_least)
+            self.active = ActiveAL(
+                threshold, t_start_check, node_check, dt=dt, at_least=at_least
+            )
         else:
             self.active = Active(threshold, t_start_check, node_check, dt=dt)
         self.rec = Recorder(max_only=True)
@@ -91,7 +94,7 @@ class Thresholder:
         self.ub_initial = self.ub.clone()
         self.lb = self.lb.float()
         return self
-    
+
     def double(self):
         self.fp32 = False
         self.model = self.model.double()
@@ -124,7 +127,9 @@ class Thresholder:
         self.active.reset()
         self.rec.reset()
         ve = self.bases * bound[None, :, None, None]
-        self.model.run(ve, self.diams, callbacks=[self.active, self.rec], reinit=True, dt=self.dt)
+        self.model.run(
+            ve, self.diams, callbacks=[self.active, self.rec], reinit=True, dt=self.dt
+        )
         return self.active.is_active(), self.rec.stack()
 
     def fix_bounds(self, block_possible=True):
@@ -141,8 +146,12 @@ class Thresholder:
                 mask, rec = self.check_active_with_rec(self.ub)
                 inactive = ~mask
                 if block_possible:
-                    self.ub[(rec[:, -1] < self.threshold) & inactive] *= self.fix_bound_up
-                    self.ub[(rec[:, -1] >= self.threshold) & inactive] *= self.fix_bound_down
+                    self.ub[
+                        (rec[:, -1] < self.threshold) & inactive
+                    ] *= self.fix_bound_up
+                    self.ub[
+                        (rec[:, -1] >= self.threshold) & inactive
+                    ] *= self.fix_bound_down
                 else:
                     self.ub[inactive] *= self.fix_bound_up
                 tries += 1
