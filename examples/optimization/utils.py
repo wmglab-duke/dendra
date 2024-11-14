@@ -45,7 +45,7 @@ def deltax(diam):
     dx = np.where(diam >= 5.26, -8.215284e00 * diam**2 + 2.724201e02 * diam + -7.802411e02, (500 / 5.7) * diam) 
     if dx.size == 1:
         return float(dx)
-    return dx.tolist()
+    return dx
 
 
 # -- loss functions --

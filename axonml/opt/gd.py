@@ -75,7 +75,7 @@ class AxonSpec:
     def dx(self):
         length = np.asarray(self.length)
         half_length = length / 2
-        if hasattr(self.length, "__iter__"):
+        if not self.is_single():
             return [np.linspace(-h, h, self.nodes) for h in half_length]
         return np.linspace(-half_length, half_length, self.nodes)
     
