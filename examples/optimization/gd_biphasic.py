@@ -84,7 +84,7 @@ if __name__ == "__main__":
 
         class MyMRG(MRG):
             def init_AP_monitors(self):
-                self.set_AP_monitors(axonnodes=[10, 90])
+                self.set_AP_monitors(axonnodes=args.node_check)
 
         N.tstop = 2.5
 
