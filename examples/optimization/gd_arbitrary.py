@@ -23,6 +23,8 @@ nodes = args.nodes
 diameter = args.diameter
 nc = args.nc
 
+is_vec = hasattr(diameter, "__iter__")
+
 tcourse = np.arange(0, 2.5, 0.005)
 
 pw = 1
@@ -100,13 +102,17 @@ if __name__ == "__main__":
 
             axons = []
             for i in range(fields[0].shape[0]):
+                if is_vec:
+                    d = diameter[i]
+                else:
+                    d = diameter
                 axons.append(
                     MyMRG.SPEC(
                         y=p.f_spec.midpoint(),
                         gid=i,
                         enforce_odd_axonnodes=True,
                         axonnodes=nodes,
-                        diameter=diameter,
+                        diameter=d,
                         try_exact=False,
                         piecewise_geom_interp=False,
                         interpolation_method=1,

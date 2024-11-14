@@ -29,6 +29,8 @@ nodes = args.nodes
 diameter = args.diameter
 nc = args.nc
 
+is_vec = hasattr(diameter, "__iter__")
+
 if args.samples == "all":
     all_samples = natsorted([f.name for f in os.scandir("./samples/") if f.is_dir()])
 else:
@@ -101,13 +103,17 @@ if __name__ == "__main__":
 
             axons = []
             for i in range(fields[0].shape[0]):
+                if is_vec:
+                    d = diameter[i]
+                else:
+                    d = diameter
                 axons.append(
                     MyMRG.SPEC(
                         y=p.f_spec.midpoint(),
                         gid=i,
                         enforce_odd_axonnodes=True,
                         axonnodes=nodes,
-                        diameter=diameter,
+                        diameter=d,
                         try_exact=False,
                         piecewise_geom_interp=False,
                         interpolation_method=1,
