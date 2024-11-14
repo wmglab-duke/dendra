@@ -121,7 +121,12 @@ class GDProblem:
         all_bases = np.stack(all_bases)
 
         self.bases = torch.Tensor(all_bases).double().cuda()
-        self.diams = self.diameter * torch.ones(self.n_axons).cuda().double()
+
+        if hasattr(self.diameter, "__len__"):
+            assert len(self.diameter) == self.n_axons, "len(diameter) != n_axons"
+            self.diams = torch.tensor(self.diameter).cuda().double()
+        else:
+            self.diams = self.diameter * torch.ones(self.n_axons).cuda().double()
 
     def x_to_input(self) -> torch.Tensor:
         raise NotImplementedError()
