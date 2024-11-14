@@ -3,7 +3,7 @@ Methods and classes for gradient-based parameter optimization
 using differentiable neural surrogate model.
 """
 from dataclasses import dataclass
-from typing import List
+from typing import List, Union
 
 import numpy as np
 from pytorch_optimizer import Ranger
@@ -59,7 +59,7 @@ class WeightedBinaryCrossEntropy(PredictionLoss):
 @dataclass
 class FieldSpec:
     fields: List[np.array]
-    fiber_z: np.array
+    fiber_z: np.array #1d
     nc: int
 
     def midpoint(self):
@@ -68,13 +68,20 @@ class FieldSpec:
 
 @dataclass
 class AxonSpec:
-    diameter: float
+    diameter: Union[float, List[float]]
     nodes: int
-    length: float
+    length: Union[float, List[float]]
 
     def dx(self):
-        half_length = self.length / 2
+        length = np.asarray(self.length)
+        half_length = length / 2
+        if hasattr(self.length, "__iter__"):
+            return [np.linspace(-h, h, self.nodes) for h in half_length]
         return np.linspace(-half_length, half_length, self.nodes)
+    
+    def is_single(self):
+        return not hasattr(self.length, "__iter__")
+        
 
 
 class GDProblem:
@@ -107,12 +114,17 @@ class GDProblem:
             for field in self.fields
         ]
 
-        interp_at = a_spec.dx() + f_spec.midpoint()
+        dx = a_spec.dx()
+        mid = f_spec.midpoint()
 
         all_bases = []
 
         for i in range(self.n_axons):
             bases_ = []
+            if self.a_spec.is_single():
+                interp_at = mid + dx
+            else:
+                interp_at = mid + dx[i]
             for interp in interpolators:
                 b = interp._interpolate(interp.get(i), interp.x[0], interp_at)
                 bases_.append(b)
