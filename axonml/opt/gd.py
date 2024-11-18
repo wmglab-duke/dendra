@@ -16,8 +16,14 @@ from cajal.opt.loss import PredictionLoss
 
 from axonml.models.callbacks import Recorder
 
+from pytictoc import TicToc
+t = TicToc()
 
-class WeightedQuotient(torch.nn.Module):
+
+class WeightedQuotient(torch.jit.ScriptModule):
+
+    __constants__ = ["scale", "ends_only", "nodes", "n_lb", "n_ub"]
+    
     def __init__(
         self, target, weights, scale=1, ends_only=True, n_end_nodes=10, nodes=101
     ):
@@ -30,7 +36,7 @@ class WeightedQuotient(torch.nn.Module):
         self.nodes = nodes
         self.n_lb = n_end_nodes
         self.n_ub = nodes - n_end_nodes
-
+    
     def forward(self, x):
         x = x[:, :, 0, :]
         if self.ends_only:
@@ -235,6 +241,7 @@ class GD:
         self.best_preds = [[] for _ in range(len(problems))]
         self.dtype = dtype
 
+
         self.loss_fns = [
             WeightedQuotient(
                 torch.Tensor(p.target),
@@ -287,7 +294,6 @@ class GD:
 
             input = torch.concat(inputs, dim=1)
             model.run(input, diams, dt=dt, callbacks=[rec], reinit=True)
-
             out = rec.stack()
 
             all_losses = []
