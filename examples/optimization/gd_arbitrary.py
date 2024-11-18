@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 from natsort import natsorted
+import torch
 
 from cajal.common.logging import tic, toc
 from cajal.nrn.sources import PreComputedInterpolate1D
@@ -16,6 +17,9 @@ from gd_parser import parser
 
 args = parser.parse_args()
 
+
+# -- FP32? --
+dtype = torch.float32 if args.fp32 else torch.float64
 
 # -- bases --
 
@@ -50,13 +54,13 @@ for sample in all_samples:
     f_spec = FieldSpec(fields, fiber_zs, nc)
     a_spec = AxonSpec(diameter, nodes, length)
 
-    problem = GDProblemArbitrary(target, weights, f_spec, a_spec, tcourse, pw, delay)
+    problem = GDProblemArbitrary(target, weights, f_spec, a_spec, tcourse, pw, delay, dtype)
     problems.append(problem)
 
 
 # -- model --
 
-mrg = SMF(fp32=False).cuda().load(args.model).compile(nodes=nodes).train().double()
+mrg = SMF(fp32=args.fp32).cuda().load(args.model).compile(nodes=nodes).train().to(dtype)
 
 
 if __name__ == "__main__":
@@ -68,6 +72,7 @@ if __name__ == "__main__":
         args.n_end_nodes,
         args.nodes,
         args.node_check,
+        dtype
     )
 
     tic()

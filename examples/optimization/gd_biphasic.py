@@ -17,12 +17,9 @@ from utils import deltax, percent_on_target_active, percent_off_target_active
 
 args = parser.parse_args()
 
-# -- FP32? --
 
-if args.fp32:
-    dtype = torch.float32
-else:
-    dtype = torch.float64
+# -- FP32? --
+dtype = torch.float32 if args.fp32 else torch.float64
 
 # -- stim --
 
