@@ -22,5 +22,8 @@ parser.add_argument("--n_end_nodes", type=int, default=config.n_end_nodes)
 parser.add_argument("--node_check", nargs="+", default=config.node_check)
 parser.add_argument("--nc", type=int, default=config.nc)
 
+# FP precision
+parser.add_argument("--fp32", action="store_true", default=config.fp32)
+
 # parse
 args = parser.parse_args()

@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 from natsort import natsorted
+import torch
 
 from cajal.common.logging import tic, toc
 from cajal.nrn.stimuli import SymmetricBiphasic
@@ -16,6 +17,12 @@ from utils import deltax, percent_on_target_active, percent_off_target_active
 
 args = parser.parse_args()
 
+# -- FP32? --
+
+if args.fp32:
+    dtype = torch.float32
+else:
+    dtype = torch.float64
 
 # -- stim --
 
@@ -52,13 +59,13 @@ for sample in all_samples:
     f_spec = FieldSpec(fields, fiber_zs, nc)
     a_spec = AxonSpec(diameter, nodes, length)
 
-    problem = GDProblemUniform(target, weights, f_spec, a_spec, tcourse, stim)
+    problem = GDProblemUniform(target, weights, f_spec, a_spec, tcourse, stim, dtype=dtype)
     problems.append(problem)
 
 
 # -- model --
 
-mrg = SMF(fp32=False).cuda().load(args.model).compile(nodes=nodes).train().double()
+mrg = SMF(fp32=args.fp32).cuda().load(args.model).compile(nodes=nodes).train().to(dtype)
 
 
 # -- run optimization --
@@ -72,6 +79,7 @@ if __name__ == "__main__":
         args.n_end_nodes,
         args.nodes,
         args.node_check,
+        dtype=dtype,
     )
 
     tic()

@@ -85,7 +85,15 @@ class AxonSpec:
 
 
 class GDProblem:
-    def __init__(self, target, weights, f_spec: FieldSpec, a_spec: AxonSpec, time):
+    def __init__(
+            self, 
+            target,
+            weights, 
+            f_spec: FieldSpec, 
+            a_spec: AxonSpec, 
+            time, 
+            dtype=torch.float64
+        ):
         self.f_spec = f_spec
         self.a_spec = a_spec
         self.target = target
@@ -94,11 +102,13 @@ class GDProblem:
 
         self.fields = f_spec.fields
         self.fiber_z = f_spec.fiber_z
-        self.nc = f_spec.nc
+        self.nc = f_spec.ncs
 
         self.diameter = a_spec.diameter
         self.nodes = a_spec.nodes
         self.length = a_spec.length
+
+        self.dtype = dtype
 
         self.n_axons = self.fields[0].shape[0]
 
@@ -132,23 +142,23 @@ class GDProblem:
 
         all_bases = np.stack(all_bases)
 
-        self.bases = torch.Tensor(all_bases).double().cuda()
+        self.bases = torch.Tensor(all_bases).cuda().ast
 
         if hasattr(self.diameter, "__len__"):
             assert len(self.diameter) == self.n_axons, "len(diameter) != n_axons"
-            self.diams = torch.tensor(self.diameter).cuda().double()
+            self.diams = torch.tensor(self.diameter).cuda().to(self.dtype)
         else:
-            self.diams = self.diameter * torch.ones(self.n_axons).cuda().double()
+            self.diams = self.diameter * torch.ones(self.n_axons).cuda().to(self.dtype)
 
     def x_to_input(self) -> torch.Tensor:
         raise NotImplementedError()
 
 
 class GDProblemUniform(GDProblem):
-    def __init__(self, target, weights, f_spec, a_spec, time, stim: Stimulus):
-        super().__init__(target, weights, f_spec, a_spec, time)
-        self.stim = torch.Tensor(stim.timecourse(self.time)).double().cuda()
-        self.x = torch.zeros(1, self.nc, requires_grad=True, device="cuda").double()
+    def __init__(self, target, weights, f_spec, a_spec, time, stim: Stimulus, dtype=torch.float64):
+        super().__init__(target, weights, f_spec, a_spec, time, dtype)
+        self.stim = torch.Tensor(stim.timecourse(self.time)).cuda().to(self.dtype)
+        self.x = torch.zeros(1, self.nc, requires_grad=True, device="cuda").to(self.dtype)
         self.x.retain_grad()
         self.ndim = torch.numel(self.x)
 
@@ -161,8 +171,8 @@ class GDProblemUniform(GDProblem):
 
 
 class GDProblemArbitrary(GDProblem):
-    def __init__(self, target, weights, f_spec, a_spec, time, pw, delay, dt=0.005):
-        super().__init__(target, weights, f_spec, a_spec, time)
+    def __init__(self, target, weights, f_spec, a_spec, time, pw, delay, dt=0.005, dtype=torch.float64):
+        super().__init__(target, weights, f_spec, a_spec, time, dtype)
 
         # arbitrary stimulus is nonzero at ...
         self.pw = pw
@@ -172,12 +182,12 @@ class GDProblemArbitrary(GDProblem):
         # generate mask
         sb = MonophasicPulse(1, pw, delay)
         tcourse = sb.timecourse(self.time)
-        self.mask = torch.Tensor(tcourse).double().cuda()
+        self.mask = torch.Tensor(tcourse).to(self.dtype).cuda()
 
         # to be optimized
         self.x = torch.zeros(
             len(self.time), 1, self.nc, requires_grad=True, device="cuda"
-        ).double()
+        ).to(self.dtype)
         self.x.retain_grad()
 
         # size of problem
@@ -210,6 +220,7 @@ class GD:
         n_end_nodes=10,
         nodes=101,
         node_check=[10, 90],
+        dtype=torch.float64
     ):
         assert max(node_check) < nodes, "maximum node check index must be < nodes"
         assert min(node_check) > 0, "minimum node check index must be > 0"
@@ -222,6 +233,7 @@ class GD:
         self.best_torch_loss = [None] * len(problems)
         self.best_xs = [[] for _ in range(len(problems))]
         self.best_preds = [[] for _ in range(len(problems))]
+        self.dtype = dtype
 
         self.loss_fns = [
             WeightedQuotient(
@@ -233,7 +245,7 @@ class GD:
                 nodes,
             )
             .cuda()
-            .double()
+            .to(self.dtype)
             for p in self.problems
         ]
 

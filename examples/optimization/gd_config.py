@@ -1,5 +1,6 @@
 """GD config"""
 
+
 # model
 model = "MRG"
 
@@ -19,3 +20,6 @@ n_end_nodes = 10
 node_check = [10, 91]
 
 nc = 6
+
+# FP precision
+fp32 = False
