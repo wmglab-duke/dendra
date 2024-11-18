@@ -102,7 +102,7 @@ class GDProblem:
 
         self.fields = f_spec.fields
         self.fiber_z = f_spec.fiber_z
-        self.nc = f_spec.ncs
+        self.nc = f_spec.nc
 
         self.diameter = a_spec.diameter
         self.nodes = a_spec.nodes
@@ -142,7 +142,7 @@ class GDProblem:
 
         all_bases = np.stack(all_bases)
 
-        self.bases = torch.Tensor(all_bases).cuda().ast
+        self.bases = torch.Tensor(all_bases).cuda().to(self.dtype)
 
         if hasattr(self.diameter, "__len__"):
             assert len(self.diameter) == self.n_axons, "len(diameter) != n_axons"
