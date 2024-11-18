@@ -16,14 +16,10 @@ from cajal.opt.loss import PredictionLoss
 
 from axonml.models.callbacks import Recorder
 
-from pytictoc import TicToc
-t = TicToc()
-
 
 class WeightedQuotient(torch.jit.ScriptModule):
-
     __constants__ = ["scale", "ends_only", "nodes", "n_lb", "n_ub"]
-    
+
     def __init__(
         self, target, weights, scale=1, ends_only=True, n_end_nodes=10, nodes=101
     ):
@@ -36,7 +32,7 @@ class WeightedQuotient(torch.jit.ScriptModule):
         self.nodes = nodes
         self.n_lb = n_end_nodes
         self.n_ub = nodes - n_end_nodes
-    
+
     def forward(self, x):
         x = x[:, :, 0, :]
         if self.ends_only:
@@ -65,7 +61,7 @@ class WeightedBinaryCrossEntropy(PredictionLoss):
 @dataclass
 class FieldSpec:
     fields: List[np.array]
-    fiber_z: np.array #1d
+    fiber_z: np.array  # 1d
     nc: int
 
     def midpoint(self):
@@ -84,22 +80,21 @@ class AxonSpec:
         if not self.is_single():
             return [np.linspace(-h, h, self.nodes) for h in half_length]
         return np.linspace(-half_length, half_length, self.nodes)
-    
+
     def is_single(self):
         return not hasattr(self.length, "__iter__")
-        
 
 
 class GDProblem:
     def __init__(
-            self, 
-            target,
-            weights, 
-            f_spec: FieldSpec, 
-            a_spec: AxonSpec, 
-            time, 
-            dtype=torch.float64
-        ):
+        self,
+        target,
+        weights,
+        f_spec: FieldSpec,
+        a_spec: AxonSpec,
+        time,
+        dtype=torch.float64,
+    ):
         self.f_spec = f_spec
         self.a_spec = a_spec
         self.target = target
@@ -161,10 +156,14 @@ class GDProblem:
 
 
 class GDProblemUniform(GDProblem):
-    def __init__(self, target, weights, f_spec, a_spec, time, stim: Stimulus, dtype=torch.float64):
+    def __init__(
+        self, target, weights, f_spec, a_spec, time, stim: Stimulus, dtype=torch.float64
+    ):
         super().__init__(target, weights, f_spec, a_spec, time, dtype)
         self.stim = torch.Tensor(stim.timecourse(self.time)).cuda().to(self.dtype)
-        self.x = torch.zeros(1, self.nc, requires_grad=True, device="cuda").to(self.dtype)
+        self.x = torch.zeros(1, self.nc, requires_grad=True, device="cuda").to(
+            self.dtype
+        )
         self.x.retain_grad()
         self.ndim = torch.numel(self.x)
 
@@ -177,7 +176,18 @@ class GDProblemUniform(GDProblem):
 
 
 class GDProblemArbitrary(GDProblem):
-    def __init__(self, target, weights, f_spec, a_spec, time, pw, delay, dt=0.005, dtype=torch.float64):
+    def __init__(
+        self,
+        target,
+        weights,
+        f_spec,
+        a_spec,
+        time,
+        pw,
+        delay,
+        dt=0.005,
+        dtype=torch.float64,
+    ):
         super().__init__(target, weights, f_spec, a_spec, time, dtype)
 
         # arbitrary stimulus is nonzero at ...
@@ -226,7 +236,7 @@ class GD:
         n_end_nodes=10,
         nodes=101,
         node_check=[10, 90],
-        dtype=torch.float64
+        dtype=torch.float64,
     ):
         assert max(node_check) < nodes, "maximum node check index must be < nodes"
         assert min(node_check) > 0, "minimum node check index must be > 0"
@@ -240,7 +250,6 @@ class GD:
         self.best_xs = [[] for _ in range(len(problems))]
         self.best_preds = [[] for _ in range(len(problems))]
         self.dtype = dtype
-
 
         self.loss_fns = [
             WeightedQuotient(

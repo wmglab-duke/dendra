@@ -54,7 +54,9 @@ for sample in all_samples:
     f_spec = FieldSpec(fields, fiber_zs, nc)
     a_spec = AxonSpec(diameter, nodes, length)
 
-    problem = GDProblemArbitrary(target, weights, f_spec, a_spec, tcourse, pw, delay, dtype)
+    problem = GDProblemArbitrary(
+        target, weights, f_spec, a_spec, tcourse, pw, delay, dtype
+    )
     problems.append(problem)
 
 
@@ -72,7 +74,7 @@ if __name__ == "__main__":
         args.n_end_nodes,
         args.nodes,
         args.node_check,
-        dtype
+        dtype,
     )
 
     tic()

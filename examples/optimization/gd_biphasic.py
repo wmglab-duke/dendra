@@ -56,7 +56,9 @@ for sample in all_samples:
     f_spec = FieldSpec(fields, fiber_zs, nc)
     a_spec = AxonSpec(diameter, nodes, length)
 
-    problem = GDProblemUniform(target, weights, f_spec, a_spec, tcourse, stim, dtype=dtype)
+    problem = GDProblemUniform(
+        target, weights, f_spec, a_spec, tcourse, stim, dtype=dtype
+    )
     problems.append(problem)
 
 
