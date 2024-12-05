@@ -3,6 +3,7 @@ from typing import List
 import torch
 from torch import Tensor
 from torch import expm1, sigmoid as expit
+from .mechanisms.ops import exprelr
 
 from ._core import Axon
 
@@ -207,7 +208,7 @@ class SMF(Axon):
 
     def alphap(self, v):
         x = - (v + self.ampB)
-        b = self.ampA * (x / expm1(x / self.ampC))
+        b = self.ampA * exprelr(x, self.ampC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.ampA * self.ampC)
@@ -215,7 +216,7 @@ class SMF(Axon):
 
     def betap(self, v):
         x = (v + self.bmpB)
-        b = self.bmpA * (x / expm1(x / self.bmpC))
+        b = self.bmpA * exprelr(x, self.bmpC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.bmpA * self.bmpC)
@@ -223,7 +224,7 @@ class SMF(Axon):
 
     def alpham(self, v):
         x = - (v + self.amB)
-        b = self.amA * (x / expm1(x / self.amC))
+        b = self.amA * exprelr(x, self.amC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.amA * self.amC)
@@ -231,7 +232,7 @@ class SMF(Axon):
 
     def betam(self, v):
         x = (v + self.bmB)
-        b = self.bmA * (x / expm1(x / self.bmC))
+        b = self.bmA * exprelr(x, self.bmC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.bmA * self.bmC)
@@ -239,7 +240,7 @@ class SMF(Axon):
 
     def alphah(self, v):
         x = (v + self.ahB)
-        b = self.ahA * (x / expm1(x / self.ahC))
+        b = self.ahA * exprelr(x, self.ahC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.ahA * self.ahC)
