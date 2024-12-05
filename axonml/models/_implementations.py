@@ -3,7 +3,7 @@ from typing import List
 import torch
 from torch import Tensor
 
-from .core import Axon
+from ._core import Axon
 
 
 class SMF(Axon):
