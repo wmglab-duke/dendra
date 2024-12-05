@@ -2,6 +2,7 @@ from typing import List
 
 import torch
 from torch import Tensor
+from torch import expm1, sigmoid as expit
 
 from ._core import Axon
 
@@ -204,72 +205,62 @@ class SMF(Axon):
         s_inf = als / asbs
         return self.cnexp(s, s_inf, q10_3 * asbs, dt)
 
-    def alphap(self, vm):
-        a = (vm + self.ampB)
-        num = self.ampA * a
-        den = 1 - torch.exp(-a / self.ampC)
-        b = num / den
+    def alphap(self, v):
+        x = - (v + self.ampB)
+        b = self.ampA * (x / expm1(x / self.ampC))
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.ampA * self.ampC)
         return b
 
-    def betap(self, vm):
-        a = (vm + self.bmpB)
-        num = self.bmpA * (-a)
-        den = 1 - torch.exp(a / self.bmpC)
-        b = num / den
+    def betap(self, v):
+        x = (v + self.bmpB)
+        b = self.bmpA * (x / expm1(x / self.bmpC))
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.bmpA * self.bmpC)
         return b
 
-    def alpham(self, vm):
-        a = (vm + self.amB)
-        num = self.amA * a
-        den = 1 - torch.exp(-a / self.amC)
-        b = num / den
+    def alpham(self, v):
+        x = - (v + self.amB)
+        b = self.amA * (x / expm1(x / self.amC))
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.amA * self.amC)
         return b
 
-    def betam(self, vm):
-        a = (vm + self.bmB)
-        num = self.bmA * (-a)
-        den = 1 - torch.exp(a / self.bmC)
-        b = num / den
+    def betam(self, v):
+        x = (v + self.bmB)
+        b = self.bmA * (x / expm1(x / self.bmC))
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.bmA * self.bmC)
         return b
 
-    def alphah(self, vm):
-        a = (vm + self.ahB)
-        num = self.ahA * (-a)
-        den = 1 - torch.exp(a / self.ahC)
-        b = num / den
+    def alphah(self, v):
+        x = (v + self.ahB)
+        b = self.ahA * (x / expm1(x / self.ahC))
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b, nan=self.ahA * self.ahC)
         return b
 
-    def betah(self, vm):
-        b = self.bhA / (1 + torch.exp(-(vm + self.bhB) / self.bhC))
+    def betah(self, v):
+        b = self.bhA * expit((v + self.bhB) / self.bhC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b)
         return b
 
-    def alphas(self, vm):
-        b = self.asA / (torch.exp((vm + self.asB - self.vtraub) / self.asC) + 1)
+    def alphas(self, v):
+        b = self.asA * expit((self.vtraub - v - self.asB) / self.asC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b)
         return b
 
-    def betas(self, vm):
-        b = self.bsA / (torch.exp((vm + self.bsB - self.vtraub) / self.bsC) + 1)
+    def betas(self, v):
+        b = self.bsA * expit((self.vtraub - v - self.bsB) / self.bsC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
                 b = torch.nan_to_num(b)

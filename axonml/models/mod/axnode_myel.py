@@ -28,7 +28,7 @@ class m(State):
 
     def alpha(self, v):
         x = - (v + self.amB)
-        return - self.amA * (x / expm1(x / self.amC))
+        return self.amA * (x / expm1(x / self.amC))
     
     def beta(self, v):
         x = (v + self.bmB)
@@ -63,7 +63,7 @@ class p(State):
 
     def alpha(self, v):
         x = - (v + self.ampB)
-        return - self.ampA * (x / expm1(x / self.ampC))
+        return self.ampA * (x / expm1(x / self.ampC))
     
     def beta(self, v):
         x = (v + self.bmpB)

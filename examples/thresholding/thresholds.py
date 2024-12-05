@@ -55,7 +55,7 @@ if __name__ == "__main__":
     nrn_thresh_path = f"{directory}/example_thresholds_{field}.npy"
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
-    mrg = SMF(handle_nan=True).cuda().load("MRG")
+    mrg = SMF(handle_nan=False).cuda().load("MRG")
     thresholder = Thresholder(mrg, fp, diams).float()
     thresh, _ = thresholder.calculate_thresholds()
 
