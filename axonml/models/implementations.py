@@ -205,8 +205,9 @@ class SMF(Axon):
         return self.cnexp(s, s_inf, q10_3 * asbs, dt)
 
     def alphap(self, vm):
-        num = self.ampA * (vm + self.ampB)
-        den = 1 - torch.exp(-(vm + self.ampB) / self.ampC)
+        a = (vm + self.ampB)
+        num = self.ampA * a
+        den = 1 - torch.exp(-a / self.ampC)
         b = num / den
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
@@ -214,8 +215,9 @@ class SMF(Axon):
         return b
 
     def betap(self, vm):
-        num = self.bmpA * (-(vm + self.bmpB))
-        den = 1 - torch.exp((vm + self.bmpB) / self.bmpC)
+        a = (vm + self.bmpB)
+        num = self.bmpA * (-a)
+        den = 1 - torch.exp(a / self.bmpC)
         b = num / den
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
@@ -223,8 +225,9 @@ class SMF(Axon):
         return b
 
     def alpham(self, vm):
-        num = self.amA * (vm + self.amB)
-        den = 1 - torch.exp(-(vm + self.amB) / self.amC)
+        a = (vm + self.amB)
+        num = self.amA * a
+        den = 1 - torch.exp(-a / self.amC)
         b = num / den
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
@@ -232,8 +235,9 @@ class SMF(Axon):
         return b
 
     def betam(self, vm):
-        num = self.bmA * (-(vm + self.bmB))
-        den = 1 - torch.exp((vm + self.bmB) / self.bmC)
+        a = (vm + self.bmB)
+        num = self.bmA * (-a)
+        den = 1 - torch.exp(a / self.bmC)
         b = num / den
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
@@ -241,8 +245,9 @@ class SMF(Axon):
         return b
 
     def alphah(self, vm):
-        num = self.ahA * (-(vm + self.ahB))
-        den = 1 - torch.exp((vm + self.ahB) / self.ahC)
+        a = (vm + self.ahB)
+        num = self.ahA * (-a)
+        den = 1 - torch.exp(a / self.ahC)
         b = num / den
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
