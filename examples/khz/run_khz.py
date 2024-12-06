@@ -112,14 +112,14 @@ def longrun(
     warmup=True,
 ):
     field_stack = torch.tensor(field_stack, device="cuda").float().unsqueeze(1)
-    diams_gpu = torch.tensor(diams, device="cuda")
+    diams_gpu = torch.tensor(diams, device="cuda").float()
 
     if warmup:
         print("warming up...")
 
         ve = torch.rand(5, len(field_stack) * len(stims), 1, nodes).float().cuda()
         intra = torch.zeros_like(ve).cuda()
-        dg = torch.rand(len(field_stack) * len(stims)).cuda()
+        dg = torch.rand(len(field_stack) * len(stims)).float().cuda()
 
         for _ in range(3):
             with torch.no_grad():
@@ -149,7 +149,7 @@ def longrun(
                 input_intra.append(intra)
 
         input_ve = torch.cat(input_ve, 1)
-        input_diams = torch.cat(input_diams)
+        input_diams = torch.cat(input_diams).float()
         if input_intra:
             input_intra = torch.cat(input_intra, 1)
         else:
