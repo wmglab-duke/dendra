@@ -32,6 +32,12 @@ class State(Parameterized):
     def cnexp(self, gv, inf, tau_inv, dt):
         return inf - (inf - gv) * torch.exp(-dt * tau_inv)
 
+
+@torch.jit.interface
+class MechanismInterface:
+    def get(self, s: str) -> torch.Tensor:
+        pass
+
     
 class Mechanism(Parameterized):
 
@@ -43,43 +49,41 @@ class Mechanism(Parameterized):
         super().__init__()
         self.temp : float = temp
         self.v_init : float = v_init
+
         self.states: Dict[str, torch.Tensor] = {}
-        self.conductances: Dict[str, torch.Tensor] = {}
-        self.derivatives = torch.nn.ModuleDict({
+        self.dynamics = torch.nn.ModuleDict({
             cls.__name__: cls(self.temp) for cls in self._states
         })
+
+        # -- bunch of stuff to handle initial conditions + torch compiler --
+        self._init_params : Dict[str, float] = {
+            k:v for k, v in self._init.items()
+        }
         self.init(v_init)
 
-    def _init_c(self):
-        for n, v in self._conductances.items():
-            self.conductances[n] = torch.tensor(v, device=self.device())
-
-    def _init_buffers(self, v_init):
-        for n, m in self.derivatives.items():
-            if n in self._init:
-                buffer_tensor = torch.tensor(self._init[n], device=self.device())
+    def _init_buffers_s(self, v_init):
+        for n, m in self.dynamics.items():
+            if n in self._init_params:
+                buffer_tensor = torch.tensor(self._init_params[n], device=v_init.device)
             else:
                 buffer_tensor = m.inf(v_init)
             self.states[n] = buffer_tensor
 
+    @torch.jit.export
     def init(self, v_init):
-        self._init_c()
-        self._init_buffers(v_init)
+        self._init_buffers_s(v_init)
 
-    def inflate(self, v, area):
-        self._inflate_c(area)
+    @torch.jit.export
+    def inflate(self, v):
         self._inflate_s(v)
 
-    def _inflate_c(self, area):
-        for k, s in self.conductances.items():
-            self.conductances[k] = (s*area)[:, None, None]
-
+    @torch.jit.export
     def _inflate_s(self, v):
         for k, s in self.states.items():
             self.states[k] = s.expand(v.shape)
 
     def _advance(self, v, dt):
-        for name, m in self.derivatives.items():
+        for name, m in self.dynamics.items():
             self.states[name] = m.advance(self.states[name], v, dt)
 
     @torch.jit.export

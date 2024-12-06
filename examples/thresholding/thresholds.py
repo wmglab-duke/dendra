@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from axonml.instruments.thresholder import Thresholder
-from axonml.models import SMF
+from axonml.models.implementations import SMF
 
 
 parser = argparse.ArgumentParser()
@@ -55,7 +55,7 @@ if __name__ == "__main__":
     nrn_thresh_path = f"{directory}/example_thresholds_{field}.npy"
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
-    mrg = SMF(handle_nan=False).cuda().load("MRG")
+    mrg = SMF().cuda().load("MRG2024")
     thresholder = Thresholder(mrg, fp, diams).float()
     thresh, _ = thresholder.calculate_thresholds()
 

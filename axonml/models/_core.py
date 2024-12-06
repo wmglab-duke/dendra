@@ -6,7 +6,7 @@ import torch.jit as jit
 from torch import Tensor
 
 from axonml import trained
-from .callbacks import CallbackList, Callback
+from ._callbacks import CallbackList, Callback
 from .backend import Backend as A
 
 
@@ -425,9 +425,9 @@ class Axon(jit.ScriptModule):
 
     def load(self, state_dict):
         if state_dict in trained:
-            state_dict = torch.load(trained[state_dict], map_location=self.device())
+            state_dict = torch.load(trained[state_dict], map_location=self.device(), weights_only=True)
         elif isinstance(state_dict, str):
-            state_dict = torch.load(state_dict, map_location=self.device())
+            state_dict = torch.load(state_dict, map_location=self.device(), weights_only=True)
         self.load_state_dict(state_dict)
         return self
 

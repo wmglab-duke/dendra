@@ -5,7 +5,7 @@ import numpy as np
 from cajal.nrn.sources import FEMInterpolate1D
 
 from axonml.models import SMF
-from axonml.models.callbacks import APCount
+from axonml.models._callbacks import APCount
 
 
 torch.set_default_dtype(torch.float32)
@@ -174,7 +174,7 @@ def longrun(
 
 # run
 
-mrg = SMF(handle_nan=True).cuda().load("MRG")
+mrg = SMF(handle_nan=False).cuda().load("MRG")
 
 frequencies = [1, 2, 5, 10]
 stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]

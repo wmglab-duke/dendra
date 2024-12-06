@@ -83,7 +83,7 @@ class Thresholder:
             )
         else:
             self.active = Active(threshold, t_start_check, node_check, dt=dt)
-        self.rec = Recorder(max_only=True)
+        self.rec = Recorder(['v'],max_only=True)
 
     def float(self):
         self.fp32 = True

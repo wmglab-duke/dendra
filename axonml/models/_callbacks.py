@@ -1,14 +1,13 @@
-from typing import Tuple, Dict, List
+from typing import List, Tuple
 
 import torch
+from torch import Tensor
 
 from .backend import Backend as A
-from .interfaces import AxonInterface
 
 
 class Callback:
-
-    def pre_loop_hook(self, model: AxonInterface):
+    def pre_loop_hook(self, states: Tensor):
         """Execute before entering solver loop.
 
         Parameters
@@ -18,7 +17,7 @@ class Callback:
         """
         pass
 
-    def post_step_hook(self, model: AxonInterface):
+    def post_step_hook(self, states: Tensor):
         """Execute after each loop of solver (advance of
         single timestep.)
 
@@ -29,7 +28,7 @@ class Callback:
         """
         pass
 
-    def post_loop_hook(self, model: AxonInterface):
+    def post_loop_hook(self, states: Tensor):
         """Execute after solver loop completes.
 
         Parameters
@@ -53,64 +52,47 @@ class CallbackList:
     def __next__(self):
         return next(self.callbacks)
 
-    def pre_loop_hook(self, model: AxonInterface):
+    def pre_loop_hook(self, states):
         for c in self:
-            c.pre_loop_hook(model)
+            c.pre_loop_hook(states)
 
-    def post_step_hook(self, model: AxonInterface):
+    def post_step_hook(self, states):
         for c in self:
-            c.post_step_hook(model)
+            c.post_step_hook(states)
 
-    def post_loop_hook(self, model: AxonInterface):
+    def post_loop_hook(self, states):
         for c in self:
-            c.post_loop_hook(model)
+            c.post_loop_hook(states)
 
 
 class Recorder(Callback):
-    def __init__(self, states, max_only=False, node_indices=None, state_indices=None):
-        self.states = states
-        self.rec: Dict[str, List[torch.Tensor]] = {
-            s: [] for s in states
-        }
+    def __init__(self, max_only=False, node_indices=None, state_indices=None):
+        self.rec: List[Tensor] = []
         self.max_only = max_only
         self.node_indices = node_indices
         self.state_indices = state_indices
 
     def reset(self):
-        self.rec = {s: [] for s in self.states} 
+        self.rec.clear()
 
-    def pre_loop_hook(self, model: AxonInterface):
-        for s in self.rec:
-            states = model.get_state(s)
-            if self.max_only:
-                self.rec[s].append(torch.amax(states, -1))
-            else:
-                if self.node_indices is not None:
-                    self.rec[s].append(states[:, :, self.node_indices])
-                else:
-                    self.rec[s].append(states)
-
-    def post_step_hook(self, model: AxonInterface):
-        for s in self.rec:
-            states = model.get_state(s)
-            if self.max_only:
-                self.rec[s].append(torch.amax(states, -1))
-            else:
-                if self.node_indices is not None:
-                    self.rec[s].append(states[:, :, self.node_indices])
-                else:
-                    self.rec[s].append(states)
-
-    def stack(self, var: str=None):
-        if var is not None:
-            vs = torch.stack(self.rec[var])
-            if self.max_only:
-                return torch.amax(vs, 0)
-            return vs
-        vs = torch.cat([torch.stack(self.rec[s]) for s in self.rec], dim=2)
+    def pre_loop_hook(self, states):
         if self.max_only:
-            return torch.amax(vs, 0)
-        return vs
+            self.rec.append(torch.amax(states, -1))
+        else:
+            self.rec.append(states)
+
+    def post_step_hook(self, states):
+        if self.max_only:
+            self.rec.append(torch.amax(states, -1))
+        else:
+            if self.node_indices is not None:
+                self.rec.append(states[:, :, :, self.node_indices])
+            self.rec.append(states)
+
+    def stack(self):
+        if self.max_only:
+            return torch.amax(torch.stack(self.rec), 0)
+        return torch.stack(self.rec)
 
 
 class ThresholdCallback(Callback):
@@ -141,7 +123,7 @@ class ThresholdCallback(Callback):
         if self.record is not None:
             return self.record.detach().cpu().numpy()
         return self.record
-    
+
 
 class APCount(ThresholdCallback):
 
@@ -149,27 +131,28 @@ class APCount(ThresholdCallback):
     checked node.
     """
 
-    def pre_loop_hook(self, model: AxonInterface):
+    def pre_loop_hook(self, states):
         if self.record is None:
             self.record = torch.zeros(
-                model.n(),
+                states.shape[0],
                 len(self.node_check),
-                dtype=torch.int32,
-                device=model.device(),
+                dtype=torch.int16,
+                device=states.device,
             )
         if self.state_cache is None:
             self.state_cache = torch.ones(
-                model.n(),
+                states.shape[0],
                 len(self.node_check),
                 dtype=torch.bool,
-                device=model.device(),
+                device=states.device,
             )
 
-    def post_step_hook(self, model: AxonInterface):
+    def post_step_hook(self, states):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.get_state("v")[:, -1, self.node_check]
+            vm_new = states[:, -1, self.node_check]
             vm = self.state_cache
             self.state_cache = increment_count_(vm, vm_new, self.record, self.threshold)
+        # self.state_cache = states
         self.i += 1
 
 
@@ -189,33 +172,32 @@ class ActiveAL(APCount):
         if self.record is not None:
             return self.is_active().detach().cpu().numpy()
         return self.record
-    
+
 
 class Active(ThresholdCallback):
 
     """Record if fibers generated action potential(s)."""
 
-    def pre_loop_hook(self, model):
+    def pre_loop_hook(self, states):
         if self.record is None:
             self.record = torch.zeros(
-                model.n(), 
-                dtype=torch.bool, 
-                device=model.device()
+                states.shape[0], dtype=torch.bool, device=states.device
             )
         if self.state_cache is None:
             self.state_cache = torch.ones(
-                model.n(),
+                states.shape[0],
                 len(self.node_check),
                 dtype=torch.bool,
-                device=model.device(),
+                device=states.device,
             )
 
-    def post_step_hook(self, model: AxonInterface):
+    def post_step_hook(self, states):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.get_state("v")[:, -1, self.node_check]
+            vm_new = states[:, -1, self.node_check]
             vm = self.state_cache
             self.state_cache, la = update_active(vm, vm_new, self.threshold)
             self.record[la] = True
+        # self.state_cache = states
         self.i += 1
 
     def is_active(self):
@@ -225,8 +207,48 @@ class Active(ThresholdCallback):
         return self.record.detach().cpu().numpy()
 
 
+class Raster(ThresholdCallback):
+
+    """Record all timepoints at which action potentials occur
+    at checked nodes.
+    """
+
+    def pre_loop_hook(self, states):
+        if self.record is None:
+            self.record = []
+        if self.state_cache is None:
+            self.state_cache = torch.ones(
+                states.shape[0],
+                len(self.node_check),
+                dtype=torch.bool,
+                device=states.device,
+            )
+
+    def post_step_hook(self, states):
+        if self.i * self.dt >= self.t_start_check:
+            vm_new = states[:, -1, self.node_check]
+            vm = self.state_cache
+            self.state_cache, la = increment_count(vm, vm_new, self.threshold)
+            self.record.append(la)
+        # self.state_cache = states
+        self.i += 1
+
+    def stack(self):
+        return torch.stack(self.record)
+
+    def numpy(self):
+        return self.stack().detach().cpu().numpy()
+
+
 @torch.jit.script
-def increment_count_(vm, vm_new, record, threshold: float) -> torch.Tensor:
+def increment_count(vm, vm_new, threshold: float) -> Tuple[Tensor, Tensor]:
+    ge = vm_new >= threshold
+    l_and = torch.logical_and(ge, vm)
+    return ~ge, l_and
+
+
+@torch.jit.script
+def increment_count_(vm, vm_new, record, threshold: float) -> Tensor:
     ge = vm_new >= threshold
     l_and = torch.logical_and(ge, vm)
     record[l_and] += 1
@@ -234,11 +256,12 @@ def increment_count_(vm, vm_new, record, threshold: float) -> torch.Tensor:
 
 
 @torch.jit.script
-def update_active(vm, vm_new, threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
+def update_active(vm, vm_new, threshold: float) -> Tuple[Tensor, Tensor]:
     ge = vm_new >= threshold
     l_and = torch.any(torch.logical_and(ge, vm), dim=1)
     return ~ge, l_and
 
+
 @torch.jit.script
-def is_active(record, at_least: int) -> torch.Tensor:
+def is_active(record, at_least: int) -> Tensor:
     return torch.count_nonzero(record, dim=1) >= at_least

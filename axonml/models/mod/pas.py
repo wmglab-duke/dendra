@@ -1,18 +1,12 @@
-from ..mechanisms import (
-    Mechanism, PARAMETER, CONDUCTANCE
-)
+from ..mechanisms import Mechanism, PARAMETER
 
 
 class pas(Mechanism):
 
-    CONDUCTANCE({
-        'g': 0.007
-    })
-
     PARAMETER({
+        'g': 0.007,
         'e': -70.0
     })
 
     def i(self, v):
-        g = self.conductances['g']
-        return g * (v - self.e)
+        return self.g * (v - self.e)

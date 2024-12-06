@@ -14,7 +14,7 @@ from cajal.nrn.sources import PreComputedInterpolate1D
 from cajal.nrn.stimuli import Stimulus, MonophasicPulse
 from cajal.opt.loss import PredictionLoss
 
-from axonml.models.callbacks import Recorder
+from axonml.models._callbacks import Recorder
 
 
 class WeightedQuotient(torch.jit.ScriptModule):

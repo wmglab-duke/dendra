@@ -11,7 +11,7 @@ from cajal.opt.differentialevolution import DEBASE
 from cajal.opt.differentialevolution.callbacks import Logger, EarlyStopping, Timer
 
 from axonml.models import SMF
-from axonml.models.callbacks import Active
+from axonml.models._callbacks import Active
 
 import de_config as config
 from utils import (

@@ -8,7 +8,7 @@ from .mechanisms.ops import exprelr
 from ._core import Axon
 
 
-class SMF(Axon):
+class SMF_(Axon):
     """Surrogate Myelinated Fiber"""
 
     params = {

@@ -1,10 +1,9 @@
 import torch
 
 from ..mechanisms import (
-    Mechanism, State, PARAMETER, STATE, 
-    CONDUCTANCE, INITIAL, USEQ10
+    Mechanism, State, PARAMETER, STATE, INITIAL, USEQ10
 )
-from ..mechanisms.ops import expm1, expit
+from ..mechanisms.ops import expit, exprelr
 
 
 class m(State):
@@ -18,21 +17,21 @@ class m(State):
         "bmA": 0.086,
         "bmB": 25.7,
         "bmC": 9.16,
-        "aq10": 2.2,
+        "aq10_1": 2.2,
         "bq10": 20.0,
         "cq10": 10.0
     })
 
     def calc_q10(self):
-        return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
+        return self.aq10_1 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
         x = - (v + self.amB)
-        return self.amA * (x / expm1(x / self.amC))
+        return self.amA * exprelr(x, self.amC)
     
     def beta(self, v):
         x = (v + self.bmB)
-        return self.bmA * (x / expm1(x / self.bmC))
+        return self.bmA * exprelr(x, self.bmC)
     
     def advance(self, m, v, dt):
         am = self.alpha(v)
@@ -53,21 +52,21 @@ class p(State):
         "bmpA": 0.00025,
         "bmpB": 34.0,
         "bmpC": 10.0,
-        "aq10": 2.2,
+        "pq10_1": 2.2,
         "bq10": 20.0,
         "cq10": 10.0
     })
 
     def calc_q10(self):
-        return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
+        return self.pq10_1 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
         x = - (v + self.ampB)
-        return self.ampA * (x / expm1(x / self.ampC))
+        return self.ampA * exprelr(x, self.ampC)
     
     def beta(self, v):
         x = (v + self.bmpB)
-        return self.bmpA * (x / expm1(x / self.bmpC))
+        return self.bmpA * exprelr(x, self.bmpC)
     
     def advance(self, p, v, dt):
         amp = self.alpha(v)
@@ -88,17 +87,17 @@ class h(State):
         "bhA": 2.3,
         "bhB": 31.8,
         "bhC": 13.4,
-        "aq10": 2.9,
+        "aq10_2": 2.9,
         "bq10": 20.0,
         "cq10": 10.0
     })
 
     def calc_q10(self):
-        return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
+        return self.aq10_2 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
         x = (v + self.ahB)
-        return self.ahA * (x / expm1(x / self.ahC))
+        return self.ahA * exprelr(x, self.ahC)
     
     def beta(self, v):
         return self.bhA * expit((v + self.bhB) / self.bhC)
@@ -122,14 +121,14 @@ class s(State):
         "bsA": 0.03,
         "bsB": 10.0,
         "bsC": -1.0,
-        "aq10": 3.0,
+        "aq10_3": 3.0,
         "bq10": 36.0,
         "cq10": 10.0,
         "vtraub": -80.0
     })
 
     def calc_q10(self):
-        return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
+        return self.aq10_3 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
         b = self.asA * expit((self.vtraub - v - self.asB) / self.asC)
@@ -151,17 +150,14 @@ class Axnode_Myel(Mechanism):
     
     STATE(m, p, h, s)
     
-    CONDUCTANCE({
+    PARAMETER({
         'gnabar': 3.0,
         'gnapbar': 0.01,
         'gkbar': 0.08,
-        'gl': 0.007
-    })
-    
-    PARAMETER({
+        'gl': 0.007,
         'ena': 50.0,
-        'ek': -65.0,
-        'el': -35.0
+        'ek': -90.0,
+        'el': -90.0
     })
     
     INITIAL({
@@ -179,21 +175,15 @@ class Axnode_Myel(Mechanism):
         p = self.states['p']
         s = self.states['s']
 
-        # -- conductances --
-        gkbar = self.conductances['gkbar']
-        gnabar = self.conductances['gnabar']
-        gnapbar = self.conductances['gnapbar']
-        gl = self.conductances['gl']
-
         # -- current --
         current = (
-            (gnabar * m * m * m * h * (v - self.ena))
+            (self.gnabar * m * m * m * h * (v - self.ena))
             + 
-            (gnapbar * p * p * p * (v - self.ena))
+            (self.gnapbar * p * p * p * (v - self.ena))
             + 
-            (gkbar *s * (v - self.ek))
+            (self.gkbar * s * (v - self.ek))
             + 
-            (gl * (v - self.el))
+            (self.gl * (v - self.el))
         )
         
         return current

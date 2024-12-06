@@ -7,7 +7,7 @@ from torch.nn.modules.loss import _Loss
 from tqdm import tqdm
 
 from .data import DataLoader
-from ..models.callbacks import Recorder
+from ..models._callbacks import Recorder
 from ..models import Axon
 
 
