@@ -123,7 +123,7 @@ def longrun(
 
         for _ in range(3):
             with torch.no_grad():
-                out = model(ve, dg, intra=intra, dt=dt)
+                out = model.run(ve, dg, intra=intra, dt=dt)
 
     t_vec = np.arange(0, tstop, dt)
     views = np.array_split(t_vec, chunks)
@@ -159,7 +159,7 @@ def longrun(
             reinit = False
             if i == 0:
                 reinit = True
-            _ = model(
+            _ = model.run(
                 input_ve,
                 input_diams,
                 intra=input_intra,
