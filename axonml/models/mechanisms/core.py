@@ -48,8 +48,7 @@ class Mechanism(Parameterized):
         self.derivatives = torch.nn.ModuleDict({
             cls.__name__: cls(self.temp) for cls in self._states
         })
-        self._init_c()
-        self._init_buffers(v_init)
+        self.init(v_init)
 
     def _init_c(self):
         for n, v in self._conductances.items():
@@ -63,11 +62,15 @@ class Mechanism(Parameterized):
                 buffer_tensor = m.inf(v_init)
             self.states[n] = buffer_tensor
 
+    def init(self, v_init):
+        self._init_c()
+        self._init_buffers(v_init)
+
     def inflate(self, v, area):
-        self._inflate_c(v, area)
+        self._inflate_c(area)
         self._inflate_s(v)
 
-    def _inflate_c(self, v, area):
+    def _inflate_c(self, area):
         for k, s in self.conductances.items():
             self.conductances[k] = (s*area)[:, None, None]
 
