@@ -1,6 +1,5 @@
 """GD config"""
 
-
 # model
 model = "MRG"
 

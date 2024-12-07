@@ -6,13 +6,12 @@ def to_param(val):
 
 
 class Parameterized(torch.nn.Module):
-    
     _params = None
-    
+
     def __init__(self):
         super(Parameterized, self).__init__()
         self.instantiate_parameters()
-        
+
     def instantiate_parameters(self):
         if self.__class__._params is not None:
             for name, value in self.__class__._params.items():

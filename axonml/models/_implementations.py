@@ -207,7 +207,7 @@ class SMF_(Axon):
         return self.cnexp(s, s_inf, q10_3 * asbs, dt)
 
     def alphap(self, v):
-        x = - (v + self.ampB)
+        x = -(v + self.ampB)
         b = self.ampA * exprelr(x, self.ampC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
@@ -215,7 +215,7 @@ class SMF_(Axon):
         return b
 
     def betap(self, v):
-        x = (v + self.bmpB)
+        x = v + self.bmpB
         b = self.bmpA * exprelr(x, self.bmpC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
@@ -223,7 +223,7 @@ class SMF_(Axon):
         return b
 
     def alpham(self, v):
-        x = - (v + self.amB)
+        x = -(v + self.amB)
         b = self.amA * exprelr(x, self.amC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
@@ -231,7 +231,7 @@ class SMF_(Axon):
         return b
 
     def betam(self, v):
-        x = (v + self.bmB)
+        x = v + self.bmB
         b = self.bmA * exprelr(x, self.bmC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):
@@ -239,7 +239,7 @@ class SMF_(Axon):
         return b
 
     def alphah(self, v):
-        x = (v + self.ahB)
+        x = v + self.ahB
         b = self.ahA * exprelr(x, self.ahC)
         if self.handle_nan:
             if torch.any(torch.isnan(b)):

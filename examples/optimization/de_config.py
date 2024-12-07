@@ -1,6 +1,5 @@
 """DE + Surrogate config"""
 
-
 # DE params
 strategy = "best1bin"
 mutation = 0.8

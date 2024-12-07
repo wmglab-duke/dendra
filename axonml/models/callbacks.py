@@ -7,7 +7,6 @@ from .interfaces import AxonInterface
 
 
 class Callback:
-
     def pre_loop_hook(self, model: AxonInterface):
         """Execute before entering solver loop.
 
@@ -69,15 +68,13 @@ class CallbackList:
 class Recorder(Callback):
     def __init__(self, states, max_only=False, node_indices=None, state_indices=None):
         self.states = states
-        self.rec: Dict[str, List[torch.Tensor]] = {
-            s: [] for s in states
-        }
+        self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only = max_only
         self.node_indices = node_indices
         self.state_indices = state_indices
 
     def reset(self):
-        self.rec = {s: [] for s in self.states} 
+        self.rec = {s: [] for s in self.states}
 
     def pre_loop_hook(self, model: AxonInterface):
         for s in self.rec:
@@ -101,7 +98,7 @@ class Recorder(Callback):
                 else:
                     self.rec[s].append(states)
 
-    def stack(self, var: str=None):
+    def stack(self, var: str = None):
         if var is not None:
             vs = torch.stack(self.rec[var])
             if self.max_only:
@@ -141,10 +138,9 @@ class ThresholdCallback(Callback):
         if self.record is not None:
             return self.record.detach().cpu().numpy()
         return self.record
-    
+
 
 class APCount(ThresholdCallback):
-
     """Count the number of action potentials that arrived at each
     checked node.
     """
@@ -189,18 +185,15 @@ class ActiveAL(APCount):
         if self.record is not None:
             return self.is_active().detach().cpu().numpy()
         return self.record
-    
+
 
 class Active(ThresholdCallback):
-
     """Record if fibers generated action potential(s)."""
 
     def pre_loop_hook(self, model):
         if self.record is None:
             self.record = torch.zeros(
-                model.n(), 
-                dtype=torch.bool, 
-                device=model.device()
+                model.n(), dtype=torch.bool, device=model.device()
             )
         if self.state_cache is None:
             self.state_cache = torch.ones(
@@ -226,7 +219,6 @@ class Active(ThresholdCallback):
 
 
 class Raster(ThresholdCallback):
-
     """Record all timepoints at which action potentials occur
     at checked nodes.
     """

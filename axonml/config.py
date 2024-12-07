@@ -1,4 +1,5 @@
 """Training config."""
+
 from typing import List
 
 import torch

@@ -83,7 +83,7 @@ class Thresholder:
             )
         else:
             self.active = Active(threshold, t_start_check, node_check, dt=dt)
-        self.rec = Recorder(['v'],max_only=True)
+        self.rec = Recorder(["v"], max_only=True)
 
     def float(self):
         self.fp32 = True
@@ -146,12 +146,12 @@ class Thresholder:
                 mask, rec = self.check_active_with_rec(self.ub)
                 inactive = ~mask
                 if block_possible:
-                    self.ub[
-                        (rec[:, -1] < self.threshold) & inactive
-                    ] *= self.fix_bound_up
-                    self.ub[
-                        (rec[:, -1] >= self.threshold) & inactive
-                    ] *= self.fix_bound_down
+                    self.ub[(rec[:, -1] < self.threshold) & inactive] *= (
+                        self.fix_bound_up
+                    )
+                    self.ub[(rec[:, -1] >= self.threshold) & inactive] *= (
+                        self.fix_bound_down
+                    )
                 else:
                     self.ub[inactive] *= self.fix_bound_up
                 tries += 1

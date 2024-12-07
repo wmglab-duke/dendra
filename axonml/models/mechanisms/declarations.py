@@ -17,12 +17,12 @@ def add_to_namespace_dict(namespace, name, dct):
         namespace[name].update(dct)
     else:
         namespace[name] = dct
-    
+
 
 def _declare(name, *args):
     # Get the calling frame (the frame where myfunc was called)
     frame = sys._getframe(1)
-    
+
     # Get the local namespace of the calling frame
     namespace = frame.f_locals
 
@@ -31,7 +31,7 @@ def _declare(name, *args):
 
 def _declare_parameters(name, dct):
     frame = sys._getframe(1)
-    
+
     # Get the local namespace of the calling frame
     namespace = frame.f_locals
 
@@ -41,10 +41,10 @@ def _declare_parameters(name, dct):
 def USEQ10():
     frame = sys._getframe(1)
     namespace = frame.f_locals
-    namespace['is_q10'] = True
+    namespace["is_q10"] = True
 
 
-STATE = partial(_declare, '_states')
-PARAMETER = partial(_declare_parameters, '_params')
-CONDUCTANCE = partial(_declare_parameters, '_conductances')
-INITIAL = partial(_declare_parameters, '_init')
+STATE = partial(_declare, "_states")
+PARAMETER = partial(_declare_parameters, "_params")
+CONDUCTANCE = partial(_declare_parameters, "_conductances")
+INITIAL = partial(_declare_parameters, "_init")

@@ -126,7 +126,6 @@ class ThresholdCallback(Callback):
 
 
 class APCount(ThresholdCallback):
-
     """Count the number of action potentials that arrived at each
     checked node.
     """
@@ -175,7 +174,6 @@ class ActiveAL(APCount):
 
 
 class Active(ThresholdCallback):
-
     """Record if fibers generated action potential(s)."""
 
     def pre_loop_hook(self, states):
@@ -208,7 +206,6 @@ class Active(ThresholdCallback):
 
 
 class Raster(ThresholdCallback):
-
     """Record all timepoints at which action potentials occur
     at checked nodes.
     """

@@ -2,6 +2,7 @@
 Methods and classes for gradient-based parameter optimization
 using differentiable neural surrogate model.
 """
+
 from dataclasses import dataclass
 from typing import List, Union
 

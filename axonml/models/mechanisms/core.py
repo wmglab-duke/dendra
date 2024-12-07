@@ -6,14 +6,15 @@ from ..mixins import Parameterized
 
 
 class State(Parameterized):
-    
     is_q10 = False
-    
+
     def __init__(self, temp: float):
         super().__init__()
-        self.temp : float = temp
+        self.temp: float = temp
         if self.is_q10:
-            assert getattr(self, 'calc_q10', None) is not None, "must implement `calc_q10` if using q10"
+            assert (
+                getattr(self, "calc_q10", None) is not None
+            ), "must implement `calc_q10` if using q10"
             self.register_buffer("q10_cache", self.calc_q10())
 
     def eval(self):
@@ -25,13 +26,13 @@ class State(Parameterized):
         if not self.training:
             return self.q10_cache
         return self.calc_q10()
-    
+
     def inf(self, v):
         return self.alpha(v) / (self.alpha(v) + self.beta(v))
 
     def cnexp(self, gv, inf, tau_inv, dt):
         return inf - (inf - gv) * torch.exp(-dt * tau_inv)
-    
+
     def set(self, key, value):
         p = getattr(self, key)
         if isinstance(p, torch.Tensor):
@@ -43,30 +44,27 @@ class MechanismInterface:
     def get(self, s: str) -> torch.Tensor:
         pass
 
-    
-class Mechanism(Parameterized):
 
+class Mechanism(Parameterized):
     _states = set()
     _conductances = {}
     _init = {}
 
     _init_params: Dict[str, float]
     states: Dict[str, torch.Tensor]
-    
-    def __init__(self, temp: float, v_init: float, ic : dict = None, **kwargs):
+
+    def __init__(self, temp: float, v_init: float, ic: dict = None, **kwargs):
         super().__init__()
-        self.temp : float = temp
-        self.v_init : float = v_init
+        self.temp: float = temp
+        self.v_init: float = v_init
 
         self.states: Dict[str, torch.Tensor] = {}
-        self.DE = torch.nn.ModuleDict({
-            cls.__name__: cls(self.temp) for cls in self._states
-        })
+        self.DE = torch.nn.ModuleDict(
+            {cls.__name__: cls(self.temp) for cls in self._states}
+        )
 
         # -- bunch of stuff to handle initial conditions + torch compiler --
-        self._init_params : Dict[str, float] = {
-            k:v for k, v in self._init.items()
-        }
+        self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
         if ic is not None:
             self._init_params.update(ic)
         self._init_buffers_s(v_init)
@@ -110,4 +108,3 @@ class Mechanism(Parameterized):
 
     def i(self, v):
         raise NotImplementedError()
-    
