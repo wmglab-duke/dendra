@@ -51,8 +51,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def device(self):
         return self.ssd.weight.device
 
-    def insert(self, mechanism: Mechanism, **kwargs):
-        m = mechanism(self.temp, torch.tensor(self.v_init, device=self.device()), **kwargs)
+    def insert(self, mechanism: Mechanism, ic=None, **kwargs):
+        v_init = torch.tensor(self.v_init, device=self.device())
+        m = mechanism(self.temp, v_init, ic=ic, **kwargs)
         self.mechanisms[mechanism.__name__] = m
 
     def advance_mechanisms(self, v, dt):

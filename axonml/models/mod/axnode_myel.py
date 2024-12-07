@@ -157,13 +157,6 @@ class axnode_myel(Mechanism):
         'ek': -90.0,
         'el': -90.0
     })
-    
-    INITIAL({
-        'm': 0.0732093,
-        'h': 0.62069505,
-        'p': 0.20260409,
-        's': 0.04302994
-    })
 
     def i(self, v):
 

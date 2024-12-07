@@ -53,7 +53,7 @@ class Mechanism(Parameterized):
     _init_params: Dict[str, float]
     states: Dict[str, torch.Tensor]
     
-    def __init__(self, temp: float, v_init: float, **kwargs):
+    def __init__(self, temp: float, v_init: float, ic : dict = None, **kwargs):
         super().__init__()
         self.temp : float = temp
         self.v_init : float = v_init
@@ -67,6 +67,9 @@ class Mechanism(Parameterized):
         self._init_params : Dict[str, float] = {
             k:v for k, v in self._init.items()
         }
+        if ic is not None:
+            self._init_params.update(ic)
+        self._init_buffers_s(v_init)
         self.init(v_init)
         for k, v in kwargs.items():
             self.set(k, v)
