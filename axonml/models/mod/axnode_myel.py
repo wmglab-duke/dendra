@@ -146,7 +146,7 @@ class s(State):
         return self.cnexp(s, s_inf, self.q10() * s_tau_inv, dt)
     
 
-class Axnode_Myel(Mechanism):
+class axnode_myel(Mechanism):
     
     STATE(m, p, h, s)
     
