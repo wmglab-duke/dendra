@@ -45,7 +45,7 @@ class Mechanism(Parameterized):
     _conductances = {}
     _init = {}
     
-    def __init__(self, temp: float, v_init: float):
+    def __init__(self, temp: float, v_init: float, **kwargs):
         super().__init__()
         self.temp : float = temp
         self.v_init : float = v_init
@@ -60,6 +60,13 @@ class Mechanism(Parameterized):
             k:v for k, v in self._init.items()
         }
         self.init(v_init)
+        for k, v in kwargs.items():
+            self.set(k, v)
+
+    def set(self, key, value):
+        p = getattr(self, key)
+        if isinstance(p, torch.Tensor):
+            p.data = torch.tensor(value, dtype=p.data.dtype, device=p.device)
 
     def _init_buffers_s(self, v_init):
         for n, m in self.dynamics.items():

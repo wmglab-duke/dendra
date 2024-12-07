@@ -47,9 +47,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     @torch.jit.export
     def n(self) -> int:
         return self.v.shape[0]
+    
+    def device(self):
+        return self.ssd.weight.device
 
-    def insert(self, mechanism: Mechanism):
-        m = mechanism(self.temp, torch.tensor(self.v_init, device=self.device()))
+    def insert(self, mechanism: Mechanism, **kwargs):
+        m = mechanism(self.temp, torch.tensor(self.v_init, device=self.device()), **kwargs)
         self.mechanisms[mechanism.__name__] = m
 
     def advance_mechanisms(self, v, dt):
