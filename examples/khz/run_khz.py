@@ -128,18 +128,15 @@ def longrun(
     t_vec = np.arange(0, tstop, dt)
     views = np.array_split(t_vec, chunks)
 
-    returns = []
-    tstart = 0.0
-
     for i, t_chunk in enumerate(tqdm(views, desc="Running")):
         input_ve = []
         input_intra = []
         input_diams = []
 
         for stim in stims:
-            tc = stim(t=t_chunk)
+            tc = stim(t=t_chunk).astype(np.float32)
             t_course = torch.tensor(tc, device="cuda")
-            ve = torch.einsum("i, jkl -> ijkl", t_course, field_stack).float()
+            ve = torch.einsum("i, jkl -> ijkl", t_course, field_stack)
             input_ve.append(ve)
             input_diams.append(diams_gpu)
             if with_intra:
@@ -149,7 +146,7 @@ def longrun(
                 input_intra.append(intra)
 
         input_ve = torch.cat(input_ve, 1)
-        input_diams = torch.cat(input_diams).float()
+        input_diams = torch.cat(input_diams)
         if input_intra:
             input_intra = torch.cat(input_intra, 1)
         else:
@@ -167,7 +164,6 @@ def longrun(
                 callbacks=[count],
                 reinit=reinit,
             )
-        tstart = t_chunk[-1]
 
     return 0
 
