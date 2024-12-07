@@ -31,6 +31,11 @@ class State(Parameterized):
 
     def cnexp(self, gv, inf, tau_inv, dt):
         return inf - (inf - gv) * torch.exp(-dt * tau_inv)
+    
+    def set(self, key, value):
+        p = getattr(self, key)
+        if isinstance(p, torch.Tensor):
+            p.data = torch.tensor(value, dtype=p.data.dtype, device=p.device)
 
 
 @torch.jit.interface
@@ -54,7 +59,7 @@ class Mechanism(Parameterized):
         self.v_init : float = v_init
 
         self.states: Dict[str, torch.Tensor] = {}
-        self.dynamics = torch.nn.ModuleDict({
+        self.DE = torch.nn.ModuleDict({
             cls.__name__: cls(self.temp) for cls in self._states
         })
 
@@ -72,7 +77,7 @@ class Mechanism(Parameterized):
             p.data = torch.tensor(value, dtype=p.data.dtype, device=p.device)
 
     def _init_buffers_s(self, v_init):
-        for n, m in self.dynamics.items():
+        for n, m in self.DE.items():
             if n in self._init_params:
                 buffer_tensor = torch.tensor(self._init_params[n], device=v_init.device)
             else:
@@ -93,7 +98,7 @@ class Mechanism(Parameterized):
             self.states[k] = s.expand(v.shape)
 
     def _advance(self, v, dt):
-        for name, m in self.dynamics.items():
+        for name, m in self.DE.items():
             self.states[name] = m.advance(self.states[name], v, dt)
 
     @torch.jit.export

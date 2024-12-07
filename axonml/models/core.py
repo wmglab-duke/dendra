@@ -184,7 +184,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def get_state(self, s: str) -> Tensor:
         if s == 'v':
             return self.v
-        mech, state = s.split(':')
+        mech, state = s.split('.')
         m : MechanismInterface = self.mechanisms[mech]
         return m.get(state)
     
@@ -202,6 +202,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for _ in range(5):
             self.run(ve, d, reinit=True)
         return self
+    
+    @torch.jit.script_method
+    def all_states(self) -> List[str]:
+        out = ['v']
+        for n, m in self.mechanisms.items():
+            for s in m.states.keys():
+                out.append(f'{n}.{s}')
+        return out
 
 
 class Unmyelinated(Axon):

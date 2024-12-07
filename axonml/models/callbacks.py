@@ -225,6 +225,45 @@ class Active(ThresholdCallback):
         return self.record.detach().cpu().numpy()
 
 
+class Raster(ThresholdCallback):
+
+    """Record all timepoints at which action potentials occur
+    at checked nodes.
+    """
+
+    def pre_loop_hook(self, model: AxonInterface):
+        if self.record is None:
+            self.record = []
+        if self.state_cache is None:
+            self.state_cache = torch.ones(
+                model.n(),
+                len(self.node_check),
+                dtype=torch.bool,
+                device=model.device(),
+            )
+
+    def post_step_hook(self, model: AxonInterface):
+        if self.i * self.dt >= self.t_start_check:
+            vm_new = model.get_state("v")[:, -1, self.node_check]
+            vm = self.state_cache
+            self.state_cache, la = increment_count(vm, vm_new, self.threshold)
+            self.record.append(la)
+        self.i += 1
+
+    def stack(self):
+        return torch.stack(self.record)
+
+    def numpy(self):
+        return self.stack().detach().cpu().numpy()
+
+
+@torch.jit.script
+def increment_count(vm, vm_new, threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    ge = vm_new >= threshold
+    l_and = torch.logical_and(ge, vm)
+    return ~ge, l_and
+
+
 @torch.jit.script
 def increment_count_(vm, vm_new, record, threshold: float) -> torch.Tensor:
     ge = vm_new >= threshold
@@ -238,6 +277,7 @@ def update_active(vm, vm_new, threshold: float) -> Tuple[torch.Tensor, torch.Ten
     ge = vm_new >= threshold
     l_and = torch.any(torch.logical_and(ge, vm), dim=1)
     return ~ge, l_and
+
 
 @torch.jit.script
 def is_active(record, at_least: int) -> torch.Tensor:
