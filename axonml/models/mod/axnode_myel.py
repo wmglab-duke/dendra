@@ -1,5 +1,3 @@
-import torch
-
 from ..mechanisms import (
     Mechanism, State, PARAMETER, STATE, INITIAL, USEQ10
 )

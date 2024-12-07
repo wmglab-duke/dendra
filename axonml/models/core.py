@@ -209,7 +209,7 @@ class Unmyelinated(Axon):
     PARAMETER({
         "membrane": {
             "cm": 1e-3,     # mF / cm2
-            "rhoa": 100.0,  # ohm-cm
+            "rhoa": 35.4,   # ohm-cm
         }
     })
 

@@ -44,6 +44,9 @@ class Mechanism(Parameterized):
     _states = set()
     _conductances = {}
     _init = {}
+
+    _init_params: Dict[str, float]
+    states: Dict[str, torch.Tensor]
     
     def __init__(self, temp: float, v_init: float, **kwargs):
         super().__init__()

@@ -318,7 +318,7 @@ class SMF_(Axon):
         return ic
 
 
-class Sundt(Axon):
+class Sundt_(Axon):
     params = {
         "conductances": {
             "gnabar": 0.04,  # S/cm2
