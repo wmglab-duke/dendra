@@ -14,7 +14,10 @@ from .mechanisms.declarations import PARAMETER
 
 class SymmetricConv1D(torch.nn.Conv1d):
     def forward(self, x):
-        weight_ = (self.weight + torch.flip(self.weight, [-1])) / 2
+        if self.training:
+            weight_ = (self.weight + torch.flip(self.weight, [-1])) / 2
+        else:
+            weight_ = self.weight
         return self._conv_forward(x, weight_, self.bias)
 
 
