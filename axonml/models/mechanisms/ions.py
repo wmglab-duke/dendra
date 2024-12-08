@@ -6,6 +6,41 @@ import torch
 from .declarations import add_to_namespace, add_to_namespace_dict
 
 
+REVERSALS = {
+    'ena': 50.0,
+    'ek': -77.0,
+    'eca': 132.0
+}
+
+# defaults from NEURON
+CINIT = {
+    'nao0': 140.0,
+    'nai0': 10.0,
+    'ko0': 2.5,
+    'ki0': 54.4,
+    'cao0': 2.0,
+    'cai0': 5e-5
+}
+
+
+def cinit(name, val):
+    global CINIT
+    CINIT[name] = val
+
+
+def einit(name, val):
+    global REVERSALS
+    REVERSALS[name] = val
+
+
+def _cinit(name):
+    return CINIT[name]
+
+
+def _einit(name):
+    return REVERSALS[name]
+
+
 def USEION(ion, read=[], write=[]):
     frame = sys._getframe(1)
     namespace = frame.f_locals
@@ -45,7 +80,7 @@ class Ion(torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def initialize(self, v):
-        self.buffers[self.ename] = torch.as_tensor(self.buffers[self.ename], device=v.device, dtype=v.dtype)
+        self.buffers[self.ename] = torch.as_tensor(_einit(self.ename), device=v.device, dtype=v.dtype)
         pass
 
     @torch.jit.script_method

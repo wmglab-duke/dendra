@@ -83,8 +83,6 @@ class h(State):
 class nahh(Mechanism):
     STATE(m, h)
 
-    USEION("na", read=["ena"])
-
     PARAMETER({"gnabar": 0.3, "ena": 50.0})
 
     def i(self, v):
