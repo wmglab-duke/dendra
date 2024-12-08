@@ -38,6 +38,12 @@ class State(Parameterized):
         if isinstance(p, torch.Tensor):
             p.data = torch.tensor(value, dtype=p.data.dtype, device=p.device)
 
+    def __setattr__(self, name, param):
+        if name in self._parameters:
+            p = self._parameters[name]
+            param = torch.nn.Parameter(torch.tensor(param, device=p.device, dtype=p.dtype))
+        return super().__setattr__(name, param)
+
 
 @torch.jit.interface
 class MechanismInterface:
@@ -47,8 +53,10 @@ class MechanismInterface:
 
 class Mechanism(Parameterized):
     _states = set()
+    _ions = set()
     _conductances = {}
     _init = {}
+    _read_ion = {}
 
     _init_params: Dict[str, float]
     states: Dict[str, torch.Tensor]
@@ -62,6 +70,7 @@ class Mechanism(Parameterized):
         self.DE = torch.nn.ModuleDict(
             {cls.__name__: cls(self.temp) for cls in self._states}
         )
+        self.ions = torch.nn.ModuleDict()
 
         # -- bunch of stuff to handle initial conditions + torch compiler --
         self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
@@ -72,10 +81,24 @@ class Mechanism(Parameterized):
         for k, v in kwargs.items():
             self.set(k, v)
 
+    def register_ion(self, name, ion):
+        self.ions[name] = ion
+
     def set(self, key, value):
         p = getattr(self, key)
         if isinstance(p, torch.Tensor):
             p.data = torch.tensor(value, dtype=p.data.dtype, device=p.device)
+
+    def __setattr__(self, name, param):
+        if name in self._parameters:
+            p = self._parameters[name]
+            param = torch.nn.Parameter(torch.tensor(param, device=p.device, dtype=p.dtype))
+        return super().__setattr__(name, param)
+    
+    def __getattr__(self, name):
+        if name in self._read_ion:
+            return self.ions[self._read_ion[name]].get(name)
+        return super().__getattr__(name)
 
     def _init_buffers_s(self, v_init):
         for n, m in self.DE.items():
@@ -105,6 +128,15 @@ class Mechanism(Parameterized):
     @torch.jit.export
     def get(self, s: str) -> torch.Tensor:
         return self.states[s]
+
+    def i_na(self, v):
+        return None
+    
+    def i_k(self, v):
+        return None
+    
+    def i_ca(self, v):
+        return None
 
     def i(self, v):
         return None

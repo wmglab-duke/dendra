@@ -3,6 +3,7 @@
 
 from ..mechanisms import Mechanism, State, PARAMETER, STATE, USEQ10
 from ..mechanisms.ops import exprelr, exp, expit
+from ..mechanisms.ions import USEION
 
 
 class m(State):
@@ -81,6 +82,8 @@ class h(State):
 
 class nahh(Mechanism):
     STATE(m, h)
+
+    USEION("na", read=["ena"])
 
     PARAMETER({"gnabar": 0.3, "ena": 50.0})
 

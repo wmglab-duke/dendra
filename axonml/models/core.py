@@ -10,6 +10,7 @@ from .backend import Backend as A
 from .mixins import Parameterized
 from .mechanisms.core import Mechanism, MechanismInterface
 from .mechanisms.declarations import PARAMETER
+from .mechanisms.ions import IONS
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
@@ -29,6 +30,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.temp = temp
         self.v_init = v_init
         self.mechanisms = torch.nn.ModuleDict()
+        self.ions = torch.nn.ModuleDict()
 
         # solver stuff
         weight = [1.0, -2.0, 1.0]
@@ -57,6 +59,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         v_init = torch.tensor(self.v_init, device=self.device())
         m = mechanism(self.temp, v_init, ic=ic, **kwargs)
         self.mechanisms[mechanism.__name__] = m
+        if m._ions:
+            for ion in m._ions:
+                if ion not in self.ions:
+                    self.ions[ion] = IONS[ion]()
+                m.register_ion(ion, self.ions[ion])
 
     def advance_mechanisms(self, v, dt):
         for _, mech in self.mechanisms.items():
@@ -103,6 +110,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 self.init(self.v)
                 self.initialized = True
 
+            self.test()
+
             callbacks = CallbackList(callbacks)
             callbacks.pre_loop_hook(self)
 
@@ -111,6 +120,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     self.v, ve[i], self.cm_c, self.ra_c, dt, area, i, intra
                 )
                 callbacks.post_step_hook(self)
+
+    @torch.jit.script_method
+    def test(self):
+        for _, ion in self.ions.items():
+            print(ion.buffers[ion.ename])
 
     def dv(self, cm, ra, d2v, ion, dt) -> Tensor:
         """Calculate dv/dt
@@ -163,6 +177,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     @torch.jit.script_method
     def init(self, v) -> None:
         self.inflate(v)
+        for _, ion in self.ions.items():
+            ion.initialize(v)
 
     def inflate(self, v):
         for _, mech in self.mechanisms.items():
