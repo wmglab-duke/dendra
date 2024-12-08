@@ -35,7 +35,7 @@ class m(State):
     def export(self, v):
         am = self.alpha(v)
         bm = self.beta(v)
-        mtau = (am + bm)
+        mtau = am + bm
         minf = am / mtau
         return minf, mtau
 
@@ -73,7 +73,7 @@ class p(State):
     def export(self, v):
         amp = self.alpha(v)
         bmp = self.beta(v)
-        ptau = (amp + bmp)
+        ptau = amp + bmp
         pinf = amp / ptau
         return pinf, ptau
 
@@ -106,11 +106,11 @@ class h(State):
 
     def beta(self, v):
         return self.q10() * self.bhA * expit((v + self.bhB) / self.bhC)
-    
+
     def export(self, v):
         ah = self.alpha(v)
         bh = self.beta(v)
-        htau = (ah + bh)
+        htau = ah + bh
         hinf = ah / htau
         return hinf, htau
 
@@ -145,11 +145,11 @@ class s(State):
     def beta(self, v):
         b = self.q10() * self.bsA * expit((self.vtraub - v - self.bsB) / self.bsC)
         return b
-    
+
     def export(self, v):
         as_ = self.alpha(v)
         bs = self.beta(v)
-        stau = (as_ + bs)
+        stau = as_ + bs
         sinf = as_ / stau
         return sinf, stau
 
