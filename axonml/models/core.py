@@ -172,6 +172,22 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             c = m.i(v)
             if c is not None:
                 i = i + c
+            if m._ions:
+                cik = m.ik(v)
+                if cik is not None:
+                    ik = ik + cik
+                cina = m.ina(v)
+                if cina is not None:
+                    ina = ina + cina
+                cica = m.ica(v)
+                if cica is not None:
+                    ica = ica + cica
+        if 'na' in self.ions:
+            self.ions['na'].set('ina', ina)
+        if 'ca' in self.ions:
+            self.ions['ca'].set('ica', ica)
+        if 'k' in self.ions:
+            self.ions['k'].set('ik', ik)
         i = i + ik + ina + ica
         i = i * area[:, None, None]
         if intra is not None:
