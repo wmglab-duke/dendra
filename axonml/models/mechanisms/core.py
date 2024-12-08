@@ -9,16 +9,19 @@ import torch
 
 from ..mixins import Parameterized
 
+
 forward_template = """
-def forward(self, t: Dict[str, torch.Tensor]) -> torch.Tensor:
+def advance(t: Dict[str, torch.Tensor]) -> torch.Tensor:
   {populate_input_globals}
   {f}
   return {state}
 """
 
+
 input_globals_template="""
   {field} = t["{field}"]
 """
+
 
 def make_integrate(state):
     input_fields = state.all_names()
@@ -33,9 +36,9 @@ def make_integrate(state):
         state=state_name,
     )
 
-    class ModuleTemplate(torch.nn.Module):
-        def forward(self):
-            raise NotImplementedError()
+    #class ModuleTemplate(torch.nn.Module):
+    #    def forward(self):
+    #        raise NotImplementedError()
 
     filename = "<forward_template>"
     code = compile(forward_str, filename, "exec")
@@ -44,9 +47,9 @@ def make_integrate(state):
     lines = [line + '\n' for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
-    m = ModuleTemplate()
-    m.forward = types.MethodType(locals()["forward"], m)
-    m = torch.jit.script(m)
+    # m = ModuleTemplate()
+    # m.forward = types.MethodType(locals()["forward"], m)
+    m = torch.jit.script(locals()["advance"])
     return m
 
 # Get a list of all available PyTorch operations
