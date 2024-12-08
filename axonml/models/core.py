@@ -152,7 +152,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def i(self, v, area, idx: int, intra: Optional[Tensor] = None) -> Tensor:
         out = torch.tensor(0.0, device=self.device())
         for _, m in self.mechanisms.items():
-            out = out + m.i(v)
+            c = m.i(v)
+            if c is not None:
+                out = out + c
         out = out * area[:, None, None]
         if intra is not None:
             out -= intra[idx]

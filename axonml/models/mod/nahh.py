@@ -1,7 +1,7 @@
 # From Traub & Miles "Neuronal networks of the hippocampus" (1991)
 # Cummins et al. (2007), Sheets et al. (2007)
 
-from ..mechanisms import Mechanism, State, PARAMETER, STATE, INITIAL, USEQ10
+from ..mechanisms import Mechanism, State, PARAMETER, STATE, USEQ10
 from ..mechanisms.ops import exprelr, exp, expit
 
 

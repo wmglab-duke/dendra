@@ -107,4 +107,4 @@ class Mechanism(Parameterized):
         return self.states[s]
 
     def i(self, v):
-        raise NotImplementedError()
+        return None
