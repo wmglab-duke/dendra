@@ -11,8 +11,7 @@ from ..mixins import Parameterized
 
 
 forward_template = """
-def advance(t: Dict[str, torch.Tensor]) -> torch.Tensor:
-  {populate_input_globals}
+def advance({names}) -> torch.Tensor:
   {f}
   return {state}
 """
@@ -26,13 +25,14 @@ input_globals_template="""
 def make_integrate(state):
     input_fields = state.all_names()
 
-    input_globals = "".join(input_globals_template.format(field=field) for field in input_fields)
+    # input_globals = "".join(input_globals_template.format(field=field) for field in input_fields)
 
     state_name = state.__class__.__name__
 
     forward_str = forward_template.format(
+        names = str(input_fields)[1:-1].replace("'", ""),
         f=state.i_func,
-        populate_input_globals=input_globals,
+        #populate_input_globals=input_globals,
         state=state_name,
     )
 
@@ -136,9 +136,8 @@ class State(Parameterized):
         return [self._name, "dt"] + self._export_names
     
     def advance(self, state, v, dt):
-        values = [state, dt, *self.export(v)]
-        d = {n:v for n, v in zip(self._all_names, values)}
-        return self.integrate(d)
+        export = self.export(v)
+        return self.integrate(state, dt, *export)
 
 @torch.jit.script
 def make_dict(names: List[str], values: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
