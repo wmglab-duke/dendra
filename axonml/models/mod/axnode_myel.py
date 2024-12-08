@@ -19,24 +19,26 @@ class m(State):
         }
     )
 
-    DERIVATIVE("m' = am - m * mrho")
+    DERIVATIVE("m' = (minf - m) * mtau")
 
     def calc_q10(self):
         return self.aq10_1 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
         x = -(v + self.amB)
-        return self.q10() *self.amA * exprelr(x, self.amC)
+        return self.amA * exprelr(x, self.amC)
 
     def beta(self, v):
         x = v + self.bmB
-        return self.q10() * self.bmA * exprelr(x, self.bmC)
+        return self.bmA * exprelr(x, self.bmC)
 
     def export(self, v):
-        am = self.alpha(v)
-        bm = self.beta(v)
-        mrho = am + bm
-        return am, mrho
+        q10 = self.q10()
+        am = q10 * self.alpha(v)
+        bm = q10 * self.beta(v)
+        mtau = (am + bm)
+        minf = am / mtau
+        return minf, mtau
 
 
 class p(State):
@@ -56,24 +58,26 @@ class p(State):
         }
     )
 
-    DERIVATIVE("p' = amp - p * prho")
+    DERIVATIVE("p' = (pinf - p) * ptau")
 
     def calc_q10(self):
         return self.pq10_1 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
         x = -(v + self.ampB)
-        return self.q10() * self.ampA * exprelr(x, self.ampC)
+        return self.ampA * exprelr(x, self.ampC)
 
     def beta(self, v):
         x = v + self.bmpB
-        return self.q10() *self.bmpA * exprelr(x, self.bmpC)
+        return self.bmpA * exprelr(x, self.bmpC)
 
     def export(self, v):
-        amp = self.alpha(v)
-        bmp = self.beta(v)
-        prho = amp + bmp
-        return amp, prho
+        q10 = self.q10()
+        amp = q10 * self.alpha(v)
+        bmp = q10 * self.beta(v)
+        ptau = (amp + bmp)
+        pinf = amp / ptau
+        return pinf, ptau
 
 
 class h(State):
@@ -93,23 +97,25 @@ class h(State):
         }
     )
 
-    DERIVATIVE("h' = ah - h * hrho")
+    DERIVATIVE("h' = (hinf - h) * htau")
 
     def calc_q10(self):
         return self.aq10_2 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
         x = v + self.ahB
-        return self.q10() * self.ahA * exprelr(x, self.ahC)
+        return self.ahA * exprelr(x, self.ahC)
 
     def beta(self, v):
-        return self.q10() *self.bhA * expit((v + self.bhB) / self.bhC)
+        return self.bhA * expit((v + self.bhB) / self.bhC)
     
     def export(self, v):
-        ah = self.alpha(v)
-        bh = self.beta(v)
-        hrho = ah + bh
-        return ah, hrho
+        q10 = self.q10()
+        ah = q10 * self.alpha(v)
+        bh = q10 * self.beta(v)
+        htau = (ah + bh)
+        hinf = ah / htau
+        return hinf, htau
 
 
 class s(State):
@@ -130,24 +136,26 @@ class s(State):
         }
     )
 
-    DERIVATIVE("s' = as_ - s * srho")
+    DERIVATIVE("s' = (sinf - s) * stau")
 
     def calc_q10(self):
         return self.aq10_3 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
-        b = self.q10() * self.asA * expit((self.vtraub - v - self.asB) / self.asC)
+        b = self.asA * expit((self.vtraub - v - self.asB) / self.asC)
         return b
 
     def beta(self, v):
-        b = self.q10() * self.bsA * expit((self.vtraub - v - self.bsB) / self.bsC)
+        b = self.bsA * expit((self.vtraub - v - self.bsB) / self.bsC)
         return b
     
     def export(self, v):
-        as_ = self.alpha(v)
-        bs = self.beta(v)
-        srho = as_ + bs
-        return as_, srho
+        q10 = self.q10()
+        as_ = q10 * self.alpha(v)
+        bs = q10 * self.beta(v)
+        stau = (as_ + bs)
+        sinf = as_ / stau
+        return sinf, stau
 
 
 class axnode_myel(Mechanism):
