@@ -31,6 +31,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.v_init = v_init
         self.mechanisms = torch.nn.ModuleDict()
         self.ions = torch.nn.ModuleDict()
+        self.ion_names : List[str] = []
 
         # solver stuff
         weight = [1.0, -2.0, 1.0]
@@ -63,6 +64,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             for ion in m._ions:
                 if ion not in self.ions:
                     self.ions[ion] = IONS[ion]()
+                    self.ion_names.append(ion)
                 m.register_ion(ion, self.ions[ion])
 
     def advance_mechanisms(self, v, dt):
@@ -165,31 +167,35 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     @torch.jit.script_method
     def i(self, v, area, idx: int, intra: Optional[Tensor] = None) -> Tensor:
         i = torch.tensor(0.0, device=self.device())
-        ik = torch.tensor(0.0, device=self.device())
-        ina = torch.tensor(0.0, device=self.device())
-        ica = torch.tensor(0.0, device=self.device())
+
+        d = {
+            "k": torch.tensor(0.0, device=self.device()),
+            "na": torch.tensor(0.0, device=self.device()),
+            "ca": torch.tensor(0.0, device=self.device()),
+        }
+
         for _, m in self.mechanisms.items():
             c = m.i(v)
             if c is not None:
                 i = i + c
-            if m._ions:
-                cik = m.ik(v)
-                if cik is not None:
-                    ik = ik + cik
-                cina = m.ina(v)
-                if cina is not None:
-                    ina = ina + cina
-                cica = m.ica(v)
-                if cica is not None:
-                    ica = ica + cica
-        if 'na' in self.ions:
-            self.ions['na'].set('ina', ina)
-        if 'ca' in self.ions:
-            self.ions['ca'].set('ica', ica)
-        if 'k' in self.ions:
-            self.ions['k'].set('ik', ik)
-        i = i + ik + ina + ica
+            cik = m.i_k(v)
+            if cik is not None:
+                d["k"] = d["k"] + cik
+            cina = m.i_na(v)
+            if cina is not None:
+                d["na"] = d["na"] + cina
+            cica = m.i_ca(v)
+            if cica is not None:
+                d["ca"] = d["ca"] + cica
+
+        for k, v in d.items():
+            d[k] = v * area[:, None, None]
+        
+        for k, v in self.ions.items():
+            v.set('i'+k, d[k])
+
         i = i * area[:, None, None]
+        i = i + d["k"] + d["na"] + d["ca"]
         if intra is not None:
             i = i - intra[idx]
         return i
