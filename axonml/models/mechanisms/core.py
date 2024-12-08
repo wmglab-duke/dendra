@@ -83,11 +83,11 @@ class State(Parameterized):
             ), "must implement `calc_q10` if using q10"
             self.register_buffer("q10_cache", self.calc_q10())
         
-        self.name = self.__class__.__name__
+        self._name = self.__class__.__name__
         self._export_names = self.export_names()
         self._all_names = self.all_names()
 
-        self.i_func = modify_operations(integrate2c(self._derivative, "dt", self.export_names()))
+        self.i_func = modify_operations(integrate2c(self._derivative, "dt", self._export_names))
         self.integrate = make_integrate(self)
 
     def eval(self):
@@ -130,13 +130,12 @@ class State(Parameterized):
         return return_lines
     
     def all_names(self) -> List[str]:
-        return [self.name, "dt"] + self._export_names
+        return [self._name, "dt"] + self._export_names
     
     def advance(self, state, v, dt):
-        names = self._all_names
         export = self.export(v)
         values = [state, dt, *export]
-        d = make_dict(names, values)
+        d = {n:v for n, v in zip(self._all_names, values)}
         return self.integrate(d)
 
 @torch.jit.script
