@@ -17,28 +17,15 @@ def advance({names}) -> torch.Tensor:
 """
 
 
-input_globals_template="""
-  {field} = t["{field}"]
-"""
-
-
 def make_integrate(state):
-    input_fields = state.all_names()
-
-    # input_globals = "".join(input_globals_template.format(field=field) for field in input_fields)
-
-    state_name = state.__class__.__name__
+    input_fields = state._all_names
+    state_name = state._name
 
     forward_str = forward_template.format(
         names = str(input_fields)[1:-1].replace("'", ""),
         f=state.i_func,
-        #populate_input_globals=input_globals,
         state=state_name,
     )
-
-    #class ModuleTemplate(torch.nn.Module):
-    #    def forward(self):
-    #        raise NotImplementedError()
 
     filename = "<forward_template>"
     code = compile(forward_str, filename, "exec")
@@ -47,8 +34,6 @@ def make_integrate(state):
     lines = [line + '\n' for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
-    # m = ModuleTemplate()
-    # m.forward = types.MethodType(locals()["forward"], m)
     m = torch.jit.script(locals()["advance"])
     return m
 
