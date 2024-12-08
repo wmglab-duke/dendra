@@ -40,13 +40,6 @@ class m(State):
         minf = am * mtau
         return minf, mtau
 
-    def _advance(self, m, v, dt):
-        am = self.alpha(v)
-        bm = self.beta(v)
-        m_tau_inv = am + bm
-        m_inf = am / m_tau_inv
-        return self.cnexp(m, m_inf, self.q10() * m_tau_inv, dt)
-
 
 class p(State):
     USEQ10()
@@ -86,13 +79,6 @@ class p(State):
         pinf = amp * ptau
         return pinf, ptau
 
-    def advance(self, p, v, dt):
-        amp = self.alpha(v)
-        bmp = self.beta(v)
-        p_tau_inv = amp + bmp
-        p_inf = amp / p_tau_inv
-        return self.cnexp(p, p_inf, self.q10() * p_tau_inv, dt)
-
 
 class h(State):
     USEQ10()
@@ -130,13 +116,6 @@ class h(State):
         htau = 1 / (ah + bh)
         hinf = ah * htau
         return hinf, htau
-
-    def advance(self, h, v, dt):
-        ah = self.alpha(v)
-        bh = self.beta(v)
-        h_tau_inv = ah + bh
-        h_inf = ah / h_tau_inv
-        return self.cnexp(h, h_inf, self.q10() * h_tau_inv, dt)
 
 
 class s(State):
@@ -177,13 +156,6 @@ class s(State):
         stau = 1 / (as_ + bs)
         sinf = as_ * stau
         return sinf, stau
-
-    def advance(self, s, v, dt):
-        as_ = self.alpha(v)
-        bs = self.beta(v)
-        s_tau_inv = as_ + bs
-        s_inf = as_ / s_tau_inv
-        return self.cnexp(s, s_inf, self.q10() * s_tau_inv, dt)
 
 
 class axnode_myel(Mechanism):
