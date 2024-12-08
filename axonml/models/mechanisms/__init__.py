@@ -1,5 +1,6 @@
-from .declarations import STATE, PARAMETER, CONDUCTANCE, INITIAL, USEQ10
+from .declarations import STATE, PARAMETER, CONDUCTANCE, INITIAL, USEQ10, DERIVATIVE
 from .core import Mechanism, State
+from .ions import USEION
 
 __all__ = [
     "Mechanism",
@@ -9,4 +10,5 @@ __all__ = [
     "CONDUCTANCE",
     "INITIAL",
     "USEQ10",
+    "DERIVATIVE",
 ]

@@ -1,4 +1,4 @@
-from ..mechanisms import Mechanism, State, PARAMETER, STATE, INITIAL, USEQ10
+from ..mechanisms import Mechanism, State, PARAMETER, STATE, DERIVATIVE, USEQ10
 from ..mechanisms.ops import expit, exprelr
 
 
@@ -19,6 +19,8 @@ class m(State):
         }
     )
 
+    DERIVATIVE("m' = (minf - m) / mtau")
+
     def calc_q10(self):
         return self.aq10_1 ** ((self.temp - self.bq10) / self.cq10)
 
@@ -30,7 +32,15 @@ class m(State):
         x = v + self.bmB
         return self.bmA * exprelr(x, self.bmC)
 
-    def advance(self, m, v, dt):
+    def export(self, v):
+        q10 = self.q10()
+        am = q10 * self.alpha(v)
+        bm = q10 * self.beta(v)
+        mtau = 1 / (am + bm)
+        minf = am * mtau
+        return minf, mtau
+
+    def _advance(self, m, v, dt):
         am = self.alpha(v)
         bm = self.beta(v)
         m_tau_inv = am + bm
@@ -55,6 +65,8 @@ class p(State):
         }
     )
 
+    DERIVATIVE("p' = (pinf - p) / ptau")
+
     def calc_q10(self):
         return self.pq10_1 ** ((self.temp - self.bq10) / self.cq10)
 
@@ -65,6 +77,14 @@ class p(State):
     def beta(self, v):
         x = v + self.bmpB
         return self.bmpA * exprelr(x, self.bmpC)
+
+    def export(self, v):
+        q10 = self.q10()
+        amp = q10 * self.alpha(v)
+        bmp = q10 * self.beta(v)
+        ptau = 1 / (amp + bmp)
+        pinf = amp * ptau
+        return pinf, ptau
 
     def advance(self, p, v, dt):
         amp = self.alpha(v)
@@ -91,6 +111,8 @@ class h(State):
         }
     )
 
+    DERIVATIVE("h' = (hinf - h) / htau")
+
     def calc_q10(self):
         return self.aq10_2 ** ((self.temp - self.bq10) / self.cq10)
 
@@ -100,6 +122,14 @@ class h(State):
 
     def beta(self, v):
         return self.bhA * expit((v + self.bhB) / self.bhC)
+    
+    def export(self, v):
+        q10 = self.q10()
+        ah = q10 * self.alpha(v)
+        bh = q10 * self.beta(v)
+        htau = 1 / (ah + bh)
+        hinf = ah * htau
+        return hinf, htau
 
     def advance(self, h, v, dt):
         ah = self.alpha(v)
@@ -127,6 +157,8 @@ class s(State):
         }
     )
 
+    DERIVATIVE("s' = (sinf - s) / stau")
+
     def calc_q10(self):
         return self.aq10_3 ** ((self.temp - self.bq10) / self.cq10)
 
@@ -137,6 +169,14 @@ class s(State):
     def beta(self, v):
         b = self.bsA * expit((self.vtraub - v - self.bsB) / self.bsC)
         return b
+    
+    def export(self, v):
+        q10 = self.q10()
+        as_ = q10 * self.alpha(v)
+        bs = q10 * self.beta(v)
+        stau = 1 / (as_ + bs)
+        sinf = as_ * stau
+        return sinf, stau
 
     def advance(self, s, v, dt):
         as_ = self.alpha(v)
@@ -170,8 +210,8 @@ class axnode_myel(Mechanism):
 
         # -- current --
         current = (
-            (self.gnabar * m * m * m * h * (v - self.ena))
-            + (self.gnapbar * p * p * p * (v - self.ena))
+            (self.gnabar * m**3 * h * (v - self.ena))
+            + (self.gnapbar * p**3 * (v - self.ena))
             + (self.gkbar * s * (v - self.ek))
             + (self.gl * (v - self.el))
         )
