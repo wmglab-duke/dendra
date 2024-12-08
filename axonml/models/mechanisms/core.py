@@ -133,8 +133,7 @@ class State(Parameterized):
         return [self._name, "dt"] + self._export_names
     
     def advance(self, state, v, dt):
-        export = self.export(v)
-        values = [state, dt, *export]
+        values = [state, dt, *self.export(v)]
         d = {n:v for n, v in zip(self._all_names, values)}
         return self.integrate(d)
 
