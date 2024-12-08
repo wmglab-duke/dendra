@@ -188,14 +188,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             if cica is not None:
                 d["ca"] = d["ca"] + cica
 
-        for k, v in d.items():
-            d[k] = v * area[:, None, None]
+        i = i * area[:, None, None]
         
         for k, v in self.ions.items():
+            d[k] = d[k] * area[:, None, None]
             v.set('i'+k, d[k])
+            i = i + d[k]
 
-        i = i * area[:, None, None]
-        i = i + d["k"] + d["na"] + d["ca"]
         if intra is not None:
             i = i - intra[idx]
         return i
