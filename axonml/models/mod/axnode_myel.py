@@ -19,7 +19,7 @@ class m(State):
         }
     )
 
-    DERIVATIVE("m' = (minf - m) * mtau")
+    DERIVATIVE("m' = (minf - m) / mtau")
 
     def calc_q10(self):
         return self.aq10_1 ** ((self.temp - self.bq10) / self.cq10)
@@ -35,8 +35,8 @@ class m(State):
     def export(self, v):
         am = self.alpha(v)
         bm = self.beta(v)
-        mtau = (am + bm)
-        minf = am / mtau
+        mtau = 1 / (am + bm)
+        minf = am * mtau
         return minf, mtau
 
 
@@ -57,7 +57,7 @@ class p(State):
         }
     )
 
-    DERIVATIVE("p' = (pinf - p) * ptau")
+    DERIVATIVE("p' = (pinf - p) / ptau")
 
     def calc_q10(self):
         return self.pq10_1 ** ((self.temp - self.bq10) / self.cq10)
@@ -73,8 +73,8 @@ class p(State):
     def export(self, v):
         amp = self.alpha(v)
         bmp = self.beta(v)
-        ptau = (amp + bmp)
-        pinf = amp / ptau
+        ptau = 1 / (amp + bmp)
+        pinf = amp * ptau
         return pinf, ptau
 
 
@@ -95,7 +95,7 @@ class h(State):
         }
     )
 
-    DERIVATIVE("h' = (hinf - h) * htau")
+    DERIVATIVE("h' = (hinf - h) / htau")
 
     def calc_q10(self):
         return self.aq10_2 ** ((self.temp - self.bq10) / self.cq10)
@@ -110,8 +110,8 @@ class h(State):
     def export(self, v):
         ah = self.alpha(v)
         bh = self.beta(v)
-        htau = (ah + bh)
-        hinf = ah / htau
+        htau = 1 / (ah + bh)
+        hinf = ah * htau
         return hinf, htau
 
 
@@ -133,7 +133,7 @@ class s(State):
         }
     )
 
-    DERIVATIVE("s' = (sinf - s) * stau")
+    DERIVATIVE("s' = (sinf - s) / stau")
 
     def calc_q10(self):
         return self.aq10_3 ** ((self.temp - self.bq10) / self.cq10)
@@ -149,8 +149,8 @@ class s(State):
     def export(self, v):
         as_ = self.alpha(v)
         bs = self.beta(v)
-        stau = (as_ + bs)
-        sinf = as_ / stau
+        stau = 1 / (as_ + bs)
+        sinf = as_ * stau
         return sinf, stau
 
 
