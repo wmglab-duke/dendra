@@ -254,6 +254,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         d = 10 * torch.ones(axons, device=self.device())
         for _ in range(5):
             self.run(ve, d, reinit=True)
+        self.initialized = False
         return self
 
     @torch.jit.script_method
