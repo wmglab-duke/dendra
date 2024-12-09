@@ -7,6 +7,7 @@ expit = torch.sigmoid
 
 @torch.jit.script
 def exprelr(x, y):
-    val = x / expm1(x / y)
+    q = x / y
+    val = x / expm1(q)
     approx = y - (x / 2)
-    return torch.where(x.abs() < 1e-6, approx, val)
+    return torch.where(q.abs() < 1e-6, approx, val)

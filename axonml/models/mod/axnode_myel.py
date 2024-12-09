@@ -1,3 +1,5 @@
+# McIntyre, Richardson, Grill 2002
+
 from ..mechanisms import Mechanism, State, PARAMETER, STATE, DERIVATIVE, USEQ10
 from ..mechanisms.ops import expit, exprelr
 
