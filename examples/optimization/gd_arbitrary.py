@@ -9,7 +9,7 @@ from cajal.common.logging import tic, toc
 from cajal.nrn.sources import PreComputedInterpolate1D
 from cajal.nrn.stimuli import MonophasicPulse
 
-from axonml.models import SMF
+from axonml.models.implementations import SMF
 from axonml.opt.gd import AxonSpec, FieldSpec, GDProblemArbitrary, GD
 
 from utils import deltax, percent_on_target_active, percent_off_target_active

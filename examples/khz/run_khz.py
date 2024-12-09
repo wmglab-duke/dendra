@@ -9,7 +9,7 @@ from axonml.models.callbacks import APCount
 
 
 torch.set_default_dtype(torch.float32)
-
+torch.set_float32_matmul_precision('high')
 
 def deltax(diam):
     return -8.215284e00 * diam**2 + 2.724201e02 * diam + -7.802411e02
@@ -117,11 +117,11 @@ def longrun(
     if warmup:
         print("warming up...")
 
-        ve = torch.rand(5, len(field_stack) * len(stims), 1, nodes).float().cuda()
+        ve = torch.rand(1, len(field_stack) * len(stims), 1, nodes).float().cuda()
         intra = torch.zeros_like(ve).cuda()
         dg = torch.rand(len(field_stack) * len(stims)).float().cuda()
 
-        for _ in range(3):
+        for _ in range(5):
             with torch.no_grad():
                 out = model.run(ve, dg, intra=intra, dt=dt)
 
@@ -176,7 +176,7 @@ frequencies = [1, 2, 5, 10]
 stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]
 
 count.reset()
-_ = longrun(mrg, 100, 0.001, stims, field_stack, diam, chunks=500, warmup=True)
+_ = longrun(mrg, 100, 0.001, stims, field_stack, diam, chunks=400, warmup=True)
 all_n = count.record.cpu().numpy()
 
 
