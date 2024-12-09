@@ -60,7 +60,7 @@ def modify_operations(input_string):
 
 class State(Parameterized):
     is_q10 = False
-    _derivative: str = None
+    _derivative: Tuple[str, bool] = None
 
     def __init__(self, temp: float):
         super().__init__()
@@ -77,7 +77,7 @@ class State(Parameterized):
         self._all_names = self.all_names()
 
         self.i_func = modify_operations(
-            integrate2c(self._derivative, "dt", self._export_names)
+            integrate2c(self._derivative[0], "dt", self._export_names, use_pade_approx=self._derivative[1])
         )
         self.integrate = make_integrate(self)
 
@@ -133,7 +133,7 @@ class MechanismInterface:
         pass
 
 
-class Mechanism(Parameterized):
+class Mechanism(Parameterized, torch.jit.ScriptModule):
     _states = set()
     _ions = set()
     _conductances = {}
@@ -209,7 +209,7 @@ class Mechanism(Parameterized):
         for name, m in self.DE.items():
             self.states[name] = m.advance(self.states[name], v, dt)
 
-    @torch.jit.export
+    @torch.jit.script_method
     def get(self, s: str) -> torch.Tensor:
         return self.states[s]
 

@@ -1,6 +1,6 @@
 # McIntyre, Richardson, Grill 2002
 
-from ..mechanisms import Mechanism, State, PARAMETER, STATE, DERIVATIVE, USEQ10
+from ..mechanisms import *
 from ..mechanisms.ops import expit, exprelr
 
 
@@ -21,7 +21,7 @@ class m(State):
         }
     )
 
-    DERIVATIVE("m' = (minf - m) / mtau")
+    DERIVATIVE("m' = (minf - m) / mtau", pade=True)
 
     def calc_q10(self):
         return self.aq10_1 ** ((self.temp - self.bq10) / self.cq10)
@@ -59,7 +59,7 @@ class p(State):
         }
     )
 
-    DERIVATIVE("p' = (pinf - p) / ptau")
+    DERIVATIVE("p' = (pinf - p) / ptau", pade=True)
 
     def calc_q10(self):
         return self.pq10_1 ** ((self.temp - self.bq10) / self.cq10)
@@ -97,7 +97,7 @@ class h(State):
         }
     )
 
-    DERIVATIVE("h' = (hinf - h) / htau")
+    DERIVATIVE("h' = (hinf - h) / htau", pade=True)
 
     def calc_q10(self):
         return self.aq10_2 ** ((self.temp - self.bq10) / self.cq10)
@@ -135,7 +135,7 @@ class s(State):
         }
     )
 
-    DERIVATIVE("s' = (sinf - s) / stau")
+    DERIVATIVE("s' = (sinf - s) / stau", pade=True)
 
     def calc_q10(self):
         return self.aq10_3 ** ((self.temp - self.bq10) / self.cq10)
@@ -170,6 +170,8 @@ class axnode_myel(Mechanism):
             "el": -90.0,
         }
     )
+
+    NONSPECIFIC_CURRENT('i')
 
     def i(self, v):
         # -- gating variables --

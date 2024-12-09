@@ -48,9 +48,10 @@ STATE = partial(_declare, "_states")
 PARAMETER = partial(_declare_parameters, "_params")
 CONDUCTANCE = partial(_declare_parameters, "_conductances")
 INITIAL = partial(_declare_parameters, "_init")
+NONSPECIFIC_CURRENT = partial(_declare, "_nonspecific_currents")
 
 
-def DERIVATIVE(f):
+def DERIVATIVE(f, pade=False):
     frame = sys._getframe(1)
     namespace = frame.f_locals
-    namespace["_derivative"] = f
+    namespace["_derivative"] = (f, pade)

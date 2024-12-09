@@ -1,5 +1,5 @@
 import math
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import torch
 from torch import Tensor
@@ -11,7 +11,13 @@ from .mixins import Parameterized
 from .mechanisms.core import Mechanism, MechanismInterface
 from .mechanisms.declarations import PARAMETER
 from .mechanisms.ions import IONS
+from .compiler.i import make_calc_i
 
+
+@torch.jit.interface
+class HandlerInterface:
+    def forward(self, v, area, i: int, intra: Optional[Tensor] = None) -> torch.Tensor:
+        pass
 
 class SymmetricConv1D(torch.nn.Conv1d):
     def forward(self, x):
@@ -27,9 +33,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def __init__(self, temp=37.0, v_init=-80.0):
         super().__init__()
+        from .mechanisms.handler import m
         self.temp = temp
         self.v_init = v_init
         self.mechanisms = torch.nn.ModuleDict()
+        self.m : HandlerInterface = m
         self.ions = torch.nn.ModuleDict()
         self.ion_names: List[str] = []
 
@@ -48,24 +56,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         # -- constants --
         self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
         self.eval()
-
-    def __init_subclass__(cls, **kwargs):
-        super().__init_subclass__(**kwargs)
-        original_init = cls.__init__
-
-        def new_init(self, *args, **kwargs):
-            original_init(self, *args, **kwargs)
-            # If this class (or the parent) defines __post_init__, call it now.
-            if hasattr(self, '__post_init__'):
-                self.__post_init__()
-
-        # Assign the wrapped init to the subclass
-        cls.__init__ = new_init
-
-    def __post_init__(self):
-        # Default __post_init__ in the base class.
-        # Subclasses can override or rely on this version.
-        pass
 
     @torch.jit.export
     def n(self) -> int:
@@ -177,7 +167,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for _, m in self.mechanisms.items():
             m.init(torch.tensor(v_init, device=self.device()))
 
-    @torch.jit.script_method
+    @staticmethod
+    def i_test(v, area, mech: Dict[str, torch.nn.Module], i: int, intra: Optional[Tensor] = None) -> torch.Tensor:
+        return torch.tensor(0.0)
+
+    #@torch.jit.script_method
     def i(self, v, area, idx: int, intra: Optional[Tensor] = None) -> Tensor:
         i = torch.tensor(0.0, device=self.device())
 

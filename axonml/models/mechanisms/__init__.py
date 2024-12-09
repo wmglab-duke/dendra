@@ -1,4 +1,4 @@
-from .declarations import STATE, PARAMETER, CONDUCTANCE, INITIAL, USEQ10, DERIVATIVE
+from .declarations import STATE, PARAMETER, CONDUCTANCE, INITIAL, USEQ10, DERIVATIVE, NONSPECIFIC_CURRENT
 from .core import Mechanism, State
 from .ions import USEION
 
@@ -11,4 +11,5 @@ __all__ = [
     "INITIAL",
     "USEQ10",
     "DERIVATIVE",
+    "NONSPECIFIC_CURRENT",
 ]
