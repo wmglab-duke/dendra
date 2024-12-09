@@ -106,7 +106,7 @@ class h(State):
 
     def beta(self, v):
         return self.q10() * self.bhA * expit((v + self.bhB) / self.bhC)
-    
+
     def export(self, v):
         ah = self.alpha(v)
         bh = self.beta(v)
@@ -145,7 +145,7 @@ class s(State):
     def beta(self, v):
         b = self.q10() * self.bsA * expit((self.vtraub - v - self.bsB) / self.bsC)
         return b
-    
+
     def export(self, v):
         as_ = self.alpha(v)
         bs = self.beta(v)

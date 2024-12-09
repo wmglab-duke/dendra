@@ -1,7 +1,6 @@
 import inspect
 from typing import Dict, List, Tuple
 import re
-import types
 import linecache
 
 from nmodl.ode import integrate2c
@@ -22,7 +21,7 @@ def make_integrate(state):
     state_name = state._name
 
     forward_str = forward_template.format(
-        names = str(input_fields)[1:-1].replace("'", ""),
+        names=str(input_fields)[1:-1].replace("'", ""),
         f=state.i_func,
         state=state_name,
     )
@@ -31,27 +30,29 @@ def make_integrate(state):
     code = compile(forward_str, filename, "exec")
     exec(code)
 
-    lines = [line + '\n' for line in forward_str.splitlines()]
+    lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
     m = torch.jit.script(locals()["advance"])
     return m
 
+
 # Get a list of all available PyTorch operations
 torch_operations = set(dir(torch))
+
 
 # Function to modify the input string
 def modify_operations(input_string):
     # Regular expression to find function names and calls
-    pattern = r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\('
-    
+    pattern = r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\("
+
     # Function to replace matches with 'torch.' prefix if they are PyTorch operations
     def replacer(match):
         func_name = match.group(1)
         if func_name in torch_operations:
             return f"torch.{func_name}("
         return match.group(0)
-    
+
     # Apply the replacement
     modified_string = re.sub(pattern, replacer, input_string)
     return modified_string
@@ -59,7 +60,7 @@ def modify_operations(input_string):
 
 class State(Parameterized):
     is_q10 = False
-    _derivative : str = None
+    _derivative: str = None
 
     def __init__(self, temp: float):
         super().__init__()
@@ -70,12 +71,14 @@ class State(Parameterized):
                 getattr(self, "calc_q10", None) is not None
             ), "must implement `calc_q10` if using q10"
             self.register_buffer("q10_cache", self.calc_q10())
-        
+
         self._name = self.__class__.__name__
         self._export_names = self.export_names()
         self._all_names = self.all_names()
 
-        self.i_func = modify_operations(integrate2c(self._derivative, "dt", self._export_names))
+        self.i_func = modify_operations(
+            integrate2c(self._derivative, "dt", self._export_names)
+        )
         self.integrate = make_integrate(self)
 
     def eval(self):
@@ -91,9 +94,6 @@ class State(Parameterized):
     def inf(self, v):
         return self.alpha(v) / (self.alpha(v) + self.beta(v))
 
-    def cnexp(self, gv, inf, tau_inv, dt):
-        return inf - (inf - gv) * torch.exp(-dt * tau_inv)
-
     def set(self, key, value):
         p = getattr(self, key)
         if isinstance(p, torch.Tensor):
@@ -102,9 +102,11 @@ class State(Parameterized):
     def __setattr__(self, name, param):
         if name in self._parameters:
             p = self._parameters[name]
-            param = torch.nn.Parameter(torch.tensor(param, device=p.device, dtype=p.dtype))
+            param = torch.nn.Parameter(
+                torch.tensor(param, device=p.device, dtype=p.dtype)
+            )
         return super().__setattr__(name, param)
-    
+
     def export(self, v) -> Tuple[torch.Tensor]:
         pass
 
@@ -116,18 +118,14 @@ class State(Parameterized):
                 return_lines = list(line[7:].split(", "))
                 break
         return return_lines
-    
+
     def all_names(self) -> List[str]:
         return [self._name, "dt"] + self._export_names
-    
+
     def advance(self, state, v, dt):
         export = self.export(v)
         return self.integrate(state, dt, *export)
 
-@torch.jit.script
-def make_dict(names: List[str], values: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
-    d = {n:v for n, v in zip(names, values)}
-    return d
 
 @torch.jit.interface
 class MechanismInterface:
@@ -176,9 +174,11 @@ class Mechanism(Parameterized):
     def __setattr__(self, name, param):
         if name in self._parameters:
             p = self._parameters[name]
-            param = torch.nn.Parameter(torch.tensor(param, device=p.device, dtype=p.dtype))
+            param = torch.nn.Parameter(
+                torch.tensor(param, device=p.device, dtype=p.dtype)
+            )
         return super().__setattr__(name, param)
-    
+
     def __getattr__(self, name):
         if name in self._read_ion:
             return self.ions[self._read_ion[name]].get(name)
@@ -215,10 +215,10 @@ class Mechanism(Parameterized):
 
     def i_na(self, v):
         return None
-    
+
     def i_k(self, v):
         return None
-    
+
     def i_ca(self, v):
         return None
 

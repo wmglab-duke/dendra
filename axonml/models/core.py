@@ -31,7 +31,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.v_init = v_init
         self.mechanisms = torch.nn.ModuleDict()
         self.ions = torch.nn.ModuleDict()
-        self.ion_names : List[str] = []
+        self.ion_names: List[str] = []
 
         # solver stuff
         weight = [1.0, -2.0, 1.0]
@@ -46,7 +46,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.initialized: bool = False
 
         # -- constants --
-        self.pi = torch.nn.Parameter(torch.tensor(math.pi, requires_grad=False))
+        self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
         self.eval()
 
     @torch.jit.export
@@ -189,10 +189,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 d["ca"] = d["ca"] + cica
 
         i = i * area[:, None, None]
-        
+
         for k, v in self.ions.items():
             d[k] = d[k] * area[:, None, None]
-            v.set('i'+k, d[k])
+            v.set("i" + k, d[k])
             i = i + d[k]
 
         if intra is not None:

@@ -1,6 +1,6 @@
 # Borg-Graham type KDR channel; Borg-Graham 1987
 
-from ..mechanisms import Mechanism, State, PARAMETER, STATE, USEQ10
+from ..mechanisms import Mechanism, State, PARAMETER, STATE, USEQ10, DERIVATIVE
 from ..mechanisms.ops import exp
 
 
@@ -18,6 +18,8 @@ class l(State):
             "cq10": 10.0,
         }
     )
+
+    DERIVATIVE("l' = (linf - l) / taul")
 
     def calc_q10(self):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
@@ -41,13 +43,13 @@ class l(State):
             / (8.315 * (273.16 + self.temp))
         )
 
-    def advance(self, l, v, dt):
-        al = self.alpha(v)
-        bl = self.beta(v)
-        al_ = 1 + al
-        inf = 1 / al_
-        l_tau_inv = (self.q10() * self.a0l * al_) / bl
-        return self.cnexp(l, inf, l_tau_inv, dt)
+    def export(self, v):
+        a = self.alpha(v)
+        b = self.beta(v)
+        al = 1 + a
+        linf = 1 / al
+        taul = b / (self.q10() * self.a0l * al)
+        return linf, taul
 
     def inf(self, v):
         return 1 / (1 + self.alpha(v))
@@ -67,6 +69,8 @@ class n(State):
             "cq10": 10.0,
         }
     )
+
+    DERIVATIVE("n' = (ninf - n) / taun")
 
     def calc_q10(self):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
@@ -90,13 +94,13 @@ class n(State):
             / (8.315 * (273.16 + self.temp))
         )
 
-    def advance(self, n, v, dt):
-        an = self.alpha(v)
-        bn = self.beta(v)
-        an_ = 1 + an
-        inf = 1 / an_
-        n_tau_inv = (self.q10() * self.a0n * an_) / bn
-        return self.cnexp(n, inf, n_tau_inv, dt)
+    def export(self, v):
+        a = self.alpha(v)
+        b = self.beta(v)
+        an = 1 + a
+        ninf = 1 / an
+        taun = b / (self.q10() * self.a0n * an)
+        return ninf, taun
 
     def inf(self, v):
         return 1 / (1 + self.alpha(v))

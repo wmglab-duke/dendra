@@ -66,12 +66,11 @@ class CallbackList:
 
 
 class Recorder(Callback):
-
     def __init__(self, states, max_only=False, node_indices=None):
         super().__init__()
         self.states = states
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
-        self.max_only : bool = max_only
+        self.max_only: bool = max_only
         self.node_indices = node_indices
 
     def reset(self):
@@ -114,13 +113,13 @@ class Recorder(Callback):
 class ThresholdCallback(Callback):
     def __init__(self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None):
         super().__init__()
-        self.record : torch.Tensor = None
-        self.state_cache : torch.Tensor = None
-        self.threshold : float = threshold
-        self.t_start_check : float = t_start_check
-        self.node_check : List[int] = node_check
-        self.i : int = 0
-        self.dt : float= dt if dt is not None else A.dt
+        self.record: torch.Tensor = None
+        self.state_cache: torch.Tensor = None
+        self.threshold: float = threshold
+        self.t_start_check: float = t_start_check
+        self.node_check: List[int] = node_check
+        self.i: int = 0
+        self.dt: float = dt if dt is not None else A.dt
 
     def reset_timer(self):
         self.i = 0
