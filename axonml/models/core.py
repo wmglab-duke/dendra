@@ -46,7 +46,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.initialized: bool = False
 
         # -- constants --
-        self.pi = torch.nn.Parameter(torch.tensor(math.pi, requires_grad=False))
+        self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
         self.eval()
 
     @torch.jit.export

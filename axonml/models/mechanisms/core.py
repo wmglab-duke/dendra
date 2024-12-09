@@ -1,7 +1,6 @@
 import inspect
 from typing import Dict, List, Tuple
 import re
-import types
 import linecache
 
 from nmodl.ode import integrate2c
@@ -94,9 +93,6 @@ class State(Parameterized):
 
     def inf(self, v):
         return self.alpha(v) / (self.alpha(v) + self.beta(v))
-
-    def cnexp(self, gv, inf, tau_inv, dt):
-        return inf - (inf - gv) * torch.exp(-dt * tau_inv)
 
     def set(self, key, value):
         p = getattr(self, key)
