@@ -187,7 +187,7 @@ class Mechanism(Parameterized):
     def _init_buffers_s(self, v_init):
         for n, m in self.DE.items():
             if n in self._init_params:
-                buffer_tensor = torch.tensor(self._init_params[n], device=v_init.device)
+                buffer_tensor = torch.tensor(self._init_params[n], device=v_init.device, dtype=v_init.dtype)
             else:
                 buffer_tensor = m.inf(v_init)
             self.states[n] = buffer_tensor

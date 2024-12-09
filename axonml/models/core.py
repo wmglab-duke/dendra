@@ -49,6 +49,24 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
         self.eval()
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        original_init = cls.__init__
+
+        def new_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            # If this class (or the parent) defines __post_init__, call it now.
+            if hasattr(self, '__post_init__'):
+                self.__post_init__()
+
+        # Assign the wrapped init to the subclass
+        cls.__init__ = new_init
+
+    def __post_init__(self):
+        # Default __post_init__ in the base class.
+        # Subclasses can override or rely on this version.
+        pass
+
     @torch.jit.export
     def n(self) -> int:
         return self.v.shape[0]
@@ -160,40 +178,35 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             m.init(torch.tensor(v_init, device=self.device()))
 
     @torch.jit.script_method
-    def advance_vm(self, vm: Tensor, dv: Tensor) -> Tensor:
-        vm = vm + dv
-        return vm
-
-    @torch.jit.script_method
     def i(self, v, area, idx: int, intra: Optional[Tensor] = None) -> Tensor:
         i = torch.tensor(0.0, device=self.device())
 
-        d = {
-            "k": torch.tensor(0.0, device=self.device()),
-            "na": torch.tensor(0.0, device=self.device()),
-            "ca": torch.tensor(0.0, device=self.device()),
-        }
+        #d = {
+        #    "k": torch.tensor(0.0, device=self.device()),
+        #    "na": torch.tensor(0.0, device=self.device()),
+        #    "ca": torch.tensor(0.0, device=self.device()),
+        #}
 
         for _, m in self.mechanisms.items():
             c = m.i(v)
             if c is not None:
                 i = i + c
-            cik = m.i_k(v)
-            if cik is not None:
-                d["k"] = d["k"] + cik
-            cina = m.i_na(v)
-            if cina is not None:
-                d["na"] = d["na"] + cina
-            cica = m.i_ca(v)
-            if cica is not None:
-                d["ca"] = d["ca"] + cica
+            #cik = m.i_k(v)
+            #if cik is not None:
+            #    d["k"] = d["k"] + cik
+            #cina = m.i_na(v)
+            #if cina is not None:
+            #    d["na"] = d["na"] + cina
+            #cica = m.i_ca(v)
+            #if cica is not None:
+            #    d["ca"] = d["ca"] + cica
 
         i = i * area[:, None, None]
 
-        for k, v in self.ions.items():
-            d[k] = d[k] * area[:, None, None]
-            v.set("i" + k, d[k])
-            i = i + d[k]
+        #for k, v in self.ions.items():
+        #    d[k] = d[k] * area[:, None, None]
+        #    v.set("i" + k, d[k])
+        #    i = i + d[k]
 
         if intra is not None:
             i = i - intra[idx]
@@ -225,7 +238,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         # -- update vm --
         dv = self.dv(cm, ra, d2v, i_ion, dt)
-        v = self.advance_vm(v, dv)
+        v = v + dv
 
         return v
 
