@@ -11,13 +11,26 @@ from .mixins import Parameterized
 from .mechanisms.core import Mechanism, MechanismInterface
 from .mechanisms.declarations import PARAMETER
 from .mechanisms.ions import IONS
-from .compiler.i import make_calc_i
+from .mechanisms.handler import build_handler
 
 
 @torch.jit.interface
 class HandlerInterface:
     def forward(self, v, area, i: int, intra: Optional[Tensor] = None) -> torch.Tensor:
         pass
+
+    def inflate(self, v) -> None:
+        pass
+
+    def advance(self, v, dt) -> None:
+        pass
+
+    def init_buffers(self, v_init: float) -> None:
+        pass
+
+    def get(self, mech: str, state: str) -> torch.Tensor:
+        pass
+
 
 class SymmetricConv1D(torch.nn.Conv1d):
     def forward(self, x):
@@ -33,13 +46,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def __init__(self, temp=37.0, v_init=-80.0):
         super().__init__()
-        from .mechanisms.handler import m
         self.temp = temp
-        self.v_init = v_init
-        self.mechanisms = torch.nn.ModuleDict()
-        self.m : HandlerInterface = m
-        self.ions = torch.nn.ModuleDict()
-        self.ion_names: List[str] = []
+        self.v_init = torch.nn.Parameter(torch.tensor(v_init), requires_grad=False)
+        self.m : HandlerInterface = None
+
+        self._m_list = []
+        self._m_name = []
+        self._m_curr = {}
 
         # solver stuff
         weight = [1.0, -2.0, 1.0]
@@ -50,7 +63,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for p in self.ssd.parameters():
             p.requires_grad = False
 
-        self.v = torch.tensor([self.v_init])
+        self.v = self.v_init.data.clone()
         self.initialized: bool = False
 
         # -- constants --
@@ -65,19 +78,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self.ssd.weight.device
 
     def insert(self, mechanism: Mechanism, ic=None, **kwargs):
-        v_init = torch.tensor(self.v_init, device=self.device())
-        m = mechanism(self.temp, v_init, ic=ic, **kwargs)
-        self.mechanisms[mechanism.__name__] = m
-        if m._ions:
-            for ion in m._ions:
-                if ion not in self.ions:
-                    self.ions[ion] = IONS[ion]()
-                    self.ion_names.append(ion)
-                m.register_ion(ion, self.ions[ion])
+        m = mechanism(self.temp, self.v_init, ic=ic, **kwargs)
+        self._m_list.append(m)
+        self._m_name.append(mechanism.__name__)
+        for k, v in m._currents.items():
+            self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
+
+    def finalize(self):
+        self.m = build_handler(self._m_list, self._m_name, self._m_curr)
 
     def advance_mechanisms(self, v, dt):
-        for _, mech in self.mechanisms.items():
-            mech._advance(v, dt)
+        self.m.advance(v, dt)
 
     def area_(self, diameters) -> torch.Tensor:
         """Membrane surface area of compartment."""
@@ -120,8 +131,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 self.init(self.v)
                 self.initialized = True
 
-            self.test()
-
             callbacks = CallbackList(callbacks)
             callbacks.pre_loop_hook(self)
 
@@ -130,11 +139,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     self.v, ve[i], self.cm_c, self.ra_c, dt, area, i, intra
                 )
                 callbacks.post_step_hook(self)
-
-    @torch.jit.script_method
-    def test(self):
-        for _, ion in self.ions.items():
-            print(ion.buffers[ion.ename])
 
     def dv(self, cm, ra, d2v, ion, dt) -> Tensor:
         """Calculate dv/dt
@@ -163,58 +167,23 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return dv
 
     @torch.jit.script_method
-    def init_buffers(self, v_init: float) -> None:
-        for _, m in self.mechanisms.items():
-            m.init(torch.tensor(v_init, device=self.device()))
+    def init_buffers(self, v_init) -> None:
+        self.m.init_buffers(v_init)
 
     @staticmethod
     def i_test(v, area, mech: Dict[str, torch.nn.Module], i: int, intra: Optional[Tensor] = None) -> torch.Tensor:
         return torch.tensor(0.0)
 
-    #@torch.jit.script_method
+    @torch.jit.script_method
     def i(self, v, area, idx: int, intra: Optional[Tensor] = None) -> Tensor:
-        i = torch.tensor(0.0, device=self.device())
-
-        #d = {
-        #    "k": torch.tensor(0.0, device=self.device()),
-        #    "na": torch.tensor(0.0, device=self.device()),
-        #    "ca": torch.tensor(0.0, device=self.device()),
-        #}
-
-        for _, m in self.mechanisms.items():
-            c = m.i(v)
-            if c is not None:
-                i = i + c
-            #cik = m.i_k(v)
-            #if cik is not None:
-            #    d["k"] = d["k"] + cik
-            #cina = m.i_na(v)
-            #if cina is not None:
-            #    d["na"] = d["na"] + cina
-            #cica = m.i_ca(v)
-            #if cica is not None:
-            #    d["ca"] = d["ca"] + cica
-
-        i = i * area[:, None, None]
-
-        #for k, v in self.ions.items():
-        #    d[k] = d[k] * area[:, None, None]
-        #    v.set("i" + k, d[k])
-        #    i = i + d[k]
-
-        if intra is not None:
-            i = i - intra[idx]
-        return i
+        return self.m(v, area, idx, intra)
 
     @torch.jit.script_method
     def init(self, v) -> None:
         self.inflate(v)
-        for _, ion in self.ions.items():
-            ion.initialize(v)
 
     def inflate(self, v):
-        for _, mech in self.mechanisms.items():
-            mech.inflate(v)
+        self.m.inflate(v)
 
     @torch.jit.script_method
     def step(
@@ -241,8 +210,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if s == "v":
             return self.v
         mech, state = s.split(".")
-        m: MechanismInterface = self.mechanisms[mech]
-        return m.get(state)
+        return self.m.get(mech, state)
 
     def load(self, state_dict):
         if state_dict in trained:
@@ -264,11 +232,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.initialized = False
         return self
 
-    @torch.jit.script_method
+    @torch.jit.ignore
     def all_states(self) -> List[str]:
         out = ["v"]
-        for n, m in self.mechanisms.items():
-            for s in m.states.keys():
+        for n in self._m_name:
+            for s in getattr(self.m, n).states.keys():
                 out.append(f"{n}.{s}")
         return out
 

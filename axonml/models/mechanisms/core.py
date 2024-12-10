@@ -139,6 +139,7 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
     _conductances = {}
     _init = {}
     _read_ion = {}
+    _currents = {}
 
     _init_params: Dict[str, float]
     states: Dict[str, torch.Tensor]

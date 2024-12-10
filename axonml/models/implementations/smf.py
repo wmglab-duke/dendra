@@ -9,3 +9,4 @@ class SMF(Myelinated):
             axnode_myel,
             ic={"m": 0.0732093, "h": 0.62069505, "p": 0.20260409, "s": 0.04302994},
         )
+        self.finalize()
