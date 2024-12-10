@@ -11,3 +11,4 @@ class Sundt(Unmyelinated):
         self.insert(kdr, gkbar=0.04, ek=-90.0)
         self.insert(nahh, gnabar=0.04)
         self.insert(pas, g=0.0001, e=-65.0)
+        self.finalize()

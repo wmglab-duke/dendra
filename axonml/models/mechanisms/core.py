@@ -84,7 +84,16 @@ class State(Parameterized):
     def eval(self):
         if self.is_q10:
             self.q10_cache = self.calc_q10()
+            self.q10 = self.return_q10_cache
         return super().eval()
+    
+    def train(self):
+        if self.is_q10:
+            self.q10 = self.calc_q10
+        return super().train()
+    
+    def return_q10_cache(self):
+        return self.q10_cache
 
     def q10(self):
         if not self.training:
@@ -213,15 +222,3 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
     @torch.jit.script_method
     def get(self, s: str) -> torch.Tensor:
         return self.states[s]
-
-    def i_na(self, v):
-        return None
-
-    def i_k(self, v):
-        return None
-
-    def i_ca(self, v):
-        return None
-
-    def i(self, v):
-        return None
