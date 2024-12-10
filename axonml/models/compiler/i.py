@@ -21,7 +21,7 @@ def parse_dictionary_to_sum(data: dict, current: str) -> str:
     result = []
     for key, value_set in data.items():
         for value in value_set:
-            result.append(f'self.{key}.{value}(v)')
+            result.append(f"self.{key}.{value}(v)")
     s = " + ".join(result)
     return f"{current} = {s}"
 
@@ -32,7 +32,9 @@ def parse_dictionary_to_scale(data: dict, current: str) -> str:
     return f"{current} = {current} * area[:, None, None]"
 
 
-def parse_dictionaries_to_total(ns_dct=None, k_dct=None, na_dct=None, ca_dct=None) -> str:
+def parse_dictionaries_to_total(
+    ns_dct=None, k_dct=None, na_dct=None, ca_dct=None
+) -> str:
     result = []
     if ns_dct:
         result.append("nonspecfic")

@@ -64,7 +64,7 @@ for sample in all_samples:
 
 # -- model --
 
-mrg = SMF().cuda().load('MRG2024').compile(nodes=nodes).train().to(dtype)
+mrg = SMF().cuda().load("MRG2024").compile(nodes=nodes).train().to(dtype)
 
 
 # -- run optimization --

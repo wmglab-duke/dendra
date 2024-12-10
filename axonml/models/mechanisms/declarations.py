@@ -49,12 +49,14 @@ PARAMETER = partial(_declare_parameters, "_params")
 CONDUCTANCE = partial(_declare_parameters, "_conductances")
 INITIAL = partial(_declare_parameters, "_init")
 
+
 def NONSPECIFIC_CURRENT(*args):
     frame = sys._getframe(1)
     namespace = frame.f_locals
-    if '_currents' not in namespace:
+    if "_currents" not in namespace:
         namespace["_currents"] = {}
-    namespace["_currents"].setdefault('nonspecific', []).extend(args)
+    namespace["_currents"].setdefault("nonspecific", []).extend(args)
+
 
 def DERIVATIVE(f, pade=False):
     frame = sys._getframe(1)

@@ -10,18 +10,25 @@ from .backend import Backend as A
 from .mixins import Parameterized
 from .mechanisms.core import Mechanism
 from .mechanisms.declarations import PARAMETER
-from .mechanisms.ions import IONS
-from .mechanisms.handler import build_handler
+from .mechanisms.handler.handler import build_handler
 
 
 @torch.jit.interface
 class HandlerInterface:
-    def i_intra(self, v, area, intra) -> torch.Tensor: pass
-    def i_no_intra(self, v, area) -> torch.Tensor: pass
-    def inflate(self, v) -> None: pass
-    def advance(self, v, dt) -> None: pass
-    def init_buffers(self, v_init: float) -> None: pass
-    def get(self, mech: str, state: str) -> torch.Tensor: pass
+    def i_intra(self, v, area, intra) -> torch.Tensor:
+        pass
+
+    def i_no_intra(self, v, area) -> torch.Tensor:
+        pass
+
+    def initialize(self, v, v_init) -> None:
+        pass
+
+    def advance(self, v, dt) -> None:
+        pass
+
+    def get(self, mech: str, state: str) -> torch.Tensor:
+        pass
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
@@ -39,8 +46,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def __init__(self, temp=37.0, v_init=-80.0):
         super().__init__()
         self.temp = temp
-        self.v_init = torch.nn.Parameter(torch.tensor(v_init), requires_grad=False)
-        self.mech : HandlerInterface = None
+        self.v_init = v_init
+        self.mech: HandlerInterface = None
 
         self._m_list = []
         self._m_name = []
@@ -55,7 +62,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for p in self.ssd.parameters():
             p.requires_grad = False
 
-        self.v = self.v_init.data.clone()
+        self.v = torch.tensor([v_init])
         self.initialized: bool = False
 
         # -- constants --
@@ -69,19 +76,22 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def device(self):
         return self.ssd.weight.device
 
+    def dtype(self):
+        return self.ssd.weight.dtype
+
     def insert(self, mechanism: Mechanism, ic=None, **kwargs):
-        m = mechanism(self.temp, self.v_init, ic=ic, **kwargs)
+        m = mechanism(self.temp, ic=ic, **kwargs)
         self._m_list.append(m)
         self._m_name.append(mechanism.__name__)
         for k, v in m._currents.items():
             self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
 
-    def finalize(self):
+    def build(self):
         self.mech = build_handler(self._m_list, self._m_name, self._m_curr)
 
     def area_(self, diameters):
         raise NotImplementedError()
-    
+
     def ra_(self, diameters):
         raise NotImplementedError()
 
@@ -97,9 +107,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         callbacks: List[Callback] = None,
         reinit: bool = False,
     ):
-        with_intra = (intra is not None)
+        with_intra = intra is not None
         with torch.set_grad_enabled(self.training):
-
             device = self.device()
 
             dt = dt if dt is not None else A.dt
@@ -117,8 +126,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 self.v = torch.full_like(ve[0], self.v_init)
                 self.cm_c = self.cm_(area)
                 self.ra_c = self.ra_(diameters)
-                self.init_buffers(self.v_init)
-                self.init(self.v)
+                self.initialize()
                 self.initialized = True
 
             callbacks = CallbackList(callbacks)
@@ -134,6 +142,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                         self.v, ve[i], self.cm_c, self.ra_c, dt, area
                     )
                 callbacks.post_step_hook(self)
+
+    @torch.jit.script_method
+    def initialize(self):
+        v_init = torch.tensor(self.v_init, device=self.device(), dtype=self.dtype())
+        self.mech.initialize(self.v, v_init)
 
     def dv(self, cm, ra, d2v, ion, dt) -> Tensor:
         """Calculate dv/dt
@@ -162,16 +175,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return dv
 
     @torch.jit.script_method
-    def init_buffers(self, v_init) -> None:
-        self.mech.init_buffers(v_init)
-
-    @torch.jit.script_method
-    def init(self, v) -> None:
-        self.mech.inflate(v)
-
-    @torch.jit.script_method
     def step_no_intra(
-        self, v, ve, cm, ra, dt, area,
+        self,
+        v,
+        ve,
+        cm,
+        ra,
+        dt,
+        area,
     ) -> Tensor:
         # -- 2nd diff --
         x = torch.cat([v, ve], dim=1)
@@ -189,11 +200,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         return v
 
-
     @torch.jit.script_method
-    def step_intra(
-        self, v, ve, cm, ra, dt, area, intra
-    ) -> Tensor:
+    def step_intra(self, v, ve, cm, ra, dt, area, intra) -> Tensor:
         # -- 2nd diff --
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)

@@ -171,7 +171,7 @@ class axnode_myel(Mechanism):
         }
     )
 
-    NONSPECIFIC_CURRENT('i')
+    NONSPECIFIC_CURRENT("i")
 
     def i(self, v):
         # -- gating variables --

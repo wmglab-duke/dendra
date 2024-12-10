@@ -77,7 +77,12 @@ class State(Parameterized):
         self._all_names = self.all_names()
 
         self.i_func = modify_operations(
-            integrate2c(self._derivative[0], "dt", self._export_names, use_pade_approx=self._derivative[1])
+            integrate2c(
+                self._derivative[0],
+                "dt",
+                self._export_names,
+                use_pade_approx=self._derivative[1],
+            )
         )
         self.integrate = make_integrate(self)
 
@@ -86,12 +91,12 @@ class State(Parameterized):
             self.q10_cache = self.calc_q10()
             self.q10 = self.return_q10_cache
         return super().eval()
-    
+
     def train(self):
         if self.is_q10:
             self.q10 = self.calc_q10
         return super().train()
-    
+
     def return_q10_cache(self):
         return self.q10_cache
 
@@ -153,10 +158,9 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
     _init_params: Dict[str, float]
     states: Dict[str, torch.Tensor]
 
-    def __init__(self, temp: float, v_init: float, ic: dict = None, **kwargs):
+    def __init__(self, temp, ic: dict = None, **kwargs):
         super().__init__()
-        self.temp: float = temp
-        self.v_init: float = v_init
+        self.temp = temp
 
         self.states: Dict[str, torch.Tensor] = {}
         self.DE = torch.nn.ModuleDict(
@@ -168,8 +172,6 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
         self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
         if ic is not None:
             self._init_params.update(ic)
-        self._init_buffers_s(v_init)
-        self.init(v_init)
         for k, v in kwargs.items():
             self.set(k, v)
 
@@ -194,21 +196,16 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
             return self.ions[self._read_ion[name]].get(name)
         return super().__getattr__(name)
 
+    @torch.jit.export
     def _init_buffers_s(self, v_init):
         for n, m in self.DE.items():
             if n in self._init_params:
-                buffer_tensor = torch.tensor(self._init_params[n], device=v_init.device, dtype=v_init.dtype)
+                buffer_tensor = torch.tensor(
+                    self._init_params[n], device=v_init.device, dtype=v_init.dtype
+                )
             else:
                 buffer_tensor = m.inf(v_init)
             self.states[n] = buffer_tensor
-
-    @torch.jit.export
-    def init(self, v_init):
-        self._init_buffers_s(v_init)
-
-    @torch.jit.export
-    def inflate(self, v):
-        self._inflate_s(v)
 
     @torch.jit.export
     def _inflate_s(self, v):

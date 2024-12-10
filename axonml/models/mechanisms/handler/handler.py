@@ -22,6 +22,10 @@ class MechanismHandler(torch.nn.Module):
     total = total - intra
     return total
 
+  def initialize(self, v, v_init) -> None:
+    self.init_buffers(v_init)
+    self.inflate(v)
+
   def inflate(self, v) -> None:
     {inflate}
   
@@ -35,6 +39,7 @@ class MechanismHandler(torch.nn.Module):
   def get(self, mech: str, state: str) -> torch.Tensor:
     return getattr(self, mech).get(state)
 """
+
 
 def parse_assignments(mechanism_names) -> str:
     result = []
@@ -56,7 +61,7 @@ def parse_dictionary_to_sum(data: dict, current: str) -> str:
     result = []
     for key, value_set in data.items():
         for value in value_set:
-            result.append(f'self.{key}.{value}(v)')
+            result.append(f"self.{key}.{value}(v)")
     s = " + ".join(result)
     return f"{current} = {s}"
 
@@ -93,7 +98,7 @@ def parse_advance(mechanism_names) -> str:
 def parse_inflate(mechanism_names) -> str:
     result = []
     for key in mechanism_names:
-        result.append(f"self.{key}.inflate(v)")
+        result.append(f"self.{key}._inflate_s(v)")
     s = "\n".join(result)
     return s
 
@@ -101,13 +106,12 @@ def parse_inflate(mechanism_names) -> str:
 def parse_init_buffers(mechanism_names) -> str:
     result = []
     for key in mechanism_names:
-        result.append(f"self.{key}.init(v_init)")
+        result.append(f"self.{key}._init_buffers_s(v_init)")
     s = "\n".join(result)
     return s
 
 
 def build_handler(mechanisms, names, currents):
-
     forward_str = template.format(
         arguments=parse_args(names),
         assignments=parse_assignments(names),

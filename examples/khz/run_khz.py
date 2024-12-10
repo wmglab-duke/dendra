@@ -9,7 +9,8 @@ from axonml.models.callbacks import APCount
 
 
 torch.set_default_dtype(torch.float32)
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
+
 
 def deltax(diam):
     return -8.215284e00 * diam**2 + 2.724201e02 * diam + -7.802411e02

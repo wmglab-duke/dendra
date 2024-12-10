@@ -2,7 +2,13 @@
 # Cummins et al. (2007), Sheets et al. (2007)
 
 from ..mechanisms import (
-    Mechanism, State, PARAMETER, STATE, USEQ10, DERIVATIVE, NONSPECIFIC_CURRENT
+    Mechanism,
+    State,
+    PARAMETER,
+    STATE,
+    USEQ10,
+    DERIVATIVE,
+    NONSPECIFIC_CURRENT,
 )
 from ..mechanisms.ops import exprelr, exp, expit
 
@@ -75,7 +81,7 @@ class h(State):
 
     def beta(self, v):
         v = v + 65.0 + self.hshift
-        return self.q10() *self.bh1 * expit((v - self.bh2) / self.bh3)
+        return self.q10() * self.bh1 * expit((v - self.bh2) / self.bh3)
 
     def export(self, v):
         a = self.alpha(v)
@@ -90,7 +96,7 @@ class nahh(Mechanism):
 
     PARAMETER({"gnabar": 0.3, "ena": 50.0})
 
-    NONSPECIFIC_CURRENT('i')
+    NONSPECIFIC_CURRENT("i")
 
     def i(self, v):
         m = self.states["m"]

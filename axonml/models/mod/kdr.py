@@ -1,8 +1,6 @@
 # Borg-Graham type KDR channel; Borg-Graham 1987
 
-from ..mechanisms import (
-    Mechanism, State, PARAMETER, STATE, USEQ10, DERIVATIVE, NONSPECIFIC_CURRENT
-)
+from ..mechanisms import *
 from ..mechanisms.ops import exp
 
 
@@ -113,7 +111,7 @@ class kdr(Mechanism):
 
     PARAMETER({"gkbar": 0.003, "ek": -77.0})
 
-    NONSPECIFIC_CURRENT('i')
+    NONSPECIFIC_CURRENT("i")
 
     def i(self, v):
         l = self.states["l"]

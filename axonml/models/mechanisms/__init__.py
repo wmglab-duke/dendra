@@ -1,6 +1,14 @@
-from .declarations import STATE, PARAMETER, CONDUCTANCE, INITIAL, USEQ10, DERIVATIVE, NONSPECIFIC_CURRENT
+from .declarations import (
+    STATE,
+    PARAMETER,
+    CONDUCTANCE,
+    INITIAL,
+    USEQ10,
+    DERIVATIVE,
+    NONSPECIFIC_CURRENT,
+)
 from .core import Mechanism, State
-from .ions import USEION
+from .handler.ions import USEION
 
 __all__ = [
     "Mechanism",
