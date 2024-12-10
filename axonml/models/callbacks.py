@@ -164,7 +164,7 @@ class APCount(ThresholdCallback):
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.get_state("v")[:, 0, self.node_check]
+            vm_new = model.v[:, 0, self.node_check]
             vm = self.state_cache
             self.state_cache = increment_count_(vm, vm_new, self.record, self.threshold)
         self.i += 1
@@ -206,7 +206,7 @@ class Active(ThresholdCallback):
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.get_state("v")[:, 0, self.node_check]
+            vm_new = model.v[:, 0, self.node_check]
             vm = self.state_cache
             self.state_cache, la = update_active(vm, vm_new, self.threshold)
             self.record[la] = True
@@ -237,7 +237,7 @@ class Raster(ThresholdCallback):
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.get_state("v")[:, -1, self.node_check]
+            vm_new = model.v[:, -1, self.node_check]
             vm = self.state_cache
             self.state_cache, la = increment_count(vm, vm_new, self.threshold)
             self.record.append(la)

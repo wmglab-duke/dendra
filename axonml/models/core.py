@@ -8,7 +8,7 @@ from axonml import trained
 from .callbacks import CallbackList, Callback
 from .backend import Backend as A
 from .mixins import Parameterized
-from .mechanisms.core import Mechanism, MechanismInterface
+from .mechanisms.core import Mechanism
 from .mechanisms.declarations import PARAMETER
 from .mechanisms.ions import IONS
 from .mechanisms.handler import build_handler
@@ -16,20 +16,12 @@ from .mechanisms.handler import build_handler
 
 @torch.jit.interface
 class HandlerInterface:
-    def forward(self, v, area, i: int, intra: Optional[Tensor] = None) -> torch.Tensor:
-        pass
-
-    def inflate(self, v) -> None:
-        pass
-
-    def advance(self, v, dt) -> None:
-        pass
-
-    def init_buffers(self, v_init: float) -> None:
-        pass
-
-    def get(self, mech: str, state: str) -> torch.Tensor:
-        pass
+    def i_intra(self, v, area, intra) -> torch.Tensor: pass
+    def i_no_intra(self, v, area) -> torch.Tensor: pass
+    def inflate(self, v) -> None: pass
+    def advance(self, v, dt) -> None: pass
+    def init_buffers(self, v_init: float) -> None: pass
+    def get(self, mech: str, state: str) -> torch.Tensor: pass
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
@@ -87,17 +79,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def finalize(self):
         self.mech = build_handler(self._m_list, self._m_name, self._m_curr)
 
-    def area_(self, diameters) -> torch.Tensor:
-        """Membrane surface area of compartment."""
-        pass
+    def area_(self, diameters):
+        raise NotImplementedError()
+    
+    def ra_(self, diameters):
+        raise NotImplementedError()
 
-    def ra_(self, diameters) -> torch.Tensor:
-        """Axial resistance of compartment."""
-        pass
-
-    def cm_(self, area) -> Tuple[Tensor, Tensor]:
-        """Capacitance of compartment."""
-        pass
+    def cm_(self, area):
+        return self.cm * area
 
     def run(
         self,
@@ -108,16 +97,20 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         callbacks: List[Callback] = None,
         reinit: bool = False,
     ):
+        with_intra = (intra is not None)
         with torch.set_grad_enabled(self.training):
+
+            device = self.device()
+
             dt = dt if dt is not None else A.dt
-            dt = torch.tensor(dt, device=self.device())
+            dt = torch.tensor(dt, device=device)
 
             if callbacks:
                 for c in callbacks:
                     c.dt = dt
 
-            ve = torch.as_tensor(ve, device=self.device())
-            diameters = torch.as_tensor(diameters, device=self.device())
+            ve = torch.as_tensor(ve, device=device)
+            diameters = torch.as_tensor(diameters, device=device)
             area = self.area_(diameters)
 
             if (not self.initialized) or reinit:
@@ -132,9 +125,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             callbacks.pre_loop_hook(self)
 
             for i in range(len(ve)):
-                self.v = self.step(
-                    self.v, ve[i], self.cm_c, self.ra_c, dt, area, i, intra
-                )
+                if with_intra:
+                    self.v = self.step_intra(
+                        self.v, ve[i], self.cm_c, self.ra_c, dt, area, intra[i]
+                    )
+                else:
+                    self.v = self.step_no_intra(
+                        self.v, ve[i], self.cm_c, self.ra_c, dt, area
+                    )
                 callbacks.post_step_hook(self)
 
     def dv(self, cm, ra, d2v, ion, dt) -> Tensor:
@@ -167,21 +165,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def init_buffers(self, v_init) -> None:
         self.mech.init_buffers(v_init)
 
-    @staticmethod
-    def i_test(v, area, mech: Dict[str, torch.nn.Module], i: int, intra: Optional[Tensor] = None) -> torch.Tensor:
-        return torch.tensor(0.0)
-
-    @torch.jit.script_method
-    def i(self, v, area, idx: int, intra: Optional[Tensor] = None) -> Tensor:
-        return self.mech(v, area, idx, intra)
-
     @torch.jit.script_method
     def init(self, v) -> None:
         self.mech.inflate(v)
 
     @torch.jit.script_method
-    def step(
-        self, v, ve, cm, ra, dt, area, i: int, intra: Optional[Tensor] = None
+    def step_no_intra(
+        self, v, ve, cm, ra, dt, area,
     ) -> Tensor:
         # -- 2nd diff --
         x = torch.cat([v, ve], dim=1)
@@ -191,7 +181,28 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt)
 
         # -- calculate ionic current --
-        i_ion = self.i(v, area, i, intra)
+        i_ion = self.mech.i_no_intra(v, area)
+
+        # -- update vm --
+        dv = self.dv(cm, ra, d2v, i_ion, dt)
+        v = v + dv
+
+        return v
+
+
+    @torch.jit.script_method
+    def step_intra(
+        self, v, ve, cm, ra, dt, area, intra
+    ) -> Tensor:
+        # -- 2nd diff --
+        x = torch.cat([v, ve], dim=1)
+        d2v = self.ssd(x)
+
+        # -- update gvs --
+        self.mech.advance(v, dt)
+
+        # -- calculate ionic current --
+        i_ion = self.mech.i_intra(v, area, intra)
 
         # -- update vm --
         dv = self.dv(cm, ra, d2v, i_ion, dt)
@@ -253,9 +264,6 @@ class Unmyelinated(Axon):
         dx = torch.full_like(diameters, self.dx / 10000)
         return self.pi * (diameters / 10000) * dx
 
-    def cm_(self, area) -> torch.Tensor:
-        return self.cm * area
-
     def ra_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)
         radii = diameters / 20000
@@ -295,9 +303,6 @@ class Myelinated(Axon):
         radii = diameters / 20000  # radius in cm
         rhoa = self.rhoa * self.rhoa_scale(diameters)
         return (rhoa * self.deltax(diameters)) / (self.pi * (radii**2))
-
-    def cm_(self, area):
-        return self.cm * area
 
     def rhoa_scale(self, diameters):
         return 1 / ((self.axonD(diameters) / diameters) ** 2)

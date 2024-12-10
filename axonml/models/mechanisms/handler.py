@@ -9,12 +9,17 @@ class MechanismHandler(torch.nn.Module):
     super().__init__()
     {assignments}
 
-  def forward(self, v, area, i: int, intra: Optional[torch.Tensor] = None) -> torch.Tensor:
+  def i_no_intra(self, v, area) -> torch.Tensor:
     {currents}
     {scale}
     total = {total}
-    if intra is not None:
-      total = total - intra[i]
+    return total
+
+  def i_intra(self, v, area, intra) -> torch.Tensor:
+    {currents}
+    {scale}
+    total = {total}
+    total = total - intra
     return total
 
   def inflate(self, v) -> None:
