@@ -1,9 +1,10 @@
 # From Traub & Miles "Neuronal networks of the hippocampus" (1991)
 # Cummins et al. (2007), Sheets et al. (2007)
 
-from ..mechanisms import Mechanism, State, PARAMETER, STATE, USEQ10, DERIVATIVE
+from ..mechanisms import (
+    Mechanism, State, PARAMETER, STATE, USEQ10, DERIVATIVE, NONSPECIFIC_CURRENT
+)
 from ..mechanisms.ops import exprelr, exp, expit
-from ..mechanisms.ions import USEION
 
 
 class m(State):
@@ -88,6 +89,8 @@ class nahh(Mechanism):
     STATE(m, h)
 
     PARAMETER({"gnabar": 0.3, "ena": 50.0})
+
+    NONSPECIFIC_CURRENT('i')
 
     def i(self, v):
         m = self.states["m"]

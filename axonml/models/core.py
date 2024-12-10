@@ -48,7 +48,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         super().__init__()
         self.temp = temp
         self.v_init = torch.nn.Parameter(torch.tensor(v_init), requires_grad=False)
-        self.m : HandlerInterface = None
+        self.mech : HandlerInterface = None
 
         self._m_list = []
         self._m_name = []
@@ -85,10 +85,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
 
     def finalize(self):
-        self.m = build_handler(self._m_list, self._m_name, self._m_curr)
-
-    def advance_mechanisms(self, v, dt):
-        self.m.advance(v, dt)
+        self.mech = build_handler(self._m_list, self._m_name, self._m_curr)
 
     def area_(self, diameters) -> torch.Tensor:
         """Membrane surface area of compartment."""
@@ -168,7 +165,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def init_buffers(self, v_init) -> None:
-        self.m.init_buffers(v_init)
+        self.mech.init_buffers(v_init)
 
     @staticmethod
     def i_test(v, area, mech: Dict[str, torch.nn.Module], i: int, intra: Optional[Tensor] = None) -> torch.Tensor:
@@ -176,14 +173,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def i(self, v, area, idx: int, intra: Optional[Tensor] = None) -> Tensor:
-        return self.m(v, area, idx, intra)
+        return self.mech(v, area, idx, intra)
 
     @torch.jit.script_method
     def init(self, v) -> None:
-        self.inflate(v)
-
-    def inflate(self, v):
-        self.m.inflate(v)
+        self.mech.inflate(v)
 
     @torch.jit.script_method
     def step(
@@ -194,7 +188,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         d2v = self.ssd(x)
 
         # -- update gvs --
-        self.advance_mechanisms(v, dt)
+        self.mech.advance(v, dt)
 
         # -- calculate ionic current --
         i_ion = self.i(v, area, i, intra)
@@ -210,7 +204,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if s == "v":
             return self.v
         mech, state = s.split(".")
-        return self.m.get(mech, state)
+        return self.mech.get(mech, state)
 
     def load(self, state_dict):
         if state_dict in trained:
