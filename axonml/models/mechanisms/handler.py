@@ -13,6 +13,8 @@ class MechanismHandler(torch.nn.Module):
     {currents}
     {scale}
     total = {total}
+    if intra is not None:
+      total = total - intra[i]
     return total
 
   def inflate(self, v) -> None:
