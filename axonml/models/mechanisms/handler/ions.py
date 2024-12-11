@@ -65,22 +65,24 @@ class Ion(torch.nn.Module):
 
   def einit(self, temp) -> None:
     {einit}
+    return
 
   def eadvance(self, temp) -> None:
     {eadvance}
+    return
 
   def write_after_init(self) -> None:
     {write_c_after_init}
     {write_i_after_init}
     {write_e_after_init}
-    pass
+    return
 
   def write(self) -> None:
     # write things which get read
     {write_c}
     {write_i}
     {write_e}
-    pass
+    return
 """
 
 
