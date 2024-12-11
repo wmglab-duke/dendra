@@ -3,6 +3,7 @@
 from ..mechanisms import *
 from ..mechanisms.ops import expit, exprelr
 
+import torch
 
 class m(State):
     USEQ10()
@@ -171,9 +172,11 @@ class axnode_myel(Mechanism):
         }
     )
 
-    NONSPECIFIC_CURRENT("i")
+    # NONSPECIFIC_CURRENT("i")
 
-    def i(self, v):
+    USEION("na", write=["ina"])
+
+    def ina(self, v):
         # -- gating variables --
         m = self.states["m"]
         h = self.states["h"]

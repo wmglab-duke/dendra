@@ -11,24 +11,46 @@ from .mixins import Parameterized
 from .mechanisms.core import Mechanism
 from .mechanisms.declarations import PARAMETER
 from .mechanisms.handler.handler import build_handler
+from .mechanisms.handler.ions import build_ion
+
+
+def get_unique_keys(list_of_dicts):
+    """Gets all unique keys from a list of dictionaries.
+
+    Args:
+        list_of_dicts: A list of dictionaries.
+
+    Returns:
+        A set of unique keys.
+    """
+
+    unique_keys = set()
+    for dictionary in list_of_dicts:
+        unique_keys.update(dictionary.keys())
+    return unique_keys
 
 
 @torch.jit.interface
 class HandlerInterface:
+
+    def initialize(self, v, v_init, area, temp) -> None:
+        pass
+
+    def advance(self, v, dt) -> None:
+        pass
+
     def i_intra(self, v, area, intra) -> torch.Tensor:
         pass
 
     def i_no_intra(self, v, area) -> torch.Tensor:
         pass
 
-    def initialize(self, v, v_init) -> None:
-        pass
-
-    def advance(self, v, dt) -> None:
+    def update(self, temp) -> None:
         pass
 
     def get(self, mech: str, state: str) -> torch.Tensor:
         pass
+
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
@@ -52,6 +74,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self._m_list = []
         self._m_name = []
         self._m_curr = {}
+
+        self._ion_read = {}
+        self._ion_write = {}
+        self._ion_write_c = {}
+
+        self._all_read = {}
+        self._all_write = {}
+        self._all_write_c = {}
+
+        self._ion_style = {}
 
         # solver stuff
         weight = [1.0, -2.0, 1.0]
@@ -83,11 +115,54 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         m = mechanism(self.temp, ic=ic, **kwargs)
         self._m_list.append(m)
         self._m_name.append(mechanism.__name__)
+
         for k, v in m._currents.items():
             self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
 
+        for k, v in m._read_ion.items():
+            self._ion_read.setdefault(k, {}).update({mechanism.__name__: v})
+
+        for k, v in m._write_ion.items():
+            self._ion_write.setdefault(k, {}).update({mechanism.__name__: v})
+
+        for k, v in m._write_ion_c.items():
+            self._ion_write_c.setdefault(k, {}).update({mechanism.__name__: v})
+
+    def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
+        self._ion_style[ion] = (c_style, e_style, einit, eadvance, cinit)
+
+    def get_ion_style(self, ion):
+        if ion in self._ion_style:
+            return self._ion_style[ion]
+        return self.calc_ion_style(ion)
+
+    def calc_ion_style(self, ion):
+        # TODO : implement this
+        return (0, 1, 0, 0, 0)
+
     def build(self):
-        self.mech = build_handler(self._m_list, self._m_name, self._m_curr)
+        all_ions = get_unique_keys([self._ion_read, self._ion_write, self._ion_write_c])
+        ions_to_write = list(self._ion_write.keys())
+
+        _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
+        self._m_curr.update(_ion_write)
+
+        ions = {}
+        for ion in all_ions:
+            ion_write_c = self._ion_write_c.get(ion, {})
+            ion_write = self._ion_write.get(ion, {})
+            ion_read = self._ion_read.get(ion, {})
+            ions[ion] = build_ion(
+                ion, self._m_list, self._m_name, ion_read, ion_write_c, *self.get_ion_style("na")
+            )
+        self.mech = build_handler(
+            self._m_list,
+            self._m_name,
+            self._m_curr,
+            self.temp,
+            ions,
+            ions_to_write,
+        )
 
     def area_(self, diameters):
         raise NotImplementedError()
@@ -108,6 +183,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         reinit: bool = False,
     ):
         with_intra = intra is not None
+        
+        self.v_init_c = torch.tensor(self.v_init, device=self.device(), dtype=self.dtype())
+        self.temp_c = torch.tensor(self.temp, device=self.device(), dtype=self.dtype())
+        
         with torch.set_grad_enabled(self.training):
             device = self.device()
 
@@ -120,13 +199,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
             ve = torch.as_tensor(ve, device=device)
             diameters = torch.as_tensor(diameters, device=device)
-            area = self.area_(diameters)
 
             if (not self.initialized) or reinit:
                 self.v = torch.full_like(ve[0], self.v_init)
-                self.cm_c = self.cm_(area)
+                self.area_c = self.area_(diameters)
+                self.cm_c = self.cm_(self.area_c)
                 self.ra_c = self.ra_(diameters)
-                self.initialize()
+                self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
                 self.initialized = True
 
             callbacks = CallbackList(callbacks)
@@ -135,18 +214,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             for i in range(len(ve)):
                 if with_intra:
                     self.v = self.step_intra(
-                        self.v, ve[i], self.cm_c, self.ra_c, dt, area, intra[i]
+                        self.v, ve[i], self.cm_c, self.ra_c, dt, self.area_c, intra[i]
                     )
                 else:
                     self.v = self.step_no_intra(
-                        self.v, ve[i], self.cm_c, self.ra_c, dt, area
+                        self.v, ve[i], self.cm_c, self.ra_c, dt, self.area_c
                     )
                 callbacks.post_step_hook(self)
 
     @torch.jit.script_method
-    def initialize(self):
-        v_init = torch.tensor(self.v_init, device=self.device(), dtype=self.dtype())
-        self.mech.initialize(self.v, v_init)
+    def initialize(self, v, v_init, area, temp):
+        self.mech.initialize(v, v_init, area, temp)
 
     def dv(self, cm, ra, d2v, ion, dt) -> Tensor:
         """Calculate dv/dt
@@ -234,7 +312,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
-        self.load_state_dict(state_dict)
+        self.load_state_dict(state_dict, strict=False)
         return self
 
     def compile(self, nodes=16, axons=1):

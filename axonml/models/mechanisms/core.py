@@ -152,21 +152,24 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
     _ions = set()
     _conductances = {}
     _init = {}
-    _read_ion = {}
     _currents = {}
+
+    _read_ion = {}
+    _write_ion = {}
+    _write_ion_c = {}
 
     _init_params: Dict[str, float]
     states: Dict[str, torch.Tensor]
 
     def __init__(self, temp, ic: dict = None, **kwargs):
         super().__init__()
+        self.validate_implementation()
         self.temp = temp
 
         self.states: Dict[str, torch.Tensor] = {}
         self.DE = torch.nn.ModuleDict(
             {cls.__name__: cls(self.temp) for cls in self._states}
         )
-        self.ions = torch.nn.ModuleDict()
 
         # -- bunch of stuff to handle initial conditions + torch compiler --
         self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
@@ -175,8 +178,14 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
         for k, v in kwargs.items():
             self.set(k, v)
 
-    def register_ion(self, name, ion):
-        self.ions[name] = ion
+        for k, v in self._read_ion.items():
+            for v_ in v:
+                self.register_buffer(v_, torch.tensor(0.0))
+
+    def validate_implementation(self):
+        for v in self._write_ion.values():
+            for v_ in v:
+                assert callable(getattr(self, v_, None)), f"current {v_} not implemented"
 
     def set(self, key, value):
         p = getattr(self, key)
@@ -190,11 +199,6 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
                 torch.tensor(param, device=p.device, dtype=p.dtype)
             )
         return super().__setattr__(name, param)
-
-    def __getattr__(self, name):
-        if name in self._read_ion:
-            return self.ions[self._read_ion[name]].get(name)
-        return super().__getattr__(name)
 
     @torch.jit.export
     def _init_buffers_s(self, v_init):
