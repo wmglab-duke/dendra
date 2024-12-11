@@ -109,11 +109,14 @@ class n(State):
 class kdr(Mechanism):
     STATE(l, n)
 
-    PARAMETER({"gkbar": 0.003, "ek": -77.0})
+    CONDUCTANCE({"gkbar": 0.003})
 
-    NONSPECIFIC_CURRENT("i")
+    USEION("k", read=["ek"], write=["ik"])
 
-    def i(self, v):
+    def ik(self, v):
         l = self.states["l"]
         n = self.states["n"]
-        return self.gkbar * n**3 * l * (v - self.ek)
+
+        gkbar = self.conductances['gkbar']
+
+        return gkbar * n**3 * l * (v - self.ek)

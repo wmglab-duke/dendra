@@ -31,10 +31,7 @@ def _declare(name, *args):
 
 def _declare_parameters(name, dct):
     frame = sys._getframe(1)
-
-    # Get the local namespace of the calling frame
     namespace = frame.f_locals
-
     add_to_namespace_dict(namespace, name, dct)
 
 

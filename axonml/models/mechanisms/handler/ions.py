@@ -6,35 +6,10 @@ import torch
 from .handler import parse_args, parse_assignments
 from ..declarations import add_to_namespace_dict
 
-
-def ion_register(ion, valence, e, i0, o0):
-    global VALENCES
-    global REVERSAL
-    global CINIT
-    VALENCES[ion] = valence
-    REVERSAL[ion] = e
-    CINIT[f"{ion}o0"] = o0
-    CINIT[f"{ion}i0"] = i0
-
+from .defaults import REVERSAL, VALENCES, CINIT
 
 R = 1e3 * 8.31446261815324
 FARADAY = 96485.33212331001
-
-
-# default reversal potentials from NEURON
-REVERSAL = {"na": 50.0, "k": -77.0, "ca": 132.0}
-
-VALENCES = {"na": 1.0, "k": 1.0, "ca": 2.0}
-
-# default initial concentrations from NEURON
-CINIT = {
-    "nao0": 140.0,
-    "nai0": 10.0,
-    "ko0": 2.5,
-    "ki0": 54.4,
-    "cao0": 2.0,
-    "cai0": 5e-5,
-}
 
 
 template = """
@@ -63,6 +38,16 @@ class Ion(torch.nn.Module):
     self.eadvance(temp)
     self.write()
 
+  @torch.jit.export
+  def immediate_update_e(self) -> None:
+    {write_e_immediate}
+    return
+
+  @torch.jit.export
+  def immediate_update_c(self) -> None:
+    {write_c_immediate}
+    return
+
   def einit(self, temp) -> None:
     {einit}
     return
@@ -88,7 +73,7 @@ class Ion(torch.nn.Module):
 
 def parse_einit(ion, einit):
     if einit == 0:
-        return "pass"
+        return ""
     return f"self.e{ion} = torch.log(self.{ion}o / self.{ion}i) * self.rzf * (273.15 + temp)"
 
 
@@ -118,7 +103,8 @@ def parse_write_c(c_style):
 def parse_write_i(ion_read_i):
     res = []
     for k, v in ion_read_i.items():
-        res.append(f"self.{k}.{v} = self.{v}")
+        for v_ in v:
+            res.append(f"self.{k}.set('{v_}', self.{v_})")
     return "\n    ".join(res)
 
 
@@ -127,7 +113,8 @@ def parse_write_e(ion_read_e, eadvance):
         return ""
     res = []
     for k, v in ion_read_e.items():
-        res.append(f"self.{k}.{v} = self.{v}")
+        for v_ in v:
+            res.append(f"self.{k}.{v_} = self.{v_}")
     return "\n    ".join(res)
 
 
@@ -136,7 +123,8 @@ def parse_write_c(ion_read_c, c_style):
         return ""
     res = []
     for k, v in ion_read_c.items():
-        res.append(f"self.{k}.{v} = self.{v}")
+        for v_ in v:
+            res.append(f"self.{k}.{v_} = self.{v_}")
     return "\n    ".join(res)
 
 
@@ -145,7 +133,8 @@ def parse_write_c_after_init(ion_read_c, cinit):
         return ""
     res = []
     for k, v in ion_read_c.items():
-        res.append(f"self.{k}.{v} = self.{v}")
+        for v_ in v:
+            res.append(f"self.{k}.{v_} = self.{v_}")
     return "\n    ".join(res)
 
 
@@ -154,7 +143,8 @@ def parse_write_i_after_init(ion_read_i):
         return ""
     res = []
     for k, v in ion_read_i.items():
-        res.append(f"self.{k}.{v} = self.{v}")
+        for v_ in v:
+            res.append(f"self.{k}.{v_} = self.{v_}")
     return "\n    ".join(res)
 
 
@@ -163,12 +153,22 @@ def parse_write_e_after_init(ion_read_e, einit):
         return ""
     res = []
     for k, v in ion_read_e.items():
-        res.append(f"self.{k}.{v} = self.{v}")
+        for v_ in v:
+            res.append(f"self.{k}.{v_} = self.{v_}")
     return "\n    ".join(res)
 
 
 def build_ion(
-    ion, mechanisms, mechanism_names, ion_read, ion_write_c, c_style, e_style, einit, eadvance, cinit
+    ion,
+    mechanisms,
+    mechanism_names,
+    ion_read,
+    ion_write_c,
+    c_style,
+    e_style,
+    einit,
+    eadvance,
+    cinit,
 ):
     ion_read_i = {}
     ion_read_e = {}
@@ -182,7 +182,7 @@ def build_ion(
                 ion_read_i.setdefault(mech, []).append(v_)
             elif v_ in [f"{ion}i", f"{ion}o"]:
                 ion_read_c.setdefault(mech, []).append(v_)
-    
+
     # args
     arguments = parse_args(mechanism_names)
 
@@ -196,9 +196,6 @@ def build_ion(
 
     # eadvance
     eadvance_str = parse_eadvance(ion, eadvance)
-
-    # update -> copy to mechanisms
-    update = "pass"
 
     forward_str = template.format(
         arguments=arguments,
@@ -219,6 +216,8 @@ def build_ion(
         write_c_after_init=parse_write_c_after_init(ion_read_c, cinit),
         write_i_after_init=parse_write_i_after_init(ion_read_i),
         write_e_after_init=parse_write_e_after_init(ion_read_e, einit),
+        write_e_immediate=parse_write_e(ion_read_e, 1),
+        write_c_immediate=parse_write_c(ion_read_c, 3),
     )
 
     filename = "<forward_template>"
@@ -239,7 +238,7 @@ def USEION(ion, read=[], write=[]):
 
     assert ion in VALENCES, f"ion {ion} is not registered"
 
-    if (common := set(read).intersection(write)):
+    if common := set(read).intersection(write):
         raise ValueError(f"{common} is/are both read and written")
 
     valid = {f"{ion}i", f"{ion}o", f"e{ion}", f"i{ion}"}

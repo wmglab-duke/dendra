@@ -8,7 +8,8 @@ from .declarations import (
     NONSPECIFIC_CURRENT,
 )
 from .core import Mechanism, State
-from .handler.ions import USEION, ion_register
+from .handler.ions import USEION
+from .handler.defaults import ion_register
 
 __all__ = [
     "Mechanism",

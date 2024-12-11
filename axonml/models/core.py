@@ -32,7 +32,6 @@ def get_unique_keys(list_of_dicts):
 
 @torch.jit.interface
 class HandlerInterface:
-
     def initialize(self, v, v_init, area, temp) -> None:
         pass
 
@@ -51,6 +50,11 @@ class HandlerInterface:
     def get(self, mech: str, state: str) -> torch.Tensor:
         pass
 
+    def set(self, name: str, value: float) -> None:
+        pass
+
+    def all_states(self) -> List[str]:
+        pass
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
@@ -152,7 +156,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ion_write_c = self._ion_write_c.get(ion, {})
             ion_read = self._ion_read.get(ion, {})
             ions[ion] = build_ion(
-                ion, self._m_list, self._m_name, ion_read, ion_write_c, *self.get_ion_style("na")
+                ion,
+                self._m_list,
+                self._m_name,
+                ion_read,
+                ion_write_c,
+                *self.get_ion_style("na"),
             )
         self.mech = build_handler(
             self._m_list,
@@ -182,10 +191,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         reinit: bool = False,
     ):
         with_intra = intra is not None
-        
-        self.v_init_c = torch.tensor(self.v_init, device=self.device(), dtype=self.dtype())
+
+        self.v_init_c = torch.tensor(
+            self.v_init, device=self.device(), dtype=self.dtype()
+        )
         self.temp_c = torch.tensor(self.temp, device=self.device(), dtype=self.dtype())
-        
+
         with torch.set_grad_enabled(self.training):
             device = self.device()
 
@@ -322,13 +333,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.initialized = False
         return self
 
-    @torch.jit.ignore
     def all_states(self) -> List[str]:
         out = ["v"]
-        for n in self._m_name:
-            for s in getattr(self.m, n).states.keys():
-                out.append(f"{n}.{s}")
-        return out
+        return out + self.mech.all_states()
+    
+    @torch.jit.export
+    def set(self, key: str, value: float):
+        self.mech.set(key, value)
 
 
 class Unmyelinated(Axon):

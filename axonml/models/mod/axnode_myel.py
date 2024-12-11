@@ -5,6 +5,7 @@ from ..mechanisms.ops import expit, exprelr
 
 import torch
 
+
 class m(State):
     USEQ10()
 
@@ -160,12 +161,17 @@ class s(State):
 class axnode_myel(Mechanism):
     STATE(m, p, h, s)
 
-    PARAMETER(
+    CONDUCTANCE(
         {
             "gnabar": 3.0,
             "gnapbar": 0.01,
             "gkbar": 0.08,
             "gl": 0.007,
+        }
+    )
+
+    PARAMETER(
+        {
             "ena": 50.0,
             "ek": -90.0,
             "el": -90.0,
@@ -181,12 +187,17 @@ class axnode_myel(Mechanism):
         p = self.states["p"]
         s = self.states["s"]
 
+        gnabar = self.conductances['gnabar']
+        gnapbar = self.conductances['gnapbar']
+        gkbar = self.conductances['gkbar']
+        gl = self.conductances['gl']
+
         # -- current --
         current = (
-            (self.gnabar * m**3 * h * (v - self.ena))
-            + (self.gnapbar * p**3 * (v - self.ena))
-            + (self.gkbar * s * (v - self.ek))
-            + (self.gl * (v - self.el))
+            (gnabar * m**3 * h * (v - self.ena))
+            + (gnapbar * p**3 * (v - self.ena))
+            + (gkbar * s * (v - self.ek))
+            + (gl * (v - self.el))
         )
 
         return current

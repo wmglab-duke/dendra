@@ -1,15 +1,7 @@
 # From Traub & Miles "Neuronal networks of the hippocampus" (1991)
 # Cummins et al. (2007), Sheets et al. (2007)
 
-from ..mechanisms import (
-    Mechanism,
-    State,
-    PARAMETER,
-    STATE,
-    USEQ10,
-    DERIVATIVE,
-    NONSPECIFIC_CURRENT,
-)
+from ..mechanisms import *
 from ..mechanisms.ops import exprelr, exp, expit
 
 
@@ -94,11 +86,14 @@ class h(State):
 class nahh(Mechanism):
     STATE(m, h)
 
-    PARAMETER({"gnabar": 0.3, "ena": 50.0})
+    CONDUCTANCE({"gnabar": 0.3})
 
-    NONSPECIFIC_CURRENT("i")
+    USEION("na", read=["ena"], write=["ina"])
 
-    def i(self, v):
+    def ina(self, v):
         m = self.states["m"]
         h = self.states["h"]
-        return self.gnabar * m**3 * h * (v - self.ena)
+
+        gnabar = self.conductances['gnabar']
+
+        return gnabar * m**3 * h * (v - self.ena)

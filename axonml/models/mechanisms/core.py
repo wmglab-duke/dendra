@@ -6,7 +6,7 @@ import linecache
 from nmodl.ode import integrate2c
 import torch
 
-from ..mixins import Parameterized
+from ..mixins import Parameterized, to_param
 
 
 forward_template = """
@@ -147,6 +147,15 @@ class MechanismInterface:
         pass
 
 
+class Dummy(torch.nn.Module):
+    def __init__(self, x):
+        super().__init__()
+        self.x = torch.nn.Parameter(torch.tensor(x))
+
+    def forward(self):
+        return self.x
+
+
 class Mechanism(Parameterized, torch.jit.ScriptModule):
     _states = set()
     _ions = set()
@@ -159,24 +168,36 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
     _write_ion_c = {}
 
     _init_params: Dict[str, float]
+
     states: Dict[str, torch.Tensor]
+    conductances: Dict[str, torch.Tensor]
 
     def __init__(self, temp, ic: dict = None, **kwargs):
-        super().__init__()
+        super().__init__(**kwargs)
         self.validate_implementation()
         self.temp = temp
 
         self.states: Dict[str, torch.Tensor] = {}
+        self.conductances: Dict[str, torch.Tensor] = {}
+
+        _conductances = self._conductances
+        _conductances = dict((k, kwargs.get(k, v)) for k, v in _conductances.items())
+
+        self._init_conductances = torch.nn.ModuleDict(
+            {k: Dummy(v) for k, v in _conductances.items()}
+        )
+
+        self._conductance_names = [k for k in self._init_conductances.keys()]
+
         self.DE = torch.nn.ModuleDict(
             {cls.__name__: cls(self.temp) for cls in self._states}
         )
 
         # -- bunch of stuff to handle initial conditions + torch compiler --
         self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
+
         if ic is not None:
             self._init_params.update(ic)
-        for k, v in kwargs.items():
-            self.set(k, v)
 
         for k, v in self._read_ion.items():
             for v_ in v:
@@ -185,12 +206,15 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
     def validate_implementation(self):
         for v in self._write_ion.values():
             for v_ in v:
-                assert callable(getattr(self, v_, None)), f"current {v_} not implemented"
+                assert callable(
+                    getattr(self, v_, None)
+                ), f"current {v_} not implemented"
 
-    def set(self, key, value):
+    @torch.jit.ignore
+    def set(self, key: str, value):
         p = getattr(self, key)
         if isinstance(p, torch.Tensor):
-            p.data = torch.tensor(value, dtype=p.data.dtype, device=p.device)
+            p.data = torch.as_tensor(value, dtype=p.data.dtype, device=p.device)
 
     def __setattr__(self, name, param):
         if name in self._parameters:
@@ -201,7 +225,7 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
         return super().__setattr__(name, param)
 
     @torch.jit.export
-    def _init_buffers_s(self, v_init):
+    def _init_buffers_s(self, v_init, area):
         for n, m in self.DE.items():
             if n in self._init_params:
                 buffer_tensor = torch.tensor(
@@ -210,6 +234,9 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
             else:
                 buffer_tensor = m.inf(v_init)
             self.states[n] = buffer_tensor
+
+        for k, v in self._init_conductances.items():
+            self.conductances[k] = v() * area[:, None, None]
 
     @torch.jit.export
     def _inflate_s(self, v):

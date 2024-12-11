@@ -1,5 +1,9 @@
+from typing import List
+
 import torch
 import linecache
+
+from .defaults import REVERSAL
 
 
 template = """
@@ -8,9 +12,10 @@ class MechanismHandler(torch.nn.Module):
     super().__init__()
     self.temp = temp
     {assignments}
+    {defaults}
 
   def initialize(self, v, v_init, area, temp) -> None:
-    self.init_buffers(v_init)
+    self.init_buffers(v_init, area)
     self.inflate(v)
     self.ion_init(temp)
     self.i_no_intra(v, area)
@@ -21,14 +26,12 @@ class MechanismHandler(torch.nn.Module):
 
   def i_no_intra(self, v, area) -> torch.Tensor:
     {currents}
-    {scale}
     {write_ion_currents}
     total = {total}
     return total
 
   def i_intra(self, v, area, intra) -> torch.Tensor:
     {currents}
-    {scale}
     {write_ion_currents}
     total = {total}
     total = total - intra
@@ -46,13 +49,23 @@ class MechanismHandler(torch.nn.Module):
     {inflate}
     return
 
-  def init_buffers(self, v_init) -> None:
+  def init_buffers(self, v_init, area) -> None:
     {init_buffers}
     return
 
   @torch.jit.ignore
   def get(self, mech: str, state: str) -> torch.Tensor:
     return getattr(self, mech).get(state)
+
+  @torch.jit.export
+  def set(self, name: str, value: float) -> None:
+    {define_setattr}
+    return
+
+  @torch.jit.export
+  def all_states(self) -> List[str]:
+    return [{all_states}]
+    
 """
 
 
@@ -74,7 +87,7 @@ def parse_ions(ion_names) -> str:
     result = []
     for key in ion_names:
         result.append(f"{key}_ion: torch.nn.Module")
-    return "\n    ".join(result)
+    return ", ".join(result)
 
 
 def parse_dictionary_to_sum(data: dict, current: str) -> str:
@@ -128,7 +141,7 @@ def parse_inflate(mechanism_names) -> str:
 def parse_init_buffers(mechanism_names) -> str:
     result = []
     for key in mechanism_names:
-        result.append(f"self.{key}._init_buffers_s(v_init)")
+        result.append(f"self.{key}._init_buffers_s(v_init, area)")
     s = "\n    ".join(result)
     return s
 
@@ -163,6 +176,35 @@ def parse_ion_advance(ions) -> str:
     return s
 
 
+def parse_setattr(ions) -> str:
+    if ions is None:
+        return ""
+    result = []
+    for ion in ions:
+        for attr, p in [(f"{ion}o", "c"), (f"{ion}i", "c"), (f"e{ion}", "e")]:
+            result.append(
+                f"if name == '{attr}': self.{ion}_ion.{attr} = torch.as_tensor(value, device=self.{ion}_ion.{attr}.device); self.{ion}_ion.immediate_update_{p}(); return"
+            )
+    s = "\n    ".join(result)
+    return s
+
+
+def parse_all_states(mechanisms) -> str:
+    result = []
+    for mech in mechanisms:
+        for state in mech.DE:
+            result.append(f"'{mech.__class__.__name__}.{state}'")
+    s = ", ".join(result)
+    return s
+
+
+def parse_defaults(ions) -> str:
+    res = []
+    for ion in ions:
+        res.append(f"self.set('e{ion}', {REVERSAL[ion]})")
+    return "\n    ".join(res)
+
+
 def build_handler(mechanisms, names, currents, temp, ions=None, ions_write=None):
     arguments = parse_args(names)
 
@@ -176,8 +218,9 @@ def build_handler(mechanisms, names, currents, temp, ions=None, ions_write=None)
     forward_str = template.format(
         arguments=arguments,
         assignments=parse_assignments(all_names),
+        defaults=parse_defaults(ions),
         currents=parse_currents(currents),
-        scale=parse_scale(currents),
+        # scale=parse_scale(currents),
         write_ion_currents=parse_write_ions(ions_write),
         total=parse_total(currents),
         inflate=parse_inflate(names),
@@ -185,6 +228,8 @@ def build_handler(mechanisms, names, currents, temp, ions=None, ions_write=None)
         init_buffers=parse_init_buffers(names),
         ion_init=parse_ion_init(ions),
         ion_advance=parse_ion_advance(ions),
+        define_setattr=parse_setattr(ions),
+        all_states=parse_all_states(mechanisms),
     )
 
     filename = "<forward_template>"

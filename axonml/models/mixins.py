@@ -8,13 +8,15 @@ def to_param(val):
 class Parameterized(torch.nn.Module):
     _params = None
 
-    def __init__(self):
+    def __init__(self, **kwargs):
         super(Parameterized, self).__init__()
-        self.instantiate_parameters()
+        self.instantiate_parameters(**kwargs)
 
-    def instantiate_parameters(self):
-        if self.__class__._params is not None:
-            for name, value in self.__class__._params.items():
+    def instantiate_parameters(self, **kwargs):
+        _params = self.__class__._params
+        if _params is not None:
+            _params = dict((k, kwargs.get(k, v)) for k, v in _params.items())
+            for name, value in _params.items():
                 if isinstance(value, dict):
                     setattr(self, name, [])
                     for pname, pval in value.items():
