@@ -150,7 +150,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ions = {}
         for ion in all_ions:
             ion_write_c = self._ion_write_c.get(ion, {})
-            ion_write = self._ion_write.get(ion, {})
             ion_read = self._ion_read.get(ion, {})
             ions[ion] = build_ion(
                 ion, self._m_list, self._m_name, ion_read, ion_write_c, *self.get_ion_style("na")

@@ -172,11 +172,9 @@ class axnode_myel(Mechanism):
         }
     )
 
-    # NONSPECIFIC_CURRENT("i")
+    NONSPECIFIC_CURRENT("i")
 
-    USEION("na", write=["ina"])
-
-    def ina(self, v):
+    def i(self, v):
         # -- gating variables --
         m = self.states["m"]
         h = self.states["h"]
