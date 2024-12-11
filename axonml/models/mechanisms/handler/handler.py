@@ -17,6 +17,7 @@ class MechanismHandler(torch.nn.Module):
 
   def advance(self, v, dt) -> None:
     {mech_advance}
+    return
 
   def i_no_intra(self, v, area) -> torch.Tensor:
     {currents}
@@ -35,15 +36,19 @@ class MechanismHandler(torch.nn.Module):
 
   def update(self, temp) -> None:
     {ion_advance}
+    return
 
   def ion_init(self, temp) -> None:
     {ion_init}
+    return
 
   def inflate(self, v) -> None:
     {inflate}
+    return
 
   def init_buffers(self, v_init) -> None:
     {init_buffers}
+    return
 
   @torch.jit.ignore
   def get(self, mech: str, state: str) -> torch.Tensor:
