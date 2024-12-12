@@ -86,7 +86,8 @@ def parse_read_c_self(ion_write_c):
         return ""
     res = []
     for k, v in ion_write_c.items():
-        res.append(f"self.{v} = self.{k}.{v}")
+        for v_ in v:
+            res.append(f"self.{v_} = self.{k}.{v_}")
     return "\n    ".join(res)
 
 
@@ -104,7 +105,7 @@ def parse_write_i(ion_read_i):
     res = []
     for k, v in ion_read_i.items():
         for v_ in v:
-            res.append(f"self.{k}.set('{v_}', self.{v_})")
+            res.append(f"self.{k}.{v_} = self.{v_}")
     return "\n    ".join(res)
 
 

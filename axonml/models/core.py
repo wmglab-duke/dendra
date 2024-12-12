@@ -1,6 +1,7 @@
 import math
 from typing import List, Tuple, Optional, Dict, Callable
 import re
+import itertools
 
 import torch
 from torch import Tensor
@@ -32,13 +33,21 @@ def get_unique_keys(list_of_dicts):
 
 
 def follows_pattern(base_pattern, target_string):
-    regex_pattern = r'\b' + r'\b.*?\b'.join(re.escape(part) for part in base_pattern.split('.')) + r'\b'
+    regex_pattern = (
+        r"\b"
+        + r"\b.*?\b".join(re.escape(part) for part in base_pattern.split("."))
+        + r"\b"
+    )
     return re.search(regex_pattern, target_string) is not None
 
 
 def matches_any_pattern(base_patterns, target_string):
     for base_pattern in base_patterns:
-        regex_pattern = r'\b' + r'\b.*?\b'.join(re.escape(part) for part in base_pattern.split('.')) + r'\b'
+        regex_pattern = (
+            r"\b"
+            + r"\b.*?\b".join(re.escape(part) for part in base_pattern.split("."))
+            + r"\b"
+        )
         if re.search(regex_pattern, target_string):
             return True
     return False
@@ -171,6 +180,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for k, v in m._write_ion_c.items():
             self._ion_write_c.setdefault(k, {}).update({mechanism.__name__: v})
 
+        if len(self._ion_write_c) > 1:
+            raise ValueError(
+                f"Multiple ion channels {self._ion_write_c.keys()} writing concentrations are not supported."
+            )
+
     def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
         self._ion_style[ion] = (c_style, e_style, einit, eadvance, cinit)
 
@@ -179,9 +193,39 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             return self._ion_style[ion]
         return self.calc_ion_style(ion)
 
+    def c_is_written(self, ion):
+        d = self._ion_write_c.get(ion, {})
+        return bool(d)
+
+    def c_is_read(self, ion):
+        d = self._ion_read.get(ion, {})
+        if not d:
+            return False
+        check = list(itertools.chain(*d.values()))
+        return f"{ion}i" in check or f"{ion}o" in check
+
+    def e_is_read(self, ion):
+        d = self._ion_read.get(ion, {})
+        if not d:
+            return False
+        return f"e{ion}" in list(itertools.chain(*d.values()))
+
     def calc_ion_style(self, ion):
-        # TODO : implement this
-        return (0, 1, 0, 0, 0)
+        c_is_written = self.c_is_written(ion)
+        c_is_read = self.c_is_read(ion)
+        e_is_read = self.e_is_read(ion)
+
+        if c_is_written:
+            if e_is_read:
+                return (3, 2, 1, 1, 1)
+            return (3, 0, 0, 0, 1)
+        if c_is_read:
+            if e_is_read:
+                return (1, 2, 1, 0, 0)
+            return (1, 0, 0, 0, 0)
+        if e_is_read:
+            return (0, 1, 0, 0, 0)
+        return (0, 0, 0, 0, 0)
 
     def build(self):
         all_ions = get_unique_keys([self._ion_read, self._ion_write, self._ion_write_c])
@@ -193,13 +237,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for ion in all_ions:
             ion_write_c = self._ion_write_c.get(ion, {})
             ion_read = self._ion_read.get(ion, {})
+            ion_style = self.get_ion_style(ion)
             ions[ion] = build_ion(
-                ion,
-                self._m_list,
-                self._m_name,
-                ion_read,
-                ion_write_c,
-                *self.get_ion_style("na"),
+                ion, self._m_list, self._m_name, ion_read, ion_write_c, *ion_style
             )
         self.mech = build_handler(
             self._m_list,
@@ -266,7 +306,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     )
                 else:
                     self.v = self.step_no_intra(
-                        self.v, ve[i], self.cm_c, self.ra_c, dt,
+                        self.v,
+                        ve[i],
+                        self.cm_c,
+                        self.ra_c,
+                        dt,
                     )
                 callbacks.post_step_hook(self)
 

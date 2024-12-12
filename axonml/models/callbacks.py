@@ -93,24 +93,25 @@ v_template = """
       self.rec['v'].append(states)
 """
 
+
 def parse_template(full_state):
     mech, state = full_state.split(".")
     return impl_template.format(mech=mech, state=state, full_state=full_state)
 
+
 def build_recorder_func(states):
     res = []
     for s in states:
-        if s == 'v':
+        if s == "v":
             res.append(v_template)
         else:
             res.append(parse_template(s))
-    impl = ''.join(res)
+    impl = "".join(res)
     forward_str = template.format(implementation=impl)
     filename = "<rec_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
     return locals()["recorder"]
-
 
 
 class Recorder(Callback):
@@ -121,9 +122,8 @@ class Recorder(Callback):
         self.max_only: bool = max_only
         self.node_indices = node_indices
         rfunc = build_recorder_func(states)
-        setattr(self, 'post_step_hook', MethodType(rfunc, self))
-        setattr(self, 'pre_loop_hook', MethodType(rfunc, self))
-
+        setattr(self, "post_step_hook", MethodType(rfunc, self))
+        setattr(self, "pre_loop_hook", MethodType(rfunc, self))
 
     def reset(self):
         self.rec = {s: [] for s in self.states}
