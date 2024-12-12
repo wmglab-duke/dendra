@@ -94,6 +94,6 @@ class nahh(Mechanism):
         m = self.states["m"]
         h = self.states["h"]
 
-        gnabar = self.conductances['gnabar']
+        gnabar = self.conductances["gnabar"]
 
         return gnabar * m**3 * h * (v - self.ena)

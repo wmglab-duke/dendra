@@ -1,4 +1,5 @@
 from typing import Tuple, Dict, List
+from types import MethodType
 
 import torch
 
@@ -65,6 +66,53 @@ class CallbackList:
             c.post_loop_hook(model)
 
 
+template = """
+def recorder(self, model):
+  {implementation}
+"""
+
+impl_template = """
+  states = model.mech.{mech}.states["{state}"]
+  if self.max_only:
+    self.rec['{full_state}'].append(torch.amax(states, -1))
+  else:
+    if self.node_indices is not None:
+      self.rec['{full_state}'].append(states[:, :, self.node_indices])
+    else:
+      self.rec['{full_state}'].append(states)
+"""
+
+v_template = """
+  states = model.v
+  if self.max_only:
+    self.rec['v'].append(torch.amax(states, -1))
+  else:
+    if self.node_indices is not None:
+      self.rec['v'].append(states[:, :, self.node_indices])
+    else:
+      self.rec['v'].append(states)
+"""
+
+def parse_template(full_state):
+    mech, state = full_state.split(".")
+    return impl_template.format(mech=mech, state=state, full_state=full_state)
+
+def build_recorder_func(states):
+    res = []
+    for s in states:
+        if s == 'v':
+            res.append(v_template)
+        else:
+            res.append(parse_template(s))
+    impl = ''.join(res)
+    forward_str = template.format(implementation=impl)
+    filename = "<rec_template>"
+    code = compile(forward_str, filename, "exec")
+    exec(code)
+    return locals()["recorder"]
+
+
+
 class Recorder(Callback):
     def __init__(self, states, max_only=False, node_indices=None):
         super().__init__()
@@ -72,31 +120,13 @@ class Recorder(Callback):
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
         self.node_indices = node_indices
+        rfunc = build_recorder_func(states)
+        setattr(self, 'post_step_hook', MethodType(rfunc, self))
+        setattr(self, 'pre_loop_hook', MethodType(rfunc, self))
+
 
     def reset(self):
         self.rec = {s: [] for s in self.states}
-
-    def pre_loop_hook(self, model: AxonInterface):
-        for s in self.rec:
-            states = model.get_state(s)
-            if self.max_only:
-                self.rec[s].append(torch.amax(states, -1))
-            else:
-                if self.node_indices is not None:
-                    self.rec[s].append(states[:, :, self.node_indices])
-                else:
-                    self.rec[s].append(states)
-
-    def post_step_hook(self, model: AxonInterface):
-        for s in self.rec:
-            states = model.get_state(s)
-            if self.max_only:
-                self.rec[s].append(torch.amax(states, -1))
-            else:
-                if self.node_indices is not None:
-                    self.rec[s].append(states[:, :, self.node_indices])
-                else:
-                    self.rec[s].append(states)
 
     def stack(self, var: str = None):
         if var is not None:

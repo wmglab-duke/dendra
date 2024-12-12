@@ -336,7 +336,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def all_states(self) -> List[str]:
         out = ["v"]
         return out + self.mech.all_states()
-    
+
     @torch.jit.export
     def set(self, key: str, value: float):
         self.mech.set(key, value)

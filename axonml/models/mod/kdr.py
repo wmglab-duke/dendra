@@ -117,6 +117,6 @@ class kdr(Mechanism):
         l = self.states["l"]
         n = self.states["n"]
 
-        gkbar = self.conductances['gkbar']
+        gkbar = self.conductances["gkbar"]
 
         return gkbar * n**3 * l * (v - self.ek)

@@ -1,4 +1,5 @@
 from typing import List
+import re
 
 import torch
 import linecache
@@ -26,13 +27,11 @@ class MechanismHandler(torch.nn.Module):
 
   def i_no_intra(self, v, area) -> torch.Tensor:
     {currents}
-    {write_ion_currents}
     total = {total}
     return total
 
   def i_intra(self, v, area, intra) -> torch.Tensor:
     {currents}
-    {write_ion_currents}
     total = {total}
     total = total - intra
     return total
@@ -90,6 +89,19 @@ def parse_ions(ion_names) -> str:
     return ", ".join(result)
 
 
+def parse_current_string(s: str) -> str:
+    pattern = r"^i([A-Za-z]+)$"
+    match = re.match(pattern, s)
+    if match:
+        # Extract the letters following 'i'
+        letters = match.group(1)
+        # Construct the transformed string
+        return f"self.{letters}_ion.i{letters}"
+    else:
+        # If no match, leave the string unchanged
+        return s
+
+
 def parse_dictionary_to_sum(data: dict, current: str) -> str:
     if not data:
         return ""
@@ -98,7 +110,7 @@ def parse_dictionary_to_sum(data: dict, current: str) -> str:
         for value in value_set:
             result.append(f"self.{key}.{value}(v)")
     s = " + ".join(result)
-    return f"{current} = {s}"
+    return f"{parse_current_string(current)} = {s}"
 
 
 def parse_currents(currents) -> str:
@@ -118,7 +130,7 @@ def parse_scale(currents) -> str:
 
 
 def parse_total(currents) -> str:
-    s = " + ".join(currents.keys())
+    s = " + ".join([parse_current_string(key) for key in currents.keys()])
     return s
 
 
@@ -221,7 +233,7 @@ def build_handler(mechanisms, names, currents, temp, ions=None, ions_write=None)
         defaults=parse_defaults(ions),
         currents=parse_currents(currents),
         # scale=parse_scale(currents),
-        write_ion_currents=parse_write_ions(ions_write),
+        # write_ion_currents=parse_write_ions(ions_write),
         total=parse_total(currents),
         inflate=parse_inflate(names),
         mech_advance=parse_advance(names),

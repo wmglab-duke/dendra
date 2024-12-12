@@ -187,10 +187,10 @@ class axnode_myel(Mechanism):
         p = self.states["p"]
         s = self.states["s"]
 
-        gnabar = self.conductances['gnabar']
-        gnapbar = self.conductances['gnapbar']
-        gkbar = self.conductances['gkbar']
-        gl = self.conductances['gl']
+        gnabar = self.conductances["gnabar"]
+        gnapbar = self.conductances["gnapbar"]
+        gkbar = self.conductances["gkbar"]
+        gl = self.conductances["gl"]
 
         # -- current --
         current = (
