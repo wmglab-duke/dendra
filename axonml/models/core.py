@@ -1,5 +1,6 @@
 import math
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Callable
+import re
 
 import torch
 from torch import Tensor
@@ -28,6 +29,19 @@ def get_unique_keys(list_of_dicts):
     for dictionary in list_of_dicts:
         unique_keys.update(dictionary.keys())
     return unique_keys
+
+
+def follows_pattern(base_pattern, target_string):
+    regex_pattern = r'\b' + r'\b.*?\b'.join(re.escape(part) for part in base_pattern.split('.')) + r'\b'
+    return re.search(regex_pattern, target_string) is not None
+
+
+def matches_any_pattern(base_patterns, target_string):
+    for base_pattern in base_patterns:
+        regex_pattern = r'\b' + r'\b.*?\b'.join(re.escape(part) for part in base_pattern.split('.')) + r'\b'
+        if re.search(regex_pattern, target_string):
+            return True
+    return False
 
 
 @torch.jit.interface
@@ -89,6 +103,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self._ion_style = {}
 
+        self.post_initialize_hooks: List[Callable] = []
+
         # solver stuff
         weight = [1.0, -2.0, 1.0]
         self.ssd = SymmetricConv1D(
@@ -104,6 +120,29 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         # -- constants --
         self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
         self.eval()
+
+    def unfreeze(self, *names):
+        if not names:
+            for p in self.parameters():
+                p.requires_grad = True
+        else:
+            for n, p in self.named_parameters():
+                if matches_any_pattern(names, n):
+                    print(f"Unfreezing {n}")
+                    p.requires_grad = True
+
+    def freeze(self, *names):
+        if not names:
+            for p in self.parameters():
+                p.requires_grad = False
+        else:
+            for n, p in self.named_parameters():
+                if matches_any_pattern(names, n):
+                    print(f"Freezing {n}")
+                    p.requires_grad = False
+
+    def register_post_initialize_hook(self, fn: Callable):
+        self.post_initialize_hooks.append(fn)
 
     @torch.jit.export
     def n(self) -> int:
@@ -214,6 +253,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 self.cm_c = self.cm_(self.area_c)
                 self.ra_c = self.ra_(diameters)
                 self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
+                self.post_initialize()
                 self.initialized = True
 
             callbacks = CallbackList(callbacks)
@@ -229,6 +269,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                         self.v, ve[i], self.cm_c, self.ra_c, dt,
                     )
                 callbacks.post_step_hook(self)
+
+    def post_initialize(self):
+        for h in self.post_initialize_hooks:
+            h(self)
 
     @torch.jit.script_method
     def initialize(self, v, v_init, area, temp):
