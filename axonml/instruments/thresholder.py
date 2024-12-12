@@ -47,7 +47,7 @@ class Thresholder:
         if fix_bound_up <= 1:
             raise ValueError("fix_bound_up should be > 1.")
 
-        self.model = model.compile(bases.shape[-1], bases.shape[0])
+        self.model = model
 
         bases = torch.as_tensor(bases)
         diams = torch.as_tensor(diams)
@@ -198,7 +198,7 @@ class Thresholder:
                 tries += 1
             if tries >= self.max_tries_thresh:
                 print("hmm")
-                return ub, lb
+                return ub.cpu().numpy(), lb.cpu().numpy()
 
             # final
             # stimamp = (ub + lb) / 2

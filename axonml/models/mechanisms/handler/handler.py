@@ -19,18 +19,18 @@ class MechanismHandler(torch.nn.Module):
     self.init_buffers(v_init, area)
     self.inflate(v)
     self.ion_init(temp)
-    self.i_no_intra(v, area)
+    self.i(v)
 
   def advance(self, v, dt) -> None:
     {mech_advance}
     return
 
-  def i_no_intra(self, v, area) -> torch.Tensor:
+  def i(self, v) -> torch.Tensor:
     {currents}
     total = {total}
     return total
 
-  def i_intra(self, v, area, intra) -> torch.Tensor:
+  def i_intra(self, v, intra) -> torch.Tensor:
     {currents}
     total = {total}
     total = total - intra
@@ -217,7 +217,7 @@ def parse_defaults(ions) -> str:
     return "\n    ".join(res)
 
 
-def build_handler(mechanisms, names, currents, temp, ions=None, ions_write=None):
+def build_handler(mechanisms, names, currents, temp, ions=None):
     arguments = parse_args(names)
 
     all_names = names
@@ -232,8 +232,6 @@ def build_handler(mechanisms, names, currents, temp, ions=None, ions_write=None)
         assignments=parse_assignments(all_names),
         defaults=parse_defaults(ions),
         currents=parse_currents(currents),
-        # scale=parse_scale(currents),
-        # write_ion_currents=parse_write_ions(ions_write),
         total=parse_total(currents),
         inflate=parse_inflate(names),
         mech_advance=parse_advance(names),
