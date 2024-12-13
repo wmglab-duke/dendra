@@ -205,7 +205,7 @@ def parse_all_states(mechanisms) -> str:
     result = []
     for mech in mechanisms:
         for state in mech.DE:
-            result.append(f"'{mech.__class__.__name__}.{state}'")
+            result.append(f"'{mech._name}.{state}'")
     s = ", ".join(result)
     return s
 

@@ -13,10 +13,11 @@ def indent(text, level=0):
 
 template = """
 class mech(torch.nn.Module):
-    def __init__(self, temp, params, states, conductances, init, ic: dict = None, **kwargs):
+    def __init__(self, temp, name: str,params, states, conductances, init, ic: dict = None, **kwargs):
         super().__init__()
         self.instantiate_parameters(params, **kwargs)
         self.temp = temp
+        self._name = name
         self.DE = torch.nn.ModuleDict(
             {{cls.__name__: cls(self.temp) for cls in states}}
         )
@@ -234,9 +235,12 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
 
     lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
+    name = mechanism.__name__
 
     m = torch.jit.script(
-        locals()["mech"](temp, params, states, conductances, init, ic=ic, **kwargs)
+        locals()["mech"](
+            temp, name, params, states, conductances, init, ic=ic, **kwargs
+        )
     )
 
     return m
