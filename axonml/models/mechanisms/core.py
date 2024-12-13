@@ -147,15 +147,6 @@ class MechanismInterface:
         pass
 
 
-class Dummy(torch.nn.Module):
-    def __init__(self, x):
-        super().__init__()
-        self.x = torch.nn.Parameter(torch.tensor(x), requires_grad=False)
-
-    def forward(self):
-        return self.x
-    
-
 def validate(mechanism):
     for v in mechanism._write_ion.values():
         if not callable(getattr(mechanism, v, None)):

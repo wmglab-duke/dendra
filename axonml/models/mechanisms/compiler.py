@@ -1,13 +1,14 @@
 import linecache
 import textwrap
 
-def indent(text, level=0):
-    return textwrap.indent(text, ' '*(4*level))
-
 import torch
 
 from .compile_f import convert_func
 from ..mixins import to_param
+
+
+def indent(text, level=0):
+    return textwrap.indent(text, " " * (4 * level))
 
 
 template = """
@@ -82,20 +83,18 @@ self.{state} = buffer_tensor
 """
 
 
-
-
 def conductances_init_assignments(conductances):
     assignments = []
     for k, _ in conductances.items():
         assignments.append(f"self.{k}_init = to_param(conductances['{k}'])")
-    return '\n'.join(assignments)
+    return "\n".join(assignments)
 
 
 def conductances_buffer_assignments(conductances):
     assignments = []
     for k, _ in conductances.items():
         assignments.append(f"self.register_buffer('{k}', torch.tensor(0.0))")
-    return '\n'.join(assignments)
+    return "\n".join(assignments)
 
 
 def state_buffer_assignments(states):
@@ -103,7 +102,7 @@ def state_buffer_assignments(states):
     for k in states:
         name = k.__name__
         assignments.append(f"self.register_buffer('{name}', torch.tensor(0.0))")
-    return '\n'.join(assignments)
+    return "\n".join(assignments)
 
 
 def current_buffer_assignments(currents, range_vars):
@@ -111,7 +110,7 @@ def current_buffer_assignments(currents, range_vars):
     for k in currents:
         if k in range_vars:
             assignments.append(f"self.register_buffer('{k}_', torch.tensor(0.0))")
-    return '\n'.join(assignments)
+    return "\n".join(assignments)
 
 
 def init_state_buffers(states):
@@ -119,7 +118,7 @@ def init_state_buffers(states):
     for k in states:
         name = k.__name__
         assignments.append(init_state_buffer_template.format(state=name))
-    return '\n'.join(assignments)
+    return "\n".join(assignments)
 
 
 def inflate_states(states):
@@ -127,14 +126,14 @@ def inflate_states(states):
     for k in states:
         name = k.__name__
         assignments.append(f"self.{name} = self.{name}.expand(v.shape)")
-    return '\n'.join(assignments)
+    return "\n".join(assignments)
 
 
 def init_conductance_buffers(conductances):
     assignments = []
     for k, _ in conductances.items():
         assignments.append(f"self.{k} = self.{k}_init * area[:, None, None]")
-    return '\n'.join(assignments)
+    return "\n".join(assignments)
 
 
 def read_ion_buffers(read_ion):
@@ -142,28 +141,28 @@ def read_ion_buffers(read_ion):
     for k, v in read_ion.items():
         for v_ in v:
             assignments.append(f"self.register_buffer('{v_}', torch.tensor(0.0))")
-    return '\n'.join(assignments)
+    return "\n".join(assignments)
 
 
 def advance(states):
     assignments = []
     for k in states:
         name = k.__name__
-        assignments.append(f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)")
-    return '\n'.join(assignments)
+        assignments.append(
+            f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
+        )
+    return "\n".join(assignments)
 
 
 def current_equations(currents, mechanism, range_vars):
     assignments = []
     for k in currents:
-        assign = (k in range_vars)
+        assign = k in range_vars
         assignments.append(convert_func(getattr(mechanism, k), assign))
-    return '\n'.join(assignments)
-
+    return "\n".join(assignments)
 
 
 def compile_mechanism(mechanism, temp, ic=None, **kwargs):
-
     states = mechanism._states
     params = mechanism._params
     conductances = mechanism._conductances
@@ -182,10 +181,14 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     for _, v in write_ion.items():
         current_eqs.extend(v)
 
-    conductances_init_assignments_str = conductances_init_assignments(mechanism._conductances)
+    conductances_init_assignments_str = conductances_init_assignments(
+        mechanism._conductances
+    )
     conductances_init_assignments_str = indent(conductances_init_assignments_str, 2)
 
-    conductances_buffer_assignments_str = conductances_buffer_assignments(mechanism._conductances)
+    conductances_buffer_assignments_str = conductances_buffer_assignments(
+        mechanism._conductances
+    )
     conductances_buffer_assignments_str = indent(conductances_buffer_assignments_str, 2)
 
     state_buffer_assignments_str = state_buffer_assignments(states)
@@ -195,7 +198,7 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     current_buffer_assignments_str = indent(current_buffer_assignments_str, 2)
 
     read_ion_buffers_str = read_ion_buffers(read_ion)
-    read_ion_buffers_str = indent(read_ion_buffers_str, 2)    
+    read_ion_buffers_str = indent(read_ion_buffers_str, 2)
 
     inflate_states_str = inflate_states(states)
     inflate_states_str = indent(inflate_states_str, 2)
@@ -222,7 +225,7 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
         init_conductance_buffers=init_conductance_buffers_str,
         inflate_states=inflate_states_str,
         advance=advance_str,
-        current_equations=current_equations_str
+        current_equations=current_equations_str,
     )
 
     filename = "<compiler_template>"
@@ -232,6 +235,8 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
-    m = torch.jit.script(locals()["mech"](temp, params, states, conductances, init, ic=ic, **kwargs))
+    m = torch.jit.script(
+        locals()["mech"](temp, params, states, conductances, init, ic=ic, **kwargs)
+    )
 
     return m

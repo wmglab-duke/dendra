@@ -4,29 +4,31 @@ import inspect
 
 import ast
 
+
 def transform_function(source: str, assign_return: bool = True) -> str:
     # Parse the source into an AST
     tree = ast.parse(source)
-    
+
     # Find the function definition (assumes there is only one)
     func_def = None
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
             func_def = node
             break
-    
+
     if func_def is None:
         raise ValueError("No function definition found in source.")
 
     func_name = func_def.name
 
     # Modify the function arguments to (self, v)
-    func_def.args.args = [ast.arg(arg='self'), ast.arg(arg='v')]
+    func_def.args.args = [ast.arg(arg="self"), ast.arg(arg="v")]
 
     # First pass: Identify classification of variables.
     first_appearance = {}  # var_name: 'LHS' or 'RHS'
+
     def record_var_appearance(var_name: str, context: str):
-        if var_name in ('self', 'v'):
+        if var_name in ("self", "v"):
             return
         if var_name not in first_appearance:
             first_appearance[var_name] = context
@@ -45,7 +47,7 @@ def transform_function(source: str, assign_return: bool = True) -> str:
                 self.in_lhs = False
             # Value is RHS
             self.visit(node.value)
-        
+
         def visit_AugAssign(self, node):
             # target is LHS
             self.in_lhs = True
@@ -55,7 +57,7 @@ def transform_function(source: str, assign_return: bool = True) -> str:
             self.visit(node.value)
 
         def visit_Name(self, node):
-            context = 'LHS' if self.in_lhs else 'RHS'
+            context = "LHS" if self.in_lhs else "RHS"
             record_var_appearance(node.id, context)
 
     var_visitor = VarVisitor()
@@ -63,23 +65,29 @@ def transform_function(source: str, assign_return: bool = True) -> str:
         var_visitor.visit(stmt)
 
     # Determine local and global sets
-    local_vars = {var for var, ctx in first_appearance.items() if ctx == 'LHS'}
-    global_vars = {var for var, ctx in first_appearance.items() if ctx == 'RHS'}
+    local_vars = {var for var, ctx in first_appearance.items() if ctx == "LHS"}
+    global_vars = {var for var, ctx in first_appearance.items() if ctx == "RHS"}
 
     def prepend_self_to_names(node):
         if isinstance(node, ast.Name):
             var_name = node.id
             # 'self' and 'v' remain as is.
-            if var_name in ('self', 'v'):
+            if var_name in ("self", "v"):
                 return node
             # If var is local, do not prefix
             if var_name in local_vars:
                 return node
             # If var is global, prefix with self.
             if var_name in global_vars:
-                return ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=var_name, ctx=node.ctx)
+                return ast.Attribute(
+                    value=ast.Name(id="self", ctx=ast.Load()),
+                    attr=var_name,
+                    ctx=node.ctx,
+                )
             # Otherwise, prefix with self
-            return ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=var_name, ctx=node.ctx)
+            return ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()), attr=var_name, ctx=node.ctx
+            )
 
         for field, value in ast.iter_fields(node):
             if isinstance(value, list):
@@ -102,7 +110,7 @@ def transform_function(source: str, assign_return: bool = True) -> str:
 
         elif isinstance(stmt, ast.Return):
             return_value = stmt.value
-            
+
             # If we are assigning the return value to self.<func_name>_ first
             # before returning it.
             if assign_return:
@@ -114,34 +122,38 @@ def transform_function(source: str, assign_return: bool = True) -> str:
                     new_body.append(
                         ast.Assign(
                             targets=[ast.Name(id=temp_name, ctx=ast.Store())],
-                            value=prepend_self_to_names(return_value)
+                            value=prepend_self_to_names(return_value),
                         )
                     )
                     return_target = temp_name
-                
+
                 # Assign return_target to self.<func_name>_
                 new_body.append(
                     ast.Assign(
-                        targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()),
-                                               attr=func_name + '_', ctx=ast.Store())],
-                        value=ast.Name(id=return_target, ctx=ast.Load())
+                        targets=[
+                            ast.Attribute(
+                                value=ast.Name(id="self", ctx=ast.Load()),
+                                attr=func_name + "_",
+                                ctx=ast.Store(),
+                            )
+                        ],
+                        value=ast.Name(id=return_target, ctx=ast.Load()),
                     )
                 )
 
                 # Return self.<func_name>_
                 new_body.append(
                     ast.Return(
-                        value=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()),
-                                            attr=func_name + '_', ctx=ast.Load())
+                        value=ast.Attribute(
+                            value=ast.Name(id="self", ctx=ast.Load()),
+                            attr=func_name + "_",
+                            ctx=ast.Load(),
+                        )
                     )
                 )
             else:
                 # If not assigning to self.<func_name>_ first, just return the value
-                new_body.append(
-                    ast.Return(
-                        value=prepend_self_to_names(return_value)
-                    )
-                )
+                new_body.append(ast.Return(value=prepend_self_to_names(return_value)))
         else:
             new_body.append(prepend_self_to_names(stmt))
 

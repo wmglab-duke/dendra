@@ -179,8 +179,6 @@ class axnode_myel(Mechanism):
     NONSPECIFIC_CURRENT("i")
 
     def i(self, v):
-
-        # -- current --
         current = (
             (self.gnabar * self.m**3 * self.h * (v - self.ena))
             + (self.gnapbar * self.p**3 * (v - self.ena))
