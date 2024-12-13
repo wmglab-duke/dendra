@@ -3,8 +3,6 @@
 from ..mechanisms import *
 from ..mechanisms.ops import expit, exprelr
 
-import torch
-
 
 class m(State):
     USEQ10()
@@ -181,23 +179,13 @@ class axnode_myel(Mechanism):
     NONSPECIFIC_CURRENT("i")
 
     def i(self, v):
-        # -- gating variables --
-        m = self.states["m"]
-        h = self.states["h"]
-        p = self.states["p"]
-        s = self.states["s"]
-
-        gnabar = self.conductances["gnabar"]
-        gnapbar = self.conductances["gnapbar"]
-        gkbar = self.conductances["gkbar"]
-        gl = self.conductances["gl"]
 
         # -- current --
         current = (
-            (gnabar * m**3 * h * (v - self.ena))
-            + (gnapbar * p**3 * (v - self.ena))
-            + (gkbar * s * (v - self.ek))
-            + (gl * (v - self.el))
+            (self.gnabar * self.m**3 * self.h * (v - self.ena))
+            + (self.gnapbar * self.p**3 * (v - self.ena))
+            + (self.gkbar * self.s * (v - self.ek))
+            + (self.gl * (v - self.el))
         )
 
         return current

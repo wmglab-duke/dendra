@@ -154,6 +154,13 @@ class Dummy(torch.nn.Module):
 
     def forward(self):
         return self.x
+    
+
+def validate(mechanism):
+    for v in mechanism._write_ion.values():
+        if not callable(getattr(mechanism, v, None)):
+            raise ValueError(f"current {v} not implemented")
+    return True
 
 
 class Mechanism(Parameterized, torch.jit.ScriptModule):
@@ -174,7 +181,6 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
 
     def __init__(self, temp, ic: dict = None, **kwargs):
         super().__init__(**kwargs)
-        self.validate_implementation()
         self.temp = temp
 
         self.states: Dict[str, torch.Tensor] = {}
@@ -186,8 +192,6 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
         self._init_conductances = torch.nn.ModuleDict(
             {k: Dummy(v) for k, v in _conductances.items()}
         )
-
-        self._conductance_names = [k for k in self._init_conductances.keys()]
 
         self.DE = torch.nn.ModuleDict(
             {cls.__name__: cls(self.temp) for cls in self._states}
@@ -202,13 +206,6 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
         for k, v in self._read_ion.items():
             for v_ in v:
                 self.register_buffer(v_, torch.tensor(0.0))
-
-    def validate_implementation(self):
-        for v in self._write_ion.values():
-            for v_ in v:
-                assert callable(
-                    getattr(self, v_, None)
-                ), f"current {v_} not implemented"
 
     @torch.jit.ignore
     def set(self, key: str, value):

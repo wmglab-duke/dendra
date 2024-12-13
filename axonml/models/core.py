@@ -10,10 +10,11 @@ from axonml import trained
 from .callbacks import CallbackList, Callback
 from .backend import Backend as A
 from .mixins import Parameterized
-from .mechanisms.core import Mechanism
+from .mechanisms.core import Mechanism, validate
 from .mechanisms.declarations import PARAMETER
 from .mechanisms.handler.handler import build_handler
 from .mechanisms.handler.ions import build_ion
+from .mechanisms.compiler import compile_mechanism
 
 
 def get_unique_keys(list_of_dicts):
@@ -164,20 +165,24 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self.ssd.weight.dtype
 
     def insert(self, mechanism: Mechanism, ic=None, **kwargs):
-        m = mechanism(self.temp, ic=ic, **kwargs)
+        validate(mechanism)
+        # m = mechanism(self.temp, ic=ic, **kwargs)
+
+        m = compile_mechanism(mechanism, self.temp, ic=ic, **kwargs)
+
         self._m_list.append(m)
         self._m_name.append(mechanism.__name__)
 
-        for k, v in m._currents.items():
+        for k, v in mechanism._currents.items():
             self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
 
-        for k, v in m._read_ion.items():
+        for k, v in mechanism._read_ion.items():
             self._ion_read.setdefault(k, {}).update({mechanism.__name__: v})
 
-        for k, v in m._write_ion.items():
+        for k, v in mechanism._write_ion.items():
             self._ion_write.setdefault(k, {}).update({mechanism.__name__: v})
 
-        for k, v in m._write_ion_c.items():
+        for k, v in mechanism._write_ion_c.items():
             self._ion_write_c.setdefault(k, {}).update({mechanism.__name__: v})
 
         if len(self._ion_write_c) > 1:

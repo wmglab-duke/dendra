@@ -242,7 +242,7 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
         all_states=parse_all_states(mechanisms),
     )
 
-    filename = "<forward_template>"
+    filename = "<handler_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
 

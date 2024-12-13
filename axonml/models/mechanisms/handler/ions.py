@@ -221,7 +221,7 @@ def build_ion(
         write_c_immediate=parse_write_c(ion_read_c, 3),
     )
 
-    filename = "<forward_template>"
+    filename = "<ion_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
 
