@@ -28,6 +28,10 @@ parser.add_argument(
     help="Plot predicted thresholds & error histogram.",
 )
 
+parser.add_argument(
+    "-c", "--cuda", action="store_true", default=False, help="Run on GPU."
+)
+
 args = parser.parse_args()
 
 
@@ -55,7 +59,10 @@ if __name__ == "__main__":
     nrn_thresh_path = f"{directory}/example_thresholds_{field}.npy"
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
-    mrg = SMF().cuda().load("MRG")
+    mrg = SMF().load("MRG")
+    if args.cuda:
+        mrg = mrg.cuda()
+
     thresholder = Thresholder(mrg, fp, diams).float()
     thresh, _ = thresholder.calculate_thresholds()
 

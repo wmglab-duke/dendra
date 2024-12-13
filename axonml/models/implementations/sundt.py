@@ -5,7 +5,7 @@ from ..mechanisms.handler.defaults import e_context
 
 
 class Sundt(Unmyelinated):
-    PARAMETER({"cm": 1e-3, "rhoa": 100.0})
+    PARAMETER(cm=1e-3, rhoa=100.0)
 
     def __init__(self, dx=10, temp=37.0, v_init=-65.0):
         super().__init__(dx, temp, v_init)

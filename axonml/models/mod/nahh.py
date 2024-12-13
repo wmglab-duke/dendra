@@ -9,18 +9,16 @@ class m(State):
     USEQ10()
 
     PARAMETER(
-        {
-            "am1": 0.32,
-            "am2": 13.1,
-            "am3": 4.0,
-            "bm1": 0.28,
-            "bm2": 40.1,
-            "bm3": 5.0,
-            "aq10": 3.0,
-            "bq10": 30.0,
-            "cq10": 10.0,
-            "mshift": -6.0,
-        }
+        am1=0.32,
+        am2=13.1,
+        am3=4.0,
+        bm1=0.28,
+        bm2=40.1,
+        bm3=5.0,
+        aq10=3.0,
+        bq10=30.0,
+        cq10=10.0,
+        mshift=-6.0,
     )
 
     DERIVATIVE("m' = (minf - m) / taum")
@@ -48,18 +46,16 @@ class h(State):
     USEQ10()
 
     PARAMETER(
-        {
-            "ah1": 0.128,
-            "ah2": 17.0,
-            "ah3": 18.0,
-            "bh1": 4.0,
-            "bh2": 40.0,
-            "bh3": 5.0,
-            "aq10": 3.0,
-            "bq10": 30.0,
-            "cq10": 10.0,
-            "hshift": 6.0,
-        }
+        ah1=0.128,
+        ah2=17.0,
+        ah3=18.0,
+        bh1=4.0,
+        bh2=40.0,
+        bh3=5.0,
+        aq10=3.0,
+        bq10=30.0,
+        cq10=10.0,
+        hshift=6.0,
     )
 
     DERIVATIVE("h' = (hinf - h) / tauh")
@@ -86,7 +82,7 @@ class h(State):
 class nahh(Mechanism):
     STATE(m, h)
 
-    CONDUCTANCE({"gnabar": 0.3})
+    CONDUCTANCE(gnabar=0.3)
 
     USEION("na", read=["ena"], write=["ina"])
 

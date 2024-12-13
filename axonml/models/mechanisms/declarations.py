@@ -12,11 +12,11 @@ def add_to_namespace(namespace, name, *args):
             namespace[name].add(arg)
 
 
-def add_to_namespace_dict(namespace, name, dct):
+def add_to_namespace_dict(namespace, name, **kwargs):
     if name in namespace:
-        namespace[name].update(dct)
+        namespace[name].update(kwargs)
     else:
-        namespace[name] = dct
+        namespace[name] = kwargs
 
 
 def _declare(name, *args):
@@ -29,10 +29,10 @@ def _declare(name, *args):
     add_to_namespace(namespace, name, *args)
 
 
-def _declare_parameters(name, dct):
+def _declare_parameters(name, **kwargs):
     frame = sys._getframe(1)
     namespace = frame.f_locals
-    add_to_namespace_dict(namespace, name, dct)
+    add_to_namespace_dict(namespace, name, **kwargs)
 
 
 def USEQ10():

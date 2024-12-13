@@ -8,15 +8,13 @@ class l(State):
     USEQ10()
 
     PARAMETER(
-        {
-            "zetal": 2.0,
-            "gml": 1.0,
-            "vhalfl": -61.0,
-            "a0l": 0.001,
-            "aq10": 3.0,
-            "bq10": 30.0,
-            "cq10": 10.0,
-        }
+        zetal=2.0,
+        gml=1.0,
+        vhalfl=-61.0,
+        a0l=0.001,
+        aq10=3.0,
+        bq10=30.0,
+        cq10=10.0,
     )
 
     DERIVATIVE("l' = (linf - l) / taul")
@@ -59,15 +57,13 @@ class n(State):
     USEQ10()
 
     PARAMETER(
-        {
-            "zetan": -5.0,
-            "gmn": 0.4,
-            "vhalfn": -32.0,
-            "a0n": 0.03,
-            "aq10": 3.0,
-            "bq10": 30.0,
-            "cq10": 10.0,
-        }
+        zetan=-5.0,
+        gmn=0.4,
+        vhalfn=-32.0,
+        a0n=0.03,
+        aq10=3.0,
+        bq10=30.0,
+        cq10=10.0,
     )
 
     DERIVATIVE("n' = (ninf - n) / taun")
@@ -109,7 +105,7 @@ class n(State):
 class kdr(Mechanism):
     STATE(l, n)
 
-    CONDUCTANCE({"gkbar": 0.003})
+    CONDUCTANCE(gkbar=0.003)
 
     USEION("k", read=["ek"], write=["ik"])
 

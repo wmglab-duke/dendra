@@ -447,11 +447,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
 class Unmyelinated(Axon):
     PARAMETER(
-        {
-            "membrane": {
-                "cm": 1e-3,  # mF / cm2
-                "rhoa": 35.4,  # ohm-cm
-            }
+        membrane={
+            "cm": 1e-3,  # mF / cm2
+            "rhoa": 35.4,  # ohm-cm
         }
     )
 
@@ -471,27 +469,25 @@ class Unmyelinated(Axon):
 
 class Myelinated(Axon):
     PARAMETER(
-        {
-            "axon_d": {
-                "axond1": 0.0187623,
-                "axond2": 4.787487e-01,
-                "axond3": 1.203613e-01,
-            },
-            "node_d": {
-                "noded1": 6.303781e-03,
-                "noded2": 2.070544e-01,
-                "noded3": 5.339006e-01,
-            },
-            "delta_x": {
-                "deltax1": -8.215284e00,
-                "deltax2": 2.724201e02,
-                "deltax3": -7.802411e02,
-            },
-            "membrane": {
-                "cm": 10e-3,
-                "rhoa": 70.0,  # ohm-cm
-            },
-        }
+        axon_d={
+            "axond1": 0.0187623,
+            "axond2": 4.787487e-01,
+            "axond3": 1.203613e-01,
+        },
+        node_d={
+            "noded1": 6.303781e-03,
+            "noded2": 2.070544e-01,
+            "noded3": 5.339006e-01,
+        },
+        delta_x={
+            "deltax1": -8.215284e00,
+            "deltax2": 2.724201e02,
+            "deltax3": -7.802411e02,
+        },
+        membrane={
+            "cm": 10e-3,
+            "rhoa": 70.0,  # ohm-cm
+        },
     )
 
     def area_(self, diameters):

@@ -200,11 +200,6 @@ class Thresholder:
                 print("hmm")
                 return ub.cpu().numpy(), lb.cpu().numpy()
 
-            # final
-            # stimamp = (ub + lb) / 2
-            # mask = self.check_active(stimamp)
-            # ub[mask] = stimamp[mask]
-
             if self.ignore is not None:
                 ub[self.ignore] = torch.nan
                 lb[self.ignore] = torch.nan

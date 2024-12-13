@@ -294,7 +294,7 @@ def USEION(ion, read=[], write=[]):
     namespace = frame.f_locals
 
     if read:
-        add_to_namespace_dict(namespace, "_read_ion", {ion: read})
+        add_to_namespace_dict(namespace, "_read_ion", **{ion: read})
 
     if write:
         c_write = []
@@ -306,6 +306,6 @@ def USEION(ion, read=[], write=[]):
                 other.append(w)
 
         if c_write:
-            add_to_namespace_dict(namespace, "_write_ion_c", {ion: c_write})
+            add_to_namespace_dict(namespace, "_write_ion_c", **{ion: c_write})
         if other:
-            add_to_namespace_dict(namespace, "_write_ion", {ion: other})
+            add_to_namespace_dict(namespace, "_write_ion", **{ion: other})

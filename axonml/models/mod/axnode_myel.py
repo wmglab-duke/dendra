@@ -8,17 +8,15 @@ class m(State):
     USEQ10()
 
     PARAMETER(
-        {
-            "amA": 1.86,
-            "amB": 21.4,
-            "amC": 10.3,
-            "bmA": 0.086,
-            "bmB": 25.7,
-            "bmC": 9.16,
-            "aq10_1": 2.2,
-            "bq10": 20.0,
-            "cq10": 10.0,
-        }
+        amA=1.86,
+        amB=21.4,
+        amC=10.3,
+        bmA=0.086,
+        bmB=25.7,
+        bmC=9.16,
+        aq10_1=2.2,
+        bq10=20.0,
+        cq10=10.0,
     )
 
     DERIVATIVE("m' = (minf - m) / mtau", pade=True)
@@ -46,17 +44,15 @@ class p(State):
     USEQ10()
 
     PARAMETER(
-        {
-            "ampA": 0.01,
-            "ampB": 27.0,
-            "ampC": 10.2,
-            "bmpA": 0.00025,
-            "bmpB": 34.0,
-            "bmpC": 10.0,
-            "pq10_1": 2.2,
-            "bq10": 20.0,
-            "cq10": 10.0,
-        }
+        ampA=0.01,
+        ampB=27.0,
+        ampC=10.2,
+        bmpA=0.00025,
+        bmpB=34.0,
+        bmpC=10.0,
+        pq10_1=2.2,
+        bq10=20.0,
+        cq10=10.0,
     )
 
     DERIVATIVE("p' = (pinf - p) / ptau", pade=True)
@@ -84,17 +80,15 @@ class h(State):
     USEQ10()
 
     PARAMETER(
-        {
-            "ahA": 0.062,
-            "ahB": 114.0,
-            "ahC": 11.0,
-            "bhA": 2.3,
-            "bhB": 31.8,
-            "bhC": 13.4,
-            "aq10_2": 2.9,
-            "bq10": 20.0,
-            "cq10": 10.0,
-        }
+        ahA=0.062,
+        ahB=114.0,
+        ahC=11.0,
+        bhA=2.3,
+        bhB=31.8,
+        bhC=13.4,
+        aq10_2=2.9,
+        bq10=20.0,
+        cq10=10.0,
     )
 
     DERIVATIVE("h' = (hinf - h) / htau", pade=True)
@@ -121,18 +115,16 @@ class s(State):
     USEQ10()
 
     PARAMETER(
-        {
-            "asA": 0.3,
-            "asB": -27.0,
-            "asC": -5.0,
-            "bsA": 0.03,
-            "bsB": 10.0,
-            "bsC": -1.0,
-            "aq10_3": 3.0,
-            "bq10": 36.0,
-            "cq10": 10.0,
-            "vtraub": -80.0,
-        }
+        asA=0.3,
+        asB=-27.0,
+        asC=-5.0,
+        bsA=0.03,
+        bsB=10.0,
+        bsC=-1.0,
+        aq10_3=3.0,
+        bq10=36.0,
+        cq10=10.0,
+        vtraub=-80.0,
     )
 
     DERIVATIVE("s' = (sinf - s) / stau", pade=True)
@@ -159,22 +151,9 @@ class s(State):
 class axnode_myel(Mechanism):
     STATE(m, p, h, s)
 
-    CONDUCTANCE(
-        {
-            "gnabar": 3.0,
-            "gnapbar": 0.01,
-            "gkbar": 0.08,
-            "gl": 0.007,
-        }
-    )
+    CONDUCTANCE(gnabar=3.0, gnapbar=0.01, gkbar=0.08, gl=0.007)
 
-    PARAMETER(
-        {
-            "ena": 50.0,
-            "ek": -90.0,
-            "el": -90.0,
-        }
-    )
+    PARAMETER(ena=50.0, ek=-90.0, el=-90.0)
 
     NONSPECIFIC_CURRENT("i")
 
