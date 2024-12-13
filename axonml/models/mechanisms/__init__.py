@@ -6,6 +6,7 @@ from .declarations import (
     USEQ10,
     DERIVATIVE,
     NONSPECIFIC_CURRENT,
+    RANGE,
 )
 from .core import Mechanism, State
 from .handler.ions import USEION
@@ -23,4 +24,5 @@ __all__ = [
     "NONSPECIFIC_CURRENT",
     "USEION",
     "ion_register",
+    "RANGE",
 ]
