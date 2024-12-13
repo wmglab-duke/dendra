@@ -29,7 +29,6 @@ class Ion(torch.nn.Module):
     {initialize_e}
     {initialize_i}
     {initialize_o}
-    print(self.e{ion})
     self.einit(temp)
     self.write_after_init()
 
@@ -259,8 +258,6 @@ def build_ion(
         write_c_immediate=parse_write_c(ion_read_c, 3),
     )
 
-    print(forward_str)
-
     filename = f"<{ion}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
@@ -278,6 +275,9 @@ def USEION(ion, read=[], write=[]):
         return
 
     assert ion in VALENCES, f"ion {ion} is not registered"
+
+    if f"e{ion}" in write:
+        raise ValueError(f"e{ion} cannot be written")
 
     if common := set(read).intersection(write):
         raise ValueError(f"{common} is/are both read and written")
