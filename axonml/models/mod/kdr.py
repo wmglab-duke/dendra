@@ -114,9 +114,4 @@ class kdr(Mechanism):
     USEION("k", read=["ek"], write=["ik"])
 
     def ik(self, v):
-        l = self.states["l"]
-        n = self.states["n"]
-
-        gkbar = self.conductances["gkbar"]
-
-        return gkbar * n**3 * l * (v - self.ek)
+        return self.gkbar * self.n**3 * self.l * (v - self.ek)

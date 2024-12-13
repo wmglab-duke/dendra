@@ -1,5 +1,7 @@
+from contextlib import ContextDecorator
+
 # default reversal potentials from NEURON
-REVERSAL = {"na": 50.0, "k": -77.0, "ca": 132.0}
+REVERSAL = {"ena": 50.0, "ek": -77.0, "eca": 132.0}
 
 VALENCES = {"na": 1.0, "k": 1.0, "ca": 2.0}
 
@@ -14,11 +16,59 @@ CINIT = {
 }
 
 
+def reversals():
+    global REVERSAL
+    return REVERSAL
+
+
+def cinits():
+    global CINIT
+    return CINIT
+
+
 def ion_register(ion, valence, e, i0, o0):
     global VALENCES
     global REVERSAL
     global CINIT
     VALENCES[ion] = valence
-    REVERSAL[ion] = e
+    REVERSAL[f"e{ion}"] = e
     CINIT[f"{ion}o0"] = o0
     CINIT[f"{ion}i0"] = i0
+
+
+class e_context(ContextDecorator):
+    def __init__(self, **kwargs):
+        self.updates = kwargs
+        self.original_values = {}
+
+    def __enter__(self):
+        global REVERSAL
+        # Store original values of the keys to be updated
+        self.original_values = {k: REVERSAL[k] for k in self.updates if k in REVERSAL}
+        # Update the global dictionary
+        REVERSAL.update(self.updates)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        global REVERSAL
+        # Restore original values
+        REVERSAL.update(self.original_values)
+        return False  # Propagate exceptions if any
+
+
+class c_context(ContextDecorator):
+    def __init__(self, **kwargs):
+        self.updates = kwargs
+        self.original_values = {}
+
+    def __enter__(self):
+        global CINIT
+        # Store original values of the keys to be updated
+        self.original_values = {k: CINIT[k] for k in self.updates if k in CINIT}
+        # Update the global dictionary
+        CINIT.update(self.updates)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        global CINIT
+        # Restore original values
+        CINIT.update(self.original_values)
+        return False  # Propagate exceptions if any

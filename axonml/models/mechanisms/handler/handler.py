@@ -1,10 +1,10 @@
 from typing import List
 import re
+import string
+import random
 
 import torch
 import linecache
-
-from .defaults import REVERSAL
 
 
 template = """
@@ -213,8 +213,13 @@ def parse_all_states(mechanisms) -> str:
 def parse_defaults(ions) -> str:
     res = []
     for ion in ions:
-        res.append(f"self.set('e{ion}', {REVERSAL[ion]})")
+        res.append(f"self.{ion}_ion.immediate_update_e()")
     return "\n    ".join(res)
+
+
+def randomword(length):
+    letters = string.ascii_lowercase
+    return "".join(random.choice(letters) for i in range(length))
 
 
 def build_handler(mechanisms, names, currents, temp, ions=None):
@@ -242,7 +247,7 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
         all_states=parse_all_states(mechanisms),
     )
 
-    filename = "<handler_template>"
+    filename = f"<{randomword(10)}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
 

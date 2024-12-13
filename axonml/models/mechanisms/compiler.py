@@ -1,9 +1,11 @@
+from typing import Dict
 import linecache
 import textwrap
 
 import torch
 
 from .compile_f import convert_func
+from .core import Mechanism
 from ..mixins import to_param
 
 
@@ -13,6 +15,7 @@ def indent(text, level=0):
 
 template = """
 class mech(torch.nn.Module):
+    _init_params: Dict[str, float]
     def __init__(self, temp, name: str,params, states, conductances, init, ic: dict = None, **kwargs):
         super().__init__()
         self.instantiate_parameters(params, **kwargs)
@@ -55,6 +58,7 @@ class mech(torch.nn.Module):
     def _init_buffers_s(self, v_init, area):
 {init_state_buffers}
 {init_conductance_buffers}
+        return
     
     @torch.jit.ignore
     def set(self, key: str, value):
@@ -68,9 +72,11 @@ class mech(torch.nn.Module):
 
     def _inflate_s(self, v):
 {inflate_states}
+        return
 
     def _advance(self, v, dt):
 {advance}
+        return
 
 {current_equations}
 """
@@ -163,18 +169,26 @@ def current_equations(currents, mechanism, range_vars):
     return "\n".join(assignments)
 
 
+def load(m, attr):
+    try:
+        return getattr(m, attr)
+    except AttributeError:
+        return getattr(Mechanism, attr)
+
+
 def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     states = mechanism._states
-    params = mechanism._params
-    conductances = mechanism._conductances
-    init = mechanism._init
-    currents = mechanism._currents
-    range_vars = mechanism._range
-    ions = mechanism._ions
 
-    read_ion = mechanism._read_ion
-    write_ion = mechanism._write_ion
-    write_ion_c = mechanism._write_ion_c
+    params = load(mechanism, "_params")
+    conductances = load(mechanism, "_conductances")
+    init = load(mechanism, "_init")
+    currents = load(mechanism, "_currents")
+    range_vars = load(mechanism, "_range")
+    ions = load(mechanism, "_ions")
+
+    read_ion = load(mechanism, "_read_ion")
+    write_ion = load(mechanism, "_write_ion")
+    write_ion_c = load(mechanism, "_write_ion_c")
 
     current_eqs = []
     for k, v in currents.items():
@@ -229,7 +243,7 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
         current_equations=current_equations_str,
     )
 
-    filename = "<compiler_template>"
+    filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
 

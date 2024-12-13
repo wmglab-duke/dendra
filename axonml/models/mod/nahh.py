@@ -91,9 +91,4 @@ class nahh(Mechanism):
     USEION("na", read=["ena"], write=["ina"])
 
     def ina(self, v):
-        m = self.states["m"]
-        h = self.states["h"]
-
-        gnabar = self.conductances["gnabar"]
-
-        return gnabar * m**3 * h * (v - self.ena)
+        return self.gnabar * self.m**3 * self.h * (v - self.ena)

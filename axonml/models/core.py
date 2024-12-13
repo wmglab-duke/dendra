@@ -115,6 +115,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.post_initialize_hooks: List[Callable] = []
 
+        self._caches = {}
+
         # solver stuff
         weight = [1.0, -2.0, 1.0]
         self.ssd = SymmetricConv1D(
@@ -124,7 +126,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for p in self.ssd.parameters():
             p.requires_grad = False
 
-        self.v = torch.tensor([v_init])
+        self.register_buffer("v", torch.tensor([v_init]))
         self.initialized: bool = False
 
         # -- constants --
@@ -430,6 +432,19 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     @torch.jit.export
     def set(self, key: str, value: float):
         self.mech.set(key, value)
+
+    @torch.jit.export
+    def cache(self, name: str = None):
+        if name is None:
+            name = "latest"
+        self._caches[name] = self.state_dict()
+
+    @torch.jit.export
+    def restore(self, name: str = None):
+        if name is None:
+            name = "latest"
+        self.load_state_dict(self._caches[name])
+        self.initialized = True
 
 
 class Unmyelinated(Axon):

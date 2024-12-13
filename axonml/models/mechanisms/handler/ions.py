@@ -6,7 +6,7 @@ import torch
 from .handler import parse_args, parse_assignments
 from ..declarations import add_to_namespace_dict
 
-from .defaults import REVERSAL, VALENCES, CINIT
+from .defaults import reversals, VALENCES, cinits
 
 R = 1e3 * 8.31446261815324
 FARADAY = 96485.33212331001
@@ -17,18 +17,19 @@ class Ion(torch.nn.Module):
   def __init__(self, {arguments}):
     super().__init__()
     self.rzf = {R} / ({valence} * {FARADAY})
-    self.register_buffer("i{ion}", torch.tensor(0.0), persistent=False)
-    self.register_buffer("e{ion}", torch.tensor({e_ion}), persistent=False)
-    self.register_buffer("{ion}i", torch.tensor({ion_i_0}), persistent=False)
-    self.register_buffer("{ion}o", torch.tensor({ion_o_0}), persistent=False)
+    self.register_buffer("i{ion}", torch.tensor(0.0))
+    self.register_{e_buffer_or_param}("e{ion}", torch.nn.Parameter(torch.tensor({e_ion}), requires_grad=False))
+    self.register_{c_buffer_or_param}("{ion}i", torch.nn.Parameter(torch.tensor({ion_i_0}), requires_grad=False))
+    self.register_{c_buffer_or_param}("{ion}o", torch.nn.Parameter(torch.tensor({ion_o_0}), requires_grad=False))
     {assignments}
 
   @torch.jit.export
   def initialize(self, temp) -> None:
     self.i{ion} = torch.tensor(0.0, device=self.i{ion}.device)
-    self.e{ion} = torch.tensor({e_ion}, device=self.e{ion}.device)
-    self.{ion}i = torch.tensor({ion_i_0}, device=self.{ion}i.device)
-    self.{ion}o = torch.tensor({ion_o_0}, device=self.{ion}o.device)
+    {initialize_e}
+    {initialize_i}
+    {initialize_o}
+    print(self.e{ion})
     self.einit(temp)
     self.write_after_init()
 
@@ -159,6 +160,18 @@ def parse_write_e_after_init(ion_read_e, einit):
     return "\n    ".join(res)
 
 
+def parse_e_buffer_or_param(e_style):
+    if e_style < 2:
+        return "parameter"
+    return "buffer"
+
+
+def parse_c_buffer_or_param(c_style):
+    if c_style < 2:
+        return "parameter"
+    return "buffer"
+
+
 def build_ion(
     ion,
     mechanisms,
@@ -195,18 +208,43 @@ def build_ion(
     # einit
     einit_str = parse_einit(ion, einit)
 
+    fi = f"{ion}i0"
+    fo = f"{ion}o0"
+    fe = f"e{ion}"
+
+    e_init_str = (
+        f"self.e{ion} = torch.tensor({reversals()[fe]}, device=self.e{ion}.device)"
+    )
+    i_init_str = (
+        f"self.{ion}i = torch.tensor({cinits()[fi]}, device=self.{ion}i.device)"
+    )
+    o_init_str = (
+        f"self.{ion}o = torch.tensor({cinits()[fo]}, device=self.{ion}o.device)"
+    )
+
+    if e_style < 2:
+        e_init_str = ""
+    if c_style < 2:
+        i_init_str = ""
+        o_init_str = ""
+
     # eadvance
     eadvance_str = parse_eadvance(ion, eadvance)
 
     forward_str = template.format(
         arguments=arguments,
         assignments=assignments,
+        e_buffer_or_param=parse_e_buffer_or_param(e_style),
+        c_buffer_or_param=parse_c_buffer_or_param(c_style),
+        initialize_e=e_init_str,
+        initialize_i=i_init_str,
+        initialize_o=o_init_str,
         ion=ion,
         R=R,
         FARADAY=FARADAY,
-        e_ion=REVERSAL[ion],
-        ion_i_0=CINIT[f"{ion}i0"],
-        ion_o_0=CINIT[f"{ion}o0"],
+        e_ion=reversals()[f"e{ion}"],
+        ion_i_0=cinits()[f"{ion}i0"],
+        ion_o_0=cinits()[f"{ion}o0"],
         valence=VALENCES[ion],
         read_c_self=parse_read_c_self(ion_write_c),
         einit=einit_str,
@@ -221,7 +259,9 @@ def build_ion(
         write_c_immediate=parse_write_c(ion_read_c, 3),
     )
 
-    filename = "<ion_template>"
+    print(forward_str)
+
+    filename = f"<{ion}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
 
