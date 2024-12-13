@@ -296,9 +296,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
             if (not self.initialized) or reinit:
                 self.v = torch.full_like(ve[0], self.v_init)
-                self.area_c = self.area_(diameters)
+                self.area_c = self.area_(diameters)[:, None, None]
                 self.cm_c = self.cm_(self.area_c)
-                self.ra_c = self.ra_(diameters)
+                self.ra_c = self.ra_(diameters)[:, None, None]
                 self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
                 self.post_initialize()
                 self.initialized = True
@@ -350,8 +350,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         Tensor
             dv/dt
         """
-        cm = cm[:, None, None]
-        ra = ra[:, None, None]
         dv = dt * (1 / cm) * (((1 / ra) * d2v) - ion)
         return dv
 

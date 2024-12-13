@@ -139,7 +139,7 @@ def inflate_states(states):
 def init_conductance_buffers(conductances):
     assignments = []
     for k, _ in conductances.items():
-        assignments.append(f"self.{k} = self.{k}_init * area[:, None, None]")
+        assignments.append(f"self.{k} = self.{k}_init * area")
     return "\n".join(assignments)
 
 
