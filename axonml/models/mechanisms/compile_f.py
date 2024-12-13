@@ -4,7 +4,7 @@ import inspect
 
 import ast
 
-def transform_function(source: str) -> str:
+def transform_function(source: str, assign_return: bool = True) -> str:
     # Parse the source into an AST
     tree = ast.parse(source)
     
@@ -77,15 +77,9 @@ def transform_function(source: str) -> str:
                 return node
             # If var is global, prefix with self.
             if var_name in global_vars:
-                return ast.copy_location(
-                    ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=var_name, ctx=node.ctx),
-                    node
-                )
+                return ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=var_name, ctx=node.ctx)
             # Otherwise, prefix with self
-            return ast.copy_location(
-                ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=var_name, ctx=node.ctx),
-                node
-            )
+            return ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=var_name, ctx=node.ctx)
 
         for field, value in ast.iter_fields(node):
             if isinstance(value, list):
@@ -108,34 +102,46 @@ def transform_function(source: str) -> str:
 
         elif isinstance(stmt, ast.Return):
             return_value = stmt.value
-            if isinstance(return_value, ast.Name):
-                return_target = return_value.id
-            else:
-                # Assign complex return to a temp variable first
-                temp_name = "_return_temp"
-                assign_node = ast.Assign(
-                    targets=[ast.Name(id=temp_name, ctx=ast.Store())],
-                    value=prepend_self_to_names(return_value)
-                )
-                new_body.append(assign_node)
-                return_target = temp_name
             
-            # Assign return_target to self.<func_name>_
-            new_body.append(
-                ast.Assign(
-                    targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()),
-                                           attr=func_name + '_', ctx=ast.Store())],
-                    value=ast.Name(id=return_target, ctx=ast.Load())
+            # If we are assigning the return value to self.<func_name>_ first
+            # before returning it.
+            if assign_return:
+                if isinstance(return_value, ast.Name):
+                    return_target = return_value.id
+                else:
+                    # Assign complex return to a temp variable first
+                    temp_name = "_return_temp"
+                    new_body.append(
+                        ast.Assign(
+                            targets=[ast.Name(id=temp_name, ctx=ast.Store())],
+                            value=prepend_self_to_names(return_value)
+                        )
+                    )
+                    return_target = temp_name
+                
+                # Assign return_target to self.<func_name>_
+                new_body.append(
+                    ast.Assign(
+                        targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()),
+                                               attr=func_name + '_', ctx=ast.Store())],
+                        value=ast.Name(id=return_target, ctx=ast.Load())
+                    )
                 )
-            )
 
-            # Return self.<func_name>_
-            new_body.append(
-                ast.Return(
-                    value=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()),
-                                        attr=func_name + '_', ctx=ast.Load())
+                # Return self.<func_name>_
+                new_body.append(
+                    ast.Return(
+                        value=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()),
+                                            attr=func_name + '_', ctx=ast.Load())
+                    )
                 )
-            )
+            else:
+                # If not assigning to self.<func_name>_ first, just return the value
+                new_body.append(
+                    ast.Return(
+                        value=prepend_self_to_names(return_value)
+                    )
+                )
         else:
             new_body.append(prepend_self_to_names(stmt))
 
@@ -147,6 +153,6 @@ def transform_function(source: str) -> str:
     return ast.unparse(tree)
 
 
-def convert_func(f):
+def convert_func(f, assign_return=False):
     source = textwrap.dedent(inspect.getsource(f))
-    return transform_function(source)
+    return transform_function(source, assign_return)

@@ -169,6 +169,7 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
     _conductances = {}
     _init = {}
     _currents = {}
+    _range = set()
 
     _read_ion = {}
     _write_ion = {}

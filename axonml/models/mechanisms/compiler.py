@@ -152,10 +152,11 @@ def advance(states):
     return '\n'.join(assignments)
 
 
-def current_equations(currents, mechanism):
+def current_equations(currents, mechanism, range_):
     assignments = []
     for k in currents:
-        assignments.append(convert_func(getattr(mechanism, k)))
+        assign = (k in range_)
+        assignments.append(convert_func(getattr(mechanism, k), assign))
     return '\n'.join(assignments)
 
 
@@ -167,6 +168,7 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     conductances = mechanism._conductances
     init = mechanism._init
     currents = mechanism._currents
+    _range = mechanism._range
     ions = mechanism._ions
 
     read_ion = mechanism._read_ion
@@ -206,7 +208,7 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     advance_str = advance(states)
     advance_str = indent(advance_str, 2)
 
-    current_equations_str = current_equations(current_eqs, mechanism)
+    current_equations_str = current_equations(current_eqs, mechanism, _range)
     current_equations_str = indent(current_equations_str, 1)
 
     forward_str = template.format(
@@ -221,6 +223,8 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
         advance=advance_str,
         current_equations=current_equations_str
     )
+
+    print(forward_str)
 
     filename = "<compiler_template>"
     code = compile(forward_str, filename, "exec")
