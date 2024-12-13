@@ -72,7 +72,7 @@ def recorder(self, model):
 """
 
 impl_template = """
-  states = model.mech.{mech}.states["{state}"]
+  states = model.mech.{mech}.{state}
   if self.max_only:
     self.rec['{full_state}'].append(torch.amax(states, -1))
   else:

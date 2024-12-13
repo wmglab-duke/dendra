@@ -106,10 +106,11 @@ def state_buffer_assignments(states):
     return '\n'.join(assignments)
 
 
-def current_buffer_assignments(currents):
+def current_buffer_assignments(currents, range_vars):
     assignments = []
     for k in currents:
-        assignments.append(f"self.register_buffer('{k}_', torch.tensor(0.0))")
+        if k in range_vars:
+            assignments.append(f"self.register_buffer('{k}_', torch.tensor(0.0))")
     return '\n'.join(assignments)
 
 
@@ -152,10 +153,10 @@ def advance(states):
     return '\n'.join(assignments)
 
 
-def current_equations(currents, mechanism, range_):
+def current_equations(currents, mechanism, range_vars):
     assignments = []
     for k in currents:
-        assign = (k in range_)
+        assign = (k in range_vars)
         assignments.append(convert_func(getattr(mechanism, k), assign))
     return '\n'.join(assignments)
 
@@ -168,7 +169,7 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     conductances = mechanism._conductances
     init = mechanism._init
     currents = mechanism._currents
-    _range = mechanism._range
+    range_vars = mechanism._range
     ions = mechanism._ions
 
     read_ion = mechanism._read_ion
@@ -190,7 +191,7 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     state_buffer_assignments_str = state_buffer_assignments(states)
     state_buffer_assignments_str = indent(state_buffer_assignments_str, 2)
 
-    current_buffer_assignments_str = current_buffer_assignments(current_eqs)
+    current_buffer_assignments_str = current_buffer_assignments(current_eqs, range_vars)
     current_buffer_assignments_str = indent(current_buffer_assignments_str, 2)
 
     read_ion_buffers_str = read_ion_buffers(read_ion)
@@ -208,7 +209,7 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     advance_str = advance(states)
     advance_str = indent(advance_str, 2)
 
-    current_equations_str = current_equations(current_eqs, mechanism, _range)
+    current_equations_str = current_equations(current_eqs, mechanism, range_vars)
     current_equations_str = indent(current_equations_str, 1)
 
     forward_str = template.format(
@@ -223,8 +224,6 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
         advance=advance_str,
         current_equations=current_equations_str
     )
-
-    print(forward_str)
 
     filename = "<compiler_template>"
     code = compile(forward_str, filename, "exec")

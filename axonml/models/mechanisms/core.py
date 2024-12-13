@@ -163,7 +163,7 @@ def validate(mechanism):
     return True
 
 
-class Mechanism(Parameterized, torch.jit.ScriptModule):
+class Mechanism:
     _states = set()
     _ions = set()
     _conductances = {}
@@ -176,75 +176,3 @@ class Mechanism(Parameterized, torch.jit.ScriptModule):
     _write_ion_c = {}
 
     _init_params: Dict[str, float]
-
-    states: Dict[str, torch.Tensor]
-    conductances: Dict[str, torch.Tensor]
-
-    def __init__(self, temp, ic: dict = None, **kwargs):
-        super().__init__(**kwargs)
-        self.temp = temp
-
-        self.states: Dict[str, torch.Tensor] = {}
-        self.conductances: Dict[str, torch.Tensor] = {}
-
-        _conductances = self._conductances
-        _conductances = dict((k, kwargs.get(k, v)) for k, v in _conductances.items())
-
-        self._init_conductances = torch.nn.ModuleDict(
-            {k: Dummy(v) for k, v in _conductances.items()}
-        )
-
-        self.DE = torch.nn.ModuleDict(
-            {cls.__name__: cls(self.temp) for cls in self._states}
-        )
-
-        # -- bunch of stuff to handle initial conditions + torch compiler --
-        self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
-
-        if ic is not None:
-            self._init_params.update(ic)
-
-        for k, v in self._read_ion.items():
-            for v_ in v:
-                self.register_buffer(v_, torch.tensor(0.0))
-
-    @torch.jit.ignore
-    def set(self, key: str, value):
-        p = getattr(self, key)
-        if isinstance(p, torch.Tensor):
-            p.data = torch.as_tensor(value, dtype=p.data.dtype, device=p.device)
-
-    def __setattr__(self, name, param):
-        if name in self._parameters:
-            p = self._parameters[name]
-            param = torch.nn.Parameter(
-                torch.tensor(param, device=p.device, dtype=p.dtype)
-            )
-        return super().__setattr__(name, param)
-
-    @torch.jit.export
-    def _init_buffers_s(self, v_init, area):
-        for n, m in self.DE.items():
-            if n in self._init_params:
-                buffer_tensor = torch.tensor(
-                    self._init_params[n], device=v_init.device, dtype=v_init.dtype
-                )
-            else:
-                buffer_tensor = m.inf(v_init)
-            self.states[n] = buffer_tensor
-
-        for k, v in self._init_conductances.items():
-            self.conductances[k] = v() * area[:, None, None]
-
-    @torch.jit.export
-    def _inflate_s(self, v):
-        for k, s in self.states.items():
-            self.states[k] = s.expand(v.shape)
-
-    def _advance(self, v, dt):
-        for name, m in self.DE.items():
-            self.states[name] = m.advance(self.states[name], v, dt)
-
-    @torch.jit.script_method
-    def get(self, s: str) -> torch.Tensor:
-        return self.states[s]
