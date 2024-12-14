@@ -158,7 +158,7 @@ def advance(states):
     for k in states:
         name = k.__name__
         assignments.append(
-            f"self.{name}[:] = self.DE['{name}'].advance(self.{name}, v, dt)"
+            f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
         )
     return "\n".join(assignments)
 
