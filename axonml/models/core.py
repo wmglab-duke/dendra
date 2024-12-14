@@ -93,7 +93,7 @@ class SymmetricConv1D(torch.nn.Conv1d):
 class Axon(Parameterized, torch.jit.ScriptModule):
     """Base 1D fiber class."""
 
-    def __init__(self, n_ax, n_node, temp=37.0, v_init=-80.0):
+    def __init__(self, n_ax: int, n_node: int, temp=37.0, v_init=-80.0):
         super().__init__()
         self.n_ax = n_ax
         self.n_node = n_node
