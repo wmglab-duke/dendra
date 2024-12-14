@@ -2,10 +2,9 @@ import torch
 from tqdm import tqdm
 import numpy as np
 
-from cajal.nrn.sources import FEMInterpolate1D
-
 from axonml.models.implementations import SMF
 from axonml.models.callbacks import APCount
+from axonml.instruments.fields import FEMInterpolate1D
 
 
 torch.set_default_dtype(torch.float32)
