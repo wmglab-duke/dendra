@@ -93,8 +93,10 @@ class SymmetricConv1D(torch.nn.Conv1d):
 class Axon(Parameterized, torch.jit.ScriptModule):
     """Base 1D fiber class."""
 
-    def __init__(self, temp=37.0, v_init=-80.0):
+    def __init__(self, n_ax, n_node, temp=37.0, v_init=-80.0):
         super().__init__()
+        self.n_ax = n_ax
+        self.n_node = n_node
         self.temp = temp
         self.v_init = v_init
         self.mech: HandlerInterface = None
@@ -170,7 +172,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         validate(mechanism)
         # m = mechanism(self.temp, ic=ic, **kwargs)
 
-        m = compile_mechanism(mechanism, self.temp, ic=ic, **kwargs)
+        m = compile_mechanism(mechanism, self.temp, self.n_ax, self.n_node, ic=ic, **kwargs)
 
         self._m_list.append(m)
         self._m_name.append(mechanism.__name__)
@@ -415,7 +417,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
-        self.load_state_dict(state_dict, strict=False)
+        matched, unmatched = match_state_dict(self.state_dict(), state_dict)
+        print(unmatched)
+        self.load_state_dict(matched, strict=False)
         return self
 
     def compile(self, nodes=16, axons=1):
@@ -446,6 +450,38 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             name = "latest"
         self.load_state_dict(self._caches[name])
         self.initialized = True
+
+
+def match_state_dict(
+	state_dict_a: Dict[str, torch.Tensor],
+	state_dict_b: Dict[str, torch.Tensor],
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+	""" Filters state_dict_b to contain only states that are present in state_dict_a.
+
+	Matching happens according to two criteria:
+	    - Is the key present in state_dict_a?
+	    - Does the state with the same key in state_dict_a have the same shape?
+
+	Returns
+	    (matched_state_dict, unmatched_state_dict)
+
+	    States in matched_state_dict contains states from state_dict_b that are also
+	    in state_dict_a and unmatched_state_dict contains states that have no
+	    corresponding state in state_dict_a.
+
+		In addition: state_dict_b = matched_state_dict U unmatched_state_dict.
+	"""
+	matched_state_dict = {
+		key: state
+		for (key, state) in state_dict_b.items()
+		if key in state_dict_a and state.shape == state_dict_a[key].shape
+	}
+	unmatched_state_dict = {
+		key: state
+		for (key, state) in state_dict_b.items()
+		if key not in matched_state_dict
+	}
+	return matched_state_dict, unmatched_state_dict
 
 
 class Unmyelinated(Axon):

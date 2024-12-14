@@ -14,18 +14,18 @@ FARADAY = 96485.33212331001
 
 template = """
 class Ion(torch.nn.Module):
-  def __init__(self, {arguments}):
+  def __init__(self):
     super().__init__()
     self.rzf = {R} / ({valence} * {FARADAY})
     self.register_buffer("i{ion}", torch.tensor(0.0))
-    self.register_{e_buffer_or_param}("e{ion}", torch.nn.Parameter(torch.tensor({e_ion}), requires_grad=False))
-    self.register_{c_buffer_or_param}("{ion}i", torch.nn.Parameter(torch.tensor({ion_i_0}), requires_grad=False))
-    self.register_{c_buffer_or_param}("{ion}o", torch.nn.Parameter(torch.tensor({ion_o_0}), requires_grad=False))
+    self.register_{e_buffer_or_param}("e{ion}", {einit_tensor})
+    self.register_{c_buffer_or_param}("{ion}i", {cinit_i_tensor})
+    self.register_{c_buffer_or_param}("{ion}o", {cinit_o_tensor})
     {assignments}
 
   @torch.jit.export
   def initialize(self, temp) -> None:
-    self.i{ion} = torch.tensor(0.0, device=self.i{ion}.device)
+    self.i{ion}[:] = 0.0
     {initialize_e}
     {initialize_i}
     {initialize_o}
@@ -69,6 +69,12 @@ class Ion(torch.nn.Module):
     {write_e}
     return
 """
+
+
+def init_tensor(val, buffer_or_param):
+    if buffer_or_param == "buffer":
+        return f"torch.tensor({val})"
+    return f"torch.nn.Parameter(torch.tensor({val}), requires_grad=False)"
 
 
 def parse_einit(ion, einit):
@@ -230,11 +236,14 @@ def build_ion(
     # eadvance
     eadvance_str = parse_eadvance(ion, eadvance)
 
+    e_is_buffer = parse_e_buffer_or_param(e_style)
+    c_is_buffer = parse_c_buffer_or_param(c_style)
+
     forward_str = template.format(
         arguments=arguments,
         assignments=assignments,
-        e_buffer_or_param=parse_e_buffer_or_param(e_style),
-        c_buffer_or_param=parse_c_buffer_or_param(c_style),
+        e_buffer_or_param=e_is_buffer,
+        c_buffer_or_param=c_is_buffer,
         initialize_e=e_init_str,
         initialize_i=i_init_str,
         initialize_o=o_init_str,
@@ -265,7 +274,7 @@ def build_ion(
     lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
-    m = torch.jit.script(locals()["Ion"](*mechanisms))
+    m = locals()["Ion"]()
 
     return m
 

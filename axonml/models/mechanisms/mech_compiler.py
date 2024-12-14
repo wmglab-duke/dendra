@@ -19,7 +19,7 @@ def indent(text, level=0):
 template = """
 class mech(torch.nn.Module):
     _init_params: Dict[str, float]
-    def __init__(self, temp, name: str,params, states, conductances, init, ic: dict = None, **kwargs):
+    def __init__(self, temp, n_ax, n_nodes, name: str, params, states, conductances, init, ic: dict = None, **kwargs):
         super().__init__()
         self.instantiate_parameters(params, **kwargs)
         self.temp = temp
@@ -71,10 +71,6 @@ class mech(torch.nn.Module):
     def get(self, key: str):
         return getattr(self, key)
 
-    def _inflate_s(self, v):
-{inflate_states}
-        return
-
     def _advance(self, v, dt):
         self.breakpoint(v)
 {advance}
@@ -92,7 +88,7 @@ if '{state}' in self._init_params:
     buffer_tensor = torch.tensor(self._init_params['{state}'], device=v_init.device, dtype=v_init.dtype)
 else:
     buffer_tensor = self.DE['{state}'].inf(v_init)
-self.{state} = buffer_tensor
+self.{state}[:] = buffer_tensor
 """
 
 
@@ -114,7 +110,7 @@ def state_buffer_assignments(states):
     assignments = []
     for k in states:
         name = k.__name__
-        assignments.append(f"self.register_buffer('{name}', torch.tensor(0.0))")
+        assignments.append(f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))")
     return "\n".join(assignments)
 
 
@@ -122,7 +118,7 @@ def current_buffer_assignments(currents, range_vars):
     assignments = []
     for k in currents:
         if k in range_vars:
-            assignments.append(f"self.register_buffer('{k}_', torch.tensor(0.0))")
+            assignments.append(f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_nodes)))")  # noqa(0.0))")
     return "\n".join(assignments)
 
 
@@ -162,7 +158,7 @@ def advance(states):
     for k in states:
         name = k.__name__
         assignments.append(
-            f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
+            f"self.{name}[:] = self.DE['{name}'].advance(self.{name}, v, dt)"
         )
     return "\n".join(assignments)
 
@@ -211,7 +207,7 @@ def assigned_str_f(assigned):
     return "\n".join(assignments)
 
 
-def compile_mechanism(mechanism, temp, ic=None, **kwargs):
+def compile_mechanism(mechanism, temp, n_ax, n_nodes, ic=None, **kwargs):
     states = mechanism._states
 
     params = load(mechanism, "_params")
@@ -297,10 +293,6 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
 
     states = [compile_state(s, temp) for s in states]
 
-    m = torch.jit.script(
-        locals()["mech"](
-            temp, name, params, states, conductances, init, ic=ic, **kwargs
-        )
-    )
+    m = locals()["mech"](temp, n_ax, n_nodes, name, params, states, conductances, init, ic=ic, **kwargs)
 
     return m

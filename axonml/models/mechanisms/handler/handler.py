@@ -17,7 +17,7 @@ class MechanismHandler(torch.nn.Module):
 
   def initialize(self, v, v_init, area, temp) -> None:
     self.init_buffers(v_init)
-    self.inflate(v)
+    # self.inflate(v)
     self.ion_init(temp)
     self.i(v)
 
@@ -90,7 +90,7 @@ def parse_current_string(s: str) -> str:
         # Extract the letters following 'i'
         letters = match.group(1)
         # Construct the transformed string
-        return f"self.{letters}_ion.i{letters}"
+        return f"self.{letters}_ion.i{letters}[:]"
     else:
         # If no match, leave the string unchanged
         return s
@@ -240,6 +240,8 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
         define_setattr=parse_setattr(ions),
         all_states=parse_all_states(mechanisms),
     )
+
+    print(forward_str)
 
     filename = f"<{randomword(10)}_template>"
     code = compile(forward_str, filename, "exec")
