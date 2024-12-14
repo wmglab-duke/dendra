@@ -19,7 +19,7 @@ from .ops import *
 def extract_vars(f, exclude):
     pattern = r'\b[a-zA-Z_]\w*\b'
     all_variables = re.findall(pattern, f)
-    filtered_variables = [var for var in all_variables if var != exclude]
+    filtered_variables = [var for var in all_variables if var not in exclude]
     return filtered_variables
 
 
@@ -53,8 +53,8 @@ def modify_operations(input_string):
     return modified_string
 
 
-def convert(deriv, state, use_pade_approx=False):
-    v = extract_vars(deriv, state)
+def convert(deriv, state, assigned, use_pade_approx=False):
+    v = extract_vars(deriv, set([state]) | assigned)
     f = integrate2c(deriv, "dt", v, use_pade_approx=use_pade_approx)
     return modify_operations(replace(f, v))
 
@@ -69,8 +69,6 @@ class state(torch.nn.Module):
         self.is_q10 = is_q10
         if self.is_q10:
             self.register_buffer("q10_cache", self.calc_q10())
-
-{assigned}
 
     def eval(self):
         if self.is_q10:
@@ -114,10 +112,9 @@ class state(torch.nn.Module):
         return getattr(self, key)
 
     def advance(self, {state}, v, dt):
-        self.breakpoint(v)
-        return self.integrate({state}, dt)
+        return self.integrate({state}, dt {breakpoint_int})
 
-    def integrate(self, {state}, dt):
+    def integrate(self, {state}, dt {integrate_args}):
         {integrate_f}
         return {state}
 
@@ -162,6 +159,20 @@ default_f = """
 {ret}
 """
 
+breakpoint_str = """
+    def breakpoint(self, v):
+{body}
+{ret}
+"""
+
+
+def translate_breakpoint(state, assigned):
+    f = getattr(state, "breakpoint", None)
+    if not f:
+        return ""
+    body = get_function_body_as_str(f)
+    return breakpoint_str.format(body=body, ret=indent("return " + ", ".join(assigned), 2))
+
 
 def translate_f(mechanism, fname, default=None):
     f = getattr(mechanism, fname, None)
@@ -192,10 +203,24 @@ def collect_helper_functions(state):
     return "\n".join(ret)
 
 
+def breakpoint_int(s):
+    f = getattr(s, "breakpoint", None)
+    if not f:
+        return ""
+    return ", *self.breakpoint(v)"
+
+
+def integrate_args(assigned):
+    if not assigned:
+        return ""
+    return ", " + ", ".join(assigned)
+
+
 def compile_state(s, temp):
     state_name = s.__name__
     params = load(s, "_params")
     assigned = load(s, "_assigned")
+    assigned_list = list(assigned)
     is_q10 = load(s, "is_q10")
     derivative = load(s, "_derivative")
 
@@ -205,13 +230,15 @@ def compile_state(s, temp):
     assigned_str = assigned_str_f(assigned)
     assigned_str = indent(assigned_str, 2)
 
-    integrate_f = convert(derivative[0], state_name, use_pade_approx=derivative[1])
+    integrate_f = convert(derivative[0], state_name, assigned, use_pade_approx=derivative[1])
 
     forward_str = template.format(
-        assigned=assigned_str,
+        # assigned=assigned_str,
         state=state_name,
+        breakpoint_int=breakpoint_int(s),
         integrate_f=integrate_f,
-        breakpoint_f=translate_f(s, "breakpoint"),
+        breakpoint_f=translate_breakpoint(s, assigned_list),
+        integrate_args=integrate_args(assigned_list),
         inf_f=translate_f(s, "inf", "return self.alpha(v) / (self.alpha(v) + self.beta(v))"),
         calc_q10_f=calc_q10(s, is_q10),
         helpers=collect_helper_functions(s),

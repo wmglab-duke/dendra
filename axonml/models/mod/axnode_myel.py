@@ -36,8 +36,8 @@ class m(State):
     def breakpoint(self, v):
         am = self.alpha(v)
         bm = self.beta(v)
-        self.mtau = 1 / (am + bm)
-        self.minf = am * self.mtau
+        mtau = 1 / (am + bm)
+        minf = am * mtau
 
 
 class p(State):
@@ -72,8 +72,8 @@ class p(State):
     def breakpoint(self, v):
         amp = self.alpha(v)
         bmp = self.beta(v)
-        self.ptau = 1 / (amp + bmp)
-        self.pinf = amp * self.ptau
+        ptau = 1 / (amp + bmp)
+        pinf = amp * ptau
 
 
 class h(State):
@@ -107,8 +107,8 @@ class h(State):
     def breakpoint(self, v):
         ah = self.alpha(v)
         bh = self.beta(v)
-        self.htau = 1 / (ah + bh)
-        self.hinf = ah * self.htau
+        htau = 1 / (ah + bh)
+        hinf = ah * htau
 
 
 class s(State):
@@ -144,8 +144,8 @@ class s(State):
     def breakpoint(self, v):
         as_ = self.alpha(v)
         bs = self.beta(v)
-        self.stau = 1 / (as_ + bs)
-        self.sinf = as_ * self.stau
+        stau = 1 / (as_ + bs)
+        sinf = as_ * stau
 
 
 class axnode_myel(Mechanism):
