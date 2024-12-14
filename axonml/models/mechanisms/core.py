@@ -159,6 +159,7 @@ class Mechanism:
     _states = set()
     _ions = set()
     _range = set()
+    _assigned = set()
 
     _params = {}
     _conductances = {}

@@ -330,6 +330,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def initialize(self, v, v_init, area, temp):
         self.mech.initialize(v, v_init, area, temp)
 
+    @torch.jit.script_method
     def dv(self, cm, ra, d2v, ion, dt) -> Tensor:
         """Calculate dv/dt
 

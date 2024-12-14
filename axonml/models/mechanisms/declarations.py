@@ -46,6 +46,7 @@ PARAMETER = partial(_declare_parameters, "_params")
 CONDUCTANCE = partial(_declare_parameters, "_conductances")
 INITIAL = partial(_declare_parameters, "_init")
 RANGE = partial(_declare, "_range")
+ASSIGNED = partial(_declare, "_assigned")
 
 
 def NONSPECIFIC_CURRENT(*args):
