@@ -1,4 +1,5 @@
 from typing import Dict
+import inspect
 import linecache
 import textwrap
 
@@ -7,6 +8,8 @@ import torch
 from .compile_f import convert_func
 from .core import Mechanism
 from ..mixins import to_param
+
+from .state_compiler import compile_state
 
 
 def indent(text, level=0):
@@ -22,7 +25,7 @@ class mech(torch.nn.Module):
         self.temp = temp
         self._name = name
         self.DE = torch.nn.ModuleDict(
-            {{cls.__name__: cls(self.temp) for cls in states}}
+            {{state._name: state for state in states}}
         )
 
         for n, _ in self.DE.items():
@@ -39,6 +42,8 @@ class mech(torch.nn.Module):
 
 {read_ion_buffers}
 
+{assigned}
+
     def instantiate_parameters(self, params, **kwargs):
         if params is not None:
             params = dict((k, kwargs.get(k, v)) for k, v in params.items())
@@ -52,6 +57,7 @@ class mech(torch.nn.Module):
                     setattr(self, name, to_param(value))
 
     def _init_buffers_s(self, v_init):
+        self.initial(v_init)
 {init_state_buffers}
         return
 
@@ -70,8 +76,13 @@ class mech(torch.nn.Module):
         return
 
     def _advance(self, v, dt):
+        self.breakpoint(v)
 {advance}
         return
+
+{initial_f}
+
+{breakpoint_f}
 
 {current_equations}
 """
@@ -169,6 +180,35 @@ def load(m, attr):
         return getattr(m, attr)
     except AttributeError:
         return getattr(Mechanism, attr)
+    
+
+def get_function_body_as_str(func):
+    source_lines = inspect.getsourcelines(func)[0]  # Get source code as lines
+    body_lines = source_lines[1:]  # Skip the first line (def line)
+    body = "".join(body_lines)  # Combine into a single string
+    return body
+    
+
+default_f = """
+    def {fname}(self, v):
+{ret}
+"""
+
+
+def translate_f(mechanism, fname):
+    f = getattr(mechanism, fname, None)
+    if f:
+        body = get_function_body_as_str(f)
+    else:
+        body = indent("return", 2)
+    return default_f.format(fname=fname, ret=body)
+    
+
+def assigned_str_f(assigned):
+    assignments = []
+    for a in assigned:
+        assignments.append(f"self.register_buffer('{a}', torch.tensor(0.0))")
+    return "\n".join(assignments)
 
 
 def compile_mechanism(mechanism, temp, ic=None, **kwargs):
@@ -180,6 +220,7 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     currents = load(mechanism, "_currents")
     range_vars = load(mechanism, "_range")
     ions = load(mechanism, "_ions")
+    assigned = load(mechanism, "_assigned")
 
     read_ion = load(mechanism, "_read_ion")
     write_ion = load(mechanism, "_write_ion")
@@ -225,18 +266,26 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     current_equations_str = current_equations(current_eqs, mechanism, range_vars)
     current_equations_str = indent(current_equations_str, 1)
 
+    assigned_str = assigned_str_f(assigned)
+    assigned_str = indent(assigned_str, 2)
+
     forward_str = template.format(
         # conductances_init_assignments=conductances_init_assignments_str,
         # conductances_buffer_assignments=conductances_buffer_assignments_str,
         state_buffer_assignments=state_buffer_assignments_str,
         current_buffer_assignments=current_buffer_assignments_str,
         read_ion_buffers=read_ion_buffers_str,
+        assigned=assigned_str,
         init_state_buffers=init_state_buffers_str,
         # init_conductance_buffers=init_conductance_buffers_str,
         inflate_states=inflate_states_str,
         advance=advance_str,
         current_equations=current_equations_str,
+        breakpoint_f=translate_f(mechanism, "breakpoint"),
+        initial_f=translate_f(mechanism, "initial"),
     )
+
+    print(forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
@@ -245,6 +294,8 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
     name = mechanism.__name__
+
+    states = [compile_state(s, temp) for s in states]
 
     m = torch.jit.script(
         locals()["mech"](

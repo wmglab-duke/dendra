@@ -20,6 +20,7 @@ class m(State):
     )
 
     DERIVATIVE("m' = (minf - m) / mtau", pade=True)
+    ASSIGNED("minf", "mtau")
 
     def calc_q10(self):
         return self.aq10_1 ** ((self.temp - self.bq10) / self.cq10)
@@ -32,12 +33,11 @@ class m(State):
         x = v + self.bmB
         return self.q10() * self.bmA * exprelr(x, self.bmC)
 
-    def export(self, v):
+    def breakpoint(self, v):
         am = self.alpha(v)
         bm = self.beta(v)
-        mtau = 1 / (am + bm)
-        minf = am * mtau
-        return minf, mtau
+        self.mtau = 1 / (am + bm)
+        self.minf = am * self.mtau
 
 
 class p(State):
@@ -56,6 +56,7 @@ class p(State):
     )
 
     DERIVATIVE("p' = (pinf - p) / ptau", pade=True)
+    ASSIGNED("pinf", "ptau")
 
     def calc_q10(self):
         return self.pq10_1 ** ((self.temp - self.bq10) / self.cq10)
@@ -68,12 +69,11 @@ class p(State):
         x = v + self.bmpB
         return self.q10() * self.bmpA * exprelr(x, self.bmpC)
 
-    def export(self, v):
+    def breakpoint(self, v):
         amp = self.alpha(v)
         bmp = self.beta(v)
-        ptau = 1 / (amp + bmp)
-        pinf = amp * ptau
-        return pinf, ptau
+        self.ptau = 1 / (amp + bmp)
+        self.pinf = amp * self.ptau
 
 
 class h(State):
@@ -92,6 +92,7 @@ class h(State):
     )
 
     DERIVATIVE("h' = (hinf - h) / htau", pade=True)
+    ASSIGNED("hinf", "htau")
 
     def calc_q10(self):
         return self.aq10_2 ** ((self.temp - self.bq10) / self.cq10)
@@ -103,12 +104,11 @@ class h(State):
     def beta(self, v):
         return self.q10() * self.bhA * expit((v + self.bhB) / self.bhC)
 
-    def export(self, v):
+    def breakpoint(self, v):
         ah = self.alpha(v)
         bh = self.beta(v)
-        htau = 1 / (ah + bh)
-        hinf = ah * htau
-        return hinf, htau
+        self.htau = 1 / (ah + bh)
+        self.hinf = ah * self.htau
 
 
 class s(State):
@@ -128,6 +128,7 @@ class s(State):
     )
 
     DERIVATIVE("s' = (sinf - s) / stau", pade=True)
+    ASSIGNED("sinf", "stau")
 
     def calc_q10(self):
         return self.aq10_3 ** ((self.temp - self.bq10) / self.cq10)
@@ -140,12 +141,11 @@ class s(State):
         b = self.q10() * self.bsA * expit((self.vtraub - v - self.bsB) / self.bsC)
         return b
 
-    def export(self, v):
+    def breakpoint(self, v):
         as_ = self.alpha(v)
         bs = self.beta(v)
-        stau = 1 / (as_ + bs)
-        sinf = as_ * stau
-        return sinf, stau
+        self.stau = 1 / (as_ + bs)
+        self.sinf = as_ * self.stau
 
 
 class axnode_myel(Mechanism):

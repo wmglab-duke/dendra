@@ -44,8 +44,10 @@ class n(State):
 
 
 class kd(Mechanism):
-    USEION(n)
+    STATE(n)
+
     PARAMETER(gbar=0.000180376)
+
     USEION("k", read=["ek"], write=["ik"])
 
     def ik(self, v):

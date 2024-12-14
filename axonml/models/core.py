@@ -14,7 +14,7 @@ from .mechanisms.core import Mechanism, validate
 from .mechanisms.declarations import PARAMETER
 from .mechanisms.handler.handler import build_handler
 from .mechanisms.handler.ions import build_ion
-from .mechanisms.compiler import compile_mechanism
+from .mechanisms.mech_compiler import compile_mechanism
 
 
 def get_unique_keys(list_of_dicts):
