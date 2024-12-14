@@ -170,10 +170,13 @@ def longrun(
 
 # run
 
-mrg = SMF(len(diams), nodes).cuda().load("MRG")
 
 frequencies = [1, 2, 5, 10]
 stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]
+
+
+mrg = SMF(len(diam) * len(stims), nodes).cuda().load("MRG")
+
 
 count.reset()
 _ = longrun(mrg, 100, 0.001, stims, field_stack, diam, chunks=400, warmup=True)
