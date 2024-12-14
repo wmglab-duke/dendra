@@ -390,7 +390,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt)
 
         # -- calculate ionic current --
-        i_ion = self.mech.i_intra(v, intra) * area
+        i_ion = self.mech.i(v) * area - intra
 
         # -- update vm --
         dv = self.dv(cm, ra, d2v, i_ion, dt)

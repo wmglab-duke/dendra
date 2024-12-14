@@ -30,12 +30,6 @@ class MechanismHandler(torch.nn.Module):
     total = {total}
     return total
 
-  def i_intra(self, v, intra) -> torch.Tensor:
-    {currents}
-    total = {total}
-    total = total - intra
-    return total
-
   def update(self, temp) -> None:
     {ion_advance}
     return

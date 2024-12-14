@@ -238,8 +238,6 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
         current_equations=current_equations_str,
     )
 
-    print(forward_str)
-
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
