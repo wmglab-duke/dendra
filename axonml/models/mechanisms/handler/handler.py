@@ -16,7 +16,7 @@ class MechanismHandler(torch.nn.Module):
     {defaults}
 
   def initialize(self, v, v_init, area, temp) -> None:
-    self.init_buffers(v_init, area)
+    self.init_buffers(v_init)
     self.inflate(v)
     self.ion_init(temp)
     self.i(v)
@@ -48,7 +48,7 @@ class MechanismHandler(torch.nn.Module):
     {inflate}
     return
 
-  def init_buffers(self, v_init, area) -> None:
+  def init_buffers(self, v_init) -> None:
     {init_buffers}
     return
 
@@ -124,7 +124,7 @@ def parse_currents(currents) -> str:
 def parse_scale(currents) -> str:
     result = []
     for key in currents.keys():
-        result.append(f"{key} = {key} * area[:, None, None]")
+        result.append(f"{key} = {key} * area")
     s = "\n    ".join(result)
     return s
 
@@ -153,7 +153,7 @@ def parse_inflate(mechanism_names) -> str:
 def parse_init_buffers(mechanism_names) -> str:
     result = []
     for key in mechanism_names:
-        result.append(f"self.{key}._init_buffers_s(v_init, area)")
+        result.append(f"self.{key}._init_buffers_s(v_init)")
     s = "\n    ".join(result)
     return s
 

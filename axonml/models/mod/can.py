@@ -110,9 +110,7 @@ class f2(State):
 class can(Mechanism):
     STATE(d, f1, f2)
 
-    CONDUCTANCE(gbar=0.000106103)
-
-    PARAMETER(R=8314, z=2, ecaoffset=78.7, F=96500)
+    PARAMETER(bar=0.000106103, R=8314, z=2, ecaoffset=78.7, F=96500)
 
     USEION("ca", read=["cao", "cai"], write=["ica"])
 

@@ -33,10 +33,6 @@ class mech(torch.nn.Module):
         if ic is not None:
             self._init_params.update(ic)
 
-{conductances_init_assignments}
-
-{conductances_buffer_assignments}
-
 {state_buffer_assignments}
 
 {current_buffer_assignments}
@@ -55,11 +51,10 @@ class mech(torch.nn.Module):
                 else:
                     setattr(self, name, to_param(value))
 
-    def _init_buffers_s(self, v_init, area):
+    def _init_buffers_s(self, v_init):
 {init_state_buffers}
-{init_conductance_buffers}
         return
-    
+
     @torch.jit.ignore
     def set(self, key: str, value):
         p = getattr(self, key)
@@ -231,17 +226,19 @@ def compile_mechanism(mechanism, temp, ic=None, **kwargs):
     current_equations_str = indent(current_equations_str, 1)
 
     forward_str = template.format(
-        conductances_init_assignments=conductances_init_assignments_str,
-        conductances_buffer_assignments=conductances_buffer_assignments_str,
+        # conductances_init_assignments=conductances_init_assignments_str,
+        # conductances_buffer_assignments=conductances_buffer_assignments_str,
         state_buffer_assignments=state_buffer_assignments_str,
         current_buffer_assignments=current_buffer_assignments_str,
         read_ion_buffers=read_ion_buffers_str,
         init_state_buffers=init_state_buffers_str,
-        init_conductance_buffers=init_conductance_buffers_str,
+        # init_conductance_buffers=init_conductance_buffers_str,
         inflate_states=inflate_states_str,
         advance=advance_str,
         current_equations=current_equations_str,
     )
+
+    print(forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")

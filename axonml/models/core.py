@@ -309,12 +309,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             for i in range(len(ve)):
                 if with_intra:
                     self.v = self.step_intra(
-                        self.v, ve[i], self.cm_c, self.ra_c, dt, intra[i]
+                        self.v, ve[i], self.area_c, self.cm_c, self.ra_c, dt, intra[i]
                     )
                 else:
                     self.v = self.step_no_intra(
                         self.v,
                         ve[i],
+                        self.area_c,
                         self.cm_c,
                         self.ra_c,
                         dt,
@@ -358,6 +359,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self,
         v,
         ve,
+        area,
         cm,
         ra,
         dt,
@@ -370,7 +372,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt)
 
         # -- calculate ionic current --
-        i_ion = self.mech.i(v)
+        i_ion = self.mech.i(v) * area
 
         # -- update vm --
         dv = self.dv(cm, ra, d2v, i_ion, dt)
@@ -379,7 +381,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return v
 
     @torch.jit.script_method
-    def step_intra(self, v, ve, cm, ra, dt, intra) -> Tensor:
+    def step_intra(self, v, ve, area, cm, ra, dt, intra) -> Tensor:
         # -- 2nd diff --
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)
@@ -388,7 +390,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt)
 
         # -- calculate ionic current --
-        i_ion = self.mech.i_intra(v, intra)
+        i_ion = self.mech.i_intra(v, intra) * area
 
         # -- update vm --
         dv = self.dv(cm, ra, d2v, i_ion, dt)

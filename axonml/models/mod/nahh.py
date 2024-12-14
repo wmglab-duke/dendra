@@ -82,7 +82,7 @@ class h(State):
 class nahh(Mechanism):
     STATE(m, h)
 
-    CONDUCTANCE(gnabar=0.3)
+    PARAMETER(gnabar=0.3)
 
     USEION("na", read=["ena"], write=["ina"])
 

@@ -80,9 +80,7 @@ class n(State):
 class rattay_aberham(Mechanism):
     STATE(m, h, n)
 
-    CONDUCTANCE(gnabar=0.12, gkbar=0.036, gl=0.0003)
-
-    PARAMETER(el=-59.4)
+    PARAMETER(gnabar=0.12, gkbar=0.036, gl=0.0003, el=-59.4)
 
     USEION("na", read=["ena"], write=["ina"])
     USEION("k", read=["ek"], write=["ik"])

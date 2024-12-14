@@ -105,7 +105,7 @@ class n(State):
 class kdr(Mechanism):
     STATE(l, n)
 
-    CONDUCTANCE(gkbar=0.003)
+    PARAMETER(gkbar=0.003)
 
     USEION("k", read=["ek"], write=["ik"])
 

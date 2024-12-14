@@ -45,7 +45,7 @@ class n(State):
 
 class kd(Mechanism):
     USEION(n)
-    CONDUCTANCE(gbar=0.000180376)
+    PARAMETER(gbar=0.000180376)
     USEION("k", read=["ek"], write=["ik"])
 
     def ik(self, v):

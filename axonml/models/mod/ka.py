@@ -69,7 +69,7 @@ class q(State):
 class ka(Mechanism):
     STATE(p, q)
 
-    CONDUCTANCE(gbar=0.000141471)
+    PARAMETER(gbar=0.000141471)
 
     USEION("k", read=["ek"], write=["ik"])
 

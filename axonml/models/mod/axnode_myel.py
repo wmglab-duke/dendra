@@ -151,9 +151,9 @@ class s(State):
 class axnode_myel(Mechanism):
     STATE(m, p, h, s)
 
-    CONDUCTANCE(gnabar=3.0, gnapbar=0.01, gkbar=0.08, gl=0.007)
-
-    PARAMETER(ena=50.0, ek=-90.0, el=-90.0)
+    PARAMETER(
+        gnabar=3.0, gnapbar=0.01, gkbar=0.08, gl=0.007, ena=50.0, ek=-90.0, el=-90.0
+    )
 
     NONSPECIFIC_CURRENT("i")
 
