@@ -607,12 +607,15 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.load_state_dict(matched, strict=False)
         return self
 
-    def compile(self, nodes=16, axons=1):
-        ve = torch.ones(1, axons, 1, nodes, device=self.device())
-        d = 10 * torch.ones(axons, device=self.device())
+    def compile(self, callbacks: List[Callback] = None):
+        ve = torch.ones(1, self.n_ax, 1, self.n_node, device=self.device())
+        d = 5 * torch.ones(self.n_ax, device=self.device())
         for _ in range(5):
-            self.run(ve, d, reinit=True)
+            self.run(ve, d, callbacks=callbacks)
         self.initialized = False
+        if callbacks:
+            for c in callbacks:
+                c.reset()
         return self
 
     def all_states(self) -> List[str]:
