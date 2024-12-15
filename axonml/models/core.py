@@ -103,6 +103,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             raise ValueError(
                 f"Invalid method: {method}. Valid methods: {valid_methods}"
             )
+        
+        self.method_conversion = {
+            "euler": "euler",
+            "dufort-frankel": "df",
+            "rk4": "rk4",
+        }
 
         self.method = method
         self.n_ax = n_ax
@@ -136,12 +142,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             "dufort-frankel": [
                 [1.0, 0.0, 1.0],
                 [0.0, -1.0, 0.0],
-                [1.0, 0.0, 1.0],
-                [0.0, -2.0, 0.0],
+                [1.0, -2.0, 1.0],
             ],
         }
 
-        self.nc = {"euler": 2,  "dufort-frankel": 4}
+        self.nc = {"euler": 2, "rk4":2, "dufort-frankel": 3}
 
         # solver stuff
         weight = self.weight_choices[method]
@@ -320,12 +325,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         reinit: bool = False,
     ):
         with_intra = intra is not None
-        euler = self.method == "euler" or self.method == "rk4"
 
         self.v_init_c = torch.tensor(
             self.v_init, device=self.device(), dtype=self.dtype()
         )
         self.temp_c = torch.tensor(self.temp, device=self.device(), dtype=self.dtype())
+
+        method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
+        method_intra = getattr(self, f"step_intra_{self.method_conversion[self.method]}")
+
+        df = self.method == "dufort-frankel"
 
         with torch.set_grad_enabled(self.training):
             device = self.device()
@@ -353,9 +362,36 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             callbacks.pre_loop_hook(self)
 
             for i in range(len(ve)):
-                if euler:
+                if df:
+                    dtcm = dt / self.cm_c
+                    s = 2 * dtcm
+                    s2 = s / self.ra_c
                     if with_intra:
-                        self.v = self.step_intra_rk4(
+                        self.v, self.v_prev = method_intra(
+                            self.v,
+                            self.v_prev,
+                            ve[i],
+                            self.area_c,
+                            dtcm,
+                            s,
+                            s2,
+                            dt,
+                            intra[i],
+                        )
+                    else:
+                        self.v, self.v_prev = method(
+                            self.v,
+                            self.v_prev,
+                            ve[i],
+                            self.area_c,
+                            dtcm,
+                            s,
+                            s2,
+                            dt,
+                        )
+                else:
+                    if with_intra:
+                        self.v = method_intra(
                             self.v,
                             ve[i],
                             self.area_c,
@@ -365,7 +401,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             intra[i],
                         )
                     else:
-                        self.v = self.step_no_intra_rk4(
+                        self.v = method(
                             self.v,
                             ve[i],
                             self.area_c,
@@ -373,18 +409,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             self.ra_c,
                             dt,
                         )
-                else:
-                    prev_idx = max(i - 1, 0)
-                    self.v, self.v_prev = self.step_no_intra_df(
-                        self.v,
-                        self.v_prev,
-                        ve[i],
-                        ve[prev_idx],
-                        self.area_c,
-                        self.cm_c,
-                        self.ra_c,
-                        dt,
-                    )
                 callbacks.post_step_hook(self)
 
     def post_initialize(self):
@@ -439,6 +463,24 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         # -- calculate ionic current --
         i_ion = self.mech.i(v) * area
+
+        # -- update vm --
+        dv = self.dv(cm, ra, d2v, i_ion, dt)
+        v = v + dv
+
+        return v
+    
+    @torch.jit.script_method
+    def step_intra_euler(self, v, ve, area, cm, ra, dt, intra) -> Tensor:
+        # -- 2nd diff --
+        x = torch.cat([v, ve], dim=1)
+        d2v = self.ssd(x)
+
+        # -- update gvs --
+        self.mech.advance(v, dt)
+
+        # -- calculate ionic current --
+        i_ion = self.mech.i(v) * area - intra
 
         # -- update vm --
         dv = self.dv(cm, ra, d2v, i_ion, dt)
@@ -505,19 +547,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         return v
 
+    @torch.jit.script_method
     def step_no_intra_df(
-        self, v, v_prev, ve, ve_prev, area, cm, ra, dt
+        self, v, v_prev, ve, area, dtcm, s, s2, dt
     ) -> Tuple[Tensor, Tensor]:
         # -- 2nd diff --
-        x = torch.cat([v, v_prev, ve, ve_prev], dim=1)
+        x = torch.cat([v, v_prev, ve], dim=1)
         d2v = self.ssd(x)
 
         # -- calculate ionic current --
         i_ion = self.mech.i(0.5 * v_prev) * area
-
-        dtcm = dt / cm
-        s = 2 * dtcm
-        s2 = s / ra
 
         # -- update vm --
         v_new = (v_prev + s2 * d2v - s * i_ion) / (
@@ -527,23 +566,26 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt)
 
         return v_new, v
-
-    def step_intra(self, v, ve, area, cm, ra, dt, intra) -> Tensor:
+    
+    @torch.jit.script_method
+    def step_intra_df(
+        self, v, v_prev, ve, area, dtcm, s, s2, dt, intra
+    ) -> Tuple[Tensor, Tensor]:
         # -- 2nd diff --
-        x = torch.cat([v, ve], dim=1)
+        x = torch.cat([v, v_prev, ve], dim=1)
         d2v = self.ssd(x)
 
-        # -- update gvs --
-        self.mech.advance(v, dt)
-
         # -- calculate ionic current --
-        i_ion = self.mech.i(v) * area - intra
+        i_ion = self.mech.i(0.5 * v_prev) * area - intra
 
         # -- update vm --
-        dv = self.dv(cm, ra, d2v, i_ion, dt)
-        v = v + dv
+        v_new = (v_prev + s2 * d2v - s * i_ion) / (
+            1 + s2 + dtcm * self.mech.gtot() * area
+        )
 
-        return v
+        self.mech.advance(v, dt)
+
+        return v_new, v
 
     @torch.jit.script_method
     def get_state(self, s: str) -> Tensor:

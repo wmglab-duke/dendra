@@ -60,7 +60,7 @@ if __name__ == "__main__":
     nrn_thresh_path = f"{directory}/example_thresholds_{field}.npy"
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
-    mrg = SMF(n_ax=n, n_node=n_node).load("MRG")
+    mrg = SMF(n_ax=n, n_node=n_node, method='euler').load("MRG")
     if args.cuda:
         mrg = mrg.cuda()
 
