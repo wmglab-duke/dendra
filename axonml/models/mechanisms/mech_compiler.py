@@ -108,6 +108,9 @@ def gtot(state):
     for fname, f in functions:
         if fname in ["gtot"]:
             ret.append(inspect.getsource(f))
+            break
+    if not ret:
+        ret.append("    def gtot(self): return torch.tensor(0.0)")
     return "\n".join(ret)
 
 
