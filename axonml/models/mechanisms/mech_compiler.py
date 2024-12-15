@@ -118,7 +118,9 @@ def state_buffer_assignments(states):
     assignments = []
     for k in states:
         name = k.__name__
-        assignments.append(f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))")
+        assignments.append(
+            f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
+        )
     return "\n".join(assignments)
 
 
@@ -126,7 +128,9 @@ def current_buffer_assignments(currents, range_vars):
     assignments = []
     for k in currents:
         if k in range_vars:
-            assignments.append(f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_nodes)))")  # noqa(0.0))")
+            assignments.append(
+                f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_nodes)))"
+            )  # noqa(0.0))")
     return "\n".join(assignments)
 
 
@@ -184,14 +188,14 @@ def load(m, attr):
         return getattr(m, attr)
     except AttributeError:
         return getattr(Mechanism, attr)
-    
+
 
 def get_function_body_as_str(func):
     source_lines = inspect.getsourcelines(func)[0]  # Get source code as lines
     body_lines = source_lines[1:]  # Skip the first line (def line)
     body = "".join(body_lines)  # Combine into a single string
     return body
-    
+
 
 default_f = """
     def {fname}(self, v):
@@ -206,7 +210,7 @@ def translate_f(mechanism, fname):
     else:
         body = indent("return", 2)
     return default_f.format(fname=fname, ret=body)
-    
+
 
 def assigned_str_f(assigned):
     assignments = []
@@ -295,6 +299,18 @@ def compile_mechanism(mechanism, temp, n_ax, n_nodes, ic=None, **kwargs):
 
     states = [compile_state(s, temp) for s in states]
 
-    m = locals()["mech"](temp, n_ax, n_nodes, name, params, read_ion, states, conductances, init, ic=ic, **kwargs)
+    m = locals()["mech"](
+        temp,
+        n_ax,
+        n_nodes,
+        name,
+        params,
+        read_ion,
+        states,
+        conductances,
+        init,
+        ic=ic,
+        **kwargs,
+    )
 
     return m

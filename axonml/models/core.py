@@ -172,7 +172,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         validate(mechanism)
         # m = mechanism(self.temp, ic=ic, **kwargs)
 
-        m = compile_mechanism(mechanism, self.temp, self.n_ax, self.n_node, ic=ic, **kwargs)
+        m = compile_mechanism(
+            mechanism, self.temp, self.n_ax, self.n_node, ic=ic, **kwargs
+        )
 
         self._m_list.append(m)
         self._m_name.append(mechanism.__name__)
@@ -243,7 +245,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ion_read = self._ion_read.get(ion, {})
             ion_style = self.get_ion_style(ion)
             ions[ion] = build_ion(
-                ion, self.n_ax, self.n_node, self._m_list, self._m_name, ion_read, ion_write_c, *ion_style
+                ion,
+                self.n_ax,
+                self.n_node,
+                self._m_list,
+                self._m_name,
+                ion_read,
+                ion_write_c,
+                *ion_style,
             )
             for m in self._m_list:
                 m.register_ion(ions[ion])
@@ -452,35 +461,35 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
 
 def match_state_dict(
-	state_dict_a: Dict[str, torch.Tensor],
-	state_dict_b: Dict[str, torch.Tensor],
+    state_dict_a: Dict[str, torch.Tensor],
+    state_dict_b: Dict[str, torch.Tensor],
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-	""" Filters state_dict_b to contain only states that are present in state_dict_a.
+    """Filters state_dict_b to contain only states that are present in state_dict_a.
 
-	Matching happens according to two criteria:
-	    - Is the key present in state_dict_a?
-	    - Does the state with the same key in state_dict_a have the same shape?
+    Matching happens according to two criteria:
+        - Is the key present in state_dict_a?
+        - Does the state with the same key in state_dict_a have the same shape?
 
-	Returns
-	    (matched_state_dict, unmatched_state_dict)
+    Returns
+        (matched_state_dict, unmatched_state_dict)
 
-	    States in matched_state_dict contains states from state_dict_b that are also
-	    in state_dict_a and unmatched_state_dict contains states that have no
-	    corresponding state in state_dict_a.
+        States in matched_state_dict contains states from state_dict_b that are also
+        in state_dict_a and unmatched_state_dict contains states that have no
+        corresponding state in state_dict_a.
 
-		In addition: state_dict_b = matched_state_dict U unmatched_state_dict.
-	"""
-	matched_state_dict = {
-		key: state
-		for (key, state) in state_dict_b.items()
-		if key in state_dict_a and state.shape == state_dict_a[key].shape
-	}
-	unmatched_state_dict = {
-		key: state
-		for (key, state) in state_dict_b.items()
-		if key not in matched_state_dict
-	}
-	return matched_state_dict, unmatched_state_dict
+            In addition: state_dict_b = matched_state_dict U unmatched_state_dict.
+    """
+    matched_state_dict = {
+        key: state
+        for (key, state) in state_dict_b.items()
+        if key in state_dict_a and state.shape == state_dict_a[key].shape
+    }
+    unmatched_state_dict = {
+        key: state
+        for (key, state) in state_dict_b.items()
+        if key not in matched_state_dict
+    }
+    return matched_state_dict, unmatched_state_dict
 
 
 class Unmyelinated(Axon):

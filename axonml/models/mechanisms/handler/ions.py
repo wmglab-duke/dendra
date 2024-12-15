@@ -197,15 +197,9 @@ def build_ion(
     fo = f"{ion}o0"
     fe = f"e{ion}"
 
-    e_init_str = (
-        f"self.e{ion}.data.copy_({reversals()[fe]})"
-    )
-    i_init_str = (
-        f"self.{ion}i.data.copy_({cinits()[fi]})"
-    )
-    o_init_str = (
-        f"self.{ion}o.data.copy_({cinits()[fo]})"
-    )
+    e_init_str = f"self.e{ion}.data.copy_({reversals()[fe]})"
+    i_init_str = f"self.{ion}i.data.copy_({cinits()[fi]})"
+    o_init_str = f"self.{ion}o.data.copy_({cinits()[fo]})"
 
     # eadvance
     eadvance_str = parse_eadvance(ion, eadvance)

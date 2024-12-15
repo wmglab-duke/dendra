@@ -17,7 +17,7 @@ from .ops import *
 
 
 def extract_vars(f, exclude):
-    pattern = r'\b[a-zA-Z_]\w*\b'
+    pattern = r"\b[a-zA-Z_]\w*\b"
     all_variables = re.findall(pattern, f)
     filtered_variables = [var for var in all_variables if var not in exclude]
     return filtered_variables
@@ -29,7 +29,7 @@ def indent(text, level=0):
 
 def replace(input_string, replace_list):
     for substring in replace_list:
-        input_string = re.sub(rf'\b{substring}\b', f'self.{substring}', input_string)
+        input_string = re.sub(rf"\b{substring}\b", f"self.{substring}", input_string)
     return input_string
 
 
@@ -126,7 +126,7 @@ class state(torch.nn.Module):
 
 {helpers}
 """
-    
+
 
 def assigned_str_f(assigned):
     assignments = []
@@ -140,7 +140,7 @@ def load(m, attr):
         return getattr(m, attr)
     except AttributeError:
         return getattr(State, attr)
-    
+
 
 def randomword(length):
     letters = string.ascii_lowercase
@@ -171,7 +171,9 @@ def translate_breakpoint(state, assigned):
     if not f:
         return ""
     body = get_function_body_as_str(f)
-    return breakpoint_str.format(body=body, ret=indent("return " + ", ".join(assigned), 2))
+    return breakpoint_str.format(
+        body=body, ret=indent("return " + ", ".join(assigned), 2)
+    )
 
 
 def translate_f(mechanism, fname, default=None):
@@ -230,7 +232,9 @@ def compile_state(s, temp):
     assigned_str = assigned_str_f(assigned)
     assigned_str = indent(assigned_str, 2)
 
-    integrate_f = convert(derivative[0], state_name, assigned, use_pade_approx=derivative[1])
+    integrate_f = convert(
+        derivative[0], state_name, assigned, use_pade_approx=derivative[1]
+    )
 
     forward_str = template.format(
         # assigned=assigned_str,
@@ -239,7 +243,9 @@ def compile_state(s, temp):
         integrate_f=integrate_f,
         breakpoint_f=translate_breakpoint(s, assigned_list),
         integrate_args=integrate_args(assigned_list),
-        inf_f=translate_f(s, "inf", "return self.alpha(v) / (self.alpha(v) + self.beta(v))"),
+        inf_f=translate_f(
+            s, "inf", "return self.alpha(v) / (self.alpha(v) + self.beta(v))"
+        ),
         calc_q10_f=calc_q10(s, is_q10),
         helpers=collect_helper_functions(s),
     )
@@ -251,8 +257,6 @@ def compile_state(s, temp):
     lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
-    m = torch.jit.script(
-        locals()["state"](temp, is_q10, state_name, params)
-    )
+    m = torch.jit.script(locals()["state"](temp, is_q10, state_name, params))
 
     return m
