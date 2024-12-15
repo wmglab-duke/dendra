@@ -310,6 +310,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         reinit: bool = False,
     ):
         with_intra = intra is not None
+        euler = self.method == "euler"
 
         self.v_init_c = torch.tensor(
             self.v_init, device=self.device(), dtype=self.dtype()
@@ -341,7 +342,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             callbacks.pre_loop_hook(self)
 
             for i in range(len(ve)):
-                if self.method == "euler":
+                if euler:
                     if with_intra:
                         self.v = self.step_intra(
                             self.v, ve[i], self.area_c, self.cm_c, self.ra_c, dt, intra[i]
