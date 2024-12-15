@@ -23,6 +23,9 @@ class MechanismHandler(torch.nn.Module):
     {mech_advance}
     return
 
+  def gtot(self) -> torch.Tensor:
+    return {gtot}
+
   def i(self, v) -> torch.Tensor:
     {currents}
     total = {total}
@@ -207,6 +210,10 @@ def randomword(length):
     return "".join(random.choice(letters) for i in range(length))
 
 
+def gtot(mechanisms):
+    return " + ".join([f"self.{m._name}.gtot()" for m in mechanisms])
+
+
 def build_handler(mechanisms, names, currents, temp, ions=None):
     arguments = parse_args(names)
 
@@ -230,6 +237,7 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
         ion_advance=parse_ion_advance(ions),
         define_setattr=parse_setattr(ions),
         all_states=parse_all_states(mechanisms),
+        gtot=gtot(mechanisms),
     )
 
     filename = f"<{randomword(10)}_template>"

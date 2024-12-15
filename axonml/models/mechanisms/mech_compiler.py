@@ -89,6 +89,8 @@ class mech(torch.nn.Module):
 {breakpoint_f}
 
 {current_equations}
+
+{gtot}
 """
 
 init_state_buffer_template = """
@@ -98,6 +100,15 @@ else:
     buffer_tensor = self.DE['{state}'].inf(v_init)
 self.{state}[:] = buffer_tensor
 """
+
+
+def gtot(state):
+    functions = inspect.getmembers(state, predicate=inspect.isfunction)
+    ret = []
+    for fname, f in functions:
+        if fname in ["gtot"]:
+            ret.append(inspect.getsource(f))
+    return "\n".join(ret)
 
 
 def conductances_init_assignments(conductances):
@@ -287,6 +298,7 @@ def compile_mechanism(mechanism, temp, n_ax, n_nodes, ic=None, **kwargs):
         current_equations=current_equations_str,
         breakpoint_f=translate_f(mechanism, "breakpoint"),
         initial_f=translate_f(mechanism, "initial"),
+        gtot=gtot(mechanism),
     )
 
     filename = f"<{mechanism.__name__}_template>"

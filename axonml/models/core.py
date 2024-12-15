@@ -93,12 +93,21 @@ class SymmetricConv1D(torch.nn.Conv1d):
 class Axon(Parameterized, torch.jit.ScriptModule):
     """Base 1D fiber class."""
 
-    def __init__(self, n_ax: int, n_node: int, temp=37.0, v_init=-80.0):
+    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init"]
+
+    def __init__(self, n_ax: int, n_node: int, temp=37.0, v_init=-80.0, method="euler"):
         super().__init__()
+
+        valid_methods = ["euler", "dufort-frankel"]
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method: {method}. Valid methods: {valid_methods}")
+
+        self.method = method
         self.n_ax = n_ax
         self.n_node = n_node
         self.temp = temp
         self.v_init = v_init
+
         self.mech: HandlerInterface = None
 
         self._m_list = []
@@ -119,16 +128,31 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self._caches = {}
 
+        self.weight_choices = {
+            'euler': [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
+            'dufort-frankel': [[1.0, 0.0, 1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 1.0], [0.0, -2.0, 0.0]]
+        }
+
+        self.nc = {
+            'euler': 2,
+            'dufort-frankel': 4
+        }
+
         # solver stuff
-        weight = [1.0, -2.0, 1.0]
+        weight = self.weight_choices[method]
+        nc = self.nc[method]
+
         self.ssd = SymmetricConv1D(
-            2, 1, 3, bias=False, padding="same", padding_mode="reflect"
+            nc, 1, 3, bias=False, padding="same", padding_mode="reflect"
         )
-        self.ssd.weight.data = torch.tensor([weight, weight]).reshape(1, 2, 3)
+        self.ssd.weight.data = torch.tensor(weight).reshape(1, nc, 3)
         for p in self.ssd.parameters():
             p.requires_grad = False
 
-        self.register_buffer("v", torch.tensor([v_init]))
+        self.register_buffer("v", torch.full((n_ax, 1, n_node), v_init))
+        if method == 'dufort-frankel':
+            self.register_buffer("v_prev", torch.full((n_ax, 1, n_node), v_init))
+
         self.initialized: bool = False
 
         # -- constants --
@@ -306,7 +330,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             diameters = torch.as_tensor(diameters, device=device)
 
             if (not self.initialized) or reinit:
-                self.v = torch.full_like(ve[0], self.v_init)
                 self.area_c = self.area_(diameters)[:, None, None]
                 self.cm_c = self.cm_(self.area_c)
                 self.ra_c = self.ra_(diameters)[:, None, None]
@@ -318,14 +341,27 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             callbacks.pre_loop_hook(self)
 
             for i in range(len(ve)):
-                if with_intra:
-                    self.v = self.step_intra(
-                        self.v, ve[i], self.area_c, self.cm_c, self.ra_c, dt, intra[i]
-                    )
+                if self.method == "euler":
+                    if with_intra:
+                        self.v = self.step_intra(
+                            self.v, ve[i], self.area_c, self.cm_c, self.ra_c, dt, intra[i]
+                        )
+                    else:
+                        self.v = self.step_no_intra(
+                            self.v,
+                            ve[i],
+                            self.area_c,
+                            self.cm_c,
+                            self.ra_c,
+                            dt,
+                        )
                 else:
-                    self.v = self.step_no_intra(
+                    prev_idx = max(i - 1, 0)
+                    self.v, self.v_prev = self.step_no_intra_df(
                         self.v,
+                        self.v_prev,
                         ve[i],
+                        ve[prev_idx],
                         self.area_c,
                         self.cm_c,
                         self.ra_c,
@@ -391,6 +427,26 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         v = v + dv
 
         return v
+    
+    @torch.jit.script_method
+    def step_no_intra_df(self, v, v_prev, ve, ve_prev, area, cm, ra, dt) -> Tuple[Tensor, Tensor]:
+        # -- 2nd diff --
+        x = torch.cat([v, v_prev, ve, ve_prev], dim=1)
+        d2v = self.ssd(x)
+
+        # -- calculate ionic current --
+        i_ion = self.mech.i(0.5 * v_prev) * area
+
+        dtcm = dt / cm
+        s = 2 * dtcm
+        s2 = s / ra
+
+        # -- update vm --
+        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + dtcm * self.mech.gtot() * area)
+
+        self.mech.advance(v, dt)
+
+        return v_new, v
 
     @torch.jit.script_method
     def step_intra(self, v, ve, area, cm, ra, dt, intra) -> Tensor:
@@ -500,8 +556,8 @@ class Unmyelinated(Axon):
         }
     )
 
-    def __init__(self, n_ax, n_node, dx=10.0, temp=37, v_init=-80):
-        super().__init__(n_ax, n_node, temp, v_init)
+    def __init__(self, n_ax, n_node, dx=10.0, temp=37, v_init=-80, method="euler"):
+        super().__init__(n_ax, n_node, temp, v_init, method)
         self.dx: float = dx
 
     def area_(self, diameters) -> torch.Tensor:
