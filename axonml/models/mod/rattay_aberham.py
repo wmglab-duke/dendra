@@ -8,6 +8,7 @@ class m(State):
     PARAMETER(amA=1.0, aq10=2.24659524757)
 
     DERIVATIVE("m' = (minf - m) / mtau")
+    ASSIGNED("minf", "mtau")
 
     def calc_q10(self):
         return self.aq10 ** ((self.temp - 6.3) / 10)
@@ -18,13 +19,12 @@ class m(State):
     def beta(self, v):
         return 4.0 * exp(-(v + 70.0) / 18.0)
 
-    def export(self, v):
+    def breakpoint(self, v):
         a = self.alpha(v)
         b = self.beta(v)
         s = a + b
         minf = a / s
         mtau = 1.0 / (self.q10() * s)
-        return minf, mtau
 
 
 class h(State):
@@ -33,6 +33,7 @@ class h(State):
     PARAMETER(aq10=2.24659524757)
 
     DERIVATIVE("h' = (hinf - h) / htau")
+    ASSIGNED("hinf", "htau")
 
     def calc_q10(self):
         return self.aq10 ** ((self.temp - 6.3) / 10)
@@ -43,13 +44,12 @@ class h(State):
     def beta(self, v):
         return expit(3 - 0.1 * (v + 70))
 
-    def export(self, v):
+    def breakpoint(self, v):
         a = self.alpha(v)
         b = self.beta(v)
         s = a + b
         hinf = a / s
         htau = 1.0 / (self.q10() * s)
-        return hinf, htau
 
 
 class n(State):
@@ -58,6 +58,7 @@ class n(State):
     PARAMETER(anA=1.0, aq10=2.24659524757)
 
     DERIVATIVE("n' = (ninf - n) / ntau")
+    ASSIGNED("ninf", "ntau")
 
     def calc_q10(self):
         return self.aq10 ** ((self.temp - 6.3) / 10)
@@ -68,13 +69,12 @@ class n(State):
     def beta(self, v):
         return 0.125 * exp(-(v + 70.0) / 80.0)
 
-    def export(self, v):
+    def breakpoint(self, v):
         a = self.alpha(v)
         b = self.beta(v)
         s = a + b
         ninf = a / s
         ntau = 1.0 / (self.q10() * s)
-        return ninf, ntau
 
 
 class rattay_aberham(Mechanism):

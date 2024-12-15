@@ -6,6 +6,7 @@ import torch
 class State:
     is_q10 = False
     _derivative: Tuple[str, bool] = None
+    _assigned = set()
 
 
 @torch.jit.interface

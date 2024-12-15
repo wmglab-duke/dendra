@@ -244,8 +244,6 @@ def compile_state(s, temp):
         helpers=collect_helper_functions(s),
     )
 
-    print(forward_str)
-
     filename = f"<{state_name}_{randomword(5)}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)

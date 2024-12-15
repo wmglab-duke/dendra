@@ -18,6 +18,7 @@ class l(State):
     )
 
     DERIVATIVE("l' = (linf - l) / taul")
+    ASSIGNED("linf", "taul")
 
     def calc_q10(self):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
@@ -41,13 +42,12 @@ class l(State):
             / (8.315 * (273.16 + self.temp))
         )
 
-    def export(self, v):
+    def breakpoint(self, v):
         a = self.alpha(v)
         b = self.beta(v)
         al = 1 + a
         linf = 1 / al
         taul = b / (self.q10() * self.a0l * al)
-        return linf, taul
 
     def inf(self, v):
         return 1 / (1 + self.alpha(v))
@@ -67,6 +67,7 @@ class n(State):
     )
 
     DERIVATIVE("n' = (ninf - n) / taun")
+    ASSIGNED("ninf", "taun")
 
     def calc_q10(self):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
@@ -90,13 +91,12 @@ class n(State):
             / (8.315 * (273.16 + self.temp))
         )
 
-    def export(self, v):
+    def breakpoint(self, v):
         a = self.alpha(v)
         b = self.beta(v)
         an = 1 + a
         ninf = 1 / an
         taun = b / (self.q10() * self.a0n * an)
-        return ninf, taun
 
     def inf(self, v):
         return 1 / (1 + self.alpha(v))

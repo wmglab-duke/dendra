@@ -22,6 +22,7 @@ class m(State):
     )
 
     DERIVATIVE("m' = (minf - m) / taum")
+    ASSIGNED("minf", "taum")
 
     def calc_q10(self):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
@@ -34,12 +35,11 @@ class m(State):
         v = v + 65.0 + self.mshift
         return self.q10() * self.bm1 * exprelr(v - self.bm2, self.bm3)
 
-    def export(self, v):
+    def breakpoint(self, v):
         a = self.alpha(v)
         b = self.beta(v)
         taum = 1 / (a + b)
         minf = a * taum
-        return minf, taum
 
 
 class h(State):
@@ -59,6 +59,7 @@ class h(State):
     )
 
     DERIVATIVE("h' = (hinf - h) / tauh")
+    ASSIGNED("hinf", "tauh")
 
     def calc_q10(self):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
@@ -71,12 +72,11 @@ class h(State):
         v = v + 65.0 + self.hshift
         return self.q10() * self.bh1 * expit((v - self.bh2) / self.bh3)
 
-    def export(self, v):
+    def breakpoint(self, v):
         a = self.alpha(v)
         b = self.beta(v)
         tauh = 1 / (a + b)
         hinf = a * tauh
-        return hinf, tauh
 
 
 class nahh(Mechanism):

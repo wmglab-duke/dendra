@@ -19,7 +19,7 @@ def indent(text, level=0):
 template = """
 class mech(torch.nn.Module):
     _init_params: Dict[str, float]
-    def __init__(self, temp, n_ax, n_nodes, name: str, params, states, conductances, init, ic: dict = None, **kwargs):
+    def __init__(self, temp, n_ax, n_nodes, name: str, params, read_ion, states, conductances, init, ic: dict = None, **kwargs):
         super().__init__()
         self.instantiate_parameters(params, **kwargs)
         self.temp = temp
@@ -36,13 +36,21 @@ class mech(torch.nn.Module):
         if ic is not None:
             self._init_params.update(ic)
 
+        self.n_ax = n_ax
+        self.n_nodes = n_nodes
+        self.read_ion = read_ion
+
 {state_buffer_assignments}
 
 {current_buffer_assignments}
 
-{read_ion_buffers}
-
 {assigned}
+
+    def register_ion(self, ion):
+        name = ion.name
+        if name in self.read_ion:
+            for v in self.read_ion[name]:
+                self.register_buffer(v, getattr(ion, v))
 
     def instantiate_parameters(self, params, **kwargs):
         if params is not None:
@@ -266,22 +274,16 @@ def compile_mechanism(mechanism, temp, n_ax, n_nodes, ic=None, **kwargs):
     assigned_str = indent(assigned_str, 2)
 
     forward_str = template.format(
-        # conductances_init_assignments=conductances_init_assignments_str,
-        # conductances_buffer_assignments=conductances_buffer_assignments_str,
         state_buffer_assignments=state_buffer_assignments_str,
         current_buffer_assignments=current_buffer_assignments_str,
         read_ion_buffers=read_ion_buffers_str,
         assigned=assigned_str,
         init_state_buffers=init_state_buffers_str,
-        # init_conductance_buffers=init_conductance_buffers_str,
-        inflate_states=inflate_states_str,
         advance=advance_str,
         current_equations=current_equations_str,
         breakpoint_f=translate_f(mechanism, "breakpoint"),
         initial_f=translate_f(mechanism, "initial"),
     )
-
-    print(forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
@@ -293,6 +295,6 @@ def compile_mechanism(mechanism, temp, n_ax, n_nodes, ic=None, **kwargs):
 
     states = [compile_state(s, temp) for s in states]
 
-    m = locals()["mech"](temp, n_ax, n_nodes, name, params, states, conductances, init, ic=ic, **kwargs)
+    m = locals()["mech"](temp, n_ax, n_nodes, name, params, read_ion, states, conductances, init, ic=ic, **kwargs)
 
     return m

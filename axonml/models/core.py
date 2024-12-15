@@ -189,11 +189,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for k, v in mechanism._write_ion_c.items():
             self._ion_write_c.setdefault(k, {}).update({mechanism.__name__: v})
 
-        if len(self._ion_write_c) > 1:
-            raise ValueError(
-                f"Multiple ion channels {self._ion_write_c.keys()} writing concentrations are not supported."
-            )
-
     def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
         self._ion_style[ion] = (c_style, e_style, einit, eadvance, cinit)
 
@@ -248,8 +243,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ion_read = self._ion_read.get(ion, {})
             ion_style = self.get_ion_style(ion)
             ions[ion] = build_ion(
-                ion, self._m_list, self._m_name, ion_read, ion_write_c, *ion_style
+                ion, self.n_ax, self.n_node, self._m_list, self._m_name, ion_read, ion_write_c, *ion_style
             )
+            for m in self._m_list:
+                m.register_ion(ions[ion])
+                if m._name in self._ion_write_c.get(ion, {}):
+                    ions[ion].register_write_c(m)
+
         self.mech = build_handler(
             self._m_list,
             self._m_name,
@@ -417,8 +417,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
-        matched, unmatched = match_state_dict(self.state_dict(), state_dict)
-        print(unmatched)
+        matched, _ = match_state_dict(self.state_dict(), state_dict)
         self.load_state_dict(matched, strict=False)
         return self
 
@@ -492,8 +491,8 @@ class Unmyelinated(Axon):
         }
     )
 
-    def __init__(self, dx=10.0, temp=37, v_init=-80):
-        super().__init__(temp, v_init)
+    def __init__(self, n_ax, n_node, dx=10.0, temp=37, v_init=-80):
+        super().__init__(n_ax, n_node, temp, v_init)
         self.dx: float = dx
 
     def area_(self, diameters) -> torch.Tensor:

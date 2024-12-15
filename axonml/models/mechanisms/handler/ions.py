@@ -14,14 +14,17 @@ FARADAY = 96485.33212331001
 
 template = """
 class Ion(torch.nn.Module):
-  def __init__(self):
+  def __init__(self, n_ax, n_node):
     super().__init__()
+    self.name = "{ion}"
     self.rzf = {R} / ({valence} * {FARADAY})
-    self.register_buffer("i{ion}", torch.tensor(0.0))
+    self.register_buffer("i{ion}", torch.zeros((n_ax, 1, n_node)))
     self.register_{e_buffer_or_param}("e{ion}", {einit_tensor})
     self.register_{c_buffer_or_param}("{ion}i", {cinit_i_tensor})
     self.register_{c_buffer_or_param}("{ion}o", {cinit_o_tensor})
-    {assignments}
+
+  def register_mech_writes_c(self, mech):
+    setattr(self, mech._name, mech)
 
   @torch.jit.export
   def initialize(self, temp) -> None:
@@ -30,23 +33,11 @@ class Ion(torch.nn.Module):
     {initialize_i}
     {initialize_o}
     self.einit(temp)
-    self.write_after_init()
 
   @torch.jit.export
   def advance(self, temp) -> None:
     {read_c_self}
     self.eadvance(temp)
-    self.write()
-
-  @torch.jit.export
-  def immediate_update_e(self) -> None:
-    {write_e_immediate}
-    return
-
-  @torch.jit.export
-  def immediate_update_c(self) -> None:
-    {write_c_immediate}
-    return
 
   def einit(self, temp) -> None:
     {einit}
@@ -55,32 +46,19 @@ class Ion(torch.nn.Module):
   def eadvance(self, temp) -> None:
     {eadvance}
     return
-
-  def write_after_init(self) -> None:
-    {write_c_after_init}
-    {write_i_after_init}
-    {write_e_after_init}
-    return
-
-  def write(self) -> None:
-    # write things which get read
-    {write_c}
-    {write_i}
-    {write_e}
-    return
 """
 
 
 def init_tensor(val, buffer_or_param):
     if buffer_or_param == "buffer":
-        return f"torch.tensor({val})"
+        return f"torch.full((n_ax, 1, n_node), {val})"
     return f"torch.nn.Parameter(torch.tensor({val}), requires_grad=False)"
 
 
 def parse_einit(ion, einit):
     if einit == 0:
         return ""
-    return f"self.e{ion} = torch.log(self.{ion}o / self.{ion}i) * self.rzf * (273.15 + temp)"
+    return f"self.e{ion}.data.copy_(torch.log(self.{ion}o / self.{ion}i) * self.rzf * (273.15 + temp))"
 
 
 def parse_eadvance(ion, eadvance):
@@ -93,7 +71,7 @@ def parse_read_c_self(ion_write_c):
     res = []
     for k, v in ion_write_c.items():
         for v_ in v:
-            res.append(f"self.{v_} = self.{k}.{v_}")
+            res.append(f"self.{v_}.data.copy_(self.{k}.{v_})")
     return "\n    ".join(res)
 
 
@@ -179,6 +157,8 @@ def parse_c_buffer_or_param(c_style):
 
 def build_ion(
     ion,
+    n_ax,
+    n_node,
     mechanisms,
     mechanism_names,
     ion_read,
@@ -218,20 +198,14 @@ def build_ion(
     fe = f"e{ion}"
 
     e_init_str = (
-        f"self.e{ion} = torch.tensor({reversals()[fe]}, device=self.e{ion}.device)"
+        f"self.e{ion}.data.copy_({reversals()[fe]})"
     )
     i_init_str = (
-        f"self.{ion}i = torch.tensor({cinits()[fi]}, device=self.{ion}i.device)"
+        f"self.{ion}i.data.copy_({cinits()[fi]})"
     )
     o_init_str = (
-        f"self.{ion}o = torch.tensor({cinits()[fo]}, device=self.{ion}o.device)"
+        f"self.{ion}o.data.copy_({cinits()[fo]})"
     )
-
-    if e_style < 2:
-        e_init_str = ""
-    if c_style < 2:
-        i_init_str = ""
-        o_init_str = ""
 
     # eadvance
     eadvance_str = parse_eadvance(ion, eadvance)
@@ -244,6 +218,9 @@ def build_ion(
         assignments=assignments,
         e_buffer_or_param=e_is_buffer,
         c_buffer_or_param=c_is_buffer,
+        einit_tensor=init_tensor(reversals()[f"e{ion}"], e_is_buffer),
+        cinit_i_tensor=init_tensor(cinits()[f"{ion}i0"], c_is_buffer),
+        cinit_o_tensor=init_tensor(cinits()[f"{ion}o0"], c_is_buffer),
         initialize_e=e_init_str,
         initialize_i=i_init_str,
         initialize_o=o_init_str,
@@ -274,7 +251,7 @@ def build_ion(
     lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
-    m = locals()["Ion"]()
+    m = locals()["Ion"](n_ax, n_node)
 
     return m
 

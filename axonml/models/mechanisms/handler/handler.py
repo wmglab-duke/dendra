@@ -13,11 +13,9 @@ class MechanismHandler(torch.nn.Module):
     super().__init__()
     self.temp = temp
     {assignments}
-    {defaults}
 
   def initialize(self, v, v_init, area, temp) -> None:
     self.init_buffers(v_init)
-    # self.inflate(v)
     self.ion_init(temp)
     self.i(v)
 
@@ -38,10 +36,6 @@ class MechanismHandler(torch.nn.Module):
     {ion_init}
     return
 
-  def inflate(self, v) -> None:
-    {inflate}
-    return
-
   def init_buffers(self, v_init) -> None:
     {init_buffers}
     return
@@ -49,11 +43,6 @@ class MechanismHandler(torch.nn.Module):
   @torch.jit.ignore
   def get(self, mech: str, state: str) -> torch.Tensor:
     return getattr(self, mech).get(state)
-
-  @torch.jit.export
-  def set(self, name: str, value: float) -> None:
-    {define_setattr}
-    return
 
   @torch.jit.export
   def all_states(self) -> List[str]:
@@ -83,13 +72,15 @@ def parse_ions(ion_names) -> str:
     return ", ".join(result)
 
 
-def parse_current_string(s: str) -> str:
+def parse_current_string(s: str, total=False) -> str:
     pattern = r"^i([A-Za-z]+)$"
     match = re.match(pattern, s)
     if match:
         # Extract the letters following 'i'
         letters = match.group(1)
         # Construct the transformed string
+        if total:
+            return f"self.{letters}_ion.i{letters}"
         return f"self.{letters}_ion.i{letters}[:]"
     else:
         # If no match, leave the string unchanged
@@ -124,7 +115,7 @@ def parse_scale(currents) -> str:
 
 
 def parse_total(currents) -> str:
-    s = " + ".join([parse_current_string(key) for key in currents.keys()])
+    s = " + ".join([parse_current_string(key, True) for key in currents.keys()])
     return s
 
 
@@ -240,8 +231,6 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
         define_setattr=parse_setattr(ions),
         all_states=parse_all_states(mechanisms),
     )
-
-    print(forward_str)
 
     filename = f"<{randomword(10)}_template>"
     code = compile(forward_str, filename, "exec")
