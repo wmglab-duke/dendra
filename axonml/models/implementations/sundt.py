@@ -7,7 +7,9 @@ from ..mechanisms.handler.defaults import e_context
 class Sundt(Unmyelinated):
     PARAMETER(cm=1e-3, rhoa=100.0)
 
-    def __init__(self, n_ax=1, n_node=1001, dx=10, temp=37.0, v_init=-65.0, method="euler"):
+    def __init__(
+        self, n_ax=1, n_node=1001, dx=10, temp=37.0, v_init=-65.0, method="euler"
+    ):
         super().__init__(n_ax, n_node, dx, temp, v_init, method)
 
         with e_context(ek=-90.0):

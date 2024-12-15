@@ -98,9 +98,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def __init__(self, n_ax: int, n_node: int, temp=37.0, v_init=-80.0, method="euler"):
         super().__init__()
 
-        valid_methods = ["euler", "dufort-frankel"]
+        valid_methods = ["euler", "dufort-frankel", "rk4"]
         if method not in valid_methods:
-            raise ValueError(f"Invalid method: {method}. Valid methods: {valid_methods}")
+            raise ValueError(
+                f"Invalid method: {method}. Valid methods: {valid_methods}"
+            )
 
         self.method = method
         self.n_ax = n_ax
@@ -129,14 +131,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self._caches = {}
 
         self.weight_choices = {
-            'euler': [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
-            'dufort-frankel': [[1.0, 0.0, 1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 1.0], [0.0, -2.0, 0.0]]
+            "euler": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
+            "rk4":  [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
+            "dufort-frankel": [
+                [1.0, 0.0, 1.0],
+                [0.0, -1.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, -2.0, 0.0],
+            ],
         }
 
-        self.nc = {
-            'euler': 2,
-            'dufort-frankel': 4
-        }
+        self.nc = {"euler": 2,  "dufort-frankel": 4}
 
         # solver stuff
         weight = self.weight_choices[method]
@@ -150,7 +155,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             p.requires_grad = False
 
         self.register_buffer("v", torch.full((n_ax, 1, n_node), v_init))
-        if method == 'dufort-frankel':
+        if method == "dufort-frankel":
             self.register_buffer("v_prev", torch.full((n_ax, 1, n_node), v_init))
 
         self.initialized: bool = False
@@ -300,6 +305,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def cm_(self, area):
         return self.cm * area
 
+    def init_v(self):
+        self.v[:] = self.v_init
+        if self.method == "dufort-frankel":
+            self.v_prev[:] = self.v_init
+
     def run(
         self,
         ve: Tensor,
@@ -310,7 +320,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         reinit: bool = False,
     ):
         with_intra = intra is not None
-        euler = self.method == "euler"
+        euler = self.method == "euler" or self.method == "rk4"
 
         self.v_init_c = torch.tensor(
             self.v_init, device=self.device(), dtype=self.dtype()
@@ -331,6 +341,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             diameters = torch.as_tensor(diameters, device=device)
 
             if (not self.initialized) or reinit:
+                self.init_v()
                 self.area_c = self.area_(diameters)[:, None, None]
                 self.cm_c = self.cm_(self.area_c)
                 self.ra_c = self.ra_(diameters)[:, None, None]
@@ -345,10 +356,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 if euler:
                     if with_intra:
                         self.v = self.step_intra(
-                            self.v, ve[i], self.area_c, self.cm_c, self.ra_c, dt, intra[i]
+                            self.v,
+                            ve[i],
+                            self.area_c,
+                            self.cm_c,
+                            self.ra_c,
+                            dt,
+                            intra[i],
                         )
                     else:
-                        self.v = self.step_no_intra(
+                        self.v = self.step_no_intra_rk4(
                             self.v,
                             ve[i],
                             self.area_c,
@@ -404,7 +421,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return dv
 
     @torch.jit.script_method
-    def step_no_intra(
+    def step_no_intra_euler(
         self,
         v,
         ve,
@@ -429,8 +446,38 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         return v
     
+    def FRK(self, v, ve, area, cm, ra):
+        x = torch.cat([v, ve], dim=1)
+        d2v = self.ssd(x)
+        i_ion = self.mech.i(v) * area
+        return (1 / cm) * (((1 / ra) * d2v) - i_ion)
+    
     @torch.jit.script_method
-    def step_no_intra_df(self, v, v_prev, ve, ve_prev, area, cm, ra, dt) -> Tuple[Tensor, Tensor]:
+    def step_no_intra_rk4(
+        self,
+        v,
+        ve,
+        area,
+        cm,
+        ra,
+        dt,
+    ) -> Tensor:
+        
+        self.mech.advance(v, dt)
+
+        # -- update vm --
+        K1 = self.FRK(v, ve, area, cm, ra)
+        K2 = self.FRK(v + (dt/2)*K1, ve, area, cm, ra)
+        K3 = self.FRK(v + (dt/2)*K2, ve, area, cm, ra)
+        K4 = self.FRK(v + dt*K3, ve, area, cm, ra)
+
+        v = v + (dt/6) * (K1 + 2*K2 + 2*K3 + K4)
+
+        return v
+
+    def step_no_intra_df(
+        self, v, v_prev, ve, ve_prev, area, cm, ra, dt
+    ) -> Tuple[Tensor, Tensor]:
         # -- 2nd diff --
         x = torch.cat([v, v_prev, ve, ve_prev], dim=1)
         d2v = self.ssd(x)
@@ -443,13 +490,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         s2 = s / ra
 
         # -- update vm --
-        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + dtcm * self.mech.gtot() * area)
+        v_new = (v_prev + s2 * d2v - s * i_ion) / (
+            1 + s2 + dtcm * self.mech.gtot() * area
+        )
 
         self.mech.advance(v, dt)
 
         return v_new, v
 
-    @torch.jit.script_method
     def step_intra(self, v, ve, area, cm, ra, dt, intra) -> Tensor:
         # -- 2nd diff --
         x = torch.cat([v, ve], dim=1)

@@ -42,7 +42,7 @@ class h(State):
         return 0.07 * exp(-(v + 70) / 20)
 
     def beta(self, v):
-        return expit(3 - 0.1 * (v + 70))
+        return expit((-3.0) + 0.1 * (v + 70))
 
     def breakpoint(self, v):
         a = self.alpha(v)
@@ -64,7 +64,7 @@ class n(State):
         return self.aq10 ** ((self.temp - 6.3) / 10)
 
     def alpha(self, v):
-        return 00.1 * exprelr(1.0 - 0.1 * (v + 70.0), self.anA)
+        return 0.1 * exprelr(1.0 - 0.1 * (v + 70.0), self.anA)
 
     def beta(self, v):
         return 0.125 * exp(-(v + 70.0) / 80.0)

@@ -88,6 +88,6 @@ class nahh(Mechanism):
 
     def ina(self, v):
         return self.gnabar * self.m**3 * self.h * (v - self.ena)
-    
+
     def gtot(self):
         return self.gnabar * self.m**3 * self.h

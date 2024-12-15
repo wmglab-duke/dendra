@@ -111,6 +111,6 @@ class kdr(Mechanism):
 
     def ik(self, v):
         return self.gkbar * self.n**3 * self.l * (v - self.ek)
-    
+
     def gtot(self):
         return self.gkbar * self.n**3 * self.l

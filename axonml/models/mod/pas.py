@@ -8,6 +8,6 @@ class pas(Mechanism):
 
     def i(self, v):
         return self.g * (v - self.e)
-    
+
     def gtot(self):
         return self.g

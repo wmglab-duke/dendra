@@ -166,3 +166,11 @@ class axnode_myel(Mechanism):
         )
 
         return current
+
+    def gtot(self):
+        return (
+            self.gnabar * self.m**3 * self.h
+            + self.gnapbar * self.p**3
+            + self.gkbar * self.s
+            + self.gl
+        )
