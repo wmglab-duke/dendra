@@ -218,7 +218,7 @@ def gtot(mechanisms):
 def breakpoint(mechanisms):
     ret = []
     for m in mechanisms:
-        ret.append(f"self.{m._name}.breakpoint()")
+        ret.append(f"self.{m._name}.breakpoint(v)")
     return "\n    ".join(ret)
 
 
