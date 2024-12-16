@@ -27,6 +27,7 @@ class MechanismHandler(torch.nn.Module):
     return {gtot}
 
   def i(self, v) -> torch.Tensor:
+    {breakpoint}
     {currents}
     total = {total}
     return total
@@ -214,6 +215,13 @@ def gtot(mechanisms):
     return " + ".join([f"self.{m._name}.gtot()" for m in mechanisms])
 
 
+def breakpoint(mechanisms):
+    ret = []
+    for m in mechanisms:
+        ret.append(f"self.{m._name}.breakpoint()")
+    return "\n    ".join(ret)
+
+
 def build_handler(mechanisms, names, currents, temp, ions=None):
     arguments = parse_args(names)
 
@@ -238,6 +246,7 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
         define_setattr=parse_setattr(ions),
         all_states=parse_all_states(mechanisms),
         gtot=gtot(mechanisms),
+        breakpoint=breakpoint(mechanisms),
     )
 
     filename = f"<{randomword(10)}_template>"

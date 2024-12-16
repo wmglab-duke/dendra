@@ -81,7 +81,6 @@ class mech(torch.nn.Module):
         return getattr(self, key)
 
     def _advance(self, v, dt):
-        self.breakpoint(v)
 {advance}
         return
 
