@@ -8,7 +8,7 @@ class Sundt(Unmyelinated):
     PARAMETER(cm=1e-3, rhoa=100.0)
 
     def __init__(
-        self, n_ax=1, L=5.0, dx=10, temp=37.0, v_init=-65.0, method="euler"
+        self, n_ax=1, L=5.0, dx=10, temp=37.0, v_init=-65.0, method="rk1"
     ):
         super().__init__(n_ax, L, dx, temp, v_init, method)
 

@@ -95,20 +95,19 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     __constants__ = ["method", "n_ax", "n_node", "temp", "v_init"]
 
-    def __init__(self, n_ax: int, n_node: int, temp=37.0, v_init=-80.0, method="euler"):
+    def __init__(self, n_ax: int, n_node: int, temp=37.0, v_init=-80.0, method="rk1"):
         super().__init__()
 
-        valid_methods = ["euler", "dufort-frankel", "rk4"]
-        if method not in valid_methods:
-            raise ValueError(
-                f"Invalid method: {method}. Valid methods: {valid_methods}"
-            )
-        
         self.method_conversion = {
-            "euler": "euler",
-            "dufort-frankel": "df",
+            "rk1": "rk1",
             "rk4": "rk4",
+            "dufort-frankel": "df",
         }
+
+        if method not in self.method_conversion:
+            raise ValueError(
+                f"Invalid method: {method}. Valid methods: {list(self.method_conversion.keys())}"
+            )
 
         self.method = method
         self.n_ax = n_ax
@@ -137,8 +136,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self._caches = {}
 
         self.weight_choices = {
-            "euler": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
-            "rk4":  [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
+            "rk1": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
+            "rk4": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "dufort-frankel": [
                 [1.0, 0.0, 1.0],
                 [0.0, -1.0, 0.0],
@@ -146,7 +145,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ],
         }
 
-        self.nc = {"euler": 2, "rk4":2, "dufort-frankel": 3}
+        self.nc = {"rk1": 2, "rk4":2, "dufort-frankel": 3}
 
         # solver stuff
         weight = self.weight_choices[method]
@@ -361,11 +360,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             callbacks = CallbackList(callbacks)
             callbacks.pre_loop_hook(self)
 
+            if df:
+                dtcm = dt / self.cm_c
+                s = 2 * dtcm
+                s2 = s / self.ra_c
+            else:
+                cm_inv = 1 / self.cm_c
+                ra_inv = 1 / self.ra_c
+
             for i in range(len(ve)):
                 if df:
-                    dtcm = dt / self.cm_c
-                    s = 2 * dtcm
-                    s2 = s / self.ra_c
                     if with_intra:
                         self.v, self.v_prev = method_intra(
                             self.v,
@@ -395,8 +399,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             self.v,
                             ve[i],
                             self.area_c,
-                            self.cm_c,
-                            self.ra_c,
+                            cm_inv,
+                            ra_inv,
                             dt,
                             intra[i],
                         )
@@ -405,8 +409,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             self.v,
                             ve[i],
                             self.area_c,
-                            self.cm_c,
-                            self.ra_c,
+                            cm_inv,
+                            ra_inv,
                             dt,
                         )
                 callbacks.post_step_hook(self)
@@ -418,34 +422,21 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     @torch.jit.script_method
     def initialize(self, v, v_init, area, temp):
         self.mech.initialize(v, v_init, area, temp)
+    
+    def FRK(self, v, ve, area, cm, ra):
+        x = torch.cat([v, ve], dim=1)
+        d2v = self.ssd(x)
+        i_ion = self.mech.i(v) * area
+        return cm * ((ra * d2v) - i_ion)
+    
+    def FRK_intra(self, v, ve, area, cm, ra, intra):
+        x = torch.cat([v, ve], dim=1)
+        d2v = self.ssd(x)
+        i_ion = self.mech.i(v) * area - intra
+        return cm * ((ra * d2v) - i_ion)
 
     @torch.jit.script_method
-    def dv(self, cm, ra, d2v, ion, dt) -> Tensor:
-        """Calculate dv/dt
-
-        Parameters
-        ----------
-        cm : torch.Tensor
-            Node capacitance.
-        ra : torch.Tensor
-            Internodal resistance.
-        d2v : torch.Tensor
-            Spatial 2nd difference.
-        ion : torch.Tensor
-            Ionic current.
-        dt : float
-            Timestep.
-
-        Returns
-        -------
-        Tensor
-            dv/dt
-        """
-        dv = dt * (1 / cm) * (((1 / ra) * d2v) - ion)
-        return dv
-
-    @torch.jit.script_method
-    def step_no_intra_euler(
+    def step_no_intra_rk1(
         self,
         v,
         ve,
@@ -454,51 +445,30 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ra,
         dt,
     ) -> Tensor:
-        # -- 2nd diff --
-        x = torch.cat([v, ve], dim=1)
-        d2v = self.ssd(x)
-
-        # -- update gvs --
+        
         self.mech.advance(v, dt)
-
-        # -- calculate ionic current --
-        i_ion = self.mech.i(v) * area
-
-        # -- update vm --
-        dv = self.dv(cm, ra, d2v, i_ion, dt)
-        v = v + dv
+        K1 = self.FRK(v, ve, area, cm, ra)
+        v = v + K1 * dt
 
         return v
     
     @torch.jit.script_method
-    def step_intra_euler(self, v, ve, area, cm, ra, dt, intra) -> Tensor:
-        # -- 2nd diff --
-        x = torch.cat([v, ve], dim=1)
-        d2v = self.ssd(x)
-
-        # -- update gvs --
+    def step_intra_rk1(
+        self,
+        v,
+        ve,
+        area,
+        cm,
+        ra,
+        dt,
+        intra
+    ) -> Tensor:
+        
         self.mech.advance(v, dt)
-
-        # -- calculate ionic current --
-        i_ion = self.mech.i(v) * area - intra
-
-        # -- update vm --
-        dv = self.dv(cm, ra, d2v, i_ion, dt)
-        v = v + dv
+        K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
+        v = v + K1 * dt
 
         return v
-    
-    def FRK(self, v, ve, area, cm, ra):
-        x = torch.cat([v, ve], dim=1)
-        d2v = self.ssd(x)
-        i_ion = self.mech.i(v) * area
-        return (1 / cm) * (((1 / ra) * d2v) - i_ion)
-    
-    def FRK_intra(self, v, ve, area, cm, ra, intra):
-        x = torch.cat([v, ve], dim=1)
-        d2v = self.ssd(x)
-        i_ion = self.mech.i(v) * area - intra
-        return (1 / cm) * (((1 / ra) * d2v) - i_ion)
     
     @torch.jit.script_method
     def step_no_intra_rk4(
