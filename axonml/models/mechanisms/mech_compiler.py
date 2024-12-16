@@ -1,7 +1,8 @@
-from typing import Dict
+from typing import Dict, List
 import inspect
 import linecache
 import textwrap
+import ast
 
 import torch
 
@@ -101,17 +102,92 @@ else:
 self.{state}[:] = buffer_tensor
 """
 
+def extract_multipliers(class_def_str: str) -> List[str]:
+    """
+    Extracts all expressions that precede any expression matching '* (v - <x>)'
+    within the given Python class definition string. The <x> can be a variable or an attribute.
 
-def gtot(state):
-    functions = inspect.getmembers(state, predicate=inspect.isfunction)
+    Args:
+        class_def_str (str): The string representation of the Python class.
+
+    Returns:
+        List[str]: A list of multiplier expressions as strings.
+    """
+
+    class MultiplierVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.multipliers = []
+
+        def is_target_subtraction(self, node: ast.BinOp) -> bool:
+            """
+            Checks if the given BinOp node represents a subtraction of the form (v - <x>),
+            where <x> can be a Name or an Attribute.
+
+            Args:
+                node (ast.BinOp): The binary operation node to check.
+
+            Returns:
+                bool: True if the node matches the pattern (v - <x>), False otherwise.
+            """
+            if not isinstance(node, ast.BinOp):
+                return False
+            if not isinstance(node.op, ast.Sub):
+                return False
+
+            # Check if left operand is 'v'
+            if not (isinstance(node.left, ast.Name) and node.left.id == 'v'):
+                return False
+
+            # Check if right operand is a Name or Attribute
+            if isinstance(node.right, (ast.Name, ast.Attribute)):
+                return True
+
+            return False
+
+        def visit_BinOp(self, node):
+            # Check if the operation is multiplication
+            if isinstance(node.op, ast.Mult):
+                # Check the right operand for (v - x)
+                if isinstance(node.right, ast.BinOp) and self.is_target_subtraction(node.right):
+                    multiplier_expr = node.left
+                    multiplier_str = ast.unparse(multiplier_expr).strip()
+                    self.multipliers.append(multiplier_str)
+
+                # Check the left operand for (v - x)
+                elif isinstance(node.left, ast.BinOp) and self.is_target_subtraction(node.left):
+                    multiplier_expr = node.right
+                    multiplier_str = ast.unparse(multiplier_expr).strip()
+                    self.multipliers.append(multiplier_str)
+
+            # Continue traversing the AST
+            self.generic_visit(node)
+
+    # Parse the class definition string into an AST
+    try:
+        tree = ast.parse(class_def_str)
+    except SyntaxError as e:
+        print(f"SyntaxError while parsing the class definition: {e}")
+        return []
+
+    # Initialize and run the visitor
+    visitor = MultiplierVisitor()
+    visitor.visit(tree)
+
+    return visitor.multipliers
+
+
+def gtot(mechanism):
+    functions = inspect.getmembers(mechanism, predicate=inspect.isfunction)
     ret = []
     for fname, f in functions:
         if fname in ["gtot"]:
             ret.append(inspect.getsource(f))
-            break
-    if not ret:
-        ret.append("    def gtot(self): return torch.tensor(0.0)")
-    return "\n".join(ret)
+            return "\n".join(ret)
+    multipliers = extract_multipliers(inspect.getsource(mechanism))
+    if multipliers:
+        sum_gtot = " + ".join(multipliers)
+        return f"    def gtot(self): return {sum_gtot}"
+    return "    def gtot(self): return torch.tensor(0.0)"
 
 
 def conductances_init_assignments(conductances):

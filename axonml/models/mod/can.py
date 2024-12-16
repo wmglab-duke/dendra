@@ -21,17 +21,17 @@ class d(State):
     )
 
     DERIVATIVE("d' = (dinf - d) / taud")
+    ASSIGNED("dinf", "taud")
 
     def calc_q10(self):
         return self.Q10can ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
-    def export(self, v):
+    def breakpoint(self, v):
         taud = (
             self.q10() * self.A_taud * exp(-((self.B_taud) ** 2) * (v - self.Vpd) ** 2)
             + self.C_taud
         )
         dinf = 1.0 / (1.0 + exp((v + self.V0p5d + self.shiftcan) / self.S0p5d))
-        return dinf, taud
 
     def inf(self, v):
         return 1.0 / (1.0 + exp((v + self.V0p5d + self.shiftcan) / self.S0p5d))
@@ -54,11 +54,12 @@ class f1(State):
     )
 
     DERIVATIVE("f1' = (f1inf - f1) / tauf1")
+    ASSIGNED("f1inf", "tauf1")
 
     def calc_q10(self):
         return self.Q10can ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
-    def export(self, v):
+    def breakpoint(self, v):
         tauf1 = (
             self.q10()
             * self.A_tauf1
@@ -66,7 +67,6 @@ class f1(State):
             + self.C_tauf1
         )
         f1inf = 1.0 / (1.0 + exp((v + self.V0p5f1 + self.shiftcan) / self.S0p5f1))
-        return f1inf, tauf1
 
     def inf(self, v):
         return 1.0 / (1.0 + exp((v + self.V0p5f1 + self.shiftcan) / self.S0p5f1))
@@ -89,11 +89,12 @@ class f2(State):
     )
 
     DERIVATIVE("f2' = (f2inf - f2) / tauf2")
+    ASSIGNED("f2inf", "tauf2")
 
     def calc_q10(self):
         return self.Q10can ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
-    def export(self, v):
+    def breakpoint(self, v):
         tauf2 = (
             self.q10()
             * self.A_tauf2
@@ -101,7 +102,6 @@ class f2(State):
             + self.C_tauf2
         )
         f2inf = 1.0 / (1.0 + exp((v + self.V0p5f2 + self.shiftcan) / self.S0p5f2))
-        return f2inf, tauf2
 
     def inf(self, v):
         return 1.0 / (1.0 + exp((v + self.V0p5f2 + self.shiftcan) / self.S0p5f2))

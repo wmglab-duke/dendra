@@ -94,6 +94,3 @@ class rattay_aberham(Mechanism):
 
     def il(self, v):
         return self.gl * (v - self.el)
-    
-    def gtot(self):
-        return self.gnabar * self.m**3 * self.h + self.gkbar * self.n**4 + self.gl

@@ -680,9 +680,16 @@ class Unmyelinated(Axon):
         }
     )
 
-    def __init__(self, n_ax, n_node, dx=10.0, temp=37, v_init=-80, method="euler"):
+    def __init__(self, n_ax, L=1.0, dx=10.0, temp=37, v_init=-80, method="euler"):
+        L = L * 1000  # mm -> um
+        n_node = L / dx
+        n_node = math.ceil(n_node) // 2 * 2 + 1
         super().__init__(n_ax, n_node, temp, v_init, method)
         self.dx: float = dx
+
+    def x(self) -> torch.Tensor:
+        l = (self.n_node - 1) * self.dx
+        return torch.linspace(-l/2, l/2, self.n_node)
 
     def area_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)

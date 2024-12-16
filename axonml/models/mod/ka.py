@@ -18,17 +18,17 @@ class p(State):
     )
 
     DERIVATIVE("p' = (pinf - p) / taup")
+    ASSIGNED("pinf", "taup")
 
     def calc_q10(self):
         return self.q10ka ** ((self.q10TempA - self.temp) / self.q10TempB)
 
-    def export(self, v):
+    def breakpoint(self, v):
         taup = (
             self.q10() * self.A_taup * exp(-((self.B_taup) ** 2) * (v - self.Vpp) ** 2)
             + self.C_taup
         )
         pinf = 1.0 / (1.0 + exp((v + self.V0p5p + self.shiftka) / self.S0pp5p))
-        return pinf, taup
 
     def inf(self, v):
         return 1.0 / (1.0 + exp((v + self.V0p5p + self.shiftka) / self.S0pp5p))
@@ -50,17 +50,17 @@ class q(State):
     )
 
     DERIVATIVE("q' = (qinf - q) / tauq")
+    ASSIGNED("qinf", "tauq")
 
     def calc_q10(self):
         return self.q10ka ** ((self.q10TempA - self.temp) / self.q10TempB)
 
-    def export(self, v):
+    def breakpoint(self, v):
         tauq = (
             self.q10() * self.A_tauq * exp(-((self.B_tauq) ** 2) * (v - self.Vpq) ** 2)
             + self.C_tauq
         )
         qinf = 1.0 / (1.0 + exp((v + self.V0p5q + self.shiftka) / self.S0p5q))
-        return qinf, tauq
 
     def inf(self, v):
         return 1.0 / (1.0 + exp((v + self.V0p5q + self.shiftka) / self.S0p5q))

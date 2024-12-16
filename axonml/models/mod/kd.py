@@ -21,6 +21,7 @@ class n(State):
     )
 
     DERIVATIVE("n' = (ninf - n) / ntau")
+    ASSIGNED("ninf", "ntau")
 
     def calc_q10(self):
         return self.q10kdn ** ((self.q10TempA - self.temp) / self.q10TempB)
@@ -32,12 +33,11 @@ class n(State):
     def beta(self, v):
         return self.A_betan * exp((v + self.B_betan) / self.C_betan)
 
-    def export(self, v):
+    def breakpoint(self, v):
         a = self.alpha(v)
         b = self.beta(v)
         ntau = self.q10() * (1.0 + (1.0 / (a + b)))
         ninf = 1.0 / (1.0 + exp((v + self.V0p5n + self.shiftkd) / self.S0p5n))
-        return ninf, ntau
 
     def inf(self, v):
         return 1.0 / (1.0 + exp((v + self.V0p5n + self.shiftkd) / self.S0p5n))
