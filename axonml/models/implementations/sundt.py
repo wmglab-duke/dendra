@@ -1,5 +1,5 @@
 from ..core import Unmyelinated
-from ..mod import kdr, pas, nahh
+from ..mod import kdr, pas, nahh, nacapump
 from ..mechanisms import PARAMETER
 from ..mechanisms.handler.defaults import e_context
 

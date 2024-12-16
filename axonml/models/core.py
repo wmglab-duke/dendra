@@ -205,8 +205,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         validate(mechanism)
         # m = mechanism(self.temp, ic=ic, **kwargs)
 
+        df = self.method == "dufort-frankel"
+
         m = compile_mechanism(
-            mechanism, self.temp, self.n_ax, self.n_node, ic=ic, **kwargs
+            mechanism, self.temp, self.n_ax, self.n_node, ic=ic, df=df, **kwargs
         )
 
         self._m_list.append(m)
@@ -361,8 +363,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             callbacks.pre_loop_hook(self)
 
             if df:
-                dtcm = dt / self.cm_c
-                s = 2 * dtcm
+                s = 2 * dt / self.cm_c
                 s2 = s / self.ra_c
             else:
                 cm_inv = 1 / self.cm_c
@@ -376,7 +377,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             self.v_prev,
                             ve[i],
                             self.area_c,
-                            dtcm,
                             s,
                             s2,
                             dt,
@@ -388,7 +388,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             self.v_prev,
                             ve[i],
                             self.area_c,
-                            dtcm,
                             s,
                             s2,
                             dt,
@@ -519,41 +518,43 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def step_no_intra_df(
-        self, v, v_prev, ve, area, dtcm, s, s2, dt
+        self, v, v_prev, ve, area, s, s2, dt
     ) -> Tuple[Tensor, Tensor]:
+        
+        self.mech.advance(v, dt)
+
         # -- 2nd diff --
         x = torch.cat([v, v_prev, ve], dim=1)
         d2v = self.ssd(x)
 
         # -- calculate ionic current --
-        i_ion = self.mech.i(0.5 * v_prev) * area
+        i_ion = self.mech.i(v_prev) * area
 
         # -- update vm --
         v_new = (v_prev + s2 * d2v - s * i_ion) / (
-            1 + s2 + dtcm * self.mech.gtot() * area
+            1 + s2 + s * self.mech.gtot() * area
         )
-
-        self.mech.advance(v, dt)
 
         return v_new, v
     
     @torch.jit.script_method
     def step_intra_df(
-        self, v, v_prev, ve, area, dtcm, s, s2, dt, intra
+        self, v, v_prev, ve, area, s, s2, dt, intra
     ) -> Tuple[Tensor, Tensor]:
+        
+        self.mech.advance(v, dt)
+
         # -- 2nd diff --
         x = torch.cat([v, v_prev, ve], dim=1)
         d2v = self.ssd(x)
 
         # -- calculate ionic current --
-        i_ion = self.mech.i(0.5 * v_prev) * area - intra
+        i_ion = self.mech.i(v_prev) * area - intra
 
         # -- update vm --
         v_new = (v_prev + s2 * d2v - s * i_ion) / (
-            1 + s2 + dtcm * self.mech.gtot() * area
+            1 + s2 + s * self.mech.gtot() * area
         )
-
-        self.mech.advance(v, dt)
 
         return v_new, v
 

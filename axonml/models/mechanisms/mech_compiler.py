@@ -3,18 +3,103 @@ import inspect
 import linecache
 import textwrap
 import ast
+import re
+
+import warnings
 
 import torch
 
 from .compile_f import convert_func
 from .core import Mechanism
 from ..mixins import to_param
+from .ops import *
 
 from .state_compiler import compile_state
 
 
 def indent(text, level=0):
     return textwrap.indent(text, " " * (4 * level))
+
+
+def replace_v(code_str):
+    # Use a regex with word boundaries to ensure only standalone 'v' is replaced.
+    # The replacement inserts '(v + v_n) / 2' in place of v.
+    return re.sub(r'\bv\b', '(v + v_n) / 2', code_str)
+
+
+import re
+from sympy import symbols, sympify, Poly, expand, factor
+
+def factor_linear_in_x_from_codeblock(code_str, x_var='v_n'):
+    lines = code_str.strip().split('\n')
+    
+    # Identify self-prefixed variables
+    pattern = r'self\.(\w+)'
+    self_vars_all = re.findall(pattern, code_str)
+    self_mapping = {var: f"self.{var}" for var in self_vars_all}
+    
+    env = {}
+    
+    def parse_expr(expr_str):
+        # Extract potential variables
+        potential_vars = set(re.findall(r'[a-zA-Z_]\w*', expr_str))
+        for var in potential_vars:
+            if var not in env:
+                env[var] = symbols(var, real=True)
+        return sympify(expr_str, locals=env)
+
+    final_expr = None
+
+    # Parse line by line
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        line_no_self = line.replace('self.', '')
+        
+        if line_no_self.startswith('return '):
+            return_expr_str = line_no_self[len('return '):].strip()
+            final_expr = parse_expr(return_expr_str)
+        elif '=' in line_no_self:
+            lhs, rhs = line_no_self.split('=', 1)
+            var_name = lhs.strip()
+            rhs_expr_str = rhs.strip()
+            rhs_expr = parse_expr(rhs_expr_str)
+            env[var_name] = rhs_expr
+        else:
+            final_expr = parse_expr(line_no_self)
+    
+    if final_expr is None:
+        raise ValueError("No final expression or return statement found.")
+    
+    if x_var not in env:
+        env[x_var] = symbols(x_var, real=True)
+    x = env[x_var]
+
+    # Factor the final_expr as A + B*x
+    expr_expanded = expand(final_expr)
+    p = Poly(expr_expanded, x)
+    
+    if p.degree() != 1:
+        raise ValueError("Expression is not linear in x.")
+    
+    A = p.eval(0)
+    B = p.coeff_monomial(x)
+
+    # Now factor each of A and B individually
+    A_factor = factor(A)
+    B_factor = factor(B)
+
+    # Convert to strings
+    A_str = str(A_factor)
+    B_str = str(B_factor)
+
+    # Restore self. prefixes
+    for var in sorted(self_mapping.keys(), key=len, reverse=True):
+        A_str = re.sub(rf'\b{var}\b', self_mapping[var], A_str)
+        B_str = re.sub(rf'\b{var}\b', self_mapping[var], B_str)
+
+    return A_str, B_str
 
 
 template = """
@@ -175,20 +260,6 @@ def extract_multipliers(class_def_str: str) -> List[str]:
     return visitor.multipliers
 
 
-def gtot(mechanism):
-    functions = inspect.getmembers(mechanism, predicate=inspect.isfunction)
-    ret = []
-    for fname, f in functions:
-        if fname in ["gtot"]:
-            ret.append(inspect.getsource(f))
-            return "\n".join(ret)
-    multipliers = extract_multipliers(inspect.getsource(mechanism))
-    if multipliers:
-        sum_gtot = " + ".join(multipliers)
-        return f"    def gtot(self): return {sum_gtot}"
-    return "    def gtot(self): return torch.tensor(0.0)"
-
-
 def conductances_init_assignments(conductances):
     assignments = []
     for k, _ in conductances.items():
@@ -264,12 +335,53 @@ def advance(states):
     return "\n".join(assignments)
 
 
-def current_equations(currents, mechanism, range_vars):
+current_eq_template = """
+def {k}(self, v):
+    return {v}
+"""
+
+current_eq_template_assign = """
+def {k}(self, v):
+    self.{k}_ = {v}
+    return self.{k}_
+"""
+
+
+def current_equations(currents, mechanism, range_vars, df):
     assignments = []
     for k in currents:
         assign = k in range_vars
-        assignments.append(convert_func(getattr(mechanism, k), assign))
+        if not df:
+            assignments.append(convert_func(getattr(mechanism, k), assign))
+        else:
+            code_block = get_function_body_as_str(getattr(mechanism, k))
+            try:
+                i, _ = factor_linear_in_x_from_codeblock(replace_v(code_block))
+                if assign:
+                    assignments.append(current_eq_template_assign.format(k=k, v=i))
+                else:
+                    assignments.append(current_eq_template.format(k=k, v=i))
+            except:
+                warnings.warn("Could not confirm all currents are linear in v. Dufort-Frankel may not be stable.")
+                assignments.append(convert_func(getattr(mechanism, k), assign))
     return "\n".join(assignments)
+
+
+def gtot(currents, mechanism, df):
+    if not df:
+        return "    def gtot(self): return torch.tensor(0.0)"
+    assignments = []
+    for k in currents:
+        code_block = get_function_body_as_str(getattr(mechanism, k))
+        try:
+            _, b = factor_linear_in_x_from_codeblock(replace_v(code_block))
+            assignments.append(b)
+        except:
+            pass
+    if not assignments:
+        return "    def gtot(self): return torch.tensor(0.0)"
+    s =  " + ".join(assignments)
+    return f"    def gtot(self): return {s}"
 
 
 def load(m, attr):
@@ -308,7 +420,7 @@ def assigned_str_f(assigned):
     return "\n".join(assignments)
 
 
-def compile_mechanism(mechanism, temp, n_ax, n_nodes, ic=None, **kwargs):
+def compile_mechanism(mechanism, temp, n_ax, n_nodes, df=False, ic=None, **kwargs):
     states = mechanism._states
 
     params = load(mechanism, "_params")
@@ -360,7 +472,7 @@ def compile_mechanism(mechanism, temp, n_ax, n_nodes, ic=None, **kwargs):
     advance_str = advance(states)
     advance_str = indent(advance_str, 2)
 
-    current_equations_str = current_equations(current_eqs, mechanism, range_vars)
+    current_equations_str = current_equations(current_eqs, mechanism, range_vars, df)
     current_equations_str = indent(current_equations_str, 1)
 
     assigned_str = assigned_str_f(assigned)
@@ -376,7 +488,7 @@ def compile_mechanism(mechanism, temp, n_ax, n_nodes, ic=None, **kwargs):
         current_equations=current_equations_str,
         breakpoint_f=translate_f(mechanism, "breakpoint"),
         initial_f=translate_f(mechanism, "initial"),
-        gtot=gtot(mechanism),
+        gtot=gtot(current_eqs, mechanism, df),
     )
 
     filename = f"<{mechanism.__name__}_template>"
