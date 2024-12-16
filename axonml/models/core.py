@@ -650,7 +650,7 @@ class Unmyelinated(Axon):
         }
     )
 
-    def __init__(self, n_ax, L=1.0, dx=10.0, temp=37, v_init=-80, method="euler"):
+    def __init__(self, n_ax, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"):
         L = L * 1000  # mm -> um
         n_node = L / dx
         n_node = math.ceil(n_node) // 2 * 2 + 1
