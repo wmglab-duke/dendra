@@ -2,8 +2,6 @@ import ast
 import textwrap
 import inspect
 
-import ast
-
 
 def transform_function(source: str, assign_return: bool = True) -> str:
     # Parse the source into an AST

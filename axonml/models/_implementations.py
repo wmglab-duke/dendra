@@ -2,7 +2,7 @@ from typing import List
 
 import torch
 from torch import Tensor
-from torch import expm1, sigmoid as expit
+from torch import sigmoid as expit
 from .mechanisms.ops import exprelr
 
 from ._core import Axon

@@ -2,6 +2,7 @@ import math
 from typing import List, Tuple, Optional, Dict, Callable
 import re
 import itertools
+import warnings
 
 import torch
 from torch import Tensor
@@ -145,7 +146,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ],
         }
 
-        self.nc = {"rk1": 2, "rk4":2, "dufort-frankel": 3}
+        self.nc = {"rk1": 2, "rk4": 2, "dufort-frankel": 3}
 
         # solver stuff
         weight = self.weight_choices[method]
@@ -207,9 +208,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         df = self.method == "dufort-frankel"
 
-        m = compile_mechanism(
-            mechanism, self.temp, self.n_ax, self.n_node, ic=ic, df=df, **kwargs
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("once")
+            m = compile_mechanism(
+                mechanism, self.temp, self.n_ax, self.n_node, ic=ic, df=df, **kwargs
+            )
 
         self._m_list.append(m)
         self._m_name.append(mechanism.__name__)
@@ -333,7 +336,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.temp_c = torch.tensor(self.temp, device=self.device(), dtype=self.dtype())
 
         method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
-        method_intra = getattr(self, f"step_intra_{self.method_conversion[self.method]}")
+        method_intra = getattr(
+            self, f"step_intra_{self.method_conversion[self.method]}"
+        )
 
         df = self.method == "dufort-frankel"
 
@@ -421,13 +426,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     @torch.jit.script_method
     def initialize(self, v, v_init, area, temp):
         self.mech.initialize(v, v_init, area, temp)
-    
+
     def FRK(self, v, ve, area, cm, ra):
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)
         i_ion = self.mech.i(v) * area
         return cm * ((ra * d2v) - i_ion)
-    
+
     def FRK_intra(self, v, ve, area, cm, ra, intra):
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)
@@ -444,31 +449,20 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ra,
         dt,
     ) -> Tensor:
-        
         self.mech.advance(v, dt)
         K1 = self.FRK(v, ve, area, cm, ra)
         v = v + K1 * dt
 
         return v
-    
+
     @torch.jit.script_method
-    def step_intra_rk1(
-        self,
-        v,
-        ve,
-        area,
-        cm,
-        ra,
-        dt,
-        intra
-    ) -> Tensor:
-        
+    def step_intra_rk1(self, v, ve, area, cm, ra, dt, intra) -> Tensor:
         self.mech.advance(v, dt)
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         v = v + K1 * dt
 
         return v
-    
+
     @torch.jit.script_method
     def step_no_intra_rk4(
         self,
@@ -479,19 +473,18 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ra,
         dt,
     ) -> Tensor:
-        
         self.mech.advance(v, dt)
 
         # -- update vm --
         K1 = self.FRK(v, ve, area, cm, ra)
-        K2 = self.FRK(v + (dt/2)*K1, ve, area, cm, ra)
-        K3 = self.FRK(v + (dt/2)*K2, ve, area, cm, ra)
-        K4 = self.FRK(v + dt*K3, ve, area, cm, ra)
+        K2 = self.FRK(v + (dt / 2) * K1, ve, area, cm, ra)
+        K3 = self.FRK(v + (dt / 2) * K2, ve, area, cm, ra)
+        K4 = self.FRK(v + dt * K3, ve, area, cm, ra)
 
-        v = v + (dt/6) * (K1 + 2*K2 + 2*K3 + K4)
+        v = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
 
         return v
-    
+
     @torch.jit.script_method
     def step_intra_rk4(
         self,
@@ -503,24 +496,20 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         dt,
         intra,
     ) -> Tensor:
-        
         self.mech.advance(v, dt)
 
         # -- update vm --
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
-        K2 = self.FRK_intra(v + (dt/2)*K1, ve, area, cm, ra, intra)
-        K3 = self.FRK_intra(v + (dt/2)*K2, ve, area, cm, ra, intra)
-        K4 = self.FRK_intra(v + dt*K3, ve, area, cm, ra, intra)
+        K2 = self.FRK_intra(v + (dt / 2) * K1, ve, area, cm, ra, intra)
+        K3 = self.FRK_intra(v + (dt / 2) * K2, ve, area, cm, ra, intra)
+        K4 = self.FRK_intra(v + dt * K3, ve, area, cm, ra, intra)
 
-        v = v + (dt/6) * (K1 + 2*K2 + 2*K3 + K4)
+        v = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
 
         return v
 
     @torch.jit.script_method
-    def step_no_intra_df(
-        self, v, v_prev, ve, area, s, s2, dt
-    ) -> Tuple[Tensor, Tensor]:
-        
+    def step_no_intra_df(self, v, v_prev, ve, area, s, s2, dt) -> Tuple[Tensor, Tensor]:
         self.mech.advance(v, dt)
 
         # -- 2nd diff --
@@ -531,17 +520,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         i_ion = self.mech.i(v_prev) * area
 
         # -- update vm --
-        v_new = (v_prev + s2 * d2v - s * i_ion) / (
-            1 + s2 + s * self.mech.gtot() * area
-        )
+        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area)
 
         return v_new, v
-    
+
     @torch.jit.script_method
     def step_intra_df(
         self, v, v_prev, ve, area, s, s2, dt, intra
     ) -> Tuple[Tensor, Tensor]:
-        
         self.mech.advance(v, dt)
 
         # -- 2nd diff --
@@ -552,9 +538,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         i_ion = self.mech.i(v_prev) * area - intra
 
         # -- update vm --
-        v_new = (v_prev + s2 * d2v - s * i_ion) / (
-            1 + s2 + s * self.mech.gtot() * area
-        )
+        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area)
 
         return v_new, v
 
@@ -660,7 +644,7 @@ class Unmyelinated(Axon):
 
     def x(self) -> torch.Tensor:
         l = (self.n_node - 1) * self.dx
-        return torch.linspace(-l/2, l/2, self.n_node)
+        return torch.linspace(-l / 2, l / 2, self.n_node)
 
     def area_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)

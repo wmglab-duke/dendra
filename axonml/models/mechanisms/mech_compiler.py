@@ -6,6 +6,8 @@ import ast
 import re
 
 import warnings
+from sympy import symbols, sympify, Poly, expand, factor
+
 
 import torch
 
@@ -24,25 +26,22 @@ def indent(text, level=0):
 def replace_v(code_str):
     # Use a regex with word boundaries to ensure only standalone 'v' is replaced.
     # The replacement inserts '(v + v_n) / 2' in place of v.
-    return re.sub(r'\bv\b', '(v + v_n) / 2', code_str)
+    return re.sub(r"\bv\b", "(v + v_n) / 2", code_str)
 
 
-import re
-from sympy import symbols, sympify, Poly, expand, factor
+def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
+    lines = code_str.strip().split("\n")
 
-def factor_linear_in_x_from_codeblock(code_str, x_var='v_n'):
-    lines = code_str.strip().split('\n')
-    
     # Identify self-prefixed variables
-    pattern = r'self\.(\w+)'
+    pattern = r"self\.(\w+)"
     self_vars_all = re.findall(pattern, code_str)
     self_mapping = {var: f"self.{var}" for var in self_vars_all}
-    
+
     env = {}
-    
+
     def parse_expr(expr_str):
         # Extract potential variables
-        potential_vars = set(re.findall(r'[a-zA-Z_]\w*', expr_str))
+        potential_vars = set(re.findall(r"[a-zA-Z_]\w*", expr_str))
         for var in potential_vars:
             if var not in env:
                 env[var] = symbols(var, real=True)
@@ -55,23 +54,23 @@ def factor_linear_in_x_from_codeblock(code_str, x_var='v_n'):
         line = line.strip()
         if not line:
             continue
-        line_no_self = line.replace('self.', '')
-        
-        if line_no_self.startswith('return '):
-            return_expr_str = line_no_self[len('return '):].strip()
+        line_no_self = line.replace("self.", "")
+
+        if line_no_self.startswith("return "):
+            return_expr_str = line_no_self[len("return ") :].strip()
             final_expr = parse_expr(return_expr_str)
-        elif '=' in line_no_self:
-            lhs, rhs = line_no_self.split('=', 1)
+        elif "=" in line_no_self:
+            lhs, rhs = line_no_self.split("=", 1)
             var_name = lhs.strip()
             rhs_expr_str = rhs.strip()
             rhs_expr = parse_expr(rhs_expr_str)
             env[var_name] = rhs_expr
         else:
             final_expr = parse_expr(line_no_self)
-    
+
     if final_expr is None:
         raise ValueError("No final expression or return statement found.")
-    
+
     if x_var not in env:
         env[x_var] = symbols(x_var, real=True)
     x = env[x_var]
@@ -79,10 +78,10 @@ def factor_linear_in_x_from_codeblock(code_str, x_var='v_n'):
     # Factor the final_expr as A + B*x
     expr_expanded = expand(final_expr)
     p = Poly(expr_expanded, x)
-    
+
     if p.degree() != 1:
         raise ValueError("Expression is not linear in x.")
-    
+
     A = p.eval(0)
     B = p.coeff_monomial(x)
 
@@ -96,8 +95,8 @@ def factor_linear_in_x_from_codeblock(code_str, x_var='v_n'):
 
     # Restore self. prefixes
     for var in sorted(self_mapping.keys(), key=len, reverse=True):
-        A_str = re.sub(rf'\b{var}\b', self_mapping[var], A_str)
-        B_str = re.sub(rf'\b{var}\b', self_mapping[var], B_str)
+        A_str = re.sub(rf"\b{var}\b", self_mapping[var], A_str)
+        B_str = re.sub(rf"\b{var}\b", self_mapping[var], B_str)
 
     return A_str, B_str
 
@@ -186,6 +185,7 @@ else:
 self.{state}[:] = buffer_tensor
 """
 
+
 def extract_multipliers(class_def_str: str) -> List[str]:
     """
     Extracts all expressions that precede any expression matching '* (v - <x>)'
@@ -219,7 +219,7 @@ def extract_multipliers(class_def_str: str) -> List[str]:
                 return False
 
             # Check if left operand is 'v'
-            if not (isinstance(node.left, ast.Name) and node.left.id == 'v'):
+            if not (isinstance(node.left, ast.Name) and node.left.id == "v"):
                 return False
 
             # Check if right operand is a Name or Attribute
@@ -232,13 +232,17 @@ def extract_multipliers(class_def_str: str) -> List[str]:
             # Check if the operation is multiplication
             if isinstance(node.op, ast.Mult):
                 # Check the right operand for (v - x)
-                if isinstance(node.right, ast.BinOp) and self.is_target_subtraction(node.right):
+                if isinstance(node.right, ast.BinOp) and self.is_target_subtraction(
+                    node.right
+                ):
                     multiplier_expr = node.left
                     multiplier_str = ast.unparse(multiplier_expr).strip()
                     self.multipliers.append(multiplier_str)
 
                 # Check the left operand for (v - x)
-                elif isinstance(node.left, ast.BinOp) and self.is_target_subtraction(node.left):
+                elif isinstance(node.left, ast.BinOp) and self.is_target_subtraction(
+                    node.left
+                ):
                     multiplier_expr = node.right
                     multiplier_str = ast.unparse(multiplier_expr).strip()
                     self.multipliers.append(multiplier_str)
@@ -362,7 +366,9 @@ def current_equations(currents, mechanism, range_vars, df):
                 else:
                     assignments.append(current_eq_template.format(k=k, v=i))
             except:
-                warnings.warn("Could not confirm all currents are linear in v. Dufort-Frankel may not be stable.")
+                warnings.warn(
+                    "Could not confirm all currents are linear in v. Dufort-Frankel may not be stable."
+                )
                 assignments.append(convert_func(getattr(mechanism, k), assign))
     return "\n".join(assignments)
 
@@ -380,7 +386,7 @@ def gtot(currents, mechanism, df):
             pass
     if not assignments:
         return "    def gtot(self): return torch.tensor(0.0)"
-    s =  " + ".join(assignments)
+    s = " + ".join(assignments)
     return f"    def gtot(self): return {s}"
 
 
