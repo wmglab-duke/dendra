@@ -10,7 +10,7 @@ class d(State):
     PARAMETER(
         Q10can=4.30,
         Q10TempA=22.85,
-        Q10TempB=10,
+        Q10TempB=10.0,
         shiftcan=-7.0,
         V0p5d=20.0,
         S0p5d=-4.5,
@@ -43,7 +43,7 @@ class f1(State):
     PARAMETER(
         Q10can=4.30,
         Q10TempA=22.85,
-        Q10TempB=10,
+        Q10TempB=10.0,
         shiftcan=-7.0,
         V0p5f1=20.0,
         S0p5f1=25.0,
@@ -78,7 +78,7 @@ class f2(State):
     PARAMETER(
         Q10can=4.30,
         Q10TempA=22.85,
-        Q10TempB=10,
+        Q10TempB=10.0,
         shiftcan=-7.0,
         V0p5f2=40.0,
         S0p5f2=10.0,
@@ -110,7 +110,7 @@ class f2(State):
 class can(Mechanism):
     STATE(d, f1, f2)
 
-    PARAMETER(gbar=0.000106103, R=8314, z=2, ecaoffset=78.7, F=96500)
+    PARAMETER(gbar=0.000106103, R=8314.0, z=2, ecaoffset=78.7, F=96500)
 
     USEION("ca", read=["cao", "cai"], write=["ica"])
 

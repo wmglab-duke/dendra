@@ -36,7 +36,6 @@ class Ion(torch.nn.Module):
 
   @torch.jit.export
   def advance(self, temp) -> None:
-    {read_c_self}
     self.eadvance(temp)
 
   def einit(self, temp) -> None:

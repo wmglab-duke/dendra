@@ -61,9 +61,10 @@ def convert(deriv, state, assigned, use_pade_approx=False):
 
 template = """
 class state(torch.nn.Module):
-    def __init__(self, temp, is_q10: bool, name: str, params):
+    def __init__(self, temp, diameters, is_q10: bool, name: str, params):
         super().__init__()
         self.instantiate_parameters(params)
+        self.register_buffer("diam", diameters[:, None, None])
         self.temp = temp
         self._name = name
         self.is_q10 = is_q10
@@ -218,7 +219,7 @@ def integrate_args(assigned):
     return ", " + ", ".join(assigned)
 
 
-def compile_state(s, temp):
+def compile_state(s, temp, diameters):
     state_name = s.__name__
     params = load(s, "_params")
     assigned = load(s, "_assigned")
@@ -257,6 +258,6 @@ def compile_state(s, temp):
     lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
-    m = torch.jit.script(locals()["state"](temp, is_q10, state_name, params))
+    m = locals()["state"](temp, diameters, is_q10, state_name, params)
 
     return m

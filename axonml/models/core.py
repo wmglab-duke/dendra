@@ -7,6 +7,8 @@ import warnings
 import torch
 from torch import Tensor
 
+from tqdm.auto import tqdm
+
 from axonml import trained
 from .callbacks import CallbackList, Callback
 from .backend import Backend as A
@@ -96,7 +98,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     __constants__ = ["method", "n_ax", "n_node", "temp", "v_init"]
 
-    def __init__(self, n_ax: int, n_node: int, temp=37.0, v_init=-80.0, method="rk1"):
+    def __init__(self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1"):
         super().__init__()
 
         self.method_conversion = {
@@ -110,8 +112,15 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 f"Invalid method: {method}. Valid methods: {list(self.method_conversion.keys())}"
             )
 
+        # self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
+
+        self.register_buffer("diam", torch.as_tensor(diameters))
+        self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
+        self.register_buffer("cm_c", self.cm_(self.area_c))
+        self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
+
         self.method = method
-        self.n_ax = n_ax
+        self.n_ax = len(diameters)
         self.n_node = n_node
         self.temp = temp
         self.v_init = v_init
@@ -159,14 +168,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for p in self.ssd.parameters():
             p.requires_grad = False
 
-        self.register_buffer("v", torch.full((n_ax, 1, n_node), v_init))
+        self.register_buffer("v", torch.full((self.n_ax, 1, n_node), v_init))
         if method == "dufort-frankel":
-            self.register_buffer("v_prev", torch.full((n_ax, 1, n_node), v_init))
+            self.register_buffer("v_prev", torch.full((self.n_ax, 1, n_node), v_init))
 
         self.initialized: bool = False
 
         # -- constants --
-        self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
         self.eval()
 
     def unfreeze(self, *names):
@@ -211,7 +219,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         with warnings.catch_warnings():
             warnings.simplefilter("once")
             m = compile_mechanism(
-                mechanism, self.temp, self.n_ax, self.n_node, ic=ic, df=df, **kwargs
+                mechanism,
+                self.temp,
+                self.diam,
+                self.n_ax,
+                self.n_node,
+                ic=ic,
+                df=df,
+                **kwargs,
             )
 
         self._m_list.append(m)
@@ -294,8 +309,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             )
             for m in self._m_list:
                 m.register_ion(ions[ion])
-                if m._name in self._ion_write_c.get(ion, {}):
-                    ions[ion].register_write_c(m)
+                # if m._name in self._ion_write_c.get(ion, {}):
+                #    ions[ion].register_write_c(m)
 
         self.mech = build_handler(
             self._m_list,
@@ -322,11 +337,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def run(
         self,
         ve: Tensor,
-        diameters: Tensor,
         dt: float = None,
         intra: Optional[Tensor] = None,
         callbacks: List[Callback] = None,
         reinit: bool = False,
+        progressbar: bool = True,
     ):
         with_intra = intra is not None
 
@@ -353,13 +368,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     c.dt = dt
 
             ve = torch.as_tensor(ve, device=device)
-            diameters = torch.as_tensor(diameters, device=device)
 
             if (not self.initialized) or reinit:
                 self.init_v()
-                self.area_c = self.area_(diameters)[:, None, None]
-                self.cm_c = self.cm_(self.area_c)
-                self.ra_c = self.ra_(diameters)[:, None, None]
                 self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
                 self.post_initialize()
                 self.initialized = True
@@ -374,7 +385,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 cm_inv = 1 / self.cm_c
                 ra_inv = 1 / self.ra_c
 
-            for i in range(len(ve)):
+            for i in tqdm(range(ve.shape[0]), desc="Running", disable=not progressbar):
                 if df:
                     if with_intra:
                         self.v, self.v_prev = method_intra(
@@ -564,9 +575,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def compile(self, callbacks: List[Callback] = None):
         ve = torch.ones(1, self.n_ax, 1, self.n_node, device=self.device())
-        d = 5 * torch.ones(self.n_ax, device=self.device())
         for _ in range(5):
-            self.run(ve, d, callbacks=callbacks)
+            self.run(ve, callbacks=callbacks, progressbar=False)
         self.initialized = False
         if callbacks:
             for c in callbacks:
@@ -635,12 +645,12 @@ class Unmyelinated(Axon):
         }
     )
 
-    def __init__(self, n_ax, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"):
+    def __init__(self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"):
         L = L * 1000  # mm -> um
         n_node = L / dx
         n_node = math.ceil(n_node) // 2 * 2 + 1
-        super().__init__(n_ax, n_node, temp, v_init, method)
         self.dx: float = dx
+        super().__init__(diameters, n_node, temp, v_init, method)
 
     def x(self) -> torch.Tensor:
         l = (self.n_node - 1) * self.dx
@@ -648,12 +658,12 @@ class Unmyelinated(Axon):
 
     def area_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)
-        return self.pi * (diameters / 10000) * dx
+        return torch.pi * (diameters / 10000) * dx
 
     def ra_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)
         radii = diameters / 20000
-        return (self.rhoa * dx) / (self.pi * (radii**2))
+        return (self.rhoa * dx) / (torch.pi * (radii**2))
 
 
 class Myelinated(Axon):
@@ -681,12 +691,12 @@ class Myelinated(Axon):
 
     def area_(self, diameters):
         lengths = torch.ones_like(diameters) / 10000
-        return self.pi * self.nodeD(diameters) * lengths  # cm2
+        return torch.pi * self.nodeD(diameters) * lengths  # cm2
 
     def ra_(self, diameters):
         radii = diameters / 20000  # radius in cm
         rhoa = self.rhoa * self.rhoa_scale(diameters)
-        return (rhoa * self.deltax(diameters)) / (self.pi * (radii**2))
+        return (rhoa * self.deltax(diameters)) / (torch.pi * (radii**2))
 
     def rhoa_scale(self, diameters):
         return 1 / ((self.axonD(diameters) / diameters) ** 2)

@@ -104,10 +104,11 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
 template = """
 class mech(torch.nn.Module):
     _init_params: Dict[str, float]
-    def __init__(self, temp, n_ax, n_nodes, name: str, params, read_ion, states, conductances, init, ic: dict = None, **kwargs):
+    def __init__(self, temp, diameters, n_ax, n_nodes, name: str, params, read_ion, write_ion_c, states, conductances, init, ic: dict = None, **kwargs):
         super().__init__()
         self.instantiate_parameters(params, **kwargs)
         self.temp = temp
+        self.register_buffer("diam", diameters[:, None, None])
         self._name = name
         self.DE = torch.nn.ModuleDict(
             {{state._name: state for state in states}}
@@ -124,6 +125,7 @@ class mech(torch.nn.Module):
         self.n_ax = n_ax
         self.n_nodes = n_nodes
         self.read_ion = read_ion
+        self.write_ion_c = write_ion_c
 
 {state_buffer_assignments}
 
@@ -135,6 +137,12 @@ class mech(torch.nn.Module):
         name = ion.name
         if name in self.read_ion:
             for v in self.read_ion[name]:
+                self.register_buffer(v, getattr(ion, v))
+                for _, s in self.DE.items():
+                    s.register_buffer(v, getattr(ion, v))
+
+        if name in self.write_ion_c:
+            for v in self.write_ion_c[name]:
                 self.register_buffer(v, getattr(ion, v))
 
     def instantiate_parameters(self, params, **kwargs):
@@ -426,7 +434,9 @@ def assigned_str_f(assigned):
     return "\n".join(assignments)
 
 
-def compile_mechanism(mechanism, temp, n_ax, n_nodes, df=False, ic=None, **kwargs):
+def compile_mechanism(
+    mechanism, temp, diameters, n_ax, n_nodes, df=False, ic=None, **kwargs
+):
     states = mechanism._states
 
     params = load(mechanism, "_params")
@@ -440,6 +450,8 @@ def compile_mechanism(mechanism, temp, n_ax, n_nodes, df=False, ic=None, **kwarg
     read_ion = load(mechanism, "_read_ion")
     write_ion = load(mechanism, "_write_ion")
     write_ion_c = load(mechanism, "_write_ion_c")
+
+    states = [state for state in states if state.__name__ not in write_ion_c]
 
     current_eqs = []
     for k, v in currents.items():
@@ -505,15 +517,17 @@ def compile_mechanism(mechanism, temp, n_ax, n_nodes, df=False, ic=None, **kwarg
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
     name = mechanism.__name__
 
-    states = [compile_state(s, temp) for s in states]
+    states = [compile_state(s, temp, diameters) for s in states]
 
     m = locals()["mech"](
         temp,
+        diameters,
         n_ax,
         n_nodes,
         name,
         params,
         read_ion,
+        write_ion_c,
         states,
         conductances,
         init,

@@ -9,14 +9,7 @@ from ..mechanisms.ops import *
 class h(State):
     USEQ10()
 
-    PARAMETER(
-        aq10=3.3, 
-        bq10=23, 
-        cq10=10, 
-        vhh=-49.9, 
-        kh=4.6, 
-        shift=-15
-    )
+    PARAMETER(aq10=3.3, bq10=23, cq10=10, vhh=-49.9, kh=4.6, shift=-15.0)
 
     DERIVATIVE("h' = (hinf - h) / tauh")
     ASSIGNED("hinf", "tauh")
@@ -26,23 +19,17 @@ class h(State):
 
     def breakpoint(self, v):
         hinf = sigmoid((v - self.vhh + self.shift) / -self.kh)
-        tauh = self.calc_q10() * (20 + 50 * exp(-((v+40)**2)/(2*40**2)))
-        tauh = torch.where(tauh < 5, 5.0, tauh)
+        tauh = 20 + 50 * exp(-((v + 40) ** 2) / (2 * 40**2))
+        tauh = self.q10() * torch.where(tauh < 5, 5.0, tauh)
 
     def inf(self, v):
         return sigmoid((v - self.vhh + self.shift) / -self.kh)
-    
+
 
 class m(State):
     USEQ10()
 
-    PARAMETER(
-        aq10=3.3, 
-        bq10=23, 
-        cq10=10,
-        vhm=-5.4,
-        km=16.4
-    )
+    PARAMETER(aq10=3.3, bq10=23.0, cq10=10.0, vhm=-5.4, km=16.4, shift=-15.0)
 
     DERIVATIVE("m' = (minf - m) / taum")
     ASSIGNED("minf", "taum")
@@ -50,28 +37,20 @@ class m(State):
     def calc_q10(self):
         return 1 / (self.aq10 ** ((self.temp - self.bq10) / self.cq10))
 
-    def alpha(self, v):
-        return 0.00395 * exp((v + 30) / 40)
-    
-    def beta(self, v):
-        return 0.00395 * exp(-(v + 30) / 20)
-    
     def breakpoint(self, v):
-        a = self.alpha(v)
-        b = self.beta(v)
-        finf = sigmoid((v + 30) / 6)
-        tauf = self.calc_q10() / (a + b)
+        minf = sigmoid((v - self.vhm + self.shift) / self.km) ** 4
+        taum = self.q10() * (0.25 + 10.04 * exp(-((v + 24.67) ** 2) / (2 * 34.8**2)))
 
     def inf(self, v):
-        return sigmoid((v + 30) / 6)
-    
+        return sigmoid((v - self.vhm + self.shift) / self.km) ** 4
 
-class ks(Mechanism):
-    STATE(s, f)
+
+class kf(Mechanism):
+    STATE(m, h)
 
     PARAMETER(gbar=0.0001)
 
     USEION("k", read=["ek"], write=["ik"])
 
     def ik(self, v):
-        return self.gbar * (0.25 * self.s + 0.75 * self.f) * (v - self.ek)
+        return self.gbar * self.m * self.h * (v - self.ek)
