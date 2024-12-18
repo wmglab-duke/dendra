@@ -16,6 +16,11 @@ CINIT = {
 }
 
 
+def valid_concentrations():
+    global CINIT
+    return [s[:-1] for s in CINIT.keys()]
+
+
 def reversals():
     global REVERSAL
     return REVERSAL

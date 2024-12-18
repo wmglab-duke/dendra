@@ -81,12 +81,12 @@ class s(State):
         aq10=2.5,
         bq10=21,
         cq10=10,
-        A_as=0.001,
-        B_as=0.0,
-        C_as=0.0,
-        A_bs=0.0001,
-        B_bs=0.0,
-        C_bs=0.0,
+        A_as=0.00092,
+        B_as=93.9,
+        C_as=16.6,
+        A_bs=-132.05,
+        B_bs=-384.9,
+        C_bs=28.5,
     )
 
     DERIVATIVE("s' = (sinf - s) / taus")

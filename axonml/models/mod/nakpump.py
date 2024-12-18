@@ -19,7 +19,7 @@ class nakpump(Mechanism):
             / ((1.0 + self.b1 / self.ko) ** 2)
             * (
                 1.62 / (1.0 + (6.7 / (self.nai + 8.0)) ** 3)
-                + 1.0 / (1.0 + (67.6 / (self.nai + 8)) ** 3)
+                + 1.0 / (1.0 + (67.6 / (self.nai + 8.0)) ** 3)
             )
         )
 

@@ -13,4 +13,5 @@ class nao(State):
 
 
 class naoiTiger(Mechanism):
+    STATE(nai, nao)
     USEION("na", read=["ina"], write=["nao", "nai"])

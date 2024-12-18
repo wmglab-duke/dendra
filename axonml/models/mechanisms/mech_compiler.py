@@ -16,6 +16,7 @@ from .core import Mechanism
 from ..mixins import to_param
 from .ops import *
 
+from .handler.defaults import valid_concentrations
 from .state_compiler import compile_state
 
 
@@ -341,9 +342,14 @@ def advance(states):
     assignments = []
     for k in states:
         name = k.__name__
-        assignments.append(
-            f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
-        )
+        if name in valid_concentrations():
+            assignments.append(
+                f"self.{name}[:] = self.DE['{name}'].advance(self.{name}, v, dt)"
+                )
+        else:
+            assignments.append(
+                f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
+            )
     return "\n".join(assignments)
 
 
@@ -451,7 +457,7 @@ def compile_mechanism(
     write_ion = load(mechanism, "_write_ion")
     write_ion_c = load(mechanism, "_write_ion_c")
 
-    states = [state for state in states if state.__name__ not in write_ion_c]
+    states_no_conc = [state for state in states if state.__name__ not in valid_concentrations()]
 
     current_eqs = []
     for k, v in currents.items():
@@ -469,7 +475,7 @@ def compile_mechanism(
     )
     conductances_buffer_assignments_str = indent(conductances_buffer_assignments_str, 2)
 
-    state_buffer_assignments_str = state_buffer_assignments(states)
+    state_buffer_assignments_str = state_buffer_assignments(states_no_conc)
     state_buffer_assignments_str = indent(state_buffer_assignments_str, 2)
 
     current_buffer_assignments_str = current_buffer_assignments(current_eqs, range_vars)
@@ -481,7 +487,7 @@ def compile_mechanism(
     inflate_states_str = inflate_states(states)
     inflate_states_str = indent(inflate_states_str, 2)
 
-    init_state_buffers_str = init_state_buffers(states)
+    init_state_buffers_str = init_state_buffers(states_no_conc)
     init_state_buffers_str = indent(init_state_buffers_str, 2)
 
     init_conductance_buffers_str = init_conductance_buffers(conductances)
