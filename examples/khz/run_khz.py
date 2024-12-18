@@ -105,25 +105,21 @@ def longrun(
     dt,
     stims,
     field_stack,
-    diams,
     chunks=20,
-    count_only=True,
     with_intra=True,
     warmup=True,
 ):
     field_stack = torch.tensor(field_stack, device="cuda").float().unsqueeze(1)
-    diams_gpu = torch.tensor(diams, device="cuda").float()
 
     if warmup:
         print("warming up...")
 
         ve = torch.rand(1, len(field_stack) * len(stims), 1, nodes).float().cuda()
         intra = torch.zeros_like(ve).cuda()
-        dg = torch.rand(len(field_stack) * len(stims)).float().cuda()
 
         for _ in range(5):
             with torch.no_grad():
-                out = model.run(ve, dg, intra=intra, dt=dt)
+                _ = model.run(ve, intra=intra, dt=dt, progressbar=False)
 
     t_vec = np.arange(0, tstop, dt)
     views = np.array_split(t_vec, chunks)
@@ -131,14 +127,12 @@ def longrun(
     for i, t_chunk in enumerate(tqdm(views, desc="Running")):
         input_ve = []
         input_intra = []
-        input_diams = []
 
         for stim in stims:
             tc = stim(t=t_chunk).astype(np.float32)
             t_course = torch.tensor(tc, device="cuda")
             ve = torch.einsum("i, jkl -> ijkl", t_course, field_stack)
             input_ve.append(ve)
-            input_diams.append(diams_gpu)
             if with_intra:
                 intra = torch.zeros_like(ve)
                 i_stim = pulse_train(t_chunk, np.array([50, 60, 70, 80, 90]), rect(0.1))
@@ -146,7 +140,7 @@ def longrun(
                 input_intra.append(intra)
 
         input_ve = torch.cat(input_ve, 1)
-        input_diams = torch.cat(input_diams)
+
         if input_intra:
             input_intra = torch.cat(input_intra, 1)
         else:
@@ -158,11 +152,11 @@ def longrun(
                 reinit = True
             _ = model.run(
                 input_ve,
-                input_diams,
                 intra=input_intra,
                 dt=dt,
                 callbacks=[count],
                 reinit=reinit,
+                progressbar=False
             )
 
     return 0
@@ -175,11 +169,11 @@ frequencies = [1, 2, 5, 10]
 stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]
 
 
-mrg = SMF(len(diam) * len(stims), nodes).cuda().load("MRG")
+mrg = SMF(np.tile(diam, len(stims)).astype(np.float32), nodes).cuda().load("MRG")
 
 
 count.reset()
-_ = longrun(mrg, 100, 0.001, stims, field_stack, diam, chunks=400, warmup=True)
+_ = longrun(mrg, 100, 0.001, stims, field_stack, chunks=400, warmup=True)
 all_n = count.record.cpu().numpy()
 
 
