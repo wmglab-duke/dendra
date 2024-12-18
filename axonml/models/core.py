@@ -177,6 +177,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         # -- constants --
         self.eval()
 
+    def calculate_geometric_params(self):
+        self.area_c = self.area_(self.diam)[:, None, None]
+        self.cm_c = self.cm_(self.area_c)
+        self.ra_c = self.ra_(self.diam)[:, None, None]
+
     def unfreeze(self, *names):
         if not names:
             for p in self.parameters():
@@ -571,6 +576,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             )
         matched, _ = match_state_dict(self.state_dict(), state_dict)
         self.load_state_dict(matched, strict=False)
+        self.calculate_geometric_params()
         return self
 
     def compile(self, callbacks: List[Callback] = None):
