@@ -12,4 +12,5 @@ def allow_tf32(allow=True):
     torch.backends.cuda.matmul.allow_tf32 = allow
     torch.backends.cudnn.allow_tf32 = allow
 
+
 allow_tf32(False)
