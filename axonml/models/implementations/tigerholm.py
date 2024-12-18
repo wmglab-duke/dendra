@@ -22,7 +22,13 @@ class Tigerholm(Unmyelinated):
     PARAMETER(cm=1e-3, rhoa=35.4)
 
     def __init__(
-        self, diameters=[1.0], L=5.0, dx=10, temp=37.0, v_init=-55.0, method="rk1"
+        self,
+        diameters=[1.0],
+        L=5.0,
+        dx=10,
+        temp=37.0,
+        v_init=-55.0,
+        method="dufort-frankel",
     ):
         super().__init__(diameters, L, dx, temp, v_init, method)
 
@@ -38,7 +44,5 @@ class Tigerholm(Unmyelinated):
             self.insert(kna, gbar=0.00042)
             self.insert(naoiTiger)
             self.insert(koiTiger)
-            self.insert(
-                leak, gnaleak=2.0582549212196094e-05, gkleak=1.3155194197618722e-05
-            )
+            self.insert(leak, gnaleak=2.058e-05, gkleak=1.316e-05)
             self.build()

@@ -345,7 +345,7 @@ def advance(states):
         if name in valid_concentrations():
             assignments.append(
                 f"self.{name}[:] = self.DE['{name}'].advance(self.{name}, v, dt)"
-                )
+            )
         else:
             assignments.append(
                 f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
@@ -457,7 +457,9 @@ def compile_mechanism(
     write_ion = load(mechanism, "_write_ion")
     write_ion_c = load(mechanism, "_write_ion_c")
 
-    states_no_conc = [state for state in states if state.__name__ not in valid_concentrations()]
+    states_no_conc = [
+        state for state in states if state.__name__ not in valid_concentrations()
+    ]
 
     current_eqs = []
     for k, v in currents.items():
