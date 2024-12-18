@@ -6,9 +6,8 @@ from axonml.models.implementations import SMF
 from axonml.models.callbacks import APCount
 from axonml.instruments.fields import FEMInterpolate1D
 
-
 torch.set_default_dtype(torch.float32)
-torch.set_float32_matmul_precision("high")
+torch.set_float32_matmul_precision("highest")
 
 
 def deltax(diam):
@@ -124,6 +123,7 @@ def longrun(
     t_vec = np.arange(0, tstop, dt)
     views = np.array_split(t_vec, chunks)
 
+
     for i, t_chunk in enumerate(tqdm(views, desc="Running")):
         input_ve = []
         input_intra = []
@@ -169,8 +169,12 @@ frequencies = [1, 2, 5, 10]
 stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]
 
 
-mrg = SMF(np.tile(diam, len(stims)).astype(np.float32), nodes).cuda().load("MRG")
+input_diams = []
+for stim in stims:
+    input_diams.append(torch.tensor(diam, device="cuda").float())
+input_diams = torch.cat(input_diams)
 
+mrg = SMF(input_diams, nodes).cuda().load("MRG")
 
 count.reset()
 _ = longrun(mrg, 100, 0.001, stims, field_stack, chunks=400, warmup=True)
