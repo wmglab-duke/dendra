@@ -5,6 +5,11 @@ import random
 
 import torch
 import linecache
+import textwrap
+
+
+def indent(text, level=0):
+    return textwrap.indent(text, " " * (4 * level))
 
 
 template = """
@@ -18,6 +23,11 @@ class MechanismHandler(torch.nn.Module):
     self.init_buffers(v_init)
     self.ion_init(temp)
     self.i(v)
+
+  @torch.jit.export
+  def set_buffers(self):
+{set_buffers}
+    return
 
   def advance(self, v, dt) -> None:
     {mech_advance}
@@ -53,6 +63,36 @@ class MechanismHandler(torch.nn.Module):
     return [{all_states}]
     
 """
+
+
+set_buffer_template = """
+self.{mech}.{v}.set_(self.{ion}_ion.{v})
+for _, s in self.{mech}.DE.items():
+  s.{v}.set_(self.{ion}_ion.{v})
+"""
+
+
+set_ion_write_c_buffer_template = """
+self.{mech}.{v}.set_(self.{ion}_ion.{v})
+"""
+
+
+def parse_set_buffers(mechanisms, ions):
+    out = []
+    for m in mechanisms:
+        for ion in ions:
+            if ion in m.read_ion:
+                for v in m.read_ion[ion]:
+                    out.append(set_buffer_template.format(mech=m._name, v=v, ion=ion))
+            if ion in m.write_ion_c:
+                for v in m.write_ion_c[ion]:
+                    out.append(
+                        set_ion_write_c_buffer_template.format(
+                            mech=m._name, v=v, ion=ion
+                        )
+                    )
+    out = "\n".join(out)
+    return indent(out, 1)
 
 
 def parse_assignments(mechanism_names) -> str:
@@ -247,7 +287,10 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
         all_states=parse_all_states(mechanisms),
         gtot=gtot(mechanisms),
         breakpoint=breakpoint(mechanisms),
+        set_buffers=parse_set_buffers(mechanisms, list(ions.keys())),
     )
+
+    print(forward_str)
 
     filename = f"<{randomword(10)}_template>"
     code = compile(forward_str, filename, "exec")
@@ -261,5 +304,5 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
     else:
         inputs = mechanisms
 
-    m = torch.jit.script(locals()["MechanismHandler"](temp, *inputs))
+    m = locals()["MechanismHandler"](temp, *inputs)
     return m

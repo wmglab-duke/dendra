@@ -610,6 +610,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.load_state_dict(self._caches[name])
         self.initialized = True
 
+    def cuda(self):
+        super().cuda()
+        self.mech.set_buffers()
+        return self
+
+    def cpu(self):
+        super().cpu()
+        self.mech.set_buffers()
+        return self
+
 
 def match_state_dict(
     state_dict_a: Dict[str, torch.Tensor],
