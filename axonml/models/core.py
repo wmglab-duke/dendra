@@ -412,6 +412,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             s,
                             s2,
                             dt,
+                            self.temp_c
                         )
                 else:
                     if with_intra:
@@ -464,16 +465,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         cm,
         ra,
         dt,
+        temp
     ) -> Tensor:
-        self.mech.advance(v, dt)
+        self.mech.advance(v, dt, temp)
         K1 = self.FRK(v, ve, area, cm, ra)
         v = v + K1 * dt
 
         return v
 
     @torch.jit.script_method
-    def step_intra_rk1(self, v, ve, area, cm, ra, dt, intra) -> Tensor:
-        self.mech.advance(v, dt)
+    def step_intra_rk1(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
+        self.mech.advance(v, dt, temp)
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         v = v + K1 * dt
 
@@ -488,8 +490,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         cm,
         ra,
         dt,
+        temp
     ) -> Tensor:
-        self.mech.advance(v, dt)
+        self.mech.advance(v, dt, temp)
 
         # -- update vm --
         K1 = self.FRK(v, ve, area, cm, ra)
@@ -510,9 +513,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         cm,
         ra,
         dt,
+        temp,
         intra,
     ) -> Tensor:
-        self.mech.advance(v, dt)
+        self.mech.advance(v, dt, temp)
 
         # -- update vm --
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
@@ -525,8 +529,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return v
 
     @torch.jit.script_method
-    def step_no_intra_df(self, v, v_prev, ve, area, s, s2, dt) -> Tuple[Tensor, Tensor]:
-        self.mech.advance(v, dt)
+    def step_no_intra_df(self, v, v_prev, ve, area, s, s2, dt, temp) -> Tuple[Tensor, Tensor]:
+        self.mech.advance(v, dt, temp)
 
         # -- 2nd diff --
         x = torch.cat([v, v_prev, ve], dim=1)
@@ -542,9 +546,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def step_intra_df(
-        self, v, v_prev, ve, area, s, s2, dt, intra
+        self, v, v_prev, ve, area, s, s2, dt, temp, intra
     ) -> Tuple[Tensor, Tensor]:
-        self.mech.advance(v, dt)
+        self.mech.advance(v, dt, temp)
 
         # -- 2nd diff --
         x = torch.cat([v, v_prev, ve], dim=1)

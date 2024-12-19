@@ -29,8 +29,9 @@ class MechanismHandler(torch.nn.Module):
 {set_buffers}
     return
 
-  def advance(self, v, dt) -> None:
+  def advance(self, v, dt, temp) -> None:
     {mech_advance}
+    self.update(temp)
     return
 
   def gtot(self) -> torch.Tensor:
