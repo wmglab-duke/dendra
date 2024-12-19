@@ -22,7 +22,7 @@ class MechanismHandler(torch.nn.Module):
   def initialize(self, v, v_init, area, temp) -> None:
     self.init_buffers(v_init)
     self.ion_init(temp)
-    self.i(v)
+    self.itot(v)
 
   @torch.jit.export
   def set_buffers(self):
@@ -42,6 +42,10 @@ class MechanismHandler(torch.nn.Module):
     {currents}
     total = {total}
     return total
+
+  def itot(self, v):
+    {currents_tot}
+    return
 
   def update(self, temp) -> None:
     {ion_advance}
@@ -117,7 +121,9 @@ def parse_ions(ion_names) -> str:
     return ", ".join(result)
 
 
-def parse_current_string(s: str, total=False) -> str:
+def parse_current_string(s: str, total=False, write=True) -> str:
+    if not write:
+        return s
     pattern = r"^i([A-Za-z]+)$"
     match = re.match(pattern, s)
     if match:
@@ -132,21 +138,24 @@ def parse_current_string(s: str, total=False) -> str:
         return s
 
 
-def parse_dictionary_to_sum(data: dict, current: str) -> str:
+def parse_dictionary_to_sum(data: dict, current: str, df=False, write=True) -> str:
     if not data:
         return ""
     result = []
     for key, value_set in data.items():
         for value in value_set:
-            result.append(f"self.{key}.{value}(v)")
+            if df:
+                result.append(f"self.{key}.{value}_tot(v)")
+            else:
+                result.append(f"self.{key}.{value}(v)")
     s = " + ".join(result)
-    return f"{parse_current_string(current)} = {s}"
+    return f"{parse_current_string(current, write=write)} = {s}"
 
 
-def parse_currents(currents) -> str:
+def parse_currents(currents, write=True) -> str:
     result = []
     for key, value in currents.items():
-        result.append(parse_dictionary_to_sum(value, key))
+        result.append(parse_dictionary_to_sum(value, key, write=write))
     s = "\n    ".join(result)
     return s
 
@@ -159,8 +168,8 @@ def parse_scale(currents) -> str:
     return s
 
 
-def parse_total(currents) -> str:
-    s = " + ".join([parse_current_string(key, True) for key in currents.keys()])
+def parse_total(currents, write=True) -> str:
+    s = " + ".join([parse_current_string(key, True, write) for key in currents.keys()])
     return s
 
 
@@ -263,7 +272,15 @@ def breakpoint(mechanisms):
     return "\n    ".join(ret)
 
 
-def build_handler(mechanisms, names, currents, temp, ions=None):
+def tot_currents(currents, df=False):
+    result = []
+    for key, value in currents.items():
+        result.append(parse_dictionary_to_sum(value, key, df))
+    s = "\n    ".join(result)
+    return s
+
+
+def build_handler(mechanisms, names, currents, temp, ions=None, df=False):
     arguments = parse_args(names)
 
     all_names = names
@@ -277,8 +294,8 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
         arguments=arguments,
         assignments=parse_assignments(all_names),
         defaults=parse_defaults(ions),
-        currents=parse_currents(currents),
-        total=parse_total(currents),
+        currents=parse_currents(currents, write=not df),
+        total=parse_total(currents, write=not df),
         inflate=parse_inflate(names),
         mech_advance=parse_advance(names),
         init_buffers=parse_init_buffers(names),
@@ -289,9 +306,8 @@ def build_handler(mechanisms, names, currents, temp, ions=None):
         gtot=gtot(mechanisms),
         breakpoint=breakpoint(mechanisms),
         set_buffers=parse_set_buffers(mechanisms, list(ions.keys())),
+        currents_tot=tot_currents(currents, df),
     )
-
-    print(forward_str)
 
     filename = f"<{randomword(10)}_template>"
     code = compile(forward_str, filename, "exec")

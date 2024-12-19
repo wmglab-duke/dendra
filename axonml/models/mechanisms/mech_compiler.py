@@ -156,8 +156,8 @@ class mech(torch.nn.Module):
                     setattr(self, name, to_param(value))
 
     def _init_buffers_s(self, v_init):
-        self.initial(v_init)
 {init_state_buffers}
+        self.initial(v_init)
         for _, s in self.DE.items():
             s.initialize(v_init)
         return
@@ -386,14 +386,23 @@ def {k}(self, v):
 """
 
 
+current_tot_template = """
+def {k}_tot(self, v):
+{body}
+"""
+
+
 def current_equations(currents, mechanism, range_vars, df):
     assignments = []
     for k in currents:
         assign = k in range_vars
         if not df:
             assignments.append(convert_func(getattr(mechanism, k), assign))
+            code_block = get_function_body_as_str(getattr(mechanism, k))
+            assignments.append(current_tot_template.format(k=k, body=code_block))
         else:
             code_block = get_function_body_as_str(getattr(mechanism, k))
+            assignments.append(current_tot_template.format(k=k, body=code_block))
             try:
                 i, _ = factor_linear_in_x_from_codeblock(replace_v(code_block))
                 if assign:
@@ -542,8 +551,6 @@ def compile_mechanism(
         gtot=gtot(current_eqs, mechanism, df),
         coupled_infs=coupled_infs(mechanism, states_compiled),
     )
-
-    print(forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")

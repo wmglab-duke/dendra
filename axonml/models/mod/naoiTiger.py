@@ -8,7 +8,7 @@ class nai(State):
 
 
 class nao(State):
-    PARAMETER(FARADAY=96520, theta=29.0e-3, D=0.1e-6, naoinf=154.0)
+    PARAMETER(FARADAY=96520, theta=0.029, D=0.1e-6, naoinf=154.0)
     DERIVATIVE("nao' = (ina/FARADAY - 0.1*D*(nao-naoinf)) / theta*(1e4)")
 
 

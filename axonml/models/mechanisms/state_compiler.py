@@ -364,8 +364,6 @@ def compile_state(s, temp, diameters, **kwargs):
         initial_f=translate_initial(s),
     )
 
-    print(forward_str)
-
     filename = f"<{state_name}_{randomword(5)}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
@@ -415,8 +413,6 @@ def compile_coupled_state(s, temp, diameters, **kwargs):
         initial_f=translate_initial(s),
         helpers=collect_helper_functions(s),
     )
-
-    print(forward_str)
 
     filename = f"<{randomword(7)}_template>"
     code = compile(forward_str, filename, "exec")

@@ -8,7 +8,7 @@ class ki(State):
 
 
 class ko(State):
-    PARAMETER(FARADAY=96520, theta=29.0e-3, D=0.1e-6, koinf=5.6)
+    PARAMETER(FARADAY=96520, theta=0.029, D=0.1e-6, koinf=5.6)
     DERIVATIVE("ko' = (ik/FARADAY - 0.1*D*(ko-koinf)) / theta*(1e4)")
 
 

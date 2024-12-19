@@ -119,6 +119,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.register_buffer("cm_c", self.cm_(self.area_c))
         self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
 
+        self.register_buffer("v_init_c", torch.tensor(v_init))
+        self.register_buffer("temp_c", torch.tensor(temp))
+
         self.method = method
         self.n_ax = len(diameters)
         self.n_node = n_node
@@ -297,6 +300,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
         self._m_curr.update(_ion_write)
 
+        df = self.method == "dufort-frankel"
+
         ions = {}
         for ion in all_ions:
             ion_write_c = self._ion_write_c.get(ion, {})
@@ -318,11 +323,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 #    ions[ion].register_write_c(m)
 
         self.mech = build_handler(
-            self._m_list,
-            self._m_name,
-            self._m_curr,
-            self.temp,
-            ions,
+            self._m_list, self._m_name, self._m_curr, self.temp, ions, df
         )
 
     def area_(self, diameters):
@@ -349,11 +350,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         progressbar: bool = True,
     ):
         with_intra = intra is not None
-
-        self.v_init_c = torch.tensor(
-            self.v_init, device=self.device(), dtype=self.dtype()
-        )
-        self.temp_c = torch.tensor(self.temp, device=self.device(), dtype=self.dtype())
 
         method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
         method_intra = getattr(
@@ -401,6 +397,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             s,
                             s2,
                             dt,
+                            self.temp_c,
                             intra[i],
                         )
                     else:
@@ -423,16 +420,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             cm_inv,
                             ra_inv,
                             dt,
+                            self.temp_c,
                             intra[i],
                         )
                     else:
                         self.v = method(
-                            self.v,
-                            ve[i],
-                            self.area_c,
-                            cm_inv,
-                            ra_inv,
-                            dt,
+                            self.v, ve[i], self.area_c, cm_inv, ra_inv, dt, self.temp_c
                         )
                 callbacks.post_step_hook(self)
 
@@ -526,6 +519,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         # -- update vm --
         v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area)
 
+        self.mech.itot(v)
+
         return v_new, v
 
     @torch.jit.script_method
@@ -543,6 +538,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         # -- update vm --
         v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area)
+
+        self.mech.itot(v)
 
         return v_new, v
 

@@ -12,6 +12,7 @@ from ..mod import (
     naoiTiger,
     koiTiger,
     leak,
+    extrapump,
 )
 from ..mechanisms import PARAMETER
 from ..mechanisms.handler.defaults import c_context
@@ -43,5 +44,7 @@ class Tigerholm(Unmyelinated):
             self.insert(kna, gbar=0.00042)
             self.insert(naoiTiger)
             self.insert(koiTiger)
-            self.insert(leak, gnaleak=2.058e-05, gkleak=1.316e-05)
+            self.insert(
+                leak, gkleak=1.3155237866158132e-05, gnaleak=2.1094052499393e-05
+            )
             self.build()

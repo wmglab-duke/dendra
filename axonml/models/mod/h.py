@@ -62,6 +62,9 @@ class h(Mechanism):
 
     ASSIGNED("g")
 
+    def initial(self):
+        self.g = self.gbar * (0.5 * self.s + 0.5 * self.f)
+
     def breakpoint(self, v):
         self.g = self.gbar * (0.5 * self.s + 0.5 * self.f)
 
