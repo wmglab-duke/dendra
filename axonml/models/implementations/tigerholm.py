@@ -11,7 +11,6 @@ from ..mod import (
     kna,
     naoiTiger,
     koiTiger,
-    extrapump,
     leak,
 )
 from ..mechanisms import PARAMETER

@@ -8,6 +8,7 @@ from .declarations import (
     NONSPECIFIC_CURRENT,
     RANGE,
     ASSIGNED,
+    BUFFERS,
 )
 from .core import Mechanism, State
 from .handler.ions import USEION
@@ -27,4 +28,5 @@ __all__ = [
     "ion_register",
     "RANGE",
     "ASSIGNED",
+    "BUFFERS",
 ]

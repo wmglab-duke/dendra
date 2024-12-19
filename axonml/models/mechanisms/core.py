@@ -3,10 +3,17 @@ from typing import Tuple
 import torch
 
 
+def coupled(state):
+    return getattr(state, "coupled", False)
+
+
 class State:
     is_q10 = False
+    coupled = False
     _derivative: Tuple[str, bool] = None
     _assigned = set()
+    _initialized = set()
+    _buffers = set()
 
 
 @torch.jit.interface

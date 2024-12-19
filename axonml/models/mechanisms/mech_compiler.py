@@ -12,12 +12,12 @@ from sympy import symbols, sympify, Poly, expand, factor
 import torch
 
 from .compile_f import convert_func
-from .core import Mechanism
+from .core import Mechanism, coupled
 from ..mixins import to_param
 from .ops import *
 
 from .handler.defaults import valid_concentrations
-from .state_compiler import compile_state
+from .state_compiler import compile_state, compile_coupled_state
 
 
 def indent(text, level=0):
@@ -114,9 +114,6 @@ class mech(torch.nn.Module):
         self.DE = torch.nn.ModuleDict(
             {{state._name: state for state in states}}
         )
-
-        for n, _ in self.DE.items():
-            self.register_buffer(n, torch.tensor(0.0))
                 
         self._init_params: Dict[str, float] = {{k: v for k, v in init.items()}}
 
@@ -161,6 +158,8 @@ class mech(torch.nn.Module):
     def _init_buffers_s(self, v_init):
         self.initial(v_init)
 {init_state_buffers}
+        for _, s in self.DE.items():
+            s.initialize(v_init)
         return
 
     @torch.jit.ignore
@@ -181,6 +180,8 @@ class mech(torch.nn.Module):
 
 {breakpoint_f}
 
+{coupled_infs}
+
 {current_equations}
 
 {gtot}
@@ -193,6 +194,52 @@ else:
     buffer_tensor = self.DE['{state}'].inf(v_init)
 self.{state}[:] = buffer_tensor
 """
+
+init_state_buffers_coupled_template = """
+if '{state}' in self._init_params:
+    buffer_tensor = torch.tensor(self._init_params['{state}'], device=v_init.device, dtype=v_init.dtype)
+else:
+    buffer_tensor = self.{state}_inf(v_init)
+self.{state}[:] = buffer_tensor
+"""
+
+
+mech_inf_template = """
+def {state}_inf(self, v):
+    return torch.tensor(0.0, device=v.device, dtype=v.dtype)
+"""
+
+
+def coupled_infs(mechanism, states):
+    assignments = []
+    for k in states:
+        if k.coupled:
+            for name in k._state_names:
+                if name not in valid_concentrations():
+                    f = getattr(mechanism, f"{name}_inf", None)
+                    if f is not None:
+                        assignments.append(inspect.getsource(f))
+                    else:
+                        assignments.append(
+                            indent(mech_inf_template.format(state=name), 1)
+                        )
+    return "\n".join(assignments)
+
+
+def init_state_buffers(states):
+    assignments = []
+    for k in states:
+        if not k.coupled:
+            name = k._name
+            if name not in valid_concentrations():
+                assignments.append(init_state_buffer_template.format(state=name))
+        else:
+            for name in k._state_names:
+                if name not in valid_concentrations():
+                    assignments.append(
+                        init_state_buffers_coupled_template.format(state=name)
+                    )
+    return "\n".join(assignments)
 
 
 def extract_multipliers(class_def_str: str) -> List[str]:
@@ -273,27 +320,22 @@ def extract_multipliers(class_def_str: str) -> List[str]:
     return visitor.multipliers
 
 
-def conductances_init_assignments(conductances):
-    assignments = []
-    for k, _ in conductances.items():
-        assignments.append(f"self.{k}_init = to_param(conductances['{k}'])")
-    return "\n".join(assignments)
-
-
-def conductances_buffer_assignments(conductances):
-    assignments = []
-    for k, _ in conductances.items():
-        assignments.append(f"self.register_buffer('{k}', torch.tensor(0.0))")
-    return "\n".join(assignments)
-
-
 def state_buffer_assignments(states):
     assignments = []
     for k in states:
-        name = k.__name__
-        assignments.append(
-            f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
-        )
+        if not k.coupled:
+            name = k._name
+            if name not in valid_concentrations():
+                assignments.append(
+                    f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
+                )
+        else:
+            names = k._state_names
+            for name in names:
+                if name not in valid_concentrations():
+                    assignments.append(
+                        f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
+                    )
     return "\n".join(assignments)
 
 
@@ -307,22 +349,6 @@ def current_buffer_assignments(currents, range_vars):
     return "\n".join(assignments)
 
 
-def init_state_buffers(states):
-    assignments = []
-    for k in states:
-        name = k.__name__
-        assignments.append(init_state_buffer_template.format(state=name))
-    return "\n".join(assignments)
-
-
-def inflate_states(states):
-    assignments = []
-    for k in states:
-        name = k.__name__
-        assignments.append(f"self.{name} = self.{name}.expand(v.shape)")
-    return "\n".join(assignments)
-
-
 def init_conductance_buffers(conductances):
     assignments = []
     for k, _ in conductances.items():
@@ -330,26 +356,21 @@ def init_conductance_buffers(conductances):
     return "\n".join(assignments)
 
 
-def read_ion_buffers(read_ion):
-    assignments = []
-    for k, v in read_ion.items():
-        for v_ in v:
-            assignments.append(f"self.register_buffer('{v_}', torch.tensor(0.0))")
-    return "\n".join(assignments)
-
-
 def advance(states):
     assignments = []
     for k in states:
-        name = k.__name__
-        if name in valid_concentrations():
-            assignments.append(
-                f"self.{name}[:] = self.DE['{name}'].advance(self.{name}, v, dt)"
-            )
+        if k.coupled:
+            assignments.append(coupled_assignment(k))
         else:
-            assignments.append(
-                f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
-            )
+            name = k._name
+            if name in valid_concentrations():
+                assignments.append(
+                    f"self.{name}[:] = self.DE['{name}'].advance(self.{name}, v, dt)"
+                )
+            else:
+                assignments.append(
+                    f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
+                )
     return "\n".join(assignments)
 
 
@@ -440,6 +461,24 @@ def assigned_str_f(assigned):
     return "\n".join(assignments)
 
 
+def coupled_assignment(state):
+    name = state._name
+    states_names = state._state_names
+    template = "{lhs} = self.DE['{name}'].advance({rhs}, v, dt)"
+    lhs = []
+    rhs = []
+    for state_name in states_names:
+        if not state_name in valid_concentrations():
+            lhs.append(f"self.{state_name}")
+            rhs.append(f"self.{state_name}")
+        else:
+            lhs.append(f"self.{state_name}[:]")
+            rhs.append(f"self.{state_name}")
+    lhs = ", ".join(lhs)
+    rhs = ", ".join(rhs)
+    return template.format(name=name, lhs=lhs, rhs=rhs)
+
+
 def compile_mechanism(
     mechanism, temp, diameters, n_ax, n_nodes, df=False, ic=None, **kwargs
 ):
@@ -457,45 +496,32 @@ def compile_mechanism(
     write_ion = load(mechanism, "_write_ion")
     write_ion_c = load(mechanism, "_write_ion_c")
 
-    states_no_conc = [
-        state for state in states if state.__name__ not in valid_concentrations()
-    ]
-
     current_eqs = []
     for k, v in currents.items():
         current_eqs.extend(v)
     for _, v in write_ion.items():
         current_eqs.extend(v)
 
-    conductances_init_assignments_str = conductances_init_assignments(
-        mechanism._conductances
-    )
-    conductances_init_assignments_str = indent(conductances_init_assignments_str, 2)
+    states_compiled = []
+    for s in states:
+        if coupled(s):
+            states_compiled.append(compile_coupled_state(s, temp, diameters, **kwargs))
+        else:
+            states_compiled.append(compile_state(s, temp, diameters, **kwargs))
 
-    conductances_buffer_assignments_str = conductances_buffer_assignments(
-        mechanism._conductances
-    )
-    conductances_buffer_assignments_str = indent(conductances_buffer_assignments_str, 2)
-
-    state_buffer_assignments_str = state_buffer_assignments(states_no_conc)
+    state_buffer_assignments_str = state_buffer_assignments(states_compiled)
     state_buffer_assignments_str = indent(state_buffer_assignments_str, 2)
 
     current_buffer_assignments_str = current_buffer_assignments(current_eqs, range_vars)
     current_buffer_assignments_str = indent(current_buffer_assignments_str, 2)
 
-    read_ion_buffers_str = read_ion_buffers(read_ion)
-    read_ion_buffers_str = indent(read_ion_buffers_str, 2)
-
-    inflate_states_str = inflate_states(states)
-    inflate_states_str = indent(inflate_states_str, 2)
-
-    init_state_buffers_str = init_state_buffers(states_no_conc)
+    init_state_buffers_str = init_state_buffers(states_compiled)
     init_state_buffers_str = indent(init_state_buffers_str, 2)
 
     init_conductance_buffers_str = init_conductance_buffers(conductances)
     init_conductance_buffers_str = indent(init_conductance_buffers_str, 2)
 
-    advance_str = advance(states)
+    advance_str = advance(states_compiled)
     advance_str = indent(advance_str, 2)
 
     current_equations_str = current_equations(current_eqs, mechanism, range_vars, df)
@@ -507,7 +533,6 @@ def compile_mechanism(
     forward_str = template.format(
         state_buffer_assignments=state_buffer_assignments_str,
         current_buffer_assignments=current_buffer_assignments_str,
-        read_ion_buffers=read_ion_buffers_str,
         assigned=assigned_str,
         init_state_buffers=init_state_buffers_str,
         advance=advance_str,
@@ -515,7 +540,10 @@ def compile_mechanism(
         breakpoint_f=translate_f(mechanism, "breakpoint"),
         initial_f=translate_f(mechanism, "initial"),
         gtot=gtot(current_eqs, mechanism, df),
+        coupled_infs=coupled_infs(mechanism, states_compiled),
     )
+
+    print(forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
@@ -524,8 +552,6 @@ def compile_mechanism(
     lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
     name = mechanism.__name__
-
-    states = [compile_state(s, temp, diameters) for s in states]
 
     m = locals()["mech"](
         temp,
@@ -536,7 +562,7 @@ def compile_mechanism(
         params,
         read_ion,
         write_ion_c,
-        states,
+        states_compiled,
         conductances,
         init,
         ic=ic,

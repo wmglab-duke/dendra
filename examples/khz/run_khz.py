@@ -123,7 +123,6 @@ def longrun(
     t_vec = np.arange(0, tstop, dt)
     views = np.array_split(t_vec, chunks)
 
-
     for i, t_chunk in enumerate(tqdm(views, desc="Running")):
         input_ve = []
         input_intra = []
@@ -156,7 +155,7 @@ def longrun(
                 dt=dt,
                 callbacks=[count],
                 reinit=reinit,
-                progressbar=False
+                progressbar=False,
             )
 
     return 0
