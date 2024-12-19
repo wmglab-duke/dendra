@@ -412,7 +412,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             s,
                             s2,
                             dt,
-                            self.temp_c
+                            self.temp_c,
                         )
                 else:
                     if with_intra:
@@ -457,16 +457,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return cm * ((ra * d2v) - i_ion)
 
     @torch.jit.script_method
-    def step_no_intra_rk1(
-        self,
-        v,
-        ve,
-        area,
-        cm,
-        ra,
-        dt,
-        temp
-    ) -> Tensor:
+    def step_no_intra_rk1(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
         self.mech.advance(v, dt, temp)
         K1 = self.FRK(v, ve, area, cm, ra)
         v = v + K1 * dt
@@ -482,16 +473,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return v
 
     @torch.jit.script_method
-    def step_no_intra_rk4(
-        self,
-        v,
-        ve,
-        area,
-        cm,
-        ra,
-        dt,
-        temp
-    ) -> Tensor:
+    def step_no_intra_rk4(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
         self.mech.advance(v, dt, temp)
 
         # -- update vm --
@@ -529,7 +511,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return v
 
     @torch.jit.script_method
-    def step_no_intra_df(self, v, v_prev, ve, area, s, s2, dt, temp) -> Tuple[Tensor, Tensor]:
+    def step_no_intra_df(
+        self, v, v_prev, ve, area, s, s2, dt, temp
+    ) -> Tuple[Tensor, Tensor]:
         self.mech.advance(v, dt, temp)
 
         # -- 2nd diff --
