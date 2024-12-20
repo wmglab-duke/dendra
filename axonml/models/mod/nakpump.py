@@ -13,7 +13,7 @@ class nakpump(Mechanism):
     USEION("na", read=["nai"], write=["ina"])
     USEION("k", read=["ko"], write=["ik"])
 
-    def initial(self, v):
+    def initial(self):
         self.pump = (
             self.smalla
             / ((1.0 + self.b1 / self.ko) ** 2)

@@ -319,8 +319,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             )
             for m in self._m_list:
                 m.register_ion(ions[ion])
-                # if m._name in self._ion_write_c.get(ion, {}):
-                #    ions[ion].register_write_c(m)
 
         self.mech = build_handler(
             self._m_list, self._m_name, self._m_curr, self.temp, ions, df
@@ -348,6 +346,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         callbacks: List[Callback] = None,
         reinit: bool = False,
         progressbar: bool = True,
+        first: bool = True,
     ):
         with_intra = intra is not None
 
@@ -362,13 +361,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             device = self.device()
 
             dt = dt if dt is not None else A.dt
-            dt = torch.tensor(dt, device=device)
-
-            if callbacks:
-                for c in callbacks:
-                    c.dt = dt
-
-            ve = torch.as_tensor(ve, device=device)
 
             if (not self.initialized) or reinit:
                 self.init_v()
@@ -376,8 +368,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 self.post_initialize()
                 self.initialized = True
 
-            callbacks = CallbackList(callbacks)
-            callbacks.pre_loop_hook(self)
+            if first:
+                if callbacks:
+                    for c in callbacks:
+                        c.dt = dt
+
+                if not isinstance(callbacks, CallbackList):
+                    callbacks = CallbackList(callbacks)
+                callbacks.pre_loop_hook(self)
+
+            dt = torch.as_tensor(dt, device=device)
+            ve = torch.as_tensor(ve, device=device)
 
             if df:
                 s = 2 * dt / self.cm_c
@@ -386,7 +387,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 cm_inv = 1 / self.cm_c
                 ra_inv = 1 / self.ra_c
 
-            for i in tqdm(range(ve.shape[0]), desc="Running", disable=not progressbar):
+            if progressbar:
+                if not isinstance(progressbar, tqdm):
+                    progressbar = tqdm(total=ve.shape[0], desc="Running")
+
+            for i in range(ve.shape[0]):
                 if df:
                     if with_intra:
                         self.v, self.v_prev = method_intra(
@@ -428,6 +433,56 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             self.v, ve[i], self.area_c, cm_inv, ra_inv, dt, self.temp_c
                         )
                 callbacks.post_step_hook(self)
+
+                if progressbar:
+                    progressbar.update(1)
+
+    def longrun(
+        self,
+        ve_s: Tensor,
+        ve_t: Tensor,
+        n_chunks: int,
+        dt: float = None,
+        reinit=False,
+        callbacks: List[Callback] = None,
+        progressbar=True,
+    ):
+        ve_s = torch.as_tensor(ve_s, device=self.device())
+        ve_t = torch.as_tensor(ve_t, device=self.device())
+
+        # ve_s : [n_ax, n_node] or [1, n_node]
+        # ve_t : [n_ax, n_timesteps] or [1, n_timesteps]
+
+        ve_s = ve_s.expand(self.n_ax, -1)
+        ve_t = ve_t.expand(self.n_ax, -1)
+
+        dt = dt if dt is not None else A.dt
+
+        t_chunks = torch.tensor_split(ve_t, n_chunks, dim=1)
+
+        if progressbar:
+            progressbar = tqdm(total=ve_t.shape[1], desc="Running")
+
+        if callbacks:
+            for c in callbacks:
+                c.dt = dt
+
+        callbacks = CallbackList(callbacks)
+
+        for i, t_chunk in enumerate(t_chunks):
+            if (i == 0) and reinit:
+                reinit = True
+            else:
+                reinit = False
+            ve = torch.einsum("an,at->tan", ve_s, t_chunk).unsqueeze(2)
+            self.run(
+                ve,
+                dt,
+                callbacks=callbacks,
+                reinit=reinit,
+                progressbar=progressbar,
+                first=(i == 0),
+            )
 
     def post_initialize(self):
         for h in self.post_initialize_hooks:

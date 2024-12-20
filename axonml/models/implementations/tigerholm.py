@@ -12,7 +12,6 @@ from ..mod import (
     naoiTiger,
     koiTiger,
     leak,
-    extrapump,
 )
 from ..mechanisms import PARAMETER
 from ..mechanisms.handler.defaults import c_context
