@@ -2,6 +2,8 @@ import ast
 import textwrap
 import inspect
 
+from .ops import all_ops
+
 
 def transform_function(source: str, assign_return: bool = True) -> str:
     # Parse the source into an AST
@@ -70,6 +72,8 @@ def transform_function(source: str, assign_return: bool = True) -> str:
         if isinstance(node, ast.Name):
             var_name = node.id
             # 'self' and 'v' remain as is.
+            if var_name in all_ops():
+                return node
             if var_name in ("self", "v"):
                 return node
             # If var is local, do not prefix

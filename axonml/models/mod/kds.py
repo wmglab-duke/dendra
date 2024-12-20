@@ -20,7 +20,7 @@ class x(State):
         shiftkds=3.0,
     )
 
-    DERIVATIVE("x' = (xinf - ) / taux")
+    DERIVATIVE("x' = (xinf - x) / taux")
     ASSIGNED("xinf", "taux")
 
     def calc_q10(self):

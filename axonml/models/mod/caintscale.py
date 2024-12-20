@@ -28,3 +28,5 @@ class oc_cai(State):
 class caintscale(Mechanism):
     STATE(oc_cai)
     USEION("ca", read=["ica"], write=["cai"])
+
+    INITIAL(oc=0.05)

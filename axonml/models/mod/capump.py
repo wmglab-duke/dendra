@@ -11,10 +11,10 @@ class capump(Mechanism):
 
     USEION("ca", read=["cai"], write=["ica"])
 
-    ASSIGNED("IcaPmax")
+    ASSIGNED("ICaPmax")
 
     def initial(self):
-        self.ICaPmax = self.ICaPmac22 * self.Q10CaP ** (
+        self.ICaPmax = self.ICaPmax22 * self.Q10CaP ** (
             (self.Q10TempA - self.temp) / self.Q10TempB
         )
 

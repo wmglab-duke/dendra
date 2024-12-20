@@ -36,6 +36,7 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
     # Identify self-prefixed variables
     pattern = r"self\.(\w+)"
     self_vars_all = re.findall(pattern, code_str)
+    self_vars_all = set(self_vars_all)
     self_mapping = {var: f"self.{var}" for var in self_vars_all}
 
     env = {}

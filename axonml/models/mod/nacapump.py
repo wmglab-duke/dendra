@@ -22,10 +22,12 @@ class nacapump(Mechanism):
 
     ASSIGNED("inca", "KNaCa")
 
-    def initial(self):
+    def initial(self, v):
         self.KNaCa = self.KNaCa22 * self.Q10NaCa ** (
             (self.Q10TempA - self.temp) / self.Q10TempB
         )
+        self.breakpoint(v)
+
 
     def breakpoint(self, v):
         temp = self.temp + 273.15

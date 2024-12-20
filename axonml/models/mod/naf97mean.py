@@ -30,7 +30,7 @@ class m(State):
             self.q10() * self.A_taum * exp(-((self.B_taum) ** 2) * (v - self.Vpm) ** 2)
             + self.C_taum
         )
-        minf = sigmoid((v - self.V0p5h) / self.S0p5h)
+        minf = sigmoid((v - self.V0p5m) / self.S0p5m)
 
     def inf(self, v):
         return sigmoid((v - self.V0p5m) / self.S0p5m)

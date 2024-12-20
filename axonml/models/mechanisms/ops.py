@@ -13,3 +13,7 @@ def exprelr(x, y):
     val = x / torch.expm1(q)
     approx = y - (x / 2)
     return torch.where(q.abs() < 1e-6, approx, val)
+
+
+def all_ops():
+    return  {"exp", "expm1", "expit", "sigmoid", "log", "exprelr"}

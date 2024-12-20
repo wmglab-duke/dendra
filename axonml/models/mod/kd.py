@@ -16,7 +16,7 @@ class n(State):
         C_betan=-2.5,
         q10kdn=1.40,
         q10TempA=22.85,
-        Q10TempB=10.0,
+        q10TempB=10.0,
         shiftkd=3.0,
     )
 

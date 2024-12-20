@@ -20,8 +20,8 @@ class MechanismHandler(torch.nn.Module):
     {assignments}
 
   def initialize(self, v, v_init, area, temp) -> None:
-    self.init_buffers(v_init)
     self.ion_init(temp)
+    self.init_buffers(v_init)
     self.itot(v)
 
   @torch.jit.export
