@@ -7,7 +7,7 @@ class p(State):
     PARAMETER(
         shiftka=3.0,
         V0p5p=28.0,
-        S0pp5p=-28.0,
+        S0p5p=-28.0,
         A_taup=5.0,
         B_taup=0.022,
         C_taup=2.5,
@@ -24,14 +24,13 @@ class p(State):
         return self.q10ka ** ((self.q10TempA - self.temp) / self.q10TempB)
 
     def breakpoint(self, v):
-        taup = (
-            self.q10() * self.A_taup * exp(-((self.B_taup) ** 2) * (v - self.Vpp) ** 2)
-            + self.C_taup
+        taup = self.q10() * (
+            self.A_taup * exp(-((self.B_taup) ** 2) * (v - self.Vpp) ** 2) + self.C_taup
         )
-        pinf = 1.0 / (1.0 + exp((v + self.V0p5p + self.shiftka) / self.S0pp5p))
+        pinf = 1.0 / (1.0 + exp((v + self.V0p5p + self.shiftka) / self.S0p5p))
 
     def inf(self, v):
-        return 1.0 / (1.0 + exp((v + self.V0p5p + self.shiftka) / self.S0pp5p))
+        return 1.0 / (1.0 + exp((v + self.V0p5p + self.shiftka) / self.S0p5p))
 
 
 class q(State):
@@ -56,9 +55,8 @@ class q(State):
         return self.q10ka ** ((self.q10TempA - self.temp) / self.q10TempB)
 
     def breakpoint(self, v):
-        tauq = (
-            self.q10() * self.A_tauq * exp(-((self.B_tauq) ** 2) * (v - self.Vpq) ** 2)
-            + self.C_tauq
+        tauq = self.q10() * (
+            self.A_tauq * exp(-((self.B_tauq) ** 2) * (v - self.Vpq) ** 2) + self.C_tauq
         )
         qinf = 1.0 / (1.0 + exp((v + self.V0p5q + self.shiftka) / self.S0p5q))
 
@@ -74,4 +72,4 @@ class ka(Mechanism):
     USEION("k", read=["ek"], write=["ik"])
 
     def ik(self, v):
-        return self.gbar * self.p**2 * self.q * (v - self.ek)
+        return self.gbar * self.p**3 * self.q * (v - self.ek)

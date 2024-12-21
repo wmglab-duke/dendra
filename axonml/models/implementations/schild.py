@@ -34,8 +34,8 @@ class Schild97(Unmyelinated):
         method="dufort-frankel",
     ):
         super().__init__(diameters, L, dx, temp, v_init, method)
-        R = 8314    # molar gas constant
-        F = 96500   # Faraday's constant
+        R = 8314  # molar gas constant
+        F = 96500  # Faraday's constant
 
         ko = 5.4
         ki = 145.0
@@ -48,7 +48,10 @@ class Schild97(Unmyelinated):
         self.ion_style("na", 1, 2, 0, 0, 0)
         self.ion_style("k", 1, 2, 0, 0, 0)
 
-        with E(ena=ena, ek=ek), C(ca0=2.0, cai0=0.000117, ko0=ko, ki0=ki, nao0=nao, nai0=nai):
+        with (
+            E(ena=ena, ek=ek),
+            C(cao0=2.0, cai0=0.000117, ko0=ko, ki0=ki, nao0=nao, nai0=nai),
+        ):
             self.insert(leakSchild, gbna=1.8261e-05, gbca=9.13049e-06)
             self.insert(kd, gbar=0.001956534)
             self.insert(ka, gbar=0.001304356)
@@ -56,8 +59,8 @@ class Schild97(Unmyelinated):
             self.insert(cat, gbar=0.00018261)
             self.insert(kds, gbar=0.000782614)
             self.insert(kca, gbar=0.000913049)
-            self.insert(caextscale, L=dx)
-            self.insert(caintscale, L=dx)
+            self.insert(caextscale, lseg=(1e-4) * dx)
+            self.insert(caintscale, lseg=(1e-4) * dx)
             self.insert(capump)
             self.insert(nacapump)
             self.insert(nakpumpSchild)

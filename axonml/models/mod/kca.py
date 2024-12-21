@@ -23,7 +23,7 @@ class c(State):
     ASSIGNED("cinf", "tauc")
 
     def calc_q10(self):
-        return self.Q10kcac ** ((self.temp - self.Q10TempA) / self.Q10TempB)
+        return self.Q10kcac ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def alpha(self, v):
         return self.A_alphac * self.cai * exp((v + self.B_alphac) / self.C_alphac)

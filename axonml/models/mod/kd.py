@@ -37,10 +37,10 @@ class n(State):
         a = self.alpha(v)
         b = self.beta(v)
         ntau = self.q10() * (1.0 + (1.0 / (a + b)))
-        ninf = 1.0 / (1.0 + exp((v + self.V0p5n + self.shiftkd) / self.S0p5n))
+        ninf = sigmoid((-v - self.V0p5n - self.shiftkd) / self.S0p5n)
 
     def inf(self, v):
-        return 1.0 / (1.0 + exp((v + self.V0p5n + self.shiftkd) / self.S0p5n))
+        return sigmoid((-v - self.V0p5n - self.shiftkd) / self.S0p5n)
 
 
 class kd(Mechanism):

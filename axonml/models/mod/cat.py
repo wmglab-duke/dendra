@@ -24,7 +24,7 @@ class d(State):
     ASSIGNED("taud", "dinf")
 
     def calc_q10(self):
-        return self.Q10catd ** ((self.temp - self.Q10TempA) / self.Q10TempB)
+        return self.Q10catd ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def breakpoint(self, v):
         taud = (
@@ -57,7 +57,7 @@ class f(State):
     ASSIGNED("tauf", "finf")
 
     def calc_q10(self):
-        return self.Q10catf ** ((self.temp - self.Q10TempA) / self.Q10TempB)
+        return self.Q10catf ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def breakpoint(self, v):
         tauf = (

@@ -2,7 +2,6 @@ import math
 from typing import List, Tuple, Optional, Dict, Callable
 import re
 import itertools
-import warnings
 
 import torch
 from torch import Tensor
@@ -224,18 +223,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         df = self.method == "dufort-frankel"
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("once")
-            m = compile_mechanism(
-                mechanism,
-                self.temp,
-                self.diam,
-                self.n_ax,
-                self.n_node,
-                ic=ic,
-                df=df,
-                **kwargs,
-            )
+        m = compile_mechanism(
+            mechanism,
+            self.temp,
+            self.diam,
+            self.n_ax,
+            self.n_node,
+            ic=ic,
+            df=df,
+            **kwargs,
+        )
 
         self._m_list.append(m)
         self._m_name.append(mechanism.__name__)
@@ -363,10 +360,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             dt = dt if dt is not None else A.dt
 
             if (not self.initialized) or reinit:
-                self.init_v()
-                self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
-                self.post_initialize()
-                self.initialized = True
+                if "_steady_state" in self._caches:
+                    self.restore("_steady_state")
+                else:
+                    self.init_v()
+                    self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
+                    self.post_initialize()
+                    self.initialized = True
 
             if first:
                 if callbacks:
@@ -483,6 +483,18 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 progressbar=progressbar,
                 first=(i == 0),
             )
+
+        if progressbar:
+            progressbar.close()
+
+    def steady_state(self, dt=0.2, maxiter=3000):
+        if "_steady_state" in self._caches:
+            self._caches.pop("_steady_state")
+        ve = torch.zeros(1, self.n_ax, 1, self.n_node, device=self.device())
+        for i in tqdm(range(maxiter), desc="Steady state..."):
+            reinit = i == 0
+            self.run(ve, dt, reinit=reinit, progressbar=False)
+        self.cache("_steady_state")
 
     def post_initialize(self):
         for h in self.post_initialize_hooks:

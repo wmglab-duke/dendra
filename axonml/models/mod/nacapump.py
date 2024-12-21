@@ -28,7 +28,6 @@ class nacapump(Mechanism):
         )
         self.breakpoint(v)
 
-
     def breakpoint(self, v):
         temp = self.temp + 273.15
         S = 1.0 + self.DNaCa * (self.cai * self.nao**3 + self.cao * self.nai**3)

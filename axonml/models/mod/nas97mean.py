@@ -26,9 +26,8 @@ class m(State):
         return self.Q10nasm ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def breakpoint(self, v):
-        taum = (
-            self.q10() * self.A_taum * exp(-((self.B_taum) ** 2) * (v - self.Vpm) ** 2)
-            + self.C_taum
+        taum = self.q10() * (
+            self.A_taum * exp(-((self.B_taum) ** 2) * (v - self.Vpm) ** 2) + self.C_taum
         )
         minf = sigmoid((v - self.V0p5m) / self.S0p5m)
 
@@ -58,9 +57,8 @@ class h(State):
         return self.Q10nash ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def breakpoint(self, v):
-        tauh = (
-            self.q10() * self.A_tauh * exp(-((self.B_tauh) ** 2) * (v - self.Vph) ** 2)
-            + self.C_tauh
+        tauh = self.q10() * (
+            self.A_tauh * exp(-((self.B_tauh) ** 2) * (v - self.Vph) ** 2) + self.C_tauh
         )
         hinf = sigmoid((v - self.V0p5h) / self.S0p5h)
 

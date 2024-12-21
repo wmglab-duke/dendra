@@ -27,9 +27,8 @@ class d(State):
         return self.Q10can ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def breakpoint(self, v):
-        taud = (
-            self.q10() * self.A_taud * exp(-((self.B_taud) ** 2) * (v - self.Vpd) ** 2)
-            + self.C_taud
+        taud = self.q10() * (
+            self.A_taud * exp(-((self.B_taud) ** 2) * (v - self.Vpd) ** 2) + self.C_taud
         )
         dinf = 1.0 / (1.0 + exp((v + self.V0p5d + self.shiftcan) / self.S0p5d))
 
@@ -60,10 +59,8 @@ class f1(State):
         return self.Q10can ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def breakpoint(self, v):
-        tauf1 = (
-            self.q10()
-            * self.A_tauf1
-            * exp(-((self.B_tauf1) ** 2) * (v - self.Vpf1) ** 2)
+        tauf1 = self.q10() * (
+            self.A_tauf1 * exp(-((self.B_tauf1) ** 2) * (v - self.Vpf1) ** 2)
             + self.C_tauf1
         )
         f1inf = 1.0 / (1.0 + exp((v + self.V0p5f1 + self.shiftcan) / self.S0p5f1))
@@ -86,6 +83,8 @@ class f2(State):
         B_tauf2=0.0275,
         C_tauf2=75.0,
         Vpf2=-40.0,
+        A_rn=5.0,
+        B_rn=-10.0,
     )
 
     DERIVATIVE("f2' = (f2inf - f2) / tauf2")
@@ -95,16 +94,18 @@ class f2(State):
         return self.Q10can ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def breakpoint(self, v):
-        tauf2 = (
-            self.q10()
-            * self.A_tauf2
-            * exp(-((self.B_tauf2) ** 2) * (v - self.Vpf2) ** 2)
+        tauf2 = self.q10() * (
+            self.A_tauf2 * exp(-((self.B_tauf2) ** 2) * (v - self.Vpf2) ** 2)
             + self.C_tauf2
         )
-        f2inf = 1.0 / (1.0 + exp((v + self.V0p5f2 + self.shiftcan) / self.S0p5f2))
+        rn = 0.2 / (1.0 + exp((v + self.A_rn + self.shiftcan) / self.B_rn))
+        f2inf = rn + (
+            1.0 / (1.0 + exp((v + self.V0p5f2 + self.shiftcan) / self.S0p5f2))
+        )
 
     def inf(self, v):
-        return 1.0 / (1.0 + exp((v + self.V0p5f2 + self.shiftcan) / self.S0p5f2))
+        rn = 0.2 / (1.0 + exp((v + self.A_rn + self.shiftcan) / self.B_rn))
+        return rn + (1.0 / (1.0 + exp((v + self.V0p5f2 + self.shiftcan) / self.S0p5f2)))
 
 
 class can(Mechanism):
@@ -119,4 +120,4 @@ class can(Mechanism):
             self.R * ((self.temp + 273.15) / self.z / self.F * log(self.cao / self.cai))
             - self.ecaoffset
         )
-        return self.gbar * self.d * (0.55 * self.f1 * 0.45 * self.f2) * (v - ecan)
+        return self.gbar * self.d * (0.55 * self.f1 + 0.45 * self.f2) * (v - ecan)

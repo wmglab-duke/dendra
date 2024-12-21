@@ -24,7 +24,7 @@ class x(State):
     ASSIGNED("xinf", "taux")
 
     def calc_q10(self):
-        return self.Q10kds ** ((self.temp - self.Q10TempA) / self.Q10TempB)
+        return self.Q10kds ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def breakpoint(self, v):
         taux = (
@@ -54,7 +54,7 @@ class y(State):
     ASSIGNED("yinf", "tauy")
 
     def calc_q10(self):
-        return self.Q10kds ** ((self.temp - self.Q10TempA) / self.Q10TempB)
+        return self.Q10kds ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def breakpoint(self, v):
         tauy = self.tau_y22 * self.q10()

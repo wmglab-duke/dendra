@@ -16,4 +16,4 @@ def exprelr(x, y):
 
 
 def all_ops():
-    return  {"exp", "expm1", "expit", "sigmoid", "log", "exprelr"}
+    return {"exp", "expm1", "expit", "sigmoid", "log", "exprelr"}
