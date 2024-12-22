@@ -15,5 +15,12 @@ def exprelr(x, y):
     return torch.where(q.abs() < 1e-6, approx, val)
 
 
+@torch.jit.script
+def expinv(x):
+    val = x / torch.expm1(x)
+    approx = 1 - 0.5 * x
+    return torch.where(x.abs() < 1e-6, approx, val)
+
+
 def all_ops():
-    return {"exp", "expm1", "expit", "sigmoid", "log", "exprelr"}
+    return {"exp", "expm1", "expit", "sigmoid", "log", "exprelr", "expinv"}
