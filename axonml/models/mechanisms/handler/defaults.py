@@ -43,6 +43,10 @@ def ion_register(ion, valence, e, i0, o0):
 
 class e_context(ContextDecorator):
     def __init__(self, **kwargs):
+        global REVERSAL
+        not_in_reversal = [k for k in kwargs if k not in REVERSAL]
+        if not_in_reversal:
+            raise ValueError(f"Reversal potential not found: {not_in_reversal}")
         self.updates = kwargs
         self.original_values = {}
 
@@ -62,6 +66,10 @@ class e_context(ContextDecorator):
 
 class c_context(ContextDecorator):
     def __init__(self, **kwargs):
+        global CINIT
+        not_in_cinit = [k for k in kwargs if k not in CINIT]
+        if not_in_cinit:
+            raise ValueError(f"Initial concentration not found: {not_in_cinit}")
         self.updates = kwargs
         self.original_values = {}
 
