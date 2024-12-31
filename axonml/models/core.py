@@ -2,6 +2,7 @@ import math
 from typing import List, Tuple, Optional, Dict, Callable
 import re
 import itertools
+from decimal import Decimal
 
 import torch
 from torch import Tensor
@@ -132,7 +133,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.v_init = v_init
 
         self.mech: HandlerInterface = None
-        self.t : float = 0.0
+        self.t : Decimal = Decimal("0.0")
 
         self._m_list = []
         self._m_name = []
@@ -363,6 +364,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             device = self.device()
 
             dt = dt if dt is not None else A.dt
+            dt_d = Decimal(str(dt))
 
             if (not self.initialized) or reinit:
                 if "_steady_state" in self._caches:
@@ -440,7 +442,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             self.v, ve[i], self.area_c, cm_inv, ra_inv, dt, self.temp_c
                         )
                 callbacks.post_step_hook(self)
-                self.t += dt
+                self.t += dt_d
 
                 if progressbar:
                     progressbar.update(1)
