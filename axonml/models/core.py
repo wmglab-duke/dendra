@@ -132,6 +132,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.v_init = v_init
 
         self.mech: HandlerInterface = None
+        self.t : float = 0.0
 
         self._m_list = []
         self._m_name = []
@@ -223,7 +224,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def insert(self, mechanism: Mechanism, ic=None, **kwargs):
         validate(mechanism)
-        # m = mechanism(self.temp, ic=ic, **kwargs)
 
         df = self.method == "dufort-frankel"
 
@@ -367,10 +367,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             if (not self.initialized) or reinit:
                 if "_steady_state" in self._caches:
                     self.restore("_steady_state")
+                    self.t = 0.0
                 else:
                     self.init_v()
                     self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
                     self.post_initialize()
+                    self.t = 0.0
                     self.initialized = True
 
             if first:
@@ -394,7 +396,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
-                    progressbar = tqdm(total=ve.shape[0], desc="Running")
+                    progressbar = tqdm(total=ve.shape[0], desc=f"{self.t:.3f} ms")
 
             for i in range(ve.shape[0]):
                 if df:
@@ -438,9 +440,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             self.v, ve[i], self.area_c, cm_inv, ra_inv, dt, self.temp_c
                         )
                 callbacks.post_step_hook(self)
+                self.t += dt
 
                 if progressbar:
                     progressbar.update(1)
+                    progressbar.set_description(f"{self.t:.3f} ms")
+
 
     def longrun(
         self,
@@ -466,7 +471,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         t_chunks = torch.tensor_split(ve_t, n_chunks, dim=1)
 
         if progressbar:
-            progressbar = tqdm(total=ve_t.shape[1], desc="Running")
+            progressbar = tqdm(total=ve_t.shape[1], desc=f"{self.t:.3f} ms")
 
         if callbacks:
             for c in callbacks:
