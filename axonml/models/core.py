@@ -444,7 +444,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
                 if progressbar:
                     progressbar.update(1)
-                    progressbar.set_description(f"{self.t:.3f} ms")
+                    if i % 100 == 0:
+                        progressbar.set_description(f"{self.t:.3f} ms")
 
 
     def longrun(
