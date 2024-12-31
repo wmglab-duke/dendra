@@ -28,8 +28,9 @@ class Tigerholm(Unmyelinated):
         temp=37.0,
         v_init=-55.0,
         method="dufort-frankel",
+        pade=None,
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method)
+        super().__init__(diameters, L, dx, temp, v_init, method, pade)
 
         with c_context(nai0=11.4, nao0=154.0, ki0=144.9, ko0=5.6):
             self.insert(ks, gbar=0.0069733)

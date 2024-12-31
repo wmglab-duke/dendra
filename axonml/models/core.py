@@ -95,9 +95,11 @@ class SymmetricConv1D(torch.nn.Conv1d):
 class Axon(Parameterized, torch.jit.ScriptModule):
     """Base 1D fiber class."""
 
-    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init"]
+    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade"]
 
-    def __init__(self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1"):
+    def __init__(
+        self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", pade=None
+    ):
         super().__init__()
 
         self.method_conversion = {
@@ -105,6 +107,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             "rk4": "rk4",
             "dufort-frankel": "df",
         }
+
+        self.pade = pade
 
         if method not in self.method_conversion:
             raise ValueError(
@@ -231,6 +235,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             self.n_node,
             ic=ic,
             df=df,
+            pade=self.pade,
             **kwargs,
         )
 
@@ -713,12 +718,14 @@ class Unmyelinated(Axon):
         }
     )
 
-    def __init__(self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"):
+    def __init__(
+        self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1", pade=None
+    ):
         L = L * 1000  # mm -> um
         n_node = L / dx
         n_node = math.ceil(n_node) // 2 * 2 + 1
         self.dx: float = dx
-        super().__init__(diameters, n_node, temp, v_init, method)
+        super().__init__(diameters, n_node, temp, v_init, method, pade)
 
     def x(self) -> torch.Tensor:
         l = (self.n_node - 1) * self.dx

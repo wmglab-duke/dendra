@@ -139,6 +139,11 @@ class Recorder(Callback):
             return torch.amax(vs, 0)
         return vs
 
+    def numpy(self, var: str = None):
+        if var is not None:
+            return self.stack(var).detach().cpu().numpy()
+        return self.stack().detach().cpu().numpy()
+
 
 class ThresholdCallback(Callback):
     def __init__(self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None):

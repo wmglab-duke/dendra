@@ -490,7 +490,7 @@ def coupled_assignment(state):
 
 
 def compile_mechanism(
-    mechanism, temp, diameters, n_ax, n_nodes, df=False, ic=None, **kwargs
+    mechanism, temp, diameters, n_ax, n_nodes, df=False, ic=None, pade=None, **kwargs
 ):
     states = mechanism._states
 
@@ -515,9 +515,13 @@ def compile_mechanism(
     states_compiled = []
     for s in states:
         if coupled(s):
-            states_compiled.append(compile_coupled_state(s, temp, diameters, **kwargs))
+            states_compiled.append(
+                compile_coupled_state(s, temp, diameters, pade=pade, **kwargs)
+            )
         else:
-            states_compiled.append(compile_state(s, temp, diameters, **kwargs))
+            states_compiled.append(
+                compile_state(s, temp, diameters, pade=pade, **kwargs)
+            )
 
     state_buffer_assignments_str = state_buffer_assignments(states_compiled)
     state_buffer_assignments_str = indent(state_buffer_assignments_str, 2)

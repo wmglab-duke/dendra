@@ -330,7 +330,7 @@ def integrate_args(assigned):
     return ", " + ", ".join(assigned)
 
 
-def compile_state(s, temp, diameters, **kwargs):
+def compile_state(s, temp, diameters, pade=None, **kwargs):
     state_name = s.__name__
     params = load(s, "_params")
     assigned = load(s, "_assigned")
@@ -345,8 +345,10 @@ def compile_state(s, temp, diameters, **kwargs):
     assigned_str = assigned_str_f(assigned)
     assigned_str = indent(assigned_str, 2)
 
+    pade_approx = pade if pade is not None else derivative[1]
+
     integrate_f = convert(
-        derivative[0], state_name, assigned, use_pade_approx=derivative[1]
+        derivative[0], state_name, assigned, use_pade_approx=pade_approx
     )
 
     forward_str = template.format(
@@ -378,7 +380,7 @@ def compile_state(s, temp, diameters, **kwargs):
     return m
 
 
-def compile_coupled_state(s, temp, diameters, **kwargs):
+def compile_coupled_state(s, temp, diameters, pade=None, **kwargs):
     name = s.__name__
     state_names = s._states
     state_name_list = list(state_names)
@@ -398,8 +400,10 @@ def compile_coupled_state(s, temp, diameters, **kwargs):
     assigned_str = assigned_str_f(assigned)
     assigned_str = indent(assigned_str, 2)
 
+    pade_approx = pade if pade is not None else derivative[1]
+
     integrate_fs = construct_integrate_fs(
-        derivative[0], state_names, assigned, use_pade_approx=derivative[1]
+        derivative[0], state_names, assigned, use_pade_approx=pade_approx
     )
 
     forward_str = template_coupled.format(
