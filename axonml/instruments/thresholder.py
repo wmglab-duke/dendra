@@ -120,7 +120,9 @@ class Thresholder:
         """
         self.active.reset()
         ve = self.bases * bound[None, :, None, None]
-        self.model.run(ve, self.diams, callbacks=[self.active], reinit=True, dt=self.dt)
+        self.model.run(
+            ve, callbacks=[self.active], reinit=True, dt=self.dt, progressbar=False
+        )
         return self.active.is_active()
 
     def check_active_with_rec(self, bound: Tensor):
@@ -128,7 +130,11 @@ class Thresholder:
         self.rec.reset()
         ve = self.bases * bound[None, :, None, None]
         self.model.run(
-            ve, self.diams, callbacks=[self.active, self.rec], reinit=True, dt=self.dt
+            ve,
+            callbacks=[self.active, self.rec],
+            reinit=True,
+            dt=self.dt,
+            progressbar=False,
         )
         return self.active.is_active(), self.rec.stack()
 

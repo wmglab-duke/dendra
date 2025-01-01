@@ -104,6 +104,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         super().__init__()
 
         self.method_conversion = {
+            "euler": "rk1",
             "rk1": "rk1",
             "rk4": "rk4",
             "dufort-frankel": "df",
@@ -133,7 +134,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.v_init = v_init
 
         self.mech: HandlerInterface = None
-        self.t : Decimal = Decimal("0.0")
+        self.t_ind: int = 0
+        self.dt: float = 0.005
 
         self._m_list = []
         self._m_name = []
@@ -156,18 +158,18 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.weight_choices = {
             "rk1": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "rk4": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
-            "dufort-frankel": [
+            "df": [
                 [1.0, 0.0, 1.0],
                 [0.0, -1.0, 0.0],
                 [1.0, -2.0, 1.0],
             ],
         }
 
-        self.nc = {"rk1": 2, "rk4": 2, "dufort-frankel": 3}
+        self.nc = {"rk1": 2, "rk4": 2, "df": 3}
 
         # solver stuff
-        weight = self.weight_choices[method]
-        nc = self.nc[method]
+        weight = self.weight_choices[self.method_conversion[method]]
+        nc = self.nc[self.method_conversion[method]]
 
         self.ssd = SymmetricConv1D(
             nc, 1, 3, bias=False, padding="same", padding_mode="reflect"
@@ -341,6 +343,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if self.method == "dufort-frankel":
             self.v_prev[:] = self.v_init
 
+    @property
+    def t(self):
+        return self.t_ind * self.dt
+
     def run(
         self,
         ve: Tensor,
@@ -364,17 +370,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             device = self.device()
 
             dt = dt if dt is not None else A.dt
-            dt_d = Decimal(str(dt))
+            self.dt = dt
 
             if (not self.initialized) or reinit:
                 if "_steady_state" in self._caches:
                     self.restore("_steady_state")
-                    self.t = 0.0
+                    self.t_ind = 0
                 else:
                     self.init_v()
                     self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
                     self.post_initialize()
-                    self.t = 0.0
+                    self.t_ind = 0
                     self.initialized = True
 
             if first:
@@ -442,13 +448,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             self.v, ve[i], self.area_c, cm_inv, ra_inv, dt, self.temp_c
                         )
                 callbacks.post_step_hook(self)
-                self.t += dt_d
+                self.t_ind += 1
 
                 if progressbar:
                     progressbar.update(1)
-                    if i % 100 == 0:
+                    if (i + 1) % 100 == 0:
                         progressbar.set_description(f"{self.t:.3f} ms")
-
 
     def longrun(
         self,
