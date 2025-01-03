@@ -3,7 +3,6 @@ from ..mod import axnode_myel
 from ..mechanisms.declarations import PARAMETER
 
 
-
 ic = {"m": 0.0732093, "h": 0.62069505, "p": 0.20260409, "s": 0.04302994}
 
 
@@ -30,6 +29,7 @@ class SMF(Myelinated):
             "rhoa": 70.0,  # ohm-cm
         },
     )
+
     def __init__(
         self,
         diameters=[8.0],

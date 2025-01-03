@@ -524,7 +524,9 @@ def parse_params_distributions(params, kwargs):
 def distribution_buffers(distributions):
     assignments = []
     for k, v in distributions.items():
-        assignments.append(f"self.register_buffer('{k}', torch.zeros((n_ax, 1, n_nodes)))")
+        assignments.append(
+            f"self.register_buffer('{k}', torch.zeros((n_ax, 1, n_nodes)))"
+        )
     return "\n".join(assignments)
 
 
