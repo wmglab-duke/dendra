@@ -359,6 +359,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         progressbar: bool = True,
         first: bool = True,
         multicontact: bool = False,
+        longrunning: bool = False,
     ):
         if ve is None and (ve_s is None and ve_t is None):
             raise ValueError("Either ve or ve_s and ve_t must be provided.")
@@ -463,6 +464,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     progressbar.update(1)
                     if (i + 1) % 100 == 0:
                         progressbar.set_description(f"{self.t:.3f} ms")
+            
+            if not longrunning:
+                if progressbar:
+                    progressbar.close()
 
     def ve_from_s_t(self, ve_s, ve_t, multicontact=False):
         ve_s = torch.as_tensor(ve_s, device=self.device())
@@ -537,6 +542,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 reinit=reinit,
                 progressbar=progressbar,
                 first=(i == 0),
+                longrunning=True,
             )
 
         if progressbar:
