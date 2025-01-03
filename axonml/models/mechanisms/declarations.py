@@ -29,7 +29,10 @@ def _declare(name, *args):
     add_to_namespace(namespace, name, *args)
 
 
-def _declare_parameters(name, **kwargs):
+def _declare_parameters(name, inherit=None, **kwargs):
+    if inherit is not None:
+        data = getattr(inherit, name, {})
+        kwargs = dict(data, **kwargs)
     frame = sys._getframe(1)
     namespace = frame.f_locals
     add_to_namespace_dict(namespace, name, **kwargs)

@@ -349,14 +349,23 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def run(
         self,
-        ve: Tensor,
+        ve: Tensor = None,
+        ve_s: Tensor = None,
+        ve_t: Tensor = None,
         dt: float = None,
         intra: Optional[Tensor] = None,
         callbacks: List[Callback] = None,
         reinit: bool = False,
         progressbar: bool = True,
         first: bool = True,
+        multicontact: bool = False,
     ):
+        if ve is None and (ve_s is None and ve_t is None):
+            raise ValueError("Either ve or ve_s and ve_t must be provided.")
+        
+        if ve is None:
+            ve = self.ve_from_s_t(ve_s, ve_t, multicontact)
+
         with_intra = intra is not None
 
         method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
@@ -455,6 +464,26 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     if (i + 1) % 100 == 0:
                         progressbar.set_description(f"{self.t:.3f} ms")
 
+
+    def ve_from_s_t(self, ve_s, ve_t, multicontact=False):
+        ve_s = torch.as_tensor(ve_s, device=self.device())
+        ve_t = torch.as_tensor(ve_t, device=self.device())
+
+        if multicontact:
+            ve_s = ve_s.expand(-1, self.n_ax, -1)
+            ve_t = ve_t.expand(-1, self.n_ax, -1)
+        else:
+            ve_s = ve_s.expand(self.n_ax, -1)
+            ve_t = ve_t.expand(self.n_ax, -1)
+
+        if multicontact:
+            einsum = "can,cat->tan"
+        else:
+            einsum = "an,at->tan"
+
+        return torch.einsum(einsum, ve_s, ve_t).unsqueeze(2)
+
+
     def longrun(
         self,
         ve_s: Tensor,
@@ -464,22 +493,32 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         reinit=False,
         callbacks: List[Callback] = None,
         progressbar=True,
+        multicontact=False,
     ):
         ve_s = torch.as_tensor(ve_s, device=self.device())
         ve_t = torch.as_tensor(ve_t, device=self.device())
 
-        # ve_s : [n_ax, n_node] or [1, n_node]
-        # ve_t : [n_ax, n_timesteps] or [1, n_timesteps]
+        # ve_s : [n_ax, n_node] or [1, n_node] or [n_contacts, *]
+        # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
 
-        ve_s = ve_s.expand(self.n_ax, -1)
-        ve_t = ve_t.expand(self.n_ax, -1)
+        if multicontact:
+            ve_s = ve_s.expand(-1, self.n_ax, -1)
+            ve_t = ve_t.expand(-1, self.n_ax, -1)
+        else:
+            ve_s = ve_s.expand(self.n_ax, -1)
+            ve_t = ve_t.expand(self.n_ax, -1)
+
+        if multicontact:
+            einsum = "can,cat->tan"
+        else:
+            einsum = "an,at->tan"
 
         dt = dt if dt is not None else A.dt
 
-        t_chunks = torch.tensor_split(ve_t, n_chunks, dim=1)
+        t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
 
         if progressbar:
-            progressbar = tqdm(total=ve_t.shape[1], desc=f"{self.t:.3f} ms")
+            progressbar = tqdm(total=ve_t.shape[-1], desc=f"{self.t:.3f} ms")
 
         if callbacks:
             for c in callbacks:
@@ -492,7 +531,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 reinit = True
             else:
                 reinit = False
-            ve = torch.einsum("an,at->tan", ve_s, t_chunk).unsqueeze(2)
+            ve = torch.einsum(einsum, ve_s, t_chunk).unsqueeze(2)
             self.run(
                 ve,
                 dt,
@@ -724,12 +763,7 @@ def match_state_dict(
 
 
 class Unmyelinated(Axon):
-    PARAMETER(
-        membrane={
-            "cm": 1e-3,  # mF / cm2
-            "rhoa": 35.4,  # ohm-cm
-        }
-    )
+    PARAMETER(cm=1e-3, rhoa=35.4)
 
     def __init__(
         self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1", pade=None
@@ -756,29 +790,30 @@ class Unmyelinated(Axon):
 
 class Myelinated(Axon):
     PARAMETER(
+        node_l=1.5,
         axon_d={
-            "axond1": 0.0187623,
-            "axond2": 4.787487e-01,
-            "axond3": 1.203613e-01,
+            "axond1": 0.0,
+            "axond2": 0.6,
+            "axond3": 0.0,
         },
         node_d={
-            "noded1": 6.303781e-03,
-            "noded2": 2.070544e-01,
-            "noded3": 5.339006e-01,
+            "noded1": 0.0,
+            "noded2": 0.6,
+            "noded3": 0.0,
         },
         delta_x={
-            "deltax1": -8.215284e00,
-            "deltax2": 2.724201e02,
-            "deltax3": -7.802411e02,
+            "deltax1": 0.0,
+            "deltax2": 100.0,
+            "deltax3": 0.0,
         },
         membrane={
-            "cm": 10e-3,
-            "rhoa": 70.0,  # ohm-cm
+            "cm": 1e-3,
+            "rhoa": 35.4,  # ohm-cm
         },
     )
 
     def area_(self, diameters):
-        lengths = torch.ones_like(diameters) / 10000
+        lengths = self.node_l * torch.ones_like(diameters) / 10000
         return torch.pi * self.nodeD(diameters) * lengths  # cm2
 
     def ra_(self, diameters):

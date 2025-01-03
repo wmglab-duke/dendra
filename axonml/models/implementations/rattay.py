@@ -5,7 +5,7 @@ from ..mechanisms.handler.defaults import e_context
 
 
 class Rattay(Unmyelinated):
-    PARAMETER(cm=1e-3, rhoa=100.0)
+    PARAMETER(inherit=Unmyelinated, rhoa=100.0)
 
     def __init__(
         self,

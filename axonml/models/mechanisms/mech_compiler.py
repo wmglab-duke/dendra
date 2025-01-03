@@ -106,9 +106,10 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
 template = """
 class mech(torch.nn.Module):
     _init_params: Dict[str, float]
-    def __init__(self, temp, diameters, n_ax, n_nodes, name: str, params, read_ion, write_ion_c, states, conductances, init, ic: dict = None, **kwargs):
+    def __init__(self, temp, diameters, n_ax, n_nodes, name: str, params, distributions, read_ion, write_ion_c, states, conductances, init, ic: dict = None):
         super().__init__()
-        self.instantiate_parameters(params, **kwargs)
+        self.instantiate_parameters(params)
+        self.instantiate_distributions(distributions)
         self.temp = temp
         self.register_buffer("diam", diameters[:, None, None])
         self._name = name
@@ -128,6 +129,8 @@ class mech(torch.nn.Module):
 
 {state_buffer_assignments}
 
+{distribution_buffer_assignments}
+
 {current_buffer_assignments}
 
 {assigned}
@@ -144,9 +147,8 @@ class mech(torch.nn.Module):
             for v in self.write_ion_c[name]:
                 self.register_buffer(v, getattr(ion, v))
 
-    def instantiate_parameters(self, params, **kwargs):
+    def instantiate_parameters(self, params):
         if params is not None:
-            params = dict((k, kwargs.get(k, v)) for k, v in params.items())
             for name, value in params.items():
                 if isinstance(value, dict):
                     setattr(self, name, [])
@@ -156,8 +158,14 @@ class mech(torch.nn.Module):
                 else:
                     setattr(self, name, to_param(value))
 
+    def instantiate_distributions(self, distributions):
+        if distributions is not None:
+            for name, dist in distributions.items():
+                setattr(self, name+"_d", dist)
+
     def _init_buffers_s(self, v_init):
 {init_state_buffers}
+{init_distribution_buffers}
         self.initial(v_init)
         for _, s in self.DE.items():
             s.initialize(v_init)
@@ -209,6 +217,18 @@ mech_inf_template = """
 def {state}_inf(self, v):
     return torch.tensor(0.0, device=v.device, dtype=v.dtype)
 """
+
+
+distribution_init_template = """
+self.{name} = self.{name}_d._sample(self.{name})
+"""
+
+
+def init_distribution_buffers(distributions):
+    assignments = []
+    for k, _ in distributions.items():
+        assignments.append(distribution_init_template.format(name=k))
+    return "\n".join(assignments)
 
 
 def coupled_infs(mechanism, states):
@@ -489,12 +509,32 @@ def coupled_assignment(state):
     return template.format(name=name, lhs=lhs, rhs=rhs)
 
 
+def parse_params_distributions(params, kwargs):
+    params = dict((k, kwargs.get(k, v)) for k, v in params.items())
+    regular_params = {}
+    distributions = {}
+    for k, v in params.items():
+        if isinstance(v, torch.nn.Module):
+            distributions[k] = v
+        else:
+            regular_params[k] = v
+    return regular_params, distributions
+
+
+def distribution_buffers(distributions):
+    assignments = []
+    for k, v in distributions.items():
+        assignments.append(f"self.register_buffer('{k}', torch.zeros((n_ax, 1, n_nodes)))")
+    return "\n".join(assignments)
+
+
 def compile_mechanism(
     mechanism, temp, diameters, n_ax, n_nodes, df=False, ic=None, pade=None, **kwargs
 ):
     states = mechanism._states
 
     params = load(mechanism, "_params")
+    params, distributions = parse_params_distributions(params, kwargs)
     conductances = load(mechanism, "_conductances")
     init = load(mechanism, "_init")
     currents = load(mechanism, "_currents")
@@ -544,6 +584,12 @@ def compile_mechanism(
     assigned_str = assigned_str_f(assigned)
     assigned_str = indent(assigned_str, 2)
 
+    distribution_buffer_assignments_str = distribution_buffers(distributions)
+    distribution_buffer_assignments_str = indent(distribution_buffer_assignments_str, 2)
+
+    init_distribution_buffers_str = init_distribution_buffers(distributions)
+    init_distribution_buffers_str = indent(init_distribution_buffers_str, 2)
+
     forward_str = template.format(
         state_buffer_assignments=state_buffer_assignments_str,
         current_buffer_assignments=current_buffer_assignments_str,
@@ -555,6 +601,8 @@ def compile_mechanism(
         initial_f=translate_f(mechanism, "initial"),
         gtot=gtot(current_eqs, mechanism, df),
         coupled_infs=coupled_infs(mechanism, states_compiled),
+        distribution_buffer_assignments=distribution_buffer_assignments_str,
+        init_distribution_buffers=init_distribution_buffers_str,
     )
 
     filename = f"<{mechanism.__name__}_template>"
@@ -572,13 +620,13 @@ def compile_mechanism(
         n_nodes,
         name,
         params,
+        distributions,
         read_ion,
         write_ion_c,
         states_compiled,
         conductances,
         init,
         ic=ic,
-        **kwargs,
     )
 
     return m
