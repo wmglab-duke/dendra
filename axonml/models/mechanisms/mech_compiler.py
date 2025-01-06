@@ -202,6 +202,7 @@ if '{state}' in self._init_params:
 else:
     buffer_tensor = self.DE['{state}'].inf(v_init)
 self.{state}[:] = buffer_tensor
+self.{state}.detach_()
 """
 
 init_state_buffers_coupled_template = """
@@ -210,6 +211,7 @@ if '{state}' in self._init_params:
 else:
     buffer_tensor = self.{state}_inf(v_init)
 self.{state}[:] = buffer_tensor
+self.{state}.detach_()
 """
 
 

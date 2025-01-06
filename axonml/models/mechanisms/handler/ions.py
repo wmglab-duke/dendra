@@ -29,6 +29,7 @@ class Ion(torch.nn.Module):
   @torch.jit.export
   def initialize(self, temp) -> None:
     self.i{ion}[:] = 0.0
+    self.i{ion}.detach_()
     {initialize_e}
     {initialize_i}
     {initialize_o}
@@ -57,7 +58,7 @@ def init_tensor(val, buffer_or_param):
 def parse_einit(ion, einit):
     if einit == 0:
         return ""
-    return f"self.e{ion}[:] = (torch.log(self.{ion}o / self.{ion}i) * self.rzf * (273.15 + temp))"
+    return f"self.e{ion}[:] = (torch.log(self.{ion}o / self.{ion}i) * self.rzf * (273.15 + temp)); self.e{ion}.detach_()"
 
 
 def parse_eadvance(ion, eadvance):

@@ -340,12 +340,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def init_v(self):
         self.v[:] = self.v_init
+        self.v.detach_()
         if self.method == "dufort-frankel":
             self.v_prev[:] = self.v_init
+            self.v_prev.detach_()
 
     @property
     def t(self):
         return self.t_ind * self.dt
+
+    def c(self, *args):
+        return [round((self.n_node - 1) * i) for i in args]
 
     def run(
         self,
@@ -464,7 +469,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     progressbar.update(1)
                     if (i + 1) % 100 == 0:
                         progressbar.set_description(f"{self.t:.3f} ms")
-            
+
             if not longrunning:
                 if progressbar:
                     progressbar.close()
@@ -778,7 +783,7 @@ class Unmyelinated(Axon):
         self.dx: float = dx
         super().__init__(diameters, n_node, temp, v_init, method, pade)
 
-    def x(self) -> torch.Tensor:
+    def x(self) -> torch.Tensor:  # x in um
         l = (self.n_node - 1) * self.dx
         return torch.linspace(-l / 2, l / 2, self.n_node)
 
@@ -839,3 +844,11 @@ class Myelinated(Axon):
     def nodeD(self, diameters):
         noded = self.noded1 * diameters**2 + self.noded2 * diameters + self.noded3
         return noded / 10000
+
+    def x(self) -> torch.Tensor:  # x in um
+        l = (self.n_node - 1) * self.deltax(self.diam) * 10000
+        start = -l / 2
+        end = l / 2
+        steps = self.n_node
+        t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(-1)
+        return ((1 - t) * start + t * end).T
