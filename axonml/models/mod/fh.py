@@ -178,7 +178,7 @@ class fh(Mechanism):
         pkbar=1.2e-3,
         gl=30.3e-3,
         el=-69.74,
-        R=8314.41,
+        R=8.31441,
         FARADAY=96514,
     )
 
@@ -188,14 +188,14 @@ class fh(Mechanism):
     NONSPECIFIC_CURRENT("il")
 
     def ina(self, v):
-        z = self.FARADAY * v / (self.R * (self.temp + 273.15))
+        z = 1e-3 * self.FARADAY * v / (self.R * (self.temp + 273.15))
         enao = self.nao * expinv(z)
         enai = self.nai * expinv(-z)
         ghkna = 1e-3 * self.FARADAY * (enai - enao)
-        return (self.pnabar * self.m**2 * self.h) + (self.ppbar * self.p**2) * ghkna
+        return ((self.pnabar * self.m**2 * self.h) + (self.ppbar * self.p**2)) * ghkna
 
     def ik(self, v):
-        z = self.FARADAY * v / (self.R * (self.temp + 273.15))
+        z = 1e-3 * self.FARADAY * v / (self.R * (self.temp + 273.15))
         eko = self.ko * expinv(z)
         eki = self.ki * expinv(-z)
         ghk = 1e-3 * self.FARADAY * (eki - eko)
