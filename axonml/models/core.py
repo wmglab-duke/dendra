@@ -96,7 +96,7 @@ class SymmetricConv1D(torch.nn.Conv1d):
 class Axon(Parameterized, torch.jit.ScriptModule):
     """Base 1D fiber class."""
 
-    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade"]
+    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade", "is_df"]
 
     def __init__(
         self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", pade=None
@@ -108,9 +108,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             "rk1": "rk1",
             "rk4": "rk4",
             "dufort-frankel": "df",
+            "df": "df",
         }
 
         self.pade = pade
+        self.is_df = self.method_conversion[method] == "df"
 
         if method not in self.method_conversion:
             raise ValueError(
@@ -179,7 +181,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             p.requires_grad = False
 
         self.register_buffer("v", torch.full((self.n_ax, 1, n_node), v_init))
-        if method == "dufort-frankel":
+        if self.is_df:
             self.register_buffer("v_prev", torch.full((self.n_ax, 1, n_node), v_init))
 
         self.initialized: bool = False
@@ -228,7 +230,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def insert(self, mechanism: Mechanism, ic=None, **kwargs):
         validate(mechanism)
 
-        df = self.method == "dufort-frankel"
+        df = self.is_df
 
         m = compile_mechanism(
             mechanism,
@@ -305,7 +307,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
         self._m_curr.update(_ion_write)
 
-        df = self.method == "dufort-frankel"
+        df = self.is_df
 
         ions = {}
         for ion in all_ions:
@@ -341,7 +343,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def init_v(self):
         self.v[:] = self.v_init
         self.v.detach_()
-        if self.method == "dufort-frankel":
+        if self.is_df:
             self.v_prev[:] = self.v_init
             self.v_prev.detach_()
 
@@ -379,7 +381,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             self, f"step_intra_{self.method_conversion[self.method]}"
         )
 
-        df = self.method == "dufort-frankel"
+        df = self.is_df
 
         with torch.set_grad_enabled(self.training):
             device = self.device()

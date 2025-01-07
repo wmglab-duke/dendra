@@ -4,6 +4,7 @@ from .sundt import Sundt
 from .tigerholm import Tigerholm
 from .schild import Schild97, Schild94
 from .fh import FHM, SENN, FHUM
+from .sweeney import Sweeney
 
 __all__ = [
     "SMF",
@@ -15,4 +16,5 @@ __all__ = [
     "FHM",
     "SENN",
     "FHUM",
+    "Sweeney",
 ]
