@@ -1,7 +1,6 @@
 from ..core import Unmyelinated
 from ..mod import rattay_aberham
-from ..mechanisms import PARAMETER
-from ..mechanisms.handler.defaults import e_context
+from ..mechanisms import PARAMETER, e_context
 
 
 class Rattay(Unmyelinated):

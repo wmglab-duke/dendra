@@ -12,7 +12,7 @@ from .declarations import (
 )
 from .core import Mechanism, State
 from .handler.ions import USEION
-from .handler.defaults import ion_register
+from .handler.defaults import ion_register, c_context, e_context
 
 __all__ = [
     "Mechanism",
@@ -29,4 +29,6 @@ __all__ = [
     "RANGE",
     "ASSIGNED",
     "BUFFERS",
+    "c_context",
+    "e_context",
 ]

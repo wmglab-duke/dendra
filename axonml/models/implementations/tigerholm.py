@@ -13,8 +13,7 @@ from ..mod import (
     koiTiger,
     leak,
 )
-from ..mechanisms import PARAMETER
-from ..mechanisms.handler.defaults import c_context
+from ..mechanisms import PARAMETER, c_context
 
 
 class Tigerholm(Unmyelinated):

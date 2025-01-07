@@ -17,8 +17,7 @@ from ..mod import (
     naf,
     nas,
 )
-from ..mechanisms import PARAMETER
-from ..mechanisms.handler.defaults import e_context as E, c_context as C
+from ..mechanisms import PARAMETER, e_context as E, c_context as C
 
 import math
 

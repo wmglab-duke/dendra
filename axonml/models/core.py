@@ -799,15 +799,15 @@ class Unmyelinated(Axon):
 
 class Myelinated(Axon):
     PARAMETER(
-        node_l=1.5,
+        node_l=2.0,
         axon_d={
             "axond1": 0.0,
-            "axond2": 0.6,
+            "axond2": 0.7,
             "axond3": 0.0,
         },
         node_d={
             "noded1": 0.0,
-            "noded2": 0.6,
+            "noded2": 0.7,
             "noded3": 0.0,
         },
         delta_x={
