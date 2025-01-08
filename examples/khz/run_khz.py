@@ -2,13 +2,12 @@ import torch
 from tqdm import tqdm
 import numpy as np
 
-from cajal.nrn.sources import FEMInterpolate1D
-
-from axonml.models import SMF
+from axonml.models.implementations import SMF
 from axonml.models.callbacks import APCount
-
+from axonml.instruments.fields import FEMInterpolate1D
 
 torch.set_default_dtype(torch.float32)
+torch.set_float32_matmul_precision("highest")
 
 
 def deltax(diam):
@@ -105,43 +104,34 @@ def longrun(
     dt,
     stims,
     field_stack,
-    diams,
     chunks=20,
-    count_only=True,
     with_intra=True,
     warmup=True,
 ):
     field_stack = torch.tensor(field_stack, device="cuda").float().unsqueeze(1)
-    diams_gpu = torch.tensor(diams, device="cuda")
 
     if warmup:
         print("warming up...")
 
-        ve = torch.rand(5, len(field_stack) * len(stims), 1, nodes).float().cuda()
+        ve = torch.rand(1, len(field_stack) * len(stims), 1, nodes).float().cuda()
         intra = torch.zeros_like(ve).cuda()
-        dg = torch.rand(len(field_stack) * len(stims)).cuda()
 
-        for _ in range(3):
+        for _ in range(5):
             with torch.no_grad():
-                out = model(ve, dg, intra=intra, dt=dt)
+                _ = model.run(ve, intra=intra, dt=dt, progressbar=False)
 
     t_vec = np.arange(0, tstop, dt)
     views = np.array_split(t_vec, chunks)
 
-    returns = []
-    tstart = 0.0
-
     for i, t_chunk in enumerate(tqdm(views, desc="Running")):
         input_ve = []
         input_intra = []
-        input_diams = []
 
         for stim in stims:
-            tc = stim(t=t_chunk)
+            tc = stim(t=t_chunk).astype(np.float32)
             t_course = torch.tensor(tc, device="cuda")
-            ve = torch.einsum("i, jkl -> ijkl", t_course, field_stack).float()
+            ve = torch.einsum("i, jkl -> ijkl", t_course, field_stack)
             input_ve.append(ve)
-            input_diams.append(diams_gpu)
             if with_intra:
                 intra = torch.zeros_like(ve)
                 i_stim = pulse_train(t_chunk, np.array([50, 60, 70, 80, 90]), rect(0.1))
@@ -149,7 +139,7 @@ def longrun(
                 input_intra.append(intra)
 
         input_ve = torch.cat(input_ve, 1)
-        input_diams = torch.cat(input_diams)
+
         if input_intra:
             input_intra = torch.cat(input_intra, 1)
         else:
@@ -159,28 +149,34 @@ def longrun(
             reinit = False
             if i == 0:
                 reinit = True
-            _ = model(
+            _ = model.run(
                 input_ve,
-                input_diams,
                 intra=input_intra,
                 dt=dt,
                 callbacks=[count],
                 reinit=reinit,
+                progressbar=False,
             )
-        tstart = t_chunk[-1]
 
     return 0
 
 
 # run
 
-mrg = SMF(handle_nan=True).cuda().load("MRG")
 
 frequencies = [1, 2, 5, 10]
 stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]
 
+
+input_diams = []
+for stim in stims:
+    input_diams.append(torch.tensor(diam, device="cuda").float())
+input_diams = torch.cat(input_diams)
+
+mrg = SMF(input_diams, nodes).cuda().load("MRG")
+
 count.reset()
-_ = longrun(mrg, 100, 0.001, stims, field_stack, diam, chunks=500, warmup=True)
+_ = longrun(mrg, 100, 0.001, stims, field_stack, chunks=400, warmup=True)
 all_n = count.record.cpu().numpy()
 
 

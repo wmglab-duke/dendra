@@ -1,4 +1,5 @@
 """Training config."""
+
 from typing import List
 
 import torch
@@ -17,7 +18,10 @@ dt: float = A.dt
 train_dset = "./data/example_datasets/train_example.h5"
 valid_dset = "./data/example_datasets/valid_example.h5"
 
-# states
+# model states
+m_states = ["axnode_myel.m", "axnode_myel.h", "axnode_myel.p", "axnode_myel.s", "v"]
+
+# h5 states
 states = ["m", "h", "p", "s", "v"]
 
 # -- training params --
@@ -30,10 +34,10 @@ to_train: List[str] = [
     "membrane",
     "axon_d",
     "node_d",
-    "aq10_1",
-    "pq10_1",
-    "aq10_2",
-    "aq10_3",
+    "m.aq10_1",
+    "p.pq10_1",
+    "h.aq10_2",
+    "s.aq10_3",
     "ssd",
 ]
 

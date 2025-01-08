@@ -1,6 +1,5 @@
 """GD config"""
 
-
 # model
 model = "MRG"
 
@@ -11,6 +10,8 @@ samples = "all"
 lr = 2.0
 lr_decay = 0.6
 n_steps = 200
+
+loss_v = "axnode_myel.m"
 
 # models params
 diameter = 5.7

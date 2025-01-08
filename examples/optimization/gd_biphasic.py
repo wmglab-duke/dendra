@@ -9,7 +9,7 @@ from cajal.common.logging import tic, toc
 from cajal.nrn.stimuli import SymmetricBiphasic
 from cajal.nrn.sources import PreComputedInterpolate1D
 
-from axonml.models import SMF
+from axonml.models.implementations import SMF
 from axonml.opt.gd import AxonSpec, FieldSpec, GDProblemUniform, GD
 
 from gd_parser import parser
@@ -64,7 +64,8 @@ for sample in all_samples:
 
 # -- model --
 
-mrg = SMF(fp32=args.fp32).cuda().load(args.model).compile(nodes=nodes).train().to(dtype)
+diams = torch.concat([p.diams for p in problems])
+mrg = SMF(diams, nodes).cuda().load(args.model).compile().train().to(dtype)
 
 
 # -- run optimization --
@@ -74,6 +75,7 @@ if __name__ == "__main__":
         problems,
         args.lr,
         args.lr_decay,
+        args.loss_v,
         args.ends_only,
         args.n_end_nodes,
         args.nodes,

@@ -56,6 +56,7 @@ if __name__ == "__main__":
     # perform training
     tbptt(
         model,
+        config.m_states,
         train_data,
         loss,
         optimizer,

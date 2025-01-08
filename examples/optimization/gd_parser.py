@@ -14,6 +14,8 @@ parser.add_argument("--lr", type=float, default=config.lr)
 parser.add_argument("--lr-decay", type=float, default=config.lr_decay)
 parser.add_argument("--n-steps", type=int, default=config.n_steps)
 
+parser.add_argument("--loss-v", default=config.loss_v)
+
 # fiber params
 parser.add_argument("--diameter", type=float, default=config.diameter)
 parser.add_argument("--nodes", type=int, default=config.nodes)

@@ -47,7 +47,7 @@ class Thresholder:
         if fix_bound_up <= 1:
             raise ValueError("fix_bound_up should be > 1.")
 
-        self.model = model.compile(bases.shape[-1], bases.shape[0])
+        self.model = model
 
         bases = torch.as_tensor(bases)
         diams = torch.as_tensor(diams)
@@ -83,7 +83,7 @@ class Thresholder:
             )
         else:
             self.active = Active(threshold, t_start_check, node_check, dt=dt)
-        self.rec = Recorder(max_only=True)
+        self.rec = Recorder(["v"], max_only=True)
 
     def float(self):
         self.fp32 = True
@@ -120,7 +120,9 @@ class Thresholder:
         """
         self.active.reset()
         ve = self.bases * bound[None, :, None, None]
-        self.model.run(ve, self.diams, callbacks=[self.active], reinit=True, dt=self.dt)
+        self.model.run(
+            ve, callbacks=[self.active], reinit=True, dt=self.dt, progressbar=False
+        )
         return self.active.is_active()
 
     def check_active_with_rec(self, bound: Tensor):
@@ -128,7 +130,11 @@ class Thresholder:
         self.rec.reset()
         ve = self.bases * bound[None, :, None, None]
         self.model.run(
-            ve, self.diams, callbacks=[self.active, self.rec], reinit=True, dt=self.dt
+            ve,
+            callbacks=[self.active, self.rec],
+            reinit=True,
+            dt=self.dt,
+            progressbar=False,
         )
         return self.active.is_active(), self.rec.stack()
 
@@ -146,12 +152,12 @@ class Thresholder:
                 mask, rec = self.check_active_with_rec(self.ub)
                 inactive = ~mask
                 if block_possible:
-                    self.ub[
-                        (rec[:, -1] < self.threshold) & inactive
-                    ] *= self.fix_bound_up
-                    self.ub[
-                        (rec[:, -1] >= self.threshold) & inactive
-                    ] *= self.fix_bound_down
+                    self.ub[(rec[:, -1] < self.threshold) & inactive] *= (
+                        self.fix_bound_up
+                    )
+                    self.ub[(rec[:, -1] >= self.threshold) & inactive] *= (
+                        self.fix_bound_down
+                    )
                 else:
                     self.ub[inactive] *= self.fix_bound_up
                 tries += 1
@@ -198,12 +204,7 @@ class Thresholder:
                 tries += 1
             if tries >= self.max_tries_thresh:
                 print("hmm")
-                return ub, lb
-
-            # final
-            # stimamp = (ub + lb) / 2
-            # mask = self.check_active(stimamp)
-            # ub[mask] = stimamp[mask]
+                return ub.cpu().numpy(), lb.cpu().numpy()
 
             if self.ignore is not None:
                 ub[self.ignore] = torch.nan

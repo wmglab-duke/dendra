@@ -1,6 +1,5 @@
-__all__ = ["Backend", "Axon", "SMF"]
-
 from .backend import Backend
 
+# from ._core import Axon
 from .core import Axon
-from .implementations import SMF
+from .implementations import *

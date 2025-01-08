@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from axonml.instruments.thresholder import Thresholder
-from axonml.models import SMF
+from axonml.models.implementations import SMF
 
 
 parser = argparse.ArgumentParser()
@@ -28,6 +28,10 @@ parser.add_argument(
     help="Plot predicted thresholds & error histogram.",
 )
 
+parser.add_argument(
+    "-c", "--cuda", action="store_true", default=False, help="Run on GPU."
+)
+
 args = parser.parse_args()
 
 
@@ -43,11 +47,12 @@ if __name__ == "__main__":
 
     diams = np.load(f"{directory}/example_diameters_{field}.npy")
     n = len(diams)
+    n_node = 101
     fp = np.memmap(
         f"{directory}/example_field_array_{field}.mmap",
         dtype="float32",
         mode="r",
-        shape=(n, 1000, 101),
+        shape=(n, 1000, n_node),
     )
     if args.preload:
         fp = np.array(fp)
@@ -55,7 +60,10 @@ if __name__ == "__main__":
     nrn_thresh_path = f"{directory}/example_thresholds_{field}.npy"
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
-    mrg = SMF(handle_nan=True).cuda().load("MRG")
+    mrg = SMF(diameters=diams, n_node=n_node).load("MRG")
+    if args.cuda:
+        mrg = mrg.cuda()
+
     thresholder = Thresholder(mrg, fp, diams).float()
     thresh, _ = thresholder.calculate_thresholds()
 
