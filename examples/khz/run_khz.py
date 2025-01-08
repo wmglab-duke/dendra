@@ -5,6 +5,7 @@ import numpy as np
 from axonml.models.implementations import SMF
 from axonml.models.callbacks import APCount
 from axonml.instruments.fields import FEMInterpolate1D
+from axonml.instruments.stim import IntraStim
 
 torch.set_default_dtype(torch.float32)
 torch.set_float32_matmul_precision("highest")
@@ -105,7 +106,7 @@ def longrun(
     stims,
     field_stack,
     chunks=20,
-    with_intra=True,
+    intra=None,
     warmup=True,
 ):
     field_stack = torch.tensor(field_stack, device="cuda").float().unsqueeze(1)
@@ -114,36 +115,25 @@ def longrun(
         print("warming up...")
 
         ve = torch.rand(1, len(field_stack) * len(stims), 1, nodes).float().cuda()
-        intra = torch.zeros_like(ve).cuda()
+        intra_v = torch.zeros_like(ve).cuda()
 
         for _ in range(5):
             with torch.no_grad():
-                _ = model.run(ve, intra=intra, dt=dt, progressbar=False)
+                _ = model.run(ve, intra=intra_v, dt=dt, progressbar=False, reinit=True)
 
     t_vec = np.arange(0, tstop, dt)
     views = np.array_split(t_vec, chunks)
 
     for i, t_chunk in enumerate(tqdm(views, desc="Running")):
         input_ve = []
-        input_intra = []
 
         for stim in stims:
             tc = stim(t=t_chunk).astype(np.float32)
             t_course = torch.tensor(tc, device="cuda")
             ve = torch.einsum("i, jkl -> ijkl", t_course, field_stack)
             input_ve.append(ve)
-            if with_intra:
-                intra = torch.zeros_like(ve)
-                i_stim = pulse_train(t_chunk, np.array([50, 60, 70, 80, 90]), rect(0.1))
-                intra[:, :, :, 5] = 2e-6 * torch.tensor(i_stim)[:, None, None]
-                input_intra.append(intra)
 
         input_ve = torch.cat(input_ve, 1)
-
-        if input_intra:
-            input_intra = torch.cat(input_intra, 1)
-        else:
-            input_intra = None
 
         with torch.no_grad():
             reinit = False
@@ -151,7 +141,7 @@ def longrun(
                 reinit = True
             _ = model.run(
                 input_ve,
-                intra=input_intra,
+                intra=intra,
                 dt=dt,
                 callbacks=[count],
                 reinit=reinit,
@@ -173,10 +163,18 @@ for stim in stims:
     input_diams.append(torch.tensor(diam, device="cuda").float())
 input_diams = torch.cat(input_diams)
 
+tstop = 100
+dt = 0.001
+
 mrg = SMF(input_diams, nodes).cuda().load("MRG")
 
+intra = IntraStim(mrg.n_ax, mrg.n_node).cuda().float()
+t_vec = np.arange(0, tstop, dt)
+i_stim = 2e-6 * pulse_train(t_vec, np.array([50, 60, 70, 80, 90]), rect(0.1))
+intra.insert_vec(None, 5, i_stim)
+
 count.reset()
-_ = longrun(mrg, 100, 0.001, stims, field_stack, chunks=400, warmup=True)
+_ = longrun(mrg, tstop, dt, stims, field_stack, intra=intra, chunks=400, warmup=True)
 all_n = count.record.cpu().numpy()
 
 

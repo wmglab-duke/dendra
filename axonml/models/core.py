@@ -438,7 +438,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             s2,
                             dt,
                             self.temp_c,
-                            intra[i],
+                            intra[self.t_ind],
                         )
                     else:
                         self.v, self.v_prev = method(
@@ -461,7 +461,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             ra_inv,
                             dt,
                             self.temp_c,
-                            intra[i],
+                            intra[self.t_ind],
                         )
                     else:
                         self.v = method(
