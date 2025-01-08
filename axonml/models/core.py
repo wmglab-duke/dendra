@@ -602,7 +602,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         v = v + K1 * dt
 
         return v
-    
+
     @torch.jit.script_method
     def step_no_intra_rk2(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
         self.mech.advance(v, dt, temp)
@@ -612,7 +612,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         v = v + (K1 + K2) * (dt / 2)
 
         return v
-    
+
     @torch.jit.script_method
     def step_intra_rk2(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
         self.mech.advance(v, dt, temp)

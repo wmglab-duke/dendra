@@ -224,7 +224,6 @@ class GDProblemArbitrary(GDProblem):
 
 
 class GD:
-
     xs = []
     preds = []
 

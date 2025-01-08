@@ -19,13 +19,7 @@ train_dset = "./data/example_datasets/train_example.h5"
 valid_dset = "./data/example_datasets/valid_example.h5"
 
 # model states
-m_states = [
-    "axnode_myel.m",
-    "axnode_myel.h",
-    "axnode_myel.p",
-    "axnode_myel.s",
-    "v"
-]
+m_states = ["axnode_myel.m", "axnode_myel.h", "axnode_myel.p", "axnode_myel.s", "v"]
 
 # h5 states
 states = ["m", "h", "p", "s", "v"]
