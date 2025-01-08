@@ -7,7 +7,7 @@ from torch.nn.modules.loss import _Loss
 from tqdm import tqdm
 
 from .data import DataLoader
-from ..models._callbacks import Recorder
+from ..models.callbacks import Recorder
 from ..models import Axon
 
 
@@ -35,6 +35,7 @@ def save(model, optimizer, index, validation_error, train_error, directory):
 
 def tbptt(
     model: Axon,
+    states: List[str],
     data: DataLoader,
     loss_fn: _Loss,
     optimizer: Optimizer,
@@ -77,7 +78,7 @@ def tbptt(
         Validation data, by default None
     """
 
-    rec = Recorder()
+    rec = Recorder(states)
     directory = save_dir if save_dir is not None else "checkpoints"
     zero = torch.tensor(0.0, device=model.device())
     save_idx = 0
