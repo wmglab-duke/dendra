@@ -106,6 +106,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.method_conversion = {
             "euler": "rk1",
             "rk1": "rk1",
+            "heun": "rk2",
+            "rk2": "rk2",
             "rk4": "rk4",
             "dufort-frankel": "df",
             "df": "df",
@@ -160,6 +162,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.weight_choices = {
             "rk1": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "rk4": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
+            "rk2": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "df": [
                 [1.0, 0.0, 1.0],
                 [0.0, -1.0, 0.0],
@@ -167,7 +170,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ],
         }
 
-        self.nc = {"rk1": 2, "rk4": 2, "df": 3}
+        self.nc = {"rk1": 2, "rk2": 2, "rk4": 2, "df": 3}
 
         # solver stuff
         weight = self.weight_choices[self.method_conversion[method]]
@@ -597,6 +600,26 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt, temp)
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         v = v + K1 * dt
+
+        return v
+    
+    @torch.jit.script_method
+    def step_no_intra_rk2(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
+        self.mech.advance(v, dt, temp)
+
+        K1 = self.FRK(v, ve, area, cm, ra)
+        K2 = self.FRK(v + K1 * dt, ve, area, cm, ra)
+        v = v + (K1 + K2) * (dt / 2)
+
+        return v
+    
+    @torch.jit.script_method
+    def step_intra_rk2(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
+        self.mech.advance(v, dt, temp)
+
+        K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
+        K2 = self.FRK_intra(v + K1 * dt, ve, area, cm, ra, intra)
+        v = v + (K1 + K2) * (dt / 2)
 
         return v
 
