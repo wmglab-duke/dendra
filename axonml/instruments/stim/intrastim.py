@@ -1,4 +1,3 @@
-from collections import namedtuple
 import torch
 
 from axonml.models.backend import Backend as A
