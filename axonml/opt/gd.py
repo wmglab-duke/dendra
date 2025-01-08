@@ -15,7 +15,8 @@ from cajal.nrn.sources import PreComputedInterpolate1D
 from cajal.nrn.stimuli import Stimulus, MonophasicPulse
 from cajal.opt.loss import PredictionLoss
 
-from axonml.models._callbacks import Recorder
+from axonml.models.callbacks import Recorder
+from axonml.models import Axon
 
 
 class WeightedQuotient(torch.jit.ScriptModule):
@@ -223,7 +224,6 @@ class GDProblemArbitrary(GDProblem):
 
 
 class GD:
-    rec = Recorder()
 
     xs = []
     preds = []
@@ -233,6 +233,7 @@ class GD:
         problems: List[GDProblem],
         lr,
         lr_decay,
+        loss_v,
         ends_only=True,
         n_end_nodes=10,
         nodes=101,
@@ -251,6 +252,10 @@ class GD:
         self.best_xs = [[] for _ in range(len(problems))]
         self.best_preds = [[] for _ in range(len(problems))]
         self.dtype = dtype
+
+        self.loss_v = loss_v
+
+        self.rec = Recorder([loss_v, "v"])
 
         self.loss_fns = [
             WeightedQuotient(
@@ -285,10 +290,9 @@ class GD:
     def best(self):
         return [x[-1] for x in self.best_xs]
 
-    def solve(self, model, steps, dt=0.005):
+    def solve(self, model: Axon, steps, dt=0.005):
         problems = self.problems
 
-        diams = torch.concat([p.diams for p in problems])
         n_axon_list = [p.n_axons for p in problems]
 
         x_list = [p.x for p in problems]
@@ -303,7 +307,7 @@ class GD:
                 inputs.append(p.x_to_input())
 
             input = torch.concat(inputs, dim=1)
-            model.run(input, diams, dt=dt, callbacks=[rec], reinit=True)
+            model.run(input, dt=dt, callbacks=[rec], reinit=True, progressbar=False)
             out = rec.stack()
 
             all_losses = []

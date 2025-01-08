@@ -64,7 +64,8 @@ for sample in all_samples:
 
 # -- model --
 
-mrg = SMF().cuda().load("MRG2024").compile(nodes=nodes).train().to(dtype)
+diams = torch.concat([p.diams for p in problems])
+mrg = SMF(diams, nodes).cuda().load(args.model).compile().train().to(dtype)
 
 
 # -- run optimization --
@@ -74,6 +75,7 @@ if __name__ == "__main__":
         problems,
         args.lr,
         args.lr_decay,
+        args.loss_v,
         args.ends_only,
         args.n_end_nodes,
         args.nodes,

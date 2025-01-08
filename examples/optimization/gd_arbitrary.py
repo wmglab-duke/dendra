@@ -62,7 +62,8 @@ for sample in all_samples:
 
 # -- model --
 
-mrg = SMF(fp32=args.fp32).cuda().load(args.model).compile(nodes=nodes).train().to(dtype)
+diams = torch.concat([p.diams for p in problems])
+mrg = SMF(diams, nodes).cuda().load(args.model).compile().train().to(dtype)
 
 
 if __name__ == "__main__":
@@ -70,6 +71,7 @@ if __name__ == "__main__":
         problems,
         args.lr,
         args.lr_decay,
+        args.loss_v,
         args.ends_only,
         args.n_end_nodes,
         args.nodes,
