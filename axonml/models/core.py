@@ -18,7 +18,7 @@ from .mechanisms.declarations import PARAMETER
 from .mechanisms.handler.handler import build_handler
 from .mechanisms.handler.ions import build_ion
 from .mechanisms.mech_compiler import compile_mechanism
-from axonml.instruments.stim.intrastim import IntraStim
+from axonml.stim.intrastim import IntraStim
 
 
 def get_unique_keys(list_of_dicts):
