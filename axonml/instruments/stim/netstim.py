@@ -1,10 +1,11 @@
+from typing import Tuple, Optional
 import torch
-import math
+
 
 class NetStim:
     """
     A PyTorch implementation of NEURON's NetStim-like spike generator.
-    
+
     Args:
         shape (tuple): The shape (m, n) indicating the number of synapses.
         interval (float): Mean inter-spike interval in ms.
@@ -16,16 +17,17 @@ class NetStim:
         seed (int or None): Seed for reproducible random number generation. If None,
                             it will use the global RNG state.
     """
+
     def __init__(
         self,
-        shape,
-        interval,
-        start,
-        max_spikes,
-        noise,
-        device='cpu',
+        interval: float,
+        max_spikes: int,
+        start: Optional[float] = 0,
+        noise: Optional[float] = 0,
+        shape=None,
+        device="cpu",
         dtype=torch.float,
-        seed=None
+        seed: Optional[int] = None,
     ):
         # Store parameters
         self.shape = shape
@@ -35,47 +37,62 @@ class NetStim:
         self.noise = noise
         self.device = device
         self.dtype = dtype
+        self.seed = seed
 
         # If a seed is provided, create a Generator and seed it for reproducible behavior
         self._rng = None
-        if seed is not None:
-            self._rng = torch.Generator(device=device)
-            self._rng.manual_seed(seed)
+
+        self.next_spike_time = None
+        self.spike_counts = None
+
+    def init_rng(self):
+        if self.seed is not None:
+            self._rng = torch.Generator(device=self.device)
+            self._rng.manual_seed(self.seed)
+
+    def init(self, n_ax, n_node, device, dtype):
+        self.shape = (n_ax, n_node)
+        self.device = device
+        self.dtype = dtype
+
+        self.init_rng()
 
         # Initialize next_spike_time:
         # If noise=0, the first spike time = start (no randomization).
         # Otherwise, draw from an exponential distribution with mean = noise * interval,
         # so that E[next_spike_time] = start + noise * interval.
         self.next_spike_time = torch.full(
-            shape, self.start, device=self.device, dtype=self.dtype
+            self.shape, self.start, device=self.device, dtype=self.dtype
         )
         if self.noise > 0:
             # Draw from Exp(1 / (noise*interval)) so that mean = noise*interval
-            randvals = torch.rand(shape, generator=self._rng, device=self.device, dtype=self.dtype)
+            randvals = torch.rand(
+                self.shape, generator=self._rng, device=self.device, dtype=self.dtype
+            )
             # Exponential variable with mean = noise*interval => -log(U) * (noise*interval)
-            init_offsets = - (self.noise * self.interval) * torch.log(randvals)
+            init_offsets = -(self.noise * self.interval) * torch.log(randvals)
             self.next_spike_time += init_offsets
 
         # spike_counts: how many spikes each synapse has emitted
         self.spike_counts = torch.zeros(
-            shape, device=self.device, dtype=torch.long
+            self.shape, device=self.device, dtype=torch.long
         )
 
-    def event(self, t):
+    def event(self, t: float):
         """
         Returns an m x n binary tensor indicating which synapses spike at time `t`.
         Updates internal states for spiking synapses (increments spike count,
         and schedules their next spike time).
-        
+
         Args:
             t (float): Current simulation time in ms.
-        
+
         Returns:
             A binary tensor of shape (m, n) indicating which synapses spike.
         """
 
         # Identify which synapses are still allowed to spike
-        can_spike = (self.spike_counts < self.max_spikes)
+        can_spike = self.spike_counts < self.max_spikes
 
         # Determine which synapses spike exactly at this time
         # (i.e., t >= next_spike_time)
@@ -86,7 +103,7 @@ class NetStim:
 
         # Get the indices of synapses that spike
         spiking_indices = is_spiking_now.nonzero(as_tuple=True)
-        
+
         # Increment the spike count for those synapses
         self.spike_counts[spiking_indices] += 1
 
@@ -98,22 +115,28 @@ class NetStim:
         if num_spiking > 0:
             # Exponential random deviates (for partial or full noise)
             exp_rand = -torch.log(
-                torch.rand(num_spiking, generator=self._rng, device=self.device, dtype=self.dtype)
+                torch.rand(
+                    num_spiking,
+                    generator=self._rng,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
             )
             # Weighted combination of deterministic + random
-            next_interval = self.interval * (1 - self.noise) \
-                            + self.interval * self.noise * exp_rand
+            next_interval = (
+                self.interval * (1 - self.noise) + self.interval * self.noise * exp_rand
+            )
 
             self.next_spike_time[spiking_indices] += next_interval
 
         # Any synapse that has just reached its maximum number of spikes
         # will no longer spike (set next_spike_time = inf)
         done_indices = (self.spike_counts >= self.max_spikes).nonzero(as_tuple=True)
-        self.next_spike_time[done_indices] = float('inf')
+        self.next_spike_time[done_indices] = float("inf")
 
         return output
 
-    def __call__(self, t):
+    def __call__(self, t: float):
         return self.event(t)
 
 
@@ -135,9 +158,9 @@ if __name__ == "__main__":
         start=5.0,
         max_spikes=5,
         noise=0.5,
-        device='cpu',
+        device="cpu",
         dtype=torch.float,
-        seed=123
+        seed=123,
     )
 
     # Simulate from t=0 to t=50 ms in 1 ms steps

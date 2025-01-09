@@ -83,7 +83,7 @@ class IntraStim:
 
     def __getitem__(self, idx, v):
         t = self.dt * idx
-        
+
         intra = torch.zeros(
             self.n_axons, self.n_nodes, device=self.device, dtype=self.dtype
         )
@@ -94,5 +94,5 @@ class IntraStim:
             self.add_from_callable(intra, c, t)
         for s in self.stim_synapse:
             self.add_from_synapse(intra, s, t, v)
-        
+
         return intra.unsqueeze(1)

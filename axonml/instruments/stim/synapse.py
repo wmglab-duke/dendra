@@ -29,7 +29,7 @@ class Synapse:
         self.register_events(t)
         self.advance()
         return self.i(v)
-    
+
     def register_events(self, t):
         pass
 
@@ -38,7 +38,7 @@ class Synapse:
 
     def i(self, v):
         pass
-    
+
 
 class ExpSyn(Synapse):
     def __init__(self, e=0.0, tau=2.0):
@@ -50,7 +50,7 @@ class ExpSyn(Synapse):
         self.dexp = math.exp(-self.dt / self.tau)
         self.g = torch.zeros(n_axons, n_nodes, device=device, dtype=dtype)
         return self
-    
+
     def register_events(self, t):
         if self.driver is not None:
             self.g += self.driver(t) * self.weight
@@ -66,17 +66,17 @@ class Exp2Syn(Synapse):
     def __init__(self, e=0.0, tau1=0.1, tau2=10.0):
         super().__init__(e)
 
-        if (tau1/tau2 > 0.9999):
+        if tau1 / tau2 > 0.9999:
             tau1 = 0.9999 * tau2
-            
-        if (tau1/tau2 < 1e-9):
+
+        if tau1 / tau2 < 1e-9:
             tau1 = tau2 * 1e-9
 
         self.tau1 = tau1
         self.tau2 = tau2
 
-        tp = (tau1 * tau2) / (tau2 - tau1) * math.log(tau2/tau1)
-        factor = -math.exp(-tp/tau1) + math.exp(-tp/tau2)
+        tp = (tau1 * tau2) / (tau2 - tau1) * math.log(tau2 / tau1)
+        factor = -math.exp(-tp / tau1) + math.exp(-tp / tau2)
         self.factor = 1 / factor
 
     def drive(self, driver, weight):
@@ -91,7 +91,7 @@ class Exp2Syn(Synapse):
         self.A = torch.zeros(n_axons, n_nodes, device=device, dtype=dtype)
         self.B = torch.zeros(n_axons, n_nodes, device=device, dtype=dtype)
         return self
-    
+
     def register_events(self, t):
         if self.driver is not None:
             inc = self.driver(t) * self.factor
