@@ -115,7 +115,7 @@ def longrun(
         print("warming up...")
 
         ve = torch.rand(1, len(field_stack) * len(stims), 1, nodes).float().cuda()
-        intra_v = torch.zeros_like(ve).cuda()
+        intra_v = IntraStim(model)
 
         for _ in range(5):
             with torch.no_grad():
@@ -167,8 +167,8 @@ tstop = 100
 dt = 0.001
 
 mrg = SMF(input_diams, nodes).cuda().load("MRG")
-
 intra = IntraStim(mrg)
+
 t_vec = np.arange(0, tstop, dt)
 i_stim = 2e-6 * pulse_train(t_vec, np.array([50, 60, 70, 80, 90]), rect(0.1))
 intra.insert_vec(None, 5, i_stim)
