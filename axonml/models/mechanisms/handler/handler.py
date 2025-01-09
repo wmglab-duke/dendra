@@ -86,6 +86,7 @@ set_diam_buffer_template = """
 self.{mech}.diam.set_(diameters.view(-1, 1, 1))
 """
 
+
 def parse_set_buffers(mechanisms, ions):
     out = []
     for m in mechanisms:

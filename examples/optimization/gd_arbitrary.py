@@ -55,7 +55,7 @@ for sample in all_samples:
     a_spec = AxonSpec(diameter, nodes, length)
 
     problem = GDProblemArbitrary(
-        target, weights, f_spec, a_spec, tcourse, pw, delay, dtype
+        target, weights, f_spec, a_spec, tcourse, pw, delay, dtype=dtype
     )
     problems.append(problem)
 
@@ -63,7 +63,7 @@ for sample in all_samples:
 # -- model --
 
 diams = torch.concat([p.diams for p in problems])
-mrg = SMF(diams, nodes).cuda().load(args.model).compile().train().to(dtype)
+mrg = SMF(diams, nodes).cuda().load(args.model).to(dtype).compile().train()
 
 
 if __name__ == "__main__":
@@ -76,7 +76,7 @@ if __name__ == "__main__":
         args.n_end_nodes,
         args.nodes,
         args.node_check,
-        dtype,
+        dtype=dtype,
     )
 
     tic()

@@ -162,8 +162,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.weight_choices = {
             "rk1": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
-            "rk4": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "rk2": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
+            "rk4": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "df": [
                 [1.0, 0.0, 1.0],
                 [0.0, -1.0, 0.0],
@@ -192,6 +192,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         # -- constants --
         self.eval()
+
+    def set_diam(self, diams):
+        diams = torch.as_tensor(diams, dtype=self.dtype())
+        self.diam[:] = diams
+        self.calculate_geometric_params()
 
     def calculate_geometric_params(self):
         self.area_c[:] = self.area_(self.diam)[:, None, None]
@@ -727,7 +732,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self
 
     def compile(self, callbacks: List[Callback] = None):
-        ve = torch.ones(1, self.n_ax, 1, self.n_node, device=self.device())
+        ve = torch.ones(
+            1, self.n_ax, 1, self.n_node, device=self.device(), dtype=self.dtype()
+        )
         for _ in range(5):
             self.run(ve, callbacks=callbacks, progressbar=False)
         self.initialized = False
