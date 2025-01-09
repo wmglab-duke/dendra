@@ -46,7 +46,7 @@ class ExpSyn(Synapse):
         self.tau = tau
 
     def init(self, n_axons, n_nodes, dt, device, dtype):
-        super().init(n_axons, n_nodes, dt)
+        super().init(n_axons, n_nodes, dt, device, dtype)
         self.dexp = math.exp(-self.dt / self.tau)
         self.g = torch.zeros(n_axons, n_nodes, device=device, dtype=dtype)
         return self
@@ -85,7 +85,7 @@ class Exp2Syn(Synapse):
         return self
 
     def init(self, n_axons, n_nodes, dt, device, dtype):
-        super().init(n_axons, n_nodes, dt)
+        super().init(n_axons, n_nodes, dt, device, dtype)
         self.dexp1 = math.exp(-self.dt / self.tau1)
         self.dexp2 = math.exp(-self.dt / self.tau2)
         self.A = torch.zeros(n_axons, n_nodes, device=device, dtype=dtype)

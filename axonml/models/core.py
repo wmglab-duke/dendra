@@ -140,7 +140,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.mech: HandlerInterface = None
         self.t_ind: int = 0
-        self.dt: float = 0.005
+        self.dt: float = A.dt
 
         self._m_list = []
         self._m_name = []
@@ -407,6 +407,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     self.post_initialize()
                     self.t_ind = 0
                     self.initialized = True
+                if with_intra:
+                    intra.init(self)
 
             if first:
                 if callbacks:

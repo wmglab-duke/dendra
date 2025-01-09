@@ -4,22 +4,29 @@ from axonml.models.backend import Backend as A
 
 
 class IntraStim:
-    def __init__(self, n_axons, n_nodes):
+    def __init__(self, model):
         self.stim_vec = []
         self.stim_callable = []
         self.stim_synapse = []
 
-        self.dt = A.dt
+        self.dt = model.dt
 
-        self.n_nodes = n_nodes
-        self.n_axons = n_axons
-        self.device = torch.device("cpu")
-        self.dtype = torch.float32
+        self.n_nodes = model.n_node
+        self.n_axons = model.n_ax
+        self.device = model.device()
+        self.dtype = model.dtype()
 
     def init(self, model):
         self.dt = model.dt
-        for s in self.stim_synapse:
-            s[2].init(model.n_axons, model.n_nodes, model.dt, self.device, self.dtype)
+        self.device = model.device()
+        self.dtype = model.dtype()
+        self.n_axons = model.n_ax
+        self.n_nodes = model.n_node
+
+        for ax, node, synapse in self.stim_synapse:
+            n_ax = n(ax)
+            n_node = n(node)
+            synapse.init(n_ax, n_node, self.dt, self.device, self.dtype)
 
     def float(self):
         self.dtype = torch.float32
@@ -96,3 +103,47 @@ class IntraStim:
             self.add_from_synapse(intra, s, t, v)
 
         return intra.unsqueeze(1)
+
+
+def n(obj):
+    """
+    Return the 'length' of obj:
+      - if obj is an int, return 1
+      - if obj is a list, return len(obj)
+      - if obj is a slice, compute how many indices it would produce
+
+    Raises ValueError for unsupported types.
+    """
+    import sys
+
+    # 1) If the object is an integer, length = 1
+    if isinstance(obj, int):
+        return 1
+
+    # 2) If the object is a list, length = len(obj)
+    elif isinstance(obj, list):
+        return len(obj)
+
+    # 3) If the object is a slice, compute the length
+    elif isinstance(obj, slice):
+        # Extract start, stop, step with Python's defaults
+        start = obj.start if obj.start is not None else 0
+        step = obj.step if obj.step is not None else 1
+        if obj.stop is None:
+            raise ValueError("Unbounded slice not supported.")
+        stop = obj.stop
+
+        # If stop is None and we try to interpret an "unbounded" slice,
+        # we must pick some convention. Here we use sys.maxsize (or -sys.maxsize).
+        # You might choose to raise an error instead.
+        if step > 0:
+            length = max(0, (stop - start + step - 1) // step)
+        else:
+            # step < 0
+            length = max(0, (start - stop - step - 1) // abs(step))
+
+        return length
+
+    # If none of the above, raise an error for unsupported types
+    else:
+        raise ValueError(f"Unsupported type: {type(obj)}")
