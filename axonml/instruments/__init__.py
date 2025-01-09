@@ -1,4 +1,3 @@
-__all__ = ["Thresholder", "IntraStim"]
+__all__ = ["Thresholder"]
 
 from .thresholder import Thresholder
-from .stim import IntraStim
