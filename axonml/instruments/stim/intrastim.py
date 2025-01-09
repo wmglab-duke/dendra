@@ -4,8 +4,7 @@ from axonml.models.backend import Backend as A
 
 
 class IntraStim:
-    def __init__(self, n_axons, n_nodes, seed=None):
-        self.seed = seed
+    def __init__(self, n_axons, n_nodes):
         self.stim_vec = []
         self.stim_callable = []
         self.stim_synapse = []
@@ -16,6 +15,11 @@ class IntraStim:
         self.n_axons = n_axons
         self.device = torch.device("cpu")
         self.dtype = torch.float32
+
+    def init(self, model):
+        self.dt = model.dt
+        for s in self.stim_synapse:
+            s[2].init(model.n_axons, model.n_nodes, model.dt, self.device, self.dtype)
 
     def float(self):
         self.dtype = torch.float32
@@ -55,7 +59,13 @@ class IntraStim:
         val = func[2](t)
         intra[axons, nodes] += val
 
-    def insert_callable(self, axons: None, nodes: None, func):
+    def add_from_synapse(self, intra, synapse, t, v):
+        axons = synapse[0]
+        nodes = synapse[1]
+        val = synapse[2](t, v)
+        intra[axons, nodes] -= val
+
+    def insert_func(self, axons: None, nodes: None, func):
         axon_inds = self.render_axons(axons)
         node_inds = self.render_nodes(nodes)
         self.stim_callable.append((axon_inds, node_inds, func))
@@ -66,13 +76,23 @@ class IntraStim:
         vec = torch.tensor(vec, device=self.device, dtype=self.dtype)
         self.stim_vec.append((axon_inds, node_inds, vec))
 
-    def __getitem__(self, idx):
+    def insert_synapse(self, axons: None, nodes: None, synapse):
+        axon_inds = self.render_axons(axons)
+        node_inds = self.render_nodes(nodes)
+        self.stim_synapse.append((axon_inds, node_inds, synapse))
+
+    def __getitem__(self, idx, v):
         t = self.dt * idx
+        
         intra = torch.zeros(
             self.n_axons, self.n_nodes, device=self.device, dtype=self.dtype
         )
+
         for v in self.stim_vec:
             self.add_from_vec(intra, v, idx)
         for c in self.stim_callable:
             self.add_from_callable(intra, c, t)
+        for s in self.stim_synapse:
+            self.add_from_synapse(intra, s, t, v)
+        
         return intra.unsqueeze(1)

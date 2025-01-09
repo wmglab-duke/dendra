@@ -18,6 +18,7 @@ from .mechanisms.declarations import PARAMETER
 from .mechanisms.handler.handler import build_handler
 from .mechanisms.handler.ions import build_ion
 from .mechanisms.mech_compiler import compile_mechanism
+from axonml.instruments.stim.intrastim import IntraStim
 
 
 def get_unique_keys(list_of_dicts):
@@ -363,7 +364,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ve_s: Tensor = None,
         ve_t: Tensor = None,
         dt: float = None,
-        intra: Optional[Tensor] = None,
+        intra: Optional[IntraStim] = None,
         callbacks: List[Callback] = None,
         reinit: bool = False,
         progressbar: bool = True,
@@ -377,7 +378,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if ve is None:
             ve = self.ve_from_s_t(ve_s, ve_t, multicontact)
 
+        dt = dt if dt is not None else A.dt
+        self.dt = dt
+
         with_intra = intra is not None
+        if with_intra:
+            if not isinstance(intra, IntraStim):
+                raise ValueError("intra must be an instance of IntraStim")
+            intra.init(self)
 
         method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
         method_intra = getattr(
@@ -388,9 +396,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         with torch.set_grad_enabled(self.training):
             device = self.device()
-
-            dt = dt if dt is not None else A.dt
-            self.dt = dt
 
             if (not self.initialized) or reinit:
                 if "_steady_state" in self._caches:
@@ -438,7 +443,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             s2,
                             dt,
                             self.temp_c,
-                            intra[self.t_ind],
+                            intra[self.t_ind, self.v],
                         )
                     else:
                         self.v, self.v_prev = method(
@@ -461,7 +466,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                             ra_inv,
                             dt,
                             self.temp_c,
-                            intra[self.t_ind],
+                            intra[self.t_ind, self.v],
                         )
                     else:
                         self.v = method(
