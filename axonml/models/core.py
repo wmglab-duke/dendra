@@ -385,7 +385,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if with_intra:
             if not isinstance(intra, IntraStim):
                 raise ValueError("intra must be an instance of IntraStim")
-            intra.init(self)
 
         method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
         method_intra = getattr(
