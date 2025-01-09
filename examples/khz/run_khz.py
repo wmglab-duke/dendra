@@ -5,7 +5,7 @@ import numpy as np
 from axonml.models.implementations import SMF
 from axonml.models.callbacks import APCount
 from axonml.instruments.fields import FEMInterpolate1D
-from axonml.instruments.stim import IntraStim
+from axonml.stim import IntraStim
 
 torch.set_default_dtype(torch.float32)
 torch.set_float32_matmul_precision("highest")
