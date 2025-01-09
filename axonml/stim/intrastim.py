@@ -88,7 +88,7 @@ class IntraStim:
         node_inds = self.render_nodes(nodes)
         self.stim_synapse.append((axon_inds, node_inds, synapse))
 
-    def __getitem__(self, idx, v):
+    def __call__(self, idx, v):
         t = self.dt * idx
 
         intra = torch.zeros(
