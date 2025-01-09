@@ -60,7 +60,7 @@ def matches_any_pattern(base_patterns, target_string):
 
 @torch.jit.interface
 class HandlerInterface:
-    def initialize(self, v, v_init, area, temp) -> None:
+    def initialize(self, v, v_init, temp) -> None:
         pass
 
     def advance(self, v, dt) -> None:
@@ -402,7 +402,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     self.t_ind = 0
                 else:
                     self.init_v()
-                    self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
+                    self.initialize(self.v, self.v_init_c, self.temp_c)
                     self.post_initialize()
                     self.t_ind = 0
                     self.initialized = True
@@ -578,8 +578,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             h(self)
 
     @torch.jit.script_method
-    def initialize(self, v, v_init, area, temp):
-        self.mech.initialize(v, v_init, area, temp)
+    def initialize(self, v, v_init, temp):
+        self.mech.initialize(v, v_init, temp)
 
     def FRK(self, v, ve, area, cm, ra):
         x = torch.cat([v, ve], dim=1)
@@ -598,7 +598,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt, temp)
         K1 = self.FRK(v, ve, area, cm, ra)
         v = v + K1 * dt
-
         return v
 
     @torch.jit.script_method
@@ -606,7 +605,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt, temp)
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         v = v + K1 * dt
-
         return v
 
     @torch.jit.script_method
@@ -761,12 +759,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def cuda(self):
         super().cuda()
-        self.mech.set_buffers()
+        self.mech.set_buffers(self.diam)
         return self
 
     def cpu(self):
         super().cpu()
-        self.mech.set_buffers()
+        self.mech.set_buffers(self.diam)
         return self
 
 

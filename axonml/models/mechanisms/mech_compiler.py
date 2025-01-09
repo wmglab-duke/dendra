@@ -111,7 +111,7 @@ class mech(torch.nn.Module):
         self.instantiate_parameters(params)
         self.instantiate_distributions(distributions)
         self.temp = temp
-        self.register_buffer("diam", diameters[:, None, None])
+        self.register_buffer("diam", diameters.view(-1, 1, 1))
         self._name = name
         self.DE = torch.nn.ModuleDict(
             {{state._name: state for state in states}}

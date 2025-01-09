@@ -19,13 +19,13 @@ class MechanismHandler(torch.nn.Module):
     self.temp = temp
     {assignments}
 
-  def initialize(self, v, v_init, area, temp) -> None:
+  def initialize(self, v, v_init, temp) -> None:
     self.ion_init(temp)
     self.init_buffers(v_init)
     self.itot(v)
 
   @torch.jit.export
-  def set_buffers(self):
+  def set_buffers(self, diameters):
 {set_buffers}
     return
 
@@ -82,6 +82,10 @@ self.{mech}.{v}.set_(self.{ion}_ion.{v})
 """
 
 
+set_diam_buffer_template = """
+self.{mech}.diam.set_(diameters.view(-1, 1, 1))
+"""
+
 def parse_set_buffers(mechanisms, ions):
     out = []
     for m in mechanisms:
@@ -96,6 +100,7 @@ def parse_set_buffers(mechanisms, ions):
                             mech=m._name, v=v, ion=ion
                         )
                     )
+        out.append(set_diam_buffer_template.format(mech=m._name))
     out = "\n".join(out)
     return indent(out, 1)
 
