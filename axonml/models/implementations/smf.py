@@ -36,7 +36,7 @@ class SMF(Myelinated):
         n_node=101,
         temp=37.0,
         v_init=-80.0,
-        method="rk1",
+        method="euler",
         pade=None,
     ):
         super().__init__(diameters, n_node, temp, v_init, method, pade)
