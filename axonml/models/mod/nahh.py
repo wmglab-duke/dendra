@@ -28,14 +28,13 @@ class m(State):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
-        v = v + 65.0 + self.mshift
         return self.q10() * self.am1 * exprelr(self.am2 - v, self.am3)
 
     def beta(self, v):
-        v = v + 65.0 + self.mshift
         return self.q10() * self.bm1 * exprelr(v - self.bm2, self.bm3)
 
     def breakpoint(self, v):
+        v = v + 65.0 + self.mshift
         a = self.alpha(v)
         b = self.beta(v)
         taum = 1 / (a + b)
@@ -65,14 +64,13 @@ class h(State):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
-        v = v + 65.0 + self.hshift
         return self.q10() * self.ah1 * exp((self.ah2 - v) / self.ah3)
 
     def beta(self, v):
-        v = v + 65.0 + self.hshift
         return self.q10() * self.bh1 * expit((v - self.bh2) / self.bh3)
 
     def breakpoint(self, v):
+        v = v + 65.0 + self.hshift
         a = self.alpha(v)
         b = self.beta(v)
         tauh = 1 / (a + b)
