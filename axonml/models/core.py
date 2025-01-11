@@ -181,7 +181,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if self.is_df:
             self.register_buffer("v_prev", torch.full((self.n_ax, 1, n_node), v_init))
 
-        self.register_buffer("diam", torch.tensor(diameters, dtype=self.dtype()))
+        if torch.is_tensor(diameters):
+            diameters = diameters.to(self.dtype()).clone().detach()
+        else:
+            diameters = torch.tensor(diameters, dtype=self.dtype())
+
+        self.register_buffer("diam", diameters)
         self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
         self.register_buffer("cm_c", self.cm_(self.area_c))
         self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
