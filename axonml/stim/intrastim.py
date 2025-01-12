@@ -80,18 +80,18 @@ class IntraStim:
         val = synapse[2](t, v)
         intra[axons, nodes] -= val
 
-    def insert_func(self, axons: None, nodes: None, func):
+    def insert_func(self, func, axons=None, nodes=None):
         axon_inds = self.render_axons(axons)
         node_inds = self.render_nodes(avoid_smart_indexing(nodes))
         self.stim_callable.append((axon_inds, node_inds, func))
 
-    def insert_vec(self, axons: None, nodes: None, vec):
+    def insert_vec(self, vec, axons=None, nodes=None):
         axon_inds = self.render_axons(axons)
         node_inds = self.render_nodes(avoid_smart_indexing(nodes))
         vec = torch.tensor(vec, device=self.device, dtype=self.dtype)
         self.stim_vec.append((axon_inds, node_inds, vec))
 
-    def insert_synapse(self, axons: None, nodes: None, synapse):
+    def insert_synapse(self, synapse, axons=None, nodes=None):
         axon_inds = self.render_axons(axons)
         node_inds = self.render_nodes(avoid_smart_indexing(nodes))
         self.stim_synapse.append((axon_inds, node_inds, synapse))

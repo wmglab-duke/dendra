@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 from tqdm import tqdm
 import numpy as np
@@ -8,6 +10,11 @@ from axonml.instruments.fields import FEMInterpolate1D
 from axonml.stim import IntraStim
 
 torch.set_default_dtype(torch.float32)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--chunks", type=int, default=200)
+
+args = parser.parse_args()
 
 
 def deltax(diam):
@@ -171,10 +178,10 @@ mrg = SMF(input_diams, nodes).cuda().load("MRG")
 # intracellular stim to generate activity
 intra = IntraStim(mrg)
 i_stim = 2e-6 * pulse_train(t_vec, np.array([50, 60, 70, 80, 90]), rect(0.1))
-intra.insert_vec(nodes=5, vec=i_stim)
+intra.insert_vec(i_stim, nodes=5)
 
 count.reset()
-_ = longrun(mrg, tstop, dt, stims, field_stack, intra=intra, chunks=200, warmup=True)
+_ = longrun(mrg, tstop, dt, stims, field_stack, intra=intra, chunks=args.chunks, warmup=True)
 all_n = count.numpy()
 
 
