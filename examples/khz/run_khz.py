@@ -30,7 +30,6 @@ interpolator = FEMInterpolate1D(FIELD_DATA[s_idx] * 1000, field_x)
 
 def make_ve_at_nodes(diameter, a_idx, nodes=nodes, offset=37500):
     start = (deltax(diameter) * (nodes - 1)) / 2
-    dx = np.linspace(-start, start, nodes)
     interp_at = np.linspace(-start, start, nodes) + offset
     b = interpolator._interpolate(interpolator.get(a_idx), interpolator.x[0], interp_at)
     return b
@@ -152,29 +151,31 @@ def longrun(
 
 # run
 
-
 frequencies = [1, 2, 5, 10]
 stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]
 
 
 input_diams = []
-for stim in stims:
+for _ in stims:
     input_diams.append(torch.tensor(diam, device="cuda").float())
 input_diams = torch.cat(input_diams)
 
 tstop = 100
 dt = 0.001
 
-mrg = SMF(input_diams, nodes).cuda().load("MRG")
-intra = IntraStim(mrg)
-
 t_vec = np.arange(0, tstop, dt)
+
+# fiber model
+mrg = SMF(input_diams, nodes).cuda().load("MRG")
+
+# intracellular stim to generate activity
+intra = IntraStim(mrg)
 i_stim = 2e-6 * pulse_train(t_vec, np.array([50, 60, 70, 80, 90]), rect(0.1))
-intra.insert_vec(None, 5, i_stim)
+intra.insert_vec(nodes=5, vec=i_stim)
 
 count.reset()
 _ = longrun(mrg, tstop, dt, stims, field_stack, intra=intra, chunks=200, warmup=True)
-all_n = count.record.cpu().numpy()
+all_n = count.numpy()
 
 
 # visualize
