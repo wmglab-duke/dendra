@@ -77,7 +77,7 @@ impl_template = """
     self.rec['{full_state}'].append(torch.amax(states, -1))
   else:
     if self.node_indices is not None:
-      self.rec['{full_state}'].append(states[:, :, self.node_indices])
+      self.rec['{full_state}'].append(atleast_3d(states[:, :, self.node_indices]))
     else:
       self.rec['{full_state}'].append(states)
 """
@@ -88,7 +88,7 @@ v_template = """
     self.rec['v'].append(torch.amax(states, -1))
   else:
     if self.node_indices is not None:
-      self.rec['v'].append(states[:, :, self.node_indices])
+      self.rec['v'].append(atleast_3d(states[:, :, self.node_indices]))
     else:
       self.rec['v'].append(states)
 """
@@ -114,13 +114,41 @@ def build_recorder_func(states):
     return locals()["recorder"]
 
 
+def avoid_smart_indexing(node_indices):
+    if node_indices is not None:
+        if len(node_indices) == 1:
+            return node_indices[0]
+    return node_indices
+
+
+def n(node_indices):
+    if isinstance(node_indices, int):
+        return 1
+    return len(node_indices)
+
+
+def atleast_2d(x: torch.Tensor) -> torch.Tensor:
+    dims = x.dim()
+    if dims == 1:
+        return x.unsqueeze(-1)
+    return x
+    
+
+def atleast_3d(x: torch.Tensor) -> torch.Tensor:
+    dims = x.dim()
+    if dims == 2:
+        return x.unsqueeze(-1)
+    return x
+
+
 class Recorder(Callback):
     def __init__(self, states, max_only=False, node_indices=None):
         super().__init__()
         self.states = states
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
-        self.node_indices = node_indices
+        self.node_indices = avoid_smart_indexing(node_indices)
+        self.n = n(self.node_indices)
         rfunc = build_recorder_func(states)
         setattr(self, "post_step_hook", MethodType(rfunc, self))
         setattr(self, "pre_loop_hook", MethodType(rfunc, self))
@@ -152,7 +180,8 @@ class ThresholdCallback(Callback):
         self.state_cache: torch.Tensor = None
         self.threshold: float = threshold
         self.t_start_check: float = t_start_check
-        self.node_check: List[int] = node_check
+        self.node_check: List[int] = avoid_smart_indexing(node_check)
+        self.n: int = n(self.node_check)
         self.i: int = 0
         self.dt: float = dt if dt is not None else A.dt
 
@@ -185,21 +214,21 @@ class APCount(ThresholdCallback):
         if self.record is None:
             self.record = torch.zeros(
                 model.n(),
-                len(self.node_check),
+                n(self.node_check),
                 dtype=torch.int32,
                 device=model.device(),
             )
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                len(self.node_check),
+                n(self.node_check),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.v[:, 0, self.node_check]
+            vm_new = atleast_2d(model.v[:, 0, self.node_check])
             vm = self.state_cache
             self.state_cache = increment_count_(vm, vm_new, self.record, self.threshold)
         self.i += 1
@@ -234,14 +263,14 @@ class Active(ThresholdCallback):
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                len(self.node_check),
+                n(self.node_check),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.v[:, 0, self.node_check]
+            vm_new = atleast_2d(model.v[:, 0, self.node_check])
             vm = self.state_cache
             self.state_cache, la = update_active(vm, vm_new, self.threshold)
             self.record[la] = True
@@ -265,14 +294,14 @@ class Raster(ThresholdCallback):
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                len(self.node_check),
+                n(self.node_check),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.v[:, -1, self.node_check]
+            vm_new = atleast_2d(model.v[:, 0, self.node_check])
             vm = self.state_cache
             self.state_cache, la = increment_count(vm, vm_new, self.threshold)
             self.record.append(la)

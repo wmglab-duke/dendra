@@ -8,7 +8,6 @@ from axonml.instruments.fields import FEMInterpolate1D
 from axonml.stim import IntraStim
 
 torch.set_default_dtype(torch.float32)
-torch.set_float32_matmul_precision("highest")
 
 
 def deltax(diam):
@@ -174,7 +173,7 @@ i_stim = 2e-6 * pulse_train(t_vec, np.array([50, 60, 70, 80, 90]), rect(0.1))
 intra.insert_vec(None, 5, i_stim)
 
 count.reset()
-_ = longrun(mrg, tstop, dt, stims, field_stack, intra=intra, chunks=400, warmup=True)
+_ = longrun(mrg, tstop, dt, stims, field_stack, intra=intra, chunks=200, warmup=True)
 all_n = count.record.cpu().numpy()
 
 
