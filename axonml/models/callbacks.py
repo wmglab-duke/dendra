@@ -132,7 +132,7 @@ def atleast_2d(x: torch.Tensor) -> torch.Tensor:
     if dims == 1:
         return x.unsqueeze(-1)
     return x
-    
+
 
 def atleast_3d(x: torch.Tensor) -> torch.Tensor:
     dims = x.dim()
@@ -148,7 +148,6 @@ class Recorder(Callback):
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
         self.node_indices = avoid_smart_indexing(node_indices)
-        self.n = n(self.node_indices)
         rfunc = build_recorder_func(states)
         setattr(self, "post_step_hook", MethodType(rfunc, self))
         setattr(self, "pre_loop_hook", MethodType(rfunc, self))

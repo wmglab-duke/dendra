@@ -2,7 +2,6 @@ import math
 from typing import List, Tuple, Optional, Dict, Callable
 import re
 import itertools
-from decimal import Decimal
 
 import torch
 from torch import Tensor
@@ -186,18 +185,21 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         else:
             diameters = torch.tensor(diameters, dtype=self.dtype())
 
-        self.register_buffer("diam", diameters)
-        self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
-        self.register_buffer("cm_c", self.cm_(self.area_c))
-        self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
-
-        self.register_buffer("v_init_c", torch.tensor(v_init))
-        self.register_buffer("temp_c", torch.tensor(temp))
+        self.register_buffers(diameters)
 
         self.initialized: bool = False
 
         # -- constants --
         self.eval()
+
+    def register_buffers(self, diameters):
+        self.register_buffer("diam", diameters)
+        self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
+        self.register_buffer("cm_c", self.cm_(self.area_c))
+        self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
+
+        self.register_buffer("v_init_c", torch.tensor(self.v_init))
+        self.register_buffer("temp_c", torch.tensor(self.temp))
 
     def set_diam(self, diams):
         diams = torch.as_tensor(diams, dtype=self.dtype())
@@ -383,16 +385,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         multicontact: bool = False,
         longrunning: bool = False,
     ):
-        
         with_intra = intra is not None
         if with_intra:
             if not isinstance(intra, IntraStim):
                 raise ValueError("intra must be an instance of IntraStim")
-        
+
         intra_only = False
         if ve is None and (ve_s is None and ve_t is None):
             if intra is None:
-                raise ValueError("Either ve or ve_s and ve_t or intra must be provided.")
+                raise ValueError(
+                    "Either ve or ve_s and ve_t or intra must be provided."
+                )
             intra_only = True
             ve_zero = torch.zeros_like(self.v)
 
@@ -414,7 +417,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         df = self.is_df
 
         with torch.set_grad_enabled(self.training):
-
             if (not self.initialized) or reinit:
                 if "_steady_state" in self._caches:
                     self.restore("_steady_state")

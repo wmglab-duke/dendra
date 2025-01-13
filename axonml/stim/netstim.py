@@ -42,12 +42,12 @@ class NetStim(torch.jit.ScriptModule):
 
         # each NetStim gets its own Generator
         self._rng = torch.Generator()
-        self.register_buffer('next_spike_time', torch.zeros(1))
-        self.register_buffer('spike_counts', torch.zeros(1, dtype=torch.long))
+        self.register_buffer("next_spike_time", torch.zeros(1))
+        self.register_buffer("spike_counts", torch.zeros(1, dtype=torch.long))
 
     def device(self):
         return self.next_spike_time.device
-    
+
     def dtype(self):
         return self.next_spike_time.dtype
 
@@ -81,9 +81,7 @@ class NetStim(torch.jit.ScriptModule):
             self.next_spike_time += init_offsets
 
         # spike_counts: how many spikes each synapse has emitted
-        self.spike_counts = torch.zeros(
-            self.shape, device=device, dtype=torch.long
-        )
+        self.spike_counts = torch.zeros(self.shape, device=device, dtype=torch.long)
         return self
 
     @torch.jit.script_method
@@ -101,7 +99,6 @@ class NetStim(torch.jit.ScriptModule):
         """
 
         with torch.no_grad():
-
             # Identify which synapses are still allowed to spike
             can_spike = self.spike_counts < self.max_spikes
 
@@ -136,14 +133,17 @@ class NetStim(torch.jit.ScriptModule):
                 )
                 # Weighted combination of deterministic + random
                 next_interval = (
-                    self.interval * (1 - self.noise) + self.interval * self.noise * exp_rand
+                    self.interval * (1 - self.noise)
+                    + self.interval * self.noise * exp_rand
                 )
 
                 self.next_spike_time[r_inds, c_inds] += next_interval
 
             # Any synapse that has just reached its maximum number of spikes
             # will no longer spike (set next_spike_time = inf)
-            done_r_indices, done_c_indices = (self.spike_counts >= self.max_spikes).nonzero().unbind(1)
+            done_r_indices, done_c_indices = (
+                (self.spike_counts >= self.max_spikes).nonzero().unbind(1)
+            )
             self.next_spike_time[done_r_indices, done_c_indices] = float("inf")
 
             return output
