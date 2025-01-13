@@ -3,6 +3,9 @@ import torch
 from axonml.models.backend import Backend as A
 
 
+from .synapse import Synapse
+
+
 def avoid_smart_indexing(node_indices):
     if node_indices is not None:
         if hasattr(node_indices, "__len__"):
@@ -80,6 +83,14 @@ class IntraStim:
         val = synapse[2](t, v)
         intra[axons, nodes] -= val
 
+    def insert(self, obj, axons=None, nodes=None):
+        if isinstance(obj, Synapse):
+            self.insert_synapse(obj, axons, nodes)
+        elif callable(obj):
+            self.insert_func(obj, axons, nodes)
+        else:
+            self.insert_vec(obj, axons, nodes)
+
     def insert_func(self, func, axons=None, nodes=None):
         axon_inds = self.render_axons(axons)
         node_inds = self.render_nodes(avoid_smart_indexing(nodes))
@@ -88,7 +99,7 @@ class IntraStim:
     def insert_vec(self, vec, axons=None, nodes=None):
         axon_inds = self.render_axons(axons)
         node_inds = self.render_nodes(avoid_smart_indexing(nodes))
-        vec = torch.tensor(vec, device=self.device, dtype=self.dtype)
+        vec = torch.as_tensor(vec, device=self.device, dtype=self.dtype)
         self.stim_vec.append((axon_inds, node_inds, vec))
 
     def insert_synapse(self, synapse, axons=None, nodes=None):
