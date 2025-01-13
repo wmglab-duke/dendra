@@ -178,7 +178,7 @@ mrg = SMF(input_diams, nodes).cuda().load("MRG")
 # intracellular stim to generate activity
 intra = IntraStim(mrg)
 i_stim = 2e-6 * pulse_train(t_vec, np.array([50, 60, 70, 80, 90]), rect(0.1))
-intra.insert_vec(i_stim, nodes=5)
+intra.insert(i_stim, nodes=5)
 
 count.reset()
 _ = longrun(mrg, tstop, dt, stims, field_stack, intra=intra, chunks=args.chunks, warmup=True)
