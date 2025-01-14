@@ -4,7 +4,7 @@ import torch
 from torch.nn import functional as F
 from torch import Tensor
 
-from .core import Axon
+from ..core import Axon
 
 
 class Heterogeneous(Axon):
@@ -17,7 +17,7 @@ class Heterogeneous(Axon):
         method="dufort-frankel",
         pade=None,
     ):
-        if method != "dufort-frankel":
+        if method not in {"dufort-frankel", "df"}:
             raise ValueError(
                 f"Method {method} is not supported for heterogeneous axons."
             )
