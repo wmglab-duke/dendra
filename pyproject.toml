@@ -1,2 +1,15 @@
+[build-system]
+requires = ["setuptools", "cython"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "axonml"
+version = "0.2"
+
+[tool.setuptools]
+ext-modules = [
+  {name = "axonml.models.heterogeneous.ops", sources = ["axonml/models/heterogeneous/ops.pyx"]}
+]
+
 [tool.ruff.lint]
 ignore-init-module-imports = true
