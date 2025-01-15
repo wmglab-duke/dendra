@@ -43,7 +43,7 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_inl(
         n_inl = n_node_per_ax[i] - 1
         for j in range(n_inl):
             idx += nc_per_node[i, j]
-            result[i, idx - 1] += inl[i, j]
+            result[i, idx - 1] += inls[i, j]
 
     return result
 
@@ -56,7 +56,7 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_ind(
     int[:] n_node_per_ax,
     int[:, :] nc_per_node,
     float[:, :] node_d,
-    float[:, :] ind
+    float[:, :] inds
 ):
 
     cdef np.ndarray[np.float32_t, ndim=2] result = np.zeros((n_ax, nc - 1), dtype=np.float32)
@@ -81,7 +81,7 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_ind(
         n_ind = n_node_per_ax[i] - 1
         for j in range(n_ind):
             idx += nc_per_node[i, j]
-            result[i, idx - 1] = ind[i, j]
+            result[i, idx - 1] = inds[i, j]
 
     return result
 
