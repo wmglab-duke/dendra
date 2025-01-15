@@ -16,6 +16,8 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_inl(
     int n_ax, 
     int nc, 
     int[:] n_node_per_ax,
+    int[:] n_internode_per_ax,
+    int[:, :] internode_inds,
     int[:, :] nc_per_node, 
     float[:, :] node_l, 
     float[:, :] inls
@@ -23,7 +25,7 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_inl(
 
     cdef np.ndarray[np.float32_t, ndim=2] result = np.zeros((n_ax, nc - 1), dtype=np.float32)
     cdef np.ndarray[np.float32_t, ndim=2] node_length = np.zeros((n_ax, nc), dtype=np.float32)
-    cdef int i, j, k, nn, n_inl, nc_n, idx
+    cdef int i, j, k, nn, n_inl, nc_n, idx, in_ind
 
     for i in range(n_ax):
         nn = n_node_per_ax[i]
@@ -40,9 +42,12 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_inl(
 
     for i in range(n_ax):
         idx = 0
-        n_inl = n_node_per_ax[i] - 1
+        in_ind = -1
+        n_inl = n_internode_per_ax[i]
         for j in range(n_inl):
-            idx += nc_per_node[i, j]
+            while in_ind < internode_inds[i, j]:
+                idx += nc_per_node[i, in_ind]
+                in_ind += 1
             result[i, idx - 1] += inls[i, j]
 
     return result
@@ -54,6 +59,8 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_ind(
     int n_ax,
     int nc,
     int[:] n_node_per_ax,
+    int[:] n_internode_per_ax,
+    int[:, :] internode_inds,
     int[:, :] nc_per_node,
     float[:, :] node_d,
     float[:, :] inds
@@ -61,7 +68,7 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_ind(
 
     cdef np.ndarray[np.float32_t, ndim=2] result = np.zeros((n_ax, nc - 1), dtype=np.float32)
     cdef np.ndarray[np.float32_t, ndim=2] node_diameter = np.zeros((n_ax, nc), dtype=np.float32)
-    cdef int i, j, k, nn, n_ind, nc_n, idx
+    cdef int i, j, k, nn, n_ind, nc_n, idx, in_ind
 
     for i in range(n_ax):
         nn = n_node_per_ax[i]
@@ -78,9 +85,12 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_ind(
 
     for i in range(n_ax):
         idx = 0
-        n_ind = n_node_per_ax[i] - 1
+        in_ind = -1
+        n_ind = n_internode_per_ax[i]
         for j in range(n_ind):
-            idx += nc_per_node[i, j]
+            while in_ind < internode_inds[i, j]:
+                idx += nc_per_node[i, in_ind]
+                in_ind += 1
             result[i, idx - 1] = inds[i, j]
 
     return result
