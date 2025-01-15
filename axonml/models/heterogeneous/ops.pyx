@@ -2,7 +2,7 @@
 
 import cython
 
-from libc.math cimport floor  # For fast floor operation in C
+from libc.math cimport floor, sqrtf  # For fast floor operation in C
 from libcpp.vector cimport vector
 from libcpp.algorithm cimport sort
 
@@ -18,7 +18,7 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_inl(
     int[:] n_node_per_ax,
     int[:, :] nc_per_node, 
     float[:, :] node_l, 
-    float[:, :] inl
+    float[:, :] inls
 ):
 
     cdef np.ndarray[np.float32_t, ndim=2] result = np.zeros((n_ax, nc - 1), dtype=np.float32)
@@ -44,6 +44,44 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_inl(
         for j in range(n_inl):
             idx += nc_per_node[i, j]
             result[i, idx - 1] += inl[i, j]
+
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray[np.float32_t, ndim=2] calc_ind(
+    int n_ax,
+    int nc,
+    int[:] n_node_per_ax,
+    int[:, :] nc_per_node,
+    float[:, :] node_d,
+    float[:, :] ind
+):
+
+    cdef np.ndarray[np.float32_t, ndim=2] result = np.zeros((n_ax, nc - 1), dtype=np.float32)
+    cdef np.ndarray[np.float32_t, ndim=2] node_diameter = np.zeros((n_ax, nc), dtype=np.float32)
+    cdef int i, j, k, nn, n_ind, nc_n, idx
+
+    for i in range(n_ax):
+        nn = n_node_per_ax[i]
+        idx = 0
+        for j in range(nn):
+            nc_n = nc_per_node[i, j]
+            for k in range(nc_n):
+                node_diameter[i, idx + k] = node_d[i, j]
+            idx += nc_n
+
+    for i in range(n_ax):
+        for j in range(nc - 1):
+            result[i, j] = sqrtf(node_diameter[i, j] * node_diameter[i, j + 1])
+
+    for i in range(n_ax):
+        idx = 0
+        n_ind = n_node_per_ax[i] - 1
+        for j in range(n_ind):
+            idx += nc_per_node[i, j]
+            result[i, idx - 1] = ind[i, j]
 
     return result
 
