@@ -70,6 +70,8 @@ cdef int compare_ascending(const tuple[double, int] &a, const tuple[double, int]
     return 0
 
 
+@cython.boundscheck(False)
+@cython.wraparound(False)
 cdef distribute_compartments_single(double[:] lengths, int[:] buff, int P, int N):
     """
     Given:
