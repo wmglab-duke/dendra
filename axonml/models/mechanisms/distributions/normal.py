@@ -11,7 +11,7 @@ class Normal(Distribution):
         self.sigma = to_param(sigma)
 
     def sample(self, n: int):
-        eps = torch.randn(n, device=self.mu.device)
+        eps = torch.randn(n, device=self.device(), generator=self.rng)
         return self.mu + self.sigma * eps
 
 
@@ -22,5 +22,5 @@ class PositiveNormal(Distribution):
         self.sigma = to_param(sigma)
 
     def sample(self, n: int):
-        eps = torch.randn(n, device=self.mu.device)
+        eps = torch.randn(n, device=self.device(), generator=self.rng)
         return (self.mu + self.sigma * eps).abs()

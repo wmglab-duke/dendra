@@ -11,7 +11,7 @@ class Laplace(Distribution):
         self.b = to_param(b)
 
     def sample(self, n: int):
-        u = torch.rand(n, device=self.mu.device) - 0.5
+        u = torch.rand(n, device=self.device(), generator=self.rng) - 0.5
         return self.mu - self.b * u.sign() * torch.log1p(-2 * u.abs())
 
 
@@ -22,5 +22,5 @@ class PositiveLaplace(Distribution):
         self.b = to_param(b)
 
     def sample(self, n: int):
-        u = torch.rand(n, device=self.mu.device)
+        u = torch.rand(n, device=self.device(), generator=self.rng)
         return self.mu - self.b * torch.log1p(-2 * u)

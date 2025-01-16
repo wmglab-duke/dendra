@@ -11,7 +11,7 @@ class Uniform(Distribution):
         self.high = to_param(high)
 
     def sample(self, n: int):
-        return torch.rand(n, device=self.low.device) * (self.high - self.low) + self.low
+        return torch.rand(n, device=self.device(), generator=self.rng) * (self.high - self.low) + self.low
 
 
 class PositiveUniform(Distribution):
@@ -22,5 +22,5 @@ class PositiveUniform(Distribution):
 
     def sample(self, n: int):
         return (
-            torch.rand(n, device=self.low.device) * (self.high - self.low) + self.low
+            torch.rand(n, device=self.device(), generator=self.device()) * (self.high - self.low) + self.low
         ).abs()
