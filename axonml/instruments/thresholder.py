@@ -152,12 +152,12 @@ class Thresholder:
                 mask, rec = self.check_active_with_rec(self.ub)
                 inactive = ~mask
                 if block_possible:
-                    self.ub[(rec[:, -1] < self.threshold) & inactive] *= (
-                        self.fix_bound_up
-                    )
-                    self.ub[(rec[:, -1] >= self.threshold) & inactive] *= (
-                        self.fix_bound_down
-                    )
+                    self.ub[
+                        (rec[:, -1] < self.threshold) & inactive
+                    ] *= self.fix_bound_up
+                    self.ub[
+                        (rec[:, -1] >= self.threshold) & inactive
+                    ] *= self.fix_bound_down
                 else:
                     self.ub[inactive] *= self.fix_bound_up
                 tries += 1

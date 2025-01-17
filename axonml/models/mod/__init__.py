@@ -23,13 +23,13 @@ for file in py_files:
 
 def load_mechanisms(*paths):
     """
-    Load mechanisms from a directory containing Python files.
+    Load mechanisms from directories containing Python files.
 
     Args:
-        path (str): Path to the directory containing Python files.
+        *paths (str): Path(s) to the directory(s) containing Python files.
 
     Returns:
-        dict: Dictionary of class names and corresponding classes.
+        dict[str, Mechanism]: Dictionary of mechanism names and corresponding mechanisms.
     """
     mechanisms = {}
 

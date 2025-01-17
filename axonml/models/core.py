@@ -185,14 +185,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         else:
             diameters = torch.tensor(diameters, dtype=self.dtype())
 
-        self.register_buffers(diameters)
+        self._register_buffers(diameters)
 
         self.initialized: bool = False
 
         # -- constants --
         self.eval()
 
-    def register_buffers(self, diameters):
+    def _register_buffers(self, diameters):
         self.register_buffer("diam", diameters)
         self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
         self.register_buffer("cm_c", self.cm_(self.area_c))
@@ -212,6 +212,22 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.ra_c[:] = self.ra_(self.diam)[:, None, None]
 
     def unfreeze(self, *names):
+        """
+        Unfreezes the parameters of the model for training.
+        If no parameter names are provided, all parameters of the model will be unfrozen.
+        If specific parameter names are provided, only those parameters will be unfrozen.
+
+        Args:
+            *names (str): Variable length argument list of parameter names to unfreeze.
+
+        Examples:
+            Unfreeze all parameters::
+            >>> model.unfreeze()
+
+            Unfreeze specific parameters::
+            >>> model = SMF()
+            >>> model.unfreeze('axnode_myel.gnabar', 'axnode_myel.gkbar')
+        """
         if not names:
             for p in self.parameters():
                 p.requires_grad = True
@@ -245,6 +261,20 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self.ssd.weight.dtype
 
     def insert(self, mechanism: Mechanism, ic=None, **kwargs):
+        """
+        Inserts a mechanism into the model.
+
+        This method validates and compiles the given mechanism, then appends it to the model's mechanism list.
+        It also updates the model's current, ion read, ion write, and ion write_c dictionaries with the mechanism's respective values.
+
+        Args:
+            mechanism (Mechanism): The mechanism to be inserted into the model.
+            ic (optional): Initial conditions for the mechanism.
+            **kwargs: Additional keyword arguments to be passed to the compile_mechanism function.
+
+        Returns:
+            None
+        """
         validate(mechanism)
 
         df = self.is_df

@@ -56,7 +56,9 @@ class NetStim(torch.jit.ScriptModule):
 
     def init_rng(self):
         if self._rng.device != self.device():
-            self._rng = torch.Generator(device=self.device()).manual_seed(self._seeder.seed())
+            self._rng = torch.Generator(device=self.device()).manual_seed(
+                self._seeder.seed()
+            )
         if self.seed is not None:
             self._rng.manual_seed(self.seed)
 

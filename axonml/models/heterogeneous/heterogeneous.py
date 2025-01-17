@@ -24,7 +24,7 @@ class Heterogeneous(Axon):
         diameters = torch.ones(n_ax)
         super().__init__(diameters, n_node, temp, v_init, method, pade)
 
-    def register_buffers(self, diameters):
+    def _register_buffers(self, diameters):
         self.register_buffer("diam", torch.ones(self.n_ax, 1, self.n_node))
         self.register_buffer(
             "inter_node_length", 100 * torch.ones(self.n_ax, 1, self.n_node - 1)
