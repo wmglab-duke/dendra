@@ -604,7 +604,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ve = torch.einsum(einsum, ve_s, t_chunk).unsqueeze(2)
             self.run(
                 ve,
-                dt,
+                dt=dt,
                 callbacks=callbacks,
                 reinit=reinit,
                 progressbar=progressbar,
