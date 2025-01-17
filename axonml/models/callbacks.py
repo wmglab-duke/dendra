@@ -1,6 +1,8 @@
 from typing import Tuple, Dict, List
 from types import MethodType
 
+from h5py import File
+
 import torch
 
 from .backend import Backend as A
@@ -149,11 +151,65 @@ class Recorder(Callback):
         self.max_only: bool = max_only
         self.node_indices = avoid_smart_indexing(node_indices)
         rfunc = build_recorder_func(states)
-        setattr(self, "post_step_hook", MethodType(rfunc, self))
-        setattr(self, "pre_loop_hook", MethodType(rfunc, self))
+        setattr(self, "_post_step_hook", MethodType(rfunc, self))
+        setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
+
+        # HDF5 -- optional -- for large data
+        self.hdf5_file = None
+        self.cache_with_hdf5 = False
+        self.save_every = None
+        self.save_count = 0
+        self.major_groups = {}
+        self.hdf5_groups = {}
+        self.i = 0
+        self.run_number = 0
+
+    def set_hdf5(self, hdf5: str, save_every=10000):
+        self.hdf5_file = File(hdf5, "w")
+        self.cache_with_hdf5 = True
+        self.save_every = save_every
+        for s in self.states:
+            self.major_groups[s] = self.hdf5_file.create_group(s)
+        return self
+
+    def pre_loop_hook(self, model):
+        self._pre_loop_hook(model)
+        if self.cache_with_hdf5:
+            for s in self.states:
+                self.hdf5_groups[s] = self.major_groups[s].create_group(
+                    f"run_{self.run_number}"
+                )
+            self.run_number += 1
+            self.i += 1
+
+
+    def cache_hdf5(self):
+        for s in self.states:
+            self.hdf5_groups[s].create_dataset(
+                f"{self.save_count}", data=self.numpy(s)
+            )
+            self.save_count += 1
+
+    def post_step_hook(self, model):
+        self._post_step_hook(model)
+        if self.cache_with_hdf5:
+            self.i += 1
+            if self.i % self.save_every == 0:
+                self.cache_hdf5()
+                self.reset()
+
+    def post_loop_hook(self, model):
+        if self.cache_with_hdf5:
+            self.cache_hdf5()
+        self.save_count = 0
 
     def reset(self):
         self.rec = {s: [] for s in self.states}
+        self.i = 0
+
+    def close(self):
+        if self.cache_with_hdf5:
+            self.hdf5_file.close()
 
     def stack(self, var: str = None):
         if var is not None:
