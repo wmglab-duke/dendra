@@ -1,6 +1,8 @@
 from typing import Tuple, Optional
 import torch
 
+import random
+
 
 class NetStim(torch.jit.ScriptModule):
     """
@@ -41,7 +43,8 @@ class NetStim(torch.jit.ScriptModule):
         self.seed: Optional[int] = seed
 
         # each NetStim gets its own Generator
-        self._rng = torch.Generator()
+        self._seeder = torch.Generator()
+        self._rng = torch.Generator().manual_seed(self._seeder.seed())
         self.register_buffer("next_spike_time", torch.zeros(1))
         self.register_buffer("spike_counts", torch.zeros(1, dtype=torch.long))
 
@@ -53,7 +56,7 @@ class NetStim(torch.jit.ScriptModule):
 
     def init_rng(self):
         if self._rng.device != self.device():
-            self._rng = torch.Generator(device=self.device())
+            self._rng = torch.Generator(device=self.device()).manual_seed(self._seeder.seed())
         if self.seed is not None:
             self._rng.manual_seed(self.seed)
 

@@ -1,12 +1,14 @@
 import torch
 
+import random
 
 class Distribution(torch.nn.Module):
     __constants__ = ["once", "seeded"]
 
     def __init__(self, seed=None, once=False):
         super().__init__()
-        self.rng : torch.Generator = torch.Generator()
+        self._seeder = torch.Generator()
+        self.rng : torch.Generator = torch.Generator().manual_seed(self._seeder.seed())
         self.register_buffer("seed_holder", torch.zeros(1, dtype=torch.int64))
         if seed is not None:
             self.rng.manual_seed(seed)
@@ -21,8 +23,8 @@ class Distribution(torch.nn.Module):
 
     def _sample(self, buffer):
         n = buffer.shape[0]
-        if self.rng.device != self.seed_holder.device:
-            self.rng = torch.Generator(device=self.seed_holder.device)
+        if self.rng.device != self.device():
+            self.rng = torch.Generator(device=self.device()).manual_seed(self._seeder.seed())
             if self.seeded:
                 self.rng.manual_seed(self.seed_holder[0].item())
         if (self.once and not self.initiated) or (not self.once):

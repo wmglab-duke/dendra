@@ -5,8 +5,8 @@ from axonml.models.mixins import to_param
 
 
 class Uniform(Distribution):
-    def __init__(self, low, high, seed=None):
-        super().__init__(seed)
+    def __init__(self, low, high, seed=None, once=False):
+        super().__init__(seed, once)
         self.low = to_param(low)
         self.high = to_param(high)
 
@@ -15,8 +15,8 @@ class Uniform(Distribution):
 
 
 class PositiveUniform(Distribution):
-    def __init__(self, low, high, seed=None):
-        super().__init__(seed)
+    def __init__(self, low, high, seed=None, once=False):
+        super().__init__(seed, once)
         self.low = to_param(low)
         self.high = to_param(high)
 

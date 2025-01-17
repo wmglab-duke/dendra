@@ -5,8 +5,8 @@ from axonml.models.mixins import to_param
 
 
 class Laplace(Distribution):
-    def __init__(self, mu, b, seed=None):
-        super().__init__(seed)
+    def __init__(self, mu, b, seed=None, once=False):
+        super().__init__(seed, once)
         self.mu = to_param(mu)
         self.b = to_param(b)
 
@@ -16,8 +16,8 @@ class Laplace(Distribution):
 
 
 class PositiveLaplace(Distribution):
-    def __init__(self, mu, b, seed=None):
-        super().__init__(seed)
+    def __init__(self, mu, b, seed=None, once=False):
+        super().__init__(seed, once)
         self.mu = to_param(mu)
         self.b = to_param(b)
 
