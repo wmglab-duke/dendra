@@ -6,8 +6,8 @@ import numpy as np
 
 from axonml.models.implementations import SMF
 from axonml.models.callbacks import APCount
-from axonml.instruments.fields import FEMInterpolate1D
-from axonml.stim import IntraStim
+from axonml.models.instruments.fields import FEMInterpolate1D
+from axonml.models.stim import IntraStim
 
 torch.set_default_dtype(torch.float32)
 

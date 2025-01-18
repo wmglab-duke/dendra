@@ -9,7 +9,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from axonml import trained
-from axonml.stim.intrastim import IntraStim
+from axonml.models.stim.intrastim import IntraStim
 
 from .callbacks import CallbackList, Callback
 from .backend import Backend as A
