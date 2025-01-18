@@ -66,6 +66,9 @@ class HandlerInterface:
     def advance(self, v, dt) -> None:
         pass
 
+    def detach(self) -> None:
+        pass
+
     def i_intra(self, v, intra) -> torch.Tensor:
         pass
 

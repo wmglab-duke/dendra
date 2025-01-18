@@ -14,7 +14,8 @@ class NetStim(torch.jit.ScriptModule):
         noise (float): 0 <= noise <= 1, controls how randomly the intervals vary.
         max_spikes (int): Maximum number of spikes each synapse can deliver.
         seed (int or None): Seed for reproducible random number generation. If None,
-                            it will use the global RNG state.
+                            it will seed non-deterministically from std::random_device 
+                            or the current time.
     """
 
     __constants__ = ["seed"]
