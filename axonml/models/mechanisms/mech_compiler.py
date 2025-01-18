@@ -158,6 +158,10 @@ class mech(torch.nn.Module):
                 else:
                     setattr(self, name, to_param(value))
 
+    def detach(self):
+{detach}
+        return
+
     def instantiate_distributions(self, distributions):
         if distributions is not None:
             for name, dist in distributions.items():
@@ -224,6 +228,20 @@ def {state}_inf(self, v):
 distribution_init_template = """
 self.{name} = self.{name}_d._sample(self.{name})
 """
+
+
+def detach(states):
+    assignments = []
+    for k in states:
+        if not k.coupled:
+            name = k._name
+            if name not in valid_concentrations():
+                assignments.append(f"self.{name}.detach_()")
+        else:
+            for name in k._state_names:
+                if name not in valid_concentrations():
+                    assignments.append(f"self.{name}.detach_()")
+    return "\n".join(assignments)
 
 
 def init_distribution_buffers(distributions):
@@ -607,6 +625,7 @@ def compile_mechanism(
         coupled_infs=coupled_infs(mechanism, states_compiled),
         distribution_buffer_assignments=distribution_buffer_assignments_str,
         init_distribution_buffers=init_distribution_buffers_str,
+        detach=indent(detach(states_compiled), 2),
     )
 
     filename = f"<{mechanism.__name__}_template>"

@@ -35,6 +35,11 @@ class Ion(torch.nn.Module):
     {initialize_o}
     self.einit(temp)
 
+  def detach(self):
+    self.i{ion}.detach_()
+    self.{ion}i.detach_()
+    self.{ion}o.detach_()
+
   @torch.jit.export
   def advance(self, temp) -> None:
     self.eadvance(temp)

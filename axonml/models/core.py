@@ -157,7 +157,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             "rk2": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "rk4": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "df": [
-                [1.0, 0.0, 1.0],
+                [1.0, +0.0, 1.0],
                 [0.0, -1.0, 0.0],
                 [1.0, -2.0, 1.0],
             ],
@@ -394,6 +394,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             self.v_prev[:] = self.v_init
             self.v_prev.detach_()
 
+    def detach(self):
+        self.v.detach_()
+        if self.is_df:
+            self.v_prev.detach_()
+        self.mech.detach()
+
     @property
     def t(self):
         return self.t_ind * self.dt
@@ -459,6 +465,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     self.initialized = True
                 if with_intra:
                     intra.init(self)
+            else:
+                self.detach()
 
             if first:
                 if callbacks:

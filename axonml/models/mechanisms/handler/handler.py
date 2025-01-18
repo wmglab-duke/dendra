@@ -34,6 +34,12 @@ class MechanismHandler(torch.nn.Module):
     self.update(temp)
     return
 
+  @torch.jit.export
+  def detach(self) -> None:
+    {mech_detach}
+    {ion_detach}
+    return
+
   def gtot(self) -> torch.Tensor:
     return {gtot}
 
@@ -286,6 +292,20 @@ def tot_currents(currents, df=False):
     return s
 
 
+def mech_detach(mechanisms):
+    result = []
+    for m in mechanisms:
+        result.append(f"self.{m._name}.detach()")
+    return "\n    ".join(result)
+
+
+def ion_detach(ions):
+    result = []
+    for ion in ions:
+        result.append(f"self.{ion}_ion.detach()")
+    return "\n    ".join(result)
+
+
 def build_handler(mechanisms, names, currents, temp, ions=None, df=False):
     arguments = parse_args(names)
 
@@ -313,6 +333,8 @@ def build_handler(mechanisms, names, currents, temp, ions=None, df=False):
         breakpoint=breakpoint(mechanisms),
         set_buffers=parse_set_buffers(mechanisms, list(ions.keys())),
         currents_tot=tot_currents(currents, df),
+        mech_detach=mech_detach(mechanisms),
+        ion_detach=ion_detach(ions),
     )
 
     filename = f"<{randomword(10)}_template>"
