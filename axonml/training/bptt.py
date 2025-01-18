@@ -6,7 +6,7 @@ from torch.optim import Optimizer
 from torch.nn.modules.loss import _Loss
 from tqdm import tqdm
 
-from .data import DataLoader
+from .dataloader import DataLoader
 from ..models.callbacks import Recorder
 from ..models import Axon
 
