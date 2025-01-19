@@ -184,9 +184,10 @@ class Recorder(Callback):
 
     def cache_hdf5(self):
         for s in self.states:
-            chunks = s.shape
+            data = self.numpy(s)
+            chunks = data.shape
             chunks[1] = 1
-            self.hdf5_groups[s].create_dataset(f"{self.save_count}", data=self.numpy(s), chunks=chunks)
+            self.hdf5_groups[s].create_dataset(f"{self.save_count}", data=data, chunks=chunks)
             self.save_count += 1
 
     def post_step_hook(self, model):
