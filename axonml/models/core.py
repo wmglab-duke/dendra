@@ -438,9 +438,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             intra_only = True
             ve_zero = torch.zeros_like(self.v)
 
-        if ve is None and not intra_only:
-            ve = self.ve_from_s_t(ve_s, ve_t, multicontact)
-
         device = self.device()
         if ve is not None:
             ve = torch.as_tensor(ve, device=device)
@@ -456,6 +453,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         df = self.is_df
 
         with torch.set_grad_enabled(self.training):
+            if ve is None and not intra_only:
+                ve = self.ve_from_s_t(ve_s, ve_t, multicontact)
+            
+            if self.training:
+                self.calculate_geometric_params()
+
             if (not self.initialized) or reinit:
                 if "_steady_state" in self._caches:
                     self.restore("_steady_state")
