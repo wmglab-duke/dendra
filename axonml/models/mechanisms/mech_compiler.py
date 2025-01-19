@@ -235,12 +235,10 @@ def detach(states):
     for k in states:
         if not k.coupled:
             name = k._name
-            if name not in valid_concentrations():
-                assignments.append(f"self.{name}.detach_()")
+            assignments.append(f"self.{name}.detach_()")
         else:
             for name in k._state_names:
-                if name not in valid_concentrations():
-                    assignments.append(f"self.{name}.detach_()")
+                assignments.append(f"self.{name}.detach_()")
     return "\n".join(assignments)
 
 

@@ -210,9 +210,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.calculate_geometric_params()
 
     def calculate_geometric_params(self):
-        self.area_c[:] = self.area_(self.diam)[:, None, None]
-        self.cm_c[:] = self.cm_(self.area_c)
-        self.ra_c[:] = self.ra_(self.diam)[:, None, None]
+        self.area_c = self.area_(self.diam)[:, None, None]
+        self.cm_c = self.cm_(self.area_c)
+        self.ra_c = self.ra_(self.diam)[:, None, None]
 
     def unfreeze(self, *names):
         """
