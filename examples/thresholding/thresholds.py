@@ -3,7 +3,7 @@ import argparse
 import numpy as np
 import torch
 
-from axonml.instruments.thresholder import Thresholder
+from axonml.models.instruments.thresholder import Thresholder
 from axonml.models.implementations import SMF
 
 

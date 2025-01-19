@@ -1,6 +1,8 @@
 from typing import Tuple, Dict, List
 from types import MethodType
 
+from h5py import File
+
 import torch
 
 from .backend import Backend as A
@@ -77,7 +79,7 @@ impl_template = """
     self.rec['{full_state}'].append(torch.amax(states, -1))
   else:
     if self.node_indices is not None:
-      self.rec['{full_state}'].append(states[:, :, self.node_indices])
+      self.rec['{full_state}'].append(atleast_3d(states[:, :, self.node_indices]))
     else:
       self.rec['{full_state}'].append(states)
 """
@@ -88,7 +90,7 @@ v_template = """
     self.rec['v'].append(torch.amax(states, -1))
   else:
     if self.node_indices is not None:
-      self.rec['v'].append(states[:, :, self.node_indices])
+      self.rec['v'].append(atleast_3d(states[:, :, self.node_indices]))
     else:
       self.rec['v'].append(states)
 """
@@ -114,19 +116,97 @@ def build_recorder_func(states):
     return locals()["recorder"]
 
 
+def avoid_smart_indexing(node_indices):
+    if node_indices is not None:
+        if len(node_indices) == 1:
+            return node_indices[0]
+    return node_indices
+
+
+def n(node_indices):
+    if isinstance(node_indices, int):
+        return 1
+    return len(node_indices)
+
+
+def atleast_2d(x: torch.Tensor) -> torch.Tensor:
+    dims = x.dim()
+    if dims == 1:
+        return x.unsqueeze(-1)
+    return x
+
+
+def atleast_3d(x: torch.Tensor) -> torch.Tensor:
+    dims = x.dim()
+    if dims == 2:
+        return x.unsqueeze(-1)
+    return x
+
+
 class Recorder(Callback):
     def __init__(self, states, max_only=False, node_indices=None):
         super().__init__()
         self.states = states
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
-        self.node_indices = node_indices
+        self.node_indices = avoid_smart_indexing(node_indices)
         rfunc = build_recorder_func(states)
-        setattr(self, "post_step_hook", MethodType(rfunc, self))
-        setattr(self, "pre_loop_hook", MethodType(rfunc, self))
+        setattr(self, "_post_step_hook", MethodType(rfunc, self))
+        setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
+
+        # HDF5 -- optional -- for large data
+        self.hdf5_file = None
+        self.cache_with_hdf5 = False
+        self.save_every = None
+        self.save_count = 0
+        self.major_groups = {}
+        self.hdf5_groups = {}
+        self.i = 0
+        self.run_number = 0
+
+    def set_hdf5(self, hdf5: str, save_every=10000):
+        self.hdf5_file = File(hdf5, "w")
+        self.cache_with_hdf5 = True
+        self.save_every = save_every
+        for s in self.states:
+            self.major_groups[s] = self.hdf5_file.create_group(s)
+        return self
+
+    def pre_loop_hook(self, model):
+        self._pre_loop_hook(model)
+        if self.cache_with_hdf5:
+            for s in self.states:
+                self.hdf5_groups[s] = self.major_groups[s].create_group(
+                    f"run_{self.run_number}"
+                )
+            self.run_number += 1
+            self.i += 1
+
+    def cache_hdf5(self):
+        for s in self.states:
+            self.hdf5_groups[s].create_dataset(f"{self.save_count}", data=self.numpy(s))
+            self.save_count += 1
+
+    def post_step_hook(self, model):
+        self._post_step_hook(model)
+        if self.cache_with_hdf5:
+            self.i += 1
+            if self.i % self.save_every == 0:
+                self.cache_hdf5()
+                self.reset()
+
+    def post_loop_hook(self, model):
+        if self.cache_with_hdf5:
+            self.cache_hdf5()
+        self.save_count = 0
 
     def reset(self):
         self.rec = {s: [] for s in self.states}
+        self.i = 0
+
+    def close(self):
+        if self.cache_with_hdf5:
+            self.hdf5_file.close()
 
     def stack(self, var: str = None):
         if var is not None:
@@ -152,7 +232,8 @@ class ThresholdCallback(Callback):
         self.state_cache: torch.Tensor = None
         self.threshold: float = threshold
         self.t_start_check: float = t_start_check
-        self.node_check: List[int] = node_check
+        self.node_check: List[int] = avoid_smart_indexing(node_check)
+        self.n: int = n(self.node_check)
         self.i: int = 0
         self.dt: float = dt if dt is not None else A.dt
 
@@ -185,21 +266,21 @@ class APCount(ThresholdCallback):
         if self.record is None:
             self.record = torch.zeros(
                 model.n(),
-                len(self.node_check),
+                n(self.node_check),
                 dtype=torch.int32,
                 device=model.device(),
             )
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                len(self.node_check),
+                n(self.node_check),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.v[:, 0, self.node_check]
+            vm_new = atleast_2d(model.v[:, 0, self.node_check])
             vm = self.state_cache
             self.state_cache = increment_count_(vm, vm_new, self.record, self.threshold)
         self.i += 1
@@ -234,14 +315,14 @@ class Active(ThresholdCallback):
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                len(self.node_check),
+                n(self.node_check),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.v[:, 0, self.node_check]
+            vm_new = atleast_2d(model.v[:, 0, self.node_check])
             vm = self.state_cache
             self.state_cache, la = update_active(vm, vm_new, self.threshold)
             self.record[la] = True
@@ -265,14 +346,14 @@ class Raster(ThresholdCallback):
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                len(self.node_check),
+                n(self.node_check),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = model.v[:, -1, self.node_check]
+            vm_new = atleast_2d(model.v[:, 0, self.node_check])
             vm = self.state_cache
             self.state_cache, la = increment_count(vm, vm_new, self.threshold)
             self.record.append(la)

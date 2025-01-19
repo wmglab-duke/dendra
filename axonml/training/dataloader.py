@@ -116,3 +116,8 @@ class DataLoader:
 
     def total(self) -> int:
         return self.n_idx * self.sample_size // self.chunk_size
+
+    def n(self):
+        gen = self.single_epoch()
+        x, *_ = next(gen)
+        return x.size(1)

@@ -13,21 +13,15 @@ def collect_states(h5py_file, states):
 dset_t = h5py.File(config.train_dset, "r")
 dset_v = h5py.File(config.valid_dset, "r")
 
+if config.cuda:
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
 
 if __name__ == "__main__":
     if not config.fp32:
         torch.set_default_dtype(torch.float64)
-
-    model: Axon = config.model(fp32=config.fp32)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    loss = torch.nn.MSELoss()
-
-    if config.cuda:
-        model = model.cuda()
-        loss = loss.cuda()
-
-    for p in config.to_train:
-        model.unfreeze(p)
 
     train_data = DataLoader(
         config.nodes,
@@ -37,7 +31,7 @@ if __name__ == "__main__":
         config.train_n_idx,
         config.train_chunk_size,
         config.sampling,
-        model.device(),
+        device,
         config.fp32,
     )
 
@@ -49,9 +43,22 @@ if __name__ == "__main__":
         config.val_n_idx,
         config.val_chunk_size,
         config.sampling,
-        model.device(),
+        device,
         config.fp32,
     )
+
+    model: Axon = config.model(diameters=[5.7] * train_data.n(), n_node=config.nodes)
+    if not config.fp32:
+        model.double()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+    loss = torch.nn.MSELoss()
+
+    if config.cuda:
+        model = model.cuda()
+        loss = loss.cuda()
+
+    for p in config.to_train:
+        model.unfreeze(p)
 
     # perform training
     tbptt(

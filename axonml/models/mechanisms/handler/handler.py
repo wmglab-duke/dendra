@@ -19,19 +19,25 @@ class MechanismHandler(torch.nn.Module):
     self.temp = temp
     {assignments}
 
-  def initialize(self, v, v_init, area, temp) -> None:
+  def initialize(self, v, v_init, temp) -> None:
     self.ion_init(temp)
     self.init_buffers(v_init)
     self.itot(v)
 
   @torch.jit.export
-  def set_buffers(self):
+  def set_buffers(self, diameters):
 {set_buffers}
     return
 
   def advance(self, v, dt, temp) -> None:
     {mech_advance}
     self.update(temp)
+    return
+
+  @torch.jit.export
+  def detach(self) -> None:
+    {mech_detach}
+    {ion_detach}
     return
 
   def gtot(self) -> torch.Tensor:
@@ -82,6 +88,11 @@ self.{mech}.{v}.set_(self.{ion}_ion.{v})
 """
 
 
+set_diam_buffer_template = """
+self.{mech}.diam.set_(diameters.view(-1, 1, 1))
+"""
+
+
 def parse_set_buffers(mechanisms, ions):
     out = []
     for m in mechanisms:
@@ -96,6 +107,7 @@ def parse_set_buffers(mechanisms, ions):
                             mech=m._name, v=v, ion=ion
                         )
                     )
+        out.append(set_diam_buffer_template.format(mech=m._name))
     out = "\n".join(out)
     return indent(out, 1)
 
@@ -280,6 +292,20 @@ def tot_currents(currents, df=False):
     return s
 
 
+def mech_detach(mechanisms):
+    result = []
+    for m in mechanisms:
+        result.append(f"self.{m._name}.detach()")
+    return "\n    ".join(result)
+
+
+def ion_detach(ions):
+    result = []
+    for ion in ions:
+        result.append(f"self.{ion}_ion.detach()")
+    return "\n    ".join(result)
+
+
 def build_handler(mechanisms, names, currents, temp, ions=None, df=False):
     arguments = parse_args(names)
 
@@ -307,6 +333,8 @@ def build_handler(mechanisms, names, currents, temp, ions=None, df=False):
         breakpoint=breakpoint(mechanisms),
         set_buffers=parse_set_buffers(mechanisms, list(ions.keys())),
         currents_tot=tot_currents(currents, df),
+        mech_detach=mech_detach(mechanisms),
+        ion_detach=ion_detach(ions),
     )
 
     filename = f"<{randomword(10)}_template>"

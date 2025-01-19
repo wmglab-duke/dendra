@@ -12,7 +12,7 @@ class Sweeney(Myelinated):
         n_node=101,
         temp=37.0,
         v_init=-80.0,
-        method="df",
+        method="dufort-frankel",
         pade=True,
     ):
         super().__init__(diameters, n_node, temp, v_init, method, pade)

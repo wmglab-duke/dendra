@@ -2,7 +2,6 @@ import math
 from typing import List, Tuple, Optional, Dict, Callable
 import re
 import itertools
-from decimal import Decimal
 
 import torch
 from torch import Tensor
@@ -10,6 +9,8 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from axonml import trained
+from axonml.models.stim.intrastim import IntraStim
+
 from .callbacks import CallbackList, Callback
 from .backend import Backend as A
 from .mixins import Parameterized
@@ -59,10 +60,13 @@ def matches_any_pattern(base_patterns, target_string):
 
 @torch.jit.interface
 class HandlerInterface:
-    def initialize(self, v, v_init, area, temp) -> None:
+    def initialize(self, v, v_init, temp) -> None:
         pass
 
     def advance(self, v, dt) -> None:
+        pass
+
+    def detach(self) -> None:
         pass
 
     def i_intra(self, v, intra) -> torch.Tensor:
@@ -123,14 +127,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         # self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
 
-        self.register_buffer("diam", torch.as_tensor(diameters))
-        self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
-        self.register_buffer("cm_c", self.cm_(self.area_c))
-        self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
-
-        self.register_buffer("v_init_c", torch.tensor(v_init))
-        self.register_buffer("temp_c", torch.tensor(temp))
-
         self.method = method
         self.n_ax = len(diameters)
         self.n_node = n_node
@@ -139,7 +135,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.mech: HandlerInterface = None
         self.t_ind: int = 0
-        self.dt: float = 0.005
+        self.dt: float = A.dt
 
         self._m_list = []
         self._m_name = []
@@ -161,10 +157,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.weight_choices = {
             "rk1": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
-            "rk4": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "rk2": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
+            "rk4": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
             "df": [
-                [1.0, 0.0, 1.0],
+                [1.0, +0.0, 1.0],
                 [0.0, -1.0, 0.0],
                 [1.0, -2.0, 1.0],
             ],
@@ -187,17 +183,54 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if self.is_df:
             self.register_buffer("v_prev", torch.full((self.n_ax, 1, n_node), v_init))
 
+        if torch.is_tensor(diameters):
+            diameters = diameters.to(self.dtype()).clone().detach()
+        else:
+            diameters = torch.tensor(diameters, dtype=self.dtype())
+
+        self._register_buffers(diameters)
+
         self.initialized: bool = False
 
         # -- constants --
         self.eval()
 
+    def _register_buffers(self, diameters):
+        self.register_buffer("diam", diameters)
+        self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
+        self.register_buffer("cm_c", self.cm_(self.area_c))
+        self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
+
+        self.register_buffer("v_init_c", torch.tensor(self.v_init))
+        self.register_buffer("temp_c", torch.tensor(self.temp))
+
+    def set_diam(self, diams):
+        diams = torch.as_tensor(diams, dtype=self.dtype())
+        self.diam[:] = diams
+        self.calculate_geometric_params()
+
     def calculate_geometric_params(self):
-        self.area_c[:] = self.area_(self.diam)[:, None, None]
-        self.cm_c[:] = self.cm_(self.area_c)
-        self.ra_c[:] = self.ra_(self.diam)[:, None, None]
+        self.area_c = self.area_(self.diam)[:, None, None]
+        self.cm_c = self.cm_(self.area_c)
+        self.ra_c = self.ra_(self.diam)[:, None, None]
 
     def unfreeze(self, *names):
+        """
+        Unfreezes the parameters of the model for training.
+        If no parameter names are provided, all parameters of the model will be unfrozen.
+        If specific parameter names are provided, only those parameters will be unfrozen.
+
+        Args:
+            *names (str): Variable length argument list of parameter names to unfreeze.
+
+        Examples:
+            Unfreeze all parameters::
+            >>> model.unfreeze()
+
+            Unfreeze specific parameters::
+            >>> model = SMF()
+            >>> model.unfreeze('axnode_myel.gnabar', 'axnode_myel.gkbar')
+        """
         if not names:
             for p in self.parameters():
                 p.requires_grad = True
@@ -231,6 +264,20 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self.ssd.weight.dtype
 
     def insert(self, mechanism: Mechanism, ic=None, **kwargs):
+        """
+        Inserts a mechanism into the model.
+
+        This method validates and compiles the given mechanism, then appends it to the model's mechanism list.
+        It also updates the model's current, ion read, ion write, and ion write_c dictionaries with the mechanism's respective values.
+
+        Args:
+            mechanism (Mechanism): The mechanism to be inserted into the model.
+            ic (optional): Initial conditions for the mechanism.
+            **kwargs: Additional keyword arguments to be passed to the compile_mechanism function.
+
+        Returns:
+            None
+        """
         validate(mechanism)
 
         df = self.is_df
@@ -350,6 +397,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             self.v_prev[:] = self.v_init
             self.v_prev.detach_()
 
+    def detach(self):
+        self.v.detach_()
+        if self.is_df:
+            self.v_prev.detach_()
+        self.mech.detach()
+
     @property
     def t(self):
         return self.t_ind * self.dt
@@ -363,7 +416,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ve_s: Tensor = None,
         ve_t: Tensor = None,
         dt: float = None,
-        intra: Optional[Tensor] = None,
+        intra: Optional[IntraStim] = None,
         callbacks: List[Callback] = None,
         reinit: bool = False,
         progressbar: bool = True,
@@ -371,13 +424,26 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         multicontact: bool = False,
         longrunning: bool = False,
     ):
-        if ve is None and (ve_s is None and ve_t is None):
-            raise ValueError("Either ve or ve_s and ve_t must be provided.")
-
-        if ve is None:
-            ve = self.ve_from_s_t(ve_s, ve_t, multicontact)
-
         with_intra = intra is not None
+        if with_intra:
+            if not isinstance(intra, IntraStim):
+                raise ValueError("intra must be an instance of IntraStim")
+
+        intra_only = False
+        if ve is None and (ve_s is None and ve_t is None):
+            if intra is None:
+                raise ValueError(
+                    "Either ve or ve_s and ve_t or intra must be provided."
+                )
+            intra_only = True
+            ve_zero = torch.zeros_like(self.v)
+
+        device = self.device()
+        if ve is not None:
+            ve = torch.as_tensor(ve, device=device)
+
+        dt = dt if dt is not None else A.dt
+        self.dt = dt
 
         method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
         method_intra = getattr(
@@ -387,10 +453,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         df = self.is_df
 
         with torch.set_grad_enabled(self.training):
-            device = self.device()
-
-            dt = dt if dt is not None else A.dt
-            self.dt = dt
+            if ve is None and not intra_only:
+                ve = self.ve_from_s_t(ve_s, ve_t, multicontact)
+            
+            if self.training:
+                self.calculate_geometric_params()
 
             if (not self.initialized) or reinit:
                 if "_steady_state" in self._caches:
@@ -398,10 +465,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     self.t_ind = 0
                 else:
                     self.init_v()
-                    self.initialize(self.v, self.v_init_c, self.area_c, self.temp_c)
+                    self.initialize(self.v, self.v_init_c, self.temp_c)
                     self.post_initialize()
                     self.t_ind = 0
                     self.initialized = True
+                if with_intra:
+                    intra.init(self)
+            else:
+                self.detach()
 
             if first:
                 if callbacks:
@@ -413,7 +484,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 callbacks.pre_loop_hook(self)
 
             dt = torch.as_tensor(dt, device=device)
-            ve = torch.as_tensor(ve, device=device)
 
             if df:
                 s = 2 * dt / self.cm_c
@@ -427,24 +497,25 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     progressbar = tqdm(total=ve.shape[0], desc=f"{self.t:.3f} ms")
 
             for i in range(ve.shape[0]):
+                ve_ = ve[i] if not intra_only else ve_zero
                 if df:
                     if with_intra:
                         self.v, self.v_prev = method_intra(
                             self.v,
                             self.v_prev,
-                            ve[i],
+                            ve_,
                             self.area_c,
                             s,
                             s2,
                             dt,
                             self.temp_c,
-                            intra[i],
+                            intra(self.t_ind, self.v),
                         )
                     else:
                         self.v, self.v_prev = method(
                             self.v,
                             self.v_prev,
-                            ve[i],
+                            ve_,
                             self.area_c,
                             s,
                             s2,
@@ -455,17 +526,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     if with_intra:
                         self.v = method_intra(
                             self.v,
-                            ve[i],
+                            ve_,
                             self.area_c,
                             cm_inv,
                             ra_inv,
                             dt,
                             self.temp_c,
-                            intra[i],
+                            intra(self.t_ind, self.v),
                         )
                     else:
                         self.v = method(
-                            self.v, ve[i], self.area_c, cm_inv, ra_inv, dt, self.temp_c
+                            self.v, ve_, self.area_c, cm_inv, ra_inv, dt, self.temp_c
                         )
                 callbacks.post_step_hook(self)
                 self.t_ind += 1
@@ -547,7 +618,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ve = torch.einsum(einsum, ve_s, t_chunk).unsqueeze(2)
             self.run(
                 ve,
-                dt,
+                dt=dt,
                 callbacks=callbacks,
                 reinit=reinit,
                 progressbar=progressbar,
@@ -572,8 +643,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             h(self)
 
     @torch.jit.script_method
-    def initialize(self, v, v_init, area, temp):
-        self.mech.initialize(v, v_init, area, temp)
+    def initialize(self, v, v_init, temp):
+        self.mech.initialize(v, v_init, temp)
 
     def FRK(self, v, ve, area, cm, ra):
         x = torch.cat([v, ve], dim=1)
@@ -592,7 +663,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt, temp)
         K1 = self.FRK(v, ve, area, cm, ra)
         v = v + K1 * dt
-
         return v
 
     @torch.jit.script_method
@@ -600,7 +670,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.advance(v, dt, temp)
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         v = v + K1 * dt
-
         return v
 
     @torch.jit.script_method
@@ -723,7 +792,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self
 
     def compile(self, callbacks: List[Callback] = None):
-        ve = torch.ones(1, self.n_ax, 1, self.n_node, device=self.device())
+        ve = torch.ones(
+            1, self.n_ax, 1, self.n_node, device=self.device(), dtype=self.dtype()
+        )
         for _ in range(5):
             self.run(ve, callbacks=callbacks, progressbar=False)
         self.initialized = False
@@ -755,12 +826,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def cuda(self):
         super().cuda()
-        self.mech.set_buffers()
+        self.mech.set_buffers(self.diam)
         return self
 
     def cpu(self):
         super().cpu()
-        self.mech.set_buffers()
+        self.mech.set_buffers(self.diam)
         return self
 
 

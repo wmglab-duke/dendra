@@ -19,3 +19,36 @@ for file in py_files:
         module_name  # Assume class name is the capitalized version of file name
     )
     globals()[class_name] = getattr(module, class_name)  # Add class to global namespace
+
+
+def load_mechanisms(*paths):
+    """
+    Load mechanisms from directories containing Python files.
+
+    Args:
+        *paths (str): Path(s) to the directory(s) containing Python files.
+
+    Returns:
+        dict[str, Mechanism]: Dictionary of mechanism names and corresponding mechanisms.
+    """
+    mechanisms = {}
+
+    for path in paths:
+        dirpath = os.path.abspath(path)
+        py_files = [
+            f for f in os.listdir(dirpath) if f.endswith(".py") and f != "__init__.py"
+        ]
+
+        for file in py_files:
+            # import file as module
+            module_name = os.path.splitext(file)[0]
+            file_path = os.path.join(dirpath, file)
+
+            # Create a spec from the file and then import the module
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                mechanisms[module_name] = getattr(module, module_name)
+
+    return mechanisms

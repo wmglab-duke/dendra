@@ -1,2 +1,10 @@
+[build-system]
+requires = ["setuptools", "cython"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "axonml"
+version = "0.2"
+
 [tool.ruff.lint]
 ignore-init-module-imports = true
