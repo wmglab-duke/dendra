@@ -187,7 +187,9 @@ class Recorder(Callback):
             data = self.numpy(s)
             chunks = data.shape
             chunks = (chunks[0], 1, chunks[2], chunks[3])
-            self.hdf5_groups[s].create_dataset(f"{self.save_count}", data=data, chunks=chunks)
+            self.hdf5_groups[s].create_dataset(
+                f"{self.save_count}", data=data, chunks=chunks
+            )
             self.save_count += 1
 
     def post_step_hook(self, model):

@@ -455,7 +455,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         with torch.set_grad_enabled(self.training):
             if ve is None and not intra_only:
                 ve = self.ve_from_s_t(ve_s, ve_t, multicontact)
-            
+
             if self.training:
                 self.calculate_geometric_params()
 
