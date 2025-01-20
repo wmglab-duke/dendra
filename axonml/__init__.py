@@ -8,7 +8,7 @@ from .models.mod import load_mechanisms
 this = os.path.dirname(__file__)
 all_trained = glob.glob(this + "/trained/*")
 
-trained = {os.path.split(t)[1]: t for t in all_trained}
+all_trained = {os.path.split(t)[1]: t for t in all_trained}
 
 
 def allow_tf32(allow=True):
