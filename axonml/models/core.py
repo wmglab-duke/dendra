@@ -557,13 +557,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if multicontact:
             ve_s = ve_s.expand(-1, self.n_ax, -1)
             ve_t = ve_t.expand(-1, self.n_ax, -1)
+            einsum = op_mc
         else:
             ve_s = ve_s.expand(self.n_ax, -1)
             ve_t = ve_t.expand(self.n_ax, -1)
-
-        if multicontact:
-            einsum = op_mc
-        else:
             einsum = op_sc
 
         return einsum(ve_s, ve_t)
@@ -588,13 +585,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if multicontact:
             ve_s = ve_s.expand(-1, self.n_ax, -1)
             ve_t = ve_t.expand(-1, self.n_ax, -1)
+            einsum = op_mc
         else:
             ve_s = ve_s.expand(self.n_ax, -1)
             ve_t = ve_t.expand(self.n_ax, -1)
-
-        if multicontact:
-            einsum = op_mc
-        else:
             einsum = op_sc
 
         dt = dt if dt is not None else A.dt
