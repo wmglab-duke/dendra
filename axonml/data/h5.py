@@ -8,7 +8,7 @@ class H5Reader:
         self.file = h5py.File(path, "r")
 
     def __getitem__(self, key):
-        return H5Var(self.file[key], str(self))
+        return H5Var(self.file[key], str(self), key)
     
     def __del__(self):
         self.file.close()
@@ -21,12 +21,13 @@ class H5Reader:
     
 
 class H5Var:
-    def __init__(self, group, reader):
+    def __init__(self, group, reader, name):
         self.group = group
         self.reader = reader
+        self.name = name
 
     def __getitem__(self, key: int):
-        return H5Rec(self.group[f"run_{key}"], self.reader, self.group.name, key)
+        return H5Rec(self.group[f"run_{key}"], self.reader, self.name, key)
     
     def n(self):
         return len(self.group.keys())
@@ -35,7 +36,7 @@ class H5Var:
         return list(self.group.keys())
     
     def __repr__(self):
-        return f"{self.reader} : {self.group.name}"
+        return f"{self.reader} : {self.name}"
 
     
 class H5Rec:
