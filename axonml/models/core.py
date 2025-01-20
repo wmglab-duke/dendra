@@ -543,8 +543,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
                 if progressbar:
                     progressbar.update(1)
-                    if (i + 1) % 100 == 0:
-                        progressbar.set_description(f"{self.t:.3f} ms")
+                    if self.t_ind % 100 == 0:
+                        progressbar.set_description(f"{self.t:.1f} ms")
 
             if not longrunning:
                 if progressbar:
@@ -562,11 +562,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ve_t = ve_t.expand(self.n_ax, -1)
 
         if multicontact:
-            einsum = "can,cat->tan"
+            einsum = op_mc
         else:
-            einsum = "an,at->tan"
+            einsum = op_sc
 
-        return torch.einsum(einsum, ve_s, ve_t).unsqueeze(2)
+        return einsum(ve_s, ve_t)
 
     def longrun(
         self,
@@ -593,9 +593,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ve_t = ve_t.expand(self.n_ax, -1)
 
         if multicontact:
-            einsum = "can,cat->tan"
+            einsum = op_mc
         else:
-            einsum = "an,at->tan"
+            einsum = op_sc
 
         dt = dt if dt is not None else A.dt
 
@@ -615,7 +615,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 reinit = True
             else:
                 reinit = False
-            ve = torch.einsum(einsum, ve_s, t_chunk).unsqueeze(2)
+            ve = einsum(ve_s, t_chunk)
             self.run(
                 ve,
                 dt=dt,
@@ -948,3 +948,13 @@ class Myelinated(Axon):
         steps = self.n_node
         t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(-1)
         return ((1 - t) * start + t * end).T
+
+
+@torch.jit.script
+def op_mc(s: Tensor, t: Tensor) -> Tensor:
+    return torch.einsum("can,cat->tan", s, t).unsqueeze(2)
+
+
+@torch.jit.script
+def op_sc(s: Tensor, t: Tensor) -> Tensor:
+    return torch.einsum("an,at->tan", s, t).unsqueeze(2)
