@@ -8,7 +8,6 @@ from torch import Tensor
 
 from tqdm.auto import tqdm
 
-from axonml import all_trained
 from axonml.models.stim.intrastim import IntraStim
 
 from .callbacks import CallbackList, Callback
@@ -772,6 +771,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self.mech.get(mech, state)
 
     def load(self, state_dict):
+        from axonml import all_trained
         if state_dict in all_trained:
             state_dict = torch.load(
                 all_trained[state_dict], map_location=self.device(), weights_only=True
