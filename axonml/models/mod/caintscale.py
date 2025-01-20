@@ -1,5 +1,7 @@
 # Intracellular calcium ion accumulation
 
+from axonml.constants import PI
+
 from ..mechanisms import *
 from ..mechanisms.ops import *
 
@@ -21,8 +23,8 @@ class oc_cai(State):
     )
 
     def initial(self, v):
-        self.SA = torch.pi * (1e-4) * self.diam * self.lseg
-        self.Vol = torch.pi * ((1e-4) * (self.diam / 2)) ** 2 * self.lseg
+        self.SA = PI * (1e-4) * self.diam * self.lseg
+        self.Vol = PI * ((1e-4) * (self.diam / 2)) ** 2 * self.lseg
 
 
 class caintscale(Mechanism):
