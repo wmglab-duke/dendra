@@ -4,6 +4,7 @@ import linecache
 import textwrap
 import ast
 import re
+import math
 
 import warnings
 from sympy import symbols, sympify, Poly, expand, factor
@@ -15,6 +16,7 @@ from .compile_f import convert_func
 from .core import Mechanism, coupled
 from ..mixins import to_param
 from .ops import *
+from axonml import const
 
 from .handler.defaults import valid_concentrations
 from .state_compiler import compile_state, compile_coupled_state

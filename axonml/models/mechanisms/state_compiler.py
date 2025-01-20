@@ -4,6 +4,7 @@ import linecache
 import textwrap
 import string
 import random
+import math
 
 import torch
 
@@ -14,6 +15,7 @@ from nmodl.ode import integrate2c
 
 import re
 from .ops import *
+from axonml import const
 
 
 def extract_vars(f, exclude):

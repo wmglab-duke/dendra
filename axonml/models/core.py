@@ -412,8 +412,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def run(
         self,
         ve: Tensor = None,
-        ve_s: Tensor = None,
-        ve_t: Tensor = None,
+        space: Tensor = None,
+        time: Tensor = None,
         dt: float = None,
         intra: Optional[IntraStim] = None,
         callbacks: List[Callback] = None,
@@ -429,7 +429,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 raise ValueError("intra must be an instance of IntraStim")
 
         intra_only = False
-        if ve is None and (ve_s is None and ve_t is None):
+        if ve is None and (space is None and time is None):
             if intra is None:
                 raise ValueError(
                     "Either ve or ve_s and ve_t or intra must be provided."
@@ -453,7 +453,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         with torch.set_grad_enabled(self.training):
             if ve is None and not intra_only:
-                ve = self.ve_from_s_t(ve_s, ve_t, multicontact)
+                ve = self.ve_from_s_t(space, time, multicontact)
 
             if self.training:
                 self.calculate_geometric_params()
@@ -566,8 +566,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def longrun(
         self,
-        ve_s: Tensor,
-        ve_t: Tensor,
+        space: Tensor,
+        time: Tensor,
         n_chunks: int,
         dt: float = None,
         reinit=False,
@@ -575,8 +575,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         progressbar=True,
         multicontact=False,
     ):
-        ve_s = torch.as_tensor(ve_s, device=self.device())
-        ve_t = torch.as_tensor(ve_t, device=self.device())
+        ve_s = torch.as_tensor(space, device=self.device())
+        ve_t = torch.as_tensor(time, device=self.device())
 
         # ve_s : [n_ax, n_node] or [1, n_node] or [n_contacts, *]
         # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
