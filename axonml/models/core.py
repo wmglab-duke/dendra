@@ -596,7 +596,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
 
         if progressbar:
-            progressbar = tqdm(total=ve_t.shape[-1], desc=f"{self.t:.3f} ms")
+            progressbar = tqdm(total=ve_t.shape[-1], desc=f"{self.t:.1f} ms")
 
         if callbacks:
             for c in callbacks:
