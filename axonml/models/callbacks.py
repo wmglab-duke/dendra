@@ -165,7 +165,7 @@ class Recorder(Callback):
         self.run_number = 0
 
     def set_hdf5(self, hdf5: str, save_every=10000):
-        self.hdf5_file = File(hdf5, "w")
+        self.hdf5_file = File(hdf5, "w", libver="latest")
         self.cache_with_hdf5 = True
         self.save_every = save_every
         for s in self.states:
