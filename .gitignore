@@ -136,3 +136,6 @@ checkpoints/
 examples/*/*.png
 examples/*/*.pkl
 *.bak
+
+# h5
+*.h5

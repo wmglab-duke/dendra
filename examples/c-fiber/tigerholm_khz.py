@@ -2,6 +2,12 @@ import torch
 from axonml.models import Tigerholm
 from axonml.models.callbacks import Recorder
 
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--save_every", type=int, default=10000)
+parser.add_argument("--n_chunks", type=int, default=1000)
+args = parser.parse_args()
 
 n_ax = 10000
 L = 50  # mm
@@ -26,6 +32,10 @@ amplitude = 20.0
 ve_t = amplitude * torch.sin(t * 1 * torch.pi * 1).unsqueeze(0)
 
 # -- run & record --
-rec = Recorder(["v"], node_indices=model.c(0.4, 0.5)).set_hdf5("tigerholm_voltage.h5")
-model.longrun(ve_s=ve_s, ve_t=ve_t, n_chunks=1000, dt=dt, reinit=True, callbacks=[rec])
+rec = Recorder(["v"], node_indices=model.c(0.4, 0.5)).set_hdf5(
+    "tigerholm_voltage.h5", save_every=args.save_every
+)
+model.longrun(
+    ve_s=ve_s, ve_t=ve_t, n_chunks=args.n_chunks, dt=dt, reinit=True, callbacks=[rec]
+)
 rec.close()
