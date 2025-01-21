@@ -17,7 +17,7 @@ class H5Reader:
         return list(self.file.keys())
 
     def __repr__(self):
-        return f"H5Reader({self.path})"
+        return f"H5Reader {{ {self.path} }}"
 
 
 class H5Var:
