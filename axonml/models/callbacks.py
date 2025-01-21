@@ -1,5 +1,7 @@
+from queue import Queue
 from typing import Tuple, Dict, List
 from types import MethodType
+import threading
 
 from h5py import File
 
@@ -70,29 +72,34 @@ class CallbackList:
 
 template = """
 def recorder(self, model):
+  if self.save_every is not None:
+    save = self.i % self.save_every == 0
+  else:
+    save = True
+  if save:
   {implementation}
 """
 
 impl_template = """
-  states = model.mech.{mech}.{state}
-  if self.max_only:
-    self.rec['{full_state}'].append(torch.amax(states, -1))
-  else:
-    if self.node_indices is not None:
-      self.rec['{full_state}'].append(atleast_3d(states[:, :, self.node_indices]))
+    states = model.mech.{mech}.{state}
+    if self.max_only:
+      self.rec['{full_state}'].append(torch.amax(states, -1))
     else:
-      self.rec['{full_state}'].append(states)
+      if self.node_indices is not None:
+        self.rec['{full_state}'].append(atleast_3d(states[:, :, self.node_indices]))
+      else:
+        self.rec['{full_state}'].append(states)
 """
 
 v_template = """
-  states = model.v
-  if self.max_only:
-    self.rec['v'].append(torch.amax(states, -1))
-  else:
-    if self.node_indices is not None:
-      self.rec['v'].append(atleast_3d(states[:, :, self.node_indices]))
+    states = model.v
+    if self.max_only:
+      self.rec['v'].append(torch.amax(states, -1))
     else:
-      self.rec['v'].append(states)
+      if self.node_indices is not None:
+        self.rec['v'].append(atleast_3d(states[:, :, self.node_indices]))
+      else:
+        self.rec['v'].append(states)
 """
 
 
@@ -144,7 +151,7 @@ def atleast_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 class Recorder(Callback):
-    def __init__(self, states, max_only=False, node_indices=None):
+    def __init__(self, states, max_only=False, node_indices=None, dt=None):
         super().__init__()
         self.states = states
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
@@ -154,20 +161,40 @@ class Recorder(Callback):
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
 
+        self._dt = None
+        self.save_dt = dt
+        self.save_every = int(self.save_dt / self.dt) if self.save_dt is not None else None
+
         # HDF5 -- optional -- for large data
+        self.queue = None
         self.hdf5_file = None
         self.cache_with_hdf5 = False
-        self.save_every = None
+        self.cache_every = None
         self.save_count = 0
         self.major_groups = {}
         self.hdf5_groups = {}
         self.i = 0
         self.run_number = 0
+        self.writer_thread = None
 
-    def set_hdf5(self, hdf5: str, save_every=10000):
+    @property
+    def dt(self):
+        return self._dt or A.dt
+    
+    @dt.setter
+    def dt(self, value):
+        self._dt = value
+        if self.save_dt is not None:
+            self.save_every = int(self.save_dt / self.dt)
+
+
+    def set_hdf5(self, hdf5: str, cache_every=10000):
+        self.queue = Queue()
+        self.writer_thread = threading.Thread(target=hdf5_write, args=(self.queue,), daemon=True)
+        self.writer_thread.start()
         self.hdf5_file = File(hdf5, "w", libver="latest")
         self.cache_with_hdf5 = True
-        self.save_every = save_every
+        self.cache_every = cache_every
         for s in self.states:
             self.major_groups[s] = self.hdf5_file.create_group(s)
         return self
@@ -187,18 +214,16 @@ class Recorder(Callback):
             data = self.numpy(s)
             chunks = data.shape
             chunks = (chunks[0], 1, chunks[2], chunks[3])
-            self.hdf5_groups[s].create_dataset(
-                f"{self.save_count}", data=data, chunks=chunks
-            )
-            self.save_count += 1
+            self.queue.put((self.hdf5_groups[s], f"{self.save_count}", data, chunks))
+        self.save_count += 1
 
     def post_step_hook(self, model):
         self._post_step_hook(model)
+        self.i += 1
         if self.cache_with_hdf5:
-            self.i += 1
-            if self.i % self.save_every == 0:
+            if self.i % self.cache_every == 0:
                 self.cache_hdf5()
-                self.reset()
+                self.rec = {s: [] for s in self.states}
 
     def post_loop_hook(self, model):
         if self.cache_with_hdf5:
@@ -211,6 +236,8 @@ class Recorder(Callback):
 
     def close(self):
         if self.cache_with_hdf5:
+            self.queue.put(None)
+            self.writer_thread.join()
             self.hdf5_file.close()
 
     def stack(self, var: str = None):
@@ -228,6 +255,16 @@ class Recorder(Callback):
         if var is not None:
             return self.stack(var).detach().cpu().numpy()
         return self.stack().detach().cpu().numpy()
+    
+
+def hdf5_write(queue: Queue):
+    while True:
+        item = queue.get()
+        if item is None:
+            break
+        group, name, data, chunks = item
+        group.create_dataset(name, data=data, chunks=chunks)
+        queue.task_done()
 
 
 class ThresholdCallback(Callback):
