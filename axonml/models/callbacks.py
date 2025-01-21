@@ -236,9 +236,6 @@ class Recorder(Callback):
 
     def close(self):
         if self.cache_with_hdf5:
-            self.queue.put(None)
-            self.writer_thread.join(timeout=1)
-            print(self.writer_thread.is_alive())
             self.hdf5_file.close()
 
     def stack(self, var: str = None):
