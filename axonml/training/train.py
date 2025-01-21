@@ -57,8 +57,8 @@ if __name__ == "__main__":
         model = model.cuda()
         loss = loss.cuda()
 
-    for p in config.to_train:
-        model.unfreeze(p)
+    model.unfreeze(*config.to_train)
+    model.unfreeze_group(*config.to_train_groups)
 
     # perform training
     tbptt(

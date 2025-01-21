@@ -3,14 +3,15 @@ from axonml.models import Tigerholm
 from axonml.models.callbacks import Recorder
 
 import argparse
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--save_every", type=int, default=10000)
 parser.add_argument("--n_chunks", type=int, default=1000)
 args = parser.parse_args()
 
 n_ax = 10000
-L = 50      # mm
-dx = 25.0   # um
+L = 50  # mm
+dx = 25.0  # um
 
 diameters = torch.linspace(0.5, 2.0, n_ax)
 model = Tigerholm(diameters, L, dx=dx, method="euler").cuda()

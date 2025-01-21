@@ -239,6 +239,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     print(f"Unfreezing {n}")
                     p.requires_grad = True
 
+    def unfreeze_group(self, *groups):
+        for g in groups:
+            group = getattr(self, g)
+            print(f"Unfreezing group '{g}'")
+            for p in group:
+                p.requires_grad = True
+
     def freeze(self, *names):
         if not names:
             for p in self.parameters():
@@ -248,6 +255,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 if matches_any_pattern(names, n):
                     print(f"Freezing {n}")
                     p.requires_grad = False
+
+    def freeze_group(self, *groups):
+        for g in groups:
+            group = getattr(self, g)
+            print(f"Freezing group '{g}'")
+            for p in group:
+                p.requires_grad = False
 
     def register_post_initialize_hook(self, fn: Callable):
         self.post_initialize_hooks.append(fn)
@@ -772,6 +786,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def load(self, state_dict):
         from axonml import all_trained
+
         if state_dict in all_trained:
             state_dict = torch.load(
                 all_trained[state_dict], map_location=self.device(), weights_only=True

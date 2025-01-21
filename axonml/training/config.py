@@ -29,17 +29,20 @@ epochs = 5
 truncation_length = 50
 lr = 3e-5
 grad_accumulation = False
+
 to_train: List[str] = [
-    "conductances",
-    "membrane",
-    "axon_d",
-    "node_d",
+    "axnode_myel.gnabar",
+    "axnode_myel.gnapbar",
+    "axnode_myel.gkbar",
+    "axnode_myel.gl",
     "m.aq10_1",
     "p.pq10_1",
     "h.aq10_2",
     "s.aq10_3",
-    "ssd",
+    "ssd.weight",
 ]
+
+to_train_groups: List[str] = ["membrane", "node_d", "axon_d"]
 
 # -- data --
 train_n_idx = 64
