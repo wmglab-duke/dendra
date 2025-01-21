@@ -237,7 +237,8 @@ class Recorder(Callback):
     def close(self):
         if self.cache_with_hdf5:
             self.queue.put(None)
-            self.writer_thread.join()
+            self.writer_thread.join(timeout=1)
+            print(self.writer_thread.is_alive())
             self.hdf5_file.close()
 
     def stack(self, var: str = None):
@@ -261,6 +262,7 @@ def hdf5_write(queue: Queue):
     while True:
         item = queue.get()
         if item is None:
+            queue.task_done()
             break
         group, name, data, chunks = item
         group.create_dataset(name, data=data, chunks=chunks)
