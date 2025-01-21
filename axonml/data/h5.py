@@ -36,7 +36,7 @@ class H5Var:
         return list(self.group.keys())
 
     def __repr__(self):
-        return f"{self.reader} : {self.name}"
+        return f"{self.reader} {{ {self.name} }}"
 
 
 class H5Rec:
@@ -53,4 +53,4 @@ class H5Rec:
         return self.data[key]
 
     def __repr__(self):
-        return f"{self.reader} : {self.name} : run {self.run}"
+        return f"{self.reader} {{ {self.name} }} {{ run {self.run} }}"
