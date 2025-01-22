@@ -167,7 +167,9 @@ class Recorder(Callback):
 
         self._dt = None
         self.save_dt = dt
-        self.save_every = int(self.save_dt / self.dt) if self.save_dt is not None else None
+        self.save_every = (
+            int(self.save_dt / self.dt) if self.save_dt is not None else None
+        )
 
         # HDF5 -- optional -- for large data
         self.queue = None
@@ -185,20 +187,21 @@ class Recorder(Callback):
     @property
     def dt(self):
         return self._dt or A.dt
-    
+
     @dt.setter
     def dt(self, value):
         self._dt = value
         if self.save_dt is not None:
             self.save_every = int(self.save_dt / self.dt)
 
-
     def set_hdf5(self, hdf5: str, cache_every=10000):
         self.hdf5_path = hdf5
         mp.set_start_method("spawn", force=True)
         self.manager = mp.Manager()
         self.queue = self.manager.Queue()
-        self.writer_thread = mp.Process(target=hdf5_write, args=(self.queue, self.hdf5_path))
+        self.writer_thread = mp.Process(
+            target=hdf5_write, args=(self.queue, self.hdf5_path)
+        )
         self.writer_thread.start()
         self.cache_with_hdf5 = True
         self.cache_every = cache_every
@@ -214,15 +217,21 @@ class Recorder(Callback):
             for s in self.states:
                 data = self.stack(s)
                 if s not in self.data_pinned:
-                    self.data_pinned[s] = torch.empty(data.shape, dtype=data.dtype, device='cpu', pin_memory=True)
+                    self.data_pinned[s] = torch.empty(
+                        data.shape, dtype=data.dtype, device="cpu", pin_memory=True
+                    )
                 if self.data_pinned[s].shape[0] != data.shape[0]:
-                    self.data_pinned[s] = torch.empty(data.shape, dtype=data.dtype, device='cpu', pin_memory=True)
+                    self.data_pinned[s] = torch.empty(
+                        data.shape, dtype=data.dtype, device="cpu", pin_memory=True
+                    )
                 self.data_pinned[s].copy_(data, non_blocking=True)
         self.queue.put("flush")
         chunks = data.shape
         chunks = (chunks[0], 1, chunks[2], chunks[3])
         for s in self.states:
-            self.queue.put((s, self.run_number, self.save_count, self.data_pinned[s], chunks))
+            self.queue.put(
+                (s, self.run_number, self.save_count, self.data_pinned[s], chunks)
+            )
         self.save_count += 1
 
     def post_step_hook(self, model):
@@ -263,7 +272,7 @@ class Recorder(Callback):
         if var is not None:
             return self.stack(var).detach().cpu().numpy()
         return self.stack().detach().cpu().numpy()
-    
+
 
 def hdf5_write(queue: Queue, path: str):
     with File(path, "w", libver="latest") as f:
@@ -277,7 +286,7 @@ def hdf5_write(queue: Queue, path: str):
                 queue.task_done()
                 break
             state, run, save_count, data, chunks = item
-            group = f.require_group(f'/{state}/run_{run}')
+            group = f.require_group(f"/{state}/run_{run}")
             group.create_dataset(f"{save_count}", data=data, chunks=chunks)
             queue.task_done()
 
