@@ -1,5 +1,8 @@
+from queue import Queue
 from typing import Tuple, Dict, List
 from types import MethodType
+import threading
+import multiprocessing as mp
 
 from h5py import File
 
@@ -7,6 +10,9 @@ import torch
 
 from .backend import Backend as A
 from .interfaces import AxonInterface
+
+
+STREAM = torch.cuda.Stream()
 
 
 class Callback:
@@ -70,29 +76,34 @@ class CallbackList:
 
 template = """
 def recorder(self, model):
+  if self.save_every is not None:
+    save = self.i % self.save_every == 0
+  else:
+    save = True
+  if save:
   {implementation}
 """
 
 impl_template = """
-  states = model.mech.{mech}.{state}
-  if self.max_only:
-    self.rec['{full_state}'].append(torch.amax(states, -1))
-  else:
-    if self.node_indices is not None:
-      self.rec['{full_state}'].append(atleast_3d(states[:, :, self.node_indices]))
+    states = model.mech.{mech}.{state}
+    if self.max_only:
+      self.rec['{full_state}'].append(torch.amax(states, -1))
     else:
-      self.rec['{full_state}'].append(states)
+      if self.node_indices is not None:
+        self.rec['{full_state}'].append(atleast_3d(states[:, :, self.node_indices]))
+      else:
+        self.rec['{full_state}'].append(states)
 """
 
 v_template = """
-  states = model.v
-  if self.max_only:
-    self.rec['v'].append(torch.amax(states, -1))
-  else:
-    if self.node_indices is not None:
-      self.rec['v'].append(atleast_3d(states[:, :, self.node_indices]))
+    states = model.v
+    if self.max_only:
+      self.rec['v'].append(torch.amax(states, -1))
     else:
-      self.rec['v'].append(states)
+      if self.node_indices is not None:
+        self.rec['v'].append(atleast_3d(states[:, :, self.node_indices]))
+      else:
+        self.rec['v'].append(states)
 """
 
 
@@ -144,7 +155,7 @@ def atleast_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 class Recorder(Callback):
-    def __init__(self, states, max_only=False, node_indices=None):
+    def __init__(self, states, max_only=False, node_indices=None, dt=None):
         super().__init__()
         self.states = states
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
@@ -154,56 +165,88 @@ class Recorder(Callback):
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
 
+        self._dt = None
+        self.save_dt = dt
+        self.save_every = (
+            int(self.save_dt / self.dt) if self.save_dt is not None else None
+        )
+
         # HDF5 -- optional -- for large data
-        self.hdf5_file = None
+        self.queue = None
+        self.hdf5_path = None
         self.cache_with_hdf5 = False
-        self.save_every = None
+        self.cache_every = None
         self.save_count = 0
-        self.major_groups = {}
-        self.hdf5_groups = {}
         self.i = 0
         self.run_number = 0
+        self.manager = None
+        self.writer_thread = None
+        self.data_pinned = {}
+        self.stream = None
 
-    def set_hdf5(self, hdf5: str, save_every=10000):
-        self.hdf5_file = File(hdf5, "w", libver="latest")
+    @property
+    def dt(self):
+        return self._dt or A.dt
+
+    @dt.setter
+    def dt(self, value):
+        self._dt = value
+        if self.save_dt is not None:
+            self.save_every = int(self.save_dt / self.dt)
+
+    def set_hdf5(self, hdf5: str, cache_every=10000):
+        self.hdf5_path = hdf5
+        mp.set_start_method("spawn", force=True)
+        self.manager = mp.Manager()
+        self.queue = self.manager.Queue()
+        self.writer_thread = mp.Process(
+            target=hdf5_write, args=(self.queue, self.hdf5_path)
+        )
+        self.writer_thread.start()
         self.cache_with_hdf5 = True
-        self.save_every = save_every
-        for s in self.states:
-            self.major_groups[s] = self.hdf5_file.create_group(s)
+        self.cache_every = cache_every
         return self
 
     def pre_loop_hook(self, model):
         self._pre_loop_hook(model)
         if self.cache_with_hdf5:
-            for s in self.states:
-                self.hdf5_groups[s] = self.major_groups[s].create_group(
-                    f"run_{self.run_number}"
-                )
-            self.run_number += 1
             self.i += 1
 
     def cache_hdf5(self):
+        with torch.cuda.stream(STREAM):
+            for s in self.states:
+                data = self.stack(s)
+                if s not in self.data_pinned:
+                    self.data_pinned[s] = torch.empty(
+                        data.shape, dtype=data.dtype, device="cpu", pin_memory=True
+                    )
+                if self.data_pinned[s].shape[0] != data.shape[0]:
+                    self.data_pinned[s] = torch.empty(
+                        data.shape, dtype=data.dtype, device="cpu", pin_memory=True
+                    )
+                self.data_pinned[s].copy_(data, non_blocking=True)
+        self.queue.put("flush")
+        chunks = data.shape
+        chunks = (chunks[0], 1, chunks[2], chunks[3])
         for s in self.states:
-            data = self.numpy(s)
-            chunks = data.shape
-            chunks = (chunks[0], 1, chunks[2], chunks[3])
-            self.hdf5_groups[s].create_dataset(
-                f"{self.save_count}", data=data, chunks=chunks
+            self.queue.put(
+                (s, self.run_number, self.save_count, self.data_pinned[s], chunks)
             )
-            self.save_count += 1
+        self.save_count += 1
 
     def post_step_hook(self, model):
         self._post_step_hook(model)
+        self.i += 1
         if self.cache_with_hdf5:
-            self.i += 1
-            if self.i % self.save_every == 0:
+            if self.i % self.cache_every == 0:
                 self.cache_hdf5()
-                self.reset()
+                self.rec = {s: [] for s in self.states}
 
     def post_loop_hook(self, model):
         if self.cache_with_hdf5:
             self.cache_hdf5()
         self.save_count = 0
+        self.run_number += 1
 
     def reset(self):
         self.rec = {s: [] for s in self.states}
@@ -211,7 +254,8 @@ class Recorder(Callback):
 
     def close(self):
         if self.cache_with_hdf5:
-            self.hdf5_file.close()
+            self.queue.put(None)
+            self.writer_thread.join()
 
     def stack(self, var: str = None):
         if var is not None:
@@ -228,6 +272,23 @@ class Recorder(Callback):
         if var is not None:
             return self.stack(var).detach().cpu().numpy()
         return self.stack().detach().cpu().numpy()
+
+
+def hdf5_write(queue: Queue, path: str):
+    with File(path, "w", libver="latest") as f:
+        while True:
+            item = queue.get()
+            if item == "flush":
+                STREAM.synchronize()
+                queue.task_done()
+                continue
+            if item is None:
+                queue.task_done()
+                break
+            state, run, save_count, data, chunks = item
+            group = f.require_group(f"/{state}/run_{run}")
+            group.create_dataset(f"{save_count}", data=data, chunks=chunks)
+            queue.task_done()
 
 
 class ThresholdCallback(Callback):
