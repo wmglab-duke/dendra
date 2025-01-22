@@ -1,5 +1,6 @@
 import h5py
 import dask.array as da
+from natsort import natsorted
 
 
 class H5Reader:
@@ -45,7 +46,7 @@ class H5Rec:
         self.reader = reader
         self.name = name
         self.run = run
-        datasets = [self.group[ds] for ds in self.group]
+        datasets = [self.group[ds] for ds in natsorted(self.group.keys())]
         arrays = [da.from_array(ds, chunks=(-1, 1, -1, -1)) for ds in datasets]
         self.data = da.concatenate(arrays, axis=0)
 

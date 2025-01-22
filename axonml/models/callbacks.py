@@ -2,6 +2,7 @@ from queue import Queue
 from typing import Tuple, Dict, List
 from types import MethodType
 import threading
+import multiprocessing as mp
 
 from h5py import File
 
@@ -9,6 +10,9 @@ import torch
 
 from .backend import Backend as A
 from .interfaces import AxonInterface
+
+
+STREAM = torch.cuda.Stream()
 
 
 class Callback:
@@ -167,15 +171,16 @@ class Recorder(Callback):
 
         # HDF5 -- optional -- for large data
         self.queue = None
-        self.hdf5_file = None
+        self.hdf5_path = None
         self.cache_with_hdf5 = False
         self.cache_every = None
         self.save_count = 0
-        self.major_groups = {}
-        self.hdf5_groups = {}
         self.i = 0
         self.run_number = 0
+        self.manager = None
         self.writer_thread = None
+        self.data_pinned = {}
+        self.stream = None
 
     @property
     def dt(self):
@@ -189,32 +194,35 @@ class Recorder(Callback):
 
 
     def set_hdf5(self, hdf5: str, cache_every=10000):
-        self.queue = Queue()
-        self.writer_thread = threading.Thread(target=hdf5_write, args=(self.queue,), daemon=True)
+        self.hdf5_path = hdf5
+        mp.set_start_method("spawn", force=True)
+        self.manager = mp.Manager()
+        self.queue = self.manager.Queue()
+        self.writer_thread = mp.Process(target=hdf5_write, args=(self.queue, self.hdf5_path))
         self.writer_thread.start()
-        self.hdf5_file = File(hdf5, "w", libver="latest")
         self.cache_with_hdf5 = True
         self.cache_every = cache_every
-        for s in self.states:
-            self.major_groups[s] = self.hdf5_file.create_group(s)
         return self
 
     def pre_loop_hook(self, model):
         self._pre_loop_hook(model)
         if self.cache_with_hdf5:
-            for s in self.states:
-                self.hdf5_groups[s] = self.major_groups[s].create_group(
-                    f"run_{self.run_number}"
-                )
-            self.run_number += 1
             self.i += 1
 
     def cache_hdf5(self):
+        with torch.cuda.stream(STREAM):
+            for s in self.states:
+                data = self.stack(s)
+                if s not in self.data_pinned:
+                    self.data_pinned[s] = torch.empty(data.shape, dtype=data.dtype, device='cpu', pin_memory=True)
+                if self.data_pinned[s].shape[0] != data.shape[0]:
+                    self.data_pinned[s] = torch.empty(data.shape, dtype=data.dtype, device='cpu', pin_memory=True)
+                self.data_pinned[s].copy_(data, non_blocking=True)
+        self.queue.put("flush")
+        chunks = data.shape
+        chunks = (chunks[0], 1, chunks[2], chunks[3])
         for s in self.states:
-            data = self.numpy(s)
-            chunks = data.shape
-            chunks = (chunks[0], 1, chunks[2], chunks[3])
-            self.queue.put((self.hdf5_groups[s], f"{self.save_count}", data, chunks))
+            self.queue.put((s, self.run_number, self.save_count, self.data_pinned[s], chunks))
         self.save_count += 1
 
     def post_step_hook(self, model):
@@ -229,6 +237,7 @@ class Recorder(Callback):
         if self.cache_with_hdf5:
             self.cache_hdf5()
         self.save_count = 0
+        self.run_number += 1
 
     def reset(self):
         self.rec = {s: [] for s in self.states}
@@ -236,7 +245,8 @@ class Recorder(Callback):
 
     def close(self):
         if self.cache_with_hdf5:
-            self.hdf5_file.close()
+            self.queue.put(None)
+            self.writer_thread.join()
 
     def stack(self, var: str = None):
         if var is not None:
@@ -255,15 +265,21 @@ class Recorder(Callback):
         return self.stack().detach().cpu().numpy()
     
 
-def hdf5_write(queue: Queue):
-    while True:
-        item = queue.get()
-        if item is None:
+def hdf5_write(queue: Queue, path: str):
+    with File(path, "w", libver="latest") as f:
+        while True:
+            item = queue.get()
+            if item == "flush":
+                STREAM.synchronize()
+                queue.task_done()
+                continue
+            if item is None:
+                queue.task_done()
+                break
+            state, run, save_count, data, chunks = item
+            group = f.require_group(f'/{state}/run_{run}')
+            group.create_dataset(f"{save_count}", data=data, chunks=chunks)
             queue.task_done()
-            break
-        group, name, data, chunks = item
-        group.create_dataset(name, data=data, chunks=chunks)
-        queue.task_done()
 
 
 class ThresholdCallback(Callback):
