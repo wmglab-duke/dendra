@@ -25,18 +25,19 @@ class Heterogeneous(Axon):
         super().__init__(diameters, n_node, temp, v_init, method, pade)
 
     def _register_buffers(self, diameters):
-        self.register_buffer("diam", torch.ones(self.n_ax, 1, self.n_node))
+        self.register_buffer("diam", torch.empty(self.n_ax, 1, self.n_node))
+        self.register_buffer("node_l", torch.empty(self.n_ax, 1, self.n_node))
         self.register_buffer(
-            "inter_node_length", 100 * torch.ones(self.n_ax, 1, self.n_node - 1)
+            "inter_node_length", torch.empty(self.n_ax, 1, self.n_node - 1)
         )
 
         self.register_buffer(
-            "inter_node_diam", torch.sqrt(self.diam[:, 0, :-1] * self.diam[:, 0, 1:])
+            "inter_node_diam", torch.empty(self.n_ax, 1, self.n_node - 1)
         )
-        self.register_buffer("area_c", self.area_(self.diam))
-        self.register_buffer("cm_c", self.cm_(self.area_c))
+        self.register_buffer("area_c", torch.empty(self.diam.shape))
+        self.register_buffer("cm_c", torch.empty(self.area_c.shape))
         self.register_buffer(
-            "ra_c", self.ra_(self.inter_node_diam, self.inter_node_length)
+            "ra_c", torch.empty(self.inter_node_diam.shape)
         )
 
         self.register_buffer("v_init_c", torch.tensor(self.v_init))
@@ -45,10 +46,19 @@ class Heterogeneous(Axon):
     def ra_(self, inter_node_diam, inter_node_length):
         radii = inter_node_diam / 20000  # radius in cm
         return (self.rhoa * inter_node_length) / (torch.pi * (radii**2))
+    
+    def area_(self, diameters, node_l) -> torch.Tensor:
+        dx = node_l / 10000 # um -> cm
+        return torch.pi * (diameters / 10000) * dx
 
     def set_diam(self, diams):
         diams = torch.as_tensor(diams, dtype=self.dtype()).unsqueeze(1)
         self.diam[:] = diams
+        self.calculate_geometric_params()
+
+    def set_inter_node_diam(self, inter_node_diam):
+        inter_node_diam = torch.as_tensor(inter_node_diam, dtype=self.dtype()).unsqueeze(1)
+        self.inter_node_diam[:] = inter_node_diam
         self.calculate_geometric_params()
 
     def set_inl(self, inl):
@@ -56,16 +66,24 @@ class Heterogeneous(Axon):
         self.inter_node_length[:] = inl
         self.calculate_geometric_params()
 
-    def set_diam_inl(self, diams, inl):
-        diams = torch.as_tensor(diams, dtype=self.dtype()).unsquueze(1)
+    def set_node_l(self, node_l):
+        node_l = torch.as_tensor(node_l, dtype=self.dtype()).unsqueeze(1)
+        self.node_l[:] = node_l
+        self.calculate_geometric_params()
+
+    def set_all(self, node_d, ind, node_l, inl):
+        diams = torch.as_tensor(node_d, dtype=self.dtype()).unsqueeze(1)
         inl = torch.as_tensor(inl, dtype=self.dtype()).unsqueeze(1)
+        node_l = torch.as_tensor(node_l, dtype=self.dtype()).unsqueeze(1)
+        inter_node_diam = torch.as_tensor(ind, dtype=self.dtype()).unsqueeze(1)
         self.diam[:] = diams
         self.inter_node_length[:] = inl
+        self.node_l[:] = node_l
+        self.inter_node_diam[:] = inter_node_diam
         self.calculate_geometric_params()
 
     def calculate_geometric_params(self):
-        self.inter_node_diam[:] = torch.sqrt(self.diam[:, 0, :-1] * self.diam[:, 0, 1:])
-        self.area_c[:] = self.area_(self.diam)
+        self.area_c[:] = self.area_(self.diam, self.node_l)
         self.cm_c[:] = self.cm_(self.area_c)
         self.ra_c[:] = self.ra_(self.inter_node_diam, self.inter_node_length)
 

@@ -12,7 +12,7 @@ cimport numpy as np
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef np.ndarray[np.float32_t, ndim=2] calc_inl(
+cpdef object calc_inl(
     int n_ax, 
     int nc, 
     int[:] n_node_per_ax,
@@ -22,6 +22,24 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_inl(
     float[:, :] node_l, 
     float[:, :] inls
 ):
+    """
+    Calculate internode lengths for each compartment.
+
+    Args:
+        n_ax: number of axons
+        nc: number of compartments
+        n_node_per_ax: number of nodes per axon
+        n_internode_per_ax: number of internodes per axon
+        internode_inds: indices of internodes
+        nc_per_node: number of compartments per node
+        node_l: node lengths
+        inls: internode lengths
+    
+    Returns:
+        A tuple of two 2D arrays:
+        - internode lengths for each compartment
+        - node lengths for each compartment
+    """
 
     cdef np.ndarray[np.float32_t, ndim=2] result = np.zeros((n_ax, nc - 1), dtype=np.float32)
     cdef np.ndarray[np.float32_t, ndim=2] node_length = np.zeros((n_ax, nc), dtype=np.float32)
@@ -50,12 +68,12 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_inl(
                 in_ind += 1
             result[i, idx - 1] += inls[i, j]
 
-    return result
+    return (result, node_length)
 
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cpdef np.ndarray[np.float32_t, ndim=2] calc_ind(
+cpdef object calc_ind(
     int n_ax,
     int nc,
     int[:] n_node_per_ax,
@@ -93,34 +111,12 @@ cpdef np.ndarray[np.float32_t, ndim=2] calc_ind(
                 in_ind += 1
             result[i, idx - 1] = inds[i, j]
 
-    return result
+    return (result, node_diameter)
 
 
-cdef int compare_descending(const tuple[double, int] &a, const tuple[double, int] &b) nogil:
-    """
-    Comparator for descending order of fractional parts.
-    """
-    if a[0] > b[0]:
-        return -1
-    elif a[0] < b[0]:
-        return 1
-    return 0
-
-
-cdef int compare_ascending(const tuple[double, int] &a, const tuple[double, int] &b) nogil:
-    """
-    Comparator for ascending order of fractional parts.
-    """
-    if a[0] < b[0]:
-        return -1
-    elif a[0] > b[0]:
-        return 1
-    return 0
-
-
-@cython.boundscheck(False)
+@cython.boundscheck(True)
 @cython.wraparound(False)
-cdef distribute_compartments_single(double[:] lengths, int[:] buff, int P, int N):
+cdef distribute_compartments_single(double[:] lengths, int[:, ::1] buff, int row, int P, int N):
     """
     Given:
       - lengths: a 1D array (Cython typed) of unmyelinated section lengths
@@ -155,8 +151,7 @@ cdef distribute_compartments_single(double[:] lengths, int[:] buff, int P, int N
     cdef vector[int] x
     x.reserve(N)
 
-    cdef vector[tuple[double, int]] fractional_parts
-    fractional_parts.reserve(N)
+    cdef list fractional_parts = []
 
     # Compute x_star[i] = L_i / T and floor it
     # and store in x[i], ensuring at least 1
@@ -175,25 +170,22 @@ cdef distribute_compartments_single(double[:] lengths, int[:] buff, int P, int N
         S += x[i]
 
     # We need fractional parts for sorting
-    # fractional_part[i] = x_star[i] - floor(x_star[i])
     for i in range(N):
         frac = x_star[i] - floor(x_star[i])
-        # We'll store a tuple: (fractional_part, index)
-        fractional_parts.push_back((frac, i))
+        fractional_parts.append((frac, i))
 
     if S == P:
         # Perfect match
         for i in range(N):
-            buff[i] = x[i]
+            buff[row, i] = x[i]
 
     elif S < P:
         # Need more pieces: increment some x_i
         diff = P - S
 
         # Sort by fractional part descending
-        sort(fractional_parts.begin(), fractional_parts.end(),
-             compare_descending)
-        # We'll do a simple round-robin increment
+        fractional_parts.sort(key=lambda x: x[0], reverse=True)
+        # round-robin increment
         idx = 0
         while diff > 0:
             frac, i = fractional_parts[idx]
@@ -204,7 +196,7 @@ cdef distribute_compartments_single(double[:] lengths, int[:] buff, int P, int N
                 idx = 0
 
         for i in range(N):
-            buff[i] = x[i]
+            buff[row, i] = x[i]
 
 
     else:
@@ -212,8 +204,7 @@ cdef distribute_compartments_single(double[:] lengths, int[:] buff, int P, int N
         diff = S - P
 
         # Sort by fractional part ascending
-        sort(fractional_parts.begin(), fractional_parts.end(),
-             compare_ascending)
+        fractional_parts.sort(key=lambda x: x[0])
         idx = 0
         while diff > 0:
             frac, i = fractional_parts[idx]
@@ -224,10 +215,10 @@ cdef distribute_compartments_single(double[:] lengths, int[:] buff, int P, int N
             if idx >= N:
                 idx = 0
         for i in range(N):
-            buff[i] = x[i]
+            buff[row, i] = x[i]
 
 
-@cython.boundscheck(False)
+@cython.boundscheck(True)
 @cython.wraparound(False)
 cpdef np.ndarray[np.int32_t, ndim=2] distribute_compartments(
     int n_ax, 
@@ -236,8 +227,22 @@ cpdef np.ndarray[np.int32_t, ndim=2] distribute_compartments(
     int nc,
     int[:] n_um
 ):
+    """
+    Distribute compartments for multiple axons.
+
+    Args:
+        n_ax: number of axons
+        max_n_unmyel: maximum number of unmyelinated sections
+        lengths: 2D array of unmyelinated section lengths
+        nc: number of compartments
+        n_um: number of unmyelinated sections per axon
+    
+    Returns:
+        A 2D array of integers, where each row corresponds to an axon
+        and each column corresponds to the number of compartments in an unmyelinated section.
+    """
     cdef np.ndarray[np.int32_t, ndim=2] result = np.zeros((n_ax, max_n_unmyel), dtype=np.int32)
     cdef int i
     for i in range(n_ax):
-        distribute_compartments_single(lengths[i], result[i], nc, n_um[i])
+        distribute_compartments_single(lengths[i], result, i, nc, n_um[i])
     return result
