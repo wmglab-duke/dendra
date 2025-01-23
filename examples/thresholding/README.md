@@ -12,7 +12,7 @@ The basic procedure for running thresholds is:
 3. Construct an `axonml.instruments.thresholder.Thresholder` object.
 
 ```python
-from axonml.instruments.thresholder import Thresholder
+from axonml.models.instruments.thresholder import Thresholder
 # load model, construct field arrays
 thresholder = Thresholder(model, field_arrays, fiber_diameters)
 ```
