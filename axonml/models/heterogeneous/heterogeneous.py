@@ -43,7 +43,7 @@ class Heterogeneous(Axon):
         self.register_buffer("v_init_c", torch.tensor(self.v_init))
         self.register_buffer("temp_c", torch.tensor(self.temp))
 
-    def ra_(self, inter_node_diam, inter_node_length):
+    def ra_(self, inter_node_diam, inter_node_length) -> torch.Tensor:
         radii = inter_node_diam / 20000  # radius in cm
         return (self.rhoa * inter_node_length) / (torch.pi * (radii**2))
     
