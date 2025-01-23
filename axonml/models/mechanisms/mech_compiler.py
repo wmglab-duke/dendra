@@ -435,6 +435,7 @@ def {k}_tot(self, v):
 
 def current_equations(currents, mechanism, range_vars, df):
     assignments = []
+    unfactorable = [] if df else None
     for k in currents:
         assign = k in range_vars
         if not df:
@@ -455,7 +456,8 @@ def current_equations(currents, mechanism, range_vars, df):
                     "Could not confirm all currents are linear in v. Dufort-Frankel may not be stable."
                 )
                 assignments.append(convert_func(getattr(mechanism, k), assign))
-    return "\n".join(assignments)
+                unfactorable.append(k)
+    return "\n".join(assignments), unfactorable
 
 
 def gtot(currents, mechanism, df):
@@ -600,7 +602,7 @@ def compile_mechanism(
     advance_str = advance(states_compiled)
     advance_str = indent(advance_str, 2)
 
-    current_equations_str = current_equations(current_eqs, mechanism, range_vars, df)
+    current_equations_str, unfactorable = current_equations(current_eqs, mechanism, range_vars, df)
     current_equations_str = indent(current_equations_str, 1)
 
     assigned_str = assigned_str_f(assigned)
@@ -628,6 +630,8 @@ def compile_mechanism(
         detach=indent(detach(states_compiled), 2),
     )
 
+    print(forward_str)
+
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
@@ -652,4 +656,4 @@ def compile_mechanism(
         ic=ic,
     )
 
-    return m
+    return m, unfactorable

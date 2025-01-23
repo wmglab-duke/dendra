@@ -43,7 +43,7 @@ class MechanismHandler(torch.nn.Module):
   def gtot(self) -> torch.Tensor:
     return {gtot}
 
-  def i(self, v) -> torch.Tensor:
+  def i(self, v_prev, v) -> torch.Tensor:
     {breakpoint}
     {currents}
     total = {total}
@@ -74,6 +74,12 @@ class MechanismHandler(torch.nn.Module):
     return [{all_states}]
     
 """
+
+
+def v_args(df=False):
+    if df:
+        return "v_prev, v"
+    return "v"
 
 
 set_buffer_template = """
@@ -150,7 +156,7 @@ def parse_current_string(s: str, total=False, write=True) -> str:
         return s
 
 
-def parse_dictionary_to_sum(data: dict, current: str, df=False, write=True) -> str:
+def parse_dictionary_to_sum(data: dict, current: str, df=False, dufort=False, unfactorable=None, write=True) -> str:
     if not data:
         return ""
     result = []
@@ -159,15 +165,23 @@ def parse_dictionary_to_sum(data: dict, current: str, df=False, write=True) -> s
             if df:
                 result.append(f"self.{key}.{value}_tot(v)")
             else:
-                result.append(f"self.{key}.{value}(v)")
+                if not dufort:
+                    result.append(f"self.{key}.{value}(v)")
+                else:
+                    if unfactorable is None:
+                        raise ValueError("unfactorable must be provided")
+                    if value in unfactorable[key]:
+                        result.append(f"self.{key}.{value}(v)")
+                    else:
+                        result.append(f"self.{key}.{value}(v_prev)")
     s = " + ".join(result)
     return f"{parse_current_string(current, write=write)} = {s}"
 
 
-def parse_currents(currents, write=True) -> str:
+def parse_currents(currents, write=True, df=False, unfactorable=None) -> str:
     result = []
     for key, value in currents.items():
-        result.append(parse_dictionary_to_sum(value, key, write=write))
+        result.append(parse_dictionary_to_sum(value, key, dufort=df, unfactorable=unfactorable, write=write))
     s = "\n    ".join(result)
     return s
 
@@ -306,7 +320,7 @@ def ion_detach(ions):
     return "\n    ".join(result)
 
 
-def build_handler(mechanisms, names, currents, temp, ions=None, df=False):
+def build_handler(mechanisms, names, currents, unfactorable, temp, ions=None, df=False):
     arguments = parse_args(names)
 
     all_names = names
@@ -320,7 +334,7 @@ def build_handler(mechanisms, names, currents, temp, ions=None, df=False):
         arguments=arguments,
         assignments=parse_assignments(all_names),
         defaults=parse_defaults(ions),
-        currents=parse_currents(currents, write=not df),
+        currents=parse_currents(currents, df=df, unfactorable=unfactorable, write=not df),
         total=parse_total(currents, write=not df),
         inflate=parse_inflate(names),
         mech_advance=parse_advance(names),
@@ -336,6 +350,8 @@ def build_handler(mechanisms, names, currents, temp, ions=None, df=False):
         mech_detach=mech_detach(mechanisms),
         ion_detach=ion_detach(ions),
     )
+
+    print(forward_str)
 
     filename = f"<{randomword(10)}_template>"
     code = compile(forward_str, filename, "exec")

@@ -139,6 +139,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self._m_list = []
         self._m_name = []
         self._m_curr = {}
+        self._m_unfactorable = {}
 
         self._ion_read = {}
         self._ion_write = {}
@@ -295,7 +296,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         df = self.is_df
 
-        m = compile_mechanism(
+        m, unfactorable = compile_mechanism(
             mechanism,
             self.temp,
             self.diam,
@@ -309,6 +310,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self._m_list.append(m)
         self._m_name.append(mechanism.__name__)
+        self._m_unfactorable[mechanism.__name__] = unfactorable
 
         for k, v in mechanism._currents.items():
             self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
@@ -391,7 +393,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 m.register_ion(ions[ion])
 
         self.mech = build_handler(
-            self._m_list, self._m_name, self._m_curr, self.temp, ions, df
+            self._m_list, self._m_name, self._m_curr, self._m_unfactorable, self.temp, ions, df
         )
 
     def area_(self, diameters):
@@ -656,13 +658,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def FRK(self, v, ve, area, cm, ra):
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)
-        i_ion = self.mech.i(v) * area
+        i_ion = self.mech.i(v, v) * area
         return cm * ((ra * d2v) - i_ion)
 
     def FRK_intra(self, v, ve, area, cm, ra, intra):
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)
-        i_ion = self.mech.i(v) * area - intra
+        i_ion = self.mech.i(v, v) * area - intra
         return cm * ((ra * d2v) - i_ion)
 
     @torch.jit.script_method
@@ -748,7 +750,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         d2v = self.ssd(x)
 
         # -- calculate ionic current --
-        i_ion = self.mech.i(v_prev) * area
+        i_ion = self.mech.i(v_prev, v) * area
 
         # -- update vm --
         v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area)
@@ -768,7 +770,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         d2v = self.ssd(x)
 
         # -- calculate ionic current --
-        i_ion = self.mech.i(v_prev) * area - intra
+        i_ion = self.mech.i(v_prev, v) * area - intra
 
         # -- update vm --
         v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area)
