@@ -156,7 +156,9 @@ def parse_current_string(s: str, total=False, write=True) -> str:
         return s
 
 
-def parse_dictionary_to_sum(data: dict, current: str, df=False, dufort=False, unfactorable=None, write=True) -> str:
+def parse_dictionary_to_sum(
+    data: dict, current: str, df=False, dufort=False, unfactorable=None, write=True
+) -> str:
     if not data:
         return ""
     result = []
@@ -181,7 +183,11 @@ def parse_dictionary_to_sum(data: dict, current: str, df=False, dufort=False, un
 def parse_currents(currents, write=True, df=False, unfactorable=None) -> str:
     result = []
     for key, value in currents.items():
-        result.append(parse_dictionary_to_sum(value, key, dufort=df, unfactorable=unfactorable, write=write))
+        result.append(
+            parse_dictionary_to_sum(
+                value, key, dufort=df, unfactorable=unfactorable, write=write
+            )
+        )
     s = "\n    ".join(result)
     return s
 
@@ -334,7 +340,9 @@ def build_handler(mechanisms, names, currents, unfactorable, temp, ions=None, df
         arguments=arguments,
         assignments=parse_assignments(all_names),
         defaults=parse_defaults(ions),
-        currents=parse_currents(currents, df=df, unfactorable=unfactorable, write=not df),
+        currents=parse_currents(
+            currents, df=df, unfactorable=unfactorable, write=not df
+        ),
         total=parse_total(currents, write=not df),
         inflate=parse_inflate(names),
         mech_advance=parse_advance(names),

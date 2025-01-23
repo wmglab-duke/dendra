@@ -393,7 +393,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 m.register_ion(ions[ion])
 
         self.mech = build_handler(
-            self._m_list, self._m_name, self._m_curr, self._m_unfactorable, self.temp, ions, df
+            self._m_list,
+            self._m_name,
+            self._m_curr,
+            self._m_unfactorable,
+            self.temp,
+            ions,
+            df,
         )
 
     def area_(self, diameters):

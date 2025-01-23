@@ -106,7 +106,7 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
 
 
 template = """
-class mech(torch.nn.Module):
+class {mech}(torch.nn.Module):
     _init_params: Dict[str, float]
     def __init__(self, temp, diameters, n_ax, n_nodes, name: str, params, distributions, read_ion, write_ion_c, states, conductances, init, ic: dict = None):
         super().__init__()
@@ -602,7 +602,9 @@ def compile_mechanism(
     advance_str = advance(states_compiled)
     advance_str = indent(advance_str, 2)
 
-    current_equations_str, unfactorable = current_equations(current_eqs, mechanism, range_vars, df)
+    current_equations_str, unfactorable = current_equations(
+        current_eqs, mechanism, range_vars, df
+    )
     current_equations_str = indent(current_equations_str, 1)
 
     assigned_str = assigned_str_f(assigned)
@@ -615,6 +617,7 @@ def compile_mechanism(
     init_distribution_buffers_str = indent(init_distribution_buffers_str, 2)
 
     forward_str = template.format(
+        mech=mechanism.__name__,
         state_buffer_assignments=state_buffer_assignments_str,
         current_buffer_assignments=current_buffer_assignments_str,
         assigned=assigned_str,
@@ -638,7 +641,7 @@ def compile_mechanism(
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
     name = mechanism.__name__
 
-    m = locals()["mech"](
+    m = locals()[mechanism.__name__](
         temp,
         diameters,
         n_ax,
