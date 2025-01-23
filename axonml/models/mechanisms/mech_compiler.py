@@ -630,8 +630,6 @@ def compile_mechanism(
         detach=indent(detach(states_compiled), 2),
     )
 
-    print(forward_str)
-
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)

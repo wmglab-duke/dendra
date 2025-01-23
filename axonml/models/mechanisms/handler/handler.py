@@ -351,8 +351,6 @@ def build_handler(mechanisms, names, currents, unfactorable, temp, ions=None, df
         ion_detach=ion_detach(ions),
     )
 
-    print(forward_str)
-
     filename = f"<{randomword(10)}_template>"
     code = compile(forward_str, filename, "exec")
     exec(code)
