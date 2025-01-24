@@ -12,7 +12,7 @@ from .backend import Backend as A
 from .interfaces import AxonInterface
 
 
-STREAM = None
+STREAM = torch.cuda.Stream()
 
 
 class Callback:
@@ -195,8 +195,6 @@ class Recorder(Callback):
             self.save_every = int(self.save_dt / self.dt)
 
     def set_hdf5(self, hdf5: str, cache_every=10000):
-        global STREAM
-        STREAM = torch.cuda.Stream()
         self.hdf5_path = hdf5
         mp.set_start_method("spawn", force=True)
         self.manager = mp.Manager()
