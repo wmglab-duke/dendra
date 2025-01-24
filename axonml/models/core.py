@@ -851,6 +851,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.set_buffers(self.diam)
         return self
 
+    def float(self):
+        super().float()
+        self.mech.set_buffers(self.diam)
+        return self
+    
+    def double(self):
+        super().double()
+        self.mech.set_buffers(self.diam)
+        return self
+
 
 def match_state_dict(
     state_dict_a: Dict[str, torch.Tensor],
