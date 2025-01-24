@@ -235,7 +235,7 @@ class Heterogeneous(Axon):
         self.mech.advance(v, dt, temp)
 
         # Calculate the ionic current
-        i_ion = self.mech.i(v_prev) * area
+        i_ion = self.mech.i(v_prev, v) * area
 
         # Calculate the new voltage
         v_new = (v_prev + self.ssd_df(v, v_prev, ve, phi_l, phi_r) - s * i_ion) / (
@@ -255,7 +255,7 @@ class Heterogeneous(Axon):
         self.mech.advance(v, dt, temp)
 
         # Calculate the ionic current
-        i_ion = self.mech.i(v_prev) * area - intra
+        i_ion = self.mech.i(v_prev, v) * area - intra
 
         # Calculate the new voltage
         v_new = (v_prev + self.ssd_df(v, v_prev, ve, phi_l, phi_r) - s * i_ion) / (
