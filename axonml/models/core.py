@@ -140,6 +140,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self._m_name = []
         self._m_curr = {}
         self._m_unfactorable = {}
+        self._m_has_gtot = {}
 
         self._ion_read = {}
         self._ion_write = {}
@@ -296,7 +297,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         df = self.is_df
 
-        m, unfactorable = compile_mechanism(
+        m, unfactorable, has_gtot = compile_mechanism(
             mechanism,
             self.temp,
             self.diam,
@@ -311,6 +312,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self._m_list.append(m)
         self._m_name.append(mechanism.__name__)
         self._m_unfactorable[mechanism.__name__] = unfactorable
+        self._m_has_gtot[mechanism.__name__] = has_gtot
 
         for k, v in mechanism._currents.items():
             self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
@@ -397,6 +399,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             self._m_name,
             self._m_curr,
             self._m_unfactorable,
+            self._m_has_gtot,
             self.temp,
             ions,
             df,

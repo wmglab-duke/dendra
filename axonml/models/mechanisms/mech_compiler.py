@@ -471,10 +471,12 @@ def gtot(currents, mechanism, df):
             assignments.append(b)
         except:
             pass
+    has_gtot = True
     if not assignments:
-        return "    def gtot(self): return torch.tensor(0.0)"
+        has_gtot = False
+        return "    def gtot(self): return torch.tensor(0.0)", has_gtot
     s = " + ".join(assignments)
-    return f"    def gtot(self): return {s}"
+    return f"    def gtot(self): return {s}", has_gtot
 
 
 def load(m, attr):
@@ -616,6 +618,8 @@ def compile_mechanism(
     init_distribution_buffers_str = init_distribution_buffers(distributions)
     init_distribution_buffers_str = indent(init_distribution_buffers_str, 2)
 
+    gtot_str, has_gtot = gtot(current_eqs, mechanism, df)
+
     forward_str = template.format(
         mech=mechanism.__name__,
         state_buffer_assignments=state_buffer_assignments_str,
@@ -626,7 +630,7 @@ def compile_mechanism(
         current_equations=current_equations_str,
         breakpoint_f=translate_f(mechanism, "breakpoint"),
         initial_f=translate_f(mechanism, "initial"),
-        gtot=gtot(current_eqs, mechanism, df),
+        gtot=gtot_str,
         coupled_infs=coupled_infs(mechanism, states_compiled),
         distribution_buffer_assignments=distribution_buffer_assignments_str,
         init_distribution_buffers=init_distribution_buffers_str,
@@ -657,4 +661,4 @@ def compile_mechanism(
         ic=ic,
     )
 
-    return m, unfactorable
+    return m, unfactorable, has_gtot
