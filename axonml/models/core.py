@@ -858,7 +858,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         super().float()
         self.mech.set_buffers(self.diam)
         return self
-    
+
     def double(self):
         super().double()
         self.mech.set_buffers(self.diam)

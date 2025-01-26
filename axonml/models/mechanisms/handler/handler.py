@@ -294,7 +294,9 @@ def randomword(length):
 
 
 def gtot(mechanisms, has_gtot):
-    return " + ".join([f"self.{m._name}.gtot()" for m in mechanisms if has_gtot[m._name]])
+    return " + ".join(
+        [f"self.{m._name}.gtot()" for m in mechanisms if has_gtot[m._name]]
+    )
 
 
 def breakpoint(mechanisms):
@@ -326,7 +328,9 @@ def ion_detach(ions):
     return "\n    ".join(result)
 
 
-def build_handler(mechanisms, names, currents, unfactorable, has_gtot, temp, ions=None, df=False):
+def build_handler(
+    mechanisms, names, currents, unfactorable, has_gtot, temp, ions=None, df=False
+):
     arguments = parse_args(names)
 
     all_names = names
