@@ -231,8 +231,6 @@ class Heterogeneous(Axon):
     def step_no_intra_df(
         self, v, v_prev, ve, area, s, phi_l, phi_r, phi_sum, dt, temp
     ) -> Tuple[Tensor, Tensor]:
-        # Advance the mechanism
-        self.mech.advance(v, dt, temp)
 
         # Calculate the ionic current
         i_ion = self.mech.i(v_prev, v) * area
@@ -245,14 +243,15 @@ class Heterogeneous(Axon):
         # Calculate the total current
         self.mech.itot(v)
 
+        # Advance the mechanism
+        self.mech.advance(v, dt, temp)
+
         return v_new, v
 
     @torch.jit.script_method
     def step_intra_df(
         self, v, v_prev, ve, area, s, phi_l, phi_r, phi_sum, dt, temp, intra
     ) -> Tuple[Tensor, Tensor]:
-        # Advance the mechanism
-        self.mech.advance(v, dt, temp)
 
         # Calculate the ionic current
         i_ion = self.mech.i(v_prev, v) * area - intra
@@ -264,5 +263,8 @@ class Heterogeneous(Axon):
 
         # Calculate the total current
         self.mech.itot(v)
+
+        # Advance the mechanism
+        self.mech.advance(v, dt, temp)
 
         return v_new, v

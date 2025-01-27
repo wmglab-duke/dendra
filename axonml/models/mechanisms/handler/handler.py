@@ -294,9 +294,10 @@ def randomword(length):
 
 
 def gtot(mechanisms, has_gtot):
-    return " + ".join(
-        [f"self.{m._name}.gtot()" for m in mechanisms if has_gtot[m._name]]
-    )
+    assignments = [f"self.{m._name}.gtot()" for m in mechanisms if has_gtot[m._name]]
+    if len(assignments) == 0:
+        return "torch.tensor(0.0)"
+    return " + ".join(assignments)
 
 
 def breakpoint(mechanisms):

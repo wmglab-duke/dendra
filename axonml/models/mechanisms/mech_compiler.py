@@ -462,7 +462,7 @@ def current_equations(currents, mechanism, range_vars, df):
 
 def gtot(currents, mechanism, df):
     if not df:
-        return "    def gtot(self): return torch.tensor(0.0)"
+        return "    def gtot(self): return torch.tensor(0.0)", False
     assignments = []
     for k in currents:
         code_block = get_function_body_as_str(getattr(mechanism, k))
