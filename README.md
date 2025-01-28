@@ -16,32 +16,37 @@ Implement and train high-throughput GPU-compatible neural fiber models.
 `axonml` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).
 
 ### Python dependencies
-`axonml` requires Python 3.9+ (tested with 3.9, 3.10) and PyTorch 2.0+ with GPU support (tested with PyTorch 2.0.0 & CUDA 11.7). See `requirements.txt` for additional package dependencies.
+`axonml` requires Python 3.11+ and PyTorch 2.0+ with GPU support (tested with PyTorch 2.5.0 & CUDA 12.4).
 
 
 ## 🖥️ Installation
 
 > [!TIP]
-> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.10`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
+> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.11`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
 
-1.  Install PyTorch (with GPU support, check which CUDA version you have / is compatible with your GPU) - follow the installation instructions [on the PyTorch homepage](https://pytorch.org/).
+1. Clone this repository recursively.
 
-> [!IMPORTANT]
-> Differences in GPU hardware and PyTorch / CUDA version may affect the performance and numerical outcomes of simulations / optimizations. All presented results use PyTorch 2.0.0 and CUDA 11.7).
+```bash
+git clone --recursive https://gitlab.oit.duke.edu/mah148/axonml.git
+```
 
-2.  Clone this repository.
+2. Install.
 
-3.  Install requirements : `pip install -r requirements.txt`
+```bash
+> cd axonml
+> python -m pip install .
+```
 
-4.  Add the cloned `axonml` directory to your `PYTHONPATH`.
+- You can also install with jupyter support:
+    - `python -m pip install '.[jupyter]'`
 
 🥳 You're all set! 
 
 > [!NOTE]
-> Installation of all dependencies should not take more time than a couple of minutes. Installation of `axonml` itself takes only the time required to clone the repository.
+> Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive sapce.
 
 > [!IMPORTANT]
-> The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, use the data generation algorithms, run high-throughput surrogate simulations of kHz stimulation, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal) (however do not create a separate `conda` environment for `cajal` - install all dependencies into `axonml`).
+> The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, run the data generation script, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal) (however do not create a separate `conda` environment for `cajal` - install all dependencies into `axonml`).
 
 ## :rocket: Training a model
 
