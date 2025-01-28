@@ -27,7 +27,7 @@ Implement and train high-throughput GPU-compatible neural fiber models.
 1. Clone this repository recursively.
 
 ```bash
-git clone --recursive https://gitlab.oit.duke.edu/mah148/axonml.git
+> git clone --recursive https://gitlab.oit.duke.edu/mah148/axonml.git
 ```
 
 2. Install.
