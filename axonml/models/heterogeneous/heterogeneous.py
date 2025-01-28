@@ -231,7 +231,6 @@ class Heterogeneous(Axon):
     def step_no_intra_df(
         self, v, v_prev, ve, area, s, phi_l, phi_r, phi_sum, dt, temp
     ) -> Tuple[Tensor, Tensor]:
-
         # Calculate the ionic current
         i_ion = self.mech.i(v_prev, v) * area
 
@@ -252,7 +251,6 @@ class Heterogeneous(Axon):
     def step_intra_df(
         self, v, v_prev, ve, area, s, phi_l, phi_r, phi_sum, dt, temp, intra
     ) -> Tuple[Tensor, Tensor]:
-
         # Calculate the ionic current
         i_ion = self.mech.i(v_prev, v) * area - intra
 

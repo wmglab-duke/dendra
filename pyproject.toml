@@ -1,10 +1,21 @@
 [build-system]
-requires = ["setuptools", "cython"]
+requires = ["setuptools", "cython", "numpy>=2.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "axonml"
 version = "0.2"
 
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+jupyter = ["jupyter"]
+
 [tool.ruff.lint]
 ignore-init-module-imports = true
+
+[tool.setuptools.packages.find]
+where = ["."]  # list of folders that contain the packages (["."] by default)
+include = ["axonml"]  # package names should match these glob patterns (["*"] by default)
+exclude = ["extern"]  # exclude packages matching these glob patterns (empty by default)
+namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
