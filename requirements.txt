@@ -3,3 +3,4 @@ numpy
 pytorch_optimizer
 tqdm
 natsort
+dask

@@ -106,7 +106,7 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
 
 
 template = """
-class mech(torch.nn.Module):
+class {mech}(torch.nn.Module):
     _init_params: Dict[str, float]
     def __init__(self, temp, diameters, n_ax, n_nodes, name: str, params, distributions, read_ion, write_ion_c, states, conductances, init, ic: dict = None):
         super().__init__()
@@ -435,6 +435,7 @@ def {k}_tot(self, v):
 
 def current_equations(currents, mechanism, range_vars, df):
     assignments = []
+    unfactorable = [] if df else None
     for k in currents:
         assign = k in range_vars
         if not df:
@@ -455,12 +456,13 @@ def current_equations(currents, mechanism, range_vars, df):
                     "Could not confirm all currents are linear in v. Dufort-Frankel may not be stable."
                 )
                 assignments.append(convert_func(getattr(mechanism, k), assign))
-    return "\n".join(assignments)
+                unfactorable.append(k)
+    return "\n".join(assignments), unfactorable
 
 
 def gtot(currents, mechanism, df):
     if not df:
-        return "    def gtot(self): return torch.tensor(0.0)"
+        return "    def gtot(self): return torch.tensor(0.0)", False
     assignments = []
     for k in currents:
         code_block = get_function_body_as_str(getattr(mechanism, k))
@@ -469,10 +471,12 @@ def gtot(currents, mechanism, df):
             assignments.append(b)
         except:
             pass
+    has_gtot = True
     if not assignments:
-        return "    def gtot(self): return torch.tensor(0.0)"
+        has_gtot = False
+        return "    def gtot(self): return torch.tensor(0.0)", has_gtot
     s = " + ".join(assignments)
-    return f"    def gtot(self): return {s}"
+    return f"    def gtot(self): return {s}", has_gtot
 
 
 def load(m, attr):
@@ -600,7 +604,9 @@ def compile_mechanism(
     advance_str = advance(states_compiled)
     advance_str = indent(advance_str, 2)
 
-    current_equations_str = current_equations(current_eqs, mechanism, range_vars, df)
+    current_equations_str, unfactorable = current_equations(
+        current_eqs, mechanism, range_vars, df
+    )
     current_equations_str = indent(current_equations_str, 1)
 
     assigned_str = assigned_str_f(assigned)
@@ -612,7 +618,10 @@ def compile_mechanism(
     init_distribution_buffers_str = init_distribution_buffers(distributions)
     init_distribution_buffers_str = indent(init_distribution_buffers_str, 2)
 
+    gtot_str, has_gtot = gtot(current_eqs, mechanism, df)
+
     forward_str = template.format(
+        mech=mechanism.__name__,
         state_buffer_assignments=state_buffer_assignments_str,
         current_buffer_assignments=current_buffer_assignments_str,
         assigned=assigned_str,
@@ -621,7 +630,7 @@ def compile_mechanism(
         current_equations=current_equations_str,
         breakpoint_f=translate_f(mechanism, "breakpoint"),
         initial_f=translate_f(mechanism, "initial"),
-        gtot=gtot(current_eqs, mechanism, df),
+        gtot=gtot_str,
         coupled_infs=coupled_infs(mechanism, states_compiled),
         distribution_buffer_assignments=distribution_buffer_assignments_str,
         init_distribution_buffers=init_distribution_buffers_str,
@@ -636,7 +645,7 @@ def compile_mechanism(
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
     name = mechanism.__name__
 
-    m = locals()["mech"](
+    m = locals()[mechanism.__name__](
         temp,
         diameters,
         n_ax,
@@ -652,4 +661,4 @@ def compile_mechanism(
         ic=ic,
     )
 
-    return m
+    return m, unfactorable, has_gtot

@@ -231,11 +231,9 @@ class Heterogeneous(Axon):
     def step_no_intra_df(
         self, v, v_prev, ve, area, s, phi_l, phi_r, phi_sum, dt, temp
     ) -> Tuple[Tensor, Tensor]:
-        # Advance the mechanism
-        self.mech.advance(v, dt, temp)
 
         # Calculate the ionic current
-        i_ion = self.mech.i(v_prev) * area
+        i_ion = self.mech.i(v_prev, v) * area
 
         # Calculate the new voltage
         v_new = (v_prev + self.ssd_df(v, v_prev, ve, phi_l, phi_r) - s * i_ion) / (
@@ -244,6 +242,9 @@ class Heterogeneous(Axon):
 
         # Calculate the total current
         self.mech.itot(v)
+
+        # Advance the mechanism
+        self.mech.advance(v, dt, temp)
 
         return v_new, v
 
@@ -251,11 +252,9 @@ class Heterogeneous(Axon):
     def step_intra_df(
         self, v, v_prev, ve, area, s, phi_l, phi_r, phi_sum, dt, temp, intra
     ) -> Tuple[Tensor, Tensor]:
-        # Advance the mechanism
-        self.mech.advance(v, dt, temp)
 
         # Calculate the ionic current
-        i_ion = self.mech.i(v_prev) * area - intra
+        i_ion = self.mech.i(v_prev, v) * area - intra
 
         # Calculate the new voltage
         v_new = (v_prev + self.ssd_df(v, v_prev, ve, phi_l, phi_r) - s * i_ion) / (
@@ -264,5 +263,8 @@ class Heterogeneous(Axon):
 
         # Calculate the total current
         self.mech.itot(v)
+
+        # Advance the mechanism
+        self.mech.advance(v, dt, temp)
 
         return v_new, v
