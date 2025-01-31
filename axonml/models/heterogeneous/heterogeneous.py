@@ -48,7 +48,8 @@ class Heterogeneous(Axon):
 
     def ra_(self, inter_node_diam, inter_node_length) -> torch.Tensor:
         radii = inter_node_diam / 20000  # radius in cm
-        return (self.rhoa * inter_node_length) / (torch.pi * (radii**2))
+        inl = inter_node_length / 10000  # um -> cm
+        return (self.rhoa * inl) / (torch.pi * (radii**2))
 
     def area_(self, diameters, node_l) -> torch.Tensor:
         dx = node_l / 10000  # um -> cm
@@ -219,11 +220,11 @@ class Heterogeneous(Axon):
 
     @torch.jit.script_method
     def ssd_df(self, v_c, v_p, v_e, phi_l, phi_r):
-        v_c_p = F.pad(v_c, (1, 1), "reflect")
+        v_c_p = 2 * F.pad(v_c, (1, 1), "reflect")
         v_e_p = F.pad(v_e, (1, 1), "reflect")
 
-        l = (2 * v_c_p[:, :, :-2] - v_p + v_e_p[:, :, :-2] - v_e) * phi_l
-        r = (2 * v_c_p[:, :, 2:] - v_p + v_e_p[:, :, 2:] - v_e) * phi_r
+        l = (v_c_p[:, :, :-2] - v_p + v_e_p[:, :, :-2] - v_e) * phi_l
+        r = (v_c_p[:, :, 2:] - v_p + v_e_p[:, :, 2:] - v_e) * phi_r
 
         return l + r
 

@@ -23,7 +23,7 @@ class m(State):
         v = v + 10.0
         q10 = self.q10()
         minf = 1.0 / (1.0 + exp(-v / 19.0))
-        taum = (0.34 + 0.92 * exp(-((v + 71) / 59) ^ 2)) / q10
+        taum = (0.34 + 0.92 * exp(-(((v + 71) / 59) ** 2))) / q10
 
     def inf(self, v):
         v = v + 10.0
@@ -45,7 +45,7 @@ class h(State):
         v = v + 10.0
         q10 = self.q10()
         hinf = 1.0 / (1.0 + exp(-(v + 66.0) / -10.0))
-        tauh = (8.0 + 49.0 * exp(-((v + 73.0) / 23.0) ^ 2)) / q10
+        tauh = (8.0 + 49.0 * exp(-(((v + 73.0) / 23.0) ** 2))) / q10
 
     def inf(self, v):
         v = v + 10.0

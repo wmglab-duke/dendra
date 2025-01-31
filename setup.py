@@ -20,7 +20,7 @@ ext_modules = cythonize(
 
 setup(
     install_requires=[
-        "numpy>=2.0.0",
+        "numpy",
         "torch",
         "h5py",
         "pytorch_optimizer",

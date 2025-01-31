@@ -860,6 +860,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.set_buffers(self.diam)
         return self
 
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.mech.set_buffers(self.diam)
+        return self
+
 
 def match_state_dict(
     state_dict_a: Dict[str, torch.Tensor],

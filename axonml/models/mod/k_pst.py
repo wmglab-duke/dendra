@@ -23,9 +23,9 @@ class m(State):
         v = v + 10.0
         q10 = self.q10()
         minf = 1.0 / (1.0 + exp(-(v + 1.0) / 12.0))
-        mtau_o = (1.25 + 13 * exp(-v * 0.026)) / q10
-        mtau_e = (1.25 + 175.03 * exp(-v * -0.026)) / q10
-        taum = torch.where(v < -50.0, mtau_e, mtau_o)
+        mtau_o = 1.25 + 13 * exp(-v * 0.026)
+        mtau_e = 1.25 + 175.03 * exp(-v * -0.026)
+        taum = torch.where(v < -50.0, mtau_e, mtau_o) / q10
 
     def inf(self, v):
         v = v + 10.0
@@ -47,7 +47,7 @@ class h(State):
         v = v + 10.0
         q10 = self.q10()
         hinf = 1.0 / (1.0 + exp(-(v + 54.0) / -11.0))
-        tauh = (360 + (1010 + 24 * (v + 55)) * exp(-((v + 75) / 48) ^ 2)) / q10
+        tauh = (360 + (1010 + 24 * (v + 55)) * exp(-(((v + 75) / 48) ** 2))) / q10
 
     def inf(self, v):
         v = v + 10.0
