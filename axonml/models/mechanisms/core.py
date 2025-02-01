@@ -14,6 +14,7 @@ class State:
     _assigned = set()
     _initialized = set()
     _buffers = set()
+    _params = {}
 
 
 @torch.jit.interface
