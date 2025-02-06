@@ -108,7 +108,7 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
 template = """
 class {mech}(torch.nn.Module):
     _init_params: Dict[str, float]
-    def __init__(self, temp, diameters, n_ax, n_nodes, name: str, params, distributions, read_ion, write_ion_c, states, conductances, init, ic: dict = None, mask=None):
+    def __init__(self, temp, diameters, n_ax, n_nodes, name: str, params, distributions, read_ion, write_ion_c, states, conductances, init, ic: dict = None):
         super().__init__()
         self.instantiate_parameters(params)
         self.instantiate_distributions(distributions)
@@ -119,10 +119,7 @@ class {mech}(torch.nn.Module):
             {{state._name: state for state in states}}
         )
 
-        if mask is not None:
-            mask_ = torch.ones(1, 1, n_nodes)
-            mask_[:, :, mask] = 0
-            self.register_buffer("mask", mask_)
+{mask_def}
                 
         self._init_params: Dict[str, float] = {{k: v for k, v in init.items()}}
 
@@ -235,6 +232,12 @@ def {state}_inf(self, v):
 distribution_init_template = """
 self.{name} = self.{name}_d._sample(self.{name})
 """
+
+
+def mask_def(mask):
+    if mask is not None:
+        return f"mask_ = torch.ones(1, 1, n_nodes)\nmask_[:, :, {mask}] = 0\nself.register_buffer('mask', mask_)"
+    return ""
 
 
 def detach(states):
@@ -685,6 +688,7 @@ def compile_mechanism(
         distribution_buffer_assignments=distribution_buffer_assignments_str,
         init_distribution_buffers=init_distribution_buffers_str,
         detach=indent(detach(states_compiled), 2),
+        mask_def=indent(mask_def(mask), 2),
     )
 
     filename = f"<{mechanism.__name__}_template>"
@@ -709,7 +713,6 @@ def compile_mechanism(
         conductances,
         init,
         ic=ic,
-        mask=mask,
     )
 
     return m, unfactorable, has_gtot

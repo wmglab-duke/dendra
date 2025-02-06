@@ -278,7 +278,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def dtype(self):
         return self.ssd.weight.dtype
 
-    def insert(self, mechanism: Mechanism, ic=None, mask: int = None, **kwargs):
+    def insert(
+        self,
+        mechanism: Mechanism,
+        ic: Dict[str, float] = None,
+        mask: str | int = None,
+        **kwargs,
+    ):
         """
         Inserts a mechanism into the model.
 
@@ -287,7 +293,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         Args:
             mechanism (Mechanism): The mechanism to be inserted into the model.
-            ic (optional): Initial conditions for the mechanism.
+            ic (optional, Dict[str:float]): Initial conditions for the mechanism.
+            mask (optional): Compartments for which the mechanism will not be included in current calculation. NumPy / Pytorch slice syntax.
             **kwargs: Additional keyword arguments to be passed to the compile_mechanism function.
 
         Returns:
