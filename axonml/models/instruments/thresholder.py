@@ -1,45 +1,61 @@
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Union
 
 import numpy as np
+import numpy.typing as npt
 
 import torch
 from torch import Tensor
 
 from axonml.models import Axon
-from axonml.models.callbacks import Active, ActiveAL, Recorder
+from axonml.models.callbacks import Recorder, ThresholdCallback
 
 
 class Thresholder:
     def __init__(
         self,
         model: Axon,
-        bases: Tensor,
-        diams: Tensor,
-        dt=0.005,
+        active: ThresholdCallback,
+        space: Optional[Union[npt.NDArray, Tensor]] = None,
+        time: Optional[Union[npt.NDArray, Tensor]] = None,
+        bases: Optional[Union[npt.NDArray, Tensor]] = None,
+        diams: Optional[Union[npt.NDArray, Tensor, List]] = None,
         ub=None,
         fix_bound_up=5.0,
         fix_bound_down=0.1,
         max_tries_bound_fix=10,
         max_tries_thresh=25,
         resolution=0.01,
-        threshold=0.0,
-        node_check: List[int] = [5, -5],
-        t_start_check=0.0,
-        at_least=1,
+        multicontact=False,
     ):
-        if isinstance(diams, Tensor) or isinstance(diams, np.ndarray):
-            assert len(diams) == bases.shape[0]
+        self.model = model
 
-        elif isinstance(diams, float):
-            diams = np.atleast_1d(np.full(bases.shape[0], diams))
-
-        else:
-            raise TypeError(
-                "diams must be a NumPy array / PyTorch tensor with same length as bases or a float."
+        if bases is None and (space is None and time is None):
+            raise ValueError(
+                "At least one of bases or space and time must be provided."
             )
 
-        if at_least < 1:
-            raise ValueError("at_least must be >= 1.")
+        if bases is not None:
+            bases = torch.as_tensor(bases)
+            bases = bases.permute(1, 0, 2).unsqueeze(2)
+            self.bases = bases.to(model.device())
+        else:
+            bases = self.ve_from_s_t(
+                space, time, self.model.device(), multicontact=multicontact
+            )
+            self.bases = bases
+
+        if diams is not None:
+            if hasattr(diams, "__iter__"):
+                assert len(diams) == self.bases.shape[1]
+
+            elif isinstance(diams, float):
+                diams = np.atleast_1d(np.full(self.bases.shape[1], diams))
+
+            diams = torch.as_tensor(diams)
+            self.diams = diams.to(model.device())
+
+        else:
+            self.diams = None
 
         if fix_bound_down >= 1 or fix_bound_up <= 0:
             raise ValueError("fix_bound_down should be < 1 and > 0.")
@@ -47,25 +63,13 @@ class Thresholder:
         if fix_bound_up <= 1:
             raise ValueError("fix_bound_up should be > 1.")
 
-        self.model = model
-
-        bases = torch.as_tensor(bases)
-        diams = torch.as_tensor(diams)
-
-        self.dt = dt
-
-        bases = bases.permute(1, 0, 2).unsqueeze(2)
-
-        self.bases = bases.to(model.device())
-        self.diams = diams.to(model.device())
-
-        self.threshold = threshold
-
         self.ignore = None
 
         with torch.no_grad():
             if ub is not None:
-                self.ub = ub * torch.ones_like(self.diams, device=model.device())
+                self.ub = torch.as_tensor(ub, device=model.device(), dtype=model.dtype()) * torch.ones(
+                    self.model.n_ax, device=model.device(), dtype=model.dtype()
+                )
             else:
                 self.ub = 0.2 * torch.ones_like(self.diams) / (self.diams / 5) ** 2
             self.ub_initial = self.ub.clone()
@@ -77,19 +81,30 @@ class Thresholder:
         self.max_tries_thresh = max_tries_thresh
         self.resolution = resolution
 
-        if at_least > 1:
-            self.active = ActiveAL(
-                threshold, t_start_check, node_check, dt=dt, at_least=at_least
-            )
-        else:
-            self.active = Active(threshold, t_start_check, node_check, dt=dt)
+        self.active = active
         self.rec = Recorder(["v"], max_only=True)
+
+    def ve_from_s_t(self, ve_s, ve_t, device, multicontact=False):
+        ve_s = torch.as_tensor(ve_s, device=device)
+        ve_t = torch.as_tensor(ve_t, device=device)
+
+        if multicontact:
+            ve_s = ve_s.expand(-1, self.model.n_ax, -1)
+            ve_t = ve_t.expand(-1, self.model.n_ax, -1)
+            einsum = op_mc
+        else:
+            ve_s = ve_s.expand(self.model.n_ax, -1)
+            ve_t = ve_t.expand(self.model.n_ax, -1)
+            einsum = op_sc
+
+        return einsum(ve_s, ve_t)
 
     def float(self):
         self.fp32 = True
         self.model = self.model.float()
         self.bases = self.bases.float()
-        self.diams = self.diams.float()
+        if self.diams is not None:
+            self.diams = self.diams.float()
         self.ub = self.ub.float()
         self.ub_initial = self.ub.clone()
         self.lb = self.lb.float()
@@ -99,13 +114,14 @@ class Thresholder:
         self.fp32 = False
         self.model = self.model.double()
         self.bases = self.bases.double()
-        self.diams = self.diams.double()
+        if self.diams is not None:
+            self.diams = self.diams.double()
         self.ub = self.ub.double()
         self.ub_initial = self.ub.clone()
         self.lb = self.lb.double()
         return self
 
-    def check_active(self, bound: Tensor):
+    def check_active(self, dt, bound: Tensor):
         """Check whether stimulus amplitudes generates APs.
 
         Parameters
@@ -121,11 +137,11 @@ class Thresholder:
         self.active.reset()
         ve = self.bases * bound[None, :, None, None]
         self.model.run(
-            ve, callbacks=[self.active], reinit=True, dt=self.dt, progressbar=False
+            ve, callbacks=[self.active], reinit=True, dt=dt, progressbar=False
         )
         return self.active.is_active()
 
-    def check_active_with_rec(self, bound: Tensor):
+    def check_active_with_rec(self, dt, bound: Tensor):
         self.active.reset()
         self.rec.reset()
         ve = self.bases * bound[None, :, None, None]
@@ -133,23 +149,23 @@ class Thresholder:
             ve,
             callbacks=[self.active, self.rec],
             reinit=True,
-            dt=self.dt,
+            dt=dt,
             progressbar=False,
         )
         return self.active.is_active(), self.rec.stack()
 
-    def fix_bounds(self, block_possible=True):
+    def fix_bounds(self, dt, block_possible=True):
         """Make sure upper bound generates AP."""
 
         with torch.no_grad():
             tries = 0
-            mask, rec = self.check_active_with_rec(self.ub)
+            mask, rec = self.check_active_with_rec(dt, self.ub)
             print("Fixing bounds.", end="")
             while torch.any(~mask):
                 print(".", end="")
                 if tries >= self.max_tries_bound_fix:
                     break
-                mask, rec = self.check_active_with_rec(self.ub)
+                mask, rec = self.check_active_with_rec(dt, self.ub)
                 inactive = ~mask
                 if block_possible:
                     self.ub[(rec[:, -1] < self.threshold) & inactive] *= (
@@ -172,7 +188,7 @@ class Thresholder:
             self.ub[self.ignore] = 1
             self.lb[self.ignore] = 1
 
-    def calculate_thresholds(self) -> Tuple[Tensor, Tensor]:
+    def calculate_thresholds(self, dt, block_possible=False) -> Tuple[Tensor, Tensor]:
         """Calculate thresholds.
 
         Returns
@@ -180,7 +196,7 @@ class Thresholder:
         Tuple[Tensor, Tensor]
             Upper and lower bound on thresholds.
         """
-        self.fix_bounds()
+        self.fix_bounds(dt, block_possible)
         self.rec.reset()
         self.active.reset()
 
@@ -194,7 +210,7 @@ class Thresholder:
 
             while torch.any(msk) & (tries < self.max_tries_thresh):
                 stimamp = (ub + lb) / 2
-                mask = self.check_active(stimamp)
+                mask = self.check_active(dt, stimamp)
                 a_thr = msk & mask
                 b_thr = msk & ~mask
                 ub[a_thr] = stimamp[a_thr]
@@ -204,6 +220,9 @@ class Thresholder:
                 tries += 1
             if tries >= self.max_tries_thresh:
                 print("hmm")
+                if self.ignore is not None:
+                    ub[self.ignore] = torch.nan
+                    lb[self.ignore] = torch.nan
                 return ub.cpu().numpy(), lb.cpu().numpy()
 
             if self.ignore is not None:
@@ -211,3 +230,13 @@ class Thresholder:
                 lb[self.ignore] = torch.nan
 
             return ub.cpu().numpy(), lb.cpu().numpy()
+
+
+@torch.jit.script
+def op_mc(s: Tensor, t: Tensor) -> Tensor:
+    return torch.einsum("can,cat->tan", s, t).unsqueeze(2)
+
+
+@torch.jit.script
+def op_sc(s: Tensor, t: Tensor) -> Tensor:
+    return torch.einsum("an,at->tan", s, t).unsqueeze(2)

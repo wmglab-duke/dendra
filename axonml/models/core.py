@@ -278,7 +278,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def dtype(self):
         return self.ssd.weight.dtype
 
-    def insert(self, mechanism: Mechanism, ic=None, **kwargs):
+    def insert(self, mechanism: Mechanism, ic=None, mask:int=None, **kwargs):
         """
         Inserts a mechanism into the model.
 
@@ -306,6 +306,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ic=ic,
             df=df,
             pade=self.pade,
+            mask=mask,
             **kwargs,
         )
 
