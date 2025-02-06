@@ -67,7 +67,9 @@ class Thresholder:
 
         with torch.no_grad():
             if ub is not None:
-                self.ub = torch.as_tensor(ub, device=model.device(), dtype=model.dtype()) * torch.ones(
+                self.ub = torch.as_tensor(
+                    ub, device=model.device(), dtype=model.dtype()
+                ) * torch.ones(
                     self.model.n_ax, device=model.device(), dtype=model.dtype()
                 )
             else:

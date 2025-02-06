@@ -443,16 +443,16 @@ def multiply_return_value(code_string, multiplier_expr: str) -> str:
     Given a function body in a string,
     replace any `return x` statement with `return <multiplier_expr> * x`.
     """
-    # Pattern captures: 
+    # Pattern captures:
     # (1) the word 'return'
     # (2) optional whitespace
     # (3) the return expression (grouped as (.+) to capture it)
-    pattern = r'(return)\s+(.+)'
-    
-    # Use an f-string to insert the multiplier expression 
+    pattern = r"(return)\s+(.+)"
+
+    # Use an f-string to insert the multiplier expression
     # before whatever was captured in group 2.
-    replacement = fr'return {multiplier_expr} * \2'
-    
+    replacement = rf"return {multiplier_expr} * \2"
+
     # Perform the substitution.
     new_code = re.sub(pattern, replacement, code_string)
     return new_code
@@ -596,7 +596,16 @@ def distribution_buffers(distributions):
 
 
 def compile_mechanism(
-    mechanism, temp, diameters, n_ax, n_nodes, df=False, ic=None, pade=None, mask=None, **kwargs
+    mechanism,
+    temp,
+    diameters,
+    n_ax,
+    n_nodes,
+    df=False,
+    ic=None,
+    pade=None,
+    mask=None,
+    **kwargs,
 ):
     states = mechanism._states
 
