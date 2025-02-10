@@ -10,14 +10,16 @@ from tqdm.auto import tqdm
 
 from axonml.models.stim.intrastim import IntraStim
 
-from .callbacks import CallbackList, Callback
-from .backend import Backend as A
-from .mixins import Parameterized
-from .mechanisms.core import Mechanism, validate
-from .mechanisms.declarations import PARAMETER
-from .mechanisms.handler.handler import build_handler
-from .mechanisms.handler.ions import build_ion
-from .mechanisms.mech_compiler import compile_mechanism
+from axonml.models.callbacks import CallbackList, Callback
+from axonml.models.backend import Backend as A
+from axonml.models.mixins import Parameterized
+from axonml.models.mechanisms.core import Mechanism, validate
+from axonml.models.mechanisms.declarations import PARAMETER
+from axonml.models.mechanisms.handler.handler import build_handler
+from axonml.models.mechanisms.handler.ions import build_ion
+from axonml.models.mechanisms.mech_compiler import compile_mechanism
+
+from axonml.helpers import op_mc, op_sc, ve_from_s_t
 
 
 def get_unique_keys(list_of_dicts):
@@ -486,7 +488,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         with torch.set_grad_enabled(self.training):
             if ve is None and not intra_only:
-                ve = self.ve_from_s_t(space, time, multicontact)
+                ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
 
             if self.training:
                 self.calculate_geometric_params()
@@ -581,21 +583,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             if not longrunning:
                 if progressbar:
                     progressbar.close()
-
-    def ve_from_s_t(self, ve_s, ve_t, multicontact=False):
-        ve_s = torch.as_tensor(ve_s, device=self.device())
-        ve_t = torch.as_tensor(ve_t, device=self.device())
-
-        if multicontact:
-            ve_s = ve_s.expand(-1, self.n_ax, -1)
-            ve_t = ve_t.expand(-1, self.n_ax, -1)
-            einsum = op_mc
-        else:
-            ve_s = ve_s.expand(self.n_ax, -1)
-            ve_t = ve_t.expand(self.n_ax, -1)
-            einsum = op_sc
-
-        return einsum(ve_s, ve_t)
 
     def longrun(
         self,
@@ -987,13 +974,3 @@ class Myelinated(Axon):
         steps = self.n_node
         t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(-1)
         return ((1 - t) * start + t * end).T
-
-
-@torch.jit.script
-def op_mc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("can,cat->tan", s, t).unsqueeze(2)
-
-
-@torch.jit.script
-def op_sc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("an,at->tan", s, t).unsqueeze(2)

@@ -7,9 +7,10 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from axonml.models.stim.intrastim import IntraStim
-from ..backend import Backend as A
-from ..callbacks import CallbackList, Callback
-from ..core import Axon
+from axonml.models.backend import Backend as A
+from axonml.models.callbacks import CallbackList, Callback
+from axonml.models.core import Axon
+from axonml.helpers import ve_from_s_t
 
 
 class Heterogeneous(Axon):
@@ -133,7 +134,7 @@ class Heterogeneous(Axon):
 
         with torch.set_grad_enabled(self.training):
             if ve is None and not intra_only:
-                ve = self.ve_from_s_t(space, time, multicontact)
+                ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
 
             ve = 2 * ve
 
