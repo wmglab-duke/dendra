@@ -48,43 +48,6 @@ Implement and train high-throughput GPU-compatible neural fiber models.
 > [!IMPORTANT]
 > The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, run the data generation script, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal) (however do not create a separate `conda` environment for `cajal` - install all dependencies into `axonml`).
 
-## :rocket: Training a model
-
-By default, `axonml` trains approximations to the MRG[^2] myelinated fiber model. Check `axonml/models/README.md` for instructions on how to implement approximations of other fiber models. 
-
-Training configurations can be modified by changing the relevant values in `config.py`:
-
-|Variable|Description|
-|---|---|
-|`model`|Surrogate fiber model `class` to train. **Default: `axonml.models.SMF`**.|
-|`cuda`|Whether to use GPU. **Default: True if GPU is available, False otherwise**.|
-|`fp32`|Whether to use single-precision floating point arithmetic. If not, double precision is used. **Default: False**.|
-|`nodes`|Nodes of Ranvier per axon. **Default: 53**.|
-|`dt`|Simulation timestep [ms]. **Default: 0.005**.|
-|`train_dset`|Path to training dataset.|
-|`valid_dset`|Path to validation dataset.|
-|`states`|The state variables in the training / validations dataset(s) and the order in which they will be concatenated. Must agree with the order in which states are concatenated when recorded from the surrogate model. **Default: ['m', 'h', 'p', 's', 'v']**.|
-|`epochs`|Number of training epochs. **Default: 5**.|
-|`truncation_length`|Sequence length over which to perform truncated backpropagation through time. **Default: 50**.|
-|`lr`|Adam optimizer learning rate. **Default: $3\times10^{-5}$**.|
-|`grad_accumulation`|Whether to use gradient accumulation over disjoint chunks in truncated backpropagation through time. **Default: False**.|
-|`train_n_idx`|Total # training set batches to use per training epoch (see `./axonml/data/generate_data.py` - `n_batches`). **Default: 64**.|
-|`val_n_idx`| # validation set batches to use per round of validation. **Default: 8**.|
-|`train_chunk_size`| # training set batches to use per gradient-descent step. (Should be a factor of `train_n_idx`). **Default: 2**.|
-|`val_chunk_size`| # validation set batches to use per validation step. **Default: 8**.|
-|`sampling`|Whether to downsample training set in time, and by how much (sample every `sampling` timesteps). **Default: None**.|
-|`postfix`|List of model parameters to display in progressbar as training progresses. **Default: None**.|
-|`save_every`|Save model parameters every `save_every` minibatch iterations. **Default: 32**.|
-|`save_dir`|Location into which to save model parameters. **Default: `./checkpoints/`**.|
-
-Once you've set variables appropriately in `config.py`, you can initiate training:
-
-```bash
-(base) foo@bar : ~ $ cd /path/to/cloned/repository
-(base) foo@bar : /path/to/cloned/repository $ conda activate axonml
-(axonml) foo@bar : /path/to/cloned/repository $ python train.py
-```
-
 ## 🗄️ Loading a model
 Trained `axonml.models.Axon` models can be loaded using the `load` method. We have included a trained version of the MRG fiber (the 'surrogate myelinated fiber', S-MF, pronounced 'smurf'):
 
