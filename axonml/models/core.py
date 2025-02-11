@@ -284,7 +284,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self,
         mechanism: Mechanism,
         ic: Dict[str, float] = None,
-        mask: str | int = None,
+        mask_out: str | int = None,
+        mask_in: str | int = None,
         **kwargs,
     ):
         """
@@ -315,7 +316,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ic=ic,
             df=df,
             pade=self.pade,
-            mask=mask,
+            mask_out=mask_out,
+            mask_in=mask_in,
             **kwargs,
         )
 

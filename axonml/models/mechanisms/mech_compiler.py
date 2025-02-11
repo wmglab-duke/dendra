@@ -234,10 +234,22 @@ self.{name} = self.{name}_d._sample(self.{name})
 """
 
 
-def mask_def(mask):
-    if mask is not None:
-        return f"mask_ = torch.ones(1, 1, n_nodes)\nmask_[:, :, {mask}] = 0\nself.register_buffer('mask', mask_)"
-    return ""
+def mask_def(mask_out, mask_in):
+    if mask_out is None and mask_in is None:
+        return ""
+    ret = []
+    if mask_out is not None:
+        ret.append(f"mask_out = torch.ones(1, 1, n_nodes)\nmask_[:, :, {mask_out}] = 0")
+    if mask_in is not None:
+        ret.append(f"mask_in = torch.zeros(1, 1, n_nodes)\nmask_[:, :, {mask_in}] = 1")
+    if mask_out is not None and mask_in is not None:
+        ret.append("mask = mask_out * mask_in")
+    elif mask_out is not None:
+        ret.append("mask = mask_out")
+    else:
+        ret.append("mask = mask_in")
+    ret.append("self.register_buffer('mask', mask)")
+    return "\n".join(ret)
 
 
 def detach(states):
@@ -468,28 +480,28 @@ def current_equations(currents, mechanism, range_vars, df, mask):
         assign = k in range_vars
         if not df:
             code = convert_func(getattr(mechanism, k), assign)
-            if mask is not None:
+            if mask:
                 code = multiply_return_value(code, "self.mask")
             assignments.append(code)
             code_block = get_function_body_as_str(getattr(mechanism, k))
-            if mask is not None:
+            if mask:
                 code_block = multiply_return_value(code_block, "self.mask")
             assignments.append(current_tot_template.format(k=k, body=code_block))
         else:
             code_block = get_function_body_as_str(getattr(mechanism, k))
-            if mask is not None:
+            if mask:
                 code_block = multiply_return_value(code_block, "self.mask")
             assignments.append(current_tot_template.format(k=k, body=code_block))
             try:
                 i, _ = factor_linear_in_x_from_codeblock(replace_v(code_block))
                 if assign:
                     code = current_eq_template_assign.format(k=k, v=i)
-                    if mask is not None:
+                    if mask:
                         code = multiply_return_value(code, "self.mask")
                     assignments.append(code)
                 else:
                     code = current_eq_template.format(k=k, v=i)
-                    if mask is not None:
+                    if mask:
                         code = multiply_return_value(code, "self.mask")
                     assignments.append(code)
             except:
@@ -497,7 +509,7 @@ def current_equations(currents, mechanism, range_vars, df, mask):
                     "Could not confirm all currents are linear in v. Dufort-Frankel may not be stable."
                 )
                 code = convert_func(getattr(mechanism, k), assign)
-                if mask is not None:
+                if mask:
                     code = multiply_return_value(code, "self.mask")
                 assignments.append(code)
                 unfactorable.append(k)
@@ -607,7 +619,8 @@ def compile_mechanism(
     df=False,
     ic=None,
     pade=None,
-    mask=None,
+    mask_out=None,
+    mask_in=None,
     **kwargs,
 ):
     states = mechanism._states
@@ -658,7 +671,7 @@ def compile_mechanism(
     advance_str = indent(advance_str, 2)
 
     current_equations_str, unfactorable = current_equations(
-        current_eqs, mechanism, range_vars, df, mask
+        current_eqs, mechanism, range_vars, df, (mask_out is not None) or (mask_in is not None)
     )
     current_equations_str = indent(current_equations_str, 1)
 
@@ -688,7 +701,7 @@ def compile_mechanism(
         distribution_buffer_assignments=distribution_buffer_assignments_str,
         init_distribution_buffers=init_distribution_buffers_str,
         detach=indent(detach(states_compiled), 2),
-        mask_def=indent(mask_def(mask), 2),
+        mask_def=indent(mask_def(mask_out, mask_in), 2),
     )
 
     filename = f"<{mechanism.__name__}_template>"
