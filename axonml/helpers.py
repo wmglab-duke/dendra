@@ -27,7 +27,7 @@ class Context(contextlib.ContextDecorator):
 
 
 class ContextVar:
-    _cache: ClassVar[dict[str, 'ContextVar']] = {}
+    _cache: ClassVar[dict[str, "ContextVar"]] = {}
     value: int
     key: str
 
@@ -54,6 +54,7 @@ class ContextVar:
 
 
 DEBUG = ContextVar("DEBUG", 0)
+TF32 = ContextVar("TF32", 0)
 
 
 # --- pytorch functions --

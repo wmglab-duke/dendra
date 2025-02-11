@@ -21,6 +21,8 @@ from axonml import const
 from .handler.defaults import valid_concentrations
 from .state_compiler import compile_state, compile_coupled_state
 
+from axonml.helpers import DEBUG
+
 
 def indent(text, level=0):
     return textwrap.indent(text, " " * (4 * level))
@@ -671,7 +673,11 @@ def compile_mechanism(
     advance_str = indent(advance_str, 2)
 
     current_equations_str, unfactorable = current_equations(
-        current_eqs, mechanism, range_vars, df, (mask_out is not None) or (mask_in is not None)
+        current_eqs,
+        mechanism,
+        range_vars,
+        df,
+        (mask_out is not None) or (mask_in is not None),
     )
     current_equations_str = indent(current_equations_str, 1)
 
@@ -703,6 +709,8 @@ def compile_mechanism(
         detach=indent(detach(states_compiled), 2),
         mask_def=indent(mask_def(mask_out, mask_in), 2),
     )
+
+    if DEBUG > 0: print(forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")

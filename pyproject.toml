@@ -11,9 +11,6 @@ dynamic = ["dependencies"]
 [project.optional-dependencies]
 jupyter = ["jupyter"]
 
-[tool.ruff.lint]
-ignore-init-module-imports = true
-
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
 include = ["axonml"]  # package names should match these glob patterns (["*"] by default)
