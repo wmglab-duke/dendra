@@ -26,12 +26,23 @@ class m(State):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
-        return self.q10() * self.ma1 * exprelr(self.mshift - v, self.ma2)
+        return (
+            self.q10()
+            * self.ma1
+            * (v - self.mshift)
+            / (1 - exp(-(v - self.mshift) / self.ma2))
+        )
 
     def beta(self, v):
-        return self.q10() * self.mb1 * exprelr(v - self.mshift, self.mb2)
+        return (
+            self.q10()
+            * self.mb1
+            * (-v + self.mshift)
+            / (1 - exp(-(-v + self.mshift) / self.mb2))
+        )
 
     def breakpoint(self, v):
+        v = torch.where(v == self.mshift, v + 0.0001, v)
         a = self.alpha(v)
         b = self.beta(v)
         taum = 1 / (a + b)
@@ -59,12 +70,23 @@ class h(State):
         return self.aq10 ** ((self.temp - self.bq10) / self.cq10)
 
     def alpha(self, v):
-        return self.q10() * self.ha1 * exprelr(self.hshift - v, self.ha2)
+        return (
+            self.q10()
+            * self.ha1
+            * (v - self.hshift)
+            / (1 - exp((v - self.hshift) / self.ha2))
+        )
 
     def beta(self, v):
-        return self.q10() * self.hb1 * exprelr(v - self.hshift, self.hb2)
+        return (
+            self.q10()
+            * self.hb1
+            * (-v + self.hshift)
+            / (1 - exp((-v + self.hshift) / self.hb2))
+        )
 
     def breakpoint(self, v):
+        v = torch.where(v == self.hshift, v + 0.0001, v)
         a = self.alpha(v)
         b = self.beta(v)
         tauh = 1 / (a + b)

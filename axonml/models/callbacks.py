@@ -7,12 +7,13 @@ import multiprocessing as mp
 from h5py import File
 
 import torch
+import torch.nn.functional as F
 
 from .backend import Backend as A
 from .interfaces import AxonInterface
 
 
-STREAM = torch.cuda.Stream()
+TRANSFERSTREAM = torch.cuda.Stream()
 
 
 class Callback:
@@ -134,7 +135,9 @@ def avoid_smart_indexing(node_indices):
     return node_indices
 
 
-def n(node_indices):
+def n(node_indices, model):
+    if node_indices is None:
+        return model.n_node
     if isinstance(node_indices, int):
         return 1
     return len(node_indices)
@@ -155,12 +158,15 @@ def atleast_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 class Recorder(Callback):
-    def __init__(self, states, max_only=False, node_indices=None, dt=None):
+    def __init__(
+        self, states, max_only=False, node_indices=None, dt=None, sliding_window=None
+    ):
         super().__init__()
         self.states = states
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
         self.node_indices = avoid_smart_indexing(node_indices)
+        self.sliding_window = sliding_window
         rfunc = build_recorder_func(states)
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
@@ -213,7 +219,7 @@ class Recorder(Callback):
             self.i += 1
 
     def cache_hdf5(self):
-        with torch.cuda.stream(STREAM):
+        with torch.cuda.stream(TRANSFERSTREAM):
             for s in self.states:
                 data = self.stack(s)
                 if s not in self.data_pinned:
@@ -260,10 +266,14 @@ class Recorder(Callback):
     def stack(self, var: str = None):
         if var is not None:
             vs = torch.stack(self.rec[var])
+            if self.sliding_window is not None:
+                vs = sliding_window_average(vs, self.sliding_window)
             if self.max_only:
                 return torch.amax(vs, 0)
             return vs
         vs = torch.cat([torch.stack(self.rec[s]) for s in self.rec], dim=2)
+        if self.sliding_window is not None:
+            vs = sliding_window_average(vs, self.sliding_window)
         if self.max_only:
             return torch.amax(vs, 0)
         return vs
@@ -279,7 +289,7 @@ def hdf5_write(queue: Queue, path: str):
         while True:
             item = queue.get()
             if item == "flush":
-                STREAM.synchronize()
+                TRANSFERSTREAM.synchronize()
                 queue.task_done()
                 continue
             if item is None:
@@ -299,7 +309,6 @@ class ThresholdCallback(Callback):
         self.threshold: float = threshold
         self.t_start_check: float = t_start_check
         self.node_check: List[int] = avoid_smart_indexing(node_check)
-        self.n: int = n(self.node_check)
         self.i: int = 0
         self.dt: float = dt if dt is not None else A.dt
 
@@ -332,21 +341,21 @@ class APCount(ThresholdCallback):
         if self.record is None:
             self.record = torch.zeros(
                 model.n(),
-                n(self.node_check),
+                n(self.node_check, model),
                 dtype=torch.int32,
                 device=model.device(),
             )
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                n(self.node_check),
+                n(self.node_check, model),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = atleast_2d(model.v[:, 0, self.node_check])
+            vm_new = atleast_2d(model.v[:, 0, self.node_check].squeeze())
             vm = self.state_cache
             self.state_cache = increment_count_(vm, vm_new, self.record, self.threshold)
         self.i += 1
@@ -381,14 +390,14 @@ class Active(ThresholdCallback):
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                n(self.node_check),
+                n(self.node_check, model),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
     def post_step_hook(self, model: AxonInterface):
         if self.i * self.dt >= self.t_start_check:
-            vm_new = atleast_2d(model.v[:, 0, self.node_check])
+            vm_new = atleast_2d(model.v[:, 0, self.node_check].squeeze())
             vm = self.state_cache
             self.state_cache, la = update_active(vm, vm_new, self.threshold)
             self.record[la] = True
@@ -412,7 +421,7 @@ class Raster(ThresholdCallback):
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                n(self.node_check),
+                n(self.node_check, model),
                 dtype=torch.bool,
                 device=model.device(),
             )
@@ -457,3 +466,95 @@ def update_active(vm, vm_new, threshold: float) -> Tuple[torch.Tensor, torch.Ten
 @torch.jit.script
 def is_active(record, at_least: int) -> torch.Tensor:
     return torch.count_nonzero(record, dim=1) >= at_least
+
+
+@torch.jit.script
+def sliding_window_average(x, window_size: int):
+    """
+    Compute the sliding (moving) window average along axis 0 for a 4D array/tensor,
+    with padding so that the output has the same shape as the input.
+
+    For an input of shape (N, C, H, W) and a given window_size, the function pads the input
+    along axis 0 using edge replication and then computes the average over every consecutive window.
+    The output shape is (N, C, H, W).
+
+    Parameters
+    ----------
+    x : np.ndarray or torch.Tensor
+        A 4-dimensional array/tensor with shape (N, C, H, W).
+    window_size : int
+        The size of the sliding window (must be >= 1).
+
+    Returns
+    -------
+    out : same type as x
+        The sliding window averages computed along axis 0 with the same shape as the input.
+
+    Raises
+    ------
+    ValueError
+        If window_size is less than 1.
+    TypeError
+        If x is not a NumPy array or a PyTorch tensor.
+    """
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1.")
+
+    # Compute padding sizes so that:
+    #    pad_left + pad_right = window_size - 1
+    if window_size % 2 == 1:
+        pad_left = pad_right = window_size // 2
+    else:
+        pad_left = window_size // 2
+        pad_right = window_size // 2 - 1
+
+    # ---------------------------
+    # PyTorch implementation
+    # ---------------------------
+    # x shape: (N, C, H, W)
+    N, C, H, W = x.shape
+
+    # Manually pad along axis 0 (the N dimension) using replication.
+    # For pad_left, replicate the first slice; for pad_right, replicate the last slice.
+    left_pad = (
+        x[0:1].expand(pad_left, -1, -1, -1)
+        if pad_left > 0
+        else torch.empty(0, device=x.device, dtype=x.dtype)
+    )
+    right_pad = (
+        x[-1:].expand(pad_right, -1, -1, -1)
+        if pad_right > 0
+        else torch.empty(0, device=x.device, dtype=x.dtype)
+    )
+    # Concatenate along dimension 0.
+    x_padded = torch.cat([left_pad, x, right_pad], dim=0)
+    N_padded = x_padded.shape[0]  # should equal N + (window_size - 1)
+
+    # Reshape so that the padded N dimension is the "length" dimension.
+    # Collapse (C, H, W) into the channel dimension and use a batch size of 1.
+    # New shape: (1, C*H*W, N_padded)
+    x_reshaped = x_padded.permute(1, 2, 3, 0).reshape(1, C * H * W, N_padded)
+
+    # Create an averaging kernel for each channel.
+    # For grouped conv1d with groups = C*H*W, the kernel should have shape:
+    # (C*H*W, 1, window_size)
+    kernel = (
+        torch.ones(C * H * W, 1, window_size, dtype=x.dtype, device=x.device)
+        / window_size
+    )
+
+    # Perform grouped convolution along the length dimension.
+    out_conv = F.conv1d(x_reshaped, kernel, groups=C * H * W)
+    # out_conv shape: (1, C*H*W, L) where L = N_padded - window_size + 1.
+    L = out_conv.shape[-1]
+    if L != N:
+        raise RuntimeError(f"Unexpected output length: got {L}, expected {N}.")
+
+    # Reshape back to (1, C, H, W, N) and then permute to (N, C, H, W)
+    # First, view out_conv as (1, C, H, W, N)
+    out_5d = out_conv.view(1, C, H, W, N)
+    # Permute to bring the last dimension (N) to the front: (1, N, C, H, W)
+    out_perm = out_5d.permute(0, 4, 1, 2, 3)
+    # Remove the extra batch dimension (squeeze dimension 0)
+    out = out_perm.squeeze(0)
+    return out

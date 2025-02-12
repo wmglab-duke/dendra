@@ -16,69 +16,37 @@ Implement and train high-throughput GPU-compatible neural fiber models.
 `axonml` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).
 
 ### Python dependencies
-`axonml` requires Python 3.9+ (tested with 3.9, 3.10) and PyTorch 2.0+ with GPU support (tested with PyTorch 2.0.0 & CUDA 11.7). See `requirements.txt` for additional package dependencies.
+`axonml` requires Python 3.11+ and PyTorch 2.0+ with GPU support (tested with PyTorch 2.5.0 & CUDA 12.4).
 
 
 ## 🖥️ Installation
 
 > [!TIP]
-> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.10`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
+> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.11`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
 
-1.  Install PyTorch (with GPU support, check which CUDA version you have / is compatible with your GPU) - follow the installation instructions [on the PyTorch homepage](https://pytorch.org/).
+1. Clone this repository recursively.
 
-> [!IMPORTANT]
-> Differences in GPU hardware and PyTorch / CUDA version may affect the performance and numerical outcomes of simulations / optimizations. All presented results use PyTorch 2.0.0 and CUDA 11.7).
+```bash
+> git clone --recursive https://gitlab.oit.duke.edu/mah148/axonml.git
+```
 
-2.  Clone this repository.
+2. Install.
 
-3.  Install requirements : `pip install -r requirements.txt`
+```bash
+> cd axonml
+> python -m pip install .
+```
 
-4.  Add the cloned `axonml` directory to your `PYTHONPATH`.
+- You can also install with jupyter support:
+    - `python -m pip install '.[jupyter]'`
 
 🥳 You're all set! 
 
 > [!NOTE]
-> Installation of all dependencies should not take more time than a couple of minutes. Installation of `axonml` itself takes only the time required to clone the repository.
+> Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive sapce.
 
 > [!IMPORTANT]
-> The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, use the data generation algorithms, run high-throughput surrogate simulations of kHz stimulation, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal) (however do not create a separate `conda` environment for `cajal` - install all dependencies into `axonml`).
-
-## :rocket: Training a model
-
-By default, `axonml` trains approximations to the MRG[^2] myelinated fiber model. Check `axonml/models/README.md` for instructions on how to implement approximations of other fiber models. 
-
-Training configurations can be modified by changing the relevant values in `config.py`:
-
-|Variable|Description|
-|---|---|
-|`model`|Surrogate fiber model `class` to train. **Default: `axonml.models.SMF`**.|
-|`cuda`|Whether to use GPU. **Default: True if GPU is available, False otherwise**.|
-|`fp32`|Whether to use single-precision floating point arithmetic. If not, double precision is used. **Default: False**.|
-|`nodes`|Nodes of Ranvier per axon. **Default: 53**.|
-|`dt`|Simulation timestep [ms]. **Default: 0.005**.|
-|`train_dset`|Path to training dataset.|
-|`valid_dset`|Path to validation dataset.|
-|`states`|The state variables in the training / validations dataset(s) and the order in which they will be concatenated. Must agree with the order in which states are concatenated when recorded from the surrogate model. **Default: ['m', 'h', 'p', 's', 'v']**.|
-|`epochs`|Number of training epochs. **Default: 5**.|
-|`truncation_length`|Sequence length over which to perform truncated backpropagation through time. **Default: 50**.|
-|`lr`|Adam optimizer learning rate. **Default: $3\times10^{-5}$**.|
-|`grad_accumulation`|Whether to use gradient accumulation over disjoint chunks in truncated backpropagation through time. **Default: False**.|
-|`train_n_idx`|Total # training set batches to use per training epoch (see `./axonml/data/generate_data.py` - `n_batches`). **Default: 64**.|
-|`val_n_idx`| # validation set batches to use per round of validation. **Default: 8**.|
-|`train_chunk_size`| # training set batches to use per gradient-descent step. (Should be a factor of `train_n_idx`). **Default: 2**.|
-|`val_chunk_size`| # validation set batches to use per validation step. **Default: 8**.|
-|`sampling`|Whether to downsample training set in time, and by how much (sample every `sampling` timesteps). **Default: None**.|
-|`postfix`|List of model parameters to display in progressbar as training progresses. **Default: None**.|
-|`save_every`|Save model parameters every `save_every` minibatch iterations. **Default: 32**.|
-|`save_dir`|Location into which to save model parameters. **Default: `./checkpoints/`**.|
-
-Once you've set variables appropriately in `config.py`, you can initiate training:
-
-```bash
-(base) foo@bar : ~ $ cd /path/to/cloned/repository
-(base) foo@bar : /path/to/cloned/repository $ conda activate axonml
-(axonml) foo@bar : /path/to/cloned/repository $ python train.py
-```
+> The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, run the data generation script, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal) (however do not create a separate `conda` environment for `cajal` - install all dependencies into `axonml`).
 
 ## 🗄️ Loading a model
 Trained `axonml.models.Axon` models can be loaded using the `load` method. We have included a trained version of the MRG fiber (the 'surrogate myelinated fiber', S-MF, pronounced 'smurf'):

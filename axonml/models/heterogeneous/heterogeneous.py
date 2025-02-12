@@ -7,9 +7,10 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from axonml.models.stim.intrastim import IntraStim
-from ..backend import Backend as A
-from ..callbacks import CallbackList, Callback
-from ..core import Axon
+from axonml.models.backend import Backend as A
+from axonml.models.callbacks import CallbackList, Callback
+from axonml.models.core import Axon
+from axonml.helpers import ve_from_s_t
 
 
 class Heterogeneous(Axon):
@@ -48,7 +49,8 @@ class Heterogeneous(Axon):
 
     def ra_(self, inter_node_diam, inter_node_length) -> torch.Tensor:
         radii = inter_node_diam / 20000  # radius in cm
-        return (self.rhoa * inter_node_length) / (torch.pi * (radii**2))
+        inl = inter_node_length / 10000  # um -> cm
+        return (self.rhoa * inl) / (torch.pi * (radii**2))
 
     def area_(self, diameters, node_l) -> torch.Tensor:
         dx = node_l / 10000  # um -> cm
@@ -132,7 +134,7 @@ class Heterogeneous(Axon):
 
         with torch.set_grad_enabled(self.training):
             if ve is None and not intra_only:
-                ve = self.ve_from_s_t(space, time, multicontact)
+                ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
 
             ve = 2 * ve
 
@@ -219,11 +221,11 @@ class Heterogeneous(Axon):
 
     @torch.jit.script_method
     def ssd_df(self, v_c, v_p, v_e, phi_l, phi_r):
-        v_c_p = F.pad(v_c, (1, 1), "reflect")
+        v_c_p = 2 * F.pad(v_c, (1, 1), "reflect")
         v_e_p = F.pad(v_e, (1, 1), "reflect")
 
-        l = (2 * v_c_p[:, :, :-2] - v_p + v_e_p[:, :, :-2] - v_e) * phi_l
-        r = (2 * v_c_p[:, :, 2:] - v_p + v_e_p[:, :, 2:] - v_e) * phi_r
+        l = (v_c_p[:, :, :-2] - v_p + v_e_p[:, :, :-2] - v_e) * phi_l
+        r = (v_c_p[:, :, 2:] - v_p + v_e_p[:, :, 2:] - v_e) * phi_r
 
         return l + r
 
@@ -231,7 +233,6 @@ class Heterogeneous(Axon):
     def step_no_intra_df(
         self, v, v_prev, ve, area, s, phi_l, phi_r, phi_sum, dt, temp
     ) -> Tuple[Tensor, Tensor]:
-
         # Calculate the ionic current
         i_ion = self.mech.i(v_prev, v) * area
 
@@ -252,7 +253,6 @@ class Heterogeneous(Axon):
     def step_intra_df(
         self, v, v_prev, ve, area, s, phi_l, phi_r, phi_sum, dt, temp, intra
     ) -> Tuple[Tensor, Tensor]:
-
         # Calculate the ionic current
         i_ion = self.mech.i(v_prev, v) * area - intra
 

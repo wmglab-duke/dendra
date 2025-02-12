@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from axonml.models.instruments.thresholder import Thresholder
+from axonml.models.callbacks import Active
 from axonml.models.implementations import SMF
 
 
@@ -64,8 +65,10 @@ if __name__ == "__main__":
     if args.cuda:
         mrg = mrg.cuda()
 
-    thresholder = Thresholder(mrg, fp, diams).float()
-    thresh, _ = thresholder.calculate_thresholds()
+    dt = 0.005
+    active = Active(dt=dt)
+    thresholder = Thresholder(mrg, active, bases=fp, diams=diams).float()
+    thresh, _ = thresholder.calculate_thresholds(dt=dt)
 
     err = 100 * (thresh - thresh_nrn) / thresh_nrn
 

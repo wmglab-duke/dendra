@@ -10,14 +10,16 @@ from tqdm.auto import tqdm
 
 from axonml.models.stim.intrastim import IntraStim
 
-from .callbacks import CallbackList, Callback
-from .backend import Backend as A
-from .mixins import Parameterized
-from .mechanisms.core import Mechanism, validate
-from .mechanisms.declarations import PARAMETER
-from .mechanisms.handler.handler import build_handler
-from .mechanisms.handler.ions import build_ion
-from .mechanisms.mech_compiler import compile_mechanism
+from axonml.models.callbacks import CallbackList, Callback
+from axonml.models.backend import Backend as A
+from axonml.models.mixins import Parameterized
+from axonml.models.mechanisms.core import Mechanism, validate
+from axonml.models.mechanisms.declarations import PARAMETER
+from axonml.models.mechanisms.handler.handler import build_handler
+from axonml.models.mechanisms.handler.ions import build_ion
+from axonml.models.mechanisms.mech_compiler import compile_mechanism
+
+from axonml.helpers import op_mc, op_sc, ve_from_s_t
 
 
 def get_unique_keys(list_of_dicts):
@@ -278,7 +280,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def dtype(self):
         return self.ssd.weight.dtype
 
-    def insert(self, mechanism: Mechanism, ic=None, **kwargs):
+    def insert(
+        self,
+        mechanism: Mechanism,
+        ic: Dict[str, float] = None,
+        mask_out: str | int = None,
+        mask_in: str | int = None,
+        **kwargs,
+    ):
         """
         Inserts a mechanism into the model.
 
@@ -287,7 +296,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         Args:
             mechanism (Mechanism): The mechanism to be inserted into the model.
-            ic (optional): Initial conditions for the mechanism.
+            ic (optional, Dict[str:float]): Initial conditions for the mechanism.
+            mask (optional): Compartments for which the mechanism will not be included in current calculation. NumPy / Pytorch slice syntax.
             **kwargs: Additional keyword arguments to be passed to the compile_mechanism function.
 
         Returns:
@@ -306,6 +316,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ic=ic,
             df=df,
             pade=self.pade,
+            mask_out=mask_out,
+            mask_in=mask_in,
             **kwargs,
         )
 
@@ -478,7 +490,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         with torch.set_grad_enabled(self.training):
             if ve is None and not intra_only:
-                ve = self.ve_from_s_t(space, time, multicontact)
+                ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
 
             if self.training:
                 self.calculate_geometric_params()
@@ -573,21 +585,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             if not longrunning:
                 if progressbar:
                     progressbar.close()
-
-    def ve_from_s_t(self, ve_s, ve_t, multicontact=False):
-        ve_s = torch.as_tensor(ve_s, device=self.device())
-        ve_t = torch.as_tensor(ve_t, device=self.device())
-
-        if multicontact:
-            ve_s = ve_s.expand(-1, self.n_ax, -1)
-            ve_t = ve_t.expand(-1, self.n_ax, -1)
-            einsum = op_mc
-        else:
-            ve_s = ve_s.expand(self.n_ax, -1)
-            ve_t = ve_t.expand(self.n_ax, -1)
-            einsum = op_sc
-
-        return einsum(ve_s, ve_t)
 
     def longrun(
         self,
@@ -692,7 +689,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def step_no_intra_rk2(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
-
         K1 = self.FRK(v, ve, area, cm, ra)
         K2 = self.FRK(v + K1 * dt, ve, area, cm, ra)
         self.mech.advance(v, dt, temp)
@@ -702,7 +698,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def step_intra_rk2(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
-
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         K2 = self.FRK_intra(v + K1 * dt, ve, area, cm, ra, intra)
         self.mech.advance(v, dt, temp)
@@ -712,7 +707,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def step_no_intra_rk4(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
-
         # -- update vm --
         K1 = self.FRK(v, ve, area, cm, ra)
         K2 = self.FRK(v + (dt / 2) * K1, ve, area, cm, ra)
@@ -737,7 +731,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         temp,
         intra,
     ) -> Tensor:
-
         # -- update vm --
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         K2 = self.FRK_intra(v + (dt / 2) * K1, ve, area, cm, ra, intra)
@@ -754,7 +747,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def step_no_intra_df(
         self, v, v_prev, ve, area, s, s2, dt, temp
     ) -> Tuple[Tensor, Tensor]:
-
         # -- 2nd diff --
         x = torch.cat([v, v_prev, ve], dim=1)
         d2v = self.ssd(x)
@@ -774,7 +766,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def step_intra_df(
         self, v, v_prev, ve, area, s, s2, dt, temp, intra
     ) -> Tuple[Tensor, Tensor]:
-
         # -- 2nd diff --
         x = torch.cat([v, v_prev, ve], dim=1)
         d2v = self.ssd(x)
@@ -863,6 +854,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def double(self):
         super().double()
+        self.mech.set_buffers(self.diam)
+        return self
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
         self.mech.set_buffers(self.diam)
         return self
 
@@ -980,13 +976,3 @@ class Myelinated(Axon):
         steps = self.n_node
         t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(-1)
         return ((1 - t) * start + t * end).T
-
-
-@torch.jit.script
-def op_mc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("can,cat->tan", s, t).unsqueeze(2)
-
-
-@torch.jit.script
-def op_sc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("an,at->tan", s, t).unsqueeze(2)
