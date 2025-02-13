@@ -7,6 +7,8 @@ import torch
 import linecache
 import textwrap
 
+from axonml.helpers import DEBUG, DFITOT
+
 
 def indent(text, level=0):
     return textwrap.indent(text, " " * (4 * level))
@@ -308,6 +310,7 @@ def breakpoint(mechanisms):
 
 
 def tot_currents(currents, df=False):
+    if not DFITOT: return ""
     result = []
     for key, value in currents.items():
         result.append(parse_dictionary_to_sum(value, key, df))
@@ -363,6 +366,8 @@ def build_handler(
         mech_detach=mech_detach(mechanisms),
         ion_detach=ion_detach(ions),
     )
+
+    if DEBUG > 0: print(forward_str)
 
     filename = f"<{randomword(10)}_template>"
     code = compile(forward_str, filename, "exec")

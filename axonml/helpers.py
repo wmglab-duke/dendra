@@ -10,7 +10,7 @@ def getenv(key: str, default=0):
     return type(default)(os.getenv(key, default))
 
 
-class Context(contextlib.ContextDecorator):
+class ctx(contextlib.ContextDecorator):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
@@ -55,6 +55,7 @@ class ContextVar:
 
 DEBUG = ContextVar("DEBUG", 0)
 TF32 = ContextVar("TF32", 0)
+DFITOT = ContextVar("DFITOT", 1)
 
 
 # --- pytorch functions --

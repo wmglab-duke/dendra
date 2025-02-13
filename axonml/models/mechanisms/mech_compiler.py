@@ -241,9 +241,9 @@ def mask_def(mask_out, mask_in):
         return ""
     ret = []
     if mask_out is not None:
-        ret.append(f"mask_out = torch.ones(1, 1, n_nodes)\nmask_[:, :, {mask_out}] = 0")
+        ret.append(f"mask_out = torch.ones(1, 1, n_nodes)\nmask_out[:, :, {mask_out}] = 0")
     if mask_in is not None:
-        ret.append(f"mask_in = torch.zeros(1, 1, n_nodes)\nmask_[:, :, {mask_in}] = 1")
+        ret.append(f"mask_in = torch.zeros(1, 1, n_nodes)\nmask_in[:, :, {mask_in}] = 1")
     if mask_out is not None and mask_in is not None:
         ret.append("mask = mask_out * mask_in")
     elif mask_out is not None:
