@@ -1,3 +1,4 @@
+import inspect
 from typing import Tuple, List, Optional
 
 import torch
@@ -268,3 +269,39 @@ class Heterogeneous(Axon):
         self.mech.advance(v, dt, temp)
 
         return v_new, v
+    
+    @classmethod
+    def from_geom(
+        cls,
+        node_d,
+        node_l,
+        inter_node_diam,
+        inter_node_length,
+        temp=None,
+        v_init=None,
+        method=None,
+        pade=None,
+    ):
+        if temp is None:
+            temp = cls._get_init_defaults()["temp"]
+        if v_init is None:
+            v_init = cls._get_init_defaults()["v_init"]
+        if method is None:
+            method = cls._get_init_defaults()["method"]
+        if pade is None:
+            pade = cls._get_init_defaults()["pade"]
+        n_ax = len(node_d)
+        n_node = len(node_d[0])
+        axon = cls(n_ax, n_node, temp, v_init, method, pade)
+        axon.set_all(node_d, inter_node_diam, node_l, inter_node_length)
+        return axon
+    
+    @classmethod
+    def _get_init_defaults(cls):
+        """Extract default values from __init__ signature."""
+        signature = inspect.signature(cls.__init__)
+        return {
+            k: v.default
+            for k, v in signature.parameters.items()
+            if v.default is not inspect.Parameter.empty and k != "self"
+        }
