@@ -19,7 +19,7 @@ from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
 
-from axonml.helpers import op_mc, op_sc, ve_from_s_t
+from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM
 
 
 def get_unique_keys(list_of_dicts):
@@ -101,7 +101,7 @@ class SymmetricConv1D(torch.nn.Conv1d):
 class Axon(Parameterized, torch.jit.ScriptModule):
     """Base 1D fiber class."""
 
-    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade", "is_df"]
+    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade", "is_df", "use_fast_imem"]
 
     def __init__(
         self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", pade=None
@@ -157,6 +157,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.post_initialize_hooks: List[Callable] = []
 
         self._caches = {}
+
+        self.use_fast_imem = bool(IMEM)
+        if self.use_fast_imem:
+            self.register_buffer("i_membrane", torch.zeros((self.n_ax, 1, n_node)))
 
         self.weight_choices = {
             "rk1": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
@@ -472,7 +476,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     "Either ve or ve_s and ve_t or intra must be provided."
                 )
             intra_only = True
-            ve_zero = torch.zeros_like(self.v)
+        ve_zero = torch.zeros_like(self.v)
 
         device = self.device()
         if ve is not None:
@@ -533,13 +537,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     progressbar = tqdm(total=ve.shape[0], desc=f"{self.t:.3f} ms")
 
             for i in range(ve.shape[0]):
-                ve_ = ve[i] if not intra_only else ve_zero
+                ve_c = ve[i] if not intra_only else ve_zero
                 if df:
                     if with_intra:
                         self.v, self.v_prev = method_intra(
                             self.v,
                             self.v_prev,
-                            ve_,
+                            ve_c,
                             self.area_c,
                             s,
                             s2,
@@ -551,7 +555,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                         self.v, self.v_prev = method(
                             self.v,
                             self.v_prev,
-                            ve_,
+                            ve_c,
                             self.area_c,
                             s,
                             s2,
@@ -562,7 +566,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     if with_intra:
                         self.v = method_intra(
                             self.v,
-                            ve_,
+                            ve_c,
                             self.area_c,
                             cm_inv,
                             ra_inv,
@@ -572,7 +576,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                         )
                     else:
                         self.v = method(
-                            self.v, ve_, self.area_c, cm_inv, ra_inv, dt, self.temp_c
+                            self.v, ve_c, self.area_c, cm_inv, ra_inv, dt, self.temp_c
                         )
                 callbacks.post_step_hook(self)
                 self.t_ind += 1
@@ -677,33 +681,43 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def step_no_intra_rk1(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
         K1 = self.FRK(v, ve, area, cm, ra)
         self.mech.advance(v, dt, temp)
-        v = v + K1 * dt
-        return v
+        v_n = v + K1 * dt
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_intra_rk1(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         self.mech.advance(v, dt, temp)
-        v = v + K1 * dt
-        return v
+        v_n = v + K1 * dt
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_no_intra_rk2(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
         K1 = self.FRK(v, ve, area, cm, ra)
         K2 = self.FRK(v + K1 * dt, ve, area, cm, ra)
         self.mech.advance(v, dt, temp)
-        v = v + (K1 + K2) * (dt / 2)
-
-        return v
+        v_n = v + (K1 + K2) * (dt / 2)
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_intra_rk2(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         K2 = self.FRK_intra(v + K1 * dt, ve, area, cm, ra, intra)
         self.mech.advance(v, dt, temp)
-        v = v + (K1 + K2) * (dt / 2)
-
-        return v
+        v_n = v + (K1 + K2) * (dt / 2)
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_no_intra_rk4(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
@@ -715,9 +729,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.mech.advance(v, dt, temp)
 
-        v = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
-
-        return v
+        v_n = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_intra_rk4(
@@ -739,9 +755,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.mech.advance(v, dt, temp)
 
-        v = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
-
-        return v
+        v_n = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_no_intra_df(
@@ -759,6 +777,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
+
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
+            self.i_membrane[:] = i_cap + self.mech.imem * area
 
         return v_new, v
 
@@ -778,6 +800,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
+
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
+            self.i_membrane[:] = i_cap + self.mech.imem
 
         return v_new, v
 

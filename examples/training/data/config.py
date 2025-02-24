@@ -14,7 +14,7 @@ n_node_record = 53
 n_contacts = 6
 
 # datagenerator metadata
-round = 0  # round of data collection
+data_collection_round = 0
 
 # datagenerator params
 diameter = 5.7

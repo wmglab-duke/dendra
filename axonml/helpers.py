@@ -56,7 +56,7 @@ class ContextVar:
 DEBUG = ContextVar("DEBUG", 0)
 TF32 = ContextVar("TF32", 0)
 DFITOT = ContextVar("DFITOT", 1)
-
+IMEM = ContextVar("IMEM", 0)
 
 # --- pytorch functions --
 

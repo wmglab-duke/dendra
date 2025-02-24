@@ -32,7 +32,7 @@ parser.add_argument(
     "--axons_per_minibatch", type=int, default=config.axons_per_minibatch
 )
 
-parser.add_argument("--round", type=int, default=config.round)
+parser.add_argument("--round", type=int, default=config.data_collection_round)
 parser.add_argument("--mode", type=str, default="w")
 parser.add_argument("--record_v", default=config.record_v, action="store_true")
 parser.add_argument("--record_e", default=config.record_e, action="store_true")

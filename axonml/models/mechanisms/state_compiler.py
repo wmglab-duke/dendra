@@ -369,7 +369,7 @@ def compile_state(s, temp, diameters, pade=None, **kwargs):
         initial_f=translate_initial(s),
     )
 
-    if DEBUG > 0: print(forward_str)
+    if DEBUG >= 3: print(forward_str)
 
     filename = f"<{state_name}_{randomword(5)}_template>"
     code = compile(forward_str, filename, "exec")
@@ -423,7 +423,7 @@ def compile_coupled_state(s, temp, diameters, pade=None, **kwargs):
         helpers=collect_helper_functions(s),
     )
 
-    if DEBUG > 0: print(forward_str)
+    if DEBUG >= 3: print(DEBUG.value, forward_str)
 
     filename = f"<{randomword(7)}_template>"
     code = compile(forward_str, filename, "exec")

@@ -74,6 +74,8 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
         else:
             final_expr = parse_expr(line_no_self)
 
+    if DEBUG >= 1: print(f"Final expression in mech factorization: {final_expr}")
+
     if final_expr is None:
         raise ValueError("No final expression or return statement found.")
 
@@ -710,7 +712,7 @@ def compile_mechanism(
         mask_def=indent(mask_def(mask_out, mask_in), 2),
     )
 
-    if DEBUG > 0: print(forward_str)
+    if DEBUG >= 2: print(DEBUG.value, forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")

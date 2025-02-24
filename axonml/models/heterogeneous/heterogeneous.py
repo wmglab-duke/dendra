@@ -245,7 +245,7 @@ class Heterogeneous(Axon):
         # Calculate the total current
         self.mech.itot(v)
 
-        # Advance the mechanism
+        # Advance the mech state
         self.mech.advance(v, dt, temp)
 
         return v_new, v
@@ -265,11 +265,11 @@ class Heterogeneous(Axon):
         # Calculate the total current
         self.mech.itot(v)
 
-        # Advance the mechanism
+        # Advance the mech state
         self.mech.advance(v, dt, temp)
 
         return v_new, v
-    
+
     @classmethod
     def from_geom(
         cls,
@@ -295,7 +295,7 @@ class Heterogeneous(Axon):
         axon = cls(n_ax, n_node, temp, v_init, method, pade)
         axon.set_all(node_d, inter_node_diam, node_l, inter_node_length)
         return axon
-    
+
     @classmethod
     def _get_init_defaults(cls):
         """Extract default values from __init__ signature."""
