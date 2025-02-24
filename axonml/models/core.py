@@ -101,10 +101,10 @@ class SymmetricConv1D(torch.nn.Conv1d):
 class Axon(Parameterized, torch.jit.ScriptModule):
     """Base 1D fiber class."""
 
-    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade", "is_df", "use_fast_imem"]
+    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade", "is_df", "use_fast_imem", "hd"]
 
     def __init__(
-        self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", pade=None
+        self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", pade=None, beta=0.0
     ):
         super().__init__()
 
@@ -161,6 +161,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.use_fast_imem = bool(IMEM)
         if self.use_fast_imem:
             self.register_buffer("i_membrane", torch.zeros((self.n_ax, 1, n_node)))
+
+        self.beta = beta
+        self.hd = bool(beta) # hyper-diffusion
+        if self.hd:
+            self.filter = torch.nn.Conv1d(1, 1, 5, padding=2, bias=False, padding_mode="reflect")
+            self.filter.weight.data = torch.tensor([-1, 4, -6, 4, -1], dtype=torch.float).reshape(1, 1, 5)
+            for p in self.filter.parameters():
+                p.requires_grad = False
 
         self.weight_choices = {
             "rk1": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
@@ -782,6 +790,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
             self.i_membrane[:] = i_cap + self.mech.imem * area
 
+        if self.hd:
+            v_new = v_new - self.beta * self.filter(v_new)
+
         return v_new, v
 
     @torch.jit.script_method
@@ -804,6 +815,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if self.use_fast_imem:
             i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
             self.i_membrane[:] = i_cap + self.mech.imem
+
+        if self.hd:
+            v_new = v_new - self.beta * self.filter(v_new)
 
         return v_new, v
 

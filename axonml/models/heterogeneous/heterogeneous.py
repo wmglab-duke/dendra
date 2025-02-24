@@ -23,13 +23,14 @@ class Heterogeneous(Axon):
         v_init=-70.0,
         method="dufort-frankel",
         pade=None,
+        beta=0.0,
     ):
         if method not in {"dufort-frankel", "df"}:
             raise ValueError(
                 f"Method {method} is not supported for heterogeneous axons."
             )
         diameters = torch.ones(n_ax)
-        super().__init__(diameters, n_node, temp, v_init, method, pade)
+        super().__init__(diameters, n_node, temp, v_init, method, pade, beta)
 
     def _register_buffers(self, diameters):
         self.register_buffer("diam", torch.empty(self.n_ax, 1, self.n_node))
@@ -248,6 +249,13 @@ class Heterogeneous(Axon):
         # Advance the mech state
         self.mech.advance(v, dt, temp)
 
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+
+        if self.hd:
+            v_new = v_new - self.beta * self.filter(v_new)
+
         return v_new, v
 
     @torch.jit.script_method
@@ -267,6 +275,13 @@ class Heterogeneous(Axon):
 
         # Advance the mech state
         self.mech.advance(v, dt, temp)
+
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+
+        if self.hd:
+            v_new = v_new - self.beta * self.filter(v_new)
 
         return v_new, v
 

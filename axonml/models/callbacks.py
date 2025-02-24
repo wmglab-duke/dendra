@@ -96,16 +96,19 @@ impl_template = """
         self.rec['{full_state}'].append(states)
 """
 
-v_template = """
-    states = model.v
+m_template = """
+    states = model.{val}
     if self.max_only:
-      self.rec['v'].append(torch.amax(states, -1))
+      self.rec['{val}'].append(torch.amax(states, -1))
     else:
       if self.node_indices is not None:
-        self.rec['v'].append(atleast_3d(states[:, :, self.node_indices]))
+        self.rec['{val}'].append(atleast_3d(states[:, :, self.node_indices]))
       else:
-        self.rec['v'].append(states)
+        self.rec['{val}'].append(states)
 """
+
+def is_state(s):
+    return '.' in s
 
 
 def parse_template(full_state):
@@ -116,8 +119,8 @@ def parse_template(full_state):
 def build_recorder_func(states):
     res = []
     for s in states:
-        if s == "v":
-            res.append(v_template)
+        if not is_state(s):
+            res.append(m_template.format(val=s))
         else:
             res.append(parse_template(s))
     impl = "".join(res)
