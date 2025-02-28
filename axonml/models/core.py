@@ -436,7 +436,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         raise NotImplementedError()
 
     def cm_(self, area):
-        return self.cm * area
+        return (self.cm / 1e3) * area
 
     def init_v(self):
         self.v[:] = self.v_init
@@ -936,7 +936,7 @@ def match_state_dict(
 
 
 class Unmyelinated(Axon):
-    PARAMETER(cm=1e-3, rhoa=35.4)
+    PARAMETER(cm=1.0, rhoa=35.4)
 
     def __init__(
         self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1", pade=None
@@ -980,7 +980,7 @@ class Myelinated(Axon):
             "deltax3": 0.0,
         },
         membrane={
-            "cm": 1e-3,
+            "cm": 1.0,
             "rhoa": 35.4,  # ohm-cm
         },
     )

@@ -23,7 +23,7 @@ import math
 
 
 class Schild97(Unmyelinated):
-    PARAMETER(cm=1.326291192e-3, rhoa=100.0)
+    PARAMETER(cm=1.326291192, rhoa=100.0)
 
     def __init__(
         self,
@@ -72,7 +72,7 @@ class Schild97(Unmyelinated):
 
 
 class Schild94(Unmyelinated):
-    PARAMETER(cm=1.326291192e-3, rhoa=100.0)
+    PARAMETER(cm=1.326291192, rhoa=100.0)
 
     def __init__(
         self,

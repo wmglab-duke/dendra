@@ -60,3 +60,6 @@ class SMF(Myelinated):
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         v = v + K1 * dt
         return v
+    
+    def cm_(self, area):
+        return self.cm * area

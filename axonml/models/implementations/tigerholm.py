@@ -17,7 +17,7 @@ from ..mechanisms import PARAMETER, c_context
 
 
 class Tigerholm(Unmyelinated):
-    PARAMETER(cm=1e-3, rhoa=35.4)
+    PARAMETER(cm=1.0, rhoa=35.4)
 
     def __init__(
         self,

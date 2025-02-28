@@ -4,7 +4,7 @@ from ..mechanisms import PARAMETER, c_context as C
 
 
 class FHM(Myelinated):
-    PARAMETER(inherit=Myelinated, node_l=2.5, membrane={"cm": 2e-3, "rhoa": 110.0})
+    PARAMETER(inherit=Myelinated, node_l=2.5, membrane={"cm": 2.0, "rhoa": 110.0})
 
     def __init__(
         self,
@@ -27,7 +27,7 @@ SENN = FHM
 class FHUM(Unmyelinated):
     PARAMETER(
         inherit=Unmyelinated,
-        cm=2e-3,
+        cm=2.0,
     )
 
     def __init__(
