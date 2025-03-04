@@ -465,6 +465,42 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         multicontact: bool = False,
         longrunning: bool = False,
     ):
+        """Runs the axon model simulation for the specified input and parameters.
+        
+        This method performs the numerical integration of the cable equation to simulate
+        the axon's response to extracellular and/or intracellular stimulation. It can use
+        different numerical methods (Euler/RK1, Heun/RK2, RK4, or Dufort-Frankel) as 
+        specified during model initialization.
+        
+        Args:
+            ve: Optional tensor of extracellular voltage. Shape should be 
+                [timesteps, n_ax, 1, n_node] or compatible.
+            space: Optional tensor for spatial components when ve is not directly provided.
+                Used with time to construct ve.
+            time: Optional tensor for temporal components when ve is not directly provided.
+                Used with space to construct ve.
+            dt: Time step size in milliseconds. If None, uses the default from backend.
+            intra: Optional intracellular stimulation object. Must be an instance of IntraStim.
+            callbacks: List of callback objects to execute during simulation steps.
+            reinit: If True, reinitialize the model state before running. If steady state is
+                cached, it will be restored instead of initializing from scratch.
+            progressbar: If True, displays a progress bar during simulation. Can also be a
+                tqdm instance for custom progress tracking.
+            first: If True, indicates this is the first run in a sequence, triggering
+                pre-loop hooks for callbacks.
+            multicontact: If True, handles multiple electrode contacts for ve construction.
+            longrunning: If True, indicates this run is part of a longer simulation sequence,
+                affecting progress bar behavior.
+        
+        Raises:
+            ValueError: If neither ve nor (space and time) nor intra is provided.
+            ValueError: If intra is provided but is not an instance of IntraStim.
+        
+        Note:
+            The simulation updates the model's internal state (v, v_prev for DF method, etc.)
+            and advances the model's time index (t_ind).
+        """
+        
         with_intra = intra is not None
         if with_intra:
             if not isinstance(intra, IntraStim):
@@ -602,6 +638,32 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         progressbar=True,
         multicontact=False,
     ):
+        """Runs a long simulation by splitting it into multiple chunks.
+        
+        This method handles large-scale simulations by dividing the temporal component
+        into smaller chunks and running them sequentially. This approach helps manage
+        memory usage for very long simulations, as it avoids creating a single large
+        extracellular voltage tensor.
+        
+        Args:
+            space: Tensor for spatial components of extracellular voltage. Shape should be
+                [n_ax, n_node] or [1, n_node] or [n_contacts, ...] for multicontact mode.
+            time: Tensor for temporal components of extracellular voltage. Shape should be
+                [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, ...] for multicontact mode.
+            n_chunks: Number of chunks to split the temporal component into.
+            dt: Time step size in milliseconds. If None, uses the default from backend.
+            reinit: If True, reinitialize the model state before running the first chunk.
+                Subsequent chunks will not reinitialize.
+            callbacks: List of callback objects to execute during simulation steps.
+            progressbar: If True, displays a progress bar during simulation.
+            multicontact: If True, handles multiple electrode contacts for ve construction.
+        
+        Note:
+            This method uses the same numerical methods as the `run` method, but manages
+            memory more efficiently for long simulations by processing the data in chunks.
+            The state of the model (v, v_prev, etc.) is preserved between chunks.
+        """
+        
         ve_s = torch.as_tensor(space, device=self.device())
         ve_t = torch.as_tensor(time, device=self.device())
 

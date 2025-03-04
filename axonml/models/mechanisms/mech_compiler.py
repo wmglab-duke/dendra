@@ -1,16 +1,13 @@
-from typing import Dict, List
+from functools import partial
+from typing import List
 import inspect
 import linecache
-import textwrap
 import ast
 import re
-import math
-
 import warnings
-from sympy import symbols, sympify, Poly, expand, factor
-
 
 import torch
+from sympy import symbols, sympify, Poly, expand, factor
 
 from .compile_f import convert_func
 from .core import Mechanism, coupled
@@ -20,12 +17,13 @@ from axonml import const
 
 from .handler.defaults import valid_concentrations
 from .state_compiler import compile_state, compile_coupled_state
+from .utils import load, indent, get_function_body_as_str
 
 from axonml.helpers import DEBUG
 
 
-def indent(text, level=0):
-    return textwrap.indent(text, " " * (4 * level))
+# utility functions
+load = partial(load, cls=Mechanism)
 
 
 def replace_v(code_str):
@@ -238,7 +236,7 @@ self.{name} = self.{name}_d._sample(self.{name})
 """
 
 
-def mask_def(mask_out, mask_in):
+def define_mask(mask_out, mask_in):
     if mask_out is None and mask_in is None:
         return ""
     ret = []
@@ -256,7 +254,7 @@ def mask_def(mask_out, mask_in):
     return "\n".join(ret)
 
 
-def detach(states):
+def define_detach(states):
     assignments = []
     for k in states:
         if not k.coupled:
@@ -268,14 +266,7 @@ def detach(states):
     return "\n".join(assignments)
 
 
-def init_distribution_buffers(distributions):
-    assignments = []
-    for k, _ in distributions.items():
-        assignments.append(distribution_init_template.format(name=k))
-    return "\n".join(assignments)
-
-
-def coupled_infs(mechanism, states):
+def define_coupled_infs(mechanism, states):
     assignments = []
     for k in states:
         if k.coupled:
@@ -288,6 +279,13 @@ def coupled_infs(mechanism, states):
                         assignments.append(
                             indent(mech_inf_template.format(state=name), 1)
                         )
+    return "\n".join(assignments)
+
+
+def init_distribution_buffers(distributions):
+    assignments = []
+    for k, _ in distributions.items():
+        assignments.append(distribution_init_template.format(name=k))
     return "\n".join(assignments)
 
 
@@ -539,20 +537,6 @@ def gtot(currents, mechanism, df):
     return f"    def gtot(self): return {s}", has_gtot
 
 
-def load(m, attr):
-    try:
-        return getattr(m, attr)
-    except AttributeError:
-        return getattr(Mechanism, attr)
-
-
-def get_function_body_as_str(func):
-    source_lines = inspect.getsourcelines(func)[0]  # Get source code as lines
-    body_lines = source_lines[1:]  # Skip the first line (def line)
-    body = "".join(body_lines)  # Combine into a single string
-    return body
-
-
 default_f = """
     def {fname}(self, v):
 {ret}
@@ -707,14 +691,14 @@ def compile_mechanism(
         breakpoint_f=translate_f(mechanism, "breakpoint"),
         initial_f=translate_f(mechanism, "initial"),
         gtot=gtot_str,
-        coupled_infs=coupled_infs(mechanism, states_compiled),
+        coupled_infs=define_coupled_infs(mechanism, states_compiled),
         distribution_buffer_assignments=distribution_buffer_assignments_str,
         init_distribution_buffers=init_distribution_buffers_str,
-        detach=indent(detach(states_compiled), 2),
-        mask_def=indent(mask_def(mask_out, mask_in), 2),
+        detach=indent(define_detach(states_compiled), 2),
+        mask_def=indent(define_mask(mask_out, mask_in), 2),
     )
 
-    if DEBUG >= 2: print(DEBUG.value, forward_str)
+    if DEBUG >= 2: print(forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
