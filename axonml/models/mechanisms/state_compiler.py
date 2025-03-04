@@ -17,6 +17,11 @@ import re
 from .ops import *
 from axonml import const
 from axonml.helpers import DEBUG
+from axonml.models.math.diffusion import diffuse_step_neumann_dct1
+
+
+# PyTorch operations
+torch_operations = set(dir(torch))
 
 
 def extract_vars(f, exclude):
@@ -36,9 +41,6 @@ def replace(input_string, replace_list):
     return input_string
 
 
-torch_operations = set(dir(torch))
-
-
 # Function to modify the input string
 def modify_operations(input_string):
     # Regular expression to find function names and calls
@@ -56,9 +58,29 @@ def modify_operations(input_string):
     return modified_string
 
 
-def convert(deriv, state, assigned, use_pade_approx=False):
+def diffusion_expr(state, D, method, L):
+    dt_str = "dt"
+    if method == 'strang':
+        dt_str = "dt / 2"
+    return f"{state} = diffuse_step_neumann_dct1({state}, {dt_str}, {D}, {L})"
+
+
+def add_diffusion(f, state, diffusion, model):
+    L = model.dx * (model.n_node - 1)
+    D, method = diffusion
+    diff = diffusion_expr(state, D, method, L)
+    f = f"{diff} ; {f}"
+    if method == "strang":
+        f = f"{f} ; {diff}"
+    return f
+
+
+def convert(deriv, state, assigned, use_pade_approx=False, diffusion=None, model=None):
     v = extract_vars(deriv, set([state]) | assigned)
     f = integrate2c(deriv, "dt", v, use_pade_approx=use_pade_approx)
+    if diffusion is not None:
+        f = add_diffusion(f, state, diffusion, model)
+    if DEBUG: print(f)
     return modify_operations(replace(f, v))
 
 
@@ -333,7 +355,10 @@ def integrate_args(assigned):
     return ", " + ", ".join(assigned)
 
 
-def compile_state(s, temp, diameters, pade=None, **kwargs):
+def compile_state(s, model, pade=None, **kwargs):
+    temp = model.temp
+    diameters = model.diam
+
     state_name = s.__name__
     params = load(s, "_params")
     assigned = load(s, "_assigned")
@@ -341,6 +366,7 @@ def compile_state(s, temp, diameters, pade=None, **kwargs):
     is_q10 = load(s, "is_q10")
     derivative = load(s, "_derivative")
     buffers = load(s, "_buffers")
+    diffusion = load(s, "_diffusion")
 
     if derivative is None:
         raise ValueError("Must specify derivative function")
@@ -351,7 +377,7 @@ def compile_state(s, temp, diameters, pade=None, **kwargs):
     pade_approx = pade if pade is not None else derivative[1]
 
     integrate_f = convert(
-        derivative[0], state_name, assigned, use_pade_approx=pade_approx
+        derivative[0], state_name, assigned, use_pade_approx=pade_approx, diffusion=diffusion, model=model
     )
 
     forward_str = template.format(

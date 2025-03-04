@@ -317,17 +317,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         """
         validate(mechanism)
 
-        df = self.is_df
-
         m, unfactorable, has_gtot = compile_mechanism(
             mechanism,
-            self.temp,
-            self.diam,
-            self.n_ax,
-            self.n_node,
+            self,
             ic=ic,
-            df=df,
-            pade=self.pade,
             mask_out=mask_out,
             mask_in=mask_in,
             **kwargs,

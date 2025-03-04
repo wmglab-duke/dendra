@@ -4,7 +4,7 @@ from ..mechanisms import PARAMETER
 
 
 class Sweeney(Myelinated):
-    PARAMETER(inherit=Myelinated, node_l=1.5, membrane={"cm": 2.5e-3, "rhoa": 54.7})
+    PARAMETER(inherit=Myelinated, node_l=1.5, membrane={"cm": 2.5, "rhoa": 54.7})
 
     def __init__(
         self,

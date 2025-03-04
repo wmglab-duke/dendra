@@ -9,6 +9,7 @@ from .declarations import (
     RANGE,
     ASSIGNED,
     BUFFERS,
+    DIFFUSION,
 )
 from .core import Mechanism, State
 from .handler.ions import USEION
@@ -29,6 +30,7 @@ __all__ = [
     "RANGE",
     "ASSIGNED",
     "BUFFERS",
+    "DIFFUSION",
     "c_context",
     "e_context",
 ]

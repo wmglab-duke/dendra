@@ -616,17 +616,19 @@ def distribution_buffers(distributions):
 
 def compile_mechanism(
     mechanism,
-    temp,
-    diameters,
-    n_ax,
-    n_nodes,
-    df=False,
+    model,
     ic=None,
-    pade=None,
     mask_out=None,
     mask_in=None,
     **kwargs,
 ):
+    temp = model.temp
+    diameters = model.diam
+    n_ax = model.n_ax
+    n_nodes = model.n_node
+    df = model.is_df
+    pade = model.pade
+
     states = mechanism._states
 
     params = load(mechanism, "_params")
@@ -652,11 +654,11 @@ def compile_mechanism(
     for s in states:
         if coupled(s):
             states_compiled.append(
-                compile_coupled_state(s, temp, diameters, pade=pade, **kwargs)
+                compile_coupled_state(s, model, pade=pade, **kwargs)
             )
         else:
             states_compiled.append(
-                compile_state(s, temp, diameters, pade=pade, **kwargs)
+                compile_state(s, model, pade=pade, **kwargs)
             )
 
     state_buffer_assignments_str = state_buffer_assignments(states_compiled)

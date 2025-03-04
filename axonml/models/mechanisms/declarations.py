@@ -65,3 +65,12 @@ def DERIVATIVE(f, pade=False):
     frame = sys._getframe(1)
     namespace = frame.f_locals
     namespace["_derivative"] = (f, pade)
+
+
+def DIFFUSION(D, method='strang'):
+    if method not in {'strang', 'lie'}:
+        raise ValueError(f"Method must be one of 'strang' or 'lie', got {method}")
+    frame = sys._getframe(1)
+    namespace = frame.f_locals
+    namespace["_diffusion"] = (D, method)
+    

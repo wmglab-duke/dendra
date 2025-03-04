@@ -304,6 +304,20 @@ def hdf5_write(queue: Queue, path: str):
             queue.task_done()
 
 
+class LFP(Callback):
+    def __init__(self, v_unit):
+        super().__init__()
+        self.lfp = []
+        self.v_unit = v_unit
+
+    def pre_loop_hook(self, model):
+        self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
+        return super().pre_loop_hook(model)
+    
+    def post_step_hook(self, model):
+        self.lfp.append(torch.einsum("ij,ij->", model.i_membrane, self.v_unit))
+
+
 class ThresholdCallback(Callback):
     def __init__(self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None):
         super().__init__()
