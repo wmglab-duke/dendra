@@ -68,7 +68,6 @@ class Schild97(Unmyelinated):
             self.insert(nakpumpSchild)
             self.insert(naf97mean, gbar=0.022434928)
             self.insert(nas97mean, gbar=0.022434928)
-            self.build()
 
 
 class Schild94(Unmyelinated):
@@ -117,4 +116,3 @@ class Schild94(Unmyelinated):
             self.insert(nakpumpSchild)
             self.insert(naf)
             self.insert(nas)
-            self.build()

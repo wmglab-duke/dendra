@@ -4,6 +4,7 @@ from typing import List, Tuple
 import inspect
 import linecache
 import re
+import math
 
 import torch
 
@@ -614,7 +615,12 @@ def compile_state(s: State, model, pade=None, **kwargs) -> torch.nn.Module:
     pade_approx = pade if pade is not None else derivative[1]
 
     integrate_f = convert(
-        derivative[0], name, assigned, use_pade_approx=pade_approx, diffusion=diffusion, model=model
+        derivative[0], 
+        name, 
+        assigned, 
+        use_pade_approx=pade_approx, 
+        diffusion=diffusion, 
+        model=model
     )
 
     forward_str = template.format(

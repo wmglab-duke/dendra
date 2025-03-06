@@ -307,15 +307,23 @@ def hdf5_write(queue: Queue, path: str):
 class LFP(Callback):
     def __init__(self, v_unit):
         super().__init__()
-        self.lfp = []
+        self._lfp = []
         self.v_unit = v_unit
 
     def pre_loop_hook(self, model):
         self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
+        self._lfp.append(torch.einsum("ij,ij->", model.i_membrane.squeeze(), self.v_unit))
         return super().pre_loop_hook(model)
     
     def post_step_hook(self, model):
-        self.lfp.append(torch.einsum("ij,ij->", model.i_membrane, self.v_unit))
+        self._lfp.append(torch.einsum("ij,ij->", model.i_membrane.squeeze(), self.v_unit))
+
+    @property
+    def lfp(self):
+        return torch.stack(self._lfp)
+    
+    def numpy(self):
+        return self.lfp.detach().cpu().numpy()
 
 
 class ThresholdCallback(Callback):

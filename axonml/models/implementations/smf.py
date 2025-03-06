@@ -45,7 +45,6 @@ class SMF(Myelinated):
             raise ValueError(f"Method {method} is not supported.")
         super().__init__(diameters, n_node, temp, v_init, method, pade)
         self.insert(axnode_myel, ic=ic)
-        self.build()
 
     @torch.jit.script_method
     def step_no_intra_rk1(self, v, ve, area, cm, ra, dt, temp) -> torch.Tensor:

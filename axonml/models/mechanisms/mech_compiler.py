@@ -1,10 +1,11 @@
 from functools import partial
-from typing import List
+from typing import Dict, List
 import inspect
 import linecache
 import ast
 import re
 import warnings
+import math
 
 import torch
 from sympy import symbols, sympify, Poly, expand, factor
@@ -72,7 +73,7 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
         else:
             final_expr = parse_expr(line_no_self)
 
-    if DEBUG >= 1: print(f"Final expression in mech factorization: {final_expr}")
+    if DEBUG: print(f"Final expression in mech factorization: {final_expr}")
 
     if final_expr is None:
         raise ValueError("No final expression or return statement found.")
@@ -235,6 +236,7 @@ distribution_init_template = """
 self.{name} = self.{name}_d._sample(self.{name})
 """
 
+# ----------------- Definitions -----------------
 
 def define_mask(mask_out, mask_in):
     if mask_out is None and mask_in is None:
@@ -281,6 +283,7 @@ def define_coupled_infs(mechanism, states):
                         )
     return "\n".join(assignments)
 
+# ----------------- Initializations -----------------
 
 def init_distribution_buffers(distributions):
     assignments = []
@@ -302,6 +305,44 @@ def init_state_buffers(states):
                     assignments.append(
                         init_state_buffers_coupled_template.format(state=name)
                     )
+    return "\n".join(assignments)
+
+
+def init_conductance_buffers(conductances):
+    assignments = []
+    for k, _ in conductances.items():
+        assignments.append(f"self.{k} = self.{k}_init * area")
+    return "\n".join(assignments)
+
+
+# ----------------- Assignments -----------------
+
+def state_buffer_assignments(states):
+    assignments = []
+    for k in states:
+        if not k.coupled:
+            name = k._name
+            if name not in valid_concentrations():
+                assignments.append(
+                    f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
+                )
+        else:
+            names = k._state_names
+            for name in names:
+                if name not in valid_concentrations():
+                    assignments.append(
+                        f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
+                    )
+    return "\n".join(assignments)
+
+
+def current_buffer_assignments(currents, range_vars):
+    assignments = []
+    for k in currents:
+        if k in range_vars:
+            assignments.append(
+                f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_nodes)))"
+            )  # noqa(0.0))")
     return "\n".join(assignments)
 
 
@@ -381,42 +422,6 @@ def extract_multipliers(class_def_str: str) -> List[str]:
     visitor.visit(tree)
 
     return visitor.multipliers
-
-
-def state_buffer_assignments(states):
-    assignments = []
-    for k in states:
-        if not k.coupled:
-            name = k._name
-            if name not in valid_concentrations():
-                assignments.append(
-                    f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
-                )
-        else:
-            names = k._state_names
-            for name in names:
-                if name not in valid_concentrations():
-                    assignments.append(
-                        f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
-                    )
-    return "\n".join(assignments)
-
-
-def current_buffer_assignments(currents, range_vars):
-    assignments = []
-    for k in currents:
-        if k in range_vars:
-            assignments.append(
-                f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_nodes)))"
-            )  # noqa(0.0))")
-    return "\n".join(assignments)
-
-
-def init_conductance_buffers(conductances):
-    assignments = []
-    for k, _ in conductances.items():
-        assignments.append(f"self.{k} = self.{k}_init * area")
-    return "\n".join(assignments)
 
 
 def advance(states):

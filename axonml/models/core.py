@@ -19,7 +19,7 @@ from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
 
-from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM
+from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM, CUDA
 
 
 def get_unique_keys(list_of_dicts):
@@ -209,6 +209,20 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         # -- constants --
         self.eval()
+
+    def __init_subclass__(cls, **kwargs):
+        def init_decorator(previous_init):
+            def new_init(self, *args, **kwargs):
+                previous_init(self, *args, **kwargs)
+                if type(self) == cls:
+                    Axon.__post_init__(self)
+            return new_init
+
+        cls.__init__ = init_decorator(cls.__init__)
+
+    def __post_init__(self):
+        self.build()
+        if CUDA: self.cuda()
 
     def _register_buffers(self, diameters):
         self.register_buffer("diam", diameters)
@@ -461,8 +475,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         callbacks: List[Callback] = None,
         reinit: bool = False,
         progressbar: bool = True,
-        first: bool = True,
         multicontact: bool = False,
+        first: bool = True,
         longrunning: bool = False,
     ):
         """Runs the axon model simulation for the specified input and parameters.
@@ -635,6 +649,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         dt: float = None,
         reinit=False,
         callbacks: List[Callback] = None,
+        intra: Optional[IntraStim] = None,
         progressbar=True,
         multicontact=False,
     ):
@@ -701,6 +716,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             self.run(
                 ve,
                 dt=dt,
+                intra=intra,
                 callbacks=callbacks,
                 reinit=reinit,
                 progressbar=progressbar,
@@ -728,12 +744,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def initialize(self, v, v_init, temp):
         self.mech.initialize(v, v_init, temp)
 
+    @torch.jit.script_method
     def FRK(self, v, ve, area, cm, ra):
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)
         i_ion = self.mech.i(v, v) * area
         return cm * ((ra * d2v) - i_ion)
 
+    @torch.jit.script_method
     def FRK_intra(self, v, ve, area, cm, ra, intra):
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)
@@ -1004,7 +1022,7 @@ class Unmyelinated(Axon):
 
     def x(self) -> torch.Tensor:  # x in um
         l = (self.n_node - 1) * self.dx
-        return torch.linspace(-l / 2, l / 2, self.n_node)
+        return torch.linspace(-l / 2, l / 2, self.n_node, device=self.device())
 
     def area_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)

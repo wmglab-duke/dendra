@@ -20,4 +20,3 @@ class Rattay(Unmyelinated):
 
         with e_context(ena=45.0, ek=-82.0):
             self.insert(rattay_aberham)
-            self.build()

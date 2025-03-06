@@ -18,17 +18,13 @@ class FHM(Myelinated):
         super().__init__(diameters, n_node, temp, v_init, method, pade)
         with C(nai0=13.74, nao0=114.5, ki0=120.0, ko0=2.5):
             self.insert(fh)
-            self.build()
 
 
 SENN = FHM
 
 
 class FHUM(Unmyelinated):
-    PARAMETER(
-        inherit=Unmyelinated,
-        cm=2.0,
-    )
+    PARAMETER(cm=2.0, rhoa=110.0)
 
     def __init__(
         self,
@@ -43,4 +39,3 @@ class FHUM(Unmyelinated):
         super().__init__(diameters, L, dx, temp, v_init, method, pade)
         with C(nai0=13.74, nao0=114.5, ki0=120.0, ko0=2.5):
             self.insert(fh)
-            self.build()

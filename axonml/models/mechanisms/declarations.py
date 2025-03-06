@@ -38,12 +38,6 @@ def _declare_parameters(name, inherit=None, **kwargs):
     add_to_namespace_dict(namespace, name, **kwargs)
 
 
-def USEQ10():
-    frame = sys._getframe(1)
-    namespace = frame.f_locals
-    namespace["is_q10"] = True
-
-
 STATE = partial(_declare, "_states")
 PARAMETER = partial(_declare_parameters, "_params")
 CONDUCTANCE = partial(_declare_parameters, "_conductances")
@@ -51,6 +45,12 @@ INITIAL = partial(_declare_parameters, "_init")
 RANGE = partial(_declare, "_range")
 ASSIGNED = partial(_declare, "_assigned")
 BUFFERS = partial(_declare, "_buffers")
+
+
+def USEQ10():
+    frame = sys._getframe(1)
+    namespace = frame.f_locals
+    namespace["is_q10"] = True
 
 
 def NONSPECIFIC_CURRENT(*args):

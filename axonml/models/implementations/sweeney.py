@@ -17,4 +17,3 @@ class Sweeney(Myelinated):
     ):
         super().__init__(diameters, n_node, temp, v_init, method, pade)
         self.insert(sweeney)
-        self.build()

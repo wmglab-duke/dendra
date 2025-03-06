@@ -46,4 +46,3 @@ class Tigerholm(Unmyelinated):
             self.insert(
                 leak, gkleak=1.3155237866158132e-05, gnaleak=2.1094052499393e-05
             )
-            self.build()
