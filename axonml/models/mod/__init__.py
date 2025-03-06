@@ -50,5 +50,19 @@ def load_mechanisms(*paths):
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 mechanisms[module_name] = getattr(module, module_name)
+    
+    mechanisms = MechanismContainer(**mechanisms)
 
     return mechanisms
+
+
+class MechanismContainer:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+    
+    def __getitem__(self, key):
+        return getattr(self, key)
+    
+    def available(self):
+        return list(self.__dict__.keys())
