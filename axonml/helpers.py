@@ -59,8 +59,9 @@ DFITOT = ContextVar("DFITOT", 1)
 IMEM = ContextVar("IMEM", 0)
 CUDA = ContextVar("CUDA", int(torch.cuda.is_available()))
 
-# --- pytorch functions --
 
+
+# --- pytorch functions --
 
 def ve_from_s_t(space, time, n, device, multicontact=False):
     ve_s = torch.as_tensor(space, device=device)

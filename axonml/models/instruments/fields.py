@@ -95,6 +95,14 @@ class PreComputedInterpolate1D(PreComputed):
         """Interpolate voltage values along axon."""
         return np.vstack([self.interpolate(yp, idx) for (yp, idx) in tqdm(zip(y_points, indices))])
     
+    def interpolate_batch_indices(self, y_points, indices):
+        """Interpolate voltage values along axon."""
+        cache = {}
+        for i in indices:
+            if i not in cache:
+                cache[i] = self.interpolate(y_points, i)
+        return np.vstack([cache[i] for i in indices])
+    
     def interpolate(self, y_points, idx):
         fem_vec = self.get(idx)
         y_vec = self.x[0]
