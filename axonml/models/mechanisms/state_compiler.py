@@ -17,7 +17,7 @@ from axonml.helpers import DEBUG
 
 # -- used in generated code --
 from axonml.models.math.diffusion import diffuse_step_neumann_dct1
-from axonml.models.mixins import to_param
+from axonml.models.parametric import to_param
 
 
 # PyTorch operations

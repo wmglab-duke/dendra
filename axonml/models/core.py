@@ -2,6 +2,7 @@ import math
 from typing import List, Tuple, Optional, Dict, Callable
 import re
 import itertools
+import warnings
 
 import torch
 from torch import Tensor
@@ -12,14 +13,14 @@ from axonml.models.stim.intrastim import IntraStim
 
 from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
-from axonml.models.mixins import Parameterized
+from axonml.models.parametric import Parameterized
 from axonml.models.mechanisms.core import Mechanism, validate
 from axonml.models.mechanisms.declarations import PARAMETER
 from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
 
-from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM, CUDA
+from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM, CUDA, DTWARN, ctx
 
 
 def get_unique_keys(list_of_dicts):
@@ -100,7 +101,7 @@ class SymmetricConv1D(torch.nn.Conv1d):
 
 class Axon(Parameterized, torch.jit.ScriptModule):
     """Base 1D fiber class."""
-
+    _dt_lim = None
     __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade", "is_df", "use_fast_imem", "hd"]
 
     def __init__(
@@ -221,7 +222,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         cls.__init__ = init_decorator(cls.__init__)
 
     def __post_init__(self):
-        self.build()
+        changed = self.instantiate_parameters_lambda()
+        if changed: self.calculate_geometric_params()
+        self._build()
         if CUDA: self.cuda()
 
     def _register_buffers(self, diameters):
@@ -229,13 +232,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
         self.register_buffer("cm_c", self.cm_(self.area_c))
         self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
-
         self.register_buffer("v_init_c", torch.tensor(self.v_init))
         self.register_buffer("temp_c", torch.tensor(self.temp))
 
     def set_diam(self, diams):
         diams = torch.as_tensor(diams, dtype=self.dtype())
         self.diam[:] = diams
+        self.instantiate_parameters_lambda()
         self.calculate_geometric_params()
 
     def calculate_geometric_params(self):
@@ -252,11 +255,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         Args:
             *names (str): Variable length argument list of parameter names to unfreeze.
 
-        Examples:
-            Unfreeze all parameters::
-            >>> model.unfreeze()
-
-            Unfreeze specific parameters::
+        Example:
             >>> model = SMF()
             >>> model.unfreeze('axnode_myel.gnabar', 'axnode_myel.gkbar')
         """
@@ -310,24 +309,24 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self,
         mechanism: Mechanism,
         ic: Dict[str, float] = None,
-        mask_out: str | int = None,
-        mask_in: str | int = None,
+        mask_out: str | int | slice = None,
+        mask_in: str | int | slice = None,
         **kwargs,
     ):
-        """
-        Inserts a mechanism into the model.
-
-        This method validates and compiles the given mechanism, then appends it to the model's mechanism list.
-        It also updates the model's current, ion read, ion write, and ion write_c dictionaries with the mechanism's respective values.
-
+        """Inserts a mechanism into the model.
+        
+        This method validates and compiles the given mechanism, then adds it to the model's
+        mechanism list. It also registers the mechanism's currents and ion interactions.
+        
         Args:
-            mechanism (Mechanism): The mechanism to be inserted into the model.
-            ic (optional, Dict[str:float]): Initial conditions for the mechanism.
-            mask (optional): Compartments for which the mechanism will not be included in current calculation. NumPy / Pytorch slice syntax.
+            mechanism: The mechanism to be inserted into the model.
+            ic: Optional dictionary of initial conditions for the mechanism states.
+                Keys are state names and values are initial values.
+            mask_out: Optional mask specifying compartments for which the mechanism will not
+                contribute to the current calculation. Can be a string, integer, or slice.
+            mask_in: Optional mask specifying compartments for which the mechanism will not
+                receive input. Can be a string, integer, or slice.
             **kwargs: Additional keyword arguments to be passed to the compile_mechanism function.
-
-        Returns:
-            None
         """
         validate(mechanism)
 
@@ -399,7 +398,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             return (0, 1, 0, 0, 0)
         return (0, 0, 0, 0, 0)
 
-    def build(self):
+    def _build(self):
         all_ions = get_unique_keys([self._ion_read, self._ion_write, self._ion_write_c])
 
         _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
@@ -460,9 +459,34 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @property
     def t(self):
+        """Returns the current simulation time.
+        
+        This property calculates the current simulation time by multiplying
+        the time index (t_ind) by the time step size (dt).
+        
+        Returns:
+            float: Current simulation time in milliseconds.
+        """
         return self.t_ind * self.dt
 
     def c(self, *args):
+        """Converts relative positions to node indices.
+        
+        This method takes relative positions along the axon (as fractions between 0 and 1)
+        and converts them to the corresponding node indices. For example, 0.5 represents
+        the middle node, 0 the first node, and 1 the last node.
+        
+        Args:
+            *args: Variable number of float values between 0 and 1, representing
+                relative positions along the axon.
+        
+        Returns:
+            list: A list of integer node indices corresponding to the input positions.
+            
+        Example:
+            >>> model.c(0.25, 0.5, 0.75)
+            [25, 50, 75]  # For a model with n_node=101
+        """
         return [round((self.n_node - 1) * i) for i in args]
 
     def run(
@@ -534,6 +558,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ve = torch.as_tensor(ve, device=device)
 
         dt = dt if dt is not None else A.dt
+        self.warn_about_dt(dt)
         self.dt = dt
 
         method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
@@ -695,6 +720,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             einsum = op_sc
 
         dt = dt if dt is not None else A.dt
+        self.warn_about_dt(dt)
 
         t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
 
@@ -713,27 +739,46 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             else:
                 reinit = False
             ve = einsum(ve_s, t_chunk)
-            self.run(
-                ve,
-                dt=dt,
-                intra=intra,
-                callbacks=callbacks,
-                reinit=reinit,
-                progressbar=progressbar,
-                first=(i == 0),
-                longrunning=True,
-            )
+            with ctx(DTWARN=0):
+                self.run(
+                    ve,
+                    dt=dt,
+                    intra=intra,
+                    callbacks=callbacks,
+                    reinit=reinit,
+                    progressbar=progressbar,
+                    first=(i == 0),
+                    longrunning=True,
+                )
 
         if progressbar:
             progressbar.close()
 
     def steady_state(self, dt=0.2, maxiter=3000):
+        """Runs the model until it reaches a steady state and caches the result.
+        
+        This method simulates the axon model with zero extracellular voltage for a 
+        specified number of iterations to allow the model to reach a stable membrane
+        potential. The resulting steady state is then cached for later use in 
+        simulations that require initialization from a steady state.
+        
+        Args:
+            dt: Time step size in milliseconds. Default is 0.2 ms.
+            maxiter: Maximum number of iterations to run the simulation. Default is 3000.
+            
+        Note:
+            This method clears any previous steady state cache before creating a new one.
+            The steady state can be restored later by setting reinit=True when calling 
+            the run method.
+        """
+        
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
         ve = torch.zeros(1, self.n_ax, 1, self.n_node, device=self.device())
-        for i in tqdm(range(maxiter), desc="Steady state..."):
-            reinit = i == 0
-            self.run(ve, dt, reinit=reinit, progressbar=False)
+        with ctx(DTWARN=0):
+            for i in tqdm(range(maxiter), desc="Steady state..."):
+                reinit = i == 0
+                self.run(ve, dt, reinit=reinit, progressbar=False)
         self.cache("_steady_state")
 
     def post_initialize(self):
@@ -974,6 +1019,12 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         super().to(*args, **kwargs)
         self.mech.set_buffers(self.diam)
         return self
+    
+    def warn_about_dt(self, dt):
+        if DTWARN:
+            if self._dt_lim is not None:
+                if dt > self._dt_lim:
+                    warnings.warn(f"dt ({dt}) exceeds limit ({self._dt_lim}), solution may have large oscillations.")
 
 
 def match_state_dict(

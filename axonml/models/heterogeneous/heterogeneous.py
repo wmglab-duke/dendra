@@ -1,4 +1,5 @@
 import inspect
+import warnings
 from typing import Tuple, List, Optional
 
 import torch
@@ -11,7 +12,7 @@ from axonml.models.stim.intrastim import IntraStim
 from axonml.models.backend import Backend as A
 from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.core import Axon
-from axonml.helpers import ve_from_s_t
+from axonml.helpers import ve_from_s_t, DTWARN
 
 
 class Heterogeneous(Axon):
@@ -38,10 +39,15 @@ class Heterogeneous(Axon):
 
         self.register_buffer("area_c", torch.empty(self.diam.shape))
         self.register_buffer("cm_c", torch.empty(self.area_c.shape))
-        self.register_buffer("ra_c", torch.empty(self.inter_node_diam.shape))
+        self.register_buffer("ra_c", torch.empty(self.n_ax, 1, self.n_node - 1))
 
         self.register_buffer("v_init_c", torch.tensor(self.v_init))
         self.register_buffer("temp_c", torch.tensor(self.temp))
+
+    def x(self):
+        node_l = torch.atleast_2d(self.node_l.squeeze())
+        x = node_l.cumsum(dim=1) - node_l / 2
+        return x - torch.median(x, dim=1)[0].unsqueeze(1)
 
     def ra_(self, diameters, node_l) -> torch.Tensor:
         radii = diameters / 20000
@@ -108,6 +114,7 @@ class Heterogeneous(Axon):
             ve = torch.as_tensor(ve, device=device)
 
         dt = dt if dt is not None else A.dt
+        self.warn_about_dt(dt)
         self.dt = dt
 
         method = getattr(self, f"step_no_intra_df")
@@ -380,6 +387,7 @@ class MyelinatedHeterogeneous(Axon):
             ve = torch.as_tensor(ve, device=device)
 
         dt = dt if dt is not None else A.dt
+        self.warn_about_dt(dt)
         self.dt = dt
 
         method = getattr(self, f"step_no_intra_df")

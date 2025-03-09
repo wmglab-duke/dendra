@@ -12,7 +12,7 @@ from sympy import symbols, sympify, Poly, expand, factor
 
 from .compile_f import convert_func
 from .core import Mechanism, coupled
-from ..mixins import to_param
+from ..parametric import to_param
 from .ops import *
 from axonml import const
 
@@ -111,13 +111,37 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
 template = """
 class {mech}(torch.nn.Module):
     _init_params: Dict[str, float]
-    def __init__(self, temp, diameters, n_ax, n_nodes, name: str, params, distributions, read_ion, write_ion_c, states, conductances, init, ic: dict = None):
+    def __init__(
+            self, 
+            temp, 
+            diameters, 
+            n_ax, 
+            n_nodes, 
+            name: str, 
+            params, 
+            distributions, 
+            read_ion, 
+            write_ion_c, 
+            states, 
+            conductances, 
+            init, 
+            model,
+            ic: dict = None
+        ):
         super().__init__()
-        self.instantiate_parameters(params)
+        
+        self._name = name
+
+        self.instantiate_parameters(params, model)
         self.instantiate_distributions(distributions)
         self.temp = temp
-        self.register_buffer("diam", diameters.view(-1, 1, 1))
-        self._name = name
+
+        if len(diameters.shape) == 1:
+            final_axis = 1
+        else:
+            final_axis = diameters.shape[-1]
+        self.register_buffer("diam", diameters.view(diameters.shape[0], 1, final_axis))
+
         self.DE = torch.nn.ModuleDict(
             {{state._name: state for state in states}}
         )
@@ -154,16 +178,16 @@ class {mech}(torch.nn.Module):
             for v in self.write_ion_c[name]:
                 self.register_buffer(v, getattr(ion, v))
 
-    def instantiate_parameters(self, params):
+    def instantiate_parameters(self, params, model):
         if params is not None:
             for name, value in params.items():
                 if isinstance(value, dict):
                     setattr(self, name, [])
                     for pname, pval in value.items():
-                        setattr(self, pname, to_param(pval))
+                        setattr(self, pname, to_param(pval, model))
                         getattr(self, name).append(getattr(self, pname))
                 else:
-                    setattr(self, name, to_param(value))
+                    setattr(self, name, to_param(value, model))
 
     def detach(self):
 {detach}
@@ -497,8 +521,10 @@ def current_equations(currents, mechanism, range_vars, df, mask):
         else:
             code_block = get_function_body_as_str(getattr(mechanism, k))
             if mask:
-                code_block = multiply_return_value(code_block, "self.mask")
-            assignments.append(current_tot_template.format(k=k, body=code_block))
+                code_block_tot = multiply_return_value(code_block, "self.mask")
+            else:
+                code_block_tot = code_block
+            assignments.append(current_tot_template.format(k=k, body=code_block_tot))
             try:
                 i, _ = factor_linear_in_x_from_codeblock(replace_v(code_block))
                 if assign:
@@ -523,7 +549,7 @@ def current_equations(currents, mechanism, range_vars, df, mask):
     return "\n".join(assignments), unfactorable
 
 
-def gtot(currents, mechanism, df):
+def gtot(currents, mechanism, df, mask):
     if not df:
         return "    def gtot(self): return torch.tensor(0.0)", False
     assignments = []
@@ -539,7 +565,11 @@ def gtot(currents, mechanism, df):
         has_gtot = False
         return "    def gtot(self): return torch.tensor(0.0)", has_gtot
     s = " + ".join(assignments)
-    return f"    def gtot(self): return {s}", has_gtot
+    if mask:
+        mult = " * self.mask"
+    else:
+        mult = ""
+    return f"    def gtot(self): return {s} {mult}", has_gtot
 
 
 default_f = """
@@ -665,12 +695,14 @@ def compile_mechanism(
     advance_str = advance(states_compiled)
     advance_str = indent(advance_str, 2)
 
+    masked = (mask_out is not None) or (mask_in is not None)
+
     current_equations_str, unfactorable = current_equations(
         current_eqs,
         mechanism,
         range_vars,
         df,
-        (mask_out is not None) or (mask_in is not None),
+        masked,
     )
     current_equations_str = indent(current_equations_str, 1)
 
@@ -683,7 +715,7 @@ def compile_mechanism(
     init_distribution_buffers_str = init_distribution_buffers(distributions)
     init_distribution_buffers_str = indent(init_distribution_buffers_str, 2)
 
-    gtot_str, has_gtot = gtot(current_eqs, mechanism, df)
+    gtot_str, has_gtot = gtot(current_eqs, mechanism, df, masked)
 
     forward_str = template.format(
         mech=mechanism.__name__,
@@ -726,6 +758,7 @@ def compile_mechanism(
         states_compiled,
         conductances,
         init,
+        model,
         ic=ic,
     )
 

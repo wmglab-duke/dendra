@@ -6,6 +6,7 @@ import multiprocessing as mp
 
 from h5py import File
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -308,22 +309,33 @@ class LFP(Callback):
     def __init__(self, v_unit):
         super().__init__()
         self._lfp = []
+        self._t = []
         self.v_unit = v_unit
 
     def pre_loop_hook(self, model):
         self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
-        self._lfp.append(torch.einsum("ij,ij->", model.i_membrane.squeeze(), self.v_unit))
+        self._lfp.append(torch.einsum("ij,ij->", torch.atleast_2d(model.i_membrane.squeeze()), self.v_unit))
+        self._t.append(model.t)
         return super().pre_loop_hook(model)
     
     def post_step_hook(self, model):
-        self._lfp.append(torch.einsum("ij,ij->", model.i_membrane.squeeze(), self.v_unit))
+        self._lfp.append(torch.einsum("ij,ij->", torch.atleast_2d(model.i_membrane.squeeze()), self.v_unit))
+        self._t.append(model.t)
 
     @property
     def lfp(self):
         return torch.stack(self._lfp)
     
+    @property
+    def t(self):
+        return torch.tensor(self._t)
+    
     def numpy(self):
         return self.lfp.detach().cpu().numpy()
+    
+    def reset(self):
+        self._lfp = []
+        self._t = []
 
 
 class ThresholdCallback(Callback):

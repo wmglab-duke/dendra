@@ -1,9 +1,160 @@
+import numpy as np
 import torch
 
 from ..heterogeneous import Heterogeneous
-from ..mod import axnode_myel
+from ..heterogeneous.compartments import CompartmentID
+from ..mod import mrg_k, mrg_leak, mrg_naf, mrg_nap, pas
 from ..mechanisms.declarations import PARAMETER
+from ..parametric import Functional
 
 
-class MRGSC(Heterogeneous):
-    pass
+ns = ['node', 'mysa', 'flut', 'stin * 6', 'flut', 'mysa']
+
+# -- compartment diameters --
+def fd(model):
+    return model.fd.cpu().numpy()
+
+def axonD(model):
+    fd = model.fd.cpu().numpy()
+    return 0.553 * fd - 0.024 
+
+def nodeD(model):
+    fd = model.fd.cpu().numpy()
+    return 0.321 * (0.553 * fd - 0.024) + 0.37
+
+# -- compartment lengths --
+def deltax(model):
+    fd = model.fd.cpu().numpy()
+    return np.where(fd>=5.643, -8.215284e00 * fd**2 + 2.724201e02 * fd + -7.802411e02, 81.08 * fd + 37.84)
+
+nodelength = lambda model: np.full_like(model.fd.cpu().numpy(), 1.0)
+paralength1 = lambda model: np.full_like(model.fd.cpu().numpy(), 3.0)
+
+def paralength2(model):
+    fd = model.fd.cpu().numpy()
+    return -0.171 * fd**2 + 6.48 * fd - 0.935
+
+def interlength(model):
+    return (deltax(model) - nodelength(model) - (2 * paralength1(model)) - (2 * paralength2(model))) / 6
+
+
+def scale(model):
+    return np.full_like(model.fd.cpu().numpy(), 0.0001)
+
+def mysa_scale(model):
+    return np.full_like(model.fd.cpu().numpy(), 0.001)
+
+
+node_d_funcs = {
+    'node': nodeD,
+    'flut': fd,
+    'mysa': fd,
+    'stin': fd,
+}
+
+node_l_funcs = {
+    'node': nodelength,
+    'flut': paralength2,
+    'mysa': paralength1,
+    'stin': interlength,
+}
+
+secd_funcs = {
+    'node': fd,
+    'flut': axonD,
+    'mysa': nodeD,
+    'stin': axonD,
+}
+
+
+scale_funcs = {
+    'node': scale,
+    'flut': scale,
+    'mysa': mysa_scale,
+    'stin': scale,
+}
+
+
+class mrg_rhoa(Functional):
+    def __init__(self, rhoa):
+        self.rhoa = rhoa
+
+    def fn(self, model):
+        scale = 1 / (model.secd / model.fd[:, None, None]) ** 2
+        return self.rhoa * scale
+    
+
+class mrg_cm(Functional):
+    def __init__(self, cm, node_cm, mysa_cm):
+        self.cm = cm
+        self.node_cm = node_cm
+        self.mysa_cm = mysa_cm
+    
+    def fn(self, model):
+        cm = self.cm / (model.nl * 2)[:, None]
+        cm = cm.expand(model.n_ax, model.n_node).unsqueeze(1).clone()
+        node_locs = model.cid.locs(['node'])
+        cm[:, :, node_locs] = self.node_cm
+        mysa_locs = model.cid.locs(['mysa'])
+        mysa_cm = self.mysa_cm / (model.nl * 2)[:, None]
+        mysa_cm = mysa_cm.expand(model.n_ax, len(mysa_locs)).unsqueeze(1)
+        cm[:, :, mysa_locs] = mysa_cm
+        return cm
+    
+
+class g_mrg(Functional):
+    def __init__(self, g):
+        self.g = g
+
+    def fn(self, model):
+        g_myel = self.g / (model.nl * 2)[:, None, None]
+        g_memb = model.scale * model.secd / model.fd[:, None, None]
+        g = 1 / (1 / g_myel + 1 / g_memb)
+        return g
+
+
+ic = {"m": 0.0732093, "h": 0.62069505, "p": 0.20260409, "s": 0.04302994}
+
+class smolMRG(Heterogeneous):
+    _dt_lim = 0.002
+    PARAMETER(rhoa=mrg_rhoa(70.0), cm=mrg_cm(0.1, 2.0, 5.0))
+    def __init__(
+            self,
+            diameters=[8.0],
+            n_node=101,
+            temp=37.0,
+            v_init=-80.0,
+            method="dufort-frankel",
+            pade=None,
+    ):
+        cid = CompartmentID(ns, n_node-1)
+        n_ax = len(diameters)
+        n_c = cid.nc()
+
+        super().__init__(n_ax, n_c, temp, v_init, method=method, pade=pade)
+        self.cid = cid
+
+        self.register_buffer('fd', torch.tensor(diameters, dtype=self.dtype()))
+        self.register_buffer('secd', torch.tensor(
+            self.cid.build(secd_funcs, self), dtype=self.dtype()).unsqueeze(1)
+        )
+        self.register_buffer('nl', torch.clamp(torch.floor(17.4 * (0.553 * self.fd - 0.024) - 1.74), min=1))
+        self.register_buffer('scale', torch.tensor(
+            self.cid.build(scale_funcs, self), dtype=self.dtype()).unsqueeze(1)
+        )
+
+        self.diam[:] = torch.tensor(self.cid.build(node_d_funcs, self))[:, None, :]
+        self.node_l[:] = torch.tensor(self.cid.build(node_l_funcs, self))[:, None, :]
+
+        self.calculate_geometric_params()
+
+        self.insert(mrg_nap, mask_in=self.cid.loc('node'))
+        self.insert(mrg_naf, mask_in=self.cid.loc('node'), gnabar=2.33333)
+        self.insert(mrg_k, mask_in=self.cid.loc('node'), gkbar=0.115556)
+        self.insert(mrg_leak, mask_in=self.cid.loc('node'))
+        self.insert(pas, mask_out=self.cid.loc('node'), g=g_mrg(0.001), e=v_init)
+
+    def c(self, *args):
+        locs = self.cid.loc('node')
+        n = len(locs)
+        return [locs[round((n-1) * arg)] for arg in args]

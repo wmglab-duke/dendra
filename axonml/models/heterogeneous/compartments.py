@@ -1,8 +1,85 @@
-from typing import Callable
+from typing import Callable, List
 import re
 
-import numba
+import torch
 import numpy as np
+
+
+class CompartmentID:
+    def __init__(self, names: List[str], n_repeats: int):
+        self._names = names
+        self.n_repeats = n_repeats
+        self.names = np.array(expand_string_list(names) * n_repeats + names[:1])
+
+    def nc(self):
+        return len(self.names)
+    
+    def __getitem__(self, i):
+        return self.names[i]
+    
+    def __len__(self):
+        return len(self.names)
+    
+    def __iter__(self):
+        return iter(self.names)
+    
+    def unique(self):
+        return np.unique(self.names).tolist()
+    
+    def loc(self, name):
+        return np.where(self.names == name)[0].tolist()
+    
+    def locs(self, names):
+        return np.where(np.isin(self.names, names))[0].tolist()
+    
+    def build(self, funcs, model):
+        assert model.n_node == self.nc()
+        out = np.empty((model.n_ax, self.nc()))
+
+        s = self.unique()
+
+        for s_ in s:
+            d_ = funcs[s_](model)
+            out[:, self.names==s_] = d_[:, None]
+                    
+        return out
+
+
+class CompartmentIDTorch:
+    def __init__(self, names: List[str], n_repeats: int):
+        self._names = names
+        self.n_repeats = n_repeats
+        self.names = torch.tensor(expand_string_list(names) * n_repeats + names[:1])
+
+    def nc(self):
+        return len(self.names)
+    
+    def __getitem__(self, i):
+        return self.names[i]
+    
+    def __len__(self):
+        return len(self.names)
+    
+    def unique(self):
+        return self.names.unique().tolist()
+    
+    def loc(self, name):
+        return torch.where(self.names == name)[0].tolist()
+    
+    def locs(self, names):
+        return torch.where(self.names.unsqueeze(0) == torch.tensor(names).unsqueeze(1))[1].tolist()
+    
+    def build(self, funcs, model):
+        assert model.n_node == self.nc()
+        out = torch.empty((model.n_ax, self.nc()))  # type: ignore
+
+        s = self.unique()
+
+        for s_ in s:
+            d_ = funcs[s_](model)
+            out[:, self.names==s_] = d_[:, None]
+
+        return out
 
 
 def expand_string_list(strings):
@@ -29,24 +106,3 @@ def expand_string_list(strings):
             expanded.append(s)
     
     return expanded
-
-
-@numba.jit
-def build_node_diams(
-    sequence: list[str],
-    n_repeats: int,
-    diams: list[float],
-    node_d_dict: dict[str, Callable[[float], float]],
-):
-    sequence = expand_string_list(sequence)
-    d2_size = len(sequence) * n_repeats + 1
-    d = np.array(diams)[:, np.newaxis]
-    out = np.tile(d, (1, d2_size))
-    for i in range(len(diams)):
-        j = 0
-        for r in range(n_repeats):
-            for s in sequence:
-                out[i, j] = node_d_dict[s](out[i, j])
-                j += 1
-        out[i, j] = node_d_dict[s[0]](out[i, j])
-    return out

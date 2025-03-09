@@ -3,7 +3,7 @@ import os, contextlib
 from typing import ClassVar
 
 import torch
-
+import numpy as np
 
 @functools.lru_cache(maxsize=None)
 def getenv(key: str, default=0):
@@ -58,7 +58,11 @@ TF32 = ContextVar("TF32", 0)
 DFITOT = ContextVar("DFITOT", 1)
 IMEM = ContextVar("IMEM", 0)
 CUDA = ContextVar("CUDA", int(torch.cuda.is_available()))
+DTWARN = ContextVar("DTWARN", 1)
 
+
+def numpify(x):
+    return x.cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
 
 
 # --- pytorch functions --
