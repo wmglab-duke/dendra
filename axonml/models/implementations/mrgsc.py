@@ -1,6 +1,9 @@
+import warnings
+
 import numpy as np
 import torch
 
+from axonml.helpers import numpify
 from ..heterogeneous import Heterogeneous
 from ..heterogeneous.compartments import CompartmentID
 from ..mod import mrg_k, mrg_leak, mrg_naf, mrg_nap, pas
@@ -11,38 +14,27 @@ from ..parametric import Functional
 ns = ['node', 'mysa', 'flut', 'stin * 6', 'flut', 'mysa']
 
 # -- compartment diameters --
-def fd(model):
-    return model.fd.cpu().numpy()
-
-def axonD(model):
-    fd = model.fd.cpu().numpy()
-    return 0.553 * fd - 0.024 
-
-def nodeD(model):
-    fd = model.fd.cpu().numpy()
-    return 0.321 * (0.553 * fd - 0.024) + 0.37
+fd = lambda model: numpify(model.fd)
+axonD = lambda model: 0.553 * numpify(model.fd) - 0.024
+nodeD = lambda model: 0.321 * (0.553 * numpify(model.fd) - 0.024) + 0.37
 
 # -- compartment lengths --
+nodelength = lambda model: np.full_like(numpify(model.fd), 1.0)
+paralength1 = lambda model: np.full_like(numpify(model.fd), 3.0)
+
 def deltax(model):
-    fd = model.fd.cpu().numpy()
+    fd = numpify(model.fd)
     return np.where(fd>=5.643, -8.215284e00 * fd**2 + 2.724201e02 * fd + -7.802411e02, 81.08 * fd + 37.84)
 
-nodelength = lambda model: np.full_like(model.fd.cpu().numpy(), 1.0)
-paralength1 = lambda model: np.full_like(model.fd.cpu().numpy(), 3.0)
-
 def paralength2(model):
-    fd = model.fd.cpu().numpy()
+    fd = numpify(model.fd)
     return -0.171 * fd**2 + 6.48 * fd - 0.935
 
 def interlength(model):
     return (deltax(model) - nodelength(model) - (2 * paralength1(model)) - (2 * paralength2(model))) / 6
 
-
-def scale(model):
-    return np.full_like(model.fd.cpu().numpy(), 0.0001)
-
-def mysa_scale(model):
-    return np.full_like(model.fd.cpu().numpy(), 0.001)
+scale = lambda model: np.full_like(numpify(model.fd), 0.0001)
+mysa_scale = lambda model: np.full_like(numpify(model.fd), 0.001)
 
 
 node_d_funcs = {
@@ -113,8 +105,6 @@ class g_mrg(Functional):
         return g
 
 
-ic = {"m": 0.0732093, "h": 0.62069505, "p": 0.20260409, "s": 0.04302994}
-
 class smolMRG(Heterogeneous):
     _dt_lim = 0.002
     PARAMETER(rhoa=mrg_rhoa(70.0), cm=mrg_cm(0.1, 2.0, 5.0))
@@ -127,6 +117,11 @@ class smolMRG(Heterogeneous):
             method="dufort-frankel",
             pade=None,
     ):
+        if torch.any(torch.as_tensor(diameters) < 1.02):
+            warnings.warn("Fiber diameter should not be less than 1.02 um for smolMRG.")
+        if torch.any(torch.as_tensor(diameters) > 5.7):
+            warnings.warn("Fiber diameter should not exceed 5.7 um for smolMRG. Use SMF instead.")
+
         cid = CompartmentID(ns, n_node-1)
         n_ax = len(diameters)
         n_c = cid.nc()

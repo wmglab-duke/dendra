@@ -62,7 +62,7 @@ DTWARN = ContextVar("DTWARN", 1)
 
 
 def numpify(x):
-    return x.cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+    return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
 
 
 # --- pytorch functions --
