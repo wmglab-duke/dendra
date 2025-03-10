@@ -24,15 +24,19 @@ from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM, CUDA, DTWARN, ctx
 
 
 def get_unique_keys(list_of_dicts):
-    """Gets all unique keys from a list of dictionaries.
-
-    Args:
-        list_of_dicts: A list of dictionaries.
-
-    Returns:
+    """
+    Get all unique keys from a list of dictionaries.
+    
+    Parameters
+    ----------
+    list_of_dicts : list
+        A list of dictionaries.
+    
+    Returns
+    -------
+    set
         A set of unique keys.
     """
-
     unique_keys = set()
     for dictionary in list_of_dicts:
         unique_keys.update(dictionary.keys())
@@ -100,7 +104,49 @@ class SymmetricConv1D(torch.nn.Conv1d):
 
 
 class Axon(Parameterized, torch.jit.ScriptModule):
-    """Base 1D fiber class."""
+    """
+    Base 1D fiber class.
+    
+    This is the base class for axon models, implementing common functionality
+    for simulating action potential propagation along 1D fibers.
+    
+    Parameters
+    ----------
+    diameters : array_like
+        Diameters of the axons in μm.
+    n_node : int
+        Number of nodes in the axon model.
+    temp : float, optional
+        Temperature in degrees Celsius. Default is 37.0.
+    v_init : float, optional
+        Initial membrane potential in mV. Default is -80.0.
+    method : str, optional
+        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4', 
+        'dufort-frankel', or 'df'. Default is 'rk1'.
+    pade : optional
+        Padé approximation order, if applicable.
+    beta : float, optional
+        Hyperdiffusion coefficient. Default is 0.0.
+    
+    Attributes
+    ----------
+    n_ax : int
+        Number of axons in the model.
+    n_node : int
+        Number of nodes in each axon.
+    temp : float
+        Temperature in degrees Celsius.
+    v_init : float
+        Initial membrane potential in mV.
+    method : str
+        Integration method.
+    mech : HandlerInterface
+        Handler for membrane mechanisms.
+    t_ind : int
+        Current time index.
+    dt : float
+        Time step in ms.
+    """
     _dt_lim = None
     __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade", "is_df", "use_fast_imem", "hd"]
 
@@ -248,16 +294,23 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def unfreeze(self, *names):
         """
-        Unfreezes the parameters of the model for training.
-        If no parameter names are provided, all parameters of the model will be unfrozen.
-        If specific parameter names are provided, only those parameters will be unfrozen.
-
-        Args:
-            *names (str): Variable length argument list of parameter names to unfreeze.
-
-        Example:
-            >>> model = SMF()
-            >>> model.unfreeze('axnode_myel.gnabar', 'axnode_myel.gkbar')
+        Unfreezes model parameters, making them trainable.
+        
+        If no names are provided, all parameters will be unfrozen.
+        If names are provided, only parameters whose names match any 
+        of the provided patterns will be unfrozen.
+        
+        Parameters
+        ----------
+        *names : str
+            Variable length argument list of parameter name patterns.
+            If empty, all parameters will be unfrozen.
+            Otherwise, only parameters matching any of these patterns will be unfrozen.
+            
+        Notes
+        -----
+        The matching is done using the `matches_any_pattern` function.
+        When a parameter is unfrozen, a message is printed to the console.
         """
         if not names:
             for p in self.parameters():
@@ -305,28 +358,25 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def dtype(self):
         return self.ssd.weight.dtype
 
-    def insert(
-        self,
-        mechanism: Mechanism,
-        ic: Dict[str, float] = None,
-        mask_out: str | int | slice = None,
-        mask_in: str | int | slice = None,
-        **kwargs,
-    ):
-        """Inserts a mechanism into the model.
+    def insert(self, mechanism, ic=None, mask_out=None, mask_in=None, **kwargs):
+        """
+        Insert a mechanism into the model.
         
-        This method validates and compiles the given mechanism, then adds it to the model's
-        mechanism list. It also registers the mechanism's currents and ion interactions.
-        
-        Args:
-            mechanism: The mechanism to be inserted into the model.
-            ic: Optional dictionary of initial conditions for the mechanism states.
-                Keys are state names and values are initial values.
-            mask_out: Optional mask specifying compartments for which the mechanism will not
-                contribute to the current calculation. Can be a string, integer, or slice.
-            mask_in: Optional mask specifying compartments for which the mechanism will not
-                receive input. Can be a string, integer, or slice.
-            **kwargs: Additional keyword arguments to be passed to the compile_mechanism function.
+        Parameters
+        ----------
+        mechanism : Mechanism
+            The mechanism to be inserted into the model.
+        ic : dict, optional
+            Dictionary of initial conditions for the mechanism states.
+            Keys are state names and values are initial values.
+        mask_out : str, int, or slice, optional
+            Mask specifying compartments for which the mechanism will not
+            contribute to the current calculation.
+        mask_in : str, int, or slice, optional
+            Mask specifying compartments for which the mechanism will not
+            receive input.
+        **kwargs
+            Additional keyword arguments to be passed to the compile_mechanism function.
         """
         validate(mechanism)
 
@@ -459,84 +509,97 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @property
     def t(self):
-        """Returns the current simulation time.
+        """
+        Get the current simulation time.
         
-        This property calculates the current simulation time by multiplying
-        the time index (t_ind) by the time step size (dt).
-        
-        Returns:
-            float: Current simulation time in milliseconds.
+        Returns
+        -------
+        float
+            Current simulation time in milliseconds.
         """
         return self.t_ind * self.dt
 
     def c(self, *args):
-        """Converts relative positions to node indices.
+        """
+        Convert relative positions to node indices.
         
-        This method takes relative positions along the axon (as fractions between 0 and 1)
-        and converts them to the corresponding node indices. For example, 0.5 represents
-        the middle node, 0 the first node, and 1 the last node.
+        Parameters
+        ----------
+        *args : float
+            Variable number of float values between 0 and 1, representing
+            relative positions along the axon.
         
-        Args:
-            *args: Variable number of float values between 0 and 1, representing
-                relative positions along the axon.
+        Returns
+        -------
+        list
+            List of integer node indices corresponding to the input positions.
         
-        Returns:
-            list: A list of integer node indices corresponding to the input positions.
-            
-        Example:
-            >>> model.c(0.25, 0.5, 0.75)
-            [25, 50, 75]  # For a model with n_node=101
+        Examples
+        --------
+        >>> model.c(0.25, 0.5, 0.75)
+        [25, 50, 75]  # For a model with n_node=101
         """
         return [round((self.n_node - 1) * i) for i in args]
 
-    def run(
-        self,
-        ve: Tensor = None,
-        space: Tensor = None,
-        time: Tensor = None,
-        dt: float = None,
-        intra: Optional[IntraStim] = None,
-        callbacks: List[Callback] = None,
-        reinit: bool = False,
-        progressbar: bool = True,
-        multicontact: bool = False,
-        first: bool = True,
-        longrunning: bool = False,
-    ):
-        """Runs the axon model simulation for the specified input and parameters.
+    def run(self, 
+            ve=None, 
+            space=None, 
+            time=None, 
+            dt=None, 
+            intra=None,
+            callbacks=None, 
+            reinit=False, 
+            progressbar=True, 
+            multicontact=False,
+            first=True, 
+            longrunning=False):
+        """
+        Run the axon model simulation.
         
-        This method performs the numerical integration of the cable equation to simulate
-        the axon's response to extracellular and/or intracellular stimulation. It can use
-        different numerical methods (Euler/RK1, Heun/RK2, RK4, or Dufort-Frankel) as 
-        specified during model initialization.
+        Parameters
+        ----------
+        ve : Tensor, optional
+            Extracellular voltage tensor. Shape should be 
+            [timesteps, n_ax, 1, n_node] or compatible.
+        space : Tensor, optional
+            Spatial components when ve is not directly provided.
+            Used with time to construct ve.
+        time : Tensor, optional
+            Temporal components when ve is not directly provided.
+            Used with space to construct ve.
+        dt : float, optional
+            Time step size in milliseconds. If None, uses the default from backend.
+        intra : IntraStim, optional
+            Intracellular stimulation object.
+        callbacks : list of Callback, optional
+            List of callback objects to execute during simulation steps.
+        reinit : bool, optional
+            If True, reinitialize the model state before running. If steady state is
+            cached, it will be restored instead of initializing from scratch.
+            Default is False.
+        progressbar : bool or tqdm, optional
+            If True, displays a progress bar during simulation. Can also be a
+            tqdm instance for custom progress tracking. Default is True.
+        multicontact : bool, optional
+            If True, handles multiple electrode contacts for ve construction.
+            Default is False.
+        first : bool, optional
+            If True, indicates this is the first run in a sequence, triggering
+            pre-loop hooks for callbacks. Default is True.
+        longrunning : bool, optional
+            If True, indicates this run is part of a longer simulation sequence,
+            affecting progress bar behavior. Default is False.
         
-        Args:
-            ve: Optional tensor of extracellular voltage. Shape should be 
-                [timesteps, n_ax, 1, n_node] or compatible.
-            space: Optional tensor for spatial components when ve is not directly provided.
-                Used with time to construct ve.
-            time: Optional tensor for temporal components when ve is not directly provided.
-                Used with space to construct ve.
-            dt: Time step size in milliseconds. If None, uses the default from backend.
-            intra: Optional intracellular stimulation object. Must be an instance of IntraStim.
-            callbacks: List of callback objects to execute during simulation steps.
-            reinit: If True, reinitialize the model state before running. If steady state is
-                cached, it will be restored instead of initializing from scratch.
-            progressbar: If True, displays a progress bar during simulation. Can also be a
-                tqdm instance for custom progress tracking.
-            first: If True, indicates this is the first run in a sequence, triggering
-                pre-loop hooks for callbacks.
-            multicontact: If True, handles multiple electrode contacts for ve construction.
-            longrunning: If True, indicates this run is part of a longer simulation sequence,
-                affecting progress bar behavior.
+        Raises
+        ------
+        ValueError
+            If neither ve nor (space and time) nor intra is provided.
+            If intra is provided but is not an instance of IntraStim.
         
-        Raises:
-            ValueError: If neither ve nor (space and time) nor intra is provided.
-            ValueError: If intra is provided but is not an instance of IntraStim.
-        
-        Note:
-            The simulation updates the model's internal state (v, v_prev for DF method, etc.)
-            and advances the model's time index (t_ind).
+        Notes
+        -----
+        The simulation updates the model's internal state (v, v_prev for DF method, etc.)
+        and advances the model's time index (t_ind).
         """
         
         with_intra = intra is not None
@@ -678,30 +741,39 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         progressbar=True,
         multicontact=False,
     ):
-        """Runs a long simulation by splitting it into multiple chunks.
+        """
+        Run a long simulation by splitting it into multiple chunks.
         
-        This method handles large-scale simulations by dividing the temporal component
-        into smaller chunks and running them sequentially. This approach helps manage
-        memory usage for very long simulations, as it avoids creating a single large
-        extracellular voltage tensor.
+        Parameters
+        ----------
+        space : Tensor
+            Spatial components of extracellular voltage. Shape should be
+            [n_ax, n_node] or [1, n_node] or [n_contacts, ...] for multicontact mode.
+        time : Tensor
+            Temporal components of extracellular voltage. Shape should be
+            [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, ...] for multicontact mode.
+        n_chunks : int
+            Number of chunks to split the temporal component into.
+        dt : float, optional
+            Time step size in milliseconds. If None, uses the default from backend.
+        reinit : bool, optional
+            If True, reinitialize the model state before running the first chunk.
+            Subsequent chunks will not reinitialize. Default is False.
+        callbacks : list of Callback, optional
+            List of callback objects to execute during simulation steps.
+        intra : IntraStim, optional
+            Intracellular stimulation object.
+        progressbar : bool, optional
+            If True, displays a progress bar during simulation. Default is True.
+        multicontact : bool, optional
+            If True, handles multiple electrode contacts for ve construction.
+            Default is False.
         
-        Args:
-            space: Tensor for spatial components of extracellular voltage. Shape should be
-                [n_ax, n_node] or [1, n_node] or [n_contacts, ...] for multicontact mode.
-            time: Tensor for temporal components of extracellular voltage. Shape should be
-                [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, ...] for multicontact mode.
-            n_chunks: Number of chunks to split the temporal component into.
-            dt: Time step size in milliseconds. If None, uses the default from backend.
-            reinit: If True, reinitialize the model state before running the first chunk.
-                Subsequent chunks will not reinitialize.
-            callbacks: List of callback objects to execute during simulation steps.
-            progressbar: If True, displays a progress bar during simulation.
-            multicontact: If True, handles multiple electrode contacts for ve construction.
-        
-        Note:
-            This method uses the same numerical methods as the `run` method, but manages
-            memory more efficiently for long simulations by processing the data in chunks.
-            The state of the model (v, v_prev, etc.) is preserved between chunks.
+        Notes
+        -----
+        This method uses the same numerical methods as the `run` method, but manages
+        memory more efficiently for long simulations by processing the data in chunks.
+        The state of the model (v, v_prev, etc.) is preserved between chunks.
         """
         
         ve_s = torch.as_tensor(space, device=self.device())
@@ -755,21 +827,21 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             progressbar.close()
 
     def steady_state(self, dt=0.2, maxiter=3000):
-        """Runs the model until it reaches a steady state and caches the result.
+        """
+        Run the model until it reaches a steady state and cache the result.
         
-        This method simulates the axon model with zero extracellular voltage for a 
-        specified number of iterations to allow the model to reach a stable membrane
-        potential. The resulting steady state is then cached for later use in 
-        simulations that require initialization from a steady state.
+        Parameters
+        ----------
+        dt : float, optional
+            Time step size in milliseconds. Default is 0.2 ms.
+        maxiter : int, optional
+            Maximum number of iterations to run the simulation. Default is 3000.
         
-        Args:
-            dt: Time step size in milliseconds. Default is 0.2 ms.
-            maxiter: Maximum number of iterations to run the simulation. Default is 3000.
-            
-        Note:
-            This method clears any previous steady state cache before creating a new one.
-            The steady state can be restored later by setting reinit=True when calling 
-            the run method.
+        Notes
+        -----
+        This method clears any previous steady state cache before creating a new one.
+        The steady state can be restored later by setting reinit=True when calling 
+        the run method.
         """
         
         if "_steady_state" in self._caches:
@@ -947,6 +1019,31 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self.mech.get(mech, state)
 
     def load(self, state_dict):
+        """
+        Load model weights from a state dictionary.
+        
+        This method supports loading weights from:
+        1. A key from the predefined `all_trained` dictionary
+        2. A file path as a string
+        3. An actual state dictionary object
+        
+        The loaded weights are matched to the model's current state dict structure
+        and only compatible weights are loaded. After loading, geometric parameters
+        are recalculated.
+        
+        Parameters
+        ----------
+        state_dict : str or dict
+            Can be one of:
+            - A key from the predefined `all_trained` dictionary
+            - A file path to a saved model state
+            - A state dictionary object
+        
+        Returns
+        -------
+        self
+            The model instance with loaded weights
+        """
         from axonml import all_trained
 
         if state_dict in all_trained:
@@ -957,7 +1054,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
-        matched, _ = match_state_dict(self.state_dict(), state_dict)
+        matched, _ = _match_state_dict(self.state_dict(), state_dict)
         self.load_state_dict(matched, strict=False)
         self.calculate_geometric_params()
         return self
@@ -1027,24 +1124,30 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     warnings.warn(f"dt ({dt}) exceeds limit ({self._dt_lim}), solution may have large oscillations.")
 
 
-def match_state_dict(
+def _match_state_dict(
     state_dict_a: Dict[str, torch.Tensor],
     state_dict_b: Dict[str, torch.Tensor],
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """Filters state_dict_b to contain only states that are present in state_dict_a.
+    """
+    Match tensors between two state dictionaries based on key names and shapes.
+    This function filters a state dictionary to find tensors that have matching keys
+    and identical shapes in another state dictionary, which is useful for selective 
+    parameter loading or model weight comparisons.
 
-    Matching happens according to two criteria:
-        - Is the key present in state_dict_a?
-        - Does the state with the same key in state_dict_a have the same shape?
-
+    Parameters
+    ----------
+    state_dict_a : Dict[str, torch.Tensor]
+        First state dictionary used as reference for key and shape matching.
+    state_dict_b : Dict[str, torch.Tensor]
+        Second state dictionary to filter based on keys and shapes in state_dict_a.
     Returns
-        (matched_state_dict, unmatched_state_dict)
-
-        States in matched_state_dict contains states from state_dict_b that are also
-        in state_dict_a and unmatched_state_dict contains states that have no
-        corresponding state in state_dict_a.
-
-            In addition: state_dict_b = matched_state_dict U unmatched_state_dict.
+    -------
+    Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
+        A tuple containing:
+        - matched_state_dict: Dictionary with entries from state_dict_b that have 
+          matching keys and shapes in state_dict_a.
+        - unmatched_state_dict: Dictionary with remaining entries from state_dict_b 
+          that don't have matching keys or shapes in state_dict_a.
     """
     matched_state_dict = {
         key: state

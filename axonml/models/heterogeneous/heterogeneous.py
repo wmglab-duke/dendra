@@ -12,7 +12,7 @@ from axonml.models.stim.intrastim import IntraStim
 from axonml.models.backend import Backend as A
 from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.core import Axon
-from axonml.helpers import ve_from_s_t, DTWARN
+from axonml.helpers import ve_from_s_t
 
 
 class Heterogeneous(Axon):

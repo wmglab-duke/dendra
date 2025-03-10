@@ -7,15 +7,44 @@ import random
 class NetStim(torch.jit.ScriptModule):
     """
     A PyTorch implementation of NEURON's NetStim-like spike generator.
-
-    Args:
-        interval (float): Mean inter-spike interval in ms.
-        start (float): Start time (ms) after which synapses can begin spiking.
-        noise (float): 0 <= noise <= 1, controls how randomly the intervals vary.
-        max_spikes (int): Maximum number of spikes each synapse can deliver.
-        seed (int or None): Seed for reproducible random number generation. If None,
-                            it will seed non-deterministically from std::random_device
-                            or the current time.
+    
+    This class generates spike events according to a stochastic process with 
+    configurable timing parameters, similar to NEURON's NetStim mechanism.
+    
+    Parameters
+    ----------
+    interval : float
+        Mean inter-spike interval in ms.
+    start : float, optional
+        Start time (ms) after which synapses can begin spiking. Default is 0.0.
+    noise : float, optional
+        Controls randomness of intervals, between 0 and 1. 
+        0 = deterministic intervals, 1 = fully random (exponential distribution).
+        Default is 0.0.
+    max_spikes : int, optional
+        Maximum number of spikes each synapse can deliver. Default is 1e9.
+    seed : int, optional
+        Seed for reproducible random number generation. If None,
+        uses non-deterministic seeding. Default is None.
+    
+    Attributes
+    ----------
+    shape : tuple of int
+        Shape of the output spike tensor (n_ax, n_node).
+    interval : float
+        Mean inter-spike interval in ms.
+    start : float
+        Start time in ms.
+    noise : float
+        Randomness factor (0-1).
+    max_spikes : int
+        Maximum number of spikes per synapse.
+    seed : int or None
+        Random seed.
+    next_spike_time : torch.Tensor
+        Tensor storing the next spike time for each synapse.
+    spike_counts : torch.Tensor
+        Tensor counting how many spikes each synapse has emitted.
     """
 
     __constants__ = ["seed"]
@@ -28,6 +57,23 @@ class NetStim(torch.jit.ScriptModule):
         max_spikes: int = 1e9,
         seed: Optional[int] = None,
     ):
+        """
+        Initialize the NetStim spike generator.
+        
+        Parameters
+        ----------
+        interval : float
+            Mean inter-spike interval in ms.
+        start : float, optional
+            Start time (ms) after which synapses can begin spiking. Default is 0.0.
+        noise : float, optional
+            Controls randomness of intervals, between 0 and 1. Default is 0.0.
+        max_spikes : int, optional
+            Maximum number of spikes each synapse can deliver. Default is 1e9.
+        seed : int, optional
+            Seed for reproducible random number generation. If None,
+            uses non-deterministic seeding. Default is None.
+        """
         super().__init__()
         # Store parameters
         self.shape: Tuple[int, int] = (0, 0)
@@ -50,12 +96,34 @@ class NetStim(torch.jit.ScriptModule):
         self.register_buffer("spike_counts", torch.zeros(1, dtype=torch.long))
 
     def device(self):
+        """
+        Get the device on which the module's tensors reside.
+        
+        Returns
+        -------
+        torch.device
+            The computation device (CPU or CUDA).
+        """
         return self.next_spike_time.device
 
     def dtype(self):
+        """
+        Get the data type of the module's tensors.
+        
+        Returns
+        -------
+        torch.dtype
+            The data type used for computations.
+        """
         return self.next_spike_time.dtype
 
     def init_rng(self):
+        """
+        Initialize the random number generator.
+        
+        This method ensures the RNG is on the correct device and
+        sets the seed if specified.
+        """
         if self._rng.device != self.device():
             self._rng = torch.Generator(device=self.device()).manual_seed(
                 self._seeder.seed()
@@ -64,6 +132,27 @@ class NetStim(torch.jit.ScriptModule):
             self._rng.manual_seed(self.seed)
 
     def init(self, n_ax, n_node):
+        """
+        Initialize the spike generator for a given shape.
+        
+        Parameters
+        ----------
+        n_ax : int
+            Number of axons (rows in the output tensor).
+        n_node : int
+            Number of nodes (columns in the output tensor).
+            
+        Returns
+        -------
+        self : NetStim
+            Returns self for method chaining.
+            
+        Notes
+        -----
+        This method initializes next_spike_time for each synapse:
+        - If noise=0, first spike will occur exactly at start time
+        - If noise>0, first spike times follow start + exponential(noise*interval)
+        """
         self.shape = (n_ax, n_node)
         self.init_rng()
 
@@ -93,17 +182,27 @@ class NetStim(torch.jit.ScriptModule):
     @torch.jit.script_method
     def forward(self, t: float):
         """
-        Returns an m x n binary tensor indicating which synapses spike at time `t`.
-        Updates internal states for spiking synapses (increments spike count,
-        and schedules their next spike time).
-
-        Args:
-            t (float): Current simulation time in ms.
-
-        Returns:
-            A binary tensor of shape (m, n) indicating which synapses spike.
+        Check which synapses spike at the given time and update their states.
+        
+        Parameters
+        ----------
+        t : float
+            Current simulation time in ms.
+            
+        Returns
+        -------
+        torch.Tensor
+            Binary tensor of shape (n_ax, n_node) where True/1.0 indicates 
+            a spike at this time step.
+            
+        Notes
+        -----
+        This method:
+        1. Identifies which synapses spike at time t
+        2. Increments the spike count for those synapses
+        3. Computes their next spike time based on the noise parameter
+        4. Disables synapses that have reached max_spikes
         """
-
         with torch.no_grad():
             # Identify which synapses are still allowed to spike
             can_spike = self.spike_counts < self.max_spikes
