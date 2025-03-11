@@ -18,6 +18,49 @@ TRANSFERSTREAM = torch.cuda.Stream()
 
 
 class Callback:
+    """
+    Base class for simulation callbacks in AxonML.
+    
+    This class defines the interface for callbacks that can be registered with
+    axon models to monitor and interact with the simulation at specific points
+    in the execution flow. Subclasses should override the hook methods to
+    implement specific functionality.
+    
+    Methods
+    -------
+    pre_loop_hook(model)
+        Called once before starting the simulation loop.
+    post_step_hook(model)
+        Called after each simulation time step.
+    post_loop_hook(model)
+        Called once after the simulation loop completes.
+    
+    Notes
+    -----
+    Custom callbacks should inherit from this class and override one or more
+    of the hook methods. Multiple callbacks can be used simultaneously by
+    passing them in a list to the model's run method.
+    
+    See Also
+    --------
+    Recorder : Records model states during simulation
+    LFP : Records Local Field Potential signals
+    APCount : Counts action potentials during simulation
+    Active : Detects if axons fire during simulation
+    Raster : Records spike events for raster plots
+    
+    Examples
+    --------
+    >>> class CustomCallback(Callback):
+    ...     def pre_loop_hook(self, model):
+    ...         print(f"Starting simulation with {model.n()} axons")
+    ...     def post_loop_hook(self, model):
+    ...         print(f"Finished simulation at t={model.t} ms")
+    >>> 
+    >>> callback = CustomCallback()
+    >>> model.run(ve, callbacks=[callback])
+    """
+
     def pre_loop_hook(self, model: AxonInterface):
         """Execute before entering solver loop.
 
@@ -552,6 +595,56 @@ class LFP(Callback):
 
 
 class ThresholdCallback(Callback):
+    """
+    Base class for callbacks that detect threshold crossings in membrane potential.
+    
+    This class provides common functionality for action potential detection by
+    monitoring when membrane potential crosses a specified threshold at selected nodes.
+    It serves as a base class for specialized callbacks like APCount, Active, and Raster.
+    
+    Parameters
+    ----------
+    threshold : float, optional
+        Voltage threshold in mV to detect crossings. Default is 0.0.
+    t_start_check : float, optional
+        Time in ms after which to start checking for threshold crossings.
+        Default is 0.0 (check from beginning).
+    node_check : list of int, optional
+        Indices of nodes to check for threshold crossings. Default is [5, -5]
+        (check at node 5 from beginning and node 5 from end).
+    dt : float, optional
+        Time step in ms. If None, uses the default from backend. Default is None.
+    
+    Attributes
+    ----------
+    record : torch.Tensor
+        Records detection results (specific format depends on subclass).
+    state_cache : torch.Tensor
+        Cache of state to track threshold crossings between time steps.
+    threshold : float
+        Voltage threshold for detection.
+    t_start_check : float
+        Time after which detection starts.
+    node_check : list of int
+        Indices of nodes being monitored.
+    i : int
+        Time step counter.
+    dt : float
+        Time step size in ms.
+    
+    Methods
+    -------
+    reset_timer()
+        Reset the time step counter.
+    reset_count()
+        Reset the detection record.
+    reset_state_cache()
+        Reset the state cache used for detection.
+    reset()
+        Reset all internal state (timer, count, and cache).
+    numpy()
+        Return detection results as a NumPy array.
+    """
     def __init__(self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None):
         super().__init__()
         self.record: torch.Tensor = None
@@ -563,28 +656,108 @@ class ThresholdCallback(Callback):
         self.dt: float = dt if dt is not None else A.dt
 
     def reset_timer(self):
+        """
+        Reset the time step counter to zero.
+        """
         self.i = 0
 
     def reset_count(self):
+        """
+        Reset the detection record to None.
+        """
         self.record = None
 
     def reset_state_cache(self):
+        """
+        Reset the state cache used for threshold detection.
+        """
         self.state_cache = None
 
     def reset(self):
+        """
+        Reset all internal state.
+        
+        This method resets the time step counter, detection record,
+        and state cache all at once.
+        """
         self.reset_timer()
         self.reset_count()
         self.reset_state_cache()
 
     def numpy(self):
+        """
+        Return detection results as a NumPy array.
+        
+        Returns
+        -------
+        numpy.ndarray or None
+            Detection results as a NumPy array, or None if no results are available.
+        """
         if self.record is not None:
             return self.record.detach().cpu().numpy()
         return self.record
 
 
 class APCount(ThresholdCallback):
-
+    """
+    Callback for counting action potentials during axon model simulation.
+    
+    This class detects and counts the number of times membrane potential crosses above
+    a specified voltage threshold at selected nodes. Each crossing is counted as an 
+    action potential (AP).
+    
+    Parameters
+    ----------
+    threshold : float, optional
+        Voltage threshold in mV for AP detection. Default is 0.0.
+    t_start_check : float, optional
+        Time in ms after which to start checking for APs.
+        Default is 0.0 (check from beginning).
+    node_check : list of int, optional
+        Indices of nodes to monitor for AP detection. Default is [5, -5]
+        (check at node 5 from beginning and node 5 from end).
+    dt : float, optional
+        Time step in ms. If None, uses the default from backend. Default is None.
+    
+    Attributes
+    ----------
+    record : torch.Tensor
+        Integer tensor of shape [n_axons, n_check_nodes] storing AP counts.
+    state_cache : torch.Tensor
+        Boolean tensor tracking membrane potential state relative to threshold.
+    
+    Methods
+    -------
+    pre_loop_hook(model)
+        Initialize record and state_cache tensors.
+    post_step_hook(model)
+        Update AP counts by detecting threshold crossings.
+    reset()
+        Reset AP counters and internal state.
+    numpy()
+        Return AP counts as a NumPy array.
+        
+    See Also
+    --------
+    Active : Callback for detecting if axons fire at any point during simulation
+    Raster : Callback for recording spike times for raster plots
+    
+    Examples
+    --------
+    >>> ap_counter = APCount(threshold=20.0)  # Count when v crosses +20 mV
+    >>> model.run(ve, callbacks=[ap_counter])
+    >>> ap_counts = ap_counter.numpy()  # Get AP counts for each axon
+    """
+    
     def pre_loop_hook(self, model: AxonInterface):
+        """
+        Initialize record and state_cache tensors before simulation.
+        
+        Parameters
+        ----------
+        model : AxonInterface
+            The axon model being simulated.
+        """
         if self.record is None:
             self.record = torch.zeros(
                 model.n(),
@@ -601,6 +774,14 @@ class APCount(ThresholdCallback):
             )
 
     def post_step_hook(self, model: AxonInterface):
+        """
+        Update AP counts after each simulation step.
+        
+        Parameters
+        ----------
+        model : AxonInterface
+            The axon model being simulated.
+        """
         if self.i * self.dt >= self.t_start_check:
             vm_new = atleast_2d(model.v[:, 0, self.node_check].squeeze())
             vm = self.state_cache
@@ -609,6 +790,58 @@ class APCount(ThresholdCallback):
 
 
 class ActiveAL(APCount):
+    """
+    Callback for detecting if axons fire at least a specified number of times.
+    
+    This class extends APCount to detect if the membrane potential crosses a specified 
+    voltage threshold at least N times during the simulation. It marks an axon as 
+    "active" only if the threshold is crossed at least the specified number of times.
+    
+    Parameters
+    ----------
+    threshold : float, optional
+        Voltage threshold in mV for spike detection. Default is 0.0.
+    t_start_check : float, optional
+        Time in ms after which to start checking for threshold crossings.
+        Default is 0.0 (check from beginning).
+    node_check : list of int, optional
+        Indices of nodes to monitor for spike detection. Default is [5, -5]
+        (check at node 5 from beginning and node 5 from end).
+    dt : float, optional
+        Time step in ms. If None, uses the default from backend. Default is None.
+    at_least : int, optional
+        Minimum number of threshold crossings required to mark an axon as active.
+        Default is 1.
+    
+    Attributes
+    ----------
+    record : torch.Tensor
+        Integer tensor of shape [n_axons, n_check_nodes] storing spike counts.
+    state_cache : torch.Tensor
+        Boolean tensor tracking membrane potential state relative to threshold.
+    at_least : int
+        Minimum number of threshold crossings required to mark an axon as active.
+    
+    Methods
+    -------
+    is_active()
+        Return boolean tensor indicating which axons fired at least the required number of times.
+    numpy()
+        Return activity status as a NumPy array.
+    
+    See Also
+    --------
+    APCount : Callback for counting total spikes during simulation
+    Active : Callback for detecting if axons fire at any point during simulation
+    
+    Examples
+    --------
+    >>> # Detect axons that fire at least 3 times
+    >>> detector = ActiveAL(threshold=20.0, at_least=3)
+    >>> model.run(ve, callbacks=[detector])
+    >>> active_axons = detector.numpy()  # Get boolean array of active axons
+    >>> active_count = active_axons.sum()  # Count how many axons fired ≥3 times
+    """
     def __init__(
         self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None, at_least=1
     ):
@@ -627,7 +860,57 @@ class ActiveAL(APCount):
 
 
 class Active(ThresholdCallback):
-
+    """
+    Callback for detecting if axons fire at any point during simulation.
+    
+    This class detects if the membrane potential crosses above a specified 
+    voltage threshold at selected nodes at any point during the simulation.
+    It marks an axon as "active" (fired) as soon as the first threshold 
+    crossing is detected.
+    
+    Parameters
+    ----------
+    threshold : float, optional
+        Voltage threshold in mV for spike detection. Default is 0.0.
+    t_start_check : float, optional
+        Time in ms after which to start checking for threshold crossings.
+        Default is 0.0 (check from beginning).
+    node_check : list of int, optional
+        Indices of nodes to monitor for spike detection. Default is [5, -5]
+        (check at node 5 from beginning and node 5 from end).
+    dt : float, optional
+        Time step in ms. If None, uses the default from backend. Default is None.
+    
+    Attributes
+    ----------
+    record : torch.Tensor
+        Boolean tensor of shape [n_axons] indicating which axons fired at least once.
+    state_cache : torch.Tensor
+        Boolean tensor tracking membrane potential state relative to threshold.
+    
+    Methods
+    -------
+    pre_loop_hook(model)
+        Initialize record and state_cache tensors.
+    post_step_hook(model)
+        Update axon activity status at each simulation time step.
+    is_active()
+        Return boolean tensor indicating which axons are active.
+    numpy()
+        Return activity status as a NumPy array.
+    
+    See Also
+    --------
+    APCount : Callback for counting total spikes during simulation
+    Raster : Callback for recording spike times for raster plots
+    
+    Examples
+    --------
+    >>> active_detector = Active(threshold=20.0)  # Detect when v crosses +20 mV
+    >>> model.run(ve, callbacks=[active_detector])
+    >>> active_axons = active_detector.numpy()  # Get boolean array of active axons
+    >>> active_count = active_axons.sum()  # Count how many axons fired
+    """
     def pre_loop_hook(self, model):
         if self.record is None:
             self.record = torch.zeros(
@@ -657,7 +940,67 @@ class Active(ThresholdCallback):
 
 
 class Raster(ThresholdCallback):
-
+    """
+    Callback for recording spike events for raster plot visualization.
+    
+    This class detects threshold crossings of membrane potential (spikes) at selected 
+    nodes and records their occurrence at each time step. The result can be used
+    to create raster plots that show spiking activity across multiple axons over time.
+    
+    Parameters
+    ----------
+    threshold : float, optional
+        Voltage threshold in mV for spike detection. Default is 0.0.
+    t_start_check : float, optional
+        Time in ms after which to start recording spikes.
+        Default is 0.0 (record from beginning).
+    node_check : list of int, optional
+        Indices of nodes to monitor for spike detection. Default is [5, -5]
+        (check at node 5 from beginning and node 5 from end).
+    dt : float, optional
+        Time step in ms. If None, uses the default from backend. Default is None.
+    
+    Attributes
+    ----------
+    record : list of torch.Tensor
+        List of boolean tensors, one per time step, indicating which axons spiked.
+    state_cache : torch.Tensor
+        Boolean tensor tracking membrane potential state relative to threshold.
+    
+    Methods
+    -------
+    pre_loop_hook(model)
+        Initialize record list and state_cache tensor.
+    post_step_hook(model)
+        Update spike record at each simulation time step.
+    stack()
+        Stack recorded tensors into a single tensor.
+    numpy()
+        Return spike events as a NumPy array.
+    reset()
+        Reset spike record and internal state.
+        
+    See Also
+    --------
+    APCount : Callback for counting total spikes during simulation
+    Active : Callback for detecting if axons fire at any point during simulation
+    
+    Examples
+    --------
+    >>> raster = Raster(threshold=20.0)  # Record when v crosses +20 mV
+    >>> model.run(ve, callbacks=[raster])
+    >>> spike_data = raster.numpy()  # Get spike data for plotting
+    >>> 
+    >>> # Plot raster
+    >>> import matplotlib.pyplot as plt
+    >>> plt.figure(figsize=(10, 6))
+    >>> for i in range(spike_data.shape[1]):
+    >>>     spikes = np.where(spike_data[:,i])[0]
+    >>>     plt.vlines(spikes, i, i+1)
+    >>> plt.xlabel('Time Step')
+    >>> plt.ylabel('Axon')
+    >>> plt.show()
+    """
     def pre_loop_hook(self, model: AxonInterface):
         if self.record is None:
             self.record = []
