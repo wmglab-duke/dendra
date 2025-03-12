@@ -3,38 +3,38 @@ import warnings
 import numpy as np
 import torch
 
-from axonml.helpers import numpify
-from ..heterogeneous import Heterogeneous
-from ..heterogeneous.compartments import CompartmentID
-from ..mod import mrg_k, mrg_leak, mrg_naf, mrg_nap, pas
-from ..mechanisms.declarations import PARAMETER
-from ..parametric import Functional
+from axonml.helpers import numpify, ctx
+from ...heterogeneous import Heterogeneous
+from ...heterogeneous.compartments import CompartmentID
+from ...mod import mrg_k, mrg_leak, mrg_naf, mrg_nap, pas
+from ...mechanisms.declarations import PARAMETER
+from ...parametric import Functional
 
 
 ns = ['node', 'mysa', 'flut', 'stin * 6', 'flut', 'mysa']
 
 # -- compartment diameters --
 fd = lambda model: numpify(model.fd)
-axonD = lambda model: 0.553 * numpify(model.fd) - 0.024
-nodeD = lambda model: 0.321 * (0.553 * numpify(model.fd) - 0.024) + 0.37
+axonD = lambda model: 0.02361 * numpify(model.fd)**2 + 0.3673 * numpify(model.fd) + 0.7122
+nodeD = lambda model: 0.01093 * numpify(model.fd)**2 + 0.1008 * numpify(model.fd) + 1.099
 
 # -- compartment lengths --
-nodelength = lambda model: np.full_like(numpify(model.fd), 1.0)
+nodelength0 = lambda model: np.full_like(numpify(model.fd), 1.0)
 paralength1 = lambda model: np.full_like(numpify(model.fd), 3.0)
 
 def deltax(model):
     fd = numpify(model.fd)
-    return np.where(fd>=5.643, -8.215284e00 * fd**2 + 2.724201e02 * fd + -7.802411e02, 81.08 * fd + 37.84)
+    return -8.215284e00 * fd**2 + 2.724201e02 * fd + -7.802411e02
 
 def paralength2(model):
     fd = numpify(model.fd)
-    return -0.171 * fd**2 + 6.48 * fd - 0.935
+    return -0.1652 * fd**2 + 6.354 * fd - 0.2862
 
 def interlength(model):
-    return (deltax(model) - nodelength(model) - (2 * paralength1(model)) - (2 * paralength2(model))) / 6
+    return (deltax(model) - nodelength0(model) - (2 * paralength1(model)) - (2 * paralength2(model))) / 6
 
-scale = lambda model: np.full_like(numpify(model.fd), 0.0001)
-mysa_scale = lambda model: np.full_like(numpify(model.fd), 0.001)
+g_scale = lambda model: np.full_like(numpify(model.fd), 0.0001)
+m_scale = lambda model: np.full_like(numpify(model.fd), 0.001)
 
 
 node_d_funcs = {
@@ -45,7 +45,7 @@ node_d_funcs = {
 }
 
 node_l_funcs = {
-    'node': nodelength,
+    'node': nodelength0,
     'flut': paralength2,
     'mysa': paralength1,
     'stin': interlength,
@@ -60,10 +60,10 @@ secd_funcs = {
 
 
 scale_funcs = {
-    'node': scale,
-    'flut': scale,
-    'mysa': mysa_scale,
-    'stin': scale,
+    'node': g_scale,
+    'flut': g_scale,
+    'mysa': m_scale,
+    'stin': g_scale,
 }
 
 
@@ -105,9 +105,12 @@ class g_mrg(Functional):
         return g
 
 
-class smolMRG(Heterogeneous):
+class bigMRG(Heterogeneous):
+    
     _dt_lim = 0.002
-    PARAMETER(rhoa=mrg_rhoa(70.0), cm=mrg_cm(0.1, 2.0, 5.0))
+
+    PARAMETER(rhoa=mrg_rhoa(70.0), cm=mrg_cm(0.1, 2.0, 10.0))
+
     def __init__(
             self,
             diameters=[8.0],
@@ -115,41 +118,38 @@ class smolMRG(Heterogeneous):
             temp=37.0,
             v_init=-80.0,
             method="dufort-frankel",
-            pade=None,
     ):
-        if torch.any(torch.as_tensor(diameters) < 1.02):
-            warnings.warn("Fiber diameter should not be less than 1.02 um for smolMRG.")
-        if torch.any(torch.as_tensor(diameters) > 5.7):
-            warnings.warn("Fiber diameter should not exceed 5.7 um for smolMRG. Use SMF instead.")
+        if torch.any(torch.as_tensor(diameters) < 5.7):
+            warnings.warn("Fiber diameter should not be less than 5.7 um for bigMRG. Use smolMRG instead.")
 
         cid = CompartmentID(ns, n_node-1)
         n_ax = len(diameters)
         n_c = cid.nc()
 
-        super().__init__(n_ax, n_c, temp, v_init, method=method, pade=pade)
+        super().__init__(n_ax, n_c, temp, v_init, method=method)
         self.cid = cid
 
         self.register_buffer('fd', torch.tensor(diameters, dtype=self.dtype()))
-        self.register_buffer('secd', torch.tensor(
-            self.cid.build(secd_funcs, self), dtype=self.dtype()).unsqueeze(1)
-        )
-        self.register_buffer('nl', torch.clamp(torch.floor(17.4 * (0.553 * self.fd - 0.024) - 1.74), min=1))
-        self.register_buffer('scale', torch.tensor(
-            self.cid.build(scale_funcs, self), dtype=self.dtype()).unsqueeze(1)
-        )
+        self.register_buffer('nl', torch.clamp(-0.4749 * self.fd**2 + 16.85 * self.fd - 0.7648, min=1))
+        self.register_buffer('secd', torch.tensor(self.cid.build(secd_funcs, self), dtype=self.dtype()).unsqueeze(1))
+        self.register_buffer('scale', torch.tensor(self.cid.build(scale_funcs, self), dtype=self.dtype()).unsqueeze(1))
 
         self.diam[:] = torch.tensor(self.cid.build(node_d_funcs, self))[:, None, :]
         self.node_l[:] = torch.tensor(self.cid.build(node_l_funcs, self))[:, None, :]
 
         self.calculate_geometric_params()
 
-        self.insert(mrg_nap, mask_in=self.cid.loc('node'))
-        self.insert(mrg_naf, mask_in=self.cid.loc('node'), gnabar=2.33333)
-        self.insert(mrg_k, mask_in=self.cid.loc('node'), gkbar=0.115556)
-        self.insert(mrg_leak, mask_in=self.cid.loc('node'))
-        self.insert(pas, mask_out=self.cid.loc('node'), g=g_mrg(0.001), e=v_init)
+        with ctx(PADE=1):
+            self.insert(pas, mask_out=self.cid.loc('node'), g=g_mrg(0.001), e=v_init)
+            self.insert(mrg_k, mask_in=self.cid.loc('node'))
+            self.insert(mrg_nap, mask_in=self.cid.loc('node'))
+            self.insert(mrg_naf, mask_in=self.cid.loc('node'), gnabar=2.9)
+            self.insert(mrg_leak, mask_in=self.cid.loc('node'))
 
     def c(self, *args):
         locs = self.cid.loc('node')
         n = len(locs)
         return [locs[round((n-1) * arg)] for arg in args]
+    
+    def steady_state(self, dt=1.0, maxiter=3000):
+        return super().steady_state(dt, maxiter)

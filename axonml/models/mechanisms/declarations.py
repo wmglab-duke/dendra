@@ -40,7 +40,6 @@ def _declare_parameters(name, inherit=None, **kwargs):
 
 STATE = partial(_declare, "_states")
 PARAMETER = partial(_declare_parameters, "_params")
-CONDUCTANCE = partial(_declare_parameters, "_conductances")
 INITIAL = partial(_declare_parameters, "_init")
 RANGE = partial(_declare, "_range")
 ASSIGNED = partial(_declare, "_assigned")

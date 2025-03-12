@@ -59,6 +59,7 @@ DFITOT = ContextVar("DFITOT", 1)
 IMEM = ContextVar("IMEM", 0)
 CUDA = ContextVar("CUDA", int(torch.cuda.is_available()))
 DTWARN = ContextVar("DTWARN", 1)
+PADE = ContextVar("PADE", -1)
 
 
 def numpify(x):

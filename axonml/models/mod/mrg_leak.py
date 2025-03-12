@@ -1,7 +1,6 @@
 # McIntyre, Richardson, Grill 2002
 
 from ..mechanisms import *
-from ..mechanisms.ops import expit, exprelr
 
 
 class mrg_leak(Mechanism):

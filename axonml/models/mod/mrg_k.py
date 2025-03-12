@@ -1,7 +1,7 @@
 # McIntyre, Richardson, Grill 2002
 
 from ..mechanisms import *
-from ..mechanisms.ops import expit, exprelr
+from ..mechanisms.ops import expit
 
 
 class s(State):
@@ -20,7 +20,7 @@ class s(State):
         vtraub=-80.0,
     )
 
-    DERIVATIVE("s' = (sinf - s) / stau", pade=True)
+    DERIVATIVE("s' = (sinf - s) / stau")
     ASSIGNED("sinf", "stau")
 
     def calc_q10(self):

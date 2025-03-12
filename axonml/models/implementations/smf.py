@@ -39,13 +39,12 @@ class SMF(Myelinated):
         temp=37.0,
         v_init=-80.0,
         method="euler",
-        pade=None,
     ):
         if torch.any(torch.as_tensor(diameters) < 5.7):
             raise ValueError("Fiber diameter should not be less than 5.7 um for SMF. Use smolMRG instead.")
         if method not in {"euler", "rk1"}:
             raise ValueError(f"Method {method} is not supported.")
-        super().__init__(diameters, n_node, temp, v_init, method, pade)
+        super().__init__(diameters, n_node, temp, v_init, method)
         self.insert(axnode_myel, ic=ic)
 
     @torch.jit.script_method

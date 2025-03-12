@@ -13,7 +13,6 @@ class Sweeney(Myelinated):
         temp=37.0,
         v_init=-80.0,
         method="dufort-frankel",
-        pade=True,
     ):
-        super().__init__(diameters, n_node, temp, v_init, method, pade)
+        super().__init__(diameters, n_node, temp, v_init, method)
         self.insert(sweeney)

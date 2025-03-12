@@ -1,7 +1,6 @@
 from .declarations import (
     STATE,
     PARAMETER,
-    CONDUCTANCE,
     INITIAL,
     USEQ10,
     DERIVATIVE,
@@ -20,7 +19,6 @@ __all__ = [
     "State",
     "STATE",
     "PARAMETER",
-    "CONDUCTANCE",
     "INITIAL",
     "USEQ10",
     "DERIVATIVE",

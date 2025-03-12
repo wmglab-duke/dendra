@@ -1,7 +1,7 @@
 # McIntyre, Richardson, Grill 2002
 
 from ..mechanisms import *
-from ..mechanisms.ops import expit, exprelr
+from ..mechanisms.ops import exprelr
 
 
 class p(State):
@@ -19,7 +19,7 @@ class p(State):
         cq10=10.0,
     )
 
-    DERIVATIVE("p' = (pinf - p) / ptau", pade=True)
+    DERIVATIVE("p' = (pinf - p) / ptau")
     ASSIGNED("pinf", "ptau")
 
     def calc_q10(self):

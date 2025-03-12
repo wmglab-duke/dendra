@@ -123,8 +123,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     method : str, optional
         Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4', 
         'dufort-frankel', or 'df'. Default is 'rk1'.
-    pade : optional
-        Padé approximation order, if applicable.
     beta : float, optional
         Hyperdiffusion coefficient. Default is 0.0.
     
@@ -148,10 +146,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         Time step in ms.
     """
     _dt_lim = None
-    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade", "is_df", "use_fast_imem", "hd"]
+    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "is_df", "use_fast_imem", "hd"]
 
     def __init__(
-        self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", pade=None, beta=0.0
+        self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", beta=0.0
     ):
         super().__init__()
 
@@ -165,7 +163,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             "df": "df",
         }
 
-        self.pade = pade
         self.is_df = self.method_conversion[method] == "df"
 
         if method not in self.method_conversion:
@@ -1081,12 +1078,66 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.export
     def cache(self, name: str = None):
+        """
+        Cache the current model state with an optional identifier.
+        
+        This method saves a snapshot of the model's current state dictionary
+        to an internal cache. The state can later be restored using the
+        restore() method with the same name.
+        
+        Parameters
+        ----------
+        name : str, optional
+            Identifier for the cached state. If None, the state is cached
+            with the name 'latest'. Default is None.
+        
+        Returns
+        -------
+        None
+        
+        See Also
+        --------
+        restore : Restore a previously cached state
+        
+        Examples
+        --------
+        >>> model.cache('before_training')  # Cache state before training
+        >>> # ... training or simulation ...
+        >>> model.restore('before_training')  # Return to cached state
+        """
         if name is None:
             name = "latest"
         self._caches[name] = self.state_dict()
 
     @torch.jit.export
     def restore(self, name: str = None):
+        """
+        Restore a previously cached model state.
+        
+        This method loads a previously cached state dictionary from the internal
+        cache and applies it to the model. It's used in conjunction with the
+        cache() method, which saves states.
+        
+        Parameters
+        ----------
+        name : str, optional
+            Identifier for the cached state to restore. If None, restores
+            the state cached as 'latest'. Default is None.
+        
+        Returns
+        -------
+        None
+        
+        See Also
+        --------
+        cache : Cache the current model state
+        
+        Examples
+        --------
+        >>> model.cache('before_training')  # Cache state before training
+        >>> # ... training or simulation ...
+        >>> model.restore('before_training')  # Return to cached state
+        """
         if name is None:
             name = "latest"
         self.load_state_dict(self._caches[name])
@@ -1166,13 +1217,13 @@ class Unmyelinated(Axon):
     PARAMETER(cm=1.0, rhoa=35.4)
 
     def __init__(
-        self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1", pade=None
+        self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"
     ):
         L = L * 1000  # mm -> um
         n_node = L / dx
         n_node = math.ceil(n_node) // 2 * 2 + 1
         self.dx: float = dx
-        super().__init__(diameters, n_node, temp, v_init, method, pade)
+        super().__init__(diameters, n_node, temp, v_init, method)
 
     def x(self) -> torch.Tensor:  # x in um
         l = (self.n_node - 1) * self.dx

@@ -20,7 +20,7 @@ from .handler.defaults import valid_concentrations
 from .state_compiler import compile_state, compile_coupled_state
 from .utils import load, indent, get_function_body_as_str
 
-from axonml.helpers import DEBUG
+from axonml.helpers import DEBUG, PADE
 
 
 # utility functions
@@ -646,7 +646,7 @@ def compile_mechanism(
     n_ax = model.n_ax
     n_nodes = model.n_node
     df = model.is_df
-    pade = model.pade
+    pade = None if PADE < 0 else bool(PADE)
 
     states = mechanism._states
 

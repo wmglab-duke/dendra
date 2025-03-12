@@ -33,9 +33,8 @@ class Schild97(Unmyelinated):
         temp=37.0,
         v_init=-69.0,
         method="dufort-frankel",
-        pade=None,
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method, pade)
+        super().__init__(diameters, L, dx, temp, v_init, method)
         R = 8314  # molar gas constant
         F = 96500  # Faraday's constant
 
@@ -81,9 +80,8 @@ class Schild94(Unmyelinated):
         temp=37.0,
         v_init=-48.0,
         method="dufort-frankel",
-        pade=None,
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method, pade)
+        super().__init__(diameters, L, dx, temp, v_init, method)
         R = 8314  # molar gas constant
         F = 96500  # Faraday's constant
 

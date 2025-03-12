@@ -23,7 +23,6 @@ class Heterogeneous(Axon):
         temp=37.0,
         v_init=-70.0,
         method="dufort-frankel",
-        pade=None,
         beta=0.0,
     ):
         if method not in {"dufort-frankel", "df"}:
@@ -31,7 +30,7 @@ class Heterogeneous(Axon):
                 f"Method {method} is not supported for heterogeneous axons."
             )
         diameters = torch.ones(n_ax)
-        super().__init__(diameters, n_node, temp, v_init, method, pade, beta)
+        super().__init__(diameters, n_node, temp, v_init, method, beta)
 
     def _register_buffers(self, diameters):
         self.register_buffer("diam", torch.empty(self.n_ax, 1, self.n_node))
@@ -280,7 +279,6 @@ class MyelinatedHeterogeneous(Axon):
         temp=37.0,
         v_init=-70.0,
         method="dufort-frankel",
-        pade=None,
         beta=0.0,
     ):
         if method not in {"dufort-frankel", "df"}:
@@ -288,7 +286,7 @@ class MyelinatedHeterogeneous(Axon):
                 f"Method {method} is not supported for heterogeneous axons."
             )
         diameters = torch.ones(n_ax)
-        super().__init__(diameters, n_node, temp, v_init, method, pade, beta)
+        super().__init__(diameters, n_node, temp, v_init, method, beta)
 
     def _register_buffers(self, diameters):
         self.register_buffer("diam", torch.empty(self.n_ax, 1, self.n_node))
@@ -554,7 +552,6 @@ class MyelinatedHeterogeneous(Axon):
         temp=None,
         v_init=None,
         method=None,
-        pade=None,
     ):
         if temp is None:
             temp = cls._get_init_defaults()["temp"]
@@ -562,11 +559,9 @@ class MyelinatedHeterogeneous(Axon):
             v_init = cls._get_init_defaults()["v_init"]
         if method is None:
             method = cls._get_init_defaults()["method"]
-        if pade is None:
-            pade = cls._get_init_defaults()["pade"]
         n_ax = len(node_d)
         n_node = len(node_d[0])
-        axon = cls(n_ax, n_node, temp, v_init, method, pade)
+        axon = cls(n_ax, n_node, temp, v_init, method)
         axon.set_all(node_d, inter_node_diam, node_l, inter_node_length)
         return axon
 

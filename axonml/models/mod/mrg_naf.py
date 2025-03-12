@@ -19,7 +19,7 @@ class m(State):
         cq10=10.0,
     )
 
-    DERIVATIVE("m' = (minf - m) / mtau", pade=True)
+    DERIVATIVE("m' = (minf - m) / mtau")
     ASSIGNED("minf", "mtau")
 
     def calc_q10(self):
@@ -55,7 +55,7 @@ class h(State):
         cq10=10.0,
     )
 
-    DERIVATIVE("h' = (hinf - h) / htau", pade=True)
+    DERIVATIVE("h' = (hinf - h) / htau")
     ASSIGNED("hinf", "htau")
 
     def calc_q10(self):
