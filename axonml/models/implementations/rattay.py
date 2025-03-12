@@ -14,10 +14,8 @@ class Rattay(Unmyelinated):
         temp=37.0,
         v_init=-70.0,
         method="dufort-frankel",
-        pade=None,
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method, pade)
+        super().__init__(diameters, L, dx, temp, v_init, method)
 
         with e_context(ena=45.0, ek=-82.0):
             self.insert(rattay_aberham)
-            self.build()

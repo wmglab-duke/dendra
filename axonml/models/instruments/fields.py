@@ -1,7 +1,10 @@
 """Precomputed fields."""
 
+import glob
+from natsort import natsorted
 import numpy as np
 from scipy.interpolate import interp1d
+from tqdm.auto import tqdm
 
 
 class PreComputed:
@@ -79,19 +82,30 @@ class PreComputedInterpolate1D(PreComputed):
             self.fv = 0
             self.use_point_source = True
 
-    def init_ve_space(self):
-        out = []
-        for a in self.axons:
-            try:
-                x = self.x[a.gid]
-            except IndexError:
-                x = self.x[0]
-            out.append(self.interpolate(self.get(a.gid), x, a))
-        return out
+    @classmethod
+    def from_ascent(cls, ascent_dir, sample, model, sim, contact, **kwargs):
+        data = glob.glob(f"{ascent_dir}/samples/{sample}/models/{model}/sims/{sim}/fibersets_bases/0/{contact}/*.dat")
+        data = natsorted(data)
+        data = np.vstack([np.loadtxt(f, skiprows=1) for f in data])
+        kwargs["in_memory"] = True
+        y = np.loadtxt(f"{ascent_dir}/samples/{sample}/models/{model}/sims/{sim}/fibersets/0/0.dat", skiprows=1)[:, -1]
+        return cls(data=data, y=y, **kwargs)
 
-    def interpolate(self, fem_vec, y_vec, axon):
+    def interpolate_batch(self, y_points, indices):
         """Interpolate voltage values along axon."""
-        y_points = axon.y_loc
+        return np.vstack([self.interpolate(yp, idx) for (yp, idx) in tqdm(zip(y_points, indices))])
+    
+    def interpolate_batch_indices(self, y_points, indices):
+        """Interpolate voltage values along axon."""
+        cache = {}
+        for i in indices:
+            if i not in cache:
+                cache[i] = self.interpolate(y_points, i)
+        return np.vstack([cache[i] for i in indices])
+    
+    def interpolate(self, y_points, idx):
+        fem_vec = self.get(idx)
+        y_vec = self.x[0]
         return self._interpolate(fem_vec, y_vec, y_points)
 
     def _interpolate(self, fem_vec, y_vec, y_points):

@@ -17,7 +17,7 @@ from ..mechanisms import PARAMETER, c_context
 
 
 class Tigerholm(Unmyelinated):
-    PARAMETER(cm=1e-3, rhoa=35.4)
+    PARAMETER(cm=1.0, rhoa=35.4)
 
     def __init__(
         self,
@@ -27,9 +27,8 @@ class Tigerholm(Unmyelinated):
         temp=37.0,
         v_init=-55.0,
         method="dufort-frankel",
-        pade=None,
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method, pade)
+        super().__init__(diameters, L, dx, temp, v_init, method)
 
         with c_context(nai0=11.4, nao0=154.0, ki0=144.9, ko0=5.6):
             self.insert(ks, gbar=0.0069733)
@@ -46,4 +45,3 @@ class Tigerholm(Unmyelinated):
             self.insert(
                 leak, gkleak=1.3155237866158132e-05, gnaleak=2.1094052499393e-05
             )
-            self.build()

@@ -1,0 +1,59 @@
+import inspect
+import string
+import random
+import textwrap
+
+
+def load(m, attr: str, cls: type):
+    """
+    Attempts to retrieve an attribute from an object, falling back to a class attribute if not found.
+    Args:
+        m (object): The object from which to retrieve the attribute.
+        attr (str): The name of the attribute to retrieve.
+        cls (type): The class from which to retrieve the attribute if it is not found in the object.
+    Returns:
+        Any: The value of the attribute from the object or the class.
+    """
+
+    try:
+        return getattr(m, attr)
+    except AttributeError:
+        return getattr(cls, attr)
+    
+
+def randomword(length: int) -> str:
+    """
+    Generate a random word of a given length.
+
+    Args:
+        length (int): The length of the random word to generate.
+
+    Returns:
+        str: A randomly generated word consisting of lowercase letters.
+    """
+
+    letters = string.ascii_lowercase
+    return "".join(random.choice(letters) for i in range(length))
+
+
+
+def indent(text: str, level=0) -> str:
+    """
+    Indents each line of the given text by a specified number of levels.
+
+    Args:
+        text (str): The text to be indented.
+        level (int, optional): The number of indentation levels. Each level corresponds to 4 spaces. Default is 0.
+    
+    Returns:
+        str: The indented text.
+    """
+
+    return textwrap.indent(text, " " * (4 * level))
+
+
+def get_function_body_as_str(func):
+    source_lines = inspect.getsourcelines(func)[0]  # Get source code as lines
+    body_lines = source_lines[1:]  # Skip the first line (def line)
+    body = "".join(body_lines)  # Combine into a single string
+    return body

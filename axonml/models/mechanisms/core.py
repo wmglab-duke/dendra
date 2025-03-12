@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, List
 
 import torch
 
@@ -15,6 +15,7 @@ class State:
     _initialized = set()
     _buffers = set()
     _params = {}
+    _diffusion: Tuple[float, str] = None
 
 
 @torch.jit.interface

@@ -29,16 +29,11 @@ parser.add_argument(
     help="Plot predicted thresholds & error histogram.",
 )
 
-parser.add_argument(
-    "-c", "--cuda", action="store_true", default=False, help="Run on GPU."
-)
-
 args = parser.parse_args()
 
 
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float32)
-    torch.cuda.empty_cache()
 
     # load field and diameter data
 
@@ -62,8 +57,6 @@ if __name__ == "__main__":
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
     mrg = SMF(diameters=diams, n_node=n_node).load("MRG")
-    if args.cuda:
-        mrg = mrg.cuda()
 
     dt = 0.005
     active = Active(dt=dt)

@@ -7,7 +7,7 @@ import torch
 import linecache
 import textwrap
 
-from axonml.helpers import DEBUG, DFITOT
+from axonml.helpers import DEBUG, DFITOT, IMEM
 
 
 def indent(text, level=0):
@@ -20,6 +20,7 @@ class MechanismHandler(torch.nn.Module):
     super().__init__()
     self.temp = temp
     {assignments}
+    {imem_assignment}
 
   def initialize(self, v, v_init, temp) -> None:
     self.ion_init(temp)
@@ -49,10 +50,12 @@ class MechanismHandler(torch.nn.Module):
     {breakpoint}
     {currents}
     total = {total}
+    {imem_write}
     return total
 
   def itot(self, v):
     {currents_tot}
+    {imem_write_df}
     return
 
   def update(self, temp) -> None:
@@ -344,6 +347,19 @@ def build_handler(
         all_names = names + [f"{i}_ion" for i in ion_names]
         arguments = arguments + ", " + parse_ions(ion_names)
 
+    if IMEM:
+        imem_assignment = "self.register_buffer('imem', torch.zeros(1))"
+        if df:
+            imem_write = ""
+            imem_write_df = f"self.imem = {' + '.join([parse_current_string(key, total=True, write=True) for key in currents.keys()])}"
+        else:
+            imem_write = "self.imem = total"
+            imem_write_df = ""
+    else:
+        imem_assignment = ""
+        imem_write = ""
+        imem_write_df = ""
+
     forward_str = template.format(
         arguments=arguments,
         assignments=parse_assignments(all_names),
@@ -365,6 +381,9 @@ def build_handler(
         currents_tot=tot_currents(currents, df),
         mech_detach=mech_detach(mechanisms),
         ion_detach=ion_detach(ions),
+        imem_assignment=imem_assignment,
+        imem_write=imem_write,
+        imem_write_df=imem_write_df,
     )
 
     if DEBUG > 0: print(forward_str)

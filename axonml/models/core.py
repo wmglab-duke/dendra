@@ -2,6 +2,7 @@ import math
 from typing import List, Tuple, Optional, Dict, Callable
 import re
 import itertools
+import warnings
 
 import torch
 from torch import Tensor
@@ -12,26 +13,30 @@ from axonml.models.stim.intrastim import IntraStim
 
 from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
-from axonml.models.mixins import Parameterized
+from axonml.models.parametric import Parameterized
 from axonml.models.mechanisms.core import Mechanism, validate
 from axonml.models.mechanisms.declarations import PARAMETER
 from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
 
-from axonml.helpers import op_mc, op_sc, ve_from_s_t
+from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM, CUDA, DTWARN, ctx
 
 
 def get_unique_keys(list_of_dicts):
-    """Gets all unique keys from a list of dictionaries.
-
-    Args:
-        list_of_dicts: A list of dictionaries.
-
-    Returns:
+    """
+    Get all unique keys from a list of dictionaries.
+    
+    Parameters
+    ----------
+    list_of_dicts : list
+        A list of dictionaries.
+    
+    Returns
+    -------
+    set
         A set of unique keys.
     """
-
     unique_keys = set()
     for dictionary in list_of_dicts:
         unique_keys.update(dictionary.keys())
@@ -99,12 +104,52 @@ class SymmetricConv1D(torch.nn.Conv1d):
 
 
 class Axon(Parameterized, torch.jit.ScriptModule):
-    """Base 1D fiber class."""
-
-    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "pade", "is_df"]
+    """
+    Base 1D fiber class.
+    
+    This is the base class for axon models, implementing common functionality
+    for simulating action potential propagation along 1D fibers.
+    
+    Parameters
+    ----------
+    diameters : array_like
+        Diameters of the axons in μm.
+    n_node : int
+        Number of nodes in the axon model.
+    temp : float, optional
+        Temperature in degrees Celsius. Default is 37.0.
+    v_init : float, optional
+        Initial membrane potential in mV. Default is -80.0.
+    method : str, optional
+        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4', 
+        'dufort-frankel', or 'df'. Default is 'rk1'.
+    beta : float, optional
+        Hyperdiffusion coefficient. Default is 0.0.
+    
+    Attributes
+    ----------
+    n_ax : int
+        Number of axons in the model.
+    n_node : int
+        Number of nodes in each axon.
+    temp : float
+        Temperature in degrees Celsius.
+    v_init : float
+        Initial membrane potential in mV.
+    method : str
+        Integration method.
+    mech : HandlerInterface
+        Handler for membrane mechanisms.
+    t_ind : int
+        Current time index.
+    dt : float
+        Time step in ms.
+    """
+    _dt_lim = None
+    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "is_df", "use_fast_imem", "hd"]
 
     def __init__(
-        self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", pade=None
+        self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", beta=0.0
     ):
         super().__init__()
 
@@ -118,7 +163,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             "df": "df",
         }
 
-        self.pade = pade
         self.is_df = self.method_conversion[method] == "df"
 
         if method not in self.method_conversion:
@@ -157,6 +201,18 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.post_initialize_hooks: List[Callable] = []
 
         self._caches = {}
+
+        self.use_fast_imem = bool(IMEM)
+        if self.use_fast_imem:
+            self.register_buffer("i_membrane", torch.zeros((self.n_ax, 1, n_node)))
+
+        self.beta = beta
+        self.hd = bool(beta) # hyper-diffusion
+        if self.hd:
+            self.filter = torch.nn.Conv1d(1, 1, 5, padding=2, bias=False, padding_mode="reflect")
+            self.filter.weight.data = torch.tensor([-1, 4, -6, 4, -1], dtype=torch.float).reshape(1, 1, 5)
+            for p in self.filter.parameters():
+                p.requires_grad = False
 
         self.weight_choices = {
             "rk1": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
@@ -198,18 +254,34 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         # -- constants --
         self.eval()
 
+    def __init_subclass__(cls, **kwargs):
+        def init_decorator(previous_init):
+            def new_init(self, *args, **kwargs):
+                previous_init(self, *args, **kwargs)
+                if type(self) == cls:
+                    Axon.__post_init__(self)
+            return new_init
+
+        cls.__init__ = init_decorator(cls.__init__)
+
+    def __post_init__(self):
+        changed = self.instantiate_parameters_lambda()
+        if changed: self.calculate_geometric_params()
+        self._build()
+        if CUDA: self.cuda()
+
     def _register_buffers(self, diameters):
         self.register_buffer("diam", diameters)
         self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
         self.register_buffer("cm_c", self.cm_(self.area_c))
         self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
-
         self.register_buffer("v_init_c", torch.tensor(self.v_init))
         self.register_buffer("temp_c", torch.tensor(self.temp))
 
     def set_diam(self, diams):
         diams = torch.as_tensor(diams, dtype=self.dtype())
         self.diam[:] = diams
+        self.instantiate_parameters_lambda()
         self.calculate_geometric_params()
 
     def calculate_geometric_params(self):
@@ -219,20 +291,23 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def unfreeze(self, *names):
         """
-        Unfreezes the parameters of the model for training.
-        If no parameter names are provided, all parameters of the model will be unfrozen.
-        If specific parameter names are provided, only those parameters will be unfrozen.
-
-        Args:
-            *names (str): Variable length argument list of parameter names to unfreeze.
-
-        Examples:
-            Unfreeze all parameters::
-            >>> model.unfreeze()
-
-            Unfreeze specific parameters::
-            >>> model = SMF()
-            >>> model.unfreeze('axnode_myel.gnabar', 'axnode_myel.gkbar')
+        Unfreezes model parameters, making them trainable.
+        
+        If no names are provided, all parameters will be unfrozen.
+        If names are provided, only parameters whose names match any 
+        of the provided patterns will be unfrozen.
+        
+        Parameters
+        ----------
+        *names : str
+            Variable length argument list of parameter name patterns.
+            If empty, all parameters will be unfrozen.
+            Otherwise, only parameters matching any of these patterns will be unfrozen.
+            
+        Notes
+        -----
+        The matching is done using the `matches_any_pattern` function.
+        When a parameter is unfrozen, a message is printed to the console.
         """
         if not names:
             for p in self.parameters():
@@ -280,42 +355,32 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def dtype(self):
         return self.ssd.weight.dtype
 
-    def insert(
-        self,
-        mechanism: Mechanism,
-        ic: Dict[str, float] = None,
-        mask_out: str | int = None,
-        mask_in: str | int = None,
-        **kwargs,
-    ):
+    def insert(self, mechanism, ic=None, mask_out=None, mask_in=None, **kwargs):
         """
-        Inserts a mechanism into the model.
-
-        This method validates and compiles the given mechanism, then appends it to the model's mechanism list.
-        It also updates the model's current, ion read, ion write, and ion write_c dictionaries with the mechanism's respective values.
-
-        Args:
-            mechanism (Mechanism): The mechanism to be inserted into the model.
-            ic (optional, Dict[str:float]): Initial conditions for the mechanism.
-            mask (optional): Compartments for which the mechanism will not be included in current calculation. NumPy / Pytorch slice syntax.
-            **kwargs: Additional keyword arguments to be passed to the compile_mechanism function.
-
-        Returns:
-            None
+        Insert a mechanism into the model.
+        
+        Parameters
+        ----------
+        mechanism : Mechanism
+            The mechanism to be inserted into the model.
+        ic : dict, optional
+            Dictionary of initial conditions for the mechanism states.
+            Keys are state names and values are initial values.
+        mask_out : str, int, or slice, optional
+            Mask specifying compartments for which the mechanism will not
+            contribute to the current calculation.
+        mask_in : str, int, or slice, optional
+            Mask specifying compartments for which the mechanism will not
+            receive input.
+        **kwargs
+            Additional keyword arguments to be passed to the compile_mechanism function.
         """
         validate(mechanism)
 
-        df = self.is_df
-
         m, unfactorable, has_gtot = compile_mechanism(
             mechanism,
-            self.temp,
-            self.diam,
-            self.n_ax,
-            self.n_node,
+            self,
             ic=ic,
-            df=df,
-            pade=self.pade,
             mask_out=mask_out,
             mask_in=mask_in,
             **kwargs,
@@ -380,7 +445,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             return (0, 1, 0, 0, 0)
         return (0, 0, 0, 0, 0)
 
-    def build(self):
+    def _build(self):
         all_ions = get_unique_keys([self._ion_read, self._ion_write, self._ion_write_c])
 
         _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
@@ -424,7 +489,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         raise NotImplementedError()
 
     def cm_(self, area):
-        return self.cm * area
+        return (self.cm / 1e3) * area
 
     def init_v(self):
         self.v[:] = self.v_init
@@ -441,25 +506,99 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @property
     def t(self):
+        """
+        Get the current simulation time.
+        
+        Returns
+        -------
+        float
+            Current simulation time in milliseconds.
+        """
         return self.t_ind * self.dt
 
     def c(self, *args):
+        """
+        Convert relative positions to node indices.
+        
+        Parameters
+        ----------
+        *args : float
+            Variable number of float values between 0 and 1, representing
+            relative positions along the axon.
+        
+        Returns
+        -------
+        list
+            List of integer node indices corresponding to the input positions.
+        
+        Examples
+        --------
+        >>> model.c(0.25, 0.5, 0.75)
+        [25, 50, 75]  # For a model with n_node=101
+        """
         return [round((self.n_node - 1) * i) for i in args]
 
-    def run(
-        self,
-        ve: Tensor = None,
-        space: Tensor = None,
-        time: Tensor = None,
-        dt: float = None,
-        intra: Optional[IntraStim] = None,
-        callbacks: List[Callback] = None,
-        reinit: bool = False,
-        progressbar: bool = True,
-        first: bool = True,
-        multicontact: bool = False,
-        longrunning: bool = False,
-    ):
+    def run(self, 
+            ve=None, 
+            space=None, 
+            time=None, 
+            dt=None, 
+            intra=None,
+            callbacks=None, 
+            reinit=False, 
+            progressbar=True, 
+            multicontact=False,
+            first=True, 
+            longrunning=False):
+        """
+        Run the axon model simulation.
+        
+        Parameters
+        ----------
+        ve : Tensor, optional
+            Extracellular voltage tensor. Shape should be 
+            [timesteps, n_ax, 1, n_node] or compatible.
+        space : Tensor, optional
+            Spatial components when ve is not directly provided.
+            Used with time to construct ve.
+        time : Tensor, optional
+            Temporal components when ve is not directly provided.
+            Used with space to construct ve.
+        dt : float, optional
+            Time step size in milliseconds. If None, uses the default from backend.
+        intra : IntraStim, optional
+            Intracellular stimulation object.
+        callbacks : list of Callback, optional
+            List of callback objects to execute during simulation steps.
+        reinit : bool, optional
+            If True, reinitialize the model state before running. If steady state is
+            cached, it will be restored instead of initializing from scratch.
+            Default is False.
+        progressbar : bool or tqdm, optional
+            If True, displays a progress bar during simulation. Can also be a
+            tqdm instance for custom progress tracking. Default is True.
+        multicontact : bool, optional
+            If True, handles multiple electrode contacts for ve construction.
+            Default is False.
+        first : bool, optional
+            If True, indicates this is the first run in a sequence, triggering
+            pre-loop hooks for callbacks. Default is True.
+        longrunning : bool, optional
+            If True, indicates this run is part of a longer simulation sequence,
+            affecting progress bar behavior. Default is False.
+        
+        Raises
+        ------
+        ValueError
+            If neither ve nor (space and time) nor intra is provided.
+            If intra is provided but is not an instance of IntraStim.
+        
+        Notes
+        -----
+        The simulation updates the model's internal state (v, v_prev for DF method, etc.)
+        and advances the model's time index (t_ind).
+        """
+        
         with_intra = intra is not None
         if with_intra:
             if not isinstance(intra, IntraStim):
@@ -472,13 +611,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     "Either ve or ve_s and ve_t or intra must be provided."
                 )
             intra_only = True
-            ve_zero = torch.zeros_like(self.v)
+        ve_zero = torch.zeros_like(self.v)
 
         device = self.device()
         if ve is not None:
             ve = torch.as_tensor(ve, device=device)
 
         dt = dt if dt is not None else A.dt
+        self.warn_about_dt(dt)
         self.dt = dt
 
         method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
@@ -533,13 +673,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     progressbar = tqdm(total=ve.shape[0], desc=f"{self.t:.3f} ms")
 
             for i in range(ve.shape[0]):
-                ve_ = ve[i] if not intra_only else ve_zero
+                ve_c = ve[i] if not intra_only else ve_zero
                 if df:
                     if with_intra:
                         self.v, self.v_prev = method_intra(
                             self.v,
                             self.v_prev,
-                            ve_,
+                            ve_c,
                             self.area_c,
                             s,
                             s2,
@@ -551,7 +691,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                         self.v, self.v_prev = method(
                             self.v,
                             self.v_prev,
-                            ve_,
+                            ve_c,
                             self.area_c,
                             s,
                             s2,
@@ -562,7 +702,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     if with_intra:
                         self.v = method_intra(
                             self.v,
-                            ve_,
+                            ve_c,
                             self.area_c,
                             cm_inv,
                             ra_inv,
@@ -572,7 +712,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                         )
                     else:
                         self.v = method(
-                            self.v, ve_, self.area_c, cm_inv, ra_inv, dt, self.temp_c
+                            self.v, ve_c, self.area_c, cm_inv, ra_inv, dt, self.temp_c
                         )
                 callbacks.post_step_hook(self)
                 self.t_ind += 1
@@ -594,9 +734,45 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         dt: float = None,
         reinit=False,
         callbacks: List[Callback] = None,
+        intra: Optional[IntraStim] = None,
         progressbar=True,
         multicontact=False,
     ):
+        """
+        Run a long simulation by splitting it into multiple chunks.
+        
+        Parameters
+        ----------
+        space : Tensor
+            Spatial components of extracellular voltage. Shape should be
+            [n_ax, n_node] or [1, n_node] or [n_contacts, ...] for multicontact mode.
+        time : Tensor
+            Temporal components of extracellular voltage. Shape should be
+            [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, ...] for multicontact mode.
+        n_chunks : int
+            Number of chunks to split the temporal component into.
+        dt : float, optional
+            Time step size in milliseconds. If None, uses the default from backend.
+        reinit : bool, optional
+            If True, reinitialize the model state before running the first chunk.
+            Subsequent chunks will not reinitialize. Default is False.
+        callbacks : list of Callback, optional
+            List of callback objects to execute during simulation steps.
+        intra : IntraStim, optional
+            Intracellular stimulation object.
+        progressbar : bool, optional
+            If True, displays a progress bar during simulation. Default is True.
+        multicontact : bool, optional
+            If True, handles multiple electrode contacts for ve construction.
+            Default is False.
+        
+        Notes
+        -----
+        This method uses the same numerical methods as the `run` method, but manages
+        memory more efficiently for long simulations by processing the data in chunks.
+        The state of the model (v, v_prev, etc.) is preserved between chunks.
+        """
+        
         ve_s = torch.as_tensor(space, device=self.device())
         ve_t = torch.as_tensor(time, device=self.device())
 
@@ -613,6 +789,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             einsum = op_sc
 
         dt = dt if dt is not None else A.dt
+        self.warn_about_dt(dt)
 
         t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
 
@@ -631,26 +808,46 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             else:
                 reinit = False
             ve = einsum(ve_s, t_chunk)
-            self.run(
-                ve,
-                dt=dt,
-                callbacks=callbacks,
-                reinit=reinit,
-                progressbar=progressbar,
-                first=(i == 0),
-                longrunning=True,
-            )
+            with ctx(DTWARN=0):
+                self.run(
+                    ve,
+                    dt=dt,
+                    intra=intra,
+                    callbacks=callbacks,
+                    reinit=reinit,
+                    progressbar=progressbar,
+                    first=(i == 0),
+                    longrunning=True,
+                )
 
         if progressbar:
             progressbar.close()
 
     def steady_state(self, dt=0.2, maxiter=3000):
+        """
+        Run the model until it reaches a steady state and cache the result.
+        
+        Parameters
+        ----------
+        dt : float, optional
+            Time step size in milliseconds. Default is 0.2 ms.
+        maxiter : int, optional
+            Maximum number of iterations to run the simulation. Default is 3000.
+        
+        Notes
+        -----
+        This method clears any previous steady state cache before creating a new one.
+        The steady state can be restored later by setting reinit=True when calling 
+        the run method.
+        """
+        
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
         ve = torch.zeros(1, self.n_ax, 1, self.n_node, device=self.device())
-        for i in tqdm(range(maxiter), desc="Steady state..."):
-            reinit = i == 0
-            self.run(ve, dt, reinit=reinit, progressbar=False)
+        with ctx(DTWARN=0):
+            for i in tqdm(range(maxiter), desc="Steady state..."):
+                reinit = i == 0
+                self.run(ve, dt, reinit=reinit, progressbar=False)
         self.cache("_steady_state")
 
     def post_initialize(self):
@@ -661,12 +858,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def initialize(self, v, v_init, temp):
         self.mech.initialize(v, v_init, temp)
 
+    @torch.jit.script_method
     def FRK(self, v, ve, area, cm, ra):
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)
         i_ion = self.mech.i(v, v) * area
         return cm * ((ra * d2v) - i_ion)
 
+    @torch.jit.script_method
     def FRK_intra(self, v, ve, area, cm, ra, intra):
         x = torch.cat([v, ve], dim=1)
         d2v = self.ssd(x)
@@ -677,33 +876,43 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def step_no_intra_rk1(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
         K1 = self.FRK(v, ve, area, cm, ra)
         self.mech.advance(v, dt, temp)
-        v = v + K1 * dt
-        return v
+        v_n = v + K1 * dt
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_intra_rk1(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         self.mech.advance(v, dt, temp)
-        v = v + K1 * dt
-        return v
+        v_n = v + K1 * dt
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_no_intra_rk2(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
         K1 = self.FRK(v, ve, area, cm, ra)
         K2 = self.FRK(v + K1 * dt, ve, area, cm, ra)
         self.mech.advance(v, dt, temp)
-        v = v + (K1 + K2) * (dt / 2)
-
-        return v
+        v_n = v + (K1 + K2) * (dt / 2)
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_intra_rk2(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
         K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
         K2 = self.FRK_intra(v + K1 * dt, ve, area, cm, ra, intra)
         self.mech.advance(v, dt, temp)
-        v = v + (K1 + K2) * (dt / 2)
-
-        return v
+        v_n = v + (K1 + K2) * (dt / 2)
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_no_intra_rk4(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
@@ -715,9 +924,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.mech.advance(v, dt, temp)
 
-        v = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
-
-        return v
+        v_n = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_intra_rk4(
@@ -739,9 +950,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.mech.advance(v, dt, temp)
 
-        v = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
-
-        return v
+        v_n = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_n - v) / dt
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+        return v_n
 
     @torch.jit.script_method
     def step_no_intra_df(
@@ -759,6 +972,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
+
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
+            self.i_membrane[:] = i_cap + self.mech.imem * area
+
+        if self.hd:
+            v_new = v_new - self.beta * self.filter(v_new)
 
         return v_new, v
 
@@ -779,6 +999,13 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
 
+        if self.use_fast_imem:
+            i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
+            self.i_membrane[:] = i_cap + self.mech.imem
+
+        if self.hd:
+            v_new = v_new - self.beta * self.filter(v_new)
+
         return v_new, v
 
     @torch.jit.script_method
@@ -789,6 +1016,31 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self.mech.get(mech, state)
 
     def load(self, state_dict):
+        """
+        Load model weights from a state dictionary.
+        
+        This method supports loading weights from:
+        1. A key from the predefined `all_trained` dictionary
+        2. A file path as a string
+        3. An actual state dictionary object
+        
+        The loaded weights are matched to the model's current state dict structure
+        and only compatible weights are loaded. After loading, geometric parameters
+        are recalculated.
+        
+        Parameters
+        ----------
+        state_dict : str or dict
+            Can be one of:
+            - A key from the predefined `all_trained` dictionary
+            - A file path to a saved model state
+            - A state dictionary object
+        
+        Returns
+        -------
+        self
+            The model instance with loaded weights
+        """
         from axonml import all_trained
 
         if state_dict in all_trained:
@@ -799,7 +1051,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
-        matched, _ = match_state_dict(self.state_dict(), state_dict)
+        matched, _ = _match_state_dict(self.state_dict(), state_dict)
         self.load_state_dict(matched, strict=False)
         self.calculate_geometric_params()
         return self
@@ -826,12 +1078,66 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.export
     def cache(self, name: str = None):
+        """
+        Cache the current model state with an optional identifier.
+        
+        This method saves a snapshot of the model's current state dictionary
+        to an internal cache. The state can later be restored using the
+        restore() method with the same name.
+        
+        Parameters
+        ----------
+        name : str, optional
+            Identifier for the cached state. If None, the state is cached
+            with the name 'latest'. Default is None.
+        
+        Returns
+        -------
+        None
+        
+        See Also
+        --------
+        restore : Restore a previously cached state
+        
+        Examples
+        --------
+        >>> model.cache('before_training')  # Cache state before training
+        >>> # ... training or simulation ...
+        >>> model.restore('before_training')  # Return to cached state
+        """
         if name is None:
             name = "latest"
         self._caches[name] = self.state_dict()
 
     @torch.jit.export
     def restore(self, name: str = None):
+        """
+        Restore a previously cached model state.
+        
+        This method loads a previously cached state dictionary from the internal
+        cache and applies it to the model. It's used in conjunction with the
+        cache() method, which saves states.
+        
+        Parameters
+        ----------
+        name : str, optional
+            Identifier for the cached state to restore. If None, restores
+            the state cached as 'latest'. Default is None.
+        
+        Returns
+        -------
+        None
+        
+        See Also
+        --------
+        cache : Cache the current model state
+        
+        Examples
+        --------
+        >>> model.cache('before_training')  # Cache state before training
+        >>> # ... training or simulation ...
+        >>> model.restore('before_training')  # Return to cached state
+        """
         if name is None:
             name = "latest"
         self.load_state_dict(self._caches[name])
@@ -861,26 +1167,38 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         super().to(*args, **kwargs)
         self.mech.set_buffers(self.diam)
         return self
+    
+    def warn_about_dt(self, dt):
+        if DTWARN:
+            if self._dt_lim is not None:
+                if dt > self._dt_lim:
+                    warnings.warn(f"dt ({dt}) exceeds limit ({self._dt_lim}), solution may have large oscillations.")
 
 
-def match_state_dict(
+def _match_state_dict(
     state_dict_a: Dict[str, torch.Tensor],
     state_dict_b: Dict[str, torch.Tensor],
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """Filters state_dict_b to contain only states that are present in state_dict_a.
+    """
+    Match tensors between two state dictionaries based on key names and shapes.
+    This function filters a state dictionary to find tensors that have matching keys
+    and identical shapes in another state dictionary, which is useful for selective 
+    parameter loading or model weight comparisons.
 
-    Matching happens according to two criteria:
-        - Is the key present in state_dict_a?
-        - Does the state with the same key in state_dict_a have the same shape?
-
+    Parameters
+    ----------
+    state_dict_a : Dict[str, torch.Tensor]
+        First state dictionary used as reference for key and shape matching.
+    state_dict_b : Dict[str, torch.Tensor]
+        Second state dictionary to filter based on keys and shapes in state_dict_a.
     Returns
-        (matched_state_dict, unmatched_state_dict)
-
-        States in matched_state_dict contains states from state_dict_b that are also
-        in state_dict_a and unmatched_state_dict contains states that have no
-        corresponding state in state_dict_a.
-
-            In addition: state_dict_b = matched_state_dict U unmatched_state_dict.
+    -------
+    Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
+        A tuple containing:
+        - matched_state_dict: Dictionary with entries from state_dict_b that have 
+          matching keys and shapes in state_dict_a.
+        - unmatched_state_dict: Dictionary with remaining entries from state_dict_b 
+          that don't have matching keys or shapes in state_dict_a.
     """
     matched_state_dict = {
         key: state
@@ -896,20 +1214,20 @@ def match_state_dict(
 
 
 class Unmyelinated(Axon):
-    PARAMETER(cm=1e-3, rhoa=35.4)
+    PARAMETER(cm=1.0, rhoa=35.4)
 
     def __init__(
-        self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1", pade=None
+        self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"
     ):
         L = L * 1000  # mm -> um
         n_node = L / dx
         n_node = math.ceil(n_node) // 2 * 2 + 1
         self.dx: float = dx
-        super().__init__(diameters, n_node, temp, v_init, method, pade)
+        super().__init__(diameters, n_node, temp, v_init, method)
 
     def x(self) -> torch.Tensor:  # x in um
         l = (self.n_node - 1) * self.dx
-        return torch.linspace(-l / 2, l / 2, self.n_node)
+        return torch.linspace(-l / 2, l / 2, self.n_node, device=self.device())
 
     def area_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)
@@ -940,7 +1258,7 @@ class Myelinated(Axon):
             "deltax3": 0.0,
         },
         membrane={
-            "cm": 1e-3,
+            "cm": 1.0,
             "rhoa": 35.4,  # ohm-cm
         },
     )

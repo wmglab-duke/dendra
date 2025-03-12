@@ -1,31 +1,30 @@
+from functools import partial
 from typing import Dict, List
 import inspect
 import linecache
-import textwrap
 import ast
 import re
+import warnings
 import math
 
-import warnings
-from sympy import symbols, sympify, Poly, expand, factor
-
-
 import torch
+from sympy import symbols, sympify, Poly, expand, factor
 
 from .compile_f import convert_func
 from .core import Mechanism, coupled
-from ..mixins import to_param
+from ..parametric import to_param
 from .ops import *
 from axonml import const
 
 from .handler.defaults import valid_concentrations
 from .state_compiler import compile_state, compile_coupled_state
+from .utils import load, indent, get_function_body_as_str
 
-from axonml.helpers import DEBUG
+from axonml.helpers import DEBUG, PADE
 
 
-def indent(text, level=0):
-    return textwrap.indent(text, " " * (4 * level))
+# utility functions
+load = partial(load, cls=Mechanism)
 
 
 def replace_v(code_str):
@@ -74,6 +73,8 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
         else:
             final_expr = parse_expr(line_no_self)
 
+    if DEBUG: print(f"Final expression in mech factorization: {final_expr}")
+
     if final_expr is None:
         raise ValueError("No final expression or return statement found.")
 
@@ -110,13 +111,37 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
 template = """
 class {mech}(torch.nn.Module):
     _init_params: Dict[str, float]
-    def __init__(self, temp, diameters, n_ax, n_nodes, name: str, params, distributions, read_ion, write_ion_c, states, conductances, init, ic: dict = None):
+    def __init__(
+            self, 
+            temp, 
+            diameters, 
+            n_ax, 
+            n_nodes, 
+            name: str, 
+            params, 
+            distributions, 
+            read_ion, 
+            write_ion_c, 
+            states, 
+            conductances, 
+            init, 
+            model,
+            ic: dict = None
+        ):
         super().__init__()
-        self.instantiate_parameters(params)
+        
+        self._name = name
+
+        self.instantiate_parameters(params, model)
         self.instantiate_distributions(distributions)
         self.temp = temp
-        self.register_buffer("diam", diameters.view(-1, 1, 1))
-        self._name = name
+
+        if len(diameters.shape) == 1:
+            final_axis = 1
+        else:
+            final_axis = diameters.shape[-1]
+        self.register_buffer("diam", diameters.view(diameters.shape[0], 1, final_axis))
+
         self.DE = torch.nn.ModuleDict(
             {{state._name: state for state in states}}
         )
@@ -153,16 +178,16 @@ class {mech}(torch.nn.Module):
             for v in self.write_ion_c[name]:
                 self.register_buffer(v, getattr(ion, v))
 
-    def instantiate_parameters(self, params):
+    def instantiate_parameters(self, params, model):
         if params is not None:
             for name, value in params.items():
                 if isinstance(value, dict):
                     setattr(self, name, [])
                     for pname, pval in value.items():
-                        setattr(self, pname, to_param(pval))
+                        setattr(self, pname, to_param(pval, model))
                         getattr(self, name).append(getattr(self, pname))
                 else:
-                    setattr(self, name, to_param(value))
+                    setattr(self, name, to_param(value, model))
 
     def detach(self):
 {detach}
@@ -235,8 +260,9 @@ distribution_init_template = """
 self.{name} = self.{name}_d._sample(self.{name})
 """
 
+# ----------------- Definitions -----------------
 
-def mask_def(mask_out, mask_in):
+def define_mask(mask_out, mask_in):
     if mask_out is None and mask_in is None:
         return ""
     ret = []
@@ -254,7 +280,7 @@ def mask_def(mask_out, mask_in):
     return "\n".join(ret)
 
 
-def detach(states):
+def define_detach(states):
     assignments = []
     for k in states:
         if not k.coupled:
@@ -266,14 +292,7 @@ def detach(states):
     return "\n".join(assignments)
 
 
-def init_distribution_buffers(distributions):
-    assignments = []
-    for k, _ in distributions.items():
-        assignments.append(distribution_init_template.format(name=k))
-    return "\n".join(assignments)
-
-
-def coupled_infs(mechanism, states):
+def define_coupled_infs(mechanism, states):
     assignments = []
     for k in states:
         if k.coupled:
@@ -286,6 +305,14 @@ def coupled_infs(mechanism, states):
                         assignments.append(
                             indent(mech_inf_template.format(state=name), 1)
                         )
+    return "\n".join(assignments)
+
+# ----------------- Initializations -----------------
+
+def init_distribution_buffers(distributions):
+    assignments = []
+    for k, _ in distributions.items():
+        assignments.append(distribution_init_template.format(name=k))
     return "\n".join(assignments)
 
 
@@ -302,6 +329,44 @@ def init_state_buffers(states):
                     assignments.append(
                         init_state_buffers_coupled_template.format(state=name)
                     )
+    return "\n".join(assignments)
+
+
+def init_conductance_buffers(conductances):
+    assignments = []
+    for k, _ in conductances.items():
+        assignments.append(f"self.{k} = self.{k}_init * area")
+    return "\n".join(assignments)
+
+
+# ----------------- Assignments -----------------
+
+def state_buffer_assignments(states):
+    assignments = []
+    for k in states:
+        if not k.coupled:
+            name = k._name
+            if name not in valid_concentrations():
+                assignments.append(
+                    f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
+                )
+        else:
+            names = k._state_names
+            for name in names:
+                if name not in valid_concentrations():
+                    assignments.append(
+                        f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
+                    )
+    return "\n".join(assignments)
+
+
+def current_buffer_assignments(currents, range_vars):
+    assignments = []
+    for k in currents:
+        if k in range_vars:
+            assignments.append(
+                f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_nodes)))"
+            )  # noqa(0.0))")
     return "\n".join(assignments)
 
 
@@ -383,42 +448,6 @@ def extract_multipliers(class_def_str: str) -> List[str]:
     return visitor.multipliers
 
 
-def state_buffer_assignments(states):
-    assignments = []
-    for k in states:
-        if not k.coupled:
-            name = k._name
-            if name not in valid_concentrations():
-                assignments.append(
-                    f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
-                )
-        else:
-            names = k._state_names
-            for name in names:
-                if name not in valid_concentrations():
-                    assignments.append(
-                        f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
-                    )
-    return "\n".join(assignments)
-
-
-def current_buffer_assignments(currents, range_vars):
-    assignments = []
-    for k in currents:
-        if k in range_vars:
-            assignments.append(
-                f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_nodes)))"
-            )  # noqa(0.0))")
-    return "\n".join(assignments)
-
-
-def init_conductance_buffers(conductances):
-    assignments = []
-    for k, _ in conductances.items():
-        assignments.append(f"self.{k} = self.{k}_init * area")
-    return "\n".join(assignments)
-
-
 def advance(states):
     assignments = []
     for k in states:
@@ -492,8 +521,10 @@ def current_equations(currents, mechanism, range_vars, df, mask):
         else:
             code_block = get_function_body_as_str(getattr(mechanism, k))
             if mask:
-                code_block = multiply_return_value(code_block, "self.mask")
-            assignments.append(current_tot_template.format(k=k, body=code_block))
+                code_block_tot = multiply_return_value(code_block, "self.mask")
+            else:
+                code_block_tot = code_block
+            assignments.append(current_tot_template.format(k=k, body=code_block_tot))
             try:
                 i, _ = factor_linear_in_x_from_codeblock(replace_v(code_block))
                 if assign:
@@ -518,7 +549,7 @@ def current_equations(currents, mechanism, range_vars, df, mask):
     return "\n".join(assignments), unfactorable
 
 
-def gtot(currents, mechanism, df):
+def gtot(currents, mechanism, df, mask):
     if not df:
         return "    def gtot(self): return torch.tensor(0.0)", False
     assignments = []
@@ -534,21 +565,11 @@ def gtot(currents, mechanism, df):
         has_gtot = False
         return "    def gtot(self): return torch.tensor(0.0)", has_gtot
     s = " + ".join(assignments)
-    return f"    def gtot(self): return {s}", has_gtot
-
-
-def load(m, attr):
-    try:
-        return getattr(m, attr)
-    except AttributeError:
-        return getattr(Mechanism, attr)
-
-
-def get_function_body_as_str(func):
-    source_lines = inspect.getsourcelines(func)[0]  # Get source code as lines
-    body_lines = source_lines[1:]  # Skip the first line (def line)
-    body = "".join(body_lines)  # Combine into a single string
-    return body
+    if mask:
+        mult = " * self.mask"
+    else:
+        mult = ""
+    return f"    def gtot(self): return {s} {mult}", has_gtot
 
 
 default_f = """
@@ -614,17 +635,19 @@ def distribution_buffers(distributions):
 
 def compile_mechanism(
     mechanism,
-    temp,
-    diameters,
-    n_ax,
-    n_nodes,
-    df=False,
+    model,
     ic=None,
-    pade=None,
     mask_out=None,
     mask_in=None,
     **kwargs,
 ):
+    temp = model.temp
+    diameters = model.diam
+    n_ax = model.n_ax
+    n_nodes = model.n_node
+    df = model.is_df
+    pade = None if PADE < 0 else bool(PADE)
+
     states = mechanism._states
 
     params = load(mechanism, "_params")
@@ -650,11 +673,11 @@ def compile_mechanism(
     for s in states:
         if coupled(s):
             states_compiled.append(
-                compile_coupled_state(s, temp, diameters, pade=pade, **kwargs)
+                compile_coupled_state(s, model, pade=pade, **kwargs)
             )
         else:
             states_compiled.append(
-                compile_state(s, temp, diameters, pade=pade, **kwargs)
+                compile_state(s, model, pade=pade, **kwargs)
             )
 
     state_buffer_assignments_str = state_buffer_assignments(states_compiled)
@@ -672,12 +695,14 @@ def compile_mechanism(
     advance_str = advance(states_compiled)
     advance_str = indent(advance_str, 2)
 
+    masked = (mask_out is not None) or (mask_in is not None)
+
     current_equations_str, unfactorable = current_equations(
         current_eqs,
         mechanism,
         range_vars,
         df,
-        (mask_out is not None) or (mask_in is not None),
+        masked,
     )
     current_equations_str = indent(current_equations_str, 1)
 
@@ -690,7 +715,7 @@ def compile_mechanism(
     init_distribution_buffers_str = init_distribution_buffers(distributions)
     init_distribution_buffers_str = indent(init_distribution_buffers_str, 2)
 
-    gtot_str, has_gtot = gtot(current_eqs, mechanism, df)
+    gtot_str, has_gtot = gtot(current_eqs, mechanism, df, masked)
 
     forward_str = template.format(
         mech=mechanism.__name__,
@@ -703,14 +728,14 @@ def compile_mechanism(
         breakpoint_f=translate_f(mechanism, "breakpoint"),
         initial_f=translate_f(mechanism, "initial"),
         gtot=gtot_str,
-        coupled_infs=coupled_infs(mechanism, states_compiled),
+        coupled_infs=define_coupled_infs(mechanism, states_compiled),
         distribution_buffer_assignments=distribution_buffer_assignments_str,
         init_distribution_buffers=init_distribution_buffers_str,
-        detach=indent(detach(states_compiled), 2),
-        mask_def=indent(mask_def(mask_out, mask_in), 2),
+        detach=indent(define_detach(states_compiled), 2),
+        mask_def=indent(define_mask(mask_out, mask_in), 2),
     )
 
-    if DEBUG > 0: print(forward_str)
+    if DEBUG >= 2: print(forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
@@ -733,6 +758,7 @@ def compile_mechanism(
         states_compiled,
         conductances,
         init,
+        model,
         ic=ic,
     )
 

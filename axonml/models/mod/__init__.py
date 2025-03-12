@@ -23,13 +23,34 @@ for file in py_files:
 
 def load_mechanisms(*paths):
     """
-    Load mechanisms from directories containing Python files.
-
-    Args:
-        *paths (str): Path(s) to the directory(s) containing Python files.
-
-    Returns:
-        dict[str, Mechanism]: Dictionary of mechanism names and corresponding mechanisms.
+    Load mechanism modules from the specified file paths.
+    This function dynamically imports Python files from the given directories,
+    extracting modules that are expected to contain mechanism implementations.
+    Each mechanism is assumed to have a class with the same name as the file.
+    
+    Parameters
+    ----------
+    *paths : str
+        Variable number of directory paths where mechanism files are located.
+    
+    Returns
+    -------
+    MechanismContainer
+        A container object that holds all successfully loaded mechanisms.
+        The mechanisms are accessible as attributes of the container,
+        with attribute names corresponding to the module names.
+    
+    Notes
+    -----
+    - Files must have a .py extension and not be named "__init__.py"
+    - Each file should define a class with the same name as the file itself
+    - The function assumes the module structure follows the convention where
+      the class name matches the file name
+    
+    Examples
+    --------
+    >>> mechanisms = load_mechanisms('/path/to/mechanisms', '/another/path')
+    >>> my_mechanism = mechanisms.mechanism_name
     """
     mechanisms = {}
 
@@ -50,5 +71,19 @@ def load_mechanisms(*paths):
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 mechanisms[module_name] = getattr(module, module_name)
+    
+    mechanisms = MechanismContainer(**mechanisms)
 
     return mechanisms
+
+
+class MechanismContainer:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+    
+    def __getitem__(self, key):
+        return getattr(self, key)
+    
+    def available(self):
+        return list(self.__dict__.keys())

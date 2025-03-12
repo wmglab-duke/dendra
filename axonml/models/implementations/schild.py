@@ -23,7 +23,7 @@ import math
 
 
 class Schild97(Unmyelinated):
-    PARAMETER(cm=1.326291192e-3, rhoa=100.0)
+    PARAMETER(cm=1.326291192, rhoa=100.0)
 
     def __init__(
         self,
@@ -33,9 +33,8 @@ class Schild97(Unmyelinated):
         temp=37.0,
         v_init=-69.0,
         method="dufort-frankel",
-        pade=None,
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method, pade)
+        super().__init__(diameters, L, dx, temp, v_init, method)
         R = 8314  # molar gas constant
         F = 96500  # Faraday's constant
 
@@ -68,11 +67,10 @@ class Schild97(Unmyelinated):
             self.insert(nakpumpSchild)
             self.insert(naf97mean, gbar=0.022434928)
             self.insert(nas97mean, gbar=0.022434928)
-            self.build()
 
 
 class Schild94(Unmyelinated):
-    PARAMETER(cm=1.326291192e-3, rhoa=100.0)
+    PARAMETER(cm=1.326291192, rhoa=100.0)
 
     def __init__(
         self,
@@ -82,9 +80,8 @@ class Schild94(Unmyelinated):
         temp=37.0,
         v_init=-48.0,
         method="dufort-frankel",
-        pade=None,
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method, pade)
+        super().__init__(diameters, L, dx, temp, v_init, method)
         R = 8314  # molar gas constant
         F = 96500  # Faraday's constant
 
@@ -117,4 +114,3 @@ class Schild94(Unmyelinated):
             self.insert(nakpumpSchild)
             self.insert(naf)
             self.insert(nas)
-            self.build()

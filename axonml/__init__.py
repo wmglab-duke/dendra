@@ -3,7 +3,7 @@ import os
 import torch
 
 from .models.mod import load_mechanisms
-from .helpers import TF32
+from .helpers import TF32, CUDA
 
 
 this = os.path.dirname(__file__)
@@ -18,3 +18,4 @@ def allow_tf32(allow=True):
 
 
 allow_tf32(bool(TF32))
+torch.set_default_device("cuda" if CUDA else "cpu")
