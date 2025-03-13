@@ -55,7 +55,7 @@ args = parser.parse_args()
 def x_to_input_uniform_stim(x, bases, stim, popsize, n_axons, nodes):
     """
     x: (popsize, n_bases) torch.Tensor
-    bases: (n_axons, n_bases, n_nodes) torch.Tensor
+    bases: (n_axons, n_bases, n_comps) torch.Tensor
     stim: (n_timesteps) torch.Tensor
 
     -> T, B, C, W

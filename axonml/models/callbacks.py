@@ -184,7 +184,7 @@ def avoid_smart_indexing(node_indices):
 
 def n(node_indices, model):
     if node_indices is None:
-        return model.n_node
+        return model.n_comp
     if isinstance(node_indices, int):
         return 1
     return len(node_indices)

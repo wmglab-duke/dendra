@@ -14,11 +14,11 @@ FARADAY = 96485.33212331001
 
 template = """
 class Ion(torch.nn.Module):
-  def __init__(self, n_ax, n_node):
+  def __init__(self, n_ax, n_comp):
     super().__init__()
     self.name = "{ion}"
     self.rzf = {R} / ({valence} * {FARADAY})
-    self.register_buffer("i{ion}", torch.zeros((n_ax, 1, n_node)))
+    self.register_buffer("i{ion}", torch.zeros((n_ax, 1, n_comp)))
     self.register_{e_buffer_or_param}("e{ion}", {einit_tensor})
     self.register_{c_buffer_or_param}("{ion}i", {cinit_i_tensor})
     self.register_{c_buffer_or_param}("{ion}o", {cinit_o_tensor})
@@ -56,7 +56,7 @@ class Ion(torch.nn.Module):
 
 def init_tensor(val, buffer_or_param):
     if buffer_or_param == "buffer":
-        return f"torch.full((n_ax, 1, n_node), {val})"
+        return f"torch.full((n_ax, 1, n_comp), {val})"
     return f"torch.nn.Parameter(torch.tensor({val}), requires_grad=False)"
 
 
@@ -163,7 +163,7 @@ def parse_c_buffer_or_param(c_style):
 def build_ion(
     ion,
     n_ax,
-    n_node,
+    n_comp,
     mechanisms,
     mechanism_names,
     ion_read,
@@ -250,7 +250,7 @@ def build_ion(
     lines = [line + "\n" for line in forward_str.splitlines()]
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
-    m = locals()["Ion"](n_ax, n_node)
+    m = locals()["Ion"](n_ax, n_comp)
 
     return m
 

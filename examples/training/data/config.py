@@ -10,7 +10,7 @@ axons_per_minibatch = 32
 
 # sim params
 tstop = 5.0
-n_node_record = 53
+n_comp_record = 53
 n_contacts = 6
 
 # datagenerator metadata

@@ -51,7 +51,7 @@ args = parser.parse_args()
 
 N.tstop = config.tstop
 
-N_NODE_RECORD = config.n_node_record
+N_NODE_RECORD = config.n_comp_record
 N_CONTACTS = config.n_contacts
 
 DATA_0 = [np.load(f"./fields/P/{i}.npy") for i in range(N_CONTACTS)]

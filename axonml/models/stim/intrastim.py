@@ -39,7 +39,7 @@ class IntraStim:
         List of synapse-based stimulations as (axons, nodes, synapse) tuples.
     dt : float
         Time step size in milliseconds.
-    n_nodes : int
+    n_comps : int
         Number of nodes in the model.
     n_axons : int
         Number of axons in the model.
@@ -93,7 +93,7 @@ class IntraStim:
 
         self.dt = model.dt
 
-        self.n_nodes = model.n_node
+        self.n_comps = model.n_comp
         self.n_axons = model.n_ax
         self.device = model.device()
         self.dtype = model.dtype()
@@ -114,12 +114,12 @@ class IntraStim:
         self.device = model.device()
         self.dtype = model.dtype()
         self.n_axons = model.n_ax
-        self.n_nodes = model.n_node
+        self.n_comps = model.n_comp
 
         for ax, node, synapse in self.stim_synapse:
             n_ax = n(ax)
-            n_node = n(node)
-            synapse.init(n_ax, n_node, self.dt, self.device, self.dtype)
+            n_comp = n(node)
+            synapse.init(n_ax, n_comp, self.dt, self.device, self.dtype)
 
     def float(self):
         """
@@ -184,7 +184,7 @@ class IntraStim:
             Processed node indices.
         """
         if indices is None:
-            return slice(0, self.n_nodes)
+            return slice(0, self.n_comps)
         return indices
 
     def render_axons(self, indices):
@@ -316,12 +316,12 @@ class IntraStim:
         Returns
         -------
         torch.Tensor
-            Tensor of intracellular current values with shape [n_axons, 1, n_nodes].
+            Tensor of intracellular current values with shape [n_axons, 1, n_comps].
         """
         t = self.dt * idx
 
         intra = torch.zeros(
-            self.n_axons, self.n_nodes, device=self.device, dtype=self.dtype
+            self.n_axons, self.n_comps, device=self.device, dtype=self.dtype
         )
 
         for v in self.stim_vec:

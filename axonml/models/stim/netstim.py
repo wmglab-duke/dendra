@@ -1,8 +1,6 @@
 from typing import Tuple, Optional
 import torch
 
-import random
-
 
 class NetStim(torch.jit.ScriptModule):
     """
@@ -30,7 +28,7 @@ class NetStim(torch.jit.ScriptModule):
     Attributes
     ----------
     shape : tuple of int
-        Shape of the output spike tensor (n_ax, n_node).
+        Shape of the output spike tensor (n_ax, n_comp).
     interval : float
         Mean inter-spike interval in ms.
     start : float
@@ -131,7 +129,7 @@ class NetStim(torch.jit.ScriptModule):
         if self.seed is not None:
             self._rng.manual_seed(self.seed)
 
-    def init(self, n_ax, n_node):
+    def init(self, n_ax, n_comp):
         """
         Initialize the spike generator for a given shape.
         
@@ -139,7 +137,7 @@ class NetStim(torch.jit.ScriptModule):
         ----------
         n_ax : int
             Number of axons (rows in the output tensor).
-        n_node : int
+        n_comp : int
             Number of nodes (columns in the output tensor).
             
         Returns
@@ -153,7 +151,7 @@ class NetStim(torch.jit.ScriptModule):
         - If noise=0, first spike will occur exactly at start time
         - If noise>0, first spike times follow start + exponential(noise*interval)
         """
-        self.shape = (n_ax, n_node)
+        self.shape = (n_ax, n_comp)
         self.init_rng()
 
         device = self.device()
@@ -192,7 +190,7 @@ class NetStim(torch.jit.ScriptModule):
         Returns
         -------
         torch.Tensor
-            Binary tensor of shape (n_ax, n_node) where True/1.0 indicates 
+            Binary tensor of shape (n_ax, n_comp) where True/1.0 indicates 
             a spike at this time step.
             
         Notes

@@ -116,7 +116,7 @@ class {mech}(torch.nn.Module):
             temp, 
             diameters, 
             n_ax, 
-            n_nodes, 
+            n_comps, 
             name: str, 
             params, 
             distributions, 
@@ -154,7 +154,7 @@ class {mech}(torch.nn.Module):
             self._init_params.update(ic)
 
         self.n_ax = n_ax
-        self.n_nodes = n_nodes
+        self.n_comps = n_comps
         self.read_ion = read_ion
         self.write_ion_c = write_ion_c
 
@@ -267,9 +267,9 @@ def define_mask(mask_out, mask_in):
         return ""
     ret = []
     if mask_out is not None:
-        ret.append(f"mask_out = torch.ones(1, 1, n_nodes)\nmask_out[:, :, {mask_out}] = 0")
+        ret.append(f"mask_out = torch.ones(1, 1, n_comps)\nmask_out[:, :, {mask_out}] = 0")
     if mask_in is not None:
-        ret.append(f"mask_in = torch.zeros(1, 1, n_nodes)\nmask_in[:, :, {mask_in}] = 1")
+        ret.append(f"mask_in = torch.zeros(1, 1, n_comps)\nmask_in[:, :, {mask_in}] = 1")
     if mask_out is not None and mask_in is not None:
         ret.append("mask = mask_out * mask_in")
     elif mask_out is not None:
@@ -348,14 +348,14 @@ def state_buffer_assignments(states):
             name = k._name
             if name not in valid_concentrations():
                 assignments.append(
-                    f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
+                    f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_comps)))"
                 )
         else:
             names = k._state_names
             for name in names:
                 if name not in valid_concentrations():
                     assignments.append(
-                        f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_nodes)))"
+                        f"self.register_buffer('{name}', torch.zeros((n_ax, 1, n_comps)))"
                     )
     return "\n".join(assignments)
 
@@ -365,7 +365,7 @@ def current_buffer_assignments(currents, range_vars):
     for k in currents:
         if k in range_vars:
             assignments.append(
-                f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_nodes)))"
+                f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_comps)))"
             )  # noqa(0.0))")
     return "\n".join(assignments)
 
@@ -628,7 +628,7 @@ def distribution_buffers(distributions):
     assignments = []
     for k, v in distributions.items():
         assignments.append(
-            f"self.register_buffer('{k}', torch.zeros((n_ax, 1, n_nodes)))"
+            f"self.register_buffer('{k}', torch.zeros((n_ax, 1, n_comps)))"
         )
     return "\n".join(assignments)
 
@@ -644,7 +644,7 @@ def compile_mechanism(
     temp = model.temp
     diameters = model.diam
     n_ax = model.n_ax
-    n_nodes = model.n_node
+    n_comps = model.n_comp
     df = model.is_df
     pade = None if PADE < 0 else bool(PADE)
 
@@ -749,7 +749,7 @@ def compile_mechanism(
         temp,
         diameters,
         n_ax,
-        n_nodes,
+        n_comps,
         name,
         params,
         distributions,

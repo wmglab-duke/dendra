@@ -125,9 +125,9 @@ def add_diffusion(f: str, state: str, diffusion: Tuple[float, str], model) -> st
     Returns:
         str: The modified code string with the diffusion step(s) added.
     """
-    L = model.dx * (model.n_node - 1)
+    L = model.dx * (model.n_comp - 1)
     D, method = diffusion
-    diff = diffusion_expr(state, D, method, L, model.n_node)
+    diff = diffusion_expr(state, D, method, L, model.n_comp)
     f = f"{diff} ; {f}"
     if method == "strang":
         f = f"{f} ; {diff}"

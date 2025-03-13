@@ -31,6 +31,25 @@ setup(
     ],
     extras_require={
         "jupyter": ["jupyter"],
+        "doc": [
+            "jupyter_contrib_nbextensions",
+            "notebook <= 6.4.12",
+            "traitlets <= 5.9.0",
+            "ipython <= 8.9.0",
+            "mkdocs",
+            "mkdocs-material",
+            "markdown-include",
+            "mkdocs-redirects",
+            "mkdocstrings[python]>=0.18",
+            "mike",
+            "sphinx",
+            "sphinx-autobuild",
+            "sphinx_autodoc_typehints",
+            "sphinx-math-dollar",
+            "myst-nb",
+            "jupytext",
+            "sphinx-book-theme",
+            ]
     },
     ext_modules=ext_modules,
 )
