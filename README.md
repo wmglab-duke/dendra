@@ -1,8 +1,6 @@
 <div align="center">
-  <img src="docs/banner.png">
+  <img src="docs/banner2.png">
 </div>
-
-> Icon courtesy of DALL·E 3, with prompt "A differentiable massively parallel GPU-based model of neural fiber dynamics for prediction and optimization of extracellular electrical stimulation."
 
 ***
 Implement and train high-throughput GPU-compatible neural fiber models.
