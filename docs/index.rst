@@ -28,7 +28,7 @@ Getting started
     # single 2.0 µm MRG model with extracellular stimulation
     model = smolMRG([2.0], n_comp=201)
 
-    # point source extracellualr kHz stimulation
+    # point source extracellular kHz stimulation
     x = model.x()
     z = 100.0
     r = torch.sqrt(z**2 + x**2) * 1e-4
