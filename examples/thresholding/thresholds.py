@@ -43,12 +43,12 @@ if __name__ == "__main__":
 
     diams = np.load(f"{directory}/example_diameters_{field}.npy")
     n = len(diams)
-    n_node = 101
+    n_comp = 101
     fp = np.memmap(
         f"{directory}/example_field_array_{field}.mmap",
         dtype="float32",
         mode="r",
-        shape=(n, 1000, n_node),
+        shape=(n, 1000, n_comp),
     )
     if args.preload:
         fp = np.array(fp)
@@ -56,7 +56,7 @@ if __name__ == "__main__":
     nrn_thresh_path = f"{directory}/example_thresholds_{field}.npy"
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
-    mrg = SMF(diameters=diams, n_node=n_node).load("MRG")
+    mrg = SMF(diameters=diams, n_comp=n_comp).load("MRG")
 
     dt = 0.005
     active = Active(dt=dt)

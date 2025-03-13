@@ -84,7 +84,7 @@ class mrg_cm(Functional):
     
     def fn(self, model):
         cm = self.cm / (model.nl * 2)[:, None]
-        cm = cm.expand(model.n_ax, model.n_node).unsqueeze(1).clone()
+        cm = cm.expand(model.n_ax, model.n_comp).unsqueeze(1).clone()
         node_locs = model.cid.locs(['node'])
         cm[:, :, node_locs] = self.node_cm
         mysa_locs = model.cid.locs(['mysa'])
@@ -127,7 +127,7 @@ class bigMRG(Heterogeneous):
         n_c = cid.nc()
 
         super().__init__(n_ax, n_c, temp, v_init, method=method)
-        self.cid = cid
+        self.register_cid(cid)
 
         self.register_buffer('fd', torch.tensor(diameters, dtype=self.dtype()))
         self.register_buffer('nl', torch.clamp(-0.4749 * self.fd**2 + 16.85 * self.fd - 0.7648, min=1))

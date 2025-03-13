@@ -5,7 +5,7 @@ import torch
 class Synapse:
     def __init__(self, e):
         self.n_axons = 0
-        self.n_nodes = 0
+        self.n_comps = 0
         self.dt = None
 
         self.e = e
@@ -17,12 +17,12 @@ class Synapse:
         self.weight = weight
         return self
 
-    def init(self, n_axons, n_nodes, dt, device, dtype):
+    def init(self, n_axons, n_comps, dt, device, dtype):
         self.n_axons = n_axons
-        self.n_nodes = n_nodes
+        self.n_comps = n_comps
         self.dt = dt
         if self.driver is not None:
-            self.driver.init(n_axons, n_nodes, device, dtype)
+            self.driver.init(n_axons, n_comps, device, dtype)
         return self
 
     def __call__(self, t, v):
@@ -45,10 +45,10 @@ class ExpSyn(Synapse):
         super().__init__(e)
         self.tau = tau
 
-    def init(self, n_axons, n_nodes, dt, device, dtype):
-        super().init(n_axons, n_nodes, dt, device, dtype)
+    def init(self, n_axons, n_comps, dt, device, dtype):
+        super().init(n_axons, n_comps, dt, device, dtype)
         self.dexp = math.exp(-self.dt / self.tau)
-        self.g = torch.zeros(n_axons, n_nodes, device=device, dtype=dtype)
+        self.g = torch.zeros(n_axons, n_comps, device=device, dtype=dtype)
         return self
 
     def register_events(self, t):
@@ -84,12 +84,12 @@ class Exp2Syn(Synapse):
         self.factor *= weight
         return self
 
-    def init(self, n_axons, n_nodes, dt, device, dtype):
-        super().init(n_axons, n_nodes, dt, device, dtype)
+    def init(self, n_axons, n_comps, dt, device, dtype):
+        super().init(n_axons, n_comps, dt, device, dtype)
         self.dexp1 = math.exp(-self.dt / self.tau1)
         self.dexp2 = math.exp(-self.dt / self.tau2)
-        self.A = torch.zeros(n_axons, n_nodes, device=device, dtype=dtype)
-        self.B = torch.zeros(n_axons, n_nodes, device=device, dtype=dtype)
+        self.A = torch.zeros(n_axons, n_comps, device=device, dtype=dtype)
+        self.B = torch.zeros(n_axons, n_comps, device=device, dtype=dtype)
         return self
 
     def register_events(self, t):

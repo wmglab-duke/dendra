@@ -9,7 +9,7 @@ Dataset generation configurations can be modified by changing the relevant value
 |`batch_size`|Size of data collection batch (# minibatches) **Default: 32**.|
 |`axons_per_minibatch`|# axons per minibatch of data collection. **Default: 32**.|
 |`tstop`|Simulation length [ms]. **Default: 5.0**.|
-|`n_node_record`|# Nodes of Ranvier from which to record. **Default: 53**.|
+|`n_comp_record`|# Nodes of Ranvier from which to record. **Default: 53**.|
 |`n_contacts`|Number of contacts in stimulating electrode used to generate data. **Default: 6**.|
 |`round`|Round of data generation. You may wish to generate multiple datasets using the same distribution. Convenient way to avoid filename collisions (just increment `round`). **Default: 0**.|
 |`diameter`|Diameter to simulate if only generating data for one axon diameter. **Default: 5.7 $\mu m$**.|

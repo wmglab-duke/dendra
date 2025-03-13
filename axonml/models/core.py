@@ -114,7 +114,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     ----------
     diameters : array_like
         Diameters of the axons in μm.
-    n_node : int
+    n_comp : int
         Number of nodes in the axon model.
     temp : float, optional
         Temperature in degrees Celsius. Default is 37.0.
@@ -130,8 +130,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     ----------
     n_ax : int
         Number of axons in the model.
-    n_node : int
-        Number of nodes in each axon.
+    n_comp : int
+        Number of compartments in each axon.
     temp : float
         Temperature in degrees Celsius.
     v_init : float
@@ -146,10 +146,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         Time step in ms.
     """
     _dt_lim = None
-    __constants__ = ["method", "n_ax", "n_node", "temp", "v_init", "is_df", "use_fast_imem", "hd"]
+    __constants__ = ["method", "n_ax", "n_comp", "temp", "v_init", "is_df", "use_fast_imem", "hd"]
 
     def __init__(
-        self, diameters, n_node: int, temp=37.0, v_init=-80.0, method="rk1", beta=0.0
+        self, diameters, n_comp: int, temp=37.0, v_init=-80.0, method="rk1", beta=0.0
     ):
         super().__init__()
 
@@ -174,9 +174,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.method = method
         self.n_ax = len(diameters)
-        self.n_node = n_node
+        self.n_comp = n_comp
         self.temp = temp
         self.v_init = v_init
+
+        self.cid = None
 
         self.mech: HandlerInterface = None
         self.t_ind: int = 0
@@ -204,7 +206,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.use_fast_imem = bool(IMEM)
         if self.use_fast_imem:
-            self.register_buffer("i_membrane", torch.zeros((self.n_ax, 1, n_node)))
+            self.register_buffer("i_membrane", torch.zeros((self.n_ax, 1, n_comp)))
 
         self.beta = beta
         self.hd = bool(beta) # hyper-diffusion
@@ -238,9 +240,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         for p in self.ssd.parameters():
             p.requires_grad = False
 
-        self.register_buffer("v", torch.full((self.n_ax, 1, n_node), v_init))
+        self.register_buffer("v", torch.full((self.n_ax, 1, n_comp), v_init))
         if self.is_df:
-            self.register_buffer("v_prev", torch.full((self.n_ax, 1, n_node), v_init))
+            self.register_buffer("v_prev", torch.full((self.n_ax, 1, n_comp), v_init))
 
         if torch.is_tensor(diameters):
             diameters = diameters.to(self.dtype()).clone().detach()
@@ -277,6 +279,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
         self.register_buffer("v_init_c", torch.tensor(self.v_init))
         self.register_buffer("temp_c", torch.tensor(self.temp))
+
+    def register_cid(self, cid):
+        self.cid = cid
 
     def set_diam(self, diams):
         diams = torch.as_tensor(diams, dtype=self.dtype())
@@ -370,8 +375,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             Mask specifying compartments for which the mechanism will not
             contribute to the current calculation.
         mask_in : str, int, or slice, optional
-            Mask specifying compartments for which the mechanism will not
-            receive input.
+            Mask specifying compartments for which the mechanism will contribute
+            to the current calculation.
         **kwargs
             Additional keyword arguments to be passed to the compile_mechanism function.
         """
@@ -461,7 +466,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ions[ion] = build_ion(
                 ion,
                 self.n_ax,
-                self.n_node,
+                self.n_comp,
                 self._m_list,
                 self._m_name,
                 ion_read,
@@ -534,9 +539,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         Examples
         --------
         >>> model.c(0.25, 0.5, 0.75)
-        [25, 50, 75]  # For a model with n_node=101
+        [25, 50, 75]  # For a model with n_comp=101
         """
-        return [round((self.n_node - 1) * i) for i in args]
+        return [round((self.n_comp - 1) * i) for i in args]
 
     def run(self, 
             ve=None, 
@@ -557,7 +562,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ----------
         ve : Tensor, optional
             Extracellular voltage tensor. Shape should be 
-            [timesteps, n_ax, 1, n_node] or compatible.
+            [timesteps, n_ax, 1, n_comp] or compatible.
         space : Tensor, optional
             Spatial components when ve is not directly provided.
             Used with time to construct ve.
@@ -745,7 +750,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ----------
         space : Tensor
             Spatial components of extracellular voltage. Shape should be
-            [n_ax, n_node] or [1, n_node] or [n_contacts, ...] for multicontact mode.
+            [n_ax, n_comp] or [1, n_comp] or [n_contacts, ...] for multicontact mode.
         time : Tensor
             Temporal components of extracellular voltage. Shape should be
             [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, ...] for multicontact mode.
@@ -776,7 +781,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ve_s = torch.as_tensor(space, device=self.device())
         ve_t = torch.as_tensor(time, device=self.device())
 
-        # ve_s : [n_ax, n_node] or [1, n_node] or [n_contacts, *]
+        # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
         # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
 
         if multicontact:
@@ -843,7 +848,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
-        ve = torch.zeros(1, self.n_ax, 1, self.n_node, device=self.device())
+        ve = torch.zeros(1, self.n_ax, 1, self.n_comp, device=self.device())
         with ctx(DTWARN=0):
             for i in tqdm(range(maxiter), desc="Steady state..."):
                 reinit = i == 0
@@ -1058,7 +1063,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def compile(self, callbacks: List[Callback] = None):
         ve = torch.ones(
-            1, self.n_ax, 1, self.n_node, device=self.device(), dtype=self.dtype()
+            1, self.n_ax, 1, self.n_comp, device=self.device(), dtype=self.dtype()
         )
         for _ in range(5):
             self.run(ve, callbacks=callbacks, progressbar=False)
@@ -1214,20 +1219,73 @@ def _match_state_dict(
 
 
 class Unmyelinated(Axon):
+    """
+    Base unmyelinated axon model class.
+    
+    This class implements a model of unmyelinated axons (nerve fibers without myelin sheaths)
+    by extending the base Axon class. It uses a uniform spatial discretization with nodes
+    spaced at regular intervals.
+    
+    Parameters
+    ----------
+    diameters : array_like
+        Diameters of the axons in μm. Can be a single value, list, or tensor.
+    L : float, optional
+        Length of the axon in mm (will be converted to μm internally). Default is 1.0 mm.
+    dx : float, optional
+        Spatial discretization step in μm. Default is 10.0 μm.
+    temp : float, optional
+        Temperature in degrees Celsius. Default is 37°C.
+    v_init : float, optional
+        Initial membrane potential in mV. Default is -80 mV.
+    method : str, optional
+        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4', 
+        'dufort-frankel', or 'df'. Default is 'rk1'.
+    
+    Attributes
+    ----------
+    dx : float
+        Spatial discretization step in μm.
+    n_comp : int
+        Number of compartments in the model (calculated based on L and dx).
+    cm : float
+        Membrane capacitance in μF/cm².
+    rhoa : float
+        Axial resistivity in Ω·cm.
+    
+    Methods
+    -------
+    x()
+        Returns spatial positions of nodes in μm.
+    area_(diameters)
+        Calculates membrane surface area in cm² for given diameters.
+    ra_(diameters)
+        Calculates axial resistance in MΩ for given diameters.
+    
+    Notes
+    -----
+    The number of nodes is calculated to ensure it's odd (for a centered node at position 0)
+    and to maintain symmetry by rounding to the next even number of segments.
+    
+    See Also
+    --------
+    Axon : Base class providing common functionality for axon models.
+    Myelinated : Companion class implementing myelinated axon models.
+    """
     PARAMETER(cm=1.0, rhoa=35.4)
 
     def __init__(
         self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"
     ):
         L = L * 1000  # mm -> um
-        n_node = L / dx
-        n_node = math.ceil(n_node) // 2 * 2 + 1
+        n_comp = L / dx
+        n_comp = math.ceil(n_comp) // 2 * 2 + 1
         self.dx: float = dx
-        super().__init__(diameters, n_node, temp, v_init, method)
+        super().__init__(diameters, n_comp, temp, v_init, method)
 
     def x(self) -> torch.Tensor:  # x in um
-        l = (self.n_node - 1) * self.dx
-        return torch.linspace(-l / 2, l / 2, self.n_node, device=self.device())
+        l = (self.n_comp - 1) * self.dx
+        return torch.linspace(-l / 2, l / 2, self.n_comp, device=self.device())
 
     def area_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)
@@ -1240,6 +1298,74 @@ class Unmyelinated(Axon):
 
 
 class Myelinated(Axon):
+    """
+    Base myelinated axon model class.
+    
+    This class implements a model of myelinated axons (nerve fibers with myelin sheaths)
+    by extending the base Axon class. It models nodes of Ranvier separated by
+    myelinated internodal regions, with parameters that scale with axon diameter.
+    
+    Parameters
+    ----------
+    diameters : array_like
+        Diameters of the axons in μm. Can be a single value, list, or tensor.
+    n_comp : int
+        Number of compartments (nodes) in the model.
+    temp : float, optional
+        Temperature in degrees Celsius. Default is 37°C.
+    v_init : float, optional
+        Initial membrane potential in mV. Default is -80 mV.
+    method : str, optional
+        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4', 
+        'dufort-frankel', or 'df'. Default is 'rk1'.
+    beta : float, optional
+        Hyperdiffusion coefficient for numerical stability. Default is 0.0.
+    
+    Attributes
+    ----------
+    node_l : float
+        Length of the nodes of Ranvier in μm. Default is 2.0 μm.
+    axond1, axond2, axond3 : float
+        Coefficients for the quadratic equation calculating axon diameter.
+        Default values are 0.0, 0.7, and 0.0, respectively.
+    noded1, noded2, noded3 : float
+        Coefficients for the quadratic equation calculating node diameter.
+        Default values are 0.0, 0.7, and 0.0, respectively.
+    deltax1, deltax2, deltax3 : float
+        Coefficients for the quadratic equation calculating internodal distance.
+        Default values are 0.0, 100.0, and 0.0, respectively.
+    cm : float
+        Membrane capacitance in μF/cm². Default is 1.0.
+    rhoa : float
+        Axial resistivity in Ω·cm. Default is 35.4.
+    
+    Methods
+    -------
+    x()
+        Returns spatial positions of nodes in μm.
+    area_(diameters)
+        Calculates membrane surface area in cm² for given diameters.
+    ra_(diameters)
+        Calculates axial resistance in MΩ for given diameters.
+    axonD(diameters)
+        Calculates axon diameter based on fiber diameter.
+    nodeD(diameters)
+        Calculates node diameter based on fiber diameter.
+    deltax(diameters)
+        Calculates internodal distance based on fiber diameter.
+    rhoa_scale(diameters)
+        Calculates scaling factor for axial resistivity based on fiber diameter.
+    
+    Notes
+    -----
+    The model uses quadratic equations to calculate various geometric parameters
+    based on the fiber diameter, following anatomical scaling relationships.
+    
+    See Also
+    --------
+    Axon : Base class providing common functionality for axon models.
+    Unmyelinated : Companion class implementing unmyelinated axon models.
+    """
     PARAMETER(
         node_l=2.0,
         axon_d={
@@ -1288,9 +1414,9 @@ class Myelinated(Axon):
         return noded / 10000
 
     def x(self) -> torch.Tensor:  # x in um
-        l = (self.n_node - 1) * self.deltax(self.diam) * 10000
+        l = (self.n_comp - 1) * self.deltax(self.diam) * 10000
         start = -l / 2
         end = l / 2
-        steps = self.n_node
+        steps = self.n_comp
         t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(-1)
         return ((1 - t) * start + t * end).T

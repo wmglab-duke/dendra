@@ -14,7 +14,7 @@ cimport numpy as cnp
 cpdef object calc_inl(
     int n_ax, 
     int nc, 
-    int[:] n_node_per_ax,
+    int[:] n_comp_per_ax,
     int[:] n_internode_per_ax,
     int[:, ::1] internode_inds,
     int[:, ::1] nc_per_node, 
@@ -27,7 +27,7 @@ cpdef object calc_inl(
     Args:
         n_ax: number of axons
         nc: number of compartments
-        n_node_per_ax: number of nodes per axon
+        n_comp_per_ax: number of nodes per axon
         n_internode_per_ax: number of internodes per axon
         internode_inds: indices of internodes
         nc_per_node: number of compartments per node
@@ -45,7 +45,7 @@ cpdef object calc_inl(
     cdef int i, j, k, nn, n_inl, nc_n, idx, in_ind
 
     for i in range(n_ax):
-        nn = n_node_per_ax[i]
+        nn = n_comp_per_ax[i]
         idx = 0
         for j in range(nn):
             nc_n = nc_per_node[i, j]
@@ -75,7 +75,7 @@ cpdef object calc_inl(
 cpdef object calc_ind(
     int n_ax,
     int nc,
-    int[:] n_node_per_ax,
+    int[:] n_comp_per_ax,
     int[:] n_internode_per_ax,
     int[:, ::1] internode_inds,
     int[:, ::1] nc_per_node,
@@ -88,7 +88,7 @@ cpdef object calc_ind(
     cdef int i, j, k, nn, n_ind, nc_n, idx, in_ind
 
     for i in range(n_ax):
-        nn = n_node_per_ax[i]
+        nn = n_comp_per_ax[i]
         idx = 0
         for j in range(nn):
             nc_n = nc_per_node[i, j]

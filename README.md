@@ -1,8 +1,6 @@
 <div align="center">
-  <img src="docs/banner.png">
+  <img src="docs/banner2.png">
 </div>
-
-> Icon courtesy of DALL·E 3, with prompt "A differentiable massively parallel GPU-based model of neural fiber dynamics for prediction and optimization of extracellular electrical stimulation."
 
 ***
 Implement and train high-throughput GPU-compatible neural fiber models.
@@ -82,11 +80,11 @@ mrg = SMF().cuda().load(checkpoint_params)
 
 ## 🤖 Running simulations
 
-You need to supply an extracellular potential boundary condition to run simulations. This must be a `torch.Tensor` of shape `(n_timesteps, n_axons, 1, n_nodes)`; for example, if your goal is to simulate the response of 50 axons each with 51 nodes of Ranvier to extracellular stimulation over 5 ms with a timestep of 0.005 ms, the input `ve` should be shape `(1000, 50, 1, 51)`. `ve[100, 0, 0, 4]` is then $V_e$ in mV at node 5 for the 1st axon you're simulating at time t=0.5 ms.
+You need to supply an extracellular potential boundary condition to run simulations. This must be a `torch.Tensor` of shape `(n_timesteps, n_axons, 1, n_comps)`; for example, if your goal is to simulate the response of 50 axons each with 51 nodes of Ranvier to extracellular stimulation over 5 ms with a timestep of 0.005 ms, the input `ve` should be shape `(1000, 50, 1, 51)`. `ve[100, 0, 0, 4]` is then $V_e$ in mV at node 5 for the 1st axon you're simulating at time t=0.5 ms.
 
 You must also specify the diameters of the fibers being simulated; this must be a 1D `torch.Tensor` of shape `n_axons`.
 
-Optionally, you can supply an array representing intracellular current simulation (in mA), e.g. to simulate synaptic input; this must also be a `torch.Tensor` of shape `(n_timesteps, n_axons, 1, n_nodes)`.
+Optionally, you can supply an array representing intracellular current simulation (in mA), e.g. to simulate synaptic input; this must also be a `torch.Tensor` of shape `(n_timesteps, n_axons, 1, n_comps)`.
 
 You can specify `dt`; by default, this is 0.005 ms. You can also set `dt` globally using the Backend.
 
@@ -97,7 +95,7 @@ You can then run simulations:
 from axonml import Backend as A
 A.dt = 0.001
 
-n_axons, n_nodes = 50, 51
+n_axons, n_comps = 50, 51
 ve = build_ve(50, 51)             # implement this function yourself
 intra = build_intra()             # or None
 diams = 5.7 * torch.ones(n_axons) # we're simulation 5.7 um fibers
@@ -108,13 +106,13 @@ model.run(ve=ve, diameters=diams, intra=intra)
 You can continue running from where you left off, e.g. run without any extracellular stim for a further 1 ms:
 
 ```python
-ve = torch.zeros(1000, n_axons, 1, n_nodes)
+ve = torch.zeros(1000, n_axons, 1, n_comps)
 model.run(ve, diameters=diams)
 ```
 
 or you can reinitialize and run from steady-state:
 ```python
-ve = torch.zeros(1000, n_axons, 1, n_nodes)
+ve = torch.zeros(1000, n_axons, 1, n_comps)
 model.run(ve, diameters=diams, reinit=True)
 ```
 

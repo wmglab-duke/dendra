@@ -19,7 +19,7 @@ class Heterogeneous(Axon):
     def __init__(
         self,
         n_ax: int,
-        n_node: int,
+        n_comp: int,
         temp=37.0,
         v_init=-70.0,
         method="dufort-frankel",
@@ -30,15 +30,15 @@ class Heterogeneous(Axon):
                 f"Method {method} is not supported for heterogeneous axons."
             )
         diameters = torch.ones(n_ax)
-        super().__init__(diameters, n_node, temp, v_init, method, beta)
+        super().__init__(diameters, n_comp, temp, v_init, method, beta)
 
     def _register_buffers(self, diameters):
-        self.register_buffer("diam", torch.empty(self.n_ax, 1, self.n_node))
-        self.register_buffer("node_l", torch.empty(self.n_ax, 1, self.n_node))
+        self.register_buffer("diam", torch.empty(self.n_ax, 1, self.n_comp))
+        self.register_buffer("node_l", torch.empty(self.n_ax, 1, self.n_comp))
 
         self.register_buffer("area_c", torch.empty(self.diam.shape))
         self.register_buffer("cm_c", torch.empty(self.area_c.shape))
-        self.register_buffer("ra_c", torch.empty(self.n_ax, 1, self.n_node - 1))
+        self.register_buffer("ra_c", torch.empty(self.n_ax, 1, self.n_comp - 1))
 
         self.register_buffer("v_init_c", torch.tensor(self.v_init))
         self.register_buffer("temp_c", torch.tensor(self.temp))
@@ -275,7 +275,7 @@ class MyelinatedHeterogeneous(Axon):
     def __init__(
         self,
         n_ax: int,
-        n_node: int,
+        n_comp: int,
         temp=37.0,
         v_init=-70.0,
         method="dufort-frankel",
@@ -286,17 +286,17 @@ class MyelinatedHeterogeneous(Axon):
                 f"Method {method} is not supported for heterogeneous axons."
             )
         diameters = torch.ones(n_ax)
-        super().__init__(diameters, n_node, temp, v_init, method, beta)
+        super().__init__(diameters, n_comp, temp, v_init, method, beta)
 
     def _register_buffers(self, diameters):
-        self.register_buffer("diam", torch.empty(self.n_ax, 1, self.n_node))
-        self.register_buffer("node_l", torch.empty(self.n_ax, 1, self.n_node))
+        self.register_buffer("diam", torch.empty(self.n_ax, 1, self.n_comp))
+        self.register_buffer("node_l", torch.empty(self.n_ax, 1, self.n_comp))
         self.register_buffer(
-            "inter_node_length", torch.empty(self.n_ax, 1, self.n_node - 1)
+            "inter_node_length", torch.empty(self.n_ax, 1, self.n_comp - 1)
         )
 
         self.register_buffer(
-            "inter_node_diam", torch.empty(self.n_ax, 1, self.n_node - 1)
+            "inter_node_diam", torch.empty(self.n_ax, 1, self.n_comp - 1)
         )
         self.register_buffer("area_c", torch.empty(self.diam.shape))
         self.register_buffer("cm_c", torch.empty(self.area_c.shape))
@@ -560,8 +560,8 @@ class MyelinatedHeterogeneous(Axon):
         if method is None:
             method = cls._get_init_defaults()["method"]
         n_ax = len(node_d)
-        n_node = len(node_d[0])
-        axon = cls(n_ax, n_node, temp, v_init, method)
+        n_comp = len(node_d[0])
+        axon = cls(n_ax, n_comp, temp, v_init, method)
         axon.set_all(node_d, inter_node_diam, node_l, inter_node_length)
         return axon
 

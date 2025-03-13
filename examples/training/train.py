@@ -47,7 +47,7 @@ if __name__ == "__main__":
         config.fp32,
     )
 
-    model: Axon = config.model(diameters=[5.7] * train_data.n(), n_node=config.nodes)
+    model: Axon = config.model(diameters=[5.7] * train_data.n(), n_comp=config.nodes)
     if not config.fp32:
         model.double()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)

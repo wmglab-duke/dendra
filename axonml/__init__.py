@@ -2,6 +2,7 @@ import glob
 import os
 import torch
 
+from .models import *
 from .models.mod import load_mechanisms
 from .helpers import TF32, CUDA
 

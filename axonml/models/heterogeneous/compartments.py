@@ -33,7 +33,7 @@ class CompartmentID:
         return np.where(np.isin(self.names, names))[0].tolist()
     
     def build(self, funcs, model):
-        assert model.n_node == self.nc()
+        assert model.n_comp == self.nc()
         out = np.empty((model.n_ax, self.nc()))
 
         s = self.unique()
@@ -70,7 +70,7 @@ class CompartmentIDTorch:
         return torch.where(self.names.unsqueeze(0) == torch.tensor(names).unsqueeze(1))[1].tolist()
     
     def build(self, funcs, model):
-        assert model.n_node == self.nc()
+        assert model.n_comp == self.nc()
         out = torch.empty((model.n_ax, self.nc()))  # type: ignore
 
         s = self.unique()
