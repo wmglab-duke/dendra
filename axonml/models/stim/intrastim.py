@@ -279,7 +279,7 @@ class IntraStim:
         """
         axon_inds = self.render_axons(axons)
         node_inds = self.render_nodes(avoid_smart_indexing(nodes))
-        vec = torch.as_tensor(vec, device=self.device, dtype=self.dtype)
+        vec = torch.as_tensor(vec, device=self.device, dtype=self.dtype).squeeze()
         self.stim_vec.append((axon_inds, node_inds, vec))
 
     def insert_synapse(self, synapse, axons=None, nodes=None):

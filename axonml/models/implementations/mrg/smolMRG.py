@@ -7,7 +7,7 @@ from axonml.helpers import numpify, ctx
 from ...heterogeneous import Heterogeneous
 from ...heterogeneous.compartments import CompartmentID
 from ...mod import mrg_k, mrg_leak, mrg_naf, mrg_nap, pas
-from ...mechanisms.declarations import PARAMETER
+from ...declarations import PARAMETER
 from ...parametric import Functional
 
 

@@ -62,3 +62,11 @@ class Parameterized(torch.nn.Module):
                         changed = True
                         setattr(self, name, to_param(value, self))
         return changed
+
+    def check_kwargs(self, kwargs):
+        _params = self.__class__._params
+        if _params is not None:
+            for name in kwargs.keys():
+                if name not in _params:
+                    raise ValueError(f"Unknown parameter {name}. Valid parameters are {list(_params.keys())}.")
+        return True

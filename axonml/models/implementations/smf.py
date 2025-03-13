@@ -2,7 +2,7 @@ import torch
 
 from ..core import Myelinated
 from ..mod import axnode_myel
-from ..mechanisms.declarations import PARAMETER
+from ..declarations import PARAMETER
 
 
 ic = {"m": 0.0732093, "h": 0.62069505, "p": 0.20260409, "s": 0.04302994}

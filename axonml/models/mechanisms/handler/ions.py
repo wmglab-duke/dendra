@@ -4,7 +4,7 @@ import sys
 import torch
 
 from .handler import parse_args, parse_assignments
-from ..declarations import add_to_namespace_dict
+from ...declarations import add_to_namespace_dict
 
 from .defaults import reversals, VALENCES, cinits
 

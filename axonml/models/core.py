@@ -15,7 +15,7 @@ from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
 from axonml.models.parametric import Parameterized
 from axonml.models.mechanisms.core import Mechanism, validate
-from axonml.models.mechanisms.declarations import PARAMETER
+from axonml.models.declarations import PARAMETER
 from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
@@ -207,6 +207,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.use_fast_imem = bool(IMEM)
         if self.use_fast_imem:
             self.register_buffer("i_membrane", torch.zeros((self.n_ax, 1, n_comp)))
+        
+        self.register_buffer("y", torch.zeros(self.n_ax, 1))
+        self.register_buffer("z", torch.zeros(self.n_ax, 1))
 
         self.beta = beta
         self.hd = bool(beta) # hyper-diffusion
@@ -349,6 +352,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def register_post_initialize_hook(self, fn: Callable):
         self.post_initialize_hooks.append(fn)
+
+    def set_y(self, y):
+        self.y[:] = torch.as_tensor(y)
+        return self
+
+    def set_z(self, z):
+        self.z[:] = torch.as_tensor(z)
+        return self
 
     @torch.jit.export
     def n(self) -> int:
@@ -1285,8 +1296,9 @@ class Unmyelinated(Axon):
 
     def x(self) -> torch.Tensor:  # x in um
         l = (self.n_comp - 1) * self.dx
-        return torch.linspace(-l / 2, l / 2, self.n_comp, device=self.device())
-
+        x = torch.linspace(-l / 2, l / 2, self.n_comp, device=self.device())
+        return torch.atleast_2d(x)
+    
     def area_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)
         return torch.pi * (diameters / 10000) * dx

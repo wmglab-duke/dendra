@@ -1,4 +1,4 @@
-from .declarations import (
+from ..declarations import (
     STATE,
     PARAMETER,
     INITIAL,

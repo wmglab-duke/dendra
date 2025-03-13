@@ -104,6 +104,7 @@ def interp1d(x, y, xnew, out=None):
     This function is working similarly to Matlab™ or scipy functions with
     the `linear` interpolation mode on, except that it parallelises over
     any number of desired interpolation problems.
+    Values outside the bounds of x are set to 0.
     The code will run on GPU if all the tensors provided are on a cuda
     device.
 
@@ -121,6 +122,10 @@ def interp1d(x, y, xnew, out=None):
     out : Pytorch Tensor, same shape as `xnew`
         Tensor for the output. If None: allocated automatically.
 
+    Returns
+    -------
+    ynew : Pytorch Tensor
+        The interpolated values, same shape as xnew.
     """
     # making the vectors at least 2D
     is_flat = {}
@@ -235,6 +240,14 @@ def interp1d(x, y, xnew, out=None):
         # now build the linear interpolation
         ynew = sel('y') + sel('slopes')*(
                                 v['xnew'] - sel('x'))
+                                
+        # Create masks for values outside the bounds of x
+        x_min = v['x'].min(dim=1, keepdim=True)[0]
+        x_max = v['x'].max(dim=1, keepdim=True)[0]
+        
+        # Set values outside bounds to zero
+        outside_bounds = (v['xnew'] < x_min) | (v['xnew'] > x_max)
+        ynew = torch.where(outside_bounds, torch.zeros_like(ynew), ynew)
 
         if reshaped_xnew:
             ynew = ynew.view(original_xnew_shape)
