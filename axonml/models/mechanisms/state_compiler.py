@@ -346,7 +346,6 @@ initial_str = """
 """
 
 
-
 def assigned_str_f(assigned):
     assignments = []
     for a in assigned:

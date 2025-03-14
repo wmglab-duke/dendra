@@ -1,5 +1,7 @@
 from contextlib import ContextDecorator
 
+from axonml.helpers import DEBUG
+
 # default reversal potentials from NEURON
 REVERSAL = {"ena": 50.0, "ek": -77.0, "eca": 132.0}
 
@@ -42,12 +44,20 @@ def ion_register(ion, valence, e, i0, o0):
 
 
 class e_context(ContextDecorator):
-    def __init__(self, **kwargs):
+    _last = {}
+    def __init__(self, use_last=False, **kwargs):
         global REVERSAL
         not_in_reversal = [k for k in kwargs if k not in REVERSAL]
         if not_in_reversal:
             raise ValueError(f"Reversal potential not found: {not_in_reversal}")
         self.updates = kwargs
+        if not use_last:
+            e_context._last = self.updates
+            if DEBUG: print(e_context._last)
+        if use_last:
+            self.updates.update(e_context._last)
+            if DEBUG: print(self.updates)
+            e_context._last = {}
         self.original_values = {}
 
     def __enter__(self):
@@ -65,12 +75,20 @@ class e_context(ContextDecorator):
 
 
 class c_context(ContextDecorator):
-    def __init__(self, **kwargs):
+    _last = {}
+    def __init__(self, use_last=False, **kwargs):
         global CINIT
         not_in_cinit = [k for k in kwargs if k not in CINIT]
         if not_in_cinit:
             raise ValueError(f"Initial concentration not found: {not_in_cinit}")
         self.updates = kwargs
+        if not use_last:
+            c_context._last = self.updates
+            if DEBUG: print(c_context._last)
+        if use_last:
+            self.updates.update(c_context._last)
+            if DEBUG: print(self.updates)
+            c_context._last = {}
         self.original_values = {}
 
     def __enter__(self):

@@ -68,6 +68,11 @@ def numpify(x):
 
 # --- pytorch functions --
 
+def allow_tf32(allow=True):
+    torch.backends.cuda.matmul.allow_tf32 = allow
+    torch.backends.cudnn.allow_tf32 = allow
+
+
 def ve_from_s_t(space, time, n, device, multicontact=False):
     ve_s = torch.as_tensor(space, device=device)
     ve_t = torch.as_tensor(time, device=device)

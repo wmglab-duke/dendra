@@ -16,6 +16,7 @@ class Point(torch.jit.ScriptModule, Parameterized):
         raise NotImplementedError
     
     def forward(self, model):
+        self.to(model.device())
         x, y, z = model.x(), model.y, model.z
         return self.fn(x, y, z)
     

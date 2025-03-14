@@ -15,6 +15,7 @@ from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
 from axonml.models.parametric import Parameterized
 from axonml.models.mechanisms.core import Mechanism, validate
+from axonml.models.mechanisms import c_context, e_context
 from axonml.models.declarations import PARAMETER
 from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
@@ -272,7 +273,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def __post_init__(self):
         changed = self.instantiate_parameters_lambda()
         if changed: self.calculate_geometric_params()
-        self._build()
+        with (
+            e_context(use_last=True),
+            c_context(use_last=True),
+        ):
+            self._build()
         if CUDA: self.cuda()
 
     def _register_buffers(self, diameters):
@@ -1292,6 +1297,7 @@ class Unmyelinated(Axon):
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
         self.dx: float = dx
+        self.L : float = n_comp * dx
         super().__init__(diameters, n_comp, temp, v_init, method)
 
     def x(self) -> torch.Tensor:  # x in um

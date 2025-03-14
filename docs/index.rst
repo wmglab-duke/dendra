@@ -3,9 +3,9 @@ Welcome to AxonML!
 
 ``AxonML`` is a differentiable simulator for biophysical neuron fiber models in `PyTorch <https://github.com/pytorch/pytorch>`_, with an emphasis on effects of extracellular stimulation. Its key features are:
 
+- support for CPU and GPU
 - automatic differentiation, allowing gradient-based optimization of thousands of parameters  
-- support for CPU and GPU with minimal changes to the code
-- a wide range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more
+- implementations of a range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more
 - ``jit``-compilation, making it blazing fast while being fully written in python  
 - a simple API, making it easy to use for beginners and experts alike
 
@@ -19,32 +19,25 @@ Getting started
 .. code-block:: python
 
     import torch
-    import numpy as np
     import matplotlib.pyplot as plt
 
-    from axonml.models import *
-    from axonml.models.callbacks import Recorder, LFP, Active
+    import axonml as ax
 
     # single 2.0 µm MRG model with extracellular stimulation
-    model = smolMRG([2.0], n_comp=201)
+    model = ax.smolMRG([2.0], n_node=201)
 
     # point source extracellular kHz stimulation
-    x = model.x()
-    z = 100.0
-    r = torch.sqrt(z**2 + x**2) * 1e-4
-    ve_s = 1000 / (4 * torch.pi * 500 * r)
+    ve_s = ax.isotropic_point(z=100.0, rhoe=500.0)(model)
 
-    dt = 0.001
-    tstop = 100
-    f = 5
+    dt, tstop = 0.001, 100
+    f, amp = 5, 0.5
     t = torch.arange(0, tstop, dt)
-    amplitude = 25
-    ve_t = amplitude * torch.sin(2 * torch.pi * f * t).unsqueeze(0)
+    i_t = ax.sin(amp=amp, freq=f)(t)
 
     # run simulation
-    rec = Recorder(['v'], node_indices=model.c(0.9))
+    rec = ax.callbacks.Recorder(['v'], node_indices=model.c(0.9))
     model.steady_state()
-    model.longrun(space=ve_s, time=ve_t, n_chunks=10000, dt=dt, callbacks=[rec])
+    model.longrun(space=ve_s, time=i_t, n_chunks=10000, dt=dt, callbacks=[rec])
 
     # visualize
     v = rec.numpy('v')

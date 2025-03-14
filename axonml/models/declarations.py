@@ -2,6 +2,20 @@ import sys
 from functools import partial
 
 
+__all__ = [
+    "STATE",
+    "PARAMETER",
+    "INITIAL",
+    "USEQ10",
+    "DERIVATIVE",
+    "NONSPECIFIC_CURRENT",
+    "RANGE",
+    "ASSIGNED",
+    "BUFFERS",
+    "DIFFUSION",
+]
+
+
 def add_to_namespace(namespace, name, *args):
     """Add values to a set in the given namespace.
     
