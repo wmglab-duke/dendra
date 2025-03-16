@@ -1,3 +1,5 @@
+"""Constants."""
+
 import math
 import torch
 

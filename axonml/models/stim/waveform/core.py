@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 from axonml.models.parametric import Parameterized
 
@@ -63,8 +65,10 @@ class Waveform(torch.jit.ScriptModule, Parameterized):
     >>> t = torch.linspace(0, 1, 100)
     >>> values = waveform(t)
     """
+    _tstop: Optional[float]
     def __init__(self, **kwargs):
         super(Waveform, self).__init__()
+        self._tstop = None
         self.check_kwargs(kwargs)
         self.instantiate_parameters(**kwargs)
     
@@ -82,6 +86,14 @@ class Waveform(torch.jit.ScriptModule, Parameterized):
     
     def parameters_repr(self):
         return ", ".join(f"{k}={v}" for k, v in self.named_parameters())
+    
+    def tstop(self, tstop):
+        self._tstop = tstop
+        return self
+    
+    def assemble(self, dt):
+        t = torch.arange(0, self._tstop, dt)
+        return self(t)
     
 
 class _repeat(Waveform):

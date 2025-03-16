@@ -8,6 +8,7 @@ from .models import *
 from .models.mod import load_mechanisms
 from .models.stim.waveform import *
 from .models.fields import *
+from .const import *
 
 import axonml.models.callbacks as callbacks
 import axonml.models.mod as mod

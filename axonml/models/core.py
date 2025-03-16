@@ -10,6 +10,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from axonml.models.stim.intrastim import IntraStim
+from axonml.models.stim.waveform import Waveform
 
 from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
@@ -582,7 +583,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         space : Tensor, optional
             Spatial components when ve is not directly provided.
             Used with time to construct ve.
-        time : Tensor, optional
+        time : Tensor or Waveform, optional
             Temporal components when ve is not directly provided.
             Used with space to construct ve.
         dt : float, optional
@@ -641,6 +642,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         dt = dt if dt is not None else A.dt
         self.warn_about_dt(dt)
         self.dt = dt
+
+        if isinstance(time, Waveform):
+            if time._tstop is None:
+                raise ValueError("Waveform must have a tstop value.")
+            time = time.assemble(dt)
 
         method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
         method_intra = getattr(
@@ -745,7 +751,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
             if not longrunning:
                 if progressbar:
-                    progressbar.close()
+                    progressbar.close()        
 
     def longrun(
         self,
@@ -767,7 +773,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         space : Tensor
             Spatial components of extracellular voltage. Shape should be
             [n_ax, n_comp] or [1, n_comp] or [n_contacts, ...] for multicontact mode.
-        time : Tensor
+        time : Tensor or Waveform
             Temporal components of extracellular voltage. Shape should be
             [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, ...] for multicontact mode.
         n_chunks : int
@@ -793,6 +799,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         memory more efficiently for long simulations by processing the data in chunks.
         The state of the model (v, v_prev, etc.) is preserved between chunks.
         """
+
+        dt = dt if dt is not None else A.dt
+        self.warn_about_dt(dt)
+
+        if isinstance(time, Waveform):
+            if time._tstop is None:
+                raise ValueError("Waveform must have a tstop value.")
+            time = time.assemble(dt)
         
         ve_s = torch.as_tensor(space, device=self.device())
         ve_t = torch.as_tensor(time, device=self.device())
@@ -808,9 +822,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ve_s = ve_s.expand(self.n_ax, -1)
             ve_t = ve_t.expand(self.n_ax, -1)
             einsum = op_sc
-
-        dt = dt if dt is not None else A.dt
-        self.warn_about_dt(dt)
 
         t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
 
@@ -870,6 +881,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 reinit = i == 0
                 self.run(ve, dt, reinit=reinit, progressbar=False)
         self.cache("_steady_state")
+        self.t_ind = 0
 
     def post_initialize(self):
         for h in self.post_initialize_hooks:
