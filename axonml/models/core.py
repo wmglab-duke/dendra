@@ -5,6 +5,7 @@ import itertools
 import warnings
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from tqdm.auto import tqdm
@@ -757,7 +758,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self,
         space: Tensor,
         time: Tensor,
-        n_chunks: int,
+        chunklength: int,
         dt: float = None,
         reinit=False,
         callbacks: List[Callback] = None,
@@ -776,8 +777,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         time : Tensor or Waveform
             Temporal components of extracellular voltage. Shape should be
             [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, ...] for multicontact mode.
-        n_chunks : int
-            Number of chunks to split the temporal component into.
+        chunklength : int
+            Length of chunks, in # timesteps, into which to split simulation.
         dt : float, optional
             Time step size in milliseconds. If None, uses the default from backend.
         reinit : bool, optional
@@ -810,6 +811,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         
         ve_s = torch.as_tensor(space, device=self.device())
         ve_t = torch.as_tensor(time, device=self.device())
+
+        n_chunks = math.ceil(ve_t.shape[-1] / chunklength)
 
         # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
         # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
@@ -1001,7 +1004,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         i_ion = self.mech.i(v_prev, v) * area
 
         # -- update vm --
-        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area)
+        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area + 1e-9)
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
@@ -1027,7 +1030,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         i_ion = self.mech.i(v_prev, v) * area - intra
 
         # -- update vm --
-        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area)
+        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area + 1e-9)
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)

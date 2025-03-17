@@ -117,7 +117,6 @@ class smolMRG(Heterogeneous):
             n_node=101,
             temp=37.0,
             v_init=-80.0,
-            method="dufort-frankel",
     ):
         if torch.any(torch.as_tensor(diameters) < 1.02):
             warnings.warn("Fiber diameter should not be less than 1.02 um for smolMRG.")
@@ -128,7 +127,7 @@ class smolMRG(Heterogeneous):
         n_ax = len(diameters)
         n_c = cid.nc()
 
-        super().__init__(n_ax, n_c, temp, v_init, method=method)
+        super().__init__(n_ax, n_c, temp, v_init)
         self.register_cid(cid)
 
         self.register_buffer('fd', torch.tensor(diameters, dtype=self.dtype()))

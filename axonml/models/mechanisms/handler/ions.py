@@ -49,6 +49,7 @@ class Ion(torch.nn.Module):
     return
 
   def eadvance(self, temp) -> None:
+    {clamp}
     {eadvance}
     return
 """
@@ -68,6 +69,10 @@ def parse_einit(ion, einit):
 
 def parse_eadvance(ion, eadvance):
     return parse_einit(ion, eadvance)
+
+
+def clamp(ion):
+    return f"self.{ion}i.clamp_(min=1e-9); self.{ion}o.clamp_(min=1e-9)"
 
 
 def parse_read_c_self(ion_write_c):
@@ -241,6 +246,7 @@ def build_ion(
         write_e_after_init=parse_write_e_after_init(ion_read_e, einit),
         write_e_immediate=parse_write_e(ion_read_e, 1),
         write_c_immediate=parse_write_c(ion_read_c, 3),
+        clamp=clamp(ion),
     )
 
     filename = f"<{ion}_template>"

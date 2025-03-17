@@ -1,39 +1,33 @@
 import torch
-from axonml.models import Tigerholm
-from axonml.models.callbacks import Recorder
+import axonml as ax
 
 import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--cache_every", type=int, default=10000)
-parser.add_argument("--n_chunks", type=int, default=1000)
+parser.add_argument("--chunklength", type=int, default=100)
 args = parser.parse_args()
 
 
 if __name__ == "__main__":
-    n_ax = 10000
-    L = 50  # mm
-    dx = 25.0  # um
+    n_ax = 10000    # number of fibers
+    L = 50          # fiber length [mm]
+    dx = 25.0       # fiber compartment length [um]
 
     diameters = torch.linspace(0.5, 2.0, n_ax)
-    model = Tigerholm(diameters, L, dx=dx, method="euler").cuda()
+    model = ax.Tigerholm(diameters, L, dx=dx, method="euler").cuda()
 
     # -- space --
-    x = model.x()
-    z = 100.0
-    r = torch.sqrt(z**2 + x**2) * 1e-4
-    v_s = (1000 / (4 * torch.pi * 500 * r)).unsqueeze(0)
+    v_s = ax.isotropic_point(z=100.0, rhoe=500.0)(model)
 
     # -- time --
-    dt = 0.001
-    tstop = 100
-    t = torch.arange(0, tstop, dt)
-    amplitude = 20.0
-    i_t = amplitude * torch.sin(t * torch.pi).unsqueeze(0)
+    dt, tstop = 0.001, 100
+    freq, amp = 1, 0.5
+    i_t = ax.sin(amp=amp, freq=freq).tstop(tstop)
 
     # -- run & record --
-    rec = Recorder(["v"], node_indices=model.c(0.4, 0.5)).set_hdf5(
+    rec = ax.callbacks.Recorder(["v"], node_indices=model.c(0.4, 0.5)).set_hdf5(
         "tigerholm_voltage.h5", cache_every=args.cache_every
     )
-    model.longrun(space=v_s, time=i_t, n_chunks=args.n_chunks, dt=dt, callbacks=[rec])
+    model.longrun(space=v_s, time=i_t, chunklength=args.chunklength, dt=dt, callbacks=[rec])
     rec.close()

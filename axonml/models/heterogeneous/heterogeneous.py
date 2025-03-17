@@ -22,14 +22,10 @@ class Heterogeneous(Axon):
         n_comp: int,
         temp=37.0,
         v_init=-70.0,
-        method="dufort-frankel",
         beta=0.0,
     ):
-        if method not in {"dufort-frankel", "df"}:
-            raise ValueError(
-                f"Method {method} is not supported for heterogeneous axons."
-            )
         diameters = torch.ones(n_ax)
+        method = "dufort-frankel"
         super().__init__(diameters, n_comp, temp, v_init, method, beta)
 
     def _register_buffers(self, diameters):
@@ -116,14 +112,19 @@ class Heterogeneous(Axon):
         self.warn_about_dt(dt)
         self.dt = dt
 
-        method = getattr(self, f"step_no_intra_df")
-        method_intra = getattr(self, f"step_intra_df")
+        df = self.is_df
+
+        method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
+        method_intra = getattr(
+            self, f"step_intra_{self.method_conversion[self.method]}"
+        )
 
         with torch.set_grad_enabled(self.training):
             if ve is None and not intra_only:
                 ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
 
-            ve = 2 * ve
+            if df:
+                ve = 2 * ve
 
             if self.training:
                 self.calculate_geometric_params()
@@ -155,11 +156,16 @@ class Heterogeneous(Axon):
             dt = torch.as_tensor(dt, device=device)
 
             rap = F.pad(self.ra_c, (1, 1), "reflect")
-            s = dt / self.cm_c
-            phi_l = s / rap[:, :, :-1]
-            phi_r = s / rap[:, :, 1:]
-            s = 2 * s
-            phi_sum = phi_l + phi_r
+
+            if df:
+                s = dt / self.cm_c
+                phi_l = s / rap[:, :, :-1]
+                phi_r = s / rap[:, :, 1:]
+                s = 2 * s
+                phi_sum = phi_l + phi_r
+            else:
+                cm_inv = 1 / self.cm_c
+                ra_inv = 1 / rap
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
@@ -167,33 +173,50 @@ class Heterogeneous(Axon):
 
             for i in range(ve.shape[0]):
                 ve_ = ve[i] if not intra_only else ve_zero
-                if with_intra:
-                    self.v, self.v_prev = method_intra(
-                        self.v,
-                        self.v_prev,
-                        ve_,
-                        self.area_c,
-                        s,
-                        phi_l,
-                        phi_r,
-                        phi_sum,
-                        dt,
-                        self.temp_c,
-                        intra(self.t_ind, self.v),
-                    )
+                if df:
+                    if with_intra:
+                        self.v, self.v_prev = method_intra(
+                            self.v,
+                            self.v_prev,
+                            ve_,
+                            self.area_c,
+                            s,
+                            phi_l,
+                            phi_r,
+                            phi_sum,
+                            dt,
+                            self.temp_c,
+                            intra(self.t_ind, self.v),
+                        )
+                    else:
+                        self.v, self.v_prev = method(
+                            self.v,
+                            self.v_prev,
+                            ve_,
+                            self.area_c,
+                            s,
+                            phi_l,
+                            phi_r,
+                            phi_sum,
+                            dt,
+                            self.temp_c,
+                        )
                 else:
-                    self.v, self.v_prev = method(
-                        self.v,
-                        self.v_prev,
-                        ve_,
-                        self.area_c,
-                        s,
-                        phi_l,
-                        phi_r,
-                        phi_sum,
-                        dt,
-                        self.temp_c,
-                    )
+                    if with_intra:
+                        self.v = method_intra(
+                            self.v,
+                            ve_,
+                            self.area_c,
+                            cm_inv,
+                            ra_inv,
+                            dt,
+                            self.temp_c,
+                            intra(self.t_ind, self.v),
+                        )
+                    else:
+                        self.v = method(
+                            self.v, ve_, self.area_c, cm_inv, ra_inv, dt, self.temp_c
+                        )
                 callbacks.post_step_hook(self)
                 self.t_ind += 1
 
@@ -205,6 +228,28 @@ class Heterogeneous(Axon):
             if not longrunning:
                 if progressbar:
                     progressbar.close()
+
+    @torch.jit.script_method
+    def FRK(self, v, ve, area, cm, ra) -> Tensor:
+        v_p = F.pad(v, (1, 1), "reflect")
+        v_e_p = F.pad(ve, (1, 1), "reflect")
+
+        i_ion = self.mech.i(v, v) * area
+
+        l = (v_p[:, :, :-2] - v + v_e_p[:, :, :-2] - ve) * ra[:, :, :-1]
+        r = (v_p[:, :, 2:] - v + v_e_p[:, :, 2:] - ve) * ra[:, :, 1:]
+        return cm * ((l + r) - i_ion)
+    
+    @torch.jit.script_method
+    def FRK_intra(self, v, ve, area, cm, ra, intra) -> Tensor:
+        v_p = F.pad(v, (1, 1), "reflect")
+        v_e_p = F.pad(ve, (1, 1), "reflect")
+
+        i_ion = self.mech.i(v, v) * area - intra
+
+        l = (v_p[:, :, :-2] - v + v_e_p[:, :, :-2] - ve) * ra[:, :, :-1]
+        r = (v_p[:, :, 2:] - v + v_e_p[:, :, 2:] - ve) * ra[:, :, 1:]
+        return cm * ((l + r) - i_ion)
 
     @torch.jit.script_method
     def ssd_df(self, v_c, v_p, v_e, phi_l, phi_r):
