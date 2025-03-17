@@ -5,10 +5,10 @@ import numpy as np
 from natsort import natsorted
 import torch
 
-from cajal.common.logging import tic, toc
 from cajal.nrn.sources import PreComputedInterpolate1D
 from cajal.nrn.stimuli import MonophasicPulse
 
+import axonml as ax
 from axonml.models.implementations import SMF
 from axonml.opt.gd import AxonSpec, FieldSpec, GDProblemArbitrary, GD
 
@@ -79,9 +79,9 @@ if __name__ == "__main__":
         dtype=dtype,
     )
 
-    tic()
+    ax.tic()
     gd.solve(mrg, args.n_steps)
-    time = toc()
+    time = ax.toc()
 
     if args.validate:
         from cajal.nrn import MRG

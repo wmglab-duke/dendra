@@ -258,3 +258,35 @@ def interp1d(x, y, xnew, out=None):
             ynew = ynew.view(original_xnew_shape)
 
     return ynew
+
+import time
+import logging
+
+TIME_STACK = []
+
+# -- define base logger and formatting options --
+logger = logging.getLogger("axonml")
+logFormatter = logging.Formatter("%(asctime)s %(name)s [%(levelname)s] %(message)s", datefmt='%Y-%m-%d %H:%M:%S')
+consoleHandler = logging.StreamHandler()
+consoleHandler.setFormatter(logFormatter)
+logger.addHandler(consoleHandler)
+logger.setLevel(logging.INFO)
+
+
+def tic(message=None, log=True):
+    TIME_STACK.append(time.time())
+    if message and log:
+        logger.info(str(message))
+
+
+def toc(message=None, log=True):
+    try:
+        t = time.time() - TIME_STACK.pop()
+        output = f"Elapsed: {t:.3f}s"
+        if message:
+            output = f"{message}:: {output}"
+        if log:
+            logger.info(output)
+        return t
+    except IndexError:
+        logger.error("You have to tic() before you toc()")
