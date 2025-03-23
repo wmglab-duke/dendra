@@ -83,4 +83,4 @@ class mrg_naf(Mechanism):
     NONSPECIFIC_CURRENT("i")
 
     def i(self, v):
-        return self.gnabar * self.m ** 3 * self.h * (v - self.ena)
+        return self.gnabar * self.m**3 * self.h * (v - self.ena)

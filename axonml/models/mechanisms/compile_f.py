@@ -71,6 +71,8 @@ def transform_function(source: str, assign_return: bool = True) -> str:
     def prepend_self_to_names(node):
         if isinstance(node, ast.Name):
             var_name = node.id
+            if "torch" in var_name:
+                return node
             # 'self' and 'v' remain as is.
             if var_name in all_ops():
                 return node
@@ -167,6 +169,8 @@ def transform_function(source: str, assign_return: bool = True) -> str:
     return ast.unparse(tree)
 
 
-def convert_func(f, assign_return=False):
+def convert_func(f, assign_return=False, rename=None):
     source = textwrap.dedent(inspect.getsource(f))
+    if rename is not None:
+        source = source.replace(f.__name__, rename)
     return transform_function(source, assign_return)

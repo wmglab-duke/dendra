@@ -3,7 +3,7 @@
 </div>
 
 ***
-Implement and train high-throughput GPU-compatible neural fiber models.
+World's fastest neural fiber simulator. Implement and train high-throughput GPU-compatible models.
 
 ## ❗Requirements
 
@@ -41,7 +41,7 @@ Implement and train high-throughput GPU-compatible neural fiber models.
 🥳 You're all set! 
 
 > [!NOTE]
-> Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive sapce.
+> Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive space.
 
 > [!IMPORTANT]
 > The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, run the data generation script, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal) (however do not create a separate `conda` environment for `cajal` - install all dependencies into `axonml`).
@@ -53,7 +53,7 @@ Trained `axonml.models.Axon` models can be loaded using the `load` method. We ha
 # import surrogate myelinated fiber class
 from axonml.models import SMF
 
-# instantiate model and load pre-rained parameters
+# instantiate model and load pre-trained parameters
 mrg = SMF().cuda().load('MRG')
 
 # ... use mrg for thresholding, modeling, stimulus optimization, etc.
@@ -98,7 +98,7 @@ A.dt = 0.001
 n_axons, n_comps = 50, 51
 ve = build_ve(50, 51)             # implement this function yourself
 intra = build_intra()             # or None
-diams = 5.7 * torch.ones(n_axons) # we're simulation 5.7 um fibers
+diams = 5.7 * torch.ones(n_axons) # we're simulating 5.7 um fibers
 
 model.run(ve=ve, diameters=diams, intra=intra)
 ```

@@ -117,7 +117,16 @@ class can(Mechanism):
 
     def ica(self, v):
         ecan = (
-            self.R * ((self.temp + 273.15) / self.z / self.F * log(self.cao / self.cai))
+            self.R
+            * (
+                (self.temp + 273.15)
+                / self.z
+                / self.F
+                * log((self.cao + 1e-9) / (self.cai + 1e-9))
+            )
             - self.ecaoffset
         )
         return self.gbar * self.d * (0.55 * self.f1 + 0.45 * self.f2) * (v - ecan)
+
+    def conductance(self, v):
+        return self.gbar * self.d * (0.55 * self.f1 + 0.45 * self.f2)

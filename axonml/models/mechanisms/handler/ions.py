@@ -7,6 +7,7 @@ from .handler import parse_args, parse_assignments
 from ...declarations import add_to_namespace_dict
 
 from .defaults import reversals, VALENCES, cinits
+from axonml.helpers import DETECT_ANOMALIES, DEBUG
 
 R = 1e3 * 8.31446261815324
 FARADAY = 96485.33212331001
@@ -33,6 +34,7 @@ class Ion(torch.nn.Module):
     {initialize_e}
     {initialize_i}
     {initialize_o}
+    self.detach()
     self.einit(temp)
 
   def detach(self):
@@ -51,6 +53,7 @@ class Ion(torch.nn.Module):
   def eadvance(self, temp) -> None:
     {clamp}
     {eadvance}
+    {detect_anomalies}
     return
 """
 
@@ -64,11 +67,13 @@ def init_tensor(val, buffer_or_param):
 def parse_einit(ion, einit):
     if einit == 0:
         return ""
-    return f"self.e{ion}[:] = (torch.log(self.{ion}o / self.{ion}i) * self.rzf * (273.15 + temp)); self.e{ion}.detach_()"
+    return f"self.e{ion}[:] = (torch.log(self.{ion}o / (self.{ion}i + 1e-9)) * self.rzf * (273.15 + temp)); self.e{ion}.detach_()"
 
 
 def parse_eadvance(ion, eadvance):
-    return parse_einit(ion, eadvance)
+    if not eadvance:
+        return ""
+    return f"self.e{ion} = (torch.log(self.{ion}o / (self.{ion}i + 1e-9)) * self.rzf * (273.15 + temp))"
 
 
 def clamp(ion):
@@ -217,6 +222,11 @@ def build_ion(
     e_is_buffer = parse_e_buffer_or_param(e_style)
     c_is_buffer = parse_c_buffer_or_param(c_style)
 
+    if DETECT_ANOMALIES:
+        detect_anomalies = f"assert torch.all(torch.isfinite(self.e{ion})), 'Anomaly detected in e{ion}'\n    assert torch.all(torch.isfinite(self.{ion}i)), 'Anomaly detected in {ion}i'\n    assert torch.all(torch.isfinite(self.{ion}o)), 'Anomaly detected in {ion}o'"
+    else:
+        detect_anomalies = ""
+
     forward_str = template.format(
         arguments=arguments,
         assignments=assignments,
@@ -247,7 +257,11 @@ def build_ion(
         write_e_immediate=parse_write_e(ion_read_e, 1),
         write_c_immediate=parse_write_c(ion_read_c, 3),
         clamp=clamp(ion),
+        detect_anomalies=detect_anomalies,
     )
+
+    if DEBUG >= 3:
+        print(forward_str)
 
     filename = f"<{ion}_template>"
     code = compile(forward_str, filename, "exec")

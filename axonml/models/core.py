@@ -19,6 +19,7 @@ from axonml.models.parametric import Parameterized
 from axonml.models.mechanisms.core import Mechanism, validate
 from axonml.models.mechanisms import c_context, e_context
 from axonml.models.declarations import PARAMETER
+from axonml.models.mechanisms.handler.defaults import valid_ions
 from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
@@ -29,12 +30,12 @@ from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM, CUDA, DTWARN, ctx
 def get_unique_keys(list_of_dicts):
     """
     Get all unique keys from a list of dictionaries.
-    
+
     Parameters
     ----------
     list_of_dicts : list
         A list of dictionaries.
-    
+
     Returns
     -------
     set
@@ -109,10 +110,10 @@ class SymmetricConv1D(torch.nn.Conv1d):
 class Axon(Parameterized, torch.jit.ScriptModule):
     """
     Base 1D fiber class.
-    
+
     This is the base class for axon models, implementing common functionality
     for simulating action potential propagation along 1D fibers.
-    
+
     Parameters
     ----------
     diameters : array_like
@@ -124,11 +125,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     v_init : float, optional
         Initial membrane potential in mV. Default is -80.0.
     method : str, optional
-        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4', 
+        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4',
         'dufort-frankel', or 'df'. Default is 'rk1'.
     beta : float, optional
         Hyperdiffusion coefficient. Default is 0.0.
-    
+
     Attributes
     ----------
     n_ax : int
@@ -148,8 +149,18 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     dt : float
         Time step in ms.
     """
+
     _dt_lim = None
-    __constants__ = ["method", "n_ax", "n_comp", "temp", "v_init", "is_df", "use_fast_imem", "hd"]
+    __constants__ = [
+        "method",
+        "n_ax",
+        "n_comp",
+        "temp",
+        "v_init",
+        "is_df",
+        "use_fast_imem",
+        "hd",
+    ]
 
     def __init__(
         self, diameters, n_comp: int, temp=37.0, v_init=-80.0, method="rk1", beta=0.0
@@ -192,6 +203,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self._m_curr = {}
         self._m_unfactorable = {}
         self._m_has_gtot = {}
+        self._m_divide_by_two = {}
 
         self._ion_read = {}
         self._ion_write = {}
@@ -210,15 +222,19 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.use_fast_imem = bool(IMEM)
         if self.use_fast_imem:
             self.register_buffer("i_membrane", torch.zeros((self.n_ax, 1, n_comp)))
-        
+
         self.register_buffer("y", torch.zeros(self.n_ax, 1))
         self.register_buffer("z", torch.zeros(self.n_ax, 1))
 
         self.beta = beta
-        self.hd = bool(beta) # hyper-diffusion
+        self.hd = bool(beta)  # hyper-diffusion
         if self.hd:
-            self.filter = torch.nn.Conv1d(1, 1, 5, padding=2, bias=False, padding_mode="reflect")
-            self.filter.weight.data = torch.tensor([-1, 4, -6, 4, -1], dtype=torch.float).reshape(1, 1, 5)
+            self.filter = torch.nn.Conv1d(
+                1, 1, 5, padding=2, bias=False, padding_mode="reflect"
+            )
+            self.filter.weight.data = torch.tensor(
+                [-1, 4, -6, 4, -1], dtype=torch.float
+            ).reshape(1, 1, 5)
             for p in self.filter.parameters():
                 p.requires_grad = False
 
@@ -268,19 +284,22 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 previous_init(self, *args, **kwargs)
                 if type(self) == cls:
                     Axon.__post_init__(self)
+
             return new_init
 
         cls.__init__ = init_decorator(cls.__init__)
 
     def __post_init__(self):
         changed = self.instantiate_parameters_lambda()
-        if changed: self.calculate_geometric_params()
+        if changed:
+            self.calculate_geometric_params()
         with (
             e_context(use_last=True),
             c_context(use_last=True),
         ):
             self._build()
-        if CUDA: self.cuda()
+        if CUDA:
+            self.cuda()
 
     def _register_buffers(self, diameters):
         self.register_buffer("diam", diameters)
@@ -307,18 +326,18 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def unfreeze(self, *names):
         """
         Unfreezes model parameters, making them trainable.
-        
+
         If no names are provided, all parameters will be unfrozen.
-        If names are provided, only parameters whose names match any 
+        If names are provided, only parameters whose names match any
         of the provided patterns will be unfrozen.
-        
+
         Parameters
         ----------
         *names : str
             Variable length argument list of parameter name patterns.
             If empty, all parameters will be unfrozen.
             Otherwise, only parameters matching any of these patterns will be unfrozen.
-            
+
         Notes
         -----
         The matching is done using the `matches_any_pattern` function.
@@ -381,7 +400,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def insert(self, mechanism, ic=None, mask_out=None, mask_in=None, **kwargs):
         """
         Insert a mechanism into the model.
-        
+
         Parameters
         ----------
         mechanism : Mechanism
@@ -400,7 +419,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         """
         validate(mechanism)
 
-        m, unfactorable, has_gtot = compile_mechanism(
+        m, unfactorable, has_gtot, divide_by_two = compile_mechanism(
             mechanism,
             self,
             ic=ic,
@@ -413,6 +432,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self._m_name.append(mechanism.__name__)
         self._m_unfactorable[mechanism.__name__] = unfactorable
         self._m_has_gtot[mechanism.__name__] = has_gtot
+        self._m_divide_by_two[mechanism.__name__] = divide_by_two
 
         for k, v in mechanism._currents.items():
             self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
@@ -427,6 +447,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             self._ion_write_c.setdefault(k, {}).update({mechanism.__name__: v})
 
     def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
+        assert ion in valid_ions(), f"Invalid ion: {ion}"
         self._ion_style[ion] = (c_style, e_style, einit, eadvance, cinit)
 
     def get_ion_style(self, ion):
@@ -500,6 +521,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             self._m_curr,
             self._m_unfactorable,
             self._m_has_gtot,
+            self._m_divide_by_two,
             self.temp,
             ions,
             df,
@@ -531,7 +553,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def t(self):
         """
         Get the current simulation time.
-        
+
         Returns
         -------
         float
@@ -542,18 +564,18 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def c(self, *args):
         """
         Convert relative positions to node indices.
-        
+
         Parameters
         ----------
         *args : float
             Variable number of float values between 0 and 1, representing
             relative positions along the axon.
-        
+
         Returns
         -------
         list
             List of integer node indices corresponding to the input positions.
-        
+
         Examples
         --------
         >>> model.c(0.25, 0.5, 0.75)
@@ -561,25 +583,27 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         """
         return [round((self.n_comp - 1) * i) for i in args]
 
-    def run(self, 
-            ve=None, 
-            space=None, 
-            time=None, 
-            dt=None, 
-            intra=None,
-            callbacks=None, 
-            reinit=False, 
-            progressbar=True, 
-            multicontact=False,
-            first=True, 
-            longrunning=False):
+    def run(
+        self,
+        ve=None,
+        space=None,
+        time=None,
+        dt=None,
+        intra=None,
+        callbacks=None,
+        reinit=False,
+        progressbar=True,
+        multicontact=False,
+        first=True,
+        longrunning=False,
+    ):
         """
         Run the axon model simulation.
-        
+
         Parameters
         ----------
         ve : Tensor, optional
-            Extracellular voltage tensor. Shape should be 
+            Extracellular voltage tensor. Shape should be
             [timesteps, n_ax, 1, n_comp] or compatible.
         space : Tensor, optional
             Spatial components when ve is not directly provided.
@@ -609,19 +633,19 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         longrunning : bool, optional
             If True, indicates this run is part of a longer simulation sequence,
             affecting progress bar behavior. Default is False.
-        
+
         Raises
         ------
         ValueError
             If neither ve nor (space and time) nor intra is provided.
             If intra is provided but is not an instance of IntraStim.
-        
+
         Notes
         -----
         The simulation updates the model's internal state (v, v_prev for DF method, etc.)
         and advances the model's time index (t_ind).
         """
-        
+
         with_intra = intra is not None
         if with_intra:
             if not isinstance(intra, IntraStim):
@@ -752,7 +776,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
             if not longrunning:
                 if progressbar:
-                    progressbar.close()        
+                    progressbar.close()
 
     def longrun(
         self,
@@ -768,7 +792,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     ):
         """
         Run a long simulation by splitting it into multiple chunks.
-        
+
         Parameters
         ----------
         space : Tensor
@@ -793,7 +817,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         multicontact : bool, optional
             If True, handles multiple electrode contacts for ve construction.
             Default is False.
-        
+
         Notes
         -----
         This method uses the same numerical methods as the `run` method, but manages
@@ -808,7 +832,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             if time._tstop is None:
                 raise ValueError("Waveform must have a tstop value.")
             time = time.assemble(dt)
-        
+
         ve_s = torch.as_tensor(space, device=self.device())
         ve_t = torch.as_tensor(time, device=self.device())
 
@@ -861,21 +885,21 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def steady_state(self, dt=0.2, maxiter=3000):
         """
         Run the model until it reaches a steady state and cache the result.
-        
+
         Parameters
         ----------
         dt : float, optional
             Time step size in milliseconds. Default is 0.2 ms.
         maxiter : int, optional
             Maximum number of iterations to run the simulation. Default is 3000.
-        
+
         Notes
         -----
         This method clears any previous steady state cache before creating a new one.
-        The steady state can be restored later by setting reinit=True when calling 
+        The steady state can be restored later by setting reinit=True when calling
         the run method.
         """
-        
+
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
         ve = torch.zeros(1, self.n_ax, 1, self.n_comp, device=self.device())
@@ -1004,7 +1028,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         i_ion = self.mech.i(v_prev, v) * area
 
         # -- update vm --
-        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area + 1e-9)
+        v_new = (v_prev + s2 * d2v - s * i_ion) / (
+            1 + s2 + s * self.mech.gtot(v) * area
+        )
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
@@ -1030,7 +1056,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         i_ion = self.mech.i(v_prev, v) * area - intra
 
         # -- update vm --
-        v_new = (v_prev + s2 * d2v - s * i_ion) / (1 + s2 + s * self.mech.gtot() * area + 1e-9)
+        v_new = (v_prev + s2 * d2v - s * i_ion) / (
+            1 + s2 + s * self.mech.gtot(v) * area
+        )
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
@@ -1054,16 +1082,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def load(self, state_dict):
         """
         Load model weights from a state dictionary.
-        
+
         This method supports loading weights from:
         1. A key from the predefined `all_trained` dictionary
         2. A file path as a string
         3. An actual state dictionary object
-        
+
         The loaded weights are matched to the model's current state dict structure
         and only compatible weights are loaded. After loading, geometric parameters
         are recalculated.
-        
+
         Parameters
         ----------
         state_dict : str or dict
@@ -1071,7 +1099,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             - A key from the predefined `all_trained` dictionary
             - A file path to a saved model state
             - A state dictionary object
-        
+
         Returns
         -------
         self
@@ -1116,25 +1144,25 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def cache(self, name: str = None):
         """
         Cache the current model state with an optional identifier.
-        
+
         This method saves a snapshot of the model's current state dictionary
         to an internal cache. The state can later be restored using the
         restore() method with the same name.
-        
+
         Parameters
         ----------
         name : str, optional
             Identifier for the cached state. If None, the state is cached
             with the name 'latest'. Default is None.
-        
+
         Returns
         -------
         None
-        
+
         See Also
         --------
         restore : Restore a previously cached state
-        
+
         Examples
         --------
         >>> model.cache('before_training')  # Cache state before training
@@ -1149,25 +1177,25 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def restore(self, name: str = None):
         """
         Restore a previously cached model state.
-        
+
         This method loads a previously cached state dictionary from the internal
         cache and applies it to the model. It's used in conjunction with the
         cache() method, which saves states.
-        
+
         Parameters
         ----------
         name : str, optional
             Identifier for the cached state to restore. If None, restores
             the state cached as 'latest'. Default is None.
-        
+
         Returns
         -------
         None
-        
+
         See Also
         --------
         cache : Cache the current model state
-        
+
         Examples
         --------
         >>> model.cache('before_training')  # Cache state before training
@@ -1203,12 +1231,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         super().to(*args, **kwargs)
         self.mech.set_buffers(self.diam)
         return self
-    
+
     def warn_about_dt(self, dt):
         if DTWARN:
             if self._dt_lim is not None:
                 if dt > self._dt_lim:
-                    warnings.warn(f"dt ({dt}) exceeds limit ({self._dt_lim}), solution may have large oscillations.")
+                    warnings.warn(
+                        f"dt ({dt}) exceeds limit ({self._dt_lim}), solution may have large oscillations."
+                    )
 
 
 def _match_state_dict(
@@ -1218,7 +1248,7 @@ def _match_state_dict(
     """
     Match tensors between two state dictionaries based on key names and shapes.
     This function filters a state dictionary to find tensors that have matching keys
-    and identical shapes in another state dictionary, which is useful for selective 
+    and identical shapes in another state dictionary, which is useful for selective
     parameter loading or model weight comparisons.
 
     Parameters
@@ -1231,9 +1261,9 @@ def _match_state_dict(
     -------
     Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
         A tuple containing:
-        - matched_state_dict: Dictionary with entries from state_dict_b that have 
+        - matched_state_dict: Dictionary with entries from state_dict_b that have
           matching keys and shapes in state_dict_a.
-        - unmatched_state_dict: Dictionary with remaining entries from state_dict_b 
+        - unmatched_state_dict: Dictionary with remaining entries from state_dict_b
           that don't have matching keys or shapes in state_dict_a.
     """
     matched_state_dict = {
@@ -1252,11 +1282,11 @@ def _match_state_dict(
 class Unmyelinated(Axon):
     """
     Base unmyelinated axon model class.
-    
+
     This class implements a model of unmyelinated axons (nerve fibers without myelin sheaths)
     by extending the base Axon class. It uses a uniform spatial discretization with nodes
     spaced at regular intervals.
-    
+
     Parameters
     ----------
     diameters : array_like
@@ -1270,9 +1300,9 @@ class Unmyelinated(Axon):
     v_init : float, optional
         Initial membrane potential in mV. Default is -80 mV.
     method : str, optional
-        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4', 
+        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4',
         'dufort-frankel', or 'df'. Default is 'rk1'.
-    
+
     Attributes
     ----------
     dx : float
@@ -1283,7 +1313,7 @@ class Unmyelinated(Axon):
         Membrane capacitance in μF/cm².
     rhoa : float
         Axial resistivity in Ω·cm.
-    
+
     Methods
     -------
     x()
@@ -1292,34 +1322,33 @@ class Unmyelinated(Axon):
         Calculates membrane surface area in cm² for given diameters.
     ra_(diameters)
         Calculates axial resistance in MΩ for given diameters.
-    
+
     Notes
     -----
     The number of nodes is calculated to ensure it's odd (for a centered node at position 0)
     and to maintain symmetry by rounding to the next even number of segments.
-    
+
     See Also
     --------
     Axon : Base class providing common functionality for axon models.
     Myelinated : Companion class implementing myelinated axon models.
     """
+
     PARAMETER(cm=1.0, rhoa=35.4)
 
-    def __init__(
-        self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"
-    ):
+    def __init__(self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"):
         L = L * 1000  # mm -> um
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
         self.dx: float = dx
-        self.L : float = n_comp * dx
+        self.L: float = n_comp * dx
         super().__init__(diameters, n_comp, temp, v_init, method)
 
     def x(self) -> torch.Tensor:  # x in um
         l = (self.n_comp - 1) * self.dx
         x = torch.linspace(-l / 2, l / 2, self.n_comp, device=self.device())
         return torch.atleast_2d(x)
-    
+
     def area_(self, diameters) -> torch.Tensor:
         dx = torch.full_like(diameters, self.dx / 10000)
         return torch.pi * (diameters / 10000) * dx
@@ -1333,11 +1362,11 @@ class Unmyelinated(Axon):
 class Myelinated(Axon):
     """
     Base myelinated axon model class.
-    
+
     This class implements a model of myelinated axons (nerve fibers with myelin sheaths)
     by extending the base Axon class. It models nodes of Ranvier separated by
     myelinated internodal regions, with parameters that scale with axon diameter.
-    
+
     Parameters
     ----------
     diameters : array_like
@@ -1349,11 +1378,11 @@ class Myelinated(Axon):
     v_init : float, optional
         Initial membrane potential in mV. Default is -80 mV.
     method : str, optional
-        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4', 
+        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4',
         'dufort-frankel', or 'df'. Default is 'rk1'.
     beta : float, optional
         Hyperdiffusion coefficient for numerical stability. Default is 0.0.
-    
+
     Attributes
     ----------
     node_l : float
@@ -1371,7 +1400,7 @@ class Myelinated(Axon):
         Membrane capacitance in μF/cm². Default is 1.0.
     rhoa : float
         Axial resistivity in Ω·cm. Default is 35.4.
-    
+
     Methods
     -------
     x()
@@ -1388,17 +1417,18 @@ class Myelinated(Axon):
         Calculates internodal distance based on fiber diameter.
     rhoa_scale(diameters)
         Calculates scaling factor for axial resistivity based on fiber diameter.
-    
+
     Notes
     -----
     The model uses quadratic equations to calculate various geometric parameters
     based on the fiber diameter, following anatomical scaling relationships.
-    
+
     See Also
     --------
     Axon : Base class providing common functionality for axon models.
     Unmyelinated : Companion class implementing unmyelinated axon models.
     """
+
     PARAMETER(
         node_l=2.0,
         axon_d={

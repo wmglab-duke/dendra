@@ -34,6 +34,7 @@ class MechanismHandler(torch.nn.Module):
 
   def advance(self, v, dt, temp) -> None:
     {mech_advance}
+    {assign_post_advance}
     self.update(temp)
     return
 
@@ -43,23 +44,26 @@ class MechanismHandler(torch.nn.Module):
     {ion_detach}
     return
 
-  def gtot(self) -> torch.Tensor:
+  def gtot(self, v) -> torch.Tensor:
     return {gtot}
 
   def i(self, v_prev, v) -> torch.Tensor:
     {breakpoint}
     {currents}
+    {assign_currents_non_df}
     total = {total}
     {imem_write}
     return total
 
   def itot(self, v):
     {currents_tot}
+    {assign_currents_df}
     {imem_write_df}
     return
 
   def update(self, temp) -> None:
     {ion_advance}
+    {assign_equilibrium}
     return
 
   def ion_init(self, temp) -> None:
@@ -102,6 +106,37 @@ self.{mech}.{v}.set_(self.{ion}_ion.{v})
 set_diam_buffer_template = """
 self.{mech}.diam.set_(diameters.view(-1, 1, 1))
 """
+
+
+def is_prefix_letters(s: str, prefix_char: str) -> bool:
+    # Construct a regex pattern to match, for example, '^i[a-zA-Z]+$'
+    pattern = re.compile(r'^' + re.escape(prefix_char) + r'[a-zA-Z]+$')
+    return bool(pattern.match(s))
+
+
+def assign(mechanisms, ions, kind='i') -> str:
+    out = []
+    for m in mechanisms:
+        for ion in ions:
+            if ion in m.read_ion:
+                for v in m.read_ion[ion]:
+                    if is_prefix_letters(v, kind):
+                        out.append(f"self.{m._name}.{v} = self.{ion}_ion.{v}")
+                        for k, _ in m.DE.items():
+                            out.append(f"self.{m._name}.DE['{k}'].{v} = self.{ion}_ion.{v}")
+    out = "\n    ".join(out)
+    return out
+
+
+def assign_post_advance(mechanisms, ions) -> str:
+    out = []
+    for m in mechanisms:
+        for ion in ions:
+            if ion in m.write_ion_c:
+                for v in m.write_ion_c[ion]:
+                    out.append(f"self.{ion}_ion.{v} = self.{m._name}.{v}")
+    out = "\n    ".join(out)
+    return out
 
 
 def parse_set_buffers(mechanisms, ions):
@@ -155,14 +190,21 @@ def parse_current_string(s: str, total=False, write=True) -> str:
         # Construct the transformed string
         if total:
             return f"self.{letters}_ion.i{letters}"
-        return f"self.{letters}_ion.i{letters}[:]"
+        return f"self.{letters}_ion.i{letters}"
     else:
         # If no match, leave the string unchanged
         return s
 
 
 def parse_dictionary_to_sum(
-    data: dict, current: str, df=False, dufort=False, unfactorable=None, write=True
+    data: dict,
+    current: str,
+    df=False,
+    dufort=False,
+    unfactorable=None,
+    write=True,
+    mech_has_conductance=None,
+    divide_by_two=None,
 ) -> str:
     if not data:
         return ""
@@ -178,19 +220,38 @@ def parse_dictionary_to_sum(
                     if unfactorable is None:
                         raise ValueError("unfactorable must be provided")
                     if value in unfactorable[key]:
-                        result.append(f"self.{key}.{value}(v)")
+                        if mech_has_conductance[key]:
+                            if divide_by_two[key][value]:
+                                result.append(f"self.{key}.{value}(0.5 * v_prev)")
+                            else:
+                                result.append(f"self.{key}.{value}(v_prev)")
+                        else:
+                            result.append(f"self.{key}.{value}(v)")
                     else:
                         result.append(f"self.{key}.{value}(v_prev)")
     s = " + ".join(result)
     return f"{parse_current_string(current, write=write)} = {s}"
 
 
-def parse_currents(currents, write=True, df=False, unfactorable=None) -> str:
+def parse_currents(
+    currents,
+    write=True,
+    df=False,
+    unfactorable=None,
+    mech_has_conductance=None,
+    divide_by_two=None,
+) -> str:
     result = []
     for key, value in currents.items():
         result.append(
             parse_dictionary_to_sum(
-                value, key, dufort=df, unfactorable=unfactorable, write=write
+                value,
+                key,
+                dufort=df,
+                unfactorable=unfactorable,
+                write=write,
+                mech_has_conductance=mech_has_conductance,
+                divide_by_two=divide_by_two,
             )
         )
     s = "\n    ".join(result)
@@ -299,7 +360,7 @@ def randomword(length):
 
 
 def gtot(mechanisms, has_gtot):
-    assignments = [f"self.{m._name}.gtot()" for m in mechanisms if has_gtot[m._name]]
+    assignments = [f"self.{m._name}.gtot(v)" for m in mechanisms if has_gtot[m._name]]
     if len(assignments) == 0:
         return "torch.tensor(0.0)"
     return " + ".join(assignments)
@@ -313,7 +374,8 @@ def breakpoint(mechanisms):
 
 
 def tot_currents(currents, df=False):
-    if not DFITOT: return ""
+    if not DFITOT:
+        return ""
     result = []
     for key, value in currents.items():
         result.append(parse_dictionary_to_sum(value, key, df))
@@ -336,7 +398,15 @@ def ion_detach(ions):
 
 
 def build_handler(
-    mechanisms, names, currents, unfactorable, has_gtot, temp, ions=None, df=False
+    mechanisms,
+    names,
+    currents,
+    unfactorable,
+    has_gtot,
+    divide_by_two,
+    temp,
+    ions=None,
+    df=False,
 ):
     arguments = parse_args(names)
 
@@ -360,12 +430,28 @@ def build_handler(
         imem_write = ""
         imem_write_df = ""
 
+    mech_has_conductance = {}
+    for mech in mechanisms:
+        mech_has_conductance[mech._name] = hasattr(mech, "conductance")
+
+    if df:
+        assign_currents_df = assign(mechanisms, ions)
+        assign_currents_non_df = ""
+    else:
+        assign_currents_df = ""
+        assign_currents_non_df = assign(mechanisms, ions)
+
     forward_str = template.format(
         arguments=arguments,
         assignments=parse_assignments(all_names),
         defaults=parse_defaults(ions),
         currents=parse_currents(
-            currents, df=df, unfactorable=unfactorable, write=not df
+            currents,
+            df=df,
+            unfactorable=unfactorable,
+            write=not df,
+            mech_has_conductance=mech_has_conductance,
+            divide_by_two=divide_by_two,
         ),
         total=parse_total(currents, write=not df),
         inflate=parse_inflate(names),
@@ -384,9 +470,14 @@ def build_handler(
         imem_assignment=imem_assignment,
         imem_write=imem_write,
         imem_write_df=imem_write_df,
+        assign_currents_df=assign_currents_df,
+        assign_currents_non_df=assign_currents_non_df,
+        assign_equilibrium=assign(mechanisms, ions, kind="e"),
+        assign_post_advance=assign_post_advance(mechanisms, ions),
     )
 
-    if DEBUG > 0: print(forward_str)
+    if DEBUG > 0:
+        print(forward_str)
 
     filename = f"<{randomword(10)}_template>"
     code = compile(forward_str, filename, "exec")

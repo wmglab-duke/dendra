@@ -53,12 +53,13 @@ class sin(Waveform):
     >>> t = torch.linspace(0, 1, 100)
     >>> values = waveform(t)
     """
+
     PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0)
 
     def fn(self, t):
         w = torch.sin(2 * torch.pi * self.freq * (t - self.delay) + self.phase)
         return self.amp * torch.where(t >= self.delay, w, 0.0)
-    
+
 
 class cos(Waveform):
     """
@@ -97,6 +98,7 @@ class cos(Waveform):
     >>> t = torch.linspace(0, 1, 100)
     >>> values = waveform(t)
     """
+
     PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0)
 
     def fn(self, t):
@@ -139,6 +141,7 @@ class mono_rect(Waveform):
     >>> t = torch.linspace(0, 2, 100)
     >>> values = waveform(t)
     """
+
     PARAMETER(amp=-1.0, delay=0.0, pw=1.0)
 
     def fn(self, t):
@@ -190,9 +193,8 @@ class bi_rect(Waveform):
     >>> t = torch.linspace(0, 3, 100)
     >>> values = waveform(t)
     """
-    PARAMETER(
-        amp1=-1.0, amp2=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0
-    )
+
+    PARAMETER(amp1=-1.0, amp2=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0)
 
     def fn(self, t):
         return self.amp1 * torch.where(
@@ -203,7 +205,7 @@ class bi_rect(Waveform):
             1.0,
             0.0,
         )
-    
+
 
 class bi_rect_balanced(Waveform):
     """
@@ -251,9 +253,8 @@ class bi_rect_balanced(Waveform):
     >>> t = torch.linspace(0, 3, 100)
     >>> values = waveform(t)
     """
-    PARAMETER(
-        amp=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0
-    )
+
+    PARAMETER(amp=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0)
 
     def fn(self, t):
         return self.amp * torch.where(
@@ -264,7 +265,7 @@ class bi_rect_balanced(Waveform):
             1.0,
             0.0,
         )
-    
+
 
 class bi_rect_symm(Waveform):
     """
@@ -307,6 +308,7 @@ class bi_rect_symm(Waveform):
     >>> t = torch.linspace(0, 3, 100)
     >>> values = waveform(t)
     """
+
     PARAMETER(amp=1.0, delay=0.0, pw=1.0, interval=0.0)
 
     def fn(self, t):
@@ -318,30 +320,30 @@ class bi_rect_symm(Waveform):
             1.0,
             0.0,
         )
-    
+
 
 class arbitrary(Waveform):
     """
     Arbitrary waveform generator using linear interpolation.
-    
-    Generates a waveform by linearly interpolating between specified amplitude 
-    values at given time points. Values outside the specified time range are 
+
+    Generates a waveform by linearly interpolating between specified amplitude
+    values at given time points. Values outside the specified time range are
     set to zero.
-    
+
     Parameters
     ----------
     amp : list or torch.Tensor, optional
         List of amplitude values at specified time points. Default is [0.0, 0.0].
     tpoints : list or torch.Tensor, optional
         List of time points in ms corresponding to amplitude values. Default is [0.0, 1.0].
-        
+
     Notes
     -----
     The waveform is defined by linear interpolation between the specified points.
     For a time point t:
     - If t is within the range of tpoints, the value is linearly interpolated
     - If t is outside the range of tpoints, the value is 0
-    
+
     Examples
     --------
     >>> import torch
@@ -351,6 +353,7 @@ class arbitrary(Waveform):
     >>> t = torch.linspace(0, 1.5, 100)
     >>> values = waveform(t)
     """
+
     PARAMETER(amp=[0.0, 0.0], tpoints=[0.0, 1.0])
 
     def fn(self, t):

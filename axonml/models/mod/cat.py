@@ -79,6 +79,13 @@ class cat(Mechanism):
 
     def ica(self, v):
         ecat = (
-            self.R * (self.temp + 273.15) / self.z / self.F * log(self.cao / self.cai)
+            self.R
+            * (self.temp + 273.15)
+            / self.z
+            / self.F
+            * log((self.cao + 1e-9) / (self.cai + 1e-9))
         ) - self.ecaoffset
         return self.gbar * self.d * self.f * (v - ecat)
+
+    def conductance(self, v):
+        return self.gbar * self.d * self.f

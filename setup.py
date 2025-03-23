@@ -49,7 +49,7 @@ setup(
             "myst-nb",
             "jupytext",
             "sphinx-book-theme",
-            ]
+        ],
     },
     ext_modules=ext_modules,
 )

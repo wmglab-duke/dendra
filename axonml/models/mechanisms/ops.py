@@ -22,5 +22,11 @@ def expinv(x):
     return torch.where(x.abs() < 1e-6, approx, val)
 
 
+@torch.jit.script
+def safe_exp(x):
+    exp_ = torch.exp(x)
+    return torch.where(torch.isfinite(exp_), exp_, torch.tensor(1e20))
+
+
 def all_ops():
-    return {"exp", "expm1", "expit", "sigmoid", "log", "exprelr", "expinv"}
+    return {"exp", "expm1", "expit", "sigmoid", "log", "exprelr", "expinv", "safe_exp"}

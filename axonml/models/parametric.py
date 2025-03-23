@@ -68,5 +68,7 @@ class Parameterized(torch.nn.Module):
         if _params is not None:
             for name in kwargs.keys():
                 if name not in _params:
-                    raise ValueError(f"Unknown parameter {name}. Valid parameters are {list(_params.keys())}.")
+                    raise ValueError(
+                        f"Unknown parameter {name}. Valid parameters are {list(_params.keys())}."
+                    )
         return True

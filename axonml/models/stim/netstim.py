@@ -5,10 +5,10 @@ import torch
 class NetStim(torch.jit.ScriptModule):
     """
     A PyTorch implementation of NEURON's NetStim-like spike generator.
-    
-    This class generates spike events according to a stochastic process with 
+
+    This class generates spike events according to a stochastic process with
     configurable timing parameters, similar to NEURON's NetStim mechanism.
-    
+
     Parameters
     ----------
     interval : float
@@ -16,7 +16,7 @@ class NetStim(torch.jit.ScriptModule):
     start : float, optional
         Start time (ms) after which synapses can begin spiking. Default is 0.0.
     noise : float, optional
-        Controls randomness of intervals, between 0 and 1. 
+        Controls randomness of intervals, between 0 and 1.
         0 = deterministic intervals, 1 = fully random (exponential distribution).
         Default is 0.0.
     max_spikes : int, optional
@@ -24,7 +24,7 @@ class NetStim(torch.jit.ScriptModule):
     seed : int, optional
         Seed for reproducible random number generation. If None,
         uses non-deterministic seeding. Default is None.
-    
+
     Attributes
     ----------
     shape : tuple of int
@@ -57,7 +57,7 @@ class NetStim(torch.jit.ScriptModule):
     ):
         """
         Initialize the NetStim spike generator.
-        
+
         Parameters
         ----------
         interval : float
@@ -96,7 +96,7 @@ class NetStim(torch.jit.ScriptModule):
     def device(self):
         """
         Get the device on which the module's tensors reside.
-        
+
         Returns
         -------
         torch.device
@@ -107,7 +107,7 @@ class NetStim(torch.jit.ScriptModule):
     def dtype(self):
         """
         Get the data type of the module's tensors.
-        
+
         Returns
         -------
         torch.dtype
@@ -118,7 +118,7 @@ class NetStim(torch.jit.ScriptModule):
     def init_rng(self):
         """
         Initialize the random number generator.
-        
+
         This method ensures the RNG is on the correct device and
         sets the seed if specified.
         """
@@ -132,19 +132,19 @@ class NetStim(torch.jit.ScriptModule):
     def init(self, n_ax, n_comp):
         """
         Initialize the spike generator for a given shape.
-        
+
         Parameters
         ----------
         n_ax : int
             Number of axons (rows in the output tensor).
         n_comp : int
             Number of nodes (columns in the output tensor).
-            
+
         Returns
         -------
         self : NetStim
             Returns self for method chaining.
-            
+
         Notes
         -----
         This method initializes next_spike_time for each synapse:
@@ -181,18 +181,18 @@ class NetStim(torch.jit.ScriptModule):
     def forward(self, t: float):
         """
         Check which synapses spike at the given time and update their states.
-        
+
         Parameters
         ----------
         t : float
             Current simulation time in ms.
-            
+
         Returns
         -------
         torch.Tensor
-            Binary tensor of shape (n_ax, n_comp) where True/1.0 indicates 
+            Binary tensor of shape (n_ax, n_comp) where True/1.0 indicates
             a spike at this time step.
-            
+
         Notes
         -----
         This method:

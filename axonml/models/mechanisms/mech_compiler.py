@@ -1,4 +1,4 @@
-from functools import partial
+from functools import partial, lru_cache
 from typing import Dict, List
 import inspect
 import linecache
@@ -20,7 +20,7 @@ from .handler.defaults import valid_concentrations
 from .state_compiler import compile_state, compile_coupled_state
 from .utils import load, indent, get_function_body_as_str
 
-from axonml.helpers import DEBUG, PADE
+from axonml.helpers import DEBUG, PADE, DETECT_ANOMALIES, logger
 
 
 # utility functions
@@ -33,6 +33,7 @@ def replace_v(code_str):
     return re.sub(r"\bv\b", "(v + v_n) / 2", code_str)
 
 
+@lru_cache(maxsize=None)
 def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
     lines = code_str.strip().split("\n")
 
@@ -73,7 +74,8 @@ def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
         else:
             final_expr = parse_expr(line_no_self)
 
-    if DEBUG: print(f"Final expression in mech factorization: {final_expr}")
+    if DEBUG:
+        print(f"Final expression in mech factorization: {final_expr}")
 
     if final_expr is None:
         raise ValueError("No final expression or return statement found.")
@@ -262,14 +264,19 @@ self.{name} = self.{name}_d._sample(self.{name})
 
 # ----------------- Definitions -----------------
 
+
 def define_mask(mask_out, mask_in):
     if mask_out is None and mask_in is None:
         return ""
     ret = []
     if mask_out is not None:
-        ret.append(f"mask_out = torch.ones(1, 1, n_comps)\nmask_out[:, :, {mask_out}] = 0")
+        ret.append(
+            f"mask_out = torch.ones(1, 1, n_comps)\nmask_out[:, :, {mask_out}] = 0"
+        )
     if mask_in is not None:
-        ret.append(f"mask_in = torch.zeros(1, 1, n_comps)\nmask_in[:, :, {mask_in}] = 1")
+        ret.append(
+            f"mask_in = torch.zeros(1, 1, n_comps)\nmask_in[:, :, {mask_in}] = 1"
+        )
     if mask_out is not None and mask_in is not None:
         ret.append("mask = mask_out * mask_in")
     elif mask_out is not None:
@@ -307,7 +314,9 @@ def define_coupled_infs(mechanism, states):
                         )
     return "\n".join(assignments)
 
+
 # ----------------- Initializations -----------------
+
 
 def init_distribution_buffers(distributions):
     assignments = []
@@ -340,6 +349,7 @@ def init_conductance_buffers(conductances):
 
 
 # ----------------- Assignments -----------------
+
 
 def state_buffer_assignments(states):
     assignments = []
@@ -457,11 +467,23 @@ def advance(states):
             name = k._name
             if name in valid_concentrations():
                 assignments.append(
-                    f"self.{name}[:] = self.DE['{name}'].advance(self.{name}, v, dt)"
+                    f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
                 )
             else:
                 assignments.append(
                     f"self.{name} = self.DE['{name}'].advance(self.{name}, v, dt)"
+                )
+    if DETECT_ANOMALIES:
+        for k in states:
+            if k.coupled:
+                for name in k._state_names:
+                    assignments.append(
+                        f"assert torch.all(torch.isfinite(self.{name})), 'Anomaly detected in {name}'"
+                    )
+            else:
+                name = k._name
+                assignments.append(
+                    f"assert torch.all(torch.isfinite(self.{name})), 'Anomaly detected in {name}'"
                 )
     return "\n".join(assignments)
 
@@ -507,6 +529,7 @@ def multiply_return_value(code_string, multiplier_expr: str) -> str:
 def current_equations(currents, mechanism, range_vars, df, mask):
     assignments = []
     unfactorable = [] if df else None
+    divide_by_two = {}
     for k in currents:
         assign = k in range_vars
         if not df:
@@ -537,21 +560,52 @@ def current_equations(currents, mechanism, range_vars, df, mask):
                     if mask:
                         code = multiply_return_value(code, "self.mask")
                     assignments.append(code)
+                divide_by_two[k] = False
             except:
-                warnings.warn(
-                    "Could not confirm all currents are linear in v. Dufort-Frankel may not be stable."
+                logger.warning(
+                    f"Could not factorize {k} in {mechanism.__name__}; looking instead for user-defined functions."
                 )
-                code = convert_func(getattr(mechanism, k), assign)
+                if not hasattr(mechanism, "conductance"):
+                    logger.warning(
+                        f"Could not find conductance function in {mechanism.__name__}."
+                    )
+                    code = convert_func(getattr(mechanism, k), assign)
+                    divide_by_two[k] = False
+                elif hasattr(mechanism, f"{k}_df"):
+                    logger.info(
+                        f"Conductance function found in {mechanism.__name__}. Using {k}_df function."
+                    )
+                    code = convert_func(getattr(mechanism, f"{k}_df"), assign, k)
+                    divide_by_two[k] = False
+                else:
+                    logger.info(
+                        f"Conductance function found in {mechanism.__name__}. No {k}_df function found, using {k}."
+                    )
+                    code = convert_func(getattr(mechanism, k), assign)
+                    divide_by_two[k] = True
                 if mask:
                     code = multiply_return_value(code, "self.mask")
                 assignments.append(code)
                 unfactorable.append(k)
-    return "\n".join(assignments), unfactorable
+    if hasattr(mechanism, "conductance"):
+        code = convert_func(mechanism.conductance, False)
+        if mask:
+            code = multiply_return_value(code, "self.mask")
+        assignments.append(code)
+    return "\n".join(assignments), unfactorable, divide_by_two
+
+
+linear_approx_template = """
+def {k}(self, v, v_prev):
+    return 0.5 * v_prev * (self.{k}_tot(v) / v)
+"""
 
 
 def gtot(currents, mechanism, df, mask):
     if not df:
         return "    def gtot(self): return torch.tensor(0.0)", False
+    if hasattr(mechanism, "conductance"):
+        return "    def gtot(self, v): return 0.5 * self.conductance(v)", True
     assignments = []
     for k in currents:
         code_block = get_function_body_as_str(getattr(mechanism, k))
@@ -563,13 +617,13 @@ def gtot(currents, mechanism, df, mask):
     has_gtot = True
     if not assignments:
         has_gtot = False
-        return "    def gtot(self): return torch.tensor(0.0)", has_gtot
+        return "    def gtot(self, v): return torch.tensor(0.0)", has_gtot
     s = " + ".join(assignments)
     if mask:
         mult = " * self.mask"
     else:
         mult = ""
-    return f"    def gtot(self): return {s} {mult}", has_gtot
+    return f"    def gtot(self, v): return {s} {mult}", has_gtot
 
 
 default_f = """
@@ -605,7 +659,7 @@ def coupled_assignment(state):
             lhs.append(f"self.{state_name}")
             rhs.append(f"self.{state_name}")
         else:
-            lhs.append(f"self.{state_name}[:]")
+            lhs.append(f"self.{state_name}")
             rhs.append(f"self.{state_name}")
     lhs = ", ".join(lhs)
     rhs = ", ".join(rhs)
@@ -672,13 +726,9 @@ def compile_mechanism(
     states_compiled = []
     for s in states:
         if coupled(s):
-            states_compiled.append(
-                compile_coupled_state(s, model, pade=pade, **kwargs)
-            )
+            states_compiled.append(compile_coupled_state(s, model, pade=pade, **kwargs))
         else:
-            states_compiled.append(
-                compile_state(s, model, pade=pade, **kwargs)
-            )
+            states_compiled.append(compile_state(s, model, pade=pade, **kwargs))
 
     state_buffer_assignments_str = state_buffer_assignments(states_compiled)
     state_buffer_assignments_str = indent(state_buffer_assignments_str, 2)
@@ -697,7 +747,7 @@ def compile_mechanism(
 
     masked = (mask_out is not None) or (mask_in is not None)
 
-    current_equations_str, unfactorable = current_equations(
+    current_equations_str, unfactorable, divide_by_two = current_equations(
         current_eqs,
         mechanism,
         range_vars,
@@ -735,7 +785,8 @@ def compile_mechanism(
         mask_def=indent(define_mask(mask_out, mask_in), 2),
     )
 
-    if DEBUG >= 2: print(forward_str)
+    if DEBUG >= 2:
+        print(forward_str)
 
     filename = f"<{mechanism.__name__}_template>"
     code = compile(forward_str, filename, "exec")
@@ -762,4 +813,4 @@ def compile_mechanism(
         ic=ic,
     )
 
-    return m, unfactorable, has_gtot
+    return m, unfactorable, has_gtot, divide_by_two

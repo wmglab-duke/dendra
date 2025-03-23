@@ -49,11 +49,11 @@ class Heterogeneous(Axon):
         inl = node_l / 10000
         c_ra = (self.rhoa * inl) / (torch.pi * (radii**2))
         return (c_ra[:, :, :-1] + c_ra[:, :, 1:]) / 2
-    
+
     def area_(self, diameters, node_l) -> torch.Tensor:
         dx = node_l / 10000
         return torch.pi * (diameters / 10000) * dx
-    
+
     def set_diam(self, diams):
         diams = torch.as_tensor(diams, dtype=self.dtype()).unsqueeze(1)
         self.diam[:] = diams
@@ -70,7 +70,7 @@ class Heterogeneous(Axon):
         self.diam[:] = diams
         self.node_l[:] = node_l
         self.calculate_geometric_params()
-    
+
     def calculate_geometric_params(self):
         self.area_c[:] = self.area_(self.diam, self.node_l)
         self.cm_c[:] = self.cm_(self.area_c)
@@ -239,7 +239,7 @@ class Heterogeneous(Axon):
         l = (v_p[:, :, :-2] - v + v_e_p[:, :, :-2] - ve) * ra[:, :, :-1]
         r = (v_p[:, :, 2:] - v + v_e_p[:, :, 2:] - ve) * ra[:, :, 1:]
         return cm * ((l + r) - i_ion)
-    
+
     @torch.jit.script_method
     def FRK_intra(self, v, ve, area, cm, ra, intra) -> Tensor:
         v_p = F.pad(v, (1, 1), "reflect")

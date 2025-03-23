@@ -34,12 +34,14 @@ class nacapump(Mechanism):
         DFin = (
             self.nai**3
             * self.cao
-            * exp(((self.r - 2) * self.gamma * v * self.F) / ((1000) * self.R * temp))
+            * safe_exp(
+                ((self.r - 2) * self.gamma * v * self.F) / ((1000) * self.R * temp)
+            )
         )
         DFout = (
             self.nao**3
             * self.cai
-            * exp(
+            * safe_exp(
                 ((self.r - 2) * (self.gamma - 1) * v * self.F)
                 / ((1000) * self.R * temp)
             )

@@ -18,7 +18,7 @@ __all__ = [
 
 def add_to_namespace(namespace, name, *args):
     """Add values to a set in the given namespace.
-    
+
     Parameters
     ----------
     namespace : dict
@@ -39,7 +39,7 @@ def add_to_namespace(namespace, name, *args):
 
 def add_to_namespace_dict(namespace, name, **kwargs):
     """Add key-value pairs to a dictionary in the given namespace.
-    
+
     Parameters
     ----------
     namespace : dict
@@ -57,7 +57,7 @@ def add_to_namespace_dict(namespace, name, **kwargs):
 
 def _declare(name, *args):
     """Internal function to declare variables in the calling namespace.
-    
+
     Parameters
     ----------
     name : str
@@ -76,7 +76,7 @@ def _declare(name, *args):
 
 def _declare_parameters(name, inherit=None, **kwargs):
     """Internal function to declare parameters in the calling namespace.
-    
+
     Parameters
     ----------
     name : str
@@ -104,8 +104,8 @@ BUFFERS = partial(_declare, "_buffers")
 
 def USEQ10():
     """Enable temperature scaling for the mechanism using Q10 rule.
-    
-    When enabled, rate constants in the mechanism will be scaled 
+
+    When enabled, rate constants in the mechanism will be scaled
     according to the temperature using the Q10 rule.
     """
     frame = sys._getframe(1)
@@ -115,7 +115,7 @@ def USEQ10():
 
 def NONSPECIFIC_CURRENT(*args):
     """Declare nonspecific current contributions from a mechanism.
-    
+
     Parameters
     ----------
     *args : str
@@ -130,7 +130,7 @@ def NONSPECIFIC_CURRENT(*args):
 
 def DERIVATIVE(f, pade=False):
     """Specify derivative function(s) for state variables.
-    
+
     Parameters
     ----------
     f : str, List[str]
@@ -143,22 +143,22 @@ def DERIVATIVE(f, pade=False):
     namespace["_derivative"] = (f, pade)
 
 
-def DIFFUSION(D, method='strang'):
+def DIFFUSION(D, method="strang"):
     """Specify diffusion parameters for a mechanism.
-    
+
     Parameters
     ----------
     D : float
         Diffusion constant.
     method : {'strang', 'lie'}, optional
         The splitting method to use, by default 'strang'.
-        
+
     Raises
     ------
     ValueError
         If the method is not one of 'strang' or 'lie'.
     """
-    if method not in {'strang', 'lie'}:
+    if method not in {"strang", "lie"}:
         raise ValueError(f"Method must be one of 'strang' or 'lie', got {method}")
     frame = sys._getframe(1)
     namespace = frame.f_locals

@@ -18,6 +18,11 @@ CINIT = {
 }
 
 
+def valid_ions():
+    global VALENCES
+    return list(VALENCES.keys())
+
+
 def valid_concentrations():
     global CINIT
     return [s[:-1] for s in CINIT.keys()]
@@ -45,6 +50,7 @@ def ion_register(ion, valence, e, i0, o0):
 
 class e_context(ContextDecorator):
     _last = {}
+
     def __init__(self, use_last=False, **kwargs):
         global REVERSAL
         not_in_reversal = [k for k in kwargs if k not in REVERSAL]
@@ -53,10 +59,12 @@ class e_context(ContextDecorator):
         self.updates = kwargs
         if not use_last:
             e_context._last = self.updates
-            if DEBUG: print(e_context._last)
+            if DEBUG:
+                print(e_context._last)
         if use_last:
             self.updates.update(e_context._last)
-            if DEBUG: print(self.updates)
+            if DEBUG:
+                print(self.updates)
             e_context._last = {}
         self.original_values = {}
 
@@ -76,6 +84,7 @@ class e_context(ContextDecorator):
 
 class c_context(ContextDecorator):
     _last = {}
+
     def __init__(self, use_last=False, **kwargs):
         global CINIT
         not_in_cinit = [k for k in kwargs if k not in CINIT]
@@ -84,10 +93,12 @@ class c_context(ContextDecorator):
         self.updates = kwargs
         if not use_last:
             c_context._last = self.updates
-            if DEBUG: print(c_context._last)
+            if DEBUG:
+                print(c_context._last)
         if use_last:
             self.updates.update(c_context._last)
-            if DEBUG: print(self.updates)
+            if DEBUG:
+                print(self.updates)
             c_context._last = {}
         self.original_values = {}
 

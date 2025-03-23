@@ -67,7 +67,7 @@ def modify_operations(input_string: str) -> str:
     Modify operations in the input string by prefixing PyTorch operations with 'torch.'.
     This function uses a regular expression to find function names and calls in the input string.
     If a function name matches a known PyTorch operation, it prefixes the function name with 'torch.'.
-    
+
     Args:
         input_string (str): The input string containing code with function calls.
 
@@ -92,10 +92,11 @@ def modify_operations(input_string: str) -> str:
 
 # -- add diffusion --
 
+
 def diffusion_expr(state: str, D: float, method: str, L: float, n: int) -> str:
     """
     Generates a diffusion expression string for a given state using the specified method.
-    
+
     Args:
         state (str): The state variable to be diffused.
         D (float): The diffusion coefficient.
@@ -107,7 +108,7 @@ def diffusion_expr(state: str, D: float, method: str, L: float, n: int) -> str:
     """
 
     dt_str = "dt"
-    if method == 'strang':
+    if method == "strang":
         dt_str = "dt / 2"
     return f"{state} = diffuse_step_neumann_dct1({state}, {dt_str}, {D}, {L}, {n})"
 
@@ -115,7 +116,7 @@ def diffusion_expr(state: str, D: float, method: str, L: float, n: int) -> str:
 def add_diffusion(f: str, state: str, diffusion: Tuple[float, str], model) -> str:
     """
     Adds diffusion step(s) to the given code string for a specified state variable.
-    
+
     Args:
         f (str): The input code string to which the diffusion step will be added.
         state (str): The state variable to be diffused.
@@ -146,7 +147,7 @@ def convert(deriv, state, assigned, use_pade_approx=False, diffusion=None, model
         use_pade_approx (bool, optional): Whether to use Pade approximation for integration. Defaults to False.
         diffusion (Tuple[float, str], optional): The diffusion to be added, if any. Defaults to None.
         model (object, optional): The model object (subclass of Axon). Defaults to None.
-    
+
     Returns:
         str: The modified derivative expression after integration and optional diffusion addition.
     """
@@ -155,7 +156,8 @@ def convert(deriv, state, assigned, use_pade_approx=False, diffusion=None, model
     f = integrate2c(deriv, "dt", v, use_pade_approx=use_pade_approx)
     if diffusion is not None:
         f = add_diffusion(f, state, diffusion, model)
-    if DEBUG: print(f)
+    if DEBUG:
+        print(f)
     return modify_operations(replace(f, v))
 
 
@@ -356,11 +358,11 @@ def assigned_str_f(assigned):
 def translate_breakpoint(state: State, assigned):
     """
     Translates the `breakpoint` function from a State object into a formatted string.
-    
+
     Args:
         state (State): The State object containing the breakpoint function.
         assigned: List of assigned variables to be returned by the breakpoint function.
-        
+
     Returns:
         str: A formatted string representing the breakpoint function, or an empty string
              if the state object does not have a breakpoint function.
@@ -377,12 +379,12 @@ def translate_breakpoint(state: State, assigned):
 def translate_initial(state: State):
     """
     Translates the `initial` function of a given State object into a formatted string.
-    
+
     Args:
         state (State): The State object containing the initial state to be translated.
-        
+
     Returns:
-        str: A formatted string representing the initial function. If the State object 
+        str: A formatted string representing the initial function. If the State object
              does not have an 'initial' function, an empty body is returned.
     """
     f = getattr(state, "initial", None)
@@ -395,12 +397,12 @@ def translate_initial(state: State):
 def translate_f(state: State, fname: str, default=None):
     """
     Translates a function from the given state object into a string representation.
-    
+
     Args:
         state (State): The state object containing the function to be translated.
         fname (str): The name of the function to be translated.
         default (str, optional): The default string to use if the function is not found.
-        
+
     Returns:
         str: The string representation of the function or the default string if the function is not found.
     """
@@ -417,15 +419,15 @@ def translate_f(state: State, fname: str, default=None):
 def translate_q10(s: State, is_q10):
     """
     Translates the Q10 calculation function to its source code if applicable.
-    
+
     Args:
         s (State): State object that may contain a method named 'calc_q10'.
         is_q10 (bool): A flag indicating whether Q10 calculation is required.
-        
+
     Returns:
         str: The source code of the 'calc_q10' function if 'is_q10' is True,
              otherwise an empty string.
-             
+
     Raises:
         ValueError: If 'is_q10' is True and the 'calc_q10' function is not found.
     """
@@ -445,7 +447,7 @@ def collect_helper_functions(state: State):
     defined within it. It filters out specific functions that are not considered
     helper functions (i.e., "breakpoint", "inf", "calc_q10", "initial") and
     collects the source code of the remaining functions.
-    
+
     Args:
         state (State): The state object containing the functions to be collected.
     Returns:
@@ -467,7 +469,7 @@ def breakpoint_args(s: State):
     Args:
         s (State): The State object from which to retrieve the breakpoint attribute.
     Returns:
-        str: A formatted string containing the breakpoint attribute if it exists, 
+        str: A formatted string containing the breakpoint attribute if it exists,
              otherwise an empty string.
     """
 
@@ -486,9 +488,9 @@ def integrate_args(assigned):
 def extract_state(input_string):
     """
     Extracts the state variable name from an input string.
-    The function uses a regular expression to match a pattern where a state 
-    variable name is followed by an equals sign and some expression. The state 
-    variable name must start with a letter or underscore and can be followed by 
+    The function uses a regular expression to match a pattern where a state
+    variable name is followed by an equals sign and some expression. The state
+    variable name must start with a letter or underscore and can be followed by
     letters, digits, or underscores.
 
     Args:
@@ -503,12 +505,14 @@ def extract_state(input_string):
     return None
 
 
-def construct_integrate_fs_for_coupled(derivative, states, assigned, use_pade_approx=False):
+def construct_integrate_fs_for_coupled(
+    derivative, states, assigned, use_pade_approx=False
+):
     """
     Constructs integration formulas for coupled differential equations.
     This function takes derivatives, states, and assigned variables and converts them into string
     representations of the equations for integration. Optionally uses Padé approximation.
-    
+
     Args:
         derivative (list): List of derivative expressions to be integrated.
         state (set): Set of state variables.
@@ -584,9 +588,9 @@ def compile_state(s: State, model, pade=None, **kwargs) -> torch.nn.Module:
         torch.nn.Module: The compiled state object.
     Raises:
         ValueError: If the derivative function is not specified.
-    
+
     Notes:
-    - The function loads various attributes from the state object `s` such as parameters, assigned variables, 
+    - The function loads various attributes from the state object `s` such as parameters, assigned variables,
       derivative function, buffers, and diffusion.
     - It generates a string representation of the assigned variables and integrates the derivative function.
     - The function then formats a template string with various components and compiles it into executable code.
@@ -614,12 +618,12 @@ def compile_state(s: State, model, pade=None, **kwargs) -> torch.nn.Module:
     pade_approx = pade if pade is not None else derivative[1]
 
     integrate_f = convert(
-        derivative[0], 
-        name, 
-        assigned, 
-        use_pade_approx=pade_approx, 
-        diffusion=diffusion, 
-        model=model
+        derivative[0],
+        name,
+        assigned,
+        use_pade_approx=pade_approx,
+        diffusion=diffusion,
+        model=model,
     )
 
     forward_str = template.format(
@@ -637,7 +641,8 @@ def compile_state(s: State, model, pade=None, **kwargs) -> torch.nn.Module:
         initial_f=translate_initial(s),
     )
 
-    if DEBUG >= 3: print(forward_str)
+    if DEBUG >= 3:
+        print(forward_str)
 
     filename = f"<{name}_{randomword(5)}_template>"
     code = compile(forward_str, filename, "exec")
@@ -711,7 +716,8 @@ def compile_coupled_state(s: State, model, pade=None, **kwargs) -> torch.nn.Modu
         helpers=collect_helper_functions(s),
     )
 
-    if DEBUG >= 3: print(DEBUG.value, forward_str)
+    if DEBUG >= 3:
+        print(DEBUG.value, forward_str)
 
     filename = f"<{randomword(7)}_template>"
     code = compile(forward_str, filename, "exec")

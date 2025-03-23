@@ -84,17 +84,24 @@ class PreComputedInterpolate1D(PreComputed):
 
     @classmethod
     def from_ascent(cls, ascent_dir, sample, model, sim, contact, **kwargs):
-        data = glob.glob(f"{ascent_dir}/samples/{sample}/models/{model}/sims/{sim}/fibersets_bases/0/{contact}/*.dat")
+        data = glob.glob(
+            f"{ascent_dir}/samples/{sample}/models/{model}/sims/{sim}/fibersets_bases/0/{contact}/*.dat"
+        )
         data = natsorted(data)
         data = np.vstack([np.loadtxt(f, skiprows=1) for f in data])
         kwargs["in_memory"] = True
-        y = np.loadtxt(f"{ascent_dir}/samples/{sample}/models/{model}/sims/{sim}/fibersets/0/0.dat", skiprows=1)[:, -1]
+        y = np.loadtxt(
+            f"{ascent_dir}/samples/{sample}/models/{model}/sims/{sim}/fibersets/0/0.dat",
+            skiprows=1,
+        )[:, -1]
         return cls(data=data, y=y, **kwargs)
 
     def interpolate_batch(self, y_points, indices):
         """Interpolate voltage values along axon."""
-        return np.vstack([self.interpolate(yp, idx) for (yp, idx) in tqdm(zip(y_points, indices))])
-    
+        return np.vstack(
+            [self.interpolate(yp, idx) for (yp, idx) in tqdm(zip(y_points, indices))]
+        )
+
     def interpolate_batch_indices(self, y_points, indices):
         """Interpolate voltage values along axon."""
         cache = {}
@@ -102,7 +109,7 @@ class PreComputedInterpolate1D(PreComputed):
             if i not in cache:
                 cache[i] = self.interpolate(y_points, i)
         return np.vstack([cache[i] for i in indices])
-    
+
     def interpolate(self, y_points, idx):
         fem_vec = self.get(idx)
         y_vec = self.x[0]

@@ -10,9 +10,9 @@ args = parser.parse_args()
 
 
 if __name__ == "__main__":
-    n_ax = 10000    # number of fibers
-    L = 50          # fiber length [mm]
-    dx = 25.0       # fiber compartment length [um]
+    n_ax = 10000  # number of fibers
+    L = 50  # fiber length [mm]
+    dx = 25.0  # fiber compartment length [um]
 
     diameters = torch.linspace(0.5, 2.0, n_ax)
     model = ax.Tigerholm(diameters, L, dx=dx, method="euler").cuda()
@@ -29,5 +29,7 @@ if __name__ == "__main__":
     rec = ax.callbacks.Recorder(["v"], node_indices=model.c(0.4, 0.5)).set_hdf5(
         "tigerholm_voltage.h5", cache_every=args.cache_every
     )
-    model.longrun(space=v_s, time=i_t, chunklength=args.chunklength, dt=dt, callbacks=[rec])
+    model.longrun(
+        space=v_s, time=i_t, chunklength=args.chunklength, dt=dt, callbacks=[rec]
+    )
     rec.close()

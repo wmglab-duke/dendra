@@ -19,7 +19,7 @@ def load(m, attr: str, cls: type):
         return getattr(m, attr)
     except AttributeError:
         return getattr(cls, attr)
-    
+
 
 def randomword(length: int) -> str:
     """
@@ -36,7 +36,6 @@ def randomword(length: int) -> str:
     return "".join(random.choice(letters) for i in range(length))
 
 
-
 def indent(text: str, level=0) -> str:
     """
     Indents each line of the given text by a specified number of levels.
@@ -44,7 +43,7 @@ def indent(text: str, level=0) -> str:
     Args:
         text (str): The text to be indented.
         level (int, optional): The number of indentation levels. Each level corresponds to 4 spaces. Default is 0.
-    
+
     Returns:
         str: The indented text.
     """

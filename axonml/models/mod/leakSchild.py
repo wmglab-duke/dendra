@@ -12,6 +12,13 @@ class leakSchild(Mechanism):
 
     def ica(self, v):
         ecaleak = (
-            self.R * (self.temp + 273.15) / self.z / self.F * log(self.cao / self.cai)
+            self.R
+            * (self.temp + 273.15)
+            / self.z
+            / self.F
+            * log((self.cao + 1e-9) / (self.cai + 1e-9))
         ) - self.ecaoffset
         return self.gbca * (v - ecaleak)
+
+    def conductance(self, v):
+        return self.gbna + self.gbca

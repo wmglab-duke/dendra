@@ -26,10 +26,10 @@ class c(State):
         return self.Q10kcac ** ((self.Q10TempA - self.temp) / self.Q10TempB)
 
     def alpha(self, v):
-        return self.A_alphac * self.cai * exp((v + self.B_alphac) / self.C_alphac)
+        return self.A_alphac * self.cai * safe_exp((v + self.B_alphac) / self.C_alphac)
 
     def beta(self, v):
-        return self.A_betac * exp((v + self.B_betac) / self.C_betac)
+        return self.A_betac * safe_exp((v + self.B_betac) / self.C_betac)
 
     def breakpoint(self, v):
         a = self.alpha(v)
