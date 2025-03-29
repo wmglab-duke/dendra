@@ -135,6 +135,14 @@ def assign_post_advance(mechanisms, ions) -> str:
             if ion in m.write_ion_c:
                 for v in m.write_ion_c[ion]:
                     out.append(f"self.{ion}_ion.{v} = self.{m._name}.{v}")
+    for m in mechanisms:
+        for ion in ions:
+            if ion in m.read_ion:
+                for v in m.read_ion[ion]:
+                    if v == f"{ion}i" or v == f"{ion}o":
+                        out.append(f"self.{m._name}.{v} = self.{ion}_ion.{v}")
+                        for k, _ in m.DE.items():
+                            out.append(f"self.{m._name}.DE['{k}'].{v} = self.{ion}_ion.{v}")
     out = "\n    ".join(out)
     return out
 

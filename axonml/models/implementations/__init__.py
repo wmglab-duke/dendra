@@ -1,23 +1,23 @@
 from .smf import SMF
-from .rattay import Rattay
-from .sundt import Sundt
-from .tigerholm import Tigerholm
-from .schild import Schild97, Schild94
+from .rattay import Rattay1993
+from .sundt import Sundt2015
+from .tigerholm import Tigerholm2014
+from .schild import Schild1997, Schild1994
 from .fh import FHM, SENN, FHUM
-from .sweeney import Sweeney
+from .sweeney import Sweeney1987
 from .mrg import smolMRG, bigMRG
 
 __all__ = [
     "SMF",
-    "Rattay",
-    "Sundt",
-    "Tigerholm",
-    "Schild97",
-    "Schild94",
+    "Rattay1993",
+    "Sundt2015",
+    "Tigerholm2014",
+    "Schild1997",
+    "Schild1994",
     "FHM",
     "SENN",
     "FHUM",
-    "Sweeney",
+    "Sweeney1987",
     "smolMRG",
     "bigMRG",
 ]

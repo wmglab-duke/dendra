@@ -14,38 +14,35 @@ class nacapump(Mechanism):
         gamma=0.5,
         DNaCa=0.0036,
         F=96500,
-        R=8.314,
+        R=8314,
     )
 
     USEION("ca", read=["cao", "cai"], write=["ica"])
     USEION("na", read=["nai", "nao"], write=["ina"])
 
-    ASSIGNED("inca", "KNaCa")
+    ASSIGNED("inca", "KNaCa", "DFin", "DFout")
 
     def initial(self, v):
         self.KNaCa = self.KNaCa22 * self.Q10NaCa ** (
             (self.Q10TempA - self.temp) / self.Q10TempB
         )
+        temp = self.temp + 273.15
+        self.DFin = (((self.r - 2) * self.gamma * self.F) / (self.R * temp))
+        self.DFout = (((self.r - 2) * (self.gamma - 1) * self.F) / (self.R * temp))
         self.breakpoint(v)
 
     def breakpoint(self, v):
-        temp = self.temp + 273.15
         S = 1.0 + self.DNaCa * (self.cai * self.nao**3 + self.cao * self.nai**3)
         DFin = (
             self.nai**3
             * self.cao
-            * safe_exp(
-                ((self.r - 2) * self.gamma * v * self.F) / ((1000) * self.R * temp)
-            )
+            * exp(self.DFin * v)
         )
         DFout = (
             self.nao**3
             * self.cai
-            * safe_exp(
-                ((self.r - 2) * (self.gamma - 1) * v * self.F)
-                / ((1000) * self.R * temp)
+            * exp(self.DFout * v)
             )
-        )
         self.inca = self.KNaCa * ((DFin - DFout) / S)
 
     def ina(self):

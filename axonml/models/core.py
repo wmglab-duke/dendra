@@ -882,7 +882,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if progressbar:
             progressbar.close()
 
-    def steady_state(self, dt=0.2, maxiter=3000):
+    def steady_state(self, dt=0.2, tstop=200.0):
         """
         Run the model until it reaches a steady state and cache the result.
 
@@ -890,8 +890,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ----------
         dt : float, optional
             Time step size in milliseconds. Default is 0.2 ms.
-        maxiter : int, optional
-            Maximum number of iterations to run the simulation. Default is 3000.
+        t : float, optional
+            Time in milliseconds to run the simulation. Default is 200 ms.
 
         Notes
         -----
@@ -903,10 +903,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
         ve = torch.zeros(1, self.n_ax, 1, self.n_comp, device=self.device())
+        maxiter = int(tstop / dt)
         with ctx(DTWARN=0):
-            for i in tqdm(range(maxiter), desc="Steady state..."):
+            for i in tqdm(range(maxiter), desc=f"Steady state [dt:{dt} ms, tstop:{tstop} ms]"):
                 reinit = i == 0
-                self.run(ve, dt, reinit=reinit, progressbar=False)
+                self.run(ve, dt=dt, reinit=reinit, progressbar=False)
         self.cache("_steady_state")
         self.t_ind = 0
 

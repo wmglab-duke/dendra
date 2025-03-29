@@ -9,8 +9,6 @@ from ..mechanisms.ops import *
 class cao(State):
     PARAMETER(
         lseg=1.0,
-        VolSchild=1.41372e-08,
-        Vol_periSchild=1.46136e-09,
         txfer=4511.0,
         FARADAY=96500,
         cabath=2,

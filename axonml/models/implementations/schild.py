@@ -22,7 +22,7 @@ from ..mechanisms import PARAMETER, e_context as E, c_context as C
 import math
 
 
-class Schild97(Unmyelinated):
+class Schild1997(Unmyelinated):
     PARAMETER(cm=1.326291192, rhoa=100.0)
 
     def __init__(
@@ -31,7 +31,7 @@ class Schild97(Unmyelinated):
         L=5.0,
         dx=10,
         temp=37.0,
-        v_init=-69.0,
+        v_init=-68.5,
         method="dufort-frankel",
     ):
         super().__init__(diameters, L, dx, temp, v_init, method)
@@ -69,7 +69,7 @@ class Schild97(Unmyelinated):
             self.insert(nas97mean, gbar=0.022434928)
 
 
-class Schild94(Unmyelinated):
+class Schild1994(Unmyelinated):
     PARAMETER(cm=1.326291192, rhoa=100.0)
 
     def __init__(
@@ -78,7 +78,7 @@ class Schild94(Unmyelinated):
         L=5.0,
         dx=10,
         temp=37.0,
-        v_init=-48.0,
+        v_init=-46.5,
         method="dufort-frankel",
     ):
         super().__init__(diameters, L, dx, temp, v_init, method)

@@ -3,7 +3,7 @@ from ..mod import sweeney
 from ..mechanisms import PARAMETER
 
 
-class Sweeney(Myelinated):
+class Sweeney1987(Myelinated):
     """
     Implementation of the mammalian myelinated nerve fiber model by Sweeney et al. (1987).
 

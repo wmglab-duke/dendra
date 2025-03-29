@@ -287,7 +287,7 @@ def define_mask(mask_out, mask_in):
     return "\n".join(ret)
 
 
-def define_detach(states):
+def define_detach(states, assigned, ion_read=None):
     assignments = []
     for k in states:
         if not k.coupled:
@@ -296,6 +296,11 @@ def define_detach(states):
         else:
             for name in k._state_names:
                 assignments.append(f"self.{name}.detach_()")
+    for a in assigned:
+        assignments.append(f"self.{a}.detach_()")
+    for k, v in ion_read.items():
+        for v_ in v:
+            assignments.append(f"self.{v_}.detach_()")
     return "\n".join(assignments)
 
 
@@ -781,7 +786,7 @@ def compile_mechanism(
         coupled_infs=define_coupled_infs(mechanism, states_compiled),
         distribution_buffer_assignments=distribution_buffer_assignments_str,
         init_distribution_buffers=init_distribution_buffers_str,
-        detach=indent(define_detach(states_compiled), 2),
+        detach=indent(define_detach(states_compiled, assigned, read_ion), 2),
         mask_def=indent(define_mask(mask_out, mask_in), 2),
     )
 

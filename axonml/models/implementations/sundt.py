@@ -3,7 +3,7 @@ from ..mod import kdr, pas, nahh
 from ..mechanisms import PARAMETER, e_context
 
 
-class Sundt(Unmyelinated):
+class Sundt2015(Unmyelinated):
     """
     Implementation of the unmyelinated sensory neuron model by Sundt et al. (2015).
 

@@ -16,7 +16,7 @@ from ..mod import (
 from ..mechanisms import PARAMETER, c_context
 
 
-class Tigerholm(Unmyelinated):
+class Tigerholm2014(Unmyelinated):
     """
     Computational model of unmyelinated C-fiber nociceptors based on Tigerholm et al. (2014).
 
@@ -79,7 +79,7 @@ class Tigerholm(Unmyelinated):
            1721-35. doi:10.1152/jn.00777.2012
     """
 
-    PARAMETER(cm=1.0, rhoa=35.4)
+    PARAMETER(cm=1.0, rhoa=35.5)
 
     def __init__(
         self,

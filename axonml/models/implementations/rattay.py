@@ -3,7 +3,7 @@ from ..mod import rattay_aberham
 from ..mechanisms import PARAMETER, e_context
 
 
-class Rattay(Unmyelinated):
+class Rattay1993(Unmyelinated):
     PARAMETER(inherit=Unmyelinated, rhoa=100.0)
 
     def __init__(

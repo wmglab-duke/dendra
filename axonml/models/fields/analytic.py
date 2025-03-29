@@ -85,7 +85,7 @@ class anisotropic_point(Point):
     The potential is calculated using the anisotropic medium equation:
 
     .. math::
-        V(x,y,z) = \\frac{1000}{4\\pi \\cdot \\sqrt{\\frac{(x-x_0)^2}{\\rho_x} + \\frac{(y-y_0)^2}{\\rho_y} + \\frac{(z-z_0)^2}{\\rho_z}}}
+        V(x,y,z) = \\frac{1000}{4\\pi \\cdot \\sqrt{\\frac{(x-x_0)^2}{\\rho_y * \\rho_z} + \\frac{(y-y_0)^2}{\\rho_x * \\rho_z} + \\frac{(z-z_0)^2}{\\rho_y * \\rho_z}}}
 
     where distances are converted from μm to cm (× 10⁻⁴) for calculation.
 
@@ -102,7 +102,7 @@ class anisotropic_point(Point):
 
         # Calculate anisotropic distance term
         r_aniso = torch.sqrt(
-            (dx**2) / self.rhox + (dy**2) / self.rhoy + (dz**2) / self.rhoz
+            (dx**2) / (self.rhoy * self.rhoz) + (dy**2) / (self.rhox * self.rhoz) + (dz**2) / (self.rhox * self.rhoy)
         )
 
         # Calculate potential in mV

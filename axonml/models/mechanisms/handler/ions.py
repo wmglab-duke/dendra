@@ -67,13 +67,13 @@ def init_tensor(val, buffer_or_param):
 def parse_einit(ion, einit):
     if einit == 0:
         return ""
-    return f"self.e{ion}[:] = (torch.log(self.{ion}o / (self.{ion}i + 1e-9)) * self.rzf * (273.15 + temp)); self.e{ion}.detach_()"
+    return f"self.e{ion}[:] = (torch.log(self.{ion}o / self.{ion}i) * self.rzf * (273.15 + temp)); self.e{ion}.detach_()"
 
 
 def parse_eadvance(ion, eadvance):
     if not eadvance:
         return ""
-    return f"self.e{ion} = (torch.log(self.{ion}o / (self.{ion}i + 1e-9)) * self.rzf * (273.15 + temp))"
+    return f"self.e{ion} = (torch.log(self.{ion}o / self.{ion}i) * self.rzf * (273.15 + temp))"
 
 
 def clamp(ion):
@@ -256,7 +256,7 @@ def build_ion(
         write_e_after_init=parse_write_e_after_init(ion_read_e, einit),
         write_e_immediate=parse_write_e(ion_read_e, 1),
         write_c_immediate=parse_write_c(ion_read_c, 3),
-        clamp=clamp(ion),
+        clamp="",
         detect_anomalies=detect_anomalies,
     )
 
