@@ -15,7 +15,7 @@ if __name__ == "__main__":
     dx = 25.0  # fiber compartment length [um]
 
     diameters = torch.linspace(0.5, 2.0, n_ax)
-    model = ax.Tigerholm(diameters, L, dx=dx, method="euler").cuda()
+    model = ax.Tigerholm2014(diameters, L, dx=dx, method="euler").cuda()
 
     # -- space --
     v_s = ax.isotropic_point(z=100.0, rhoe=500.0)(model)
@@ -26,7 +26,11 @@ if __name__ == "__main__":
     i_t = ax.sin(amp=amp, freq=freq).tstop(tstop)
 
     # -- run & record --
-    rec = ax.callbacks.Recorder(["v"], node_indices=model.c(0.4, 0.5)).set_hdf5(
+    indices = model.c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+    states = [
+        'v',
+    ]
+    rec = ax.callbacks.Recorder(states, node_indices=indices).set_hdf5(
         "tigerholm_voltage.h5", cache_every=args.cache_every
     )
     model.longrun(

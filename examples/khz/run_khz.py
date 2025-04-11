@@ -4,10 +4,8 @@ import torch
 from tqdm import tqdm
 import numpy as np
 
-from axonml.models.implementations import SMF
-from axonml.models.callbacks import APCount
-from axonml.models.fields import FEMInterpolate1D
-from axonml.models.stim import IntraStim
+import axonml as ax
+
 
 torch.set_default_dtype(torch.float32)
 
@@ -32,7 +30,7 @@ field_x = np.load("./fields/fiber_zs.npy")
 
 # -- generate field bases --
 # machinery
-interpolator = FEMInterpolate1D(FIELD_DATA[s_idx] * 1000, field_x)
+interpolator = ax.precomputed_interpolate_1d(FIELD_DATA[s_idx] * 1000, field_x)
 
 
 def make_ve_at_nodes(diameter, a_idx, nodes=nodes, offset=37500):
@@ -101,7 +99,7 @@ def pulse_train(t, at, shape):
 
 # code to run and count APs
 
-count = APCount(node_check=[-5], threshold=-20.0, t_start_check=50, dt=0.001)
+count = ax.callbacks.APCount(node_check=[-5], threshold=-20.0, t_start_check=50, dt=0.001)
 
 
 def longrun(
@@ -120,11 +118,10 @@ def longrun(
         print("warming up...")
 
         ve = torch.rand(1, len(field_stack) * len(stims), 1, nodes).float().cuda()
-        intra_v = IntraStim(model)
 
         for _ in range(5):
             with torch.no_grad():
-                _ = model.run(ve, intra=intra_v, dt=dt, progressbar=False, reinit=True)
+                _ = model.run(ve, intra=intra, dt=dt, progressbar=False, reinit=True)
 
     t_vec = np.arange(0, tstop, dt)
     views = np.array_split(t_vec, chunks)
@@ -173,10 +170,10 @@ dt = 0.001
 t_vec = np.arange(0, tstop, dt)
 
 # fiber model
-mrg = SMF(input_diams, nodes).cuda().load("MRG")
+mrg = ax.SMF(input_diams, nodes).cuda().load("MRG")
 
 # intracellular stim to generate activity
-intra = IntraStim(mrg)
+intra = ax.IntraStim(mrg)
 i_stim = 2e-6 * pulse_train(t_vec, np.array([50, 60, 70, 80, 90]), rect(0.1))
 intra.insert(i_stim, nodes=5)
 
@@ -194,7 +191,7 @@ import seaborn as sns
 import matplotlib
 import matplotlib.pyplot as plt
 
-matplotlib.use("TKAgg")
+# matplotlib.use("TKAgg")
 
 data = {
     "frequency": [],
@@ -287,6 +284,6 @@ plt.gca().legend(
     ncols=2,
 )
 
-plt.show()
+# plt.show()
 
 fig.savefig("khz_stim_example.png", bbox_inches="tight")

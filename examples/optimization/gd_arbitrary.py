@@ -5,9 +5,6 @@ import numpy as np
 from natsort import natsorted
 import torch
 
-from cajal.nrn.sources import PreComputedInterpolate1D
-from cajal.nrn.stimuli import MonophasicPulse
-
 import axonml as ax
 from axonml.models.implementations import SMF
 from axonml.opt.gd import AxonSpec, FieldSpec, GDProblemArbitrary, GD
@@ -89,6 +86,9 @@ if __name__ == "__main__":
         from cajal.nrn.specs import Mutable as Mut
         from cajal.nrn import Backend as N
         from cajal.nrn.stimuli import Arbitrary
+        from cajal.nrn.sources import PreComputedInterpolate1D
+        from cajal.nrn.stimuli import MonophasicPulse
+
 
         class MyMRG(MRG):
             def init_AP_monitors(self):
