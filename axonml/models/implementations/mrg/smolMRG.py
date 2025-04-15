@@ -18,10 +18,18 @@ fd = lambda model: numpify(model.fd)
 axonD = lambda model: 0.553 * numpify(model.fd) - 0.024
 nodeD = lambda model: 0.321 * (0.553 * numpify(model.fd) - 0.024) + 0.37
 
+space_p1 = 0.002  # Thickness of periaxonal space in MYSA [um]
+space_p2 = 0.004  # Thickness of periaxonal space in FLUT [um]
+space_i = 0.004   # Thickness of periaxonal space in STIN [um]
+
+f_fd = lambda model: fd(model) + space_p1
+f_FLUT = lambda model: axonD(model) + space_p2
+f_STIN = lambda model: axonD(model) + space_i
+f_MYSA = lambda model: nodeD(model) + space_p1
+
 # -- compartment lengths --
 nodelength0 = lambda model: np.full_like(numpify(model.fd), 1.0)
 paralength1 = lambda model: np.full_like(numpify(model.fd), 3.0)
-
 
 def deltax(model):
     fd = numpify(model.fd)
@@ -67,6 +75,13 @@ secd_funcs = {
     "stin": axonD,
 }
 
+fulld_funcs = {
+    "node": f_fd,
+    "flut": f_FLUT,
+    "mysa": f_MYSA,
+    "stin": f_STIN,
+}
+
 
 scale_funcs = {
     "node": g_scale,
@@ -81,7 +96,7 @@ class mrg_rhoa(Functional):
         self.rhoa = rhoa
 
     def fn(self, model):
-        scale = 1 / (model.secd / model.fd[:, None, None]) ** 2
+        scale = 1 / (model.fulld / model.fd[:, None, None]) ** 2
         return self.rhoa * scale
 
 
@@ -92,14 +107,16 @@ class mrg_cm(Functional):
         self.mysa_cm = mysa_cm
 
     def fn(self, model):
-        cm = self.cm / (model.nl * 2)[:, None]
-        cm = cm.expand(model.n_ax, model.n_comp).unsqueeze(1).clone()
+        # cm = self.cm / (model.nl * 2)[:, None]
+        cm = 0.04 * model.secd
+        # cm = cm.expand(model.n_ax, model.n_comp).unsqueeze(1).clone()
+        cm = cm.expand(model.n_ax, 1, model.n_comp).clone()
         node_locs = model.cid.locs(["node"])
         cm[:, :, node_locs] = self.node_cm
-        mysa_locs = model.cid.locs(["mysa"])
-        mysa_cm = self.mysa_cm / (model.nl * 2)[:, None]
-        mysa_cm = mysa_cm.expand(model.n_ax, len(mysa_locs)).unsqueeze(1)
-        cm[:, :, mysa_locs] = mysa_cm
+        # mysa_locs = model.cid.locs(["mysa"])
+        # mysa_cm = self.mysa_cm / (model.nl * 2)[:, None]
+        # mysa_cm = mysa_cm.expand(model.n_ax, len(mysa_locs)).unsqueeze(1)
+        # cm[:, :, mysa_locs] = mysa_cm
         return cm
 
 
@@ -117,7 +134,7 @@ class g_mrg(Functional):
 class smolMRG(Heterogeneous):
     _dt_lim = 0.001
 
-    PARAMETER(rhoa=mrg_rhoa(70.0), cm=mrg_cm(0.1, 2.0, 5.0))
+    PARAMETER(rhoa=mrg_rhoa(70.0), cm=mrg_cm(0.1, 2.0, 30.0))
 
     def __init__(
         self,
@@ -152,6 +169,12 @@ class smolMRG(Heterogeneous):
             ).unsqueeze(1),
         )
         self.register_buffer(
+            "fulld",
+            torch.tensor(
+                self.cid.build(fulld_funcs, self), dtype=self.dtype()
+            ).unsqueeze(1),
+        )
+        self.register_buffer(
             "scale",
             torch.tensor(
                 self.cid.build(scale_funcs, self), dtype=self.dtype()
@@ -163,12 +186,12 @@ class smolMRG(Heterogeneous):
 
         self.calculate_geometric_params()
 
-        with ctx(PADE=1):
+        with ctx(PADE=0):
             self.insert(pas, mask_out=self.cid.loc("node"), g=g_mrg(0.001), e=v_init)
             self.insert(mrg_k, mask_in=self.cid.loc("node"), gkbar=0.115556)
             self.insert(mrg_nap, mask_in=self.cid.loc("node"))
             self.insert(mrg_naf, mask_in=self.cid.loc("node"), gnabar=2.33333)
-            self.insert(mrg_leak, mask_in=self.cid.loc("node"))
+            self.insert(mrg_leak, mask_in=self.cid.loc("node"), el=-85.0)
 
     def c(self, *args):
         locs = self.cid.loc("node")

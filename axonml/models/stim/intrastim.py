@@ -214,7 +214,7 @@ class IntraStim:
     def add_from_callable(self, intra, func, t):
         axons = func[0]
         nodes = func[1]
-        val = func[2](t)
+        val = func[2](t).squeeze()
         intra[axons, nodes] += val
 
     def add_from_synapse(self, intra, synapse, t, v):

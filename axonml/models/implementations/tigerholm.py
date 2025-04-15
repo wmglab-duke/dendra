@@ -15,6 +15,8 @@ from ..mod import (
 )
 from ..mechanisms import PARAMETER, c_context
 
+from axonml.units import mm
+
 
 class Tigerholm2014(Unmyelinated):
     """
@@ -84,7 +86,7 @@ class Tigerholm2014(Unmyelinated):
     def __init__(
         self,
         diameters=[1.0],
-        L=5.0,
+        L=5.0*mm,
         dx=10,
         temp=37.0,
         v_init=-55.0,

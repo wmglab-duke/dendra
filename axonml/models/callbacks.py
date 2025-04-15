@@ -1009,12 +1009,9 @@ class Raster(ThresholdCallback):
     >>>
     >>> # Plot raster
     >>> import matplotlib.pyplot as plt
-    >>> plt.figure(figsize=(10, 6))
-    >>> for i in range(spike_data.shape[1]):
-    >>>     spikes = np.where(spike_data[:,i])[0]
-    >>>     plt.vlines(spikes, i, i+1)
-    >>> plt.xlabel('Time Step')
-    >>> plt.ylabel('Axon')
+    >>> fig, axis = plt.subplots(dpi=200, figsize=(5,5))
+    >>> diams = model.diam.cpu().numpy()
+    >>> raster.plot(diams, dt=model.dt, ax=axis)
     >>> plt.show()
     """
 
@@ -1042,6 +1039,85 @@ class Raster(ThresholdCallback):
 
     def numpy(self):
         return self.stack().detach().cpu().numpy()
+    
+    def plot(self, 
+             var,
+             varname: str,
+             dt=None, 
+             ax=None, 
+             cmap=None, 
+             node_idx=None, 
+             axon_idx=None):
+        """
+        Plot the raster plot of spiking activity.
+
+        Parameters
+        ----------
+        var : np.ndarray
+            Array of fiber diameters in μm. Must match the number of axons in the model.
+        varname: str
+            Name of the variable to plot.
+        dt : float, optional
+            Time step in ms. If None, uses the default from backend. Default is None.
+        ax : matplotlib.axes.Axes, optional
+            Axes to plot on. If None, creates a new figure and axes. Default is None.
+        cmap : str or matplotlib colormap, optional
+            Colormap for the plot. Default is None (uses default colormap).
+        node_idx : int, optional
+            Index of the node to plot. If None, plots all nodes. Default is None.
+        axon_idx : int, optional
+            Index of the axon to plot. If None, plots all axons. Default is None.
+
+        Returns
+        -------
+        matplotlib.figure.Figure
+            The figure containing the raster plot.
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib as mpl
+
+        if dt is None:
+            dt = self.dt
+        if node_idx is None:
+            node_idx = 0
+        if axon_idx is None:
+            axon_idx = slice(None)
+        if cmap is None:
+            cmap = plt.cm.viridis
+        if isinstance(cmap, str):
+            cmap = plt.get_cmap(cmap)
+        binary_array = self.numpy()[:, axon_idx, node_idx].T
+        if ax is None:
+            fig, ax = plt.subplots(dpi=300, figsize=(10, 6))
+
+        num_fibers, num_timepoints = binary_array.shape
+        assert len(var) == num_fibers, "Length of var must match the number of axons selected to plot."
+
+        # Build a list of spike-time arrays. Each entry in data_for_eventplot
+        # corresponds to a single fiber's event times.
+        data_for_eventplot = []
+        for row_idx in range(num_fibers):
+            spike_times = np.where(binary_array[row_idx] == 1)[0] * dt
+            data_for_eventplot.append(spike_times)
+
+        norm = mpl.colors.Normalize(vmin=var.min(), vmax=var.max())
+
+        # Convert each diameter to an RGBA color using the colormap + normalization
+        line_colors = [cmap(norm(d)) for d in var]
+        ax.eventplot(
+            data_for_eventplot, 
+            lineoffsets=var, 
+            linelengths=0.8*min(var[1:]-var[:-1]), 
+            colors=line_colors)
+        tstop = num_timepoints * dt
+        range_var = var.max() - var.min()
+        y_min = var.min() - 0.02 * range_var
+        y_max = var.max() + 0.02 * range_var
+        ax.set_ylim(y_min, y_max)
+        ax.set_xlim(0-0.02*tstop, tstop+0.02*tstop)
+        ax.set_xlabel("Time (ms)")
+        ax.set_ylabel(f"{varname}")
+        return ax
 
 
 @torch.jit.script

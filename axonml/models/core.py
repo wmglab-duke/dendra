@@ -23,6 +23,7 @@ from axonml.models.mechanisms.handler.defaults import valid_ions
 from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
+from axonml.units import mm
 
 from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM, CUDA, DTWARN, ctx
 
@@ -71,6 +72,9 @@ def matches_any_pattern(base_patterns, target_string):
 @torch.jit.interface
 class HandlerInterface:
     def initialize(self, v, v_init, temp) -> None:
+        pass
+
+    def generic(self, model) -> None:
         pass
 
     def advance(self, v, dt) -> None:
@@ -910,6 +914,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 self.run(ve, dt=dt, reinit=reinit, progressbar=False)
         self.cache("_steady_state")
         self.t_ind = 0
+        return self
 
     def post_initialize(self):
         for h in self.post_initialize_hooks:
@@ -1021,6 +1026,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def step_no_intra_df(
         self, v, v_prev, ve, area, s, s2, dt, temp
     ) -> Tuple[Tensor, Tensor]:
+        
+        self.mech.generic(self)
+
         # -- 2nd diff --
         x = torch.cat([v, v_prev, ve], dim=1)
         d2v = self.ssd(x)
@@ -1049,6 +1057,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def step_intra_df(
         self, v, v_prev, ve, area, s, s2, dt, temp, intra
     ) -> Tuple[Tensor, Tensor]:
+        
+        self.mech.generic(self)
+
         # -- 2nd diff --
         x = torch.cat([v, v_prev, ve], dim=1)
         d2v = self.ssd(x)
@@ -1337,8 +1348,8 @@ class Unmyelinated(Axon):
 
     PARAMETER(cm=1.0, rhoa=35.4)
 
-    def __init__(self, diameters, L=1.0, dx=10.0, temp=37, v_init=-80, method="rk1"):
-        L = L * 1000  # mm -> um
+    def __init__(self, diameters, L=1.0*mm, dx=10.0, temp=37, v_init=-80, method="rk1"):
+        # L = L * 1000  # mm -> um
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
         self.dx: float = dx

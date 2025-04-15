@@ -21,6 +21,7 @@ from .state_compiler import compile_state, compile_coupled_state
 from .utils import load, indent, get_function_body_as_str
 
 from axonml.helpers import DEBUG, PADE, DETECT_ANOMALIES, logger
+from axonml.models.interfaces import AxonInterface
 
 
 # utility functions
@@ -231,6 +232,8 @@ class {mech}(torch.nn.Module):
 {current_equations}
 
 {gtot}
+
+{update_f}
 """
 
 init_state_buffer_template = """
@@ -637,6 +640,12 @@ default_f = """
 """
 
 
+generic_f = """
+    def {fname}(self, model: AxonInterface):
+{ret}
+"""
+
+
 def translate_f(mechanism, fname):
     f = getattr(mechanism, fname, None)
     if f:
@@ -644,6 +653,15 @@ def translate_f(mechanism, fname):
     else:
         body = indent("return", 2)
     return default_f.format(fname=fname, ret=body)
+
+
+def translate_generic(mechanism, fname):
+    f = getattr(mechanism, fname, None)
+    if f:
+        body = get_function_body_as_str(f)
+    else:
+        body = indent("return", 2)
+    return generic_f.format(fname=fname, ret=body)
 
 
 def assigned_str_f(assigned):
@@ -782,6 +800,7 @@ def compile_mechanism(
         current_equations=current_equations_str,
         breakpoint_f=translate_f(mechanism, "breakpoint"),
         initial_f=translate_f(mechanism, "initial"),
+        update_f=translate_generic(mechanism, "update"),
         gtot=gtot_str,
         coupled_infs=define_coupled_infs(mechanism, states_compiled),
         distribution_buffer_assignments=distribution_buffer_assignments_str,

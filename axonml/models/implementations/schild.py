@@ -19,6 +19,8 @@ from ..mod import (
 )
 from ..mechanisms import PARAMETER, e_context as E, c_context as C
 
+from axonml.units import mm
+
 import math
 
 
@@ -28,7 +30,7 @@ class Schild1997(Unmyelinated):
     def __init__(
         self,
         diameters=[1.0],
-        L=5.0,
+        L=5.0*mm,
         dx=10,
         temp=37.0,
         v_init=-68.5,
@@ -75,7 +77,7 @@ class Schild1994(Unmyelinated):
     def __init__(
         self,
         diameters=[1.0],
-        L=5.0,
+        L=5.0*mm,
         dx=10,
         temp=37.0,
         v_init=-46.5,

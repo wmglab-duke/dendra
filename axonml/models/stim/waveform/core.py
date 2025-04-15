@@ -30,9 +30,9 @@ class Waveform(torch.jit.ScriptModule, Parameterized):
         Must be implemented by subclasses.
     forward(t)
         Evaluates the waveform at given time points. Calls fn() internally.
-    repeat(freq)
-        Creates a repeating version of the waveform.
-        Not implemented in the base class.
+    repeat(freq, delay=0.0)
+        Creates a repeating version of the waveform. Frequency should be given in 
+        kHz and delay in ms.
 
     Notes
     -----

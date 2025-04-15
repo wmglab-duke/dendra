@@ -15,3 +15,5 @@ Implementations
    :members:
 .. autoclass:: axonml.models.stim.waveform.implementations.bi_rect_symm
    :members:
+.. autoclass:: axonml.models.stim.waveform.implementations.arbitrary
+   :members:

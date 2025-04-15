@@ -42,7 +42,7 @@ class Heterogeneous(Axon):
     def x(self):
         node_l = torch.atleast_2d(self.node_l.squeeze())
         x = node_l.cumsum(dim=1) - node_l / 2
-        return x - torch.median(x, dim=1)[0].unsqueeze(1)
+        return x - torch.sum(node_l, dim=1) / 2
 
     def ra_(self, diameters, node_l) -> torch.Tensor:
         radii = diameters / 20000
@@ -270,7 +270,7 @@ class Heterogeneous(Axon):
 
         # Calculate the new voltage
         v_new = (v_prev + self.ssd_df(v, v_prev, ve, phi_l, phi_r) - s * i_ion) / (
-            1 + phi_sum + s * self.mech.gtot() * area
+            1 + phi_sum + s * self.mech.gtot(v) * area
         )
 
         # Calculate the total current
@@ -297,7 +297,7 @@ class Heterogeneous(Axon):
 
         # Calculate the new voltage
         v_new = (v_prev + self.ssd_df(v, v_prev, ve, phi_l, phi_r) - s * i_ion) / (
-            1 + phi_sum + s * self.mech.gtot() * area
+            1 + phi_sum + s * self.mech.gtot(v) * area
         )
 
         # Calculate the total current

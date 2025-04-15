@@ -2,6 +2,8 @@ from ..core import Myelinated, Unmyelinated
 from ..mod import fh
 from ..mechanisms import PARAMETER, c_context as C
 
+from axonml.units import mm
+
 
 class FHM(Myelinated):
     PARAMETER(inherit=Myelinated, node_l=2.5, membrane={"cm": 2.0, "rhoa": 110.0})
@@ -28,7 +30,7 @@ class FHUM(Unmyelinated):
     def __init__(
         self,
         diameters=[2.0],
-        L=5.0,
+        L=5.0*mm,
         dx=25.0,
         temp=20.0,
         v_init=-70.0,

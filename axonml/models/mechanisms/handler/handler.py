@@ -8,6 +8,7 @@ import linecache
 import textwrap
 
 from axonml.helpers import DEBUG, DFITOT, IMEM
+from axonml.models.interfaces import AxonInterface
 
 
 def indent(text, level=0):
@@ -64,6 +65,10 @@ class MechanismHandler(torch.nn.Module):
   def update(self, temp) -> None:
     {ion_advance}
     {assign_equilibrium}
+    return
+
+  def generic(self, model: AxonInterface) -> None:
+    {mech_update_fs}
     return
 
   def ion_init(self, temp) -> None:
@@ -405,6 +410,15 @@ def ion_detach(ions):
     return "\n    ".join(result)
 
 
+def parse_mech_update_fs(mechanisms):
+    result = []
+    for m in mechanisms:
+        if hasattr(m, "update"):
+            result.append(f"self.{m._name}.update(model)")
+    s = "\n    ".join(result)
+    return s
+
+
 def build_handler(
     mechanisms,
     names,
@@ -474,6 +488,7 @@ def build_handler(
         set_buffers=parse_set_buffers(mechanisms, list(ions.keys())),
         currents_tot=tot_currents(currents, df),
         mech_detach=mech_detach(mechanisms),
+        mech_update_fs=parse_mech_update_fs(mechanisms),
         ion_detach=ion_detach(ions),
         imem_assignment=imem_assignment,
         imem_write=imem_write,
