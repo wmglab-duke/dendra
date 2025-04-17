@@ -14,6 +14,7 @@ def exprelr(x, y):
     approx = y - (x / 2)
     return torch.where(q.abs() < 1e-6, approx, val)
 
+vtrap = exprelr
 
 @torch.jit.script
 def expinv(x):
@@ -29,4 +30,4 @@ def safe_exp(x):
 
 
 def all_ops():
-    return {"exp", "expm1", "expit", "sigmoid", "log", "exprelr", "expinv", "safe_exp"}
+    return {"exp", "expm1", "expit", "sigmoid", "log", "exprelr", "expinv", "safe_exp", "vtrap"}

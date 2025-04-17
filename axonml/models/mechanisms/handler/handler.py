@@ -7,7 +7,7 @@ import torch
 import linecache
 import textwrap
 
-from axonml.helpers import DEBUG, DFITOT, IMEM
+from axonml.helpers import DEBUG, DFITOT, IMEM, NETWORK
 from axonml.models.interfaces import AxonInterface
 
 
@@ -47,6 +47,9 @@ class MechanismHandler(torch.nn.Module):
 
   def gtot(self, v) -> torch.Tensor:
     return {gtot}
+
+  def irev(self) -> torch.Tensor:
+    return {irev}
 
   def i(self, v_prev, v) -> torch.Tensor:
     {breakpoint}
@@ -419,6 +422,17 @@ def parse_mech_update_fs(mechanisms):
     return s
 
 
+def irev(mechanisms):
+    result = []
+    if NETWORK:
+        for m in mechanisms:
+            if hasattr(m, "irev"):
+                result.append(f"self.{m._name}.irev()")
+    if len(result) == 0:
+        return "torch.tensor(0.0)"
+    return " + ".join(result)
+
+
 def build_handler(
     mechanisms,
     names,
@@ -484,6 +498,7 @@ def build_handler(
         define_setattr=parse_setattr(ions),
         all_states=parse_all_states(mechanisms),
         gtot=gtot(mechanisms, has_gtot),
+        irev=irev(mechanisms),
         breakpoint=breakpoint(mechanisms),
         set_buffers=parse_set_buffers(mechanisms, list(ions.keys())),
         currents_tot=tot_currents(currents, df),

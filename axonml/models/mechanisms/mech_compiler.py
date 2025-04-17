@@ -19,8 +19,9 @@ from axonml import const
 from .handler.defaults import valid_concentrations
 from .state_compiler import compile_state, compile_coupled_state
 from .utils import load, indent, get_function_body_as_str
+from .ast import factorize_linear_in_v
 
-from axonml.helpers import DEBUG, PADE, DETECT_ANOMALIES, logger
+from axonml.helpers import DEBUG, PADE, DETECT_ANOMALIES, NETWORK, logger
 from axonml.models.interfaces import AxonInterface
 
 
@@ -232,6 +233,8 @@ class {mech}(torch.nn.Module):
 {current_equations}
 
 {gtot}
+
+{irev}
 
 {update_f}
 """
@@ -609,29 +612,52 @@ def {k}(self, v, v_prev):
 """
 
 
-def gtot(currents, mechanism, df, mask):
-    if not df:
-        return "    def gtot(self): return torch.tensor(0.0)", False
-    if hasattr(mechanism, "conductance"):
-        return "    def gtot(self, v): return 0.5 * self.conductance(v)", True
-    assignments = []
-    for k in currents:
-        code_block = get_function_body_as_str(getattr(mechanism, k))
-        try:
-            _, b = factor_linear_in_x_from_codeblock(replace_v(code_block))
-            assignments.append(b)
-        except:
-            pass
-    has_gtot = True
-    if not assignments:
-        has_gtot = False
-        return "    def gtot(self, v): return torch.tensor(0.0)", has_gtot
-    s = " + ".join(assignments)
+def gtot(currents, mechanism, df, mask, NETWORK):
     if mask:
         mult = " * self.mask"
     else:
         mult = ""
-    return f"    def gtot(self, v): return {s} {mult}", has_gtot
+
+    if not df and not NETWORK:
+        return "    def gtot(self): return torch.tensor(0.0)", False
+    if hasattr(mechanism, "conductance"):
+        if NETWORK:
+            return "    def gtot(self, v): return self.conductance(v)", True
+        return f"    def gtot(self, v): return 0.5 * self.conductance(v) {mult}", True
+    
+    assignments = []
+    for k in currents:
+        if NETWORK:
+            A, _ = factorize_linear_in_v(mechanism, method=k)
+            assignments.append(A)
+        else:    
+            code_block = get_function_body_as_str(getattr(mechanism, k))
+            try:
+                _, b = factor_linear_in_x_from_codeblock(replace_v(code_block))
+                assignments.append(b)
+            except:
+                pass
+
+    has_gtot = True
+    if not assignments:
+        has_gtot = False
+        return "    def gtot(self, v): return torch.tensor(0.0)", has_gtot
+    
+    s = " + ".join(assignments)
+    return f"    def gtot(self, v): return ({s}) {mult}", has_gtot
+
+
+def irev(currents, mechanism, NETWORK):
+    if not NETWORK:
+        return ""
+    assignments = []
+    for k in currents:
+        _, B = factorize_linear_in_v(mechanism, method=k)
+        if B != "0":
+            assignments.append(B)
+    if not assignments:
+        return ""
+    return f"    def irev(self): return ({' + '.join(assignments)})"
 
 
 default_f = """
@@ -788,7 +814,7 @@ def compile_mechanism(
     init_distribution_buffers_str = init_distribution_buffers(distributions)
     init_distribution_buffers_str = indent(init_distribution_buffers_str, 2)
 
-    gtot_str, has_gtot = gtot(current_eqs, mechanism, df, masked)
+    gtot_str, has_gtot = gtot(current_eqs, mechanism, df, masked, NETWORK)
 
     forward_str = template.format(
         mech=mechanism.__name__,
@@ -807,6 +833,7 @@ def compile_mechanism(
         init_distribution_buffers=init_distribution_buffers_str,
         detach=indent(define_detach(states_compiled, assigned, read_ion), 2),
         mask_def=indent(define_mask(mask_out, mask_in), 2),
+        irev=irev(current_eqs, mechanism, NETWORK),
     )
 
     if DEBUG >= 2:
