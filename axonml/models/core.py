@@ -24,8 +24,13 @@ from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
 from axonml.units import mm
+from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
 
-from axonml.helpers import op_mc, op_sc, ve_from_s_t, IMEM, CUDA, DTWARN, ctx
+from axonml.helpers import (
+    op_mc, op_sc, ve_from_s_t, 
+    IMEM, CUDA, DTWARN, DEBUG, DETECT_ANOMALIES, PADE,
+    ctx
+)
 
 
 def get_unique_keys(list_of_dicts):
@@ -181,12 +186,24 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             "df": "df",
         }
 
+        self.compiler_conversion = {
+            "euler": MechCompiler,
+            "rk1": MechCompiler,
+            "heun": MechCompiler,
+            "rk2": MechCompiler,
+            "rk4": MechCompiler,
+            "dufort-frankel": DF_Compiler,
+            "df": DF_Compiler,
+        }
+
         self.is_df = self.method_conversion[method] == "df"
 
         if method not in self.method_conversion:
             raise ValueError(
                 f"Invalid method: {method}. Valid methods: {list(self.method_conversion.keys())}"
             )
+        
+        self.compiler = self.compiler_conversion[method](DEBUG, DETECT_ANOMALIES, PADE)
 
         # self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
 
@@ -279,8 +296,19 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self.initialized: bool = False
 
+        # -- biophysics --
+        self.biophysics()
+
         # -- constants --
         self.eval()
+
+    def biophysics(self):
+        """
+        Placeholder for biophysics-related initializations.
+        This method can be overridden in subclasses to add specific
+        biophysics-related parameters or configurations.
+        """
+        pass
 
     def __init_subclass__(cls, **kwargs):
         def init_decorator(previous_init):
@@ -423,9 +451,20 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         """
         validate(mechanism)
 
+        """
         m, unfactorable, has_gtot, divide_by_two = compile_mechanism(
             mechanism,
             self,
+            ic=ic,
+            mask_out=mask_out,
+            mask_in=mask_in,
+            **kwargs,
+        )
+        """
+
+        m, unfactorable, has_gtot, divide_by_two = self.compiler.compile(
+            mechanism, 
+            self, 
             ic=ic,
             mask_out=mask_out,
             mask_in=mask_in,

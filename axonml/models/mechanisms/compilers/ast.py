@@ -1,7 +1,9 @@
 from __future__ import annotations
 import ast, inspect, textwrap, sympy as sp, re
+from sympy import symbols, sympify, Poly, expand, factor
 from functools import lru_cache
-from typing import List
+
+from axonml.helpers import DEBUG
 
 # helper: Python‑AST → SymPy
 def _ast_to_sympy(node: ast.AST, local_syms: dict[str, sp.Expr]) -> sp.Expr:
@@ -101,79 +103,84 @@ def factorize_linear_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
     return _dotify(A), _dotify(C)
 
 
-def extract_multipliers(class_def_str: str) -> List[str]:
-    """
-    Extracts all expressions that precede any expression matching '* (v - <x>)'
-    within the given Python class definition string. The <x> can be a variable or an attribute.
+def replace_v(code_str):
+    # Use a regex with word boundaries to ensure only standalone 'v' is replaced.
+    # The replacement inserts '(v + v_n) / 2' in place of v.
+    return re.sub(r"\bv\b", "(v + v_n) / 2", code_str)
 
-    Args:
-        class_def_str (str): The string representation of the Python class.
 
-    Returns:
-        List[str]: A list of multiplier expressions as strings.
-    """
+@lru_cache(maxsize=None)
+def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
+    lines = code_str.strip().split("\n")
 
-    class MultiplierVisitor(ast.NodeVisitor):
-        def __init__(self):
-            self.multipliers = []
+    # Identify self-prefixed variables
+    pattern = r"self\.(\w+)"
+    self_vars_all = re.findall(pattern, code_str)
+    self_vars_all = set(self_vars_all)
+    self_mapping = {var: f"self.{var}" for var in self_vars_all}
 
-        def is_target_subtraction(self, node: ast.BinOp) -> bool:
-            """
-            Checks if the given BinOp node represents a subtraction of the form (v - <x>),
-            where <x> can be a Name or an Attribute.
+    env = {}
 
-            Args:
-                node (ast.BinOp): The binary operation node to check.
+    def parse_expr(expr_str):
+        # Extract potential variables
+        potential_vars = set(re.findall(r"[a-zA-Z_]\w*", expr_str))
+        for var in potential_vars:
+            if var not in env:
+                env[var] = symbols(var, real=True)
+        return sympify(expr_str, locals=env)
 
-            Returns:
-                bool: True if the node matches the pattern (v - <x>), False otherwise.
-            """
-            if not isinstance(node, ast.BinOp):
-                return False
-            if not isinstance(node.op, ast.Sub):
-                return False
+    final_expr = None
 
-            # Check if left operand is 'v'
-            if not (isinstance(node.left, ast.Name) and node.left.id == "v"):
-                return False
+    # Parse line by line
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        line_no_self = line.replace("self.", "")
 
-            # Check if right operand is a Name or Attribute
-            if isinstance(node.right, (ast.Name, ast.Attribute)):
-                return True
+        if line_no_self.startswith("return "):
+            return_expr_str = line_no_self[len("return ") :].strip()
+            final_expr = parse_expr(return_expr_str)
+        elif "=" in line_no_self:
+            lhs, rhs = line_no_self.split("=", 1)
+            var_name = lhs.strip()
+            rhs_expr_str = rhs.strip()
+            rhs_expr = parse_expr(rhs_expr_str)
+            env[var_name] = rhs_expr
+        else:
+            final_expr = parse_expr(line_no_self)
 
-            return False
+    if DEBUG:
+        print(f"Final expression in mech factorization: {final_expr}")
 
-        def visit_BinOp(self, node):
-            # Check if the operation is multiplication
-            if isinstance(node.op, ast.Mult):
-                # Check the right operand for (v - x)
-                if isinstance(node.right, ast.BinOp) and self.is_target_subtraction(
-                    node.right
-                ):
-                    multiplier_expr = node.left
-                    multiplier_str = ast.unparse(multiplier_expr).strip()
-                    self.multipliers.append(multiplier_str)
+    if final_expr is None:
+        raise ValueError("No final expression or return statement found.")
 
-                # Check the left operand for (v - x)
-                elif isinstance(node.left, ast.BinOp) and self.is_target_subtraction(
-                    node.left
-                ):
-                    multiplier_expr = node.right
-                    multiplier_str = ast.unparse(multiplier_expr).strip()
-                    self.multipliers.append(multiplier_str)
+    if x_var not in env:
+        env[x_var] = symbols(x_var, real=True)
+    x = env[x_var]
 
-            # Continue traversing the AST
-            self.generic_visit(node)
+    # Factor the final_expr as A + B*x
+    expr_expanded = expand(final_expr)
+    p = Poly(expr_expanded, x)
 
-    # Parse the class definition string into an AST
-    try:
-        tree = ast.parse(class_def_str)
-    except SyntaxError as e:
-        print(f"SyntaxError while parsing the class definition: {e}")
-        return []
+    if p.degree() != 1:
+        raise ValueError("Expression is not linear in x.")
 
-    # Initialize and run the visitor
-    visitor = MultiplierVisitor()
-    visitor.visit(tree)
+    A = p.eval(0)
+    B = p.coeff_monomial(x)
 
-    return visitor.multipliers
+    # Now factor each of A and B individually
+    A_factor = factor(A)
+    B_factor = factor(B)
+
+    # Convert to strings
+    A_str = str(A_factor)
+    B_str = str(B_factor)
+
+    # Restore self. prefixes
+    for var in sorted(self_mapping.keys(), key=len, reverse=True):
+        A_str = re.sub(rf"\b{var}\b", self_mapping[var], A_str)
+        B_str = re.sub(rf"\b{var}\b", self_mapping[var], B_str)
+
+    return A_str, B_str

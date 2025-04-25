@@ -30,19 +30,20 @@ class Population(torch.jit.ScriptModule):
     @torch.jit.script_method
     def step_no_intra(self, cmdt, dt, temp):
         v = self.model.v
-        self.model.mech.advance(v, dt, temp)
+        self.model.mech.i(v, v)
         irev = self.model.mech.irev()
         gtot = self.model.mech.gtot(v)
         self.model.v = self._advance_implicit(v, irev, gtot, cmdt)
+        self.model.mech.advance(v, dt, temp)
         return
     
     @torch.jit.script_method
     def step_intra(self, cmdt, dt, temp, intra):
         v = self.model.v
-        self.model.mech.advance(v, dt, temp)
         irev = self.model.mech.irev()
         gtot = self.model.mech.gtot(v)
         self.model.v = self._advance_implicit_intra(v, irev, gtot, cmdt, intra)
+        self.model.mech.advance(v, dt, temp)
         return
 
     @property

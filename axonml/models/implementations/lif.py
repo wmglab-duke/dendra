@@ -7,7 +7,16 @@ from ..mechanisms import PARAMETER
 
 class LIF(Axon):
     PARAMETER(cm=1.0, rhoa=100.0)
-    def __init__(self, diameters, L=10.0, temp=37, v_init=-70, g_pas=0.1, threshold=-50, method="dufort-frankel"):
+    def __init__(
+            self, 
+            diameters, 
+            L=10.0, 
+            temp=37, 
+            v_init=-70, 
+            g_pas=0.1, 
+            threshold=-50, 
+            method="dufort-frankel"
+        ):
         n_comp = 1
         self.dx: float = L
         self.L: float = L

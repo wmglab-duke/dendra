@@ -422,11 +422,11 @@ def parse_mech_update_fs(mechanisms):
     return s
 
 
-def irev(mechanisms):
+def irev(mechanisms, has_gtot):
     result = []
     if NETWORK:
         for m in mechanisms:
-            if hasattr(m, "irev"):
+            if has_gtot[m._name]:
                 result.append(f"self.{m._name}.irev()")
     if len(result) == 0:
         return "torch.tensor(0.0)"
@@ -498,7 +498,7 @@ def build_handler(
         define_setattr=parse_setattr(ions),
         all_states=parse_all_states(mechanisms),
         gtot=gtot(mechanisms, has_gtot),
-        irev=irev(mechanisms),
+        irev=irev(mechanisms, has_gtot),
         breakpoint=breakpoint(mechanisms),
         set_buffers=parse_set_buffers(mechanisms, list(ions.keys())),
         currents_tot=tot_currents(currents, df),

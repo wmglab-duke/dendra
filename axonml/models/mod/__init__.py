@@ -21,6 +21,24 @@ for file in py_files:
     globals()[class_name] = getattr(module, class_name)  # Add class to global namespace
 
 
+import sys
+import importlib.util
+from pathlib import Path
+
+
+class MechanismContainer:
+    """Simple attribute / dict‑style container."""
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def available(self):
+        return list(self.__dict__.keys())
+
+
 def load_mechanisms(*paths):
     """
     Load mechanism modules from the specified file paths.
@@ -52,38 +70,32 @@ def load_mechanisms(*paths):
     >>> mechanisms = load_mechanisms('/path/to/mechanisms', '/another/path')
     >>> my_mechanism = mechanisms.mechanism_name
     """
+    
     mechanisms = {}
 
-    for path in paths:
-        dirpath = os.path.abspath(path)
-        py_files = [
-            f for f in os.listdir(dirpath) if f.endswith(".py") and f != "__init__.py"
-        ]
+    for root in paths:
+        root = Path(root).resolve()
+        for file in root.glob("*.py"):
+            if file.name == "__init__.py":
+                continue
 
-        for file in py_files:
-            # import file as module
-            module_name = os.path.splitext(file)[0]
-            file_path = os.path.join(dirpath, file)
+            module_name = file.stem            # e.g. "nats"
+            unique_name = f"{module_name}_{file.stat().st_ino}"  # avoids collisions
 
-            # Create a spec from the file and then import the module
-            spec = importlib.util.spec_from_file_location(module_name, file_path)
-            if spec and spec.loader:
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+            spec = importlib.util.spec_from_file_location(unique_name, file)
+            module = importlib.util.module_from_spec(spec)
+
+            # ★ Make the module discoverable
+            sys.modules[unique_name] = module
+
+            spec.loader.exec_module(module)
+
+            try:
                 mechanisms[module_name] = getattr(module, module_name)
+            except AttributeError as e:
+                raise AttributeError(
+                    f"{file.name} does not define a class called {module_name}"
+                ) from e
 
-    mechanisms = MechanismContainer(**mechanisms)
+    return MechanismContainer(**mechanisms)
 
-    return mechanisms
-
-
-class MechanismContainer:
-    def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-    def __getitem__(self, key):
-        return getattr(self, key)
-
-    def available(self):
-        return list(self.__dict__.keys())
