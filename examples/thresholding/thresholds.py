@@ -56,7 +56,7 @@ if __name__ == "__main__":
     nrn_thresh_path = f"{directory}/example_thresholds_{field}.npy"
     thresh_nrn = np.load(nrn_thresh_path).flatten()
 
-    mrg = SMF(diameters=diams, n_comp=n_comp).load("MRG")
+    mrg = SMF(diameters=diams, n_node=n_comp).load("MRG")
 
     dt = 0.005
     active = Active(dt=dt)

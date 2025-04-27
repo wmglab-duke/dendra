@@ -1,21 +1,14 @@
 from ..core import Unmyelinated
 from ..mod import (
-    ks,
-    kf,
-    h,
-    nattxs,
-    nav1p8,
-    nav1p9_slow_inact,
-    nakpump,
-    kdrTiger,
-    kna,
-    naoiTiger,
-    koiTiger,
+    ks, kf, h, nattxs, nav1p8,
+    nav1p9_slow_inact, nakpump,
+    kdrTiger, kna, naoiTiger, koiTiger,
     leak,
 )
 from ..mechanisms import PARAMETER, c_context
 
 from axonml.units import mm
+from axonml.models.integrators import dufort_frankel
 
 
 class Tigerholm2014(Unmyelinated):
@@ -90,9 +83,9 @@ class Tigerholm2014(Unmyelinated):
         dx=10,
         temp=37.0,
         v_init=-55.0,
-        method="dufort-frankel",
+        integrator=dufort_frankel(),
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method)
+        super().__init__(diameters, L, dx, temp, v_init, integrator)
 
         with c_context(nai0=11.4, nao0=154.0, ki0=144.9, ko0=5.6):
             self.insert(ks, gbar=0.0069733)

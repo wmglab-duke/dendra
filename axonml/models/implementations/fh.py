@@ -3,6 +3,7 @@ from ..mod import fh
 from ..mechanisms import PARAMETER, c_context as C
 
 from axonml.units import mm
+from axonml.models.integrators import euler
 
 
 class FHM(Myelinated):
@@ -14,9 +15,9 @@ class FHM(Myelinated):
         n_node=101,
         temp=20.0,
         v_init=-70.0,
-        method="euler",
+        integrator=euler(),
     ):
-        super().__init__(diameters, n_node, temp, v_init, method)
+        super().__init__(diameters, n_node, temp, v_init, integrator)
         with C(nai0=13.74, nao0=114.5, ki0=120.0, ko0=2.5):
             self.insert(fh)
 
@@ -34,8 +35,8 @@ class FHUM(Unmyelinated):
         dx=25.0,
         temp=20.0,
         v_init=-70.0,
-        method="euler",
+        integrator=euler(),
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method)
+        super().__init__(diameters, L, dx, temp, v_init, integrator)
         with C(nai0=13.74, nao0=114.5, ki0=120.0, ko0=2.5):
             self.insert(fh)

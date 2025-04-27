@@ -25,6 +25,8 @@ from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
 from axonml.units import mm
 from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
+from axonml.models.interfaces import HandlerInterface
+from axonml.models.integrators import euler
 
 from axonml.helpers import (
     op_mc, op_sc, ve_from_s_t, 
@@ -72,39 +74,6 @@ def matches_any_pattern(base_patterns, target_string):
         if re.search(regex_pattern, target_string):
             return True
     return False
-
-
-@torch.jit.interface
-class HandlerInterface:
-    def initialize(self, v, v_init, temp) -> None:
-        pass
-
-    def generic(self, model) -> None:
-        pass
-
-    def advance(self, v, dt) -> None:
-        pass
-
-    def detach(self) -> None:
-        pass
-
-    def i_intra(self, v, intra) -> torch.Tensor:
-        pass
-
-    def i(self, v) -> torch.Tensor:
-        pass
-
-    def update(self, temp) -> None:
-        pass
-
-    def get(self, mech: str, state: str) -> torch.Tensor:
-        pass
-
-    def set(self, name: str, value: float) -> None:
-        pass
-
-    def all_states(self) -> List[str]:
-        pass
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
@@ -161,61 +130,29 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     _dt_lim = None
     __constants__ = [
-        "method",
         "n_ax",
         "n_comp",
         "temp",
         "v_init",
-        "is_df",
-        "use_fast_imem",
-        "hd",
     ]
 
     def __init__(
-        self, diameters, n_comp: int, temp=37.0, v_init=-80.0, method="rk1", beta=0.0
+        self, diameters, n_comp: int, temp=37.0, v_init=-80.0, integrator=euler()
     ):
         super().__init__()
-
-        self.method_conversion = {
-            "euler": "rk1",
-            "rk1": "rk1",
-            "heun": "rk2",
-            "rk2": "rk2",
-            "rk4": "rk4",
-            "dufort-frankel": "df",
-            "df": "df",
-        }
-
-        self.compiler_conversion = {
-            "euler": MechCompiler,
-            "rk1": MechCompiler,
-            "heun": MechCompiler,
-            "rk2": MechCompiler,
-            "rk4": MechCompiler,
-            "dufort-frankel": DF_Compiler,
-            "df": DF_Compiler,
-        }
-
-        self.is_df = self.method_conversion[method] == "df"
-
-        if method not in self.method_conversion:
-            raise ValueError(
-                f"Invalid method: {method}. Valid methods: {list(self.method_conversion.keys())}"
-            )
         
-        self.compiler = self.compiler_conversion[method](DEBUG, DETECT_ANOMALIES, PADE)
-
-        # self.pi = torch.nn.Parameter(torch.tensor(math.pi), requires_grad=False)
-
-        self.method = method
         self.n_ax = len(diameters)
         self.n_comp = n_comp
         self.temp = temp
         self.v_init = v_init
 
+        self.register_buffer("_dummy", torch.zeros(1))
+
         self.cid = None
 
-        self.mech: HandlerInterface = None
+        self.compiler = integrator.compiler(DEBUG, DETECT_ANOMALIES, PADE)
+        self.integrator = integrator
+
         self.t_ind: int = 0
         self.dt: float = A.dt
 
@@ -240,52 +177,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self._caches = {}
 
-        self.use_fast_imem = bool(IMEM)
-        if self.use_fast_imem:
-            self.register_buffer("i_membrane", torch.zeros((self.n_ax, 1, n_comp)))
-
         self.register_buffer("y", torch.zeros(self.n_ax, 1))
         self.register_buffer("z", torch.zeros(self.n_ax, 1))
-
-        self.beta = beta
-        self.hd = bool(beta)  # hyper-diffusion
-        if self.hd:
-            self.filter = torch.nn.Conv1d(
-                1, 1, 5, padding=2, bias=False, padding_mode="reflect"
-            )
-            self.filter.weight.data = torch.tensor(
-                [-1, 4, -6, 4, -1], dtype=torch.float
-            ).reshape(1, 1, 5)
-            for p in self.filter.parameters():
-                p.requires_grad = False
-
-        self.weight_choices = {
-            "rk1": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
-            "rk2": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
-            "rk4": [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]],
-            "df": [
-                [1.0, +0.0, 1.0],
-                [0.0, -1.0, 0.0],
-                [1.0, -2.0, 1.0],
-            ],
-        }
-
-        self.nc = {"rk1": 2, "rk2": 2, "rk4": 2, "df": 3}
-
-        # solver stuff
-        weight = self.weight_choices[self.method_conversion[method]]
-        nc = self.nc[self.method_conversion[method]]
-
-        self.ssd = SymmetricConv1D(
-            nc, 1, 3, bias=False, padding="same", padding_mode="reflect"
-        )
-        self.ssd.weight.data = torch.tensor(weight).reshape(1, nc, 3)
-        for p in self.ssd.parameters():
-            p.requires_grad = False
-
-        self.register_buffer("v", torch.full((self.n_ax, 1, n_comp), v_init))
-        if self.is_df:
-            self.register_buffer("v_prev", torch.full((self.n_ax, 1, n_comp), v_init))
 
         if torch.is_tensor(diameters):
             diameters = diameters.to(self.dtype()).clone().detach()
@@ -309,6 +202,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         biophysics-related parameters or configurations.
         """
         pass
+
+    @property
+    def mech(self):
+        return self.integrator.mech
 
     def __init_subclass__(cls, **kwargs):
         def init_decorator(previous_init):
@@ -424,10 +321,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self.v.shape[0]
 
     def device(self):
-        return self.ssd.weight.device
+        return self._dummy.device
 
     def dtype(self):
-        return self.ssd.weight.dtype
+        return self._dummy.dtype
 
     def insert(self, mechanism, ic=None, mask_out=None, mask_in=None, **kwargs):
         """
@@ -450,17 +347,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             Additional keyword arguments to be passed to the compile_mechanism function.
         """
         validate(mechanism)
-
-        """
-        m, unfactorable, has_gtot, divide_by_two = compile_mechanism(
-            mechanism,
-            self,
-            ic=ic,
-            mask_out=mask_out,
-            mask_in=mask_in,
-            **kwargs,
-        )
-        """
 
         m, unfactorable, has_gtot, divide_by_two = self.compiler.compile(
             mechanism, 
@@ -538,7 +424,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
         self._m_curr.update(_ion_write)
 
-        df = self.is_df
+        df = self.integrator.is_df
 
         ions = {}
         for ion in all_ions:
@@ -558,7 +444,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             for m in self._m_list:
                 m.register_ion(ions[ion])
 
-        self.mech = build_handler(
+        mech = build_handler(
             self._m_list,
             self._m_name,
             self._m_curr,
@@ -570,6 +456,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             df,
         )
 
+        self.integrator = self.integrator(self, mech)
+
     def area_(self, diameters):
         raise NotImplementedError()
 
@@ -580,17 +468,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return (self.cm / 1e3) * area
 
     def init_v(self):
-        self.v[:] = self.v_init
-        self.v.detach_()
-        if self.is_df:
-            self.v_prev[:] = self.v_init
-            self.v_prev.detach_()
+        self.integrator.init_v(self)
 
     def detach(self):
-        self.v.detach_()
-        if self.is_df:
-            self.v_prev.detach_()
-        self.mech.detach()
+        self.integrator.detach(self)
 
     @property
     def t(self):
@@ -716,13 +597,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 raise ValueError("Waveform must have a tstop value.")
             time = time.assemble(dt)
 
-        method = getattr(self, f"step_no_intra_{self.method_conversion[self.method]}")
-        method_intra = getattr(
-            self, f"step_intra_{self.method_conversion[self.method]}"
-        )
-
-        df = self.is_df
-
         with torch.set_grad_enabled(self.training):
             if ve is None and not intra_only:
                 ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
@@ -735,7 +609,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     self.restore("_steady_state")
                     self.t_ind = 0
                 else:
-                    self.init_v()
+                    self.integrator.init_v(self)
                     self.initialize(self.v, self.v_init_c, self.temp_c)
                     self.post_initialize()
                     self.t_ind = 0
@@ -755,13 +629,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 callbacks.pre_loop_hook(self)
 
             dt = torch.as_tensor(dt, device=device)
-
-            if df:
-                s = 2 * dt / self.cm_c
-                s2 = s / self.ra_c
-            else:
-                cm_inv = 1 / self.cm_c
-                ra_inv = 1 / self.ra_c
+            self.integrator.initialize(self, dt)
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
@@ -769,46 +637,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
             for i in range(ve.shape[0]):
                 ve_c = ve[i] if not intra_only else ve_zero
-                if df:
-                    if with_intra:
-                        self.v, self.v_prev = method_intra(
-                            self.v,
-                            self.v_prev,
-                            ve_c,
-                            self.area_c,
-                            s,
-                            s2,
-                            dt,
-                            self.temp_c,
-                            intra(self.t_ind, self.v),
-                        )
-                    else:
-                        self.v, self.v_prev = method(
-                            self.v,
-                            self.v_prev,
-                            ve_c,
-                            self.area_c,
-                            s,
-                            s2,
-                            dt,
-                            self.temp_c,
-                        )
+                if with_intra:
+                    intra_c = intra(self.t_ind, self.v)
+                    self.integrator.step_intra(self, ve_c, intra_c, dt, self.t_ind)
                 else:
-                    if with_intra:
-                        self.v = method_intra(
-                            self.v,
-                            ve_c,
-                            self.area_c,
-                            cm_inv,
-                            ra_inv,
-                            dt,
-                            self.temp_c,
-                            intra(self.t_ind, self.v),
-                        )
-                    else:
-                        self.v = method(
-                            self.v, ve_c, self.area_c, cm_inv, ra_inv, dt, self.temp_c
-                        )
+                    self.integrator.step(self, ve_c, dt, self.t_ind)
                 callbacks.post_step_hook(self)
                 self.t_ind += 1
 
@@ -964,171 +797,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.mech.initialize(v, v_init, temp)
 
     @torch.jit.script_method
-    def FRK(self, v, ve, area, cm, ra):
-        x = torch.cat([v, ve], dim=1)
-        d2v = self.ssd(x)
-        i_ion = self.mech.i(v, v) * area
-        return cm * ((ra * d2v) - i_ion)
-
-    @torch.jit.script_method
-    def FRK_intra(self, v, ve, area, cm, ra, intra):
-        x = torch.cat([v, ve], dim=1)
-        d2v = self.ssd(x)
-        i_ion = self.mech.i(v, v) * area - intra
-        return cm * ((ra * d2v) - i_ion)
-
-    @torch.jit.script_method
-    def step_no_intra_rk1(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
-        K1 = self.FRK(v, ve, area, cm, ra)
-        self.mech.advance(v, dt, temp)
-        v_n = v + K1 * dt
-        if self.use_fast_imem:
-            i_cap = self.cm_c * (v_n - v) / dt
-            self.i_membrane[:] = i_cap + self.mech.imem * area
-        return v_n
-
-    @torch.jit.script_method
-    def step_intra_rk1(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
-        K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
-        self.mech.advance(v, dt, temp)
-        v_n = v + K1 * dt
-        if self.use_fast_imem:
-            i_cap = self.cm_c * (v_n - v) / dt
-            self.i_membrane[:] = i_cap + self.mech.imem * area
-        return v_n
-
-    @torch.jit.script_method
-    def step_no_intra_rk2(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
-        K1 = self.FRK(v, ve, area, cm, ra)
-        K2 = self.FRK(v + K1 * dt, ve, area, cm, ra)
-        self.mech.advance(v, dt, temp)
-        v_n = v + (K1 + K2) * (dt / 2)
-        if self.use_fast_imem:
-            i_cap = self.cm_c * (v_n - v) / dt
-            self.i_membrane[:] = i_cap + self.mech.imem * area
-        return v_n
-
-    @torch.jit.script_method
-    def step_intra_rk2(self, v, ve, area, cm, ra, dt, temp, intra) -> Tensor:
-        K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
-        K2 = self.FRK_intra(v + K1 * dt, ve, area, cm, ra, intra)
-        self.mech.advance(v, dt, temp)
-        v_n = v + (K1 + K2) * (dt / 2)
-        if self.use_fast_imem:
-            i_cap = self.cm_c * (v_n - v) / dt
-            self.i_membrane[:] = i_cap + self.mech.imem * area
-        return v_n
-
-    @torch.jit.script_method
-    def step_no_intra_rk4(self, v, ve, area, cm, ra, dt, temp) -> Tensor:
-        # -- update vm --
-        K1 = self.FRK(v, ve, area, cm, ra)
-        K2 = self.FRK(v + (dt / 2) * K1, ve, area, cm, ra)
-        K3 = self.FRK(v + (dt / 2) * K2, ve, area, cm, ra)
-        K4 = self.FRK(v + dt * K3, ve, area, cm, ra)
-
-        self.mech.advance(v, dt, temp)
-
-        v_n = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
-        if self.use_fast_imem:
-            i_cap = self.cm_c * (v_n - v) / dt
-            self.i_membrane[:] = i_cap + self.mech.imem * area
-        return v_n
-
-    @torch.jit.script_method
-    def step_intra_rk4(
-        self,
-        v,
-        ve,
-        area,
-        cm,
-        ra,
-        dt,
-        temp,
-        intra,
-    ) -> Tensor:
-        # -- update vm --
-        K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
-        K2 = self.FRK_intra(v + (dt / 2) * K1, ve, area, cm, ra, intra)
-        K3 = self.FRK_intra(v + (dt / 2) * K2, ve, area, cm, ra, intra)
-        K4 = self.FRK_intra(v + dt * K3, ve, area, cm, ra, intra)
-
-        self.mech.advance(v, dt, temp)
-
-        v_n = v + (dt / 6) * (K1 + 2 * K2 + 2 * K3 + K4)
-        if self.use_fast_imem:
-            i_cap = self.cm_c * (v_n - v) / dt
-            self.i_membrane[:] = i_cap + self.mech.imem * area
-        return v_n
-
-    @torch.jit.script_method
-    def step_no_intra_df(
-        self, v, v_prev, ve, area, s, s2, dt, temp
-    ) -> Tuple[Tensor, Tensor]:
-        
-        self.mech.generic(self)
-
-        # -- 2nd diff --
-        x = torch.cat([v, v_prev, ve], dim=1)
-        d2v = self.ssd(x)
-
-        # -- calculate ionic current --
-        i_ion = self.mech.i(v_prev, v) * area
-
-        # -- update vm --
-        v_new = (v_prev + s2 * d2v - s * i_ion) / (
-            1 + s2 + s * self.mech.gtot(v) * area
-        )
-
-        self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
-
-        if self.use_fast_imem:
-            i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
-            self.i_membrane[:] = i_cap + self.mech.imem * area
-
-        if self.hd:
-            v_new = v_new - self.beta * self.filter(v_new)
-
-        return v_new, v
-
-    @torch.jit.script_method
-    def step_intra_df(
-        self, v, v_prev, ve, area, s, s2, dt, temp, intra
-    ) -> Tuple[Tensor, Tensor]:
-        
-        self.mech.generic(self)
-
-        # -- 2nd diff --
-        x = torch.cat([v, v_prev, ve], dim=1)
-        d2v = self.ssd(x)
-
-        # -- calculate ionic current --
-        i_ion = self.mech.i(v_prev, v) * area - intra
-
-        # -- update vm --
-        v_new = (v_prev + s2 * d2v - s * i_ion) / (
-            1 + s2 + s * self.mech.gtot(v) * area
-        )
-
-        self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
-
-        if self.use_fast_imem:
-            i_cap = self.cm_c * (v_new - v_prev) / (2 * dt)
-            self.i_membrane[:] = i_cap + self.mech.imem
-
-        if self.hd:
-            v_new = v_new - self.beta * self.filter(v_new)
-
-        return v_new, v
-
-    @torch.jit.script_method
     def get_state(self, s: str) -> Tensor:
         if s == "v":
             return self.v
         mech, state = s.split(".")
-        return self.mech.get(mech, state)
+        return self.integrator.mech.get(mech, state)
 
     def load(self, state_dict):
         """
@@ -1189,7 +862,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.export
     def set(self, key: str, value: float):
-        self.mech.set(key, value)
+        self.integrator.mech.set(key, value)
 
     @torch.jit.export
     def cache(self, name: str = None):
@@ -1260,27 +933,27 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def cuda(self):
         super().cuda()
-        self.mech.set_buffers(self.diam)
+        self.integrator.mech.set_buffers(self.diam)
         return self
 
     def cpu(self):
         super().cpu()
-        self.mech.set_buffers(self.diam)
+        self.integrator.mech.set_buffers(self.diam)
         return self
 
     def float(self):
         super().float()
-        self.mech.set_buffers(self.diam)
+        self.integrator.mech.set_buffers(self.diam)
         return self
 
     def double(self):
         super().double()
-        self.mech.set_buffers(self.diam)
+        self.integrator.mech.set_buffers(self.diam)
         return self
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
-        self.mech.set_buffers(self.diam)
+        self.integrator.mech.set_buffers(self.diam)
         return self
 
     def warn_about_dt(self, dt):
@@ -1387,13 +1060,21 @@ class Unmyelinated(Axon):
 
     PARAMETER(cm=1.0, rhoa=35.4)
 
-    def __init__(self, diameters, L=1.0*mm, dx=10.0, temp=37, v_init=-80, method="rk1"):
+    def __init__(
+            self, 
+            diameters, 
+            L=1.0*mm, 
+            dx=10.0, 
+            temp=37, 
+            v_init=-80,
+            integrator=euler
+        ):
         # L = L * 1000  # mm -> um
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
         self.dx: float = dx
         self.L: float = n_comp * dx
-        super().__init__(diameters, n_comp, temp, v_init, method)
+        super().__init__(diameters, n_comp, temp, v_init, integrator)
 
     def x(self) -> torch.Tensor:  # x in um
         l = (self.n_comp - 1) * self.dx

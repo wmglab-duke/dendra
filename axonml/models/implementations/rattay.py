@@ -3,7 +3,7 @@ from ..mod import rattay_aberham
 from ..mechanisms import PARAMETER, e_context
 
 from axonml.units import mm
-
+from axonml import dufort_frankel
 
 class Rattay1993(Unmyelinated):
     PARAMETER(inherit=Unmyelinated, rhoa=100.0)
@@ -15,9 +15,9 @@ class Rattay1993(Unmyelinated):
         dx=10,
         temp=37.0,
         v_init=-70.0,
-        method="dufort-frankel",
+        integrator=dufort_frankel(),
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method)
+        super().__init__(diameters, L, dx, temp, v_init, integrator)
 
         with e_context(ena=45.0, ek=-82.0):
             self.insert(rattay_aberham)

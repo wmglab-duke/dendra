@@ -23,6 +23,7 @@ from ..mod import (
 from ..mechanisms import PARAMETER, e_context as E, c_context as C
 
 from axonml.units import mm
+from axonml import dufort_frankel
 
 import math
 
@@ -37,9 +38,9 @@ class ThioAutonomic2025(Unmyelinated):
         dx=10,
         temp=37.0,
         v_init=-58.5,
-        method="dufort-frankel",
+        integrator=dufort_frankel(),
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method)
+        super().__init__(diameters, L, dx, temp, v_init, integrator)
         R = 8314  # molar gas constant
         F = 96485.3329  # Faraday's constant
 
@@ -94,9 +95,9 @@ class ThioCutaneous2025(Unmyelinated):
         dx=10,
         temp=37.0,
         v_init=-58.5,
-        method="dufort-frankel",
+        integrator=dufort_frankel(),
     ):
-        super().__init__(diameters, L, dx, temp, v_init, method)
+        super().__init__(diameters, L, dx, temp, v_init, integrator)
         R = 8314  # molar gas constant
         F = 96485.3329  # Faraday's constant
 

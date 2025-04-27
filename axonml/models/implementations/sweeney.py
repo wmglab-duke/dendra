@@ -2,6 +2,7 @@ from ..core import Myelinated
 from ..mod import sweeney
 from ..mechanisms import PARAMETER
 
+from axonml import dufort_frankel
 
 class Sweeney1987(Myelinated):
     """
@@ -70,7 +71,7 @@ class Sweeney1987(Myelinated):
         n_node=101,
         temp=37.0,
         v_init=-80.0,
-        method="dufort-frankel",
+        integrator=dufort_frankel(),
     ):
-        super().__init__(diameters, n_node, temp, v_init, method)
+        super().__init__(diameters, n_node, temp, v_init, integrator)
         self.insert(sweeney)

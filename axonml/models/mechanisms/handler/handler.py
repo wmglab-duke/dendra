@@ -23,6 +23,7 @@ class MechanismHandler(torch.nn.Module):
     {assignments}
     {imem_assignment}
 
+  @torch.jit.export  
   def initialize(self, v, v_init, temp) -> None:
     self.ion_init(temp)
     self.init_buffers(v_init)
@@ -462,7 +463,7 @@ def build_handler(
             imem_write = "self.imem = total"
             imem_write_df = ""
     else:
-        imem_assignment = ""
+        imem_assignment = "self.register_buffer('imem', torch.zeros(1))"
         imem_write = ""
         imem_write_df = ""
 
