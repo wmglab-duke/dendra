@@ -614,7 +614,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     self.t_ind = 0
                 else:
                     self.integrator.init_v(self)
-                    self.initialize(self.v, self.v_init_c, self.temp_c)
+                    self.integrator.mech.initialize(self.v, self.v_init_c, self.temp_c)
                     self.post_initialize()
                     self.t_ind = 0
                     self.initialized = True
@@ -632,10 +632,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     callbacks = CallbackList(callbacks)
                 callbacks.pre_loop_hook(self)
 
+            dt = torch.as_tensor(dt, device=device)
+
             if first or self.training:
                 self.integrator.initialize(self, dt)
-
-            dt = torch.as_tensor(dt, device=device)
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
@@ -803,7 +803,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def initialize(self, v, v_init, temp):
-        self.mech.initialize(v, v_init, temp)
+        self.integrator.mech.initialize(v, v_init, temp)
 
     @torch.jit.script_method
     def get_state(self, s: str) -> Tensor:
@@ -867,7 +867,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def all_states(self) -> List[str]:
         out = ["v"]
-        return out + self.mech.all_states()
+        return out + self.integrator.mech.all_states()
 
     @torch.jit.export
     def set(self, key: str, value: float):
