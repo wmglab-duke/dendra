@@ -3,7 +3,7 @@ from ..mod import kdr, pas, nahh
 from ..mechanisms import PARAMETER, e_context
 
 from axonml.units import mm
-from axonml import dufort_frankel
+from axonml.models.integrators import dufort_frankel
 
 
 class Sundt2015(Unmyelinated):

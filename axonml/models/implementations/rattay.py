@@ -3,7 +3,7 @@ from ..mod import rattay_aberham
 from ..mechanisms import PARAMETER, e_context
 
 from axonml.units import mm
-from axonml import dufort_frankel
+from axonml.models.integrators import dufort_frankel
 
 class Rattay1993(Unmyelinated):
     PARAMETER(inherit=Unmyelinated, rhoa=100.0)

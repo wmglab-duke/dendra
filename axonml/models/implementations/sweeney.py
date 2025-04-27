@@ -2,7 +2,7 @@ from ..core import Myelinated
 from ..mod import sweeney
 from ..mechanisms import PARAMETER
 
-from axonml import dufort_frankel
+from axonml.models.integrators import dufort_frankel
 
 class Sweeney1987(Myelinated):
     """

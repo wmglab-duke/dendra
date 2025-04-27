@@ -23,7 +23,7 @@ from ..mod import (
 from ..mechanisms import PARAMETER, e_context as E, c_context as C
 
 from axonml.units import mm
-from axonml import dufort_frankel
+from axonml.models.integrators import dufort_frankel
 
 import math
 

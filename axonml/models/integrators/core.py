@@ -2,6 +2,7 @@ from functools import partial, partialmethod
 from typing import Any, Type, Tuple, Callable
 
 import torch
+from torch.nn import functional as F
 
 from axonml.models.mechanisms.compilers import (
     MechCompiler, DF_Compiler, ImplicitCompiler
@@ -65,8 +66,7 @@ class Integrator(torch.jit.ScriptModule):
         imem = imem if imem is not None else IMEM
         self.imem = bool(imem)
         model.register_buffer("v", torch.full((model.n_ax, 1, model.n_comp), model.v_init))
-        if self.imem:
-            model.register_buffer("i_membrane", torch.zeros((model.n_ax, 1, model.n_comp)))
+        self.register_buffer("i_membrane", torch.zeros((model.n_ax, 1, model.n_comp)))
         self.mech = mech
 
     def init_v(self, model):
@@ -132,48 +132,34 @@ class _euler(Integrator):
         return cm * ((ra * d2v) - i_ion)
     
     def step(self, model, ve, dt, t_ind):
-        v = model.v
-        area = model.area_c
-        temp = model.temp_c
-        model.v = self._step_no_intra(v, ve, area, dt, temp)
+        model.v = self._step_no_intra(
+            model.v, ve, model.area_c, dt, model.temp_c, model.cm_c
+        )
 
     def step_intra(self, model, ve, intra, dt, t_ind):
-        v = model.v
-        area = model.area_c
-        temp = model.temp_c
-        model.v = self._step_intra(v, ve, area, dt, temp, intra)
+        model.v = self._step_intra(
+            model.v, ve, model.area_c, dt, model.temp_c, model.cm_c, intra
+        )
 
     @torch.jit.script_method
-    def _step_no_intra(self, v, ve, area, dt, temp):
+    def _step_no_intra(self, v, ve, area, dt, temp, cm):
         K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         self.mech.advance(v, dt, temp)
         v_n = v + K1 * dt
+        if self.imem:
+            i_cap = cm * (v_n - v) / dt
+            self.i_membrane = i_cap + self.mech.imem * area
         return v_n
-    
-    @torch.jit.script_method
-    def _step_no_intra_imem(self, v, ve, area, dt, temp, cm) -> Tuple[torch.Tensor, torch.Tensor]:
-        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
-        self.mech.advance(v, dt, temp)
-        v_n = v + K1 * dt
-        i_cap = cm * (v_n - v) / dt
-        i_membrane = i_cap + self.mech.imem * area
-        return v_n, i_membrane
 
     @torch.jit.script_method
-    def _step_intra(self, v, ve, area, dt, temp, intra):
+    def _step_intra(self, v, ve, area, dt, temp, cm, intra):
         K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         self.mech.advance(v, dt, temp)
         v_n = v + K1 * dt
+        if self.imem:
+            i_cap = cm * (v_n - v) / dt
+            self.i_membrane = i_cap + self.mech.imem * area
         return v_n
-    
-    @torch.jit.script_method
-    def _step_intra_imem(self, v, ve, area, dt, temp, cm, intra) -> Tuple[torch.Tensor, torch.Tensor]:    
-        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        self.mech.advance(v, dt, temp)
-        v_n = v + K1 * dt
-        i_cap = cm * (v_n - v) / dt
-        i_membrane = i_cap + self.mech.imem * area
-        return v_n, i_membrane
 
 
 class _eulerv1(_euler):
@@ -182,36 +168,24 @@ class _eulerv1(_euler):
     """
 
     @torch.jit.script_method
-    def _step_no_intra(self, v, ve, area, dt, temp):
+    def _step_no_intra(self, v, ve, area, dt, temp, cm):
         self.mech.advance(v, dt, temp)
         K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         v_n = v + K1 * dt
+        if self.imem:
+            i_cap = cm * (v_n - v) / dt
+            self.i_membrane = i_cap + self.mech.imem * area
         return v_n
-    
-    @torch.jit.script_method
-    def step_no_intra_imem(self, v, ve, area, dt, temp, cm) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.mech.advance(v, dt, temp)
-        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
-        v_n = v + K1 * dt
-        i_cap = cm * (v_n - v) / dt
-        i_membrane = i_cap + self.mech.imem * area
-        return v_n, i_membrane
 
     @torch.jit.script_method
-    def _step_intra(self, v, ve, area, dt, temp, intra):
-        self.mech.advance(v, dt, temp)        
-        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        v_n = v + K1 * dt
-        return v_n
-    
-    @torch.jit.script_method
-    def step_intra_imem(self, v, ve, area, dt, temp, cm, intra) -> Tuple[torch.Tensor, torch.Tensor]:    
+    def _step_intra(self, v, ve, area, dt, temp, cm, intra):
         self.mech.advance(v, dt, temp)
         K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         v_n = v + K1 * dt
-        i_cap = cm * (v_n - v) / dt
-        i_membrane = i_cap + self.mech.imem * area
-        return v_n, i_membrane
+        if self.imem:
+            i_cap = cm * (v_n - v) / dt
+            self.i_membrane = i_cap + self.mech.imem * area
+        return v_n
 
 
 _rk1 = _euler
@@ -223,19 +197,25 @@ class _rk2(_euler):
     """
 
     @torch.jit.script_method
-    def _step_no_intra(self, v, ve, area, dt, temp) -> None:
+    def _step_no_intra(self, v, ve, area, dt, temp, cm):
         K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         self.mech.advance(v, dt, temp)
-        K2 = self.FRK(v + K1 * dt, ve, area, self.cm_inv, self.ra_inv)
-        v_n = v + (K1 + K2) * dt / 2.0
+        K2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
+        v_n = v + K2 * dt
+        if self.imem:
+            i_cap = cm * (v_n - v) / dt
+            self.i_membrane = i_cap + self.mech.imem * area
         return v_n
-
+    
     @torch.jit.script_method
-    def _step_intra(self, v, ve, area, dt, temp, intra) -> None:
+    def _step_intra(self, v, ve, area, dt, temp, cm, intra):
         K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         self.mech.advance(v, dt, temp)
-        K2 = self.FRK_intra(v + K1 * dt, ve, area, self.cm_inv, self.ra_inv, intra)
-        v_n = v + (K1 + K2) * dt / 2.0
+        K2 = self.FRK_intra(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
+        v_n = v + K2 * dt
+        if self.imem:
+            i_cap = cm * (v_n - v) / dt
+            self.i_membrane = i_cap + self.mech.imem * area
         return v_n
 
 
@@ -245,25 +225,35 @@ class _rk4(_euler):
     """
 
     @torch.jit.script_method
-    def _step_no_intra(self, v, ve, area, dt, temp) -> None:
+    def _step_no_intra(self, v, ve, area, dt, temp, cm):
         K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         self.mech.advance(v, dt, temp)
         K2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         K3 = self.FRK(v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         K4 = self.FRK(v + K3 * dt, ve, area, self.cm_inv, self.ra_inv)
         v_n = v + (K1 + 2 * K2 + 2 * K3 + K4) * dt / 6.0
+        if self.imem:
+            i_cap = cm * (v_n - v) / dt
+            self.i_membrane = i_cap + self.mech.imem * area
         return v_n
 
     @torch.jit.script_method
-    def _step_intra(self, v, ve, area, dt, temp, intra) -> None:
+    def _step_intra(self, v, ve, area, dt, temp, cm, intra):
         K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         self.mech.advance(v, dt, temp)
         K2 = self.FRK_intra(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         K3 = self.FRK_intra(v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         K4 = self.FRK_intra(v + K3 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         v_n = v + (K1 + 2 * K2 + 2 * K3 + K4) * dt / 6.0
+        if self.imem:
+            i_cap = cm * (v_n - v) / dt
+            self.i_membrane = i_cap + self.mech.imem * area
         return v_n
-    
+
+
+@torch.jit.ignore
+def make_vn_df(num, den):
+    return num / den
 
 class _dufort_frankel(Integrator):
     """
@@ -272,7 +262,7 @@ class _dufort_frankel(Integrator):
     compiler = DF_Compiler
     is_df = True
 
-    __constants__ = {"beta", "hd", "apply_smoothing_every"}
+    __constants__ = {"beta", "smoothing", "apply_smoothing_every", "imem"}
 
     def __init__(
             self,
@@ -288,11 +278,14 @@ class _dufort_frankel(Integrator):
 
         self.register_buffer("s1", torch.tensor(0.0))
         self.register_buffer("s2", torch.tensor(0.0))
+        self.register_buffer("s3", torch.tensor(0.0))
+        self.register_buffer("s4", torch.tensor(0.0))
 
         self.apply_smoothing_every = apply_smoothing_every
         self.beta = beta
-        self.hd = bool((1 - beta))  # hyper-diffusion
-        if self.hd:
+        self.f64 = False
+        self.smoothing = bool((1 - beta))
+        if self.smoothing:
             self.filter = torch.nn.Conv1d(
                 1, 1, 5, padding=2, bias=False, padding_mode="reflect"
             )
@@ -319,38 +312,72 @@ class _dufort_frankel(Integrator):
     def initialize(self, model, dt) -> None:
         self.s1 = 2 * dt / model.cm_c
         self.s2 = self.s1 / model.ra_c
+        self.s3 = model.area_c * self.s1
+        self.s4 = 1 + self.s2
+        self.f64 = model.dtype() == torch.float64
 
     def step(self, model, ve, dt, t_ind):
-        v = model.v
-        v_prev = model.v_prev
-        area = model.area_c
-        temp = model.temp_c
-        model.v, model.v_prev = self._step_no_intra(v, v_prev, ve, area, dt, temp, t_ind)
+        if self.f64:
+            model.v, model.v_prev = self._step_no_intra_64(
+                model.v, model.v_prev, ve, model.area_c, dt, model.temp_c, t_ind
+            )
+        else:
+            model.v, model.v_prev = self._step_no_intra(
+                model.v, model.v_prev, ve, model.area_c, dt, model.temp_c, t_ind
+            )
 
     def step_intra(self, model, ve, intra, dt, t_ind):
-        v = model.v
-        v_prev = model.v_prev
-        area = model.area_c
-        temp = model.temp_c
-        model.v, model.v_prev = self._step_intra(v, v_prev, ve, area, dt, temp, intra, t_ind)
+        if self.f64:
+            model.v, model.v_prev = self._step_intra_64(
+                model.v, model.v_prev, ve, model.area_c, dt, model.temp_c, intra, t_ind
+            )
+        else:
+            model.v, model.v_prev = self._step_intra(
+                model.v, model.v_prev, ve, model.area_c, dt, model.temp_c, intra, t_ind
+            )
 
+    @torch.jit.script_method
+    def _step_no_intra_64(self, v, v_prev, ve, area, dt, temp, t_ind:int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = torch.cat([v, v_prev, ve], dim=1)
+
+        d2v = self.s2 * self.ssd(x)
+        num = v_prev + d2v - self.mech.i(v, v_prev) * self.s3
+        den = self.s4 + self.mech.gtot(v) * self.s3
+
+        v_new = make_vn_df(num, den)
+
+        self.mech.itot(v)
+        self.mech.advance(v, dt, temp)
+
+        if self.smoothing:
+            if (t_ind + 1) % self.apply_smoothing_every == 0:
+                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+
+        if self.imem:
+            i_cap = (v_new - v_prev) / self.s1
+            self.i_membrane = i_cap + self.mech.imem * area
+
+        return v_new, v
+    
     @torch.jit.script_method
     def _step_no_intra(self, v, v_prev, ve, area, dt, temp, t_ind:int) -> Tuple[torch.Tensor, torch.Tensor]:
         x = torch.cat([v, v_prev, ve], dim=1)
-        d2v = self.ssd(x)
 
-        i_ion = self.mech.i(v, v_prev) * area
-
-        v_new = (v_prev + self.s2 * d2v - self.s1 * i_ion) / (
-            1 + self.s2 + self.s1 * self.mech.gtot(v) * area
+        i_ion = self.mech.i(v, v_prev)
+        v_new = (v_prev + self.s2 * self.ssd(x) - self.s3 * i_ion) / (
+            self.s4 + self.s3 * self.mech.gtot(v)
         )
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
 
-        if self.hd:
+        if self.smoothing:
             if (t_ind + 1) % self.apply_smoothing_every == 0:
                 v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+
+        if self.imem:
+            i_cap = (v_new - v_prev) / self.s1
+            self.i_membrane = i_cap + self.mech.imem * area
 
         return v_new, v
 
@@ -362,15 +389,44 @@ class _dufort_frankel(Integrator):
         i_ion = self.mech.i(v, v_prev) * area - intra
 
         v_new = (v_prev + self.s2 * d2v - self.s1 * i_ion) / (
-            1 + self.s2 + self.s1 * self.mech.gtot(v) * area
+            1 + self.s2 + self.mech.gtot(v) * self.s3
         )
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
 
-        if self.hd:
+        if self.smoothing:
             if (t_ind + 1) % self.apply_smoothing_every == 0:
                 v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+
+        if self.imem:
+            i_cap = (v_new - v_prev) / self.s1
+            self.i_membrane = i_cap + self.mech.imem * area
+
+        return v_new, v
+    
+    @torch.jit.script_method
+    def _step_intra_64(self, v, v_prev, ve, area, dt, temp, intra, t_ind:int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = torch.cat([v, v_prev, ve], dim=1)
+        d2v = self.ssd(x)
+
+        i_ion = self.mech.i(v, v_prev) * area - intra
+
+        num = v_prev + self.s2 * d2v - self.s1 * i_ion
+        den = self.s4 + self.mech.gtot(v) * self.s3
+
+        v_new = make_vn_df(num, den)
+
+        self.mech.itot(v)
+        self.mech.advance(v, dt, temp)
+
+        if self.smoothing:
+            if (t_ind + 1) % self.apply_smoothing_every == 0:
+                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+
+        if self.imem:
+            i_cap = (v_new - v_prev) / self.s1
+            self.i_membrane = i_cap + self.mech.imem * area
 
         return v_new, v
 
@@ -380,15 +436,15 @@ class _dufort_frankel(Integrator):
         model.v_prev[:] = model.v_init
         model.v_prev.detach_()
         if self.imem:
-            model.i_membrane[:] = 0.0
-            model.i_membrane.detach_()
+            self.i_membrane[:] = 0.0
+            self.i_membrane.detach_()
 
     def detach(self, model):
         model.v_prev.detach_()
         model.v.detach_()
         self.mech.detach()
         if self.imem:
-            model.i_membrane.detach_()
+            self.i_membrane.detach_()
 
 
 euler = partial(partial_class, _euler)

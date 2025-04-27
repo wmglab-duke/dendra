@@ -26,7 +26,7 @@ from axonml.models.mechanisms.mech_compiler import compile_mechanism
 from axonml.units import mm
 from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
 from axonml.models.interfaces import HandlerInterface
-from axonml.models.integrators import euler
+from axonml.models.integrators import euler, dufort_frankel
 
 from axonml.helpers import (
     op_mc, op_sc, ve_from_s_t, 
@@ -206,6 +206,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     @property
     def mech(self):
         return self.integrator.mech
+    
+    @property
+    def i_membrane(self):
+        return self.integrator.i_membrane
 
     def __init_subclass__(cls, **kwargs):
         def init_decorator(previous_init):
@@ -628,8 +632,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     callbacks = CallbackList(callbacks)
                 callbacks.pre_loop_hook(self)
 
+            if first or self.training:
+                self.integrator.initialize(self, dt)
+
             dt = torch.as_tensor(dt, device=device)
-            self.integrator.initialize(self, dt)
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
@@ -653,6 +659,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             if not longrunning:
                 if progressbar:
                     progressbar.close()
+                callbacks.post_loop_hook(self)
 
     def longrun(
         self,
@@ -754,6 +761,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     first=(i == 0),
                     longrunning=True,
                 )
+
+        callbacks.post_loop_hook(self)
 
         if progressbar:
             progressbar.close()
@@ -1067,7 +1076,7 @@ class Unmyelinated(Axon):
             dx=10.0, 
             temp=37, 
             v_init=-80,
-            integrator=euler
+            integrator=dufort_frankel()
         ):
         # L = L * 1000  # mm -> um
         n_comp = L / dx

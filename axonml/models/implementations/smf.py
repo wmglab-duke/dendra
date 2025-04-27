@@ -4,7 +4,7 @@ from ..core import Myelinated
 from ..mod import axnode_myel
 from ..declarations import PARAMETER
 
-from axonml import eulerv1
+from axonml.models.integrators import eulerv1
 
 
 ic = {"m": 0.0732093, "h": 0.62069505, "p": 0.20260409, "s": 0.04302994}
