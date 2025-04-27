@@ -5,6 +5,7 @@ from .tigerholm import Tigerholm2014
 from .schild import Schild1997, Schild1994
 from .fh import FHM, SENN, FHUM
 from .sweeney import Sweeney1987
+from .thio import ThioAutonomic2025, ThioCutaneous2025
 
 __all__ = [
     "SMF",
@@ -17,4 +18,6 @@ __all__ = [
     "SENN",
     "FHUM",
     "Sweeney1987",
+    "ThioAutonomic2025",
+    "ThioCutaneous2025",
 ]

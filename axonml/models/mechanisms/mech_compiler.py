@@ -19,8 +19,9 @@ from axonml import const
 from .handler.defaults import valid_concentrations
 from .state_compiler import compile_state, compile_coupled_state
 from .utils import load, indent, get_function_body_as_str
+from .ast import factorize_linear_in_v
 
-from axonml.helpers import DEBUG, PADE, DETECT_ANOMALIES, logger
+from axonml.helpers import DEBUG, PADE, DETECT_ANOMALIES, NETWORK, logger
 from axonml.models.interfaces import AxonInterface
 
 
@@ -167,6 +168,8 @@ class {mech}(torch.nn.Module):
 
 {current_buffer_assignments}
 
+{network_buffer_assignments}
+
 {assigned}
 
     def register_ion(self, ion):
@@ -232,6 +235,8 @@ class {mech}(torch.nn.Module):
 {current_equations}
 
 {gtot}
+
+{irev}
 
 {update_f}
 """
@@ -384,7 +389,21 @@ def current_buffer_assignments(currents, range_vars):
         if k in range_vars:
             assignments.append(
                 f"self.register_buffer('{k}_', torch.zeros((n_ax, 1, n_comps)))"
-            )  # noqa(0.0))")
+            ) 
+    return "\n".join(assignments)
+
+
+def network_buffer_assignments(currents, NETWORK=False):
+    if not NETWORK:
+        return ""
+    assignments = []
+    for k in currents:
+        assignments.append(
+            f"self.register_buffer('gtot_{k}', torch.zeros((n_ax, 1, n_comps)))"
+        )
+        assignments.append(
+            f"self.register_buffer('irev_{k}', torch.zeros((n_ax, 1, n_comps)))"
+        )
     return "\n".join(assignments)
 
 
@@ -513,6 +532,28 @@ def {k}_tot(self, v):
 {body}
 """
 
+network_equation_template = """
+def {k}(self, v):
+    self.gtot_{k} = {gtot}
+    self.irev_{k} = self.gtot_{k} * {irev}
+    i = self.gtot_{k} * (v - {irev})
+    {assign_to_buffer}
+    return i
+"""
+
+
+def build_network_equation(current, gtot, irev, assign):
+    if assign:
+        assign_to_buffer = f"self.{current}_ = i"
+    else:
+        assign_to_buffer = ""
+    return network_equation_template.format(
+        k=current,
+        gtot=gtot,
+        irev=irev,
+        assign_to_buffer=assign_to_buffer,
+    )
+
 
 def multiply_return_value(code_string, multiplier_expr: str) -> str:
     """
@@ -534,67 +575,73 @@ def multiply_return_value(code_string, multiplier_expr: str) -> str:
     return new_code
 
 
-def current_equations(currents, mechanism, range_vars, df, mask):
+def current_equations(currents, mechanism, range_vars, df, mask, NETWORK=False):
     assignments = []
     unfactorable = [] if df else None
     divide_by_two = {}
     for k in currents:
         assign = k in range_vars
-        if not df:
-            code = convert_func(getattr(mechanism, k), assign)
-            if mask:
-                code = multiply_return_value(code, "self.mask")
-            assignments.append(code)
-            code_block = get_function_body_as_str(getattr(mechanism, k))
-            if mask:
-                code_block = multiply_return_value(code_block, "self.mask")
-            assignments.append(current_tot_template.format(k=k, body=code_block))
+        if NETWORK:
+            gtot, irev = factorize_linear_in_v(mechanism, method=k)
+            assignments.append(
+                build_network_equation(k, gtot, irev, assign)
+            )
         else:
-            code_block = get_function_body_as_str(getattr(mechanism, k))
-            if mask:
-                code_block_tot = multiply_return_value(code_block, "self.mask")
-            else:
-                code_block_tot = code_block
-            assignments.append(current_tot_template.format(k=k, body=code_block_tot))
-            try:
-                i, _ = factor_linear_in_x_from_codeblock(replace_v(code_block))
-                if assign:
-                    code = current_eq_template_assign.format(k=k, v=i)
-                    if mask:
-                        code = multiply_return_value(code, "self.mask")
-                    assignments.append(code)
-                else:
-                    code = current_eq_template.format(k=k, v=i)
-                    if mask:
-                        code = multiply_return_value(code, "self.mask")
-                    assignments.append(code)
-                divide_by_two[k] = False
-            except:
-                logger.warning(
-                    f"Could not factorize {k} in {mechanism.__name__}; looking instead for user-defined functions."
-                )
-                if not hasattr(mechanism, "conductance"):
-                    logger.warning(
-                        f"Could not find conductance function in {mechanism.__name__}."
-                    )
-                    code = convert_func(getattr(mechanism, k), assign)
-                    divide_by_two[k] = False
-                elif hasattr(mechanism, f"{k}_df"):
-                    logger.info(
-                        f"Conductance function found in {mechanism.__name__}. Using {k}_df function."
-                    )
-                    code = convert_func(getattr(mechanism, f"{k}_df"), assign, k)
-                    divide_by_two[k] = False
-                else:
-                    logger.info(
-                        f"Conductance function found in {mechanism.__name__}. No {k}_df function found, using {k}."
-                    )
-                    code = convert_func(getattr(mechanism, k), assign)
-                    divide_by_two[k] = True
+            if not df:
+                code = convert_func(getattr(mechanism, k), assign)
                 if mask:
                     code = multiply_return_value(code, "self.mask")
                 assignments.append(code)
-                unfactorable.append(k)
+                code_block = get_function_body_as_str(getattr(mechanism, k))
+                if mask:
+                    code_block = multiply_return_value(code_block, "self.mask")
+                assignments.append(current_tot_template.format(k=k, body=code_block))
+            else:
+                code_block = get_function_body_as_str(getattr(mechanism, k))
+                if mask:
+                    code_block_tot = multiply_return_value(code_block, "self.mask")
+                else:
+                    code_block_tot = code_block
+                assignments.append(current_tot_template.format(k=k, body=code_block_tot))
+                try:
+                    i, _ = factor_linear_in_x_from_codeblock(replace_v(code_block))
+                    if assign:
+                        code = current_eq_template_assign.format(k=k, v=i)
+                        if mask:
+                            code = multiply_return_value(code, "self.mask")
+                        assignments.append(code)
+                    else:
+                        code = current_eq_template.format(k=k, v=i)
+                        if mask:
+                            code = multiply_return_value(code, "self.mask")
+                        assignments.append(code)
+                    divide_by_two[k] = False
+                except:
+                    logger.warning(
+                        f"Could not factorize {k} in {mechanism.__name__}; looking instead for user-defined functions."
+                    )
+                    if not hasattr(mechanism, "conductance"):
+                        logger.warning(
+                            f"Could not find conductance function in {mechanism.__name__}."
+                        )
+                        code = convert_func(getattr(mechanism, k), assign)
+                        divide_by_two[k] = False
+                    elif hasattr(mechanism, f"{k}_df"):
+                        logger.info(
+                            f"Conductance function found in {mechanism.__name__}. Using {k}_df function."
+                        )
+                        code = convert_func(getattr(mechanism, f"{k}_df"), assign, k)
+                        divide_by_two[k] = False
+                    else:
+                        logger.info(
+                            f"Conductance function found in {mechanism.__name__}. No {k}_df function found, using {k}."
+                        )
+                        code = convert_func(getattr(mechanism, k), assign)
+                        divide_by_two[k] = True
+                    if mask:
+                        code = multiply_return_value(code, "self.mask")
+                    assignments.append(code)
+                    unfactorable.append(k)
     if hasattr(mechanism, "conductance"):
         code = convert_func(mechanism.conductance, False)
         if mask:
@@ -609,29 +656,50 @@ def {k}(self, v, v_prev):
 """
 
 
-def gtot(currents, mechanism, df, mask):
-    if not df:
-        return "    def gtot(self): return torch.tensor(0.0)", False
-    if hasattr(mechanism, "conductance"):
-        return "    def gtot(self, v): return 0.5 * self.conductance(v)", True
-    assignments = []
-    for k in currents:
-        code_block = get_function_body_as_str(getattr(mechanism, k))
-        try:
-            _, b = factor_linear_in_x_from_codeblock(replace_v(code_block))
-            assignments.append(b)
-        except:
-            pass
-    has_gtot = True
-    if not assignments:
-        has_gtot = False
-        return "    def gtot(self, v): return torch.tensor(0.0)", has_gtot
-    s = " + ".join(assignments)
+def gtot(currents, mechanism, df, mask, NETWORK):
+    mask = mask and not NETWORK
+
     if mask:
         mult = " * self.mask"
     else:
         mult = ""
-    return f"    def gtot(self, v): return {s} {mult}", has_gtot
+
+    if not df and not NETWORK:
+        return "    def gtot(self): return torch.tensor(0.0)", False
+    if hasattr(mechanism, "conductance"):
+        if NETWORK:
+            return "    def gtot(self, v): return self.conductance(v)", True
+        return f"    def gtot(self, v): return 0.5 * self.conductance(v) {mult}", True
+    
+    assignments = []
+    for k in currents:
+        if NETWORK:
+            assignments.append(f"self.gtot_{k}")
+        else:    
+            code_block = get_function_body_as_str(getattr(mechanism, k))
+            try:
+                _, b = factor_linear_in_x_from_codeblock(replace_v(code_block))
+                assignments.append(b)
+            except:
+                pass
+
+    has_gtot = True
+    if not assignments:
+        has_gtot = False
+        return "    def gtot(self, v): return torch.tensor(0.0)", has_gtot
+    
+    s = " + ".join(assignments)
+    return f"    def gtot(self, v): return ({s}) {mult}", has_gtot
+
+
+def irev(currents, NETWORK):
+    if not NETWORK:
+        return ""
+    assignments = []
+    for k in currents:
+        assignments.append(f"self.irev_{k}")
+    total = " + ".join(assignments)
+    return f"    def irev(self): return {total}"
 
 
 default_f = """
@@ -753,6 +821,8 @@ def compile_mechanism(
         else:
             states_compiled.append(compile_state(s, model, pade=pade, **kwargs))
 
+    # register buffers
+
     state_buffer_assignments_str = state_buffer_assignments(states_compiled)
     state_buffer_assignments_str = indent(state_buffer_assignments_str, 2)
 
@@ -765,6 +835,9 @@ def compile_mechanism(
     init_conductance_buffers_str = init_conductance_buffers(conductances)
     init_conductance_buffers_str = indent(init_conductance_buffers_str, 2)
 
+    network_buffer_assignments_str = network_buffer_assignments(current_eqs, NETWORK)
+    network_buffer_assignments_str = indent(network_buffer_assignments_str, 2)
+
     advance_str = advance(states_compiled)
     advance_str = indent(advance_str, 2)
 
@@ -776,6 +849,7 @@ def compile_mechanism(
         range_vars,
         df,
         masked,
+        NETWORK
     )
     current_equations_str = indent(current_equations_str, 1)
 
@@ -788,13 +862,14 @@ def compile_mechanism(
     init_distribution_buffers_str = init_distribution_buffers(distributions)
     init_distribution_buffers_str = indent(init_distribution_buffers_str, 2)
 
-    gtot_str, has_gtot = gtot(current_eqs, mechanism, df, masked)
+    gtot_str, has_gtot = gtot(current_eqs, mechanism, df, masked, NETWORK)
 
     forward_str = template.format(
         mech=mechanism.__name__,
         state_buffer_assignments=state_buffer_assignments_str,
         current_buffer_assignments=current_buffer_assignments_str,
         assigned=assigned_str,
+        network_buffer_assignments=network_buffer_assignments_str,
         init_state_buffers=init_state_buffers_str,
         advance=advance_str,
         current_equations=current_equations_str,
@@ -807,6 +882,7 @@ def compile_mechanism(
         init_distribution_buffers=init_distribution_buffers_str,
         detach=indent(define_detach(states_compiled, assigned, read_ion), 2),
         mask_def=indent(define_mask(mask_out, mask_in), 2),
+        irev=irev(current_eqs, NETWORK),
     )
 
     if DEBUG >= 2:

@@ -4,6 +4,8 @@ from ..core import Myelinated
 from ..mod import axnode_myel
 from ..declarations import PARAMETER
 
+from axonml.models.integrators import eulerv1
+
 
 ic = {"m": 0.0732093, "h": 0.62069505, "p": 0.20260409, "s": 0.04302994}
 
@@ -115,30 +117,14 @@ class SMF(Myelinated):
         n_node=101,
         temp=37.0,
         v_init=-80.0,
-        method="euler",
+        integrator=eulerv1(),
     ):
         if torch.any(torch.as_tensor(diameters) < 5.7):
             raise ValueError(
                 "Fiber diameter should not be less than 5.7 um for SMF. Use smolMRG instead."
             )
-        if method not in {"euler", "rk1"}:
-            raise ValueError(f"Method {method} is not supported.")
-        super().__init__(diameters, n_node, temp, v_init, method)
+        super().__init__(diameters, n_node, temp, v_init, integrator)
         self.insert(axnode_myel, ic=ic)
-
-    @torch.jit.script_method
-    def step_no_intra_rk1(self, v, ve, area, cm, ra, dt, temp) -> torch.Tensor:
-        self.mech.advance(v, dt, temp)
-        K1 = self.FRK(v, ve, area, cm, ra)
-        v = v + K1 * dt
-        return v
-
-    @torch.jit.script_method
-    def step_intra_rk1(self, v, ve, area, cm, ra, dt, temp, intra) -> torch.Tensor:
-        self.mech.advance(v, dt, temp)
-        K1 = self.FRK_intra(v, ve, area, cm, ra, intra)
-        v = v + K1 * dt
-        return v
 
     def cm_(self, area):
         return self.cm * area

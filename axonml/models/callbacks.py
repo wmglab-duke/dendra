@@ -570,14 +570,14 @@ class LFP(Callback):
         self.v_unit = v_unit
 
     def pre_loop_hook(self, model):
-        if not model.use_fast_imem:
+        if not model.integrator.imem:
             raise RuntimeError(
                 "Axon must be compiled with IMEM=1. Use with axonml.helpers.ctx(IMEM=1): model = ..."
             )
         self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
         self._lfp.append(
             torch.einsum(
-                "ij,ij->", torch.atleast_2d(model.i_membrane.squeeze()), self.v_unit
+                "ij,ij->", torch.atleast_2d(model.integrator.i_membrane.squeeze()), self.v_unit
             )
         )
         self._t.append(model.t)
@@ -586,7 +586,7 @@ class LFP(Callback):
     def post_step_hook(self, model):
         self._lfp.append(
             torch.einsum(
-                "ij,ij->", torch.atleast_2d(model.i_membrane.squeeze()), self.v_unit
+                "ij,ij->", torch.atleast_2d(model.integrator.i_membrane.squeeze()), self.v_unit
             )
         )
         self._t.append(model.t)
