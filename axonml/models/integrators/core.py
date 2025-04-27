@@ -290,7 +290,7 @@ class _dufort_frankel(Integrator):
         self.register_buffer("s3", torch.tensor(0.0))
         self.register_buffer("s4", torch.tensor(0.0))
 
-        self.smoothevery = smooth_every
+        self.smooth_every = smooth_every
         self.beta = beta
         self.f64 = False
         self.smoothing = bool((1 - beta))
