@@ -1,4 +1,6 @@
 import torch
+from torch.nn import functional as F
+from torch.nn.utils import parametrize
 
 
 class Functional:
@@ -12,6 +14,24 @@ class Lambda(Functional):
 
     def fn(self, model):
         return self.f(model)
+    
+
+class positive:
+    def __init__(self, val):
+        self.val = val
+
+
+class PositiveSoftplus(torch.nn.Module):
+    def forward(self, x):
+        return F.softplus(x)                # f(x)
+
+    def right_inverse(self, y):
+        return softplus_inv(y)              # f⁻¹(y)  ← same helper as §2
+
+
+def softplus_inv(y, beta=1., eps=1e-6):
+    # y must be >0; eps keeps the log well-behaved numerically
+    return (torch.log(torch.exp(beta*(y-eps)) - 1.0) / beta)
 
 
 def to_param(val, model=None):

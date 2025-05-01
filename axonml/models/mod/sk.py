@@ -8,8 +8,10 @@ class n(State):
     DERIVATIVE("n' = (ninf - n) / taun")
     ASSIGNED("ninf", "taun")
 
+    PARAMETER(aq10=3.0)
+
     def calc_q10(self):
-        return 3.0 ** ((self.temp - 22.0) / 10.0)
+        return self.aq10 ** ((self.temp - 22.0) / 10.0)
     
     def breakpoint(self, v):
         pca = log10(self.cai) - 3

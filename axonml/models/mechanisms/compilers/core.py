@@ -4,6 +4,7 @@ import linecache
 from typing import Dict, List
 
 import torch
+from torch.nn.utils import parametrize
 
 from .txt import (
     template, 
@@ -25,7 +26,7 @@ from ..ops import *
 
 from axonml.helpers import logger
 from axonml.models.interfaces import AxonInterface
-from axonml.models.parametric import to_param
+from axonml.models.parametric import to_param, positive, PositiveSoftplus
 
 load = partial(load, cls=Mechanism)
 

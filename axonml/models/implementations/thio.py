@@ -28,6 +28,18 @@ from axonml.models.integrators import dufort_frankel
 import math
 
 
+def pre_init(model):
+    model.mech.extrapump.pumpina.zero_()
+    model.mech.extrapump.pumpik.zero_()
+    model.mech.extrapump.pumpica.zero_()
+
+
+def balance(model):
+    model.mech.extrapump.pumpina = -model.mech.na_ion.ina.flatten()[0]
+    model.mech.extrapump.pumpik = -model.mech.k_ion.ik.flatten()[0]
+    model.mech.extrapump.pumpica = -model.mech.ca_ion.ica.flatten()[0]
+
+
 class ThioAutonomic2025(Unmyelinated):
     PARAMETER(cm=1.326291192, rhoa=23.117539)
 
@@ -57,6 +69,9 @@ class ThioAutonomic2025(Unmyelinated):
         self.ion_style("na", 3, 2, 1, 1, 0)
         self.ion_style("k", 3, 2, 1, 1, 0)
 
+        self.register_pre_initialize_hook(pre_init)
+        self.register_post_initialize_hook(balance)
+
         with (
             E(ena=ena, ek=ek),
             C(cao0=2.0, cai0=0.000117, ko0=ko, ki0=ki_real, nao0=nao, nai0=nai_real),
@@ -79,10 +94,7 @@ class ThioAutonomic2025(Unmyelinated):
             self.insert(nakpumpSchild, INaKmax22=0.056316)
             self.insert(naoi)
             self.insert(koi)
-            self.insert(extrapump, 
-                        pumpina=0.008984065418475011,
-                        pumpik=-0.0007734098599539847,
-                        pumpica=7.183351313835647e-05)
+            self.insert(extrapump)
 
 
 class ThioCutaneous2025(Unmyelinated):
@@ -114,6 +126,9 @@ class ThioCutaneous2025(Unmyelinated):
         self.ion_style("na", 3, 2, 1, 1, 0)
         self.ion_style("k", 3, 2, 1, 1, 0)
 
+        self.register_pre_initialize_hook(pre_init)
+        self.register_post_initialize_hook(balance)
+
         with (
             E(ena=ena, ek=ek),
             C(cao0=2.0, cai0=0.000117, ko0=ko, ki0=ki_real, nao0=nao, nai0=nai_real),
@@ -136,7 +151,4 @@ class ThioCutaneous2025(Unmyelinated):
             self.insert(nakpumpSchild, INaKmax22=0.000456)
             self.insert(naoi)
             self.insert(koi)
-            self.insert(extrapump, 
-                        pumpina=0.008189162632367714,
-                        pumpik=-0.024943221032771065,
-                        pumpica=8.817746671498872e-05)
+            self.insert(extrapump)
