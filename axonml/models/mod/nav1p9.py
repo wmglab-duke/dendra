@@ -120,7 +120,7 @@ class s(State):
         taus = self.q10() * s
 
 
-class nav1p9_slow_inact(Mechanism):
+class nav1p9(Mechanism):
     STATE(m, h, s)
 
     PARAMETER(gbar=0.0)

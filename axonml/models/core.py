@@ -173,6 +173,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         self._ion_style = {}
 
+        self.pre_initialize_hooks: List[Callable] = []
         self.post_initialize_hooks: List[Callable] = []
 
         self._caches = {}
@@ -256,6 +257,48 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.cm_c = self.cm_(self.area_c)
         self.ra_c = self.ra_(self.diam)[:, None, None]
 
+    def collect_parameters(self, *names):
+        """
+        Collects parameters from the model based on the provided names.
+
+        Parameters
+        ----------
+        *names : str
+            Variable length argument list of parameter name patterns.
+            If empty, all parameters will be collected.
+            Otherwise, only parameters matching any of these patterns will be collected.
+
+        Returns
+        -------
+        list
+            List of parameters matching the provided names.
+        """
+        if not names:
+            return self.parameters()
+        else:
+            return [p for n, p in self.named_parameters() if matches_any_pattern(names, n)]
+        
+    def collect_named_parameters(self, *names):
+        """
+        Collects parameters from the model based on the provided names.
+
+        Parameters
+        ----------
+        *names : str
+            Variable length argument list of parameter name patterns.
+            If empty, all parameters will be collected.
+            Otherwise, only parameters matching any of these patterns will be collected.
+
+        Returns
+        -------
+        list
+            List of tuples (name, parameter) matching the provided names.
+        """
+        if not names:
+            return self.named_parameters()
+        else:
+            return [(n, p) for n, p in self.named_parameters() if matches_any_pattern(names, n)]
+
     def unfreeze(self, *names):
         """
         Unfreezes model parameters, making them trainable.
@@ -311,6 +354,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def register_post_initialize_hook(self, fn: Callable):
         self.post_initialize_hooks.append(fn)
+
+    def register_pre_initialize_hook(self, fn: Callable):
+        self.pre_initialize_hooks.append(fn)
 
     def set_y(self, y):
         self.y[:] = torch.as_tensor(y)
@@ -614,6 +660,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                     self.t_ind = 0
                 else:
                     self.integrator.init_v(self)
+                    self.pre_initialize()
                     self.integrator.mech.initialize(self.v, self.v_init_c, self.temp_c)
                     self.post_initialize()
                     self.t_ind = 0
@@ -798,8 +845,14 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         return self
 
     def post_initialize(self):
-        for h in self.post_initialize_hooks:
-            h(self)
+        with torch.no_grad():
+            for h in self.post_initialize_hooks:
+                h(self)
+
+    def pre_initialize(self):
+        with torch.no_grad():
+            for h in self.pre_initialize_hooks:
+                h(self)
 
     @torch.jit.script_method
     def initialize(self, v, v_init, temp):

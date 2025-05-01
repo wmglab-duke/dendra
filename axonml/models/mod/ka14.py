@@ -8,8 +8,10 @@ class m(State):
     DERIVATIVE("m' = (minf - m) / taum")
     ASSIGNED("minf", "taum")
 
+    PARAMETER(aq10=3.0)
+
     def calc_q10(self):
-        return 3.0 ** ((self.temp - 22.0) / 10.0)
+        return self.aq10 ** ((self.temp - 22.0) / 10.0)
     
     def breakpoint(self, v):
         minf = (1/(1+exp(-1*(v+25)/12)))**(1/3)
@@ -26,8 +28,10 @@ class h(State):
     DERIVATIVE("h' = (hinf - h) / tauh")
     ASSIGNED("hinf", "tauh")
 
+    PARAMETER(aq10=3.0)
+
     def calc_q10(self):
-        return 3.0 ** ((self.temp - 22.0) / 10.0)
+        return self.aq10 ** ((self.temp - 22.0) / 10.0)
     
     def breakpoint(self, v):
         hinf = .073 + 0.924/(1+exp((v+47)/4.75)) 
@@ -44,8 +48,10 @@ class s(State):
     DERIVATIVE("s' = (sinf - s) / taus")
     ASSIGNED("sinf", "taus")
 
+    PARAMETER(aq10=3.0)
+
     def calc_q10(self):
-        return 3.0 ** ((self.temp - 22.0) / 10.0)
+        return self.aq10 ** ((self.temp - 22.0) / 10.0)
     
     def breakpoint(self, v):
         sinf = .415 + .576/(1+exp((v+44.5)/5.93)) + .103/(1+exp(-1*(v)/18.37))
