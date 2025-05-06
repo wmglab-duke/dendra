@@ -777,8 +777,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 raise ValueError("Waveform must have a tstop value.")
             time = time.assemble(dt)
 
-        ve_s = torch.as_tensor(space, device=self.device())
-        ve_t = torch.as_tensor(time, device=self.device())
+        ve_s = torch.as_tensor(space, device=self.device(), dtype=self.dtype())
+        ve_t = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
 
         n_chunks = math.ceil(ve_t.shape[-1] / chunklength)
 
