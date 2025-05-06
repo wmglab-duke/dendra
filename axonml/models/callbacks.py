@@ -205,6 +205,35 @@ def atleast_3d(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+@torch.jit.script
+def detect_anomalies(x: torch.Tensor, prev) -> torch.Tensor:
+    anomalous = (torch.isnan(x) | torch.isinf(x)).squeeze().any(-1)
+    anomalous = torch.logical_or(anomalous, prev)
+    return anomalous
+
+
+class AnomalyDetector(Callback):
+
+    def __init__(self):
+        super().__init__()
+        self.rec = None
+    
+    def pre_loop_hook(self, model):
+        self.rec = torch.zeros(model.n_ax, dtype=torch.bool, device=model.device())
+
+    def post_step_hook(self, model):
+        self.rec = detect_anomalies(model.v, self.rec)
+
+    def reset(self):
+        if self.rec is not None:
+            self.rec = torch.zeros(self.rec.shape, dtype=torch.bool, device=self.rec.device())
+
+    def numpy(self):
+        if self.rec is not None:
+            return self.rec.detach().cpu().numpy()
+        return None
+
+
 class Recorder(Callback):
     """
     Record and store model states during simulation.
