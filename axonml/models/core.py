@@ -151,6 +151,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.cid = None
 
         self.compiler = integrator.compiler(DEBUG, DETECT_ANOMALIES, PADE)
+        self.builder = None
+        if integrator.builder is not None:
+            self.builder = integrator.builder(DEBUG, IMEM)
         self.integrator = integrator
 
         self.t_ind: int = 0
@@ -493,18 +496,29 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             )
             for m in self._m_list:
                 m.register_ion(ions[ion])
-
-        mech = build_handler(
-            self._m_list,
-            self._m_name,
-            self._m_curr,
-            self._m_unfactorable,
-            self._m_has_gtot,
-            self._m_divide_by_two,
-            self.temp,
-            ions,
-            df,
-        )
+        if self.builder is None:
+            mech = build_handler(
+                self._m_list,
+                self._m_name,
+                self._m_curr,
+                self._m_unfactorable,
+                self._m_has_gtot,
+                self._m_divide_by_two,
+                self.temp,
+                ions,
+                df,
+            )
+        else:
+            mech = self.builder.build(
+                self._m_list,
+                self._m_name,
+                self._m_curr,
+                self._m_unfactorable,
+                self._m_has_gtot,
+                self._m_divide_by_two,
+                self.temp,
+                ions,
+            )
 
         self.integrator = self.integrator(self, mech)
 

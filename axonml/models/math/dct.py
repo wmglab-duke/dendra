@@ -19,7 +19,7 @@ def dct1(x: torch.Tensor):
     torch.Tensor
         The DCT-I of the signal over the last dimension.
     """
-    x = x.squeeze()
+    # x = x.squeeze()
     x = torch.cat([x, x.flip([1])[:, 1:-1]], dim=1)
 
     return dct1_rfft_impl(x)[:, :, 0].unsqueeze(1)

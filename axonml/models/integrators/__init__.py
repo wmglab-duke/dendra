@@ -1,11 +1,44 @@
-from .core import (
-    euler,
-    eulerv1,
-    rk1,
-    rk2,
-    rk4,
-    dufort_frankel,
+from functools import partial, partialmethod
+from typing import Any, Type
+
+
+from .explicit import (
+    _euler,
+    _eulerv1,
+    _rk1,
+    _rk2,
+    _rk4,
+    _dufort_frankel,
 )
+
+from .implicit import (
+    _krylov_etd1,
+)
+
+
+def partial_class(cls: Type[Any], /, *args, **kwargs) -> Type[Any]:
+    """
+    Return a subclass of *cls* whose __init__ is pre-filled with *args/kwargs*.
+    Because it is a real subclass, all class attributes, methods,
+    and isinstance checks continue to behave as expected.
+    """
+
+    class _Partial(cls):
+        __init__ = partialmethod(cls.__init__, *args, **kwargs)
+
+    _Partial.__name__ = f"{cls.__name__}Partial"
+    _Partial.__qualname__ = _Partial.__name__
+    return _Partial
+
+
+euler = partial(partial_class, _euler)
+rk1 = partial(partial_class, _rk1)
+rk2 = partial(partial_class, _rk2)
+rk4 = partial(partial_class, _rk4)
+dufort_frankel = partial(partial_class, _dufort_frankel)
+eulerv1 = partial(partial_class, _eulerv1)
+
+krylov_etd1 = partial(partial_class, _krylov_etd1)
 
 
 __all__ = [
@@ -15,4 +48,5 @@ __all__ = [
     "rk2",
     "rk4",
     "dufort_frankel",
+    "krylov_etd1",
 ]

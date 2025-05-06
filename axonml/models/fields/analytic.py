@@ -9,6 +9,7 @@ class Point(torch.jit.ScriptModule, Parameterized):
 
     def __init__(self, **kwargs):
         super().__init__()
+        self.check_kwargs(kwargs)
         self.instantiate_parameters(**kwargs)
 
     def fn(self, x, y, z):

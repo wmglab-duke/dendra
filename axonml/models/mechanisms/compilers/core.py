@@ -295,7 +295,9 @@ class MechCompiler:
                 state_names.extend(s._state_names)
         
         current_names = []
+        all_current_names = []
         for k in current_eqs:
+            all_current_names.append(k)
             if k in range_vars:
                 current_names.append(k)
 
@@ -314,10 +316,10 @@ class MechCompiler:
 
         mask = (mask_out is not None) or (mask_in is not None)
 
-        gtot, has_gtot = self.gtot(current_eqs, mechanism, mask)
         current_eqs_str, unfactorable, divide_by_two = self.current_equations(
             current_eqs, mechanism, range_vars, mask
         )
+        gtot, has_gtot = self.gtot(current_eqs, mechanism, mask)
 
         compiled_str = template.format(
             mech                        = mechanism.__name__,
@@ -325,7 +327,7 @@ class MechCompiler:
             state_buffers               = self.buffers(state_names),
             distribution_buffers        = self.buffers(distributions.keys()),
             current_buffers             = self.current_buffers(current_names),
-            implicit_buffers            = self.implicit_buffers(current_names),
+            implicit_buffers            = self.implicit_buffers(all_current_names),
             assigned                    = self.assigned(assigned),
             detach                      = self.detach(to_detach),
             init_state_buffers          = self.init_state_buffers(states_compiled),
@@ -388,9 +390,55 @@ def {k}_tot(self, v):
 """
 
 
+df_equation_template = """
+def {k}(self, v):
+    gt = {gtot}
+    i = gt * (0.5 * v - {irev})
+    self.gtot_{k} = gt
+    return i
+"""
+
+
+df_itot_template = """
+def {k}_tot(self, v):
+    i = self.gtot_{k} * (v - {irev})
+    {assign_to_buffer}
+    return i
+"""
+
+
+def build_df_equation(current, gtot, irev):
+    return df_equation_template.format(
+        k=current,
+        gtot=gtot,
+        irev=irev,
+    )
+
+
+def build_df_itot(current, irev, assign):
+    if assign:
+        assign_to_buffer = f"self.{current}_ = i"
+    else:
+        assign_to_buffer = ""
+    return df_itot_template.format(
+        k=current,
+        irev=irev,
+        assign_to_buffer=assign_to_buffer,
+    )
+
+
 class DF_Compiler(MechCompiler):
     def __init__(self, DEBUG=0, DETECT_ANOMALIES=0, PADE=-1):
         super().__init__(DEBUG, DETECT_ANOMALIES, PADE)
+
+    @staticmethod
+    def _implicit_buffers(names):
+        assignments = []
+        for n in names:
+            assignments.append(
+                f"self.register_buffer('gtot_{n}', torch.zeros((n_ax, 1, n_comps)))"
+            )
+        return indent("\n".join(assignments), 2)
 
     @staticmethod
     def gtot(currents, mechanism, mask):
@@ -414,6 +462,71 @@ class DF_Compiler(MechCompiler):
         
         s = " + ".join(assignments)
         return f"    def gtot(self, v): return ({s}) {mult}", has_gtot
+    
+    def _gtot(self, currents, mechanism, mask):
+        mult = " * self.mask" if mask else ""
+        
+        assignments = []
+        for k in currents:
+            if k in self.unfactorable:
+                continue
+            if hasattr(mechanism, f"conductance_{k}"):
+                assignments.append(f"self.conductance_{k}(v)")
+            else:
+                assignments.append(f"self.gtot_{k}")
+        
+        has_gtot = True
+        if not assignments:
+            has_gtot = False
+            return "    def gtot(self, v): return torch.tensor(0.0)", has_gtot
+        
+        s = " + ".join(assignments)
+        return f"    def gtot(self, v): return 0.5 * ({s}) {mult}", has_gtot
+    
+    def _current_equations(self, currents, mechanism, range_vars, mask):
+        assignments = []
+        unfactorable = []
+        divide_by_two = {}
+        for k in currents:
+            assign = k in range_vars
+            try:
+                gtot, irev = factorize_linear_in_v(mechanism, method=k)
+                code = build_df_equation(k, gtot, irev)
+                if mask:
+                    code = multiply_return_value(code, "self.mask")
+                assignments.append(code)
+                code = build_df_itot(k, irev, assign)
+                if mask:
+                    code = multiply_return_value(code, "self.mask")
+                assignments.append(code)
+            except:
+                logger.warning(
+                    f"Could not factorize {k} in {mechanism.__name__}."
+                )
+                code = convert_func(getattr(mechanism, k), assign)
+                if mask:
+                    code = multiply_return_value(code, "self.mask")
+                assignments.append(code)
+
+                code_block = get_function_body_as_str(getattr(mechanism, k))
+                if mask:
+                    code_block_tot = multiply_return_value(code_block, "self.mask")
+                else:
+                    code_block_tot = code_block
+                assignments.append(current_tot_template.format(k=k, body=code_block_tot))
+
+                if not hasattr(mechanism, f"conductance_{k}"):
+                    logger.warning(
+                        f"Could not find conductance function for {k} in {mechanism.__name__}."
+                    )
+                    unfactorable.append(k)
+                else:
+                    code = convert_func(getattr(mechanism, f"conductance_{k}"), False)
+                    if mask:
+                        code = multiply_return_value(code, "self.mask")
+                    assignments.append(code)
+        self.unfactorable = unfactorable
+        return indent("\n".join(assignments), 1), unfactorable, divide_by_two
     
     @staticmethod
     def current_equations(currents, mechanism, range_vars, mask):
@@ -505,15 +618,17 @@ class ImplicitCompiler(MechCompiler):
     def __init__(self, DEBUG=0, DETECT_ANOMALIES=0, PADE=-1):
         super().__init__(DEBUG, DETECT_ANOMALIES, PADE)
     
-    @staticmethod
-    def gtot(currents, mechanism, mask):
+    def gtot(self, currents, mechanism, mask):
         mult = " * self.mask" if mask else ""
-        if hasattr(mechanism, "conductance"):
-            return f"    def gtot(self, v): return self.conductance(v) {mult}", True
         
         assignments = []
         for k in currents:
-            assignments.append(f"self.gtot_{k}")
+            if k in self.unfactorable:
+                continue
+            if hasattr(mechanism, f"conductance_{k}"):
+                assignments.append(f"self.conductance_{k}(v)")
+            else:
+                assignments.append(f"self.gtot_{k}")
         
         has_gtot = True
         if not assignments:
@@ -523,23 +638,39 @@ class ImplicitCompiler(MechCompiler):
         s = " + ".join(assignments)
         return f"    def gtot(self, v): return ({s}) {mult}", has_gtot
     
-    @staticmethod
-    def current_equations(currents, mechanism, range_vars, mask):
+    def current_equations(self, currents, mechanism, range_vars, mask):
         assignments = []
         unfactorable = []
         divide_by_two = {}
         for k in currents:
             assign = k in range_vars
-            gtot, irev = factorize_linear_in_v(mechanism, method=k)
-            assignments.append(
-                build_implicit_equation(k, gtot, irev, assign)
-            )
-        if hasattr(mechanism, "conductance"):
-            code = convert_func(mechanism.conductance, False)
-            if mask:
-                code = multiply_return_value(code, "self.mask")
-            assignments.append(code)
-        return "\n".join(assignments), unfactorable, divide_by_two
+            try:
+                gtot, irev = factorize_linear_in_v(mechanism, method=k)
+                code = build_implicit_equation(k, gtot, irev, assign)
+                if mask:
+                    code = multiply_return_value(code, "self.mask")
+                assignments.append(code)
+            except:
+                logger.warning(
+                    f"Could not factorize {k} in {mechanism.__name__}."
+                )
+                code = convert_func(getattr(mechanism, k), assign)
+                if mask:
+                    code = multiply_return_value(code, "self.mask")
+                assignments.append(code)
+
+                if not hasattr(mechanism, f"conductance_{k}"):
+                    logger.warning(
+                        f"Could not find conductance function for {k} in {mechanism.__name__}."
+                    )
+                    unfactorable.append(k)
+                else:
+                    code = convert_func(getattr(mechanism, f"conductance_{k}"), False)
+                    if mask:
+                        code = multiply_return_value(code, "self.mask")
+                    assignments.append(code)
+        self.unfactorable = unfactorable
+        return indent("\n".join(assignments), 1), unfactorable, divide_by_two
     
     @staticmethod
     def implicit_buffers(names):
@@ -553,11 +684,11 @@ class ImplicitCompiler(MechCompiler):
             )
         return indent("\n".join(assignments), 2)
     
-    @staticmethod
-    def irev(currents, mask):
+    def irev(self, currents, mask):
         mult = " * self.mask" if mask else ""
         assignments = []
         for k in currents:
-            assignments.append(f"self.irev_{k}")
+            if k not in self.unfactorable:
+                assignments.append(f"self.irev_{k}")
         total = " + ".join(assignments)
-        return f"    def irev(self, v): return {total} {mult}"
+        return f"    def irev(self): return {total} {mult}"
