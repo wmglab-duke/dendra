@@ -63,7 +63,8 @@ def run(model, params, rec_suffix='', steady_state=False):
     testpulse_fs = 10 * Hz
     testpulse_start = 15 * ms
     intra = ax.IntraStim(model)
-    i_stim = ax.mono_rect(amp=1*nA, pw=1*ms).repeat(testpulse_fs, delay=testpulse_start)(t) 
+    i_stim = ax.mono_rect(amp=1*nA, pw=1*ms).repeat(
+        testpulse_fs, delay=testpulse_start)(t) 
     intra.insert(i_stim, nodes=model.c(0.1))
 
     # ve from point source
