@@ -782,7 +782,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 raise ValueError('`time` must be of type `Waveform`')
             time = time.to(self.dtype())
             functional = True
-            t = torch.arange(0, tstop, dt)
+            t = torch.arange(0, tstop, dt, dtype=self.dtype())
             n_chunks = math.ceil(len(t) / chunklength)
             t_chunks = torch.tensor_split(t, n_chunks)
 
@@ -871,7 +871,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
-        ve = torch.zeros(1, self.n_ax, 1, self.n_comp, device=self.device())
+        ve = torch.zeros(1, self.n_ax, 1, self.n_comp, device=self.device(), dtype=self.dtype())
         maxiter = int(tstop / dt)
         with ctx(DTWARN=0):
             for i in tqdm(range(maxiter), desc=f"Steady state [dt:{dt} ms, tstop:{tstop} ms]"):
