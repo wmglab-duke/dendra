@@ -42,7 +42,7 @@ def to_param(val, model=None):
 
 def distributed(val, over='a', kind='fiber'):
     valid = {
-        'fiber': ['a', 'c'],
+        'fiber': ['a', 'c', 'ac'],
         'stim': ['a']
     }
     if kind not in valid:
@@ -55,6 +55,8 @@ def distributed(val, over='a', kind='fiber'):
             return val[:, None, None]
         elif over == 'c':
             return val[None, None, :]
+        elif over == 'ac':
+            return val[:, None, :]
     elif kind == 'stim':
         if over == 'a':
             return val[:, None]
