@@ -29,8 +29,9 @@ total = len(all_params)
 
 # choose model
 model_type = ax.Tigerholm2014
-model_name = 'tigerholm'
+model_name = 'tigerholm2014'
 steady_state = False
+L = 40.0
 
 # global parameters
 tstop = 2000 * ms
@@ -40,7 +41,7 @@ pre = 200 * ms
 off = 610 * ms
 
 # fastest is 32-bit with default (Dufort-Frankel) integrator so try that first
-model = model_type([1.0*um]*total, L=40.0*mm, dx=10.0*um)
+model = model_type([1.0*um]*total, L=L*mm, dx=10.0*um)
 
 # define simulation
 def run(model, params, rec_suffix='', steady_state=False):
@@ -107,12 +108,15 @@ anomalous, raster = run(model, all_params, steady_state=steady_state)
 n_anomalous = np.count_nonzero(anomalous)
 
 if n_anomalous > 0 and rerun_anomalies:
-    print('Anomalies detected. Trying with ETD1 integrator & 64-bit math.')
+    print(f'{n_anomalous} anomalies detected. Trying with ETD1 integrator & 64-bit math.')
     robust_model = model_type(
-        [1.0*um]*n_anomalous, L=40.0*mm, dx=10.0*um, integrator=ax.krylov_etd1(m=6)
+        [1.0*um]*n_anomalous, L=L*mm, dx=10.0*um, integrator=ax.krylov_etd1(m=6)
     ).double()
     rerun_params = [all_params[i] for i, f in enumerate(anomalous) if f]
     anomalous_r, raster_r = run(robust_model, rerun_params, '_robust', steady_state=steady_state)
+
+    n_anomalous_r = np.count_nonzero(anomalous_r)
+    print(f"{n_anomalous_r} simulations still failed.")
 
 
 # put together data
