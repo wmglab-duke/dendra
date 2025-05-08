@@ -130,19 +130,22 @@ for i in range(raster.shape[1]):
     freq, amp = all_params[i]
     
     if anomalous[i]:
-        if not rerun_anomalies:
+        if (not rerun_anomalies) or anomalous_r[anomalous_i]:
             valid.append(False)
-            continue
-        if anomalous_r[anomalous_i]:
-            valid.append(False)
+            all_times.append([])
+            n_aps_during_khz.append(0)
+            all_freq.append(freq)
+            all_amps.append(amp)
             anomalous_i += 1
             continue
         r = raster_r
+        index = anomalous_i
         anomalous_i += 1
     else:
+        index = i
         r = raster
         
-    t_ap = np.where(r[:, i, 0])[0] * dt
+    t_ap = np.where(r[:, index, 0])[0] * dt
     all_times.append(t_ap.tolist())
     n_ap = np.count_nonzero(np.logical_and(t_ap>pre, t_ap<off))
     n_aps_during_khz.append(n_ap)
