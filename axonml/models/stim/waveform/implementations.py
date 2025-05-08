@@ -54,11 +54,11 @@ class sin(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0)
+    PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf)
 
     def fn(self, t):
         w = torch.sin(2 * torch.pi * self.freq * (t - self.delay) + self.phase)
-        return self.amp * torch.where(t >= self.delay, w, 0.0)
+        return self.amp * torch.where((t >= self.delay) & (t < self.off), w, 0.0)
 
 
 class cos(Waveform):
@@ -99,11 +99,11 @@ class cos(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0)
+    PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf)
 
     def fn(self, t):
         w = torch.cos(2 * torch.pi * self.freq * (t - self.delay) + self.phase)
-        return self.amp * torch.where(t >= self.delay, w, 0.0)
+        return self.amp * torch.where((t >= self.delay) & (t < self.off), w, 0.0)
 
 
 class mono_rect(Waveform):

@@ -14,7 +14,7 @@ World's fastest neural fiber simulator. Implement and train high-throughput GPU-
 `axonml` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).
 
 ### Python dependencies
-`axonml` requires Python 3.11+ and PyTorch 2.0+ with GPU support (tested with PyTorch 2.5.0 & CUDA 12.4).
+`axonml` requires Python 3.11+ and PyTorch 2.0+ with GPU support (tested with PyTorch 2.5.0+ & CUDA 12.4).
 
 
 ## 🖥️ Installation
@@ -34,6 +34,8 @@ World's fastest neural fiber simulator. Implement and train high-throughput GPU-
 > cd axonml
 > python -m pip install .
 ```
+- To install in development mode:
+    - `python -m pip install --editable .`
 
 - You can also install with jupyter support:
     - `python -m pip install '.[jupyter]'`
