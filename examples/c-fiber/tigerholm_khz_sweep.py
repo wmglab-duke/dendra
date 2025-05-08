@@ -24,7 +24,7 @@ frequencies = [
     1, 2, 5, 10, 20, 30, 40, 50, 60, 80, 100
 ]
 amps = np.arange(0, 26.1).tolist()
-all_params = list(itertools.product(frequencies, amps))
+all_params = list(itertools.product(frequencies, amps)) # in AxonML, we run everything at once
 total = len(all_params)
 
 # choose model
@@ -44,7 +44,7 @@ model = model_type([1.0*um]*total, L=40.0*mm, dx=10.0*um)
 # define simulation
 def run(model, params, rec_suffix='', steady_state=False):
 
-    # only necessary for Schild
+    # only necessary for Schild, default False
     if steady_state:
         model.steady_state()
     
@@ -147,7 +147,7 @@ for i in range(raster.shape[1]):
         
     t_ap = np.where(r[:, i, 0])[0] * dt
     all_times.append(t_ap.tolist())
-    n_ap = np.count_nonzero(np.logical_and(t_ap>pre_stim, t_ap<end_after))
+    n_ap = np.count_nonzero(np.logical_and(t_ap>pre, t_ap<off))
     n_aps_during_khz.append(n_ap)
     all_freq.append(freq)
     all_amps.append(amp)
