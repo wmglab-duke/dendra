@@ -80,8 +80,8 @@ class Waveform(torch.jit.ScriptModule, Parameterized):
     def forward(self, t):
         return torch.atleast_2d(self.fn(torch.as_tensor(t)))
 
-    def repeat(self, freq: float, delay: float = 0.0):
-        return _repeat(self, freq, delay)
+    def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
+        return _repeat(self, freq, delay, off)
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.parameters_repr()})"
@@ -96,18 +96,25 @@ class Waveform(torch.jit.ScriptModule, Parameterized):
     def assemble(self, dt):
         t = torch.arange(0, self._tstop, dt)
         return self(t)
+    
+    def assemble_chunked(self, dt, chunks):
+        t = torch.arange(0, self._tstop, dt)
+        t = torch.tensor_split(t, chunks)
+        for t_ in t:
+            yield self(t)
 
 
 class _repeat(Waveform):
-    def __init__(self, waveform, freq: float, delay: float = 0.0):
+    def __init__(self, waveform, freq: float, delay: float = 0.0, off: float = torch.inf):
         super(_repeat, self).__init__()
         self.waveform = waveform
         self.freq = freq
         self.delay = delay
+        self.off = off
 
     def fn(self, t):
         t_adjusted = t - self.delay
-        mask = t >= self.delay
+        mask = (t >= self.delay) & (t < self.off)
         t_periodic = torch.fmod(t_adjusted, 1.0 / self.freq)
         return torch.where(mask, self.waveform.fn(t_periodic), 0.0)
 
