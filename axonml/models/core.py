@@ -727,6 +727,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         space: Tensor,
         time: Tensor,
         chunklength: int,
+        tstop: float = None,
         dt: float = None,
         reinit=False,
         callbacks: List[Callback] = None,
@@ -772,32 +773,51 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         dt = dt if dt is not None else A.dt
         self.warn_about_dt(dt)
 
-        if isinstance(time, Waveform):
-            if time._tstop is None:
-                raise ValueError("Waveform must have a tstop value.")
-            time = time.assemble(dt)
-
         ve_s = torch.as_tensor(space, device=self.device(), dtype=self.dtype())
-        ve_t = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
 
-        n_chunks = math.ceil(ve_t.shape[-1] / chunklength)
+        functional = False
 
-        # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
-        # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
+        if tstop is not None:
+            if not isinstance(time, Waveform):
+                raise ValueError('`time` must be of type `Waveform`')
+            time = time.to(self.dtype())
+            functional = True
+            t = torch.arange(0, tstop, dt, dtype=self.dtype())
+            n_chunks = math.ceil(len(t) / chunklength)
+            t_chunks = torch.tensor_split(t, n_chunks)
 
-        if multicontact:
-            ve_s = ve_s.expand(-1, self.n_ax, -1)
-            ve_t = ve_t.expand(-1, self.n_ax, -1)
-            einsum = op_mc
-        else:
             ve_s = ve_s.expand(self.n_ax, -1)
-            ve_t = ve_t.expand(self.n_ax, -1)
             einsum = op_sc
 
-        t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
+            if progressbar:
+                progressbar = tqdm(total=len(t), desc=f"{self.t:.1f} ms")
 
-        if progressbar:
-            progressbar = tqdm(total=ve_t.shape[-1], desc=f"{self.t:.1f} ms")
+        else:
+            if isinstance(time, Waveform):
+                if time._tstop is None:
+                    raise ValueError("Waveform must have a tstop value.")
+                time = time.assemble(dt)
+
+            ve_t = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
+
+            n_chunks = math.ceil(ve_t.shape[-1] / chunklength)
+
+            # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
+            # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
+
+            if multicontact:
+                ve_s = ve_s.expand(-1, self.n_ax, -1)
+                ve_t = ve_t.expand(-1, self.n_ax, -1)
+                einsum = op_mc
+            else:
+                ve_s = ve_s.expand(self.n_ax, -1)
+                ve_t = ve_t.expand(self.n_ax, -1)
+                einsum = op_sc
+
+            t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
+
+            if progressbar:
+                progressbar = tqdm(total=ve_t.shape[-1], desc=f"{self.t:.1f} ms")
 
         if callbacks:
             for c in callbacks:
@@ -810,7 +830,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 reinit = True
             else:
                 reinit = False
-            ve = einsum(ve_s, t_chunk)
+            if functional:
+                ve = einsum(ve_s, time(t_chunk).to(self.dtype()))
+            else:
+                ve = einsum(ve_s, t_chunk)
             with ctx(DTWARN=0):
                 self.run(
                     ve,
@@ -848,7 +871,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
-        ve = torch.zeros(1, self.n_ax, 1, self.n_comp, device=self.device())
+        ve = torch.zeros(1, self.n_ax, 1, self.n_comp, device=self.device(), dtype=self.dtype())
         maxiter = int(tstop / dt)
         with ctx(DTWARN=0):
             for i in tqdm(range(maxiter), desc=f"Steady state [dt:{dt} ms, tstop:{tstop} ms]"):
