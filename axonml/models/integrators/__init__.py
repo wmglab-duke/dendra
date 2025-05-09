@@ -13,6 +13,7 @@ from .explicit import (
 
 from .implicit import (
     _krylov_etd1,
+    _bwd_euler,
 )
 
 
@@ -39,6 +40,7 @@ dufort_frankel = partial(partial_class, _dufort_frankel)
 eulerv1 = partial(partial_class, _eulerv1)
 
 krylov_etd1 = partial(partial_class, _krylov_etd1)
+bwd_euler = partial(partial_class, _bwd_euler)
 
 
 __all__ = [
@@ -49,4 +51,5 @@ __all__ = [
     "rk4",
     "dufort_frankel",
     "krylov_etd1",
+    "bwd_euler",
 ]
