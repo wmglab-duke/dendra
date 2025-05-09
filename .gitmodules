@@ -1,4 +1,0 @@
-[submodule "extern/nmodl"]
-	path = extern/nmodl
-	url = git@gitlab.oit.duke.edu:mah148/nmodl.git
-    ignore = dirty

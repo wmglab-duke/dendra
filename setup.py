@@ -4,7 +4,6 @@ from setuptools import setup, Extension
 from Cython.Build import cythonize
 import numpy as np
 
-nmodl_path: str = (Path(__file__).parent / "extern/nmodl").as_uri()
 
 ext_modules = cythonize(
     [
@@ -21,13 +20,14 @@ ext_modules = cythonize(
 setup(
     install_requires=[
         "numpy",
+        "sympy >= 1.2",
         "torch >= 2.6.0",
+        "scipy",
         "h5py",
         "pytorch_optimizer",
         "tqdm",
         "natsort",
         "dask",
-        f"nmodl @ {nmodl_path}",
     ],
     extras_require={
         "jupyter": ["jupyter"],

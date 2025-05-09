@@ -262,7 +262,6 @@ class _krylov_etd1(Integrator):
     def __init__(self, model, mech, m: int = 4, method='arnoldi', guard=False, imem=None):
         super().__init__(model, mech, imem)
         self.m = m
-        self.mech = mech
 
         B = model.n_ax
         K = model.n_comp
@@ -326,14 +325,13 @@ class _krylov_etd1(Integrator):
     def _step_no_intra(self, v, ve, dt, temp):
         dt_s = dt * 1e-3
         self.mech.advance(v, dt, temp)
-        f_n = -self.mech.i(v).squeeze(1) * self.scale
+        f_n = (self.mech.irev().squeeze(1) - self.mech.i(v).squeeze(1)) * self.scale
         gtot = self.mech.gtot(v).squeeze(1) * self.scale
-        irev = self.mech.irev().squeeze(1) * self.scale
         S = F.conv1d(ve, self.kernel, padding=1).squeeze(1)
         S[:, 0]  = ve[:, 0, 1] - ve[:, 0, 0]       # fix boundary left
         S[:, -1] = ve[:, 0, -2] - ve[:, 0, -1]     # fix boundary right
         S *= self.g_ax
-        f_n = f_n + S + irev
+        f_n = f_n + S
         diag = self.diag - gtot
         v_lin = self._expm(
             v.squeeze(1), dt_s, self.m, diag, self.g_ax, self.g_ax, self.V_buf, self.H_buf
@@ -355,14 +353,13 @@ class _krylov_etd1(Integrator):
     def _step_intra(self, v, ve, dt, temp, intra):
         dt_s = dt * 1e-3
         self.mech.advance(v, dt, temp)
-        f_n = -self.mech.i(v).squeeze(1) * self.scale
+        f_n = (self.mech.irev().squeeze(1) - self.mech.i(v).squeeze(1)) * self.scale
         gtot = self.mech.gtot(v).squeeze(1) * self.scale
-        irev = self.mech.irev().squeeze(1) * self.scale
         S = F.conv1d(ve, self.kernel, padding=1).squeeze(1)
         S[:, 0]  = ve[:, 0, 1] - ve[:, 0, 0]       # fix boundary left
         S[:, -1] = ve[:, 0, -2] - ve[:, 0, -1]     # fix boundary right
         S *= self.g_ax
-        f_n = f_n + S + irev - intra.squeeze(1)
+        f_n = f_n + S - intra.squeeze(1)
         diag = self.diag - gtot
         v_lin = self._expm(
             v.squeeze(1), dt_s, self.m, diag, self.g_ax, self.g_ax, self.V_buf, self.H_buf
@@ -392,3 +389,44 @@ class _krylov_etd1(Integrator):
         if self.imem:
             model.i_membrane[:] = 0.0
             model.i_membrane.detach_()
+
+
+class _bwd_euler(Integrator):
+    """
+    Implicit Euler method.
+    """
+
+    compiler = ImplicitCompiler
+    builder = ImplicitHandlerBuilder
+    is_df = False
+
+    def __init__(self, model, mech, imem=None):
+        if model.n_comp != 1:
+            raise ValueError("Backward Euler currently only supports single compartment models.")
+        
+        super().__init__(model, mech, imem)
+
+        self.register_buffer("cmdt", torch.tensor(0.0))
+
+    def initialize(self, model, dt):
+        self.cmdt = model.cm / dt
+
+    def step(self, model, ve, dt, t_ind):
+        model.v = self._step_no_intra(model.v, ve, dt, model.temp_c)
+
+    def step_intra(self, model, ve, intra, dt, t_ind):
+        model.v = self._step_intra(model.v, ve, dt, model.temp_c, intra)
+
+    @torch.jit.script_method
+    def _step_no_intra(self, v, ve, dt, temp):
+        i = -self.mech.i(v) + self.mech.irev()
+        gtot = self.mech.gtot(v)
+        self.mech.advance(v, dt, temp)
+        return (self.cmdt * v + i) / (self.cmdt + gtot)
+    
+    @torch.jit.script_method
+    def _step_intra(self, v, ve, dt, temp, intra):
+        i = -self.mech.i(v) + self.mech.irev() + intra
+        gtot = self.mech.gtot(v)
+        self.mech.advance(v, dt, temp)
+        return (self.cmdt * v + i) / (self.cmdt + gtot)
