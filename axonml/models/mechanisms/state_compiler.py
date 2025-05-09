@@ -8,7 +8,7 @@ import math
 
 import torch
 
-from nmodl.ode import integrate2c
+from .ode import integrate2c
 
 from .core import State
 from .ops import *
