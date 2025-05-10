@@ -391,7 +391,7 @@ class _krylov_etd1(Integrator):
             model.i_membrane.detach_()
 
 
-class _bwd_euler(Integrator):
+class _bwd_euler_sc(Integrator):
     """
     Implicit Euler method.
     """
@@ -401,31 +401,30 @@ class _bwd_euler(Integrator):
     is_df = False
 
     def __init__(self, model, mech, imem=None):
+        torch.jit.ScriptModule.__init__(self)
         if model.n_comp != 1:
             raise ValueError("Backward Euler currently only supports single compartment models.")
-        
-        super().__init__(model, mech, imem)
-
+        self.mech = mech
         self.register_buffer("cmdt", torch.tensor(0.0))
 
     def initialize(self, model, dt):
         self.cmdt = model.cm / dt
 
-    def step(self, model, ve, dt, t_ind):
-        model.v = self._step_no_intra(model.v, ve, dt, model.temp_c)
+    def step(self, model, dt, t_ind):
+        model.v = self._step_no_intra(model.v, dt, model.temp_c)
 
-    def step_intra(self, model, ve, intra, dt, t_ind):
-        model.v = self._step_intra(model.v, ve, dt, model.temp_c, intra)
+    def step_intra(self, model, intra, dt, t_ind):
+        model.v = self._step_intra(model.v, dt, model.temp_c, intra)
 
     @torch.jit.script_method
-    def _step_no_intra(self, v, ve, dt, temp):
+    def _step_no_intra(self, v, dt, temp):
         i = -self.mech.i(v) + self.mech.irev()
         gtot = self.mech.gtot(v)
         self.mech.advance(v, dt, temp)
         return (self.cmdt * v + i) / (self.cmdt + gtot)
     
     @torch.jit.script_method
-    def _step_intra(self, v, ve, dt, temp, intra):
+    def _step_intra(self, v, dt, temp, intra):
         i = -self.mech.i(v) + self.mech.irev() + intra
         gtot = self.mech.gtot(v)
         self.mech.advance(v, dt, temp)

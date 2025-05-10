@@ -16,7 +16,7 @@ from .ast import (
     replace_v,
     factorize_linear_in_v,
 )
-from .utils import indent, load, get_function_body_as_str
+from .utils import indent, load, get_function_body_as_str, get_function_as_str
 from .compile_f import convert_func, multiply_return_value
 
 from ..core import Mechanism, coupled
@@ -50,6 +50,13 @@ def translate(mech, fname, template):
     else:
         body = indent("return", 2)
     return template.format(fname=fname, ret=body)
+
+
+def translate_if_exists(mech, fname):
+    f = getattr(mech, fname, None)
+    if f:
+        return get_function_as_str(f)
+    return ""
 
 
 mech_inf_template = """
@@ -337,6 +344,7 @@ class MechCompiler:
             breakpoint_f                = translate(mechanism, "breakpoint", default_f),
             generic_f                   = translate(mechanism, "generic", generic_f),
             coupled_infs                = define_coupled_infs(mechanism, states_compiled),
+            net_receive_f               = translate_if_exists(mechanism, "net_receive"),
             irev                        = self.irev(current_eqs, mask),
             gtot                        = gtot,
             current_equations           = current_eqs_str,

@@ -1190,27 +1190,6 @@ class Unmyelinated(Axon):
         return (self.rhoa * dx) / (torch.pi * (radii**2))
 
 
-def single_compartment(model, diameters, L=10*um, **kwargs):
-    """
-    Create a single compartment model for the given diameters.
-
-    Parameters
-    ----------
-    model : Axon
-        The axon model to be used.
-    diameters : array_like
-        Diameters of the axons in μm. Can be a single value, list, or tensor.
-
-    Returns
-    -------
-    Axon
-        A new axon model with a single compartment.
-    """
-    kwargs["dx"] = L
-    kwargs["integrator"] = bwd_euler()
-    return model(diameters, **kwargs)
-
-
 class Myelinated(Axon):
     """
     Base myelinated axon model class.

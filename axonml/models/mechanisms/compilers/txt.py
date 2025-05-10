@@ -117,6 +117,8 @@ class {mech}(torch.nn.Module):
 
 {generic_f}
 
+{net_receive_f}
+
 {coupled_infs}
 
 {current_equations}
