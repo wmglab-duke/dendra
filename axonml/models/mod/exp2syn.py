@@ -29,8 +29,8 @@ class exp2syn(Mechanism):
     def initial(self):
         tau1 = self.DE['A'].tau1
         tau2 = self.DE['B'].tau2
-        tp = (tau1 * tau2) / (tau1 - tau2) * log(tau1 / tau2)
-        factor = -exp(tp / tau1) + exp(-tp / tau2)
+        tp = (tau1 * tau2) / (tau2 - tau1) * log(tau2 / tau1)
+        factor = -exp(-tp / tau1) + exp(-tp / tau2)
         self.factor = 1 / factor
 
     def i(self, v):

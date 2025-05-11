@@ -5,8 +5,9 @@ import torch.nn.functional as F
 
 from axonml.models.mechanisms.compilers import MechCompiler, ImplicitCompiler
 from axonml.models.mechanisms.handler.builders import ImplicitHandlerBuilder
+from axonml.helpers import IMEM
 
-from .core import Integrator
+from .core import Integrator, SCIntegrator
 
 
 @torch.jit.script
@@ -391,7 +392,7 @@ class _krylov_etd1(Integrator):
             model.i_membrane.detach_()
 
 
-class _bwd_euler_sc(Integrator):
+class _bwd_euler_sc(SCIntegrator):
     """
     Implicit Euler method.
     """
@@ -400,15 +401,14 @@ class _bwd_euler_sc(Integrator):
     builder = ImplicitHandlerBuilder
     is_df = False
 
-    def __init__(self, model, mech, imem=None):
-        torch.jit.ScriptModule.__init__(self)
+    def __init__(self, model, mech, imem=None, N=1, P=1, C=1):
         if model.n_comp != 1:
             raise ValueError("Backward Euler currently only supports single compartment models.")
-        self.mech = mech
-        self.register_buffer("cmdt", torch.tensor(0.0))
+        super().__init__(model, mech, imem, N, P, C)
 
+    @torch.jit.ignore
     def initialize(self, model, dt):
-        self.cmdt = model.cm / dt
+        self.cmdt = (1e-6 * model.cm) / (1e-3 * dt)
 
     def step(self, model, dt, t_ind):
         model.v = self._step_no_intra(model.v, dt, model.temp_c)
@@ -418,9 +418,10 @@ class _bwd_euler_sc(Integrator):
 
     @torch.jit.script_method
     def _step_no_intra(self, v, dt, temp):
-        i = -self.mech.i(v) + self.mech.irev()
-        gtot = self.mech.gtot(v)
         self.mech.advance(v, dt, temp)
+        self.mech.i(v)
+        i = self.mech.irev()
+        gtot = self.mech.gtot(v)
         return (self.cmdt * v + i) / (self.cmdt + gtot)
     
     @torch.jit.script_method

@@ -161,10 +161,10 @@ def parse_template(full_state):
     return impl_template.format(mech=mech, state=state, full_state=full_state)
 
 
-def build_recorder_func(states):
+def build_recorder_func(states, network=False):
     res = []
     for s in states:
-        if not is_state(s):
+        if not is_state(s) or network:
             res.append(m_template.format(val=s))
         else:
             res.append(parse_template(s))
@@ -286,7 +286,13 @@ class Recorder(Callback):
     """
 
     def __init__(
-        self, states, max_only=False, node_indices=None, dt=None, sliding_window=None
+        self, 
+        states, 
+        max_only=False, 
+        node_indices=None, 
+        dt=None, 
+        sliding_window=None,
+        network=False
     ):
         super().__init__()
         self.states = states
@@ -294,7 +300,7 @@ class Recorder(Callback):
         self.max_only: bool = max_only
         self.node_indices = node_indices
         self.sliding_window = sliding_window
-        rfunc = build_recorder_func(states)
+        rfunc = build_recorder_func(states, network=network)
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
 

@@ -151,7 +151,7 @@ class MechCompiler:
         assignments = []
         for n in names:
             assignments.append(
-                f"self.register_buffer('{n}', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('{n}', torch.zeros(shape))"
             )
         return indent("\n".join(assignments), 2)
     
@@ -160,7 +160,7 @@ class MechCompiler:
         assignments = []
         for n in names:
             assignments.append(
-                f"self.register_buffer('{n}_', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('{n}_', torch.zeros(shape))"
             )
         return indent("\n".join(assignments), 2)
     
@@ -261,6 +261,7 @@ class MechCompiler:
         ):
         temp = model.temp
         diameters = model.diam
+        shape = model.shape
         n_ax = model.n_ax
         n_comps = model.n_comp
         pade = None if self.PADE < 0 else bool(self.PADE)
@@ -365,6 +366,7 @@ class MechCompiler:
         m = locals()[name](
             temp,
             diameters,
+            shape,
             n_ax,
             n_comps,
             name,
@@ -444,7 +446,7 @@ class DF_Compiler(MechCompiler):
         assignments = []
         for n in names:
             assignments.append(
-                f"self.register_buffer('gtot_{n}', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('gtot_{n}', torch.zeros(shape))"
             )
         return indent("\n".join(assignments), 2)
 
@@ -685,10 +687,10 @@ class ImplicitCompiler(MechCompiler):
         assignments = []
         for n in names:
             assignments.append(
-                f"self.register_buffer('gtot_{n}', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('gtot_{n}', torch.zeros(shape))"
             )
             assignments.append(
-                f"self.register_buffer('irev_{n}', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('irev_{n}', torch.zeros(shape))"
             )
         return indent("\n".join(assignments), 2)
     

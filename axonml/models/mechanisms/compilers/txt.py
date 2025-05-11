@@ -5,8 +5,9 @@ class {mech}(torch.nn.Module):
             self, 
             temp, 
             diameters, 
-            n_ax, 
-            n_comps, 
+            shape,
+            n_ax: int,
+            n_comps: int,
             name: str, 
             params, 
             distributions, 
@@ -29,7 +30,11 @@ class {mech}(torch.nn.Module):
             final_axis = 1
         else:
             final_axis = diameters.shape[-1]
-        self.register_buffer("diam", diameters.view(diameters.shape[0], 1, final_axis))
+        
+        try:
+            self.register_buffer("diam", diameters.view(diameters.shape[0], 1, final_axis))
+        except:
+            self.register_buffer("diam", diameters)
 
         self.DE = torch.nn.ModuleDict(
             {{state._name: state for state in states}}

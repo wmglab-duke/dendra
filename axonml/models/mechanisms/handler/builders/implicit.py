@@ -41,7 +41,7 @@ class MechanismHandler(torch.nn.Module):
 
   def initialize(self, v, v_init, temp) -> None:
     self.ion_init(temp)
-    self.init_buffers(v_init)
+    self.init_buffers(v)
     self.i(v_init)
 
   @torch.jit.export
@@ -91,6 +91,11 @@ class MechanismHandler(torch.nn.Module):
 
   def init_buffers(self, v_init) -> None:
     {init_buffers}
+    return
+
+  @torch.jit.export
+  def net_receive(self, weights) -> None:
+    {net_receive}
     return
 
   @torch.jit.ignore
@@ -177,7 +182,7 @@ def explicit_current(currents, unfactorable) -> str:
                 if current in unfactorable[mech]:
                     result.append(f"{mech}_{current}")
     if not result:
-        return 'torch.tensor(0.0)'
+        return 'torch.tensor([0.0])'
     s = " + ".join(result)
     return s
 
@@ -219,6 +224,14 @@ def parse_currents(
         )
     s = "\n    ".join(result)
     return s
+
+
+def parse_net_receive(mechanisms) -> str:
+    result = []
+    for m in mechanisms:
+        if hasattr(m, "net_receive"):
+            result.append(f"self.{m._name}.net_receive(weights)")
+    return "\n    ".join(result)
 
 
 class ImplicitHandlerBuilder(HandlerBuilder):
@@ -284,6 +297,7 @@ class ImplicitHandlerBuilder(HandlerBuilder):
             mech_update_fs="",
             ion_init=parse_ion_init(ions),
             init_buffers=parse_init_buffers(names),
+            net_receive=parse_net_receive(mechanisms),
             all_states=parse_all_states(mechanisms)
         )
 

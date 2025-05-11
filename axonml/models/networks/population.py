@@ -1,3 +1,4 @@
+import numbers
 from typing import Dict, Tuple
 
 import torch
@@ -6,13 +7,30 @@ from axonml.units import um
 from axonml.models.integrators import bwd_euler_sc
 
 
+def torch_isscalar(x) -> bool:
+    """
+    True for Python scalars (int, float, bool, complex, etc.)
+    and for 0-dim (scalar) torch.Tensors.
+    """
+    # 1) plain Python scalar?
+    if isinstance(x, numbers.Number):
+        return True
+
+    # 2) torch scalar tensor?
+    if torch.is_tensor(x) and x.dim() == 0:
+        return True
+
+    return False
+
+
 class Population:
-    def __init__(self, name, base_model, diam=[10.0 * um], L=10.0 * um, temp=36.0):
+    def __init__(self, name, base_model, diam=[10.0 * um], L=10.0 * um, temp=37.0, v_init=-70.0):
         self.name = name
         self.base_model = base_model
         self.diam = diam
         self.L = L
         self.temp = temp
+        self.v_init = v_init
         self.n = len(diam)
 
     def build(self, N=1, P=1, **kwargs):
@@ -36,15 +54,23 @@ class Population:
         if self.n == 1:
             diameters = self.diam[0] * torch.ones((N, P, 1))
         else:
-            diameters = torch.as_tensor(self.diam, dtype=float)
+            diameters = torch.as_tensor(self.diam, dtype=torch.float)
             diameters = diameters.view(1, 1, self.n).expand(N, P, self.n)
 
         return _single_compartment(
-            N, P, self.base_model, diameters, L=self.L, temp=self.temp, **kwargs
+            N, 
+            P,
+            self.n, 
+            self.base_model, 
+            diameters, 
+            L=self.L, 
+            temp=self.temp, 
+            v_init=self.v_init, 
+            **kwargs
         )
 
 
-def _single_compartment(N, P, model, diameters, L=10 * um, **kwargs):
+def _single_compartment(N, P, C, model, diameters, L=10 * um, **kwargs):
     """
     Create a single compartment model for the given diameters.
 
@@ -62,14 +88,13 @@ def _single_compartment(N, P, model, diameters, L=10 * um, **kwargs):
     """
     kwargs["L"] = L
     kwargs["dx"] = L
-    kwargs["integrator"] = bwd_euler_sc()
+    kwargs["integrator"] = bwd_euler_sc(N=N, P=P, C=C)
     m = model(diameters, **kwargs)
-    m.register_buffer("v", torch.full((N, P, m.n_ax), m.v_init))
     return m
 
 
 def _make_mask(n_pre: int, n_post: int, p) -> torch.Tensor:
-    if torch.isscalar(p):
+    if torch_isscalar(p):
         if not (0.0 <= p <= 1.0):
             raise ValueError("Probability must be in [0,1].")
         return torch.rand(n_pre, n_post) < p
@@ -101,8 +126,10 @@ def connect(pre: str, post: str, p, weight, delay):
     n_pre, n_post = pre.n, post.n
 
     mask = _make_mask(n_pre, n_post, p)  # bool matrix
-    weight_arr = torch.broadcast_to(weight, mask.shape).astype(float)
-    delay_arr = torch.broadcast_to(delay, mask.shape).astype(float)
+    weight = torch.as_tensor(weight)
+    delay = torch.as_tensor(delay)
+    weight_arr = torch.broadcast_to(weight, mask.shape).to(float)
+    delay_arr = torch.broadcast_to(delay, mask.shape).to(float)
 
     return {
         "pre": pre.name,
@@ -135,8 +162,8 @@ def assemble_global_adjacencies(populations, connections, dt, max_delay=None):
         _offsets[pop.name] = (start, start + pop.n)  # (inclusive, exclusive)
         start += pop.n
 
-    W = torch.zeros((N, N), dtype=float)
-    D = torch.zeros((N, N), dtype=float)
+    W = torch.zeros((N, N), dtype=torch.float)
+    D = torch.zeros((N, N), dtype=torch.float)
 
     for c in connections:
         pre0, pre1 = _offsets[c["pre"]]  # slice of pre-cells
@@ -157,7 +184,7 @@ def assemble_global_adjacencies(populations, connections, dt, max_delay=None):
             raise ValueError("max_delay must be greater than dt.")
         max_delay = int(max_delay / dt)
 
-    D = torch.ceil(D / dt).astype(int).clamp(min=1, max=max_delay)
+    D = torch.ceil(D / dt).to(int).clamp(min=1, max=max_delay)
     M = (W != 0).float()
 
     return W, M, D
