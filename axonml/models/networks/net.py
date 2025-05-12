@@ -348,6 +348,7 @@ class Network(torch.jit.ScriptModule):
         self.net = net
         self.dt : float = net.dt.item()
         self.t_ind : int = 0
+        self.eval()
 
     @property
     def t(self):
@@ -377,36 +378,38 @@ class Network(torch.jit.ScriptModule):
         dt = self.dt
         n_steps = int(math.ceil(tstop / dt))
 
-        if reinit:
-            self.net.initialize()
-            self.t_ind = 0
+        with torch.set_grad_enabled(self.training):
 
-        if callbacks is not None:
-            for callback in callbacks:
-                callback.dt = dt
+            if reinit:
+                self.net.initialize()
+                self.t_ind = 0
 
-        if not isinstance(callbacks, CallbackList):
-            callbacks = CallbackList(callbacks)
+            if callbacks is not None:
+                for callback in callbacks:
+                    callback.dt = dt
 
-        callbacks.pre_loop_hook(self)
+            if not isinstance(callbacks, CallbackList):
+                callbacks = CallbackList(callbacks)
 
-        if progressbar:
-            progressbar = tqdm(total=n_steps, desc=f"{self.t:.3f} ms")
-
-        for _ in range(n_steps):
-            self.step()
-            callbacks.post_step_hook(self)
-            self.t_ind += 1
+            callbacks.pre_loop_hook(self)
 
             if progressbar:
-                progressbar.update(1)
-                if self.t_ind % 100 == 0:
-                    progressbar.set_description(f"{self.t:.3f} ms")
+                progressbar = tqdm(total=n_steps, desc=f"{self.t:.3f} ms")
 
-        if progressbar:
-            progressbar.close()
-        
-        callbacks.post_loop_hook(self)
+            for _ in range(n_steps):
+                self.step()
+                callbacks.post_step_hook(self)
+                self.t_ind += 1
+
+                if progressbar:
+                    progressbar.update(1)
+                    if self.t_ind % 100 == 0:
+                        progressbar.set_description(f"{self.t:.3f} ms")
+
+            if progressbar:
+                progressbar.close()
+            
+            callbacks.post_loop_hook(self)
 
 
 def build_network(
