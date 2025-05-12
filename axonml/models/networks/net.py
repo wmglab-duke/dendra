@@ -151,7 +151,6 @@ class _network(torch.nn.Module):
 """
 
 
-@torch.no_grad()
 def weights_by_delay(weight: torch.Tensor, delay: torch.Tensor) -> torch.Tensor:
     D_max = int(delay.max().item())
     Wd: List[torch.Tensor] = []
@@ -168,7 +167,7 @@ class VariableDelaySynapse(torch.jit.ScriptModule):
     returns: (N, P, C)  float
     """
 
-    __constants__ = ["has_intrinsic"]
+    __constants__ = ["has_intrinsic", "P_greater_than_N"]
 
     def __init__(
         self,
@@ -183,16 +182,27 @@ class VariableDelaySynapse(torch.jit.ScriptModule):
     ):
         super().__init__()
 
+        self.W = torch.nn.Parameter(W, requires_grad=False)  # (N,C,C)
+        self.register_buffer("D", D)  # (N,C,C)
+
         W_by_delay = weights_by_delay(W, D)  # (D,N,C,C)
 
         # parameters
         self.register_buffer("M", M)  # (D,N,C,C)
-        self.register_buffer("W", W_by_delay)  # (D,N,C,C)
         self.D_max = W_by_delay.size(0)
         self.D_buf = self.D_max + 1 
         self.N = W_by_delay.size(1)
         self.C = W_by_delay.size(2)
         self.P = int(P)
+
+        self.P_greater_than_N = self.P >= self.N
+
+        if False:
+            Wd = W_by_delay.unsqueeze(2).contiguous()  # (D,N,1,C,C)
+        else:
+            Wd = W_by_delay.contiguous()
+        
+        self.register_buffer("Wd", Wd)
 
         # intrinsic parameters
         self.dt = float(dt)
@@ -222,13 +232,37 @@ class VariableDelaySynapse(torch.jit.ScriptModule):
         )
         self.register_buffer("head", torch.zeros((), dtype=torch.long))
 
+        # pre-compute tensor of slot offsets  [1,2,…,D_max]
+        self.register_buffer(
+            "delay_offsets",
+            torch.arange(self.D_max, dtype=torch.long, device=W_by_delay.device) + 1
+        )
+
+        self.eval()
+
     @torch.jit.export
     def initialize(self) -> None:
         """
         Initialize the synapse state.
         """
-        self.queue.zero_()
-        self.head.zero_()
+        self.queue.zero_().detach_()
+        self.head.zero_().detach_()
+        if self.training:
+            self.Wd.detach_()
+            self.Wd = weights_by_delay(self.W, self.D)  # (D,N,C,C)
+
+    @torch.jit.export
+    def float16(self) -> None:
+        """
+        Convert the synapse weights to float16.
+        """
+        self.Wd = self.Wd.to(torch.float16)
+        self.M = self.M.to(torch.float16)
+        self.D = self.D.to(torch.float16)
+        self.W = self.W.to(torch.float16)
+        self.rate_int = self.rate_int.to(torch.float16)
+        self.w_int = self.w_int.to(torch.float16)
+        self.queue = self.queue.to(torch.float16)
 
     @torch.jit.export
     def set_weights(self, W: torch.Tensor, D: torch.Tensor) -> None:
@@ -237,7 +271,7 @@ class VariableDelaySynapse(torch.jit.ScriptModule):
         """
         W = W * self.M
         W_by_delay = weights_by_delay(W, D)  # (D,N,C,C)
-        self.W.copy_(W_by_delay)  # (D,N,C,C)
+        self.Wd.copy_(W_by_delay)  # (D,N,C,C)
 
     # ------------------------------------------------------------------
     def forward(self, spikes: torch.Tensor) -> torch.Tensor:
@@ -253,14 +287,24 @@ class VariableDelaySynapse(torch.jit.ScriptModule):
         self.head = h                                 # save back
 
         # ── 2. schedule recurrent events ─────────────———
-        s = spikes.to(self.W.dtype).unsqueeze(-2)      # (N,P,1,C)
-        for d, Wd in enumerate(self.W, start=1):       # d = 1 … D_max
-            contrib = torch.matmul(s, Wd.unsqueeze(1)).squeeze(-2)  # (N,P,C)
-            slot = (h + d) % self.D_buf
-            self.queue[slot] += contrib
+        if True:
+            # --- path A: batched GEMM (einsum)  fast when P is long -------
+            contrib = torch.einsum(           # (D,N,P,C)
+                'npj,dnji->dnpi',
+                spikes.to(self.Wd.dtype),
+                self.Wd
+            )
+
+        #  scatter-add into the ring buffer (no loop)
+        slots = (h + self.delay_offsets) % self.D_buf         # (D,)
+        self.queue.view(self.D_buf, -1).index_add_(
+            0,
+            slots,
+            contrib.reshape(self.D_max, -1)
+        )
 
         # ── 3. intrinsic Poisson drive ─────────────———
-        if (self.rate_int > 0).any():
+        if self.has_intrinsic:
             p   = 1.0 - torch.exp(-self.rate_int * self.dt)   # (N,C)
             p   = p.unsqueeze(1)                              # (N,1,C)
             w_i = self.w_int.unsqueeze(1)                     # (N,1,C)
@@ -273,7 +317,6 @@ class VariableDelaySynapse(torch.jit.ScriptModule):
             self.queue[slot_int] += intrinsic
 
         return out
-    
 
 
 class CheckActive(torch.jit.ScriptModule):
@@ -312,6 +355,13 @@ class Network(torch.jit.ScriptModule):
         Current time in the network.
         """
         return self.t_ind * self.dt
+
+    @property
+    def synapses(self):
+        """
+        Synapse object.
+        """
+        return self.net.synapses
 
     @torch.jit.script_method
     def step(self) -> None:
