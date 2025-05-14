@@ -81,6 +81,7 @@ def total_weights(populations, connections, intrinsic):
     Generate the code to compute the total weights for each population.
     """
     total_weights = []
+    no_act = []
     for pop in populations:
         relevant_weights = []
         for c in connections:
@@ -88,6 +89,7 @@ def total_weights(populations, connections, intrinsic):
                 relevant_weights.append(f"{c['pre']}_{c['post']}_weights")
         if not relevant_weights:
             if not pop in intrinsic:
+                no_act.append(pop)
                 continue
             total_weights.append(f"weights_{pop} = self.{pop}_intrinsic()")
             continue
@@ -95,7 +97,7 @@ def total_weights(populations, connections, intrinsic):
         if pop in intrinsic:
             relevant_weights_sum = f"self.{pop}_intrinsic() + {relevant_weights_sum}"
         total_weights.append(f"weights_{pop} = {relevant_weights_sum}")
-    return indent("\n".join(total_weights), 2)
+    return indent("\n".join(total_weights), 2), no_act
 
 
 def split_weights(populations):
@@ -111,12 +113,14 @@ def split_weights(populations):
     return indent(split_weights, 2)
 
 
-def net_receive(populations):
+def net_receive(populations, no_act):
     """
     Generate the code to advance the voltage of each population.
     """
     net_receive = []
     for pop in populations:
+        if pop in no_act:
+            continue
         net_receive.append(net_receive_template.format(pop=pop))
     return indent("\n".join(net_receive), 2)
 
@@ -557,12 +561,14 @@ def build_network(
 
     populations = {pop.name: pop.build(N, P) for pop in populations}
 
+    tw, no_act = total_weights(populations, connections, intrinsic)
+
     forward = template.format(
         advance_v=advance_v(populations),
         compute_spikes=compute_spikes(populations),
         compute_weights=compute_weights(connections),
-        total_weights=total_weights(populations, connections, intrinsic),
-        net_receive=net_receive(populations),
+        total_weights=tw,
+        net_receive=net_receive(populations, no_act),
         synapses_init=synapses_init(synapses),
         check_active_init=check_active_init(populations),
         init_v=init_v(populations),
