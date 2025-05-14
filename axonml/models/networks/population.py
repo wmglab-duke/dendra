@@ -1,5 +1,5 @@
 import numbers
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 import torch
 
@@ -188,3 +188,60 @@ def assemble_global_adjacencies(populations, connections, dt, max_delay=None):
     M = (W != 0).float()
 
     return W, M, D
+
+
+def blocks_by_projection(
+    connections: List[dict],
+    n,
+    dt: float,
+    max_delay=None,
+    dtype: torch.dtype = torch.float32,
+) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Turn the flat list returned by `connect` into a dict:
+        { "pre_post": (W, D) }
+    Each (W, D) pair is a **dense** tensor of shape
+        (n_pre, n_post)
+    ready to be passed to `weights_by_delay`.
+
+    Parameters
+    ----------
+    connections : list of dicts   – from the `connect` helper
+    device      : torch device    – where to allocate W and D
+    dtype       : torch dtype     – weight / delay dtype for tensors
+                                    (delay is stored in torch.int64)
+
+    Returns
+    -------
+    proj2blocks : {f"{pre}_{post}": (W, D)}
+    """
+    proj2blocks: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    if max_delay is not None:
+        if max_delay < 0:
+            raise ValueError("max_delay must be non-negative.")
+        if max_delay < dt:
+            raise ValueError("max_delay must be greater than dt.")
+        max_delay = int(max_delay / dt)
+
+    for c in connections:
+        pre, post = c["pre"], c["post"]
+        msk       = c["mask"]                        # (n_pre,n_post) bool
+        w_arr     = c["weight"]                      # same shape
+        d_arr     = c["delay"]                       # same shape
+
+        d_arr = torch.ceil(d_arr / dt).to(int).clamp(min=1, max=max_delay)
+
+        key = f"{pre}_{post}"
+        if key not in proj2blocks:
+            # allocate empty blocks once per projection
+            n_pre, n_post = n[pre], n[post]
+            W = torch.zeros((n_pre, n_post), dtype=dtype)
+            D = torch.zeros((n_pre, n_post), dtype=torch.int64)
+            proj2blocks[key] = (W, D)
+
+        W, D = proj2blocks[key]
+        W[msk] = torch.as_tensor(w_arr[msk], dtype=dtype)
+        D[msk] = torch.as_tensor(d_arr[msk], dtype=torch.int64)
+
+    return proj2blocks
