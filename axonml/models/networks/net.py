@@ -1,5 +1,5 @@
 import linecache
-from typing import List
+from typing import List, Dict
 
 from tqdm.auto import tqdm
 import torch, torch.nn as nn, math
@@ -165,6 +165,16 @@ def synapses_init(synapses):
     return indent("\n".join(synapses_init), 2)
 
 
+def initrinsic_init(intrinsic):
+    """
+    Generate the code to advance the voltage of each population.
+    """
+    intrinsic_init = []
+    for i in intrinsic:
+        intrinsic_init.append(f"self.{i}_intrinsic.initialize()")
+    return indent("\n".join(intrinsic_init), 2)
+
+
 def check_active_init(populations):
     """
     Generate the code to advance the voltage of each population.
@@ -206,6 +216,7 @@ class _network(torch.nn.Module):
     @torch.jit.ignore
     def initialize(self):
 {synapses_init}
+{intrinsic_init}
 {check_active_init}
 {init_v}
 {init_integrator}
@@ -391,7 +402,9 @@ class VariableDelaySynapse(torch.jit.ScriptModule):
         return out
 
 
-class Intrinsic(torch.jit.ScriptModule):
+class Intrinsic(torch.nn.Module):
+
+    scheduled_stimuli: Dict[int, torch.Tensor]
 
     def __init__(
         self,
@@ -407,7 +420,8 @@ class Intrinsic(torch.jit.ScriptModule):
         self.P = P
         self.C = C
 
-        self.dt = float(dt)
+        self.dt : float = float(dt)
+        self.t_ind : int = 0
         self.register_buffer(
             "rate_int",
             torch.as_tensor(rate_int, dtype=torch.float).expand(self.N, self.C).clone(),
@@ -417,6 +431,23 @@ class Intrinsic(torch.jit.ScriptModule):
             torch.as_tensor(w_int, dtype=torch.float).expand(self.N, self.C).clone(),
         )  # (N,C)
 
+        self.scheduled_stimuli = {}
+
+    @torch.jit.export
+    def initialize(self) -> None:
+        """
+        Initialize the intrinsic state.
+        """
+        self.t_ind = 0
+
+    @torch.jit.export
+    def schedule_stimulus(self, weight, time: float) -> None:
+        time_int = int(time / self.dt)
+        if time_int in self.scheduled_stimuli:
+            raise ValueError(f"Stimulus at time {time} already scheduled.")
+        self.scheduled_stimuli[time_int] = weight
+
+    @torch.jit.export
     def forward(self):
         """
         intrinsic : (N,P,C)
@@ -427,6 +458,57 @@ class Intrinsic(torch.jit.ScriptModule):
         rand = torch.rand(self.N, self.P, self.C,
                           dtype=self.w_int.dtype, device=self.w_int.device)
         intrinsic = (rand < p).to(self.w_int.dtype) * w_i  # (N,P,C)
+        if self.t_ind in self.scheduled_stimuli:
+            intrinsic += self.scheduled_stimuli[self.t_ind].to(intrinsic.dtype)
+        self.t_ind += 1
+        return intrinsic
+
+
+class IntrinsicStimOnly(torch.nn.Module):
+
+    scheduled_stimuli: Dict[int, torch.Tensor]
+
+    def __init__(
+        self,
+        N: int,
+        P: int,
+        C: int,
+        dt: float,
+    ):
+        super().__init__()
+        self.N = N
+        self.P = P
+        self.C = C
+
+        self.dt : float = float(dt)
+        self.t_ind : int = 0
+
+        self.scheduled_stimuli = {}
+        self.register_buffer("stimulus", torch.zeros((N, P, C), dtype=torch.float))
+
+    @torch.jit.export
+    def initialize(self) -> None:
+        """
+        Initialize the intrinsic state.
+        """
+        self.t_ind = 0
+
+    @torch.jit.export
+    def schedule_stimulus(self, weight, time: float) -> None:
+        time_int = int(time / self.dt)
+        if time_int in self.scheduled_stimuli:
+            raise ValueError(f"Stimulus at time {time} already scheduled.")
+        self.scheduled_stimuli[time_int] = weight
+
+    @torch.jit.export
+    def forward(self):
+        """
+        intrinsic : (N,P,C)
+        """
+        intrinsic = self.stimulus
+        if self.t_ind in self.scheduled_stimuli:
+            intrinsic = intrinsic + self.scheduled_stimuli[self.t_ind].to(intrinsic.dtype)
+        self.t_ind += 1
         return intrinsic
 
 
@@ -467,6 +549,26 @@ class Network(torch.jit.ScriptModule):
         Current time in the network.
         """
         return self.t_ind * self.dt
+
+    def s(self, pre, post):
+        """
+        Get the synapse object for a given pre and post population.
+        """
+        return getattr(self.net, f"synapses_{pre}_{post}")
+
+    def p(self, name):
+        """
+        Get the population object for a given name.
+        """
+        return getattr(self.net, name)
+
+    def schedule_stimulus(self, pop, weight, time: float) -> None:
+        """
+        Schedule a stimulus for a given time.
+        """
+        if not hasattr(self.net, f"{pop}_intrinsic"):
+            raise ValueError(f"Population {pop} does not have intrinsic.")
+        getattr(self.net, f"{pop}_intrinsic").schedule_stimulus(weight, time)
 
     @torch.jit.script_method
     def step(self) -> None:
@@ -554,14 +656,19 @@ def build_network(
             dt=dt,
         )
 
+    intrinsic_ = {}
+
     if intrinsic is not None:
-        intrinsic = {
-            name: Intrinsic(N, P, n[name], dt, r, w) for name, (r, w) in intrinsic.items()
-        }
+        for name, (r, w) in intrinsic.items():
+            intrinsic_[name] = Intrinsic(N, P, n[name], dt, r, w)
+
+    for name in n:
+        if name not in intrinsic_:
+            intrinsic_[name] = IntrinsicStimOnly(N, P, n[name], dt)
 
     populations = {pop.name: pop.build(N, P) for pop in populations}
 
-    tw, no_act = total_weights(populations, connections, intrinsic)
+    tw, no_act = total_weights(populations, connections, intrinsic_)
 
     forward = template.format(
         advance_v=advance_v(populations),
@@ -570,6 +677,7 @@ def build_network(
         total_weights=tw,
         net_receive=net_receive(populations, no_act),
         synapses_init=synapses_init(synapses),
+        intrinsic_init=initrinsic_init(intrinsic),
         check_active_init=check_active_init(populations),
         init_v=init_v(populations),
         init_integrator=init_integrator(populations),
@@ -587,7 +695,7 @@ def build_network(
     linecache.cache[filename] = (len(forward), None, lines, filename)
 
     n = locals()["_network"](
-        populations, synapses, check_active, intrinsic, dt
+        populations, synapses, check_active, intrinsic_, dt
     )
 
     net = Network(n)

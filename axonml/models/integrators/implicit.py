@@ -40,7 +40,7 @@ def arnoldi(
         w[:, 1:] += g_left * V[:, :-1, j]
 
         Vj = V[:, :, : j + 1]  # (B,K,j+1)
-        coef = torch.einsum("bkj,bk->bj", Vj, w)  # (B,j+1)
+        coef = torch.einsum("bkj,bk->bj", Vj, w)   # (B,j+1)
         w -= torch.einsum("bj,bkj->bk", coef, Vj)  # update
         H[:, : j + 1, j] = coef
 
@@ -67,8 +67,8 @@ def lanczos(
     T = T_buf.narrow(1, 0, m).narrow(2, 0, m).zero_()
 
     # β₀ = ∥v0∥, and v₁ = v0/β₀
-    β0 = torch.linalg.norm(v0, dim=1)
-    V[:, :, 0] = v0 / β0[:, None]
+    b0 = torch.linalg.norm(v0, dim=1)
+    V[:, :, 0] = v0 / b0[:, None]
     prev_v = torch.zeros_like(v0)  # just store last v_j
 
     for j in range(m):
@@ -80,35 +80,35 @@ def lanczos(
 
         if j == 0:
             # First step: subtract α₀ v₁
-            α = (vj * w).sum(dim=1)          # (B,)
-            w = w - α[:, None] * vj
+            a = (vj * w).sum(dim=1)          # (B,)
+            w = w - a[:, None] * vj
         else:
             # Two-term orthogonalization in one fused einsum
             V2    = torch.stack([vj, prev_v], dim=2)     # (B,K,2)
             coeff = torch.einsum("bkj,bk->bj", V2, w)    # (B,2)
-            α     = coeff[:, 0]                          # α_j = <vj,w>
+            a     = coeff[:, 0]                          # α_j = <vj,w>
             # subtract α_j vj + β_{j-1} prev_v
             w     = w - torch.einsum("bj,bkj->bk", coeff, V2)
 
         # recompute β_j = ∥w∥
-        β = torch.linalg.norm(w, dim=1)  # (B,)
+        b = torch.linalg.norm(w, dim=1)  # (B,)
 
         # fill T and next basis vector
-        T[:, j, j] = α
+        T[:, j, j] = a
         if j + 1 < m:
-            T[:, j, j+1] = β
-            T[:, j+1, j] = β
-            V[:, :, j+1] = w / β[:, None]
+            T[:, j, j+1] = b
+            T[:, j+1, j] = b
+            V[:, :, j+1] = w / b[:, None]
             prev_v       = vj
 
-    return V, T, β0
+    return V, T, b0
 
 
 @torch.jit.script
 def expm_krylov_arnoldi(v, h, m: int, diag, g_left, g_right, V, H):
     V, H, beta = arnoldi(v, m, diag, g_left, g_right, V, H)
     expH = torch.matrix_exp(h * H)              # (B,m,m)
-    y = expH[..., 0] * beta.unsqueeze(1)    # (B,m,1)
+    y = expH[..., 0] * beta.unsqueeze(1)        # (B,m,1)
     return torch.einsum('bkm,bm->bk', V, y)
 
 
@@ -116,7 +116,7 @@ def expm_krylov_arnoldi(v, h, m: int, diag, g_left, g_right, V, H):
 def expm_krylov_lanczos(v, h, m: int, diag, g_left, g_right, V, H):
     V, H, beta = lanczos(v, m, diag, g_left, g_right, V, H)
     expH = torch.matrix_exp(h * H)              # (B,m,m)
-    y = expH[..., 0] * beta.unsqueeze(1)    # (B,m,1)
+    y = expH[..., 0] * beta.unsqueeze(1)        # (B,m,1)
     return torch.einsum('bkm,bm->bk', V, y)
 
 
