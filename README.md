@@ -3,7 +3,7 @@
 </div>
 
 ***
-World's fastest neural fiber simulator. Implement and train high-throughput GPU-compatible models.
+Fast and scalable neural fiber simulator. Implement and train high-throughput GPU-compatible models.
 
 ## ❗Requirements
 
