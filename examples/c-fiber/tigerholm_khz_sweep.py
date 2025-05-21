@@ -109,9 +109,9 @@ anomalous, raster = run(model, all_params, steady_state=steady_state)
 n_anomalous = np.count_nonzero(anomalous)
 
 if n_anomalous > 0 and rerun_anomalies:
-    print(f'{n_anomalous} anomalies detected. Trying with ETD1 integrator & 64-bit math.')
+    print(f'{n_anomalous} anomalies detected. Trying with Implicit Euler integrator & 64-bit math.')
     robust_model = model_type(
-        [1.0*um]*n_anomalous, L=L*mm, dx=10.0*um, integrator=ax.krylov_etd1(m=6)
+        [1.0*um]*n_anomalous, L=L*mm, dx=10.0*um, integrator=ax.bwd_euler_ub()
     ).double()
     rerun_params = [all_params[i] for i, f in enumerate(anomalous) if f]
     anomalous_r, raster_r = run(robust_model, rerun_params, '_robust', steady_state=steady_state)

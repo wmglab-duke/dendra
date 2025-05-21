@@ -3,12 +3,13 @@ from axonml.helpers import IMEM
 
 import inspect
 
+
 def get_init_defaults(cls):
     signature = inspect.signature(cls.__init__)
     return {
         k: v.default
         for k, v in signature.parameters.items()
-        if v.default is not inspect.Parameter.empty and k != 'self'
+        if v.default is not inspect.Parameter.empty and k != "self"
     }
 
 
@@ -48,7 +49,6 @@ class Integrator(torch.jit.ScriptModule):
 
 
 class SCIntegrator(torch.jit.ScriptModule):
-
     def __init__(self, model, mech, imem=None, N=1, P=1, C=1):
         super().__init__()
         self.mech = mech
@@ -61,7 +61,7 @@ class SCIntegrator(torch.jit.ScriptModule):
     @classmethod
     def shape(cls, n_ax, n_comp):
         defaults = get_init_defaults(cls)
-        return (defaults['N'], defaults['P'], defaults['C'])
+        return (defaults["N"], defaults["P"], defaults["C"])
 
     def init_v(self, model):
         model.v[:] = model.v_init
