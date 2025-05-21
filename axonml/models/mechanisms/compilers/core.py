@@ -16,7 +16,7 @@ from .ast import (
     replace_v,
     factorize_linear_in_v,
 )
-from .utils import indent, load, get_function_body_as_str
+from .utils import indent, load, get_function_body_as_str, get_function_as_str
 from .compile_f import convert_func, multiply_return_value
 
 from ..core import Mechanism, coupled
@@ -50,6 +50,13 @@ def translate(mech, fname, template):
     else:
         body = indent("return", 2)
     return template.format(fname=fname, ret=body)
+
+
+def translate_if_exists(mech, fname):
+    f = getattr(mech, fname, None)
+    if f:
+        return get_function_as_str(f)
+    return ""
 
 
 mech_inf_template = """
@@ -144,7 +151,7 @@ class MechCompiler:
         assignments = []
         for n in names:
             assignments.append(
-                f"self.register_buffer('{n}', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('{n}', torch.zeros(shape))"
             )
         return indent("\n".join(assignments), 2)
     
@@ -153,7 +160,7 @@ class MechCompiler:
         assignments = []
         for n in names:
             assignments.append(
-                f"self.register_buffer('{n}_', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('{n}_', torch.zeros(shape))"
             )
         return indent("\n".join(assignments), 2)
     
@@ -254,6 +261,7 @@ class MechCompiler:
         ):
         temp = model.temp
         diameters = model.diam
+        shape = model.shape
         n_ax = model.n_ax
         n_comps = model.n_comp
         pade = None if self.PADE < 0 else bool(self.PADE)
@@ -337,6 +345,7 @@ class MechCompiler:
             breakpoint_f                = translate(mechanism, "breakpoint", default_f),
             generic_f                   = translate(mechanism, "generic", generic_f),
             coupled_infs                = define_coupled_infs(mechanism, states_compiled),
+            net_receive_f               = translate_if_exists(mechanism, "net_receive"),
             irev                        = self.irev(current_eqs, mask),
             gtot                        = gtot,
             current_equations           = current_eqs_str,
@@ -357,6 +366,7 @@ class MechCompiler:
         m = locals()[name](
             temp,
             diameters,
+            shape,
             n_ax,
             n_comps,
             name,
@@ -436,7 +446,7 @@ class DF_Compiler(MechCompiler):
         assignments = []
         for n in names:
             assignments.append(
-                f"self.register_buffer('gtot_{n}', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('gtot_{n}', torch.zeros(shape))"
             )
         return indent("\n".join(assignments), 2)
 
@@ -677,10 +687,10 @@ class ImplicitCompiler(MechCompiler):
         assignments = []
         for n in names:
             assignments.append(
-                f"self.register_buffer('gtot_{n}', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('gtot_{n}', torch.zeros(shape))"
             )
             assignments.append(
-                f"self.register_buffer('irev_{n}', torch.zeros((n_ax, 1, n_comps)))"
+                f"self.register_buffer('irev_{n}', torch.zeros(shape))"
             )
         return indent("\n".join(assignments), 2)
     

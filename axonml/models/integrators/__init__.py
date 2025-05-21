@@ -11,10 +11,7 @@ from .explicit import (
     _dufort_frankel,
 )
 
-from .implicit import (
-    _krylov_etd1,
-    _bwd_euler,
-)
+from .implicit import _krylov_etd1, _bwd_euler_sc, _bwd_euler_ub
 
 
 def partial_class(cls: Type[Any], /, *args, **kwargs) -> Type[Any]:
@@ -40,7 +37,8 @@ dufort_frankel = partial(partial_class, _dufort_frankel)
 eulerv1 = partial(partial_class, _eulerv1)
 
 krylov_etd1 = partial(partial_class, _krylov_etd1)
-bwd_euler = partial(partial_class, _bwd_euler)
+bwd_euler_sc = partial(partial_class, _bwd_euler_sc)
+bwd_euler_ub = partial(partial_class, _bwd_euler_ub)
 
 
 __all__ = [
@@ -51,5 +49,6 @@ __all__ = [
     "rk4",
     "dufort_frankel",
     "krylov_etd1",
-    "bwd_euler",
+    "bwd_euler_sc",
+    "bwd_euler_ub",
 ]

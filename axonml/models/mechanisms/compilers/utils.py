@@ -103,3 +103,22 @@ def get_function_body_as_str(func):
     body_lines = source_lines[1:]  # Skip the first line (def line)
     body = "".join(body_lines)  # Combine into a single string
     return body
+
+
+def get_function_as_str(func):
+    """
+    Extracts the entire function as a string, including its definition.
+
+    Parameters
+    ----------
+    func : function
+        The function to be extracted.
+
+    Returns
+    -------
+    str
+        The entire function as a string.
+    """
+    source_lines = inspect.getsourcelines(func)[0]  # Get source code as lines
+    body = "".join(source_lines)  # Combine into a single string
+    return body

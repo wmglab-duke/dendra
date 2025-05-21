@@ -26,7 +26,7 @@ from axonml.models.mechanisms.mech_compiler import compile_mechanism
 from axonml.units import mm, um
 from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
 from axonml.models.interfaces import HandlerInterface
-from axonml.models.integrators import euler, dufort_frankel, bwd_euler
+from axonml.models.integrators import euler, dufort_frankel
 
 from axonml.helpers import (
     op_mc, op_sc, ve_from_s_t, 
@@ -145,6 +145,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.n_comp = n_comp
         self.temp = temp
         self.v_init = v_init
+        self.shape = integrator.shape(self.n_ax, self.n_comp)
 
         self.register_buffer("_dummy", torch.zeros(1))
 
@@ -486,6 +487,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             ion_style = self.get_ion_style(ion)
             ions[ion] = build_ion(
                 ion,
+                self.shape,
                 self.n_ax,
                 self.n_comp,
                 self._m_list,
@@ -895,13 +897,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
     def initialize(self, v, v_init, temp):
         self.integrator.mech.initialize(v, v_init, temp)
 
-    @torch.jit.script_method
-    def get_state(self, s: str) -> Tensor:
-        if s == "v":
-            return self.v
-        mech, state = s.split(".")
-        return self.integrator.mech.get(mech, state)
-
     def load(self, state_dict):
         """
         Load model weights from a state dictionary.
@@ -1188,27 +1183,6 @@ class Unmyelinated(Axon):
         dx = torch.full_like(diameters, self.dx / 10000)
         radii = diameters / 20000
         return (self.rhoa * dx) / (torch.pi * (radii**2))
-
-
-def single_compartment(model, diameters, L=10*um, **kwargs):
-    """
-    Create a single compartment model for the given diameters.
-
-    Parameters
-    ----------
-    model : Axon
-        The axon model to be used.
-    diameters : array_like
-        Diameters of the axons in μm. Can be a single value, list, or tensor.
-
-    Returns
-    -------
-    Axon
-        A new axon model with a single compartment.
-    """
-    kwargs["dx"] = L
-    kwargs["integrator"] = bwd_euler()
-    return model(diameters, **kwargs)
 
 
 class Myelinated(Axon):
