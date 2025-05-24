@@ -400,13 +400,15 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         **kwargs
             Additional keyword arguments to be passed to the compile_mechanism function.
         """
+        if mechanism.__name__ in self._m_name:
+            raise ValueError(f"Mechanism {mechanism.__name__} already exists in the model.")
+
         validate(mechanism)
 
         m, unfactorable, has_gtot, divide_by_two = self.compiler.compile(
             mechanism, 
             self, 
             ic=ic,
-            mask_out=mask_out,
             mask_in=mask_in,
             **kwargs,
         )
@@ -428,6 +430,16 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
         for k, v in mechanism._write_ion_c.items():
             self._ion_write_c.setdefault(k, {}).update({mechanism.__name__: v})
+
+    def insert_at(self, index, mechanism, ic=None, **kwargs):
+        if isinstance(index, int):
+            index = [index]
+        if isinstance(index, str):
+            index = self.cid.loc(index)
+        if isinstance(index, list):
+            if all(isinstance(i, str) for i in index):
+                index = self.cid.locs(index)
+        self.insert(mechanism, ic=ic, mask_in=index, **kwargs)
 
     def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
         assert ion in valid_ions(), f"Invalid ion: {ion}"
