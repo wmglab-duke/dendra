@@ -108,6 +108,383 @@ def pcr_tridiag_solve(
     return d / b
 
 
+def inv2(mat):                     # mat : (...,2,2)
+    a,b = mat[...,0,0], mat[...,0,1]
+    c,d = mat[...,1,0], mat[...,1,1]
+    det = a*d - b*c
+    out = torch.stack([ d, -b, -c, a], dim=-1).reshape_as(mat)
+    return out / det[...,None,None]
+
+
+def inv3(mat: torch.Tensor) -> torch.Tensor:
+    """
+    Fast inverse of a batch of 3×3 matrices.
+    mat shape (...,3,3) – works on any device / dtype
+    """
+
+    # ─── entries ──────────────────────────────────────────────────────────
+    a, b, c = mat[..., 0, 0], mat[..., 0, 1], mat[..., 0, 2]
+    d, e, f = mat[..., 1, 0], mat[..., 1, 1], mat[..., 1, 2]
+    g, h, i = mat[..., 2, 0], mat[..., 2, 1], mat[..., 2, 2]
+
+    # ─── cofactors Cij (sign-included) ────────────────────────────────────
+    C00 =   e * i - f * h
+    C01 = -(d * i - f * g)
+    C02 =   d * h - e * g
+
+    C10 = -(b * i - c * h)
+    C11 =   a * i - c * g
+    C12 = -(a * h - b * g)
+
+    C20 =   b * f - c * e
+    C21 = -(a * f - c * d)
+    C22 =   a * e - b * d
+
+    cof = torch.stack([C00, C01, C02,
+                       C10, C11, C12,
+                       C20, C21, C22], dim=-1).reshape_as(mat)   # (...,3,3)
+
+    # ─── determinant (dot first row with *its* cofactors) ────────────────
+    det = a * C00 + b * C01 + c * C02           # <-- fixed line
+
+    # ─── inverse = adj(det) / det ────────────────────────────────────────
+    adj = cof.transpose(-1, -2)
+    return adj / det[..., None, None]
+
+
+@torch.jit.script
+def pcr_block_tridiag_solve_2(
+    a_in: torch.Tensor, b_in: torch.Tensor, c_in: torch.Tensor, d_in: torch.Tensor
+) -> torch.Tensor:
+    """
+    Parallel Cyclic Reduction for block tridiagonal systems.
+    Solves (A_in_i * x_i-1) + (B_in_i * x_i) + (C_in_i * x_i+1) = D_in_i for x_i.
+
+    Args:
+        a_in (torch.Tensor): Lower block diagonal. Shape: (Batch, K, M, M).
+                             a_in[:, k] is the block A_{k+1}.
+        b_in (torch.Tensor): Main block diagonal. Shape: (Batch, K, M, M).
+                             b_in[:, k] is the block B_k.
+        c_in (torch.Tensor): Upper block diagonal. Shape: (Batch, K, M, M).
+                             c_in[:, k] is the block C_k.
+        d_in (torch.Tensor): Right-hand side. Shape: (Batch, K, M) or (Batch, K, M, 1).
+                             d_in[:, k] is the vector D_k.
+
+    Returns:
+        torch.Tensor: Solution x. Shape: (Batch, K, M).
+    """
+    B, K, M, _ = b_in.shape
+
+    a = torch.zeros(B, K, M, M, dtype=b_in.dtype, device=b_in.device)
+    c = torch.zeros_like(a)
+
+    a[:, 1:] = a_in
+    c[:, :-1] = c_in
+
+    b = b_in.clone()
+    d = d_in.clone()
+
+    stride = 1
+    while stride < K:
+        left = stride
+        right = K - stride  # exclusive upper bound
+        if left >= right:  # no rows with both neighbours remain
+            break
+
+        # Indices of the equations we are updating in this pass
+        # These equations must have valid left (i-stride) and right (i+stride) neighbors
+        idx = torch.arange(left, right, device=b.device)
+
+        # Gather current coefficients for equations 'i' (idx)
+        a_i = a[:, idx]  # Shape: (B, num_active_rows, M, M)
+        b_i = b[:, idx]  # Shape: (B, num_active_rows, M, M)
+        c_i = c[:, idx]  # Shape: (B, num_active_rows, M, M)
+        d_i = d[:, idx]  # Shape: (B, num_active_rows, M)
+
+        # Gather coefficients from left neighbors 'l' (idx - stride)
+        a_l = a[:, idx - stride]
+        b_l = b[:, idx - stride]
+        c_l = c[:, idx - stride]
+        d_l = d[:, idx - stride] # Shape: (B, num_active_rows, M)
+
+        # Gather coefficients from right neighbors 'r' (idx + stride)
+        a_r = a[:, idx + stride]
+        b_r = b[:, idx + stride]
+        c_r = c[:, idx + stride]
+        d_r = d[:, idx + stride] # Shape: (B, num_active_rows, M)
+
+        # Compute reduction factors (block matrices)
+        # Alpha_i = A_i * B_l^{-1}
+        # Gamma_i = C_i * B_r^{-1}
+        alpha = a_i @ inv2(b_l) # Shape: (B, num_active_rows, M, M)
+        gamma = c_i @ inv2(b_r) # Shape: (B, num_active_rows, M, M)
+
+        b[:, idx] = b_i - (alpha @ c_l) - (gamma @ a_r)
+        
+        d_l_unsqueezed = d_l.unsqueeze(-1) # Shape: (B, num_active_rows, M, 1)
+        d_r_unsqueezed = d_r.unsqueeze(-1) # Shape: (B, num_active_rows, M, 1)
+        
+        d[:, idx] = (
+            d_i - (alpha @ d_l_unsqueezed).squeeze(-1) - (gamma @ d_r_unsqueezed).squeeze(-1)
+        )
+        
+        # A_new_i = -Alpha_i * A_l
+        a[:, idx] = -(alpha @ a_l)
+        
+        # C_new_i = -Gamma_i * C_r
+        c[:, idx] = -(gamma @ c_r)
+
+        stride <<= 1 # Double the stride: stride = stride * 2
+
+    # After reduction, a and c are effectively zero (or store negligible values),
+    # and the system B_final * x = D_final is block-diagonal.
+    # Solve B_k * x_k = D_k for each k.
+    # d has shape (B, K, M), b has shape (B, K, M, M)
+    # We need to solve Bx = D -> x = B^{-1}D
+    # torch.linalg.solve expects D to be (..., M, Nrhs), so unsqueeze d
+    solution, _ = torch.linalg.solve_ex(b, d.unsqueeze(-1)) # Shape: (B, K, M, 1)
+    return solution.squeeze(-1) # Shape: (B, K, M)
+
+
+@torch.jit.script
+def pcr_block_tridiag_solve(
+    a_in: torch.Tensor, b_in: torch.Tensor, c_in: torch.Tensor, d_in: torch.Tensor
+) -> torch.Tensor:
+    """
+    Parallel Cyclic Reduction for block tridiagonal systems.
+    Solves (A_in_i * x_i-1) + (B_in_i * x_i) + (C_in_i * x_i+1) = D_in_i for x_i.
+
+    Args:
+        a_in (torch.Tensor): Lower block diagonal. Shape: (Batch, K, M, M).
+                             a_in[:, k] is the block A_{k+1}.
+        b_in (torch.Tensor): Main block diagonal. Shape: (Batch, K, M, M).
+                             b_in[:, k] is the block B_k.
+        c_in (torch.Tensor): Upper block diagonal. Shape: (Batch, K, M, M).
+                             c_in[:, k] is the block C_k.
+        d_in (torch.Tensor): Right-hand side. Shape: (Batch, K, M) or (Batch, K, M, 1).
+                             d_in[:, k] is the vector D_k.
+
+    Returns:
+        torch.Tensor: Solution x. Shape: (Batch, K, M).
+    """
+    B, K, M, _ = b_in.shape
+
+    a = torch.zeros(B, K, M, M, dtype=b_in.dtype, device=b_in.device)
+    c = torch.zeros_like(a)
+
+    a[:, 1:] = a_in
+    c[:, :-1] = c_in
+
+    b = b_in.clone()
+    d = d_in.clone()
+
+    stride = 1
+    while stride < K:
+        left = stride
+        right = K - stride  # exclusive upper bound
+        if left >= right:  # no rows with both neighbours remain
+            break
+
+        # Indices of the equations we are updating in this pass
+        # These equations must have valid left (i-stride) and right (i+stride) neighbors
+        idx = torch.arange(left, right, device=b.device)
+
+        # Gather current coefficients for equations 'i' (idx)
+        a_i = a[:, idx]  # Shape: (B, num_active_rows, M, M)
+        b_i = b[:, idx]  # Shape: (B, num_active_rows, M, M)
+        c_i = c[:, idx]  # Shape: (B, num_active_rows, M, M)
+        d_i = d[:, idx]  # Shape: (B, num_active_rows, M)
+
+        # Gather coefficients from left neighbors 'l' (idx - stride)
+        a_l = a[:, idx - stride]
+        b_l = b[:, idx - stride]
+        c_l = c[:, idx - stride]
+        d_l = d[:, idx - stride] # Shape: (B, num_active_rows, M)
+
+        # Gather coefficients from right neighbors 'r' (idx + stride)
+        a_r = a[:, idx + stride]
+        b_r = b[:, idx + stride]
+        c_r = c[:, idx + stride]
+        d_r = d[:, idx + stride] # Shape: (B, num_active_rows, M)
+
+        # Compute reduction factors (block matrices)
+        # Alpha_i = A_i * B_l^{-1}
+        # Gamma_i = C_i * B_r^{-1}
+        alpha = a_i @ inv3(b_l) # Shape: (B, num_active_rows, M, M)
+        gamma = c_i @ inv3(b_r) # Shape: (B, num_active_rows, M, M)
+
+        b[:, idx] = b_i - (alpha @ c_l) - (gamma @ a_r)
+        
+        d_l_unsqueezed = d_l.unsqueeze(-1) # Shape: (B, num_active_rows, M, 1)
+        d_r_unsqueezed = d_r.unsqueeze(-1) # Shape: (B, num_active_rows, M, 1)
+        
+        d[:, idx] = (
+            d_i - (alpha @ d_l_unsqueezed).squeeze(-1) - (gamma @ d_r_unsqueezed).squeeze(-1)
+        )
+        
+        # A_new_i = -Alpha_i * A_l
+        a[:, idx] = -(alpha @ a_l)
+        
+        # C_new_i = -Gamma_i * C_r
+        c[:, idx] = -(gamma @ c_r)
+
+        stride <<= 1 # Double the stride: stride = stride * 2
+
+    # After reduction, a and c are effectively zero (or store negligible values),
+    # and the system B_final * x = D_final is block-diagonal.
+    # Solve B_k * x_k = D_k for each k.
+    # d has shape (B, K, M), b has shape (B, K, M, M)
+    # We need to solve Bx = D -> x = B^{-1}D
+    # torch.linalg.solve expects D to be (..., M, Nrhs), so unsqueeze d
+    solution, _ = torch.linalg.solve_ex(b, d.unsqueeze(-1)) # Shape: (B, K, M, 1)
+    return solution.squeeze(-1) # Shape: (B, K, M)
+
+
+def assemble_rhs_no_intra(
+    vc: torch.Tensor,           # (B,K,M)   voltages at tᶰ
+    g_cm: torch.Tensor,         # (B,K)     C_m / dt            (membrane cap)
+    gcap: torch.Tensor,         # (B,K,M-1) x_c[j] / dt         (all shell caps)
+    g_rad: torch.Tensor,        # (B,K)     xg_out + xcout/dt   (outermost interface)
+    ve: torch.Tensor,           # (B,K)     extcell potential
+    ires: torch.Tensor,         # (B,K)     residual current
+    irev: torch.Tensor,         # (B,K)     reversal potential
+) -> torch.Tensor:
+    """
+    Assemble RHS d for a block-tridiagonal fibre with M unknowns per axial node.
+
+    Returns
+    -------
+    d : (B,K,M)
+    """
+    _, _, M = vc.shape
+    d = torch.zeros_like(vc)                # (B,K,M)
+
+    # ------------------------------------------------------------------
+    # 1) membrane capacitor between v_i (0) and v_e0 (1)
+    # ------------------------------------------------------------------
+    dv_m = (vc[:, :, 0] - vc[:, :, 1])        # (B,K)
+    d[:, :, 0] +=  g_cm * dv_m
+    d[:, :, 1] += -g_cm * dv_m
+
+    # residual current on v_i row
+    d[:, :, 0] += -irev + ires
+
+    # ------------------------------------------------------------------
+    # 2) capacitors between consecutive shells (ve_j ↔ ve_{j+1})
+    #    for j = 0 … M-3   (inner interfaces)
+    # ------------------------------------------------------------------
+    if M > 2:
+        gcap_inner = gcap[:, :, :-1]                        # (B,K,M-2)
+        dv_shell   = (vc[:, :, 1:-1] - vc[:, :, 2:]) # (B,K,M-2)
+
+        d[:, :, 1:-1] += -gcap_inner * dv_shell    # row ve_j
+        d[:, :, 2:  ] +=  gcap_inner * dv_shell    # row ve_{j+1}
+
+    # ------------------------------------------------------------------
+    # 3) outermost interface  ve_{M-2}  ↔  bath (ve)
+    # ------------------------------------------------------------------
+    gcap_out = gcap[:, :, -1]                   # (B,K)   last capacitor
+    dv_out   = (vc[:, :, -1] - ve)       # (B,K)
+
+    # capacitor explicit piece
+    d[:, :, -1] += -gcap_out * dv_out
+
+    # constant current from bath (conductance + C/dt part)
+    d[:, :, -1] +=  g_rad * ve        #  (xg + xcout/dt) * Vbath
+
+    return d
+
+
+def thomas_block_tridiag_solve(
+    a: torch.Tensor,   # (B, K-1, M, M)   lower  blocks  A_{k}
+    b: torch.Tensor,   # (B, K  , M, M)   main   blocks  B_{k}
+    c: torch.Tensor,   # (B, K-1, M, M)   upper  blocks  C_{k}
+    d: torch.Tensor    # (B, K  , M)      right-hand side D_{k}
+) -> torch.Tensor:
+    """
+    Block Thomas algorithm  (serial sweep, O(K M³)).
+
+    Solves  A_k x_{k-1} + B_k x_k + C_k x_{k+1} = D_k   for k = 0…K-1.
+    Boundary blocks:  A_0 and C_{K-1} are unused / can be zero.
+
+    Shapes
+    ------
+    * a : (B,K-1,M,M)  — A_1 … A_{K-1}
+    * b : (B,K  ,M,M)
+    * c : (B,K-1,M,M)  — C_0 … C_{K-2}
+    * d : (B,K  ,M)    — D_0 … D_{K-1}
+
+    Returns
+    -------
+    x : (B,K,M)
+    """
+    B, K, M, _ = b.shape
+    device, dtype = b.device, b.dtype
+
+    # work copies (we'll overwrite in-place)
+    bb = b.clone()                 # (B,K,M,M)
+    dd = d.clone()                 # (B,K,M)
+
+    e = torch.eye(M, device=device, dtype=dtype)
+
+    # -------- forward sweep ------------------------------------------
+    for k in range(1, K):
+        # inv of previous main block
+        inv_prev, _ = torch.linalg.solve_ex(bb[:, k-1], e)
+        # compute multiplier  G_k = A_k · B_{k-1}^{-1}
+        Gk = torch.matmul(a[:, k-1], inv_prev)            # (B,M,M)
+
+        # update current main diagonal   B_k ← B_k - G_k · C_{k-1}
+        bb[:, k] = bb[:, k] - torch.matmul(Gk, c[:, k-1])
+
+        # update RHS                     D_k ← D_k - G_k · D_{k-1}
+        dd[:, k] = dd[:, k] - torch.matmul(Gk, dd[:, k-1].unsqueeze(-1)).squeeze(-1)
+
+    # -------- backward substitution ----------------------------------
+    x = torch.zeros(B, K, M, device=device, dtype=dtype)
+
+    # last block
+    x[:, -1], _ = torch.linalg.solve_ex(bb[:, -1], dd[:, -1])
+
+    for k in range(K-2, -1, -1):
+        rhs = dd[:, k] - torch.matmul(c[:, k], x[:, k+1].unsqueeze(-1)).squeeze(-1)
+        x[:, k], _ = torch.linalg.solve_ex(bb[:, k], rhs)
+
+    return x
+
+
+@torch.jit.script
+def block_thomas_solve(
+    lower: torch.Tensor,    # (B, K-1, 3, 3)   A_i
+    main:  torch.Tensor,    # (B, K,   3, 3)   B_i   (will be overwritten)
+    upper: torch.Tensor,    # (B, K-1, 3, 3)   C_i
+    rhs:   torch.Tensor     # (B, K,   3)
+) -> torch.Tensor:          # returns y^{n+1}   (B, K, 3)
+    B, K, _, _ = main.shape
+    x = torch.empty((B, K, 3), dtype=rhs.dtype, device=rhs.device)
+
+    # ---------- forward elimination ----------
+    for i in range(1, K):
+        # W_i = A_i @ inv(B_{i-1})
+        inv_prev, info = torch.linalg.inv_ex(main[:, i-1])
+        w = lower[:, i-1].matmul(inv_prev)          # (B,3,3)
+
+        # B_i ← B_i - W_i @ C_{i-1}
+        main[:, i] = main[:, i] - w.matmul(upper[:, i-1])
+
+        # d_i ← d_i - W_i @ d_{i-1}
+        rhs[:, i] = rhs[:, i] - torch.einsum('bij,bj->bi', w, rhs[:, i-1])
+
+    # ---------- back substitution ----------
+    x[:, -1], info = torch.linalg.solve_ex(main[:, -1], rhs[:, -1])
+    for i in range(K-2, -1, -1):
+        rhs[:, i] = rhs[:, i] - torch.einsum('bij,bj->bi',
+                                             upper[:, i], x[:, i+1])
+        x[:, i], info = torch.linalg.solve_ex(main[:, i], rhs[:, i])
+
+    return x
+
+
 @torch.jit.script
 def A_mv(v, diag, g_left, g_right):  # v shape (B, K), mV
     out = diag * v
@@ -312,6 +689,103 @@ def phi1_krylov_lanczos_g(
     # project back : V · φ · βe₁
     y = phi * beta.unsqueeze(1)  # (B,m,1)
     return torch.einsum("bkm, bm -> bk", V, y)  # (B,K)
+
+
+def build_block_matrix(
+    g_i: torch.Tensor,                  # (B, K-1)   axial conductance, axoplasm
+    g_axial: torch.Tensor,              # (B, K-1, M-1) axial conductances, all shells
+    c_rad_m: torch.Tensor,              # (B, K)     C_m / dt   (NO g_m)
+    g_rad_shell: torch.Tensor = None,   # (B, K, M-1) xg[j] + xc[j]/dt   (shell j-1 ↔ j)
+) -> torch.Tensor:
+    """
+    Assemble block-diagonal slices B_k for a cable with vi + (M-1) extracellular shells.
+
+    Parameters
+    ----------
+    g_i : (B, K-1)             axial conductance of the axoplasm.
+    g_axial : (B, K-1, M-1)    axial conductances of every extracellular shell.
+    c_rad_m : (B, K)           capacitor term C_m / dt (no leak yet).
+    g_rad_shell : (B, K, M-1), optional
+        Radial conductance between shell j-1 and shell j ( 0 ≤ j ≤ M-2 ).
+        If `None`, zeros are assumed (no radial leaks / capacitors).
+
+    Returns
+    -------
+    B : (B, K, M, M)          block matrices ready for the solver.
+                              They already contain C_m/dt but *not* g_m.
+    """
+    B, Km1 = g_i.shape
+    K = Km1 + 1      
+    M = g_axial.shape[2] + 1      # 1 intracellular + (M-1) shells
+
+    print(f"Building block matrix for {B} batches, {K} compartments, {M} shells")
+
+    device, dtype = g_i.device, g_i.dtype
+    zeros_BK   = lambda: torch.zeros(B, K,      device=device, dtype=dtype)
+    zeros_BKM1 = lambda: torch.zeros(B, K, M-1, device=device, dtype=dtype)
+
+    # ------------------------------------------------------------------
+    # 1.  left / right axial conductances for every node
+    # ------------------------------------------------------------------
+    giL = zeros_BK();  giR = zeros_BK()
+    giL[:, 1:]  = g_i
+    giR[:, :-1] = g_i
+
+    geL = zeros_BKM1(); geR = zeros_BKM1()
+    geL[:, 1:, :]  = g_axial
+    geR[:, :-1, :] = g_axial
+
+    assert (giL[:,0] == 0).all() and (giR[:,-1] == 0).all()
+    assert (geL[:,0,:] == 0).all() and (geR[:,-1,:] == 0).all()
+
+    # ------------------------------------------------------------------
+    # 2.  radial conductances between shells (if any)
+    # ------------------------------------------------------------------
+    if g_rad_shell is None:
+        g_rad_shell = zeros_BKM1()           # default: no shell-to-shell coupling
+
+    # inward radial array:  concat c_rad_m for vi↔ve0 as "index 0"
+    # shape (B, K, M-1)  where entry 0 is vi↔ve0, entries 1… for shells
+    g_inward = torch.cat([c_rad_m.unsqueeze(-1), g_rad_shell], dim=-1)
+
+    # ------------------------------------------------------------------
+    # 3.  allocate block matrix  (B, K, M, M)
+    # ------------------------------------------------------------------
+    Bmat = torch.zeros(B, K, M, M, device=device, dtype=dtype)
+
+    # ---------------- diagonals ---------------------------------------
+    # (0) intracellular node
+    Bmat[..., 0, 0] = giL + giR + g_inward[..., 0]
+
+    # (1 … M-1) shell diagonals
+    axial_in  = geL + geR                      # (B, K, M-1)
+    outward   = torch.zeros_like(axial_in)     # default 0
+
+    if M > 2:
+        # outward radial for shell j is inward radial of shell j+1
+        outward[..., :-1] = g_inward[..., 2:]  # shift left by 1
+
+        diag_shells = axial_in + g_inward[..., 1:] + outward   # (B, K, M-1)
+
+        # write them without using .diagonal -------------------------------
+        idx = torch.arange(1, M, device=device)   # [1, 2, …, M-1]
+        Bmat[..., idx, idx] = diag_shells          # shape matches (B,K,M-1)
+
+    else:  # ----- single extracellular shell (ve0) --------------------
+        # axial_in, g_inward[...,1] are both (B,K,1) → squeeze last dim
+        Bmat[..., 1, 1] = (axial_in.squeeze(-1)
+                        + g_inward[..., 1].squeeze(-1))
+
+    # ---------------- off-diagonals (symmetric) -----------------------
+    Bmat[..., 0, 1] = Bmat[..., 1, 0] = -g_inward[..., 0]  # vi ↔ ve0
+
+    if M > 2:
+        # shell j-1 ↔ shell j   for j = 1 … M-2
+        g_r = g_inward[..., 1:]                     # (B,K,M-1)
+        Bmat[..., idx[:-1], idx[1:]] = -g_r[..., :-1]
+        Bmat[..., idx[1:], idx[:-1]] = -g_r[..., :-1]
+
+    return Bmat
 
 
 class _krylov_etd1(Integrator):
@@ -663,3 +1137,285 @@ class _bwd_euler_ub(Integrator):
         if self.imem:
             model.i_membrane[:] = 0.0
             model.i_membrane.detach_()
+
+
+class _bwd_euler_bt(torch.jit.ScriptModule):
+    """
+    Implicit Euler method for block tridiagonal system.
+    """
+
+    compiler = ImplicitCompiler
+    builder = ImplicitHandlerBuilder
+    is_df = False
+
+    def __init__(self, model, mech, method="pcr", **kwargs):
+        super().__init__()
+        self.mech = mech
+
+        B, K, M = model.n_ax, model.n_comp, model.n_layers
+        M = M + 1
+        self.B = B
+        self.K = K
+        self.M = M
+
+        self.register_buffer("upper", torch.zeros(B, K-1, M, M))
+        self.register_buffer("lower", torch.zeros(B, K-1, M, M))
+        self.register_buffer("maind", torch.zeros(B, K,   M, M))
+        self.register_buffer("area", torch.zeros(B, K))
+
+        self.register_buffer("cm_dt", torch.zeros(B, K))
+        self.register_buffer("xc_dt", torch.zeros(B, K))
+        self.register_buffer("xg", torch.zeros(B, K, M))
+
+        self.register_buffer("i_membrane", torch.zeros(1))
+        
+        model.register_buffer("vc", torch.zeros(B, K, M))
+        model.vc[..., 0] = model.v_init
+
+        self._solve = thomas_block_tridiag_solve
+        
+    @classmethod
+    def shape(cls, n_ax, n_comp):
+        return (n_ax, n_comp)
+
+    def init_v(self, model):
+        model.vc[:] = 0.0
+        model.vc[..., 0] = model.v_init
+        model.vc = model.vc.detach()
+
+    def detach(self, model):
+        model.vc = model.vc.detach()
+        self.mech.detach()
+
+    def initialize(self, model, dt):
+        dt = dt * 1e-3  # convert ms to seconds
+        B, K, M = self.B, self.K, self.M
+
+        L = model.L * 1e-4                              # cm
+        diam = model.diam * 1e-4                        # cm
+        radius = 0.5 * diam                             # cm
+
+        ri = model.rhoa * L / (torch.pi * radius**2)    # Ohm
+        ri = 0.5 * (ri[:, :-1] + ri[:, 1:])             # (B, K-1)
+        gi = 1 / ri                                     # S
+        gi = F.pad(gi, (1, 1))                          # (B, K+1)        
+
+        raxial = model.xraxial * L.unsqueeze(-1) * 1e6         # Ohm
+        raxial = 0.5 * (raxial[:, :-1, :] + raxial[:, 1:, :])
+        gaxial = 1 / raxial                                    # S
+        zeros = torch.zeros_like(gaxial[:, :1])      # same dtype/device, length 1 along dim=1
+        gaxial = torch.cat([zeros, gaxial, zeros], dim=1)
+
+        gx0, gx1 = gaxial.unbind(-1)  # (B, K+1)
+
+        area = torch.pi * diam * L
+
+        cm = model.cm * 1e-6 * area                     # F
+        cm_dt = cm / dt                                 # F/s
+        xc = model.xc * 1e-6 * area.unsqueeze(-1)       # F
+        xc_dt = xc / dt                                 # F/s
+        xc0, xc1 = xc_dt.unbind(-1)                     # (B, K)
+        xg = model.xg * area.unsqueeze(-1)              # S
+        xg0, xg1 = xg.unbind(-1)                        # (B, K)
+
+        main  = torch.zeros((B, K,   M, M), device=model.device(), dtype=model.dtype())
+        lower = torch.zeros((B, K-1, M, M), device=model.device(), dtype=model.dtype())
+        upper = torch.zeros((B, K-1, M, M), device=model.device(), dtype=model.dtype())
+
+        for i in range(K):
+            # axial conductances to neighbours; 0 at sealed ends
+            ga_L  = gi[:, i]     if i > 0     else 0.0
+            ga_R  = gi[:, i+1]   if i < K-1   else 0.0
+            gx0_L = gx0[:, i]    if i > 0     else 0.0
+            gx0_R = gx0[:, i+1]  if i < K-1   else 0.0
+            gx1_L = gx1[:, i]    if i > 0     else 0.0
+            gx1_R = gx1[:, i+1]  if i < K-1   else 0.0
+
+            # convenient aliases for per-node radial parameters
+            cm_i            = cm_dt[:, i]
+            xc0_i, xg0_i    = xc0[:, i],   xg0[:, i]
+            xc1_i, xg1_i    = xc1[:, i],   xg1[:, i]
+
+            # ── MAIN block B_i (B×3×3) ───────────────────────────────────────────
+            Bi = main[:, i]
+
+            # row 0 – v
+            Bi[:, 0, 0] = cm_i + ga_L + ga_R
+            Bi[:, 0, 1] = -(cm_i)
+
+            # row 1 – ve0
+            Bi[:, 1, 0] = -(cm_i)
+            Bi[:, 1, 1] = (cm_i + xc0_i) + xg0_i + gx0_L + gx0_R
+            Bi[:, 1, 2] = -(xc0_i + xg0_i)
+
+            # row 2 – ve1
+            Bi[:, 2, 1] = -(xc0_i + xg0_i)
+            Bi[:, 2, 2] = (xc0_i + xc1_i) + xg0_i + xg1_i + gx1_L + gx1_R
+
+            # ── off-diagonal blocks (purely diagonal) ────────────────────────────
+            if i > 0:
+                lower[:, i-1, 0, 0] = -ga_L
+                lower[:, i-1, 1, 1] = -gx0_L
+                lower[:, i-1, 2, 2] = -gx1_L
+            if i < K-1:
+                upper[:, i,   0, 0] = -ga_R
+                upper[:, i,   1, 1] = -gx0_R
+                upper[:, i,   2, 2] = -gx1_R
+
+        self.area = area
+        self.cm_dt = cm_dt
+        self.xc_dt = xc_dt
+        self.xg = xg
+
+        self.maind = main
+        self.lower = lower
+        self.upper = upper
+        
+    def step(self, model, ve, dt, t_ind):
+        model.vc = self._step_no_intra(model.vc, ve, dt, model.temp_c)
+
+    @torch.jit.script_method
+    def _step_no_intra(self, vc, ve, dt, temp):
+        ve = ve.squeeze(1)
+
+        vi, ve0, ve1 = vc.unbind(-1)
+        xc0, xc1 = self.xc_dt.unbind(-1)
+        xg1 = self.xg[..., 1]
+
+        v = vc[..., 0] - vc[..., 1]
+
+        # advance gating
+        self.mech.advance(v, dt, temp)
+
+        ires = self.mech.i(v)
+
+        # nonlinear residual currents
+        ires = ires * self.area # (B, K)
+
+        # linearized ionic conductances & reversal
+        gtot = self.mech.gtot(v).squeeze(0) * self.area
+        irev = self.mech.irev().squeeze(0)  * self.area # (B, K)
+
+        B = self.maind.clone()  # (B, K, M, M)
+        B[..., 0, 0] += gtot
+        B[..., 1, 1] += gtot
+        B[..., 0, 1] -= gtot
+        B[..., 1, 0] -= gtot
+
+        D = assemble_rhs(
+            self.B,
+            self.K,
+            self.M,
+            self.cm_dt,
+            vi,
+            ve0,
+            ve1,
+            xc0,
+            xc1,
+            xg1,
+            ve,
+            ires,
+            irev,
+        )
+
+        # solve tridiagonal system
+        vc = self._solve(self.lower, B, self.upper, D)  # (B, K)
+        return vc
+
+def assemble_rhs(
+    B:int, K:int, M:int, cm_dt, vi, ve0, ve1, xc0, xc1, xg1, e_ext, ires, irev, 
+):
+    rhs = torch.zeros(B, K, M, device=vi.device, dtype=vi.dtype)
+    rhs[..., 0] = cm_dt * (vi - ve0) + irev - ires
+    rhs[..., 1] = -cm_dt * vi + (cm_dt + xc0) * ve0 - xc0 * ve1 - irev + ires
+    rhs[..., 2] = -xc0 * ve0 + (xc0 + xc1) * ve1 + xg1 * e_ext
+    return rhs
+
+from torch import Tensor
+
+@torch.jit.script
+def right_solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    # solves  A · X = B   for X,  without forming A⁻¹
+    return torch.linalg.solve_ex(A, B)[0]
+
+
+def neighbour_product_m1(off: Tensor, x: Tensor) -> Tensor:
+    out = torch.zeros_like(x)             # left neighbour exists for i ≥ 1
+    out[:, 1:] = torch.einsum('bkmn,bkn->bkm', off[:, 1:], x[:, :-1])
+    return out
+
+def neighbour_product_p1(off: Tensor, x: Tensor) -> Tensor:
+    out = torch.zeros_like(x)             # right neighbour exists for i ≤ K-2                     # right neighbour exists for i ≤ K-2
+    out[:, :-1] = torch.einsum('bkmn,bkn->bkm', off[:, :-1], x[:, 1:])
+    return out
+
+
+@torch.jit.script
+def pcr_block_tridiag_stable(
+    A_in: torch.Tensor,    # (B,K-1,3,3)  lower
+    B_in: torch.Tensor,    # (B,K,3,3)  main
+    C_in: torch.Tensor,    # (B,K-1,3,3)  upper
+    D_in: torch.Tensor     # (B,K,3)    rhs
+) -> torch.Tensor:         # --------   solution  (B,K,3)
+    
+    B,K,M,_ = B_in.shape
+
+    A_full = torch.zeros_like(B_in)        # (B, K, 3, 3)
+    C_full = torch.zeros_like(B_in)        # (B, K, 3, 3)
+    A_full[:, 1:]  = A_in                  # A₁ … A_{K-1}
+    C_full[:, :-1] = C_in                  # C₀ … C_{K-2}
+    
+    A = torch.zeros(B, K, M, M, dtype=B_in.dtype, device=B_in.device)
+    C = torch.zeros_like(A)
+    A[:,1:] = A_in
+    C[:,:-1] = C_in
+
+    # ---------- 1. diagonal scaling -----------------------------------------
+    # scale rows so that the main block is the identity:  X_i = B_i⁻¹
+    X = torch.linalg.inv(B_in)          # (B,K,3,3)
+    A[:, 1:] = torch.matmul(A[:, 1:],  X[:, :-1])  # A_i   · B_{i-1}⁻¹   (i ≥ 1)
+    C[:, :-1] = torch.matmul(C[:, :-1], X[:, 1:])  # C_i   · B_{i+1}⁻¹   (i ≤ K-2)
+
+    # rows i = 0 and i = K-1 keep A=0 or C=0 because of the sealed ends
+    D = torch.einsum('bkmn,bkn->bkm', X, D_in)     # B⁻¹ · D
+    B = torch.eye(3, device=B_in.device, dtype=B_in.dtype).expand_as(B_in).clone()
+
+    # ---------- 2. cyclic reduction -----------------------------------------
+    stride = 1
+    while stride < K:
+        if stride >= K - stride:  # no rows with both neighbours remain
+            break
+        idx = torch.arange(stride, K-stride, device=B_in.device)
+
+        A_i, C_i = A[:,idx], C[:,idx]
+        A_L, C_L = A[:,idx-stride], C[:,idx-stride]
+        A_R, C_R = A[:,idx+stride], C[:,idx+stride]
+        D_i      = D[:,idx]
+        D_L      = D[:,idx-stride]
+        D_R      = D[:,idx+stride]
+
+        # alpha = A_i          (since B_L == I after scaling)
+        # gamma = C_i          (since B_R == I)
+        alpha, gamma = A_i, C_i
+
+        B[:,idx]  = B[:,idx] - alpha @ C_L - gamma @ A_R
+        delta_L = (alpha @ D_L.unsqueeze(-1)).squeeze(-1)
+        delta_R = (gamma @ D_R.unsqueeze(-1)).squeeze(-1)
+        D[:, idx]  = D_i - delta_L - delta_R
+        A[:,idx]  = -alpha @ A_L
+        C[:,idx]  = -gamma @ C_R
+
+        stride <<= 1
+
+    # ---------- 3. solve the decoupled 3×3 blocks ----------------------------
+    X_sol = right_solve(B, D.unsqueeze(-1)).squeeze(-1)     # (B,K,3)
+
+    # left end (i = 0)
+    rhs0 = D_in[:, 0] - torch.einsum('bmn,bn->bm', C_full[:, 0], X_sol[:, 1])
+    X_sol[:, 0] = torch.linalg.solve(B_in[:, 0], rhs0)
+
+    # right end (i = K-1)
+    rhsL = D_in[:, -1] - torch.einsum('bmn,bn->bm', A_full[:, -1], X_sol[:, -2])
+    X_sol[:, -1] = torch.linalg.solve(B_in[:, -1], rhsL)
+
+    return X_sol

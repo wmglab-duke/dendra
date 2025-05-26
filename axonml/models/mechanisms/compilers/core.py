@@ -137,7 +137,7 @@ class MechCompiler:
         else:
             ret.append("mask = mask_in")
         ret.append("self.register_buffer('mask', mask)")
-        return "\n".join(ret)
+        return indent("\n".join(ret), 2)
     
     @staticmethod
     def detach(to_detach):

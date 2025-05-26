@@ -1,5 +1,4 @@
 import inspect
-import warnings
 from typing import Tuple, List, Optional
 
 import torch
@@ -619,3 +618,41 @@ class MyelinatedHeterogeneous(Axon):
             for k, v in signature.parameters.items()
             if v.default is not inspect.Parameter.empty and k != "self"
         }
+
+
+class ExtCell(Axon):
+    def __init__(
+        self,
+        n_ax: int,
+        n_comp: int,
+        temp=37.0,
+        v_init=-70.0,
+        n_layers=2,
+        integrator=None,
+    ):
+        self.n_layers = n_layers
+        diameters = torch.ones(n_ax)
+        super().__init__(diameters, n_comp, temp, v_init, integrator)
+
+    def calculate_geometric_params(self):
+        pass
+
+    @property
+    def v(self):
+        return self.vc[..., 0] - self.vc[..., 1]
+
+    def _register_buffers(self, diameters):
+        self.register_buffer("diam",    torch.empty(self.n_ax, self.n_comp))
+        self.register_buffer("L",       torch.empty(self.n_ax, self.n_comp))
+
+        self.register_buffer("xraxial", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
+        self.register_buffer("xc",      torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0))
+        self.register_buffer("xg",      torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
+
+        self.register_buffer("v_init_c", torch.tensor(self.v_init))
+        self.register_buffer("temp_c",   torch.tensor(self.temp))
+
+    def x(self):
+        node_l = torch.atleast_2d(self.L.squeeze())
+        x = node_l.cumsum(dim=1) - node_l / 2
+        return x - torch.sum(node_l, dim=1, keepdim=True) / 2

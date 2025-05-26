@@ -1,7 +1,6 @@
 from functools import partial, partialmethod
 from typing import Any, Type
 
-
 from .explicit import (
     _euler,
     _eulerv1,
@@ -11,7 +10,12 @@ from .explicit import (
     _dufort_frankel,
 )
 
-from .implicit import _krylov_etd1, _bwd_euler_sc, _bwd_euler_ub
+from .implicit import (
+    _krylov_etd1, 
+    _bwd_euler_sc, 
+    _bwd_euler_ub,
+    _bwd_euler_bt,
+)
 
 
 def partial_class(cls: Type[Any], /, *args, **kwargs) -> Type[Any]:
@@ -29,16 +33,17 @@ def partial_class(cls: Type[Any], /, *args, **kwargs) -> Type[Any]:
     return _Partial
 
 
-euler = partial(partial_class, _euler)
-rk1 = partial(partial_class, _rk1)
-rk2 = partial(partial_class, _rk2)
-rk4 = partial(partial_class, _rk4)
-dufort_frankel = partial(partial_class, _dufort_frankel)
-eulerv1 = partial(partial_class, _eulerv1)
+euler           = partial(partial_class, _euler)
+rk1             = partial(partial_class, _rk1)
+rk2             = partial(partial_class, _rk2)
+rk4             = partial(partial_class, _rk4)
+dufort_frankel  = partial(partial_class, _dufort_frankel)
+eulerv1         = partial(partial_class, _eulerv1)
 
-krylov_etd1 = partial(partial_class, _krylov_etd1)
+krylov_etd1  = partial(partial_class, _krylov_etd1)
 bwd_euler_sc = partial(partial_class, _bwd_euler_sc)
 bwd_euler_ub = partial(partial_class, _bwd_euler_ub)
+bwd_euler_bt = partial(partial_class, _bwd_euler_bt)
 
 
 __all__ = [
@@ -51,4 +56,5 @@ __all__ = [
     "krylov_etd1",
     "bwd_euler_sc",
     "bwd_euler_ub",
+    "bwd_euler_bt",
 ]

@@ -1,1 +1,1 @@
-from .heterogeneous import Heterogeneous
+from .heterogeneous import Heterogeneous, ExtCell

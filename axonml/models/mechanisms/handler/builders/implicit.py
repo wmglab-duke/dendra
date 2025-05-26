@@ -182,7 +182,7 @@ def explicit_current(currents, unfactorable) -> str:
                 if current in unfactorable[mech]:
                     result.append(f"{mech}_{current}")
     if not result:
-        return 'torch.tensor([0.0])'
+        return 'torch.tensor([0.0], device=v.device)'
     s = " + ".join(result)
     return s
 
