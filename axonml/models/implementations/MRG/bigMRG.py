@@ -168,6 +168,7 @@ class bigMRG(ExtCell):
         n_node=101,
         temp=37.0,
         v_init=-80.0,
+        integrator=None,
     ):
         if torch.any(torch.as_tensor(diameters) < 5.7):
             warnings.warn(
@@ -178,7 +179,7 @@ class bigMRG(ExtCell):
         n_ax = len(diameters)
         n_c = cid.nc()
 
-        super().__init__(n_ax, n_c, temp, v_init, integrator=ax.bwd_euler_bt())
+        super().__init__(n_ax, n_c, temp, v_init, integrator=integrator)
         self.register_cid(cid)
 
         self.register_buffer(

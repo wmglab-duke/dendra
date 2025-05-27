@@ -7,6 +7,7 @@ from torch import Tensor
 
 from tqdm.auto import tqdm
 
+import axonml as ax
 from axonml.models.stim.intrastim import IntraStim
 from axonml.models.backend import Backend as A
 from axonml.models.callbacks import CallbackList, Callback
@@ -630,6 +631,8 @@ class ExtCell(Axon):
         n_layers=2,
         integrator=None,
     ):
+        if integrator is None:
+            integrator = ax.bwd_euler_bt()
         self.n_layers = n_layers
         diameters = torch.ones(n_ax)
         super().__init__(diameters, n_comp, temp, v_init, integrator)

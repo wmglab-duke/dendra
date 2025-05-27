@@ -2,6 +2,9 @@ from typing import Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor
+
+import axonml_solvers
 
 from axonml.models.mechanisms.compilers import MechCompiler, ImplicitCompiler
 from axonml.models.mechanisms.handler.builders import ImplicitHandlerBuilder
@@ -483,6 +486,86 @@ def block_thomas_solve(
         x[:, i], info = torch.linalg.solve_ex(main[:, i], rhs[:, i])
 
     return x
+
+
+@torch.jit.script
+def inv3x3_tensor(A: Tensor) -> Tensor:
+    a = A[0,0]; b = A[0,1]; c = A[0,2]
+    d = A[1,0]; e = A[1,1]; f = A[1,2]
+    g = A[2,0]; h = A[2,1]; i = A[2,2]
+    det = a*(e*i - f*h) - b*(d*i - f*g) + c*(d*h - e*g)
+    idet = det.reciprocal()
+    inv = torch.empty(3,3, dtype=A.dtype, device=A.device)
+    inv[0,0] =  ( e*i - f*h) * idet
+    inv[0,1] =  ( c*h - b*i) * idet
+    inv[0,2] =  ( b*f - c*e) * idet
+    inv[1,0] =  ( f*g - d*i) * idet
+    inv[1,1] =  ( a*i - c*g) * idet
+    inv[1,2] =  ( c*d - a*f) * idet
+    inv[2,0] =  ( d*h - e*g) * idet
+    inv[2,1] =  ( b*g - a*h) * idet
+    inv[2,2] =  ( a*e - b*d) * idet
+    return inv
+
+
+@torch.jit.script
+def solve_thomas_jit(
+    lower: Tensor,  # (B, K-1,3,3)
+    main: Tensor,   # (B, K,  3,3)
+    upper: Tensor,  # (B, K-1,3,3)
+    rhs: Tensor     # (B, K,  3)
+) -> Tensor:
+    B, K, _, _ = main.size()
+    out = torch.empty_like(rhs)
+    # per-batch solve
+    for b in range(B):
+        # mutable references
+        M = main[b]
+        D = rhs[b]
+        # forward sweep
+        for i in range(1, K):
+            inv_prev = inv3x3_tensor(M[i-1])
+            # compute W = L_diag * inv_prev
+            W = torch.empty(3,3, dtype=M.dtype, device=M.device)
+            for r in range(3):
+                lo_rr = lower[b, i-1, r, r]
+                for c in range(3):
+                    W[r, c] = lo_rr * inv_prev[r, c]
+            # update M[i]
+            for r in range(3):
+                for c in range(3):
+                    sum_rc = 0.0
+                    for m in range(3):
+                        sum_rc += W[r, m] * upper[b, i-1, m, c]
+                    M[i, r, c] = M[i, r, c] - sum_rc
+            # update D[i]
+            for r in range(3):
+                sum_r = 0.0
+                for m in range(3):
+                    sum_r += W[r, m] * D[i-1, m]
+                D[i, r] = D[i, r] - sum_r
+        # backward substitution
+        inv_last = inv3x3_tensor(M[K-1])
+        # last X
+        for r in range(3):
+            val = 0.0
+            for m in range(3):
+                val += inv_last[r, m] * D[K-1, m]
+            out[b, K-1, r] = val
+        # remaining
+        for i in range(K-2, -1, -1):
+            # subtract upper coupling on D
+            for r in range(3):
+                up_rr = upper[b, i, r, r]
+                D[i, r] = D[i, r] - up_rr * out[b, i+1, r]
+            inv_cur = inv3x3_tensor(M[i])
+            for r in range(3):
+                val = 0.0
+                for m in range(3):
+                    val += inv_cur[r, m] * D[i, m]
+                out[b, i, r] = val
+    return out
+
 
 
 @torch.jit.script
@@ -996,10 +1079,11 @@ class _bwd_euler_ub(Integrator):
     builder = ImplicitHandlerBuilder
     is_df = False
 
-    def __init__(self, model, mech, method="pcr", **kw):
+    def __init__(self, model, mech, method="thomas", **kw):
         super().__init__(model, mech, **kw)
         B, K = model.n_ax, model.n_comp
         self.register_buffer("kernel", torch.tensor([1.0, -2.0, 1.0]).view(1, 1, 3))
+        
         # Buffers for diffusive diag, axonal conductance, membrane scale
         self.register_buffer("diag_base", torch.zeros(B, K))
         self.register_buffer("g_ax", torch.zeros(B, K))
@@ -1007,9 +1091,9 @@ class _bwd_euler_ub(Integrator):
         self.register_buffer("scale", torch.zeros(B, K))
 
         if method == "pcr":
-            self._solve = pcr_tridiag_solve
+            self._solve = torch.ops.axonml_solvers.pcr_solve_t
         elif method == "thomas":
-            self._solve = thomas_tridiag_solve
+            self._solve = torch.ops.axonml_solvers.thomas_solve_t
         else:
             raise ValueError(f"Unknown method: {method}")
 
@@ -1148,7 +1232,7 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
     builder = ImplicitHandlerBuilder
     is_df = False
 
-    def __init__(self, model, mech, method="pcr", **kwargs):
+    def __init__(self, model, mech, method="c++", **kwargs):
         super().__init__()
         self.mech = mech
 
@@ -1172,7 +1256,10 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
         model.register_buffer("vc", torch.zeros(B, K, M))
         model.vc[..., 0] = model.v_init
 
-        self._solve = thomas_block_tridiag_solve
+        if method == "c++":
+            self._solve = torch.ops.axonml_solvers.solve_bt
+        elif method == "python":
+            self._solve = solve_thomas_jit
         
     @classmethod
     def shape(cls, n_ax, n_comp):
@@ -1287,10 +1374,7 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
         # advance gating
         self.mech.advance(v, dt, temp)
 
-        ires = self.mech.i(v)
-
-        # nonlinear residual currents
-        ires = ires * self.area # (B, K)
+        ires = self.mech.i(v) * self.area
 
         # linearized ionic conductances & reversal
         gtot = self.mech.gtot(v).squeeze(0) * self.area
@@ -1319,8 +1403,8 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
         )
 
         # solve tridiagonal system
-        vc = self._solve(self.lower, B, self.upper, D)  # (B, K)
-        return vc
+        return self._solve(self.lower, B, self.upper, D)  # (B, K)
+
 
 def assemble_rhs(
     B:int, K:int, M:int, cm_dt, vi, ve0, ve1, xc0, xc1, xg1, e_ext, ires, irev, 
@@ -1330,92 +1414,3 @@ def assemble_rhs(
     rhs[..., 1] = -cm_dt * vi + (cm_dt + xc0) * ve0 - xc0 * ve1 - irev + ires
     rhs[..., 2] = -xc0 * ve0 + (xc0 + xc1) * ve1 + xg1 * e_ext
     return rhs
-
-from torch import Tensor
-
-@torch.jit.script
-def right_solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # solves  A · X = B   for X,  without forming A⁻¹
-    return torch.linalg.solve_ex(A, B)[0]
-
-
-def neighbour_product_m1(off: Tensor, x: Tensor) -> Tensor:
-    out = torch.zeros_like(x)             # left neighbour exists for i ≥ 1
-    out[:, 1:] = torch.einsum('bkmn,bkn->bkm', off[:, 1:], x[:, :-1])
-    return out
-
-def neighbour_product_p1(off: Tensor, x: Tensor) -> Tensor:
-    out = torch.zeros_like(x)             # right neighbour exists for i ≤ K-2                     # right neighbour exists for i ≤ K-2
-    out[:, :-1] = torch.einsum('bkmn,bkn->bkm', off[:, :-1], x[:, 1:])
-    return out
-
-
-@torch.jit.script
-def pcr_block_tridiag_stable(
-    A_in: torch.Tensor,    # (B,K-1,3,3)  lower
-    B_in: torch.Tensor,    # (B,K,3,3)  main
-    C_in: torch.Tensor,    # (B,K-1,3,3)  upper
-    D_in: torch.Tensor     # (B,K,3)    rhs
-) -> torch.Tensor:         # --------   solution  (B,K,3)
-    
-    B,K,M,_ = B_in.shape
-
-    A_full = torch.zeros_like(B_in)        # (B, K, 3, 3)
-    C_full = torch.zeros_like(B_in)        # (B, K, 3, 3)
-    A_full[:, 1:]  = A_in                  # A₁ … A_{K-1}
-    C_full[:, :-1] = C_in                  # C₀ … C_{K-2}
-    
-    A = torch.zeros(B, K, M, M, dtype=B_in.dtype, device=B_in.device)
-    C = torch.zeros_like(A)
-    A[:,1:] = A_in
-    C[:,:-1] = C_in
-
-    # ---------- 1. diagonal scaling -----------------------------------------
-    # scale rows so that the main block is the identity:  X_i = B_i⁻¹
-    X = torch.linalg.inv(B_in)          # (B,K,3,3)
-    A[:, 1:] = torch.matmul(A[:, 1:],  X[:, :-1])  # A_i   · B_{i-1}⁻¹   (i ≥ 1)
-    C[:, :-1] = torch.matmul(C[:, :-1], X[:, 1:])  # C_i   · B_{i+1}⁻¹   (i ≤ K-2)
-
-    # rows i = 0 and i = K-1 keep A=0 or C=0 because of the sealed ends
-    D = torch.einsum('bkmn,bkn->bkm', X, D_in)     # B⁻¹ · D
-    B = torch.eye(3, device=B_in.device, dtype=B_in.dtype).expand_as(B_in).clone()
-
-    # ---------- 2. cyclic reduction -----------------------------------------
-    stride = 1
-    while stride < K:
-        if stride >= K - stride:  # no rows with both neighbours remain
-            break
-        idx = torch.arange(stride, K-stride, device=B_in.device)
-
-        A_i, C_i = A[:,idx], C[:,idx]
-        A_L, C_L = A[:,idx-stride], C[:,idx-stride]
-        A_R, C_R = A[:,idx+stride], C[:,idx+stride]
-        D_i      = D[:,idx]
-        D_L      = D[:,idx-stride]
-        D_R      = D[:,idx+stride]
-
-        # alpha = A_i          (since B_L == I after scaling)
-        # gamma = C_i          (since B_R == I)
-        alpha, gamma = A_i, C_i
-
-        B[:,idx]  = B[:,idx] - alpha @ C_L - gamma @ A_R
-        delta_L = (alpha @ D_L.unsqueeze(-1)).squeeze(-1)
-        delta_R = (gamma @ D_R.unsqueeze(-1)).squeeze(-1)
-        D[:, idx]  = D_i - delta_L - delta_R
-        A[:,idx]  = -alpha @ A_L
-        C[:,idx]  = -gamma @ C_R
-
-        stride <<= 1
-
-    # ---------- 3. solve the decoupled 3×3 blocks ----------------------------
-    X_sol = right_solve(B, D.unsqueeze(-1)).squeeze(-1)     # (B,K,3)
-
-    # left end (i = 0)
-    rhs0 = D_in[:, 0] - torch.einsum('bmn,bn->bm', C_full[:, 0], X_sol[:, 1])
-    X_sol[:, 0] = torch.linalg.solve(B_in[:, 0], rhs0)
-
-    # right end (i = K-1)
-    rhsL = D_in[:, -1] - torch.einsum('bmn,bn->bm', A_full[:, -1], X_sol[:, -2])
-    X_sol[:, -1] = torch.linalg.solve(B_in[:, -1], rhsL)
-
-    return X_sol
