@@ -124,11 +124,11 @@ class MechCompiler:
         ret = []
         if mask_out is not None:
             ret.append(
-                f"mask_out = torch.ones(1, 1, n_comps)\nmask_out[:, :, {mask_out}] = 0"
+                f"mask_out = torch.ones(1, n_comps)\nmask_out[:, {mask_out}] = 0"
             )
         if mask_in is not None:
             ret.append(
-                f"mask_in = torch.zeros(1, 1, n_comps)\nmask_in[:, :, {mask_in}] = 1"
+                f"mask_in = torch.zeros(1, n_comps)\nmask_in[:, {mask_in}] = 1"
             )
         if mask_out is not None and mask_in is not None:
             ret.append("mask = mask_out * mask_in")

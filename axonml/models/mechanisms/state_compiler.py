@@ -203,7 +203,7 @@ class _state_{name}(torch.nn.Module):
         self.coupled = False
         self.instantiate_parameters(params, **kwargs)
 
-        self.register_buffer("diam", diameters[:, None, None])
+        self.register_buffer("diam", diameters[:, None])
         self.register_buffer("temp", torch.as_tensor(temp))
         self._name = name
 
@@ -286,7 +286,7 @@ class _state_{name}(torch.nn.Module):
         self.coupled = True
 
         self.instantiate_parameters(params, **kwargs)
-        self.register_buffer("diam", diameters[:, None, None])
+        self.register_buffer("diam", diameters[:, None])
 
         self.temp = temp
         self._name = name

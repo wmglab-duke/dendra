@@ -135,7 +135,7 @@ impl_template = """
       self.rec['{full_state}'].append(torch.amax(states, -1, keepdim=True))
     else:
       if self.node_indices is not None:
-        self.rec['{full_state}'].append(states[:, :, self.node_indices])
+        self.rec['{full_state}'].append(states[..., self.node_indices])
       else:
         self.rec['{full_state}'].append(states)
 """
@@ -146,7 +146,7 @@ m_template = """
       self.rec['{val}'].append(torch.amax(states, -1, keepdim=True))
     else:
       if self.node_indices is not None:
-        self.rec['{val}'].append(atleast_3d(states[:, :, self.node_indices]))
+        self.rec['{val}'].append(atleast_3d(states[..., self.node_indices]))
       else:
         self.rec['{val}'].append(states)
 """

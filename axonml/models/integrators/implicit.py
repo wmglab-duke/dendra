@@ -1128,21 +1128,21 @@ class _bwd_euler_ub(Integrator):
         self.mech.advance(v, dt, temp)
 
         # nonlinear residual currents
-        i_res = self.mech.i(v).squeeze(1)  # (B,K)
+        i_res = self.mech.i(v)  # (B,K)
 
         # linearized ionic conductances & reversal
-        gtot = self.mech.gtot(v).squeeze(1) * self.scale  # (B,K)
-        irev = self.mech.irev().squeeze(1)  # (B,K)
+        gtot = self.mech.gtot(v) * self.scale  # (B,K)
+        irev = self.mech.irev()  # (B,K)
 
         # diffusive extracellular coupling
-        S = torch.nn.functional.conv1d(ve, self.kernel, padding=1).squeeze(1)
-        S[:, 0] = ve[:, 0, 1] - ve[:, 0, 0]
-        S[:, -1] = ve[:, 0, -2] - ve[:, 0, -1]
+        S = torch.nn.functional.conv1d(ve.unsqueeze(1), self.kernel, padding=1).squeeze(1)
+        S[:, 0] = ve[:, 1] - ve[:, 0]
+        S[:, -1] = ve[:, -2] - ve[:, -1]
         S = S * self.g_ax
 
         # form RHS: v_n + dt*(linear_reversal + S - residual)
         f_n = irev * self.scale + S - i_res * self.scale
-        RHS = v.squeeze(1) + dt_s * f_n
+        RHS = v + dt_s * f_n
 
         # build tridiagonal system M v_{n+1} = RHS
         A_diag = self.diag_base - gtot
@@ -1163,7 +1163,7 @@ class _bwd_euler_ub(Integrator):
 
         # solve tridiagonal system
         v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
-        return v_np1.unsqueeze(1)
+        return v_np1
 
     @torch.jit.script_method
     def _step_intra(self, v, ve, dt, temp, intra):
@@ -1172,21 +1172,21 @@ class _bwd_euler_ub(Integrator):
         self.mech.advance(v, dt, temp)
 
         # nonlinear residual currents
-        i_res = self.mech.i(v).squeeze(1)  # (B,K)
+        i_res = self.mech.i(v)  # (B,K)
 
         # linearized ionic conductances & reversal
-        gtot = self.mech.gtot(v).squeeze(1) * self.scale  # (B,K)
-        irev = self.mech.irev().squeeze(1)  # (B,K)
+        gtot = self.mech.gtot(v) * self.scale  # (B,K)
+        irev = self.mech.irev()  # (B,K)
 
         # diffusive extracellular coupling
-        S = torch.nn.functional.conv1d(ve, self.kernel, padding=1).squeeze(1)
+        S = torch.nn.functional.conv1d(ve.unsqueeze(1), self.kernel, padding=1).squeeze(1)
         S[:, 0] = ve[:, 0, 1] - ve[:, 0, 0]
         S[:, -1] = ve[:, 0, -2] - ve[:, 0, -1]
         S = S * self.g_ax
 
         # form RHS: v_n + dt*(linear_reversal + S - residual)
         f_n = irev * self.scale + S - i_res * self.scale - intra.squeeze(1)
-        RHS = v.squeeze(1) + dt_s * f_n
+        RHS = v + dt_s * f_n
 
         # build tridiagonal system M v_{n+1} = RHS
         A_diag = self.diag_base - gtot
@@ -1207,7 +1207,7 @@ class _bwd_euler_ub(Integrator):
 
         # solve tridiagonal system
         v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
-        return v_np1.unsqueeze(1)
+        return v_np1
 
     def detach(self, model):
         model.v = model.v.detach()
@@ -1363,7 +1363,6 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
 
     @torch.jit.script_method
     def _step_no_intra(self, vc, ve, dt, temp):
-        ve = ve.squeeze(1)
 
         vi, ve0, ve1 = vc.unbind(-1)
         xc0, xc1 = self.xc_dt.unbind(-1)
@@ -1377,8 +1376,8 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
         ires = self.mech.i(v) * self.area
 
         # linearized ionic conductances & reversal
-        gtot = self.mech.gtot(v).squeeze(0) * self.area
-        irev = self.mech.irev().squeeze(0)  * self.area # (B, K)
+        gtot = self.mech.gtot(v) * self.area
+        irev = self.mech.irev()  * self.area # (B, K)
 
         B = self.maind.clone()  # (B, K, M, M)
         B[..., 0, 0] += gtot

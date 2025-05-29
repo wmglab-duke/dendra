@@ -212,11 +212,11 @@ def ssd_df(v_c, v_p, v_e):
     v_e_p = F.pad(v_e, (1, 1), "reflect")
 
     ret = (
-        v_c_p[:, :, :-2]
-        + v_c_p[:, :, 2:]
+        v_c_p[:, :-2]
+        + v_c_p[:, 2:]
         - v_p
-        + v_e_p[:, :, 2:]
-        + v_e_p[:, :, :-2]
+        + v_e_p[:, 2:]
+        + v_e_p[:, :-2]
         - 2 * v_e
     )
 
@@ -238,7 +238,7 @@ class _dufort_frankel(Integrator):
         super().__init__(model, mech, imem)
 
         model.register_buffer(
-            "v_prev", torch.full((model.n_ax, 1, model.n_comp), model.v_init)
+            "v_prev", torch.full((model.n_ax, model.n_comp), model.v_init)
         )
 
         self.register_buffer("s1", torch.tensor(0.0))
@@ -355,8 +355,8 @@ class _dufort_frankel(Integrator):
     def _step_no_intra_64_conv(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.cat([v, v_prev, ve], dim=1)
-        d2v = self.ssd(x)
+        x = torch.stack([v, v_prev, ve], dim=1)
+        d2v = self.ssd(x).squeeze(1)
 
         i_ion = self.mech.i(v_prev, v)
 
@@ -402,8 +402,8 @@ class _dufort_frankel(Integrator):
     def _step_no_intra_conv(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.cat([v, v_prev, ve], dim=1)
-        d2v = self.ssd(x)
+        x = torch.stack([v, v_prev, ve], dim=1)
+        d2v = self.ssd(x).squeeze(1)
 
         i_ion = self.mech.i(v_prev, v)
 
@@ -449,8 +449,8 @@ class _dufort_frankel(Integrator):
     def _step_intra_conv(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.cat([v, v_prev, ve], dim=1)
-        d2v = s2 * self.ssd(x)
+        x = torch.stack([v, v_prev, ve], dim=1)
+        d2v = s2 * self.ssd(x).squeeze(1)
 
         i_ion = self.mech.i(v_prev, v) * area - intra
 
@@ -496,8 +496,8 @@ class _dufort_frankel(Integrator):
     def _step_intra_64_conv(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.cat([v, v_prev, ve], dim=1)
-        d2v = s2 * self.ssd(x)
+        x = torch.stack([v, v_prev, ve], dim=1)
+        d2v = s2 * self.ssd(x).squeeze(1)
 
         i_ion = self.mech.i(v_prev, v) * area - intra
 

@@ -50,7 +50,7 @@ self.{mech}.{v}.set_(self.{ion}_ion.{v})
 
 
 set_diam_buffer_template = """
-self.{mech}.diam.set_(diameters.view(-1, 1, 1))
+self.{mech}.diam.set_(diameters.view(-1, 1))
 """
 
 

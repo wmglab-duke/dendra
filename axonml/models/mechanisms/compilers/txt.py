@@ -32,7 +32,7 @@ class {mech}(torch.nn.Module):
             final_axis = diameters.shape[-1]
         
         try:
-            self.register_buffer("diam", diameters.view(diameters.shape[0], 1, final_axis))
+            self.register_buffer("diam", diameters.view(diameters.shape[0], final_axis))
         except:
             self.register_buffer("diam", diameters)
 

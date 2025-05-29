@@ -241,9 +241,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
     def _register_buffers(self, diameters):
         self.register_buffer("diam", diameters)
-        self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
+        self.register_buffer("area_c", self.area_(self.diam)[:, None])
         self.register_buffer("cm_c", self.cm_(self.area_c))
-        self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
+        self.register_buffer("ra_c", self.ra_(self.diam)[:, None])
         self.register_buffer("v_init_c", torch.tensor(self.v_init))
         self.register_buffer("temp_c", torch.tensor(self.temp))
 
@@ -257,9 +257,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self.calculate_geometric_params()
 
     def calculate_geometric_params(self):
-        self.area_c = self.area_(self.diam)[:, None, None]
+        self.area_c = self.area_(self.diam)[:, None]
         self.cm_c = self.cm_(self.area_c)
-        self.ra_c = self.ra_(self.diam)[:, None, None]
+        self.ra_c = self.ra_(self.diam)[:, None]
 
     def collect_parameters(self, *names):
         """

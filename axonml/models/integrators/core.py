@@ -25,14 +25,14 @@ class Integrator(torch.jit.ScriptModule):
         imem = imem if imem is not None else IMEM
         self.imem = bool(imem)
         model.register_buffer(
-            "v", torch.full((model.n_ax, 1, model.n_comp), model.v_init)
+            "v", torch.full((model.n_ax, model.n_comp), model.v_init)
         )
-        self.register_buffer("i_membrane", torch.zeros((model.n_ax, 1, model.n_comp)))
+        self.register_buffer("i_membrane", torch.zeros((model.n_ax, model.n_comp)))
         self.mech = mech
 
     @classmethod
     def shape(cls, n_ax, n_comp):
-        return (n_ax, 1, n_comp)
+        return (n_ax, n_comp)
 
     def init_v(self, model):
         model.v[:] = model.v_init

@@ -645,15 +645,15 @@ class ExtCell(Axon):
         return self.vc[..., 0] - self.vc[..., 1]
 
     def _register_buffers(self, diameters):
-        self.register_buffer("diam",    torch.empty(self.n_ax, self.n_comp))
-        self.register_buffer("L",       torch.empty(self.n_ax, self.n_comp))
+        self.register_buffer("diam",        torch.empty(self.n_ax, self.n_comp))
+        self.register_buffer("L",           torch.empty(self.n_ax, self.n_comp))
 
-        self.register_buffer("xraxial", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
-        self.register_buffer("xc",      torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0))
-        self.register_buffer("xg",      torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
+        self.register_buffer("xraxial",     torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
+        self.register_buffer("xc",          torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0))
+        self.register_buffer("xg",          torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
 
-        self.register_buffer("v_init_c", torch.tensor(self.v_init))
-        self.register_buffer("temp_c",   torch.tensor(self.temp))
+        self.register_buffer("v_init_c",    torch.tensor(self.v_init))
+        self.register_buffer("temp_c",      torch.tensor(self.temp))
 
     def x(self):
         node_l = torch.atleast_2d(self.L.squeeze())

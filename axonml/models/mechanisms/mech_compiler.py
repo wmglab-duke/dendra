@@ -144,7 +144,7 @@ class {mech}(torch.nn.Module):
             final_axis = 1
         else:
             final_axis = diameters.shape[-1]
-        self.register_buffer("diam", diameters.view(diameters.shape[0], 1, final_axis))
+        self.register_buffer("diam", diameters.view(diameters.shape[0], final_axis))
 
         self.DE = torch.nn.ModuleDict(
             {{state._name: state for state in states}}

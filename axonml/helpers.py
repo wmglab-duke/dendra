@@ -95,13 +95,12 @@ def ve_from_s_t(space, time, n, device, multicontact=False):
 
 @torch.jit.script
 def op_mc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("can,cat->tan", s, t).unsqueeze(2)
+    return torch.einsum("can,cat->tan", s, t)
 
 
 @torch.jit.script
 def op_sc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("an,at->tan", s, t).unsqueeze(2)
-
+    return torch.einsum("an,at->tan", s, t)
 
 import contextlib
 
