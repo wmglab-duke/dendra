@@ -331,7 +331,7 @@ class IntraStim:
         for s in self.stim_synapse:
             self.add_from_synapse(intra, s, t, vm)
 
-        return intra.unsqueeze(1)
+        return intra
 
 
 def n(obj):

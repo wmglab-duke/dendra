@@ -112,12 +112,12 @@ def longrun(
     intra=None,
     warmup=True,
 ):
-    field_stack = torch.tensor(field_stack, device="cuda").float().unsqueeze(1)
+    field_stack = torch.tensor(field_stack, device="cuda").float()
 
     if warmup:
         print("warming up...")
 
-        ve = torch.rand(1, len(field_stack) * len(stims), 1, nodes).float().cuda()
+        ve = torch.rand(1, len(field_stack) * len(stims), nodes).float().cuda()
 
         for _ in range(5):
             with torch.no_grad():
@@ -132,7 +132,7 @@ def longrun(
         for stim in stims:
             tc = stim(t=t_chunk).astype(np.float32)
             t_course = torch.tensor(tc, device="cuda")
-            ve = torch.einsum("i, jkl -> ijkl", t_course, field_stack)
+            ve = torch.einsum("i, jl -> ijl", t_course, field_stack)
             input_ve.append(ve)
 
         input_ve = torch.cat(input_ve, 1)

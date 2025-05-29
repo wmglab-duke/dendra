@@ -74,15 +74,15 @@ class _euler(Integrator):
 
     @torch.jit.script_method
     def FRK(self, v, ve, area, cm, ra):
-        x = torch.cat([v, ve], dim=1)
-        d2v = self.ssd(x)
+        x = torch.stack([v, ve], dim=1)
+        d2v = self.ssd(x).squeeze(1)
         i_ion = self.mech.i(v, v) * area
         return cm * ((ra * d2v) - i_ion)
 
     @torch.jit.script_method
     def FRK_intra(self, v, ve, area, cm, ra, intra):
-        x = torch.cat([v, ve], dim=1)
-        d2v = self.ssd(x)
+        x = torch.stack([v, ve], dim=1)
+        d2v = self.ssd(x).squeeze(1)
         i_ion = self.mech.i(v, v) * area - intra
         return cm * ((ra * d2v) - i_ion)
 
