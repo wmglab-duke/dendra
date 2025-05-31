@@ -1243,8 +1243,8 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
         self.M = M
 
         self.register_buffer("upper", torch.zeros(B, K-1, M, M))
-        self.register_buffer("lower", torch.zeros(B, K-1, M, M))
-        self.register_buffer("maind", torch.zeros(B, K,   M, M))
+        self.register_buffer("lower", torch.zeros(B, K-1, M))
+        self.register_buffer("maind", torch.zeros(B, K,   M))
         self.register_buffer("area", torch.zeros(B, K))
 
         self.register_buffer("cm_dt", torch.zeros(B, K))
@@ -1338,8 +1338,8 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
         # Allocate blocks
         # ------------------------------------------------------------------
         main  = torch.zeros((B, K,   M, M), device=dev, dtype=dtyp)
-        lower = torch.zeros((B, K-1, M, M), device=dev, dtype=dtyp)
-        upper = torch.zeros((B, K-1, M, M), device=dev, dtype=dtyp)
+        lower = torch.zeros((B, K-1, M), device=dev, dtype=dtyp)
+        upper = torch.zeros((B, K-1, M), device=dev, dtype=dtyp)
 
         zeros_B = torch.zeros(B, device=dev, dtype=dtyp)    # utility vector
 
@@ -1385,14 +1385,14 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
                 # ---------- axial off-diagonal blocks ---------------------------
                 if i > 0:
                     if s == 0:
-                        lower[:, i-1, 0, 0] = -ga_L
+                        lower[:, i-1, 0] = -ga_L
                     else:
-                        lower[:, i-1, s, s] = -gx_L[:, i, s-1]
+                        lower[:, i-1, s] = -gx_L[:, i, s-1]
                 if i < K - 1:
                     if s == 0:
-                        upper[:, i, 0, 0] = -ga_R
+                        upper[:, i, 0] = -ga_R
                     else:
-                        upper[:, i, s, s] = -gx_R[:, i, s-1]
+                        upper[:, i, s] = -gx_R[:, i, s-1]
 
         # ------------------------------------------------------------------
         # Store for use in the time-stepping routine
