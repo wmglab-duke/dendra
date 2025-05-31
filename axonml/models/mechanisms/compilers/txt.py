@@ -25,6 +25,9 @@ class {mech}(torch.nn.Module):
         self.instantiate_parameters(params, model)
         self.instantiate_distributions(distributions)
         self.temp = temp
+        self.shape = shape
+
+        self.register_buffer("dummy", torch.zeros(1))
 
         if len(diameters.shape) == 1:
             final_axis = 1
@@ -111,6 +114,11 @@ class {mech}(torch.nn.Module):
     @torch.jit.ignore
     def get(self, key: str):
         return getattr(self, key)
+
+    def rebuild(self, x):
+        out = torch.zeros(*self.shape, device=self.dummy.device, dtype=self.dummy.dtype)
+        out.scatter_(-1, self.mask, x)
+        return out
 
     def _advance(self, v, dt):
 {advance}

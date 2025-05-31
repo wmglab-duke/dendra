@@ -640,10 +640,6 @@ class ExtCell(Axon):
     def calculate_geometric_params(self):
         pass
 
-    @property
-    def v(self):
-        return self.vc[..., 0] - self.vc[..., 1]
-
     def _register_buffers(self, diameters):
         self.register_buffer("diam",        torch.empty(self.n_ax, self.n_comp))
         self.register_buffer("L",           torch.empty(self.n_ax, self.n_comp))

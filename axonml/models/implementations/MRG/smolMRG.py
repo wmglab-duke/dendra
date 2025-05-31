@@ -33,7 +33,7 @@ paralength1 = lambda model: np.full_like(numpify(model.fd), 3.0)
 
 def deltax(model):
     fd = numpify(model.fd)
-    return -3.22 * d**2 + 148 * d - 128
+    return -3.22 * fd**2 + 148 * fd - 128
 
 
 def paralength2(model):
@@ -170,7 +170,7 @@ class smolMRG(ExtCell):
         v_init=-80.0,
         integrator=None,
     ):
-        if torch.any(torch.as_tensor(diameters) > 5.7 | torch.as_tensor(diameters) < 1.011):
+        if torch.any((torch.as_tensor(diameters) > 5.7) | (torch.as_tensor(diameters) < 1.011)):
             warnings.warn(
                 "Fiber diameter should not be <1.011um or >5.7 um for smolMRG. Use bigMRG for larger fibers."
             )
@@ -188,7 +188,7 @@ class smolMRG(ExtCell):
         )
         self.register_buffer(
             "nl", 
-            torch.clamp((17.4 * (0.553 * self.fd - 0.024) - 1.74).int(), min=1)
+            torch.clamp(torch.floor(17.4 * (0.553 * self.fd - 0.024) - 1.74), min=1)
         )
         self.register_buffer(
             "secd",
@@ -228,5 +228,5 @@ class smolMRG(ExtCell):
         n = len(locs)
         return [locs[round((n - 1) * arg)] for arg in args]
 
-    def steady_state(self, dt=1.0, maxiter=3000):
-        return super().steady_state(dt, maxiter)
+    def steady_state(self, dt=1.0, tstop=200):
+        return super().steady_state(dt, tstop)

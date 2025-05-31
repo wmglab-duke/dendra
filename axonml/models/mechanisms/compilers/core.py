@@ -111,6 +111,18 @@ def coupled_assignment(state):
     return template.format(name=name, lhs=lhs, rhs=rhs)
 
 
+def mask_to_index(mask_out, mask_in, n_comps):
+    if mask_out is None and mask_in is None:
+        return None
+    if mask_out is not None and mask_in is not None:
+        raise ValueError("Only one of mask_out or mask_in can be specified.")
+    if mask_out is not None:
+        return [i for i in range(n_comps) if i not in mask_out]
+    if mask_in is not None:
+        return [i for i in range(n_comps) if i in mask_in]
+    return None
+
+
 class MechCompiler:
     def __init__(self, DEBUG=0, DETECT_ANOMALIES=0, PADE=-1):
         self.DEBUG = DEBUG
@@ -137,6 +149,7 @@ class MechCompiler:
         else:
             ret.append("mask = mask_in")
         ret.append("self.register_buffer('mask', mask)")
+        # ret.append("self.register_buffer('idx', mask_)")
         return indent("\n".join(ret), 2)
     
     @staticmethod
@@ -147,7 +160,7 @@ class MechCompiler:
         return indent("\n".join(assignments), 2)
     
     @staticmethod
-    def buffers(names):
+    def buffers(names, mask=None):
         assignments = []
         for n in names:
             assignments.append(
@@ -171,8 +184,10 @@ class MechCompiler:
             assignments.append(f"self.register_buffer('{n}', torch.tensor(0.0))")
         return indent("\n".join(assignments), 2)
     
-    def advance(self, states):
+    def advance(self, states, mask=None):
         assignments = []
+        #if mask is not None:
+        #    assignments.append(f"v = v.index_select(-1, self.idx)")
         for k in states:
             if k.coupled:
                 assignments.append(coupled_assignment(k))
@@ -340,7 +355,7 @@ class MechCompiler:
             detach                      = self.detach(to_detach),
             init_state_buffers          = self.init_state_buffers(states_compiled),
             init_distribution_buffers   = self.init_distribution_buffers(distributions),
-            advance                     = self.advance(states_compiled),
+            advance                     = self.advance(states_compiled, mask),
             initial_f                   = translate(mechanism, "initial", default_f),
             breakpoint_f                = translate(mechanism, "breakpoint", default_f),
             generic_f                   = translate(mechanism, "generic", generic_f),
@@ -603,12 +618,50 @@ class DF_Compiler(MechCompiler):
 
 implicit_equation_template = """
 def {k}(self, v):
-    self.gtot_{k} = {gtot}
-    self.irev_{k} = self.gtot_{k} * {irev}
-    i = self.gtot_{k} * (v - {irev})
+    gtot_ = {gtot}
+    irev = {irev}
+    irev_ = gtot_ * irev
+    self.gtot_{k} = gtot_
+    self.irev_{k} = irev_
+    i = gtot_ * (v - irev)
     {assign_to_buffer}
     return i
 """
+
+
+mask_v_template = "v = v.index_select(-1, self.idx)"
+
+
+def build_mask_v(mask):
+    if mask is None:
+        return ""
+    return mask_v_template.format(mask=mask)
+
+
+def gtot_irev_i_z(mask):
+    if mask is None:
+        return "", "", ""
+    return (
+        "gtot_z = torch.zeros_like(v)", 
+        "irev_z = torch.zeros_like(v)", 
+        "i_z = torch.zeros_like(v)"
+    )
+
+
+def gtot_irev_build(current, mask):
+    if mask is None:
+        return f"gtot_", f"irev_"
+    else:
+        return (
+            f"self.rebuild(gtot_.expand_as(v))", 
+            f"self.rebuild(irev_.expand_as(v))"
+        )
+
+def i_build(mask):
+    if mask is None:
+        return "i = i_"
+    else:
+        return "i = self.rebuild(i_)"
 
 
 def build_implicit_equation(current, gtot, irev, assign):

@@ -883,14 +883,17 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         the run method.
         """
 
+        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
+
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
-        ve = torch.zeros(1, self.n_ax, 1, self.n_comp, device=self.device(), dtype=self.dtype())
+        ve = torch.zeros(self.n_ax, self.n_comp, device=self.device(), dtype=self.dtype())
+        self.integrator.initialize(self, dt)
         maxiter = int(tstop / dt)
         with ctx(DTWARN=0):
             for i in tqdm(range(maxiter), desc=f"Steady state [dt:{dt} ms, tstop:{tstop} ms]"):
                 reinit = i == 0
-                self.run(ve, dt=dt, reinit=reinit, progressbar=False)
+                self.integrator.step(self, ve, dt, self.t_ind)
         self.cache("_steady_state")
         self.t_ind = 0
         return self

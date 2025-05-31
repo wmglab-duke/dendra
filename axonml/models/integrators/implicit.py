@@ -1232,7 +1232,7 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
     builder = ImplicitHandlerBuilder
     is_df = False
 
-    def __init__(self, model, mech, method="c++", **kwargs):
+    def __init__(self, model, mech, method="warp", **kwargs):
         super().__init__()
         self.mech = mech
 
@@ -1249,17 +1249,22 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
 
         self.register_buffer("cm_dt", torch.zeros(B, K))
         self.register_buffer("xc_dt", torch.zeros(B, K))
+        self.register_buffer("c_rad", torch.zeros(B, K, M))
         self.register_buffer("xg", torch.zeros(B, K, M))
 
         self.register_buffer("i_membrane", torch.zeros(1))
         
+        model.register_buffer("v", torch.zeros(B, K))
         model.register_buffer("vc", torch.zeros(B, K, M))
         model.vc[..., 0] = model.v_init
+        model.v[:] = model.v_init
 
-        if method == "c++":
+        if method == "thread":
             self._solve = torch.ops.axonml_solvers.solve_bt
-        elif method == "python":
-            self._solve = solve_thomas_jit
+        elif method == "warp":
+            self._solve = torch.ops.axonml_solvers.solve_bt_warp
+        else:
+            raise ValueError(f"Unknown method: {method}")
         
     @classmethod
     def shape(cls, n_ax, n_comp):
@@ -1268,116 +1273,158 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
     def init_v(self, model):
         model.vc[:] = 0.0
         model.vc[..., 0] = model.v_init
+        model.v[:] = model.v_init
         model.vc = model.vc.detach()
+        model.v = model.v.detach()
 
     def detach(self, model):
         model.vc = model.vc.detach()
         self.mech.detach()
 
     def initialize(self, model, dt):
-        dt = dt * 1e-3  # convert ms to seconds
+        """
+        Generic MxM block initialisation (M >= 3).
+
+        Unknown ordering per compartment
+            0  : intracellular v
+            1  : ve[0]            (innermost shell)
+            ...
+            M-1: ve[M-2]          (outermost shell)
+
+        The outermost (Dirichlet) bath is *not* part of the unknowns.
+        """
+        # ------------------------------------------------------------------
+        # Geometry-dependent scalars
+        # ------------------------------------------------------------------
+        dt = dt * 1e-3                           # ms → s
         B, K, M = self.B, self.K, self.M
+        dev, dtyp = model.device(), model.dtype()
 
-        L = model.L * 1e-4                              # cm
-        diam = model.diam * 1e-4                        # cm
-        radius = 0.5 * diam                             # cm
+        L     = model.L     * 1e-4          # μm → cm
+        diam  = model.diam  * 1e-4          # μm → cm
+        radius = 0.5 * diam                 # cm
+        area   = torch.pi * diam * L        # cm² for each segment
 
-        ri = model.rhoa * L / (torch.pi * radius**2)    # Ohm
-        ri = 0.5 * (ri[:, :-1] + ri[:, 1:])             # (B, K-1)
-        gi = 1 / ri                                     # S
-        gi = F.pad(gi, (1, 1))                          # (B, K+1)        
+        # ------------------------------------------------------------------
+        # Axial conductances (left/right padding → K+1)
+        # ------------------------------------------------------------------
+        ri   = model.rhoa * L / (torch.pi * radius**2)      # Ω
+        ri   = 0.5 * (ri[:, :-1] + ri[:, 1:])               # (B,K-1)
+        gi   = 1.0 / ri                                     # S
+        gi   = F.pad(gi, (1, 1))                            # (B,K+1)
 
-        raxial = model.xraxial * L.unsqueeze(-1) * 1e6         # Ohm
-        raxial = 0.5 * (raxial[:, :-1, :] + raxial[:, 1:, :])
-        gaxial = 1 / raxial                                    # S
-        zeros = torch.zeros_like(gaxial[:, :1])      # same dtype/device, length 1 along dim=1
-        gaxial = torch.cat([zeros, gaxial, zeros], dim=1)
+        raxial  = model.xraxial * L.unsqueeze(-1) * 1e6     # Ω
+        raxial  = 0.5 * (raxial[:, :-1, :] + raxial[:, 1:, :])
+        gaxial  = 1.0 / raxial                              # S, (B,K-1,M-1)
+        zeros_G = torch.zeros((B, 1, M - 1),
+                            device=dev, dtype=dtyp)
+        gaxial  = torch.cat([zeros_G, gaxial, zeros_G], dim=1)  # (B,K+1,M-1)
 
-        gx0, gx1 = gaxial.unbind(-1)  # (B, K+1)
+        # convenience slices for later
+        gi_L  = gi[:, :-1]          # (B,K)
+        gi_R  = gi[:, 1:]
+        gx_L  = gaxial[:, :-1, :]   # (B,K,M-1)
+        gx_R  = gaxial[:, 1:,  :]
 
-        area = torch.pi * diam * L
+        # ------------------------------------------------------------------
+        # Radial (membrane + shell) elements
+        # ------------------------------------------------------------------
+        cm_dt = model.cm * 1e-6 * area / dt                 # F/s, (B,K)
 
-        cm = model.cm * 1e-6 * area                     # F
-        cm_dt = cm / dt                                 # F/s
-        xc = model.xc * 1e-6 * area.unsqueeze(-1)       # F
-        xc_dt = xc / dt                                 # F/s
-        xc0, xc1 = xc_dt.unbind(-1)                     # (B, K)
-        xg = model.xg * area.unsqueeze(-1)              # S
-        xg0, xg1 = xg.unbind(-1)                        # (B, K)
+        xc_dt = model.xc * 1e-6 * area.unsqueeze(-1) / dt   # F/s, (B,K,M-1)
+        xg    = model.xg * area.unsqueeze(-1)               # S  , (B,K,M-1)
 
-        main  = torch.zeros((B, K,   M, M), device=model.device(), dtype=model.dtype())
-        lower = torch.zeros((B, K-1, M, M), device=model.device(), dtype=model.dtype())
-        upper = torch.zeros((B, K-1, M, M), device=model.device(), dtype=model.dtype())
+        # ------------------------------------------------------------------
+        # Allocate blocks
+        # ------------------------------------------------------------------
+        main  = torch.zeros((B, K,   M, M), device=dev, dtype=dtyp)
+        lower = torch.zeros((B, K-1, M, M), device=dev, dtype=dtyp)
+        upper = torch.zeros((B, K-1, M, M), device=dev, dtype=dtyp)
 
+        zeros_B = torch.zeros(B, device=dev, dtype=dtyp)    # utility vector
+
+        # ------------------------------------------------------------------
+        # Build each compartment block
+        # ------------------------------------------------------------------
         for i in range(K):
-            # axial conductances to neighbours; 0 at sealed ends
-            ga_L  = gi[:, i]     if i > 0     else 0.0
-            ga_R  = gi[:, i+1]   if i < K-1   else 0.0
-            gx0_L = gx0[:, i]    if i > 0     else 0.0
-            gx0_R = gx0[:, i+1]  if i < K-1   else 0.0
-            gx1_L = gx1[:, i]    if i > 0     else 0.0
-            gx1_R = gx1[:, i+1]  if i < K-1   else 0.0
+            # axial conductances to neighbours (0 at sealed ends)
+            ga_L = gi_L[:, i] if i > 0     else zeros_B
+            ga_R = gi_R[:, i] if i < K-1   else zeros_B
 
-            # convenient aliases for per-node radial parameters
-            cm_i            = cm_dt[:, i]
-            xc0_i, xg0_i    = xc0[:, i],   xg0[:, i]
-            xc1_i, xg1_i    = xc1[:, i],   xg1[:, i]
+            for s in range(M):                     # row/col in M×M block
+                # ---------- diagonal element -----------------------------------
+                if s == 0:                          # vi
+                    diag = cm_dt[:, i] + ga_L + ga_R
+                elif s == 1:                        # ve[0]  (membrane + first shell)
+                    xc_out = xc_dt[:, i, 0]
+                    xg_out = xg[:,    i, 0]
+                    gs_L   = gx_L[:,  i, 0] if i > 0   else zeros_B
+                    gs_R   = gx_R[:,  i, 0] if i < K-1 else zeros_B
+                    diag   = cm_dt[:, i] + xc_out + xg_out + gs_L + gs_R
+                else:                               # ve[s-1],  s ≥ 2
+                    # inward coupling is index (s-2), outward is index (s-1)
+                    xc_in  = xc_dt[:, i, s-2]
+                    xg_in  = xg[:,    i, s-2]
+                    xc_out = xc_dt[:, i, s-1]
+                    xg_out = xg[:,    i, s-1]
+                    gs_L   = gx_L[:,  i, s-1] if i > 0   else zeros_B
+                    gs_R   = gx_R[:,  i, s-1] if i < K-1 else zeros_B
+                    diag   = xc_in + xc_out + xg_in + xg_out + gs_L + gs_R
 
-            # ── MAIN block B_i (B×3×3) ───────────────────────────────────────────
-            Bi = main[:, i]
+                main[:, i, s, s] = diag
 
-            # row 0 – v
-            Bi[:, 0, 0] = cm_i + ga_L + ga_R
-            Bi[:, 0, 1] = -(cm_i)
+                # ---------- radial off-diagonal (coupling to s+1) ---------------
+                if s < M - 1:
+                    if s == 0:
+                        coup = -cm_dt[:, i]                       # vi ↔ ve0
+                    else:
+                        coup = -(xc_dt[:, i, s-1] + xg[:, i, s-1])  # ve[s-1] ↔ ve[s]
+                    main[:, i, s,   s+1] = coup
+                    main[:, i, s+1, s  ] = coup   # symmetry
 
-            # row 1 – ve0
-            Bi[:, 1, 0] = -(cm_i)
-            Bi[:, 1, 1] = (cm_i + xc0_i) + xg0_i + gx0_L + gx0_R
-            Bi[:, 1, 2] = -(xc0_i + xg0_i)
+                # ---------- axial off-diagonal blocks ---------------------------
+                if i > 0:
+                    if s == 0:
+                        lower[:, i-1, 0, 0] = -ga_L
+                    else:
+                        lower[:, i-1, s, s] = -gx_L[:, i, s-1]
+                if i < K - 1:
+                    if s == 0:
+                        upper[:, i, 0, 0] = -ga_R
+                    else:
+                        upper[:, i, s, s] = -gx_R[:, i, s-1]
 
-            # row 2 – ve1
-            Bi[:, 2, 1] = -(xc0_i + xg0_i)
-            Bi[:, 2, 2] = (xc0_i + xc1_i) + xg0_i + xg1_i + gx1_L + gx1_R
-
-            # ── off-diagonal blocks (purely diagonal) ────────────────────────────
-            if i > 0:
-                lower[:, i-1, 0, 0] = -ga_L
-                lower[:, i-1, 1, 1] = -gx0_L
-                lower[:, i-1, 2, 2] = -gx1_L
-            if i < K-1:
-                upper[:, i,   0, 0] = -ga_R
-                upper[:, i,   1, 1] = -gx0_R
-                upper[:, i,   2, 2] = -gx1_R
-
-        self.area = area
+        # ------------------------------------------------------------------
+        # Store for use in the time-stepping routine
+        # ------------------------------------------------------------------
+        self.area  = area
         self.cm_dt = cm_dt
         self.xc_dt = xc_dt
-        self.xg = xg
+        self.xg    = xg
+        self.c_rad = torch.cat([cm_dt.unsqueeze(-1), xc_dt], dim=-1)
 
         self.maind = main
         self.lower = lower
         self.upper = upper
-        
+            
     def step(self, model, ve, dt, t_ind):
-        model.vc = self._step_no_intra(model.vc, ve, dt, model.temp_c)
+        model.vc, model.v = self._step_no_intra(model.vc, model.v, ve, dt, model.temp_c)
 
     @torch.jit.script_method
-    def _step_no_intra(self, vc, ve, dt, temp):
+    def _step_no_intra(self, vc, v, ve, dt, temp):
 
-        vi, ve0, ve1 = vc.unbind(-1)
-        xc0, xc1 = self.xc_dt.unbind(-1)
-        xg1 = self.xg[..., 1]
-
-        v = vc[..., 0] - vc[..., 1]
+        xg = self.xg[..., -1]
 
         # advance gating
         self.mech.advance(v, dt, temp)
 
-        ires = self.mech.i(v) * self.area
+        ires = self.mech.i(v)
 
         # linearized ionic conductances & reversal
         gtot = self.mech.gtot(v) * self.area
-        irev = self.mech.irev()  * self.area # (B, K)
+        irev = self.mech.irev()
+
+        d = (irev - ires) * self.area
 
         B = self.maind.clone()  # (B, K, M, M)
         B[..., 0, 0] += gtot
@@ -1386,30 +1433,33 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
         B[..., 1, 0] -= gtot
 
         D = assemble_rhs(
-            self.B,
-            self.K,
-            self.M,
-            self.cm_dt,
-            vi,
-            ve0,
-            ve1,
-            xc0,
-            xc1,
-            xg1,
-            ve,
-            ires,
-            irev,
+            vc,
+            self.c_rad,
+            d,
+            xg,
+            ve
         )
 
         # solve tridiagonal system
-        return self._solve(self.lower, B, self.upper, D)  # (B, K)
+        vc = self._solve(self.lower, B, self.upper, D)  # (B, K)
+        v = vc[..., 0] - vc[..., 1]  # vi = v - ve0
+        return vc, v
 
 
+@torch.jit.script
 def assemble_rhs(
-    B:int, K:int, M:int, cm_dt, vi, ve0, ve1, xc0, xc1, xg1, e_ext, ires, irev, 
+    v_prev, c_rad, d, xg, e_ext
 ):
-    rhs = torch.zeros(B, K, M, device=vi.device, dtype=vi.dtype)
-    rhs[..., 0] = cm_dt * (vi - ve0) + irev - ires
-    rhs[..., 1] = -cm_dt * vi + (cm_dt + xc0) * ve0 - xc0 * ve1 - irev + ires
-    rhs[..., 2] = -xc0 * ve0 + (xc0 + xc1) * ve1 + xg1 * e_ext
+    rhs = torch.zeros_like(v_prev)
+
+    v_c = c_rad[:, :, :-1] * (v_prev[:, :, :-1] - v_prev[:, :, 1:])
+
+    rhs[:, :, :-1] += v_c
+    rhs[:, :,  1:] -= v_c
+
+    rhs[:, :, 0] += d
+    rhs[:, :, 1] -= d
+
+    rhs[:, :, -1] += xg * e_ext + c_rad[:, :, -1] * v_prev[:, :, -1]
+
     return rhs

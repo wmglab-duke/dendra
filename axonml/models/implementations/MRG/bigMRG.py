@@ -228,5 +228,5 @@ class bigMRG(ExtCell):
         n = len(locs)
         return [locs[round((n - 1) * arg)] for arg in args]
 
-    def steady_state(self, dt=1.0, maxiter=3000):
-        return super().steady_state(dt, maxiter)
+    def steady_state(self, dt=1.0, tstop=200):
+        return super().steady_state(dt, tstop)

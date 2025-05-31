@@ -42,7 +42,7 @@ class MechanismHandler(torch.nn.Module):
   def initialize(self, v, v_init, temp) -> None:
     self.ion_init(temp)
     self.init_buffers(v)
-    self.i(v_init)
+    self.i(v)
 
   @torch.jit.export
   def set_buffers(self, diameters):

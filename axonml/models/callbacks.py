@@ -130,15 +130,13 @@ def recorder(self, model):
 """
 
 impl_template = """
-    states = model.mech.{mech}.{state}
-    if self.max_only:
-      self.rec['{full_state}'].append(torch.amax(states, -1, keepdim=True))
-    else:
-      if self.node_indices is not None:
-        self.rec['{full_state}'].append(states[..., self.node_indices])
-      else:
-        self.rec['{full_state}'].append(states)
+    states = model.integrator.mech.{mech}.{state}
+    {implementation}
 """
+
+max_only = "append_tensor_max(states, self.rec['{full_state}'])"
+indexed = "append_tensor_indexed(states, self.rec['{full_state}'], self.node_indices)"
+base = "append_tensor(states, self.rec['{full_state}'])"
 
 m_template = """
     states = model.{val}
@@ -152,22 +150,76 @@ m_template = """
 """
 
 
+@torch.jit.script
+def append_tensor(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
+    """
+    Append a tensor to a list of tensors.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        The tensor to append.
+    record : List[torch.Tensor]
+        The list to which the tensor will be appended.
+    """
+    record.append(tensor)
+
+
+@torch.jit.script
+def append_tenor_max(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
+    """
+    Append the maximum value of a tensor to a list of tensors.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        The tensor from which the maximum will be taken.
+    record : List[torch.Tensor]
+        The list to which the maximum value will be appended.
+    """
+    record.append(torch.amax(tensor, -1, keepdim=True))
+
+
+@torch.jit.script
+def append_tensor_indexed(tensor, record: List[torch.Tensor], node_indices: torch.Tensor) -> None:
+    """
+    Append a tensor indexed by node_indices to a list of tensors.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        The tensor to append.
+    record : List[torch.Tensor]
+        The list to which the tensor will be appended.
+    node_indices : torch.Tensor
+        Indices of nodes to select from the tensor.
+    """
+    record.append(tensor.index_select(-1, node_indices))
+
+
 def is_state(s):
     return "." in s
 
 
-def parse_template(full_state):
+def parse_template(full_state, max_only=False, indexed=False):
     mech, state = full_state.split(".")
-    return impl_template.format(mech=mech, state=state, full_state=full_state)
+    if max_only:
+        impl = max_only
+    elif indexed:
+        impl = indexed
+    else:
+        impl = base
+    implementation = impl.format(full_state=full_state)
+    return impl_template.format(mech=mech, state=state, implementation=implementation)
 
 
-def build_recorder_func(states, network=False):
+def build_recorder_func(states, max_only, indexed, network=False):
     res = []
     for s in states:
         if not is_state(s) or network:
             res.append(m_template.format(val=s))
         else:
-            res.append(parse_template(s))
+            res.append(parse_template(s, max_only, indexed))
     impl = "".join(res)
     forward_str = template.format(implementation=impl)
     filename = "<rec_template>"
@@ -298,9 +350,13 @@ class Recorder(Callback):
         self.states = states
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
-        self.node_indices = node_indices
+
+        self.indexed = node_indices is not None
+        if self.indexed:
+            self.node_indices = torch.as_tensor(node_indices, dtype=torch.long)
+
         self.sliding_window = sliding_window
-        rfunc = build_recorder_func(states, network=network)
+        rfunc = build_recorder_func(states, self.max_only, self.indexed, network=network)
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
 
@@ -373,6 +429,8 @@ class Recorder(Callback):
         return self
 
     def pre_loop_hook(self, model):
+        if self.indexed:
+            self.node_indices = self.node_indices.to(model.device())
         self.dt = float(model.dt)
         self._pre_loop_hook(model)
         if self.cache_with_hdf5:
@@ -498,7 +556,7 @@ class Recorder(Callback):
             if self.max_only:
                 return torch.amax(vs, 0)
             return vs
-        vs = torch.cat([torch.stack(self.rec[s]) for s in self.rec], dim=2)
+        vs = torch.stack([torch.stack(self.rec[s]) for s in self.rec], dim=2)
         if self.sliding_window is not None:
             vs = sliding_window_average(vs, self.sliding_window)
         if self.max_only:
