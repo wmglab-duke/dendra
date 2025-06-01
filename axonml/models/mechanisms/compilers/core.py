@@ -683,6 +683,7 @@ class ImplicitCompiler(MechCompiler):
     
     def gtot(self, currents, mechanism, mask):
         mult = " * self.mask" if mask else ""
+        factorable = []
         
         assignments = []
         for k in currents:
@@ -692,6 +693,9 @@ class ImplicitCompiler(MechCompiler):
                 assignments.append(f"self.conductance_{k}(v)")
             else:
                 assignments.append(f"self.gtot_{k}")
+                factorable.append(k)
+
+        self.factorable = factorable
         
         has_gtot = True
         if not assignments:
@@ -755,3 +759,10 @@ class ImplicitCompiler(MechCompiler):
                 assignments.append(f"self.irev_{k}")
         total = " + ".join(assignments)
         return f"    def irev(self): return {total} {mult}"
+
+    def detach(self, to_detach):
+        for k in self.factorable:
+            to_detach.append(f"gtot_{k}")
+            to_detach.append(f"irev_{k}")
+        return super().detach(to_detach)
+        

@@ -1293,6 +1293,7 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
 
     def detach(self, model):
         model.vc = model.vc.detach()
+        model.v = model.v.detach()
         self.mech.detach()
 
     def initialize(self, model, dt):
