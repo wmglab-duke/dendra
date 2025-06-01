@@ -4,7 +4,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-import axonml_solvers
+try:
+    import axonml_solvers
+    AXONML_SOLVERS_AVAILABLE = True
+except ImportError:
+    AXONML_SOLVERS_AVAILABLE = False
 
 from axonml.models.mechanisms.compilers import MechCompiler, ImplicitCompiler
 from axonml.models.mechanisms.handler.builders import ImplicitHandlerBuilder
@@ -1080,6 +1084,11 @@ class _bwd_euler_ub(Integrator):
     is_df = False
 
     def __init__(self, model, mech, method="thomas", **kw):
+        if not AXONML_SOLVERS_AVAILABLE:
+            raise ImportError(
+                "The axonml_solvers extension is not available. "
+                "Please install the axonml_solvers package."
+            )
         super().__init__(model, mech, **kw)
         B, K = model.n_ax, model.n_comp
         self.register_buffer("kernel", torch.tensor([1.0, -2.0, 1.0]).view(1, 1, 3))
@@ -1233,6 +1242,11 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
     is_df = False
 
     def __init__(self, model, mech, method="warp", **kwargs):
+        if not AXONML_SOLVERS_AVAILABLE:
+            raise ImportError(
+                "The axonml_solvers extension is not available. "
+                "Please install the axonml_solvers package."
+            )
         super().__init__()
         self.mech = mech
 
