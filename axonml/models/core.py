@@ -85,7 +85,16 @@ class SymmetricConv1D(torch.nn.Conv1d):
         return self._conv_forward(x, weight_, self.bias)
 
 
-class Axon(Parameterized, torch.jit.ScriptModule):
+@torch.compile
+def step(integrator, model, ve, dt, t_ind):
+    integrator.step(model, ve, dt, t_ind)
+
+@torch.compile
+def step_intra(integrator, model, ve, intra, dt, t_ind):
+    integrator.step_intra(model, ve, intra, dt, t_ind)
+
+
+class Axon(Parameterized):
     """
     Base 1D fiber class.
 
@@ -705,7 +714,8 @@ class Axon(Parameterized, torch.jit.ScriptModule):
 
                 if not isinstance(callbacks, CallbackList):
                     callbacks = CallbackList(callbacks)
-                callbacks.pre_loop_hook(self)
+                
+                pre_loop_hook(callbacks, self)
 
             dt = torch.as_tensor(dt, device=device)
 
@@ -720,10 +730,11 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 ve_c = ve[i] if not intra_only else ve_zero
                 if with_intra:
                     intra_c = intra(self.t_ind, self.v)
-                    self.integrator.step_intra(self, ve_c, intra_c, dt, self.t_ind)
+                    step_intra(self.integrator, self, ve_c, intra_c, dt, self.t_ind)
                 else:
-                    self.integrator.step(self, ve_c, dt, self.t_ind)
-                callbacks.post_step_hook(self)
+                    step(self.integrator, self, ve_c, dt, self.t_ind)
+                
+                post_step_hook(callbacks, self)
                 self.t_ind += 1
 
                 if progressbar:
@@ -734,7 +745,7 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             if not longrunning:
                 if progressbar:
                     progressbar.close()
-                callbacks.post_loop_hook(self)
+                post_loop_hook(callbacks, self)
 
     def longrun(
         self,
@@ -908,7 +919,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             for h in self.pre_initialize_hooks:
                 h(self)
 
-    @torch.jit.script_method
     def initialize(self, v, v_init, temp):
         self.integrator.mech.initialize(v, v_init, temp)
 
@@ -969,11 +979,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         out = ["v"]
         return out + self.integrator.mech.all_states()
 
-    @torch.jit.export
     def set(self, key: str, value: float):
         self.integrator.mech.set(key, value)
 
-    @torch.jit.export
     def cache(self, name: str = None):
         """
         Cache the current model state with an optional identifier.
@@ -1006,7 +1014,6 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             name = "latest"
         self._caches[name] = self.state_dict()
 
-    @torch.jit.export
     def restore(self, name: str = None):
         """
         Restore a previously cached model state.
@@ -1324,3 +1331,13 @@ class Myelinated(Axon):
         steps = self.n_comp
         t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(-1)
         return ((1 - t) * start + t * end).T
+
+
+def pre_loop_hook(c, m):
+    c.pre_loop_hook(m)
+
+def post_loop_hook(c, m):
+    c.post_loop_hook(m)
+
+def post_step_hook(c, m):
+    c.post_step_hook(m)

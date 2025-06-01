@@ -512,7 +512,6 @@ def inv3x3_tensor(A: Tensor) -> Tensor:
     return inv
 
 
-@torch.jit.script
 def solve_thomas_jit(
     lower: Tensor,  # (B, K-1,3,3)
     main: Tensor,   # (B, K,  3,3)
@@ -1130,7 +1129,6 @@ class _bwd_euler_ub(Integrator):
     def step_intra(self, model, ve, intra, dt, t_ind):
         model.v = self._step_intra(model.v, ve, dt, model.temp_c, intra)
 
-    @torch.jit.script_method
     def _step_no_intra(self, v, ve, dt, temp):
         dt_s = dt * 1e-3
         # advance gating
@@ -1174,7 +1172,6 @@ class _bwd_euler_ub(Integrator):
         v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
         return v_np1
 
-    @torch.jit.script_method
     def _step_intra(self, v, ve, dt, temp, intra):
         dt_s = dt * 1e-3
         # advance gating
@@ -1232,7 +1229,7 @@ class _bwd_euler_ub(Integrator):
             model.i_membrane.detach_()
 
 
-class _bwd_euler_bt(torch.jit.ScriptModule):
+class _bwd_euler_bt(torch.nn.Module):
     """
     Implicit Euler method for block tridiagonal system.
     """
@@ -1425,7 +1422,6 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
     def step(self, model, ve, dt, t_ind):
         model.vc, model.v = self._step_no_intra(model.vc, model.v, ve, dt, model.temp_c)
 
-    @torch.jit.script_method
     def _step_no_intra(self, vc, v, ve, dt, temp):
 
         xg = self.xg[..., -1]
@@ -1461,7 +1457,6 @@ class _bwd_euler_bt(torch.jit.ScriptModule):
         return vc, v
 
 
-@torch.jit.script
 def assemble_rhs(
     v_prev, c_rad, d, xg, e_ext
 ):

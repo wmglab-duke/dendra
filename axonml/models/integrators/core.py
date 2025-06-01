@@ -13,7 +13,7 @@ def get_init_defaults(cls):
     }
 
 
-class Integrator(torch.jit.ScriptModule):
+class Integrator(torch.nn.Module):
     """
     Base class for all integrators.
     """
@@ -48,7 +48,7 @@ class Integrator(torch.jit.ScriptModule):
         self.mech.detach()
 
 
-class SCIntegrator(torch.jit.ScriptModule):
+class SCIntegrator(torch.nn.Module):
     def __init__(self, model, mech, imem=None, N=1, P=1, C=1):
         super().__init__()
         self.mech = mech

@@ -39,6 +39,7 @@ class MechanismHandler(torch.nn.Module):
     {assignments}
     {imem_assignment}
 
+  @torch.jit.export
   def initialize(self, v, v_init, temp) -> None:
     self.ion_init(temp)
     self.init_buffers(v)

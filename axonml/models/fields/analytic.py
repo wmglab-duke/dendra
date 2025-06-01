@@ -4,7 +4,7 @@ from ..parametric import Parameterized
 from ..declarations import PARAMETER
 
 
-class Point(torch.jit.ScriptModule, Parameterized):
+class Point(Parameterized):
     PARAMETER(x=0.0, y=0.0, z=0.0)
 
     def __init__(self, **kwargs):

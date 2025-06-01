@@ -14,8 +14,10 @@ from .backend import Backend as A
 from .interfaces import AxonInterface
 
 
-TRANSFERSTREAM = torch.cuda.Stream()
-
+if torch.cuda.is_available():
+    TRANSFERSTREAM = torch.cuda.Stream()
+else:
+    TRANSFERSTREAM = None
 
 class Callback:
     """

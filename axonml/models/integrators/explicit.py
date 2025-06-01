@@ -72,14 +72,12 @@ class _euler(Integrator):
         self.cm_inv = 1.0 / model.cm_c
         self.ra_inv = 1.0 / model.ra_c
 
-    @torch.jit.script_method
     def FRK(self, v, ve, area, cm, ra):
         x = torch.stack([v, ve], dim=1)
         d2v = self.ssd(x).squeeze(1)
         i_ion = self.mech.i(v, v) * area
         return cm * ((ra * d2v) - i_ion)
 
-    @torch.jit.script_method
     def FRK_intra(self, v, ve, area, cm, ra, intra):
         x = torch.stack([v, ve], dim=1)
         d2v = self.ssd(x).squeeze(1)
@@ -96,7 +94,6 @@ class _euler(Integrator):
             model.v, ve, model.area_c, dt, model.temp_c, model.cm_c, intra
         )
 
-    @torch.jit.script_method
     def _step_no_intra(self, v, ve, area, dt, temp, cm):
         K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         self.mech.advance(v, dt, temp)
@@ -106,7 +103,6 @@ class _euler(Integrator):
             self.i_membrane = i_cap + self.mech.imem * area
         return v_n
 
-    @torch.jit.script_method
     def _step_intra(self, v, ve, area, dt, temp, cm, intra):
         K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         self.mech.advance(v, dt, temp)
@@ -122,7 +118,6 @@ class _eulerv1(_euler):
     Euler integrator with first-order correction.
     """
 
-    @torch.jit.script_method
     def _step_no_intra(self, v, ve, area, dt, temp, cm):
         self.mech.advance(v, dt, temp)
         K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
@@ -132,7 +127,6 @@ class _eulerv1(_euler):
             self.i_membrane = i_cap + self.mech.imem * area
         return v_n
 
-    @torch.jit.script_method
     def _step_intra(self, v, ve, area, dt, temp, cm, intra):
         self.mech.advance(v, dt, temp)
         K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
@@ -151,7 +145,6 @@ class _rk2(_euler):
     Second-order Runge-Kutta integrator.
     """
 
-    @torch.jit.script_method
     def _step_no_intra(self, v, ve, area, dt, temp, cm):
         K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         self.mech.advance(v, dt, temp)
@@ -162,7 +155,6 @@ class _rk2(_euler):
             self.i_membrane = i_cap + self.mech.imem * area
         return v_n
 
-    @torch.jit.script_method
     def _step_intra(self, v, ve, area, dt, temp, cm, intra):
         K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         self.mech.advance(v, dt, temp)
@@ -179,7 +171,6 @@ class _rk4(_euler):
     Fourth-order Runge-Kutta integrator.
     """
 
-    @torch.jit.script_method
     def _step_no_intra(self, v, ve, area, dt, temp, cm):
         K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         self.mech.advance(v, dt, temp)
@@ -192,7 +183,6 @@ class _rk4(_euler):
             self.i_membrane = i_cap + self.mech.imem * area
         return v_n
 
-    @torch.jit.script_method
     def _step_intra(self, v, ve, area, dt, temp, cm, intra):
         K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         self.mech.advance(v, dt, temp)
@@ -206,7 +196,6 @@ class _rk4(_euler):
         return v_n
 
 
-@torch.jit.script
 def ssd_df(v_c, v_p, v_e):
     v_c_p = F.pad(v_c, (1, 1), "reflect")
     v_e_p = F.pad(v_e, (1, 1), "reflect")
@@ -328,7 +317,6 @@ class _dufort_frankel(Integrator):
             t_ind,
         )
 
-    @torch.jit.ignore
     def _step_no_intra_64(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -351,7 +339,6 @@ class _dufort_frankel(Integrator):
 
         return v_new, v
 
-    @torch.jit.ignore
     def _step_no_intra_64_conv(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -375,7 +362,6 @@ class _dufort_frankel(Integrator):
 
         return v_new, v
 
-    @torch.jit.script_method
     def _step_no_intra(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -398,7 +384,6 @@ class _dufort_frankel(Integrator):
 
         return v_new, v
 
-    @torch.jit.script_method
     def _step_no_intra_conv(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -422,7 +407,6 @@ class _dufort_frankel(Integrator):
 
         return v_new, v
 
-    @torch.jit.script_method
     def _step_intra(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -445,7 +429,6 @@ class _dufort_frankel(Integrator):
 
         return v_new, v
 
-    @torch.jit.script_method
     def _step_intra_conv(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -469,7 +452,6 @@ class _dufort_frankel(Integrator):
 
         return v_new, v
 
-    @torch.jit.ignore
     def _step_intra_64(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -492,7 +474,6 @@ class _dufort_frankel(Integrator):
 
         return v_new, v
 
-    @torch.jit.ignore
     def _step_intra_64_conv(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
