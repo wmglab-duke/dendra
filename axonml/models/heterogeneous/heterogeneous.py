@@ -29,15 +29,15 @@ class Heterogeneous(Axon):
         super().__init__(diameters, n_comp, temp, v_init, method, beta)
 
     def _register_buffers(self, diameters):
-        self.register_buffer("diam", torch.empty(self.n_ax, 1, self.n_comp))
+        self.register_buffer("diam",   torch.empty(self.n_ax, 1, self.n_comp))
         self.register_buffer("node_l", torch.empty(self.n_ax, 1, self.n_comp))
 
         self.register_buffer("area_c", torch.empty(self.diam.shape))
-        self.register_buffer("cm_c", torch.empty(self.area_c.shape))
-        self.register_buffer("ra_c", torch.empty(self.n_ax, 1, self.n_comp - 1))
+        self.register_buffer("cm_c",   torch.empty(self.area_c.shape))
+        self.register_buffer("ra_c",   torch.empty(self.n_ax, 1, self.n_comp - 1))
 
         self.register_buffer("v_init_c", torch.tensor(self.v_init))
-        self.register_buffer("temp_c", torch.tensor(self.temp))
+        self.register_buffer("temp_c",   torch.tensor(self.temp))
 
     def x(self):
         node_l = torch.atleast_2d(self.node_l.squeeze())
