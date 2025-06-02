@@ -224,10 +224,10 @@ class _state_{name}(torch.nn.Module):
             self.q10 = self.return_q10_cache
         return super().eval()
 
-    def train(self):
+    def train(self, mode=True):
         if self.is_q10:
             self.q10 = self.calc_q10
-        return super().train()
+        return super().train(mode)
 
     def return_q10_cache(self):
         return self.q10_cache
@@ -309,10 +309,10 @@ class _state_{name}(torch.nn.Module):
             self.q10 = self.return_q10_cache
         return super().eval()
 
-    def train(self):
+    def train(self, mode=True):
         if self.is_q10:
             self.q10 = self.calc_q10
-        return super().train()
+        return super().train(mode)
 
     def return_q10_cache(self):
         return self.q10_cache
