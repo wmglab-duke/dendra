@@ -23,13 +23,7 @@ class nakpumpSchild(Mechanism):
         self.INaKmax = self.INaKmax22 * self.Q10NaK ** (
             (self.Q10TempA - self.temp) / self.Q10TempB
         )
-        fnk = (v + 150.0) / (v + 200.0)
-        self.ink = (
-            self.INaKmax
-            * fnk
-            * ((self.nai / (self.nai + self.Kmnai)) ** 3)
-            * ((self.ko / (self.ko + self.Kmko)) ** 2)
-        )
+        self.breakpoint(v)
 
     def breakpoint(self, v):
         fnk = (v + 150.0) / (v + 200.0)
