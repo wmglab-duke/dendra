@@ -17,7 +17,7 @@ class nacx(Mechanism):
 
     def initial(self, v):
         T = 273 + self.temp
-        self.q10 = torch.tensor((2.2*(T-296.0)+(310.0-T))/14.0)
+        self.q10.copy_((2.2*(T-296.0)+(310.0-T))/14.0)
         self.FRT = self.F/(self.R*T)
         self.breakpoint(v)
 

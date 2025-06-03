@@ -23,14 +23,12 @@ class MechanismHandler(torch.nn.Module):
     {assignments}
     {imem_assignment}
 
-  @torch.jit.export
   def initialize(self, v, v_init, temp) -> None:
     self.ion_init(temp)
     self.init_buffers(v_init)
     self.i(v, v)
     self.itot(v)
 
-  @torch.jit.export
   def set_buffers(self, diameters):
 {set_buffers}
     return
@@ -41,7 +39,6 @@ class MechanismHandler(torch.nn.Module):
     self.update(temp)
     return
 
-  @torch.jit.export
   def detach(self) -> None:
     {mech_detach}
     {ion_detach}
@@ -84,11 +81,9 @@ class MechanismHandler(torch.nn.Module):
     {init_buffers}
     return
 
-  @torch.jit.ignore
   def get(self, mech: str, state: str) -> torch.Tensor:
     return getattr(self, mech).get(state)
 
-  @torch.jit.export
   def all_states(self) -> List[str]:
     return [{all_states}]
     

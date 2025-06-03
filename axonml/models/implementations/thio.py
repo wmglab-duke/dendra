@@ -35,9 +35,15 @@ def pre_init(model):
 
 
 def balance(model):
-    model.mech.extrapump.pumpina = -model.mech.na_ion.ina.flatten()[0]
-    model.mech.extrapump.pumpik = -model.mech.k_ion.ik.flatten()[0]
-    model.mech.extrapump.pumpica = -model.mech.ca_ion.ica.flatten()[0]
+    model.mech.extrapump.pumpina.data.copy_(
+        -model.mech.na_ion.ina.flatten()[0]
+    )
+    model.mech.extrapump.pumpik.data.copy_(
+        -model.mech.k_ion.ik.flatten()[0]
+    )
+    model.mech.extrapump.pumpica.data.copy_(
+        -model.mech.ca_ion.ica.flatten()[0]
+    )
 
 
 class ThioAutonomic2025(Unmyelinated):

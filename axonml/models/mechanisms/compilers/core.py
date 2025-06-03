@@ -246,7 +246,7 @@ class MechCompiler:
 
     @staticmethod
     def gtot(currents, mechanism, mask):
-        return "    def gtot(self): return torch.tensor(0.0)", False
+        return "    def gtot(self): return 0.0", False
     
     @staticmethod
     def irev(currents, mask):
@@ -483,7 +483,7 @@ class DF_Compiler(MechCompiler):
         has_gtot = True
         if not assignments:
             has_gtot = False
-            return "    def gtot(self, v): return torch.tensor(0.0)", has_gtot
+            return "    def gtot(self, v): return 0.0", has_gtot
         
         s = " + ".join(assignments)
         return f"    def gtot(self, v): return ({s}) {mult}", has_gtot
@@ -503,7 +503,7 @@ class DF_Compiler(MechCompiler):
         has_gtot = True
         if not assignments:
             has_gtot = False
-            return "    def gtot(self, v): return torch.tensor(0.0)", has_gtot
+            return "    def gtot(self, v): return 0.0", has_gtot
         
         s = " + ".join(assignments)
         return f"    def gtot(self, v): return 0.5 * ({s}) {mult}", has_gtot
@@ -700,7 +700,7 @@ class ImplicitCompiler(MechCompiler):
         has_gtot = True
         if not assignments:
             has_gtot = False
-            return "    def gtot(self, v): return torch.tensor(0.0)", has_gtot
+            return "    def gtot(self, v): return 0.0", has_gtot
         
         s = " + ".join(assignments)
         return f"    def gtot(self, v): return ({s}) {mult}", has_gtot

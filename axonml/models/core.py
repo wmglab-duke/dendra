@@ -85,11 +85,12 @@ class SymmetricConv1D(torch.nn.Conv1d):
         return self._conv_forward(x, weight_, self.bias)
 
 
-@torch.compile
+@torch.compile(fullgraph=True)
 def step(integrator, model, ve, dt, t_ind):
     integrator.step(model, ve, dt, t_ind)
 
-@torch.compile
+
+@torch.compile(fullgraph=True)
 def step_intra(integrator, model, ve, intra, dt, t_ind):
     integrator.step_intra(model, ve, intra, dt, t_ind)
 
@@ -795,10 +796,16 @@ class Axon(Parameterized):
         The state of the model (v, v_prev, etc.) is preserved between chunks.
         """
 
+        with_intra = intra is not None
+        if with_intra:
+            if not isinstance(intra, IntraStim):
+                raise ValueError("intra must be an instance of IntraStim")
+
         dt = dt if dt is not None else A.dt
         self.warn_about_dt(dt)
 
         ve_s = torch.as_tensor(space, device=self.device(), dtype=self.dtype())
+        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
 
         functional = False
 
@@ -824,7 +831,6 @@ class Axon(Parameterized):
                 time = time.assemble(dt)
 
             ve_t = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
-
             n_chunks = math.ceil(ve_t.shape[-1] / chunklength)
 
             # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
@@ -850,28 +856,43 @@ class Axon(Parameterized):
 
         callbacks = CallbackList(callbacks)
 
-        for i, t_chunk in enumerate(t_chunks):
-            if (i == 0) and reinit:
-                reinit = True
+        if (not self.initialized) or reinit:
+            if "_steady_state" in self._caches:
+                self.restore("_steady_state")
+                self.t_ind = 0
             else:
-                reinit = False
-            if functional:
-                ve = einsum(ve_s, time(t_chunk).to(self.dtype()))
-            else:
-                ve = einsum(ve_s, t_chunk)
-            with ctx(DTWARN=0):
-                self.run(
-                    ve,
-                    dt=dt,
-                    intra=intra,
-                    callbacks=callbacks,
-                    reinit=reinit,
-                    progressbar=progressbar,
-                    first=(i == 0),
-                    longrunning=True,
-                )
+                self.integrator.init_v(self)
+                self.pre_initialize()
+                self.integrator.mech.initialize(self.v, self.v_init_c, self.temp_c)
+                self.post_initialize()
+                self.t_ind = 0
+                self.initialized = True
+            if with_intra:
+                intra.init(self)
+        else:
+            self.detach()
 
-        callbacks.post_loop_hook(self)
+        self.integrator.initialize(self, dt)
+
+        pre_loop_hook(callbacks, self)
+
+        for i, t_chunk in enumerate(t_chunks):
+            if functional:
+                t = time(t_chunk).to(self.dtype())
+            else:
+                t = t_chunk
+            ve_ = einsum(ve_s, t)
+            for ve in torch.unbind(ve_, 0):
+                step(self.integrator, self, ve, dt, self.t_ind)
+                post_step_hook(callbacks, self)
+                self.t_ind += 1
+
+                if progressbar:
+                    progressbar.update(1)
+                    if self.t_ind % 100 == 0:
+                        progressbar.set_description(f"{self.t:.1f} ms")
+
+        post_loop_hook(callbacks, self)
 
         if progressbar:
             progressbar.close()
