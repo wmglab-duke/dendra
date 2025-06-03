@@ -343,7 +343,6 @@ class _krylov_etd1(Integrator):
     def step_intra(self, model, ve, intra, dt, t_ind):
         model.v = self._step_intra(model.v, ve, dt, model.temp_c, intra)
 
-    @torch.jit.script_method
     def _step_no_intra(self, v, ve, dt, temp):
         dt_s = dt * 1e-3
         self.mech.advance(v, dt, temp)
@@ -378,7 +377,6 @@ class _krylov_etd1(Integrator):
         )
         return (v_lin + v_nl).unsqueeze(1)
 
-    @torch.jit.script_method
     def _step_intra(self, v, ve, dt, temp, intra):
         dt_s = dt * 1e-3
         self.mech.advance(v, dt, temp)
@@ -443,7 +441,6 @@ class _bwd_euler_sc(SCIntegrator):
             )
         super().__init__(model, mech, imem, N, P, C)
 
-    @torch.jit.ignore
     def initialize(self, model, dt):
         self.cmdt = (1e-6 * model.cm) / (1e-3 * dt)
 
@@ -453,7 +450,6 @@ class _bwd_euler_sc(SCIntegrator):
     def step_intra(self, model, intra, dt, t_ind):
         model.v = self._step_intra(model.v, dt, model.temp_c, intra)
 
-    @torch.jit.script_method
     def _step_no_intra(self, v, dt, temp):
         self.mech.advance(v, dt, temp)
         self.mech.i(v)
@@ -461,7 +457,6 @@ class _bwd_euler_sc(SCIntegrator):
         gtot = self.mech.gtot(v)
         return (self.cmdt * v + i) / (self.cmdt + gtot)
 
-    @torch.jit.script_method
     def _step_intra(self, v, dt, temp, intra):
         i = -self.mech.i(v) + self.mech.irev() + intra
         gtot = self.mech.gtot(v)
@@ -495,7 +490,7 @@ class _bwd_euler_ub(Integrator):
         self.register_buffer("scale", torch.zeros(B, K))
 
         if method == "pcr":
-            self._solve = torch.ops.axonml_solvers.pcr_solve_t
+            self._solve = pcr_tridiag_solve
         elif method == "thomas":
             self._solve = torch.ops.axonml_solvers.thomas_solve_t
         else:

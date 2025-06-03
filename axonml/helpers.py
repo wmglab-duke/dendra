@@ -93,12 +93,12 @@ def ve_from_s_t(space, time, n, device, multicontact=False):
     return einsum(ve_s, ve_t)
 
 
-@torch.compile
+@torch.jit.script
 def op_mc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return torch.einsum("can,cat->tan", s, t)
 
 
-@torch.compile
+@torch.jit.script
 def op_sc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return torch.einsum("an,at->tan", s, t)
 

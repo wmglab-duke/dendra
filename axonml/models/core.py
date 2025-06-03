@@ -85,12 +85,12 @@ class SymmetricConv1D(torch.nn.Conv1d):
         return self._conv_forward(x, weight_, self.bias)
 
 
-@torch.compile(fullgraph=True)
+@torch.compile
 def step(integrator, model, ve, dt, t_ind):
     integrator.step(model, ve, dt, t_ind)
 
 
-@torch.compile(fullgraph=True)
+@torch.compile
 def step_intra(integrator, model, ve, intra, dt, t_ind):
     integrator.step_intra(model, ve, intra, dt, t_ind)
 
