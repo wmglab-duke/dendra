@@ -933,9 +933,8 @@ class Axon(Parameterized):
 
         maxiter = int(tstop / dt)
 
-        with ctx(DTWARN=0):
-            for i in tqdm(range(maxiter), desc=f"Steady state [dt:{dt} ms, tstop:{tstop} ms]"):
-                step(self.integrator, self, ve, dt, self.t_ind)
+        for i in tqdm(range(maxiter), desc=f"Steady state [dt:{dt:.3f} ms, tstop:{tstop:.2f} ms]"):
+            self._step(self.integrator, self, ve, dt, self.t_ind)
         self.cache("_steady_state")
         self.t_ind = 0
         return self
