@@ -63,6 +63,7 @@ DTWARN = ContextVar("DTWARN", 1)
 PADE = ContextVar("PADE", -1)
 DETECT_ANOMALIES = ContextVar("DETECT_ANOMALIES", 0)
 NETWORK = ContextVar("NETWORK", 0)
+BACKEND = ContextVar("BACKEND", "inductor")
 
 
 def numpify(x):

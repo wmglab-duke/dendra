@@ -28,16 +28,7 @@ class {mech}(torch.nn.Module):
         self.shape = shape
 
         self.register_buffer("dummy", torch.zeros(1))
-
-        if len(diameters.shape) == 1:
-            final_axis = 1
-        else:
-            final_axis = diameters.shape[-1]
-        
-        try:
-            self.register_buffer("diam", diameters.view(diameters.shape[0], final_axis))
-        except:
-            self.register_buffer("diam", diameters)
+        self.register_buffer("diam", diameters)
 
         self.DE = torch.nn.ModuleDict(
             {{state._name: state for state in states}}

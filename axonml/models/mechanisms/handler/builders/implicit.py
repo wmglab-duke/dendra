@@ -82,10 +82,6 @@ class MechanismHandler(torch.nn.Module):
     {assign_equilibrium}
     return
 
-  def generic(self, model: AxonInterface) -> None:
-    {mech_update_fs}
-    return
-
   def ion_init(self, temp) -> None:
     {ion_init}
     return

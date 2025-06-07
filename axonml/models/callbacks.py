@@ -354,6 +354,7 @@ class Recorder(Callback):
         self.max_only: bool = max_only
 
         self.indexed = node_indices is not None
+        self.node_indices = None
         if self.indexed:
             self.node_indices = torch.as_tensor(node_indices, dtype=torch.long)
 

@@ -641,8 +641,8 @@ class ExtCell(Axon):
         pass
 
     def _register_buffers(self, diameters):
-        self.register_buffer("diam",        torch.empty(self.n_ax, self.n_comp))
-        self.register_buffer("L",           torch.empty(self.n_ax, self.n_comp))
+        self.register_buffer("diam",        torch.full((self.n_ax, self.n_comp), 10.0))
+        self.register_buffer("L",           torch.full((self.n_ax, self.n_comp), 10.0))
 
         self.register_buffer("xraxial",     torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
         self.register_buffer("xc",          torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0))

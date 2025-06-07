@@ -1,4 +1,5 @@
 from typing import Tuple
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -316,7 +317,7 @@ class _krylov_etd1(Integrator):
 
     def initialize(self, model, dt):
         B, K = model.n_ax, model.n_comp
-        radius_cm = 1e-4 * model.diam.unsqueeze(1) / 2.0
+        radius_cm = 1e-4 * model.diam / 2.0
         dx_cm = 1e-4 * model.dx
 
         # surface area
@@ -475,10 +476,10 @@ class _bwd_euler_ub(Integrator):
 
     def __init__(self, model, mech, method="thomas", **kw):
         if not AXONML_SOLVERS_AVAILABLE:
-            raise ImportError(
-                "The axonml_solvers extension is not available. "
-                "Please install the axonml_solvers package."
+            warnings.warn(
+                "axonml_solvers not available, using PCR solver for BWD Euler."
             )
+            method = "pcr"
         super().__init__(model, mech, **kw)
         B, K = model.n_ax, model.n_comp
         self.register_buffer("kernel", torch.tensor([1.0, -2.0, 1.0]).view(1, 1, 3))
@@ -499,7 +500,7 @@ class _bwd_euler_ub(Integrator):
     def initialize(self, model, dt):
         B, K = model.n_ax, model.n_comp
         # same geometry & membrane setup as ETD1
-        radius_cm = 1e-4 * model.diam.unsqueeze(1) / 2.0
+        radius_cm = 1e-4 * model.diam / 2.0
         dx_cm = 1e-4 * model.dx
         A_mem = 2 * torch.pi * radius_cm * dx_cm
         cm = 1e-6 * model.cm * A_mem
@@ -577,12 +578,12 @@ class _bwd_euler_ub(Integrator):
 
         # diffusive extracellular coupling
         S = torch.nn.functional.conv1d(ve.unsqueeze(1), self.kernel, padding=1).squeeze(1)
-        S[:, 0] = ve[:, 0, 1] - ve[:, 0, 0]
-        S[:, -1] = ve[:, 0, -2] - ve[:, 0, -1]
+        S[:, 0] = ve[:, 1] - ve[:, 0]
+        S[:, -1] = ve[:, -2] - ve[:, -1]
         S = S * self.g_ax
 
         # form RHS: v_n + dt*(linear_reversal + S - residual)
-        f_n = irev * self.scale + S - i_res * self.scale - intra.squeeze(1)
+        f_n = (irev - ires) * self.scale + S + intra.squeeze(1) * self.cm_inv
         RHS = v + dt_s * f_n
 
         # build tridiagonal system M v_{n+1} = RHS
@@ -863,7 +864,7 @@ class _bwd_euler_bt(torch.nn.Module):
         gtot = self.mech.gtot(v) * self.area
         irev = self.mech.irev()
 
-        d = (irev - ires - intra.squeeze(1)) * self.area
+        d = (irev - ires) * self.area + intra.squeeze(1)
 
         B = self.maind.clone()
         B[..., 0, 0] += gtot

@@ -12,27 +12,6 @@ from axonml.helpers import IMEM
 from .core import Integrator
 
 
-@torch.jit.interface
-class HandlerInterface:
-    def initialize(self, v, v_init, temp) -> None:
-        pass
-
-    def advance(self, v, dt, temp) -> None:
-        pass
-
-    def detach(self) -> None:
-        pass
-
-    def i(self, v, v_prev) -> torch.Tensor:
-        pass
-
-    def itot(self, v) -> torch.Tensor:
-        pass
-
-    def gtot(self, v) -> torch.Tensor:
-        pass
-
-
 class SymmetricConv1D(torch.nn.Conv1d):
     def forward(self, x):
         if self.training:

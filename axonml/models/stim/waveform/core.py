@@ -4,7 +4,7 @@ import torch
 from axonml.models.parametric import Parameterized
 
 
-class Waveform(torch.jit.ScriptModule, Parameterized):
+class Waveform(Parameterized):
     """
     Base class for creating waveform generators.
 
@@ -74,11 +74,19 @@ class Waveform(torch.jit.ScriptModule, Parameterized):
         self.check_kwargs(kwargs)
         self.instantiate_parameters(**kwargs)
 
+    def reshape_parameters(self):
+        for p in self.parameters():
+            if p.dim() == 0:
+                pass
+            else:
+                p.data = p.data.unsqueeze(-1)
+
     def fn(self, t):
         raise NotImplementedError
 
     def forward(self, t):
-        return torch.atleast_2d(self.fn(torch.as_tensor(t)))
+        t = torch.as_tensor(t)
+        return self.fn(t)
 
     def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
         return _repeat(self, freq, delay, off)

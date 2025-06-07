@@ -38,19 +38,19 @@ def parse_assignments(mechanism_names) -> str:
 
 
 set_buffer_template = """
-self.{mech}.{v}.set_(self.{ion}_ion.{v})
+self.{mech}.{v} = self.{ion}_ion.{v}
 for _, s in self.{mech}.DE.items():
-  s.{v}.set_(self.{ion}_ion.{v})
+  s.{v} = self.{ion}_ion.{v}
 """
 
 
 set_ion_write_c_buffer_template = """
-self.{mech}.{v}.set_(self.{ion}_ion.{v})
+self.{mech}.{v} = self.{ion}_ion.{v}
 """
 
 
 set_diam_buffer_template = """
-self.{mech}.diam.set_(diameters.view(-1, 1))
+self.{mech}.diam.set_(diameters)
 """
 
 
