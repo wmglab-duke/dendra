@@ -26,7 +26,7 @@ def expinv(x):
 
 def safe_exp(x):
     exp_ = torch.exp(x)
-    return torch.where(torch.isfinite(exp_), exp_, torch.tensor(1e20))
+    return torch.where(torch.isfinite(exp_), exp_, torch.tensor(1e20, device=x.device, dtype=x.dtype))
 
 
 def all_ops():
