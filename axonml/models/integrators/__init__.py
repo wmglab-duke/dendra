@@ -11,10 +11,13 @@ from .explicit import (
 )
 
 from .implicit import (
-    _krylov_etd1, 
     _bwd_euler_sc, 
     _bwd_euler_ub,
     _bwd_euler_bt,
+)
+
+from .imex import (
+    _krylov_etd1,
 )
 
 
