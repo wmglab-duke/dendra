@@ -8,7 +8,7 @@ from ..mod import (
 from ..mechanisms import PARAMETER, c_context
 
 from axonml.units import mm
-from axonml.models.integrators import dufort_frankel
+from axonml.models.integrators import bwd_euler_ub
 
 
 def pre_init(model):
@@ -95,8 +95,10 @@ class Tigerholm2014(Unmyelinated):
         dx=10,
         temp=37.0,
         v_init=-55.0,
-        integrator=dufort_frankel(),
+        integrator=None,
     ):
+        if integrator is None:
+            integrator = bwd_euler_ub()
         super().__init__(diameters, L, dx, temp, v_init, integrator)
 
         self.register_pre_initialize_hook(pre_init)

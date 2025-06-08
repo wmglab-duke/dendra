@@ -87,11 +87,8 @@ class SymmetricConv1D(torch.nn.Conv1d):
         return self._conv_forward(x, weight_, self.bias)
 
 
-def step(integrator, model, ve, dt, t_ind):
-    integrator.step(model, ve, dt, t_ind)
-
-def step_intra(integrator, model, ve, intra, dt, t_ind):
-    integrator.step_intra(model, ve, intra, dt, t_ind)
+def step(integrator, model, ve, dt, intra=None):
+    integrator.step(model, ve, dt, intra)
 
 
 class Axon(Parameterized):
@@ -160,6 +157,8 @@ class Axon(Parameterized):
 
         self.cid = None
 
+        self.backend = BACKEND.value
+
         self.compiler = integrator.compiler(DEBUG, DETECT_ANOMALIES, PADE)
         self.builder = None
         if integrator.builder is not None:
@@ -189,8 +188,7 @@ class Axon(Parameterized):
         self.pre_initialize_hooks: List[Callable] = []
         self.post_initialize_hooks: List[Callable] = []
 
-        self._step = torch.compile(step, backend=BACKEND.value)
-        self._step_intra = torch.compile(step_intra, backend=BACKEND.value)
+        self._step = torch.compile(step, backend=self.backend)
 
         self._caches = {}
 
@@ -604,8 +602,8 @@ class Axon(Parameterized):
         ve=None,
         space=None,
         time=None,
-        dt=None,
         tstop=None,
+        dt=None,
         intra=None,
         callbacks=None,
         reinit=False,
@@ -628,6 +626,10 @@ class Axon(Parameterized):
         time : Tensor or Waveform, optional
             Temporal components when ve is not directly provided.
             Used with space to construct ve.
+        tstop : float, optional
+            Simulation stop time in milliseconds. If None, uses the default from backend.
+            If ve is provided, this is ignored.
+            If ve is provided, tstop is determined by the shape of ve.
         dt : float, optional
             Time step size in milliseconds. If None, uses the default from backend.
         intra : IntraStim, optional
@@ -808,6 +810,7 @@ class Axon(Parameterized):
                 raise ValueError("intra must be an instance of IntraStim")
 
         dt = dt if dt is not None else A.dt
+        self.dt = dt
         self.warn_about_dt(dt)
 
         ve_s = torch.as_tensor(space, device=self.device(), dtype=self.dtype())
@@ -828,13 +831,14 @@ class Axon(Parameterized):
                 ve_s = ve_s.expand(self.n_ax, -1)
                 einsum = op_sc
 
-                if progressbar:
-                    progressbar = tqdm(total=len(t), desc=f"{self.t:.1f} ms")
+                n_p = len(t)
 
             else:
                 if isinstance(time, Waveform):
                     if time._tstop is None:
-                        raise ValueError("Waveform must have a tstop value.")
+                        if tstop is None:
+                            raise ValueError("Waveform must have a tstop value or supply tstop to longrun.")
+                        time._tstop = tstop
                     time = time.assemble(dt)
 
                 ve_t = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
@@ -854,8 +858,7 @@ class Axon(Parameterized):
 
                 t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
 
-                if progressbar:
-                    progressbar = tqdm(total=ve_t.shape[-1], desc=f"{self.t:.1f} ms")
+                n_p = ve_t.shape[-1]
 
             if callbacks:
                 for c in callbacks:
@@ -874,29 +877,38 @@ class Axon(Parameterized):
             else:
                 self.detach()
 
+            if progressbar:
+                progressbar = tqdm(total=n_p, desc=f"{self.t:.1f} ms")
+
             self.integrator.initialize(self, dt)
+            einsum = torch.compile(einsum)
 
             pre_loop_hook(callbacks, self)
 
             for i, t_chunk in enumerate(t_chunks):
+
                 if functional:
                     t = time(t_chunk).to(self.dtype())
                 else:
                     t = t_chunk
+
+                pre_chunk_hook(callbacks, self, len(t))
+
                 ve_ = einsum(ve_s, t)
                 for ve in ve_.unbind(dim=0):
-                    ve = ve.contiguous()
-                    if not with_intra:
-                        self._step(self.integrator, self, ve, dt, self.t_ind)
-                    else:
+                    if with_intra:
                         intra_c = intra(self.t_ind, self.v)
-                        self._step_intra(self.integrator, self, ve, intra_c, dt, self.t_ind)
+                    else:
+                        intra_c = None
+                    
+                    self._step(self.integrator, self, ve, dt, intra_c)
                     post_step_hook(callbacks, self)
+
                     self.t_ind += 1
 
                     if progressbar:
                         progressbar.update(1)
-                        if self.t_ind % 100 == 0:
+                        if self.t_ind % 500 == 0:
                             progressbar.set_description(f"{self.t:.1f} ms")
 
             post_loop_hook(callbacks, self)
@@ -1372,11 +1384,22 @@ class Myelinated(Axon):
         return ((1 - t) * start + t * end).T
 
 
+# callback helpers
 def pre_loop_hook(c, m):
     c.pre_loop_hook(m)
 
 def post_loop_hook(c, m):
     c.post_loop_hook(m)
 
+def pre_step_hook(c, m):
+    c.pre_step_hook(m)
+
+@torch.compile
 def post_step_hook(c, m):
     c.post_step_hook(m)
+
+def pre_chunk_hook(c, m, n):
+    c.pre_chunk_hook(m, n)
+
+def post_chunk_hook(c, m, n):
+    c.post_chunk_hook(m, n)

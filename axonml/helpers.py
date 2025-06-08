@@ -94,12 +94,10 @@ def ve_from_s_t(space, time, n, device, multicontact=False):
     return einsum(ve_s, ve_t)
 
 
-@torch.jit.script
 def op_mc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return torch.einsum("can,cat->tan", s, t)
 
 
-@torch.jit.script
 def op_sc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return torch.einsum("an,at->tan", s, t)
 
@@ -114,7 +112,7 @@ def interp1d(x, y, xnew, out=None):
     This function is working similarly to Matlab™ or scipy functions with
     the `linear` interpolation mode on, except that it parallelises over
     any number of desired interpolation problems.
-    Values outside the bounds of x are set to 0.
+    Values outside the bounds of x are set to the bounds.
     The code will run on GPU if all the tensors provided are on a cuda
     device.
 
@@ -247,13 +245,14 @@ def interp1d(x, y, xnew, out=None):
         # now build the linear interpolation
         ynew = sel("y") + sel("slopes") * (v["xnew"] - sel("x"))
 
-        # Create masks for values outside the bounds of x
-        x_min = v["x"].min(dim=1, keepdim=True)[0]
-        x_max = v["x"].max(dim=1, keepdim=True)[0]
+        x_min = v["x"][:, :1]          # shape (D,1)
+        x_max = v["x"][:, -1:]         # shape (D,1)
+        y_min = v["y"][:, :1]          # first column of y (same row as x)
+        y_max = v["y"][:, -1:]         # last  column of y
 
-        # Set values outside bounds to zero
-        outside_bounds = (v["xnew"] < x_min) | (v["xnew"] > x_max)
-        ynew = torch.where(outside_bounds, torch.zeros_like(ynew), ynew)
+        # left of domain → y_min, right of domain → y_max
+        ynew = torch.where(v["xnew"] < x_min, y_min.expand_as(ynew), ynew)
+        ynew = torch.where(v["xnew"] > x_max, y_max.expand_as(ynew), ynew)
 
         if reshaped_xnew:
             ynew = ynew.view(original_xnew_shape)

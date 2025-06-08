@@ -19,6 +19,8 @@ from axonml.helpers import DEBUG
 from axonml.models.math.diffusion import diffuse_step_neumann_dct1
 from axonml.models.parametric import to_param
 
+from axonml.helpers import interp1d
+
 
 # PyTorch operations
 torch_operations = set(dir(torch))
@@ -289,7 +291,7 @@ class _state_{name}(torch.nn.Module):
 
         self.register_buffer("diam", diameters)
         self.register_buffer("temp", torch.as_tensor(temp))
-        
+
         self._name = name
         self._state_names = state_names
 
@@ -403,9 +405,11 @@ def translate_breakpoint(state: State, assigned):
         A formatted string representing the breakpoint function, or an empty string
         if the state object does not have a breakpoint function.
     """
+    if not assigned:
+        return ""
     f = getattr(state, "breakpoint", None)
     if not f:
-        return ""
+        raise ValueError(f"Must specify breakpoint function to compute assigned variables: {assigned}.")
     body = get_function_body_as_str(f)
     return_names = ", ".join(assigned)
     return breakpoint_str.format(

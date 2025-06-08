@@ -3,7 +3,8 @@ from ..mod import rattay_aberham
 from ..mechanisms import PARAMETER, e_context
 
 from axonml.units import mm
-from axonml.models.integrators import dufort_frankel
+from axonml.models.integrators import bwd_euler_ub
+
 
 class Rattay1993(Unmyelinated):
     PARAMETER(inherit=Unmyelinated, rhoa=100.0)
@@ -15,8 +16,10 @@ class Rattay1993(Unmyelinated):
         dx=10,
         temp=37.0,
         v_init=-70.0,
-        integrator=dufort_frankel(),
+        integrator=None,
     ):
+        if integrator is None:
+            integrator = bwd_euler_ub()
         super().__init__(diameters, L, dx, temp, v_init, integrator)
 
         with e_context(ena=45.0, ek=-82.0):

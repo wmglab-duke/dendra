@@ -50,7 +50,7 @@ class SMF(Myelinated):
     -----
     The S-MF model is designed to enable rapid exploration of electrical stimulation parameters
     while maintaining high accuracy compared to the gold-standard MRG model. It provides
-    2,000-150,000× speedup over single-core simulations in NEURON while accurately predicting:
+    up to 1,000,000x speedup over single-core simulations in NEURON while accurately predicting:
 
     - Full spatiotemporal responses of nerve fibers to electrical stimulation
     - Action potential generation, propagation, and conduction velocity

@@ -274,13 +274,10 @@ class _krylov_etd1(Integrator):
         self.cm_inv = 1.0 / cm
         self.scale = A_mem * self.cm_inv
 
-    def step(self, model, ve, dt, t_ind):
-        model.v = self._step_no_intra(model.v, ve, dt, model.temp_c)
+    def step(self, model, ve, dt, intra=None):
+        model.v = self._step_no_intra(model.v, ve, dt, model.temp_c, intra)
 
-    def step_intra(self, model, ve, intra, dt, t_ind):
-        model.v = self._step_intra(model.v, ve, dt, model.temp_c, intra)
-
-    def _step_no_intra(self, v, ve, dt, temp):
+    def _step(self, v, ve, dt, temp, intra=None):
         dt_s = dt * 1e-3
         self.mech.advance(v, dt, temp)
 
@@ -296,47 +293,9 @@ class _krylov_etd1(Integrator):
 
         S *= self.g_ax
         f_n = f_n + S
-        
-        diag = self.diag - gtot
-        v_lin = self._expm(
-            v,
-            dt_s,
-            self.m,
-            diag,
-            self.g_ax,
-            self.g_ax,
-            self.V_buf,
-            self.H_buf,
-        )
-        v_nl = dt_s * self._phi1(
-            f_n,
-            dt_s,
-            self.m,
-            diag,
-            self.g_ax,
-            self.g_ax,
-            self.V_buf,
-            self.H_buf,
-            self.eye_m,
-        )
-        return (v_lin + v_nl)
 
-    def _step_intra(self, v, ve, dt, temp, intra):
-        dt_s = dt * 1e-3
-        self.mech.advance(v, dt, temp)
-
-        ires = self.mech.i(v)
-        irev = self.mech.irev()
-        gtot = self.mech.gtot(v) * self.scale
-
-        f_n = (irev - ires) * self.scale
-
-        S = F.conv1d(ve.unsqueeze(1), self.kernel, padding=1).squeeze(1)
-        S[:, 0] = ve[:, 1] - ve[:, 0]  # fix boundary left
-        S[:, -1] = ve[:, -2] - ve[:, -1]  # fix boundary right
-
-        S *= self.g_ax
-        f_n = f_n + S + intra.squeeze(1)
+        if intra is not None:
+            f_n = f_n + intra.squeeze(1)
         
         diag = self.diag - gtot
         v_lin = self._expm(

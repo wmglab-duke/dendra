@@ -105,13 +105,10 @@ class _bwd_euler_ub(Integrator):
         self.cm_inv.copy_(1.0 / cm)
         self.scale.copy_(A_mem * self.cm_inv)
 
-    def step(self, model, ve, dt, t_ind):
-        model.v = self._step_no_intra(model.v, ve, dt, model.temp_c)
+    def step(self, model, ve, dt, intra=None):
+        model.v = self._step(model.v, ve, dt, model.temp_c, intra)
 
-    def step_intra(self, model, ve, intra, dt, t_ind):
-        model.v = self._step_intra(model.v, ve, dt, model.temp_c, intra)
-
-    def _step_no_intra(self, v, ve, dt, temp):
+    def _step(self, v, ve, dt, temp, intra=None) -> Tensor:
         dt_s = dt * 1e-3
         # advance gating
         self.mech.advance(v, dt, temp)
@@ -130,50 +127,9 @@ class _bwd_euler_ub(Integrator):
         S = S * self.g_ax
 
         # form RHS: v_n + dt*(linear_reversal + S - residual)
-        f_n = irev * self.scale + S - i_res * self.scale
-        RHS = v + dt_s * f_n
-
-        # build tridiagonal system M v_{n+1} = RHS
-        A_diag = self.diag_base - gtot
-        main = 1.0 - dt_s * A_diag
-        lower = -dt_s * self.g_ax[:, 1:]
-        upper = -dt_s * self.g_ax[:, :-1]
-
-        # a: (B, K-1), b: (B, K), c: (B, K-1), d: (B, K)
-        inv_b = 1.0 / main  # shape (B, K)
-
-        # scale the three diagonals
-        a_s = lower * inv_b[:, 1:]  # each row i: divide a_i by b_i
-        c_s = upper * inv_b[:, :-1]  # divide c_i by b_i
-        b_s = torch.ones_like(main)
-
-        # scale RHS
-        d_s = RHS * inv_b  # divide each equation by its pivot b_i
-
-        # solve tridiagonal system
-        v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
-        return v_np1
-
-    def _step_intra(self, v, ve, dt, temp, intra):
-        dt_s = dt * 1e-3
-        # advance gating
-        self.mech.advance(v, dt, temp)
-
-        # nonlinear residual currents
-        i_res = self.mech.i(v)  # (B,K)
-
-        # linearized ionic conductances & reversal
-        gtot = self.mech.gtot(v) * self.scale  # (B,K)
-        irev = self.mech.irev()  # (B,K)
-
-        # diffusive extracellular coupling
-        S = torch.nn.functional.conv1d(ve.unsqueeze(1), self.kernel, padding=1).squeeze(1)
-        S[:, 0] = ve[:, 1] - ve[:, 0]
-        S[:, -1] = ve[:, -2] - ve[:, -1]
-        S = S * self.g_ax
-
-        # form RHS: v_n + dt*(linear_reversal + S - residual)
-        f_n = (irev - ires) * self.scale + S + intra.squeeze(1) * self.cm_inv
+        f_n = (irev - i_res) * self.scale + S
+        if intra is not None:
+            f_n = f_n + intra.squeeze(1) * self.cm_inv
         RHS = v + dt_s * f_n
 
         # build tridiagonal system M v_{n+1} = RHS
@@ -235,9 +191,9 @@ class _bwd_euler_bt(torch.nn.Module):
         self.K = K
         self.M = M
 
-        self.register_buffer("upper", torch.zeros(B, K-1, M, M))
+        self.register_buffer("upper", torch.zeros(B, K-1, M))
         self.register_buffer("lower", torch.zeros(B, K-1, M))
-        self.register_buffer("maind", torch.zeros(B, K,   M))
+        self.register_buffer("maind", torch.zeros(B, K,   M, M))
         self.register_buffer("area",  torch.zeros(B, K))
 
         self.register_buffer("cm_dt", torch.zeros(B, K))
@@ -401,13 +357,10 @@ class _bwd_euler_bt(torch.nn.Module):
         self.lower = lower
         self.upper = upper
             
-    def step(self, model, ve, dt, t_ind):
-        model.vc, model.v = self._step_no_intra(model.vc, model.v, ve, dt, model.temp_c)
+    def step(self, model, ve, dt, intra=None):
+        model.vc, model.v = self._step(model.vc, model.v, ve, dt, model.temp_c)
 
-    def step_intra(self, model, ve, intra, dt, t_ind):
-        model.vc, model.v = self._step_intra(model.vc, model.v, ve, intra, dt, model.temp_c)
-
-    def _step_no_intra(self, vc, v, ve, dt, temp):
+    def _step(self, vc, v, ve, dt, temp, intra=None) -> Tuple[Tensor, Tensor]:
 
         xg = self.xg[..., -1]
 
@@ -421,6 +374,9 @@ class _bwd_euler_bt(torch.nn.Module):
         irev = self.mech.irev()
 
         d = (irev - ires) * self.area
+
+        if intra is not None:
+            d = d + intra.squeeze(1)
 
         B = self.maind.clone()  # (B, K, M, M)
         B[..., 0, 0] += gtot
@@ -439,40 +395,6 @@ class _bwd_euler_bt(torch.nn.Module):
         # solve tridiagonal system
         vc = self._solve(self.lower, B, self.upper, D)  # (B, K)
         v = vc[..., 0] - vc[..., 1]  # vi = v - ve0
-        return vc, v
-
-    def _step_intra(self, vc, v, ve, intra, dt, temp):
-
-        xg = self.xg[..., -1]
-
-        # advance gating
-        self.mech.advance(v, dt, temp)
-
-        ires = self.mech.i(v)
-
-        # linearized ionic conductances & reversal
-        gtot = self.mech.gtot(v) * self.area
-        irev = self.mech.irev()
-
-        d = (irev - ires) * self.area + intra.squeeze(1)
-
-        B = self.maind.clone()
-        B[..., 0, 0] += gtot
-        B[..., 1, 1] += gtot
-        B[..., 0, 1] -= gtot
-        B[..., 1, 0] -= gtot
-
-        D = assemble_rhs(
-            vc,
-            self.c_rad,
-            d,
-            xg,
-            ve
-        )
-
-        # solve tridiagonal system
-        vc = self._solve(self.lower, B, self.upper, D)
-        v = vc[..., 0] - vc[..., 1]
         return vc, v
 
 

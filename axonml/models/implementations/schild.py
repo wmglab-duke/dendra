@@ -20,7 +20,7 @@ from ..mod import (
 from ..mechanisms import PARAMETER, e_context as E, c_context as C
 
 from axonml.units import mm
-from axonml.models.integrators import dufort_frankel
+from axonml.models.integrators import bwd_euler_ub
 
 import math
 
@@ -35,8 +35,10 @@ class Schild1997(Unmyelinated):
         dx=10,
         temp=37.0,
         v_init=-68.5,
-        integrator=dufort_frankel(),
+        integrator=None,
     ):
+        if integrator is None:
+            integrator = bwd_euler_ub()
         super().__init__(diameters, L, dx, temp, v_init, integrator)
         R = 8314  # molar gas constant
         F = 96500  # Faraday's constant
@@ -82,8 +84,10 @@ class Schild1994(Unmyelinated):
         dx=10,
         temp=37.0,
         v_init=-46.5,
-        integrator=dufort_frankel(),
+        integrator=None,
     ):
+        if integrator is None:
+            integrator = bwd_euler_ub()
         super().__init__(diameters, L, dx, temp, v_init, integrator)
         R = 8314  # molar gas constant
         F = 96500  # Faraday's constant
