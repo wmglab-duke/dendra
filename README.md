@@ -14,21 +14,26 @@ Fast and scalable neural fiber simulator. Implement and train high-throughput GP
 `axonml` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).
 
 ### Python dependencies
-`axonml` requires Python 3.11+ and PyTorch 2.0+ with GPU support (tested with PyTorch 2.5.0+ & CUDA 12.4).
+`axonml` requires Python 3.12+ and PyTorch 2.7+ with GPU support (tested with PyTorch 2.7.0+ & CUDA 12.8).
 
 
 ## 🖥️ Installation
 
 > [!TIP]
-> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.11`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
+> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.12`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
 
-1. Clone this repository.
+1. Install PyTorch + CUDA 12.8.
+```bash
+> pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
+
+2. Clone this repository.
 
 ```bash
 > git clone https://gitlab.oit.duke.edu/mah148/axonml.git
 ```
 
-2. Install.
+3. Install.
 
 ```bash
 > cd axonml

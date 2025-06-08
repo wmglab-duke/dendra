@@ -296,6 +296,8 @@ def avoid_smart_indexing(node_indices):
 def n(node_indices, model):
     if node_indices is None:
         return model.n_comp
+    if node_indices.ndim() == 0:
+        return 1
     return len(node_indices)
 
 
