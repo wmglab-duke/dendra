@@ -63,7 +63,7 @@ class _euler(Integrator):
         i_ion = self.mech.i(v, v) * area - intra
         return cm * ((ra * d2v) - i_ion)
 
-    def step(self, model, ve, dt, t_ind, intra=None):
+    def step(self, model, ve, dt, intra=None):
         if intra is None:
             model.v = self._step_no_intra(
                 model.v, ve, model.area_c, dt, model.temp_c, model.cm_c
@@ -219,7 +219,6 @@ class _dufort_frankel(Integrator):
         self.f64 = False
         self.smoothing = bool((1 - beta))
         self.conv = conv
-        self.t_ind = 0
 
         if self.smoothing:
             self.filter = torch.nn.Conv1d(
@@ -251,7 +250,6 @@ class _dufort_frankel(Integrator):
         self.s3 = model.area_c * self.s1
         self.s4 = 1 + self.s2
         self.f64 = model.dtype() == torch.float64
-        self.t_ind = 0
         if self.f64:
             if self.conv:
                 self.method_intra = self._step_intra_64_conv
@@ -280,7 +278,7 @@ class _dufort_frankel(Integrator):
                 model.area_c,
                 dt,
                 model.temp_c,
-                self.t_ind,
+                model.t_ind
             )
         else:
             model.v, model.v_prev = self.method_intra(
@@ -295,9 +293,8 @@ class _dufort_frankel(Integrator):
                 dt,
                 model.temp_c,
                 intra,
-                self.t_ind,
+                model.t_ind
             )
-        self.t_ind += 1
 
     def _step_no_intra_64(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int

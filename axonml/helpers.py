@@ -64,6 +64,9 @@ PADE = ContextVar("PADE", -1)
 DETECT_ANOMALIES = ContextVar("DETECT_ANOMALIES", 0)
 NETWORK = ContextVar("NETWORK", 0)
 BACKEND = ContextVar("BACKEND", "inductor")
+FULLGRAPH = ContextVar("FULLGRAPH", 1)
+DYNAMIC = ContextVar("DYNAMIC", 0)
+JIT = ContextVar("JIT", 1)
 
 
 def numpify(x):

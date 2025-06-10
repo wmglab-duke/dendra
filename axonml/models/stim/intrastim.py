@@ -91,14 +91,14 @@ class IntraStim:
         self.stim_callable = []
         self.stim_synapse = []
 
-        self.dt = model.dt
-
         self.n_comps = model.n_comp
         self.n_axons = model.n_ax
         self.device = model.device()
         self.dtype = model.dtype()
 
-    def init(self, model):
+        self.dt = None
+
+    def init(self, model, dt):
         """
         Reinitialize parameters from the model and initialize synapses.
 
@@ -110,7 +110,7 @@ class IntraStim:
         model : Axon
             The axon model to update parameters from.
         """
-        self.dt = model.dt
+        self.dt = dt
         self.device = model.device()
         self.dtype = model.dtype()
         self.n_axons = model.n_ax

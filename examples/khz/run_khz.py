@@ -99,7 +99,7 @@ def pulse_train(t, at, shape):
 
 # code to run and count APs
 
-count = ax.callbacks.APCount(node_check=[-5], threshold=-20.0, t_start_check=50, dt=0.001)
+count = ax.callbacks.APCount(node_check=[-5], threshold=-20.0, t_start_check=50)
 
 
 def longrun(
@@ -231,7 +231,7 @@ for frequency, n in zip(frequencies, all_n):
 
 data_df = pd.DataFrame(data)
 
-cols = ["5.7 $\mu m$", "8.7 $\mu m$", "14.0 $\mu m$"]
+cols = [r"5.7 $\mu m$", r"8.7 $\mu m$", r"14.0 $\mu m$"]
 rows = ["1 kHz", "2 kHz", "5 kHz", "10 kHz"]
 
 fig, axes = plt.subplots(4, 3, dpi=200, figsize=(5, 5), sharex="col", sharey=True)

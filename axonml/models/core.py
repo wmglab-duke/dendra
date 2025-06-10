@@ -30,7 +30,7 @@ from axonml.models.integrators import euler, dufort_frankel
 
 from axonml.helpers import (
     op_mc, op_sc, ve_from_s_t, 
-    IMEM, CUDA, DTWARN, DEBUG, DETECT_ANOMALIES, PADE, BACKEND,
+    IMEM, CUDA, DTWARN, DEBUG, DETECT_ANOMALIES, PADE, BACKEND, FULLGRAPH, DYNAMIC, JIT,
     ctx
 )
 
@@ -108,11 +108,7 @@ class Axon(Parameterized):
         Temperature in degrees Celsius. Default is 37.0.
     v_init : float, optional
         Initial membrane potential in mV. Default is -80.0.
-    method : str, optional
-        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4',
-        'dufort-frankel', or 'df'. Default is 'rk1'.
-    beta : float, optional
-        Hyperdiffusion coefficient. Default is 0.0.
+    integrator: Integrator
 
     Attributes
     ----------
@@ -124,10 +120,8 @@ class Axon(Parameterized):
         Temperature in degrees Celsius.
     v_init : float
         Initial membrane potential in mV.
-    method : str
-        Integration method.
-    mech : HandlerInterface
-        Handler for membrane mechanisms.
+    mech : MechanismHandler
+        Responsible for integrating all membrane mechanism states.
     t_ind : int
         Current time index.
     dt : float
@@ -143,7 +137,12 @@ class Axon(Parameterized):
     ]
 
     def __init__(
-        self, diameters, n_comp: int, temp=37.0, v_init=-80.0, integrator=euler()
+        self, 
+        diameters, 
+        n_comp: int, 
+        temp=37.0, 
+        v_init=-80.0, 
+        integrator=euler()
     ):
         super().__init__()
         
@@ -157,16 +156,20 @@ class Axon(Parameterized):
 
         self.cid = None
 
+        # compiler stuff
         self.backend = BACKEND.value
+        self.fullgraph = bool(FULLGRAPH)
+        self.dynamic = bool(DYNAMIC)
+        self.jit = bool(JIT)
 
         self.compiler = integrator.compiler(DEBUG, DETECT_ANOMALIES, PADE)
         self.builder = None
+
         if integrator.builder is not None:
             self.builder = integrator.builder(DEBUG, IMEM)
         self.integrator = integrator
 
         self.t_ind: int = 0
-        self.dt: float = A.dt
 
         self._m_list = []
         self._m_name = []
@@ -188,7 +191,15 @@ class Axon(Parameterized):
         self.pre_initialize_hooks: List[Callable] = []
         self.post_initialize_hooks: List[Callable] = []
 
-        self._step = torch.compile(step, backend=self.backend)
+        if self.jit:
+            self._step = torch.compile(
+                step, 
+                backend=self.backend, 
+                fullgraph=self.fullgraph, 
+                dynamic=self.dynamic
+            )
+        else:
+            self._step = step
 
         self._caches = {}
 
@@ -685,8 +696,8 @@ class Axon(Parameterized):
             ve = torch.as_tensor(ve, device=device)
 
         dt = dt if dt is not None else A.dt
+        dt_f = float(dt)
         self.warn_about_dt(dt)
-        self.dt = dt
 
         if isinstance(time, Waveform):
             if time._tstop is None:
@@ -707,7 +718,7 @@ class Axon(Parameterized):
                 else:
                     self.initialize()
                 if with_intra:
-                    intra.init(self)
+                    intra.init(self, dt_f)
             else:
                 self.detach()
 
@@ -726,22 +737,22 @@ class Axon(Parameterized):
             if first or self.training:
                 self.integrator.initialize(self, dt)
 
+            if ve is not None:
+                n = ve.shape[0]
+            else:
+                n = int(tstop / dt_f)
+
             if progressbar:
                 if not isinstance(progressbar, tqdm):
-                    if ve is not None:
-                        n = ve.shape[0]
-                        progressbar = tqdm(total=n, desc=f"{self.t:.3f} ms")
-                    else:
-                        n = int(tstop / self.dt)
-                        progressbar = tqdm(total=n, desc=f"{self.t:.3f} ms")
+                    progressbar = tqdm(total=n, desc=f"{self.t_ind*dt_f:.3f} ms")
 
             for i in range(n):
                 ve_c = ve[i] if not intra_only else ve_zero
                 if with_intra:
                     intra_c = intra(self.t_ind, self.v)
-                    self._step_intra(self.integrator, self, ve_c, intra_c, dt, self.t_ind)
                 else:
-                    self._step(self.integrator, self, ve_c, dt, self.t_ind)
+                    intra_c = None
+                self._step(self.integrator, self, ve_c, dt, intra_c)
                 
                 post_step_hook(callbacks, self)
                 self.t_ind += 1
@@ -749,7 +760,7 @@ class Axon(Parameterized):
                 if progressbar:
                     progressbar.update(1)
                     if self.t_ind % 100 == 0:
-                        progressbar.set_description(f"{self.t:.1f} ms")
+                        progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
 
             if not longrunning:
                 if progressbar:
@@ -810,7 +821,7 @@ class Axon(Parameterized):
                 raise ValueError("intra must be an instance of IntraStim")
 
         dt = dt if dt is not None else A.dt
-        self.dt = dt
+        dt_f = float(dt)
         self.warn_about_dt(dt)
 
         ve_s = torch.as_tensor(space, device=self.device(), dtype=self.dtype())
@@ -830,8 +841,6 @@ class Axon(Parameterized):
 
                 ve_s = ve_s.expand(self.n_ax, -1)
                 einsum = op_sc
-
-                n_p = len(t)
 
             else:
                 if isinstance(time, Waveform):
@@ -858,11 +867,9 @@ class Axon(Parameterized):
 
                 t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
 
-                n_p = ve_t.shape[-1]
-
             if callbacks:
                 for c in callbacks:
-                    c.dt = dt
+                    c.dt = dt_f
 
             callbacks = CallbackList(callbacks)
 
@@ -873,12 +880,12 @@ class Axon(Parameterized):
                 else:
                     self.initialize()
                 if with_intra:
-                    intra.init(self)
+                    intra.init(self, dt_f)
             else:
                 self.detach()
 
             if progressbar:
-                progressbar = tqdm(total=n_p, desc=f"{self.t:.1f} ms")
+                progressbar = tqdm(total=len(t_chunks), desc=f"{self.t:.1f} ms")
 
             self.integrator.initialize(self, dt)
             einsum = torch.compile(einsum)
@@ -892,9 +899,8 @@ class Axon(Parameterized):
                 else:
                     t = t_chunk
 
-                pre_chunk_hook(callbacks, self, len(t))
+                ve_ = einsum(ve_s, t).contiguous()
 
-                ve_ = einsum(ve_s, t)
                 for ve in ve_.unbind(dim=0):
                     if with_intra:
                         intra_c = intra(self.t_ind, self.v)
@@ -906,10 +912,9 @@ class Axon(Parameterized):
 
                     self.t_ind += 1
 
-                    if progressbar:
-                        progressbar.update(1)
-                        if self.t_ind % 500 == 0:
-                            progressbar.set_description(f"{self.t:.1f} ms")
+                if progressbar:
+                    progressbar.update(1)
+                    progressbar.set_description(f"{self.t:.1f} ms")
 
             post_loop_hook(callbacks, self)
 
@@ -945,8 +950,9 @@ class Axon(Parameterized):
 
         maxiter = int(tstop / dt)
 
-        for i in tqdm(range(maxiter), desc=f"Steady state [dt:{dt:.3f} ms, tstop:{tstop:.2f} ms]"):
-            self._step(self.integrator, self, ve, dt, self.t_ind)
+        for i in tqdm(range(maxiter), desc=f"Steady state:: dt:{dt:.3f} ms, tstop:{tstop:.2f} ms"):
+            self._step(self.integrator, self, ve, dt, 0)
+
         self.cache("_steady_state")
         self.t_ind = 0
         return self

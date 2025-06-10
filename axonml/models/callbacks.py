@@ -492,7 +492,6 @@ class Recorder(Callback):
     def pre_loop_hook(self, model):
         if self.indexed:
             self.node_indices = self.node_indices.to(model.device())
-        self.dt = float(model.dt)
         self._pre_loop_hook(model)
         if self.cache_with_hdf5:
             self.i += 1
@@ -735,7 +734,6 @@ class LFP(Callback):
                 "ij,nij->n", model.integrator.i_membrane, self.v_unit
             )
         )
-        self._t.append(model.t)
         return super().pre_loop_hook(model)
 
     def post_step_hook(self, model):
@@ -744,7 +742,6 @@ class LFP(Callback):
                 "ij,nij->n", model.integrator.i_membrane, self.v_unit
             )
         )
-        self._t.append(model.t)
 
     @property
     def lfp(self):
@@ -820,9 +817,20 @@ class ThresholdCallback(Callback):
         self.state_cache: torch.Tensor = None
         self.threshold: float = threshold
         self.t_start_check: float = t_start_check
-        self.node_check: List[int] = avoid_smart_indexing(node_check)
+        self.node_check: List[int] = node_check
+
         self.i: int = 0
-        self.dt: float = dt if dt is not None else A.dt
+        self._dt: float = dt if dt is not None else A.dt
+        self.ind_start = int(self.t_start_check / self._dt)
+
+    @property
+    def dt(self):
+        return self._dt
+
+    @dt.setter
+    def dt(self, value):
+        self._dt = value
+        self.ind_start = int(self.t_start_check / self._dt)
 
     def reset_timer(self):
         """
@@ -930,6 +938,11 @@ class APCount(ThresholdCallback):
         self.node_check = torch.as_tensor(
             self.node_check, dtype=torch.long, device=model.device()
         )
+        
+        # convert negative to positive index
+        nc = model.n_comp
+        self.node_check = self.node_check.remainder(nc)
+
         if self.record is None:
             self.record = torch.zeros(
                 model.n(),
@@ -945,6 +958,7 @@ class APCount(ThresholdCallback):
                 device=model.device(),
             )
 
+    @torch._dynamo.disable
     def post_step_hook(self, model):
         """
         Update AP counts after each simulation step.
@@ -954,7 +968,7 @@ class APCount(ThresholdCallback):
         model : Axon
             The axon model being simulated.
         """
-        if self.i * self.dt >= self.t_start_check:
+        if self.i >= self.ind_start:
             vm_new = model.v.index_select(-1, self.node_check)
             self.state_cache, self.record = increment_count(
                 self.state_cache, vm_new, self.record, self.threshold
@@ -1103,7 +1117,7 @@ class Active(ThresholdCallback):
             )
 
     def post_step_hook(self, model):
-        if self.i * self.dt >= self.t_start_check:
+        if self.i >= self.ind_start:
             vm_new = model.v.index_select(-1, self.node_check)
             self.state_cache, self.record = update_active(
                 self.state_cache, vm_new, self.record, self.threshold
@@ -1166,14 +1180,15 @@ class Raster(ThresholdCallback):
     Examples
     --------
     >>> raster = Raster(threshold=20.0)  # Record when v crosses +20 mV
-    >>> model.run(ve, callbacks=[raster])
+    >>> dt = 0.005 * ms
+    >>> model.run(ve, dt=dt, callbacks=[raster])
     >>> spike_data = raster.numpy()  # Get spike data for plotting
     >>>
     >>> # Plot raster
     >>> import matplotlib.pyplot as plt
     >>> fig, axis = plt.subplots(dpi=200, figsize=(5,5))
     >>> diams = model.diam.cpu().numpy()
-    >>> raster.plot(diams, dt=model.dt, ax=axis)
+    >>> raster.plot(diams, dt=dt, ax=axis)
     >>> plt.show()
     """
 
@@ -1188,8 +1203,9 @@ class Raster(ThresholdCallback):
                 device=model.device(),
             )
 
+    @torch._dynamo.disable
     def post_step_hook(self, model):
-        if self.i * self.dt >= self.t_start_check:
+        if self.i >= self.ind_start:
             vm_new = atleast_2d(model.v[:, self.node_check])
             vm = self.state_cache
             self.state_cache, la = increment_count(vm, vm_new, self.threshold)
@@ -1282,6 +1298,7 @@ class Raster(ThresholdCallback):
         return ax
 
 
+@torch.jit.script
 def increment_count(vm, vm_new, record, threshold: float):
     m = (vm_new >= threshold) 
     mask = m & vm                              # fused compare + and
@@ -1300,7 +1317,6 @@ def is_active(record, at_least: int) -> torch.Tensor:
     return torch.count_nonzero(record, dim=1) >= at_least
 
 
-@torch.jit.script
 def sliding_window_average(x, window_size: int):
     """
     Compute the sliding (moving) window average along axis 0 for a 4D array/tensor,
