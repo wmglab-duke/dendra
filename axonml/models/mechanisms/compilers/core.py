@@ -620,9 +620,7 @@ implicit_equation_template = """
 def {k}(self, v):
     gtot_ = {gtot}
     irev = {irev}
-    irev_ = gtot_ * irev
     self.gtot_{k} = gtot_
-    self.irev_{k} = irev_
     i = gtot_ * (v - irev)
     {assign_to_buffer}
     return i

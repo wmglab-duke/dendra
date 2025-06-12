@@ -254,20 +254,12 @@ class _dufort_frankel(Integrator):
         self.s3 = model.area_c * self.s1
         self.s4 = 1 + self.s2
         self.f64 = model.dtype() == torch.float64
-        if self.f64:
-            if self.conv:
-                self.method_intra = self._step_intra_64_conv
-                self.method_no_intra = self._step_no_intra_64_conv
-            else:
-                self.method_intra = self._step_intra_64
-                self.method_no_intra = self._step_no_intra_64
+        if self.conv:
+            self.method_intra = self._step_intra_conv
+            self.method_no_intra = self._step_no_intra_conv
         else:
-            if self.conv:
-                self.method_intra = self._step_intra_conv
-                self.method_no_intra = self._step_no_intra_conv
-            else:
-                self.method_intra = self._step_intra
-                self.method_no_intra = self._step_no_intra
+            self.method_intra = self._step_intra
+            self.method_no_intra = self._step_no_intra
 
     def step(self, model, ve, dt, intra=None):
         if intra is None:
@@ -299,51 +291,6 @@ class _dufort_frankel(Integrator):
                 intra,
                 model.t_ind
             )
-
-    def _step_no_intra_64(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        d2v = ssd_df(v, v_prev, ve)
-
-        i_ion = self.mech.i(v_prev, v)
-
-        v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * self.mech.gtot(v))
-
-        self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
-
-        if self.smoothing:
-            if (t_ind + 1) % self.smooth_every == 0:
-                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
-
-        if self.imem:
-            i_cap = (v_new - v_prev) / s1
-            self.i_membrane = i_cap + self.mech.imem * area
-
-        return v_new, v
-
-    def _step_no_intra_64_conv(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.stack([v, v_prev, ve], dim=1)
-        d2v = self.ssd(x).squeeze(1)
-
-        i_ion = self.mech.i(v_prev, v)
-
-        v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * self.mech.gtot(v))
-
-        self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
-
-        if self.smoothing:
-            if (t_ind + 1) % self.smooth_every == 0:
-                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
-
-        if self.imem:
-            i_cap = (v_new - v_prev) / s1
-            self.i_membrane = i_cap + self.mech.imem * area
-
-        return v_new, v
 
     def _step_no_intra(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
@@ -413,51 +360,6 @@ class _dufort_frankel(Integrator):
         return v_new, v
 
     def _step_intra_conv(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.stack([v, v_prev, ve], dim=1)
-        d2v = s2 * self.ssd(x).squeeze(1)
-
-        i_ion = self.mech.i(v_prev, v) * area - intra
-
-        v_new = (v_prev + d2v - s1 * i_ion) / (s4 + self.mech.gtot(v) * s3)
-
-        self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
-
-        if self.smoothing:
-            if (t_ind + 1) % self.smooth_every == 0:
-                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
-
-        if self.imem:
-            i_cap = (v_new - v_prev) / self.s1
-            self.i_membrane = i_cap + self.mech.imem * area
-
-        return v_new, v
-
-    def _step_intra_64(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        d2v = s2 * ssd_df(v, v_prev, ve)
-
-        i_ion = self.mech.i(v_prev, v) * area - intra
-
-        v_new = (v_prev + d2v - s1 * i_ion) / (s4 + self.mech.gtot(v) * s3)
-
-        self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
-
-        if self.smoothing:
-            if (t_ind + 1) % self.smooth_every == 0:
-                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
-
-        if self.imem:
-            i_cap = (v_new - v_prev) / self.s1
-            self.i_membrane = i_cap + self.mech.imem * area
-
-        return v_new, v
-
-    def _step_intra_64_conv(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = torch.stack([v, v_prev, ve], dim=1)

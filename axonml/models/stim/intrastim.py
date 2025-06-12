@@ -77,9 +77,6 @@ class IntraStim(torch.nn.Module):
                     f"Unsupported stimulation type: {type(stim)}. "
                     "Expected Waveform."
                 )
-            #index = tuple(
-            #    _as_index_tensor(i, n).to(self.device) for i, n in zip(idx, self.shape)
-            #)
             self.indices.append(idx)
             self.stims.append(stim)
 

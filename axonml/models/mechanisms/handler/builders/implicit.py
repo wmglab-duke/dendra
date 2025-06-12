@@ -37,15 +37,12 @@ class MechanismHandler(torch.nn.Module):
     super().__init__()
     self.temp = temp
     {assignments}
-    {imem_assignment}
 
-  @torch.jit.export
   def initialize(self, v, v_init, temp) -> None:
     self.ion_init(temp)
     self.init_buffers(v)
     self.i(v)
 
-  @torch.jit.export
   def set_buffers(self, diameters):
 {set_buffers}
     return
@@ -56,7 +53,6 @@ class MechanismHandler(torch.nn.Module):
     self.update(temp)
     return
 
-  @torch.jit.export
   def detach(self) -> None:
     {mech_detach}
     {ion_detach}
@@ -74,8 +70,7 @@ class MechanismHandler(torch.nn.Module):
     {currents}
     {assign_currents}
     total = {total}
-    {imem_write}
-    return {explicit_current}
+    return total
 
   def update(self, temp) -> None:
     {ion_advance}
@@ -262,19 +257,11 @@ class ImplicitHandlerBuilder(HandlerBuilder):
             all_names = names + [f"{i}_ion" for i in ion_names]
             arguments = arguments + ", " + parse_ions(ion_names)
 
-        if self.IMEM:
-            imem_assignment = "self.register_buffer('imem', torch.zeros(1))"
-            imem_write = "self.imem = total"
-        else:
-            imem_assignment = ""
-            imem_write = ""
-
         assign_currents = assign(mechanisms, ions)
 
         forward_str = template.format(
             arguments=arguments,
             assignments = parse_assignments(all_names),
-            imem_assignment=imem_assignment,
             set_buffers=parse_set_buffers(mechanisms, list(ions.keys())),
             mech_advance=parse_advance(names),
             assign_post_advance=assign_post_advance(mechanisms, ions),
@@ -287,8 +274,6 @@ class ImplicitHandlerBuilder(HandlerBuilder):
             currents=parse_currents(currents, write=True),
             assign_currents=assign_currents,
             total=parse_total(currents),
-            imem_write=imem_write,
-            explicit_current=explicit_current(currents, unfactorable),
             ion_advance=parse_ion_advance(ions),
             assign_equilibrium=assign(mechanisms, ions, kind='e'),
             mech_update_fs="",

@@ -118,14 +118,13 @@ class _bwd_euler_ub(Integrator):
         # advance gating
         self.mech.advance(v, dt, temp)
 
-        # nonlinear residual currents
-        i_res = self.mech.i(v)  # (B,K)
+        itot = self.mech.i(v)       # (B,K)
 
         # linearized ionic conductances & reversal
-        gtot = self.mech.gtot(v) * self.scale  # (B,K)
-        irev = self.mech.irev()  # (B,K)
+        gtot = self.mech.gtot(v)    # (B,K)
 
-        f_n = (irev - i_res) * self.scale
+        # f_n = (irev - i_res) * self.scale
+        f_n = (gtot * v - i_tot) * self.scale  # (B,K)
 
         if ve is not None:
             # diffusive extracellular coupling
@@ -143,7 +142,7 @@ class _bwd_euler_ub(Integrator):
         RHS = v + dt_s * f_n
 
         # build tridiagonal system M v_{n+1} = RHS
-        A_diag = self.diag_base - gtot
+        A_diag = self.diag_base - gtot * self.scale
         main = 1.0 - dt_s * A_diag
 
         # a: (B, K-1), b: (B, K), c: (B, K-1), d: (B, K)
@@ -375,13 +374,12 @@ class _bwd_euler_bt(torch.nn.Module):
         # advance gating
         self.mech.advance(v, dt, temp)
 
-        ires = self.mech.i(v)
+        itot = self.mech.i(v) * self.area
 
         # linearized ionic conductances & reversal
         gtot = self.mech.gtot(v) * self.area
-        irev = self.mech.irev()
 
-        d = (irev - ires) * self.area
+        d = gtot * v - itot
 
         if intra is not None:
             d = d + intra
@@ -402,7 +400,7 @@ class _bwd_euler_bt(torch.nn.Module):
 
         # solve tridiagonal system
         vc = self._solve(self.lower, B, self.upper, D)  # (B, K)
-        v = vc[..., 0] - vc[..., 1]  # vi = v - ve0
+        v = vc[..., 0] - vc[..., 1]                     # vi = v - ve0
         return vc, v
 
 

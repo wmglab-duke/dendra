@@ -96,6 +96,17 @@ def make_intra(intra, stims, indices):
     return intra(stims, indices)
 
 
+class Population(Parameterized):
+    """
+    Base class for a population of multicompartment neurons.
+    """
+
+    def __init__(self, N:int, C:int, integrator=None):
+        super().__init__()
+        self.np = N
+        self.nc = C
+
+
 class Axon(Parameterized):
     """
     Base 1D fiber class.
@@ -267,7 +278,7 @@ class Axon(Parameterized):
             e_context(use_last=True),
             c_context(use_last=True),
         ):
-            self._build()
+            self.build()
         if CUDA:
             self.cuda()
 
@@ -515,7 +526,7 @@ class Axon(Parameterized):
             return (0, 1, 0, 0, 0)
         return (0, 0, 0, 0, 0)
 
-    def _build(self):
+    def build(self):
         all_ions = get_unique_keys([self._ion_read, self._ion_write, self._ion_write_c])
 
         _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
@@ -566,6 +577,7 @@ class Axon(Parameterized):
             )
 
         self.integrator = self.integrator(self, mech)
+        return self
 
     def area_(self, diameters):
         raise NotImplementedError()
@@ -965,7 +977,7 @@ class Axon(Parameterized):
         maxiter = int(tstop / dt)
 
         with torch.no_grad():
-            for i in tqdm(range(maxiter), desc=f"Steady state:: dt:{dt:.3f} ms, tstop:{tstop:.2f} ms"):
+            for i in tqdm(range(maxiter), desc=f"Steady state:: dt:{dt:.3f} ms, tstop:{tstop:.1f} ms"):
                 self._step(self.integrator, self, dt, None, None)
 
         self.cache("_steady_state")
@@ -1047,9 +1059,6 @@ class Axon(Parameterized):
     def all_states(self) -> List[str]:
         out = ["v"]
         return out + self.integrator.mech.all_states()
-
-    def set(self, key: str, value: float):
-        self.integrator.mech.set(key, value)
 
     def cache(self, name: str = None):
         """
