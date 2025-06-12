@@ -35,6 +35,7 @@ class _euler(Integrator):
 
         self.register_buffer("cm_inv", torch.tensor(0.0))
         self.register_buffer("ra_inv", torch.tensor(0.0))
+        self.register_buffer("ve_zero", torch.tensor(0.0))
 
         weight = [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]]
         nc = 2
@@ -50,6 +51,7 @@ class _euler(Integrator):
     def initialize(self, model, dt) -> None:
         self.cm_inv = 1.0 / model.cm_c
         self.ra_inv = 1.0 / model.ra_c
+        self.ve_zero = torch.zeros_like(model.v)
 
     def FRK(self, v, ve, area, cm, ra):
         x = torch.stack([v, ve], dim=1)
@@ -63,7 +65,9 @@ class _euler(Integrator):
         i_ion = self.mech.i(v, v) * area - intra
         return cm * ((ra * d2v) - i_ion)
 
-    def step(self, model, ve, dt, intra=None):
+    def step(self, model, dt, ve=None, intra=None):
+        if ve is None:
+            ve = self.ve_zero
         if intra is None:
             model.v = self._step_no_intra(
                 model.v, ve, model.area_c, dt, model.temp_c, model.cm_c

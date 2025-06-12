@@ -74,18 +74,26 @@ class Waveform(Parameterized):
         self.check_kwargs(kwargs)
         self.instantiate_parameters(**kwargs)
 
-    def reshape_parameters(self):
+    def expand(self, shape):
         for p in self.parameters():
             if p.dim() == 0:
                 pass
             else:
-                p.data = p.data.unsqueeze(-1)
+                p.data = p.data.expand(shape)
+        return self
+
+    def reshape_for_intra(self):
+        for p in self.parameters():
+            if p.dim() == 0:
+                pass
+            else:
+                p.data = p.data.unsqueeze(0)
+        return self
 
     def fn(self, t):
         raise NotImplementedError
 
     def forward(self, t):
-        t = torch.as_tensor(t)
         return self.fn(t)
 
     def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
@@ -133,7 +141,7 @@ class _repeat(Waveform):
 class Sum(Waveform):
     def __init__(self, *waveforms):
         super(Sum, self).__init__()
-        self.waveforms = waveforms
+        self.waveforms = torch.nn.ModuleList(waveforms)
 
     def fn(self, t):
         return sum(waveform.fn(t) for waveform in self.waveforms)

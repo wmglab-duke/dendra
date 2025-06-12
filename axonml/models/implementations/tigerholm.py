@@ -19,8 +19,8 @@ def pre_init(model):
 def balance(model):
     ek, ik = model.mech.k_ion.ek, model.mech.k_ion.ik
     ena, ina = model.mech.na_ion.ena, model.mech.na_ion.ina
-    model.mech.leak.gkleak.data = -(ik / (model.v_init - ek)).flatten()[0]
-    model.mech.leak.gnaleak.data = -(ina / (model.v_init - ena)).flatten()[0]
+    model.mech.leak.gkleak.data.copy_(-(ik / (model.v_init - ek)).flatten()[0])
+    model.mech.leak.gnaleak.data.copy_(-(ina / (model.v_init - ena)).flatten()[0])
 
 
 class Tigerholm2014(Unmyelinated):
@@ -92,7 +92,7 @@ class Tigerholm2014(Unmyelinated):
         self,
         diameters=[1.0],
         L=5.0*mm,
-        dx=10,
+        dx=10.0,
         temp=37.0,
         v_init=-55.0,
         integrator=None,

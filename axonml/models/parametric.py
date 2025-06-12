@@ -35,31 +35,24 @@ def softplus_inv(y, beta=1., eps=1e-6):
 
 
 def to_param(val, model=None):
+    if isinstance(val, torch.nn.Parameter):
+        return val
     if isinstance(val, Functional):
         return torch.nn.Parameter(torch.as_tensor(val.fn(model)), requires_grad=False)
     return torch.nn.Parameter(torch.as_tensor(val), requires_grad=False)
 
 
-def distributed(val, over='a', kind='fiber'):
-    valid = {
-        'fiber': ['a', 'c', 'ac'],
-        'stim': ['a']
-    }
-    if kind not in valid:
-        raise ValueError('kind must be one of {}'.format(valid.keys()))
-    if over not in valid[kind]:
+def distribute_over(val, over='a'):
+    valid = {'p', 'c', 'pc'}
+    if over not in valid:
         raise ValueError('over must be one of {}'.format(valid[kind]))
     val = torch.as_tensor(val)
-    if kind == 'fiber':
-        if over == 'a':
-            return val[:, None, None]
-        elif over == 'c':
-            return val[None, None, :]
-        elif over == 'ac':
-            return val[:, None, :]
-    elif kind == 'stim':
-        if over == 'a':
-            return val[:, None]
+    if over == 'p':
+        return val[:, None]
+    elif over == 'c':
+        return val[None, :]
+    else:
+        return val
     
 
 class Parameterized(torch.nn.Module):

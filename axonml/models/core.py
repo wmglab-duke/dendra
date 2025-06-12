@@ -87,8 +87,13 @@ class SymmetricConv1D(torch.nn.Conv1d):
         return self._conv_forward(x, weight_, self.bias)
 
 
-def step(integrator, model, ve, dt, intra=None):
-    integrator.step(model, ve, dt, intra)
+def step(integrator, model, dt, ve=None, intra=None):
+    integrator.step(model, dt, ve, intra)
+
+
+@torch.compile(dynamic=True)
+def make_intra(intra, stims, indices):
+    return intra(stims, indices)
 
 
 class Axon(Parameterized):
@@ -168,6 +173,9 @@ class Axon(Parameterized):
         if integrator.builder is not None:
             self.builder = integrator.builder(DEBUG, IMEM)
         self.integrator = integrator
+
+        self.stimuli = []
+        self.intra = None
 
         self.t_ind: int = 0
 
@@ -615,7 +623,6 @@ class Axon(Parameterized):
         time=None,
         tstop=None,
         dt=None,
-        intra=None,
         callbacks=None,
         reinit=False,
         progressbar=True,
@@ -676,22 +683,16 @@ class Axon(Parameterized):
         and advances the model's time index (t_ind).
         """
 
+        if self.intra is None or reinit:
+            intra = self.build_intra()
+            self.intra = intra
+        else:
+            intra = self.intra
+
         with_intra = intra is not None
-        if with_intra:
-            if not isinstance(intra, IntraStim):
-                raise ValueError("intra must be an instance of IntraStim")
-
-        intra_only = False
-        if ve is None and (space is None and time is None):
-            if intra is None:
-                raise ValueError(
-                    "Either ve or ve_s and ve_t or intra must be provided."
-                )
-            intra_only = True
-
-        ve_zero = torch.zeros_like(self.v)
 
         device = self.device()
+
         if ve is not None:
             ve = torch.as_tensor(ve, device=device)
 
@@ -699,17 +700,27 @@ class Axon(Parameterized):
         dt_f = float(dt)
         self.warn_about_dt(dt)
 
+        local_ind = 0
+
         if isinstance(time, Waveform):
-            if time._tstop is None:
-                raise ValueError("Waveform must have a tstop value.")
+            if tstop is not None:
+                time._tstop = tstop
+            elif time._tstop is None:
+                raise ValueError("If `time` is a Waveform, `tstop` must be provided.")
             time = time.assemble(dt)
 
         with torch.set_grad_enabled(self.training):
-            if ve is None and not intra_only:
-                ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
-
             if self.training:
                 self.calculate_geometric_params()
+
+            if ve is None:
+                if space is not None and time is not None:
+                    ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
+
+            if ve is not None:
+                n = ve.shape[0]
+            else:
+                n = int(tstop / dt_f)
 
             if (not self.initialized) or reinit:
                 if "_steady_state" in self._caches:
@@ -717,45 +728,50 @@ class Axon(Parameterized):
                     self.t_ind = 0
                 else:
                     self.initialize()
-                if with_intra:
-                    intra.init(self, dt_f)
             else:
                 self.detach()
+
+            if with_intra:
+                start = self.t_ind*dt_f
+                end = (self.t_ind + n) * dt_f
+                t_ = torch.arange(start, end, dt_f, device=device, dtype=self.dtype())
+                t_ = t_.to(self.device(), dtype=self.dtype())
+                stims, indices = intra.init(t_)
+                stims = [s.unbind(0) for s in stims]
+
+            if not isinstance(callbacks, CallbackList):
+                callbacks = CallbackList(callbacks)
 
             if first:
                 if callbacks:
                     for c in callbacks:
                         c.dt = dt
-
-                if not isinstance(callbacks, CallbackList):
-                    callbacks = CallbackList(callbacks)
                 
                 pre_loop_hook(callbacks, self)
 
-            dt = torch.as_tensor(dt, device=device)
+            dt = torch.as_tensor(dt, device=device, dtype=self.dtype())
 
             if first or self.training:
                 self.integrator.initialize(self, dt)
-
-            if ve is not None:
-                n = ve.shape[0]
-            else:
-                n = int(tstop / dt_f)
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
                     progressbar = tqdm(total=n, desc=f"{self.t_ind*dt_f:.3f} ms")
 
             for i in range(n):
-                ve_c = ve[i] if not intra_only else ve_zero
+                ve_c = ve[i] if ve is not None else None
+
                 if with_intra:
-                    intra_c = intra(self.t_ind, self.v)
+                    s = [st[local_ind] for st in stims]
+                    intra_c = make_intra(intra, s, indices)
                 else:
                     intra_c = None
-                self._step(self.integrator, self, ve_c, dt, intra_c)
+
+                self._step(self.integrator, self, dt, ve_c, intra_c)
                 
                 post_step_hook(callbacks, self)
                 self.t_ind += 1
+                local_ind += 1
 
                 if progressbar:
                     progressbar.update(1)
@@ -776,7 +792,6 @@ class Axon(Parameterized):
         dt: float = None,
         reinit=False,
         callbacks: List[Callback] = None,
-        intra: Optional[IntraStim] = None,
         progressbar=True,
         multicontact=False,
     ):
@@ -907,7 +922,7 @@ class Axon(Parameterized):
                     else:
                         intra_c = None
                     
-                    self._step(self.integrator, self, ve, dt, intra_c)
+                    self._step(self.integrator, self, dt, ve, intra_c)
                     post_step_hook(callbacks, self)
 
                     self.t_ind += 1
@@ -943,15 +958,15 @@ class Axon(Parameterized):
 
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
-        ve = torch.zeros(self.n_ax, self.n_comp, device=self.device(), dtype=self.dtype())
 
         self.initialize()
         self.integrator.initialize(self, dt)
 
         maxiter = int(tstop / dt)
 
-        for i in tqdm(range(maxiter), desc=f"Steady state:: dt:{dt:.3f} ms, tstop:{tstop:.2f} ms"):
-            self._step(self.integrator, self, ve, dt, 0)
+        with torch.no_grad():
+            for i in tqdm(range(maxiter), desc=f"Steady state:: dt:{dt:.3f} ms, tstop:{tstop:.2f} ms"):
+                self._step(self.integrator, self, dt, None, None)
 
         self.cache("_steady_state")
         self.t_ind = 0
@@ -972,6 +987,7 @@ class Axon(Parameterized):
         self.pre_initialize()
         self.integrator.mech.initialize(self.v, self.v_init_c, self.temp_c)
         self.post_initialize()
+        self.integrator.mech.initialize(self.v, self.v_init_c, self.temp_c)
         self.t_ind = 0
         self.initialized = True
 
@@ -1134,8 +1150,23 @@ class Axon(Parameterized):
                     )
 
     def __getitem__(self, key):
+        match key:
+            case ((x, y), *rest):
+                r, c = zip(*key)
+                key = (r, c)
+            case _:
+                key = key
         index = parse_key(key, self.shape)
         return View(self, index)
+
+    def delete_stimuli(self):
+        self.stimuli = []
+
+    def build_intra(self):
+        if self.stimuli:
+            return IntraStim(self, self.stimuli)
+        return None
+
 
 
 def _match_state_dict(

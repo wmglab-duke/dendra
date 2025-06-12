@@ -2,7 +2,7 @@ import torch
 
 from axonml.models.backend import Backend as A
 
-
+from .waveform import Waveform
 from .synapse import Synapse
 
 
@@ -14,7 +14,113 @@ def avoid_smart_indexing(node_indices):
     return node_indices
 
 
-class IntraStim:
+def _as_index_tensor(indices, n):
+    """
+    Convert indices to a tensor of indices, ensuring they are within bounds.
+
+    Parameters
+    ----------
+    indices : int, list, slice, or torch.Tensor
+        Indices to convert.
+    n : int
+        The upper bound for the indices.
+
+    Returns
+    -------
+    torch.Tensor
+        A tensor of indices.
+    """
+    if isinstance(indices, int):
+        return torch.tensor([indices], dtype=torch.long)
+    elif isinstance(indices, list):
+        return torch.tensor(indices, dtype=torch.long)
+    elif isinstance(indices, slice):
+        return torch.arange(
+            start=indices.start or 0,
+            end=indices.stop or n,
+            step=indices.step or 1,
+            dtype=torch.long,
+        )
+    elif isinstance(indices, torch.Tensor):
+        return indices.to(torch.long)
+    else:
+        raise TypeError(f"Unsupported index type: {type(indices)}")
+
+
+class IntraStim(torch.nn.Module):
+
+    def __init__(self, model, stims):
+        """
+        Initialize intracellular stimulation handler.
+
+        Parameters
+        ----------
+        model : Axon
+            The axon model to which this stimulation will be applied.
+        """
+        super(IntraStim, self).__init__()
+        self.shape = model.v.shape
+        self.dtype = model.dtype()
+        self.device = model.device()
+
+        self.indices = []
+        self.stims = []
+
+        for stim, shape, idx in stims:
+            if isinstance(stim, Waveform):
+                stim = stim.to(
+                    device=self.device, dtype=self.dtype
+                )
+                stim = stim.expand(shape).reshape_for_intra()
+            else:
+                raise TypeError(
+                    f"Unsupported stimulation type: {type(stim)}. "
+                    "Expected Waveform."
+                )
+            #index = tuple(
+            #    _as_index_tensor(i, n).to(self.device) for i, n in zip(idx, self.shape)
+            #)
+            self.indices.append(idx)
+            self.stims.append(stim)
+
+    def init(self, t):
+        t = torch.as_tensor(t).to(device=self.device, dtype=self.dtype)
+        for _ in range(len(self.shape)):
+            t = t.unsqueeze(-1)
+        wavs = [stim(t).to(self.dtype) for stim in self.stims]
+        inds = self.indices
+        return wavs, inds
+
+    def __call__(self, stims, inds):
+        """
+        Compute total intracellular current at the given time index.
+
+        This method is called by the model during simulation to get
+        the total intracellular current for the current time step.
+
+        Parameters
+        ----------
+        idx : int
+            Current time index in the simulation.
+        vm : torch.Tensor
+            Current membrane potential values.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of intracellular current values with shape [n_cells, n_comps].
+        """
+        intra = torch.zeros(
+            self.shape[0], self.shape[1], device=self.device, dtype=self.dtype
+        )
+        for stim, idx in zip(stims, inds):
+            intra[idx] += stim.squeeze()
+        return intra
+
+
+
+
+class _IntraStim:
     """
     Intracellular stimulation handler for axon models.
 

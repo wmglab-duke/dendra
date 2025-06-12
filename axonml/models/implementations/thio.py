@@ -68,6 +68,7 @@ class ThioAutonomic2025(Unmyelinated):
         ki = 145.0
         ek = ((R * (temp + 273.15)) / F) * math.log(ko / ki)
         ki_real = 144.9
+        ko_real = 5.6
 
         nao = 154.0
         nai = 8.9
@@ -82,7 +83,7 @@ class ThioAutonomic2025(Unmyelinated):
 
         with (
             E(ena=ena, ek=ek),
-            C(cao0=2.0, cai0=0.000117, ko0=ko, ki0=ki_real, nao0=nao, nai0=nai_real),
+            C(cao0=2.0, cai0=0.000117, ko0=ko_real, ki0=ki_real, nao0=nao, nai0=nai_real),
         ):
             self.insert(nav7, gbar=0.036813)
             self.insert(newnav8, gbar=0.075747)
@@ -127,6 +128,7 @@ class ThioCutaneous2025(Unmyelinated):
         ki = 145.0
         ek = ((R * (temp + 273.15)) / F) * math.log(ko / ki)
         ki_real = 144.9
+        ko_real = 5.6
 
         nao = 154.0
         nai = 8.9
@@ -141,7 +143,7 @@ class ThioCutaneous2025(Unmyelinated):
 
         with (
             E(ena=ena, ek=ek),
-            C(cao0=2.0, cai0=0.000117, ko0=ko, ki0=ki_real, nao0=nao, nai0=nai_real),
+            C(cao0=2.0, cai0=0.000117, ko0=ko_real, ki0=ki_real, nao0=nao, nai0=nai_real),
         ):
             self.insert(nav7, gbar=0.035663)
             self.insert(newnav8, gbar=0.115643)

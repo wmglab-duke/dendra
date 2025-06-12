@@ -5,6 +5,7 @@ from tqdm import tqdm
 import numpy as np
 
 import axonml as ax
+from axonml.units import nA, Hz, ms
 
 
 torch.set_default_dtype(torch.float32)
@@ -109,7 +110,6 @@ def longrun(
     stims,
     field_stack,
     chunks=20,
-    intra=None,
     warmup=True,
 ):
     field_stack = torch.tensor(field_stack, device="cuda").float()
@@ -121,7 +121,7 @@ def longrun(
 
         for _ in range(5):
             with torch.no_grad():
-                _ = model.run(ve, intra=intra, dt=dt, progressbar=False, reinit=True)
+                _ = model.run(ve, dt=dt, progressbar=False, reinit=True)
 
     t_vec = np.arange(0, tstop, dt)
     views = np.array_split(t_vec, chunks)
@@ -143,11 +143,11 @@ def longrun(
                 reinit = True
             _ = model.run(
                 input_ve,
-                intra=intra,
                 dt=dt,
                 callbacks=[count],
                 reinit=reinit,
                 progressbar=False,
+                first=reinit
             )
 
     return 0
@@ -167,19 +167,16 @@ input_diams = torch.cat(input_diams)
 tstop = 100
 dt = 0.001
 
-t_vec = np.arange(0, tstop, dt)
-
 # fiber model
 mrg = ax.SMF(input_diams, nodes).cuda().load("MRG")
 
 # intracellular stim to generate activity
-intra = ax.IntraStim(mrg)
-i_stim = 2e-6 * pulse_train(t_vec, np.array([50, 60, 70, 80, 90]), rect(0.1))
-intra.insert(i_stim, nodes=5)
+intra = ax.mono_rect(amp=2*nA, pw=0.1*ms).repeat(100*Hz, delay=50*ms)
+mrg[:, 5].inject(intra)
 
 count.reset()
 _ = longrun(
-    mrg, tstop, dt, stims, field_stack, intra=intra, chunks=args.chunks, warmup=True
+    mrg, tstop, dt, stims, field_stack, chunks=args.chunks, warmup=True
 )
 all_n = count.numpy()
 

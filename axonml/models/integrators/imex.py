@@ -274,10 +274,10 @@ class _krylov_etd1(Integrator):
         self.cm_inv = 1.0 / cm
         self.scale = A_mem * self.cm_inv
 
-    def step(self, model, ve, dt, intra=None):
-        model.v = self._step_no_intra(model.v, ve, dt, model.temp_c, intra)
+    def step(self, model, dt, ve=None, intra=None):
+        model.v = self._step(model.v, dt, model.temp_c, ve, intra)
 
-    def _step(self, v, ve, dt, temp, intra=None):
+    def _step(self, v, dt, temp, ve=None, intra=None):
         dt_s = dt * 1e-3
         self.mech.advance(v, dt, temp)
 
@@ -287,15 +287,16 @@ class _krylov_etd1(Integrator):
 
         f_n = (irev - ires) * self.scale
 
-        S = F.conv1d(ve.unsqueeze(1), self.kernel, padding=1).squeeze(1)
-        S[:, 0] = ve[:, 1] - ve[:, 0]  # fix boundary left
-        S[:, -1] = ve[:, -2] - ve[:, -1]  # fix boundary right
+        if ve is not None:
+            S = F.conv1d(ve.unsqueeze(1), self.kernel, padding=1).squeeze(1)
+            S[:, 0] = ve[:, 1] - ve[:, 0]  # fix boundary left
+            S[:, -1] = ve[:, -2] - ve[:, -1]  # fix boundary right
 
-        S *= self.g_ax
-        f_n = f_n + S
+            S *= self.g_ax
+            f_n = f_n + S
 
         if intra is not None:
-            f_n = f_n + intra.squeeze(1)
+            f_n = f_n + intra
         
         diag = self.diag - gtot
         v_lin = self._expm(
