@@ -48,7 +48,7 @@ def translate(mech, fname, template):
     if f:
         body = get_function_body_as_str(f)
     else:
-        body = indent("return", 2)
+        return ""
     return template.format(fname=fname, ret=body)
 
 

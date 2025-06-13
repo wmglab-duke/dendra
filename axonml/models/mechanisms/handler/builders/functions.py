@@ -117,7 +117,8 @@ def ion_detach(ions):
 def parse_breakpoint(mechanisms):
     ret = []
     for m in mechanisms:
-        ret.append(f"self.{m._name}.breakpoint(v)")
+        if hasattr(m, "breakpoint"):
+            ret.append(f"self.{m._name}.breakpoint(v)")
     return "\n    ".join(ret)
 
 

@@ -2,7 +2,7 @@ import torch
 
 from .core import Waveform
 from axonml.models.declarations import PARAMETER
-from axonml.helpers import interp1d
+from axonml.helpers import interp1d_z
 
 
 __all__ = [
@@ -353,7 +353,10 @@ class arbitrary(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(amp=[0.0, 0.0], tpoints=[0.0, 1.0])
+    PARAMETER(values=[0.0, 0.0], tpoints=[0.0, 1.0])
 
     def fn(self, t):
-        return interp1d(self.tpoints, self.amp, t)
+        t = t.unsqueeze(0)
+        if self.values.ndim > 1:
+            t = t.expand(self.values.shape[0], -1)
+        return interp1d_z(self.tpoints, self.values, t)

@@ -797,11 +797,10 @@ class Axon(Parameterized):
 
     def longrun(
         self,
-        space: Tensor,
-        time: Tensor,
+        tstop: float,
         chunklength: int,
-        tstop: float = None,
         dt: float = None,
+        ve: Optional[Tuple[Tensor, Waveform]] = None,
         reinit=False,
         callbacks: List[Callback] = None,
         progressbar=True,
@@ -842,57 +841,62 @@ class Axon(Parameterized):
         The state of the model (v, v_prev, etc.) is preserved between chunks.
         """
 
+        # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
+        # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
+
+        if self.intra is None or reinit:
+            intra = self.build_intra()
+            self.intra = intra
+        else:
+            intra = self.intra
+
         with_intra = intra is not None
-        if with_intra:
-            if not isinstance(intra, IntraStim):
-                raise ValueError("intra must be an instance of IntraStim")
+        with_extra = ve is not None
 
         dt = dt if dt is not None else A.dt
         dt_f = float(dt)
         self.warn_about_dt(dt)
 
-        ve_s = torch.as_tensor(space, device=self.device(), dtype=self.dtype())
-        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
+        if with_extra:
+            ve_s, time = ve
+            ve_s = torch.as_tensor(ve_s, device=self.device(), dtype=self.dtype())
 
-        functional = False
-
-        with torch.set_grad_enabled(self.training):
-            if tstop is not None:
-                if not isinstance(time, Waveform):
-                    raise ValueError('`time` must be of type `Waveform`')
-                time = time.to(self.dtype())
-                functional = True
-                t = torch.arange(0, tstop, dt, dtype=self.dtype())
-                n_chunks = math.ceil(len(t) / chunklength)
-                t_chunks = torch.tensor_split(t, n_chunks)
-
-                ve_s = ve_s.expand(self.n_ax, -1)
-                einsum = op_sc
-
+            if multicontact:
+                ve_s = ve_s.expand(-1, self.n_ax, -1)
             else:
-                if isinstance(time, Waveform):
-                    if time._tstop is None:
-                        if tstop is None:
-                            raise ValueError("Waveform must have a tstop value or supply tstop to longrun.")
-                        time._tstop = tstop
-                    time = time.assemble(dt)
+                ve_s = ve_s.expand(self.n_ax, -1)
 
-                ve_t = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
-                n_chunks = math.ceil(ve_t.shape[-1] / chunklength)
-
-                # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
-                # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
+            if isinstance(time, Waveform):
+                time = time.to(device=self.device(), dtype=self.dtype())
+                functional = True
+            else:
+                time = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
+                functional = False
 
                 if multicontact:
-                    ve_s = ve_s.expand(-1, self.n_ax, -1)
-                    ve_t = ve_t.expand(-1, self.n_ax, -1)
-                    einsum = op_mc
+                    time = time.expand(-1, self.n_ax, -1)
                 else:
-                    ve_s = ve_s.expand(self.n_ax, -1)
-                    ve_t = ve_t.expand(self.n_ax, -1)
-                    einsum = op_sc
+                    time = time.expand(self.n_ax, -1)
 
-                t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
+        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
+
+        with torch.set_grad_enabled(self.training):
+
+            t = torch.arange(0, tstop, dt_f, dtype=self.dtype())
+            n_chunks = math.ceil(len(t) / chunklength)
+
+            t_c_f = torch.tensor_split(t, n_chunks)
+
+            if with_extra:
+                if functional:
+                    t_chunks = t_c_f
+                else:
+                    t_chunks = torch.tensor_split(time, n_chunks, dim=-1)
+
+            if multicontact:
+                einsum = op_mc
+            else:
+                einsum = op_sc
 
             if callbacks:
                 for c in callbacks:
@@ -906,42 +910,53 @@ class Axon(Parameterized):
                     self.t_ind = 0
                 else:
                     self.initialize()
-                if with_intra:
-                    intra.init(self, dt_f)
             else:
                 self.detach()
 
             if progressbar:
-                progressbar = tqdm(total=len(t_chunks), desc=f"{self.t:.1f} ms")
+                progressbar = tqdm(total=n_chunks, desc=f"{self.t_ind*dt_f:.1f} ms")
 
             self.integrator.initialize(self, dt)
             einsum = torch.compile(einsum)
 
             pre_loop_hook(callbacks, self)
 
-            for i, t_chunk in enumerate(t_chunks):
+            for i in range(n_chunks):
 
-                if functional:
-                    t = time(t_chunk).to(self.dtype())
-                else:
-                    t = t_chunk
+                if with_intra:
+                    stims, indices = intra.init(t_c_f[i])
+                    stims = [s.unbind(0) for s in stims]
 
-                ve_ = einsum(ve_s, t).contiguous()
+                if with_extra:
+                    if functional:
+                        t = time(t_chunks[i]).to(self.dtype())
+                        if multicontact:
+                            t = t.unsqueeze(1).expand(-1, self.n_ax, -1)
+                        else:
+                            t = t.unsqueeze(0).expand(self.n_ax, -1)
+                    else:
+                        t = t_chunks[i]
+                    ve_ = einsum(ve_s, t).contiguous().unbind(dim=0)
 
-                for ve in ve_.unbind(dim=0):
+                for j in range(len(t_c_f[i])):
+                    if with_extra:
+                        ve_c = ve_[j]
+                    else:
+                        ve_c = None
                     if with_intra:
-                        intra_c = intra(self.t_ind, self.v)
+                        s = [st[j] for st in stims]
+                        intra_c = make_intra(intra, s, indices)
                     else:
                         intra_c = None
                     
-                    self._step(self.integrator, self, dt, ve, intra_c)
+                    self._step(self.integrator, self, dt, ve_c, intra_c)
                     post_step_hook(callbacks, self)
 
                     self.t_ind += 1
 
                 if progressbar:
                     progressbar.update(1)
-                    progressbar.set_description(f"{self.t:.1f} ms")
+                    progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
 
             post_loop_hook(callbacks, self)
 

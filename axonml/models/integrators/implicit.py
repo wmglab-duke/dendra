@@ -124,7 +124,7 @@ class _bwd_euler_ub(Integrator):
         gtot = self.mech.gtot(v)    # (B,K)
 
         # f_n = (irev - i_res) * self.scale
-        f_n = (gtot * v - i_tot) * self.scale  # (B,K)
+        f_n = (gtot * v - itot) * self.scale  # (B,K)
 
         if ve is not None:
             # diffusive extracellular coupling

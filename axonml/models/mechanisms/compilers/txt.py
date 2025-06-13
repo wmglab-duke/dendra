@@ -91,20 +91,11 @@ class {mech}(torch.nn.Module):
     def _init_buffers_s(self, v_init):
 {init_state_buffers}
 {init_distribution_buffers}
-        self.initial(v_init)
+        if hasattr(self, 'initial'):
+            self.initial(v_init)
         for _, s in self.DE.items():
             s.initialize(v_init)
         return
-
-    @torch.jit.ignore
-    def set(self, key: str, value):
-        p = getattr(self, key)
-        if isinstance(p, torch.Tensor):
-            p.data = torch.as_tensor(value, dtype=p.data.dtype, device=p.device)
-
-    @torch.jit.ignore
-    def get(self, key: str):
-        return getattr(self, key)
 
     def rebuild(self, x):
         out = torch.zeros(*self.shape, device=self.dummy.device, dtype=self.dummy.dtype)

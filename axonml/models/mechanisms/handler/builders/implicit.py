@@ -261,7 +261,7 @@ class ImplicitHandlerBuilder(HandlerBuilder):
 
         forward_str = template.format(
             arguments=arguments,
-            assignments = parse_assignments(all_names),
+            assignments=parse_assignments(all_names),
             set_buffers=parse_set_buffers(mechanisms, list(ions.keys())),
             mech_advance=parse_advance(names),
             assign_post_advance=assign_post_advance(mechanisms, ions),
