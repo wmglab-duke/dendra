@@ -254,6 +254,7 @@ class _dufort_frankel(Integrator):
         self.s3 = model.area_c * self.s1
         self.s4 = 1 + self.s2
         self.f64 = model.dtype() == torch.float64
+        self.ve_zero = torch.zeros_like(model.v)
         if self.conv:
             self.method_intra = self._step_intra_conv
             self.method_no_intra = self._step_no_intra_conv
@@ -261,7 +262,9 @@ class _dufort_frankel(Integrator):
             self.method_intra = self._step_intra
             self.method_no_intra = self._step_no_intra
 
-    def step(self, model, ve, dt, intra=None):
+    def step(self, model, dt, ve=None, intra=None):
+        if ve is None:
+            ve = self.ve_zero
         if intra is None:
             model.v, model.v_prev = self.method_no_intra(
                 model.v,

@@ -378,7 +378,8 @@ def gtot(mechanisms, has_gtot):
 def breakpoint(mechanisms):
     ret = []
     for m in mechanisms:
-        ret.append(f"self.{m._name}.breakpoint(v)")
+        if hasattr(m, "breakpoint"):
+            ret.append(f"self.{m._name}.breakpoint(v)")
     return "\n    ".join(ret)
 
 
