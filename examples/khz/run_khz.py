@@ -11,7 +11,7 @@ from axonml.units import nA, Hz, ms
 torch.set_default_dtype(torch.float32)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--chunks", type=int, default=200)
+parser.add_argument("--chunks", type=int, default=1000)
 
 args = parser.parse_args()
 
