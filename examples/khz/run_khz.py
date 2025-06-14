@@ -81,11 +81,9 @@ count = ax.callbacks.APCount(node_check=[-5], threshold=-20.0, t_start_check=50)
 # run
 
 frequencies = [1, 2, 5, 10]
-stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]
-
 
 input_diams = []
-for _ in stims:
+for _ in frequencies:
     input_diams.append(torch.tensor(diam, device="cuda").float())
 input_diams = torch.cat(input_diams)
 
