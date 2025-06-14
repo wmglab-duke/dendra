@@ -89,6 +89,7 @@ class SMF(Myelinated):
     """
 
     PARAMETER(
+        inherit=Myelinated,
         node_l=1.0,
         axon_d={
             "axond1": 0.0187623,

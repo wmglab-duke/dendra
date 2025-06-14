@@ -26,7 +26,7 @@ from axonml.models.mechanisms.mech_compiler import compile_mechanism
 from axonml.units import mm, um
 from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
 from axonml.models.interfaces import HandlerInterface
-from axonml.models.integrators import euler, dufort_frankel
+from axonml.models.integrators import euler, dufort_frankel, bwd_euler_ub
 
 from axonml.helpers import (
     op_mc, op_sc, ve_from_s_t, 
@@ -101,76 +101,22 @@ class Population(Parameterized):
     Base class for a population of multicompartment neurons.
     """
 
-    def __init__(self, N:int, C:int, integrator=None):
-        super().__init__()
+    PARAMETER(cm=1.0, rhoa=35.4, celsius=37.0)
+
+    def __init__(self, N:int, C:int, integrator=None, **kwargs):
+        super().__init__(**kwargs)
         self.np = N
         self.nc = C
 
+        if integrator is None:
+            integrator = bwd_euler_ub()
 
-class Axon(Parameterized):
-    """
-    Base 1D fiber class.
-
-    This is the base class for axon models, implementing common functionality
-    for simulating action potential propagation along 1D fibers.
-
-    Parameters
-    ----------
-    diameters : array_like
-        Diameters of the axons in μm.
-    n_comp : int
-        Number of nodes in the axon model.
-    temp : float, optional
-        Temperature in degrees Celsius. Default is 37.0.
-    v_init : float, optional
-        Initial membrane potential in mV. Default is -80.0.
-    integrator: Integrator
-
-    Attributes
-    ----------
-    n_ax : int
-        Number of axons in the model.
-    n_comp : int
-        Number of compartments in each axon.
-    temp : float
-        Temperature in degrees Celsius.
-    v_init : float
-        Initial membrane potential in mV.
-    mech : MechanismHandler
-        Responsible for integrating all membrane mechanism states.
-    t_ind : int
-        Current time index.
-    dt : float
-        Time step in ms.
-    """
-
-    _dt_lim = None
-    __constants__ = [
-        "n_ax",
-        "n_comp",
-        "temp",
-        "v_init",
-    ]
-
-    def __init__(
-        self, 
-        diameters, 
-        n_comp: int, 
-        temp=37.0, 
-        v_init=-80.0, 
-        integrator=euler()
-    ):
-        super().__init__()
-        
-        self.n_ax = len(diameters)
-        self.n_comp = n_comp
-        self.temp = temp
-        self.v_init = v_init
-        self.shape = integrator.shape(self.n_ax, self.n_comp)
-
+        self.shape = integrator.shape(self.np, self.nc) if integrator else (N, C)
         self.register_buffer("_dummy", torch.zeros(1))
 
-        self.cid = None
+        self.register_buffer("v",    torch.full(self.shape, -65.0))  # default v_init in mV
+        self.register_buffer("diam", torch.full(self.shape, 500.0))
+        self.register_buffer("dx",   torch.full(self.shape, 100.0))
 
         # compiler stuff
         self.backend = BACKEND.value
@@ -189,6 +135,7 @@ class Axon(Parameterized):
         self.intra = None
 
         self.t_ind: int = 0
+        self.t_cache: float = 0.0
 
         self._m_list = []
         self._m_name = []
@@ -222,34 +169,12 @@ class Axon(Parameterized):
 
         self._caches = {}
 
-        self.register_buffer("y", torch.zeros(self.n_ax, 1))
-        self.register_buffer("z", torch.zeros(self.n_ax, 1))
-
-        if torch.is_tensor(diameters):
-            diameters = diameters.to(self.dtype()).clone().detach()
-        else:
-            diameters = torch.tensor(diameters, dtype=self.dtype())
-
-        if diameters.ndim == 1:
-            diameters = diameters.unsqueeze(1)        
-
-        self._register_buffers(diameters)
+        self.register_buffer("x", torch.zeros(self.shape))
+        self.register_buffer("y", torch.zeros(self.shape))
+        self.register_buffer("z", torch.zeros(self.shape))
 
         self.initialized: bool = False
-
-        # -- biophysics --
-        self.biophysics()
-
-        # -- constants --
         self.eval()
-
-    def biophysics(self):
-        """
-        Placeholder for biophysics-related initializations.
-        This method can be overridden in subclasses to add specific
-        biophysics-related parameters or configurations.
-        """
-        pass
 
     @property
     def mech(self):
@@ -258,51 +183,6 @@ class Axon(Parameterized):
     @property
     def i_membrane(self):
         return self.integrator.i_membrane
-
-    def __init_subclass__(cls, **kwargs):
-        def init_decorator(previous_init):
-            def new_init(self, *args, **kwargs):
-                previous_init(self, *args, **kwargs)
-                if type(self) == cls:
-                    Axon.__post_init__(self)
-
-            return new_init
-
-        cls.__init__ = init_decorator(cls.__init__)
-
-    def __post_init__(self):
-        changed = self.instantiate_parameters_lambda()
-        if changed:
-            self.calculate_geometric_params()
-        with (
-            e_context(use_last=True),
-            c_context(use_last=True),
-        ):
-            self.build()
-        if CUDA:
-            self.cuda()
-
-    def _register_buffers(self, diameters):
-        self.register_buffer("diam", diameters)
-        self.register_buffer("area_c", self.area_(self.diam))
-        self.register_buffer("cm_c", self.cm_(self.area_c))
-        self.register_buffer("ra_c", self.ra_(self.diam))
-        self.register_buffer("v_init_c", torch.tensor(self.v_init))
-        self.register_buffer("temp_c", torch.tensor(self.temp))
-
-    def register_cid(self, cid):
-        self.cid = cid
-
-    def set_diam(self, diams):
-        diams = torch.as_tensor(diams, dtype=self.dtype())
-        self.diam[:] = diams
-        self.instantiate_parameters_lambda()
-        self.calculate_geometric_params()
-
-    def calculate_geometric_params(self):
-        self.area_c = self.area_(self.diam)
-        self.cm_c = self.cm_(self.area_c)
-        self.ra_c = self.ra_(self.diam)
 
     def collect_parameters(self, *names):
         """
@@ -405,22 +285,570 @@ class Axon(Parameterized):
     def register_pre_initialize_hook(self, fn: Callable):
         self.pre_initialize_hooks.append(fn)
 
-    def set_y(self, y):
-        self.y[:] = torch.as_tensor(y)
-        return self
-
-    def set_z(self, z):
-        self.z[:] = torch.as_tensor(z)
-        return self
-
-    def n(self) -> int:
-        return self.v.shape[0]
-
     def device(self):
         return self._dummy.device
 
     def dtype(self):
         return self._dummy.dtype
+
+    def run(
+        self,
+        ve=None,
+        space=None,
+        time=None,
+        tstop=None,
+        dt=None,
+        callbacks=None,
+        reinit=False,
+        progressbar=True,
+        multicontact=False,
+        first=True,
+        longrunning=False,
+    ):
+        """
+        Run the axon model simulation.
+
+        Parameters
+        ----------
+        ve : Tensor, optional
+            Extracellular voltage tensor. Shape should be
+            [timesteps, n_ax, 1, n_comp] or compatible.
+        space : Tensor, optional
+            Spatial components when ve is not directly provided.
+            Used with time to construct ve.
+        time : Tensor or Waveform, optional
+            Temporal components when ve is not directly provided.
+            Used with space to construct ve.
+        tstop : float, optional
+            Simulation stop time in milliseconds. If None, uses the default from backend.
+            If ve is provided, this is ignored.
+            If ve is provided, tstop is determined by the shape of ve.
+        dt : float, optional
+            Time step size in milliseconds. If None, uses the default from backend.
+        intra : IntraStim, optional
+            Intracellular stimulation object.
+        callbacks : list of Callback, optional
+            List of callback objects to execute during simulation steps.
+        reinit : bool, optional
+            If True, reinitialize the model state before running. If steady state is
+            cached, it will be restored instead of initializing from scratch.
+            Default is False.
+        progressbar : bool or tqdm, optional
+            If True, displays a progress bar during simulation. Can also be a
+            tqdm instance for custom progress tracking. Default is True.
+        multicontact : bool, optional
+            If True, handles multiple electrode contacts for ve construction.
+            Default is False.
+        first : bool, optional
+            If True, indicates this is the first run in a sequence, triggering
+            pre-loop hooks for callbacks. Default is True.
+        longrunning : bool, optional
+            If True, indicates this run is part of a longer simulation sequence,
+            affecting progress bar behavior. Default is False.
+
+        Raises
+        ------
+        ValueError
+            If neither ve nor (space and time) nor intra is provided.
+            If intra is provided but is not an instance of IntraStim.
+
+        Notes
+        -----
+        The simulation updates the model's internal state (v, v_prev for DF method, etc.)
+        and advances the model's time index (t_ind).
+        """
+
+        if self.intra is None or reinit:
+            intra = self.build_intra()
+            self.intra = intra
+        else:
+            intra = self.intra
+
+        with_intra = intra is not None
+
+        device = self.device()
+
+        if ve is not None:
+            ve = torch.as_tensor(ve, device=device)
+
+        dt = dt if dt is not None else A.dt
+        dt_f = float(dt)
+
+        local_ind = 0
+
+        if isinstance(time, Waveform):
+            if tstop is not None:
+                time._tstop = tstop
+            elif time._tstop is None:
+                raise ValueError("If `time` is a Waveform, `tstop` must be provided.")
+            time = time.assemble(dt)
+
+        with torch.set_grad_enabled(self.training):
+            if self.training:
+                self.calculate_geometric_params()
+
+            if ve is None:
+                if space is not None and time is not None:
+                    ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
+
+            if ve is not None:
+                n = ve.shape[0]
+            else:
+                n = int(tstop / dt_f)
+
+            if (not self.initialized) or reinit:
+                if "_steady_state" in self._caches:
+                    self.restore("_steady_state")
+                    self.t_ind = 0
+                    self.t_cache = 0.0
+                else:
+                    self.initialize()
+            else:
+                self.detach()
+
+            if with_intra:
+                start = self.t_cache
+                end = (self.t_ind + n) * dt_f
+                t_ = torch.arange(start, end, dt_f, device=device, dtype=self.dtype())
+                t_ = t_.to(self.device(), dtype=self.dtype())
+                stims, indices = intra.init(t_)
+                stims = [s.unbind(0) for s in stims]
+
+            if not isinstance(callbacks, CallbackList):
+                callbacks = CallbackList(callbacks)
+
+            if first:
+                if callbacks:
+                    for c in callbacks:
+                        c.dt = dt
+                
+                pre_loop_hook(callbacks, self)
+
+            dt = torch.as_tensor(dt, device=device, dtype=self.dtype())
+
+            if first or self.training:
+                self.integrator.initialize(self, dt)
+
+            if progressbar:
+                if not isinstance(progressbar, tqdm):
+                    progressbar = tqdm(total=n, desc=f"{self.t_ind*dt_f:.3f} ms")
+
+            for i in range(n):
+                ve_c = ve[i] if ve is not None else None
+
+                if with_intra:
+                    s = [st[local_ind] for st in stims]
+                    intra_c = make_intra(intra, s, indices)
+                else:
+                    intra_c = None
+
+                self._step(self.integrator, self, dt, ve_c, intra_c)
+                
+                post_step_hook(callbacks, self)
+                self.t_ind += 1
+                local_ind += 1
+
+                if progressbar:
+                    progressbar.update(1)
+                    if self.t_ind % 100 == 0:
+                        progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
+
+            if not longrunning:
+                if progressbar:
+                    progressbar.close()
+                post_loop_hook(callbacks, self)
+            
+            self.t_cache = self.t_ind * dt_f
+
+    def longrun(
+        self,
+        tstop: float,
+        chunklength: int,
+        dt: float = None,
+        extra: Optional[Tuple[Tensor, Waveform]] = None,
+        reinit=False,
+        callbacks: List[Callback] = None,
+        progressbar=True,
+        multicontact=False,
+    ):
+        """
+        Run a long simulation by dividing it into multiple smaller chunks.
+
+        This method splits the overall simulation into chunks of a given length,
+        allowing for more efficient memory management during long simulations.
+        The model's state (e.g., voltage variables, v_prev, etc.) is maintained
+        between chunks, ensuring continuity across the entire simulation period.
+
+        Parameters
+        ----------
+        tstop : float
+            The simulation end time in milliseconds.
+        chunklength : int
+            The number of time steps to process in each chunk.
+        dt : float, optional
+            The simulation time step in milliseconds. If None, the default value
+            from the backend will be used.
+        extra : tuple of (Tensor, Waveform), optional
+            A tuple containing extra input parameters:
+            - The first element (ve_s) is a tensor representing spatial voltage components.
+            - The second element (time) is either a Waveform object or a tensor representing time.
+            These values are used to construct the extracellular voltage.
+        reinit : bool, optional
+            If True, reinitializes the model state before running the simulation.
+            This is useful when you want to start fresh rather than continuing from a previous run.
+        callbacks : list of Callback, optional
+            A list of callback objects to be executed during simulation, allowing for
+            customized processing at various stages (e.g., pre-loop, post-step, post-loop).
+        progressbar : bool or tqdm, optional
+            If True (or if a tqdm instance is provided), displays a progress bar to
+            track simulation progress across chunks.
+        multicontact : bool, optional
+            If True, configures the handling of multiple electrode contacts for
+            constructing the extracellular voltage input.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        - When `extra` is provided, the method uses it to assemble the extracellular
+        voltage (ve) for the simulation.
+        - The method initializes or detaches the model state before running the simulation
+        depending on whether the model has been previously initialized or reinitialized.
+        - Chunk processing helps manage memory usage during extended simulations by
+        processing data in manageable segments.
+    """
+
+        # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
+        # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
+
+        if self.intra is None or reinit:
+            intra = self.build_intra()
+            self.intra = intra
+        else:
+            intra = self.intra
+
+        with_intra = intra is not None
+        with_extra = extra is not None
+
+        dt = dt if dt is not None else A.dt
+        dt_f = float(dt)
+
+        if with_extra:
+            ve_s, time = extra
+            ve_s = torch.as_tensor(ve_s, device=self.device(), dtype=self.dtype())
+
+            if multicontact:
+                ve_s = ve_s.expand(-1, self.n_ax, -1)
+            else:
+                ve_s = ve_s.expand(self.n_ax, -1)
+
+            if isinstance(time, Waveform):
+                time = time.to(device=self.device(), dtype=self.dtype())
+                functional = True
+            else:
+                time = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
+                functional = False
+
+                if multicontact:
+                    time = time.expand(-1, self.n_ax, -1)
+                else:
+                    time = time.expand(self.n_ax, -1)
+
+        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
+
+        with torch.set_grad_enabled(self.training):
+
+            t = torch.arange(0, tstop, dt_f, dtype=self.dtype())
+            n_chunks = math.ceil(len(t) / chunklength)
+
+            t_c_f = torch.tensor_split(t, n_chunks)
+
+            if with_extra:
+                if functional:
+                    t_chunks = t_c_f
+                else:
+                    t_chunks = torch.tensor_split(time, n_chunks, dim=-1)
+
+            if multicontact:
+                einsum = op_mc
+            else:
+                einsum = op_sc
+
+            if callbacks:
+                for c in callbacks:
+                    c.dt = dt_f
+
+            callbacks = CallbackList(callbacks)
+
+            if (not self.initialized) or reinit:
+                if "_steady_state" in self._caches:
+                    self.restore("_steady_state")
+                    self.t_ind = 0
+                else:
+                    self.initialize()
+            else:
+                self.detach()
+
+            if progressbar:
+                progressbar = tqdm(total=n_chunks, desc=f"{self.t_ind*dt_f:.1f} ms")
+
+            self.integrator.initialize(self, dt)
+            einsum = torch.compile(einsum)
+
+            pre_loop_hook(callbacks, self)
+
+            for i in range(n_chunks):
+
+                if with_intra:
+                    stims, indices = intra.init(t_c_f[i])
+                    stims = [s.unbind(0) for s in stims]
+
+                if with_extra:
+                    if functional:
+                        t = time(t_chunks[i]).to(self.dtype())
+                        if multicontact:
+                            t = t.unsqueeze(0).expand(-1, self.n_ax, -1)
+                        else:
+                            t = t.expand(self.n_ax, -1)
+                    else:
+                        t = t_chunks[i]
+                    ve_ = einsum(ve_s, t).contiguous().unbind(dim=0)
+
+                for j in range(len(t_c_f[i])):
+                    if with_extra:
+                        ve_c = ve_[j]
+                    else:
+                        ve_c = None
+                    if with_intra:
+                        s = [st[j] for st in stims]
+                        intra_c = make_intra(intra, s, indices)
+                    else:
+                        intra_c = None
+                    
+                    self._step(self.integrator, self, dt, ve_c, intra_c)
+                    post_step_hook(callbacks, self)
+
+                    self.t_ind += 1
+
+                if progressbar:
+                    progressbar.update(1)
+                    progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
+
+            post_loop_hook(callbacks, self)
+
+            if progressbar:
+                progressbar.close()
+
+    def steady_state(self, dt=0.2, tstop=200.0):
+        """
+        Run the model until it reaches a steady state and cache the result.
+
+        Parameters
+        ----------
+        dt : float, optional
+            Time step size in milliseconds. Default is 0.2 ms.
+        t : float, optional
+            Time in milliseconds to run the simulation. Default is 200 ms.
+
+        Notes
+        -----
+        This method clears any previous steady state cache before creating a new one.
+        The steady state can be restored later by setting reinit=True when calling
+        the run method.
+        """
+
+        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
+
+        if "_steady_state" in self._caches:
+            self._caches.pop("_steady_state")
+
+        self.initialize()
+        self.integrator.initialize(self, dt)
+
+        maxiter = int(tstop / dt)
+
+        with torch.no_grad():
+            for i in tqdm(range(maxiter), desc=f"Steady state:: dt:{dt:.3f} ms, tstop:{tstop:.1f} ms"):
+                self._step(self.integrator, self, dt, None, None)
+
+        self.cache("_steady_state")
+        self.t_ind = 0
+        return self
+
+    def post_initialize(self):
+        with torch.no_grad():
+            for h in self.post_initialize_hooks:
+                h(self)
+
+    def pre_initialize(self):
+        with torch.no_grad():
+            for h in self.pre_initialize_hooks:
+                h(self)
+
+    def initialize(self):
+        self.integrator.init_v(self)
+        self.pre_initialize()
+        self.integrator.mech.initialize(self.v, self.v_init_c, self.celsius)
+        self.post_initialize()
+        self.integrator.mech.initialize(self.v, self.v_init_c, self.celsius)
+        self.t_ind = 0
+        self.t_cache = 0.0
+        self.initialized = True
+
+    def load(self, state_dict):
+        """
+        Load model weights from a state dictionary.
+
+        This method supports loading weights from:
+        1. A key from the predefined `all_trained` dictionary
+        2. A file path as a string
+        3. An actual state dictionary object
+
+        The loaded weights are matched to the model's current state dict structure
+        and only compatible weights are loaded. After loading, geometric parameters
+        are recalculated.
+
+        Parameters
+        ----------
+        state_dict : str or dict
+            Can be one of:
+            - A key from the predefined `all_trained` dictionary
+            - A file path to a saved model state
+            - A state dictionary object
+
+        Returns
+        -------
+        self
+            The model instance with loaded weights
+        """
+        from axonml import all_trained
+
+        if state_dict in all_trained:
+            state_dict = torch.load(
+                all_trained[state_dict], map_location=self.device(), weights_only=True
+            )
+        elif isinstance(state_dict, str):
+            state_dict = torch.load(
+                state_dict, map_location=self.device(), weights_only=True
+            )
+        matched, _ = _match_state_dict(self.state_dict(), state_dict)
+        self.load_state_dict(matched, strict=False)
+        self.calculate_geometric_params()
+        return self
+
+    def all_states(self) -> List[str]:
+        out = ["v"]
+        return out + self.integrator.mech.all_states()
+
+    def cache(self, name: str = None):
+        """
+        Cache the current model state with an optional identifier.
+
+        This method saves a snapshot of the model's current state dictionary
+        to an internal cache. The state can later be restored using the
+        restore() method with the same name.
+
+        Parameters
+        ----------
+        name : str, optional
+            Identifier for the cached state. If None, the state is cached
+            with the name 'latest'. Default is None.
+
+        Returns
+        -------
+        None
+
+        See Also
+        --------
+        restore : Restore a previously cached state
+
+        Examples
+        --------
+        >>> model.cache('before_training')  # Cache state before training
+        >>> # ... training or simulation ...
+        >>> model.restore('before_training')  # Return to cached state
+        """
+        if name is None:
+            name = "latest"
+        self._caches[name] = self.state_dict()
+
+    def restore(self, name: str = None):
+        """
+        Restore a previously cached model state.
+
+        This method loads a previously cached state dictionary from the internal
+        cache and applies it to the model. It's used in conjunction with the
+        cache() method, which saves states.
+
+        Parameters
+        ----------
+        name : str, optional
+            Identifier for the cached state to restore. If None, restores
+            the state cached as 'latest'. Default is None.
+
+        Returns
+        -------
+        None
+
+        See Also
+        --------
+        cache : Cache the current model state
+
+        Examples
+        --------
+        >>> model.cache('before_training')  # Cache state before training
+        >>> # ... training or simulation ...
+        >>> model.restore('before_training')  # Return to cached state
+        """
+        if name is None:
+            name = "latest"
+        self.load_state_dict(self._caches[name])
+        self.initialized = True
+
+    def cuda(self):
+        super().cuda()
+        self.integrator.mech.set_buffers(self.diam)
+        return self
+
+    def cpu(self):
+        super().cpu()
+        self.integrator.mech.set_buffers(self.diam)
+        return self
+
+    def float(self):
+        super().float()
+        self.integrator.mech.set_buffers(self.diam)
+        return self
+
+    def double(self):
+        super().double()
+        self.integrator.mech.set_buffers(self.diam)
+        return self
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        self.integrator.mech.set_buffers(self.diam)
+        return self
+
+    def __getitem__(self, key):
+        match key:
+            case ((x, y), *rest):
+                r, c = zip(*key)
+                key = (r, c)
+            case _:
+                key = key
+        index = parse_key(key, self.shape)
+        return View(self, index)
+
+    def delete_stimuli(self):
+        self.stimuli = []
+
+    def build_intra(self):
+        if self.stimuli:
+            return IntraStim(self, self.stimuli)
+        return None
 
     def insert(self, mechanism, ic=None, mask_out=None, mask_in=None, **kwargs):
         """
@@ -579,6 +1007,144 @@ class Axon(Parameterized):
         self.integrator = self.integrator(self, mech)
         return self
 
+
+
+class Axon(Population):
+    """
+    Base 1D fiber class.
+
+    This is the base class for axon models, implementing common functionality
+    for simulating action potential propagation along 1D fibers.
+
+    Parameters
+    ----------
+    diameters : array_like
+        Diameters of the axons in μm.
+    n_comp : int
+        Number of nodes in the axon model.
+    temp : float, optional
+        Temperature in degrees Celsius. Default is 37.0.
+    v_init : float, optional
+        Initial membrane potential in mV. Default is -80.0.
+    integrator: Integrator
+
+    Attributes
+    ----------
+    n_ax : int
+        Number of axons in the model.
+    n_comp : int
+        Number of compartments in each axon.
+    temp : float
+        Temperature in degrees Celsius.
+    v_init : float
+        Initial membrane potential in mV.
+    mech : MechanismHandler
+        Responsible for integrating all membrane mechanism states.
+    t_ind : int
+        Current time index.
+    dt : float
+        Time step in ms.
+    """
+
+    PARAMETER(inherit=Population)
+
+    _dt_lim = None
+    __constants__ = [
+        "n_ax",
+        "n_comp",
+        "temp",
+        "v_init",
+    ]
+
+    def __init__(
+        self, 
+        diameters,
+        n_comp: int, 
+        celsius=37.0, 
+        v_init=-80.0,
+        integrator=None
+    ):
+        super().__init__(len(diameters), n_comp, integrator=integrator, celsius=celsius)
+        
+        self.n_ax   = self.np
+        self.n_comp = self.nc
+        self.temp   = float(celsius)
+        self.v_init = v_init
+        self.v[:] = v_init
+
+        self.register_buffer("v_init_c", torch.tensor(v_init, dtype=self.dtype()))
+
+        self.cid = None
+
+        if torch.is_tensor(diameters):
+            diameters = diameters.to(self.dtype()).clone().detach()
+        else:
+            diameters = torch.tensor(diameters, dtype=self.dtype())
+
+        if diameters.ndim == 1:
+            diameters = diameters.unsqueeze(1)        
+
+        self.diam[:] = diameters
+
+        self._register_buffers()
+
+        # -- biophysics --
+        self.biophysics()
+
+    def biophysics(self):
+        """
+        Placeholder for biophysics-related initializations.
+        This method can be overridden in subclasses to add specific
+        biophysics-related parameters or configurations.
+        """
+        pass
+
+    def __init_subclass__(cls, **kwargs):
+        def init_decorator(previous_init):
+            def new_init(self, *args, **kwargs):
+                previous_init(self, *args, **kwargs)
+                if type(self) == cls:
+                    Axon.__post_init__(self)
+
+            return new_init
+
+        cls.__init__ = init_decorator(cls.__init__)
+
+    def __post_init__(self):
+        changed = self.instantiate_parameters_lambda()
+        if changed:
+            self.calculate_geometric_params()
+        with (
+            e_context(use_last=True),
+            c_context(use_last=True),
+        ):
+            self.build()
+        if CUDA:
+            self.cuda()
+
+    def _register_buffers(self):
+        self.register_buffer("area_c", self.area_(self.diam))
+        self.register_buffer("cm_c",   self.cm_(self.area_c))
+        self.register_buffer("ra_c",   self.ra_(self.diam))
+        self.register_buffer("temp_c", torch.tensor(self.temp))
+
+    def register_cid(self, cid):
+        self.cid = cid
+
+    def set_diam(self, diams):
+        diams = torch.as_tensor(diams, dtype=self.dtype())
+        self.diam[:] = diams
+        self.instantiate_parameters_lambda()
+        self.calculate_geometric_params()
+
+    def calculate_geometric_params(self):
+        self.area_c = self.area_(self.diam)
+        self.cm_c = self.cm_(self.area_c)
+        self.ra_c = self.ra_(self.diam)
+
+    def n(self) -> int:
+        return self.v.shape[0]
+
     def area_(self, diameters):
         raise NotImplementedError()
 
@@ -593,18 +1159,6 @@ class Axon(Parameterized):
 
     def detach(self):
         self.integrator.detach(self)
-
-    @property
-    def t(self):
-        """
-        Get the current simulation time.
-
-        Returns
-        -------
-        float
-            Current simulation time in milliseconds.
-        """
-        return self.t_ind * self.dt
 
     def c(self, *args):
         """
@@ -627,569 +1181,6 @@ class Axon(Parameterized):
         [25, 50, 75]  # For a model with n_comp=101
         """
         return [round((self.n_comp - 1) * i) for i in args]
-
-    def run(
-        self,
-        ve=None,
-        space=None,
-        time=None,
-        tstop=None,
-        dt=None,
-        callbacks=None,
-        reinit=False,
-        progressbar=True,
-        multicontact=False,
-        first=True,
-        longrunning=False,
-    ):
-        """
-        Run the axon model simulation.
-
-        Parameters
-        ----------
-        ve : Tensor, optional
-            Extracellular voltage tensor. Shape should be
-            [timesteps, n_ax, 1, n_comp] or compatible.
-        space : Tensor, optional
-            Spatial components when ve is not directly provided.
-            Used with time to construct ve.
-        time : Tensor or Waveform, optional
-            Temporal components when ve is not directly provided.
-            Used with space to construct ve.
-        tstop : float, optional
-            Simulation stop time in milliseconds. If None, uses the default from backend.
-            If ve is provided, this is ignored.
-            If ve is provided, tstop is determined by the shape of ve.
-        dt : float, optional
-            Time step size in milliseconds. If None, uses the default from backend.
-        intra : IntraStim, optional
-            Intracellular stimulation object.
-        callbacks : list of Callback, optional
-            List of callback objects to execute during simulation steps.
-        reinit : bool, optional
-            If True, reinitialize the model state before running. If steady state is
-            cached, it will be restored instead of initializing from scratch.
-            Default is False.
-        progressbar : bool or tqdm, optional
-            If True, displays a progress bar during simulation. Can also be a
-            tqdm instance for custom progress tracking. Default is True.
-        multicontact : bool, optional
-            If True, handles multiple electrode contacts for ve construction.
-            Default is False.
-        first : bool, optional
-            If True, indicates this is the first run in a sequence, triggering
-            pre-loop hooks for callbacks. Default is True.
-        longrunning : bool, optional
-            If True, indicates this run is part of a longer simulation sequence,
-            affecting progress bar behavior. Default is False.
-
-        Raises
-        ------
-        ValueError
-            If neither ve nor (space and time) nor intra is provided.
-            If intra is provided but is not an instance of IntraStim.
-
-        Notes
-        -----
-        The simulation updates the model's internal state (v, v_prev for DF method, etc.)
-        and advances the model's time index (t_ind).
-        """
-
-        if self.intra is None or reinit:
-            intra = self.build_intra()
-            self.intra = intra
-        else:
-            intra = self.intra
-
-        with_intra = intra is not None
-
-        device = self.device()
-
-        if ve is not None:
-            ve = torch.as_tensor(ve, device=device)
-
-        dt = dt if dt is not None else A.dt
-        dt_f = float(dt)
-        self.warn_about_dt(dt)
-
-        local_ind = 0
-
-        if isinstance(time, Waveform):
-            if tstop is not None:
-                time._tstop = tstop
-            elif time._tstop is None:
-                raise ValueError("If `time` is a Waveform, `tstop` must be provided.")
-            time = time.assemble(dt)
-
-        with torch.set_grad_enabled(self.training):
-            if self.training:
-                self.calculate_geometric_params()
-
-            if ve is None:
-                if space is not None and time is not None:
-                    ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
-
-            if ve is not None:
-                n = ve.shape[0]
-            else:
-                n = int(tstop / dt_f)
-
-            if (not self.initialized) or reinit:
-                if "_steady_state" in self._caches:
-                    self.restore("_steady_state")
-                    self.t_ind = 0
-                else:
-                    self.initialize()
-            else:
-                self.detach()
-
-            if with_intra:
-                start = self.t_ind*dt_f
-                end = (self.t_ind + n) * dt_f
-                t_ = torch.arange(start, end, dt_f, device=device, dtype=self.dtype())
-                t_ = t_.to(self.device(), dtype=self.dtype())
-                stims, indices = intra.init(t_)
-                stims = [s.unbind(0) for s in stims]
-
-            if not isinstance(callbacks, CallbackList):
-                callbacks = CallbackList(callbacks)
-
-            if first:
-                if callbacks:
-                    for c in callbacks:
-                        c.dt = dt
-                
-                pre_loop_hook(callbacks, self)
-
-            dt = torch.as_tensor(dt, device=device, dtype=self.dtype())
-
-            if first or self.training:
-                self.integrator.initialize(self, dt)
-
-            if progressbar:
-                if not isinstance(progressbar, tqdm):
-                    progressbar = tqdm(total=n, desc=f"{self.t_ind*dt_f:.3f} ms")
-
-            for i in range(n):
-                ve_c = ve[i] if ve is not None else None
-
-                if with_intra:
-                    s = [st[local_ind] for st in stims]
-                    intra_c = make_intra(intra, s, indices)
-                else:
-                    intra_c = None
-
-                self._step(self.integrator, self, dt, ve_c, intra_c)
-                
-                post_step_hook(callbacks, self)
-                self.t_ind += 1
-                local_ind += 1
-
-                if progressbar:
-                    progressbar.update(1)
-                    if self.t_ind % 100 == 0:
-                        progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
-
-            if not longrunning:
-                if progressbar:
-                    progressbar.close()
-                post_loop_hook(callbacks, self)
-
-    def longrun(
-        self,
-        tstop: float,
-        chunklength: int,
-        dt: float = None,
-        ve: Optional[Tuple[Tensor, Waveform]] = None,
-        reinit=False,
-        callbacks: List[Callback] = None,
-        progressbar=True,
-        multicontact=False,
-    ):
-        """
-        Run a long simulation by splitting it into multiple chunks.
-
-        Parameters
-        ----------
-        space : Tensor
-            Spatial components of extracellular voltage. Shape should be
-            [n_ax, n_comp] or [1, n_comp] or [n_contacts, ...] for multicontact mode.
-        time : Tensor or Waveform
-            Temporal components of extracellular voltage. Shape should be
-            [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, ...] for multicontact mode.
-        chunklength : int
-            Length of chunks, in # timesteps, into which to split simulation.
-        dt : float, optional
-            Time step size in milliseconds. If None, uses the default from backend.
-        reinit : bool, optional
-            If True, reinitialize the model state before running the first chunk.
-            Subsequent chunks will not reinitialize. Default is False.
-        callbacks : list of Callback, optional
-            List of callback objects to execute during simulation steps.
-        intra : IntraStim, optional
-            Intracellular stimulation object.
-        progressbar : bool, optional
-            If True, displays a progress bar during simulation. Default is True.
-        multicontact : bool, optional
-            If True, handles multiple electrode contacts for ve construction.
-            Default is False.
-
-        Notes
-        -----
-        This method uses the same numerical methods as the `run` method, but manages
-        memory more efficiently for long simulations by processing the data in chunks.
-        The state of the model (v, v_prev, etc.) is preserved between chunks.
-        """
-
-        # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
-        # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
-
-        if self.intra is None or reinit:
-            intra = self.build_intra()
-            self.intra = intra
-        else:
-            intra = self.intra
-
-        with_intra = intra is not None
-        with_extra = ve is not None
-
-        dt = dt if dt is not None else A.dt
-        dt_f = float(dt)
-        self.warn_about_dt(dt)
-
-        if with_extra:
-            ve_s, time = ve
-            ve_s = torch.as_tensor(ve_s, device=self.device(), dtype=self.dtype())
-
-            if multicontact:
-                ve_s = ve_s.expand(-1, self.n_ax, -1)
-            else:
-                ve_s = ve_s.expand(self.n_ax, -1)
-
-            if isinstance(time, Waveform):
-                time = time.to(device=self.device(), dtype=self.dtype())
-                functional = True
-            else:
-                time = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
-                functional = False
-
-                if multicontact:
-                    time = time.expand(-1, self.n_ax, -1)
-                else:
-                    time = time.expand(self.n_ax, -1)
-
-        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
-
-        with torch.set_grad_enabled(self.training):
-
-            t = torch.arange(0, tstop, dt_f, dtype=self.dtype())
-            n_chunks = math.ceil(len(t) / chunklength)
-
-            t_c_f = torch.tensor_split(t, n_chunks)
-
-            if with_extra:
-                if functional:
-                    t_chunks = t_c_f
-                else:
-                    t_chunks = torch.tensor_split(time, n_chunks, dim=-1)
-
-            if multicontact:
-                einsum = op_mc
-            else:
-                einsum = op_sc
-
-            if callbacks:
-                for c in callbacks:
-                    c.dt = dt_f
-
-            callbacks = CallbackList(callbacks)
-
-            if (not self.initialized) or reinit:
-                if "_steady_state" in self._caches:
-                    self.restore("_steady_state")
-                    self.t_ind = 0
-                else:
-                    self.initialize()
-            else:
-                self.detach()
-
-            if progressbar:
-                progressbar = tqdm(total=n_chunks, desc=f"{self.t_ind*dt_f:.1f} ms")
-
-            self.integrator.initialize(self, dt)
-            einsum = torch.compile(einsum)
-
-            pre_loop_hook(callbacks, self)
-
-            for i in range(n_chunks):
-
-                if with_intra:
-                    stims, indices = intra.init(t_c_f[i])
-                    stims = [s.unbind(0) for s in stims]
-
-                if with_extra:
-                    if functional:
-                        t = time(t_chunks[i]).to(self.dtype())
-                        if multicontact:
-                            t = t.unsqueeze(1).expand(-1, self.n_ax, -1)
-                        else:
-                            t = t.unsqueeze(0).expand(self.n_ax, -1)
-                    else:
-                        t = t_chunks[i]
-                    ve_ = einsum(ve_s, t).contiguous().unbind(dim=0)
-
-                for j in range(len(t_c_f[i])):
-                    if with_extra:
-                        ve_c = ve_[j]
-                    else:
-                        ve_c = None
-                    if with_intra:
-                        s = [st[j] for st in stims]
-                        intra_c = make_intra(intra, s, indices)
-                    else:
-                        intra_c = None
-                    
-                    self._step(self.integrator, self, dt, ve_c, intra_c)
-                    post_step_hook(callbacks, self)
-
-                    self.t_ind += 1
-
-                if progressbar:
-                    progressbar.update(1)
-                    progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
-
-            post_loop_hook(callbacks, self)
-
-            if progressbar:
-                progressbar.close()
-
-    def steady_state(self, dt=0.2, tstop=200.0):
-        """
-        Run the model until it reaches a steady state and cache the result.
-
-        Parameters
-        ----------
-        dt : float, optional
-            Time step size in milliseconds. Default is 0.2 ms.
-        t : float, optional
-            Time in milliseconds to run the simulation. Default is 200 ms.
-
-        Notes
-        -----
-        This method clears any previous steady state cache before creating a new one.
-        The steady state can be restored later by setting reinit=True when calling
-        the run method.
-        """
-
-        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
-
-        if "_steady_state" in self._caches:
-            self._caches.pop("_steady_state")
-
-        self.initialize()
-        self.integrator.initialize(self, dt)
-
-        maxiter = int(tstop / dt)
-
-        with torch.no_grad():
-            for i in tqdm(range(maxiter), desc=f"Steady state:: dt:{dt:.3f} ms, tstop:{tstop:.1f} ms"):
-                self._step(self.integrator, self, dt, None, None)
-
-        self.cache("_steady_state")
-        self.t_ind = 0
-        return self
-
-    def post_initialize(self):
-        with torch.no_grad():
-            for h in self.post_initialize_hooks:
-                h(self)
-
-    def pre_initialize(self):
-        with torch.no_grad():
-            for h in self.pre_initialize_hooks:
-                h(self)
-
-    def initialize(self):
-        self.integrator.init_v(self)
-        self.pre_initialize()
-        self.integrator.mech.initialize(self.v, self.v_init_c, self.temp_c)
-        self.post_initialize()
-        self.integrator.mech.initialize(self.v, self.v_init_c, self.temp_c)
-        self.t_ind = 0
-        self.initialized = True
-
-    def load(self, state_dict):
-        """
-        Load model weights from a state dictionary.
-
-        This method supports loading weights from:
-        1. A key from the predefined `all_trained` dictionary
-        2. A file path as a string
-        3. An actual state dictionary object
-
-        The loaded weights are matched to the model's current state dict structure
-        and only compatible weights are loaded. After loading, geometric parameters
-        are recalculated.
-
-        Parameters
-        ----------
-        state_dict : str or dict
-            Can be one of:
-            - A key from the predefined `all_trained` dictionary
-            - A file path to a saved model state
-            - A state dictionary object
-
-        Returns
-        -------
-        self
-            The model instance with loaded weights
-        """
-        from axonml import all_trained
-
-        if state_dict in all_trained:
-            state_dict = torch.load(
-                all_trained[state_dict], map_location=self.device(), weights_only=True
-            )
-        elif isinstance(state_dict, str):
-            state_dict = torch.load(
-                state_dict, map_location=self.device(), weights_only=True
-            )
-        matched, _ = _match_state_dict(self.state_dict(), state_dict)
-        self.load_state_dict(matched, strict=False)
-        self.calculate_geometric_params()
-        return self
-
-    def compile(self, callbacks: List[Callback] = None):
-        ve = torch.ones(
-            1, self.n_ax, 1, self.n_comp, device=self.device(), dtype=self.dtype()
-        )
-        for _ in range(5):
-            self.run(ve, callbacks=callbacks, progressbar=False)
-        self.initialized = False
-        if callbacks:
-            for c in callbacks:
-                c.reset()
-        return self
-
-    def all_states(self) -> List[str]:
-        out = ["v"]
-        return out + self.integrator.mech.all_states()
-
-    def cache(self, name: str = None):
-        """
-        Cache the current model state with an optional identifier.
-
-        This method saves a snapshot of the model's current state dictionary
-        to an internal cache. The state can later be restored using the
-        restore() method with the same name.
-
-        Parameters
-        ----------
-        name : str, optional
-            Identifier for the cached state. If None, the state is cached
-            with the name 'latest'. Default is None.
-
-        Returns
-        -------
-        None
-
-        See Also
-        --------
-        restore : Restore a previously cached state
-
-        Examples
-        --------
-        >>> model.cache('before_training')  # Cache state before training
-        >>> # ... training or simulation ...
-        >>> model.restore('before_training')  # Return to cached state
-        """
-        if name is None:
-            name = "latest"
-        self._caches[name] = self.state_dict()
-
-    def restore(self, name: str = None):
-        """
-        Restore a previously cached model state.
-
-        This method loads a previously cached state dictionary from the internal
-        cache and applies it to the model. It's used in conjunction with the
-        cache() method, which saves states.
-
-        Parameters
-        ----------
-        name : str, optional
-            Identifier for the cached state to restore. If None, restores
-            the state cached as 'latest'. Default is None.
-
-        Returns
-        -------
-        None
-
-        See Also
-        --------
-        cache : Cache the current model state
-
-        Examples
-        --------
-        >>> model.cache('before_training')  # Cache state before training
-        >>> # ... training or simulation ...
-        >>> model.restore('before_training')  # Return to cached state
-        """
-        if name is None:
-            name = "latest"
-        self.load_state_dict(self._caches[name])
-        self.initialized = True
-
-    def cuda(self):
-        super().cuda()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
-    def cpu(self):
-        super().cpu()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
-    def float(self):
-        super().float()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
-    def double(self):
-        super().double()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
-    def warn_about_dt(self, dt):
-        if DTWARN:
-            if self._dt_lim is not None:
-                if dt > self._dt_lim:
-                    warnings.warn(
-                        f"dt ({dt}) exceeds limit ({self._dt_lim}), solution may have large oscillations."
-                    )
-
-    def __getitem__(self, key):
-        match key:
-            case ((x, y), *rest):
-                r, c = zip(*key)
-                key = (r, c)
-            case _:
-                key = key
-        index = parse_key(key, self.shape)
-        return View(self, index)
-
-    def delete_stimuli(self):
-        self.stimuli = []
-
-    def build_intra(self):
-        if self.stimuli:
-            return IntraStim(self, self.stimuli)
-        return None
 
 
 
@@ -1286,7 +1277,7 @@ class Unmyelinated(Axon):
     Myelinated : Companion class implementing myelinated axon models.
     """
 
-    PARAMETER(cm=1.0, rhoa=35.4)
+    PARAMETER(cm=1.0, rhoa=35.4, celsius=37.0)
 
     def __init__(
             self, 
@@ -1300,21 +1291,23 @@ class Unmyelinated(Axon):
         # L = L * 1000  # mm -> um
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
-        self.dx: float = dx
+        self.dx_: float = dx
         self.L: float = n_comp * dx
         super().__init__(diameters, n_comp, temp, v_init, integrator)
+        self.x[:] = self._x()  # Initialize x positions
+        self.dx[:] = self.dx_
 
-    def x(self) -> torch.Tensor:  # x in um
-        l = (self.n_comp - 1) * self.dx
+    def _x(self) -> torch.Tensor:  # x in um
+        l = (self.n_comp - 1) * self.dx_
         x = torch.linspace(-l / 2, l / 2, self.n_comp, device=self.device())
         return torch.atleast_2d(x)
 
     def area_(self, diameters) -> torch.Tensor:
-        dx = torch.full_like(diameters, self.dx / 10000)
+        dx = torch.full_like(diameters, self.dx_ / 10000)
         return torch.pi * (diameters / 10000) * dx
 
     def ra_(self, diameters) -> torch.Tensor:
-        dx = torch.full_like(diameters, self.dx / 10000)
+        dx = torch.full_like(diameters, self.dx_ / 10000)
         radii = diameters / 20000
         return (self.rhoa * dx) / (torch.pi * (radii**2))
 
@@ -1410,6 +1403,7 @@ class Myelinated(Axon):
             "cm": 1.0,
             "rhoa": 35.4,  # ohm-cm
         },
+        celsius=37.0,
     )
 
     def area_(self, diameters):
@@ -1436,7 +1430,7 @@ class Myelinated(Axon):
         noded = self.noded1 * diameters**2 + self.noded2 * diameters + self.noded3
         return noded / 10000
 
-    def x(self) -> torch.Tensor:  # x in um
+    def x_(self) -> torch.Tensor:  # x in um
         l = (self.n_comp - 1) * self.deltax(self.diam) * 10000
         start = -l / 2
         end = l / 2

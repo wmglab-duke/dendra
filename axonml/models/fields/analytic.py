@@ -17,7 +17,7 @@ class Point(Parameterized):
 
     def forward(self, model):
         self.to(model.device())
-        x, y, z = model.x(), model.y, model.z
+        x, y, z = model.x, model.y, model.z
         return self.fn(x, y, z)
 
 

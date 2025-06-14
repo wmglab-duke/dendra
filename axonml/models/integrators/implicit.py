@@ -29,29 +29,31 @@ class _bwd_euler_sc(SCIntegrator):
     builder = ImplicitHandlerBuilder
     is_df = False
 
-    def __init__(self, model, mech, imem=None, N=1, P=1, C=1):
-        super().__init__(model, mech, imem, N, P, C)
+    def __init__(self, model, mech, imem=None):
+        super().__init__(model, mech, imem)
 
     def initialize(self, model, dt):
         self.cmdt = (1e-6 * model.cm) / (1e-3 * dt)
+        self.area = 2 * math.pi * (1e-4 * model.diam / 2.0) * (1e-4 * model.dx)  # cm²
 
-    def step(self, model, dt, t_ind):
-        model.v = self._step_no_intra(model.v, dt, model.temp_c)
-
-    def step_intra(self, model, intra, dt, t_ind):
-        model.v = self._step_intra(model.v, dt, model.temp_c, intra)
+    def step(self, model, dt, ve=None, intra=None):
+        if intra is None:
+            model.v = self._step_no_intra(model.v, dt, model.temp_c)
+        else:
+            model.v = self._step_intra(model.v, dt, model.temp_c, intra)
 
     def _step_no_intra(self, v, dt, temp):
         self.mech.advance(v, dt, temp)
-        self.mech.i(v)
-        i = self.mech.irev()
+        itot = self.mech.i(v)
         gtot = self.mech.gtot(v)
+        i = gtot * v - itot
         return (self.cmdt * v + i) / (self.cmdt + gtot)
 
     def _step_intra(self, v, dt, temp, intra):
-        i = -self.mech.i(v) + self.mech.irev() + intra
-        gtot = self.mech.gtot(v)
         self.mech.advance(v, dt, temp)
+        itot = self.mech.i(v)
+        gtot = self.mech.gtot(v)
+        i = gtot * v - itot + (intra / self.area)
         return (self.cmdt * v + i) / (self.cmdt + gtot)
 
 
@@ -72,7 +74,6 @@ class _bwd_euler_ub(Integrator):
             method = "pcr"
         super().__init__(model, mech, **kw)
         B, K = model.n_ax, model.n_comp
-        self.register_buffer("kernel", torch.tensor([1.0, -2.0, 1.0]).view(1, 1, 3))
         
         # Buffers for diffusive diag, axonal conductance, membrane scale
         self.register_buffer("diag_base", torch.zeros(B, K))
@@ -81,6 +82,7 @@ class _bwd_euler_ub(Integrator):
         self.register_buffer("scale", torch.zeros(B, K))
         self.register_buffer("lower", torch.zeros(B, K-1))
         self.register_buffer("upper", torch.zeros(B, K-1))
+        self.register_buffer("g_edge_Cinv", torch.zeros(B, K-1))
 
         if method == "pcr":
             self._solve = pcr_tridiag_solve
@@ -90,25 +92,45 @@ class _bwd_euler_ub(Integrator):
             raise ValueError(f"Unknown method: {method}")
 
     def initialize(self, model, dt):
-        B, K = model.n_ax, model.n_comp
-        dt_s = dt * 1e-3
-        # same geometry & membrane setup as ETD1
-        radius_cm = 1e-4 * model.diam / 2.0
-        dx_cm = 1e-4 * model.dx
-        A_mem = 2 * torch.pi * radius_cm * dx_cm
-        cm = 1e-6 * model.cm * A_mem
-        g_ax = torch.pi * radius_cm**2 / (model.rhoa * dx_cm)
-        g_ax_over_Cm = g_ax / cm
-        # diffusive base diag entries
+        B, K   = model.np, model.nc
+        dt_s   = dt * 1e-3                      # s
+
+        # ── geometry (all element-wise) ──────────────────────────────
+        radius_cm = 1e-4 * model.diam / 2.0                 # µm → cm   (B,K)
+        dx_cm     = 1e-4 * model.dx                         # µm → cm   (B,K)
+        area_cm2  = 2 * torch.pi * radius_cm * dx_cm        # cm²
+
+        Cm     = 1e-6 * model.cm * area_cm2         # F   (B,K)
+        Cm_inv = 1.0 / Cm                           # 1/F
+
+        # segment axial resistance  (Ω cm)
+        Ra_seg = model.rhoa * dx_cm / (torch.pi * radius_cm**2)   # (B,K)
+
+        # ── edge axial conductance between centres i ↔ i+1 ──────────
+        # harmonic mean:   g_edge = 2 / (Ra_i + Ra_{i+1})
+        g_edge = 2.0 / (Ra_seg[:, :-1] + Ra_seg[:, 1:])           # (B,K-1)
+
+        # convert to   g / C    (1/s)   for each adjoining cell
+        g_left  = g_edge / Cm[:, :-1]         # affects row i     (B,K-1)
+        g_right = g_edge / Cm[:, 1:]          # affects row i+1   (B,K-1)
+
+        g_edge_Cinv = g_edge / Cm[:, :-1]         # (B, K-1)   1/s
+        self.g_edge_Cinv.copy_(g_edge_Cinv)
+
+        # ── fill solver buffers ─────────────────────────────────────
+        # diagonal of the diffusive operator (base part, no ion channels yet)
         diag = torch.zeros(B, K, device=model.device())
-        diag[:, :-1] -= g_ax_over_Cm
-        diag[:, 1:] -= g_ax_over_Cm
+        diag[:, :-1] -= g_left
+        diag[:,  1:] -= g_right
         self.diag_base.copy_(diag)
-        self.g_ax.copy_(g_ax_over_Cm)
-        self.cm_inv.copy_(1.0 / cm)
-        self.scale.copy_(A_mem * self.cm_inv)
-        self.lower.copy_(-dt_s * self.g_ax[:, :-1])  # (B, K-1)
-        self.upper.copy_(-dt_s * self.g_ax[:, 1:])  # (B, K-1)
+
+        # time-scaled banded matrix (Thomas / DHS will overwrite main diag later)
+        self.lower.copy_(-dt_s * g_left)    # (B,K-1)
+        self.upper.copy_(-dt_s * g_right)    # (B,K-1)
+
+        # misc pre-computed factors used elsewhere
+        self.cm_inv.copy_(Cm_inv)              # (B,K)
+        self.scale.copy_(area_cm2 * Cm_inv)  # A·s / C == 1, but keep for code reuse
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, model.temp_c, ve, intra)
@@ -128,10 +150,11 @@ class _bwd_euler_ub(Integrator):
 
         if ve is not None:
             # diffusive extracellular coupling
-            S = torch.nn.functional.conv1d(ve.unsqueeze(1), self.kernel, padding=1).squeeze(1)
-            S[:, 0] = ve[:, 1] - ve[:, 0]
-            S[:, -1] = ve[:, -2] - ve[:, -1]
-            S = S * self.g_ax
+            flux = self.g_edge_Cinv * (ve[:, 1:] - ve[:, :-1])  # (B, K-1)
+            S = torch.zeros_like(ve)  # (B, K)
+            S[:, 1:-1] = flux[:, :-1] - flux[:, 1:]
+            S[:, 0]    = -flux[:, 0]
+            S[:, -1]   = flux[:, -1]
 
             # form RHS: v_n + dt*(linear_reversal + S - residual)
             f_n = f_n + S
@@ -223,8 +246,8 @@ class _bwd_euler_bt(torch.nn.Module):
             raise ValueError(f"Unknown method: {method}")
         
     @classmethod
-    def shape(cls, n_ax, n_comp):
-        return (n_ax, n_comp)
+    def shape(cls, np, nc):
+        return (np, nc)
 
     def init_v(self, model):
         model.vc[:] = 0.0
@@ -257,7 +280,7 @@ class _bwd_euler_bt(torch.nn.Module):
         B, K, M = self.B, self.K, self.M
         dev, dtyp = model.device(), model.dtype()
 
-        L     = model.L     * 1e-4          # μm → cm
+        L     = model.dx    * 1e-4          # μm → cm
         diam  = model.diam  * 1e-4          # μm → cm
         radius = 0.5 * diam                 # cm
         area   = torch.pi * diam * L        # cm² for each segment

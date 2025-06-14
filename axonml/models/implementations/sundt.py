@@ -62,20 +62,20 @@ class Sundt2015(Unmyelinated):
            Journal of Neurophysiology, 114(6), 3140-3153. doi:10.1152/jn.00226.2015
     """
 
-    PARAMETER(cm=1.0, rhoa=100.0)
+    PARAMETER(inherit=Unmyelinated, cm=1.0, rhoa=100.0)
 
     def __init__(
         self,
         diameters=[1.0],
         L=5.0*mm,
         dx=10,
-        temp=37.0,
+        celsius=37.0,
         v_init=-65.0,
         integrator=None,
     ):
         if integrator is None:
             integrator = bwd_euler_ub()
-        super().__init__(diameters, L, dx, temp, v_init, integrator)
+        super().__init__(diameters, L, dx, celsius, v_init, integrator)
 
         with e_context(ek=-90.0):
             self.insert(kdr, gkbar=0.04)

@@ -1193,6 +1193,9 @@ class Raster(ThresholdCallback):
     """
 
     def pre_loop_hook(self, model):
+        self.node_check = torch.as_tensor(
+            self.node_check, dtype=torch.long, device=model.device()
+        )
         if self.record is None:
             self.record = []
         if self.state_cache is None:
@@ -1208,7 +1211,7 @@ class Raster(ThresholdCallback):
         if self.i >= self.ind_start:
             vm_new = atleast_2d(model.v[:, self.node_check])
             vm = self.state_cache
-            self.state_cache, la = increment_count(vm, vm_new, self.threshold)
+            self.state_cache, la = increment_act(vm, vm_new, self.threshold)
             self.record.append(la)
         self.i += 1
 
@@ -1305,6 +1308,14 @@ def increment_count(vm, vm_new, record, threshold: float):
     record = record + mask.to(record.dtype)    # one fused kernel
     next_mask = ~m                             # can tag-on to same kernel
     return next_mask, record
+
+
+@torch.jit.script
+def increment_act(vm, vm_new, threshold: float):
+    m = (vm_new >= threshold) 
+    mask = m & vm                              # fused compare + and
+    next_mask = ~m                             # can tag-on to same kernel
+    return next_mask, mask
 
 
 def update_active(vm, vm_new, record, threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:

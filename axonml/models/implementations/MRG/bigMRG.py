@@ -204,15 +204,15 @@ class bigMRG(ExtCell):
         )
 
         self.diam[:] = torch.tensor(self.cid.build(node_d_funcs, self))
-        self.L[:] = torch.tensor(self.cid.build(node_l_funcs, self))
+        self.dx[:]   = torch.tensor(self.cid.build(node_l_funcs, self))
 
-        g = self.scale * self.secd / self.fd[:, None]
-        xc = self.cid.build(xc_funcs, self)
-        xg = self.cid.build(xg_funcs, self)
+        g       = self.scale * self.secd / self.fd[:, None]
+        xc      = self.cid.build(xc_funcs, self)
+        xg      = self.cid.build(xg_funcs, self)
         xraxial = self.cid.build(xr_funcs, self)
 
-        self.xc[..., 0] = torch.tensor(xc, dtype=self.dtype())
-        self.xg[..., 0] = torch.tensor(xg, dtype=self.dtype())
+        self.xc[..., 0]      = torch.tensor(xc, dtype=self.dtype())
+        self.xg[..., 0]      = torch.tensor(xg, dtype=self.dtype())
         self.xraxial[..., 0] = torch.tensor(xraxial, dtype=self.dtype())
 
         self.insert_at(

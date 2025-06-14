@@ -86,20 +86,20 @@ class Tigerholm2014(Unmyelinated):
            1721-35. doi:10.1152/jn.00777.2012
     """
 
-    PARAMETER(cm=1.0, rhoa=35.5)
+    PARAMETER(inherit=Unmyelinated, cm=1.0, rhoa=35.5)
 
     def __init__(
         self,
         diameters=[1.0],
         L=5.0*mm,
         dx=10.0,
-        temp=37.0,
+        celsius=37.0,
         v_init=-55.0,
         integrator=None,
     ):
         if integrator is None:
             integrator = bwd_euler_ub()
-        super().__init__(diameters, L, dx, temp, v_init, integrator)
+        super().__init__(diameters, L, dx, celsius, v_init, integrator)
 
         self.register_pre_initialize_hook(pre_init)
         self.register_post_initialize_hook(balance)

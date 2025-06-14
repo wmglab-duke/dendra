@@ -109,7 +109,6 @@ class Heterogeneous(Axon):
             ve = torch.as_tensor(ve, device=device)
 
         dt = dt if dt is not None else A.dt
-        self.warn_about_dt(dt)
         self.dt = dt
 
         df = self.is_df
@@ -430,7 +429,6 @@ class MyelinatedHeterogeneous(Axon):
             ve = torch.as_tensor(ve, device=device)
 
         dt = dt if dt is not None else A.dt
-        self.warn_about_dt(dt)
         self.dt = dt
 
         method = getattr(self, f"step_no_intra_df")
@@ -642,7 +640,7 @@ class ExtCell(Axon):
 
     def _register_buffers(self, diameters):
         self.register_buffer("diam",        torch.full((self.n_ax, self.n_comp), 10.0))
-        self.register_buffer("L",           torch.full((self.n_ax, self.n_comp), 10.0))
+        self.register_buffer("dx",          torch.full((self.n_ax, self.n_comp), 10.0))
 
         self.register_buffer("xraxial",     torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
         self.register_buffer("xc",          torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0))
