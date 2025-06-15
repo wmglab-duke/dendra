@@ -28,7 +28,7 @@ def dhs_fwd_bwd(
         m   = lane < w                    # mask
 
         idx    = tl.load(ORDER_ptr + s + lane, mask=m, other=0)
-        parent = tl.load(P_ptr + idx,      mask=m, other=-1)
+        parent = tl.load(P_ptr + idx, mask=m, other=-1)
 
         a_i = tl.load(A + idx, mask=m)
         d_i = tl.load(D + idx, mask=m)

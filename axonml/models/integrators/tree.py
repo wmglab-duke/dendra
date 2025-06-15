@@ -52,64 +52,97 @@ def build_morphology(parent_idx: List[int]) -> Tuple[
 
 def graph_to_parent_and_axial(
     G: nx.DiGraph,
-    dtype_axial=torch.float32
-    ):
+    dtype_axial: torch.dtype = torch.float32
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Convert a compartmental morphology stored in a DiGraph to
+    Convert a compartmental morphology stored in a DiGraph into
 
         parent_idx : int32[K]
-        a_geom     : fp32[K]   (static axial conductance)
+        a_geom     : (dtype_axial)[K]   – axial conductance (Siemens)
 
-    The node order (0 … K-1) follows a topological sort so that
-    every parent appears before its children - exactly what the
-    DHS pre-processing requires.
+    Preference order for axial resistance:
+        1.  Use `G.edges[parent, child]['R_ohm']`  if present (exact value
+            taken from NEURON’s ri()).
+        2.  Otherwise compute it from the node‑level geometric attributes
+            (L, diam, Ra) exactly as the original implementation did.
+
+    The topological sort guarantees that every parent index < child index,
+    matching the requirements of DHS / Hines matrix preprocessing.
     """
-    # topological order and index map
-    nodes = list(nx.topological_sort(G))            # length K
-    idx_of = {n: i for i, n in enumerate(nodes)}
-    K = len(nodes)
+    # ------------------------------------------------------------------
+    # 0. topological order and quick look‑ups
+    # ------------------------------------------------------------------
+    nodes   = list(nx.topological_sort(G))          # length K
+    idx_of  = {n: i for i, n in enumerate(nodes)}
+    K       = len(nodes)
 
-    parent_idx = np.full(K, -1, dtype=np.int32)     # default −1
+    parent_idx = np.full(K, -1, dtype=np.int32)
     a_geom     = np.zeros(K, dtype=np.float32)
 
-    # per‑compartment geometry
-    # 1 µm = 1e-4 cm
+    # constant: 1 µm = 1 e‑4 cm
     microns_to_cm = 1e-4
+    pi = np.pi
 
+    # ------------------------------------------------------------------
+    # 1. iterate over all nodes except the roots
+    # ------------------------------------------------------------------
     for child in nodes:
         i = idx_of[child]
+        preds = list(G.predecessors(child))
 
-        preds = list(G.predecessors(child))         # parents of `child`
-        if not preds:                               # soma / root
+        if not preds:                      # soma / root compartment
             continue
         if len(preds) > 1:
-            raise ValueError(f"Node {child} has {len(preds)} parents — "
-                             "branches must be a tree for the Hines matrix")
+            raise ValueError(
+                f"Node {child} has {len(preds)} parents — "
+                "morphology must be a rooted tree for the Hines matrix."
+            )
 
         parent = preds[0]
-        p = idx_of[parent]
+        p      = idx_of[parent]
         parent_idx[i] = p
 
-        # ------------ axial conductance ------------
-        # child geometry
-        L_i    = G.nodes[child]['L']    * microns_to_cm   # cm
-        d_i_cm = G.nodes[child]['diam'] * microns_to_cm
-        r_i_cm = 0.5 * d_i_cm
-        rho_i  = G.nodes[child]['Ra']                     # Ω·cm
+        # --------------------------------------------------------------
+        # 1a.  Attempt to use the pre‑computed exact resistance
+        # --------------------------------------------------------------
+        edge_data = G.get_edge_data(parent, child, default={})
+        R_total = edge_data.get('R_ohm', None)      # Ω or None
 
-        # parent geometry
-        L_p    = G.nodes[parent]['L']    * microns_to_cm
-        d_p_cm = G.nodes[parent]['diam'] * microns_to_cm
-        r_p_cm = 0.5 * d_p_cm
-        rho_p  = G.nodes[parent]['Ra']
+        # --------------------------------------------------------------
+        # 1b.  If not present, fall back to geometric half‑segment calc
+        # --------------------------------------------------------------
+        if R_total is None:
+            try:
+                # child geometry
+                L_i    = G.nodes[child]['L']    * microns_to_cm   # cm
+                d_i_cm = G.nodes[child]['diam'] * microns_to_cm
+                r_i_cm = 0.5 * d_i_cm
+                rho_i  = G.nodes[child]['Ra']                     # Ω·cm
 
-        R_half_i = rho_i * (L_i / 2) / (np.pi * r_i_cm**2)
-        R_half_p = rho_p * (L_p / 2) / (np.pi * r_p_cm**2)
+                # parent geometry
+                L_p    = G.nodes[parent]['L']    * microns_to_cm
+                d_p_cm = G.nodes[parent]['diam'] * microns_to_cm
+                r_p_cm = 0.5 * d_p_cm
+                rho_p  = G.nodes[parent]['Ra']                   # Ω·cm
+            except KeyError as err:
+                raise KeyError(
+                    f"Missing geometry attribute {err} on node; "
+                    "cannot compute axial resistance and no R_ohm present "
+                    "on the edge."
+                ) from err
 
-        R_total  = R_half_i + R_half_p
-        a_geom[i] = 1.0 / R_total                         # Siemens
+            R_half_i = rho_i * (L_i / 2) / (pi * r_i_cm**2)
+            R_half_p = rho_p * (L_p / 2) / (pi * r_p_cm**2)
+            R_total  = R_half_i + R_half_p           # Ω
 
-    # ---------- 3. cast to torch tensors ----------
+        # --------------------------------------------------------------
+        # 1c.  Store axial conductance  (Siemens = 1 / Ω)
+        # --------------------------------------------------------------
+        a_geom[i] = 1.0 / R_total
+
+    # ------------------------------------------------------------------
+    # 2. cast to torch tensors
+    # ------------------------------------------------------------------
     parent_idx_t = torch.as_tensor(parent_idx, dtype=torch.int32)
     a_geom_t     = torch.as_tensor(a_geom,     dtype=dtype_axial)
 
@@ -234,8 +267,8 @@ class _dhs(Integrator):
         dx_cm     = 1e-4 * model.dx                         # µm → cm   (B,K)
         area_cm2  = 2 * torch.pi * radius_cm * dx_cm        # cm²
 
-        Cm     = 1e-6 * model.cm * area_cm2         # F   (B,K)
-        Cm_inv = 1.0 / Cm                           # 1/F
+        Cm     = 1e-6 * model.cm * area_cm2                 # F   (B,K)
+        Cm_inv = 1.0 / Cm                                   # 1/F
 
         parent_idx_t, a_geom_t = graph_to_parent_and_axial(model.graph)
         parent_idx, children, depth = build_morphology(parent_idx_t.tolist())
@@ -260,7 +293,7 @@ class _dhs(Integrator):
         self.cmdt.copy_(cm / dt_s)           # (B,N) (F/s = S)
 
         # extracellular
-        parent = parent_idx                # (K,)
+        parent = parent_idx                                         # (K,)
         child  = (parent >= 0).nonzero(as_tuple=False).squeeze(1)   # (E,)
         self.register_buffer("edge_child",  child.to(torch.int64))
         self.register_buffer("edge_parent", parent[child].to(torch.int64))

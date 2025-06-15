@@ -151,7 +151,7 @@ def _thomas_triton(lower, main, upper, rhs):
 
     thomas_bt3_kernel[
         (B,)
-    ](             # one block per fibre
+    ](  # one block per fibre
         lower   .reshape(B, -1), 
         main    .reshape(B, -1),
         upper   .reshape(B, -1), 
