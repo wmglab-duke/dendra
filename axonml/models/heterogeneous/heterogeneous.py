@@ -624,7 +624,7 @@ class ExtCell(Axon):
         self,
         n_ax: int,
         n_comp: int,
-        temp=37.0,
+        celsius=37.0,
         v_init=-70.0,
         n_layers=2,
         integrator=None,
@@ -633,12 +633,13 @@ class ExtCell(Axon):
             integrator = ax.bwd_euler_bt()
         self.n_layers = n_layers
         diameters = torch.ones(n_ax)
-        super().__init__(diameters, n_comp, temp, v_init, integrator)
+        super().__init__(diameters, n_comp, celsius, v_init, integrator)
+        self.x[:] = self._x()
 
     def calculate_geometric_params(self):
         pass
 
-    def _register_buffers(self, diameters):
+    def _register_buffers(self):
         self.register_buffer("diam",        torch.full((self.n_ax, self.n_comp), 10.0))
         self.register_buffer("dx",          torch.full((self.n_ax, self.n_comp), 10.0))
 
@@ -649,7 +650,7 @@ class ExtCell(Axon):
         self.register_buffer("v_init_c",    torch.tensor(self.v_init))
         self.register_buffer("temp_c",      torch.tensor(self.temp))
 
-    def x(self):
-        node_l = torch.atleast_2d(self.L.squeeze())
+    def _x(self):
+        node_l = torch.atleast_2d(self.dx.squeeze())
         x = node_l.cumsum(dim=1) - node_l / 2
         return x - torch.sum(node_l, dim=1, keepdim=True) / 2

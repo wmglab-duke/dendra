@@ -1,3 +1,4 @@
+import logging
 from typing import Tuple
 import warnings
 import math
@@ -18,6 +19,7 @@ from axonml.helpers import IMEM
 
 from .core import Integrator, SCIntegrator
 from .tridiag import pcr_tridiag_solve
+from .triton import thomas_triton_bt
 
 
 class _bwd_euler_sc(SCIntegrator):
@@ -68,20 +70,20 @@ class _bwd_euler_ub(Integrator):
 
     def __init__(self, model, mech, method="thomas", **kw):
         if not AXONML_SOLVERS_AVAILABLE:
-            warnings.warn(
-                "axonml_solvers not available, using Python PCR solver for BWD Euler."
+            logging.warning(
+                "axonml_solvers not available, using pure Python PCR solver for BWD Euler."
             )
             method = "pcr"
         super().__init__(model, mech, **kw)
         B, K = model.n_ax, model.n_comp
         
         # Buffers for diffusive diag, axonal conductance, membrane scale
-        self.register_buffer("diag_base", torch.zeros(B, K))
-        self.register_buffer("g_ax", torch.zeros(B, K))
-        self.register_buffer("cm_inv", torch.zeros(B, K))
-        self.register_buffer("scale", torch.zeros(B, K))
-        self.register_buffer("lower", torch.zeros(B, K-1))
-        self.register_buffer("upper", torch.zeros(B, K-1))
+        self.register_buffer("diag_base",   torch.zeros(B, K))
+        self.register_buffer("g_ax",        torch.zeros(B, K))
+        self.register_buffer("cm_inv",      torch.zeros(B, K))
+        self.register_buffer("scale",       torch.zeros(B, K))
+        self.register_buffer("lower",       torch.zeros(B, K-1))
+        self.register_buffer("upper",       torch.zeros(B, K-1))
         self.register_buffer("g_edge_Cinv", torch.zeros(B, K-1))
 
         if method == "pcr":
@@ -206,13 +208,15 @@ class _bwd_euler_bt(torch.nn.Module):
     builder = ImplicitHandlerBuilder
     is_df = False
 
-    def __init__(self, model, mech, method="warp", **kwargs):
+    def __init__(self, model, mech, method="triton", **kwargs):
         if not AXONML_SOLVERS_AVAILABLE:
-            raise ImportError(
-                "The axonml_solvers extension is not available. "
-                "Please install the axonml_solvers package."
+            logging.warning(
+                f"only CUDA-based solvers available, using triton Thomas solver."
+                 "CPU models will not work."
             )
+            method = "triton"
         super().__init__()
+
         self.mech = mech
 
         B, K, M = model.n_ax, model.n_comp, model.n_layers
@@ -238,7 +242,9 @@ class _bwd_euler_bt(torch.nn.Module):
         model.vc[..., 0] = model.v_init
         model.v[:] = model.v_init
 
-        if method == "thread":
+        if method == "triton":
+            self._solve = thomas_triton_bt
+        elif method == "thread":
             self._solve = torch.ops.axonml_solvers.solve_bt
         elif method == "warp":
             self._solve = torch.ops.axonml_solvers.solve_bt_warp
@@ -297,7 +303,7 @@ class _bwd_euler_bt(torch.nn.Module):
         raxial  = 0.5 * (raxial[:, :-1, :] + raxial[:, 1:, :])
         gaxial  = 1.0 / raxial                              # S, (B,K-1,M-1)
         zeros_G = torch.zeros((B, 1, M - 1),
-                            device=dev, dtype=dtyp)
+                              device=dev, dtype=dtyp)
         gaxial  = torch.cat([zeros_G, gaxial, zeros_G], dim=1)  # (B,K+1,M-1)
 
         # convenience slices for later

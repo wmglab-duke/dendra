@@ -160,13 +160,13 @@ class mrg_cm(Functional):
 
 class bigMRG(ExtCell):
 
-    PARAMETER(rhoa=mrg_rhoa(70.0), cm=mrg_cm(2.0))
+    PARAMETER(rhoa=mrg_rhoa(70.0), cm=mrg_cm(2.0), celsius=37.0)
 
     def __init__(
         self,
         diameters=[8.0],
         n_node=101,
-        temp=37.0,
+        celsius=37.0,
         v_init=-80.0,
         integrator=None,
     ):
@@ -179,7 +179,7 @@ class bigMRG(ExtCell):
         n_ax = len(diameters)
         n_c = cid.nc()
 
-        super().__init__(n_ax, n_c, temp, v_init, integrator=integrator)
+        super().__init__(n_ax, n_c, celsius, v_init, integrator=integrator)
         self.register_cid(cid)
 
         self.register_buffer(

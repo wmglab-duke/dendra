@@ -693,7 +693,7 @@ def compile_state(s: State, model, pade=None, **kwargs) -> torch.nn.Module:
       to create the PyTorch module.
     """
 
-    temp = model.temp
+    temp = float(model.celsius)
     diameters = model.diam
 
     name = s.__name__
@@ -787,7 +787,7 @@ def compile_coupled_state(s: State, model, pade=None, **kwargs) -> torch.nn.Modu
       to create the PyTorch module.
     """
 
-    temp = model.temp
+    temp = float(model.celsius)
     diameters = model.diam
 
     name = s.__name__

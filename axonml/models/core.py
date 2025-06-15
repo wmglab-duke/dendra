@@ -103,10 +103,11 @@ class Population(Parameterized):
 
     PARAMETER(cm=1.0, rhoa=35.4, celsius=37.0)
 
-    def __init__(self, N:int, C:int, integrator=None, **kwargs):
+    def __init__(self, N:int, C:int, integrator=None, v_init=-65.0, **kwargs):
         super().__init__(**kwargs)
         self.np = N
         self.nc = C
+        self.v_init = v_init
 
         if integrator is None:
             integrator = bwd_euler_ub()
@@ -114,7 +115,8 @@ class Population(Parameterized):
         self.shape = integrator.shape(self.np, self.nc) if integrator else (N, C)
         self.register_buffer("_dummy", torch.zeros(1))
 
-        self.register_buffer("v",    torch.full(self.shape, -65.0))  # default v_init in mV
+        self.register_buffer("v_init_c", torch.as_tensor(v_init, dtype=self.dtype()))
+        self.register_buffer("v",    torch.full(self.shape, self.v_init))  # default v_init in mV
         self.register_buffer("diam", torch.full(self.shape, 500.0))
         self.register_buffer("dx",   torch.full(self.shape, 100.0))
 
@@ -358,7 +360,7 @@ class Population(Parameterized):
         and advances the model's time index (t_ind).
         """
 
-        if self.intra is None or reinit:
+        if self.intra is None:
             intra = self.build_intra()
             self.intra = intra
         else:
@@ -537,7 +539,7 @@ class Population(Parameterized):
 
         if with_extra:
             ve_s, time = extra
-            ve_s = torch.as_tensor(ve_s, device=self.device(), dtype=self.dtype())
+            ve_s = torch.as_tensor(ve_s, device=self.device(), dtype=self.dtype()).contiguous()
 
             if multicontact:
                 ve_s = ve_s.expand(-1, self.n_ax, -1)
@@ -988,7 +990,7 @@ class Population(Parameterized):
                 self._m_unfactorable,
                 self._m_has_gtot,
                 self._m_divide_by_two,
-                self.temp,
+                float(self.celsius),
                 ions,
                 df,
             )
@@ -1000,7 +1002,7 @@ class Population(Parameterized):
                 self._m_unfactorable,
                 self._m_has_gtot,
                 self._m_divide_by_two,
-                self.temp,
+                float(self.celsius),
                 ions,
             )
 

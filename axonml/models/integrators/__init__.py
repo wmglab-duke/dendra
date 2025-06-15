@@ -20,6 +20,10 @@ from .imex import (
     _krylov_etd1,
 )
 
+from .tree import (
+    _dhs,
+)
+
 
 def partial_class(cls: Type[Any], /, *args, **kwargs) -> Type[Any]:
     """
@@ -48,6 +52,8 @@ bwd_euler_sc = partial(partial_class, _bwd_euler_sc)
 bwd_euler_ub = partial(partial_class, _bwd_euler_ub)
 bwd_euler_bt = partial(partial_class, _bwd_euler_bt)
 
+dhs = partial(partial_class, _dhs)
+
 
 __all__ = [
     "euler",
@@ -60,4 +66,5 @@ __all__ = [
     "bwd_euler_sc",
     "bwd_euler_ub",
     "bwd_euler_bt",
+    "dhs",
 ]

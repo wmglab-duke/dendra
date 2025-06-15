@@ -274,11 +274,11 @@ class MechCompiler:
             mask_in=None, 
             **kwargs
         ):
-        temp = model.temp
+        temp = float(model.celsius)
         diameters = model.diam
         shape = model.shape
-        n_ax = model.n_ax
-        n_comps = model.n_comp
+        n_ax = model.np
+        n_comps = model.nc
         pade = None if self.PADE < 0 else bool(self.PADE)
 
         states = mechanism._states
