@@ -58,13 +58,13 @@ def graph_to_parent_and_axial(
     Convert a compartmental morphology stored in a DiGraph into
 
         parent_idx : int32[K]
-        a_geom     : (dtype_axial)[K]   – axial conductance (Siemens)
+        a_geom     : (dtype_axial)[K]   - axial conductance (Siemens)
 
     Preference order for axial resistance:
         1.  Use `G.edges[parent, child]['R_ohm']`  if present (exact value
-            taken from NEURON’s ri()).
-        2.  Otherwise compute it from the node‑level geometric attributes
-            (L, diam, Ra) exactly as the original implementation did.
+            taken from NEURON's ri()).
+        2.  Otherwise compute it from the node-level geometric attributes
+            (L, diam, Ra).
 
     The topological sort guarantees that every parent index < child index,
     matching the requirements of DHS / Hines matrix preprocessing.
@@ -146,7 +146,7 @@ def graph_to_parent_and_axial(
     parent_idx_t = torch.as_tensor(parent_idx, dtype=torch.int32)
     a_geom_t     = torch.as_tensor(a_geom,     dtype=dtype_axial)
 
-    return parent_idx_t, a_geom_t
+    return parent_idx_t, a_geom_t, nodes
 
 
 def build_dhs_layers(
@@ -168,7 +168,7 @@ def build_dhs_layers(
     depth_cpu = depth.cpu().numpy()
     max_d     = int(depth_cpu.max())
 
-    order:     List[int]      = []
+    order:     List[int]  = []
     layer_ptr: List[int]  = [0]
 
     # bucket sort by depth
@@ -187,6 +187,31 @@ def build_dhs_layers(
 
     return (torch.as_tensor(order,     dtype=torch.int32),
             torch.as_tensor(layer_ptr, dtype=torch.int32))
+
+
+def get_area_from_graph(G: nx.DiGraph) -> torch.Tensor:
+    """
+    Extracts the area from the graph's nodes if available.
+
+    Parameters
+    ----------
+    G : nx.DiGraph
+        The directed graph representing the tree structure.
+
+    Returns
+    -------
+    torch.Tensor or None
+        A tensor containing the area in µm² for each node, or None if not available.
+    """
+    areas = []
+    for n in G.nodes:
+        area = G.nodes[n].get('area', None)
+        if area is not None:
+            areas.append(area)
+        else:
+            return None  # If any node lacks area, return None
+
+    return torch.tensor(areas, dtype=torch.float32)
 
 
 def _edge_currents(
@@ -250,10 +275,11 @@ class _dhs(Integrator):
         self.register_buffer("parent_idx",  torch.empty(N, dtype=torch.int32))  # (N,)
         self.register_buffer("order",       torch.empty(N, dtype=torch.int32))  # (N,) order of forward elimination
 
-        self.register_buffer("diag_base",   torch.zeros(B, N))    # (B,N) base diagonal
         self.register_buffer("lower",       torch.empty(B, N))    # (B,N) lower diagonal
 
-        self.register_buffer("scale",       torch.empty(B, N))    # (B,N) scale factor
+        self.register_buffer("solver_order",        torch.empty(N, dtype=torch.int64))  # (N,) node order for the graph
+        self.register_buffer("inv_solver_order",    torch.empty(N, dtype=torch.int64))  # (N,) inverse node order
+        self.register_buffer("scale",               torch.empty(B, N))    # (N,) scale factor
 
         self.register_buffer("g_ax",        torch.empty(B, N))    # (B,N) axial conductance
         self.register_buffer("cmdt",        torch.empty(B, N))    # (B,N) capacitance * dt
@@ -263,21 +289,27 @@ class _dhs(Integrator):
         B, N = model.np, model.nc
         dt_s = dt * 1e-3
 
-        radius_cm = 1e-4 * model.diam / 2.0                 # µm → cm   (B,K)
-        dx_cm     = 1e-4 * model.dx                         # µm → cm   (B,K)
-        area_cm2  = 2 * torch.pi * radius_cm * dx_cm        # cm²
+        device = model.device()
 
-        Cm     = 1e-6 * model.cm * area_cm2                 # F   (B,K)
-        Cm_inv = 1.0 / Cm                                   # 1/F
-
-        parent_idx_t, a_geom_t = graph_to_parent_and_axial(model.graph)
+        parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(model.graph)
         parent_idx, children, depth = build_morphology(parent_idx_t.tolist())
         order, layer_ptr = build_dhs_layers(depth, self.threads)
 
-        self.register_buffer("layer_ptr", layer_ptr.to(model.device()))  # (L+1,)
-        self.order.copy_(order.to(dtype=torch.int32))
-        self.parent_idx.copy_(parent_idx.to(dtype=torch.int32))  # (N,)
-        self.lower.copy_(-a_geom_t.expand(B, -1))
+        self.solver_order.copy_(torch.as_tensor(node_order, dtype=torch.int64, device=device))   # (N,)
+        self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))        # (N,)
+
+        radius_cm = 1e-4 * model.diam / 2.0                 # µm → cm   (N,)
+        dx_cm     = 1e-4 * model.dx                         # µm → cm   (N,)
+        area_cm2  = 2 * torch.pi * radius_cm * dx_cm        # cm²
+
+        area_um2 = get_area_from_graph(model.graph)
+        if area_um2 is not None:
+            area_cm2 = 1e-8 * area_um2                      # convert from µm² to cm²
+
+        self.register_buffer("layer_ptr", layer_ptr.to(device))  # (L+1,)
+        self.order.copy_(order.to(dtype=torch.int32, device=device))
+        self.parent_idx.copy_(parent_idx.to(dtype=torch.int32, device=device))  # (N,)
+        self.lower.copy_(-a_geom_t.expand(B, -1))  # (B,N) lower diagonal
 
         K = parent_idx.numel()
         g_ax = a_geom_t.clone()
@@ -285,7 +317,7 @@ class _dhs(Integrator):
         # add children contributions to their parent’s diagonal
         valid = parent_idx >= 0
         g_ax.index_add_(0, parent_idx[valid], a_geom_t[valid])
-        self.g_ax.copy_(g_ax.expand(B, -1))  # (B,N)
+        self.g_ax.copy_(g_ax[self.inv_solver_order].expand(B, -1))  # (B,N)
 
         self.scale.copy_(area_cm2)
 
@@ -293,7 +325,7 @@ class _dhs(Integrator):
         self.cmdt.copy_(cm / dt_s)           # (B,N) (F/s = S)
 
         # extracellular
-        parent = parent_idx                                         # (K,)
+        parent = parent_idx                                         # (N,)
         child  = (parent >= 0).nonzero(as_tuple=False).squeeze(1)   # (E,)
         self.register_buffer("edge_child",  child.to(torch.int64))
         self.register_buffer("edge_parent", parent[child].to(torch.int64))
@@ -311,7 +343,7 @@ class _dhs(Integrator):
         itot = self.mech.i(v)
         gtot = self.mech.gtot(v)
 
-        f_n = (gtot * v - itot) * self.scale
+        f_n  = (gtot * v - itot) * self.scale
 
         if ve is not None:
             I_edge = _edge_currents(
@@ -321,18 +353,18 @@ class _dhs(Integrator):
                 ve
             ) # (B, E) mA
             S = torch.zeros_like(f_n) # (B, K)
-            S.scatter_add_(1, self.edge_child.expand_as(I_edge), -I_edge)  # child gets -I
-            S.scatter_add_(1, self.edge_parent.expand_as(I_edge), I_edge)  # parent gets +I
-            f_n = f_n + S # (B, K) mA
+            S.scatter_add_(1, self.edge_child .expand_as(I_edge), -I_edge)  # child gets -I
+            S.scatter_add_(1, self.edge_parent.expand_as(I_edge),  I_edge)  # parent gets +I
+            f_n = f_n + S  # (B, K) mA
 
         if intra is not None:
             f_n += intra
 
-        RHS  = f_n + self.cmdt * v                       # mA
-        main = self.g_ax + self.cmdt + gtot * self.scale # S
+        RHS  = f_n + self.cmdt * v                          # mA
+        main = self.g_ax + self.cmdt + gtot * self.scale    # S
 
-        d_ = main
-        b_ = RHS
+        d_ = main[:, self.solver_order]  # (B, N) mA
+        b_ = RHS[:,  self.solver_order]  # (B, N) mA
         a  = self.lower
 
         v_out = dhs_solve(
@@ -342,4 +374,4 @@ class _dhs(Integrator):
             self.layer_ptr.to(d_.device, dtype=torch.int32),
             threads=self.threads
         )
-        return v_out
+        return v_out[:, self.inv_solver_order]  # (B, N) mV

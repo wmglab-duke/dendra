@@ -846,6 +846,7 @@ class Population(Parameterized):
 
     def delete_stimuli(self):
         self.stimuli = []
+        self.intra = None
 
     def build_intra(self):
         if self.stimuli:
@@ -1008,7 +1009,6 @@ class Population(Parameterized):
 
         self.integrator = self.integrator(self, mech)
         return self
-
 
 
 class Axon(Population):
