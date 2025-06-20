@@ -22,6 +22,7 @@ from axonml.models.declarations import PARAMETER
 from axonml.models.mechanisms.handler.defaults import valid_ions
 from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
+from axonml.models.mechanisms._handler import MechanismHandler
 from axonml.models.mechanisms.mech_compiler import compile_mechanism
 from axonml.units import mm, um
 from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
@@ -34,7 +35,7 @@ from axonml.helpers import (
     ctx
 )
 
-from .view import parse_key, View
+from .slice import parse_key, Slice
 
 
 def get_unique_keys(list_of_dicts):
@@ -109,16 +110,18 @@ class Population(Parameterized):
         self.nc = C
         self.v_init = v_init
 
+        self.key = None
+
         if integrator is None:
             integrator = bwd_euler_ub()
 
         self.shape = integrator.shape(self.np, self.nc) if integrator else (N, C)
-        self.register_buffer("_dummy", torch.zeros(1))
+        self.register_buffer("_dummy",      torch.zeros(1))
 
-        self.register_buffer("v_init_c", torch.as_tensor(v_init, dtype=self.dtype()))
-        self.register_buffer("v",    torch.full(self.shape, self.v_init))  # default v_init in mV
-        self.register_buffer("diam", torch.full(self.shape, 500.0))
-        self.register_buffer("dx",   torch.full(self.shape, 100.0))
+        self.register_buffer("v_init_c",    torch.as_tensor(v_init, dtype=self.dtype()))
+        self.register_buffer("v",           torch.full(self.shape, self.v_init))
+        self.register_buffer("diam",        torch.full(self.shape, 500.0))
+        self.register_buffer("dx",          torch.full(self.shape, 100.0))
 
         # compiler stuff
         self.backend = BACKEND.value
@@ -141,8 +144,11 @@ class Population(Parameterized):
 
         self._m_list = []
         self._m_name = []
+        self._m_keys = []
         self._m_curr = {}
+        self._m_shape = {}
         self._m_unfactorable = {}
+        self._m_count = {}
         self._m_has_gtot = {}
         self._m_divide_by_two = {}
 
@@ -162,9 +168,9 @@ class Population(Parameterized):
         if self.jit:
             self._step = torch.compile(
                 step, 
-                backend=self.backend, 
-                fullgraph=self.fullgraph, 
-                dynamic=self.dynamic
+                backend   =self.backend, 
+                fullgraph =self.fullgraph, 
+                dynamic   =self.dynamic
             )
         else:
             self._step = step
@@ -835,14 +841,8 @@ class Population(Parameterized):
         return self
 
     def __getitem__(self, key):
-        match key:
-            case ((x, y), *rest):
-                r, c = zip(*key)
-                key = (r, c)
-            case _:
-                key = key
         index = parse_key(key, self.shape)
-        return View(self, index)
+        return Slice(self, index)
 
     def delete_stimuli(self):
         self.stimuli = []
@@ -853,7 +853,7 @@ class Population(Parameterized):
             return IntraStim(self, self.stimuli)
         return None
 
-    def insert(self, mechanism, ic=None, mask_out=None, mask_in=None, **kwargs):
+    def insert(self, mechanism, ic=None, index_spec=None, **kwargs):
         """
         Insert a mechanism into the model.
 
@@ -864,45 +864,61 @@ class Population(Parameterized):
         ic : dict, optional
             Dictionary of initial conditions for the mechanism states.
             Keys are state names and values are initial values.
-        mask_out : str, int, or slice, optional
-            Mask specifying compartments for which the mechanism will not
-            contribute to the current calculation.
-        mask_in : str, int, or slice, optional
-            Mask specifying compartments for which the mechanism will contribute
-            to the current calculation.
+        idx : __getitem__ key, optional
+            Index or key to specify where to insert the mechanism.
         **kwargs
             Additional keyword arguments to be passed to the compile_mechanism function.
         """
-        if mechanism.__name__ in self._m_name:
-            raise ValueError(f"Mechanism {mechanism.__name__} already exists in the model.")
 
         validate(mechanism)
+        
+        key = None
+        shape = self.shape
+
+        if index_spec is not None:
+            key = index_spec.index
+            shape = index_spec.shape
+
+        def impute_alias(name, m_name, m_count):
+            """Keep count of number of mechanisms with the same name."""
+            if name in m_name:
+                m_count[name] += 1
+                return f"{name}_{m_count[name]}"
+            else:
+                m_count[name] = 0
+                return name
+
+        name = impute_alias(mechanism.__name__, self._m_name, self._m_count)
 
         m, unfactorable, has_gtot, divide_by_two = self.compiler.compile(
             mechanism, 
             self, 
             ic=ic,
-            mask_in=mask_in,
+            shape=shape,
+            key=key,
             **kwargs,
         )
 
+        self._m_name.append(name)
         self._m_list.append(m)
-        self._m_name.append(mechanism.__name__)
-        self._m_unfactorable[mechanism.__name__] = unfactorable
-        self._m_has_gtot[mechanism.__name__] = has_gtot
-        self._m_divide_by_two[mechanism.__name__] = divide_by_two
+        self._m_keys.append(key)
+        self._m_shape[name] = shape
+
+        self._m_unfactorable[name] = unfactorable
+        self._m_has_gtot[name] = has_gtot
+        self._m_divide_by_two[name] = divide_by_two
 
         for k, v in mechanism._currents.items():
-            self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
+            self._m_curr.setdefault(k, {}).update({name: v})
 
         for k, v in mechanism._read_ion.items():
-            self._ion_read.setdefault(k, {}).update({mechanism.__name__: v})
+            self._ion_read.setdefault(k, {}).update({name: v})
 
         for k, v in mechanism._write_ion.items():
-            self._ion_write.setdefault(k, {}).update({mechanism.__name__: v})
+            self._ion_write.setdefault(k, {}).update({name: v})
 
         for k, v in mechanism._write_ion_c.items():
-            self._ion_write_c.setdefault(k, {}).update({mechanism.__name__: v})
+            self._ion_write_c.setdefault(k, {}).update({name: v})
 
     def insert_at(self, index, mechanism, ic=None, **kwargs):
         if isinstance(index, int):
@@ -973,8 +989,8 @@ class Population(Parameterized):
             ions[ion] = build_ion(
                 ion,
                 self.shape,
-                self.n_ax,
-                self.n_comp,
+                self.np,
+                self.nc,
                 self._m_list,
                 self._m_name,
                 ion_read,
@@ -983,29 +999,17 @@ class Population(Parameterized):
             )
             for m in self._m_list:
                 m.register_ion(ions[ion])
-        if self.builder is None:
-            mech = build_handler(
-                self._m_list,
-                self._m_name,
-                self._m_curr,
-                self._m_unfactorable,
-                self._m_has_gtot,
-                self._m_divide_by_two,
-                float(self.celsius),
-                ions,
-                df,
-            )
-        else:
-            mech = self.builder.build(
-                self._m_list,
-                self._m_name,
-                self._m_curr,
-                self._m_unfactorable,
-                self._m_has_gtot,
-                self._m_divide_by_two,
-                float(self.celsius),
-                ions,
-            )
+
+        mechs = {
+            n: m for n, m in zip(self._m_name, self._m_list)
+        }
+        keys = {
+            n: k for n, k in zip(self._m_name, self._m_keys)
+        }
+        mech = MechanismHandler(
+            self.celsius, mechs, keys, self._m_has_gtot, ions,
+            self._ion_write_c, self._ion_read, self._m_curr
+        )
 
         self.integrator = self.integrator(self, mech)
         return self

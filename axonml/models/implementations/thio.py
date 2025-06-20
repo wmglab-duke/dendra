@@ -47,32 +47,32 @@ def balance(model):
 
 
 class ThioAutonomic2025(Unmyelinated):
-    PARAMETER(cm=1.326291192, rhoa=23.117539)
+    PARAMETER(cm=1.326291192, rhoa=23.117539, celsius=37.0)
 
     def __init__(
         self,
         diameters=[1.0],
         L=5.0*mm,
         dx=10,
-        temp=37.0,
+        celsius=37.0,
         v_init=-58.5,
         integrator=None,
     ):
         if integrator is None:
             integrator = bwd_euler_ub()
-        super().__init__(diameters, L, dx, temp, v_init, integrator)
+        super().__init__(diameters, L, dx, celsius, v_init, integrator)
         R = 8314  # molar gas constant
         F = 96485.3329  # Faraday's constant
 
         ko = 5.4
         ki = 145.0
-        ek = ((R * (temp + 273.15)) / F) * math.log(ko / ki)
+        ek = ((R * (celsius + 273.15)) / F) * math.log(ko / ki)
         ki_real = 144.9
         ko_real = 5.6
 
         nao = 154.0
         nai = 8.9
-        ena = ((R * (temp + 273.15)) / F) * math.log(nao / nai)
+        ena = ((R * (celsius + 273.15)) / F) * math.log(nao / nai)
         nai_real = 11.4
 
         self.ion_style("na", 3, 2, 1, 1, 0)
@@ -107,32 +107,32 @@ class ThioAutonomic2025(Unmyelinated):
 
 
 class ThioCutaneous2025(Unmyelinated):
-    PARAMETER(cm=1.326291192, rhoa=27.513088)
+    PARAMETER(cm=1.326291192, rhoa=27.513088, celsius=37.0)
 
     def __init__(
         self,
         diameters=[1.0],
         L=5.0*mm,
         dx=10,
-        temp=37.0,
+        celsius=37.0,
         v_init=-58.5,
         integrator=None,
     ):
         if integrator is None:
             integrator = bwd_euler_ub()
-        super().__init__(diameters, L, dx, temp, v_init, integrator)
+        super().__init__(diameters, L, dx, celsius, v_init, integrator)
         R = 8314  # molar gas constant
         F = 96485.3329  # Faraday's constant
 
         ko = 5.4
         ki = 145.0
-        ek = ((R * (temp + 273.15)) / F) * math.log(ko / ki)
+        ek = ((R * (celsius + 273.15)) / F) * math.log(ko / ki)
         ki_real = 144.9
         ko_real = 5.6
 
         nao = 154.0
         nai = 8.9
-        ena = ((R * (temp + 273.15)) / F) * math.log(nao / nai)
+        ena = ((R * (celsius + 273.15)) / F) * math.log(nao / nai)
         nai_real = 11.4
 
         self.ion_style("na", 3, 2, 1, 1, 0)

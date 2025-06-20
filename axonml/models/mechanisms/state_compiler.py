@@ -199,10 +199,11 @@ def convert(deriv, state, assigned, use_pade_approx=False, diffusion=None, model
 
 template = """
 class _state_{name}(torch.nn.Module):
-    def __init__(self, temp, diameters, is_q10: bool, name: str, buffers: List[str], params, **kwargs):
+    def __init__(self, temp, diameters, key, is_q10: bool, name: str, buffers: List[str], params, **kwargs):
         super().__init__()
 
         self.coupled = False
+        self.key = key
         self.instantiate_parameters(params, **kwargs)
 
         self.register_buffer("diam", diameters)
@@ -282,10 +283,11 @@ class _state_{name}(torch.nn.Module):
 
 template_coupled = """
 class _state_{name}(torch.nn.Module):
-    def __init__(self, temp, diameters, is_q10: bool, name: str, state_names: List[str], buffers: List[str], params, **kwargs):
+    def __init__(self, temp, diameters, key, is_q10: bool, name: str, state_names: List[str], buffers: List[str], params, **kwargs):
         super().__init__()
 
         self.coupled = True
+        self.key = key
 
         self.instantiate_parameters(params, **kwargs)
 
@@ -660,7 +662,7 @@ def add_suffix_to_variables(code: str, match_strings: set, suffix: str) -> str:
     return "\n".join(modified_code)
 
 
-def compile_state(s: State, model, pade=None, **kwargs) -> torch.nn.Module:
+def compile_state(s: State, model, key, pade=None, **kwargs) -> torch.nn.Module:
     """
     Compile a state object into a PyTorch module.
 
@@ -748,13 +750,13 @@ def compile_state(s: State, model, pade=None, **kwargs) -> torch.nn.Module:
     linecache.cache[filename] = (len(forward_str), None, lines, filename)
 
     m = locals()[f"_state_{name}"](
-        temp, diameters, is_q10, name, buffers, params, **kwargs
+        temp, diameters, key, is_q10, name, buffers, params, **kwargs
     )
 
     return m
 
 
-def compile_coupled_state(s: State, model, pade=None, **kwargs) -> torch.nn.Module:
+def compile_coupled_state(s: State, model, key, pade=None, **kwargs) -> torch.nn.Module:
     """
     Compile a coupled state object into a PyTorch module.
 
@@ -841,6 +843,7 @@ def compile_coupled_state(s: State, model, pade=None, **kwargs) -> torch.nn.Modu
     m = locals()[f"_state_{name}"](
         temp,
         diameters,
+        key,
         is_q10,
         name,
         state_name_list,

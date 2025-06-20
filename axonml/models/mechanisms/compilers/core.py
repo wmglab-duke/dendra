@@ -268,7 +268,9 @@ class MechCompiler:
     def compile(
             self, 
             mechanism, 
-            model, 
+            model,
+            shape=None,
+            key=None, 
             ic=None, 
             mask_out=None, 
             mask_in=None, 
@@ -276,7 +278,7 @@ class MechCompiler:
         ):
         temp = float(model.celsius)
         diameters = model.diam
-        shape = model.shape
+        shape = shape if shape is not None else model.shape
         n_ax = model.np
         n_comps = model.nc
         pade = None if self.PADE < 0 else bool(self.PADE)
@@ -305,9 +307,9 @@ class MechCompiler:
         states_compiled = []
         for s in states:
             if coupled(s):
-                states_compiled.append(compile_coupled_state(s, model, pade=pade, **kwargs))
+                states_compiled.append(compile_coupled_state(s, model, key, pade=pade, **kwargs))
             else:
-                states_compiled.append(compile_state(s, model, pade=pade, **kwargs))
+                states_compiled.append(compile_state(s, model, key, pade=pade, **kwargs))
 
         # buffers
         state_names = []
@@ -382,6 +384,7 @@ class MechCompiler:
             temp,
             diameters,
             shape,
+            key,
             n_ax,
             n_comps,
             name,

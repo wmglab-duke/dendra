@@ -1,10 +1,4 @@
 # -- adapted from now defunct bluebrain/nmodl repository --
-# ***********************************************************************
-# Copyright (C) 2018-2022 Blue Brain Project
-#
-# This file is part of NMODL distributed under the terms of the GNU
-# Lesser General Public License. See top-level LICENSE file for details.
-# ***********************************************************************
 
 from importlib import import_module
 
@@ -23,7 +17,7 @@ else:
 
 if "Abs" in known_functions:
     known_functions.pop("Abs")
-    known_functions["abs"] = "fabs"
+    known_functions["abs"] = "abs"
 
 
 if not ((major >= 1) and (minor >= 2)):

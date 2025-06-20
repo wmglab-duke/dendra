@@ -139,8 +139,8 @@ class _bwd_euler_ub(Integrator):
 
     def _step(self, v, dt, temp, ve=None, intra=None) -> Tensor:
         dt_s = dt * 1e-3
-        # advance gating
-        self.mech.advance(v, dt, temp)
+
+        self.mech.advance(v_np1, dt, temp)
 
         itot = self.mech.i(v)       # (B,K)
 
@@ -183,6 +183,7 @@ class _bwd_euler_ub(Integrator):
 
         # solve tridiagonal system
         v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
+        # advance gating
         return v_np1
 
     def detach(self, model):

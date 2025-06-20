@@ -281,8 +281,8 @@ class _dhs(Integrator):
         self.register_buffer("inv_solver_order",    torch.empty(N, dtype=torch.int64))  # (N,) inverse node order
         self.register_buffer("scale",               torch.empty(B, N))    # (N,) scale factor
 
-        self.register_buffer("g_ax",        torch.empty(B, N))    # (B,N) axial conductance
-        self.register_buffer("cmdt",        torch.empty(B, N))    # (B,N) capacitance * dt
+        self.register_buffer("a_geom",        torch.empty(B, N))    # (B,N) axial conductance
+        self.register_buffer("cmdt",        torch.empty(B, N))      # (B,N) capacitance * dt
 
 
     def initialize(self, model, dt):
@@ -309,15 +309,16 @@ class _dhs(Integrator):
         self.register_buffer("layer_ptr", layer_ptr.to(device))  # (L+1,)
         self.order.copy_(order.to(dtype=torch.int32, device=device))
         self.parent_idx.copy_(parent_idx.to(dtype=torch.int32, device=device))  # (N,)
-        self.lower.copy_(-a_geom_t.expand(B, -1))  # (B,N) lower diagonal
+        # self.lower.copy_(-a_geom_t.expand(B, -1))  # (B,N) lower diagonal
+        self.a_geom.copy_(a_geom_t.expand(B, -1))
 
         K = parent_idx.numel()
-        g_ax = a_geom_t.clone()
+        # g_ax = a_geom_t.clone()
 
         # add children contributions to their parent’s diagonal
         valid = parent_idx >= 0
-        g_ax.index_add_(0, parent_idx[valid], a_geom_t[valid])
-        self.g_ax.copy_(g_ax[self.inv_solver_order].expand(B, -1))  # (B,N)
+        # g_ax.index_add_(0, parent_idx[valid], a_geom_t[valid])
+        # self.g_ax.copy_(g_ax[self.inv_solver_order].expand(B, -1))  # (B,N)
 
         self.scale.copy_(area_cm2)
 
@@ -327,11 +328,11 @@ class _dhs(Integrator):
         # extracellular
         parent = parent_idx                                         # (N,)
         child  = (parent >= 0).nonzero(as_tuple=False).squeeze(1)   # (E,)
-        self.register_buffer("edge_child",  child.to(torch.int64))
-        self.register_buffer("edge_parent", parent[child].to(torch.int64))
+        self.register_buffer("edge_child",  child.to(torch.int64))  # (E,) child indices in solver order
+        self.register_buffer("edge_parent", parent[child].to(torch.int64))  # (E,) parent indices in solver order
 
         # axial conductance per edge (S) already in a_geom_t[child]
-        self.register_buffer("edge_gax", a_geom_t[child])
+        self.register_buffer("edge_gax", a_geom_t[child])  # (E,) axial conductance in solver order
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)
@@ -361,17 +362,21 @@ class _dhs(Integrator):
             f_n += intra
 
         RHS  = f_n + self.cmdt * v                          # mA
-        main = self.g_ax + self.cmdt + gtot * self.scale    # S
+        main = self.cmdt + gtot * self.scale    # S
 
-        d_ = main[:, self.solver_order]  # (B, N) mA
-        b_ = RHS[:,  self.solver_order]  # (B, N) mA
-        a  = self.lower
+        d_ = main[:, self.solver_order]  # (B, N)
+        b_ = RHS[:,  self.solver_order]  # (B, N)
+        a  = self.a_geom  # (B, N) axial conductance
 
         v_out = dhs_solve(
-            d_, a, b_,
+            d_, a, b_,  # The API change is handled inside dhs_solve
             self.parent_idx.to(d_.device, dtype=torch.int32),
             self.order.to(d_.device, dtype=torch.int32),
             self.layer_ptr.to(d_.device, dtype=torch.int32),
             threads=self.threads
         )
-        return v_out[:, self.inv_solver_order]  # (B, N) mV
+
+        # The rest of the function remains the same
+        v = v_out[:, self.inv_solver_order]
+
+        return v  # (B, N) mV

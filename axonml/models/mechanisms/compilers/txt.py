@@ -6,6 +6,7 @@ class {mech}(torch.nn.Module):
             temp, 
             diameters, 
             shape,
+            key,
             n_ax: int,
             n_comps: int,
             name: str, 
@@ -22,6 +23,7 @@ class {mech}(torch.nn.Module):
         
         self._name = name
 
+        self.key = key
         self.instantiate_parameters(params, model)
         self.instantiate_distributions(distributions)
         self.temp = temp

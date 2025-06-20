@@ -4,147 +4,272 @@ import torch
 
 
 @triton.jit
-def dhs_fwd_bwd(
+def _single_dhs_kernel(
         D_ptr, A_ptr, B_ptr, V_ptr,
         P_ptr, ORDER_ptr, LAYER_PTR_ptr,
-        K: tl.constexpr,
-        L: tl.constexpr,
-        K_THREADS: tl.constexpr = 32):
-
-    # -------- one block / one neuron ------------------------
-    b    = tl.program_id(0)               # batch index
-    lane = tl.arange(0, K_THREADS)        # 0..31
+        K: tl.constexpr, L: tl.constexpr, K_THREADS: tl.constexpr):
+    
+    b = tl.program_id(0)
+    lane = tl.arange(0, K_THREADS)
 
     D = D_ptr + b * K
     A = A_ptr + b * K
     B = B_ptr + b * K
     V = V_ptr + b * K
 
-    # ---------------- forward elimination -------------------
+    # --- 1. SYMMETRIC INITIALIZATION PASS ---
+    # Each thread handles one compartment `idx`. It adds its axial conductance
+    # g_i to its own diagonal D[idx] and its parent's diagonal D[P[idx]].
+    # This guarantees D[i,i] = sum(g_ij) by construction.
     for l in range(0, L):
-        s   = tl.load(LAYER_PTR_ptr + l)
-        e   = tl.load(LAYER_PTR_ptr + l + 1)
-        w   = e - s                       # ≤ 32
-        m   = lane < w                    # mask
-
-        idx    = tl.load(ORDER_ptr + s + lane, mask=m, other=0)
+        s = tl.load(LAYER_PTR_ptr + l)
+        e = tl.load(LAYER_PTR_ptr + l + 1)
+        m = lane < (e - s)
+        
+        idx = tl.load(ORDER_ptr + s + lane, mask=m, other=0)
         parent = tl.load(P_ptr + idx, mask=m, other=-1)
+        
+        g_i = tl.load(A + idx, mask=m) # Load conductance to parent
+        
+        # Add to own diagonal
+        tl.atomic_add(D + idx, g_i, mask=m)
+        
+        # Add to parent's diagonal
+        valid_parent = parent >= 0
+        tl.atomic_add(D + parent, g_i, mask=m & valid_parent)
 
-        a_i = tl.load(A + idx, mask=m)
         d_i = tl.load(D + idx, mask=m)
         b_i = tl.load(B + idx, mask=m)
 
-        fac   = a_i / d_i
-        valid = parent >= 0
+        fac = -g_i / d_i
+        mask = m & valid_parent
 
-        # atomic updates to parent row
-        tl.atomic_add(D + parent, -(fac * a_i) * valid, mask=m & valid)
-        tl.atomic_add(B + parent, -(fac * b_i) * valid, mask=m & valid)
+        tl.atomic_add(D + parent, fac * g_i, mask=mask)
+        tl.atomic_add(B + parent, -fac * b_i, mask=mask)
 
-        # no extra barrier needed: single warp executes in lock‑step
+    tl.debug_barrier() # Ensure all atomic adds are complete before proceeding
 
-    # ---------------- back substitution --------------------
+    # --- 3. BACKWARD SUBSTITUTION (Unchanged) ---
     for l in range(L - 1, -1, -1):
         s = tl.load(LAYER_PTR_ptr + l)
         e = tl.load(LAYER_PTR_ptr + l + 1)
-        w = e - s
-        m = lane < w
+        m = lane < (e - s)
+        
+        idx = tl.load(ORDER_ptr + s + lane, mask=m, other=0)
+        parent = tl.load(P_ptr + idx, mask=m, other=-1)
 
-        idx    = tl.load(ORDER_ptr + s + lane, mask=m, other=0)
-        parent = tl.load(P_ptr + idx,         mask=m, other=-1)
-
-        a_i = tl.load(A + idx, mask=m)
+        g_i = tl.load(A + idx, mask=m)
         d_i = tl.load(D + idx, mask=m)
         b_i = tl.load(B + idx, mask=m)
 
-        valid_p   = parent >= 0
-        parent_cl = tl.where(valid_p, parent, 0)          # safe addr
-        v_parent  = tl.where(
-            valid_p,
-            tl.load(V + parent_cl, mask=m & valid_p),
-            b_i / d_i)
+        valid_p = parent >= 0
+        v_parent = tl.load(V + tl.where(valid_p, parent, 0), mask=m & valid_p, other=0.0)
 
-        tl.store(V + idx, (b_i - a_i * v_parent) / d_i, mask=m)
+        # V[i] = (B[i] - (-g_i) * V[p]) / D[i]
+        v_i = (b_i + g_i * v_parent) / d_i
+        tl.store(V + idx, v_i, mask=m)
 
 
-def _dhs_triton(d, a, b, parent, order, layer_ptr, threads=32):
-    """
-    d, a, b : (B, K) float32  (d & b will be mutated in place)
-    """
-    B, K = d.shape
-    L = layer_ptr.numel() - 1
-    V = torch.empty_like(b)
+# --- KERNEL 1: INITIALIZATION ---
+@triton.jit
+def dhs_init_kernel(D_ptr, A_ptr, P_ptr, ORDER_ptr, LAYER_PTR_ptr,
+                    B: tl.constexpr, K: tl.constexpr, L: tl.constexpr, K_THREADS: tl.constexpr):
+    pid_b = tl.program_id(0)
+    pid_k = tl.program_id(1)
 
-    # exactly one warp (32 threads) per block → num_warps = 1
-    dhs_fwd_bwd[(B,)](
-        d, a, b, V,
-        parent, order, layer_ptr,
-        K=K, L=L, K_THREADS=threads,
-        num_warps=1,             
-        num_stages=4
-    )
-    return V
+    D = D_ptr + pid_b * K
+    A = A_ptr + pid_b * K
+    
+    # Each thread block processes a unique range of compartments
+    base_idx = pid_k * K_THREADS
+    
+    for l in range(0, L):
+        s = tl.load(LAYER_PTR_ptr + l)
+        e = tl.load(LAYER_PTR_ptr + l + 1)
+        
+        # This block's threads work on a subset of the layer
+        offsets = base_idx + tl.arange(0, K_THREADS)
+        layer_mask = (offsets >= s) & (offsets < e)
+
+        idx = tl.load(ORDER_ptr + offsets, mask=layer_mask, other=0)
+        parent = tl.load(P_ptr + idx, mask=layer_mask, other=-1)
+        
+        g_i = tl.load(A + idx, mask=layer_mask, other=0.)
+        
+        tl.atomic_add(D + idx, g_i, mask=layer_mask)
+        
+        valid_parent_mask = layer_mask & (parent >= 0)
+        tl.atomic_add(D + parent, g_i, mask=valid_parent_mask)
 
 
-# autograd wrapper
-class DHSSolve(torch.autograd.Function):
+# --- KERNEL 2: FORWARD ELIMINATION ---
+@triton.jit
+def dhs_fwd_kernel(D_ptr, B_ptr, A_ptr, P_ptr, ORDER_ptr, LAYER_PTR_ptr,
+                   B: tl.constexpr, K: tl.constexpr, L: tl.constexpr, K_THREADS: tl.constexpr):
+    pid_b = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    D = D_ptr + pid_b * K
+    B = B_ptr + pid_b * K
+    A = A_ptr + pid_b * K
+    
+    base_idx = pid_k * K_THREADS
+
+    for l in range(0, L):
+        s = tl.load(LAYER_PTR_ptr + l)
+        e = tl.load(LAYER_PTR_ptr + l + 1)
+        
+        offsets = base_idx + tl.arange(0, K_THREADS)
+        layer_mask = (offsets >= s) & (offsets < e)
+
+        idx = tl.load(ORDER_ptr + offsets, mask=layer_mask, other=0)
+        parent = tl.load(P_ptr + idx, mask=layer_mask, other=-1)
+        
+        g_i = tl.load(A + idx, mask=layer_mask)
+        d_i = tl.load(D + idx, mask=layer_mask)
+        b_i = tl.load(B + idx, mask=layer_mask)
+
+        fac = -g_i / d_i
+        
+        update_mask = layer_mask & (parent >= 0)
+        tl.atomic_add(D + parent, fac * g_i, mask=update_mask)
+        tl.atomic_add(B + parent, -fac * b_i, mask=update_mask)
+
+
+# --- KERNEL 3: BACKWARD SUBSTITUTION ---
+@triton.jit
+def dhs_bwd_sub_kernel(V_ptr, D_ptr, B_ptr, A_ptr, P_ptr, ORDER_ptr, LAYER_PTR_ptr,
+                       B: tl.constexpr, K: tl.constexpr, L: tl.constexpr, K_THREADS: tl.constexpr):
+    pid_b = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    V = V_ptr + pid_b * K
+    D = D_ptr + pid_b * K
+    B = B_ptr + pid_b * K
+    A = A_ptr + pid_b * K
+    
+    base_idx = pid_k * K_THREADS
+    
+    for l in range(L - 1, -1, -1):
+        s = tl.load(LAYER_PTR_ptr + l)
+        e = tl.load(LAYER_PTR_ptr + l + 1)
+        
+        offsets = base_idx + tl.arange(0, K_THREADS)
+        layer_mask = (offsets >= s) & (offsets < e)
+
+        idx = tl.load(ORDER_ptr + offsets, mask=layer_mask, other=0)
+        parent = tl.load(P_ptr + idx, mask=layer_mask, other=-1)
+
+        g_i = tl.load(A + idx, mask=layer_mask)
+        b_i = tl.load(B + idx, mask=layer_mask)
+        d_i = tl.load(D + idx, mask=layer_mask)
+
+        valid_p = parent >= 0
+        parent_mask = layer_mask & valid_p
+        
+        v_parent = tl.load(V + tl.where(valid_p, parent, 0), mask=parent_mask, other=0.0)
+        
+        v_i = (b_i + g_i * v_parent) / d_i
+        tl.store(V + idx, v_i, mask=layer_mask)
+
+
+class DHSSolveStable(torch.autograd.Function):
+    """ Differentiable and numerically stable DHS solver. """
 
     @staticmethod
-    def forward(ctx, d, a, b,
-                parent_idx, order, layer_ptr,
-                threads):
+    def forward(ctx, d_mem, a_geom, b, parent_idx, order, layer_ptr, threads):
         """
-        d : (B,K) diag
-        a : (B,K) (-g child→parent, root arbitrary)
-        b : (B,K) rhs
-        parent_idx, order, layer_ptr : buffers (no grad)
-        threads : int, number of threads per block (default 32) (no grad)
+        d_mem: (B,K) membrane-only diagonal components
+        a_geom: (B,K) positive axial conductances g_i
+        b: (B,K) right-hand side
         """
-        v = _dhs_triton(d.clone(), a, b.clone(),
-                        parent_idx, order, layer_ptr, threads)
-        ctx.save_for_backward(d, a, v, parent_idx, order, layer_ptr, threads)
-        return v
+        B, K = d_mem.shape
+        L = layer_ptr.numel() - 1
+        d_full = d_mem.clone()
+        x = torch.empty_like(b)
+
+        # The kernel modifies d_full and b in-place, so we pass clones
+        _single_dhs_kernel[(B,)](
+            d_full, a_geom, b.clone(), x,
+            parent_idx, order, layer_ptr,
+            K=K, L=L, K_THREADS=threads,
+            num_warps=1, num_stages=4
+        )
+        
+        ctx.save_for_backward(d_mem, a_geom, x, parent_idx, order, layer_ptr)
+        ctx.threads = threads
+        return x
 
     @staticmethod
-    def backward(ctx, g_out):
-        d, a, v, parent_idx, order, layer_ptr, threads = ctx.saved_tensors
-        #    adjoint solve:  Aᵀ g = g_out
-        #    swap child ↔ parent by re‑using the same kernel
-        g = _dhs_triton(
-            d.clone(), a, g_out.clone(),
-            parent_idx, order, layer_ptr, threads
-        ) # A is symmetric!
+    def backward(ctx, grad_out):
+        """
+        grad_out: ∂L/∂x, where L is the loss and x is the output of forward.
+        """
+        d_mem, a_geom, x, parent_idx, order, layer_ptr = ctx.saved_tensors
+        threads = ctx.threads
+        B, K = d_mem.shape
+        L = layer_ptr.numel() - 1
 
-        # grads -------------------------------------------------------
-        grad_b = g                                     # (B,K)
-        grad_d = -(g * v)                              # (B,K)
+        # --- 1. Adjoint Solve: Aᵀg = grad_out ---
+        # Since our implicit matrix A is symmetric, Aᵀ=A. We can reuse the
+        # forward kernel to solve A*g = grad_out.
+        d_full_adj = d_mem.clone()
+        g = torch.empty_like(grad_out) # g is the adjoint vector
 
-        # edge‑wise gradient for a : use parent_idx mask
-        child  = torch.arange(a.size(1), device=a.device)
-        parent = parent_idx.expand_as(a)               # broadcast to (B,K)
+        _single_dhs_kernel[(B,)](
+            d_full_adj, a_geom, grad_out.clone(), g,
+            parent_idx, order, layer_ptr,
+            K=K, L=L, K_THREADS=threads,
+            num_warps=1, num_stages=4
+        )
+        
+        # --- 2. Compute Parameter Gradients ---
 
-        # Δv  and  Δg  on every edge (child row carries a_e)
-        dv  = v - v.gather(1, parent.clamp_min(0))
-        dg  = g - g.gather(1, parent.clamp_min(0))
-        grad_a = -(dg * dv)                            # (B,K)
+        # Gradient w.r.t RHS `b` is simply the adjoint `g`
+        grad_b = g
 
-        # zero‑out the root (parent == -1) which has no real edge
-        grad_a = grad_a.masked_fill(parent < 0, 0.)
+        # Gradient w.r.t membrane diagonal `d_mem`
+        # d_mem only affects the main diagonal of A, so the gradient is -(g * x)
+        grad_d_mem = -(g * x)
 
-        return grad_d, grad_a, grad_b, None, None, None, None
+        # Gradient w.r.t axial conductance `a_geom` (g_i)
+        # This is the most important change. The gradient is the negative
+        # product of the voltage difference and the adjoint difference.
+        
+        # Gather parent values for x and g
+        # We need to clamp parent indices to 0 for the root to avoid out-of-bounds
+        parent_idx_clamped = parent_idx.clamp_min(0)
+        x_parent = x.gather(1, parent_idx_clamped.expand_as(x))
+        g_parent = g.gather(1, parent_idx_clamped.expand_as(g))
+
+        # Calculate differences across each compartment's axial resistance
+        delta_x = x - x_parent
+        delta_g = g - g_parent
+
+        grad_a_geom = -(delta_g * delta_x)
+
+        # The root compartment has no parent, so its gradient must be zero.
+        # Its parent index is -1.
+        is_root = (parent_idx == -1).view(1, -1)
+        grad_a_geom = grad_a_geom.masked_fill(is_root, 0.0)
+
+        return grad_d_mem, grad_a_geom, grad_b, None, None, None, None
 
 
-def dhs_solve(
-    d: torch.Tensor,  # (B,K) diag
-    a: torch.Tensor,  # (B,K) (-g child→parent, root arbitrary)
-    b: torch.Tensor,  # (B,K) rhs
-    parent_idx: torch.Tensor,  # (K,) parent indices
-    order: torch.Tensor,        # (K,) elimination order
-    layer_ptr: torch.Tensor,    # (L+1,) layer pointers
-    threads: int = 32           # number of threads per block
-) -> torch.Tensor:
+def dhs_solve(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads=32):
     """
-    Solve the DHS system Ax = b using the triton kernel.
-    Returns x of shape (B,K).
+    Differentiable and numerically stable DHS solver for tree structures.
+
+    Args:
+        d_mem (torch.Tensor): (B,K) Membrane-only components of the main diagonal.
+        a_geom (torch.Tensor): (B,K) Positive axial conductances (g_i) to parent.
+        b (torch.Tensor): (B,K) Right-hand side of the system.
+        parent_idx (torch.Tensor): (K,) Parent indices.
+        order (torch.Tensor): (K,) DHS elimination order.
+        layer_ptr (torch.Tensor): (L+1,) Pointers to DHS layers.
+        threads (int): Threads per block (warp size).
+
+    Returns:
+        torch.Tensor: The solution vector x of shape (B,K).
     """
-    return DHSSolve.apply(d, a, b, parent_idx, order, layer_ptr, threads)
+    return DHSSolveStable.apply(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads)
