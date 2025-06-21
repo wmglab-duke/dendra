@@ -27,12 +27,14 @@ from axonml.models.mechanisms.mech_compiler import compile_mechanism
 from axonml.units import mm, um
 from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
 from axonml.models.interfaces import HandlerInterface
-from axonml.models.integrators import euler, dufort_frankel, bwd_euler_ub
+from axonml.models.integrators import euler, dufort_frankel, bwd_euler_ub, bwd_euler_sc
 
 from axonml.helpers import (
     op_mc, op_sc, ve_from_s_t, 
-    IMEM, CUDA, DTWARN, DEBUG, DETECT_ANOMALIES, PADE, BACKEND, FULLGRAPH, DYNAMIC, JIT,
-    ctx
+    IMEM, CUDA, DTWARN, DEBUG, 
+    DETECT_ANOMALIES, PADE, BACKEND, 
+    FULLGRAPH, DYNAMIC, JIT,
+    ctx, tic, toc
 )
 
 from .slice import parse_key, Slice
@@ -113,9 +115,10 @@ class Population(Parameterized):
         self.key = None
 
         if integrator is None:
-            integrator = bwd_euler_ub()
+            integrator = bwd_euler_sc()
 
         self.shape = integrator.shape(self.np, self.nc) if integrator else (N, C)
+
         self.register_buffer("_dummy",      torch.zeros(1))
 
         self.register_buffer("v_init_c",    torch.as_tensor(v_init, dtype=self.dtype()))
@@ -168,9 +171,9 @@ class Population(Parameterized):
         if self.jit:
             self._step = torch.compile(
                 step, 
-                backend   =self.backend, 
-                fullgraph =self.fullgraph, 
-                dynamic   =self.dynamic
+                backend   = self.backend, 
+                fullgraph = self.fullgraph, 
+                dynamic   = self.dynamic
             )
         else:
             self._step = step
@@ -310,8 +313,6 @@ class Population(Parameterized):
         reinit=False,
         progressbar=True,
         multicontact=False,
-        first=True,
-        longrunning=False,
     ):
         """
         Run the axon model simulation.
@@ -425,16 +426,15 @@ class Population(Parameterized):
             if not isinstance(callbacks, CallbackList):
                 callbacks = CallbackList(callbacks)
 
-            if first:
-                if callbacks:
-                    for c in callbacks:
-                        c.dt = dt
-                
-                pre_loop_hook(callbacks, self)
+            if callbacks:
+                for c in callbacks:
+                    c.dt = dt
+            
+            pre_loop_hook(callbacks, self)
 
             dt = torch.as_tensor(dt, device=device, dtype=self.dtype())
 
-            if first or self.training:
+            if not self.integrator.initialized or self.integrator.dt != dt_f or self.training:
                 self.integrator.initialize(self, dt)
 
             if progressbar:
@@ -461,10 +461,10 @@ class Population(Parameterized):
                     if self.t_ind % 100 == 0:
                         progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
 
-            if not longrunning:
-                if progressbar:
-                    progressbar.close()
-                post_loop_hook(callbacks, self)
+            if progressbar:
+                progressbar.close()
+
+            post_loop_hook(callbacks, self)
             
             self.t_cache = self.t_ind * dt_f
 

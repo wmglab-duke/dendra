@@ -26,6 +26,8 @@ class Integrator(torch.nn.Module):
         self.imem = bool(imem)
         self.mech = mech
         self.register_buffer("i_membrane", torch.zeros(model.np, model.nc))
+        self.initialized = False
+        self.dt = None
 
     @classmethod
     def shape(cls, np, nc):
@@ -53,6 +55,8 @@ class SCIntegrator(torch.nn.Module):
         self.imem = bool(imem)
         self.register_buffer("cmdt", torch.tensor(0.0))
         self.register_buffer("i_membrane", torch.zeros(model.np, model.nc))
+        self.initialized = False
+        self.dt = None
 
     @classmethod
     def shape(cls, np, nc):

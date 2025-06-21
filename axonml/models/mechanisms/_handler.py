@@ -93,18 +93,25 @@ class MechanismHandler(torch.nn.Module):
 
     def i(self, v):
         currents = {}
+        gtot = {}
         for current, cdict in self.currents.items():
             currents[current] = torch.zeros_like(v)
+            gtot[current] = torch.zeros_like(v)
             for mech, i_ion_list in cdict.items():
                 for i_ion in i_ion_list:
                     if (key := self.keys[mech]) is not None:
-                        currents[current][key] += getattr(self.mechanisms[mech], i_ion)(v[key])
+                        i, g = getattr(self.mechanisms[mech], i_ion)(v[key])
+                        currents[current][key] += i
+                        gtot[current][key] += g
                     else:
-                        currents[current] += getattr(self.mechanisms[mech], i_ion)(v)
+                        i, g = getattr(self.mechanisms[mech], i_ion)(v)
+                        currents[current] += i
+                        gtot[current] += g
         for ion, ion_h in self.ions.items():
             setattr(ion_h, f"i{ion}", currents[f"i{ion}"])
-        total = torch.stack(list(currents.values()), dim=0).sum(dim=0)
-        return total
+        total_i = torch.stack(list(currents.values()), dim=0).sum(dim=0)
+        total_g = torch.stack(list(gtot.values()), dim=0).sum(dim=0)
+        return total_i, total_g
 
 
     def set_buffers(self, diameters):

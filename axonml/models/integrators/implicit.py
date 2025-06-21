@@ -35,28 +35,38 @@ class _bwd_euler_sc(SCIntegrator):
         super().__init__(model, mech, imem)
 
     def initialize(self, model, dt):
+        self.dt = float(dt)
         self.cmdt = (1e-6 * model.cm) / (1e-3 * dt)
         self.area = 2 * math.pi * (1e-4 * model.diam / 2.0) * (1e-4 * model.dx)  # cm²
+        self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
-        if intra is None:
-            model.v = self._step_no_intra(model.v, dt, model.temp_c)
-        else:
-            model.v = self._step_intra(model.v, dt, model.temp_c, intra)
+        model.v = self._solve(model.v, dt, model.celsius, intra)
 
-    def _step_no_intra(self, v, dt, temp):
+    def _solve(self, v, dt, temp, intra=None):
+        # 1. Advance the mechanism's internal states
         self.mech.advance(v, dt, temp)
-        itot = self.mech.i(v)
-        gtot = self.mech.gtot(v)
-        i = gtot * v - itot
-        return (self.cmdt * v + i) / (self.cmdt + gtot)
+        
+        # 2. Get the total current and conductance at the current voltage `v`
+        itot, gtot = self.mech.i(v)
 
-    def _step_intra(self, v, dt, temp, intra):
-        self.mech.advance(v, dt, temp)
-        itot = self.mech.i(v)
-        gtot = self.mech.gtot(v)
-        i = gtot * v - itot + (intra / self.area)
-        return (self.cmdt * v + i) / (self.cmdt + gtot)
+        denom = self.cmdt + gtot
+
+        v_new = v
+        
+        # Adjust for the ionic current part
+        # Using a temporary variable for the update can sometimes help the compiler
+        # manage memory, but a single line is also fine.
+        ionic_update = itot / denom
+        v_new = v_new - ionic_update
+        
+        # Adjust for the external injected current, if any
+        if intra is not None:
+            # We can fuse the division with the area into the update.
+            external_update = (intra / self.area) / denom
+            v_new = v_new + external_update
+
+        return v_new
 
 
 class _bwd_euler_ub(Integrator):
@@ -142,10 +152,7 @@ class _bwd_euler_ub(Integrator):
 
         self.mech.advance(v_np1, dt, temp)
 
-        itot = self.mech.i(v)       # (B,K)
-
-        # linearized ionic conductances & reversal
-        gtot = self.mech.gtot(v)    # (B,K)
+        itot, gtot = self.mech.i(v)       # (B,K)
 
         # f_n = (irev - i_res) * self.scale
         f_n = (gtot * v - itot) * self.scale  # (B,K)

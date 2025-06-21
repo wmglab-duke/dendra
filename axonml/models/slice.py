@@ -94,24 +94,32 @@ def parse_key(key: Any, shape: Sequence[int]) -> IndexSpec:
 
 class Slice:
 
-    def __init__(self, model, index_spec: IndexSpec):
+    def __init__(self, model, index_spec: IndexSpec, base_shape=None):
         self.model : torch.nn.Module = model
+        self.base_shape = base_shape
+        if base_shape is None:
+            self.base_shape = model.shape
         self.index_spec = index_spec
 
     def __getattr__(self, name: str) -> Any:
         """
         Allow access to the model's attributes directly.
         """
-        t = getattr(self.model, name, None)
+        t = None
+        if name in self.model._buffers:
+            t = self.model._buffers[name]
+        elif name in self.model._parameters:
+            t = self.model._parameters[name]
         if t is not None:
-            module, attr_name = find_parent_module(self.model, t)
-            if (k := module.key) is not None:
+            if (k := self.model.key) is not None:
                 return expand_into_shape(
                     t,
                     k,
-                    self.model.shape
-                ).reshape(self.model.shape)[self.index_spec.index]
+                    self.base_shape
+                )[self.index_spec.index]
             return t[self.index_spec.index]
+        else:
+            return Slice(getattr(self.model, name), self.index_spec, self.base_shape)
         raise AttributeError(f"{type(self).__name__!s} has no attribute {name!s}")
 
     def inject(self, waveform):
@@ -119,3 +127,6 @@ class Slice:
 
     def insert(self, mechanism, ic=None, **kwargs):
         self.model.insert(mechanism, ic, self.index_spec, **kwargs)
+
+    def label(self, name: str):
+        setattr(self.model, name, self)

@@ -341,8 +341,7 @@ class _dhs(Integrator):
 
         self.mech.advance(v, dt, temp)
 
-        itot = self.mech.i(v)
-        gtot = self.mech.gtot(v)
+        itot, gtot = self.mech.i(v)
 
         f_n  = (gtot * v - itot) * self.scale
 

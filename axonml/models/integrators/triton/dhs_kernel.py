@@ -2,7 +2,6 @@ import triton
 import triton.language as tl
 import torch
 
-
 @triton.jit
 def _single_dhs_kernel(
         D_ptr, A_ptr, B_ptr, V_ptr,
@@ -12,15 +11,14 @@ def _single_dhs_kernel(
     b = tl.program_id(0)
     lane = tl.arange(0, K_THREADS)
 
+    # Pointers for the current batch item
     D = D_ptr + b * K
     A = A_ptr + b * K
     B = B_ptr + b * K
     V = V_ptr + b * K
 
-    # --- 1. SYMMETRIC INITIALIZATION PASS ---
-    # Each thread handles one compartment `idx`. It adds its axial conductance
-    # g_i to its own diagonal D[idx] and its parent's diagonal D[P[idx]].
-    # This guarantees D[i,i] = sum(g_ij) by construction.
+    # --- 1. FUSED INITIALIZATION & FORWARD ELIMINATION ---
+    # This single loop correctly builds the diagonal `D` just-in-time.
     for l in range(0, L):
         s = tl.load(LAYER_PTR_ptr + l)
         e = tl.load(LAYER_PTR_ptr + l + 1)
@@ -29,27 +27,40 @@ def _single_dhs_kernel(
         idx = tl.load(ORDER_ptr + s + lane, mask=m, other=0)
         parent = tl.load(P_ptr + idx, mask=m, other=-1)
         
-        g_i = tl.load(A + idx, mask=m) # Load conductance to parent
+        # Load the axial conductance g_i for the current compartment `idx`.
+        # This value is used for both initialization and elimination.
+        g_i = tl.load(A + idx, mask=m)
         
-        # Add to own diagonal
+        # --- "Just-in-Time" Diagonal Finalization ---
+        # All children of `idx` have already been processed and added their g_child to D[idx].
+        # Now, we add g_i to finalize D[idx] and to contribute to D[parent].
+        # Atomics are still required because multiple children of the same parent
+        # might be processed in parallel by different threads.
+        
+        # Add g_i to our own diagonal
         tl.atomic_add(D + idx, g_i, mask=m)
         
-        # Add to parent's diagonal
-        valid_parent = parent >= 0
-        tl.atomic_add(D + parent, g_i, mask=m & valid_parent)
+        valid_parent_mask = m & (parent >= 0)
+        # Add g_i to our parent's diagonal
+        tl.atomic_add(D + parent, g_i, mask=valid_parent_mask)
 
+        # --- Elimination Step ---
+        # At this point, D[idx] is fully computed and can be safely read.
         d_i = tl.load(D + idx, mask=m)
         b_i = tl.load(B + idx, mask=m)
 
+        # The elimination factor calculation is now safe.
         fac = -g_i / d_i
-        mask = m & valid_parent
 
-        tl.atomic_add(D + parent, fac * g_i, mask=mask)
-        tl.atomic_add(B + parent, -fac * b_i, mask=mask)
+        # Update parent's D and B values using the computed factor.
+        tl.atomic_add(D + parent, fac * g_i, mask=valid_parent_mask)
+        tl.atomic_add(B + parent, -fac * b_i, mask=valid_parent_mask)
 
-    tl.debug_barrier() # Ensure all atomic adds are complete before proceeding
+    # A barrier is still needed here to ensure the forward pass is
+    # fully complete across the entire tree before back-substitution begins.
+    tl.debug_barrier()
 
-    # --- 3. BACKWARD SUBSTITUTION (Unchanged) ---
+    # --- 2. BACKWARD SUBSTITUTION (Unchanged) ---
     for l in range(L - 1, -1, -1):
         s = tl.load(LAYER_PTR_ptr + l)
         e = tl.load(LAYER_PTR_ptr + l + 1)
@@ -64,8 +75,7 @@ def _single_dhs_kernel(
 
         valid_p = parent >= 0
         v_parent = tl.load(V + tl.where(valid_p, parent, 0), mask=m & valid_p, other=0.0)
-
-        # V[i] = (B[i] - (-g_i) * V[p]) / D[i]
+        
         v_i = (b_i + g_i * v_parent) / d_i
         tl.store(V + idx, v_i, mask=m)
 
