@@ -10,7 +10,7 @@ def pcr_tridiag_solve(
     """
     Parallel Cyclic Reduction (PCR) batched tridiagonal solver.
     Handles any length K (no power-of-two restriction) and runs in
-    O(logK) sequential stages while using only tensor ops; i.e. 100 % graph-friendly.
+    O(logK) sequential stages while using only tensor ops.
 
     Returns x of shape (B, K).
     """

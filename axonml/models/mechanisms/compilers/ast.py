@@ -4,6 +4,7 @@ from sympy import symbols, sympify, Poly, expand, factor
 from functools import lru_cache
 
 from axonml.helpers import DEBUG
+from .source import safe_source
 
 # helper: Python‑AST → SymPy
 def _ast_to_sympy(node: ast.AST, local_syms: dict[str, sp.Expr]) -> sp.Expr:
@@ -46,7 +47,7 @@ def factorize_linear_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
         src = textwrap.dedent(obj_or_src)
     else:                                                          # a class object
         try:
-            src = inspect.getsource(obj_or_src)
+            src = safe_source(obj_or_src)
         except OSError as e:       # happens e.g. for built‑ins or eval‑crafted
             raise ValueError("Can't retrieve source for the supplied class") from e
         src = textwrap.dedent(src)

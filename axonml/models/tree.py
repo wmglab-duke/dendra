@@ -1,4 +1,9 @@
+from typing import List, Optional, Union, NamedTuple, Dict
+import re
+
 import torch
+import numpy as np
+import pandas as pd
 
 from axonml.models.declarations import PARAMETER
 from axonml.models.integrators import dhs
@@ -6,10 +11,48 @@ from axonml.models.integrators import dhs
 from .core import Population
 
 
+class FindResult(NamedTuple):
+    indices: Union[slice, torch.Tensor]
+    local_indices: Dict[str, Union[slice, torch.Tensor]]
+    local_sizes: Dict[str, int]
+    total_size: int
+
+
+def _indices_to_slice_or_tensor(
+    numpy_indices: np.ndarray,
+    device: Optional[torch.device] = None
+) -> Union[slice, torch.Tensor]:
+    """Converts a 1D numpy array of indices into a slice if possible, else a tensor."""
+    num_indices = len(numpy_indices)
+
+    if num_indices == 0:
+        return slice(0, 0, None)
+
+    if num_indices == 1:
+        start = int(numpy_indices[0])
+        return slice(start, start + 1, None)
+
+    # Check if the step between all indices is constant
+    diffs = np.diff(numpy_indices)
+    step = int(diffs[0])
+
+    if np.all(diffs == step):
+        # The indices form an arithmetic progression. It can be a slice!
+        start = int(numpy_indices[0])
+        stop = int(numpy_indices[-1]) + step
+        return slice(start, stop, step if step != 1 else None)
+    else:
+        # Indices are not contiguous, fall back to returning a tensor
+        torch_indices = torch.from_numpy(numpy_indices)
+        return torch_indices.to(device) if device else torch_indices
+
+
 def gather_morphology(graph):
     # iterate through nodes and gather morphology data
     L, diam, rhoa, cm, x, y, z = [], [], [], [], [], [], []
-    for node, attrs in graph.nodes(data=True):
+
+    for i in range(len(graph.nodes)):
+        attrs = graph.nodes[i]
         L       .append(attrs.get('L'))
         diam    .append(attrs.get('diam'))
         rhoa    .append(attrs.get('Ra'))
@@ -46,11 +89,17 @@ class Tree(Population):
 
     PARAMETER(celsius=37.0)
     
-    def __init__(self, N, C, graph=None, integrator=None, **kwargs):
+    def __init__(self, N, C, graph, integrator=None, **kwargs):
         if integrator is None:
             integrator = dhs()
         super().__init__(N, C, integrator=integrator, **kwargs)
         self._graph = graph
+        names = []
+        for i in range(len(graph.nodes)):
+            attrs = graph.nodes[i]
+            name = attrs.get('name')
+            names.append(name)
+        self.names = names
 
     @property
     def graph(self):
@@ -87,6 +136,34 @@ class Tree(Population):
         for key, value in data.items():
             tree.register_buffer(key, value.expand(N, -1))
         return tree
+
+    @classmethod
+    def from_swc(cls, file_path, d_lambda=0.1, freq=100.0, N=1, integrator=None, **kwargs):
+        """
+        Create a Tree instance from an SWC file.
+
+        Parameters
+        ----------
+        file_path : str
+            Path to the SWC file.
+        N : int, optional
+            Number of instances of the tree. Default is 1.
+        integrator : Integrator, optional
+            The integrator to use for the model. Defaults to None.
+
+        Returns
+        -------
+        Tree
+            An instance of the Tree class.
+        """
+        from axonml.models.io import read_swc
+        graph, _ = read_swc(file_path, d_lambda=d_lambda, freq=freq)
+        cell = cls.from_graph(graph, N, integrator, **kwargs)
+        cell[:, cell.find('soma')].label('soma')
+        cell[:, cell.find('axon')].label('axon')
+        cell[:, cell.find('dend')].label('dend')
+        cell[:, cell.find('apic')].label('apic')
+        return cell
 
     def recentre(self, x=0.0, y=0.0, z=0.0):
         """
@@ -130,3 +207,129 @@ class Tree(Population):
         self.x += dx
         self.y += dy
         self.z += dz
+
+    def find(self, include=None, fuzzy=True, match_case=False, full_report=False):
+        indices = find_indices_smart(
+            self.names,
+            include=include,
+            fuzzy=fuzzy,
+            match_case=match_case,
+            device=self.device()
+        )
+        if full_report:
+            return indices
+        else:
+            # Return only the indices of the matches
+            if isinstance(indices.indices, slice):
+                return indices.indices
+            else:
+                return indices.indices.tolist()
+        return indices
+
+    def find_not(self, exclude=None, fuzzy=True, match_case=False):
+        indices = find_indices_smart(
+            self.names,
+            exclude=exclude,
+            fuzzy=fuzzy,
+            match_case=match_case,
+            device=self.device()
+        )
+        return indices.indices
+
+
+def find_indices_smart(
+    data: List[str],
+    include: Optional[Union[str, List[str]]] = None,
+    exclude: Optional[Union[str, List[str]]] = None,
+    fuzzy: bool = True,
+    match_case: bool = False,
+    device: Optional[torch.device] = None
+) -> FindResult:
+    """
+    Finds indices based on criteria and returns detailed results including local indices
+    for each included pattern.
+
+    Args:
+        data (List[str]): The list of strings to search through.
+        include (Optional[Union[str, List[str]]]): Patterns to include.
+        exclude (Optional[Union[str, List[str]]]): Patterns to exclude.
+        fuzzy (bool): If True, performs a whole-word match. If False, an exact match.
+        match_case (bool): If True, the matching is case-sensitive.
+        device (Optional[torch.device]): PyTorch device for resulting tensors.
+
+    Returns:
+        FindResult: A named tuple with the following fields:
+        - indices (Union[slice, torch.Tensor]): A slice if indices are contiguous,
+          otherwise a tensor of all matching indices.
+        - local_indices (Dict[str, Union[slice, torch.Tensor]]): A dict mapping each
+          'include' pattern to a slice or tensor of its indices *relative to 'indices'*.
+        - local_sizes (Dict[str, int]): A dict mapping each 'include' pattern to
+          the number of its matches.
+        - total_size (int): The total number of indices found.
+    """
+    empty_result = FindResult(slice(0, 0), {}, {}, 0)
+    if not data:
+        return empty_result
+
+    s = pd.Series(data, dtype="string")
+    final_mask = pd.Series(True, index=s.index)
+    
+    local_indices_map = {}
+    local_sizes_map = {}
+    pattern_masks: Dict[str, pd.Series] = {}
+
+    if include:
+        include_patterns = [include] if isinstance(include, str) else include
+        for pattern in include_patterns:
+            if fuzzy:
+                regex_pattern = f"\\b{re.escape(pattern)}\\b"
+                mask = s.str.contains(regex_pattern, case=match_case, regex=True, na=False)
+            else:
+                mask = (s.str.lower() if not match_case else s) == (pattern.lower() if not match_case else pattern)
+            pattern_masks[pattern] = mask
+        if pattern_masks:
+            combined_include_mask = pd.concat(pattern_masks.values(), axis=1).any(axis=1)
+            final_mask &= combined_include_mask
+    else:
+        include_patterns = []
+
+    if exclude:
+        exclude_patterns = [exclude] if isinstance(exclude, str) else exclude
+        combined_exclude_mask = pd.Series(False, index=s.index)
+        for pattern in exclude_patterns:
+            if fuzzy:
+                regex_pattern = f"\\b{re.escape(pattern)}\\b"
+                combined_exclude_mask |= s.str.contains(regex_pattern, case=match_case, regex=True, na=False)
+            else:
+                combined_exclude_mask |= (s.str.lower() if not match_case else s) == (pattern.lower() if not match_case else pattern)
+        final_mask &= ~combined_exclude_mask
+
+    numpy_indices = s.index[final_mask].to_numpy()
+    total_size = len(numpy_indices)
+
+    if total_size == 0:
+        return empty_result
+    
+    # --- REFACTORED: Use the helper for total indices ---
+    total_indices_result = _indices_to_slice_or_tensor(numpy_indices, device)
+
+    if include_patterns:
+        global_to_local_map = {global_idx: local_idx for local_idx, global_idx in enumerate(numpy_indices)}
+        
+        for pattern in include_patterns:
+            pattern_final_mask = pattern_masks[pattern] & final_mask
+            pattern_global_indices = s.index[pattern_final_mask].to_numpy()
+            
+            local_indices_list = [global_to_local_map[g_idx] for g_idx in pattern_global_indices]
+            
+            # --- REFACTORED: Use the helper for local indices ---
+            local_numpy_indices = np.array(local_indices_list, dtype=np.int64)
+            local_indices_map[pattern] = _indices_to_slice_or_tensor(local_numpy_indices, device)
+            local_sizes_map[pattern] = len(local_indices_list)
+
+    return FindResult(
+        indices=total_indices_result,
+        local_indices=local_indices_map,
+        local_sizes=local_sizes_map,
+        total_size=total_size
+    )

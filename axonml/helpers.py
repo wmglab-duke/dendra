@@ -104,6 +104,10 @@ def op_mc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
 def op_sc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return torch.einsum("an,at->tan", s, t)
 
+
+nojit = torch._dynamo.disable
+
+
 import contextlib
 
 

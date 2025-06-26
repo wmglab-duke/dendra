@@ -71,7 +71,7 @@ class IndexSpec:
     shape: Tuple[int, ...]
 
 
-def parse_key(key: Any, shape: Sequence[int]) -> IndexSpec:
+def parse_key(key: Any, shape: Sequence[int], device) -> IndexSpec:
     """
     Turn *any* valid key plus `shape` into a reusable IndexSpec.
     Works for NumPy **and** PyTorch rules (they're identical here).
@@ -83,7 +83,7 @@ def parse_key(key: Any, shape: Sequence[int]) -> IndexSpec:
     >>> spec
     IndexSpec(index=(slice(None), slice(None), 2), new_axes=(3,), ...)
     """
-    out = np.empty(shape, dtype=np.float32)[key]  # type: ignore
+    out = torch.empty(shape, device=device)[key]  # type: ignore
 
     return IndexSpec(
         index=key,
@@ -100,6 +100,13 @@ class Slice:
         if base_shape is None:
             self.base_shape = model.shape
         self.index_spec = index_spec
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        """
+        The shape of the slice.
+        """
+        return self.index_spec.shape
 
     def __getattr__(self, name: str) -> Any:
         """
@@ -125,8 +132,9 @@ class Slice:
     def inject(self, waveform):
         self.model.stimuli.append((waveform, self.index_spec.out_shape, self.index_spec.index))
 
-    def insert(self, mechanism, ic=None, **kwargs):
-        self.model.insert(mechanism, ic, self.index_spec, **kwargs)
+    def insert(self, mechanism, alias, ic=None, **kwargs):
+        self.model.insert(mechanism, alias=alias, index_spec=self.index_spec, **kwargs)
 
     def label(self, name: str):
         setattr(self.model, name, self)
+        self.model._labels[name] = self

@@ -204,7 +204,7 @@ def get_area_from_graph(G: nx.DiGraph) -> torch.Tensor:
         A tensor containing the area in µm² for each node, or None if not available.
     """
     areas = []
-    for n in G.nodes:
+    for n in range(len(G.nodes)):
         area = G.nodes[n].get('area', None)
         if area is not None:
             areas.append(area)
@@ -302,23 +302,19 @@ class _dhs(Integrator):
         dx_cm     = 1e-4 * model.dx                         # µm → cm   (N,)
         area_cm2  = 2 * torch.pi * radius_cm * dx_cm        # cm²
 
-        area_um2 = get_area_from_graph(model.graph)
+        area_um2 = get_area_from_graph(model.graph).to(device=device)
         if area_um2 is not None:
             area_cm2 = 1e-8 * area_um2                      # convert from µm² to cm²
 
         self.register_buffer("layer_ptr", layer_ptr.to(device))  # (L+1,)
         self.order.copy_(order.to(dtype=torch.int32, device=device))
         self.parent_idx.copy_(parent_idx.to(dtype=torch.int32, device=device))  # (N,)
-        # self.lower.copy_(-a_geom_t.expand(B, -1))  # (B,N) lower diagonal
         self.a_geom.copy_(a_geom_t.expand(B, -1))
 
         K = parent_idx.numel()
-        # g_ax = a_geom_t.clone()
 
         # add children contributions to their parent’s diagonal
         valid = parent_idx >= 0
-        # g_ax.index_add_(0, parent_idx[valid], a_geom_t[valid])
-        # self.g_ax.copy_(g_ax[self.inv_solver_order].expand(B, -1))  # (B,N)
 
         self.scale.copy_(area_cm2)
 
@@ -338,9 +334,7 @@ class _dhs(Integrator):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)
 
     def _step(self, v, dt, temp, ve=None, intra=None):
-
         self.mech.advance(v, dt, temp)
-
         itot, gtot = self.mech.i(v)
 
         f_n  = (gtot * v - itot) * self.scale
@@ -360,22 +354,21 @@ class _dhs(Integrator):
         if intra is not None:
             f_n += intra
 
-        RHS  = f_n + self.cmdt * v                          # mA
-        main = self.cmdt + gtot * self.scale    # S
+        RHS  = f_n + self.cmdt * v                      # mA
+        main = self.cmdt + gtot * self.scale            # S
 
-        d_ = main[:, self.solver_order]  # (B, N)
-        b_ = RHS[:,  self.solver_order]  # (B, N)
-        a  = self.a_geom  # (B, N) axial conductance
+        d_ = main.index_select(-1, self.solver_order)   # (B, N)
+        b_ = RHS.index_select(-1, self.solver_order)    # (B, N)
+        a  = self.a_geom                                # (B, N) axial conductance
 
         v_out = dhs_solve(
-            d_, a, b_,  # The API change is handled inside dhs_solve
+            d_, a, b_,
             self.parent_idx.to(d_.device, dtype=torch.int32),
             self.order.to(d_.device, dtype=torch.int32),
             self.layer_ptr.to(d_.device, dtype=torch.int32),
             threads=self.threads
         )
 
-        # The rest of the function remains the same
-        v = v_out[:, self.inv_solver_order]
+        v = v_out.index_select(-1, self.inv_solver_order)  # (B, N)
 
         return v  # (B, N) mV

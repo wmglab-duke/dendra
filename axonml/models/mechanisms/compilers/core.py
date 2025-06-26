@@ -20,7 +20,6 @@ from .utils import indent, load, get_function_body_as_str, get_function_as_str
 from .compile_f import convert_func, multiply_return_value
 
 from ..core import Mechanism, coupled
-from ..state_compiler import compile_state, compile_coupled_state
 from ..handler.defaults import valid_concentrations
 from ..ops import *
 

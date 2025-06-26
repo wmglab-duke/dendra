@@ -1,15 +1,18 @@
 from ..mechanisms import *
+from ..mechanisms._mechanism import Mechanism as M
+from ..mechanisms._state import State as S
 from ..mechanisms.ops import *
 
 
-class m(State):
-    USEQ10()
+class m(S):
+    has_q10 = True
 
-    DERIVATIVE("m' = (minf - m) / mtau")
-    ASSIGNED("minf", "mtau")
+    S.STATE('m')
+    S.DERIVATIVE("m' = (minf - m) / mtau")
+    S.ASSIGNED("minf", "mtau")
 
     def calc_q10(self):
-        return 3.0 ** ((self.temp - 6.3) / 10.0)
+        return 3.0 ** ((self.celsius - 6.3) / 10.0)
 
     def breakpoint(self, v):
         alpha = .1 * vtrap(-(v+40),10)
@@ -17,22 +20,21 @@ class m(State):
         tot = alpha + beta
         mtau = 1/(self.q10() * tot)
         minf = alpha/tot
+        return {"mtau": mtau, "minf": minf}
     
     def inf(self, v):
-        alpha = .1 * vtrap(-(v+40),10)
-        beta =  4 * exp(-(v+65)/18)
-        tot = alpha + beta
-        return alpha / tot
+        return {'m': self.breakpoint(v)['minf']}
 
 
-class h(State):
-    USEQ10()
+class h(S):
+    has_q10 = True
 
-    DERIVATIVE("h' = (hinf - h) / htau")
-    ASSIGNED("hinf", "htau")
+    S.STATE('h')
+    S.DERIVATIVE("h' = (hinf - h) / htau")
+    S.ASSIGNED("hinf", "htau")
 
     def calc_q10(self):
-        return 3.0 ** ((self.temp - 6.3) / 10.0)
+        return 3.0 ** ((self.celsius - 6.3) / 10.0)
 
     def breakpoint(self, v):
         alpha = 0.07 * exp(-(v+65)/20)
@@ -40,22 +42,21 @@ class h(State):
         tot = alpha + beta
         htau = 1/(self.q10() * tot)
         hinf = alpha/tot
+        return {"htau": htau, "hinf": hinf}
     
     def inf(self, v):
-        alpha = 0.07 * exp(-(v+65)/20)
-        beta = 1/(exp(-(v+35)/10) + 1)
-        tot = alpha + beta
-        return alpha / tot
+        return {'h': self.breakpoint(v)['hinf']}
 
 
-class n(State):
-    USEQ10()
+class n(S):
+    has_q10 = True
 
-    DERIVATIVE("n' = (ninf - n) / ntau")
-    ASSIGNED("ninf", "ntau")
+    S.STATE('n')
+    S.DERIVATIVE("n' = (ninf - n) / ntau")
+    S.ASSIGNED("ninf", "ntau")
 
     def calc_q10(self):
-        return 3.0 ** ((self.temp - 6.3) / 10.0)
+        return 3.0 ** ((self.celsius - 6.3) / 10.0)
 
     def breakpoint(self, v):
         alpha = .01 * vtrap(-(v+55),10)
@@ -63,20 +64,18 @@ class n(State):
         tot = alpha + beta
         ntau = 1/(self.q10() * tot)
         ninf = alpha/tot
+        return {"ntau": ntau, "ninf": ninf}
     
     def inf(self, v):
-        alpha = .01 * vtrap(-(v+55),10)
-        beta = 0.125 * exp(-(v+65)/80)
-        tot = alpha + beta
-        return alpha / tot
+        return {'n': self.breakpoint(v)['ninf']}
 
 
-class hh(Mechanism):
+class hh(M):
 
-    STATE(m, h, n)
-    PARAMETER(gnabar=.12, gkbar=.036, gl=.0003, ena=50.0, ek=-77.0, el=-54.3)
+    M.STATE(m, h, n)
+    M.PARAMETER(gnabar=.12, gkbar=.036, gl=.0003, ena=50.0, ek=-77.0, el=-54.3)
 
-    NONSPECIFIC_CURRENT("il", "ina", "ik")
+    M.NONSPECIFIC_CURRENT("il", "ina", "ik")
 
     def il(self, v):
         return self.gl * (v - self.el)

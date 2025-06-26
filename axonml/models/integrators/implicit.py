@@ -19,7 +19,7 @@ from axonml.helpers import IMEM
 
 from .core import Integrator, SCIntegrator
 from .tridiag import pcr_tridiag_solve
-from .triton import thomas_triton_bt
+from .triton import thomas_triton_bt, thomas_triton_bt_n
 
 
 class _bwd_euler_sc(SCIntegrator):
@@ -55,8 +55,6 @@ class _bwd_euler_sc(SCIntegrator):
         v_new = v
         
         # Adjust for the ionic current part
-        # Using a temporary variable for the update can sometimes help the compiler
-        # manage memory, but a single line is also fine.
         ionic_update = itot / denom
         v_new = v_new - ionic_update
         
@@ -220,7 +218,7 @@ class _bwd_euler_bt(torch.nn.Module):
         if not AXONML_SOLVERS_AVAILABLE:
             logging.warning(
                 f"only CUDA-based solvers available, using triton Thomas solver."
-                 "CPU models will not work."
+                 "CPU models will not work. Install axonml_solvers for CPU support."
             )
             method = "triton"
         super().__init__()
@@ -251,7 +249,10 @@ class _bwd_euler_bt(torch.nn.Module):
         model.v[:] = model.v_init
 
         if method == "triton":
-            self._solve = thomas_triton_bt
+            if M > 3:
+                self._solve = thomas_triton_bt_n
+            else:
+                self._solve = thomas_triton_bt
         elif method == "thread":
             self._solve = torch.ops.axonml_solvers.solve_bt
         elif method == "warp":

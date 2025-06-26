@@ -23,7 +23,6 @@ from axonml.models.mechanisms.handler.defaults import valid_ions
 from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms._handler import MechanismHandler
-from axonml.models.mechanisms.mech_compiler import compile_mechanism
 from axonml.units import mm, um
 from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
 from axonml.models.interfaces import HandlerInterface
@@ -112,6 +111,7 @@ class Population(Parameterized):
         self.nc = C
         self.v_init = v_init
 
+        self.is_built = False
         self.key = None
 
         if integrator is None:
@@ -121,7 +121,6 @@ class Population(Parameterized):
 
         self.register_buffer("_dummy",      torch.zeros(1))
 
-        self.register_buffer("v_init_c",    torch.as_tensor(v_init, dtype=self.dtype()))
         self.register_buffer("v",           torch.full(self.shape, self.v_init))
         self.register_buffer("diam",        torch.full(self.shape, 500.0))
         self.register_buffer("dx",          torch.full(self.shape, 100.0))
@@ -141,6 +140,11 @@ class Population(Parameterized):
 
         self.stimuli = []
         self.intra = None
+
+        self._mech_data = {}
+        self._mech_everywhere = {}
+
+        self._labels = {}
 
         self.t_ind: int = 0
         self.t_cache: float = 0.0
@@ -451,7 +455,7 @@ class Population(Parameterized):
                     intra_c = None
 
                 self._step(self.integrator, self, dt, ve_c, intra_c)
-                
+
                 post_step_hook(callbacks, self)
                 self.t_ind += 1
                 local_ind += 1
@@ -698,9 +702,9 @@ class Population(Parameterized):
     def initialize(self):
         self.integrator.init_v(self)
         self.pre_initialize()
-        self.integrator.mech.initialize(self.v, self.v_init_c, self.celsius)
+        self.integrator.mech.initialize(self.v, self.celsius, self.diam)
         self.post_initialize()
-        self.integrator.mech.initialize(self.v, self.v_init_c, self.celsius)
+        self.integrator.mech.initialize(self.v, self.celsius, self.diam)
         self.t_ind = 0
         self.t_cache = 0.0
         self.initialized = True
@@ -841,7 +845,7 @@ class Population(Parameterized):
         return self
 
     def __getitem__(self, key):
-        index = parse_key(key, self.shape)
+        index = parse_key(key, self.shape, self.device())
         return Slice(self, index)
 
     def delete_stimuli(self):
@@ -853,7 +857,7 @@ class Population(Parameterized):
             return IntraStim(self, self.stimuli)
         return None
 
-    def insert(self, mechanism, ic=None, index_spec=None, **kwargs):
+    def insert(self, mechanism, alias=None, index_spec=None, ic=None, **kwargs):
         """
         Insert a mechanism into the model.
 
@@ -861,14 +865,17 @@ class Population(Parameterized):
         ----------
         mechanism : Mechanism
             The mechanism to be inserted into the model.
-        ic : dict, optional
-            Dictionary of initial conditions for the mechanism states.
-            Keys are state names and values are initial values.
-        idx : __getitem__ key, optional
-            Index or key to specify where to insert the mechanism.
+        alias : str, optional
+            An optional alias for the mechanism. If not provided, the mechanism's name will be used.
+        index_spec : IndexSpec, optional
+            An optional index specification that defines where the mechanism should be inserted.
+            If not provided, the mechanism will be inserted everywhere.
         **kwargs
             Additional keyword arguments to be passed to the compile_mechanism function.
         """
+
+        if self.is_built:
+            raise RuntimeError("Cannot insert mechanisms after the model is built.")
 
         validate(mechanism)
         
@@ -879,56 +886,13 @@ class Population(Parameterized):
             key = index_spec.index
             shape = index_spec.shape
 
-        def impute_alias(name, m_name, m_count):
-            """Keep count of number of mechanisms with the same name."""
-            if name in m_name:
-                m_count[name] += 1
-                return f"{name}_{m_count[name]}"
-            else:
-                m_count[name] = 0
-                return name
+        if key is None:
+            self._mech_everywhere[mechanism] = (mechanism.__name__, ic, kwargs)
+            return
 
-        name = impute_alias(mechanism.__name__, self._m_name, self._m_count)
-
-        m, unfactorable, has_gtot, divide_by_two = self.compiler.compile(
-            mechanism, 
-            self, 
-            ic=ic,
-            shape=shape,
-            key=key,
-            **kwargs,
-        )
-
-        self._m_name.append(name)
-        self._m_list.append(m)
-        self._m_keys.append(key)
-        self._m_shape[name] = shape
-
-        self._m_unfactorable[name] = unfactorable
-        self._m_has_gtot[name] = has_gtot
-        self._m_divide_by_two[name] = divide_by_two
-
-        for k, v in mechanism._currents.items():
-            self._m_curr.setdefault(k, {}).update({name: v})
-
-        for k, v in mechanism._read_ion.items():
-            self._ion_read.setdefault(k, {}).update({name: v})
-
-        for k, v in mechanism._write_ion.items():
-            self._ion_write.setdefault(k, {}).update({name: v})
-
-        for k, v in mechanism._write_ion_c.items():
-            self._ion_write_c.setdefault(k, {}).update({name: v})
-
-    def insert_at(self, index, mechanism, ic=None, **kwargs):
-        if isinstance(index, int):
-            index = [index]
-        if isinstance(index, str):
-            index = self.cid.loc(index)
-        if isinstance(index, list):
-            if all(isinstance(i, str) for i in index):
-                index = self.cid.locs(index)
-        self.insert(mechanism, ic=ic, mask_in=index, **kwargs)
+        if mechanism in self._mech_everywhere:
+            raise ValueError(f"Mechanism {mechanism} is already inserted everywhere.")
+        self._mech_data.setdefault(mechanism, []).append((alias, kwargs, key))
 
     def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
         assert ion in valid_ions(), f"Invalid ion: {ion}"
@@ -973,7 +937,52 @@ class Population(Parameterized):
             return (0, 1, 0, 0, 0)
         return (0, 0, 0, 0, 0)
 
+    
+    def register_mech(self, m, shape, key):
+        name = m.name
+        mech = m.__class__
+        self._m_name.append(name)
+        self._m_list.append(m)
+        self._m_keys.append(key)
+        self._m_shape[name] = shape
+
+        self._m_unfactorable[name] = None
+        self._m_has_gtot[name] = None
+        self._m_divide_by_two[name] = None
+
+        for k, v in mech._currents.items():
+            self._m_curr.setdefault(k, {}).update({name: v})
+
+        for k, v in mech._read_ion.items():
+            self._ion_read.setdefault(k, {}).update({name: v})
+
+        for k, v in mech._write_ion.items():
+            self._ion_write.setdefault(k, {}).update({name: v})
+
+        for k, v in mech._write_ion_c.items():
+            self._ion_write_c.setdefault(k, {}).update({name: v})
+
+
     def build(self):
+        for mech, (name, ic, kwargs) in self._mech_everywhere.items():
+            key = None
+            shape = self.shape
+            m = mech(name, self.celsius, self.diam, shape, key, ic=ic, **kwargs)
+            self.register_mech(m, shape, key)
+
+        for mech, data in self._mech_data.items():
+            aliases, kwargs_list, keys = tuple(map(list, zip(*data)))
+            if len(set(aliases)) != len(aliases):
+                raise ValueError(f"Duplicate aliases found for mechanism {mech.__name__}.")
+            m, shape, key = compile_mechanism(
+                self,
+                mech,
+                keys,
+                aliases,
+                kwargs_list
+            )
+            self.register_mech(m, shape, key)
+
         all_ions = get_unique_keys([self._ion_read, self._ion_write, self._ion_write_c])
 
         _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
@@ -999,7 +1008,7 @@ class Population(Parameterized):
             )
             for m in self._m_list:
                 m.register_ion(ions[ion])
-
+                
         mechs = {
             n: m for n, m in zip(self._m_name, self._m_list)
         }
@@ -1007,11 +1016,12 @@ class Population(Parameterized):
             n: k for n, k in zip(self._m_name, self._m_keys)
         }
         mech = MechanismHandler(
-            self.celsius, mechs, keys, self._m_has_gtot, ions,
+            self.celsius, mechs, ions,
             self._ion_write_c, self._ion_read, self._m_curr
         )
 
         self.integrator = self.integrator(self, mech)
+        self.is_built = True
         return self
 
 
@@ -1077,8 +1087,6 @@ class Axon(Population):
         self.temp   = float(celsius)
         self.v_init = v_init
         self.v[:] = v_init
-
-        self.register_buffer("v_init_c", torch.tensor(v_init, dtype=self.dtype()))
 
         self.cid = None
 
@@ -1464,3 +1472,156 @@ def pre_chunk_hook(c, m, n):
 
 def post_chunk_hook(c, m, n):
     c.post_chunk_hook(m, n)
+
+
+import numpy as np
+from typing import List, Tuple, Union, Any
+
+def compose_or_flatten_union(
+    indices: List[Any],
+    shape: Tuple[int, ...]
+) -> Tuple[Union[Tuple[slice, ...], List[int]], bool, Tuple[int, ...], List[List[int]]]:
+    """
+    Calculates the union of elements selected by a list of indices, determines
+    if it can be a slice tuple, and returns the final shape and the origins
+    of the selected elements.
+
+    Args:
+        indices: A list of valid indexers. Each is applied independently.
+        shape: The shape of the array being indexed.
+
+    Returns:
+        A tuple containing four elements:
+        1. result_indices:
+           - If composable: A tuple of `slice` objects.
+           - If not composable: A sorted list of flat `int` indices.
+        2. is_composable (bool):
+           - True if the union was composed into a slice tuple.
+           - False otherwise.
+        3. final_shape (Tuple[int, ...]):
+           - The shape of the resulting selection.
+        4. local_indices (List[List[int]]):
+           - A list of lists. `local_indices[i]` contains the indices *within
+             the final selection* that correspond to the elements contributed
+             by the original `indices[i]`.
+    """
+    # --- Corrected Edge-Case Handling ---
+
+    # Prepare standard empty results
+    empty_slice_tuple = tuple(slice(0, 0) for _ in range(len(shape)))
+    empty_shape = tuple(0 for _ in range(len(shape)))
+    empty_locals = [[] for _ in indices]
+
+    # If there are no indices, the union of selections is empty.
+    if not indices:
+        return empty_slice_tuple, True, empty_shape, []
+
+    # If the shape tuple is invalid/empty, or describes an empty array.
+    if not shape:
+        return empty_slice_tuple, True, (0,), empty_locals
+    
+    # Calculate total_elements *before* using it in a check.
+    total_elements = int(np.prod(shape))
+    if not total_elements:
+        return empty_slice_tuple, True, empty_shape, empty_locals
+
+    # --- Main Logic (Now Safe to Proceed) ---
+
+    try:
+        arr = np.arange(total_elements).reshape(shape)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Invalid shape provided: {shape}. Error: {e}") from e
+
+    # 1. Forward Pass: Collect contributions from each indexer separately
+    contributions = []
+    for idx in indices:
+        try:
+            selected_elements = arr[idx]
+            contributions.append(sorted(list(set(selected_elements.flatten()))))
+        except IndexError as e:
+            raise IndexError(
+                f"An indexer in the list is invalid for the given shape. "
+                f"Indexer: {idx}, Shape: {shape}. Original Error: {e}"
+            ) from e
+
+    # 2. Aggregation: Create the final union and the reverse lookup map
+    all_flat_indices = set()
+    for contrib in contributions:
+        all_flat_indices.update(contrib)
+
+    if not all_flat_indices:
+        return empty_slice_tuple, True, empty_shape, empty_locals
+
+    sorted_union_indices = sorted(list(all_flat_indices))
+
+    global_to_local_map = {
+        global_idx: local_idx
+        for local_idx, global_idx in enumerate(sorted_union_indices)
+    }
+
+    # 3. Calculate Local Indices
+    local_indices = []
+    for contrib in contributions:
+        local_indices.append([global_to_local_map[g_idx] for g_idx in contrib])
+        
+    # 4. Composability Check & Shape Calculation
+    multi_dim_coords = np.unravel_index(sorted_union_indices, shape)
+    min_coords = np.min(multi_dim_coords, axis=1)
+    max_coords = np.max(multi_dim_coords, axis=1)
+
+    bounding_box_dims = max_coords - min_coords + 1
+    expected_size = np.prod(bounding_box_dims)
+
+    if len(sorted_union_indices) == expected_size:
+        # Composable case
+        composed_slices = tuple(
+            slice(int(min_c), int(max_c) + 1)
+            for min_c, max_c in zip(min_coords, max_coords)
+        )
+        final_shape = tuple(s.stop - s.start for s in composed_slices)
+        result_indices = composed_slices
+        is_composable = True
+    else:
+        # Non-composable case
+        final_shape = (len(sorted_union_indices),)
+        result_indices = [int(i) for i in sorted_union_indices]
+        is_composable = False
+
+    return result_indices, is_composable, final_shape, local_indices
+
+
+def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
+    from itertools import chain
+
+    total_index, is_composable, final_shape, local_indices = compose_or_flatten_union(
+        indices, model.shape
+    )
+
+    all_distinct_indices = set(chain.from_iterable(local_indices))
+    if sum(len(idx) for idx in local_indices) != len(all_distinct_indices):
+        raise ValueError(
+            "Duplicate indices found in the local indices. "
+            "Each index should be unique within the final selection."
+        )
+
+    # local indices is now a list of lists, where each sublist corresponds to the
+    # local indices of the original indices in the final selection.
+    # We can now use these local indices to compile the mechanism.
+
+    additional_parameters = {}
+
+    for alias, kwargs, idx in zip(aliases, kwargs_list, local_indices):
+        for k, v in kwargs.items():
+            additional_parameters.setdefault(k, []).append((alias, v, idx))
+
+    m = mechanism(
+        mechanism.__name__,
+        model.celsius,
+        model.diam,
+        final_shape,
+        key=total_index,
+        is_composable=is_composable,
+        additional_parameters=additional_parameters,
+    )
+
+    return m, final_shape, total_index

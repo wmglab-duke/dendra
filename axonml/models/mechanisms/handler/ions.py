@@ -55,6 +55,11 @@ class Ion(torch.nn.Module):
     {eadvance}
     {detect_anomalies}
     return
+
+  def set(self, key: str, value):
+    p = getattr(self, key)
+    if isinstance(p, torch.Tensor) or isinstance(p, torch.nn.Parameter):
+      p.data.copy_(torch.as_tensor(value, dtype=p.data.dtype, device=p.device))
 """
 
 

@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from .backend import Backend as A
+from ..helpers import nojit
 
 
 if torch.cuda.is_available():
@@ -518,7 +519,7 @@ class Recorder(Callback):
             )
         self.save_count += 1
 
-    @torch._dynamo.disable
+    @nojit
     def post_step_hook(self, model):
         self._post_step_hook(model)
         self.i += 1
@@ -1206,7 +1207,7 @@ class Raster(ThresholdCallback):
                 device=model.device(),
             )
 
-    @torch._dynamo.disable
+    @nojit
     def post_step_hook(self, model):
         if self.i >= self.ind_start:
             vm_new = atleast_2d(model.v[:, self.node_check])
