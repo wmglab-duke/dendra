@@ -236,6 +236,9 @@ class Tree(Population):
         )
         return indices.indices
 
+    def calculate_geometric_params(self):
+        return
+
 
 def find_indices_smart(
     data: List[str],

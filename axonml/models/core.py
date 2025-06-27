@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 import math
 from typing import List, Tuple, Optional, Dict, Callable
 import re
@@ -396,7 +397,9 @@ class Population(Parameterized):
                 raise ValueError("If `time` is a Waveform, `tstop` must be provided.")
             time = time.assemble(dt)
 
-        with torch.set_grad_enabled(self.training):
+        ctx = nullcontext() if self.training else torch.inference_mode()
+
+        with ctx:
             if self.training:
                 self.calculate_geometric_params()
 

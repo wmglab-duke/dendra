@@ -248,7 +248,7 @@ class DHSSolveStable(torch.autograd.Function):
         
         # Gather parent values for x and g
         # We need to clamp parent indices to 0 for the root to avoid out-of-bounds
-        parent_idx_clamped = parent_idx.clamp_min(0)
+        parent_idx_clamped = parent_idx.clamp_min(0).to(torch.int64)
         x_parent = x.gather(1, parent_idx_clamped.expand_as(x))
         g_parent = g.gather(1, parent_idx_clamped.expand_as(g))
 

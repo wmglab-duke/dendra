@@ -337,41 +337,32 @@ class State(_Parameterized):
 
         self.register_buffer('diam', diameters)
 
-        if self.has_q10:
-            self.register_buffer("q10_cache", torch.as_tensor(self.calc_q10()))
-
         for b in self._state_buffers:
             self.register_buffer(b, torch.tensor(0.0))
 
         pade = kwargs.get("pade", False)
+        self.include_q10_in_comp_graph = kwargs.get("include_q10_in_comp_graph", False)
 
         ifunc = build_integration_func(
             self._state, self._assigned, self._derivative, self.method, pade
         )
         setattr(self, "solve", MethodType(ifunc, self))
 
+    def populate_parameter_buffers(self):
+        super().populate_parameter_buffers()
+        if self.has_q10:
+            if self.include_q10_in_comp_graph:
+                self.q10 = self.calc_q10
+            else:
+                self.q10 = self.return_q10_cache
+                self.register_buffer('q10_cache', self.calc_q10())
+
     def initialize(self, v):
         self.initial(v)
         return
 
-    def eval(self):
-        if self.has_q10:
-            self.q10_cache = self.calc_q10()
-            self.q10 = self.return_q10_cache
-        return super().eval()
-
-    def train(self, mode=True):
-        if self.has_q10:
-            self.q10 = self.calc_q10
-        return super().train(mode)
-
     def return_q10_cache(self):
         return self.q10_cache
-
-    def q10(self):
-        if not self.training:
-            return self.q10_cache
-        return self.calc_q10()
 
     def set(self, key: str, value):
         p = getattr(self, key)

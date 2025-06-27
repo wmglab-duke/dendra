@@ -27,9 +27,8 @@ class Ion(torch.nn.Module):
   def register_mech_writes_c(self, mech):
     setattr(self, mech._name, mech)
 
-  @torch.jit.export
   def initialize(self, temp) -> None:
-    self.i{ion}[:] = 0.0
+    self.i{ion} = torch.full(self.i{ion}.shape, 0.0, dtype=self.i{ion}.dtype, device=self.i{ion}.device)
     self.i{ion}.detach_()
     {initialize_e}
     {initialize_i}
@@ -42,7 +41,6 @@ class Ion(torch.nn.Module):
     self.{ion}i.detach_()
     self.{ion}o.detach_()
 
-  @torch.jit.export
   def advance(self, temp) -> None:
     self.eadvance(temp)
 
@@ -218,9 +216,9 @@ def build_ion(
     fo = f"{ion}o0"
     fe = f"e{ion}"
 
-    e_init_str = f"self.e{ion}.data.copy_({reversals()[fe]})"
-    i_init_str = f"self.{ion}i.data.copy_({cinits()[fi]})"
-    o_init_str = f"self.{ion}o.data.copy_({cinits()[fo]})"
+    e_init_str = f"self.e{ion}.data = torch.full(self.e{ion}.shape, {reversals()[fe]}, dtype=self.e{ion}.dtype, device=self.e{ion}.device)"
+    i_init_str = f"self.{ion}i.data = torch.full(self.{ion}i.shape, {cinits()[fi]}, dtype=self.{ion}i.dtype, device=self.{ion}i.device)"
+    o_init_str = f"self.{ion}o.data = torch.full(self.{ion}o.shape, {cinits()[fo]}, dtype=self.{ion}o.dtype, device=self.{ion}o.device)"
 
     # eadvance
     eadvance_str = parse_eadvance(ion, eadvance)
