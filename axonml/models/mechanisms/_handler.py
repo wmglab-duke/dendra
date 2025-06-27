@@ -41,6 +41,13 @@ class MechanismHandler(torch.nn.Module):
         self.init_buffers(v)
         self.i(v)
 
+    def populate(self, mech=None) -> None:
+        if mech is not None:
+            self.mechanisms[mech].populate()
+        else:
+            for mech in self.mechanisms.values():
+                mech.populate()
+
     def ion_init(self, temp) -> None:
         for ion in self.ions.values():
             ion.initialize(temp)

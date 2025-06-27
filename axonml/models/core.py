@@ -1477,6 +1477,36 @@ def post_chunk_hook(c, m, n):
 import numpy as np
 from typing import List, Tuple, Union, Any
 
+# --- Helper for the "Fast Path" ---
+# This helper handles the common case of basic slicing (a tuple of slices)
+# without creating a large dummy array.
+
+def _get_flat_indices_for_slice_tuple(
+    slice_tuple: Tuple[slice, ...],
+    shape: Tuple[int, ...]
+) -> np.ndarray:
+    """
+    Efficiently calculates flat indices for a tuple of slices.
+    """
+    # np.mgrid generates coordinate grids. The output is a dense multi-dimensional
+    # meshgrid. For slices, it's highly efficient.
+    # Example: shape=(10,10), slice_tuple=(slice(0,2), slice(5,7))
+    # mgrid[slice(0,2), slice(5,7)] ->
+    #   array([[[0, 0], [1, 1]], [[5, 6], [5, 6]]])
+    coords = np.mgrid[slice_tuple]
+
+    # np.ravel_multi_index converts multi-dimensional coordinates into flat indices.
+    # The `coords.reshape(len(shape), -1)` part flattens the coordinate grids
+    # into the right format, e.g., (rows, cols) -> ([r1,r2,r3...], [c1,c2,c3...])
+    flat_indices = np.ravel_multi_index(
+        tuple(coords.reshape(len(shape), -1)),
+        dims=shape
+    )
+    return flat_indices
+
+
+# --- Main Optimized Function ---
+
 def compose_or_flatten_union(
     indices: List[Any],
     shape: Tuple[int, ...]
@@ -1484,67 +1514,80 @@ def compose_or_flatten_union(
     """
     Calculates the union of elements selected by a list of indices, determines
     if it can be a slice tuple, and returns the final shape and the origins
-    of the selected elements.
-
+    of the selected elements. (Optimized Version)
+    
     Args:
         indices: A list of valid indexers. Each is applied independently.
         shape: The shape of the array being indexed.
 
     Returns:
-        A tuple containing four elements:
-        1. result_indices:
-           - If composable: A tuple of `slice` objects.
-           - If not composable: A sorted list of flat `int` indices.
-        2. is_composable (bool):
-           - True if the union was composed into a slice tuple.
-           - False otherwise.
-        3. final_shape (Tuple[int, ...]):
-           - The shape of the resulting selection.
-        4. local_indices (List[List[int]]):
-           - A list of lists. `local_indices[i]` contains the indices *within
-             the final selection* that correspond to the elements contributed
-             by the original `indices[i]`.
+        A tuple containing four elements: (result_indices, is_composable, final_shape, local_indices)
     """
-    # --- Corrected Edge-Case Handling ---
-
-    # Prepare standard empty results
-    empty_slice_tuple = tuple(slice(0, 0) for _ in range(len(shape)))
-    empty_shape = tuple(0 for _ in range(len(shape)))
+    # --- Edge-Case Handling (mostly unchanged) ---
+    empty_slice_tuple = tuple(slice(0, 0) for _ in shape)
+    empty_shape = tuple(0 for _ in shape) or (0,)
     empty_locals = [[] for _ in indices]
 
-    # If there are no indices, the union of selections is empty.
     if not indices:
         return empty_slice_tuple, True, empty_shape, []
-
-    # If the shape tuple is invalid/empty, or describes an empty array.
-    if not shape:
-        return empty_slice_tuple, True, (0,), empty_locals
     
-    # Calculate total_elements *before* using it in a check.
-    total_elements = int(np.prod(shape))
-    if not total_elements:
+    if not shape or not all(s > 0 for s in shape):
         return empty_slice_tuple, True, empty_shape, empty_locals
+        
+    total_elements = int(np.prod(shape))
 
-    # --- Main Logic (Now Safe to Proceed) ---
+    # --- Main Logic with Optimizations ---
+    
+    # --- Optimization 2: Lazy Fallback Array ---
+    # We will only create this large array if we encounter an index
+    # that cannot be handled by the fast path.
+    lazy_arange_arr = None
 
-    try:
-        arr = np.arange(total_elements).reshape(shape)
-    except (ValueError, TypeError) as e:
-        raise ValueError(f"Invalid shape provided: {shape}. Error: {e}") from e
-
-    # 1. Forward Pass: Collect contributions from each indexer separately
     contributions = []
     for idx in indices:
-        try:
-            selected_elements = arr[idx]
-            contributions.append(sorted(list(set(selected_elements.flatten()))))
-        except IndexError as e:
-            raise IndexError(
-                f"An indexer in the list is invalid for the given shape. "
-                f"Indexer: {idx}, Shape: {shape}. Original Error: {e}"
-            ) from e
+        flat_idx_list = []
+        
+        # --- Fast Path Check ---
+        # Is the index a tuple composed ONLY of slice objects?
+        is_basic_slicing = (
+            isinstance(idx, tuple) and
+            all(isinstance(item, slice) for item in idx)
+        )
 
-    # 2. Aggregation: Create the final union and the reverse lookup map
+        if is_basic_slicing:
+            # Use the efficient, memory-less path
+            # We need to normalize the slice tuple to match the shape's dimensionality
+            if len(idx) < len(shape):
+                full_slice = slice(None, None, None)
+                idx = idx + tuple(full_slice for _ in range(len(shape) - len(idx)))
+            
+            # Normalize slices to have start/stop for np.mgrid
+            normalized_slices = tuple(slc.indices(dim) for slc, dim in zip(idx, shape))
+            final_slices = tuple(slice(s, e, t) for s, e, t in normalized_slices)
+            
+            flat_indices = _get_flat_indices_for_slice_tuple(final_slices, shape)
+            flat_idx_list = flat_indices.tolist()
+
+        else:
+            # --- Fallback Path (Original Logic) ---
+            # Create the dummy array only if we need it.
+            if lazy_arange_arr is None:
+                lazy_arange_arr = np.arange(total_elements).reshape(shape)
+            
+            try:
+                selected_elements = lazy_arange_arr[idx]
+                # Use .ravel() which can be a no-op view, more efficient than flatten()
+                flat_idx_list = selected_elements.ravel().tolist()
+            except IndexError as e:
+                raise IndexError(
+                    f"An indexer in the list is invalid for the given shape. "
+                    f"Indexer: {idx}, Shape: {shape}. Original Error: {e}"
+                ) from e
+
+        # Using set directly on the list is fine, no need for sorted() here yet
+        contributions.append(list(set(flat_idx_list)))
+
+    # --- Aggregation & Post-processing (mostly unchanged) ---
     all_flat_indices = set()
     for contrib in contributions:
         all_flat_indices.update(contrib)
@@ -1552,19 +1595,19 @@ def compose_or_flatten_union(
     if not all_flat_indices:
         return empty_slice_tuple, True, empty_shape, empty_locals
 
-    sorted_union_indices = sorted(list(all_flat_indices))
+    sorted_union_indices = sorted(all_flat_indices)
 
     global_to_local_map = {
         global_idx: local_idx
         for local_idx, global_idx in enumerate(sorted_union_indices)
     }
 
-    # 3. Calculate Local Indices
     local_indices = []
     for contrib in contributions:
-        local_indices.append([global_to_local_map[g_idx] for g_idx in contrib])
+        # Sort contribution for deterministic output if needed, although not strictly necessary
+        local_indices.append(sorted([global_to_local_map[g_idx] for g_idx in contrib]))
         
-    # 4. Composability Check & Shape Calculation
+    # --- Composability Check & Shape Calculation (unchanged) ---
     multi_dim_coords = np.unravel_index(sorted_union_indices, shape)
     min_coords = np.min(multi_dim_coords, axis=1)
     max_coords = np.max(multi_dim_coords, axis=1)
@@ -1573,7 +1616,6 @@ def compose_or_flatten_union(
     expected_size = np.prod(bounding_box_dims)
 
     if len(sorted_union_indices) == expected_size:
-        # Composable case
         composed_slices = tuple(
             slice(int(min_c), int(max_c) + 1)
             for min_c, max_c in zip(min_coords, max_coords)
@@ -1582,9 +1624,10 @@ def compose_or_flatten_union(
         result_indices = composed_slices
         is_composable = True
     else:
-        # Non-composable case
         final_shape = (len(sorted_union_indices),)
-        result_indices = [int(i) for i in sorted_union_indices]
+        # The original code casted to int here, which is good practice.
+        # But `sorted_union_indices` already contains Python ints.
+        result_indices = sorted_union_indices
         is_composable = False
 
     return result_indices, is_composable, final_shape, local_indices
