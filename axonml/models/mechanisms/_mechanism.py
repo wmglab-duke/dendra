@@ -186,6 +186,7 @@ class Mechanism(_Parameterized):
         self.DE = torch.nn.ModuleDict(
             {state._name: state for state in states}
         )
+
         self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
         if ic is not None:
             self._init_params.update(ic)

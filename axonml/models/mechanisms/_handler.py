@@ -48,7 +48,7 @@ class MechanismHandler(torch.nn.Module):
     def write_to_ions(self, v):
         for ion, ion_c_write in self.write_ion_c.items():
             for k, conc_list in ion_c_write.items():
-                meck = self.mechanisms[k]
+                mech = self.mechanisms[k]
                 for conc in conc_list:
                     ion_conc_u = getattr(mech, conc)
                     ion_conc_u = mech.put(ion_conc_u, getattr(self.ions[ion], conc), v)
@@ -113,15 +113,14 @@ class MechanismHandler(torch.nn.Module):
 
         for ion, dict_of_mech_and_quantities in self.write_ion_c.items():
             for mech, quantities in dict_of_mech_and_quantities.items():
+                m = self.mechanisms[mech]
                 for quantity in quantities:
-                    q = getattr(self.ions[ion], quantity)
+                    q = m.get(getattr(self.ions[ion], quantity))
                     nd = q.ndim
-                    if self.keys[mech] is not None and nd > 0:
-                        q = q[self.keys[mech]]
-                    setattr(self.mechanisms[mech], quantity, torch.empty(q.shape, device=q.device, dtype=q.dtype))
-                    getattr(self.mechanisms[mech], quantity).copy_(q)
+                    setattr(m, quantity, torch.empty(q.shape, device=q.device, dtype=q.dtype))
+                    getattr(m, quantity).copy_(q)
                     for _, s in self.mechanisms[mech].DE.items():
-                        setattr(s, quantity, getattr(self.mechanisms[mech], quantity))
+                        setattr(s, quantity, getattr(m, quantity))
         return
 
     def init_buffers(self, v):

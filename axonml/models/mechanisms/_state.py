@@ -254,8 +254,8 @@ def build_cnexp(states, assigned, derivative, pade=False):
 
 class State(_Parameterized):
 
-    _buffers = set()
-    _buffers_declarations = []
+    _state_buffers = set()
+    _state_buffers_declarations = []
 
     _state = set()
     _state_declarations = []
@@ -289,8 +289,8 @@ class State(_Parameterized):
             # We look for a _params attribute defined directly on the base
             if '_state' in base.__dict__:
                 new_state.update(base._state)
-            if '_buffers' in base.__dict__:
-                new_buffers.update(base._buffers)
+            if '_state_buffers' in base.__dict__:
+                new_buffers.update(base._state_buffers)
             if '_derivative' in base.__dict__:
                 new_derivative.update(base._derivative)
             if '_assigned' in base.__dict__:
@@ -301,10 +301,10 @@ class State(_Parameterized):
                 new_state.update(s_list)
             State._state_declarations = []
         
-        if State._buffers_declarations:
-            for b_list in State._buffers_declarations:
+        if State._state_buffers_declarations:
+            for b_list in State._state_buffers_declarations:
                 new_buffers.update(b_list)
-            State._buffers_declarations = []
+            State._state_buffers_declarations = []
 
         if State._derivative_declarations:
             for d_list in State._derivative_declarations:
@@ -317,7 +317,7 @@ class State(_Parameterized):
             State._assigned_declarations = []
 
         cls._state = list(new_state)
-        cls._buffers = new_buffers
+        cls._state_buffers = new_buffers
         cls._derivative = new_derivative
         cls._assigned = list(new_assigned)
 
@@ -340,7 +340,7 @@ class State(_Parameterized):
         if self.has_q10:
             self.register_buffer("q10_cache", torch.as_tensor(self.calc_q10()))
 
-        for b in self._buffers:
+        for b in self._state_buffers:
             self.register_buffer(b, torch.tensor(0.0))
 
         pade = kwargs.get("pade", False)

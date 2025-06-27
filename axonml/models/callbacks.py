@@ -404,7 +404,6 @@ class Recorder(Callback):
         node_indices=None, 
         dt=None, 
         sliding_window=None,
-        network=False
     ):
         super().__init__()
         self.states = states
@@ -418,7 +417,7 @@ class Recorder(Callback):
             self.node_indices = torch.as_tensor(node_indices, dtype=torch.long)
 
         self.sliding_window = sliding_window
-        rfunc = build_recorder_func(states, self.max_only, self.indexed, network=network)
+        rfunc = build_recorder_func(states, self.max_only, self.indexed)
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
 
