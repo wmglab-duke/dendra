@@ -132,7 +132,7 @@ class Slice:
     def inject(self, waveform):
         self.model.stimuli.append((waveform, self.index_spec.out_shape, self.index_spec.index))
 
-    def insert(self, mechanism, alias, ic=None, **kwargs):
+    def insert(self, mechanism, alias=None, ic=None, **kwargs):
         self.model.insert(mechanism, alias=alias, index_spec=self.index_spec, **kwargs)
 
     def label(self, name: str):

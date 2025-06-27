@@ -60,7 +60,7 @@ def _single_dhs_kernel(
     # fully complete across the entire tree before back-substitution begins.
     tl.debug_barrier()
 
-    # --- 2. BACKWARD SUBSTITUTION (Unchanged) ---
+    # --- 2. BACKWARD SUBSTITUTION ---
     for l in range(L - 1, -1, -1):
         s = tl.load(LAYER_PTR_ptr + l)
         e = tl.load(LAYER_PTR_ptr + l + 1)
