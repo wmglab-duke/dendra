@@ -1,6 +1,8 @@
+import math
 import triton
 import triton.language as tl
 import torch
+
 
 @triton.jit
 def _single_dhs_kernel(
@@ -24,7 +26,7 @@ def _single_dhs_kernel(
         e = tl.load(LAYER_PTR_ptr + l + 1)
         m = lane < (e - s)
         
-        idx = tl.load(ORDER_ptr + s + lane, mask=m, other=0)
+        idx   = tl.load(ORDER_ptr + tl.where(m, s + lane, 0), mask=m, other=0)
         parent = tl.load(P_ptr + idx, mask=m, other=-1)
         
         # Load the axial conductance g_i for the current compartment `idx`.
@@ -41,8 +43,10 @@ def _single_dhs_kernel(
         tl.atomic_add(D + idx, g_i, mask=m)
         
         valid_parent_mask = m & (parent >= 0)
+        safe_parent = tl.where(valid_parent_mask, parent, 0)
+
         # Add g_i to our parent's diagonal
-        tl.atomic_add(D + parent, g_i, mask=valid_parent_mask)
+        tl.atomic_add(D + safe_parent, g_i, mask=valid_parent_mask)
 
         # --- Elimination Step ---
         # At this point, D[idx] is fully computed and can be safely read.
@@ -53,10 +57,10 @@ def _single_dhs_kernel(
         fac = -g_i / d_i
 
         # Update parent's D and B values using the computed factor.
-        tl.atomic_add(D + parent, fac * g_i, mask=valid_parent_mask)
-        tl.atomic_add(B + parent, -fac * b_i, mask=valid_parent_mask)
+        tl.atomic_add(D + safe_parent, fac * g_i, mask=valid_parent_mask)
+        tl.atomic_add(B + safe_parent, -fac * b_i, mask=valid_parent_mask)
 
-    # A barrier is still needed here to ensure the forward pass is
+    # A barrier is needed here to ensure the forward pass is
     # fully complete across the entire tree before back-substitution begins.
     tl.debug_barrier()
 
@@ -66,121 +70,19 @@ def _single_dhs_kernel(
         e = tl.load(LAYER_PTR_ptr + l + 1)
         m = lane < (e - s)
         
-        idx = tl.load(ORDER_ptr + s + lane, mask=m, other=0)
+        idx   = tl.load(ORDER_ptr + tl.where(m, s + lane, 0), mask=m, other=0)
         parent = tl.load(P_ptr + idx, mask=m, other=-1)
+        valid_parent_mask = m & (parent >= 0)
+        safe_parent       = tl.where(valid_parent_mask, parent, 0)
 
         g_i = tl.load(A + idx, mask=m)
         d_i = tl.load(D + idx, mask=m)
         b_i = tl.load(B + idx, mask=m)
 
-        valid_p = parent >= 0
-        v_parent = tl.load(V + tl.where(valid_p, parent, 0), mask=m & valid_p, other=0.0)
+        v_parent = tl.load(V + safe_parent, mask=valid_parent_mask, other=0.0)
         
         v_i = (b_i + g_i * v_parent) / d_i
         tl.store(V + idx, v_i, mask=m)
-
-
-# --- KERNEL 1: INITIALIZATION ---
-@triton.jit
-def dhs_init_kernel(D_ptr, A_ptr, P_ptr, ORDER_ptr, LAYER_PTR_ptr,
-                    B: tl.constexpr, K: tl.constexpr, L: tl.constexpr, K_THREADS: tl.constexpr):
-    pid_b = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    D = D_ptr + pid_b * K
-    A = A_ptr + pid_b * K
-    
-    # Each thread block processes a unique range of compartments
-    base_idx = pid_k * K_THREADS
-    
-    for l in range(0, L):
-        s = tl.load(LAYER_PTR_ptr + l)
-        e = tl.load(LAYER_PTR_ptr + l + 1)
-        
-        # This block's threads work on a subset of the layer
-        offsets = base_idx + tl.arange(0, K_THREADS)
-        layer_mask = (offsets >= s) & (offsets < e)
-
-        idx = tl.load(ORDER_ptr + offsets, mask=layer_mask, other=0)
-        parent = tl.load(P_ptr + idx, mask=layer_mask, other=-1)
-        
-        g_i = tl.load(A + idx, mask=layer_mask, other=0.)
-        
-        tl.atomic_add(D + idx, g_i, mask=layer_mask)
-        
-        valid_parent_mask = layer_mask & (parent >= 0)
-        tl.atomic_add(D + parent, g_i, mask=valid_parent_mask)
-
-
-# --- KERNEL 2: FORWARD ELIMINATION ---
-@triton.jit
-def dhs_fwd_kernel(D_ptr, B_ptr, A_ptr, P_ptr, ORDER_ptr, LAYER_PTR_ptr,
-                   B: tl.constexpr, K: tl.constexpr, L: tl.constexpr, K_THREADS: tl.constexpr):
-    pid_b = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    D = D_ptr + pid_b * K
-    B = B_ptr + pid_b * K
-    A = A_ptr + pid_b * K
-    
-    base_idx = pid_k * K_THREADS
-
-    for l in range(0, L):
-        s = tl.load(LAYER_PTR_ptr + l)
-        e = tl.load(LAYER_PTR_ptr + l + 1)
-        
-        offsets = base_idx + tl.arange(0, K_THREADS)
-        layer_mask = (offsets >= s) & (offsets < e)
-
-        idx = tl.load(ORDER_ptr + offsets, mask=layer_mask, other=0)
-        parent = tl.load(P_ptr + idx, mask=layer_mask, other=-1)
-        
-        g_i = tl.load(A + idx, mask=layer_mask)
-        d_i = tl.load(D + idx, mask=layer_mask)
-        b_i = tl.load(B + idx, mask=layer_mask)
-
-        fac = -g_i / d_i
-        
-        update_mask = layer_mask & (parent >= 0)
-        tl.atomic_add(D + parent, fac * g_i, mask=update_mask)
-        tl.atomic_add(B + parent, -fac * b_i, mask=update_mask)
-
-
-# --- KERNEL 3: BACKWARD SUBSTITUTION ---
-@triton.jit
-def dhs_bwd_sub_kernel(V_ptr, D_ptr, B_ptr, A_ptr, P_ptr, ORDER_ptr, LAYER_PTR_ptr,
-                       B: tl.constexpr, K: tl.constexpr, L: tl.constexpr, K_THREADS: tl.constexpr):
-    pid_b = tl.program_id(0)
-    pid_k = tl.program_id(1)
-
-    V = V_ptr + pid_b * K
-    D = D_ptr + pid_b * K
-    B = B_ptr + pid_b * K
-    A = A_ptr + pid_b * K
-    
-    base_idx = pid_k * K_THREADS
-    
-    for l in range(L - 1, -1, -1):
-        s = tl.load(LAYER_PTR_ptr + l)
-        e = tl.load(LAYER_PTR_ptr + l + 1)
-        
-        offsets = base_idx + tl.arange(0, K_THREADS)
-        layer_mask = (offsets >= s) & (offsets < e)
-
-        idx = tl.load(ORDER_ptr + offsets, mask=layer_mask, other=0)
-        parent = tl.load(P_ptr + idx, mask=layer_mask, other=-1)
-
-        g_i = tl.load(A + idx, mask=layer_mask)
-        b_i = tl.load(B + idx, mask=layer_mask)
-        d_i = tl.load(D + idx, mask=layer_mask)
-
-        valid_p = parent >= 0
-        parent_mask = layer_mask & valid_p
-        
-        v_parent = tl.load(V + tl.where(valid_p, parent, 0), mask=parent_mask, other=0.0)
-        
-        v_i = (b_i + g_i * v_parent) / d_i
-        tl.store(V + idx, v_i, mask=layer_mask)
 
 
 class DHSSolveStable(torch.autograd.Function):
@@ -220,8 +122,8 @@ class DHSSolveStable(torch.autograd.Function):
         B, K = d_mem.shape
         L = layer_ptr.numel() - 1
 
-        # --- 1. Adjoint Solve: Aᵀg = grad_out ---
-        # Since our implicit matrix A is symmetric, Aᵀ=A. We can reuse the
+        # --- 1. Adjoint Solve: A^Tg = grad_out ---
+        # Since our implicit matrix A is symmetric, A^T=A. We can reuse the
         # forward kernel to solve A*g = grad_out.
         d_full_adj = d_mem.clone()
         g = torch.empty_like(grad_out) # g is the adjoint vector

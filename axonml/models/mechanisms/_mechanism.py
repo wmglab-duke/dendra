@@ -2,7 +2,7 @@ from types import MethodType
 import torch
 
 from axonml.models.parametric import _Parameterized
-from .handler.ions import VALENCES
+from ._ions import VALENCES
 from ._symbolic import build_current_eq
 
 

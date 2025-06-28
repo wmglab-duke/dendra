@@ -55,7 +55,6 @@ def pcr_tridiag_solve(
         alpha = torch.where(has_L, a_full / b_L, torch.zeros_like(a_full))
         gamma = torch.where(has_R, c_full / b_R, torch.zeros_like(c_full))
 
-        # core PCR updates (Stone & Schultheiss 1973, Alg. 3)
         b_full = b_full - c_L * alpha - a_R * gamma
         d_full = d_full - d_L * alpha - d_R * gamma
         a_full = -a_L * alpha

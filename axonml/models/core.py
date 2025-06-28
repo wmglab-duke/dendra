@@ -28,6 +28,8 @@ from axonml.units import mm, um
 from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
 from axonml.models.interfaces import HandlerInterface
 from axonml.models.integrators import euler, dufort_frankel, bwd_euler_ub, bwd_euler_sc
+from axonml.models.mechanisms._ions import Ion
+
 
 from axonml.helpers import (
     op_mc, op_sc, ve_from_s_t, 
@@ -36,6 +38,7 @@ from axonml.helpers import (
     FULLGRAPH, DYNAMIC, JIT,
     ctx, tic, toc
 )
+
 
 from .slice import parse_key, Slice
 
@@ -1001,15 +1004,9 @@ class Population(Parameterized):
             ion_write_c = self._ion_write_c.get(ion, {})
             ion_read = self._ion_read.get(ion, {})
             ion_style = self.get_ion_style(ion)
-            ions[ion] = build_ion(
+            ions[ion] = Ion(
                 ion,
                 self.shape,
-                self.np,
-                self.nc,
-                self._m_list,
-                self._m_name,
-                ion_read,
-                ion_write_c,
                 *ion_style,
             )
             for m in self._m_list:
