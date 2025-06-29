@@ -149,13 +149,16 @@ def _thomas_triton(lower, main, upper, rhs):
     B, K = rhs.shape[:2]
     out  = torch.empty_like(rhs)
 
+    main_c = main.clone()
+    rhs_c  = rhs.clone()
+
     thomas_bt3_kernel[
         (B,)
     ](  # one block per fibre
         lower   .reshape(B, -1), 
-        main    .reshape(B, -1),
+        main_c  .reshape(B, -1),
         upper   .reshape(B, -1), 
-        rhs     .reshape(B, -1),
+        rhs_c   .reshape(B, -1),
         out     .reshape(B, -1),
         K=K,
         num_warps=1, 
@@ -218,6 +221,6 @@ class ThomasSolve(torch.autograd.Function):
 
 
 # convenience function -------------------------------------------------
-def thomas_triton_bt(lower, main, upper, rhs):
+def thomas_solve_cuda_bt(lower, main, upper, rhs):
     """ differentiable replacement for thomas_triton """
     return ThomasSolve.apply(lower, main, upper, rhs)

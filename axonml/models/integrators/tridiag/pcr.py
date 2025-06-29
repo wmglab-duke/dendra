@@ -1,7 +1,7 @@
 import torch
 
 
-def pcr_tridiag_solve(
+def pcr_solve_t(
     a: torch.Tensor,  # (B,K-1) sub-diag
     b: torch.Tensor,  # (B,K)   main diag
     c: torch.Tensor,  # (B,K-1) super-diag

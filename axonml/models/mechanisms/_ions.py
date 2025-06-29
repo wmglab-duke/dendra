@@ -57,7 +57,7 @@ def ion_register(ion, valence, e, i0, o0):
     CINIT[f"{ion}i0"] = i0
 
 
-class e_context(ContextDecorator):
+class equilibria(ContextDecorator):
     _last = {}
 
     def __init__(self, use_last=False, **kwargs):
@@ -67,14 +67,14 @@ class e_context(ContextDecorator):
             raise ValueError(f"Reversal potential not found: {not_in_reversal}")
         self.updates = kwargs
         if not use_last:
-            e_context._last = self.updates
+            equilibria._last = self.updates
             if DEBUG:
-                print(e_context._last)
+                print(equilibria._last)
         if use_last:
-            self.updates.update(e_context._last)
+            self.updates.update(equilibria._last)
             if DEBUG:
                 print(self.updates)
-            e_context._last = {}
+            equilibria._last = {}
         self.original_values = {}
 
     def __enter__(self):
@@ -91,7 +91,7 @@ class e_context(ContextDecorator):
         return False  # Propagate exceptions if any
 
 
-class c_context(ContextDecorator):
+class concentrations(ContextDecorator):
     _last = {}
 
     def __init__(self, use_last=False, **kwargs):
@@ -101,14 +101,14 @@ class c_context(ContextDecorator):
             raise ValueError(f"Initial concentration not found: {not_in_cinit}")
         self.updates = kwargs
         if not use_last:
-            c_context._last = self.updates
+            concentrations._last = self.updates
             if DEBUG:
-                print(c_context._last)
+                print(concentrations._last)
         if use_last:
-            self.updates.update(c_context._last)
+            self.updates.update(concentrations._last)
             if DEBUG:
                 print(self.updates)
-            c_context._last = {}
+            concentrations._last = {}
         self.original_values = {}
 
     def __enter__(self):

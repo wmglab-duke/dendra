@@ -12,7 +12,7 @@ from ..declarations import (
 )
 from .core import Mechanism, State
 from .handler.ions import USEION
-from ._ions import ion_register, c_context, e_context
+from ._ions import ion_register, concentrations, equilibria
 
 __all__ = [
     "Mechanism",
@@ -29,6 +29,6 @@ __all__ = [
     "ASSIGNED",
     "BUFFERS",
     "DIFFUSION",
-    "c_context",
-    "e_context",
+    "concentrations",
+    "equilibria",
 ]

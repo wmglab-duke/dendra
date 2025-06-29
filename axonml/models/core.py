@@ -18,7 +18,7 @@ from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
 from axonml.models.parametric import Parameterized
 from axonml.models.mechanisms.core import Mechanism, validate
-from axonml.models.mechanisms import c_context, e_context
+from axonml.models.mechanisms import concentrations, equilibria
 from axonml.models.declarations import PARAMETER
 from axonml.models.mechanisms.handler.defaults import valid_ions
 from axonml.models.mechanisms.handler.handler import build_handler
@@ -35,7 +35,7 @@ from axonml.helpers import (
     op_mc, op_sc, ve_from_s_t, 
     IMEM, CUDA, DTWARN, DEBUG, 
     DETECT_ANOMALIES, PADE, BACKEND, 
-    FULLGRAPH, DYNAMIC, JIT,
+    FULLGRAPH, DYNAMIC, JIT, COMPILE_MODE,
     ctx, tic, toc
 )
 
@@ -134,6 +134,7 @@ class Population(Parameterized):
         self.fullgraph = bool(FULLGRAPH)
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
+        self.compile_mode = COMPILE_MODE.value 
 
         self.compiler = integrator.compiler(DEBUG, DETECT_ANOMALIES, PADE)
         self.builder = None
@@ -181,7 +182,8 @@ class Population(Parameterized):
                 step, 
                 backend   = self.backend, 
                 fullgraph = self.fullgraph, 
-                dynamic   = self.dynamic
+                dynamic   = self.dynamic,
+                mode      = self.compile_mode,
             )
         else:
             self._step = step
@@ -973,6 +975,9 @@ class Population(Parameterized):
 
 
     def build(self):
+        
+        df = self.integrator.is_df
+
         for mech, (name, ic, kwargs) in self._mech_everywhere.items():
             key = None
             shape = self.shape
@@ -996,8 +1001,6 @@ class Population(Parameterized):
 
         _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
         self._m_curr.update(_ion_write)
-
-        df = self.integrator.is_df
 
         ions = {}
         for ion in all_ions:
@@ -1133,8 +1136,8 @@ class Axon(Population):
         if changed:
             self.calculate_geometric_params()
         with (
-            e_context(use_last=True),
-            c_context(use_last=True),
+            equilibria(use_last=True),
+            concentrations(use_last=True),
         ):
             self.build()
         if CUDA:

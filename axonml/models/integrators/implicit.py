@@ -18,8 +18,8 @@ from axonml.models.mechanisms.handler.builders import ImplicitHandlerBuilder
 from axonml.helpers import IMEM
 
 from .core import Integrator, SCIntegrator
-from .tridiag import pcr_tridiag_solve
-from .triton import thomas_triton_bt, thomas_triton_bt_n
+from .tridiag import pcr_solve_t
+from .triton import thomas_solve_cuda_bt, thomas_solve_cuda_bt_n
 
 
 class _bwd_euler_sc(SCIntegrator):

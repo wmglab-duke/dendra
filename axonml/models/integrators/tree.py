@@ -1,4 +1,5 @@
 from collections import deque
+from functools import partial
 from typing import NamedTuple, List, Tuple
 
 import numpy as np
@@ -8,8 +9,15 @@ from axonml.models.mechanisms.compilers import MechCompiler, ImplicitCompiler
 from axonml.models.mechanisms.handler.builders import ImplicitHandlerBuilder
 
 from .core import Integrator
-from .triton import dhs_solve
+from .triton import dhs_solve_cuda
+
 from axonml.helpers import tic, toc
+
+try:
+    import axonml_solvers
+    AXONML_SOLVERS_AVAILABLE = True
+except ImportError:
+    AXONML_SOLVERS_AVAILABLE = False
 
 
 def build_morphology(parent_idx: List[int]) -> Tuple[
@@ -291,6 +299,24 @@ class _dhs(Integrator):
 
         device = model.device()
 
+        if device.type == 'cpu' and not AXONML_SOLVERS_AVAILABLE:
+            raise ImportError(
+                "DHS integrator requires axonml_solvers package for CPU execution. "
+                "Please install it with `pip install axonml_solvers`."
+            )
+        
+        if device.type == 'cuda':
+            self.solve = partial(
+                dhs_solve_cuda,
+                threads=self.threads
+            )
+        elif device.type == 'cpu':
+            self.solve = torch.ops.axonml_solvers.dhs_solve
+        else:
+            raise NotImplementedError(
+                f"DHS integrator is not implemented for device type {device.type}."
+            )
+
         parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(model.graph)
         parent_idx, children, depth = build_morphology(parent_idx_t.tolist())
         order, layer_ptr = build_dhs_layers(depth, self.threads)
@@ -361,12 +387,11 @@ class _dhs(Integrator):
         b_ = RHS.index_select(-1, self.solver_order)    # (B, N)
         a  = self.a_geom                                # (B, N) axial conductance
 
-        v_out = dhs_solve(
+        v_out = self.solve(
             d_, a, b_,
-            self.parent_idx.to(d_.device, dtype=torch.int32),
-            self.order.to(d_.device, dtype=torch.int32),
-            self.layer_ptr.to(d_.device, dtype=torch.int32),
-            threads=self.threads
+            self.parent_idx.to(d_.device, dtype=torch.int64),
+            self.order.to(d_.device, dtype=torch.int64),
+            self.layer_ptr.to(d_.device, dtype=torch.int64),
         )
 
         v = v_out.index_select(-1, self.inv_solver_order)  # (B, N)

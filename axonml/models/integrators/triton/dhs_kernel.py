@@ -122,53 +122,44 @@ class DHSSolveStable(torch.autograd.Function):
         B, K = d_mem.shape
         L = layer_ptr.numel() - 1
 
-        # --- 1. Adjoint Solve: A^Tg = grad_out ---
-        # Since our implicit matrix A is symmetric, A^T=A. We can reuse the
-        # forward kernel to solve A*g = grad_out.
+        # --- 1. Adjoint Solve ---
         d_full_adj = d_mem.clone()
-        g = torch.empty_like(grad_out) # g is the adjoint vector
-
+        g = torch.empty_like(grad_out)
         _single_dhs_kernel[(B,)](
             d_full_adj, a_geom, grad_out.clone(), g,
             parent_idx, order, layer_ptr,
-            K=K, L=L, K_THREADS=threads,
-            num_warps=1, num_stages=4
+            K=K, L=L, K_THREADS=threads, # ... other kernel args
         )
         
         # --- 2. Compute Parameter Gradients ---
-
-        # Gradient w.r.t RHS `b` is simply the adjoint `g`
         grad_b = g
-
-        # Gradient w.r.t membrane diagonal `d_mem`
-        # d_mem only affects the main diagonal of A, so the gradient is -(g * x)
         grad_d_mem = -(g * x)
 
-        # Gradient w.r.t axial conductance `a_geom` (g_i)
-        # This is the most important change. The gradient is the negative
-        # product of the voltage difference and the adjoint difference.
+        # --- CORRECTED Gradient w.r.t axial conductance `a_geom` (g_i) ---
+        grad_a_geom = torch.zeros_like(a_geom)
         
-        # Gather parent values for x and g
-        # We need to clamp parent indices to 0 for the root to avoid out-of-bounds
+        is_root = (parent_idx == -1)
+        non_root_mask = ~is_root
+
+        # Case 1: Non-root compartments
         parent_idx_clamped = parent_idx.clamp_min(0).to(torch.int64)
         x_parent = x.gather(1, parent_idx_clamped.expand_as(x))
         g_parent = g.gather(1, parent_idx_clamped.expand_as(g))
-
-        # Calculate differences across each compartment's axial resistance
+        
         delta_x = x - x_parent
         delta_g = g - g_parent
+        
+        full_grad_a_geom = -(delta_g * delta_x)
+        grad_a_geom[:, non_root_mask] = full_grad_a_geom[:, non_root_mask]
 
-        grad_a_geom = -(delta_g * delta_x)
-
-        # The root compartment has no parent, so its gradient must be zero.
-        # Its parent index is -1.
-        is_root = (parent_idx == -1).view(1, -1)
-        grad_a_geom = grad_a_geom.masked_fill(is_root, 0.0)
-
+        # Case 2: Root compartment(s)
+        grad_a_geom[:, is_root] = -(g[:, is_root] * x[:, is_root])
+        
+        # The return signature must match the forward inputs
         return grad_d_mem, grad_a_geom, grad_b, None, None, None, None
 
 
-def dhs_solve(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads=32):
+def dhs_solve_cuda(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads=32):
     """
     Differentiable and numerically stable DHS solver for tree structures.
 

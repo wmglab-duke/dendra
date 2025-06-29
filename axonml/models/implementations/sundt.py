@@ -1,6 +1,6 @@
 from ..core import Unmyelinated
 from ..mod import kdr, pas, nahh
-from ..mechanisms import PARAMETER, e_context
+from ..mechanisms import PARAMETER, equilibria
 
 from axonml.units import mm
 from axonml.models.integrators import bwd_euler_ub
@@ -77,7 +77,7 @@ class Sundt2015(Unmyelinated):
             integrator = bwd_euler_ub()
         super().__init__(diameters, L, dx, celsius, v_init, integrator)
 
-        with e_context(ek=-90.0):
+        with equilibria(ek=-90.0):
             self.insert(kdr, gkbar=0.04)
             self.insert(nahh, gnabar=0.04)
             self.insert(pas, g=0.0001, e=-65.0)

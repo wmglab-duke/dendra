@@ -5,7 +5,7 @@ from ..mod import (
     kdrTiger, kna, naoiTiger, koiTiger,
     leak,
 )
-from ..mechanisms import PARAMETER, c_context
+from ..mechanisms import PARAMETER, concentrations
 
 from axonml.units import mm
 from axonml.models.integrators import bwd_euler_ub
@@ -104,7 +104,7 @@ class Tigerholm2014(Unmyelinated):
         self.register_pre_initialize_hook(pre_init)
         self.register_post_initialize_hook(balance)
 
-        with c_context(nai0=11.4, nao0=154.0, ki0=144.9, ko0=5.6):
+        with concentrations(nai0=11.4, nao0=154.0, ki0=144.9, ko0=5.6):
             self.insert(ks, gbar=0.0069733)
             self.insert(kf, gbar=0.012756)
             self.insert(h, gbar=0.0025377)

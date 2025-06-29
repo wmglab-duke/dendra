@@ -67,6 +67,7 @@ BACKEND = ContextVar("BACKEND", "inductor")
 FULLGRAPH = ContextVar("FULLGRAPH", 1)
 DYNAMIC = ContextVar("DYNAMIC", 0)
 JIT = ContextVar("JIT", 1)
+COMPILE_MODE = ContextVar("COMPILE_MODE", "default")
 
 
 def numpify(x):

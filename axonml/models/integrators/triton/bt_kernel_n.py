@@ -8,161 +8,168 @@ import torch
 # It's designed to be called from within another kernel.
 # ---------------------------------------------------------------------
 @triton.jit
-def invNxN(mat_ptr, inv_ptr, N: tl.constexpr):
+def invNxN_scalar(A_sram, N: tl.constexpr, N_padded: tl.constexpr):
     """
-    Inverts an N x N matrix.
-    `mat_ptr`: Pointer to the input matrix (N*N elements).
-    `inv_ptr`: Pointer to store the output inverse (N*N elements).
-    `N`: The size of the matrix, must be a compile-time constant.
+    Inverts an N x N matrix by operating on a Python list-of-lists of scalar
+    Triton tensors. This is the most robust method.
+    `A_sram`: An (N_padded, N_padded) tl.tensor holding the input matrix.
     """
-    # Create local copies of the matrix and an identity matrix
-    # Using python loops with tl.static_range to unroll for the compiler
-    A = tl.zeros((N, N), dtype=tl.float32)
-    I = tl.zeros((N, N), dtype=tl.float32)
+    # 1. Load the N x N portion of A_sram into a list-of-lists of scalars.
+    #    Also create the identity matrix in the same format.
+    #    These are Python loops that unroll at compile time.
+    A = []
+    I = []
+    for i in range(N):
+        A_row = []
+        I_row = []
+        for j in range(N):
+            A_row.append(A_sram[i, j])
+            I_row.append(1.0 if i == j else 0.0)
+        A.append(A_row)
+        I.append(I_row)
 
-    for i in tl.static_range(N):
-        for j in tl.static_range(N):
-            A[i, j] = tl.load(mat_ptr + i * N + j)
-            if i == j:
-                I[i, j] = 1.0
-
-    # Perform Gaussian-Jordan elimination
-    for i in tl.static_range(N):
-        # Find pivot
-        pivot = A[i, i]
+    # 2. Perform Gaussian-Jordan elimination on the lists of scalars.
+    #    This code is now guaranteed to work because it only uses
+    #    operations on scalar tl.tensors.
+    for i in range(N):
+        pivot = A[i][i]
         inv_pivot = 1.0 / pivot
-
-        # Normalize the pivot row
-        for j in tl.static_range(N):
-            A[i, j] = A[i, j] * inv_pivot
-            I[i, j] = I[i, j] * inv_pivot
-
-        # Eliminate other rows
-        for row in tl.static_range(N):
+        for j in range(N):
+            A[i][j] *= inv_pivot
+            I[i][j] *= inv_pivot
+        for row in range(N):
             if row != i:
-                factor = A[row, i]
-                for col in tl.static_range(N):
-                    A[row, col] = A[row, col] - factor * A[i, col]
-                    I[row, col] = I[row, col] - factor * I[i, col]
+                factor = A[row][i]
+                for col in range(N):
+                    A[row][col] -= factor * A[i][col]
+                    I[row][col] -= factor * I[i][col]
 
-    # Store the result (the transformed identity matrix)
-    for i in tl.static_range(N):
-        for j in tl.static_range(N):
-            tl.store(inv_ptr + i * N + j, I[i, j])
+    # 3. Convert the result list-of-lists back into a single tl.tensor for output.
+    #    We create a new padded tensor and fill it using tl.where.
+    inv_matrix = tl.zeros((N_padded, N_padded), dtype=tl.float32)
+    for r in range(N):
+        for c in range(N):
+            # This is a functional-style assignment:
+            # "new_matrix = where(condition, value_if_true, old_matrix)"
+            is_target_cell = (tl.arange(0, N_padded)[:, None] == r) & (tl.arange(0, N_padded)[None, :] == c)
+            inv_matrix = tl.where(is_target_cell, I[r][c], inv_matrix)
+            
+    return inv_matrix
 
-# ---------------------------------------------------------------------
-# one thread / one fibre, N and K arbitrary
-# ---------------------------------------------------------------------
+
+@triton.jit
+def load_block_masked(ptr, N: tl.constexpr, N_padded: tl.constexpr):
+    """ Loads an N x N block into a padded N_padded x N_padded SRAM tensor. """
+    offs_r = tl.arange(0, N_padded)
+    offs_c = tl.arange(0, N_padded)
+    block_ptr = ptr + (offs_r[:, None] * N + offs_c[None, :])
+    mask = (offs_r[:, None] < N) & (offs_c[None, :] < N)
+    return tl.load(block_ptr, mask=mask, other=0.0)
+
+
+@triton.jit
+def store_block_masked(ptr, block, N: tl.constexpr, N_padded: tl.constexpr):
+    """ Stores the top-left N x N part of a padded SRAM tensor. """
+    offs_r = tl.arange(0, N_padded)
+    offs_c = tl.arange(0, N_padded)
+    block_ptr = ptr + (offs_r[:, None] * N + offs_c[None, :])
+    mask = (offs_r[:, None] < N) & (offs_c[None, :] < N)
+    tl.store(block_ptr, block, mask=mask)
+
+# =============================================================================
+# MAIN KERNEL
+# =============================================================================
+
 @triton.jit
 def thomas_btn_kernel(
         L_ptr, M_ptr, U_ptr, D_ptr, X_ptr,
-        K: tl.constexpr, N: tl.constexpr):
-
-    bid = tl.program_id(0)          # batch id
-
-    # Define block sizes for convenience
+        K: tl.constexpr, N: tl.constexpr, N_padded: tl.constexpr):
+    
+    bid = tl.program_id(0)
     N_SQ = N * N
-
-    # base addresses for this system
+    
     L = L_ptr + bid * (K-1) * N
     M = M_ptr + bid *  K    * N_SQ
     U = U_ptr + bid * (K-1) * N
     D = D_ptr + bid *  K    * N
     X = X_ptr + bid *  K    * N
     
-    # Allocate space for a single N*N inverse matrix in SRAM.
-    # This is much faster than re-calculating it multiple times.
-    inv_sram_ptr = tl.make_tensor_ptr(
-        base=tl.zeros((N_SQ,), dtype=tl.float32), 
-        shape=(N,N), 
-        stride=(N,1), 
-        order=(1,0)
-    )
-
-    # ---------------- forward elimination ---------------------------
-    # invert first main block
-    invNxN(M, inv_sram_ptr, N)
+    # --- Forward elimination ---
+    M_k_sram = load_block_masked(M, N, N_padded)
+    inv_sram = invNxN_scalar(M_k_sram, N, N_padded)
 
     for k in range(1, K):
-        # W_k = L_{k-1} * M_{k-1}^{-1}
-        # Since L is diagonal, this is L_i * row_i(M_inv)
-        # A_k' = A_k - W_k * U_{k-1}
-        # Since U is diagonal, this is A_k - (L_i*M_inv_ij*U_j)
-        
-        # We perform this update in-place on A_k
         base_M_k = M + k * N_SQ
-        
-        for i in tl.static_range(N):
-            l_i = tl.load(L + (k-1)*N + i)
-            for j in tl.static_range(N):
-                m_inv_ij = tl.load(inv_sram_ptr + i*N + j)
-                u_j = tl.load(U + (k-1)*N + j)
-                
-                # Update M_k[i, j]
-                m_k_ij = tl.load(base_M_k + i*N + j)
-                m_k_ij -= l_i * m_inv_ij * u_j
-                tl.store(base_M_k + i*N + j, m_k_ij)
+        M_k_sram_next = load_block_masked(base_M_k, N, N_padded)
 
-        # d_k' = d_k - L_{k-1} * M_{k-1}^{-1} * d_{k-1}
-        # We perform this update in-place on d_k
+        # A_k' = A_k - L_{k-1} * M_{k-1}^{-1} * U_{k-1}
+        # This is now a list-of-lists update
+        M_k_updated = []
+        for i in range(N):
+            row = []
+            l_i = tl.load(L + (k-1)*N + i)
+            for j in range(N):
+                m_inv_ij = inv_sram[i, j]
+                u_j = tl.load(U + (k-1)*N + j)
+                val = M_k_sram_next[i, j] - (l_i * m_inv_ij * u_j)
+                row.append(val)
+            M_k_updated.append(row)
+        
+        # Convert back to tensor to store
+        M_k_sram_next_updated = tl.zeros((N_padded, N_padded), dtype=tl.float32)
+        for r in range(N):
+            for c in range(N):
+                is_target_cell = (tl.arange(0, N_padded)[:, None] == r) & (tl.arange(0, N_padded)[None, :] == c)
+                M_k_sram_next_updated = tl.where(is_target_cell, M_k_updated[r][c], M_k_sram_next_updated)
+
+        store_block_masked(base_M_k, M_k_sram_next_updated, N, N_padded)
+
+        # d_k' update
         base_D_k = D + k*N
         base_D_prev = D + (k-1)*N
-
-        for i in tl.static_range(N):
+        for i in range(N):
             dot_product = 0.0
             l_i = tl.load(L + (k-1)*N + i)
-            for j in tl.static_range(N):
-                m_inv_ij = tl.load(inv_sram_ptr + i*N + j)
+            for j in range(N):
+                m_inv_ij = inv_sram[i, j]
                 d_prev_j = tl.load(base_D_prev + j)
                 dot_product += l_i * m_inv_ij * d_prev_j
-            
             d_k_i = tl.load(base_D_k + i)
-            d_k_i -= dot_product
-            tl.store(base_D_k + i, d_k_i)
+            tl.store(base_D_k + i, d_k_i - dot_product)
         
-        # Invert the new A_k for the next iteration
-        invNxN(base_M_k, inv_sram_ptr, N)
+        inv_sram = invNxN_scalar(M_k_sram_next_updated, N, N_padded)
 
-    # ---------------- backward substitution -------------------------
-    # last block: x_{K-1} = M_{K-1}^{-1} * d_{K-1}
-    base_X_last = X + (K-1)*N
+    # --- Backward substitution ---
     base_D_last = D + (K-1)*N
-
-    for i in tl.static_range(N):
+    base_X_last = X + (K-1)*N
+    for i in range(N):
         x_i = 0.0
-        for j in tl.static_range(N):
-            m_inv_ij = tl.load(inv_sram_ptr + i*N + j)
+        for j in range(N):
             d_j = tl.load(base_D_last + j)
-            x_i += m_inv_ij * d_j
+            x_i += inv_sram[i, j] * d_j
         tl.store(base_X_last + i, x_i)
 
     for k in range(K-2, -1, -1):
-        # First, we need the original M_k to get its inverse.
-        # The forward pass modified M, so we must re-invert it.
         base_M_k = M + k*N_SQ
-        invNxN(base_M_k, inv_sram_ptr, N)
+        M_k_sram = load_block_masked(base_M_k, N, N_padded)
+        inv_sram = invNxN_scalar(M_k_sram, N, N_padded)
         
-        # d_k' = d_k - U_k * x_{k+1}
-        # Note: d_k is the one modified from the forward pass.
         base_D_k = D + k*N
         base_X_next = X + (k+1)*N
+        d_k_updated = tl.zeros((N_padded,), dtype=tl.float32)
 
-        for i in tl.static_range(N):
+        for i in range(N):
             u_i = tl.load(U + k*N + i)
             x_next_i = tl.load(base_X_next + i)
-            
             d_k_i = tl.load(base_D_k + i)
-            d_k_i -= u_i * x_next_i
-            tl.store(base_D_k + i, d_k_i)
+            d_k_updated[i] = d_k_updated[i] + (d_k_i - u_i * x_next_i)
         
-        # x_k = M_k^{-1} * d_k'
         base_X_k = X + k*N
-        for i in tl.static_range(N):
+        for i in range(N):
             x_i = 0.0
-            for j in tl.static_range(N):
-                m_inv_ij = tl.load(inv_sram_ptr + i*N + j)
-                d_k_j = tl.load(base_D_k + j)
-                x_i += m_inv_ij * d_k_j
+            for j in range(N):
+                d_k_j = d_k_updated[j]
+                x_i += inv_sram[i, j] * d_k_j
             tl.store(base_X_k + i, x_i)
 
 
@@ -171,36 +178,32 @@ def thomas_btn_kernel(
 # ---------------------------------------------------------------------
 def _thomas_triton_n(lower, main, upper, rhs):
     """
-    lower : (B, K-1, N)   - diagonal elements
+    lower : (B, K-1, N)
     main  : (B, K,   N,N)
-    upper : (B, K-1, N)   - diagonal elements
+    upper : (B, K-1, N)
     rhs   : (B, K,   N)
     """
     B, K, N = rhs.shape
-    assert lower.shape == (B, K-1, N)
-    assert main.shape == (B, K, N, N)
-    assert upper.shape == (B, K-1, N)
-
     out = torch.empty_like(rhs)
-    
-    # The kernel modifies `main` and `rhs` in-place, so we must pass copies.
     main_clone = main.clone()
     rhs_clone = rhs.clone()
+    
+    # --- Calculate padded dimension and pass to kernel ---
+    N_padded = triton.next_power_of_2(N)
 
-    # The kernel needs contiguous memory blocks.
     grid = (B,)
     thomas_btn_kernel[grid](
-        lower      .contiguous(), 
-        main_clone .reshape(B, -1),
-        upper      .contiguous(), 
-        rhs_clone  .reshape(B, -1),
-        out        .reshape(B, -1),
+        lower.contiguous(), 
+        main_clone.reshape(B, -1),
+        upper.contiguous(), 
+        rhs_clone.reshape(B, -1),
+        out.reshape(B, -1),
         K=K,
         N=N,
-        num_warps=2, # May need adjustment based on N
+        N_padded=N_padded, # Pass the new constexpr
+        num_warps=2,
         num_stages=4
     )
-
     return out
 
 
@@ -267,7 +270,7 @@ class ThomasSolveN(torch.autograd.Function):
 
 
 # convenience function -------------------------------------------------
-def thomas_triton_bt_n(lower, main, upper, rhs):
+def thomas_solve_cuda_bt_n(lower, main, upper, rhs):
     """
     Differentiable block tridiagonal solver for systems where the
     off-diagonal blocks (lower, upper) are diagonal matrices.

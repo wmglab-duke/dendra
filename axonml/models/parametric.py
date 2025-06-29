@@ -268,7 +268,7 @@ class _Parameterized(torch.nn.Module):
                         setattr(self, pname, to_param(pval, self))
                         getattr(self, name)[pname] = getattr(self, pname)
                 else:
-                    p_name = f"{name}_"
+                    p_name = f"{name}_default"
                     setattr(self, p_name, to_param(value, self))
                     self.register_buffer(name, torch.empty(self.shape))
 
@@ -301,7 +301,7 @@ class _Parameterized(torch.nn.Module):
 
     def populate_parameter_buffers(self):
         for name in self.__class__._params:
-            p_name = f"{name}_"
+            p_name = f"{name}_default"
             getattr(self, name).detach_()
             getattr(self, name).copy_(getattr(self, p_name))
         self.load_additional_parameters()

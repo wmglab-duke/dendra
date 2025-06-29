@@ -17,7 +17,7 @@ from ..mod import (
     naf,
     nas,
 )
-from ..mechanisms import PARAMETER, e_context as E, c_context as C
+from ..mechanisms import PARAMETER, equilibria as E, concentrations as C
 
 from axonml.units import mm
 from axonml.models.integrators import bwd_euler_ub

@@ -1,6 +1,6 @@
 from ..core import Myelinated, Unmyelinated
 from ..mod import fh
-from ..mechanisms import PARAMETER, c_context as C
+from ..mechanisms import PARAMETER, concentrations as C
 
 from axonml.units import mm
 from axonml.models.integrators import euler
