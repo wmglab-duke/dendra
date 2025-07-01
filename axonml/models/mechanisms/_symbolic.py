@@ -14,6 +14,12 @@ def {k}(self, v):
 """
 
 
+implicit_equation_unfactorable_template = """
+def {k}(self, v):
+    return self.{k}(v), 0.0
+"""
+
+
 current_tot_template = """
 def {k}_tot(self, v):
 {body}
@@ -33,15 +39,22 @@ def build_implicit_equation(current, gtot, irev, assign):
     )
 
 
+def build_unfactorable_equation(current):
+    return implicit_equation_unfactorable_template.format(
+        k=current,
+    )
+
+
 def build_current_eq(mechanism, k, assign=False):
     try:
         gtot, irev = factorize_linear_in_v(mechanism.__class__, method=k)
         code = build_implicit_equation(k, gtot, irev, assign)
+        factorable = True
     except Exception as e:
-        raise e
         logger.warning(f"Could not factorize {k} in {mechanism.__class__.__name__}.")
-        code = convert_func(getattr(mechanism.__class__, k), assign)
+        code = build_unfactorable_equation(k)
+        factorable = False
     filename = "<solve_function>"
     code = compile(code, filename, "exec")
     exec(code)
-    return locals()[k]
+    return locals()[k], factorable

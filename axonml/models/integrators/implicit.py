@@ -19,7 +19,7 @@ from axonml.helpers import IMEM
 
 from .core import Integrator, SCIntegrator
 from .tridiag import pcr_solve_t
-from .triton import thomas_solve_cuda_bt, thomas_solve_cuda_bt_n
+from .triton import thomas_solve_cuda_bt, thomas_solve_cuda_bt_n, thomas_solve_cuda_t
 
 
 class _bwd_euler_sc(SCIntegrator):
@@ -77,12 +77,8 @@ class _bwd_euler_ub(Integrator):
     is_df = False
 
     def __init__(self, model, mech, method="thomas", **kw):
-        if not AXONML_SOLVERS_AVAILABLE:
-            logging.warning(
-                "axonml_solvers not available, using pure Python PCR solver for BWD Euler."
-            )
-            method = "pcr"
         super().__init__(model, mech, **kw)
+        self.method = method
         B, K = model.n_ax, model.n_comp
         
         # Buffers for diffusive diag, axonal conductance, membrane scale
@@ -95,13 +91,29 @@ class _bwd_euler_ub(Integrator):
         self.register_buffer("g_edge_Cinv", torch.zeros(B, K-1))
 
         if method == "pcr":
-            self._solve = pcr_tridiag_solve
+            self._solve = pcr_solve_t
         elif method == "thomas":
-            self._solve = torch.ops.axonml_solvers.thomas_solve_t
+            self._solve = thomas_solve_cuda_t
         else:
             raise ValueError(f"Unknown method: {method}")
 
     def initialize(self, model, dt):
+
+        if self.method == "pcr":
+            self._solve = pcr_solve_t
+        elif self.method == "thomas":
+            if model.device().type == 'cuda':
+                self._solve = thomas_solve_cuda_t
+            elif model.device().type == 'cpu':
+                if AXONML_SOLVERS_AVAILABLE:
+                    self._solve = torch.ops.axonml_solvers.thomas_solve_t
+                else:
+                    warnings.warn(
+                        "Using `bwd_euler_ub` solver on CPU without axonml_solvers installed. "
+                        "Falling back to PCR solver."
+                    )
+                    self._solve = pcr_solve_t
+
         B, K   = model.np, model.nc
         dt_s   = dt * 1e-3                      # s
 
@@ -143,12 +155,12 @@ class _bwd_euler_ub(Integrator):
         self.scale.copy_(area_cm2 * Cm_inv)  # A·s / C == 1, but keep for code reuse
 
     def step(self, model, dt, ve=None, intra=None):
-        model.v = self._step(model.v, dt, model.temp_c, ve, intra)
+        model.v = self._step(model.v, dt, model.celsius, ve, intra)
 
     def _step(self, v, dt, temp, ve=None, intra=None) -> Tensor:
         dt_s = dt * 1e-3
 
-        self.mech.advance(v_np1, dt, temp)
+        self.mech.advance(v, dt, temp)
 
         itot, gtot = self.mech.i(v)       # (B,K)
 
@@ -197,13 +209,6 @@ class _bwd_euler_ub(Integrator):
             model.i_membrane.detach_()
         self.mech.detach()
 
-    def init_v(self, model):
-        model.v[:] = model.v_init
-        model.v = model.v.detach()
-        if self.imem:
-            model.i_membrane[:] = 0.0
-            model.i_membrane.detach_()
-
 
 class _bwd_euler_bt(torch.nn.Module):
     """
@@ -249,14 +254,7 @@ class _bwd_euler_bt(torch.nn.Module):
         model.v[:] = model.v_init
 
         if method == "triton":
-            if M > 3:
-                self._solve = thomas_triton_bt_n
-            else:
-                self._solve = thomas_triton_bt
-        elif method == "thread":
-            self._solve = torch.ops.axonml_solvers.solve_bt
-        elif method == "warp":
-            self._solve = torch.ops.axonml_solvers.solve_bt_warp
+            self._solve = thomas_solve_cuda_bt
         else:
             raise ValueError(f"Unknown method: {method}")
         
@@ -265,7 +263,7 @@ class _bwd_euler_bt(torch.nn.Module):
         return (np, nc)
 
     def init_v(self, model):
-        model.vc[:] = 0.0
+        model.vc.zero_()
         model.vc[..., 0] = model.v_init
         model.v[:] = model.v_init
         model.vc = model.vc.detach()
@@ -333,8 +331,8 @@ class _bwd_euler_bt(torch.nn.Module):
         # Allocate blocks
         # ------------------------------------------------------------------
         main  = torch.zeros((B, K,   M, M), device=dev, dtype=dtyp)
-        lower = torch.zeros((B, K-1, M), device=dev, dtype=dtyp)
-        upper = torch.zeros((B, K-1, M), device=dev, dtype=dtyp)
+        lower = torch.zeros((B, K-1, M),    device=dev, dtype=dtyp)
+        upper = torch.zeros((B, K-1, M),    device=dev, dtype=dtyp)
 
         zeros_B = torch.zeros(B, device=dev, dtype=dtyp)    # utility vector
 
@@ -371,7 +369,7 @@ class _bwd_euler_bt(torch.nn.Module):
                 # ---------- radial off-diagonal (coupling to s+1) ---------------
                 if s < M - 1:
                     if s == 0:
-                        coup = -cm_dt[:, i]                       # vi ↔ ve0
+                        coup = -cm_dt[:, i]                         # vi ↔ ve0
                     else:
                         coup = -(xc_dt[:, i, s-1] + xg[:, i, s-1])  # ve[s-1] ↔ ve[s]
                     main[:, i, s,   s+1] = coup

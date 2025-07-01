@@ -101,12 +101,42 @@ class Slice:
             self.base_shape = model.shape
         self.index_spec = index_spec
 
-    @property
-    def shape(self) -> Tuple[int, ...]:
+
+    def shape(self):
         """
-        The shape of the slice.
+        Return the shape of the slice.
         """
         return self.index_spec.shape
+
+
+    def index(self):
+        """
+        Return the index of the slice.
+        """
+        return self.index_spec.index
+
+    
+    def is_scalar(self) -> bool:
+        """
+        Return True if the slice is scalar.
+        """
+        return self.index_spec.is_scalar
+
+
+    def inspect(self, var: str, mechanism: Optional[str] = None) -> Any:
+        """
+        Inspect the variable in the model or a specific mechanism.
+        Note: Most of the time, this will involve a memory allocation.
+        """
+        if mechanism is not None:
+            mech = self.model.mech.mechanisms[mechanism]
+            if not mech.key:
+                return getattr(mech, var)[self.index_spec.index]
+            dummy = torch.tensor(torch.nan, device=self.model.device(), dtype=self.model.dtype())
+            dummy = mech.put(getattr(mech, var), dummy, self.model.v)
+            return dummy[self.index_spec.index]
+        return getattr(self.model, var)[self.index_spec.index]
+
 
     def __getattr__(self, name: str) -> Any:
         """
@@ -130,7 +160,7 @@ class Slice:
         raise AttributeError(f"{type(self).__name__!s} has no attribute {name!s}")
 
     def inject(self, waveform):
-        self.model.stimuli.append((waveform, self.index_spec.out_shape, self.index_spec.index))
+        self.model.stimuli.append((waveform, self.index_spec.shape, self.index_spec.index))
 
     def insert(self, mechanism, alias=None, ic=None, **kwargs):
         self.model.insert(mechanism, alias=alias, index_spec=self.index_spec, **kwargs)

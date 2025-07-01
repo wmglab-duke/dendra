@@ -16,7 +16,7 @@ from axonml.models.stim.waveform import Waveform
 
 from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
-from axonml.models.parametric import Parameterized
+from axonml.models.parametric import Parameterized, _Parameterized as P
 from axonml.models.mechanisms.core import Mechanism, validate
 from axonml.models.mechanisms import concentrations, equilibria
 from axonml.models.declarations import PARAMETER
@@ -102,15 +102,15 @@ def make_intra(intra, stims, indices):
     return intra(stims, indices)
 
 
-class Population(Parameterized):
+class Population(P):
     """
     Base class for a population of multicompartment neurons.
     """
 
-    PARAMETER(cm=1.0, rhoa=35.4, celsius=37.0)
+    P.PARAMETER(cm=1.0, rhoa=35.4, celsius=37.0)
 
     def __init__(self, N:int, C:int, integrator=None, v_init=-65.0, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__((N, C), **kwargs)
         self.np = N
         self.nc = C
         self.v_init = v_init
@@ -136,11 +136,6 @@ class Population(Parameterized):
         self.jit = bool(JIT)
         self.compile_mode = COMPILE_MODE.value 
 
-        self.compiler = integrator.compiler(DEBUG, DETECT_ANOMALIES, PADE)
-        self.builder = None
-
-        if integrator.builder is not None:
-            self.builder = integrator.builder(DEBUG, IMEM)
         self.integrator = integrator
 
         self.stimuli = []
@@ -976,8 +971,6 @@ class Population(Parameterized):
 
     def build(self):
         
-        df = self.integrator.is_df
-
         for mech, (name, ic, kwargs) in self._mech_everywhere.items():
             key = None
             shape = self.shape
@@ -1093,7 +1086,8 @@ class Axon(Population):
         self.n_comp = self.nc
         self.temp   = float(celsius)
         self.v_init = v_init
-        self.v[:] = v_init
+        self.v[:]   = v_init
+        self.v.detach_()
 
         self.cid = None
 
@@ -1106,8 +1100,7 @@ class Axon(Population):
             diameters = diameters.unsqueeze(1)        
 
         self.diam[:] = diameters
-
-        self._register_buffers()
+        self.diam.detach_()
 
         # -- biophysics --
         self.biophysics()
@@ -1119,29 +1112,6 @@ class Axon(Population):
         biophysics-related parameters or configurations.
         """
         pass
-
-    def __init_subclass__(cls, **kwargs):
-        def init_decorator(previous_init):
-            def new_init(self, *args, **kwargs):
-                previous_init(self, *args, **kwargs)
-                if type(self) == cls:
-                    Axon.__post_init__(self)
-
-            return new_init
-
-        cls.__init__ = init_decorator(cls.__init__)
-
-    def __post_init__(self):
-        changed = self.instantiate_parameters_lambda()
-        if changed:
-            self.calculate_geometric_params()
-        with (
-            equilibria(use_last=True),
-            concentrations(use_last=True),
-        ):
-            self.build()
-        if CUDA:
-            self.cuda()
 
     def _register_buffers(self):
         self.register_buffer("area_c", self.area_(self.diam))
@@ -1305,16 +1275,16 @@ class Unmyelinated(Axon):
             diameters, 
             L=1.0*mm, 
             dx=10.0, 
-            temp=37, 
+            celsius=37, 
             v_init=-80,
-            integrator=dufort_frankel()
+            integrator=None
         ):
         # L = L * 1000  # mm -> um
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
         self.dx_: float = dx
         self.L: float = n_comp * dx
-        super().__init__(diameters, n_comp, temp, v_init, integrator)
+        super().__init__(diameters, n_comp, celsius, v_init, integrator)
         self.x[:] = self._x()  # Initialize x positions
         self.dx[:] = self.dx_
 

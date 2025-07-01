@@ -173,8 +173,8 @@ class Mechanism(_Parameterized):
 
         states = [
             state(
-                celsius, 
-                diameters, 
+                self.get(celsius), 
+                self.get(diameters), 
                 key, 
                 shape, 
                 additional_parameters=additional_parameters, 
@@ -198,6 +198,9 @@ class Mechanism(_Parameterized):
         for r in self._range:
             self.register_buffer(r, torch.zeros(shape))
 
+        for a in self._assigned:
+            self.register_buffer(a, torch.zeros(shape))
+
         # factorize current equations
         current_eqs = []
         for _, v in self._currents.items():
@@ -207,8 +210,9 @@ class Mechanism(_Parameterized):
 
         for k in current_eqs:
             assign = k in self._range
-            eq = build_current_eq(self, k, assign=assign)
-            setattr(self, k, MethodType(eq, self))
+            eq, factorable = build_current_eq(self, k, assign=assign)
+            setattr(self, f"{k}_with_g", MethodType(eq, self))
+            self.factorable = factorable
 
         self.populate()
 
@@ -216,16 +220,20 @@ class Mechanism(_Parameterized):
     def name(self):
         return self._name
 
-    def put_no_op(self, ion_conc_u, ion_conc_o, v):
+    def put_no_op(self, ion_conc_u, ion_conc_o, v, clone=True):
         return ion_conc_u
 
-    def put_slice(self, ion_conc_u, ion_conc_o, v):
-        ion_conc_o = ion_conc_o.expand_as(v).clone()
+    def put_slice(self, ion_conc_u, ion_conc_o, v, clone=True):
+        ion_conc_o = ion_conc_o.expand_as(v)
+        if clone:
+            ion_conc_o = ion_conc_o.clone()
         ion_conc_o[self.key] = ion_conc_u
         return ion_conc_o
 
-    def put_fancy(self, ion_conc_u, ion_conc_o, v):
-        ion_conc_o = ion_conc_o.expand_as(v).clone()
+    def put_fancy(self, ion_conc_u, ion_conc_o, v, clone=True):
+        ion_conc_o = ion_conc_o.expand_as(v)
+        if clone:
+            ion_conc_o = ion_conc_o.clone()
         ion_conc_o.view(-1).index_put_((self.key,), ion_conc_u)
         return ion_conc_o
 
@@ -335,6 +343,9 @@ class Mechanism(_Parameterized):
     @staticmethod
     def INIT(**kwargs):
         Mechanism._init_declarations.append(kwargs)
+
+    def breakpoint(self, v):
+        pass
 
     def detach(self):
         for n, b in self.named_buffers():

@@ -210,13 +210,14 @@ class _dufort_frankel(Integrator):
         super().__init__(model, mech, imem)
 
         model.register_buffer(
-            "v_prev", torch.full((model.n_ax, model.n_comp), model.v_init)
+            "v_prev", torch.full((model.np, model.nc), model.v_init)
         )
 
-        self.register_buffer("s1", torch.tensor(0.0))
-        self.register_buffer("s2", torch.tensor(0.0))
-        self.register_buffer("s3", torch.tensor(0.0))
-        self.register_buffer("s4", torch.tensor(0.0))
+        self.register_buffer("area", torch.tensor(0.0))
+        self.register_buffer("s1",   torch.tensor(0.0))
+        self.register_buffer("s2",   torch.tensor(0.0))
+        self.register_buffer("s3",   torch.tensor(0.0))
+        self.register_buffer("s4",   torch.tensor(0.0))
 
         self.smooth_every = smooth_every
         self.beta = beta
@@ -249,17 +250,22 @@ class _dufort_frankel(Integrator):
             p.requires_grad = False
 
     def initialize(self, model, dt) -> None:
-        self.s1 = 2 * dt / model.cm_c
-        self.s2 = self.s1 / model.ra_c
-        self.s3 = model.area_c * self.s1
+        self.area = torch.pi * (model.diam / 10000) * (model.dx / 10000)
+        cm = (model.cm / 1e3) * self.area
+        dx = model.dx / 10000
+        radii = model.diam / 20000
+        ra = (model.rhoa * dx) / (torch.pi * radii ** 2)
+        self.s1 = 2 * dt / cm
+        self.s2 = self.s1 / ra
+        self.s3 = self.area * self.s1
         self.s4 = 1 + self.s2
         self.f64 = model.dtype() == torch.float64
         self.ve_zero = torch.zeros_like(model.v)
         if self.conv:
-            self.method_intra = self._step_intra_conv
+            self.method_intra    = self._step_intra_conv
             self.method_no_intra = self._step_no_intra_conv
         else:
-            self.method_intra = self._step_intra
+            self.method_intra    = self._step_intra
             self.method_no_intra = self._step_no_intra
 
     def step(self, model, dt, ve=None, intra=None):
@@ -274,9 +280,9 @@ class _dufort_frankel(Integrator):
                 self.s2,
                 self.s3,
                 self.s4,
-                model.area_c,
+                self.area,
                 dt,
-                model.temp_c,
+                model.celsius,
                 model.t_ind
             )
         else:
@@ -288,9 +294,9 @@ class _dufort_frankel(Integrator):
                 self.s2,
                 self.s3,
                 self.s4,
-                model.area_c,
+                self.area,
                 dt,
-                model.temp_c,
+                model.celsius,
                 intra,
                 model.t_ind
             )
@@ -300,9 +306,9 @@ class _dufort_frankel(Integrator):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         d2v = ssd_df(v, v_prev, ve)
 
-        i_ion = self.mech.i(v_prev, v)
+        i_ion, gtot = self.mech.idf(v, v_prev)
 
-        v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * self.mech.gtot(v))
+        v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * 0.5 * gtot)
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
@@ -323,9 +329,9 @@ class _dufort_frankel(Integrator):
         x = torch.stack([v, v_prev, ve], dim=1)
         d2v = self.ssd(x).squeeze(1)
 
-        i_ion = self.mech.i(v_prev, v)
+        i_ion, gtot = self.mech.idf(v, v_prev)
 
-        v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * self.mech.gtot(v))
+        v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * 0.5 * gtot)
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
@@ -345,9 +351,10 @@ class _dufort_frankel(Integrator):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         d2v = s2 * ssd_df(v, v_prev, ve)
 
-        i_ion = self.mech.i(v_prev, v) * area - intra
+        i_ion, gtot = self.mech.idf(v, v_prev)
+        i_ion = i_ion * area - intra
 
-        v_new = (v_prev + d2v - s1 * i_ion) / (s4 + self.mech.gtot(v) * s3)
+        v_new = (v_prev + d2v - s1 * i_ion) / (s4 + 0.5 * gtot * s3)
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
@@ -368,9 +375,10 @@ class _dufort_frankel(Integrator):
         x = torch.stack([v, v_prev, ve], dim=1)
         d2v = s2 * self.ssd(x).squeeze(1)
 
-        i_ion = self.mech.i(v_prev, v) * area - intra
+        i_ion, gtot = self.mech.idf(v, v_prev)
+        i_ion = i_ion * area - intra
 
-        v_new = (v_prev + d2v - s1 * i_ion) / (s4 + self.mech.gtot(v) * s3)
+        v_new = (v_prev + d2v - s1 * i_ion) / (s4 + 0.5 * gtot * s3)
 
         self.mech.itot(v)
         self.mech.advance(v, dt, temp)
@@ -386,17 +394,17 @@ class _dufort_frankel(Integrator):
         return v_new, v
 
     def init_v(self, model):
-        model.v[:] = model.v_init
+        model.v = torch.full(model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device)
         model.v.detach_()
-        model.v_prev[:] = model.v_init
+        model.v_prev = torch.full(model.v_prev.shape, model.v_init, dtype=model.v_prev.dtype, device=model.v_prev.device)
         model.v_prev.detach_()
         if self.imem:
-            self.i_membrane[:] = 0.0
-            self.i_membrane.detach_()
+            model.i_membrane = torch.zeros(model.i_membrane.shape, dtype=model.i_membrane.dtype, device=model.i_membrane.device)
+            model.i_membrane.detach_()
 
     def detach(self, model):
-        model.v_prev.detach_()
         model.v.detach_()
-        self.mech.detach()
+        model.v_prev.detach_()
         if self.imem:
-            self.i_membrane.detach_()
+            model.i_membrane.detach_()
+        self.mech.detach()

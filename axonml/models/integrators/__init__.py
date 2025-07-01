@@ -22,6 +22,7 @@ from .imex import (
 
 from .tree import (
     _dhs,
+    _df_branched
 )
 
 
@@ -53,6 +54,11 @@ bwd_euler_ub = partial(partial_class, _bwd_euler_ub)
 bwd_euler_bt = partial(partial_class, _bwd_euler_bt)
 
 dhs = partial(partial_class, _dhs)
+df_branched = partial(partial_class, _df_branched)
+
+# Alias for backward compatibility
+dufort_frankel_branched = df_branched
+df = dufort_frankel
 
 
 __all__ = [
@@ -67,4 +73,7 @@ __all__ = [
     "bwd_euler_ub",
     "bwd_euler_bt",
     "dhs",
+    "df_branched",
+    "dufort_frankel_branched",
+    "df",
 ]

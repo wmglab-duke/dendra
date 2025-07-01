@@ -333,8 +333,8 @@ class State(_Parameterized):
         super().__init__(shape, additional_parameters=additional_parameters, **kwargs)
         self._name = self.__class__.__name__
         self.key = key
-        self.celsius = celsius
-
+        
+        self.register_buffer('celsius', celsius)
         self.register_buffer('diam', diameters)
 
         for b in self._state_buffers:

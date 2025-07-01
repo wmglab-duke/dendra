@@ -271,6 +271,7 @@ class _Parameterized(torch.nn.Module):
                     p_name = f"{name}_default"
                     setattr(self, p_name, to_param(value, self))
                     self.register_buffer(name, torch.empty(self.shape))
+                    getattr(self, name).copy_(getattr(self, p_name))
 
     def instantiate_additional_parameters(self, additional_parameters=None):
         if additional_parameters is not None:

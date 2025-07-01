@@ -35,11 +35,38 @@ class MechanismHandler(torch.nn.Module):
                 self.ions[ion_name] = ion
                 setattr(self, f"{ion_name}_ion", ion)
 
+        # --- flattened mapping (current-index, mechanism-obj, fn) ------------
+        self._map = []
+        self._map_df = []
+        for c_idx, mech_dict in enumerate(currents.values()):
+            for mech_name, ions in mech_dict.items():
+                mech = self.mechanisms[mech_name]
+                for ion in ions:
+                    self._map.append( (c_idx, mech, getattr(mech, f"{ion}_with_g")) )
+                    self._map_df.append( (c_idx, mech, getattr(mech, f"{ion}")) )
+
+        self.ion_to_buff_idx = {}
+        self.i_g_buffers_initialized = False
+
     def initialize(self, v, celsius, diameters):
         self.ion_init(celsius)
         self.set_buffers(diameters)
-        self.init_buffers(v)
+        self.init_i_g_bufs(v)
+        self.compute_initial_conditions(v)
+        self.read_from_ions()
         self.i(v)
+        self.write_to_ions(v)
+        self.read_from_ions()
+
+    def init_i_g_bufs(self, v):
+        if not self.i_g_buffers_initialized:
+            current_names = list(self.currents.keys())
+            self._buf_i = [torch.zeros_like(v) for _ in current_names]
+            self._buf_g = [torch.zeros_like(v) for _ in current_names]
+            for ion in self.ions.keys():
+                idx = current_names.index(f"i{ion}")
+                self.ion_to_buff_idx[ion] = idx
+            self.i_g_buffers_initialized = True
 
     def populate(self, mech=None) -> None:
         if mech is not None:
@@ -91,32 +118,81 @@ class MechanismHandler(torch.nn.Module):
         for ion in self.ions.values():
             ion.detach()
 
+
     def i(self, v):
-        currents = {}
-        gtot = {}
+        # reset buffers in-place (no realloc)
+        for t in self._buf_i:
+            t.zero_()
+        for t in self._buf_g:
+            t.zero_()
+
+        for mech in self.mechanisms.values():
+            mech.breakpoint(v)
+
+        # core loop: minimal Python, pure aten ops inside
+        for c_idx, mech, fn in self._map:
+            i, g = fn(mech.get(v))
+            mech.add_(self._buf_i[c_idx], i)
+            mech.add_(self._buf_g[c_idx], g)
+        
+        # sum up currents and conductances
+        tot_i = sum(self._buf_i)
+        tot_g = sum(self._buf_g)
+
+        # expose per-ion currents
+        for (ion, ion_h) in self.ions.items():
+            setattr(ion_h, f"i{ion}", self._buf_i[self.ion_to_buff_idx[ion]])
+
+        return tot_i, tot_g
+
+
+    def idf(self, v, v_prev):
         if not self.currents:
             return torch.zeros_like(v), torch.zeros_like(v)
-        for current, cdict in self.currents.items():
-            currents[current] = torch.zeros_like(v)
-            gtot[current] = torch.zeros_like(v)
-            for mech, i_ion_list in cdict.items():
-                mechanism = self.mechanisms[mech]
-                for i_ion in i_ion_list:
-                    i, g = getattr(mechanism, i_ion)(mechanism.get(v))
-                    mechanism.add_(currents[current], i)
-                    mechanism.add_(gtot[current], g)
+
+        for t in self._buf_i:
+            t.zero_()
+        for t in self._buf_g:
+            t.zero_()
+
+        v_half = 0.5 * v_prev
+
+        for mech in self.mechanisms.values():
+            mech.breakpoint(v)
+
+        for c_idx, mech, fn in self._map:
+            if mech.factorable:
+                v_in = v_half
+            else:
+                v_in = v
+            i, g = fn(mech.get(v_in))
+            mech.add_(self._buf_i[c_idx], i)
+            mech.add_(self._buf_g[c_idx], g)
+        
+        # sum up currents and conductances
+        tot_i = sum(self._buf_i)
+        tot_g = sum(self._buf_g)
+
+        return tot_i, tot_g
+
+    def itot(self, v):
+        if not self.currents:
+            return
+
+        for t in self._buf_i:
+            t.zero_()
+
+        for c_idx, mech, fn in self._map_df:
+            i = fn(mech.get(v))
+            mech.add_(self._buf_i[c_idx], i)
+
         for ion, ion_h in self.ions.items():
-            setattr(ion_h, f"i{ion}", currents[f"i{ion}"])
-        total_i = torch.stack(list(currents.values()), dim=0).sum(dim=0)
-        total_g = torch.stack(list(gtot.values()), dim=0).sum(dim=0)
-        return total_i, total_g
+            setattr(ion_h, f"i{ion}", self._buf_i[self.ion_to_buff_idx[ion]])
 
 
     def set_buffers(self, diameters):
         for m in self.mechanisms.values():
             m.diam.set_(diameters)
-
-        self.read_from_ions()
 
         for ion, dict_of_mech_and_quantities in self.write_ion_c.items():
             for mech, quantities in dict_of_mech_and_quantities.items():
@@ -128,22 +204,7 @@ class MechanismHandler(torch.nn.Module):
                     getattr(m, quantity).copy_(q)
                     for _, s in self.mechanisms[mech].DE.items():
                         setattr(s, quantity, getattr(m, quantity))
-        return
-
-    def init_buffers(self, v):
+        
+    def compute_initial_conditions(self, v):
         for m, mech in self.mechanisms.items():
             mech._init_buffers_s(mech.get(v))
-
-    def gtot(self, v):
-        """
-        Calculate the total conductance for all mechanisms.
-        This method sums the conductances of all mechanisms and returns the total.
-        """
-        gtot = torch.zeros_like(v)
-        for mech in self.mech_with_gtot:
-            if self.keys[mech._name] is not None:
-                gtot[self.keys[mech._name]] += mech.gtot(v[self.keys[mech._name]])
-            else:
-                gtot += mech.gtot(v)
-        return gtot
-
