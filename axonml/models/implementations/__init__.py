@@ -1,6 +1,5 @@
 from .smf import SMF
 from .rattay import Rattay1993
-from .tigerholm import Tigerholm2014
 from .schild import Schild1997, Schild1994
 from .fh import FHM, SENN, FHUM
 from .sweeney import Sweeney1987
@@ -10,7 +9,6 @@ from .MRG import bigMRG, smolMRG
 __all__ = [
     "SMF",
     "Rattay1993",
-    "Tigerholm2014",
     "Schild1997",
     "Schild1994",
     "FHM",
