@@ -289,8 +289,8 @@ class _dhs(Integrator):
         self.register_buffer("inv_solver_order",    torch.empty(N, dtype=torch.int64))  # (N,) inverse node order
         self.register_buffer("scale",               torch.empty(B, N))    # (N,) scale factor
 
-        self.register_buffer("a_geom",        torch.empty(B, N))    # (B,N) axial conductance
-        self.register_buffer("cmdt",        torch.empty(B, N))      # (B,N) capacitance * dt
+        self.register_buffer("a_geom",          torch.empty(B, N))    # (B,N) axial conductance
+        self.register_buffer("cmdt",            torch.empty(B, N))    # (B,N) capacitance * dt
 
 
     def initialize(self, model, dt):

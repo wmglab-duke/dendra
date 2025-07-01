@@ -714,6 +714,7 @@ class Population(P):
         self.t_ind = 0
         self.t_cache = 0.0
         self.initialized = True
+        return self
 
     def load(self, state_dict):
         """

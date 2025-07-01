@@ -120,6 +120,9 @@ class MechanismHandler(torch.nn.Module):
 
 
     def i(self, v):
+        if not self.currents:
+            return 0.0, 0.0
+
         # reset buffers in-place (no realloc)
         for t in self._buf_i:
             t.zero_()
@@ -148,7 +151,7 @@ class MechanismHandler(torch.nn.Module):
 
     def idf(self, v, v_prev):
         if not self.currents:
-            return torch.zeros_like(v), torch.zeros_like(v)
+            return 0.0, 0.0
 
         for t in self._buf_i:
             t.zero_()

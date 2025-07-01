@@ -333,9 +333,9 @@ class State(_Parameterized):
         super().__init__(shape, additional_parameters=additional_parameters, **kwargs)
         self._name = self.__class__.__name__
         self.key = key
-        
-        self.register_buffer('celsius', celsius)
-        self.register_buffer('diam', diameters)
+
+        self.register_buffer('celsius', celsius.reshape(shape))
+        self.register_buffer('diam', diameters.reshape(shape))
 
         for b in self._state_buffers:
             self.register_buffer(b, torch.tensor(0.0))
