@@ -161,7 +161,7 @@ def modify_operations(input_string: str) -> str:
 
 
 
-def convert(deriv, state, assigned, use_pade_approx=False):
+def convert(deriv, state, states, assigned, use_pade_approx=False):
     """
     Convert a derivative expression into a form suitable for numerical integration.
 
@@ -186,7 +186,7 @@ def convert(deriv, state, assigned, use_pade_approx=False):
         The modified derivative expression after integration and optional diffusion addition.
     """
 
-    exclude = set([state]) | set(assigned)
+    exclude = set([state]) | set(states) | set(assigned)
     v = extract_vars(deriv, exclude)
     f = integrate2c(deriv, "dt", v, use_pade_approx=use_pade_approx)
     if DEBUG:
@@ -235,7 +235,7 @@ def build_cnexp(states, assigned, derivative, pade=False):
 
     derivative = match_derivative_to_states(derivative, states)
     for state in states:
-        solves.append(convert(derivative[state], state, assigned, use_pade_approx=use_pade_approx))
+        solves.append(convert(derivative[state], state, states, assigned, use_pade_approx=use_pade_approx))
         returns.append(f"'{state}' : _{state}")
     solves = "\n    ".join(solves)
     returns = f"{{{', '.join(returns)}}}"
@@ -330,6 +330,9 @@ class State(_Parameterized):
         additional_parameters=None,
         **kwargs
     ):
+        if not self._state:
+            raise ValueError(f"State {self.__class__.__name__} has no state variables defined."
+                              "Use State.STATE(<state vars>) in State implementation to define them.")
         super().__init__(shape, additional_parameters=additional_parameters, **kwargs)
         self._name = self.__class__.__name__
         self.key = key
@@ -375,7 +378,7 @@ class State(_Parameterized):
 
     @staticmethod
     def BUFFER(*args):
-        State._buffers_declarations.append(args)
+        State._state_buffers_declarations.append(args)
 
     @staticmethod
     def DERIVATIVE(*args):

@@ -122,6 +122,7 @@ class Mechanism(_Parameterized):
         cls._read_ion = new_read_ion
         cls._write_ion = new_write_ion
         cls._write_ion_c = new_write_ion_c
+        cls._init = new_init
 
     def __init__(
         self,
@@ -140,7 +141,7 @@ class Mechanism(_Parameterized):
         """
         super().__init__(shape, additional_parameters=additional_parameters, **kwargs)
         self._name = name
-        self.celsius = celsius
+        self.register_buffer('celsius', celsius)
 
         if key is not None:
             if is_composable:
@@ -192,8 +193,9 @@ class Mechanism(_Parameterized):
             self._init_params.update(ic)
 
         self.register_buffer('diam', diameters)
-        for state_name in self.DE:
-            self.register_buffer(state_name, torch.zeros(shape))
+        for state in self.DE.values():
+            for state_name in state._state:
+                self.register_buffer(state_name, torch.zeros(shape))
 
         for r in self._range:
             self.register_buffer(r, torch.zeros(shape))
@@ -267,7 +269,7 @@ class Mechanism(_Parameterized):
                 if state_name in self._init_params:
                     buffer_tensor = torch.tensor(
                         self._init_params[state_name], device=v_init.device, dtype=v_init.dtype
-                    )
+                    ).expand_as(v_init).clone()
                     setattr(self, state_name, buffer_tensor)
                     buffer_tensor.detach_()
                 else:

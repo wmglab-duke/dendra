@@ -575,7 +575,7 @@ class Population(P):
 
         with torch.set_grad_enabled(self.training):
 
-            t = torch.arange(0, tstop, dt_f, dtype=self.dtype())
+            t = torch.arange(0, tstop, dt_f, dtype=self.dtype(), device=self.device())
             n_chunks = math.ceil(len(t) / chunklength)
 
             t_c_f = torch.tensor_split(t, n_chunks)
@@ -1063,8 +1063,6 @@ class Axon(Population):
         Time step in ms.
     """
 
-    PARAMETER(inherit=Population)
-
     _dt_lim = None
     __constants__ = [
         "n_ax",
@@ -1269,7 +1267,7 @@ class Unmyelinated(Axon):
     Myelinated : Companion class implementing myelinated axon models.
     """
 
-    PARAMETER(cm=1.0, rhoa=35.4, celsius=37.0)
+    Axon.PARAMETER(cm=1.0, rhoa=35.4, celsius=37.0)
 
     def __init__(
             self, 

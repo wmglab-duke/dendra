@@ -26,10 +26,6 @@ class _euler(Integrator):
     Euler integrator.
     """
 
-    compiler = MechCompiler
-    builder = None
-    is_df = False
-
     def __init__(self, model, mech, imem=None):
         super().__init__(model, mech, imem)
 
@@ -195,14 +191,22 @@ def ssd_df(v_c, v_p, v_e):
     return ret
 
 
+def ssd_df_no_ve(v_c, v_p):
+    v_c_p = F.pad(v_c, (1, 1), "reflect")
+
+    ret = (
+        v_c_p[:, :-2]
+        + v_c_p[:, 2:]
+        - v_p
+    )
+
+    return ret
+
+
 class _dufort_frankel(Integrator):
     """
     Dufort-Frankel integrator.
     """
-
-    compiler = DF_Compiler
-    builder = None
-    is_df = True
 
     __constants__ = ["beta", "smoothing", "smooth_every", "imem"]
 
@@ -270,7 +274,8 @@ class _dufort_frankel(Integrator):
 
     def step(self, model, dt, ve=None, intra=None):
         if ve is None:
-            ve = self.ve_zero
+            if self.conv:
+                ve = self.ve_zero
         if intra is None:
             model.v, model.v_prev = self.method_no_intra(
                 model.v,
@@ -283,7 +288,7 @@ class _dufort_frankel(Integrator):
                 self.area,
                 dt,
                 model.celsius,
-                model.t_ind
+                model.t_ind,
             )
         else:
             model.v, model.v_prev = self.method_intra(
@@ -304,7 +309,11 @@ class _dufort_frankel(Integrator):
     def _step_no_intra(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        d2v = ssd_df(v, v_prev, ve)
+    
+        if ve is None:
+            d2v = ssd_df_no_ve(v, v_prev)
+        else:
+            d2v = ssd_df(v, v_prev, ve)
 
         i_ion, gtot = self.mech.idf(v, v_prev)
 
@@ -349,7 +358,11 @@ class _dufort_frankel(Integrator):
     def _step_intra(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        d2v = s2 * ssd_df(v, v_prev, ve)
+
+        if ve is None:
+            d2v = s2 * ssd_df_no_ve(v, v_prev)
+        else:
+            d2v = s2 * ssd_df(v, v_prev, ve)
 
         i_ion, gtot = self.mech.idf(v, v_prev)
         i_ion = i_ion * area - intra

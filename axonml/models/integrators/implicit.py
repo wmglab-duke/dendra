@@ -27,10 +27,6 @@ class _bwd_euler_sc(SCIntegrator):
     Implicit Euler method.
     """
 
-    compiler = ImplicitCompiler
-    builder = ImplicitHandlerBuilder
-    is_df = False
-
     def __init__(self, model, mech, imem=None):
         super().__init__(model, mech, imem)
 
@@ -71,10 +67,6 @@ class _bwd_euler_ub(Integrator):
     """
     Implicit Euler method.
     """
-
-    compiler = ImplicitCompiler
-    builder = ImplicitHandlerBuilder
-    is_df = False
 
     def __init__(self, model, mech, method="thomas", **kw):
         super().__init__(model, mech, **kw)
@@ -171,7 +163,7 @@ class _bwd_euler_ub(Integrator):
             # diffusive extracellular coupling
             flux = self.g_edge_Cinv * (ve[:, 1:] - ve[:, :-1])  # (B, K-1)
             S = torch.zeros_like(ve)  # (B, K)
-            S[:, 1:-1] = flux[:, :-1] - flux[:, 1:]
+            S[:, 1:-1] = -flux[:, :-1] + flux[:, 1:]
             S[:, 0]    = -flux[:, 0]
             S[:, -1]   = flux[:, -1]
 
