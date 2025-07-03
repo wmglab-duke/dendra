@@ -5,9 +5,6 @@ from typing import NamedTuple, List, Tuple
 import numpy as np
 import torch, networkx as nx
 
-from axonml.models.mechanisms.compilers import MechCompiler, ImplicitCompiler
-from axonml.models.mechanisms.handler.builders import ImplicitHandlerBuilder
-
 from .core import Integrator
 from .triton import dhs_solve_cuda
 
@@ -269,10 +266,6 @@ class _dhs(Integrator):
         neuron simulation and artificial intelligence. Nat Commun 14, 5798 (2023). 
         https://doi.org/10.1038/s41467-023-41553-7
     """
-
-    compiler = ImplicitCompiler
-    builder = ImplicitHandlerBuilder
-    is_df = False
 
     def __init__(self, model, mech, imem=None, threads=32):
         super().__init__(model, mech, imem)

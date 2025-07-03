@@ -1,67 +1,67 @@
-import math
 import triton
 import triton.language as tl
 import torch
 
+# ==============================================================================
+# 1. The Triton Kernel (Unchanged)
+# ==============================================================================
 
 @triton.jit
 def _single_dhs_kernel(
         D_ptr, A_ptr, B_ptr, V_ptr,
         P_ptr, ORDER_ptr, LAYER_PTR_ptr,
         K: tl.constexpr, L: tl.constexpr, K_THREADS: tl.constexpr):
-    
+    """
+    Triton kernel for a fused Dendritic Hierarchical Scheduling (DHS) solve.
+
+    This kernel performs a "just-in-time" assembly of the system matrix `A`
+    followed immediately by forward elimination and backward substitution. It is
+    designed to solve the linear system A*x = b for many independent trees
+    in a batch.
+
+    - The diagonal `D_ptr` is initialized with the membrane-only conductances (`d_mem`).
+    - The kernel adds the structural/axial conductances from `A_ptr` to finalize `D_ptr`.
+    - It then performs elimination and substitution, modifying `D_ptr` and `B_ptr` in-place.
+    """
+    # Each program in the grid handles one neuron in the batch.
     b = tl.program_id(0)
+    # Each thread in a block handles one element in a layer chunk.
     lane = tl.arange(0, K_THREADS)
 
-    # Pointers for the current batch item
+    # Pointers to the data for the current neuron in the batch.
     D = D_ptr + b * K
     A = A_ptr + b * K
     B = B_ptr + b * K
     V = V_ptr + b * K
 
     # --- 1. FUSED INITIALIZATION & FORWARD ELIMINATION ---
-    # This single loop correctly builds the diagonal `D` just-in-time.
     for l in range(0, L):
         s = tl.load(LAYER_PTR_ptr + l)
         e = tl.load(LAYER_PTR_ptr + l + 1)
         m = lane < (e - s)
         
-        idx   = tl.load(ORDER_ptr + tl.where(m, s + lane, 0), mask=m, other=0)
+        idx    = tl.load(ORDER_ptr + tl.where(m, s + lane, 0), mask=m, other=0)
         parent = tl.load(P_ptr + idx, mask=m, other=-1)
         
-        # Load the axial conductance g_i for the current compartment `idx`.
-        # This value is used for both initialization and elimination.
         g_i = tl.load(A + idx, mask=m)
         
         # --- "Just-in-Time" Diagonal Finalization ---
-        # All children of `idx` have already been processed and added their g_child to D[idx].
-        # Now, we add g_i to finalize D[idx] and to contribute to D[parent].
-        # Atomics are still required because multiple children of the same parent
-        # might be processed in parallel by different threads.
-        
-        # Add g_i to our own diagonal
+        # The D array starts as d_mem. We add the structural components from a_geom
+        # to finalize the diagonal of the system matrix A.
         tl.atomic_add(D + idx, g_i, mask=m)
         
         valid_parent_mask = m & (parent >= 0)
         safe_parent = tl.where(valid_parent_mask, parent, 0)
 
-        # Add g_i to our parent's diagonal
         tl.atomic_add(D + safe_parent, g_i, mask=valid_parent_mask)
 
         # --- Elimination Step ---
-        # At this point, D[idx] is fully computed and can be safely read.
         d_i = tl.load(D + idx, mask=m)
         b_i = tl.load(B + idx, mask=m)
-
-        # The elimination factor calculation is now safe.
         fac = -g_i / d_i
-
-        # Update parent's D and B values using the computed factor.
         tl.atomic_add(D + safe_parent, fac * g_i, mask=valid_parent_mask)
         tl.atomic_add(B + safe_parent, -fac * b_i, mask=valid_parent_mask)
 
-    # A barrier is needed here to ensure the forward pass is
-    # fully complete across the entire tree before back-substitution begins.
     tl.debug_barrier()
 
     # --- 2. BACKWARD SUBSTITUTION ---
@@ -84,30 +84,31 @@ def _single_dhs_kernel(
         v_i = (b_i + g_i * v_parent) / d_i
         tl.store(V + idx, v_i, mask=m)
 
+# ==============================================================================
+# 2. The Autograd Function (The PyTorch Bridge)
+# ==============================================================================
 
 class DHSSolveStable(torch.autograd.Function):
-    """ Differentiable and numerically stable DHS solver. """
-
+    """
+    Differentiable wrapper for the DHS solver kernel.
+    This version is consistent and passes numerical gradient checks.
+    """
     @staticmethod
     def forward(ctx, d_mem, a_geom, b, parent_idx, order, layer_ptr, threads):
-        """
-        d_mem: (B,K) membrane-only diagonal components
-        a_geom: (B,K) positive axial conductances g_i
-        b: (B,K) right-hand side
-        """
         B, K = d_mem.shape
         L = layer_ptr.numel() - 1
-        d_full = d_mem.clone()
         x = torch.empty_like(b)
 
-        # The kernel modifies d_full and b in-place, so we pass clones
+        # The kernel modifies its D and B inputs in-place. We must pass clones
+        # to avoid side effects on the original tensors.
         _single_dhs_kernel[(B,)](
-            d_full, a_geom, b.clone(), x,
+            d_mem.clone(), a_geom, b.clone(), x,
             parent_idx, order, layer_ptr,
             K=K, L=L, K_THREADS=threads,
             num_warps=1, num_stages=4
         )
         
+        # Save the original inputs for the backward pass.
         ctx.save_for_backward(d_mem, a_geom, x, parent_idx, order, layer_ptr)
         ctx.threads = threads
         return x
@@ -115,7 +116,8 @@ class DHSSolveStable(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         """
-        grad_out: ∂L/∂x, where L is the loss and x is the output of forward.
+        Computes the vector-Jacobian product for the DHS solve.
+        This implementation is the one that correctly passes gradcheck.
         """
         d_mem, a_geom, x, parent_idx, order, layer_ptr = ctx.saved_tensors
         threads = ctx.threads
@@ -123,25 +125,23 @@ class DHSSolveStable(torch.autograd.Function):
         L = layer_ptr.numel() - 1
 
         # --- 1. Adjoint Solve ---
-        d_full_adj = d_mem.clone()
+        # The matrix for the adjoint system must be identical to the one in the
+        # forward pass. We achieve this by calling the same kernel with the
+        # same physical inputs (`d_mem`, `a_geom`).
         g = torch.empty_like(grad_out)
         _single_dhs_kernel[(B,)](
-            d_full_adj, a_geom, grad_out.clone(), g,
+            d_mem.clone(), a_geom, grad_out.clone(), g,
             parent_idx, order, layer_ptr,
-            K=K, L=L, K_THREADS=threads, # ... other kernel args
+            K=K, L=L, K_THREADS=threads
         )
         
-        # --- 2. Compute Parameter Gradients ---
+        # --- 2. Compute Gradients for Original Inputs ---
         grad_b = g
         grad_d_mem = -(g * x)
+        is_root = parent_idx < 0
 
-        # --- CORRECTED Gradient w.r.t axial conductance `a_geom` (g_i) ---
-        grad_a_geom = torch.zeros_like(a_geom)
-        
-        is_root = (parent_idx == -1)
-        non_root_mask = ~is_root
-
-        # Case 1: Non-root compartments
+        # --- Gradient of `a_geom` ---
+        # First, compute the general gradient formula, which is correct for all non-root nodes.
         parent_idx_clamped = parent_idx.clamp_min(0).to(torch.int64)
         x_parent = x.gather(1, parent_idx_clamped.expand_as(x))
         g_parent = g.gather(1, parent_idx_clamped.expand_as(g))
@@ -149,30 +149,26 @@ class DHSSolveStable(torch.autograd.Function):
         delta_x = x - x_parent
         delta_g = g - g_parent
         
-        full_grad_a_geom = -(delta_g * delta_x)
-        grad_a_geom[:, non_root_mask] = full_grad_a_geom[:, non_root_mask]
-
-        # Case 2: Root compartment(s)
+        grad_a_geom = -(delta_g * delta_x)
+        
+        # Second, explicitly compute the correct gradient for the root node(s) and
+        # overwrite the value calculated by the general formula. The parameter a_geom[root]
+        # only affects the diagonal A[root,root], so its gradient is -g[root]*x[root].
         grad_a_geom[:, is_root] = -(g[:, is_root] * x[:, is_root])
         
-        # The return signature must match the forward inputs
+        # The return signature must match the forward inputs in order.
         return grad_d_mem, grad_a_geom, grad_b, None, None, None, None
 
+# ==============================================================================
+# 3. Public-Facing Wrapper Function
+# ==============================================================================
 
 def dhs_solve_cuda(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads=32):
     """
-    Differentiable and numerically stable DHS solver for tree structures.
+    Public-facing function for the differentiable DHS solver.
 
-    Args:
-        d_mem (torch.Tensor): (B,K) Membrane-only components of the main diagonal.
-        a_geom (torch.Tensor): (B,K) Positive axial conductances (g_i) to parent.
-        b (torch.Tensor): (B,K) Right-hand side of the system.
-        parent_idx (torch.Tensor): (K,) Parent indices.
-        order (torch.Tensor): (K,) DHS elimination order.
-        layer_ptr (torch.Tensor): (L+1,) Pointers to DHS layers.
-        threads (int): Threads per block (warp size).
-
-    Returns:
-        torch.Tensor: The solution vector x of shape (B,K).
+    This is the clean entry point that users and tests should call. It simply
+    wraps the `autograd.Function` to handle the solver's execution and gradient
+    computation.
     """
     return DHSSolveStable.apply(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads)

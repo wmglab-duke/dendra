@@ -172,6 +172,8 @@ class Population(P):
         self.pre_initialize_hooks: List[Callable] = []
         self.post_initialize_hooks: List[Callable] = []
 
+        torch._dynamo.reset()
+
         if self.jit:
             self._step = torch.compile(
                 step, 
@@ -397,7 +399,7 @@ class Population(P):
                 raise ValueError("If `time` is a Waveform, `tstop` must be provided.")
             time = time.assemble(dt)
 
-        ctx = nullcontext() if self.training else torch.inference_mode()
+        ctx = nullcontext() if self.training else torch.no_grad()
 
         with ctx:
             if self.training:
@@ -439,7 +441,7 @@ class Population(P):
             
             pre_loop_hook(callbacks, self)
 
-            dt = torch.as_tensor(dt, device=device, dtype=self.dtype())
+            dt = torch.tensor(dt, device=device, dtype=self.dtype())
 
             if not self.integrator.initialized or self.integrator.dt != dt_f or self.training:
                 self.integrator.initialize(self, dt)
@@ -571,7 +573,7 @@ class Population(P):
                 else:
                     time = time.expand(self.n_ax, -1)
 
-        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
+        dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
 
         with torch.set_grad_enabled(self.training):
 
@@ -674,8 +676,6 @@ class Population(P):
         the run method.
         """
 
-        dt = torch.as_tensor(dt, device=self.device(), dtype=self.dtype())
-
         self.clear_steady_state()
 
         self.initialize()
@@ -684,6 +684,7 @@ class Population(P):
         maxiter = int(tstop / dt)
 
         with torch.no_grad():
+            dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
             for i in tqdm(range(maxiter), desc=f"Steady state:: dt:{dt:.2e} ms, tstop:{tstop:.2e} ms"):
                 self._step(self.integrator, self, dt, None, None)
 
