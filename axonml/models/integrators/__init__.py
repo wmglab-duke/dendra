@@ -22,7 +22,6 @@ from .imex import (
 
 from .tree import (
     _dhs,
-    _df_branched
 )
 
 
@@ -36,7 +35,7 @@ def partial_class(cls: Type[Any], /, *args, **kwargs) -> Type[Any]:
     class _Partial(cls):
         __init__ = partialmethod(cls.__init__, *args, **kwargs)
 
-    _Partial.__name__ = f"{cls.__name__}Partial"
+    _Partial.__name__ = f"{cls.__name__}_solver"
     _Partial.__qualname__ = _Partial.__name__
     return _Partial
 
@@ -54,10 +53,7 @@ bwd_euler_ub = partial(partial_class, _bwd_euler_ub)
 bwd_euler_bt = partial(partial_class, _bwd_euler_bt)
 
 dhs = partial(partial_class, _dhs)
-df_branched = partial(partial_class, _df_branched)
 
-# Alias for backward compatibility
-dufort_frankel_branched = df_branched
 df = dufort_frankel
 
 
@@ -73,7 +69,5 @@ __all__ = [
     "bwd_euler_ub",
     "bwd_euler_bt",
     "dhs",
-    "df_branched",
-    "dufort_frankel_branched",
     "df",
 ]

@@ -13,13 +13,11 @@ try:
 except ImportError:
     AXONML_SOLVERS_AVAILABLE = False
 
-from axonml.models.mechanisms.compilers import MechCompiler, ImplicitCompiler
-from axonml.models.mechanisms.handler.builders import ImplicitHandlerBuilder
 from axonml.helpers import IMEM
 
 from .core import Integrator, SCIntegrator
 from .tridiag import pcr_solve_t
-from .triton import thomas_solve_cuda_bt, thomas_solve_cuda_bt_n, thomas_solve_cuda_t
+from .triton import thomas_solve_cuda_bt, thomas_solve_cuda_t
 
 
 class _bwd_euler_sc(SCIntegrator):
@@ -206,10 +204,6 @@ class _bwd_euler_bt(torch.nn.Module):
     """
     Implicit Euler method for block tridiagonal system.
     """
-
-    compiler = ImplicitCompiler
-    builder = ImplicitHandlerBuilder
-    is_df = False
 
     def __init__(self, model, mech, method="triton", **kwargs):
         if not AXONML_SOLVERS_AVAILABLE:

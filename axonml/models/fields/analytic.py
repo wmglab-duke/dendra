@@ -88,7 +88,7 @@ class anisotropic_point(Point):
     .. math::
         V(x,y,z) = \\frac{1000}{4\\pi \\cdot \\sqrt{\\frac{(x-x_0)^2}{\\rho_y * \\rho_z} + \\frac{(y-y_0)^2}{\\rho_x * \\rho_z} + \\frac{(z-z_0)^2}{\\rho_y * \\rho_z}}}
 
-    where distances are converted from μm to cm (× 10⁻⁴) for calculation.
+    where distances are converted from μm to cm (x 10⁻⁴) for calculation.
 
     The result is in mV with an assumed unit current source.
     """

@@ -102,20 +102,21 @@ class Slice:
         self.index_spec = index_spec
 
 
-    def shape(self):
-        """
-        Return the shape of the slice.
-        """
-        return self.index_spec.shape
-
-
-    def index(self):
+    @property
+    def index(self) -> Tuple[IndexElement, ...]:
         """
         Return the index of the slice.
         """
         return self.index_spec.index
 
+    @property
+    def shape(self):
+        """
+        Return the shape of the slice.
+        """
+        return self.index_spec.shape
     
+    @property
     def is_scalar(self) -> bool:
         """
         Return True if the slice is scalar.
@@ -137,28 +138,6 @@ class Slice:
             return dummy[self.index_spec.index]
         return getattr(self.model, var)[self.index_spec.index]
 
-
-    def __getattr__(self, name: str) -> Any:
-        """
-        Allow access to the model's attributes directly.
-        """
-        t = None
-        if name in self.model._buffers:
-            t = self.model._buffers[name]
-        elif name in self.model._parameters:
-            t = self.model._parameters[name]
-        if t is not None:
-            if (k := self.model.key) is not None:
-                return expand_into_shape(
-                    t,
-                    k,
-                    self.base_shape
-                )[self.index_spec.index]
-            return t[self.index_spec.index]
-        else:
-            return Slice(getattr(self.model, name), self.index_spec, self.base_shape)
-        raise AttributeError(f"{type(self).__name__!s} has no attribute {name!s}")
-
     def inject(self, waveform):
         self.model.stimuli.append((waveform, self.index_spec.shape, self.index_spec.index))
 
@@ -168,3 +147,6 @@ class Slice:
     def label(self, name: str):
         setattr(self.model, name, self)
         self.model._labels[name] = self
+
+    def __repr__(self):
+        return f"Slice(index={self.index_spec.index}, shape={self.index_spec.shape}, is_scalar={self.index_spec.is_scalar})"

@@ -1,7 +1,7 @@
 from .compilers.ast import factorize_linear_in_v
 from .compilers.compile_f import convert_func
 
-from axonml.helpers import logger
+from axonml.helpers import logger, DEBUG
 
 
 implicit_equation_template = """
@@ -46,6 +46,7 @@ def build_unfactorable_equation(current):
 
 
 def build_current_eq(mechanism, k, assign=False):
+    
     try:
         gtot, irev = factorize_linear_in_v(mechanism.__class__, method=k)
         code = build_implicit_equation(k, gtot, irev, assign)
@@ -54,6 +55,8 @@ def build_current_eq(mechanism, k, assign=False):
         logger.warning(f"Could not factorize {k} in {mechanism.__class__.__name__}.")
         code = build_unfactorable_equation(k)
         factorable = False
+    if DEBUG > 0:
+        logger.info(f"Generated code for {k}:\n{code}")
     filename = "<solve_function>"
     code = compile(code, filename, "exec")
     exec(code)

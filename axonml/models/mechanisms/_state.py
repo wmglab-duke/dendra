@@ -360,6 +360,19 @@ class State(_Parameterized):
                 self.q10 = self.return_q10_cache
                 self.register_buffer('q10_cache', self.calc_q10())
 
+    @staticmethod
+    def to_column(tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a 2D tensor to a column vector (2D tensor with one column).
+        """
+        return tensor.view(-1, 1)
+
+    def from_column(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a column vector (2D tensor with one column) back to its original shape.
+        """
+        return tensor.view(*self.shape)
+
     def initialize(self, v):
         self.initial(v)
         return

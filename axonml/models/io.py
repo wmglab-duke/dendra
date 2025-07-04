@@ -14,6 +14,24 @@ def is_neuron_installed() -> bool:
     return NEURON_INSTALLED
 
 
+def xyz(seg):
+    sec = seg.sec
+    seg_x = seg.x
+    x_arr = []
+    y_arr = []
+    z_arr = []
+    arc_l = []
+    for i in range(sec.n3d()):
+        x_arr.append(sec.x3d(i))
+        y_arr.append(sec.y3d(i))
+        z_arr.append(sec.z3d(i))
+        arc_l.append(sec.arc3d(i))
+    x = np.interp(seg_x, arc_l, x_arr)
+    y = np.interp(seg_x, arc_l, y_arr)
+    z = np.interp(seg_x, arc_l, z_arr)
+    return {'x': x, 'y': y, 'z': z}
+
+
 def lambda_f(sec, freq_hz):
     """
     Python clone of the HOC function `lambda_f()`.
@@ -81,11 +99,14 @@ def apply_d_lambda(
 
 
 def read_swc(
-    file_path: str, d_lambda=0.1, freq=100.0, **data_kwargs
+    file_path: str, d_lambda=0.1, freq=100.0, data_func=None
 ) -> Tuple[nx.DiGraph, Dict[int, 'h.Segment']]:
     """Read an SWC file and return the contents."""
     if not is_neuron_installed():
         raise ImportError("NEURON is not installed. Cannot read SWC files.")
+
+    if data_func is None:
+        data_func = xyz
     
     h.load_file("import3d.hoc")
 
@@ -93,7 +114,6 @@ def read_swc(
         def __init__(self, importer):
             importer.instantiate(self)
 
-    
     reader = h.Import3d_SWC_read()
     reader.input(file_path)
     importer = h.Import3d_GUI(reader, 0)
@@ -101,7 +121,33 @@ def read_swc(
     cell = Cell(importer)
     apply_d_lambda(cell.all, d_lambda, freq)
 
-    return neuron_to_axonml_graph(root_sec=cell.all[0], **data_kwargs)
+    return neuron_to_axonml_graph(root_sec=cell.all[0], data_func)
+
+
+def read_neurolucida(
+    file_path: str, d_lambda=0.1, freq=100.0, data_func=None
+) -> Tuple[nx.DiGraph, Dict[int, 'h.Segment']]:
+    """Read a Neurolucida file and return the contents."""
+    if not is_neuron_installed():
+        raise ImportError("NEURON is not installed. Cannot read Neurolucida files.")
+
+    if data_func is None:
+        data_func = xyz
+    
+    h.load_file("import3d.hoc")
+
+    class Cell:
+        def __init__(self, importer):
+            importer.instantiate(self)
+
+    reader = h.Import3d_Neurolucida_read()
+    reader.input(file_path)
+    importer = h.Import3d_GUI(reader, 0)
+
+    cell = Cell(importer)
+    apply_d_lambda(cell.all, d_lambda, freq)
+
+    return neuron_to_axonml_graph(root_sec=cell.all[0], data_func)
 
 
 # convert NEURON sections to a directed acyclic graph (DAG)
@@ -153,7 +199,7 @@ def neuron_to_axonml_graph(
     root_sec: Optional['nrn.Section'] = None,
     *,
     attach_objects: bool = True,
-    **data_kwargs
+    data_func=None,
 ) -> Tuple[nx.DiGraph, Dict[int, 'h.Segment']]:
     """
     Build a directed acyclic graph whose nodes are NEURON compartments.
@@ -189,9 +235,7 @@ def neuron_to_axonml_graph(
             segkey2id[key] = nid
             id2seg[nid]    = seg
             if attach_objects:
-                data = {
-                    k:v(seg) for k,v in data_kwargs.items()
-                }
+                data = data_func(seg) if data_func else {}
                 G.add_node(
                     nid,
                     diam=seg.diam,
@@ -270,7 +314,7 @@ def neuron_to_axonml_graph(
 
     G, relabel_mapping = reorder_graph_by_patterns(G, patterns, group_order)
     id2seg = regenerate_id_map(id2seg, relabel_mapping)
-    fix_graph_branchpoints(G, id2seg, **data_kwargs)
+    fix_graph_branchpoints(G, id2seg, data_func)
     return G, id2seg
 
 
@@ -412,7 +456,7 @@ def get_children_of_nodes(G: nx.DiGraph, node_ids):
     return children_map
 
 
-def fix_graph_branchpoints(G, id2seg, **data_kwargs):
+def fix_graph_branchpoints(G, id2seg, data_func=None):
     children_map = get_children_of_nodes(G, find_branch_points(G))
     to_fix = {}
     for pre, post_list in children_map.items():
@@ -425,9 +469,7 @@ def fix_graph_branchpoints(G, id2seg, **data_kwargs):
     for pre_idx, dct in to_fix.items():
         for x_on_pre, post_indices in dct.items():
             parent_seg_true = id2seg[pre_idx].sec(x_on_pre)
-            data = {
-                k : v(parent_seg_true) for k, v in data_kwargs.items()
-            }
+            data = data_func(parent_seg_true) if data_func else {}
             nid = len(G.nodes)
             G.add_node(
                 nid,
@@ -435,7 +477,7 @@ def fix_graph_branchpoints(G, id2seg, **data_kwargs):
                 L=0.0,
                 Ra=parent_seg_true.sec.Ra,
                 cm=parent_seg_true.cm,
-                name=f"branchpoint.{c}",
+                name=f"branchpoint.{c}.{parent_seg_true}",
                 area=parent_seg_true.area(),
                 **data
             )
