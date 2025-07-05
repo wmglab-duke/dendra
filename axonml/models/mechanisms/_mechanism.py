@@ -350,8 +350,9 @@ class Mechanism(_Parameterized):
         pass
 
     def detach(self):
-        for n, b in self.named_buffers():
-            b.detach_()
+        super().detach()
+        for state_module in self.DE.values():
+            state_module.detach()
 
     def _advance(self, v, dt):
         local = {}

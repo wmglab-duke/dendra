@@ -6,42 +6,11 @@ from torch.nn import functional as F
 from torch.nn.utils import parametrize
 
 
-class Functional:
-    def fn(self, model):
-        raise NotImplementedError
-
-
-class Lambda(Functional):
-    def __init__(self, f):
-        self.f = f
-
-    def fn(self, model):
-        return self.f(model)
-    
-
-class positive:
-    def __init__(self, val):
-        self.val = val
-
-
-class PositiveSoftplus(torch.nn.Module):
-    def forward(self, x):
-        return F.softplus(x)                # f(x)
-
-    def right_inverse(self, y):
-        return softplus_inv(y)              # f⁻¹(y)  ← same helper as §2
-
-
-def softplus_inv(y, beta=1., eps=1e-6):
-    # y must be >0; eps keeps the log well-behaved numerically
-    return (torch.log(torch.exp(beta*(y-eps)) - 1.0) / beta)
-
-
 def to_param(val, model=None):
     if isinstance(val, torch.nn.Parameter):
         return val
-    if isinstance(val, Functional):
-        return torch.nn.Parameter(torch.as_tensor(val.fn(model)), requires_grad=False)
+    if isinstance(val, torch.nn.Module):
+        return val
     return torch.nn.Parameter(torch.as_tensor(val), requires_grad=False)
 
 
@@ -56,6 +25,43 @@ def distribute_over(val, over='a'):
         return val[None, :]
     else:
         return val
+
+
+class Functional(torch.nn.Module):
+    """
+    A functional that can be used as a parameter in a model.
+    This is useful for cases where you want to use a function as a parameter,
+    such as in a neural network layer.
+    """
+    
+    def __init__(self, func: torch.nn.Module, fill=None, key=None):
+        super(Functional, self).__init__()
+        self.func = func
+        self.fill = fill
+        if key is not None:
+            self.register_buffer('key', torch.as_tensor(key, dtype=torch.long))
+        else:
+            self.key = None
+
+    def forward(self, buffer):
+        p = self.func(buffer)
+        if self.key is None:
+            return p
+        b = buffer.clone()
+        b.view(-1).index_copy_(0, self.key, self.fill(p))
+        return b
+
+
+def build_parametrization(
+    module,
+    output,
+    key: torch.LongTensor,
+    main_shape: tuple[int, int]
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    if key is None:
+        return Functional(module)
+    fill = create_param_expander(output, key, main_shape)
+    return Functional(module, fill=fill, key=key)
 
 
 def create_param_expander(
@@ -250,6 +256,8 @@ class _Parameterized(torch.nn.Module):
         self.shape  = shape
         self.params = self.__class__._params.copy()
 
+        self.parametrizations = torch.nn.ModuleDict()
+
         if kwargs:
             self.params.update(kwargs)
 
@@ -287,10 +295,16 @@ class _Parameterized(torch.nn.Module):
                             count += 1
                         key = torch.as_tensor(key, dtype=torch.long)
                         parameter = to_param(value, self)
-                        setattr(self, p_name, parameter)
-                        fill = create_param_expander(parameter, key, self.shape)
-                        self.additional_parameters.setdefault(name, []).append((fill, getattr(self, p_name)))
-                        keys.append(key)
+                        if isinstance(parameter, torch.nn.Module):
+                            p = parameter(torch.empty(self.shape))
+                            parametrization = build_parametrization(p, parameter, key, self.shape)
+                            self.parametrizations.setdefault(name, []).append(parametrization)
+                            setattr(self, p_name, parameter)
+                        else:
+                            setattr(self, p_name, parameter)
+                            fill = create_param_expander(parameter, key, self.shape)
+                            self.additional_parameters.setdefault(name, []).append((fill, getattr(self, p_name)))
+                            keys.append(key)
                     self.keys[name] = torch.cat(keys).to(torch.long)
 
     def load_additional_parameters(self):
@@ -306,10 +320,24 @@ class _Parameterized(torch.nn.Module):
             getattr(self, name).detach_()
             getattr(self, name).copy_(getattr(self, p_name))
         self.load_additional_parameters()
+        self.apply_parametrizations()
 
-    def detach_(self):
+    def apply_parametrizations(self):
+        """
+        Apply all parametrizations to the parameters of this model.
+        """
+        for name, param_list in self.parametrizations.items():
+            b = getattr(self, name)
+            for param in param_list:
+                b = param(b)
+            setattr(self, name, b)
+
+    def detach(self):
         for n, b in self.named_buffers():
-            b.detach_()
+            try:
+                b.detach_()
+            except Exception as e:
+                setattr(self, n, b.detach())
 
     def check_kwargs(self, kwargs):
         _params = self.__class__._params

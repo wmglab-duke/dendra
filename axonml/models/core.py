@@ -25,7 +25,6 @@ from axonml.models.mechanisms.handler.handler import build_handler
 from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms._handler import MechanismHandler
 from axonml.units import mm, um
-from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
 from axonml.models.interfaces import HandlerInterface
 from axonml.models.integrators import euler, dufort_frankel, bwd_euler_ub, bwd_euler_sc
 from axonml.models.mechanisms._ions import Ion
@@ -1024,6 +1023,17 @@ class Population(P):
         self.integrator = self.integrator(self, mech)
         self.is_built = True
         self.eval()
+        return self
+
+    def detach(self):
+        """
+        Detach the model from the current computation graph.
+
+        This method is used to detach the model's parameters and buffers
+        from the current computation graph, which is useful for preventing
+        gradients from being computed during backpropagation.
+        """
+        self.integrator.detach(self)
         return self
 
 

@@ -3,10 +3,6 @@ from typing import Tuple
 import torch
 from torch.nn import functional as F
 
-from axonml.models.mechanisms.compilers import (
-    MechCompiler,
-    DF_Compiler,
-)
 from axonml.helpers import IMEM
 
 from .core import Integrator

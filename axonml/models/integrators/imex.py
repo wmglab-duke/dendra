@@ -3,7 +3,6 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-from axonml.models.mechanisms.compilers import MechCompiler, ImplicitCompiler
 from axonml.models.mechanisms.handler.builders import ImplicitHandlerBuilder
 from axonml.helpers import IMEM
 
@@ -211,10 +210,6 @@ class _krylov_etd1(Integrator):
     """
     IMEX ETD1 method using Krylov subspace for the matrix exponential.
     """
-
-    compiler = ImplicitCompiler
-    builder = ImplicitHandlerBuilder
-    is_df = False
 
     def __init__(
         self, model, mech, m: int = 4, method="arnoldi", guard=False, imem=None
