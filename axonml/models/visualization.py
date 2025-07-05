@@ -20,19 +20,22 @@ def palette_hsv(n, *, s=0.65, v=0.9, seed=0):
     return [mpl.colors.to_hex(colorsys.hsv_to_rgb(h, s, v)) for h in hues]
 
 
-def vis_2d(cell, view='z', node_scale=8, dpi=200):
+def vis_2d(cell, view='y', node_scale=8, dpi=200):
     """
-    Project a 3-D NetworkX graph to 2-D and plot.
-    
+    Project a 3-D NetworkX graph to 2-D and plot with a legend.
+
     Parameters
     ----------
     cell : AxonML Population
+        The cell object containing the graph, labels, and find method.
     view : {'x', 'y', 'z'}, optional
         Axis to project along. Default 'z' (drop z -> use x-y).
     node_scale : float, optional
         Factor that converts diam (µm) to matplotlib marker area points².
+    dpi : int, optional
+        The resolution of the figure in dots per inch.
     """
-    # ---- collect coordinates ----
+    # ---- 1. Collect coordinates and graph ----
     G = cell.graph
     if G is None:
         raise ValueError("Graph is None. Please create a graph first.")
@@ -40,45 +43,104 @@ def vis_2d(cell, view='z', node_scale=8, dpi=200):
     coords = {n: (float(d['x']), float(d['y']), float(d['z']))
               for n, d in G.nodes(data=True)}
 
-    indices = torch.arange(len(G.nodes()), device=cell.device())
-
-    labels = cell._labels
-    color_choices = palette_hsv(len(labels))
-    colors = {}
-    for i, l in enumerate(labels):
-        label_idx = indices[cell.find(l)].cpu().tolist()
-        for idx in label_idx:
-            colors[idx] = color_choices[i]
-    
-    # orthographic projection
+    # Orthographic projection
     if view == 'z':
+        x_l, y_l = 'x', 'y'
         proj = {n: (c[0], c[1]) for n, c in coords.items()}
     elif view == 'y':
+        x_l, y_l = 'x', 'z'
         proj = {n: (c[0], c[2]) for n, c in coords.items()}
     elif view == 'x':
+        x_l, y_l = 'y', 'z'
         proj = {n: (c[1], c[2]) for n, c in coords.items()}
     else:
         raise ValueError("view must be 'x', 'y', or 'z'")
-    
-    xs = [proj[n][0] for n in G.nodes()]
-    ys = [proj[n][1] for n in G.nodes()]
-    sizes = [G.nodes[n]['diam'] * node_scale for n in G.nodes()]      # area ∝ diam
-    c = [colors.get(n, 'grey') for n in G.nodes()]
 
-    # ---- plot ----
-    fig, ax = plt.subplots(dpi=dpi)
-    sc = ax.scatter(xs, ys, s=sizes, c=c, alpha=0.85,
-                    edgecolors='k', linewidths=0.3)
+    # ---- 2. Prepare data grouped by label for plotting ----
+    labels = cell._labels
+    color_choices = palette_hsv(len(labels))
     
-    # edges
+    # Create a mapping from a label string to its color
+    label_to_color = {label: color for label, color in zip(labels, color_choices)}
+    
+    # This dictionary will hold the plot data for each group
+    # e.g., {'soma': {'xs': [...], 'ys': [...], 'sizes': [...]}, ...}
+    data_by_label = {label: {'xs': [], 'ys': [], 'sizes': []} for label in labels}
+
+    indices = torch.arange(len(G.nodes()), device=cell.device())
+    
+    # Create a reverse map from node_id to its label for quick lookup
+    node_to_label = {}
+    for label in labels:
+        nodes_for_label = indices[cell.find(label)].cpu().tolist()
+        for node_id in nodes_for_label:
+            node_to_label[node_id] = label
+            
+    # Populate the data dictionary
+    unclassified_nodes = {'xs': [], 'ys': [], 'sizes': []}
+    for n in G.nodes():
+        label = node_to_label.get(n)
+        px, py = proj[n]
+        size = G.nodes[n]['diam'] * node_scale
+        
+        if label:
+            data_by_label[label]['xs'].append(px)
+            data_by_label[label]['ys'].append(py)
+            data_by_label[label]['sizes'].append(size)
+        else:
+            # Handle nodes that might not have a label
+            unclassified_nodes['xs'].append(px)
+            unclassified_nodes['ys'].append(py)
+            unclassified_nodes['sizes'].append(size)
+
+    # ---- 3. Plotting ----
+    fig, ax = plt.subplots(dpi=dpi, figsize=(8, 8))
+
+    # Plot edges first so they are in the background
     for u, v in G.edges():
         x0, y0 = proj[u]
         x1, y1 = proj[v]
         ax.plot([x0, x1], [y0, y1], 'k-', linewidth=0.5, alpha=0.7)
     
+    # Plot each group of nodes with a separate scatter call to create legend handles
+    for label, data in data_by_label.items():
+        if not data['xs']: continue # Skip empty labels
+        ax.scatter(
+            data['xs'],
+            data['ys'],
+            s=data['sizes'],
+            c=[label_to_color[label]], # Use a list with one color
+            label=label, # This is the key for the legend!
+            alpha=0.85,
+            edgecolors='k',
+            linewidths=0.3
+        )
+        
+    # Plot any unclassified nodes
+    if unclassified_nodes['xs']:
+        ax.scatter(
+            unclassified_nodes['xs'],
+            unclassified_nodes['ys'],
+            s=unclassified_nodes['sizes'],
+            c='grey',
+            label='unclassified',
+            alpha=0.6,
+            edgecolors='k',
+            linewidths=0.3
+        )
+    
+    # ---- 4. Create and display the legend ----
+    ax.legend(
+        loc='upper left',          # Specifies which corner of the legend box to anchor
+        bbox_to_anchor=(1.02, 1),  # Places the anchor point outside the axes
+        borderaxespad=0.,          # Removes padding between the anchor and the legend
+        frameon=False
+    )
+
     ax.set_aspect('equal')
-    ax.set_xlabel('µm')
-    ax.set_ylabel('µm')
+    ax.set_xlabel(f'{x_l} (µm)')
+    ax.set_ylabel(f'{y_l} (µm)')
+    fig.tight_layout()
     plt.show()
 
 

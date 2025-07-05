@@ -8,6 +8,7 @@ from .explicit import (
     _rk2,
     _rk4,
     _dufort_frankel,
+    _dufort_frankel_homogeneous,
 )
 
 from .implicit import (
@@ -45,6 +46,7 @@ rk1             = partial(partial_class, _rk1)
 rk2             = partial(partial_class, _rk2)
 rk4             = partial(partial_class, _rk4)
 dufort_frankel  = partial(partial_class, _dufort_frankel)
+dufort_frankel_homogeneous = partial(partial_class, _dufort_frankel_homogeneous)
 eulerv1         = partial(partial_class, _eulerv1)
 
 krylov_etd1  = partial(partial_class, _krylov_etd1)
@@ -55,6 +57,7 @@ bwd_euler_bt = partial(partial_class, _bwd_euler_bt)
 dhs = partial(partial_class, _dhs)
 
 df = dufort_frankel
+dfh = dufort_frankel_homogeneous
 
 
 __all__ = [
@@ -64,10 +67,12 @@ __all__ = [
     "rk2",
     "rk4",
     "dufort_frankel",
+    "dufort_frankel_homogeneous",
     "krylov_etd1",
     "bwd_euler_sc",
     "bwd_euler_ub",
     "bwd_euler_bt",
     "dhs",
     "df",
+    "dfh",
 ]

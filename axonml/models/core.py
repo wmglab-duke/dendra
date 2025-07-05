@@ -20,14 +20,10 @@ from axonml.models.parametric import Parameterized, _Parameterized as P
 from axonml.models.mechanisms.core import Mechanism, validate
 from axonml.models.mechanisms import concentrations, equilibria
 from axonml.models.declarations import PARAMETER
-from axonml.models.mechanisms.handler.defaults import valid_ions
-from axonml.models.mechanisms.handler.handler import build_handler
-from axonml.models.mechanisms.handler.ions import build_ion
 from axonml.models.mechanisms._handler import MechanismHandler
+from axonml.models.mechanisms._ions import valid_ions, Ion
 from axonml.units import mm, um
-from axonml.models.interfaces import HandlerInterface
 from axonml.models.integrators import euler, dufort_frankel, bwd_euler_ub, bwd_euler_sc
-from axonml.models.mechanisms._ions import Ion
 
 
 from axonml.helpers import (
@@ -137,7 +133,7 @@ class Population(P):
 
         self.integrator = integrator
 
-        self.stimuli = []
+        self.injections = []
         self.intra = None
 
         self._mech_data = {}
@@ -684,7 +680,7 @@ class Population(P):
 
         with torch.no_grad():
             dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
-            for i in tqdm(range(maxiter), desc=f"Steady state:: dt:{dt:.2e} ms, tstop:{tstop:.2e} ms"):
+            for i in tqdm(range(maxiter), desc=f"Steady state:"):
                 self._step(self.integrator, self, dt, None, None)
 
         self.cache("_steady_state")
@@ -855,13 +851,13 @@ class Population(P):
         index = parse_key(key, self.shape, self.device())
         return Slice(self, index)
 
-    def delete_stimuli(self):
-        self.stimuli = []
+    def delete_injections(self):
+        self.injections = []
         self.intra = None
 
     def build_intra(self):
-        if self.stimuli:
-            return IntraStim(self, self.stimuli)
+        if self.injections:
+            return IntraStim(self, self.injections)
         return None
 
     def insert(self, mechanism, alias=None, index_spec=None, ic=None, **kwargs):
@@ -1035,7 +1031,7 @@ class Population(P):
         """
         self.integrator.detach(self)
         return self
-
+        
 
 class Axon(Population):
     """
@@ -1099,6 +1095,9 @@ class Axon(Population):
         self.v[:]   = v_init
         self.v.detach_()
 
+        self.x[:] = self._x()  # Initialize x positions
+
+
         self.cid = None
 
         if torch.is_tensor(diameters):
@@ -1114,6 +1113,7 @@ class Axon(Population):
 
         # -- biophysics --
         self.biophysics()
+        self._register_buffers()
 
     def biophysics(self):
         """
@@ -1135,7 +1135,6 @@ class Axon(Population):
     def set_diam(self, diams):
         diams = torch.as_tensor(diams, dtype=self.dtype())
         self.diam[:] = diams
-        self.instantiate_parameters_lambda()
         self.calculate_geometric_params()
 
     def calculate_geometric_params(self):
@@ -1295,7 +1294,6 @@ class Unmyelinated(Axon):
         self.dx_: float = dx
         self.L: float = n_comp * dx
         super().__init__(diameters, n_comp, celsius, v_init, integrator)
-        self.x[:] = self._x()  # Initialize x positions
         self.dx[:] = self.dx_
 
     def _x(self) -> torch.Tensor:  # x in um
@@ -1431,7 +1429,7 @@ class Myelinated(Axon):
         noded = self.noded1 * diameters**2 + self.noded2 * diameters + self.noded3
         return noded / 10000
 
-    def x_(self) -> torch.Tensor:  # x in um
+    def _x(self) -> torch.Tensor:  # x in um
         l = (self.n_comp - 1) * self.deltax(self.diam) * 10000
         start = -l / 2
         end = l / 2

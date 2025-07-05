@@ -3,7 +3,6 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-from axonml.models.mechanisms.handler.builders import ImplicitHandlerBuilder
 from axonml.helpers import IMEM
 
 from .core import Integrator

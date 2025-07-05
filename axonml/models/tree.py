@@ -50,8 +50,6 @@ class Tree(Population):
     nodes : int
         Number of nodes in the tree.
     """
-
-    PARAMETER(celsius=37.0)
     
     def __init__(self, N, C, graph, integrator=None, **kwargs):
         if integrator is None:
@@ -161,6 +159,8 @@ class Tree(Population):
         cell[:, cell.find('apic')].label('apic')
         return cell
 
+    from_asc = from_neurolucida
+
     def recentre(self, x=0.0, y=0.0, z=0.0):
         """
         Recenters the tree structure so soma is at the origin.
@@ -173,9 +173,9 @@ class Tree(Population):
         z : float, optional
             Z-coordinate of the new center. Default is 0.0.
         """ 
-        current_centre_x = self.x[:, 0]
-        current_centre_y = self.y[:, 0]
-        current_centre_z = self.z[:, 0]
+        current_centre_x = self.x[:, self.find('soma')]
+        current_centre_y = self.y[:, self.find('soma')]
+        current_centre_z = self.z[:, self.find('soma')]
 
         offsets = [
             x - current_centre_x,

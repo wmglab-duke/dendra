@@ -6,19 +6,19 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 
-from axonml.models import Axon
+from axonml.models import Population
 from axonml.models.callbacks import Recorder, ThresholdCallback
 
 
 class Thresholder:
     def __init__(
         self,
-        model: Axon,
+        model:  Population,
         active: ThresholdCallback,
-        space: Optional[Union[npt.NDArray, Tensor]] = None,
-        time: Optional[Union[npt.NDArray, Tensor]] = None,
-        bases: Optional[Union[npt.NDArray, Tensor]] = None,
-        diams: Optional[Union[npt.NDArray, Tensor, List]] = None,
+        space:  Optional[Union[npt.NDArray, Tensor]] = None,
+        time:   Optional[Union[npt.NDArray, Tensor]] = None,
+        bases:  Optional[Union[npt.NDArray, Tensor]] = None,
+        diams:  Optional[Union[npt.NDArray, Tensor, List]] = None,
         ub=None,
         fix_bound_up=5.0,
         fix_bound_down=0.1,

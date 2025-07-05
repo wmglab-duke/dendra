@@ -56,6 +56,8 @@ class MechanismHandler(torch.nn.Module):
         self.read_from_ions()
         self.i(v)
         self.write_to_ions(v)
+        for ion in self.ions.values():
+            ion.advance(celsius)
         self.read_from_ions()
 
     def init_i_g_bufs(self, v):

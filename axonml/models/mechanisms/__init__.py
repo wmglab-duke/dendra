@@ -11,7 +11,6 @@ from ..declarations import (
     DIFFUSION,
 )
 from .core import Mechanism, State
-from .handler.ions import USEION
 from ._ions import ion_register, concentrations, equilibria
 
 __all__ = [
@@ -23,7 +22,6 @@ __all__ = [
     "USEQ10",
     "DERIVATIVE",
     "NONSPECIFIC_CURRENT",
-    "USEION",
     "ion_register",
     "RANGE",
     "ASSIGNED",

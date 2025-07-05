@@ -121,7 +121,7 @@ def read_swc(
     cell = Cell(importer)
     apply_d_lambda(cell.all, d_lambda, freq)
 
-    return neuron_to_axonml_graph(root_sec=cell.all[0], data_func)
+    return neuron_to_axonml_graph(root_sec=cell.all[0], data_func=data_func)
 
 
 def read_neurolucida(
@@ -140,14 +140,18 @@ def read_neurolucida(
         def __init__(self, importer):
             importer.instantiate(self)
 
-    reader = h.Import3d_Neurolucida_read()
+    reader = h.Import3d_Neurolucida3()
+    reader.quiet = 1
     reader.input(file_path)
     importer = h.Import3d_GUI(reader, 0)
 
     cell = Cell(importer)
     apply_d_lambda(cell.all, d_lambda, freq)
 
-    return neuron_to_axonml_graph(root_sec=cell.all[0], data_func)
+    return neuron_to_axonml_graph(root_sec=cell.all[0], data_func=data_func)
+
+
+read_asc = read_neurolucida
 
 
 # convert NEURON sections to a directed acyclic graph (DAG)
