@@ -169,7 +169,7 @@ class MechanismHandler(torch.nn.Module):
             mech.add_(self._buf_i[c_idx], i)
         
         # sum up currents and conductances
-        tot_i = self._buf_i[0]
+        tot_i = sum(self._buf_i)
 
         # expose per-ion currents
         for (ion, ion_h) in self.ions.items():

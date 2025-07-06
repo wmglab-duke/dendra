@@ -347,7 +347,7 @@ class Mechanism(_Parameterized):
         Mechanism._init_declarations.append(kwargs)
 
     def breakpoint(self, v):
-        pass
+        return
 
     def detach(self):
         super().detach()
@@ -367,7 +367,7 @@ class Mechanism(_Parameterized):
             state_module.populate_parameter_buffers()
 
     def initial(self, v):
-        pass
+        return
 
     @classmethod
     def rename(cls, new_name=None, suffix=None):
