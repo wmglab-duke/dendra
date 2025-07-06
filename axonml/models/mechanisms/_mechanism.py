@@ -355,12 +355,11 @@ class Mechanism(_Parameterized):
             state_module.detach()
 
     def _advance(self, v, dt):
-        local = {}
         for state_module in self.DE.values():
             states = {state_name: getattr(self, state_name) for state_name in state_module._state}
-            local.update(state_module.advance(v, dt, states))
-        for k, v in local.items():
-            setattr(self, k, v)
+            local = state_module.advance(v, dt, states)
+            for state_name, value in local.items():
+                setattr(self, state_name, value)
 
     def populate(self):
         self.populate_parameter_buffers()
@@ -369,3 +368,63 @@ class Mechanism(_Parameterized):
 
     def initial(self, v):
         pass
+
+    @classmethod
+    def rename(cls, new_name=None, suffix=None):
+        """
+        Returns a new mechanism class that is an exact copy of `cls` but with a
+        different name.
+
+        Args:
+            new_name (str): The name of the new class. If None, the original class's
+                            name will be used with an optional suffix.
+            suffix (str): An optional suffix to append to the new class name.
+
+        Returns:
+            type: A new class, identical in behavior to the original but with a new name.
+        """
+        return rename(cls, new_name=new_name, suffix=suffix)
+
+
+def rename(mechanism, new_name=None, suffix=None):
+    """
+    Returns a new mechanism that is an exact copy of `original_class` but with a
+    different name.
+
+    Args:
+        original_class (type): The class to be copied.
+        new_name (str): The name of the new class. If None, the original class's
+                        name will be used with an optional suffix.
+        suffix (str): An optional suffix to append to the new class name.
+
+    Returns:
+        type: A new class, identical in behavior to the original but with a new name.
+    """
+    # The three-argument form of type(): type(name, bases, dict)
+    # 1. name: The new class name (a string).
+    # 2. bases: A tuple of the original class's base classes.
+    # 3. dict: A dictionary containing the attributes and methods of the
+    #          original class. We create a copy to avoid side effects.
+
+    if new_name is None and suffix is None:
+        raise ValueError("Either new_name or suffix must be provided.")
+
+    if new_name is None:
+        new_name = mechanism.__name__
+
+    if suffix is not None:
+        if not isinstance(suffix, str):
+            raise TypeError("Suffix must be a string.")
+        new_name += f'_{suffix}'
+    
+    # Copy the original class's namespace dictionary.
+    class_dict = dict(mechanism.__dict__)
+
+    # The __dict__ of a class doesn't always include '__module__',
+    # so we copy it over explicitly to make the new class look authentic.
+    if '__module__' not in class_dict:
+        class_dict['__module__'] = mechanism.__module__
+
+    new_class = type(new_name, mechanism.__bases__, class_dict)
+
+    return new_class

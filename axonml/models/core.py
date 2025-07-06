@@ -570,88 +570,89 @@ class Population(P):
 
         dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
 
-        with torch.set_grad_enabled(self.training):
+        with torch.nn.utils.parametrize.cached():
+            with torch.set_grad_enabled(self.training):
 
-            t = torch.arange(0, tstop, dt_f, dtype=self.dtype(), device=self.device())
-            n_chunks = math.ceil(len(t) / chunklength)
+                t = torch.arange(0, tstop, dt_f, dtype=self.dtype(), device=self.device())
+                n_chunks = math.ceil(len(t) / chunklength)
 
-            t_c_f = torch.tensor_split(t, n_chunks)
-
-            if with_extra:
-                if functional:
-                    t_chunks = t_c_f
-                else:
-                    t_chunks = torch.tensor_split(time, n_chunks, dim=-1)
-
-            if multicontact:
-                einsum = op_mc
-            else:
-                einsum = op_sc
-
-            if callbacks:
-                for c in callbacks:
-                    c.dt = dt_f
-
-            callbacks = CallbackList(callbacks)
-
-            if (not self.initialized) or reinit:
-                if "_steady_state" in self._caches:
-                    self.restore("_steady_state")
-                    self.t_ind = 0
-                else:
-                    self.initialize()
-            else:
-                self.detach()
-
-            if progressbar:
-                progressbar = tqdm(total=n_chunks, desc=f"{self.t_ind*dt_f:.1f} ms")
-
-            self.integrator.initialize(self, dt)
-            einsum = torch.compile(einsum)
-
-            pre_loop_hook(callbacks, self)
-
-            for i in range(n_chunks):
-
-                if with_intra:
-                    stims, indices = intra.init(t_c_f[i])
-                    stims = [s.unbind(0) for s in stims]
+                t_c_f = torch.tensor_split(t, n_chunks)
 
                 if with_extra:
                     if functional:
-                        t = time(t_chunks[i]).to(self.dtype())
-                        if multicontact:
-                            t = t.unsqueeze(0).expand(-1, self.n_ax, -1)
-                        else:
-                            t = t.expand(self.n_ax, -1)
+                        t_chunks = t_c_f
                     else:
-                        t = t_chunks[i]
-                    ve_ = einsum(ve_s, t).contiguous().unbind(dim=0)
+                        t_chunks = torch.tensor_split(time, n_chunks, dim=-1)
 
-                for j in range(len(t_c_f[i])):
-                    if with_extra:
-                        ve_c = ve_[j]
-                    else:
-                        ve_c = None
-                    if with_intra:
-                        s = [st[j] for st in stims]
-                        intra_c = make_intra(intra, s, indices)
-                    else:
-                        intra_c = None
-                    
-                    self._step(self.integrator, self, dt, ve_c, intra_c)
-                    post_step_hook(callbacks, self)
+                if multicontact:
+                    einsum = op_mc
+                else:
+                    einsum = op_sc
 
-                    self.t_ind += 1
+                if callbacks:
+                    for c in callbacks:
+                        c.dt = dt_f
+
+                callbacks = CallbackList(callbacks)
+
+                if (not self.initialized) or reinit:
+                    if "_steady_state" in self._caches:
+                        self.restore("_steady_state")
+                        self.t_ind = 0
+                    else:
+                        self.initialize()
+                else:
+                    self.detach()
 
                 if progressbar:
-                    progressbar.update(1)
-                    progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
+                    progressbar = tqdm(total=n_chunks, desc=f"{self.t_ind*dt_f:.1f} ms")
 
-            post_loop_hook(callbacks, self)
+                self.integrator.initialize(self, dt)
+                einsum = torch.compile(einsum)
 
-            if progressbar:
-                progressbar.close()
+                pre_loop_hook(callbacks, self)
+
+                for i in range(n_chunks):
+
+                    if with_intra:
+                        stims, indices = intra.init(t_c_f[i])
+                        stims = [s.unbind(0) for s in stims]
+
+                    if with_extra:
+                        if functional:
+                            t = time(t_chunks[i]).to(self.dtype())
+                            if multicontact:
+                                t = t.unsqueeze(0).expand(-1, self.n_ax, -1)
+                            else:
+                                t = t.expand(self.n_ax, -1)
+                        else:
+                            t = t_chunks[i]
+                        ve_ = einsum(ve_s, t).contiguous().unbind(dim=0)
+
+                    for j in range(len(t_c_f[i])):
+                        if with_extra:
+                            ve_c = ve_[j]
+                        else:
+                            ve_c = None
+                        if with_intra:
+                            s = [st[j] for st in stims]
+                            intra_c = make_intra(intra, s, indices)
+                        else:
+                            intra_c = None
+                        
+                        self._step(self.integrator, self, dt, ve_c, intra_c)
+                        post_step_hook(callbacks, self)
+
+                        self.t_ind += 1
+
+                    if progressbar:
+                        progressbar.update(1)
+                        progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
+
+                post_loop_hook(callbacks, self)
+
+                if progressbar:
+                    progressbar.close()
 
     def steady_state(self, dt=0.2, tstop=200.0):
         """
@@ -738,19 +739,12 @@ class Population(P):
         self
             The model instance with loaded weights
         """
-        from axonml import all_trained
-
-        if state_dict in all_trained:
-            state_dict = torch.load(
-                all_trained[state_dict], map_location=self.device(), weights_only=True
-            )
-        elif isinstance(state_dict, str):
+        if isinstance(state_dict, str):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
         matched, _ = _match_state_dict(self.state_dict(), state_dict)
         self.load_state_dict(matched, strict=False)
-        self.calculate_geometric_params()
         return self
 
     def all_states(self) -> List[str]:
@@ -1031,6 +1025,11 @@ class Population(P):
         """
         self.integrator.detach(self)
         return self
+
+    def register_parametrization(self, name: str, parametrization: torch.nn.Module):
+        torch.nn.utils.parametrize.register_parametrization(
+            self, name, parametrization
+        )
         
 
 class Axon(Population):
@@ -1086,17 +1085,21 @@ class Axon(Population):
         v_init=-80.0,
         integrator=None
     ):
+        if integrator is None:
+            integrator = bwd_euler_ub()
         super().__init__(len(diameters), n_comp, integrator=integrator, celsius=celsius)
+
+        self.register_buffer("diameters", torch.as_tensor(diameters, dtype=self.dtype()))
         
         self.n_ax   = self.np
         self.n_comp = self.nc
         self.temp   = float(celsius)
+
         self.v_init = v_init
         self.v[:]   = v_init
         self.v.detach_()
 
         self.x[:] = self._x()  # Initialize x positions
-
 
         self.cid = None
 
@@ -1113,7 +1116,6 @@ class Axon(Population):
 
         # -- biophysics --
         self.biophysics()
-        self._register_buffers()
 
     def biophysics(self):
         """
@@ -1122,12 +1124,6 @@ class Axon(Population):
         biophysics-related parameters or configurations.
         """
         pass
-
-    def _register_buffers(self):
-        self.register_buffer("area_c", self.area_(self.diam))
-        self.register_buffer("cm_c",   self.cm_(self.area_c))
-        self.register_buffer("ra_c",   self.ra_(self.diam))
-        self.register_buffer("temp_c", torch.tensor(self.temp))
 
     def register_cid(self, cid):
         self.cid = cid
@@ -1381,8 +1377,7 @@ class Myelinated(Axon):
     Unmyelinated : Companion class implementing unmyelinated axon models.
     """
 
-    PARAMETER(
-        node_l=2.0,
+    Axon.PARAMETER(
         axon_d={
             "axond1": 0.0,
             "axond2": 0.7,
@@ -1398,44 +1393,88 @@ class Myelinated(Axon):
             "deltax2": 100.0,
             "deltax3": 0.0,
         },
-        membrane={
-            "cm": 1.0,
-            "rhoa": 35.4,  # ohm-cm
-        },
+        cm=1.0,
+        rhoa=35.4,
         celsius=37.0,
     )
 
-    def area_(self, diameters):
-        lengths = self.node_l * torch.ones_like(diameters) / 10000
-        return torch.pi * self.nodeD(diameters) * lengths  # cm2
+    class myelinated_rhoa(torch.nn.Module):
+        def __init__(self, dx, diam, deltax1, deltax2, deltax3, axond1, axond2, axond3):
+            super().__init__()
+            self.register_buffer("dx", dx)
+            self.register_buffer("diam", diam)
+            self.deltax1 = deltax1
+            self.deltax2 = deltax2
+            self.deltax3 = deltax3
+            self.axond1 = axond1
+            self.axond2 = axond2
+            self.axond3 = axond3
+        
+        def forward(self, rhoa):
+            axon_d = self.axond1 * self.diam**2 + self.axond2 * self.diam + self.axond3
+            deltax = self.deltax1 * self.diam**2 + self.deltax2 * self.diam + self.deltax3
+            deltax = deltax / self.dx
+            scale = 1 / ((axon_d / self.diam) ** 2)
+            rhoa = rhoa * scale * deltax
+            return rhoa
 
-    def ra_(self, diameters):
-        radii = diameters / 20000  # radius in cm
-        rhoa = self.rhoa * self.rhoa_scale(diameters)
-        return (rhoa * self.deltax(diameters)) / (torch.pi * (radii**2))
+    class myelinated_node_d(torch.nn.Module):
+        def __init__(self, noded1, noded2, noded3):
+            super().__init__()
+            self.noded1 = noded1
+            self.noded2 = noded2
+            self.noded3 = noded3
+        
+        def forward(self, diam):
+            node_d = self.noded1 * diam**2 + self.noded2 * diam + self.noded3
+            return node_d
 
-    def rhoa_scale(self, diameters):
-        return 1 / ((self.axonD(diameters) / diameters) ** 2)
+    def __init__(
+        self,
+        diameters,
+        n_node: int,
+        node_length=2.0,
+        celsius=37.0,
+        v_init=-80.0,
+        integrator=None,
+    ):
+        self.node_length = node_length  # length of the nodes of Ranvier in um
+        super().__init__(diameters, n_node, celsius, v_init, integrator)
+        self.dx[:] = self.node_length
 
-    def axonD(self, diameters):
-        axond = self.axond1 * diameters**2 + self.axond2 * diameters + self.axond3
-        return axond
+        self.register_parametrization(
+            "rhoa",
+            self.myelinated_rhoa(
+                self.dx,
+                self.diam,
+                self.deltax1,
+                self.deltax2,
+                self.deltax3,
+                self.axond1,
+                self.axond2,
+                self.axond3
+            )
+        )
+        self.register_parametrization(
+            "diam",
+            self.myelinated_node_d(
+                self.noded1,
+                self.noded2,
+                self.noded3
+            )
+        )
 
     def deltax(self, diameters):
         deltax = self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
-        return deltax / 10000
-
-    def nodeD(self, diameters):
-        noded = self.noded1 * diameters**2 + self.noded2 * diameters + self.noded3
-        return noded / 10000
+        return deltax
 
     def _x(self) -> torch.Tensor:  # x in um
-        l = (self.n_comp - 1) * self.deltax(self.diam) * 10000
+        l = (self.n_comp - 1) * self.deltax(self.diameters).unsqueeze(1)
         start = -l / 2
         end = l / 2
         steps = self.n_comp
-        t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(-1)
-        return ((1 - t) * start + t * end).T
+        t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(0)
+        return ((1 - t) * start + t * end)
 
 
 # callback helpers

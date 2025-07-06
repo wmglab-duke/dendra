@@ -29,6 +29,9 @@ class _euler(Integrator):
         self.register_buffer("ra_inv", torch.tensor(0.0))
         self.register_buffer("ve_zero", torch.tensor(0.0))
 
+        self.register_buffer("cm_c", torch.tensor(0.0))
+        self.register_buffer("area_c", torch.tensor(0.0))
+
         weight = [[1.0, -2.0, 1.0], [1.0, -2.0, 1.0]]
         nc = 2
         nw = 3
@@ -41,20 +44,26 @@ class _euler(Integrator):
             p.requires_grad = False
 
     def initialize(self, model, dt) -> None:
-        self.cm_inv = 1.0 / model.cm_c
-        self.ra_inv = 1.0 / model.ra_c
+        dx = model.dx / 10000.0                                             # Convert to cm
+        area = torch.pi * (model.diam / 10000.0) * dx                       # Convert to cm^2
+        cm = (model.cm / 1000.0) * area                                     # Convert to F/cm^2
+        ra = (model.rhoa * dx) / (torch.pi * (model.diam / 20000.0) ** 2)   # Convert to Ohm
+        self.cm_inv = 1.0 / cm
+        self.ra_inv = 1.0 / ra
+        self.cm_c = cm
+        self.area_c = area
         self.ve_zero = torch.zeros_like(model.v)
 
     def FRK(self, v, ve, area, cm, ra):
         x = torch.stack([v, ve], dim=1)
         d2v = self.ssd(x).squeeze(1)
-        i_ion, _ = self.mech.i(v)
+        i_ion = self.mech.iexp(v)
         return cm * ((ra * d2v) - i_ion * area)
 
     def FRK_intra(self, v, ve, area, cm, ra, intra):
         x = torch.stack([v, ve], dim=1)
         d2v = self.ssd(x).squeeze(1)
-        i_ion, _ = self.mech.i(v)
+        i_ion = self.mech.iexp(v)
         return cm * ((ra * d2v) - i_ion * area + intra)
 
     def step(self, model, dt, ve=None, intra=None):
@@ -62,11 +71,11 @@ class _euler(Integrator):
             ve = self.ve_zero
         if intra is None:
             model.v = self._step_no_intra(
-                model.v, ve, model.area_c, dt, model.temp_c, model.cm_c
+                model.v, ve, self.area_c, dt, model.celsius, self.cm_c
             )
         else:
             model.v = self._step_intra(
-                model.v, ve, model.area_c, dt, model.temp_c, model.cm_c, intra
+                model.v, ve, self.area_c, dt, model.celsius, self.cm_c, intra
             )
 
     def _step_no_intra(self, v, ve, area, dt, temp, cm):

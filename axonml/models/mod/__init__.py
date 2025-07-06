@@ -6,6 +6,13 @@ import importlib.util
 from pathlib import Path
 
 
+from .hh import hh
+from .exp2syn import exp2syn
+from .expsyn import expsyn
+from .alphasynapse import alphasynapse
+from .pas import pas
+
+
 class MechanismContainer:
     """Simple attribute / dict‑style container."""
     def __init__(self, **kwargs):

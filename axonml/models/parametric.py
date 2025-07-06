@@ -348,3 +348,9 @@ class _Parameterized(torch.nn.Module):
                         f"Unknown parameter {name}. Valid parameters are {list(_params.keys())}."
                     )
         return True
+
+    def parameters_dict(self):
+        """
+        Returns a dictionary of all parameters in the model.
+        """
+        return {name: param for name, param in self.named_parameters()}

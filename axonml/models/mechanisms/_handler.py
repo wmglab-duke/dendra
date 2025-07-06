@@ -37,18 +37,19 @@ class MechanismHandler(torch.nn.Module):
 
         # --- flattened mapping (current-index, mechanism-obj, fn) ------------
         self._map = []
-        self._map_df = []
+        self._map_exp = []
         for c_idx, mech_dict in enumerate(currents.values()):
             for mech_name, ions in mech_dict.items():
                 mech = self.mechanisms[mech_name]
                 for ion in ions:
                     self._map.append( (c_idx, mech, getattr(mech, f"{ion}_with_g")) )
-                    self._map_df.append( (c_idx, mech, getattr(mech, f"{ion}")) )
+                    self._map_exp.append( (c_idx, mech, getattr(mech, f"{ion}")) )
 
         self.ion_to_buff_idx = {}
         self.i_g_buffers_initialized = False
 
     def initialize(self, v, celsius, diameters):
+        self.populate()
         self.ion_init(celsius)
         self.set_buffers(diameters)
         self.init_i_g_bufs(v)
@@ -149,6 +150,32 @@ class MechanismHandler(torch.nn.Module):
             setattr(ion_h, f"i{ion}", self._buf_i[self.ion_to_buff_idx[ion]])
 
         return tot_i, tot_g
+
+
+    def iexp(self, v):
+        if not self.currents:
+            return 0.0
+
+        # reset buffers in-place (no realloc)
+        for t in self._buf_i:
+            t.zero_()
+
+        for mech in self.mechanisms.values():
+            mech.breakpoint(v)
+
+        # core loop: minimal Python, pure aten ops inside
+        for c_idx, mech, fn in self._map_exp:
+            i = fn(mech.get(v))
+            mech.add_(self._buf_i[c_idx], i)
+        
+        # sum up currents and conductances
+        tot_i = self._buf_i[0]
+
+        # expose per-ion currents
+        for (ion, ion_h) in self.ions.items():
+            setattr(ion_h, f"i{ion}", self._buf_i[self.ion_to_buff_idx[ion]])
+
+        return tot_i
 
 
     def idf(self, v, v_prev):
