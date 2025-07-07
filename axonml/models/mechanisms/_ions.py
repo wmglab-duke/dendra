@@ -180,19 +180,23 @@ class Ion(torch.nn.Module):
 
     def advance(self, celsius) -> None:
         name = self.name
-        iono = getattr(self, f"{name}o")
-        iono = torch.where(
-            iono <= 0, torch.tensor(1e-9, device=iono.device, dtype=iono.dtype), iono
+        iono = f"{name}o"
+        ioni = f"{name}i"
+
+        iono_t = self._buffers[iono]
+        ioni_t = self._buffers[ioni]
+
+        iono_t = torch.where(
+            iono_t <= 0, torch.tensor(1e-9, device=iono_t.device, dtype=iono_t.dtype), iono_t
         )
-        setattr(self, f"{name}o", iono)
-        ioni = getattr(self, f"{name}i")
-        ioni = torch.where(
-            ioni <= 0, torch.tensor(1e-9, device=ioni.device, dtype=ioni.dtype), ioni
+        self._buffers[iono] = iono_t
+        ioni_t = torch.where(
+            ioni_t <= 0, torch.tensor(1e-9, device=ioni_t.device, dtype=ioni_t.dtype), ioni_t
         )
-        setattr(self, f"{name}i", ioni)
+        self._buffers[ioni] = ioni_t
 
         if not self.advance_e:
             return
-            
-        new_val = torch.log(iono / ioni) * self.rzf * (273.15 + celsius)
-        setattr(self, f"e{name}", new_val)
+
+        new_val = torch.log(iono_t / ioni_t) * self.rzf * (273.15 + celsius)
+        self._buffers[f"e{name}"] = new_val

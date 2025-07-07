@@ -356,10 +356,9 @@ class Mechanism(_Parameterized):
 
     def _advance(self, v, dt):
         for state_module in self.DE.values():
-            states = {state_name: getattr(self, state_name) for state_name in state_module._state}
+            states = {state_name: self._buffers[state_name] for state_name in state_module._state}
             local = state_module.advance(v, dt, states)
-            for state_name, value in local.items():
-                setattr(self, state_name, value)
+            self._buffers.update(local)
 
     def populate(self):
         self.populate_parameter_buffers()

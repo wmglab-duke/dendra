@@ -405,8 +405,7 @@ class State(_Parameterized):
         return {}
 
     def advance(self, v, dt, states):
-        assigned = self.breakpoint(v)
-        return self.solve(dt, **assigned, **states)
+        return self.solve(dt, **self.breakpoint(v), **states)
 
     def initial(self, v):
         """

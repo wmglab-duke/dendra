@@ -87,19 +87,19 @@ class MechanismHandler(torch.nn.Module):
             for k, conc_list in ion_c_write.items():
                 mech = self.mechanisms[k]
                 for conc in conc_list:
-                    ion_conc_u = getattr(mech, conc)
-                    ion_conc_u = mech.put(ion_conc_u, getattr(self.ions[ion], conc), v)
-                    setattr(self.ions[ion], conc, ion_conc_u)
+                    ion_conc_u = mech._buffers[conc]
+                    ion_conc_u = mech.put(ion_conc_u, self.ions[ion]._buffers[conc], v)
+                    self.ions[ion]._buffers[conc] = ion_conc_u
 
     def read_from_ions(self):
         for ion, ion_read in self.read_ion.items():
             for k, conc_list in ion_read.items():
                 mech = self.mechanisms[k]
                 for conc in conc_list:
-                    ion_conc = mech.get(getattr(self.ions[ion], conc))
-                    setattr(mech, conc, ion_conc)
+                    ion_conc = mech.get(self.ions[ion]._buffers[conc])
+                    mech._buffers[conc] = ion_conc
                     for s in mech.DE.values():
-                        setattr(s, conc, ion_conc)
+                        s._buffers[conc] = ion_conc
 
     def advance(self, v, dt, temp):
         for mech_name, mech in self.mechanisms.items():
@@ -147,7 +147,7 @@ class MechanismHandler(torch.nn.Module):
 
         # expose per-ion currents
         for (ion, ion_h) in self.ions.items():
-            setattr(ion_h, f"i{ion}", self._buf_i[self.ion_to_buff_idx[ion]])
+            ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
         return tot_i, tot_g
 
@@ -173,7 +173,7 @@ class MechanismHandler(torch.nn.Module):
 
         # expose per-ion currents
         for (ion, ion_h) in self.ions.items():
-            setattr(ion_h, f"i{ion}", self._buf_i[self.ion_to_buff_idx[ion]])
+            ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
         return tot_i
 
@@ -214,12 +214,12 @@ class MechanismHandler(torch.nn.Module):
         for t in self._buf_i:
             t.zero_()
 
-        for c_idx, mech, fn in self._map_df:
+        for c_idx, mech, fn in self._map_exp:
             i = fn(mech.get(v))
             mech.add_(self._buf_i[c_idx], i)
 
         for ion, ion_h in self.ions.items():
-            setattr(ion_h, f"i{ion}", self._buf_i[self.ion_to_buff_idx[ion]])
+            ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
 
     def set_buffers(self, diameters):
