@@ -16,14 +16,13 @@ from axonml.models.stim.waveform import Waveform
 
 from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
-from axonml.models.parametric import Parameterized, _Parameterized as P
+from axonml.models.parametric import _Parameterized as P
 from axonml.models.mechanisms.core import Mechanism, validate
 from axonml.models.mechanisms import concentrations, equilibria
-from axonml.models.declarations import PARAMETER
 from axonml.models.mechanisms._handler import MechanismHandler
 from axonml.models.mechanisms._ions import valid_ions, Ion
 from axonml.units import mm, um
-from axonml.models.integrators import euler, dufort_frankel, bwd_euler_ub, bwd_euler_sc
+from axonml.models.integrators import bwd_euler_ub, bwd_euler_sc
 
 
 from axonml.helpers import (
@@ -1234,38 +1233,17 @@ class Unmyelinated(Axon):
         Length of the axon in mm (will be converted to μm internally). Default is 1.0 mm.
     dx : float, optional
         Spatial discretization step in μm. Default is 10.0 μm.
-    temp : float, optional
+    celsius : float, optional
         Temperature in degrees Celsius. Default is 37°C.
     v_init : float, optional
         Initial membrane potential in mV. Default is -80 mV.
-    method : str, optional
-        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4',
-        'dufort-frankel', or 'df'. Default is 'rk1'.
-
-    Attributes
-    ----------
-    dx : float
-        Spatial discretization step in μm.
-    n_comp : int
-        Number of compartments in the model (calculated based on L and dx).
-    cm : float
-        Membrane capacitance in μF/cm².
-    rhoa : float
-        Axial resistivity in Ω·cm.
-
-    Methods
-    -------
-    x()
-        Returns spatial positions of nodes in μm.
-    area_(diameters)
-        Calculates membrane surface area in cm² for given diameters.
-    ra_(diameters)
-        Calculates axial resistance in MΩ for given diameters.
+    integrator : Integrator, optional
+        The integrator to use for the simulation. If None, a default backward Euler integrator
+        will be used.
 
     Notes
     -----
-    The number of nodes is calculated to ensure it's odd (for a centered node at position 0)
-    and to maintain symmetry by rounding to the next even number of segments.
+    The number of nodes is calculated to ensure it's odd (for a centered node at position 0).
 
     See Also
     --------
@@ -1319,52 +1297,17 @@ class Myelinated(Axon):
     ----------
     diameters : array_like
         Diameters of the axons in μm. Can be a single value, list, or tensor.
-    n_comp : int
-        Number of compartments (nodes) in the model.
-    temp : float, optional
+    n_node : int
+        Number of compartments (nodes of Ranvier) in the model.
+    node_length : float, optional
+        Length of the nodes of Ranvier in μm. Default is 2.0 μm.
+    celsius : float, optional
         Temperature in degrees Celsius. Default is 37°C.
     v_init : float, optional
         Initial membrane potential in mV. Default is -80 mV.
-    method : str, optional
-        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4',
-        'dufort-frankel', or 'df'. Default is 'rk1'.
-    beta : float, optional
-        Hyperdiffusion coefficient for numerical stability. Default is 0.0.
-
-    Attributes
-    ----------
-    node_l : float
-        Length of the nodes of Ranvier in μm. Default is 2.0 μm.
-    axond1, axond2, axond3 : float
-        Coefficients for the quadratic equation calculating axon diameter.
-        Default values are 0.0, 0.7, and 0.0, respectively.
-    noded1, noded2, noded3 : float
-        Coefficients for the quadratic equation calculating node diameter.
-        Default values are 0.0, 0.7, and 0.0, respectively.
-    deltax1, deltax2, deltax3 : float
-        Coefficients for the quadratic equation calculating internodal distance.
-        Default values are 0.0, 100.0, and 0.0, respectively.
-    cm : float
-        Membrane capacitance in μF/cm². Default is 1.0.
-    rhoa : float
-        Axial resistivity in Ω·cm. Default is 35.4.
-
-    Methods
-    -------
-    x()
-        Returns spatial positions of nodes in μm.
-    area_(diameters)
-        Calculates membrane surface area in cm² for given diameters.
-    ra_(diameters)
-        Calculates axial resistance in MΩ for given diameters.
-    axonD(diameters)
-        Calculates axon diameter based on fiber diameter.
-    nodeD(diameters)
-        Calculates node diameter based on fiber diameter.
-    deltax(diameters)
-        Calculates internodal distance based on fiber diameter.
-    rhoa_scale(diameters)
-        Calculates scaling factor for axial resistivity based on fiber diameter.
+    integrator : Integrator, optional
+        The integrator to use for the simulation. If None, a default backward Euler integrator
+        will be used.
 
     Notes
     -----
