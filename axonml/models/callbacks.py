@@ -648,6 +648,53 @@ class Recorder(Callback):
         return self.stack().detach().cpu().numpy()
 
 
+class RecorderLambda(Callback):
+    """
+    A callback that records model states using a user-defined functions.
+
+    This callback allows users to specify a custom function that takes the model
+    as input and returns the data to be recorded. It is useful for recording
+    complex or derived states that are not directly accessible as model attributes.
+
+    Parameters
+    ----------
+    func : callable
+        A function that takes the model as input and returns the data to be recorded.
+        The function should return a tensor or a list of tensors.
+
+    Attributes
+    ----------
+    func : callable
+        The user-defined function for recording data.
+    rec : list
+        List to store recorded data.
+
+    Notes
+    -----
+    The function should be designed to work with the model's current state.
+    """
+
+    def __init__(self, funcs):
+        super().__init__()
+        self.funcs = funcs
+        self.rec = {}
+
+    def post_step_hook(self, model):
+        for name, func in self.funcs.items():
+            self.rec.setdefault(name, []).append(func(model))
+
+    def reset(self):
+        self.rec = {}
+
+    def numpy(self, var: str = None) -> np.ndarray:
+        if var is not None:
+            v = self.rec.get(var, [])
+            if not v:
+                return np.array([])
+            return torch.stack(v).detach().cpu().numpy()
+        return {name: torch.stack(tensors).detach().cpu().numpy() for name, tensors in self.rec.items()}
+
+
 def _hdf5_write(queue: Queue, path: str):
     with File(path, "w", libver="latest") as f:
         while True:

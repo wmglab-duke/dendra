@@ -28,7 +28,7 @@ class exp2syn(Syn):
 
     Syn.NONSPECIFIC_CURRENT("i")
 
-    def initial(self):
+    def initial(self, v):
         tau1 = self.DE['A'].tau1
         tau2 = self.DE['B'].tau2
         tp = (tau1 * tau2) / (tau2 - tau1) * log(tau2 / tau1)

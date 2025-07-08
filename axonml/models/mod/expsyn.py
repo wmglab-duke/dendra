@@ -4,7 +4,7 @@ from ..mechanisms.ops import *
 
 
 class g(S):
-
+    S.STATE('g')
     S.PARAMETER(tau=0.1)
     S.DERIVATIVE("g' = -g / tau")
 

@@ -204,10 +204,11 @@ class Tree(Population):
         self.y += dy
         self.z += dz
 
-    def find(self, include=None, fuzzy=True, match_case=False, full_report=False):
+    def find(self, include=None, exclude='branchpoint', fuzzy=True, match_case=False, full_report=False):
         indices = find_indices_smart(
             self.names,
             include=include,
+            exclude=exclude,
             fuzzy=fuzzy,
             match_case=match_case,
             device=self.device()

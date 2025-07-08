@@ -94,6 +94,11 @@ class Slice:
         return self.index_spec.is_scalar
 
 
+    @property
+    def name(self) -> str:
+        return self.model.name
+
+
     def inspect(self, var: str, mechanism: Optional[str] = None) -> Any:
         """
         Inspect the variable in the model or a specific mechanism.

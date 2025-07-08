@@ -401,7 +401,7 @@ class Population(P):
 
             if ve is None:
                 if space is not None and time is not None:
-                    ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
+                    ve = ve_from_s_t(space, time, self.np, self.device(), multicontact)
 
             if ve is not None:
                 n = ve.shape[0]
@@ -960,6 +960,13 @@ class Population(P):
 
 
     def build(self):
+
+        if self.is_built:
+            return self
+
+        def are_strings_unique(data: list) -> bool:
+            strings_only = [item for item in data if item is not None]
+            return len(strings_only) == len(set(strings_only))
         
         for mech, (name, ic, kwargs) in self._mech_everywhere.items():
             key = None
@@ -969,7 +976,7 @@ class Population(P):
 
         for mech, data in self._mech_data.items():
             aliases, kwargs_list, keys = tuple(map(list, zip(*data)))
-            if len(set(aliases)) != len(aliases):
+            if not are_strings_unique(aliases):
                 raise ValueError(f"Duplicate aliases found for mechanism {mech.__name__}.")
             m, shape, key = compile_mechanism(
                 self,
