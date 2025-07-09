@@ -144,6 +144,8 @@ class Mechanism(_Parameterized):
         self._name = name
         self.register_buffer('celsius', celsius)
 
+        self.base_ndim = 2
+
         if key is not None:
             if is_composable:
                 self.key = key
@@ -154,20 +156,52 @@ class Mechanism(_Parameterized):
 
         self.is_composable = is_composable
 
+        def get_fancy(tensor):
+            # Preserves batch dimensions by only flattening the base dimensions
+            batch_shape = tensor.shape[:-self.base_ndim]
+            flat_tensor = tensor.reshape(*batch_shape, -1)
+            # Select along the last dimension (the flattened base dimension)
+            return flat_tensor.index_select(-1, self.key)
+
+        def add_fancy_(tensor, what):
+            # Use scatter_add_ for batched index_add_
+            batch_shape = tensor.shape[:-self.base_ndim]
+            flat_tensor = tensor.reshape(*batch_shape, -1)
+            
+            # Expand key to match batch dimensions for scatter
+            # e.g., key shape [N] -> [B1, B2, ..., N]
+            expanded_key = self.key.expand(*batch_shape, -1)
+            
+            # what should have shape [B1, B2, ..., N]
+            flat_tensor.scatter_add_(-1, expanded_key, what)
+            return tensor # Return original tensor for chaining
+
+        def add_fancy(tensor, what):
+            # Use scatter_add for batched index_add
+            batch_shape = tensor.shape[:-self.base_ndim]
+            flat_tensor = tensor.reshape(*batch_shape, -1)
+
+            # Expand key to match batch dimensions for scatter
+            expanded_key = self.key.expand(*batch_shape, -1)
+            
+            # what should have shape [B1, B2, ..., N]
+            return flat_tensor.scatter_add(-1, expanded_key, what).reshape_as(tensor)
+
+
         if self.key is None:
             self.get  = lambda tensor: tensor
             self.add_ = lambda add_to, add_what: add_to.add_(add_what)
             self.add  = lambda add_to, add_what: add_to.add(add_what)
             self.put  = self.put_no_op
         elif self.is_composable:
-            self.get  = lambda tensor: tensor[self.key] if tensor.ndim > 0 else tensor
-            self.add_ = lambda add_to, add_what: add_to[self.key].add_(add_what)
-            self.add  = lambda add_to, add_what: add_to[self.key].add(add_what)
+            self.get  = lambda tensor: tensor[..., *self.key] if tensor.ndim > 0 else tensor
+            self.add_ = lambda add_to, add_what: add_to[..., *self.key].add_(add_what)
+            self.add  = lambda add_to, add_what: add_to[..., *self.key].add(add_what)
             self.put  = self.put_slice
         else:
-            self.get  = lambda tensor: tensor.view(-1).index_select(0, self.key) if tensor.ndim > 0 else tensor
-            self.add_ = lambda add_to, add_what: add_to.view(-1).index_add_(0, self.key, add_what)
-            self.add  = lambda add_to, add_what: add_to.view(-1).index_add(0, self.key, add_what)
+            self.get  = get_fancy
+            self.add_ = add_fancy_
+            self.add  = add_fancy
             self.put  = self.put_fancy
 
         self.read_ion    = self._read_ion
@@ -226,18 +260,53 @@ class Mechanism(_Parameterized):
     def put_no_op(self, ion_conc_u, ion_conc_o, v, clone=True):
         return ion_conc_u
 
-    def put_slice(self, ion_conc_u, ion_conc_o, v, clone=True):
+    def put_slice_(self, ion_conc_u, ion_conc_o, v, clone=True):
         ion_conc_o = ion_conc_o.expand_as(v)
         if clone:
             ion_conc_o = ion_conc_o.clone()
         ion_conc_o[self.key] = ion_conc_u
         return ion_conc_o
 
-    def put_fancy(self, ion_conc_u, ion_conc_o, v, clone=True):
+    def put_slice(self, ion_conc_u, ion_conc_o, v, clone=True):
+        # ion_conc_o is the full tensor, v is a reference for shape, ion_conc_u is the update
+        ion_conc_o = ion_conc_o.expand_as(v)
+        if clone:
+            ion_conc_o = ion_conc_o.clone()
+            
+        # Apply the update using Ellipsis
+        ion_conc_o[..., self.key] = ion_conc_u
+        return ion_conc_o
+
+    def put_fancy_(self, ion_conc_u, ion_conc_o, v, clone=True):
         ion_conc_o = ion_conc_o.expand_as(v)
         if clone:
             ion_conc_o = ion_conc_o.clone()
         ion_conc_o.view(-1).index_put_((self.key,), ion_conc_u)
+        return ion_conc_o
+
+    def put_fancy(self, ion_conc_u, ion_conc_o, v, clone=True):
+        # ion_conc_u: The new values to put, shape [..., len(key)]
+        # ion_conc_o: The destination tensor, shape [..., *base_shape]
+        # v: Reference tensor for shape
+        
+        ion_conc_o = ion_conc_o.expand_as(v)
+        if clone:
+            ion_conc_o = ion_conc_o.clone()
+            
+        # Get batch shape from the destination tensor
+        batch_shape = ion_conc_o.shape[:-self.base_ndim]
+        
+        # Reshape destination to [B, S]
+        flat_dest = ion_conc_o.view(*batch_shape, -1)
+        
+        # Expand key to match batch dimensions for scatter
+        expanded_key = self.key.expand(*batch_shape, -1)
+        
+        # Use scatter to place the values from ion_conc_u into flat_dest
+        # scatter_(dim, index, src)
+        flat_dest.scatter_(-1, expanded_key, ion_conc_u)
+        
+        # The original ion_conc_o tensor is modified in place, so we can just return it
         return ion_conc_o
 
     def register_ion(self, ion):

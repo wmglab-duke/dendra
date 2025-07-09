@@ -42,7 +42,7 @@ def step_pop(integrator, model, dt, ve=None, intra=None):
 
 @torch.compile
 def step(populations, synapses, dt, ve: Dict[str, torch.Tensor | None]={}, intra: Dict[str, torch.Tensor | None]={}):
-    for s in synapses:
+    for s in synapses.values():
         s.advance()
     for n, pop in populations.items():
         step_pop(pop.integrator, pop, dt, ve=ve.get(n, None), intra=intra.get(n, None))
@@ -62,7 +62,7 @@ def prepare_indices_one_one(source, target, synapse):
 
     index_arr = torch.arange(
         target_model.v.numel(), device=target_model.device(), dtype=target_model.dtype()
-    ).view(target_model.v.shape)
+    ).view_as(target_model.v)
 
     indices_in_synapse = syn.get(index_arr).flatten()
     post_idx = to_flat_idx_torch(target_model.v, target.index)
@@ -84,27 +84,60 @@ def check_weight_shape(weight, pre_idx):
     """
     if isinstance(weight, float):
         return len(pre_idx)
-    elif hasattr(weight, "__len__"):
+    if isinstance(weight, torch.nn.Module):
+        return len(pre_idx)
+    if isinstance(weight, torch.Tensor):
+        if weight.ndim == 0:
+            return len(pre_idx)
+        if weight.ndim == 1:
+            if len(weight) == 1:
+                return len(pre_idx)
+            if weight.shape[0] == len(pre_idx):
+                return 1
+            raise ValueError(f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}.")
+    if hasattr(weight, "__len__"):
         if len(weight) != len(pre_idx):
             raise ValueError(f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}.")
         return 1
-    else:
-        raise TypeError(f"Unsupported type for weight: {type(weight)}.")
+    raise TypeError(f"Unsupported type for weight: {type(weight)}.")
 
 
 def expand(value, n):
+    if isinstance(value, torch.nn.Module):
+        return value.sample(n)
     return torch.tensor(value).repeat(n)
 
 
 def make_weight(weights, n):
+
+    class ParameterOrDistributionWrapper(torch.nn.Module):
+        """A simple wrapper for parameters or distributions that can be sampled."""
+        def __init__(self, param):
+            super().__init__()
+            # nn.Parameter() is idempotent, so it's safe to call on an existing parameter.
+            self.param = param
+            
+        def sample(self, n):
+            if isinstance(self.param, torch.Tensor):
+                return self.param.repeat(n)
+            else:
+                return self.param.sample(n)
+
     class WeightExpander(torch.nn.Module):
         def __init__(self, weights, n):
             super(WeightExpander, self).__init__()
-            self.weights = torch.nn.ParameterList(weights)
+            self.weights = torch.nn.ModuleList([
+                ParameterOrDistributionWrapper(w) for w in weights
+            ])
             self.n = n
+            self.register_buffer("w", torch.zeros(1))
 
         def forward(self):
-            return torch.cat([w.repeat(n) for w, n in zip(self.weights, self.n)])
+            return self.w
+        
+        def init(self):
+            self.w = torch.cat([w.sample(n) for w, n in zip(self.weights, self.n)])
+
     return WeightExpander(weights, n)
 
 
@@ -121,6 +154,8 @@ class Network(torch.nn.Module):
             setattr(self, name, pop)
 
         self.synapse_spec = {}
+        self.synapses = torch.nn.ModuleDict()
+        self.dt = None
 
     def device(self):
         """
@@ -139,6 +174,7 @@ class Network(torch.nn.Module):
         Clears all synapse specifications in the network.
         """
         self.synapse_spec = {}
+        self.synapses.clear()
 
     def _connect(self, source_pop, source_idx, target_pop, target_idx, synapse: str,
                  threshold=0.0, weight=1.0, delay=0.0):
@@ -216,7 +252,6 @@ class Network(torch.nn.Module):
         self._connect(source_model, pre_out, target_model, post_out, synapse, threshold, weight, delay)
 
     def build_synapses(self, dt):
-        synapses = []
         for (pre_name, post_name, synapse), specs in self.synapse_spec.items():
             pre = self.populations[pre_name]
             post = self.populations[post_name]
@@ -237,9 +272,17 @@ class Network(torch.nn.Module):
                 delay=delay,
                 dt=dt
             )
-            synapses.append(syn)
-            self.add_module(f"{pre_name}_{post_name}_{synapse}", syn)
-        self.synapses = torch.nn.ModuleList(synapses)
+            self.synapses[f"{pre_name}_{post_name}_{synapse}"] = syn
+
+    def build(self, dt):
+        """
+        Build the network by initializing populations and synapses.
+        This method should be called before running the network.
+        """
+        self.dt = dt
+        self.build_synapses(dt)
+        self.eval()
+        return self
 
     def initialize(self, dt):
         """
@@ -248,22 +291,29 @@ class Network(torch.nn.Module):
         for pop in self.populations.values():
             pop.initialize()
             pop.integrator.initialize(pop, dt)
-        self.build_synapses(float(dt))
+        self.init_synapses()
 
-    def run(self, tstop, dt, callbacks=None):
-        dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
-        self.initialize(dt)
-        n_steps = int(tstop / dt.item())
-        if callbacks is None:
-            callbacks = []
-        for c in callbacks:
-            c.dt = float(dt.item())
-        callbacks = CallbackList(callbacks)
-        pre_loop_hook(callbacks, self)
-        for _ in range(n_steps):
-            step(self.populations, self.synapses, dt)
-            post_step_hook(callbacks, self)
-        post_loop_hook(callbacks, self)
+    def init_synapses(self):
+        for syn in self.synapses.values():
+            syn.weight.init()
+            syn.current_time_step.fill_(0)
+            syn.delivery_buffer.zero_()
+
+    def run(self, tstop, callbacks=None):
+        dt = torch.tensor(self.dt, device=self.device(), dtype=self.dtype())
+        with torch.set_grad_enabled(self.training):
+            self.initialize(dt)
+            n_steps = int(tstop / dt.item())
+            if callbacks is None:
+                callbacks = []
+            for c in callbacks:
+                c.dt = float(dt.item())
+            callbacks = CallbackList(callbacks)
+            pre_loop_hook(callbacks, self)
+            for _ in range(n_steps):
+                step(self.populations, self.synapses, dt)
+                post_step_hook(callbacks, self)
+            post_loop_hook(callbacks, self)
 
 
 # callback helpers
