@@ -213,6 +213,9 @@ class _Parameterized(torch.nn.Module):
     _params = {}
     _param_declarations = []
 
+    _range = {}
+    _range_declarations = []
+
     def __init_subclass__(cls, **kwargs):
         """
         This special method is called automatically whenever a class
@@ -224,24 +227,34 @@ class _Parameterized(torch.nn.Module):
         
         # Start with a fresh dictionary for the new class's parameters.
         new_params = {}
+        new_range = {}
         
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
             # We look for a _params attribute defined directly on the base
             if '_params' in base.__dict__:
                 new_params.update(base._params)
+            if '_range' in base.__dict__:
+                new_range.update(base._range)
         
         # Add parameters declared via the PARAMETER() method
         if _Parameterized._param_declarations:
             for p_dict in _Parameterized._param_declarations:
                 new_params.update(p_dict)
             _Parameterized._param_declarations = [] # Clear for next class
+        # Add range declarations
+        if _Parameterized._range_declarations:
+            for r_dict in _Parameterized._range_declarations:
+                new_range.update(r_dict)
+            _Parameterized._range_declarations = []
         
         # Add parameters from class definition keywords (e.g., a=10)
         # These will override anything set by parents.
         new_params.update(kwargs)
+        new_range.update(kwargs)
         
         cls._params = new_params
+        cls._range = new_range
 
     @staticmethod
     def PARAMETER(**kwargs):
@@ -251,19 +264,30 @@ class _Parameterized(torch.nn.Module):
         """
         _Parameterized._param_declarations.append(kwargs)
 
+    @staticmethod
+    def RANGE(**kwargs):
+        """
+        A static method to declare ranges. This has the side effect of
+        appending the ranges to a temporary class-level list.
+        """
+        _Parameterized._range_declarations.append(kwargs)
+
     def __init__(self, shape, additional_parameters=None, **kwargs):
         super().__init__()
         self.shape  = shape
         self.params = self.__class__._params.copy()
+        self.range  = self.__class__._range.copy()
 
         self.parametrizations = torch.nn.ModuleDict()
 
         if kwargs:
-            self.params.update(kwargs)
+            self.params = {key: kwargs.get(key, value) for key, value in self.params.items()}
+            self.range  = {key: kwargs.get(key, value) for key, value in self.range.items()}
 
         self.keys = {}
         self.additional_parameters = {}
         self.instantiate_parameters(**self.params)
+        self.instantiate_range(**self.range)
         self.instantiate_additional_parameters(additional_parameters)
             
     def instantiate_parameters(self, **kwargs):
@@ -278,13 +302,22 @@ class _Parameterized(torch.nn.Module):
                 else:
                     p_name = f"{name}_default"
                     setattr(self, p_name, to_param(value, self))
-                    self.register_buffer(name, torch.empty(self.shape))
+                    self.register_buffer(name, torch.empty(()))
                     getattr(self, name).copy_(getattr(self, p_name))
+
+    def instantiate_range(self, **kwargs):
+        # this is only called once, on __init__
+        if kwargs is not None:
+            for name, value in kwargs.items():
+                p_name = f"{name}_default"
+                setattr(self, p_name, to_param(value, self))
+                self.register_buffer(name, torch.empty(self.shape))
+                getattr(self, name).copy_(getattr(self, p_name))
 
     def instantiate_additional_parameters(self, additional_parameters=None):
         if additional_parameters is not None:
             for name, list_of_aliases_values_and_keys in additional_parameters.items():
-                if name in self.params:
+                if name in self.range:
                     count = 0
                     keys = []
                     for (alias, value, key) in list_of_aliases_values_and_keys:
@@ -354,3 +387,13 @@ class _Parameterized(torch.nn.Module):
         Returns a dictionary of all parameters in the model.
         """
         return {name: param for name, param in self.named_parameters()}
+
+    def batch(self, batch_size: int):
+        """
+        Returns a new instance of the model with the parameters
+        distributed over the specified batch size.
+        """
+        for name in self.__class__._params:
+            p = getattr(self, name)
+            p = p.unsqueeze(0)
+            setattr(self, name, p)

@@ -101,7 +101,8 @@ class Population(P):
     Base class for a population of multicompartment neurons.
     """
 
-    P.PARAMETER(cm=1.0, rhoa=35.4, celsius=37.0)
+    P.RANGE(cm=1.0, rhoa=35.4)
+    P.PARAMETER(celsius=37.0)
 
     def __init__(self, N:int, C:int, integrator=None, v_init=-65.0, **kwargs):
         super().__init__((N, C), **kwargs)
@@ -177,7 +178,10 @@ class Population(P):
                 mode      = self.compile_mode,
             )
         else:
-            self._step = step
+            self._step = torch.compile(
+                step,
+                backend   = 'eager',
+            )
 
         self._caches = {}
 
@@ -1258,15 +1262,16 @@ class Unmyelinated(Axon):
     Myelinated : Companion class implementing myelinated axon models.
     """
 
-    Axon.PARAMETER(cm=1.0, rhoa=35.4, celsius=37.0)
+    Axon.RANGE(cm=1.0, rhoa=35.4)
+    Axon.PARAMETER(celsius=37.0)
 
     def __init__(
             self, 
             diameters, 
             L=1.0*mm, 
             dx=10.0, 
-            celsius=37, 
-            v_init=-80,
+            celsius=37.0, 
+            v_init=-80.0,
             integrator=None
         ):
         # L = L * 1000  # mm -> um
@@ -1327,6 +1332,10 @@ class Myelinated(Axon):
     Unmyelinated : Companion class implementing unmyelinated axon models.
     """
 
+    Axon.RANGE(
+        cm=1.0,
+        rhoa=35.4,
+    )
     Axon.PARAMETER(
         axon_d={
             "axond1": 0.0,
@@ -1343,8 +1352,6 @@ class Myelinated(Axon):
             "deltax2": 100.0,
             "deltax3": 0.0,
         },
-        cm=1.0,
-        rhoa=35.4,
         celsius=37.0,
     )
 

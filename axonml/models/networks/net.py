@@ -6,6 +6,7 @@ from ..core import Population, Waveform
 from ..parametric import to_param
 from ..callbacks import CallbackList
 from .delaydelivery import VariableDelayDelivery
+from axonml.helpers import BACKEND, FULLGRAPH, DYNAMIC, JIT, COMPILE_MODE
 
 
 def to_flat_idx_torch(arr, idx):
@@ -40,7 +41,6 @@ def step_pop(integrator, model, dt, ve=None, intra=None):
     integrator.step(model, dt, ve, intra)
 
 
-@torch.compile
 def step(populations, synapses, dt, ve: Dict[str, torch.Tensor | None]={}, intra: Dict[str, torch.Tensor | None]={}):
     for s in synapses.values():
         s.advance()
@@ -157,6 +157,27 @@ class Network(torch.nn.Module):
         self.synapses = torch.nn.ModuleDict()
         self.dt = None
 
+        self.backend = BACKEND.value
+        self.fullgraph = bool(FULLGRAPH)
+        self.dynamic = bool(DYNAMIC)
+        self.jit = bool(JIT)
+        self.compile_mode = COMPILE_MODE.value 
+
+        torch._dynamo.reset()
+
+        if self.jit:
+            self.step = torch.compile(
+                step, 
+                backend   = self.backend, 
+                mode      = self.compile_mode,
+            )
+        else:
+            self.step = torch.compile(
+                step,
+                backend   = 'eager',
+            )
+
+
     def device(self):
         """
         Returns the device on which the network is located.
@@ -194,6 +215,11 @@ class Network(torch.nn.Module):
     def connect_one_to_one(
         self, source, target, synapse: str, threshold=0.0, weight=1.0, delay=0.0
     ):
+        if isinstance(source, Population):
+            source = source[:]  # Ensure source is a slice if it's a Population
+        if isinstance(target, Population):
+            target = target[:]  # Ensure target is a slice if it's a Population
+        # every target compartment receives input from exactly one source compartment
         # 1. validate that the synapse exists at all the target locations
         pre_idx, post_idx = prepare_indices_one_one(source, target, synapse)
         self._connect(source.model, pre_idx, target.model, post_idx, synapse, threshold, weight, delay)
@@ -201,6 +227,10 @@ class Network(torch.nn.Module):
     def connect_dense(
         self, source, target, synapse: str, threshold=0.0, weight=1.0, delay=0.0
     ):
+        if isinstance(source, Population):
+            source = source[:]  # Ensure source is a slice if it's a Population
+        if isinstance(target, Population):
+            target = target[:]  # Ensure target is a slice if it's a Population
         # every target compartment receives input from every source compartment
         source_model = source.model
         target_model = target.model
@@ -225,6 +255,10 @@ class Network(torch.nn.Module):
     def connect_sparse(
         self, source, target, synapse: str, prob: float, threshold=0.0, weight=1.0, delay=0.0
     ):
+        if isinstance(source, Population):
+            source = source[:]  # Ensure source is a slice if it's a Population
+        if isinstance(target, Population):
+            target = target[:]  # Ensure target is a slice if it's a Population
         # every target compartment receives input from every source compartment
         source_model = source.model
         target_model = target.model
@@ -311,7 +345,7 @@ class Network(torch.nn.Module):
             callbacks = CallbackList(callbacks)
             pre_loop_hook(callbacks, self)
             for _ in range(n_steps):
-                step(self.populations, self.synapses, dt)
+                self.step(self.populations, self.synapses, dt)
                 post_step_hook(callbacks, self)
             post_loop_hook(callbacks, self)
 

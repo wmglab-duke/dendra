@@ -72,11 +72,11 @@ class TruncatedNormal(Distribution):
     low, high     : scalars or tensors broadcastable to `mean`
     """
 
-    def __init__(self, mean=0.0, std=1.0, *, low=-math.inf, high=math.inf):
+    def __init__(self, mean=0.0, std=1.0, *, low=0.0, high=math.inf):
         super().__init__()
 
-        # register learnable μ and log σ exactly like your `Normal`
-        self.mean     = to_param(mean)             # nn.Parameter or buffer
+        # register learnable μ and log σ
+        self.mean     = to_param(mean)     # nn.Parameter or buffer
         self._log_std = to_param(torch.as_tensor(std).log())
 
         # bounds are **not** typically trained, so we keep them buffers

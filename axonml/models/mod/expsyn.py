@@ -5,7 +5,7 @@ from ..mechanisms.ops import *
 
 class g(S):
     S.STATE('g')
-    S.PARAMETER(tau=0.1)
+    S.RANGE(tau=0.1)
     S.DERIVATIVE("g' = -g / tau")
 
     def inf(self, v):
@@ -15,7 +15,7 @@ class g(S):
 class expsyn(Syn):
 
     Syn.STATE(g)
-    Syn.PARAMETER(e=0)
+    Syn.RANGE(e=0)
     Syn.NONSPECIFIC_CURRENT("i")
 
     def i(self, v):

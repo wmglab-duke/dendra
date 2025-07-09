@@ -15,7 +15,7 @@ class t(S):
 
 class alphasynapse(M):
     M.STATE(t)
-    M.PARAMETER(onset=0.0, tau=0.1, gmax=0.0, e=0.0)    
+    M.RANGE(onset=0.0, tau=0.1, gmax=0.0, e=0.0)    
     M.NONSPECIFIC_CURRENT("i")
 
     @property

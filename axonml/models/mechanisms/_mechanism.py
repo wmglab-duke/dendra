@@ -10,12 +10,12 @@ from ..slice import Slice
 class Mechanism(_Parameterized):
     _state = set()
     _ion = set()
-    _range = set()
+    _save = set()
     _assigned = set()
 
     _state_declarations = []
     _ion_declarations = []
-    _range_declarations = []
+    _save_declarations = []
     _assigned_declarations = []
 
     _conductances = {}
@@ -46,7 +46,7 @@ class Mechanism(_Parameterized):
         # Start with a fresh dictionary for the new class's parameters.
         new_state = set()
         new_ion = set()
-        new_range = set()
+        new_save = set()
         new_assigned = set()
 
         new_read_ion = {}
@@ -63,8 +63,8 @@ class Mechanism(_Parameterized):
                 new_state.update(base._state)
             if '_ion' in base.__dict__:
                 new_ion.update(base._ion)
-            if '_range' in base.__dict__:
-                new_range.update(base._range)
+            if '_save' in base.__dict__:
+                new_save.update(base._save)
             if '_assigned' in base.__dict__:
                 new_assigned.update(base._assigned)
             if '_read_ion' in base.__dict__:
@@ -86,10 +86,10 @@ class Mechanism(_Parameterized):
             for i_list in Mechanism._ion_declarations:
                 new_ion.update(i_list)
             Mechanism._ion_declarations = []
-        if Mechanism._range_declarations:
-            for r_list in Mechanism._range_declarations:
-                new_range.update(r_list)
-            Mechanism._range_declarations = []
+        if Mechanism._save_declarations:
+            for s_list in Mechanism._save_declarations:
+                new_save.update(s_list)
+            Mechanism._save_declarations = []
         if Mechanism._assigned_declarations:
             for a_list in Mechanism._assigned_declarations:
                 new_assigned.update(a_list)
@@ -117,7 +117,7 @@ class Mechanism(_Parameterized):
 
         cls._state = new_state
         cls._ion = new_ion
-        cls._range = new_range
+        cls._save = new_save
         cls._currents = new_currents
         cls._assigned = new_assigned
         cls._read_ion = new_read_ion
@@ -157,6 +157,9 @@ class Mechanism(_Parameterized):
         self.is_composable = is_composable
 
         def get_fancy(tensor):
+            if tensor.ndim == 0:
+                # If tensor is scalar, return it directly
+                return tensor
             # Preserves batch dimensions by only flattening the base dimensions
             batch_shape = tensor.shape[:-self.base_ndim]
             flat_tensor = tensor.reshape(*batch_shape, -1)
@@ -232,7 +235,7 @@ class Mechanism(_Parameterized):
             for state_name in state._state:
                 self.register_buffer(state_name, torch.zeros(shape))
 
-        for r in self._range:
+        for r in self._save:
             self.register_buffer(r, torch.zeros(shape))
 
         for a in self._assigned:
@@ -246,7 +249,7 @@ class Mechanism(_Parameterized):
             current_eqs.extend(v)
 
         for k in current_eqs:
-            assign = k in self._range
+            assign = k in self._save
             eq, factorable = build_current_eq(self, k, assign=assign)
             setattr(self, f"{k}_with_g", MethodType(eq, self))
             self.factorable = factorable
@@ -366,8 +369,8 @@ class Mechanism(_Parameterized):
         Mechanism._assigned_declarations.append(args)
 
     @staticmethod
-    def RANGE(*args):
-        Mechanism._range_declarations.append(args)
+    def SAVE(*args):
+        Mechanism._save_declarations.append(args)
 
     @staticmethod
     def USEION(ion, read=None, write=None):
@@ -454,6 +457,16 @@ class Mechanism(_Parameterized):
             type: A new class, identical in behavior to the original but with a new name.
         """
         return rename(cls, new_name=new_name, suffix=suffix)
+
+    def batch(self, batch_size: int):
+        """
+        Returns a new instance of the mechanism with the parameters
+        distributed over the specified batch size.
+        """
+        super().batch(batch_size)
+        for state_module in self.DE.values():
+            state_module.batch(batch_size)
+        return self
 
 
 def rename(mechanism, new_name=None, suffix=None):
