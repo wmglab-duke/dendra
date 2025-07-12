@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 import matplotlib as mpl
 import networkx as nx
+import numpy as np
 
 
 def generate_colors(n):
@@ -20,7 +21,7 @@ def palette_hsv(n, *, s=0.65, v=0.9, seed=0):
     return [mpl.colors.to_hex(colorsys.hsv_to_rgb(h, s, v)) for h in hues]
 
 
-def vis_2d(cell, view='y', node_scale=8, dpi=200):
+def vis_2d(cell, idx=0, view='y', node_scale=8, dpi=200):
     """
     Project a 3-D NetworkX graph to 2-D and plot with a legend.
 
@@ -40,8 +41,12 @@ def vis_2d(cell, view='y', node_scale=8, dpi=200):
     if G is None:
         raise ValueError("Graph is None. Please create a graph first.")
 
-    coords = {n: (float(d['x']), float(d['y']), float(d['z']))
-              for n, d in G.nodes(data=True)}
+    x = cell.x[idx]
+    y = cell.y[idx]
+    z = cell.z[idx]
+
+    coords = {n: (float(x[n]), float(y[n]), float(z[n]))
+              for n in G.nodes}
 
     # Orthographic projection
     if view == 'z':
@@ -110,7 +115,7 @@ def vis_2d(cell, view='y', node_scale=8, dpi=200):
             data['ys'],
             s=data['sizes'],
             c=[label_to_color[label]], # Use a list with one color
-            label=label, # This is the key for the legend!
+            label=label,
             alpha=0.85,
             edgecolors='k',
             linewidths=0.3
@@ -144,7 +149,7 @@ def vis_2d(cell, view='y', node_scale=8, dpi=200):
     plt.show()
 
 
-def vis_3d_plotly(cell, node_scale: float = 5.0) -> None:
+def vis_3d_plotly(cell, idx=0, node_scale: float = 10.0, height=800.0, width=None) -> None:
     import plotly.graph_objects as go
     """
     Plots a 3D NetworkX graph interactively using Plotly.
@@ -162,13 +167,17 @@ def vis_3d_plotly(cell, node_scale: float = 5.0) -> None:
         print("Graph is not a valid or non-empty NetworkX graph. Nothing to plot.")
         return
 
+    x = cell.x[idx]
+    y = cell.y[idx]
+    z = cell.z[idx]
+
     # ---- 1. Collect 3D coordinates for each node ----
     coords = {
         n: (
-            float(d.get('x', 0)),
-            float(d.get('y', 0)),
-            float(d.get('z', 0))
-        ) for n, d in G.nodes(data=True)
+            float(x[n]),
+            float(y[n]),
+            float(z[n])
+        ) for n in G.nodes
     }
 
     # ---- 2. Assign colors based on labels ----
@@ -196,15 +205,29 @@ def vis_3d_plotly(cell, node_scale: float = 5.0) -> None:
     # --- For the Edges ---
     # This method is efficient for drawing all lines in one go.
     edge_x, edge_y, edge_z = [], [], []
-    for u, v in G.edges():
+    edge_text = []
+    for u, v, data in G.edges(data=True):
         edge_x.extend([coords[u][0], coords[v][0], None])
         edge_y.extend([coords[u][1], coords[v][1], None])
         edge_z.extend([coords[u][2], coords[v][2], None])
+        # Prepare hover text for edges
+        r_ohm = data.get('R_ohm', None)
+        if r_ohm is not None:
+            r_ohm = float(r_ohm) * 1e-6  # Convert to MOhm
+        else:
+            r_ohm = 'N/A'
+        edge_info = (
+            f"R (MOhm): {r_ohm:.3f}<br>"
+        )
+        edge_text.append(edge_info)
+
+
 
     edge_trace = go.Scatter3d(
         x=edge_x, y=edge_y, z=edge_z,
-        line=dict(width=1, color='black'),
-        hoverinfo='none',
+        line=dict(width=1.5, color='black'),
+        hoverinfo='text',
+        text=edge_text,
         mode='lines'
     )
 
@@ -215,6 +238,8 @@ def vis_3d_plotly(cell, node_scale: float = 5.0) -> None:
     
     node_colors = [colors.get(n, 'grey') for n in node_list]
     node_sizes = [G.nodes[n].get('diam', 1.0) * node_scale for n in node_list]
+    node_sizes = np.log10(node_sizes)
+    node_sizes = np.clip(node_sizes, 0.1, None)  # Ensure minimum size for visibility
     
     hover_texts = []
     for node_id in node_list:
@@ -251,7 +276,8 @@ def vis_3d_plotly(cell, node_scale: float = 5.0) -> None:
     fig = go.Figure(
         data=[edge_trace, node_trace],
         layout=go.Layout(
-            title_text='3D Neuron Morphology',
+            height=height,
+            width=width,
             showlegend=False,
             hovermode='closest',
             margin=dict(b=20, l=5, r=5, t=40),
@@ -265,3 +291,86 @@ def vis_3d_plotly(cell, node_scale: float = 5.0) -> None:
     )
     
     fig.show()
+
+
+def vis_voltage_3d_plotly(x, y, z, voltage, height=800, width=None):
+    import plotly.graph_objects as go
+
+    # 1. Create the 3D scatter plot object
+    #    The configuration is done inside the 'go.Scatter3d' call.
+    trace = go.Scatter3d(
+        x=x,
+        y=y,
+        z=z,
+        mode='markers',  # We want to plot points, not lines
+        marker=dict(
+            size=5,             # Size of the markers
+            color=voltage,      # Set color to our voltage data
+            colorscale='Viridis', # One of Plotly's built-in colorscales
+            showscale=True,     # We want to show the color bar
+            colorbar=dict(
+                title='Voltage (mV)' # Title for the color bar
+            )
+        )
+    )
+
+    # 2. Create a layout object to configure the plot's appearance
+    layout = go.Layout(
+        height=height,  # Set the height of the plot
+        width=width,    # Set the width of the plot
+        scene=dict(
+            xaxis=dict(title='x (μm)'),
+            yaxis=dict(title='y (μm)'),
+            zaxis=dict(title='z (μm)')
+        ),
+        margin=dict(l=0, r=0, b=0, t=40) # Adjust margins
+    )
+
+    # 3. Create a figure and add the trace and layout
+    fig = go.Figure(data=[trace], layout=layout)
+
+    # 4. Show the figure
+    #    This will open an interactive plot in your web browser or in your
+    #    Jupyter Notebook / VS Code output cell.
+    fig.show()
+
+
+def vis_voltage_2d(x, y, z, voltage, view='y', node_scale=8, dpi=200):
+    """
+    Visualizes 3D voltage data in a 2D projection using matplotlib.
+
+    Parameters
+    ----------
+    x, y, z : array-like
+        Coordinates of the points.
+    voltage : array-like
+        Voltage values at each point.
+    view : {'x', 'y', 'z'}, optional
+        Axis to project along. Default 'z' (drop z -> use x-y).
+    node_scale : float, optional
+        Factor that converts diam (µm) to matplotlib marker area points².
+    dpi : int, optional
+        The resolution of the figure in dots per inch.
+    """
+    fig, ax = plt.subplots(dpi=dpi, figsize=(8, 8))
+
+    # We will capture the output of ax.scatter into a variable, let's call it `sc`.
+    if view == 'z':
+        sc = ax.scatter(x, y, c=voltage, s=node_scale * 10, cmap='viridis', alpha=0.7)
+        ax.set_xlabel('x (µm)')
+        ax.set_ylabel('y (µm)')
+    elif view == 'y':
+        sc = ax.scatter(x, z, c=voltage, s=node_scale * 10, cmap='viridis', alpha=0.7)
+        ax.set_xlabel('x (µm)')
+        ax.set_ylabel('z (µm)')
+    elif view == 'x':
+        sc = ax.scatter(y, z, c=voltage, s=node_scale * 10, cmap='viridis', alpha=0.7)
+        ax.set_xlabel('y (µm)')
+        ax.set_ylabel('z (µm)')
+    else:
+        raise ValueError("view must be 'x', 'y', or 'z'")
+
+    fig.colorbar(sc, label='Voltage (mV)', ax=ax)
+    
+    fig.tight_layout()
+    plt.show()

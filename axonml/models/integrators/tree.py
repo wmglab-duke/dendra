@@ -194,31 +194,6 @@ def build_dhs_layers(
             torch.as_tensor(layer_ptr, dtype=torch.int32))
 
 
-def get_area_from_graph(G: nx.DiGraph) -> torch.Tensor:
-    """
-    Extracts the area from the graph's nodes if available.
-
-    Parameters
-    ----------
-    G : nx.DiGraph
-        The directed graph representing the tree structure.
-
-    Returns
-    -------
-    torch.Tensor or None
-        A tensor containing the area in µm² for each node, or None if not available.
-    """
-    areas = []
-    for n in range(len(G.nodes)):
-        area = G.nodes[n].get('area', None)
-        if area is not None:
-            areas.append(area)
-        else:
-            return None  # If any node lacks area, return None
-
-    return torch.tensor(areas, dtype=torch.float32)
-
-
 def _edge_currents(
         edge_child: torch.Tensor, 
         edge_parent: torch.Tensor,
@@ -273,14 +248,12 @@ class _dhs(Integrator):
 
         B, N = model.np, model.nc
 
-        self.register_buffer("parent_idx",  torch.empty(N, dtype=torch.int32))  # (N,)
-        self.register_buffer("order",       torch.empty(N, dtype=torch.int32))  # (N,) order of forward elimination
-
-        self.register_buffer("lower",       torch.empty(B, N))    # (B,N) lower diagonal
+        self.register_buffer("parent_idx",  torch.empty(N, dtype=torch.int32))
+        self.register_buffer("order",       torch.empty(N, dtype=torch.int32))  # order of forward elimination
 
         self.register_buffer("solver_order",        torch.empty(N, dtype=torch.int64))  # (N,) node order for the graph
         self.register_buffer("inv_solver_order",    torch.empty(N, dtype=torch.int64))  # (N,) inverse node order
-        self.register_buffer("scale",               torch.empty(B, N))    # (N,) scale factor
+        self.register_buffer("scale",               torch.empty(1, N))    # (1, N) scale factor
 
         self.register_buffer("a_geom",          torch.empty(B, N))    # (B,N) axial conductance
         self.register_buffer("cmdt",            torch.empty(B, N))    # (B,N) capacitance * dt
@@ -319,11 +292,7 @@ class _dhs(Integrator):
 
         radius_cm = 1e-4 * model.diam / 2.0                 # µm → cm   (N,)
         dx_cm     = 1e-4 * model.dx                         # µm → cm   (N,)
-        area_cm2  = 2 * torch.pi * radius_cm * dx_cm        # cm²
-
-        area_um2 = get_area_from_graph(model.graph).to(device=device)
-        if area_um2 is not None:
-            area_cm2 = 1e-8 * area_um2                      # convert from µm² to cm²
+        area_cm2  = model.area                              # cm²
 
         self.register_buffer("layer_ptr", layer_ptr.to(device))  # (L+1,)
         self.order.copy_(order.to(dtype=torch.int32, device=device))
@@ -341,18 +310,52 @@ class _dhs(Integrator):
         self.cmdt.copy_(cm / dt_s)           # (B,N) (F/s = S)
 
         # extracellular
-        parent = parent_idx                                         # (N,)
-        child  = (parent >= 0).nonzero(as_tuple=False).squeeze(1)   # (E,)
-        self.register_buffer("edge_child",  child.to(torch.int64))  # (E,) child indices in solver order
-        self.register_buffer("edge_parent", parent[child].to(torch.int64))  # (E,) parent indices in solver order
+        # We will need the original node IDs from the graph for this
+        # Assuming G.nodes() provides the original order [0, 1, ..., N-1]
+        original_nodes = list(range(model.graph.number_of_nodes()))
+        original_idx_of = {n: i for i, n in enumerate(original_nodes)}
 
-        # axial conductance per edge (S) already in a_geom_t[child]
-        self.register_buffer("edge_gax", a_geom_t[child])  # (E,) axial conductance in solver order
+        # --- NEW: Create edge indices in the ORIGINAL node order ---
+        # This code will live in initialize()
+
+        edge_child_orig_list = []
+        edge_parent_orig_list = []
+        edge_gax_orig_list = []
+
+        node_order_list = node_order
+
+        for child_node, data in model.graph.nodes(data=True):
+            preds = list(model.graph.predecessors(child_node))
+            if not preds:
+                continue  # Skip root nodes
+
+            parent_node = preds[0]
+            
+            # Get the ORIGINAL index (0 to N-1) of the parent and child
+            child_idx_orig = original_idx_of[child_node]
+            parent_idx_orig = original_idx_of[parent_node]
+            
+            edge_child_orig_list.append(child_idx_orig)
+            edge_parent_orig_list.append(parent_idx_orig)
+            
+            # a_geom_t is in solver_order, so we need to find the child's
+            # index in the solver order to get its correct conductance.
+            # We can use the list `node_order_list` returned from graph_to_parent_and_axial
+            # which maps solver_order_index -> original_node_id
+            solver_idx_of_child = node_order_list.index(child_node)
+            edge_gax_orig_list.append(a_geom_t[solver_idx_of_child])
+
+        # Convert lists to tensors and register them as buffers
+        self.register_buffer("edge_child_orig",  torch.tensor(edge_child_orig_list, dtype=torch.int64, device=device))
+        self.register_buffer("edge_parent_orig", torch.tensor(edge_parent_orig_list, dtype=torch.int64, device=device))
+        self.register_buffer("edge_gax_orig",    torch.tensor(edge_gax_orig_list, dtype=a_geom_t.dtype, device=device))
+
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)
 
     def _step(self, v, dt, temp, ve=None, intra=None):
+        v = self.mech.update_v(v, dt)  # apply voltage processes
         self.mech.advance(v, dt, temp)
         itot, gtot = self.mech.i(v)
 
@@ -360,14 +363,14 @@ class _dhs(Integrator):
 
         if ve is not None:
             I_edge = _edge_currents(
-                self.edge_child,
-                self.edge_parent,
-                self.edge_gax,
+                self.edge_child_orig,
+                self.edge_parent_orig,
+                self.edge_gax_orig,
                 ve
             ) # (B, E) mA
             S = torch.zeros_like(f_n) # (B, K)
-            S.scatter_add_(1, self.edge_child .expand_as(I_edge), -I_edge)  # child gets -I
-            S.scatter_add_(1, self.edge_parent.expand_as(I_edge),  I_edge)  # parent gets +I
+            S.scatter_add_(1, self.edge_child_orig.expand_as(I_edge), -I_edge)  # child gets -I
+            S.scatter_add_(1, self.edge_parent_orig.expand_as(I_edge),  I_edge)  # parent gets +I
             f_n = f_n + S  # (B, K) mA
 
         if intra is not None:

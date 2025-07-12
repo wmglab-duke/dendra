@@ -8,6 +8,19 @@ from ..slice import Slice
 
 
 class Mechanism(_Parameterized):
+
+    """
+    Mechanism is the base class for all mechanisms in AxonML.
+    It provides a framework for defining state variables, ion channels,
+    and currents, and for managing the parameters of these mechanisms.
+    Mechanism is a subclass of _Parameterized, which provides the
+    functionality for handling parameters and their declarations.
+
+    Mechanisms are responsible for keeping track of where in the model
+    they are inserted, which facilitates AxonML's sparse internal representations
+    of states and parameters.
+    """
+
     _state = set()
     _ion = set()
     _save = set()
@@ -467,6 +480,39 @@ class Mechanism(_Parameterized):
         for state_module in self.DE.values():
             state_module.batch(batch_size)
         return self
+
+
+class VoltageProcess(Mechanism):
+    def update_v(self, v, dt):
+        """
+        A no-op update for voltage processes.
+        This method can be overridden in subclasses to implement specific behavior.
+        Any modifications to the membrane potential should not be in-place,
+        but rather return a new tensor.
+        Args:
+            v (torch.Tensor): The membrane potential tensor.
+            dt (float): The time step for the update.
+        Returns:
+            v (torch.Tensor): The updated membrane potential tensor.
+        """
+        raise NotImplementedError(
+            "VoltageProcess.update_v() must be implemented in subclasses."
+        )
+
+
+class PointProcess(Mechanism):
+    """
+    A PointProcess is a Mechanism that delivers a lumped current (units nA)
+    to a single point in space. Channel conductances must be in units uS. 
+    It exists as a convenience to replicate the behavior
+    of point processes such as ExpSyn in NEURON.
+
+    Implementing a Mechanism as PointProcess simply instructs AxonML to scale
+    the currents and conductances by the area of the relevant compartments to translate
+    them to densities. As such, unlike in NEURON, they cannot be inserted at branchpoints 
+    (which have 0 area).
+    """
+    pass
 
 
 def rename(mechanism, new_name=None, suffix=None):

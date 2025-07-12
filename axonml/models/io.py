@@ -5,6 +5,8 @@ except ImportError:
     NEURON_INSTALLED = False
 
 import networkx as nx
+import numpy as np
+
 from typing import Dict, Tuple, Optional, List, Any
 import re
 

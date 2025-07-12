@@ -1,4 +1,4 @@
-from ..mechanisms._synapse import Synapse as Syn
+from ..mechanisms._mechanism import PointProcess as PP
 from ..mechanisms._state import State as S
 from ..mechanisms.ops import *
 
@@ -21,12 +21,12 @@ class B(S):
         return {'B':torch.zeros_like(v)}
 
 
-class exp2syn(Syn):
-    Syn.STATE(A, B)
-    Syn.RANGE(e=0)
-    Syn.ASSIGNED("factor")
+class exp2syn(PP):
+    PP.STATE(A, B)
+    PP.RANGE(e=0.0)
+    PP.ASSIGNED("factor")
 
-    Syn.NONSPECIFIC_CURRENT("i")
+    PP.NONSPECIFIC_CURRENT("i")
 
     def initial(self, v):
         tau1 = self.DE['A'].tau1

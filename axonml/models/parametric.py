@@ -1,4 +1,5 @@
 import inspect
+import itertools
 from typing import Callable
 
 import torch
@@ -210,8 +211,8 @@ class _Parameterized(torch.nn.Module):
     A base class that allows subclasses to declare parameters which are
     automatically inherited and aggregated.
     """
-    _params = {}
-    _param_declarations = []
+    _global = {}
+    _global_declarations = []
 
     _range = {}
     _range_declarations = []
@@ -226,22 +227,22 @@ class _Parameterized(torch.nn.Module):
         super().__init_subclass__()
         
         # Start with a fresh dictionary for the new class's parameters.
-        new_params = {}
+        new_global = {}
         new_range = {}
         
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
-            # We look for a _params attribute defined directly on the base
-            if '_params' in base.__dict__:
-                new_params.update(base._params)
+            # We look for a _global attribute defined directly on the base
+            if '_global' in base.__dict__:
+                new_global.update(base._global)
             if '_range' in base.__dict__:
                 new_range.update(base._range)
         
-        # Add parameters declared via the PARAMETER() method
-        if _Parameterized._param_declarations:
-            for p_dict in _Parameterized._param_declarations:
-                new_params.update(p_dict)
-            _Parameterized._param_declarations = [] # Clear for next class
+        # Add parameters declared via the GLOBAL() method
+        if _Parameterized._global_declarations:
+            for p_dict in _Parameterized._global_declarations:
+                new_global.update(p_dict)
+            _Parameterized._global_declarations = [] # Clear for next class
         # Add range declarations
         if _Parameterized._range_declarations:
             for r_dict in _Parameterized._range_declarations:
@@ -250,19 +251,19 @@ class _Parameterized(torch.nn.Module):
         
         # Add parameters from class definition keywords (e.g., a=10)
         # These will override anything set by parents.
-        new_params.update(kwargs)
+        new_global.update(kwargs)
         new_range.update(kwargs)
-        
-        cls._params = new_params
+
+        cls._global = new_global
         cls._range = new_range
 
     @staticmethod
-    def PARAMETER(**kwargs):
+    def GLOBAL(**kwargs):
         """
         A static method to declare parameters. This has the side effect of
         appending the parameters to a temporary class-level list.
         """
-        _Parameterized._param_declarations.append(kwargs)
+        _Parameterized._global_declarations.append(kwargs)
 
     @staticmethod
     def RANGE(**kwargs):
@@ -275,7 +276,7 @@ class _Parameterized(torch.nn.Module):
     def __init__(self, shape, additional_parameters=None, **kwargs):
         super().__init__()
         self.shape  = shape
-        self.params = self.__class__._params.copy()
+        self.params = self.__class__._global.copy()
         self.range  = self.__class__._range.copy()
 
         self.parametrizations = torch.nn.ModuleDict()
@@ -348,7 +349,11 @@ class _Parameterized(torch.nn.Module):
             buffer.view(-1).index_copy_(0, key, additional_params)
 
     def populate_parameter_buffers(self):
-        for name in self.__class__._params:
+        keys_to_process = itertools.chain(
+            self.__class__._global.keys(),
+            self.__class__._range.keys()
+        )
+        for name in keys_to_process:
             p_name = f"{name}_default"
             getattr(self, name).detach_()
             getattr(self, name).copy_(getattr(self, p_name))

@@ -114,18 +114,7 @@ class Slice:
         return getattr(self.model, var)[self.index_spec.index]
 
     def get(self, var: str, mechanism: Optional[str] = None) -> torch.Tensor:
-        """
-        Get the variable from the model or a specific mechanism.
-        Returns a tensor with the shape of the slice.
-        """
-        if mechanism is not None:
-            mech = self.model.mech.mechanisms[mechanism]
-            if not mech.key:
-                return getattr(mech, var)[self.index_spec.index]
-            dummy = torch.tensor(torch.nan, device=self.model.device(), dtype=self.model.dtype())
-            dummy = mech.put(getattr(mech, var), dummy, self.model.v)
-            return dummy[self.index_spec.index]
-        return getattr(self.model, var)[self.index_spec.index]
+        return self.inspect(var, mechanism)
 
     def set(self, var: str, value: torch.Tensor, mechanism: Optional[str] = None):
         """

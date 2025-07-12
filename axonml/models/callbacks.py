@@ -679,6 +679,10 @@ class RecorderLambda(Callback):
         self.funcs = funcs
         self.rec = {}
 
+    def pre_loop_hook(self, model):
+        self.post_step_hook(model)
+
+    @nojit
     def post_step_hook(self, model):
         for name, func in self.funcs.items():
             self.rec.setdefault(name, []).append(func(model))

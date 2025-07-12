@@ -1,11 +1,10 @@
 import torch
 
-from ..mechanisms import *
+from ..mechanisms._mechanism import VoltageProcess
 
 
-class fire(Mechanism):
-    PARAMETER(threshold=-50.0, rest=-65.0)
+class fire(VoltageProcess):
+    VoltageProcess.RANGE(threshold=-50.0, rest=-65.0)
 
-    def breakpoint(self, v):
-        if v.dim() > 0:
-            v[:] = torch.where(v > self.threshold, self.rest, v)
+    def update_v(self, v, dt):
+        return torch.where(v > self.threshold, self.rest, v)

@@ -38,6 +38,9 @@ class _bwd_euler_sc(SCIntegrator):
         model.v = self._solve(model.v, dt, model.celsius, intra)
 
     def _solve(self, v, dt, temp, intra=None):
+        # apply voltage processes
+        v = self.mech.update_v(v, dt)
+
         # 1. Advance the mechanism's internal states
         self.mech.advance(v, dt, temp)
         
@@ -149,6 +152,8 @@ class _bwd_euler_ub(Integrator):
 
     def _step(self, v, dt, temp, ve=None, intra=None) -> Tensor:
         dt_s = dt * 1e-3
+        
+        v = self.mech.update_v(v, dt)  # apply voltage processes
 
         self.mech.advance(v, dt, temp)
 
@@ -392,6 +397,9 @@ class _bwd_euler_bt(torch.nn.Module):
     def _step(self, vc, v, dt, temp, ve=None, intra=None) -> Tuple[Tensor, Tensor]:
 
         xg = self.xg[..., -1]
+
+        # apply voltage processes
+        v = self.mech.update_v(v, dt)
 
         # advance gating
         self.mech.advance(v, dt, temp)

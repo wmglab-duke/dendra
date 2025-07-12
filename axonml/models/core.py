@@ -23,6 +23,7 @@ from axonml.models.mechanisms._handler import MechanismHandler
 from axonml.models.mechanisms._ions import valid_ions, Ion
 from axonml.units import mm, um
 from axonml.models.integrators import bwd_euler_ub, bwd_euler_sc
+from axonml.models.graph import get_area_from_graph
 
 
 from axonml.helpers import (
@@ -102,7 +103,7 @@ class Population(P):
     """
 
     P.RANGE(cm=1.0, rhoa=35.4)
-    P.PARAMETER(celsius=37.0)
+    P.GLOBAL(celsius=37.0)
 
     def __init__(self, N:int, C:int, integrator=None, v_init=-65.0, **kwargs):
         super().__init__((N, C), **kwargs)
@@ -191,6 +192,26 @@ class Population(P):
 
         self.initialized: bool = False
         self.eval()
+
+    @property
+    def graph(self):
+        """
+        Returns the graph of the population.
+        This is a placeholder for future graph-related functionality.
+        """
+        return None
+
+    @property
+    def area(self):
+        """
+        Returns the area of the population.
+        This is a placeholder for future area-related functionality.
+        """
+        if self.graph is not None:
+            area = get_area_from_graph(self.graph)
+            if area is not None:
+                return area.to(self.device(), dtype=self.dtype())
+        return self.diam * 1e-4 * torch.pi * self.dx * 1e-4  # in cm²
 
     @property
     def mech(self):
@@ -391,6 +412,7 @@ class Population(P):
         local_ind = 0
 
         if isinstance(time, Waveform):
+            time = time.to(device, dtype=self.dtype())
             if tstop is not None:
                 time._tstop = tstop
             elif time._tstop is None:
@@ -400,8 +422,6 @@ class Population(P):
         ctx = nullcontext() if self.training else torch.no_grad()
 
         with ctx:
-            if self.training:
-                self.calculate_geometric_params()
 
             if ve is None:
                 if space is not None and time is not None:
@@ -657,7 +677,7 @@ class Population(P):
                 if progressbar:
                     progressbar.close()
 
-    def steady_state(self, dt=0.2, tstop=200.0):
+    def steady_state(self, dt=0.2, tstop=200.0, with_ve=True):
         """
         Run the model until it reaches a steady state and cache the result.
 
@@ -683,9 +703,13 @@ class Population(P):
         maxiter = int(tstop / dt)
 
         with torch.no_grad():
+            if with_ve:
+                ve = torch.zeros_like(self.v).contiguous()
+            else:
+                ve = None
             dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
-            for i in tqdm(range(maxiter), desc=f"Steady state:"):
-                self._step(self.integrator, self, dt, None, None)
+            for i in tqdm(range(maxiter), desc=f"Steady state "):
+                self._step(self.integrator, self, dt, ve, None)
 
         self.cache("_steady_state")
         self.t_ind = 0
@@ -721,19 +745,16 @@ class Population(P):
         Load model weights from a state dictionary.
 
         This method supports loading weights from:
-        1. A key from the predefined `all_trained` dictionary
-        2. A file path as a string
-        3. An actual state dictionary object
+        1. A file path as a string
+        2. An actual state dictionary object
 
         The loaded weights are matched to the model's current state dict structure
-        and only compatible weights are loaded. After loading, geometric parameters
-        are recalculated.
+        and only compatible weights are loaded.
 
         Parameters
         ----------
         state_dict : str or dict
             Can be one of:
-            - A key from the predefined `all_trained` dictionary
             - A file path to a saved model state
             - A state dictionary object
 
@@ -1016,7 +1037,7 @@ class Population(P):
             n: k for n, k in zip(self._m_name, self._m_keys)
         }
         mech = MechanismHandler(
-            self.celsius, mechs, ions,
+            self.celsius, self.area, mechs, ions,
             self._ion_write_c, self._ion_read, self._m_curr
         )
 
@@ -1079,7 +1100,6 @@ class Axon(Population):
         Time step in ms.
     """
 
-    _dt_lim = None
     __constants__ = [
         "n_ax",
         "n_comp",
@@ -1137,16 +1157,6 @@ class Axon(Population):
 
     def register_cid(self, cid):
         self.cid = cid
-
-    def set_diam(self, diams):
-        diams = torch.as_tensor(diams, dtype=self.dtype())
-        self.diam[:] = diams
-        self.calculate_geometric_params()
-
-    def calculate_geometric_params(self):
-        self.area_c = self.area_(self.diam)
-        self.cm_c = self.cm_(self.area_c)
-        self.ra_c = self.ra_(self.diam)
 
     def n(self) -> int:
         return self.v.shape[0]
@@ -1263,7 +1273,7 @@ class Unmyelinated(Axon):
     """
 
     Axon.RANGE(cm=1.0, rhoa=35.4)
-    Axon.PARAMETER(celsius=37.0)
+    Axon.GLOBAL(celsius=37.0)
 
     def __init__(
             self, 
@@ -1286,15 +1296,6 @@ class Unmyelinated(Axon):
         l = (self.n_comp - 1) * self.dx_
         x = torch.linspace(-l / 2, l / 2, self.n_comp, device=self.device())
         return torch.atleast_2d(x)
-
-    def area_(self, diameters) -> torch.Tensor:
-        dx = torch.full_like(diameters, self.dx_ / 10000)
-        return torch.pi * (diameters / 10000) * dx
-
-    def ra_(self, diameters) -> torch.Tensor:
-        dx = torch.full_like(diameters, self.dx_ / 10000)
-        radii = diameters / 20000
-        return (self.rhoa * dx) / (torch.pi * (radii**2))
 
 
 class Myelinated(Axon):
@@ -1336,7 +1337,7 @@ class Myelinated(Axon):
         cm=1.0,
         rhoa=35.4,
     )
-    Axon.PARAMETER(
+    Axon.GLOBAL(
         axon_d={
             "axond1": 0.0,
             "axond2": 0.7,

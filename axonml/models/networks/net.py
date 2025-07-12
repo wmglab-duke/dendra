@@ -76,6 +76,30 @@ def prepare_indices_one_one(source, target, synapse):
     return pre_idx, post_idx
 
 
+def prepare_indices_one_one_flat(source_model, source_index, target_model, target_index, synapse):
+    """
+    Prepares indices for a one-to-one connection between source and target populations.
+    This function assumes that the synapse exists at all target locations.
+    """
+    syn = getattr(getattr(target_model, 'mech'), synapse)
+
+    index_arr = torch.arange(
+        target_model.v.numel(), device=target_model.device(), dtype=target_model.dtype()
+    ).view_as(target_model.v)
+
+    indices_in_synapse = syn.get(index_arr).flatten()
+
+    pre_idx = source_index
+    post_idx = target_index
+
+    if not torch.all(torch.isin(post_idx, indices_in_synapse)):
+        raise ValueError(f"Target population '{target.name}' does not have the synapse '{synapse}' at all target locations.")
+
+    post_idx = get_local_index(target_model, syn, post_idx)
+
+    return pre_idx, post_idx
+
+
 def check_weight_shape(weight, pre_idx):
     """
     Checks the shape of the weight tensor against the pre-synaptic indices.
@@ -130,7 +154,7 @@ def make_weight(weights, n):
                 ParameterOrDistributionWrapper(w) for w in weights
             ])
             self.n = n
-            self.register_buffer("w", torch.zeros(1))
+            self.register_buffer("w", torch.empty(0))
 
         def forward(self):
             return self.w
@@ -222,7 +246,9 @@ class Network(torch.nn.Module):
         # every target compartment receives input from exactly one source compartment
         # 1. validate that the synapse exists at all the target locations
         pre_idx, post_idx = prepare_indices_one_one(source, target, synapse)
-        self._connect(source.model, pre_idx, target.model, post_idx, synapse, threshold, weight, delay)
+        self._connect(
+            source.model, pre_idx, target.model, post_idx, synapse, threshold, weight, delay
+        )
 
     def connect_dense(
         self, source, target, synapse: str, threshold=0.0, weight=1.0, delay=0.0
@@ -231,26 +257,33 @@ class Network(torch.nn.Module):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
             target = target[:]  # Ensure target is a slice if it's a Population
+        
         # every target compartment receives input from every source compartment
         source_model = source.model
         target_model = target.model
-        pre_idx = to_flat_idx_torch(source_model.v, source.index)
+        pre_idx  = to_flat_idx_torch(source_model.v, source.index)
         post_idx = to_flat_idx_torch(target_model.v, target.index)
 
         # 1. Get the original number of elements
-        num_pre = pre_idx.numel()
+        num_pre  = pre_idx.numel()
         num_post = post_idx.numel()
 
         # 2. Expand the first tensor to repeat its elements
         # Shape becomes [3, 1] -> [3, 4] -> [12]
-        pre_out = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
+        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
 
         # 3. Expand the second tensor to repeat the whole sequence
         # Shape becomes [1, 4] -> [3, 4] -> [12]
-        post_out = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
+        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
+
+        pre_idx, post_idx = prepare_indices_one_one_flat(
+            source_model, pre_idx, target_model, post_idx, synapse
+        )
 
         # now connect
-        self._connect(source_model, pre_out, target_model, post_out, synapse, threshold, weight, delay)
+        self._connect(
+            source_model, pre_idx, target_model, post_idx, synapse, threshold, weight, delay
+        )
 
     def connect_sparse(
         self, source, target, synapse: str, prob: float, threshold=0.0, weight=1.0, delay=0.0
@@ -259,31 +292,38 @@ class Network(torch.nn.Module):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
             target = target[:]  # Ensure target is a slice if it's a Population
+
         # every target compartment receives input from every source compartment
         source_model = source.model
         target_model = target.model
-        pre_idx = to_flat_idx_torch(source_model.v, source.index)
+        pre_idx  = to_flat_idx_torch(source_model.v, source.index)
         post_idx = to_flat_idx_torch(target_model.v, target.index)
 
         # 1. Get the original number of elements
-        num_pre = pre_idx.numel()
+        num_pre  = pre_idx.numel()
         num_post = post_idx.numel()
 
         # 2. Expand the first tensor to repeat its elements
         # Shape becomes [3, 1] -> [3, 4] -> [12]
-        pre_out = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
+        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
 
         # 3. Expand the second tensor to repeat the whole sequence
         # Shape becomes [1, 4] -> [3, 4] -> [12]
-        post_out = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
+        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
 
         # randomly select connections based on the probability
-        mask = torch.rand(pre_out.numel(), device=source_model.device()) < prob
-        pre_out = pre_out[mask]
-        post_out = post_out[mask]
+        mask = torch.rand(pre_idx.numel(), device=source_model.device()) < prob
+        pre_idx = pre_idx[mask]
+        post_idx = post_idx[mask]
+
+        pre_idx, post_idx = prepare_indices_one_one_flat(
+            source_model, pre_idx, target_model, post_idx, synapse
+        )
 
         # now connect
-        self._connect(source_model, pre_out, target_model, post_out, synapse, threshold, weight, delay)
+        self._connect(
+            source_model, pre_idx, target_model, post_idx, synapse, threshold, weight, delay
+        )
 
     def build_synapses(self, dt):
         for (pre_name, post_name, synapse), specs in self.synapse_spec.items():

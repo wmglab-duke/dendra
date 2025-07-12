@@ -74,6 +74,12 @@ class Waveform(Parameterized):
         self.check_kwargs(kwargs)
         self.instantiate_parameters(**kwargs)
 
+    def device(self):
+        """
+        Returns the device of the first parameter.
+        """
+        return next(iter(self.parameters())).device
+
     def expand(self, shape):
         for p in self.parameters():
             if p.dim() == 0:
@@ -110,14 +116,14 @@ class Waveform(Parameterized):
         return self
 
     def assemble(self, dt):
-        t = torch.arange(0, self._tstop, dt)
+        t = torch.arange(0, self._tstop, dt, device=self.device())
         return self(t)
     
     def assemble_chunked(self, dt, chunks):
-        t = torch.arange(0, self._tstop, dt)
+        t = torch.arange(0, self._tstop, dt, device=self.device())
         t = torch.tensor_split(t, chunks)
         for t_ in t:
-            yield self(t)
+            yield self(t_)
 
 
 class _repeat(Waveform):

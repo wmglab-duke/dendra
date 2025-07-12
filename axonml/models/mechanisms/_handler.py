@@ -1,5 +1,49 @@
 import torch
 
+from ._mechanism import Mechanism, VoltageProcess, PointProcess
+
+
+def make_scaler(mech, area):
+    """
+    A factory that returns a scaler function.
+
+    The behavior of the scaler depends on the type of 'mech'.
+    - For Mechanism: It's an identity function (returns inputs unchanged).
+    - For PointProcess: It scales inputs by a factor derived from the area.
+
+    The returned scaler intelligently returns a single value for a single
+    input, or a tuple for multiple inputs.
+    """     
+    if isinstance(mech, PointProcess):
+        # Calculate the scaling factor once. This is a closure.
+        # The 'arr' variable will be remembered by the _scaler function.
+        arr = 1e6 * mech.get(area)
+        
+        # Add a check to prevent division by zero.
+        if torch.any(arr == 0):
+            raise ValueError("Calculated area factor is zero, perhaps you inserted a PointProcess at a branchpoint?")
+
+        def _scaler(*args):
+            # Scale all incoming arguments
+            scaled_values = tuple(a / arr for a in args)
+            
+            # If only one argument was passed, return the single scaled value.
+            if len(scaled_values) == 1:
+                return scaled_values[0]
+            # Otherwise, return the tuple of scaled values.
+            return scaled_values
+        
+        return _scaler
+            
+    def _scaler(*args):
+        # If only one argument was passed, return it directly.
+        if len(args) == 1:
+            return args[0]
+        # Otherwise, return the tuple of arguments.
+        return args
+        
+    return _scaler
+
 
 class MechanismHandler(torch.nn.Module):
     """
@@ -10,7 +54,8 @@ class MechanismHandler(torch.nn.Module):
 
     def __init__(
         self, 
-        celsius, 
+        celsius,
+        area, 
         mechs,
         ions=None, 
         write_ion_c=None, 
@@ -19,14 +64,23 @@ class MechanismHandler(torch.nn.Module):
     ):
         super().__init__()
         self.mechanisms = torch.nn.ModuleDict()
+        self.voltage_processes = torch.nn.ModuleDict()
         self.ions = torch.nn.ModuleDict()
-        self.celsius = celsius
+
+        self.register_buffer("celsius", celsius)
+        self.register_buffer("area", area)
 
         self.write_ion_c = write_ion_c if write_ion_c is not None else {}
         self.read_ion = read_ion if read_ion is not None else {}
         self.currents = currents if currents is not None else {}
 
         for mech_name, mech in mechs.items():
+            if isinstance(mech, VoltageProcess):
+                self.voltage_processes[mech_name] = mech
+                setattr(self, mech_name, mech)
+            else:
+                if not isinstance(mech, Mechanism):
+                    raise TypeError(f"Mechanism {mech_name} must be an instance of Mechanism or VoltageProcess.")
             self.mechanisms[mech_name] = mech
             setattr(self, mech_name, mech)
 
@@ -38,17 +92,27 @@ class MechanismHandler(torch.nn.Module):
         # --- flattened mapping (current-index, mechanism-obj, fn) ------------
         self._map = []
         self._map_exp = []
-        for c_idx, mech_dict in enumerate(currents.values()):
-            for mech_name, ions in mech_dict.items():
-                mech = self.mechanisms[mech_name]
-                for ion in ions:
-                    self._map.append( (c_idx, mech, getattr(mech, f"{ion}_with_g")) )
-                    self._map_exp.append( (c_idx, mech, getattr(mech, f"{ion}")) )
 
         self.ion_to_buff_idx = {}
         self.i_g_buffers_initialized = False
 
+    def make_maps(self):
+        """
+        Create the mapping of current indices to mechanisms and their functions.
+        This is used to efficiently compute currents and conductances.
+        """
+        self._map = []
+        self._map_exp = []
+        for c_idx, mech_dict in enumerate(self.currents.values()):
+            for mech_name, ions in mech_dict.items():
+                mech = self.mechanisms[mech_name]
+                scale_f = make_scaler(mech, self.area)
+                for ion in ions:
+                    self._map.append( (c_idx, mech, getattr(mech, f"{ion}_with_g"), scale_f) )
+                    self._map_exp.append( (c_idx, mech, getattr(mech, f"{ion}"), scale_f) )
+
     def initialize(self, v, celsius, diameters):
+        self.make_maps()
         self.populate()
         self.ion_init(celsius)
         self.set_buffers(diameters)
@@ -60,6 +124,11 @@ class MechanismHandler(torch.nn.Module):
         for ion in self.ions.values():
             ion.advance(celsius)
         self.read_from_ions()
+
+    def update_v(self, v, dt):
+        for vp in self.voltage_processes.values():
+            v = vp.update_v(v, dt)
+        return v
 
     def init_i_g_bufs(self, v):
         if not self.i_g_buffers_initialized:
@@ -136,8 +205,8 @@ class MechanismHandler(torch.nn.Module):
             mech.breakpoint(v)
 
         # core loop: minimal Python, pure aten ops inside
-        for c_idx, mech, fn in self._map:
-            i, g = fn(mech.get(v))
+        for c_idx, mech, fn, scale_f in self._map:
+            i, g = scale_f(*fn(mech.get(v)))
             mech.add_(self._buf_i[c_idx], i)
             mech.add_(self._buf_g[c_idx], g)
         
@@ -164,8 +233,8 @@ class MechanismHandler(torch.nn.Module):
             mech.breakpoint(v)
 
         # core loop: minimal Python, pure aten ops inside
-        for c_idx, mech, fn in self._map_exp:
-            i = fn(mech.get(v))
+        for c_idx, mech, fn, scale_f in self._map_exp:
+            i = scale_f(fn(mech.get(v)))
             mech.add_(self._buf_i[c_idx], i)
         
         # sum up currents and conductances
@@ -192,12 +261,12 @@ class MechanismHandler(torch.nn.Module):
         for mech in self.mechanisms.values():
             mech.breakpoint(v)
 
-        for c_idx, mech, fn in self._map:
+        for c_idx, mech, fn, scale_f in self._map:
             if mech.factorable:
                 v_in = v_half
             else:
                 v_in = v
-            i, g = fn(mech.get(v_in))
+            i, g = scale_f(*fn(mech.get(v_in)))
             mech.add_(self._buf_i[c_idx], i)
             mech.add_(self._buf_g[c_idx], g)
         
@@ -214,8 +283,8 @@ class MechanismHandler(torch.nn.Module):
         for t in self._buf_i:
             t.zero_()
 
-        for c_idx, mech, fn in self._map_exp:
-            i = fn(mech.get(v))
+        for c_idx, mech, fn, scale_f in self._map_exp:
+            i = scale_f(fn(mech.get(v)))
             mech.add_(self._buf_i[c_idx], i)
 
         for ion, ion_h in self.ions.items():

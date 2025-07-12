@@ -87,7 +87,7 @@ class VariableDelayDelivery(torch.nn.Module):
         future_buffer_indices = future_delivery_steps % self.max_delay_steps
 
         # Flatten the buffer and use `index_add_` for an efficient, sparse, and
-        # unconditional update. This avoids the `if is_spiking.any():` graph break.
+        # unconditional update. This avoids unnecessary graph breaks.
         flat_indices = future_buffer_indices * self.syn_numel + self.post_idx
         self.delivery_buffer.view(-1).index_add_(0, flat_indices, weighted_spikes)
 
