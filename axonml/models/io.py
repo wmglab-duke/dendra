@@ -220,6 +220,8 @@ def neuron_to_axonml_graph(
         Axial resistance (Ω) between those centres, taken from the distal
         segment's ``seg.ri()`` (which returns megohms) and scaled by 1e6.
     """
+    if data_func is None:
+        data_func = xyz
 
     # 0. discover root sections -------------------------------------------------
     if root_sec is None:

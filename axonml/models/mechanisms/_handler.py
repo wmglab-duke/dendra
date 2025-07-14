@@ -117,8 +117,8 @@ class MechanismHandler(torch.nn.Module):
         self.ion_init(celsius)
         self.set_buffers(diameters)
         self.init_i_g_bufs(v)
-        self.compute_initial_conditions(v)
         self.read_from_ions()
+        self.compute_initial_conditions(v)
         self.i(v)
         self.write_to_ions(v)
         for ion in self.ions.values():

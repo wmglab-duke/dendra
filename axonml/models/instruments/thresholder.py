@@ -72,12 +72,12 @@ class Thresholder:
 
         self.ignore = None
 
-        with torch.no_grad():
+        with torch.inference_mode():
             if ub is not None:
                 self.ub = torch.as_tensor(
                     ub, device=model.device(), dtype=model.dtype()
                 ) * torch.ones(
-                    self.model.n_ax, device=model.device(), dtype=model.dtype()
+                    self.model.np, device=model.device(), dtype=model.dtype()
                 )
             else:
                 self.ub = 0.2 * torch.ones_like(self.diams) / (self.diams / 5) ** 2
@@ -98,12 +98,12 @@ class Thresholder:
         ve_t = torch.as_tensor(ve_t, device=device)
 
         if multicontact:
-            ve_s = ve_s.expand(-1, self.model.n_ax, -1)
-            ve_t = ve_t.expand(-1, self.model.n_ax, -1)
+            ve_s = ve_s.expand(-1, self.model.np, -1)
+            ve_t = ve_t.expand(-1, self.model.np, -1)
             einsum = op_mc
         else:
-            ve_s = ve_s.expand(self.model.n_ax, -1)
-            ve_t = ve_t.expand(self.model.n_ax, -1)
+            ve_s = ve_s.expand(self.model.np, -1)
+            ve_t = ve_t.expand(self.model.np, -1)
             einsum = op_sc
 
         return einsum(ve_s, ve_t)
@@ -146,47 +146,59 @@ class Thresholder:
             boolean
         """
         self.active.reset()
-        if self.chunks is None:
-            ve = self.bases * bound[None, :, None, None]
-            self.model.run(
-                ve, callbacks=[self.active], reinit=True, dt=dt, progressbar=False
-            )
-        else:
-            time = self.time.expand(self.model.n_ax, -1) * bound[:, None]
-            self.model.longrun(
-                space=self.space,
-                time=time,
-                reinit=True,
-                progressbar=False,
-                dt=dt,
-                n_chunks=self.chunks,
-                callbacks=[self.active],
-            )
+        with torch.inference_mode():
+            if self.chunks is None:
+                ve = self.bases * bound[None, :, None, None]
+                self.model.run(
+                    ve, callbacks=[self.active], reinit=True, dt=dt, progressbar=False
+                )
+            else:
+                time = self.time.expand(self.model.np, -1) * bound[:, None]
+                self.model.longrun(
+                    space=self.space,
+                    time=time,
+                    reinit=True,
+                    progressbar=False,
+                    dt=dt,
+                    n_chunks=self.chunks,
+                    callbacks=[self.active],
+                )
         return self.active.is_active()
 
     def check_active_with_rec(self, dt, bound: Tensor):
         self.active.reset()
         self.rec.reset()
-        if self.chunks is None:
-            ve = self.bases * bound[None, :, None, None]
-            self.model.run(
-                ve,
-                callbacks=[self.active, self.rec],
-                reinit=True,
-                dt=dt,
-                progressbar=False,
-            )
-        else:
-            time = self.time.expand(self.model.n_ax, -1) * bound[:, None]
-            self.model.longrun(
-                space=self.space,
-                time=time,
-                reinit=True,
-                progressbar=False,
-                dt=dt,
-                n_chunks=self.chunks,
-                callbacks=[self.active, self.rec],
-            )
+        with torch.inference_mode():
+            if self.chunks is None:
+                ve = self.bases * bound[None, :, None, None]
+                self.model.run(
+                    ve,
+                    callbacks=[self.active, self.rec],
+                    reinit=True,
+                    dt=dt,
+                    progressbar=False,
+                )
+            else:
+                time = self.time.expand(self.model.n_ax, -1) * bound[:, None]
+                self.model.longrun(
+                    space=self.space,
+                    time=time,
+                    reinit=True,
+                    reinit=True,
+                    dt=dt,
+                    progressbar=False,
+                )
+            else:
+                time = self.time.expand(self.model.n_ax, -1) * bound[:, None]
+                self.model.longrun(
+                    space=self.space,
+                    time=time,
+                    reinit=True,
+                    progressbar=False,
+                    dt=dt,
+                    n_chunks=self.chunks,
+                    callbacks=[self.active, self.rec],
+                )
         return self.active.is_active(), self.rec.stack()
 
     def fix_bounds(self, dt, block_possible=True):
@@ -275,9 +287,9 @@ class Thresholder:
 
 @torch.jit.script
 def op_mc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("can,cat->tan", s, t).unsqueeze(2)
+    return torch.einsum("can,cat->tan", s, t).unsqueeze(2).contiguous()
 
 
 @torch.jit.script
 def op_sc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("an,at->tan", s, t).unsqueeze(2)
+    return torch.einsum("an,at->tan", s, t).unsqueeze(2).contiguous()

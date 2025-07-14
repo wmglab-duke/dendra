@@ -336,7 +336,6 @@ class Population(P):
         tstop=None,
         dt=None,
         callbacks=None,
-        reinit=False,
         progressbar=True,
         multicontact=False,
     ):
@@ -432,16 +431,6 @@ class Population(P):
             else:
                 n = int(tstop / dt_f)
 
-            if (not self.initialized) or reinit:
-                if "_steady_state" in self._caches:
-                    self.restore("_steady_state")
-                    self.t_ind = 0
-                    self.t_cache = 0.0
-                else:
-                    self.initialize()
-            else:
-                self.detach()
-
             if with_intra:
                 start = self.t_cache
                 end = (self.t_ind + n) * dt_f
@@ -501,7 +490,6 @@ class Population(P):
         chunklength: int,
         dt: float = None,
         extra: Optional[Tuple[Tensor, Waveform]] = None,
-        reinit=False,
         callbacks: List[Callback] = None,
         progressbar=True,
         multicontact=False,
@@ -558,11 +546,7 @@ class Population(P):
         # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
         # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
 
-        if self.intra is None or reinit:
-            intra = self.build_intra()
-            self.intra = intra
-        else:
-            intra = self.intra
+        intra = self.intra
 
         with_intra = intra is not None
         with_extra = extra is not None
@@ -617,15 +601,6 @@ class Population(P):
                         c.dt = dt_f
 
                 callbacks = CallbackList(callbacks)
-
-                if (not self.initialized) or reinit:
-                    if "_steady_state" in self._caches:
-                        self.restore("_steady_state")
-                        self.t_ind = 0
-                    else:
-                        self.initialize()
-                else:
-                    self.detach()
 
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t_ind*dt_f:.1f} ms")
@@ -730,6 +705,13 @@ class Population(P):
                 h(self)
 
     def initialize(self):
+        self.intra = self.build_intra()
+        if "_steady_state" in self._caches:
+            self.restore("_steady_state")
+            self.t_ind = 0
+            self.t_cache = 0.0
+            self.initialized = True
+            return self
         self.integrator.init_v(self)
         self.pre_initialize()
         self.integrator.mech.initialize(self.v, self.celsius, self.diam)

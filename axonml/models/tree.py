@@ -38,18 +38,11 @@ def gather_morphology(graph):
 
 class Tree(Population):
     """
-    Base class for tree-like structures in axonal models.
+    Base class for tree-like structures.
 
     This class serves as a foundation for creating tree structures that can
     represent branching axons or dendrites in neural models. It inherits from
     the Population class, allowing it to utilize population-level features.
-
-    Parameters
-    ----------
-    name : str
-        Name of the tree structure.
-    nodes : int
-        Number of nodes in the tree.
     """
     
     def __init__(self, N, C, graph, integrator=None, **kwargs):
@@ -109,6 +102,34 @@ class Tree(Population):
         for key, value in data.items():
             tree.register_buffer(key, value.expand(N, -1))
         return tree
+
+    @classmethod
+    def from_NEURON(cls, root_sec=None, N=1, integrator=None, **kwargs):
+        """
+        Create a Tree instance from a NEURON root section.
+
+        Parameters
+        ----------
+        root_sec : h.Section
+            The root section of the NEURON model.
+        N : int, optional
+            Number of instances of the tree. Default is 1.
+        integrator : Integrator, optional
+            The integrator to use for the model. Defaults to None.
+
+        Returns
+        -------
+        Tree
+            An instance of the Tree class.
+        """
+        from axonml.models.io import neuron_to_axonml_graph
+        graph, _ = neuron_to_axonml_graph(root_sec)
+        cell = cls.from_graph(graph, N, integrator, **kwargs)
+        cell[:, cell.find('soma')].label('soma')
+        cell[:, cell.find('axon')].label('axon')
+        cell[:, cell.find('dend')].label('dend')
+        cell[:, cell.find('apic')].label('apic')
+        return cell
 
     @classmethod
     def from_swc(cls, file_path, d_lambda=0.1, freq=100.0, N=1, integrator=None, **kwargs):
@@ -228,7 +249,7 @@ class Tree(Population):
 
         return self
 
-    def move(self, x=0.0, y=0.0, z=0.0, origin=None):
+    def move_to(self, x=0.0, y=0.0, z=0.0, origin=None):
         """
         Moves the tree structure to a new position.
 
@@ -496,6 +517,28 @@ class Tree(Population):
         terminal_mask = torch.tensor([len(list(self.graph.successors(i))) == 0 for i in range(len(self.graph.nodes))], device=self.device())
         return torch.nonzero(terminal_mask, as_tuple=False).squeeze(1).tolist()
 
+    def slice(self, include=None, exclude='branchpoint', fuzzy=True, match_case=False):
+        """
+        Finds all indices in the tree structure based on inclusion and exclusion criteria.
+
+        Parameters
+        ----------
+        include : str or list of str, optional
+            Patterns to include in the search.
+        exclude : str or list of str, optional
+            Patterns to exclude from the search.
+        fuzzy : bool, optional
+            If True, performs fuzzy matching. Default is True.
+        match_case : bool, optional
+            If True, matches case sensitively. Default is False.
+
+        Returns
+        -------
+        List[int]
+            A list of indices that match the criteria.
+        """
+        return self[:, self.find(include=include, exclude=exclude, fuzzy=fuzzy, match_case=match_case, full_report=False)]
+
 
 # Define the return type for clarity
 class FindResult(NamedTuple):
@@ -580,7 +623,7 @@ def find_indices_smart(
             # Otherwise, it's a simple name (e.g., 'axon'). Match as a "root" word.
             # Use a negative lookahead to allow suffixes like '[0]' but not more letters.
             else:
-                regex_pattern = fr"\b{re.escape(pattern)}(?![a-zA-Z0-9_])"
+                regex_pattern = fr"\b{re.escape(pattern)}(?![a-zA-Z0-9])"
             return s.str.contains(regex_pattern, case=match_case, regex=True, na=False)
         else: # Exact match
             series_to_compare = s.str.lower() if not match_case else s
