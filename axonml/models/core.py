@@ -242,7 +242,9 @@ class Population(P):
         if not names:
             return self.parameters()
         else:
-            return [p for n, p in self.named_parameters() if matches_any_pattern(names, n)]
+            for n, p in self.named_parameters():
+                if matches_any_pattern(names, n):
+                    yield p
         
     def collect_named_parameters(self, *names):
         """
@@ -263,7 +265,9 @@ class Population(P):
         if not names:
             return self.named_parameters()
         else:
-            return [(n, p) for n, p in self.named_parameters() if matches_any_pattern(names, n)]
+            for n, p in self.named_parameters():
+                if matches_any_pattern(names, n):
+                    yield (n, p)
 
     def unfreeze(self, *names):
         """
@@ -824,31 +828,6 @@ class Population(P):
         self.load_state_dict(self._caches[name])
         self.initialized = True
 
-    def cuda(self):
-        super().cuda()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
-    def cpu(self):
-        super().cpu()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
-    def float(self):
-        super().float()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
-    def double(self):
-        super().double()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        self.integrator.mech.set_buffers(self.diam)
-        return self
-
     def __getitem__(self, key):
         index = parse_key(key, self.shape, self.device())
         return Slice(self, index)
@@ -1116,6 +1095,12 @@ class Population(P):
         terminal_mask = torch.tensor([len(list(self.graph.successors(i))) == 0 for i in range(len(self.graph.nodes))], device=self.device())
         return torch.nonzero(terminal_mask, as_tuple=False).squeeze(1).tolist()
 
+    def init_v(self):
+        self.integrator.init_v(self)
+
+    def n(self) -> int:
+        return self.v.shape[-2]
+
 
 # Define the return type for clarity
 class FindResult(NamedTuple):
@@ -1354,24 +1339,6 @@ class Axon(Population):
         self.names = self.cid.names.tolist()
         for name in np.unique(self.names):
             self.slice(name).label(name)
-
-    def n(self) -> int:
-        return self.v.shape[0]
-
-    def area_(self, diameters):
-        raise NotImplementedError()
-
-    def ra_(self, diameters):
-        raise NotImplementedError()
-
-    def cm_(self, area):
-        return (self.cm / 1e3) * area
-
-    def init_v(self):
-        self.integrator.init_v(self)
-
-    def detach(self):
-        self.integrator.detach(self)
 
     def c(self, *args):
         """
