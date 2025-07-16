@@ -106,7 +106,7 @@ class Slice:
         """
         if mechanism is not None:
             mech = self.model.mech.mechanisms[mechanism]
-            if not mech.key:
+            if mech.key is None:
                 return getattr(mech, var)[self.index_spec.index]
             dummy = torch.tensor(torch.nan, device=self.model.device(), dtype=self.model.dtype())
             dummy = mech.put(getattr(mech, var), dummy, self.model.v)
@@ -123,7 +123,7 @@ class Slice:
         """
         if mechanism is not None:
             mech = self.model.mech.mechanisms[mechanism]
-            if not mech.key:
+            if mech.key is None:
                 getattr(mech, var)[self.index_spec.index] = value
                 getattr(mech, var).detach_()
                 return

@@ -183,7 +183,9 @@ class Mechanism(_Parameterized):
             # Use scatter_add_ for batched index_add_
             batch_shape = tensor.shape[:-self.base_ndim]
             flat_tensor = tensor.reshape(*batch_shape, -1)
-            
+
+            what = what.expand_as(self.key)
+
             # Expand key to match batch dimensions for scatter
             # e.g., key shape [N] -> [B1, B2, ..., N]
             expanded_key = self.key.expand(*batch_shape, -1)
@@ -196,6 +198,8 @@ class Mechanism(_Parameterized):
             # Use scatter_add for batched index_add
             batch_shape = tensor.shape[:-self.base_ndim]
             flat_tensor = tensor.reshape(*batch_shape, -1)
+
+            what = what.expand_as(self.key)
 
             # Expand key to match batch dimensions for scatter
             expanded_key = self.key.expand(*batch_shape, -1)

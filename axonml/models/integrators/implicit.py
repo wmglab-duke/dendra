@@ -244,6 +244,9 @@ class _bwd_euler_bt(torch.nn.Module):
         model.vc[..., 0] = model.v_init
         model.v[:] = model.v_init
 
+        self.initialized = False
+        self.dt = None
+
         if method == "triton":
             self._solve = thomas_solve_cuda_bt
         else:
@@ -277,6 +280,17 @@ class _bwd_euler_bt(torch.nn.Module):
 
         The outermost (Dirichlet) bath is *not* part of the unknowns.
         """
+        if model.device().type == 'cpu':
+            if not AXONML_SOLVERS_AVAILABLE:
+                raise RuntimeError(
+                    "CPU models require axonml_solvers to be installed for implicit integration."
+                )
+            self._solve = torch.ops.axonml_solvers.solve_bt
+        elif model.device().type == 'cuda':
+            self._solve = thomas_solve_cuda_bt
+
+        self.dt = dt
+
         # ------------------------------------------------------------------
         # Geometry-dependent scalars
         # ------------------------------------------------------------------
@@ -390,9 +404,11 @@ class _bwd_euler_bt(torch.nn.Module):
         self.maind = main
         self.lower = lower
         self.upper = upper
+
+        self.initialized = True
             
     def step(self, model, dt, ve=None, intra=None):
-        model.vc, model.v = self._step(model.vc, model.v, dt, model.temp_c, ve, intra)
+        model.vc, model.v = self._step(model.vc, model.v, dt, model.celsius, ve, intra)
 
     def _step(self, vc, v, dt, temp, ve=None, intra=None) -> Tuple[Tensor, Tensor]:
 
@@ -404,10 +420,12 @@ class _bwd_euler_bt(torch.nn.Module):
         # advance gating
         self.mech.advance(v, dt, temp)
 
-        itot = self.mech.i(v) * self.area
+        itot, gtot = self.mech.i(v)
 
         # linearized ionic conductances & reversal
-        gtot = self.mech.gtot(v) * self.area
+        gtot = gtot * self.area
+
+        itot = itot * self.area  # (B, K)
 
         d = gtot * v - itot
 
