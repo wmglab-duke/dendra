@@ -136,9 +136,9 @@ def vis_2d(cell, idx=0, view='y', node_scale=8, dpi=200):
     
     # ---- 4. Create and display the legend ----
     ax.legend(
-        loc='upper left',          # Specifies which corner of the legend box to anchor
-        bbox_to_anchor=(1.02, 1),  # Places the anchor point outside the axes
-        borderaxespad=0.,          # Removes padding between the anchor and the legend
+        loc='upper left',
+        bbox_to_anchor=(1.02, 1),
+        borderaxespad=0.,
         frameon=False
     )
 

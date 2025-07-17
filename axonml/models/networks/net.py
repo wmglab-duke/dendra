@@ -180,6 +180,7 @@ class Network(torch.nn.Module):
         self.synapse_spec = {}
         self.synapses = torch.nn.ModuleDict()
         self.dt = None
+        self.built = False
 
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
@@ -345,7 +346,7 @@ class Network(torch.nn.Module):
                 weight=weights,
                 delay=delay,
                 dt=dt
-            )
+            ).to(device=self.device(), dtype=self.dtype())
             self.synapses[f"{pre_name}_{post_name}_{synapse}"] = syn
 
     def build(self, dt):
@@ -353,15 +354,20 @@ class Network(torch.nn.Module):
         Build the network by initializing populations and synapses.
         This method should be called before running the network.
         """
-        self.dt = dt
-        self.build_synapses(dt)
-        self.eval()
+        if not self.built or self.dt != dt:
+            torch._dynamo.reset()
+            self.dt = dt
+            self.build_synapses(dt)
+            self.eval()
+            self.built = True
         return self
 
-    def initialize(self, dt):
+    def initialize(self, dt: float):
         """
         Initialize the network. This method should be overridden by subclasses.
         """
+        self.build(dt)
+        dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
         for pop in self.populations.values():
             pop.initialize()
             pop.integrator.initialize(pop, dt)
@@ -376,7 +382,6 @@ class Network(torch.nn.Module):
     def run(self, tstop, callbacks=None):
         dt = torch.tensor(self.dt, device=self.device(), dtype=self.dtype())
         with torch.set_grad_enabled(self.training):
-            self.initialize(dt)
             n_steps = int(tstop / dt.item())
             if callbacks is None:
                 callbacks = []

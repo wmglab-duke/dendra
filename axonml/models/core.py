@@ -711,6 +711,8 @@ class Population(P):
                 h(self)
 
     def initialize(self):
+        self.build()
+        self.populate_parameter_buffers()
         self.intra = self.build_intra()
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
@@ -1521,22 +1523,21 @@ class Myelinated(Axon):
     )
 
     class myelinated_rhoa(torch.nn.Module):
-        def __init__(self, dx, diam, deltax1, deltax2, deltax3, axond1, axond2, axond3):
+        def __init__(self, deltax1, deltax2, deltax3, axond1, axond2, axond3):
             super().__init__()
-            self.register_buffer("dx", dx)
-            self.register_buffer("diam", diam)
             self.deltax1 = deltax1
             self.deltax2 = deltax2
             self.deltax3 = deltax3
             self.axond1 = axond1
             self.axond2 = axond2
             self.axond3 = axond3
-        
-        def forward(self, rhoa):
-            axon_d = self.axond1 * self.diam**2 + self.axond2 * self.diam + self.axond3
-            deltax = self.deltax1 * self.diam**2 + self.deltax2 * self.diam + self.deltax3
-            deltax = deltax / self.dx
-            scale = 1 / ((axon_d / self.diam) ** 2)
+
+        def forward(self, rhoa, dx, diameters):
+            diameters = diameters.unsqueeze(1) if diameters.ndim == 1 else diameters
+            axon_d = self.axond1 * diameters**2 + self.axond2 * diameters + self.axond3
+            deltax = self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
+            deltax = deltax / dx
+            scale = 1 / ((axon_d / diameters) ** 2)
             rhoa = rhoa * scale * deltax
             return rhoa
 
@@ -1565,25 +1566,25 @@ class Myelinated(Axon):
         self.dx[:] = self.node_length
 
         self.register_parametrization(
-            "rhoa",
-            self.myelinated_rhoa(
-                self.dx,
-                self.diam,
-                self.deltax1,
-                self.deltax2,
-                self.deltax3,
-                self.axond1,
-                self.axond2,
-                self.axond3
-            )
-        )
-        self.register_parametrization(
             "diam",
             self.myelinated_node_d(
                 self.noded1,
                 self.noded2,
                 self.noded3
             )
+        )
+
+        self.register_parametrization_in_graph(
+            "rhoa",
+            self.myelinated_rhoa(
+                self.deltax1,
+                self.deltax2,
+                self.deltax3,
+                self.axond1,
+                self.axond2,
+                self.axond3
+            ),
+            args=('dx', 'diameters')
         )
 
     def deltax(self, diameters):

@@ -279,7 +279,7 @@ class _Parameterized(torch.nn.Module):
         self.params = self.__class__._global.copy()
         self.range  = self.__class__._range.copy()
 
-        self.parametrizations = torch.nn.ModuleDict()
+        self.in_graph_parametrizations = {}
 
         if kwargs:
             self.params = {key: kwargs.get(key, value) for key, value in self.params.items()}
@@ -315,6 +315,16 @@ class _Parameterized(torch.nn.Module):
                 self.register_buffer(name, torch.empty(self.shape))
                 getattr(self, name).copy_(getattr(self, p_name))
 
+    def register_parametrization_in_graph(self, name: str, param: Callable, args=None):
+        if name not in self.in_graph_parametrizations:
+            self.in_graph_parametrizations[name] = []
+        if not isinstance(param, torch.nn.Module):
+            # If param is a Module, we register it directly
+            param = Functional(param)
+        if args is None:
+            args = []
+        self.in_graph_parametrizations[name].append((param, args))
+
     def instantiate_additional_parameters(self, additional_parameters=None):
         if additional_parameters is not None:
             for name, list_of_aliases_values_and_keys in additional_parameters.items():
@@ -332,7 +342,7 @@ class _Parameterized(torch.nn.Module):
                         if isinstance(parameter, torch.nn.Module):
                             p = parameter(torch.empty(self.shape))
                             parametrization = build_parametrization(p, parameter, key, self.shape)
-                            self.parametrizations.setdefault(name, []).append(parametrization)
+                            self.register_parametrization_in_graph(name, parametrization)
                             setattr(self, p_name, parameter)
                         else:
                             setattr(self, p_name, parameter)
@@ -354,6 +364,8 @@ class _Parameterized(torch.nn.Module):
             self.__class__._range.keys()
         )
         for name in keys_to_process:
+            if not torch.is_tensor(getattr(self, name)):
+                continue
             p_name = f"{name}_default"
             getattr(self, name).detach_()
             getattr(self, name).copy_(getattr(self, p_name))
@@ -364,10 +376,10 @@ class _Parameterized(torch.nn.Module):
         """
         Apply all parametrizations to the parameters of this model.
         """
-        for name, param_list in self.parametrizations.items():
+        for name, param_list in self.in_graph_parametrizations.items():
             b = getattr(self, name)
-            for param in param_list:
-                b = param(b)
+            for param, args in param_list:
+                b = param(b, *[getattr(self, arg) for arg in args])
             setattr(self, name, b)
 
     def detach(self):
