@@ -69,15 +69,37 @@ def follows_pattern(base_pattern, target_string):
     return re.search(regex_pattern, target_string) is not None
 
 
+import re
+
 def matches_any_pattern(base_patterns, target_string):
+    """
+    Checks if a target string matches any of the provided base patterns.
+
+    A match occurs if the parts of a base_pattern (split by '.') appear in order
+    in the target_string. All parts except the last must be whole words.
+    The last part can be a prefix of a word.
+
+    For example:
+    - base_pattern 'hh.gbar' will match target_string 'hh.gbar_default'.
+    - base_pattern 'foo' will match 'a.foo_bar'.
+    - base_pattern 'a.b' will NOT match 'a_b.c'.
+    """
     for base_pattern in base_patterns:
+        # Split the pattern by '.' and escape each part to treat special
+        # regex characters (like '.') as literal characters.
+        escaped_parts = [re.escape(part) for part in base_pattern.split(".")]
+        
+        # The separator `\b.*?\b` ensures that all intermediate parts are
+        # treated as whole words.
         regex_pattern = (
-            r"\b"
-            + r"\b.*?\b".join(re.escape(part) for part in base_pattern.split("."))
-            + r"\b"
+            r"\b"  # The pattern must start at a word boundary.
+            + r"\b.*?\b".join(escaped_parts)
+            # The final r"\b" is removed from here!
         )
-        if re.search(regex_pattern, target_string):
+        
+        if re.search(regex_pattern, target_string, re.IGNORECASE): # Added re.IGNORECASE for more robust matching
             return True
+            
     return False
 
 
@@ -342,7 +364,7 @@ class Population(P):
         tstop=None,
         dt=None,
         callbacks=None,
-        progressbar=True,
+        progressbar=False,
         multicontact=False,
     ):
         """
@@ -761,7 +783,7 @@ class Population(P):
         self.load_state_dict(matched, strict=False)
         return self
 
-    def all_states(self) -> List[str]:
+    def state_names(self) -> List[str]:
         out = ["v"]
         return out + self.integrator.mech.all_states()
 

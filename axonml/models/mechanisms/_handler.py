@@ -196,10 +196,8 @@ class MechanismHandler(torch.nn.Module):
             return 0.0, 0.0
 
         # reset buffers in-place (no realloc)
-        for t in self._buf_i:
-            t.zero_()
-        for t in self._buf_g:
-            t.zero_()
+        self._buf_i = [torch.zeros_like(t) for t in self._buf_i]
+        self._buf_g = [torch.zeros_like(t) for t in self._buf_g]
 
         for mech in self.mechanisms.values():
             mech.breakpoint(v)
@@ -226,8 +224,7 @@ class MechanismHandler(torch.nn.Module):
             return 0.0
 
         # reset buffers in-place (no realloc)
-        for t in self._buf_i:
-            t.zero_()
+        self._buf_i = [torch.zeros_like(t) for t in self._buf_i]
 
         for mech in self.mechanisms.values():
             mech.breakpoint(v)
@@ -251,10 +248,8 @@ class MechanismHandler(torch.nn.Module):
         if not self.currents:
             return 0.0, 0.0
 
-        for t in self._buf_i:
-            t.zero_()
-        for t in self._buf_g:
-            t.zero_()
+        self._buf_i = [torch.zeros_like(t) for t in self._buf_i]
+        self._buf_g = [torch.zeros_like(t) for t in self._buf_g]
 
         v_half = 0.5 * v_prev
 
@@ -280,8 +275,7 @@ class MechanismHandler(torch.nn.Module):
         if not self.currents:
             return
 
-        for t in self._buf_i:
-            t.zero_()
+        self._buf_i = [torch.zeros_like(t) for t in self._buf_i]
 
         for c_idx, mech, fn, scale_f in self._map_exp:
             i = scale_f(fn(mech.get(v)))
@@ -309,3 +303,12 @@ class MechanismHandler(torch.nn.Module):
     def compute_initial_conditions(self, v):
         for m, mech in self.mechanisms.items():
             mech._init_buffers_s(mech.get(v))
+
+    def all_states(self):
+        """
+        Return a dictionary of all states in the MechanismHandler.
+        """
+        states = []
+        for mech in self.mechanisms.values():
+            states.extend(mech.states())
+        return states

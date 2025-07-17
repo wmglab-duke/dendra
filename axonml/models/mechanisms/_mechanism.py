@@ -485,6 +485,15 @@ class Mechanism(_Parameterized):
             state_module.batch(batch_size)
         return self
 
+    def states(self):
+        """
+        Returns a list of all state names in the Mechanism.
+        """
+        states = []
+        for state_module in self.DE.values():
+            states.extend(state_module._state)
+        return [f"{self.name}.{state}" for state in states]
+
 
 class VoltageProcess(Mechanism):
     def update_v(self, v, dt):
