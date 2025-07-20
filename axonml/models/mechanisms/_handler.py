@@ -131,14 +131,13 @@ class MechanismHandler(torch.nn.Module):
         return v
 
     def init_i_g_bufs(self, v):
-        if not self.i_g_buffers_initialized:
-            current_names = list(self.currents.keys())
-            self._buf_i = [torch.zeros_like(v) for _ in current_names]
-            self._buf_g = [torch.zeros_like(v) for _ in current_names]
-            for ion in self.ions.keys():
-                idx = current_names.index(f"i{ion}")
-                self.ion_to_buff_idx[ion] = idx
-            self.i_g_buffers_initialized = True
+        current_names = list(self.currents.keys())
+        self._buf_i = [torch.zeros_like(v) for _ in current_names]
+        self._buf_g = [torch.zeros_like(v) for _ in current_names]
+        for ion in self.ions.keys():
+            idx = current_names.index(f"i{ion}")
+            self.ion_to_buff_idx[ion] = idx
+        self.i_g_buffers_initialized = True
 
     def populate(self, mech=None) -> None:
         if mech is not None:
@@ -184,6 +183,7 @@ class MechanismHandler(torch.nn.Module):
         # read ion concentrations & equilibria
         self.read_from_ions()
 
+
     def detach(self):
         for mech in self.mechanisms.values():
             mech.detach()
@@ -195,12 +195,14 @@ class MechanismHandler(torch.nn.Module):
         if not self.currents:
             return 0.0, 0.0
 
-        # reset buffers in-place (no realloc)
-        self._buf_i = [torch.zeros_like(t) for t in self._buf_i]
-        self._buf_g = [torch.zeros_like(t) for t in self._buf_g]
-
         for mech in self.mechanisms.values():
-            mech.breakpoint(v)
+            mech.breakpoint(mech.get(v))
+
+        # reset buffers in-place (no realloc)
+        for buf in self._buf_i:
+            buf.detach().zero_()
+        for buf in self._buf_g:
+            buf.detach().zero_()
 
         # core loop: minimal Python, pure aten ops inside
         for c_idx, mech, fn, scale_f in self._map:
@@ -223,11 +225,11 @@ class MechanismHandler(torch.nn.Module):
         if not self.currents:
             return 0.0
 
-        # reset buffers in-place (no realloc)
-        self._buf_i = [torch.zeros_like(t) for t in self._buf_i]
-
         for mech in self.mechanisms.values():
-            mech.breakpoint(v)
+            mech.breakpoint(mech.get(v))
+
+        for buf in self._buf_i:
+            buf.detach().zero_()
 
         # core loop: minimal Python, pure aten ops inside
         for c_idx, mech, fn, scale_f in self._map_exp:
@@ -248,13 +250,15 @@ class MechanismHandler(torch.nn.Module):
         if not self.currents:
             return 0.0, 0.0
 
-        self._buf_i = [torch.zeros_like(t) for t in self._buf_i]
-        self._buf_g = [torch.zeros_like(t) for t in self._buf_g]
-
         v_half = 0.5 * v_prev
 
         for mech in self.mechanisms.values():
-            mech.breakpoint(v)
+            mech.breakpoint(mech.get(v))
+
+        for buf in self._buf_i:
+            buf.detach().zero_()
+        for buf in self._buf_g:
+            buf.detach().zero_()
 
         for c_idx, mech, fn, scale_f in self._map:
             if mech.factorable:
@@ -275,7 +279,8 @@ class MechanismHandler(torch.nn.Module):
         if not self.currents:
             return
 
-        self._buf_i = [torch.zeros_like(t) for t in self._buf_i]
+        for buf in self._buf_i:
+            buf.detach().zero_()
 
         for c_idx, mech, fn, scale_f in self._map_exp:
             i = scale_f(fn(mech.get(v)))

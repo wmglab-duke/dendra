@@ -152,61 +152,66 @@ def create_param_expander(
     )
     
 
-class Parameterized(torch.nn.Module):
-    _params = None
+class SimpleParameterized(torch.nn.Module):
+    
+    _params = {}
+    _params_declarations = []
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__()
+
+        new_params = {}
+
+        for base in reversed(cls.__mro__):
+            if '_params' in base.__dict__:
+                new_params.update(base._params)
+
+        if SimpleParameterized._params_declarations:
+            for p_dict in SimpleParameterized._params_declarations:
+                new_params.update(p_dict)
+            SimpleParameterized._params_declarations = []
+
+        cls._params = new_params
 
     def __init__(self, **kwargs):
-        super(Parameterized, self).__init__()
-        self.instantiate_parameters(**kwargs)
+        super(SimpleParameterized, self).__init__()
+        self._check_kwargs(kwargs)
+        self.params = self.__class__._params.copy()
+        if kwargs:
+            self.params = {key: kwargs.get(key, value) for key, value in self.params.items()}
+        self.instantiate_parameters(**self.params)
+
+    def _check_kwargs(self, kwargs):
+        for key in kwargs:
+            if key not in self._params:
+                raise ValueError(f"Unknown parameter: {key} for {self.__class__.__name__}. Valid parameters are: {list(self._params.keys())}")
 
     def instantiate_parameters(self, **kwargs):
-        _params = self.__class__._params
-        if _params is not None:
-            _params = dict((k, kwargs.get(k, v)) for k, v in _params.items())
-            for name, value in _params.items():
-                if isinstance(value, dict):
-                    setattr(self, name, torch.nn.ParameterDict())
-                    for pname, pval in value.items():
-                        if isinstance(pval, Functional):
-                            pval = 1.0
-                        setattr(self, pname, to_param(pval, self))
-                        getattr(self, name)[pname] = getattr(self, pname)
-                else:
-                    if isinstance(value, Functional):
-                        value = 1.0
-                    setattr(self, name, to_param(value, self))
+        """
+        Instantiate parameters using the provided keyword arguments.
+        This method is called during initialization to set up the waveform's parameters.
+        """
+        for key, value in kwargs.items():
+            setattr(self, key, to_param(value))
 
-    def instantiate_parameters_lambda(self, **kwargs):
-        _params = self.__class__._params
-        changed = False
-        if _params is not None:
-            _params = dict((k, kwargs.get(k, v)) for k, v in _params.items())
-            for name, value in _params.items():
-                if isinstance(value, dict):
-                    setattr(self, name, torch.nn.ParameterDict())
-                    for pname, pval in value.items():
-                        if isinstance(pval, Functional):
-                            changed = True
-                            setattr(self, pname, to_param(pval, self))
-                            getattr(self, name)[pname] = getattr(self, pname)
-                else:
-                    if isinstance(value, Functional):
-                        changed = True
-                        setattr(self, name, to_param(value, self))
-        return changed
+    @staticmethod
+    def PARAMETER(**kwargs):
+        SimpleParameterized._params_declarations.append(kwargs)
 
-    def check_kwargs(self, kwargs):
-        _params = self.__class__._params
-        if _params is not None:
-            for name in kwargs.keys():
-                if name not in _params:
-                    raise ValueError(
-                        f"Unknown parameter {name}. Valid parameters are {list(_params.keys())}."
-                    )
-        return True
+    def device(self):
+        """
+        Returns the device of the first parameter.
+        """
+        return next(iter(self.parameters())).device
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.parameters_repr()})"
+
+    def parameters_repr(self):
+        return ", ".join(f"{k}={v}" for k, v in self.named_parameters())
 
 
-class _Parameterized(torch.nn.Module):
+class Parameterized(torch.nn.Module):
     """
     A base class that allows subclasses to declare parameters which are
     automatically inherited and aggregated.
@@ -239,15 +244,15 @@ class _Parameterized(torch.nn.Module):
                 new_range.update(base._range)
         
         # Add parameters declared via the GLOBAL() method
-        if _Parameterized._global_declarations:
-            for p_dict in _Parameterized._global_declarations:
+        if Parameterized._global_declarations:
+            for p_dict in Parameterized._global_declarations:
                 new_global.update(p_dict)
-            _Parameterized._global_declarations = [] # Clear for next class
+            Parameterized._global_declarations = [] # Clear for next class
         # Add range declarations
-        if _Parameterized._range_declarations:
-            for r_dict in _Parameterized._range_declarations:
+        if Parameterized._range_declarations:
+            for r_dict in Parameterized._range_declarations:
                 new_range.update(r_dict)
-            _Parameterized._range_declarations = []
+            Parameterized._range_declarations = []
         
         # Add parameters from class definition keywords (e.g., a=10)
         # These will override anything set by parents.
@@ -263,7 +268,7 @@ class _Parameterized(torch.nn.Module):
         A static method to declare parameters. This has the side effect of
         appending the parameters to a temporary class-level list.
         """
-        _Parameterized._global_declarations.append(kwargs)
+        Parameterized._global_declarations.append(kwargs)
 
     @staticmethod
     def RANGE(**kwargs):
@@ -271,7 +276,7 @@ class _Parameterized(torch.nn.Module):
         A static method to declare ranges. This has the side effect of
         appending the ranges to a temporary class-level list.
         """
-        _Parameterized._range_declarations.append(kwargs)
+        Parameterized._range_declarations.append(kwargs)
 
     def __init__(self, shape, additional_parameters=None, **kwargs):
         super().__init__()
@@ -374,7 +379,7 @@ class _Parameterized(torch.nn.Module):
 
     def apply_parametrizations(self):
         """
-        Apply all parametrizations to the parameters of this model.
+        Apply all parametrizations to the parameter buffers of this model.
         """
         for name, param_list in self.in_graph_parametrizations.items():
             b = getattr(self, name)

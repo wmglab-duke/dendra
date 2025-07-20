@@ -1,17 +1,18 @@
 from typing import Optional
 
 import torch
-from axonml.models.parametric import Parameterized
+
+from axonml.models.parametric import SimpleParameterized
 
 
-class Waveform(Parameterized):
+
+class Waveform(SimpleParameterized):
     """
     Base class for creating waveform generators.
 
     This abstract class provides the foundation for implementing various types of
     waveforms (like sine waves, rectangular pulses, etc.) that can be used for
-    neural stimulation. It inherits from PyTorch's ScriptModule for JIT compilation
-    and Parameterized for parameter management.
+    neural stimulation. It inherits from torch.nn.Module.
 
     Parameters
     ----------
@@ -28,11 +29,9 @@ class Waveform(Parameterized):
     fn(t)
         Core implementation method that calculates the waveform value at time t.
         Must be implemented by subclasses.
-    forward(t)
-        Evaluates the waveform at given time points. Calls fn() internally.
-    repeat(freq, delay=0.0)
+    repeat(freq, delay=0.0, off=torch.inf)
         Creates a repeating version of the waveform. Frequency should be given in 
-        kHz and delay in ms.
+        kHz and delay and off in ms. Off is the time after which the waveform stops repeating.
 
     Notes
     -----
@@ -46,16 +45,14 @@ class Waveform(Parameterized):
 
     >>> import torch
     >>> from axonml.models.stim.waveform.core import Waveform
-    >>> from axonml.models.declarations import PARAMETER
     >>>
     >>> class triangle(Waveform):
     ...     '''Triangular waveform generator'''
-    ...     PARAMETER(amp=1.0, freq=1.0, delay=0.0)
+    ...     Waveform.PARAMETER(amp=1.0, freq=1.0, delay=0.0)
     ...
     ...     def fn(self, t):
     ...         t_adjusted = t - self.delay
     ...         period = 1.0 / self.freq
-    ...         # Create sawtooth wave and then take absolute value
     ...         phase = torch.fmod(t_adjusted, period) / period
     ...         tri = 2 * torch.abs(2 * phase - 1) - 1
     ...         return self.amp * torch.where(t >= self.delay, tri, 0.0)
@@ -69,16 +66,8 @@ class Waveform(Parameterized):
     _tstop: Optional[float]
 
     def __init__(self, **kwargs):
-        super(Waveform, self).__init__()
+        super(Waveform, self).__init__(**kwargs)
         self._tstop = None
-        self.check_kwargs(kwargs)
-        self.instantiate_parameters(**kwargs)
-
-    def device(self):
-        """
-        Returns the device of the first parameter.
-        """
-        return next(iter(self.parameters())).device
 
     def expand(self, shape):
         for p in self.parameters():
@@ -104,12 +93,6 @@ class Waveform(Parameterized):
 
     def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
         return _repeat(self, freq, delay, off)
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self.parameters_repr()})"
-
-    def parameters_repr(self):
-        return ", ".join(f"{k}={v}" for k, v in self.named_parameters())
 
     def tstop(self, tstop):
         self._tstop = tstop

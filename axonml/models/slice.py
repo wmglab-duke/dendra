@@ -93,6 +93,11 @@ class Slice:
         """
         return self.index_spec.is_scalar
 
+    def numel(self) -> int:
+        """
+        Return the number of elements in the slice.
+        """
+        return int(np.prod(self.index_spec.shape))
 
     @property
     def name(self) -> str:

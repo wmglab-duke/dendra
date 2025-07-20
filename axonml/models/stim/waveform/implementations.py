@@ -1,7 +1,6 @@
 import torch
 
 from .core import Waveform
-from axonml.models.declarations import PARAMETER
 from axonml.helpers import interp1d_z
 
 
@@ -54,7 +53,7 @@ class sin(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf)
+    Waveform.PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf)
 
     def fn(self, t):
         w = torch.sin(2 * torch.pi * self.freq * (t - self.delay) + self.phase)
@@ -99,7 +98,7 @@ class cos(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf)
+    Waveform.PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf)
 
     def fn(self, t):
         w = torch.cos(2 * torch.pi * self.freq * (t - self.delay) + self.phase)
@@ -142,7 +141,7 @@ class mono_rect(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(amp=-1.0, delay=0.0, pw=1.0)
+    Waveform.PARAMETER(amp=-1.0, delay=0.0, pw=1.0)
 
     def fn(self, t):
         return self.amp * torch.where(
@@ -194,7 +193,7 @@ class bi_rect(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(amp1=-1.0, amp2=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0)
+    Waveform.PARAMETER(amp1=-1.0, amp2=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0)
 
     def fn(self, t):
         return self.amp1 * torch.where(
@@ -254,7 +253,7 @@ class bi_rect_balanced(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(amp=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0)
+    Waveform.PARAMETER(amp=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0)
 
     def fn(self, t):
         return self.amp * torch.where(
@@ -309,7 +308,7 @@ class bi_rect_symm(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(amp=1.0, delay=0.0, pw=1.0, interval=0.0)
+    Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0, interval=0.0)
 
     def fn(self, t):
         return self.amp * torch.where(
@@ -353,7 +352,7 @@ class arbitrary(Waveform):
     >>> values = waveform(t)
     """
 
-    PARAMETER(values=[0.0, 0.0], tpoints=[0.0, 1.0])
+    Waveform.PARAMETER(values=[0.0, 0.0], tpoints=[0.0, 1.0])
 
     def fn(self, t):
         t = t.unsqueeze(0)

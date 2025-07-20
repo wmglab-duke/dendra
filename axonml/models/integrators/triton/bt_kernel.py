@@ -21,6 +21,7 @@ def inv3x3(a0,a1,a2, a3,a4,a5, a6,a7,a8):
 @triton.jit
 def thomas_bt3_kernel(
         L_ptr, M_ptr, U_ptr, D_ptr, X_ptr,
+        Minv_ptr,
         K: tl.constexpr):
 
     bid = tl.program_id(0)          # batch id
@@ -31,6 +32,7 @@ def thomas_bt3_kernel(
     U = U_ptr + bid * (K-1) * 3
     D = D_ptr + bid *  K    * 3
     X = X_ptr + bid *  K    * 3
+    Minv = Minv_ptr + bid * K * 9
 
     # ---------------- forward elimination ---------------------------
     # invert first main block
@@ -39,50 +41,45 @@ def thomas_bt3_kernel(
     a6 = tl.load(M+6); a7 = tl.load(M+7); a8 = tl.load(M+8)
     i0,i1,i2,i3,i4,i5,i6,i7,i8 = inv3x3(a0,a1,a2,a3,a4,a5,a6,a7,a8)
 
+    base_inv = Minv + 0*9
+    tl.store(base_inv+0, i0); tl.store(base_inv+1, i1); tl.store(base_inv+2, i2)
+    tl.store(base_inv+3, i3); tl.store(base_inv+4, i4); tl.store(base_inv+5, i5)
+    tl.store(base_inv+6, i6); tl.store(base_inv+7, i7); tl.store(base_inv+8, i8)
+
     for k in range(1, K):
         # lower diag
+        u0 = tl.load(U + (k-1)*3 + 0)
+        u1 = tl.load(U + (k-1)*3 + 1)
+        u2 = tl.load(U + (k-1)*3 + 2)
+        
+        w_u0 = i0*u0; w_u1 = i1*u1; w_u2 = i2*u2
+        w_u3 = i3*u0; w_u4 = i4*u1; w_u5 = i5*u2
+        w_u6 = i6*u0; w_u7 = i7*u1; w_u8 = i8*u2
+
+        # Update M_k = M_k - diag(L_k) * W_U
+        # This is now a row-scaling of W_U.
         l0 = tl.load(L + (k-1)*3 + 0)
         l1 = tl.load(L + (k-1)*3 + 1)
         l2 = tl.load(L + (k-1)*3 + 2)
 
-        # W = diag(l)*inv
-        w0 = l0*i0; w1 = l0*i1; w2 = l0*i2
-        w3 = l1*i3; w4 = l1*i4; w5 = l1*i5
-        w6 = l2*i6; w7 = l2*i7; w8 = l2*i8
-
-        # upper diag
-        u0 = tl.load(U + (k-1)*3 + 0)
-        u1 = tl.load(U + (k-1)*3 + 1)
-        u2 = tl.load(U + (k-1)*3 + 2)
-
-        # load current A_k
         base = M + k*9
-        a0 = tl.load(base+0); a1 = tl.load(base+1); a2 = tl.load(base+2)
-        a3 = tl.load(base+3); a4 = tl.load(base+4); a5 = tl.load(base+5)
-        a6 = tl.load(base+6); a7 = tl.load(base+7); a8 = tl.load(base+8)
+        a0 = tl.load(base+0) - l0 * w_u0; a1 = tl.load(base+1) - l0 * w_u1; a2 = tl.load(base+2) - l0 * w_u2
+        a3 = tl.load(base+3) - l1 * w_u3; a4 = tl.load(base+4) - l1 * w_u4; a5 = tl.load(base+5) - l1 * w_u5
+        a6 = tl.load(base+6) - l2 * w_u6; a7 = tl.load(base+7) - l2 * w_u7; a8 = tl.load(base+8) - l2 * w_u8
 
-        # A_k -= W * diag(u)
-        a0 -= w0*u0; a1 -= w1*u1; a2 -= w2*u2
-        a3 -= w3*u0; a4 -= w4*u1; a5 -= w5*u2
-        a6 -= w6*u0; a7 -= w7*u1; a8 -= w8*u2
-
-        # store A_k
-        tl.store(base+0, a0); tl.store(base+1, a1); tl.store(base+2, a2)
-        tl.store(base+3, a3); tl.store(base+4, a4); tl.store(base+5, a5)
-        tl.store(base+6, a6); tl.store(base+7, a7); tl.store(base+8, a8)
-
-        # D_k update
+        # 3. Update D_k = D_k - diag(L_k) * (M'_{k-1})⁻¹ * D'_{k-1}
         dp0 = tl.load(D + (k-1)*3 + 0)
         dp1 = tl.load(D + (k-1)*3 + 1)
         dp2 = tl.load(D + (k-1)*3 + 2)
 
-        dot0 = w0*dp0 + w1*dp1 + w2*dp2
-        dot1 = w3*dp0 + w4*dp1 + w5*dp2
-        dot2 = w6*dp0 + w7*dp1 + w8*dp2
+        # Calculate W_d = (M'_{k-1})⁻¹ * D'_{k-1}
+        wd0 = i0*dp0 + i1*dp1 + i2*dp2
+        wd1 = i3*dp0 + i4*dp1 + i5*dp2
+        wd2 = i6*dp0 + i7*dp1 + i8*dp2
 
-        dk0 = tl.load(D + k*3 + 0) - dot0
-        dk1 = tl.load(D + k*3 + 1) - dot1
-        dk2 = tl.load(D + k*3 + 2) - dot2
+        dk0 = tl.load(D + k*3 + 0) - l0*wd0
+        dk1 = tl.load(D + k*3 + 1) - l1*wd1
+        dk2 = tl.load(D + k*3 + 2) - l2*wd2
         tl.store(D + k*3 + 0, dk0)
         tl.store(D + k*3 + 1, dk1)
         tl.store(D + k*3 + 2, dk2)
@@ -90,6 +87,11 @@ def thomas_bt3_kernel(
         # invert A_k for next loop
         i0,i1,i2,i3,i4,i5,i6,i7,i8 = inv3x3(
             a0,a1,a2,a3,a4,a5,a6,a7,a8)
+
+        base_inv = Minv + k*9
+        tl.store(base_inv+0, i0); tl.store(base_inv+1, i1); tl.store(base_inv+2, i2)
+        tl.store(base_inv+3, i3); tl.store(base_inv+4, i4); tl.store(base_inv+5, i5)
+        tl.store(base_inv+6, i6); tl.store(base_inv+7, i7); tl.store(base_inv+8, i8)
 
     # ---------------- backward substitution -------------------------
     # last block
@@ -109,24 +111,14 @@ def thomas_bt3_kernel(
         u1 = tl.load(U + k*3 + 1)
         u2 = tl.load(U + k*3 + 2)
 
-        xp0 = tl.load(X + (k+1)*3 + 0)
-        xp1 = tl.load(X + (k+1)*3 + 1)
-        xp2 = tl.load(X + (k+1)*3 + 2)
+        dk0 = tl.load(D + k*3 + 0) - u0*x0
+        dk1 = tl.load(D + k*3 + 1) - u1*x1
+        dk2 = tl.load(D + k*3 + 2) - u2*x2
 
-        dk0 = tl.load(D + k*3 + 0) - u0*xp0
-        dk1 = tl.load(D + k*3 + 1) - u1*xp1
-        dk2 = tl.load(D + k*3 + 2) - u2*xp2
-        tl.store(D + k*3 + 0, dk0)
-        tl.store(D + k*3 + 1, dk1)
-        tl.store(D + k*3 + 2, dk2)
-
-        # invert A_k
-        base = M + k*9
-        a0 = tl.load(base+0); a1 = tl.load(base+1); a2 = tl.load(base+2)
-        a3 = tl.load(base+3); a4 = tl.load(base+4); a5 = tl.load(base+5)
-        a6 = tl.load(base+6); a7 = tl.load(base+7); a8 = tl.load(base+8)
-        i0,i1,i2,i3,i4,i5,i6,i7,i8 = inv3x3(
-            a0,a1,a2,a3,a4,a5,a6,a7,a8)
+        base_inv = Minv + k*9
+        i0 = tl.load(base_inv+0); i1 = tl.load(base_inv+1); i2 = tl.load(base_inv+2)
+        i3 = tl.load(base_inv+3); i4 = tl.load(base_inv+4); i5 = tl.load(base_inv+5)
+        i6 = tl.load(base_inv+6); i7 = tl.load(base_inv+7); i8 = tl.load(base_inv+8)
 
         # solve for x_k
         x0 = i0*dk0 + i1*dk1 + i2*dk2
@@ -149,20 +141,22 @@ def _thomas_triton(lower, main, upper, rhs):
     B, K = rhs.shape[:2]
     out  = torch.empty_like(rhs)
 
-    main_c = main.clone()
+    # main_c = main.clone()
     rhs_c  = rhs.clone()
+    minv_c = torch.empty(B, K, 9, device=main.device, dtype=main.dtype)
 
     thomas_bt3_kernel[
         (B,)
     ](  # one block per fibre
         lower   .reshape(B, -1), 
-        main_c  .reshape(B, -1),
+        main    .reshape(B, -1),
         upper   .reshape(B, -1), 
         rhs_c   .reshape(B, -1),
         out     .reshape(B, -1),
+        minv_c  .reshape(B, -1),
         K=K,
         num_warps=1, 
-        num_stages=4
+        num_stages=3
     )
 
     return out
@@ -222,5 +216,5 @@ class ThomasSolve(torch.autograd.Function):
 
 # convenience function -------------------------------------------------
 def thomas_solve_cuda_bt(lower, main, upper, rhs):
-    """ differentiable replacement for thomas_triton """
+    """ differentiable wrapper """
     return ThomasSolve.apply(lower, main, upper, rhs)

@@ -5,7 +5,7 @@ import torch
 import ast
 
 from .ode import integrate2c
-from axonml.models.parametric import _Parameterized
+from axonml.models.parametric import Parameterized
 from axonml.helpers import DEBUG, PADE
 
 
@@ -252,7 +252,7 @@ def build_cnexp(states, assigned, derivative, pade=False):
     return locals()["solve"]
 
 
-class State(_Parameterized):
+class State(Parameterized):
 
     _state_buffers = set()
     _state_buffers_declarations = []

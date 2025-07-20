@@ -1,19 +1,23 @@
+import inspect
+import textwrap
+
 from types import MethodType
 import torch
 
-from axonml.models.parametric import _Parameterized
+from axonml.helpers import classproperty
+from axonml.models.parametric import Parameterized
 from ._ions import VALENCES
 from ._symbolic import build_current_eq
 from ..slice import Slice
 
 
-class Mechanism(_Parameterized):
+class Mechanism(Parameterized):
 
     """
     Mechanism is the base class for all mechanisms in AxonML.
     It provides a framework for defining state variables, ion channels,
     and currents, and for managing the parameters of these mechanisms.
-    Mechanism is a subclass of _Parameterized, which provides the
+    Mechanism is a subclass of Parameterized, which provides the
     functionality for handling parameters and their declarations.
 
     Mechanisms are responsible for keeping track of where in the model
@@ -25,11 +29,13 @@ class Mechanism(_Parameterized):
     _ion = set()
     _save = set()
     _assigned = set()
+    _explicit = set()
 
     _state_declarations = []
     _ion_declarations = []
     _save_declarations = []
     _assigned_declarations = []
+    _explicit_declarations = []
 
     _conductances = {}
     _currents = {}
@@ -61,6 +67,7 @@ class Mechanism(_Parameterized):
         new_ion = set()
         new_save = set()
         new_assigned = set()
+        new_explicit = set()
 
         new_read_ion = {}
         new_write_ion = {}
@@ -90,7 +97,9 @@ class Mechanism(_Parameterized):
                 new_currents.update(base._currents)
             if '_init' in base.__dict__:
                 new_init.update(base._init)
-        
+            if '_explicit' in base.__dict__:
+                new_explicit.update(base._explicit)
+
         if Mechanism._state_declarations:
             for s_list in Mechanism._state_declarations:
                 new_state.update(s_list)
@@ -127,6 +136,10 @@ class Mechanism(_Parameterized):
             for i_dict in Mechanism._init_declarations:
                 new_init.update(i_dict)
             Mechanism._init_declarations = []
+        if Mechanism._explicit_declarations:
+            for v_list in Mechanism._explicit_declarations:
+                new_explicit.update(v_list)
+            Mechanism._explicit_declarations = []
 
         cls._state = new_state
         cls._ion = new_ion
@@ -137,6 +150,7 @@ class Mechanism(_Parameterized):
         cls._write_ion = new_write_ion
         cls._write_ion_c = new_write_ion_c
         cls._init = new_init
+        cls._explicit = new_explicit
 
     def __init__(
         self,
@@ -437,6 +451,14 @@ class Mechanism(_Parameterized):
     def INIT(**kwargs):
         Mechanism._init_declarations.append(kwargs)
 
+    @staticmethod
+    def EXPLICIT(*args):
+        """
+        Marks the mechanism as independent of voltage for the given methods.
+        This means that the method does not depend on the membrane potential `v`.
+        """
+        Mechanism._explicit_declarations.append(args)
+
     def breakpoint(self, v):
         return
 
@@ -494,6 +516,15 @@ class Mechanism(_Parameterized):
             states.extend(state_module._state)
         return [f"{self.name}.{state}" for state in states]
 
+    @classproperty
+    def code(cls):
+        """
+        Returns the source code of the mechanism.
+        This is useful for debugging and introspection.
+        """
+        source_code = inspect.getsource(cls)
+        return textwrap.dedent(source_code)
+
 
 class VoltageProcess(Mechanism):
     def update_v(self, v, dt):
@@ -517,9 +548,7 @@ class PointProcess(Mechanism):
     """
     A PointProcess is a Mechanism that delivers a lumped current (units nA)
     to a single point in space. Channel conductances must be in units uS. 
-    It exists as a convenience to replicate the behavior
-    of point processes such as ExpSyn in NEURON.
-
+    
     Implementing a Mechanism as PointProcess simply instructs AxonML to scale
     the currents and conductances by the area of the relevant compartments to translate
     them to densities. As such, unlike in NEURON, they cannot be inserted at branchpoints 

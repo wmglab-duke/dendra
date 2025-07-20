@@ -18,7 +18,7 @@ from axonml.models.stim.waveform import Waveform
 
 from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
-from axonml.models.parametric import _Parameterized as P
+from axonml.models.parametric import Parameterized as P
 from axonml.models.mechanisms.core import Mechanism, validate
 from axonml.models.mechanisms import concentrations, equilibria
 from axonml.models.mechanisms._handler import MechanismHandler

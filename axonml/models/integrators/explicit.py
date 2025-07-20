@@ -341,12 +341,11 @@ class _dufort_frankel_homogeneous(Integrator):
         else:
             d2v = ssd_df(v, v_prev, ve)
 
+        self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
-
         v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * 0.5 * gtot)
 
         self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
 
         if self.smoothing:
             if (t_ind + 1) % self.smooth_every == 0:
@@ -364,12 +363,11 @@ class _dufort_frankel_homogeneous(Integrator):
         x = torch.stack([v, v_prev, ve], dim=1)
         d2v = self.ssd(x).squeeze(1)
 
+        self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
-
         v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * 0.5 * gtot)
 
         self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
 
         if self.smoothing:
             if (t_ind + 1) % self.smooth_every == 0:
@@ -390,13 +388,13 @@ class _dufort_frankel_homogeneous(Integrator):
         else:
             d2v = s2 * ssd_df(v, v_prev, ve)
 
+        self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
         i_ion = i_ion * area - intra
 
         v_new = (v_prev + d2v - s1 * i_ion) / (s4 + 0.5 * gtot * s3)
 
         self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
 
         if self.smoothing:
             if (t_ind + 1) % self.smooth_every == 0:
@@ -414,13 +412,13 @@ class _dufort_frankel_homogeneous(Integrator):
         x = torch.stack([v, v_prev, ve], dim=1)
         d2v = s2 * self.ssd(x).squeeze(1)
 
+        self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
         i_ion = i_ion * area - intra
 
         v_new = (v_prev + d2v - s1 * i_ion) / (s4 + 0.5 * gtot * s3)
 
         self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
 
         if self.smoothing:
             if (t_ind + 1) % self.smooth_every == 0:
@@ -559,8 +557,8 @@ class _dufort_frankel(Integrator):
             num = num_v_prev + num_axial_v + num_axial_ve
         else:
             num = num_v_prev + num_axial_v
-        
-        # Contribution from ionic currents
+
+        self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
         num_ion = -self.s3 * i_ion
 
@@ -573,7 +571,6 @@ class _dufort_frankel(Integrator):
         v_new = numerator / denominator
 
         self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
 
         if self.smoothing and (t_ind + 1) % self.smooth_every == 0:
             # unsqueeze/squeeze needed for Conv1d which expects (N, C, L)
@@ -605,9 +602,9 @@ class _dufort_frankel(Integrator):
             num = num_v_prev + num_axial_v + num_axial_ve
         else:
             num = num_v_prev + num_axial_v
-        
+
+        self.mech.advance(v, dt, temp)        
         i_ion, gtot = self.mech.idf(v, v_prev)
-        # Here we scale ionic current by area and subtract stimulus
         i_ion_stim = i_ion * self.area - intra
         num_ion = -self.s1 * i_ion_stim  # Note: we use s1 here since i_ion_stim is in Amps
 
@@ -618,7 +615,6 @@ class _dufort_frankel(Integrator):
         v_new = numerator / denominator
 
         self.mech.itot(v)
-        self.mech.advance(v, dt, temp)
 
         if self.smoothing and (t_ind + 1) % self.smooth_every == 0:
             v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new.unsqueeze(1)).squeeze(1)

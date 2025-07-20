@@ -5,15 +5,11 @@ import torch
 import networkx as nx
 
 from .spherical_cartesian import spherical_to_cartesian
-from ..parametric import _Parameterized as P
+from ..parametric import SimpleParameterized as P
 
 
 class Point(P):
-    P.GLOBAL(x=0.0, y=0.0, z=0.0)
-
-    def __init__(self, **kwargs):
-        self.check_kwargs(kwargs)
-        super().__init__(**kwargs)
+    P.PARAMETER(x=0.0, y=0.0, z=0.0)
 
     def fn(self, x, y, z):
         raise NotImplementedError
@@ -55,7 +51,7 @@ class isotropic_point(Point):
     is converted from μm to cm for calculation.
     """
 
-    Point.GLOBAL(x=0.0, y=0.0, z=0.0, rhoe=500.0)
+    Point.PARAMETER(x=0.0, y=0.0, z=0.0, rhoe=500.0)
 
     def fn(self, x, y, z):
         r = torch.sqrt((x - self.x) ** 2 + (y - self.y) ** 2 + (z - self.z) ** 2) * 1e-4
@@ -96,7 +92,7 @@ class anisotropic_point(Point):
     The result is in mV with an assumed unit current source.
     """
 
-    Point.GLOBAL(x=0.0, y=0.0, z=0.0, rhox=500.0, rhoy=500.0, rhoz=500.0)
+    Point.PARAMETER(x=0.0, y=0.0, z=0.0, rhox=500.0, rhoy=500.0, rhoz=500.0)
 
     def fn(self, x, y, z):
         # Convert distances from μm to cm (1e-4)

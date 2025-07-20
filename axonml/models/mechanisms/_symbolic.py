@@ -20,6 +20,15 @@ def {k}(self, v):
 """
 
 
+numerical_template = """
+def {k}(self, v):
+    i = self.{k}(v)
+    i_d = self.{k}(v + 1e-3)
+    i_b = self.{k}(v - 1e-3)
+    return i, (i_d - i_b) / (2 * 1e-3)
+"""
+
+
 current_tot_template = """
 def {k}_tot(self, v):
 {body}
@@ -39,6 +48,12 @@ def build_implicit_equation(current, gtot, irev, assign):
     )
 
 
+def build_numerical_equation(current):
+    return numerical_template.format(
+        k=current,
+    )
+
+
 def build_unfactorable_equation(current):
     return implicit_equation_unfactorable_template.format(
         k=current,
@@ -46,15 +61,17 @@ def build_unfactorable_equation(current):
 
 
 def build_current_eq(mechanism, k, assign=False):
-    
     try:
         gtot, irev = factorize_linear_in_v(mechanism.__class__, method=k)
         code = build_implicit_equation(k, gtot, irev, assign)
         factorable = True
     except Exception as e:
-        logger.warning(f"Could not factorize {k} in {mechanism.__class__.__name__}.")
-        code = build_unfactorable_equation(k)
-        factorable = False
+        if not k in mechanism._explicit:
+            code = build_numerical_equation(k)
+            factorable = True
+        else:
+            code = build_unfactorable_equation(k)
+            factorable = False
     if DEBUG > 0:
         logger.info(f"Generated code for {k}:\n{code}")
     filename = "<solve_function>"

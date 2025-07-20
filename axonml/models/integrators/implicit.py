@@ -40,11 +40,7 @@ class _bwd_euler_sc(SCIntegrator):
     def _solve(self, v, dt, temp, intra=None):
         # apply voltage processes
         v = self.mech.update_v(v, dt)
-
-        # 1. Advance the mechanism's internal states
         self.mech.advance(v, dt, temp)
-        
-        # 2. Get the total current and conductance at the current voltage `v`
         itot, gtot = self.mech.i(v)
 
         denom = self.cmdt + gtot
@@ -316,7 +312,7 @@ class _bwd_euler_bt(torch.nn.Module):
         gaxial  = 1.0 / raxial                              # S, (B,K-1,M-1)
         zeros_G = torch.zeros((B, 1, M - 1),
                               device=dev, dtype=dtyp)
-        gaxial  = torch.cat([zeros_G, gaxial, zeros_G], dim=1)  # (B,K+1,M-1)
+        gaxial  = torch.cat([zeros_G, gaxial, zeros_G], dim=1) # (B,K+1,M-1)
 
         # convenience slices for later
         gi_L  = gi[:, :-1]          # (B,K)
@@ -448,7 +444,7 @@ class _bwd_euler_bt(torch.nn.Module):
 
         # solve tridiagonal system
         vc = self._solve(self.lower, B, self.upper, D)  # (B, K)
-        v = vc[..., 0] - vc[..., 1]                     # vi = v - ve0
+        v = vc[..., 0] - vc[..., 1]                     # v = vi - ve0
         return vc, v
 
 

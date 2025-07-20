@@ -11,6 +11,14 @@ def getenv(key: str, default=0):
     return type(default)(os.getenv(key, default))
 
 
+class classproperty(object):
+    def __init__(self, fget):
+        self.fget = fget
+
+    def __get__(self, owner_self, owner_cls):
+        return self.fget(owner_cls)
+
+
 class ctx(contextlib.ContextDecorator):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
