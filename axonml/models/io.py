@@ -78,7 +78,7 @@ def lambda_f(sec, freq_hz):
 
 
 def apply_d_lambda(
-    all_sections: List['h.Section'],
+    all_sections: List['nrn.Section'],
     d_lambda: float = 0.1,
     freq: float = 100.0
 ):
