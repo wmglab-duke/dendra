@@ -300,11 +300,11 @@ class Parameterized(torch.nn.Module):
                 if isinstance(value, dict):
                     setattr(self, name, torch.nn.ParameterDict())
                     for pname, pval in value.items():
-                        setattr(self, pname, to_param(pval, self))
+                        setattr(self, pname, to_param(pval))
                         getattr(self, name)[pname] = getattr(self, pname)
                 else:
                     p_name = f"{name}_default"
-                    setattr(self, p_name, to_param(value, self))
+                    setattr(self, p_name, to_param(value))
                     self.register_buffer(name, torch.empty(()))
                     getattr(self, name).copy_(getattr(self, p_name))
 
@@ -313,7 +313,7 @@ class Parameterized(torch.nn.Module):
         if kwargs is not None:
             for name, value in kwargs.items():
                 p_name = f"{name}_default"
-                setattr(self, p_name, to_param(value, self))
+                setattr(self, p_name, to_param(value))
                 self.register_buffer(name, torch.empty(self.shape))
                 getattr(self, name).copy_(getattr(self, p_name))
 
@@ -340,7 +340,7 @@ class Parameterized(torch.nn.Module):
                             p_name = f"{name}_{count}"
                             count += 1
                         key = torch.as_tensor(key, dtype=torch.long)
-                        parameter = to_param(value, self)
+                        parameter = to_param(value)
                         if isinstance(parameter, torch.nn.Module):
                             p = parameter(torch.empty(self.shape))
                             parametrization = build_parametrization(p, parameter, key, self.shape)
