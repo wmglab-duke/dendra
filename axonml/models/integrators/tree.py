@@ -306,7 +306,7 @@ class _dhs(Integrator):
 
         self.scale.copy_(area_cm2)
 
-        cm = model.cm * 1e-6 * area_cm2      # convert from µF to F
+        cm = 1e-6 * model.cm * area_cm2      # convert from µF / cm2 to F
         self.cmdt.copy_(cm / dt_s)           # (B,N) (F/s = S)
 
         # extracellular
@@ -315,9 +315,7 @@ class _dhs(Integrator):
         original_nodes = list(range(model.graph.number_of_nodes()))
         original_idx_of = {n: i for i, n in enumerate(original_nodes)}
 
-        # --- NEW: Create edge indices in the ORIGINAL node order ---
-        # This code will live in initialize()
-
+        # --- Create edge indices in the ORIGINAL node order ---
         edge_child_orig_list = []
         edge_parent_orig_list = []
         edge_gax_orig_list = []
@@ -370,14 +368,14 @@ class _dhs(Integrator):
             ) # (B, E) mA
             S = torch.zeros_like(f_n) # (B, K)
             S.scatter_add_(1, self.edge_child_orig.expand_as(I_edge), -I_edge)  # child gets -I
-            S.scatter_add_(1, self.edge_parent_orig.expand_as(I_edge),  I_edge)  # parent gets +I
+            S.scatter_add_(1, self.edge_parent_orig.expand_as(I_edge), I_edge)  # parent gets +I
             f_n = f_n + S  # (B, K) mA
 
         if intra is not None:
             f_n += intra
 
-        RHS  = f_n + self.cmdt * v                      # mA
-        main = self.cmdt + gtot * self.scale            # S
+        RHS  = f_n + (self.cmdt * v)                    # mA
+        main = self.cmdt + (gtot * self.scale)          # S
 
         d_ = main.index_select(-1, self.solver_order)   # (B, N)
         b_ = RHS.index_select(-1, self.solver_order)    # (B, N)

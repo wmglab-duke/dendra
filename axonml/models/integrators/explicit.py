@@ -19,7 +19,7 @@ class SymmetricConv1D(torch.nn.Conv1d):
 
 class _euler(Integrator):
     """
-    Euler integrator.
+    Forward Euler integrator.
     """
 
     def __init__(self, model, mech, imem=None):

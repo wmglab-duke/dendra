@@ -101,6 +101,7 @@ class Tree(Population):
         tree = cls(N, C, graph, integrator, **kwargs)
         for key, value in data.items():
             tree.register_buffer(key, value.expand(N, -1))
+        tree.set_value('cm', data['cm'])
         return tree
 
     @classmethod
@@ -209,9 +210,9 @@ class Tree(Population):
             origin = self.find('soma', as_list=True)
             origin = origin[int(len(origin) / 2)]
 
-        current_centre_x = self.x[:, origin]
-        current_centre_y = self.y[:, origin]
-        current_centre_z = self.z[:, origin]
+        current_centre_x = self.x[:, origin][:, None]
+        current_centre_y = self.y[:, origin][:, None]
+        current_centre_z = self.z[:, origin][:, None]
 
         offsets = [
             x - current_centre_x,

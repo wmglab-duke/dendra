@@ -296,7 +296,7 @@ def avoid_smart_indexing(node_indices):
 
 def n(node_indices, model):
     if node_indices is None:
-        return model.n_comp
+        return model.nc
     if node_indices.ndim == 0:
         return 1
     return len(node_indices)
@@ -874,6 +874,15 @@ class ThresholdCallback(Callback):
         self._dt: float = dt if dt is not None else A.dt
         self.ind_start = int(self.t_start_check / self._dt)
 
+    def pre_loop_hook(self, model):
+        self.node_check = torch.as_tensor(
+            self.node_check, dtype=torch.long, device=model.device()
+        )
+        
+        # convert negative to positive index
+        nc = model.nc
+        self.node_check = self.node_check.remainder(nc)
+
     @property
     def dt(self):
         return self._dt
@@ -986,13 +995,7 @@ class APCount(ThresholdCallback):
         model : Axon
             The axon model being simulated.
         """
-        self.node_check = torch.as_tensor(
-            self.node_check, dtype=torch.long, device=model.device()
-        )
-        
-        # convert negative to positive index
-        nc = model.n_comp
-        self.node_check = self.node_check.remainder(nc)
+        super().pre_loop_hook(model)
 
         if self.record is None:
             self.record = torch.zeros(
@@ -1152,9 +1155,7 @@ class Active(ThresholdCallback):
     """
 
     def pre_loop_hook(self, model):
-        self.node_check = torch.as_tensor(
-            self.node_check, dtype=torch.long, device=model.device()
-        )
+        super().pre_loop_hook(model)
         if self.record is None:
             self.record = torch.zeros(
                 model.n(), dtype=torch.bool, device=model.device()
@@ -1167,6 +1168,7 @@ class Active(ThresholdCallback):
                 device=model.device(),
             )
 
+    @nojit
     def post_step_hook(self, model):
         if self.i >= self.ind_start:
             vm_new = model.v.index_select(-1, self.node_check)
@@ -1368,7 +1370,7 @@ def increment_act(vm, vm_new, threshold: float):
     next_mask = ~m                             # can tag-on to same kernel
     return next_mask, mask
 
-
+@torch.jit.script
 def update_active(vm, vm_new, record, threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
     ge = vm_new >= threshold
     record = torch.logical_or(record, torch.any(torch.logical_and(ge, vm), dim=1))

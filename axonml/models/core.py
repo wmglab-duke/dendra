@@ -738,6 +738,7 @@ class Population(P):
         self.intra = self.build_intra()
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
+            self.post_initialize()
             self.t_ind = 0
             self.t_cache = 0.0
             self.initialized = True
@@ -1124,6 +1125,24 @@ class Population(P):
 
     def n(self) -> int:
         return self.v.shape[-2]
+
+    def set_value(self, name: str, value: torch.Tensor):
+        """
+        Set a parameter or state variable by name.
+
+        Parameters
+        ----------
+        name : str
+            The name of the parameter or state variable to set.
+        value : torch.Tensor
+            The value to set for the specified parameter or state variable.
+        """
+        def _set_value(model):
+            if hasattr(model, name):
+                getattr(model, name).copy_(value.to(device=model.device(), dtype=model.dtype()))
+            else:
+                raise AttributeError(f"Model has no attribute '{name}' to set.")
+        self.register_post_initialize_hook(_set_value)
 
 
 # Define the return type for clarity

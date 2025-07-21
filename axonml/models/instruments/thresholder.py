@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from axonml.models import Population
+from axonml.models.stim import Waveform
 from axonml.models.callbacks import Recorder, ThresholdCallback
 
 
@@ -16,7 +17,7 @@ class Thresholder:
         model:  Population,
         active: ThresholdCallback,
         space:  Optional[Union[npt.NDArray, Tensor]] = None,
-        time:   Optional[Union[npt.NDArray, Tensor]] = None,
+        time:   Optional[Waveform] = None,
         bases:  Optional[Union[npt.NDArray, Tensor]] = None,
         diams:  Optional[Union[npt.NDArray, Tensor, List]] = None,
         ub=None,
@@ -24,13 +25,17 @@ class Thresholder:
         fix_bound_down=0.1,
         max_tries_bound_fix=10,
         max_tries_thresh=25,
-        resolution=0.01,
-        multicontact=False,
-        chunks=None,
+        atol=None,
+        rtol=None,
+        chunklength=None,
     ):
         self.model = model
-        self.chunks = chunks
+        self.chunklength = chunklength
         self.bases = None
+        self.functional = False
+
+        if atol is None and rtol is None:
+            raise ValueError("Either atol or rtol must be provided.")
 
         if bases is None and (space is None and time is None):
             raise ValueError(
@@ -38,18 +43,18 @@ class Thresholder:
             )
 
         if bases is not None:
+            if chunklength is not None:
+                raise ValueError("Cannot use chunklength with bases. Supply space and time instead.")
             bases = torch.as_tensor(bases)
-            bases = bases.permute(1, 0, 2).unsqueeze(2)
-            self.bases = bases.to(model.device())
+            bases = bases.permute(1, 0, 2)
+            self.bases = bases.to(device=model.device(), dtype=model.dtype())
+            self.check_active = self._check_active_bases
+            self.functional = False
         else:
-            if chunks is None:
-                bases = self.ve_from_s_t(
-                    space, time, self.model.device(), multicontact=multicontact
-                )
-                self.bases = bases
-            else:
-                self.space = torch.as_tensor(space).to(model.device())
-                self.time = torch.as_tensor(time).to(model.device())
+            self.space = torch.as_tensor(space).to(device=model.device(), dtype=model.dtype())
+            self.time = time.to(device=model.device(), dtype=model.dtype())
+            self.check_active = self._check_active_space_time
+            self.functional = True
 
         if diams is not None:
             if hasattr(diams, "__iter__"):
@@ -59,7 +64,7 @@ class Thresholder:
                 diams = np.atleast_1d(np.full(self.bases.shape[1], diams))
 
             diams = torch.as_tensor(diams)
-            self.diams = diams.to(model.device())
+            self.diams = diams.to(device=model.device(), dtype=model.dtype())
 
         else:
             self.diams = None
@@ -72,7 +77,7 @@ class Thresholder:
 
         self.ignore = None
 
-        with torch.inference_mode():
+        with torch.no_grad():
             if ub is not None:
                 self.ub = torch.as_tensor(
                     ub, device=model.device(), dtype=model.dtype()
@@ -88,10 +93,22 @@ class Thresholder:
         self.fix_bound_down = fix_bound_down
         self.max_tries_bound_fix = max_tries_bound_fix
         self.max_tries_thresh = max_tries_thresh
-        self.resolution = resolution
+
+        self.atol = atol
+        self.rtol = rtol
 
         self.active = active
         self.rec = Recorder(["v"], max_only=True)
+
+    def check_tolerance(self, awindow: Tensor, rwindow: Tensor) -> Tensor:
+        if self.atol is not None and self.rtol is not None:
+            return (awindow >= self.atol) & (rwindow >= self.rtol)
+        elif self.atol is not None:
+            return awindow >= self.atol
+        elif self.rtol is not None:
+            return rwindow >= self.rtol
+        else:
+            raise ValueError("Either atol or rtol must be provided.")
 
     def ve_from_s_t(self, ve_s, ve_t, device, multicontact=False):
         ve_s = torch.as_tensor(ve_s, device=device)
@@ -132,7 +149,7 @@ class Thresholder:
         self.lb = self.lb.double()
         return self
 
-    def check_active(self, dt, bound: Tensor):
+    def _check_active_bases(self, dt, bound: Tensor):
         """Check whether stimulus amplitudes generates APs.
 
         Parameters
@@ -146,21 +163,45 @@ class Thresholder:
             boolean
         """
         self.active.reset()
-        with torch.inference_mode():
-            if self.chunks is None:
-                ve = self.bases * bound[None, :, None, None]
-                self.model.run(
-                    ve, callbacks=[self.active], reinit=True, dt=dt, progressbar=False
+        with torch.no_grad():
+            ve = self.bases * bound[None, :, None]
+            self.model.initialize()
+            self.model.run(
+                ve=ve,
+                dt=dt,
+                callbacks=[self.active],
+            )
+        return self.active.is_active()
+
+    def _check_active_space_time(self, dt, bound: Tensor, callbacks=None):
+        """Check whether stimulus amplitudes generates APs.
+
+        Parameters
+        ----------
+        bound : Tensor
+            Amplitudes to test.
+
+        Returns
+        -------
+        Tensor
+            boolean
+        """
+        self.active.reset()
+        with torch.no_grad():
+            ve = self.space * bound[:, None]
+            self.model.initialize()
+            if self.chunklength is not None:
+                self.model.longrun(
+                    extra=(ve, self.time),
+                    dt=dt,
+                    callbacks=[self.active],
+                    chunklength=self.chunklength,
                 )
             else:
-                time = self.time.expand(self.model.np, -1) * bound[:, None]
-                self.model.longrun(
-                    space=self.space,
-                    time=time,
-                    reinit=True,
-                    progressbar=False,
+                self.model.run(
+                    space=ve,
+                    time=self.time,
                     dt=dt,
-                    n_chunks=self.chunks,
                     callbacks=[self.active],
                 )
         return self.active.is_active()
@@ -168,37 +209,32 @@ class Thresholder:
     def check_active_with_rec(self, dt, bound: Tensor):
         self.active.reset()
         self.rec.reset()
-        with torch.inference_mode():
-            if self.chunks is None:
-                ve = self.bases * bound[None, :, None, None]
+        with torch.no_grad():
+            self.model.initialize()
+            if not self.functions:
+                ve = self.bases * bound[None, :, None]
                 self.model.run(
                     ve,
                     callbacks=[self.active, self.rec],
-                    reinit=True,
                     dt=dt,
-                    progressbar=False,
                 )
             else:
-                time = self.time.expand(self.model.n_ax, -1) * bound[:, None]
-                self.model.longrun(
-                    space=self.space,
-                    time=time,
-                    reinit=True,
-                    reinit=True,
-                    dt=dt,
-                    progressbar=False,
-                )
-            else:
-                time = self.time.expand(self.model.n_ax, -1) * bound[:, None]
-                self.model.longrun(
-                    space=self.space,
-                    time=time,
-                    reinit=True,
-                    progressbar=False,
-                    dt=dt,
-                    n_chunks=self.chunks,
-                    callbacks=[self.active, self.rec],
-                )
+                if self.chunklength is not None:
+                    ve = self.space * bound[:, None]
+                    self.model.longrun(
+                        extra=(ve, self.time),
+                        dt=dt,
+                        callbacks=[self.active, self.rec],
+                        chunklength=self.chunklength,
+                    )
+                else:
+                    ve = self.space * bound[:, None]
+                    self.model.run(
+                        space=ve,
+                        time=self.time,
+                        dt=dt,
+                        callbacks=[self.active, self.rec],
+                    )
         return self.active.is_active(), self.rec.stack()
 
     def fix_bounds(self, dt, block_possible=True):
@@ -257,8 +293,9 @@ class Thresholder:
             ub = self.ub
             lb = self.lb
 
-            window = (ub - lb) / ub
-            msk = window >= self.resolution
+            awindow = (ub - lb)
+            rwindow = awindow / ub
+            msk = self.check_tolerance(awindow, rwindow)
             tries = 0
 
             while torch.any(msk) & (tries < self.max_tries_thresh):
@@ -268,8 +305,9 @@ class Thresholder:
                 b_thr = msk & ~mask
                 ub[a_thr] = stimamp[a_thr]
                 lb[b_thr] = stimamp[b_thr]
-                window = (ub - lb) / ub
-                msk = window >= self.resolution
+                awindow = (ub - lb) 
+                rwindow = awindow / ub
+                msk = self.check_tolerance(awindow, rwindow)
                 tries += 1
             if tries >= self.max_tries_thresh:
                 print("hmm")
@@ -287,9 +325,9 @@ class Thresholder:
 
 @torch.jit.script
 def op_mc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("can,cat->tan", s, t).unsqueeze(2).contiguous()
+    return torch.einsum("can,cat->tan", s, t).contiguous()
 
 
 @torch.jit.script
 def op_sc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("an,at->tan", s, t).unsqueeze(2).contiguous()
+    return torch.einsum("an,at->tan", s, t).contiguous()

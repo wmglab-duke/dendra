@@ -24,4 +24,6 @@ def get_area_from_graph(G: nx.DiGraph) -> torch.Tensor:
         else:
             return None  # If any node lacks area, return None
 
+    # area in µm² -> convert to cm²
+    # 1 cm² = 1e8 µm²   
     return 1e-8 * torch.tensor(areas)
