@@ -1,5 +1,6 @@
 try:
     from neuron import h
+    from neuron import nrn
     NEURON_INSTALLED = True
 except ImportError:
     NEURON_INSTALLED = False
@@ -102,7 +103,7 @@ def apply_d_lambda(
 
 def read_swc(
     file_path: str, d_lambda=0.1, freq=100.0, data_func=None
-) -> Tuple[nx.DiGraph, Dict[int, 'h.Segment']]:
+) -> Tuple[nx.DiGraph, Dict[int, 'nrn.Segment']]:
     """Read an SWC file and return the contents."""
     if not is_neuron_installed():
         raise ImportError("NEURON is not installed. Cannot read SWC files.")
@@ -128,7 +129,7 @@ def read_swc(
 
 def read_neurolucida(
     file_path: str, d_lambda=0.1, freq=100.0, data_func=None
-) -> Tuple[nx.DiGraph, Dict[int, 'h.Segment']]:
+) -> Tuple[nx.DiGraph, Dict[int, 'nrn.Segment']]:
     """Read a Neurolucida file and return the contents."""
     if not is_neuron_installed():
         raise ImportError("NEURON is not installed. Cannot read Neurolucida files.")
@@ -206,7 +207,7 @@ def neuron_to_axonml_graph(
     *,
     attach_objects: bool = True,
     data_func=None,
-) -> Tuple[nx.DiGraph, Dict[int, 'h.Segment']]:
+) -> Tuple[nx.DiGraph, Dict[int, 'nrn.Segment']]:
     """
     Build a directed acyclic graph whose nodes are NEURON compartments.
 
