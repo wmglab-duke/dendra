@@ -3,10 +3,8 @@ import math
 from typing import List, Tuple, Optional, Dict, Callable, NamedTuple, Union
 import re
 import itertools
-import warnings
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 import numpy as np
 import pandas as pd
@@ -19,11 +17,10 @@ from axonml.models.stim.waveform import Waveform
 from axonml.models.callbacks import CallbackList, Callback
 from axonml.models.backend import Backend as A
 from axonml.models.parametric import Parameterized as P
-from axonml.models.mechanisms.core import Mechanism, validate
-from axonml.models.mechanisms import concentrations, equilibria
+from axonml.models.mechanisms.core import validate
 from axonml.models.mechanisms._handler import MechanismHandler
 from axonml.models.mechanisms._ions import valid_ions, Ion
-from axonml.units import mm, um
+from axonml.units import mm
 from axonml.models.integrators import bwd_euler_ub, bwd_euler_sc
 from axonml.models.graph import get_area_from_graph
 

@@ -1,13 +1,10 @@
-import inspect
 import itertools
 from typing import Callable
 
 import torch
-from torch.nn import functional as F
-from torch.nn.utils import parametrize
 
 
-def to_param(val, model=None):
+def to_param(val):
     if isinstance(val, torch.nn.Parameter):
         return val
     if isinstance(val, torch.nn.Module):
@@ -18,7 +15,7 @@ def to_param(val, model=None):
 def distribute_over(val, over='a'):
     valid = {'p', 'c', 'pc'}
     if over not in valid:
-        raise ValueError('over must be one of {}'.format(valid[kind]))
+        raise ValueError('over must be one of {}'.format(valid))
     val = torch.as_tensor(val)
     if over == 'p':
         return val[:, None]

@@ -1,10 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, List, Sequence, Tuple, Union, Optional
+from typing import Any, Sequence, Tuple, Union, Optional
 import numpy as np
 
 import torch
-import torch.nn as nn
 
 
 def expand_into_shape(src, index, shape, fill_value=torch.nan):

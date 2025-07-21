@@ -1,7 +1,6 @@
 from queue import Queue
 from typing import Tuple, Dict, List
 from types import MethodType
-import threading
 import multiprocessing as mp
 
 from h5py import File

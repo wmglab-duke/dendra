@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from torch.distributions import Normal as _Normal
-from torch.nn import functional as F
 
 import math
 from .parametric import to_param

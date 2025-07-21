@@ -1,6 +1,7 @@
 import inspect
 import textwrap
 
+from typing import Dict
 from types import MethodType
 import torch
 
