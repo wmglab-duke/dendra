@@ -53,7 +53,8 @@ class NetCon(torch.nn.Module):
         
         buffer_shape = (self.max_delay_steps, self.syn_numel.item())
         self.register_buffer("delivery_buffer", torch.zeros(buffer_shape, device=self.device, dtype=self.dtype))
-        self.register_buffer("event", torch.zeros((self.max_delay_steps, n_pre), device=self.device, dtype=torch.long))
+        self.register_buffer("event_queue", torch.zeros((self.max_delay_steps, n_pre), device=self.device, dtype=torch.long))
+        self.register_buffer("events", torch.zeros(n_pre, device=self.device, dtype=torch.long))
 
         self.register_buffer("current_time_step", torch.tensor(0, device=self.device, dtype=torch.long))
         
@@ -73,6 +74,7 @@ class NetCon(torch.nn.Module):
         # 1. DELIVER: 
         # Select the single row. The result has shape [1, num_synapses]
         todays_delivery = self.delivery_buffer.index_select(0, self.current_time_step)
+        self.events = self.event_queue.index_select(0, self.current_time_step).squeeze(0)
         
         # Unconditionally deliver the payload. If it's all zeros, this has no effect.
         # .squeeze(0) removes the dimension of size 1, matching the synapse shape.
@@ -82,7 +84,7 @@ class NetCon(torch.nn.Module):
         # This is more compiler-friendly than an in-place `zero_()` on a slice.
         # We need to expand the mask to match the shape of the delivery_buffer for masked_fill_
         self.delivery_buffer.index_fill_(0, self.current_time_step, 0.0)
-        self.event.index_fill_(0, self.current_time_step, False)
+        self.event_queue.index_fill_(0, self.current_time_step, False)
 
         # 2. SPIKE & SCHEDULE: Check for new spikes and schedule their future delivery
         v_selected = self.pre.v.view(-1).index_select(0, self.pre_idx)
@@ -103,7 +105,7 @@ class NetCon(torch.nn.Module):
         
         flat_indices = future_buffer_indices * self.n + self.pre_idx
         # Update the event buffer to mark where spikes occurred
-        self.event.view(-1).index_add_(0, flat_indices, self.is_spiking.to(torch.long))
+        self.event_queue.view(-1).index_add_(0, flat_indices, self.is_spiking.to(torch.long))
 
         # 3. INCREMENT TIME: Move to the next time step
         self.current_time_step.add_(1).remainder_(self.max_delay_steps)

@@ -1892,7 +1892,7 @@ def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
             additional_parameters.setdefault(k, []).append((alias, v, idx))
 
     m = mechanism(
-        mechanism.__name__,
+        None,
         model.celsius,
         model.diam,
         final_shape,

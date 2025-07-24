@@ -152,6 +152,7 @@ class Mechanism(Parameterized):
         cls._write_ion_c = new_write_ion_c
         cls._init = new_init
         cls._explicit = new_explicit
+        cls._name = None
 
     def __init__(
         self,
@@ -169,9 +170,12 @@ class Mechanism(Parameterized):
         Initialize the Mechanism with parameters and declarations.
         """
         super().__init__(shape, additional_parameters=additional_parameters, **kwargs)
-        self._name = name
-        self.register_buffer('celsius', celsius)
+        if name is None:
+            name = self.__class__._name or self.__class__.__name__
 
+        self.name = name
+        
+        self.register_buffer('celsius', celsius)
         self.base_ndim = 2
 
         if key is not None:
@@ -287,10 +291,6 @@ class Mechanism(Parameterized):
             self.factorable = factorable
 
         self.populate()
-
-    @property
-    def name(self):
-        return self._name
 
     def put_no_op(self, ion_conc_u, ion_conc_o, v, clone=True):
         return ion_conc_u
@@ -615,5 +615,6 @@ def rename(mechanism, new_name=None, suffix=None):
         class_dict['__module__'] = mechanism.__module__
 
     new_class = type(new_name, mechanism.__bases__, class_dict)
+    new_class._name = new_name  # Set the new name attribute
 
     return new_class
