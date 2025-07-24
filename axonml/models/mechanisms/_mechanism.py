@@ -558,6 +558,23 @@ class PointProcess(Mechanism):
     pass
 
 
+class Synapse(Mechanism):
+    def net_receive(self, weight):
+        """
+        This method is called when the synapse receives a spike.
+        It should be overridden in subclasses to implement specific behavior.
+        
+        Args:
+            weight (torch.Tensor): The weight of the synapse.
+        
+        Returns:
+            None
+        """
+        raise NotImplementedError(
+            "Synapse.net_receive() must be implemented in subclasses."
+        )
+
+
 def rename(mechanism, new_name=None, suffix=None):
     """
     Returns a new mechanism that is an exact copy of `original_class` but with a

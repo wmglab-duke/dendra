@@ -689,6 +689,28 @@ class RecorderLambda(Callback):
     def reset(self):
         self.rec = {}
 
+    def stack(self, var: str = None) -> torch.Tensor:
+        """
+        Stack recorded tensors into a single tensor.
+
+        If a specific variable name is provided, only that variable's data is stacked.
+        Otherwise, all recorded variables are stacked and concatenated.
+
+        Parameters
+        ----------
+        var : str, optional
+            Name of the specific variable to stack. If None, all recorded variables
+            are stacked and concatenated along dimension 2. Default is None.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor containing the stacked recorded data.
+        """
+        if var is not None:
+            return torch.stack(self.rec.get(var, []))
+        return torch.stack([torch.stack(tensors) for tensors in self.rec.values()], dim=2)
+
     def numpy(self, var: str = None) -> np.ndarray:
         if var is not None:
             v = self.rec.get(var, [])

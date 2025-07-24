@@ -63,11 +63,8 @@ class Waveform(SimpleParameterized):
     >>> values = waveform(t)
     """
 
-    _tstop: Optional[float]
-
     def __init__(self, **kwargs):
         super(Waveform, self).__init__(**kwargs)
-        self._tstop = None
 
     def expand(self, shape):
         for p in self.parameters():
@@ -94,12 +91,8 @@ class Waveform(SimpleParameterized):
     def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
         return _repeat(self, freq, delay, off)
 
-    def tstop(self, tstop):
-        self._tstop = tstop
-        return self
-
-    def assemble(self, dt):
-        t = torch.arange(0, self._tstop, dt, device=self.device())
+    def assemble(self, start, end, dt):
+        t = torch.arange(start, end, dt, device=self.device())
         return self(t)
     
     def assemble_chunked(self, dt, chunks):

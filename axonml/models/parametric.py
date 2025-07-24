@@ -147,9 +147,31 @@ def create_param_expander(
         f"  - For row-broadcast, expected shape: ({len(unique_rows)}, 1)\n"
         f"  - For column-broadcast, expected shape: (1, {len(unique_cols)})"
     )
+
+
+class staticproperty:
+    """A property whose value is independent of the instance."""
+    def __init__(self, func):
+        self.func = func              # zero‑argument callable
+
+    def __get__(self, obj, objtype=None):
+        return self.func()            # ignore obj / objtype
+
+
+def add_instance_property(obj, name, func):
+    sub = type(f"_{obj.__class__.__name__}Proxy", (obj.__class__,), {
+        name: staticproperty(func)
+    })
+    obj.__class__ = sub           # replace the instance’s class in‑place
+
     
 
-class SimpleParameterized(torch.nn.Module):
+class Referency(torch.nn.Module):
+    def setreference(self, name, func):
+        add_instance_property(self, name, func)
+
+
+class SimpleParameterized(Referency):
     
     _params = {}
     _params_declarations = []
@@ -208,7 +230,7 @@ class SimpleParameterized(torch.nn.Module):
         return ", ".join(f"{k}={v}" for k, v in self.named_parameters())
 
 
-class Parameterized(torch.nn.Module):
+class Parameterized(Referency):
     """
     A base class that allows subclasses to declare parameters which are
     automatically inherited and aggregated.

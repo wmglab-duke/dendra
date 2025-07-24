@@ -1,11 +1,14 @@
-from typing import Dict, Tuple
+from contextlib import nullcontext
+from typing import Dict
+
+from tqdm.auto import tqdm
 
 import torch
 
-from ..core import Population, Waveform
+from ..core import Population, make_intra
 from ..parametric import to_param
 from ..callbacks import CallbackList
-from .delaydelivery import VariableDelayDelivery
+from .delaydelivery import NetCon
 from axonml.helpers import BACKEND, FULLGRAPH, DYNAMIC, JIT, COMPILE_MODE
 
 
@@ -39,13 +42,14 @@ def to_flat_idx_torch(arr, idx):
 
 def step_pop(integrator, model, dt, ve=None, intra=None):
     integrator.step(model, dt, ve, intra)
+    model.t = model.t + dt
 
 
 def step(populations, synapses, dt, ve: Dict[str, torch.Tensor | None]={}, intra: Dict[str, torch.Tensor | None]={}):
     for s in synapses.values():
         s.advance()
     for n, pop in populations.items():
-        step_pop(pop.integrator, pop, dt, ve=ve.get(n, None), intra=intra.get(n, None))
+        step_pop(pop.integrator, pop, dt, ve.get(n, None), intra.get(n, None))
 
 
 def get_local_index(population, mech, index):
@@ -58,7 +62,7 @@ def get_local_index(population, mech, index):
 def prepare_indices_one_one(source, target, synapse):
     source_model = source.model
     target_model = target.model
-    syn = getattr(getattr(target_model, 'mech'), synapse)
+    syn = synapse
 
     index_arr = torch.arange(
         target_model.v.numel(), device=target_model.device(), dtype=target_model.dtype()
@@ -81,7 +85,7 @@ def prepare_indices_one_one_flat(source_model, source_index, target_model, targe
     Prepares indices for a one-to-one connection between source and target populations.
     This function assumes that the synapse exists at all target locations.
     """
-    syn = getattr(getattr(target_model, 'mech'), synapse)
+    syn = synapse
 
     index_arr = torch.arange(
         target_model.v.numel(), device=target_model.device(), dtype=target_model.dtype()
@@ -93,7 +97,7 @@ def prepare_indices_one_one_flat(source_model, source_index, target_model, targe
     post_idx = target_index
 
     if not torch.all(torch.isin(post_idx, indices_in_synapse)):
-        raise ValueError(f"Target population '{target.name}' does not have the synapse '{synapse}' at all target locations.")
+        raise ValueError(f"Target population '{target_model.name}' does not have the synapse '{synapse}' at all target locations.")
 
     post_idx = get_local_index(target_model, syn, post_idx)
 
@@ -159,8 +163,9 @@ def make_weight(weights, n):
         def forward(self):
             return self.w
         
-        def init(self):
-            self.w = torch.cat([w.sample(n) for w, n in zip(self.weights, self.n)])
+        def init(self, reinit=True):
+            if reinit or not self.w.numel():
+                self.w = torch.cat([w.sample(n) for w, n in zip(self.weights, self.n)])
 
     return WeightExpander(weights, n)
 
@@ -171,7 +176,7 @@ class Network(torch.nn.Module):
     """
     def __init__(self, populations: Dict[str, Population]):
         super(Network, self).__init__()
-        self.populations = torch.nn.ModuleDict(populations)
+        self.populations = populations
         for name, pop in populations.items():
             pop.build()
             pop.name = name
@@ -181,6 +186,7 @@ class Network(torch.nn.Module):
         self.synapses = torch.nn.ModuleDict()
         self.dt = None
         self.built = False
+        self.t_ind = 0
 
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
@@ -191,17 +197,42 @@ class Network(torch.nn.Module):
         torch._dynamo.reset()
 
         if self.jit:
-            self.step = torch.compile(
+            self._step = torch.compile(
                 step, 
-                backend   = self.backend, 
+                backend   = self.backend,
+                fullgraph = self.fullgraph,
+                dynamic   = self.dynamic, 
                 mode      = self.compile_mode,
             )
         else:
-            self.step = torch.compile(
+            self._step = torch.compile(
                 step,
                 backend   = 'eager',
             )
+        
+        self.eval()
 
+    def train(self, mode=True):
+        """
+        Set the network to training mode.
+        """
+        for pop in self.populations.values():
+            pop.train(mode)
+        self.training = mode
+        return self
+
+    def train_(self, mode=True):
+        self.train(mode)
+
+    def eval(self):
+        super(Network, self).eval()
+        for pop in self.populations.values():
+            pop.eval()
+        self.training = False
+        return self
+    
+    def eval_(self):
+        self.eval()
 
     def device(self):
         """
@@ -323,7 +354,8 @@ class Network(torch.nn.Module):
 
         # now connect
         self._connect(
-            source_model, pre_idx, target_model, post_idx, synapse, threshold, weight, delay
+            source_model, pre_idx, target_model, post_idx, 
+            synapse, threshold, weight, delay
         )
 
     def build_synapses(self, dt):
@@ -336,13 +368,13 @@ class Network(torch.nn.Module):
             weights = make_weight([s[4] for s in specs], [s[5] for s in specs])
             delay = torch.cat([expand(s[6], s[7]) for s in specs])
 
-            syn = VariableDelayDelivery(
+            syn = NetCon(
                 pre=pre,
                 pre_idx=pre_idx,
                 thresholds=thresholds,
                 post=post,
                 post_idx=post_idx,
-                post_syn=getattr(post.mech, synapse),
+                post_syn=synapse,
                 weight=weights,
                 delay=delay,
                 dt=dt
@@ -358,11 +390,10 @@ class Network(torch.nn.Module):
             torch._dynamo.reset()
             self.dt = dt
             self.build_synapses(dt)
-            self.eval()
             self.built = True
         return self
 
-    def initialize(self, dt: float):
+    def initialize(self, dt: float, reinit_weights: bool = True):
         """
         Initialize the network. This method should be overridden by subclasses.
         """
@@ -371,28 +402,86 @@ class Network(torch.nn.Module):
         for pop in self.populations.values():
             pop.initialize()
             pop.integrator.initialize(pop, dt)
-        self.init_synapses()
+            pop.intra = pop.build_intra()
+        self.init_synapses(reinit_weights=reinit_weights)
+        self.t_ind = 0
+        return self
+    
+    def initialize_(self, dt: float, reinit_weights: bool = True):
+        """
+        Initialize the network. This method should be overridden by subclasses.
+        """
+        self.initialize(dt, reinit_weights=reinit_weights)
 
-    def init_synapses(self):
+    def init_synapses(self, reinit_weights: bool = True):
         for syn in self.synapses.values():
-            syn.weight.init()
-            syn.current_time_step.fill_(0)
-            syn.delivery_buffer.zero_()
+            syn.zero()
+            syn.detach()
+            syn.weight.init(reinit=reinit_weights)
 
-    def run(self, tstop, callbacks=None):
+    def run(self, tstop, callbacks=None, progressbar=False):
         dt = torch.tensor(self.dt, device=self.device(), dtype=self.dtype())
-        with torch.set_grad_enabled(self.training):
-            n_steps = int(tstop / dt.item())
+        dt_f = self.dt
+
+        ctx = nullcontext() if self.training else torch.no_grad()
+
+        intra = {}
+        for n, p in self.populations.items():
+            if p is not None:
+                intra[n] = p.intra
+
+        with_intra = bool(intra)
+
+        with ctx:
+            n_steps = int(tstop / self.dt)
+
+            if with_intra:
+                intra = {n: (intra_, *self.populations[n].prep_intra(intra_, n_steps, dt)) for n, intra_ in intra.items()}
+
             if callbacks is None:
                 callbacks = []
             for c in callbacks:
-                c.dt = float(dt.item())
+                c.dt = self.dt
             callbacks = CallbackList(callbacks)
             pre_loop_hook(callbacks, self)
+
+            if progressbar:
+                if not isinstance(progressbar, tqdm):
+                    progressbar = tqdm(total=n_steps, desc=f"{self.t_ind*dt_f:.3f} ms")
+
+            local_ind = 0
+
             for _ in range(n_steps):
-                self.step(self.populations, self.synapses, dt)
+
+                intra_c = {}
+
+                if with_intra:
+                    intra_c = prepare_intra(intra_c, intra, local_ind)
+
+                self._step(self.populations, self.synapses, dt, intra=intra_c)
                 post_step_hook(callbacks, self)
+                self.t_ind += 1
+                local_ind += 1
+
+                if progressbar:
+                    progressbar.update(1)
+                    if self.t_ind % 100 == 0:
+                        progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
+            
+            if progressbar:
+                progressbar.close()    
+
             post_loop_hook(callbacks, self)
+
+
+def prepare_intra(intra_c, intra, local_ind):
+    """
+    Prepares the intra-cellular data for the current step.
+    """
+    for n, (intra_, stims, indices) in intra.items():
+        s = [st[local_ind] for st in stims]
+        intra_c[n] = make_intra(intra_, s, indices)
+    return intra_c
 
 
 # callback helpers

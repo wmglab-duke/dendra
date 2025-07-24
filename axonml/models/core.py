@@ -145,6 +145,7 @@ class Population(P):
         self.register_buffer("v",           torch.full(self.shape, self.v_init))
         self.register_buffer("diam",        torch.full(self.shape, 500.0))
         self.register_buffer("dx",          torch.full(self.shape, 100.0))
+        self.register_buffer("t",           torch.zeros(()))
 
         # compiler stuff
         self.backend = BACKEND.value
@@ -316,6 +317,10 @@ class Population(P):
                 if matches_any_pattern(names, n):
                     print(f"Unfreezing {n}")
                     p.requires_grad = True
+        return self
+
+    def unfreeze_(self, *names):
+        self.unfreeze(*names)
 
     def unfreeze_group(self, *groups):
         for g in groups:
@@ -323,6 +328,10 @@ class Population(P):
             print(f"Unfreezing group '{g}'")
             for p in group:
                 p.requires_grad = True
+        return self
+    
+    def unfreeze_group_(self, *groups):
+        self.unfreeze_group(*groups)
 
     def freeze(self, *names):
         if not names:
@@ -333,6 +342,10 @@ class Population(P):
                 if matches_any_pattern(names, n):
                     print(f"Freezing {n}")
                     p.requires_grad = False
+        return self
+
+    def freeze_(self, *names):
+        self.freeze(*names)
 
     def freeze_group(self, *groups):
         for g in groups:
@@ -340,6 +353,10 @@ class Population(P):
             print(f"Freezing group '{g}'")
             for p in group:
                 p.requires_grad = False
+        return self
+
+    def freeze_group_(self, *groups):
+        self.freeze_group(*groups)
 
     def register_post_initialize_hook(self, fn: Callable):
         self.post_initialize_hooks.append(fn)
@@ -352,6 +369,15 @@ class Population(P):
 
     def dtype(self):
         return self._dummy.dtype
+    
+    def prep_intra(self, intra, n, dt):
+        start = self.t
+        end = start + n * dt
+        t_ = torch.arange(start, end, dt, device=self.device(), dtype=self.dtype())
+        t_ = t_.to(self.device(), dtype=self.dtype())
+        stims, indices = intra.init(t_)
+        stims = [s.unbind(0) for s in stims]
+        return stims, indices
 
     def run(
         self,
@@ -433,15 +459,13 @@ class Population(P):
         dt = dt if dt is not None else A.dt
         dt_f = float(dt)
 
+        dt = torch.tensor(dt, device=device, dtype=self.dtype())
+
         local_ind = 0
 
         if isinstance(time, Waveform):
             time = time.to(device, dtype=self.dtype())
-            if tstop is not None:
-                time._tstop = tstop
-            elif time._tstop is None:
-                raise ValueError("If `time` is a Waveform, `tstop` must be provided.")
-            time = time.assemble(dt)
+            time = time.assemble(self.t, self.t+tstop, dt)
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
@@ -457,23 +481,16 @@ class Population(P):
                 n = int(tstop / dt_f)
 
             if with_intra:
-                start = self.t_cache
-                end = (self.t_ind + n) * dt_f
-                t_ = torch.arange(start, end, dt_f, device=device, dtype=self.dtype())
-                t_ = t_.to(self.device(), dtype=self.dtype())
-                stims, indices = intra.init(t_)
-                stims = [s.unbind(0) for s in stims]
+                stims, indices = self.prep_intra(intra, n, dt_f)
 
             if not isinstance(callbacks, CallbackList):
                 callbacks = CallbackList(callbacks)
 
             if callbacks:
                 for c in callbacks:
-                    c.dt = dt
+                    c.dt = dt_f
             
             pre_loop_hook(callbacks, self)
-
-            dt = torch.tensor(dt, device=device, dtype=self.dtype())
 
             if not self.integrator.initialized or self.integrator.dt != dt_f or self.training:
                 self.integrator.initialize(self, dt)
@@ -492,6 +509,7 @@ class Population(P):
                     intra_c = None
 
                 self._step(self.integrator, self, dt, ve_c, intra_c)
+                self.t = self.t + dt
 
                 post_step_hook(callbacks, self)
                 self.t_ind += 1
@@ -605,7 +623,7 @@ class Population(P):
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
 
-                t = torch.arange(0, tstop, dt_f, dtype=self.dtype(), device=self.device())
+                t = torch.arange(self.t, self.t+tstop, dt, dtype=self.dtype(), device=self.device())
                 n_chunks = math.ceil(len(t) / chunklength)
 
                 t_c_f = torch.tensor_split(t, n_chunks)
@@ -667,6 +685,7 @@ class Population(P):
                         post_step_hook(callbacks, self)
 
                         self.t_ind += 1
+                        self.t = self.t + dt
 
                     if progressbar:
                         progressbar.update(1)
@@ -712,6 +731,7 @@ class Population(P):
                 self._step(self.integrator, self, dt, ve, None)
 
         self.cache("_steady_state")
+        self.t.detach().zero_()
         self.t_ind = 0
         return self
     
@@ -737,7 +757,7 @@ class Population(P):
             self.restore("_steady_state")
             self.post_initialize()
             self.t_ind = 0
-            self.t_cache = 0.0
+            self.t.detach().zero_()
             self.initialized = True
             return self
         self.integrator.init_v(self)
@@ -746,9 +766,12 @@ class Population(P):
         self.post_initialize()
         self.integrator.mech.initialize(self.v, self.celsius, self.diam)
         self.t_ind = 0
-        self.t_cache = 0.0
+        self.t.detach().zero_()
         self.initialized = True
         return self
+    
+    def initialize_(self):
+        self.initialize()
 
     def load(self, state_dict):
         """
@@ -780,6 +803,9 @@ class Population(P):
         matched, _ = _match_state_dict(self.state_dict(), state_dict)
         self.load_state_dict(matched, strict=False)
         return self
+
+    def load_(self, state_dict):
+        self.load(state_dict)
 
     def state_names(self) -> List[str]:
         out = ["v"]
@@ -816,6 +842,10 @@ class Population(P):
         if name is None:
             name = "latest"
         self._caches[name] = self.state_dict()
+        return self
+
+    def cache_(self, name: str = None):
+        self.cache(name)
 
     def restore(self, name: str = None):
         """
@@ -849,6 +879,10 @@ class Population(P):
             name = "latest"
         self.load_state_dict(self._caches[name])
         self.initialized = True
+        return self
+
+    def restore_(self, name: str = None):
+        self.restore(name)
 
     def __getitem__(self, key):
         index = parse_key(key, self.shape, self.device())
@@ -886,11 +920,9 @@ class Population(P):
         validate(mechanism)
         
         key = None
-        shape = self.shape
 
         if index_spec is not None:
             key = index_spec.index
-            shape = index_spec.shape
 
         if key is None:
             self._mech_everywhere[mechanism] = (mechanism.__name__, ic, kwargs)
@@ -1004,8 +1036,6 @@ class Population(P):
 
         ions = {}
         for ion in all_ions:
-            ion_write_c = self._ion_write_c.get(ion, {})
-            ion_read = self._ion_read.get(ion, {})
             ion_style = self.get_ion_style(ion)
             ions[ion] = Ion(
                 ion,
@@ -1026,10 +1056,16 @@ class Population(P):
             self._ion_write_c, self._ion_read, self._m_curr
         )
 
+        for m in mech.mechanisms.values():
+            m.setreference('t', lambda:self.t)
+
         self.integrator = self.integrator(self, mech)
         self.is_built = True
         self.eval()
         return self
+    
+    def build_(self):
+        self.build()
 
     def detach(self):
         """
@@ -1041,6 +1077,9 @@ class Population(P):
         """
         self.integrator.detach(self)
         return self
+
+    def detach_(self):
+        self.detach()
 
     def register_parametrization(self, name: str, parametrization: torch.nn.Module):
         torch.nn.utils.parametrize.register_parametrization(
@@ -1119,6 +1158,9 @@ class Population(P):
 
     def init_v(self):
         self.integrator.init_v(self)
+
+    def init_v_(self):
+        self.init_v()
 
     def n(self) -> int:
         return self.v.shape[-2]

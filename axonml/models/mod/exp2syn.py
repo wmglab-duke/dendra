@@ -1,4 +1,4 @@
-from ..mechanisms._mechanism import PointProcess as PP
+from ..mechanisms._mechanism import PointProcess as PP, Synapse as Syn
 from ..mechanisms._state import State as S
 from ..mechanisms.ops import *
 
@@ -21,7 +21,7 @@ class B(S):
         return {'B':torch.zeros_like(v)}
 
 
-class exp2syn(PP):
+class exp2syn(PP, Syn):
     PP.STATE(A, B)
     PP.RANGE(e=0.0)
     PP.ASSIGNED("factor")

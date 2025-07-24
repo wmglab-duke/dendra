@@ -5,16 +5,7 @@ from ..mechanisms._state import State as S
 from ..mechanisms.ops import *
 
 
-class t(S):
-    S.STATE('t')
-    S.DERIVATIVE("t' = 1")
-
-    def inf(self, v):
-        return {'t': torch.zeros((), dtype=v.dtype, device=v.device)}
-    
-
 class alphasynapse(M):
-    M.STATE(t)
     M.RANGE(onset=0.0, tau=0.1, gmax=0.0, e=0.0)    
     M.NONSPECIFIC_CURRENT("i")
 

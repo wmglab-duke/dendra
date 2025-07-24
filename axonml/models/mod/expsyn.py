@@ -1,4 +1,4 @@
-from ..mechanisms._mechanism import PointProcess as PP
+from ..mechanisms._mechanism import PointProcess as PP, Synapse as Syn
 from ..mechanisms._state import State as S
 from ..mechanisms.ops import *
 
@@ -12,7 +12,7 @@ class g(S):
         return {'g':torch.zeros_like(v)}
 
 
-class expsyn(PP):
+class expsyn(PP, Syn):
 
     PP.STATE(g)
     PP.RANGE(e=0.0)

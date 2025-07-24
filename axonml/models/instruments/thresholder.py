@@ -19,7 +19,6 @@ class Thresholder:
         space:  Optional[Union[npt.NDArray, Tensor]] = None,
         time:   Optional[Waveform] = None,
         bases:  Optional[Union[npt.NDArray, Tensor]] = None,
-        diams:  Optional[Union[npt.NDArray, Tensor, List]] = None,
         ub=None,
         fix_bound_up=5.0,
         fix_bound_down=0.1,
@@ -56,6 +55,8 @@ class Thresholder:
             self.check_active = self._check_active_space_time
             self.functional = True
 
+        diams = getattr(model, "diameters", None)
+
         if diams is not None:
             if hasattr(diams, "__iter__"):
                 assert len(diams) == self.bases.shape[1]
@@ -85,6 +86,10 @@ class Thresholder:
                     self.model.np, device=model.device(), dtype=model.dtype()
                 )
             else:
+                if self.diams is None:
+                    raise ValueError(
+                        "Either ub must be provided or model.diameters must be set."
+                    )
                 self.ub = 0.2 * torch.ones_like(self.diams) / (self.diams / 5) ** 2
             self.ub_initial = self.ub.clone()
             self.lb = torch.zeros_like(self.ub)
@@ -149,7 +154,7 @@ class Thresholder:
         self.lb = self.lb.double()
         return self
 
-    def _check_active_bases(self, dt, bound: Tensor):
+    def _check_active_bases(self, tstop, dt, bound: Tensor):
         """Check whether stimulus amplitudes generates APs.
 
         Parameters
@@ -173,7 +178,7 @@ class Thresholder:
             )
         return self.active.is_active()
 
-    def _check_active_space_time(self, dt, bound: Tensor, callbacks=None):
+    def _check_active_space_time(self, tstop, dt, bound: Tensor):
         """Check whether stimulus amplitudes generates APs.
 
         Parameters
@@ -193,6 +198,7 @@ class Thresholder:
             if self.chunklength is not None:
                 self.model.longrun(
                     extra=(ve, self.time),
+                    tstop=tstop,
                     dt=dt,
                     callbacks=[self.active],
                     chunklength=self.chunklength,
@@ -201,17 +207,18 @@ class Thresholder:
                 self.model.run(
                     space=ve,
                     time=self.time,
+                    tstop=tstop,
                     dt=dt,
                     callbacks=[self.active],
                 )
         return self.active.is_active()
 
-    def check_active_with_rec(self, dt, bound: Tensor):
+    def check_active_with_rec(self, tstop, dt, bound: Tensor):
         self.active.reset()
         self.rec.reset()
         with torch.no_grad():
             self.model.initialize()
-            if not self.functions:
+            if not self.functional:
                 ve = self.bases * bound[None, :, None]
                 self.model.run(
                     ve,
@@ -223,6 +230,7 @@ class Thresholder:
                     ve = self.space * bound[:, None]
                     self.model.longrun(
                         extra=(ve, self.time),
+                        tstop=tstop,
                         dt=dt,
                         callbacks=[self.active, self.rec],
                         chunklength=self.chunklength,
@@ -232,29 +240,30 @@ class Thresholder:
                     self.model.run(
                         space=ve,
                         time=self.time,
+                        tstop=tstop,
                         dt=dt,
                         callbacks=[self.active, self.rec],
                     )
         return self.active.is_active(), self.rec.stack()
 
-    def fix_bounds(self, dt, block_possible=True):
+    def fix_bounds(self, tstop, dt, block_possible=True):
         """Make sure upper bound generates AP."""
 
         with torch.no_grad():
             tries = 0
             if block_possible:
-                mask, rec = self.check_active_with_rec(dt, self.ub)
+                mask, rec = self.check_active_with_rec(tstop, dt, self.ub)
             else:
-                mask = self.check_active(dt, self.ub)
+                mask = self.check_active(tstop, dt, self.ub)
             print("Fixing bounds.", end="")
             while torch.any(~mask):
                 print(".", end="")
                 if tries >= self.max_tries_bound_fix:
                     break
                 if block_possible:
-                    mask, rec = self.check_active_with_rec(dt, self.ub)
+                    mask, rec = self.check_active_with_rec(tstop, dt, self.ub)
                 else:
-                    mask = self.check_active(dt, self.ub)
+                    mask = self.check_active(tstop, dt, self.ub)
                 inactive = ~mask
                 if block_possible:
                     self.ub[(rec[:, -1] < self.threshold) & inactive] *= (
@@ -277,7 +286,7 @@ class Thresholder:
             self.ub[self.ignore] = 1
             self.lb[self.ignore] = 1
 
-    def calculate_thresholds(self, dt, block_possible=False) -> Tuple[Tensor, Tensor]:
+    def calculate_thresholds(self, tstop, dt, block_possible=False) -> Tuple[Tensor, Tensor]:
         """Calculate thresholds.
 
         Returns
@@ -285,7 +294,7 @@ class Thresholder:
         Tuple[Tensor, Tensor]
             Upper and lower bound on thresholds.
         """
-        self.fix_bounds(dt, block_possible)
+        self.fix_bounds(tstop, dt, block_possible)
         self.rec.reset()
         self.active.reset()
 
@@ -300,7 +309,7 @@ class Thresholder:
 
             while torch.any(msk) & (tries < self.max_tries_thresh):
                 stimamp = (ub + lb) / 2
-                mask = self.check_active(dt, stimamp)
+                mask = self.check_active(tstop, dt, stimamp)
                 a_thr = msk & mask
                 b_thr = msk & ~mask
                 ub[a_thr] = stimamp[a_thr]
