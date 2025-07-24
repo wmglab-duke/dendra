@@ -38,7 +38,7 @@ class exp2syn(PP, Syn):
     def i(self, v):
         return (self.B - self.A) * (v - self.e)
     
-    def net_receive(self, weights):
+    def net_receive(self, weights, netcon):
         weights = weights * self.factor
         self.A = self.A + weights
         self.B = self.B + weights

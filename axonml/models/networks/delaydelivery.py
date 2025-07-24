@@ -78,7 +78,10 @@ class NetCon(torch.nn.Module):
         
         # Unconditionally deliver the payload. If it's all zeros, this has no effect.
         # .squeeze(0) removes the dimension of size 1, matching the synapse shape.
-        self.syn.net_receive(todays_delivery.squeeze(0).view(*self.syn.shape))
+        self.syn.net_receive(
+            todays_delivery.squeeze(0).view(*self.syn.shape),
+            self
+        )
         
         # Unconditionally clear the buffer row using the mask.
         # This is more compiler-friendly than an in-place `zero_()` on a slice.

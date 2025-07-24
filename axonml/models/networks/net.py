@@ -252,6 +252,7 @@ class Network(torch.nn.Module):
         """
         self.synapse_spec = {}
         self.synapses.clear()
+        self.built = False
 
     def _connect(self, source_pop, source_idx, target_pop, target_idx, synapse: str,
                  threshold=0.0, weight=1.0, delay=0.0):

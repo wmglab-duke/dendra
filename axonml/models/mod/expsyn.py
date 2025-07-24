@@ -21,5 +21,5 @@ class expsyn(PP, Syn):
     def i(self, v):
         return self.g * (v - self.e)
     
-    def net_receive(self, weights):
+    def net_receive(self, weights, netcon):
         self.g = self.g + weights
