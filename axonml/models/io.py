@@ -1,6 +1,7 @@
 try:
     from neuron import h
     from neuron import nrn
+
     NEURON_INSTALLED = True
 except ImportError:
     NEURON_INSTALLED = False
@@ -32,7 +33,7 @@ def xyz(seg):
     x = np.interp(seg_x, arc_l, x_arr)
     y = np.interp(seg_x, arc_l, y_arr)
     z = np.interp(seg_x, arc_l, z_arr)
-    return {'x': x, 'y': y, 'z': z}
+    return {"x": x, "y": y, "z": z}
 
 
 def lambda_f(sec, freq_hz):
@@ -52,12 +53,12 @@ def lambda_f(sec, freq_hz):
         raise ImportError("NEURON is not installed. Cannot apply d_lambda.")
 
     from math import sqrt, pi
-    
+
     # make sure diam/3‑D info are up to date
     h.define_shape()
 
     n3d = int(h.n3d(sec=sec))
-    if n3d < 2:                # no 3‑D points → uniform cylinder shortcut
+    if n3d < 2:  # no 3‑D points → uniform cylinder shortcut
         return 1e5 * sqrt(sec.diam / (4 * pi * freq_hz * sec.Ra * sec.cm))
 
     # --- piecewise integration along 3‑D centre line ------------------------
@@ -78,9 +79,7 @@ def lambda_f(sec, freq_hz):
 
 
 def apply_d_lambda(
-    all_sections: List['nrn.Section'],
-    d_lambda: float = 0.1,
-    freq: float = 100.0
+    all_sections: List["nrn.Section"], d_lambda: float = 0.1, freq: float = 100.0
 ):
     """
     Apply a d_lambda value to all sections in the NEURON model.
@@ -92,25 +91,25 @@ def apply_d_lambda(
     """
     if not is_neuron_installed():
         raise ImportError("NEURON is not installed. Cannot apply d_lambda.")
-    
+
     h.define_shape()
 
     for sec in all_sections:
-        lam = lambda_f(sec, freq)          # λ(freq) in this section
+        lam = lambda_f(sec, freq)  # λ(freq) in this section
         nseg = int((sec.L / (d_lambda * lam) + 0.9) / 2) * 2 + 1
-        sec.nseg = max(1, nseg)            # safeguard: nseg must be ≥ 1    
+        sec.nseg = max(1, nseg)  # safeguard: nseg must be ≥ 1
 
 
 def read_swc(
     file_path: str, d_lambda=0.1, freq=100.0, data_func=None
-) -> Tuple[nx.DiGraph, Dict[int, 'nrn.Segment']]:
+) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read an SWC file and return the contents."""
     if not is_neuron_installed():
         raise ImportError("NEURON is not installed. Cannot read SWC files.")
 
     if data_func is None:
         data_func = xyz
-    
+
     h.load_file("import3d.hoc")
 
     class Cell:
@@ -129,14 +128,14 @@ def read_swc(
 
 def read_neurolucida(
     file_path: str, d_lambda=0.1, freq=100.0, data_func=None
-) -> Tuple[nx.DiGraph, Dict[int, 'nrn.Segment']]:
+) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read a Neurolucida file and return the contents."""
     if not is_neuron_installed():
         raise ImportError("NEURON is not installed. Cannot read Neurolucida files.")
 
     if data_func is None:
         data_func = xyz
-    
+
     h.load_file("import3d.hoc")
 
     class Cell:
@@ -167,8 +166,8 @@ def _sec_children(sec):
     """
     sr = h.SectionRef(sec=sec)
     for i in range(int(sr.nchild())):
-        child_sec = sr.child[i]                 # this is already a Section
-        parent_seg = child_sec.parentseg()      # Segment on parent
+        child_sec = sr.child[i]  # this is already a Section
+        parent_seg = child_sec.parentseg()  # Segment on parent
         yield child_sec, parent_seg.x
 
 
@@ -184,9 +183,9 @@ def _first_child_compartment(child_sec, parent_seg):
     d0 = h.distance(parent_seg, child_sec(0))  # parent ↔ child x=0
     d1 = h.distance(parent_seg, child_sec(1))  # parent ↔ child x=1
     if d0 <= d1:
-        idx = 0                                # x=0 end is proximal
+        idx = 0  # x=0 end is proximal
     else:
-        idx = child_sec.nseg - 1               # x=1 end is proximal
+        idx = child_sec.nseg - 1  # x=1 end is proximal
     x_center = (idx + 0.5) / child_sec.nseg
     return child_sec(x_center), idx
 
@@ -203,11 +202,11 @@ def r_ohm(parent_seg, child_seg):
 
 
 def neuron_to_axonml_graph(
-    root_sec: Optional['nrn.Section'] = None,
+    root_sec: Optional["nrn.Section"] = None,
     *,
     attach_objects: bool = True,
     data_func=None,
-) -> Tuple[nx.DiGraph, Dict[int, 'nrn.Segment']]:
+) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """
     Build a directed acyclic graph whose nodes are NEURON compartments.
 
@@ -230,11 +229,13 @@ def neuron_to_axonml_graph(
     else:
         roots = [root_sec]
 
-    assert len(roots) == 1, "There is more than one candidate root section in the hoc namespace. Please specify one."
+    assert len(roots) == 1, (
+        "There is more than one candidate root section in the hoc namespace. Please specify one."
+    )
 
-    G          = nx.DiGraph()
-    id2seg     = {}                 # node‑id → Segment
-    segkey2id  = {}                 # (Section, idx) → node‑id
+    G = nx.DiGraph()
+    id2seg = {}  # node‑id → Segment
+    segkey2id = {}  # (Section, idx) → node‑id
 
     def node_for(seg, idx):
         """Return existing nodeid or create one for (seg.sec, idx)."""
@@ -242,7 +243,7 @@ def neuron_to_axonml_graph(
         if key not in segkey2id:
             nid = len(segkey2id)
             segkey2id[key] = nid
-            id2seg[nid]    = seg
+            id2seg[nid] = seg
             if attach_objects:
                 data = data_func(seg) if data_func else {}
                 G.add_node(
@@ -253,7 +254,7 @@ def neuron_to_axonml_graph(
                     cm=seg.cm,
                     name=str(seg),
                     area=seg.area(),
-                    **data
+                    **data,
                 )
             else:
                 G.add_node(nid)
@@ -269,9 +270,9 @@ def neuron_to_axonml_graph(
         visited.add(sec)
 
         # 1a. axial neighbours inside this section -----------------------------
-        prev_id  = None
+        prev_id = None
         prev_seg = None
-        for x, idx in _compartments(sec):            # proximal → distal
+        for x, idx in _compartments(sec):  # proximal → distal
             seg = sec(x)
             nid = node_for(seg, idx)
 
@@ -280,46 +281,41 @@ def neuron_to_axonml_graph(
                 L_um = h.distance(prev_seg, seg)
                 # exact axial resistance from NEURON (Ω)
                 R_ohm = r_ohm(prev_seg, seg)
-                G.add_edge(prev_id, nid,
-                           L=L_um,
-                           R_ohm=R_ohm)
+                G.add_edge(prev_id, nid, L=L_um, R_ohm=R_ohm)
 
             prev_id, prev_seg = nid, seg
 
         # 1b. parent → child ----------------------------------------------------
         for child_sec, x_on_parent in _sec_children(sec):
-
             # -------- parent compartment (centre of hosting segment) -----
-            nseg_p  = sec.nseg
-            idx_p   = min(int(x_on_parent * nseg_p), nseg_p - 1)
+            nseg_p = sec.nseg
+            idx_p = min(int(x_on_parent * nseg_p), nseg_p - 1)
             parent_seg = sec((idx_p + 0.5) / nseg_p)
-            parent_id  = node_for(parent_seg, idx_p)
+            parent_id = node_for(parent_seg, idx_p)
 
             # -------- child compartment that is *actually connected* -----
             child_seg, idx_c = _first_child_compartment(child_sec, parent_seg)
             child_id = node_for(child_seg, idx_c)
 
             # exact geometry & resistance
-            L_um  = h.distance(parent_seg, child_seg)     # µm
+            L_um = h.distance(parent_seg, child_seg)  # µm
             R_ohm = r_ohm(parent_seg, child_seg)
 
-            G.add_edge(parent_id, child_id,
-                       L=L_um,
-                       R_ohm=R_ohm)
+            G.add_edge(parent_id, child_id, L=L_um, R_ohm=R_ohm)
 
             stack.append(child_sec)
 
     patterns = {
-        'DEND': r'dend',
-        'APIC': r'apic',
-        'SOMA': r'soma',
-        'UNMYELIN': r'unmyelin',      # More specific pattern
-        'MYELIN': r'\bmyelin\b',      # Matches 'myelin' as a whole word
-        'AXON': r'axon',
-        'NODE': r'node',
+        "DEND": r"dend",
+        "APIC": r"apic",
+        "SOMA": r"soma",
+        "UNMYELIN": r"unmyelin",  # More specific pattern
+        "MYELIN": r"\bmyelin\b",  # Matches 'myelin' as a whole word
+        "AXON": r"axon",
+        "NODE": r"node",
     }
 
-    group_order = ['APIC', 'DEND', 'SOMA', 'AXON', 'UNMYELIN', 'NODE', 'MYELIN']
+    group_order = ["APIC", "DEND", "SOMA", "AXON", "UNMYELIN", "NODE", "MYELIN"]
 
     G, relabel_mapping = reorder_graph_by_patterns(G, patterns, group_order)
     id2seg = regenerate_id_map(id2seg, relabel_mapping)
@@ -331,7 +327,7 @@ def reorder_graph_by_patterns(
     G: nx.DiGraph,
     group_patterns: Dict[str, str],
     group_order: List[str],
-    name_attribute: str = 'name'
+    name_attribute: str = "name",
 ) -> Tuple[nx.DiGraph, Dict[int, int]]:
     """
     Reorders graph nodes based on regular expression patterns matched against a node attribute.
@@ -360,14 +356,14 @@ def reorder_graph_by_patterns(
 
     # Compile regex patterns for efficiency
     compiled_patterns = {
-        group: re.compile(pattern, re.IGNORECASE) 
+        group: re.compile(pattern, re.IGNORECASE)
         for group, pattern in group_patterns.items()
     }
 
     for node_id, attributes in G.nodes(data=True):
         node_name = attributes.get(name_attribute, "")
         matched = False
-        
+
         # Iterate in the user-specified order to handle overlapping patterns correctly
         for group_name in group_order:
             pattern = compiled_patterns.get(group_name)
@@ -375,7 +371,7 @@ def reorder_graph_by_patterns(
                 grouped_nodes[group_name].append(node_id)
                 matched = True
                 break  # A node belongs to the first group it matches
-        
+
         if not matched:
             other_nodes.append(node_id)
 
@@ -391,13 +387,12 @@ def reorder_graph_by_patterns(
 
     # --- 3. Relabel the Graph ---
     G_reordered = nx.relabel_nodes(G, relabel_mapping, copy=True)
-    
+
     return G_reordered, relabel_mapping
-    
+
 
 def regenerate_id_map(
-    original_id_map: Dict[int, Any],
-    relabel_mapping: Dict[int, int]
+    original_id_map: Dict[int, Any], relabel_mapping: Dict[int, int]
 ) -> Dict[int, Any]:
     """
     Updates an ID-to-object map to be consistent with a reordered graph.
@@ -420,7 +415,7 @@ def regenerate_id_map(
         obj = original_id_map[old_id]
         # ...and assign it to the new ID in the new map.
         new_id_map[new_id] = obj
-        
+
     return new_id_map
 
 
@@ -444,12 +439,11 @@ def find_branch_points(G: nx.DiGraph):
     for node, out_degree in G.out_degree():
         if out_degree > 1:
             branch_nodes.append(node)
-            
+
     return branch_nodes
 
 
 def get_children_of_nodes(G: nx.DiGraph, node_ids):
-    
     children_map = {}
     for node_id in node_ids:
         # G.successors(node_id) returns an iterator over the children of the node.
@@ -461,7 +455,7 @@ def get_children_of_nodes(G: nx.DiGraph, node_ids):
             # This handles the case where a node_id in the list might not exist in the graph.
             # It's good practice to handle this gracefully.
             children_map[node_id] = []
-        
+
     return children_map
 
 
@@ -472,7 +466,7 @@ def fix_graph_branchpoints(G, id2seg, data_func=None):
         for idx in post_list:
             post_seg = id2seg[idx]
             parent_x = post_seg.sec.parentseg().x
-            if parent_x == 0 or  parent_x == 1:
+            if parent_x == 0 or parent_x == 1:
                 to_fix.setdefault(pre, {}).setdefault(parent_x, []).append(idx)
     c = 0
     for pre_idx, dct in to_fix.items():
@@ -488,15 +482,20 @@ def fix_graph_branchpoints(G, id2seg, data_func=None):
                 cm=parent_seg_true.cm,
                 name=f"branchpoint.{c}.{parent_seg_true}",
                 area=parent_seg_true.area(),
-                **data
+                **data,
             )
             c += 1
-            G.add_edge(pre_idx, nid, 
-                       L=h.distance(id2seg[pre_idx], parent_seg_true), 
-                       R_ohm=parent_seg_true.ri()*1e6)
+            G.add_edge(
+                pre_idx,
+                nid,
+                L=h.distance(id2seg[pre_idx], parent_seg_true),
+                R_ohm=parent_seg_true.ri() * 1e6,
+            )
             for post_idx in post_indices:
                 G.remove_edge(pre_idx, post_idx)
-                G.add_edge(nid, post_idx, 
-                           L=h.distance(parent_seg_true, id2seg[post_idx]), 
-                           R_ohm=id2seg[post_idx].ri()*1e6)
-    
+                G.add_edge(
+                    nid,
+                    post_idx,
+                    L=h.distance(parent_seg_true, id2seg[post_idx]),
+                    R_ohm=id2seg[post_idx].ri() * 1e6,
+                )

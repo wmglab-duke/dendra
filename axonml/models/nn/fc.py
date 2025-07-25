@@ -15,7 +15,7 @@ class fully_connected(nn.Module):
         If True, adds a learnable bias to the output. Default is True.
     """
 
-    def __init__(self, hidden_dims, nonlinearity='Sigmoid', bias=True):
+    def __init__(self, hidden_dims, nonlinearity="Sigmoid", bias=True):
         self.net = nn.Sequential()
 
         dim = 1

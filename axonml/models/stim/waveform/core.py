@@ -5,7 +5,6 @@ import torch
 from axonml.models.parametric import SimpleParameterized
 
 
-
 class Waveform(SimpleParameterized):
     """
     Base class for creating waveform generators.
@@ -30,7 +29,7 @@ class Waveform(SimpleParameterized):
         Core implementation method that calculates the waveform value at time t.
         Must be implemented by subclasses.
     repeat(freq, delay=0.0, off=torch.inf)
-        Creates a repeating version of the waveform. Frequency should be given in 
+        Creates a repeating version of the waveform. Frequency should be given in
         kHz and delay and off in ms. Off is the time after which the waveform stops repeating.
 
     Notes
@@ -94,7 +93,7 @@ class Waveform(SimpleParameterized):
     def assemble(self, start, end, dt):
         t = torch.arange(start, end, dt, device=self.device())
         return self(t)
-    
+
     def assemble_chunked(self, dt, chunks):
         t = torch.arange(0, self._tstop, dt, device=self.device())
         t = torch.tensor_split(t, chunks)
@@ -103,7 +102,9 @@ class Waveform(SimpleParameterized):
 
 
 class _repeat(Waveform):
-    def __init__(self, waveform, freq: float, delay: float = 0.0, off: float = torch.inf):
+    def __init__(
+        self, waveform, freq: float, delay: float = 0.0, off: float = torch.inf
+    ):
         super(_repeat, self).__init__()
         self.waveform = waveform
         self.freq = freq

@@ -26,11 +26,23 @@ from axonml.models.graph import get_area_from_graph
 
 
 from axonml.helpers import (
-    op_mc, op_sc, ve_from_s_t, 
-    IMEM, CUDA, DTWARN, DEBUG, 
-    DETECT_ANOMALIES, PADE, BACKEND, 
-    FULLGRAPH, DYNAMIC, JIT, COMPILE_MODE,
-    ctx, tic, toc
+    op_mc,
+    op_sc,
+    ve_from_s_t,
+    IMEM,
+    CUDA,
+    DTWARN,
+    DEBUG,
+    DETECT_ANOMALIES,
+    PADE,
+    BACKEND,
+    FULLGRAPH,
+    DYNAMIC,
+    JIT,
+    COMPILE_MODE,
+    ctx,
+    tic,
+    toc,
 )
 
 
@@ -68,6 +80,7 @@ def follows_pattern(base_pattern, target_string):
 
 import re
 
+
 def matches_any_pattern(base_patterns, target_string):
     """
     Checks if a target string matches any of the provided base patterns.
@@ -85,7 +98,7 @@ def matches_any_pattern(base_patterns, target_string):
         # Split the pattern by '.' and escape each part to treat special
         # regex characters (like '.') as literal characters.
         escaped_parts = [re.escape(part) for part in base_pattern.split(".")]
-        
+
         # The separator `\b.*?\b` ensures that all intermediate parts are
         # treated as whole words.
         regex_pattern = (
@@ -93,10 +106,12 @@ def matches_any_pattern(base_patterns, target_string):
             + r"\b.*?\b".join(escaped_parts)
             # The final r"\b" is removed from here!
         )
-        
-        if re.search(regex_pattern, target_string, re.IGNORECASE): # Added re.IGNORECASE for more robust matching
+
+        if re.search(
+            regex_pattern, target_string, re.IGNORECASE
+        ):  # Added re.IGNORECASE for more robust matching
             return True
-            
+
     return False
 
 
@@ -126,7 +141,7 @@ class Population(P):
     P.RANGE(cm=1.0, rhoa=35.4)
     P.GLOBAL(celsius=37.0)
 
-    def __init__(self, N:int, C:int, integrator=None, v_init=-65.0, **kwargs):
+    def __init__(self, N: int, C: int, integrator=None, v_init=-65.0, **kwargs):
         super().__init__((N, C), **kwargs)
         self.np = N
         self.nc = C
@@ -140,19 +155,19 @@ class Population(P):
 
         self.shape = integrator.shape(self.np, self.nc) if integrator else (N, C)
 
-        self.register_buffer("_dummy",      torch.zeros(1))
+        self.register_buffer("_dummy", torch.zeros(1))
 
-        self.register_buffer("v",           torch.full(self.shape, self.v_init))
-        self.register_buffer("diam",        torch.full(self.shape, 500.0))
-        self.register_buffer("dx",          torch.full(self.shape, 100.0))
-        self.register_buffer("t",           torch.zeros(()))
+        self.register_buffer("v", torch.full(self.shape, self.v_init))
+        self.register_buffer("diam", torch.full(self.shape, 500.0))
+        self.register_buffer("dx", torch.full(self.shape, 100.0))
+        self.register_buffer("t", torch.zeros(()))
 
         # compiler stuff
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
-        self.compile_mode = COMPILE_MODE.value 
+        self.compile_mode = COMPILE_MODE.value
 
         self.integrator = integrator
 
@@ -194,16 +209,16 @@ class Population(P):
 
         if self.jit:
             self._step = torch.compile(
-                step, 
-                backend   = self.backend, 
-                fullgraph = self.fullgraph, 
-                dynamic   = self.dynamic,
-                mode      = self.compile_mode,
+                step,
+                backend=self.backend,
+                fullgraph=self.fullgraph,
+                dynamic=self.dynamic,
+                mode=self.compile_mode,
             )
         else:
             self._step = torch.compile(
                 step,
-                backend   = 'eager',
+                backend="eager",
             )
 
         self._caches = {}
@@ -238,7 +253,7 @@ class Population(P):
     @property
     def mech(self):
         return self.integrator.mech
-    
+
     @property
     def i_membrane(self):
         return self.integrator.i_membrane
@@ -265,7 +280,7 @@ class Population(P):
             for n, p in self.named_parameters():
                 if matches_any_pattern(names, n):
                     yield p
-        
+
     def collect_named_parameters(self, *names):
         """
         Collects parameters from the model based on the provided names.
@@ -329,7 +344,7 @@ class Population(P):
             for p in group:
                 p.requires_grad = True
         return self
-    
+
     def unfreeze_group_(self, *groups):
         self.unfreeze_group(*groups)
 
@@ -369,7 +384,7 @@ class Population(P):
 
     def dtype(self):
         return self._dummy.dtype
-    
+
     def prep_intra(self, intra, n, dt):
         start = self.t
         end = start + n * dt
@@ -465,12 +480,11 @@ class Population(P):
 
         if isinstance(time, Waveform):
             time = time.to(device, dtype=self.dtype())
-            time = time.assemble(self.t, self.t+tstop, dt)
+            time = time.assemble(self.t, self.t + tstop, dt)
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
         with ctx:
-
             if ve is None:
                 if space is not None and time is not None:
                     ve = ve_from_s_t(space, time, self.np, self.device(), multicontact)
@@ -489,15 +503,19 @@ class Population(P):
             if callbacks:
                 for c in callbacks:
                     c.dt = dt_f
-            
+
             pre_loop_hook(callbacks, self)
 
-            if not self.integrator.initialized or self.integrator.dt != dt_f or self.training:
+            if (
+                not self.integrator.initialized
+                or self.integrator.dt != dt_f
+                or self.training
+            ):
                 self.integrator.initialize(self, dt)
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
-                    progressbar = tqdm(total=n, desc=f"{self.t_ind*dt_f:.3f} ms")
+                    progressbar = tqdm(total=n, desc=f"{self.t_ind * dt_f:.3f} ms")
 
             for i in range(n):
                 ve_c = ve[i] if ve is not None else None
@@ -518,13 +536,13 @@ class Population(P):
                 if progressbar:
                     progressbar.update(1)
                     if self.t_ind % 100 == 0:
-                        progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
+                        progressbar.set_description(f"{self.t_ind * dt_f:.1f} ms")
 
             if progressbar:
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
-            
+
             self.t_cache = self.t_ind * dt_f
 
     def longrun(
@@ -584,7 +602,7 @@ class Population(P):
         depending on whether the model has been previously initialized or reinitialized.
         - Chunk processing helps manage memory usage during extended simulations by
         processing data in manageable segments.
-    """
+        """
 
         # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
         # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
@@ -599,7 +617,9 @@ class Population(P):
 
         if with_extra:
             ve_s, time = extra
-            ve_s = torch.as_tensor(ve_s, device=self.device(), dtype=self.dtype()).contiguous()
+            ve_s = torch.as_tensor(
+                ve_s, device=self.device(), dtype=self.dtype()
+            ).contiguous()
 
             if multicontact:
                 ve_s = ve_s.expand(-1, self.n_ax, -1)
@@ -622,8 +642,9 @@ class Population(P):
 
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
-
-                t = torch.arange(self.t, self.t+tstop, dt, dtype=self.dtype(), device=self.device())
+                t = torch.arange(
+                    self.t, self.t + tstop, dt, dtype=self.dtype(), device=self.device()
+                )
                 n_chunks = math.ceil(len(t) / chunklength)
 
                 t_c_f = torch.tensor_split(t, n_chunks)
@@ -646,7 +667,9 @@ class Population(P):
                 callbacks = CallbackList(callbacks)
 
                 if progressbar:
-                    progressbar = tqdm(total=n_chunks, desc=f"{self.t_ind*dt_f:.1f} ms")
+                    progressbar = tqdm(
+                        total=n_chunks, desc=f"{self.t_ind * dt_f:.1f} ms"
+                    )
 
                 self.integrator.initialize(self, dt)
                 einsum = torch.compile(einsum)
@@ -654,7 +677,6 @@ class Population(P):
                 pre_loop_hook(callbacks, self)
 
                 for i in range(n_chunks):
-
                     if with_intra:
                         stims, indices = intra.init(t_c_f[i])
                         stims = [s.unbind(0) for s in stims]
@@ -680,7 +702,7 @@ class Population(P):
                             intra_c = make_intra(intra, s, indices)
                         else:
                             intra_c = None
-                        
+
                         self._step(self.integrator, self, dt, ve_c, intra_c)
                         post_step_hook(callbacks, self)
 
@@ -689,7 +711,7 @@ class Population(P):
 
                     if progressbar:
                         progressbar.update(1)
-                        progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
+                        progressbar.set_description(f"{self.t_ind * dt_f:.1f} ms")
 
                 post_loop_hook(callbacks, self)
 
@@ -734,7 +756,7 @@ class Population(P):
         self.t.detach().zero_()
         self.t_ind = 0
         return self
-    
+
     def clear_steady_state(self):
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
@@ -769,7 +791,7 @@ class Population(P):
         self.t.detach().zero_()
         self.initialized = True
         return self
-    
+
     def initialize_(self):
         self.initialize()
 
@@ -918,7 +940,7 @@ class Population(P):
             raise RuntimeError("Cannot insert mechanisms after the model is built.")
 
         validate(mechanism)
-        
+
         key = None
 
         if index_spec is not None:
@@ -975,7 +997,6 @@ class Population(P):
             return (0, 1, 0, 0, 0)
         return (0, 0, 0, 0, 0)
 
-    
     def register_mech(self, m, shape, key):
         name = m.name
         mech = m.__class__
@@ -1000,16 +1021,14 @@ class Population(P):
         for k, v in mech._write_ion_c.items():
             self._ion_write_c.setdefault(k, {}).update({name: v})
 
-
     def build(self):
-
         if self.is_built:
             return self
 
         def are_strings_unique(data: list) -> bool:
             strings_only = [item for item in data if item is not None]
             return len(strings_only) == len(set(strings_only))
-        
+
         for mech, (name, ic, kwargs) in self._mech_everywhere.items():
             key = None
             shape = self.shape
@@ -1019,14 +1038,10 @@ class Population(P):
         for mech, data in self._mech_data.items():
             aliases, kwargs_list, keys = tuple(map(list, zip(*data)))
             if not are_strings_unique(aliases):
-                raise ValueError(f"Duplicate aliases found for mechanism {mech.__name__}.")
-            m, shape, key = compile_mechanism(
-                self,
-                mech,
-                keys,
-                aliases,
-                kwargs_list
-            )
+                raise ValueError(
+                    f"Duplicate aliases found for mechanism {mech.__name__}."
+                )
+            m, shape, key = compile_mechanism(self, mech, keys, aliases, kwargs_list)
             self.register_mech(m, shape, key)
 
         all_ions = get_unique_keys([self._ion_read, self._ion_write, self._ion_write_c])
@@ -1044,26 +1059,27 @@ class Population(P):
             )
             for m in self._m_list:
                 m.register_ion(ions[ion])
-                
-        mechs = {
-            n: m for n, m in zip(self._m_name, self._m_list)
-        }
-        keys = {
-            n: k for n, k in zip(self._m_name, self._m_keys)
-        }
+
+        mechs = {n: m for n, m in zip(self._m_name, self._m_list)}
+        keys = {n: k for n, k in zip(self._m_name, self._m_keys)}
         mech = MechanismHandler(
-            self.celsius, self.area, mechs, ions,
-            self._ion_write_c, self._ion_read, self._m_curr
+            self.celsius,
+            self.area,
+            mechs,
+            ions,
+            self._ion_write_c,
+            self._ion_read,
+            self._m_curr,
         )
 
         for m in mech.mechanisms.values():
-            m.setreference('t', lambda:self.t)
+            m.setreference("t", lambda: self.t)
 
         self.integrator = self.integrator(self, mech)
         self.is_built = True
         self.eval()
         return self
-    
+
     def build_(self):
         self.build()
 
@@ -1082,11 +1098,9 @@ class Population(P):
         self.detach()
 
     def register_parametrization(self, name: str, parametrization: torch.nn.Module):
-        torch.nn.utils.parametrize.register_parametrization(
-            self, name, parametrization
-        )
+        torch.nn.utils.parametrize.register_parametrization(self, name, parametrization)
 
-    def slice(self, include=None, exclude='branchpoint', fuzzy=True, match_case=False):
+    def slice(self, include=None, exclude="branchpoint", fuzzy=True, match_case=False):
         """
         Finds all indices in the tree structure based on inclusion and exclusion criteria.
 
@@ -1106,7 +1120,16 @@ class Population(P):
         List[int]
             A list of indices that match the criteria.
         """
-        return self[:, self.find(include=include, exclude=exclude, fuzzy=fuzzy, match_case=match_case, full_report=False)]
+        return self[
+            :,
+            self.find(
+                include=include,
+                exclude=exclude,
+                fuzzy=fuzzy,
+                match_case=match_case,
+                full_report=False,
+            ),
+        ]
 
     def find_not(self, exclude=None, fuzzy=True, match_case=False):
         indices = find_indices_smart(
@@ -1114,18 +1137,18 @@ class Population(P):
             exclude=exclude,
             fuzzy=fuzzy,
             match_case=match_case,
-            device=self.device()
+            device=self.device(),
         )
         return indices.indices
 
     def find(
-        self, 
-        include=None, 
-        exclude='branchpoint', 
-        fuzzy=True, 
-        match_case=False, 
+        self,
+        include=None,
+        exclude="branchpoint",
+        fuzzy=True,
+        match_case=False,
         full_report=False,
-        as_list=False
+        as_list=False,
     ):
         indices = find_indices_smart(
             self.names,
@@ -1133,7 +1156,7 @@ class Population(P):
             exclude=exclude,
             fuzzy=fuzzy,
             match_case=match_case,
-            device=self.device()
+            device=self.device(),
         )
         if full_report:
             return indices
@@ -1141,7 +1164,13 @@ class Population(P):
             # Return only the indices of the matches
             if isinstance(indices.indices, slice):
                 if as_list:
-                    return list(range(indices.indices.start, indices.indices.stop, indices.indices.step or 1))
+                    return list(
+                        range(
+                            indices.indices.start,
+                            indices.indices.stop,
+                            indices.indices.step or 1,
+                        )
+                    )
                 return indices.indices
             else:
                 return indices.indices.tolist()
@@ -1153,7 +1182,13 @@ class Population(P):
 
         A terminal node is defined as a node that has no children in the graph.
         """
-        terminal_mask = torch.tensor([len(list(self.graph.successors(i))) == 0 for i in range(len(self.graph.nodes))], device=self.device())
+        terminal_mask = torch.tensor(
+            [
+                len(list(self.graph.successors(i))) == 0
+                for i in range(len(self.graph.nodes))
+            ],
+            device=self.device(),
+        )
         return torch.nonzero(terminal_mask, as_tuple=False).squeeze(1).tolist()
 
     def init_v(self):
@@ -1176,11 +1211,15 @@ class Population(P):
         value : torch.Tensor
             The value to set for the specified parameter or state variable.
         """
+
         def _set_value(model):
             if hasattr(model, name):
-                getattr(model, name).copy_(value.to(device=model.device(), dtype=model.dtype()))
+                getattr(model, name).copy_(
+                    value.to(device=model.device(), dtype=model.dtype())
+                )
             else:
                 raise AttributeError(f"Model has no attribute '{name}' to set.")
+
         self.register_post_initialize_hook(_set_value)
 
 
@@ -1191,10 +1230,10 @@ class FindResult(NamedTuple):
     local_sizes: Dict[str, int]
     total_size: int
 
+
 # Helper function to convert numpy indices to a slice or tensor
 def _indices_to_slice_or_tensor(
-    numpy_indices: np.ndarray,
-    device: Optional[torch.device] = None
+    numpy_indices: np.ndarray, device: Optional[torch.device] = None
 ) -> Union[slice, torch.Tensor]:
     """Converts a 1D numpy array of indices into a slice if possible, else a tensor."""
     num_indices = len(numpy_indices)
@@ -1220,13 +1259,14 @@ def _indices_to_slice_or_tensor(
         torch_indices = torch.from_numpy(numpy_indices)
         return torch_indices.to(device) if device else torch_indices
 
+
 def find_indices_smart(
     data: List[str],
     include: Optional[Union[str, List[str]]] = None,
     exclude: Optional[Union[str, List[str]]] = None,
     fuzzy: bool = True,
     match_case: bool = False,
-    device: Optional[torch.device] = None
+    device: Optional[torch.device] = None,
 ) -> FindResult:
     """
     Finds indices based on criteria and returns detailed results including local indices
@@ -1253,7 +1293,7 @@ def find_indices_smart(
 
     s = pd.Series(data, dtype="string")
     final_mask = pd.Series(True, index=s.index)
-    
+
     local_indices_map = {}
     local_sizes_map = {}
     pattern_masks: Dict[str, pd.Series] = {}
@@ -1262,14 +1302,14 @@ def find_indices_smart(
         """Helper to generate a boolean mask for a given pattern."""
         if fuzzy:
             # If pattern contains non-word chars (e.g., 'axon[0]'), treat as literal substring.
-            if re.search(r'[^a-zA-Z0-9_]', pattern):
+            if re.search(r"[^a-zA-Z0-9_]", pattern):
                 regex_pattern = re.escape(pattern)
             # Otherwise, it's a simple name (e.g., 'axon'). Match as a "root" word.
             # Use a negative lookahead to allow suffixes like '[0]' but not more letters.
             else:
-                regex_pattern = fr"\b{re.escape(pattern)}(?![a-zA-Z0-9])"
+                regex_pattern = rf"\b{re.escape(pattern)}(?![a-zA-Z0-9])"
             return s.str.contains(regex_pattern, case=match_case, regex=True, na=False)
-        else: # Exact match
+        else:  # Exact match
             series_to_compare = s.str.lower() if not match_case else s
             pattern_to_compare = pattern.lower() if not match_case else pattern
             return series_to_compare == pattern_to_compare
@@ -1279,7 +1319,9 @@ def find_indices_smart(
         for pattern in include_patterns:
             pattern_masks[pattern] = get_mask_for_pattern(pattern)
         if pattern_masks:
-            combined_include_mask = pd.concat(pattern_masks.values(), axis=1).any(axis=1)
+            combined_include_mask = pd.concat(pattern_masks.values(), axis=1).any(
+                axis=1
+            )
             final_mask &= combined_include_mask
     else:
         include_patterns = []
@@ -1296,31 +1338,36 @@ def find_indices_smart(
 
     if total_size == 0:
         return empty_result
-    
+
     total_indices_result = _indices_to_slice_or_tensor(numpy_indices, device)
 
     if include_patterns:
-        global_to_local_map = {global_idx: local_idx for local_idx, global_idx in enumerate(numpy_indices)}
-        
+        global_to_local_map = {
+            global_idx: local_idx for local_idx, global_idx in enumerate(numpy_indices)
+        }
+
         for pattern in include_patterns:
             pattern_final_mask = pattern_masks[pattern] & final_mask
             pattern_global_indices = s.index[pattern_final_mask].to_numpy()
-            
+
             if len(pattern_global_indices) > 0:
-                local_indices_list = [global_to_local_map[g_idx] for g_idx in pattern_global_indices]
+                local_indices_list = [
+                    global_to_local_map[g_idx] for g_idx in pattern_global_indices
+                ]
                 local_numpy_indices = np.array(local_indices_list, dtype=np.int64)
-                local_indices_map[pattern] = _indices_to_slice_or_tensor(local_numpy_indices, device)
+                local_indices_map[pattern] = _indices_to_slice_or_tensor(
+                    local_numpy_indices, device
+                )
                 local_sizes_map[pattern] = len(local_indices_list)
             else:
                 local_indices_map[pattern] = slice(0, 0)
                 local_sizes_map[pattern] = 0
 
-
     return FindResult(
         indices=total_indices_result,
         local_indices=local_indices_map,
         local_sizes=local_sizes_map,
-        total_size=total_size
+        total_size=total_size,
     )
 
 
@@ -1369,25 +1416,22 @@ class Axon(Population):
     ]
 
     def __init__(
-        self, 
-        diameters,
-        n_comp: int, 
-        celsius=37.0, 
-        v_init=-80.0,
-        integrator=None
+        self, diameters, n_comp: int, celsius=37.0, v_init=-80.0, integrator=None
     ):
         if integrator is None:
             integrator = bwd_euler_ub()
         super().__init__(len(diameters), n_comp, integrator=integrator, celsius=celsius)
 
-        self.register_buffer("diameters", torch.as_tensor(diameters, dtype=self.dtype()))
-        
-        self.n_ax   = self.np
+        self.register_buffer(
+            "diameters", torch.as_tensor(diameters, dtype=self.dtype())
+        )
+
+        self.n_ax = self.np
         self.n_comp = self.nc
-        self.temp   = float(celsius)
+        self.temp = float(celsius)
 
         self.v_init = v_init
-        self.v[:]   = v_init
+        self.v[:] = v_init
         self.v.detach_()
 
         self.x[:] = self._x()  # Initialize x positions
@@ -1400,7 +1444,7 @@ class Axon(Population):
             diameters = torch.tensor(diameters, dtype=self.dtype())
 
         if diameters.ndim == 1:
-            diameters = diameters.unsqueeze(1)        
+            diameters = diameters.unsqueeze(1)
 
         self.diam[:] = diameters
         self.diam.detach_()
@@ -1443,7 +1487,6 @@ class Axon(Population):
         [25, 50, 75]  # For a model with n_comp=101
         """
         return [round((self.n_comp - 1) * i) for i in args]
-
 
 
 def _match_state_dict(
@@ -1522,14 +1565,14 @@ class Unmyelinated(Axon):
     Axon.GLOBAL(celsius=37.0)
 
     def __init__(
-            self, 
-            diameters, 
-            L=1.0*mm, 
-            dx=10.0, 
-            celsius=37.0, 
-            v_init=-80.0,
-            integrator=None
-        ):
+        self,
+        diameters,
+        L=1.0 * mm,
+        dx=10.0,
+        celsius=37.0,
+        v_init=-80.0,
+        integrator=None,
+    ):
         # L = L * 1000  # mm -> um
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
@@ -1615,7 +1658,9 @@ class Myelinated(Axon):
         def forward(self, rhoa, dx, diameters):
             diameters = diameters.unsqueeze(1) if diameters.ndim == 1 else diameters
             axon_d = self.axond1 * diameters**2 + self.axond2 * diameters + self.axond3
-            deltax = self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
+            deltax = (
+                self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
+            )
             deltax = deltax / dx
             scale = 1 / ((axon_d / diameters) ** 2)
             rhoa = rhoa * scale * deltax
@@ -1627,7 +1672,7 @@ class Myelinated(Axon):
             self.noded1 = noded1
             self.noded2 = noded2
             self.noded3 = noded3
-        
+
         def forward(self, diam):
             node_d = self.noded1 * diam**2 + self.noded2 * diam + self.noded3
             return node_d
@@ -1646,12 +1691,7 @@ class Myelinated(Axon):
         self.dx[:] = self.node_length
 
         self.register_parametrization(
-            "diam",
-            self.myelinated_node_d(
-                self.noded1,
-                self.noded2,
-                self.noded3
-            )
+            "diam", self.myelinated_node_d(self.noded1, self.noded2, self.noded3)
         )
 
         self.register_parametrization_in_graph(
@@ -1662,9 +1702,9 @@ class Myelinated(Axon):
                 self.deltax3,
                 self.axond1,
                 self.axond2,
-                self.axond3
+                self.axond3,
             ),
-            args=('dx', 'diameters')
+            args=("dx", "diameters"),
         )
 
     def deltax(self, diameters):
@@ -1677,25 +1717,30 @@ class Myelinated(Axon):
         end = l / 2
         steps = self.n_comp
         t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(0)
-        return ((1 - t) * start + t * end)
+        return (1 - t) * start + t * end
 
 
 # callback helpers
 def pre_loop_hook(c, m):
     c.pre_loop_hook(m)
 
+
 def post_loop_hook(c, m):
     c.post_loop_hook(m)
 
+
 def pre_step_hook(c, m):
     c.pre_step_hook(m)
+
 
 @torch.compile
 def post_step_hook(c, m):
     c.post_step_hook(m)
 
+
 def pre_chunk_hook(c, m, n):
     c.pre_chunk_hook(m, n)
+
 
 def post_chunk_hook(c, m, n):
     c.post_chunk_hook(m, n)
@@ -1704,20 +1749,21 @@ def post_chunk_hook(c, m, n):
 import numpy as np
 from typing import List, Tuple, Union, Any
 
+
 # Helper for the super-fast path: Merges overlapping/adjacent 1D intervals
 def _merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     """Merges a list of [start, stop) intervals."""
     if not intervals:
         return []
-    
+
     # Sort intervals by their start point
     intervals.sort(key=lambda x: x[0])
-    
-    merged = [list(intervals[0])] # Use list to allow modification
-    
+
+    merged = [list(intervals[0])]  # Use list to allow modification
+
     for current_start, current_stop in intervals[1:]:
         last_start, last_stop = merged[-1]
-        
+
         # If the current interval overlaps with or is adjacent to the last one
         if current_start <= last_stop:
             # Merge them by extending the last one's stop
@@ -1725,32 +1771,33 @@ def _merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         else:
             # No overlap, start a new interval
             merged.append([current_start, current_stop])
-            
+
     return [tuple(i) for i in merged]
+
 
 # Custom exception to signal fallback to the slower method
 class NotComposableError(Exception):
     pass
 
+
 def _handle_pure_slice_union(
-    indices: List[Tuple[slice, ...]],
-    shape: Tuple[int, ...]
+    indices: List[Tuple[slice, ...]], shape: Tuple[int, ...]
 ) -> Tuple[Tuple[slice, ...], bool, Tuple[int, ...], List[List[int]]]:
     """
     SUPER FAST PATH: Calculates the union of pure slice tuples directly
     without materializing flat indices.
     """
     ndim = len(shape)
-    
+
     # 1. Normalize all slices to have concrete start, stop, step
     normalized_slices = []
     for s_tuple in indices:
         if len(s_tuple) > ndim:
             raise NotComposableError("Slice tuple has more dimensions than shape")
-        
+
         # Pad with slice(None) if needed
         s_tuple_full = s_tuple + (slice(None),) * (ndim - len(s_tuple))
-        
+
         current_norm = []
         for i, s in enumerate(s_tuple_full):
             start, stop, step = s.indices(shape[i])
@@ -1765,12 +1812,12 @@ def _handle_pure_slice_union(
     for i in range(ndim):
         dim_intervals = [s[i] for s in normalized_slices]
         merged_dim_intervals = _merge_intervals(dim_intervals)
-        
+
         # If any dimension results in a non-contiguous union (e.g., [0,5) and [10,15)),
         # then the total union is not one single slice tuple.
         if len(merged_dim_intervals) != 1:
             raise NotComposableError("Union is not a single contiguous block")
-            
+
         final_intervals.append(merged_dim_intervals[0])
 
     # 3. If we got here, the result is composable. Create final slice objects.
@@ -1788,12 +1835,11 @@ def _handle_pure_slice_union(
             slice(s - fs, e - fs)
             for (s, e), fs in zip(original_norm_slice, final_slice_starts)
         )
-        
+
         # Use mgrid and ravel_multi_index on the *final_shape* to get local indices
         coords = np.mgrid[relative_slices]
         flat_local = np.ravel_multi_index(
-            tuple(coords.reshape(ndim, -1)),
-            dims=final_shape
+            tuple(coords.reshape(ndim, -1)), dims=final_shape
         )
         local_indices.append(sorted(flat_local.tolist()))
 
@@ -1802,8 +1848,7 @@ def _handle_pure_slice_union(
 
 # The main entrypoint function, now a dispatcher
 def compose_or_flatten_union(
-    indices: List[Any],
-    shape: Tuple[int, ...]
+    indices: List[Any], shape: Tuple[int, ...]
 ) -> Tuple[Union[Tuple[slice, ...], List[int]], bool, Tuple[int, ...], List[List[int]]]:
     """
     Calculates the union of elements selected by a list of indices. Dispatches
@@ -1817,14 +1862,15 @@ def compose_or_flatten_union(
 
     if not indices:
         return empty_slice_tuple, True, empty_shape, []
-    
+
     if not shape or not all(s > 0 for s in shape):
         return empty_slice_tuple, True, empty_shape, empty_locals
-    
+
     # --- SUPER-FAST-PATH DISPATCHER ---
     # Check if we can use the slice-domain optimization
     is_pure_slice_case = all(
-        isinstance(idx, tuple) and all(isinstance(s, slice) for s in idx) for idx in indices
+        isinstance(idx, tuple) and all(isinstance(s, slice) for s in idx)
+        for idx in indices
     )
 
     if is_pure_slice_case:
@@ -1846,7 +1892,9 @@ def compose_or_flatten_union(
             selected_elements = arr[idx]
             contributions.append(sorted(list(set(selected_elements.flatten()))))
         except IndexError as e:
-            raise IndexError(f"Indexer invalid for shape. Idx: {idx}, Shape: {shape}. Error: {e}") from e
+            raise IndexError(
+                f"Indexer invalid for shape. Idx: {idx}, Shape: {shape}. Error: {e}"
+            ) from e
 
     all_flat_indices = set()
     for contrib in contributions:
@@ -1856,9 +1904,13 @@ def compose_or_flatten_union(
         return empty_slice_tuple, True, empty_shape, empty_locals
 
     sorted_union_indices = sorted(list(all_flat_indices))
-    
-    global_to_local_map = {g_idx: l_idx for l_idx, g_idx in enumerate(sorted_union_indices)}
-    local_indices = [[global_to_local_map[g_idx] for g_idx in contrib] for contrib in contributions]
+
+    global_to_local_map = {
+        g_idx: l_idx for l_idx, g_idx in enumerate(sorted_union_indices)
+    }
+    local_indices = [
+        [global_to_local_map[g_idx] for g_idx in contrib] for contrib in contributions
+    ]
 
     multi_dim_coords = np.unravel_index(sorted_union_indices, shape)
     min_coords = np.min(multi_dim_coords, axis=1)
@@ -1866,7 +1918,10 @@ def compose_or_flatten_union(
 
     bounding_box_dims = max_coords - min_coords + 1
     if len(sorted_union_indices) == np.prod(bounding_box_dims):
-        composed_slices = tuple(slice(int(min_c), int(max_c) + 1) for min_c, max_c in zip(min_coords, max_coords))
+        composed_slices = tuple(
+            slice(int(min_c), int(max_c) + 1)
+            for min_c, max_c in zip(min_coords, max_coords)
+        )
         final_shape = tuple(s.stop - s.start for s in composed_slices)
         return composed_slices, True, final_shape, local_indices
     else:
@@ -1876,7 +1931,6 @@ def compose_or_flatten_union(
 
 
 def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
-
     total_index, is_composable, final_shape, local_indices = compose_or_flatten_union(
         indices, model.shape
     )

@@ -1,4 +1,5 @@
 """Precomputed fields."""
+
 import torch
 
 import glob
@@ -175,7 +176,6 @@ FEMInterpolate1D = PreComputedInterpolate1D
 
 
 class EfieldInterpolate3D(torch.nn.Module):
-
     def __init__(self, xyz, efield, *, k: int | None = 8, eps: float = 1e-9):
         """
         Initialize the EfieldInterpolate3D module.
@@ -216,7 +216,7 @@ class EfieldInterpolate3D(torch.nn.Module):
         # store as buffers so they move with .to(device) / .half() calls
         self.register_buffer("xyz", xyz.clone())
         self.register_buffer("efield", efield.clone())
-        self.k   = k
+        self.k = k
         self.eps = eps
 
     # ------------------------------------------------------------------
@@ -237,9 +237,9 @@ class EfieldInterpolate3D(torch.nn.Module):
     # ------------------------------------------------------------------
     # user‑facing API
     # ------------------------------------------------------------------
-    def _interp(self, x: torch.Tensor,
-                      y: torch.Tensor,
-                      z: torch.Tensor) -> torch.Tensor:
+    def _interp(
+        self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+    ) -> torch.Tensor:
         """
         x, y, z : (B, K) query coordinates
         Returns  (B, K, 3) interpolated E-field
@@ -248,19 +248,19 @@ class EfieldInterpolate3D(torch.nn.Module):
             raise ValueError("x, y, z must have identical shapes (B, K)")
 
         B, K = x.shape
-        xyz_q = torch.stack((x, y, z), dim=-1)             # (B, K, 3)
+        xyz_q = torch.stack((x, y, z), dim=-1)  # (B, K, 3)
 
         # ---------- pair‑wise squared distances ----------
         #   diff → (B, K, N, 3)
-        diff  = xyz_q[..., None, :] - self.xyz  # broadcast N
-        dist2 = (diff ** 2).sum(dim=-1)         # (B, K, N)
+        diff = xyz_q[..., None, :] - self.xyz  # broadcast N
+        dist2 = (diff**2).sum(dim=-1)  # (B, K, N)
 
         # ---------- pick k nearest neighbours if requested ----------
         if self.k is not None and self.k < self.xyz.shape[0]:
             dist2, idx = torch.topk(dist2, self.k, dim=-1, largest=False)
-            vecs = self.efield[idx]                   # (B, K, k, 3)
-        else:                                         # use all N
-            vecs = self.efield.expand(B, K, -1, -1)   # broadcast to (B, K, N, 3)
+            vecs = self.efield[idx]  # (B, K, k, 3)
+        else:  # use all N
+            vecs = self.efield.expand(B, K, -1, -1)  # broadcast to (B, K, N, 3)
 
         # ---------- inverse‑distance weighted average ----------
         return self._idw(dist2, vecs)
@@ -270,6 +270,4 @@ class EfieldInterpolate3D(torch.nn.Module):
         x, y, z = model.x, model.y, model.z
         G = model.G
         efield = self._interp(x, y, z)
-        return calculate_quasipotentials_batched_coords(
-            G, x, y, z, efield
-        )
+        return calculate_quasipotentials_batched_coords(G, x, y, z, efield)

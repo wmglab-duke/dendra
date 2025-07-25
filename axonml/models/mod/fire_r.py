@@ -14,7 +14,7 @@ class fire_r(VoltageProcess):
     def update_v(self, v, dt):
         still_ref = self.is_refractory
         time_refractory = self.time_refractory
-        time_refractory = torch.where(still_ref, time_refractory-dt, time_refractory)
+        time_refractory = torch.where(still_ref, time_refractory - dt, time_refractory)
 
         # cells whose timer expired leave refractory state
         recovered = still_ref & (time_refractory <= 0)
@@ -25,7 +25,7 @@ class fire_r(VoltageProcess):
         new_spike = can_spike & (v > self.threshold)
 
         # mark & start refractory for those
-        self.is_refractory   = torch.where(new_spike, True, is_refractory)
+        self.is_refractory = torch.where(new_spike, True, is_refractory)
         self.time_refractory = torch.where(new_spike, self.refractory, time_refractory)
 
         # ---- 3. force voltage to rest while refractory ---------------

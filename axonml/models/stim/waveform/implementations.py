@@ -339,7 +339,7 @@ class arbitrary(Waveform):
     Notes
     -----
     The waveform is defined by linear interpolation between the specified points.
-    For a time point t, if t is within the range of tpoints, the value is linearly interpolated; 
+    For a time point t, if t is within the range of tpoints, the value is linearly interpolated;
     if t is outside the range of tpoints, the value is 0.
 
     Examples

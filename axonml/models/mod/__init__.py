@@ -15,6 +15,7 @@ from .pas import pas
 
 class MechanismContainer:
     """Simple attribute / dict‑style container."""
+
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -57,7 +58,7 @@ def load_mechanisms(*paths):
     >>> mechanisms = load_mechanisms('/path/to/mechanisms', '/another/path')
     >>> my_mechanism = mechanisms.mechanism_name
     """
-    
+
     mechanisms = {}
 
     for root in paths:
@@ -66,7 +67,7 @@ def load_mechanisms(*paths):
             if file.name == "__init__.py":
                 continue
 
-            module_name = file.stem            # e.g. "nats"
+            module_name = file.stem  # e.g. "nats"
             unique_name = f"{module_name}_{file.stat().st_ino}"  # avoids collisions
 
             spec = importlib.util.spec_from_file_location(unique_name, file)
@@ -85,4 +86,3 @@ def load_mechanisms(*paths):
                 ) from e
 
     return MechanismContainer(**mechanisms)
-

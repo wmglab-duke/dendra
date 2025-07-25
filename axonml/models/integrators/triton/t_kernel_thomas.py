@@ -5,11 +5,18 @@ import triton.language as tl
 
 @triton.jit
 def _thomas_solve_kernel(
-    a_ptr, b_ptr, cp_ptr, x_ptr,
-    a_stride_b, a_stride_k,
-    b_stride_b, b_stride_k,
-    cp_stride_b, cp_stride_k,
-    x_stride_b, x_stride_k,
+    a_ptr,
+    b_ptr,
+    cp_ptr,
+    x_ptr,
+    a_stride_b,
+    a_stride_k,
+    b_stride_b,
+    b_stride_k,
+    cp_stride_b,
+    cp_stride_k,
+    x_stride_b,
+    x_stride_k,
     K: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
@@ -22,11 +29,11 @@ def _thomas_solve_kernel(
     # --- Forward Elimination Sweep ---
     b0 = tl.load(b_b_ptr)
     inv_b0 = 1.0 / b0
-    
+
     cp0 = tl.load(cp_b_ptr)
     cp0 *= inv_b0
     tl.store(cp_b_ptr, cp0)
-    
+
     x0 = tl.load(x_b_ptr)
     x0 *= inv_b0
     tl.store(x_b_ptr, x0)
@@ -40,16 +47,16 @@ def _thomas_solve_kernel(
         b_i = tl.load(b_b_ptr + offset_i)
         cp_im1 = tl.load(cp_b_ptr + offset_im1)
         x_im1 = tl.load(x_b_ptr + offset_im1)
-        
+
         denom = b_i - a_im1 * cp_im1
         inv_denom = 1.0 / denom
-        
+
         cp_i = tl.load(cp_b_ptr + offset_i)
         x_i = tl.load(x_b_ptr + offset_i)
-        
+
         cp_i *= inv_denom
         tl.store(cp_b_ptr + offset_i, cp_i)
-        
+
         x_i = (x_i - a_im1 * x_im1) * inv_denom
         tl.store(x_b_ptr + offset_i, x_i)
 
@@ -61,7 +68,7 @@ def _thomas_solve_kernel(
         cp_i = tl.load(cp_b_ptr + offset_i)
         x_ip1 = tl.load(x_b_ptr + offset_ip1)
         x_i = tl.load(x_b_ptr + offset_i)
-        
+
         x_i -= cp_i * x_ip1
         tl.store(x_b_ptr + offset_i, x_i)
 
@@ -99,11 +106,18 @@ class ThomasSolve(torch.autograd.Function):
         # --- Kernel Launch ---
         grid = (B,)
         _thomas_solve_kernel[grid](
-            a, b, cp, x,
-            a.stride(0), a.stride(1),
-            b.stride(0), b.stride(1),
-            cp.stride(0), cp.stride(1),
-            x.stride(0), x.stride(1),
+            a,
+            b,
+            cp,
+            x,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            cp.stride(0),
+            cp.stride(1),
+            x.stride(0),
+            x.stride(1),
             K=K,
         )
         return x
@@ -115,11 +129,11 @@ class ThomasSolve(torch.autograd.Function):
         """
         # Solve the system
         x = ThomasSolve._solve(a, b, c, d)
-        
+
         # Save tensors needed for backward pass
         # We need a, b, c for the transpose solve, and the solution x
         ctx.save_for_backward(a, b, c, x)
-        
+
         return x
 
     @staticmethod
@@ -128,13 +142,13 @@ class ThomasSolve(torch.autograd.Function):
         Backward pass: computes gradients for a, b, c, d.
         """
         a, b, c, x = ctx.saved_tensors
-        
+
         # Initialize gradients to None
         grad_a = grad_b = grad_c = grad_d = None
 
         # Check which inputs require gradients
         needs_grad = ctx.needs_input_grad
-        
+
         # If no inputs need gradients, we can exit early
         if not any(needs_grad):
             return None, None, None, None
@@ -144,19 +158,19 @@ class ThomasSolve(torch.autograd.Function):
         y = ThomasSolve._solve(a=c, b=b, c=a, d=grad_x)
 
         # Compute gradients based on the formulas derived
-        if needs_grad[3]: # Gradient for d
+        if needs_grad[3]:  # Gradient for d
             grad_d = y
-        
-        if needs_grad[0] or needs_grad[1] or needs_grad[2]: # Gradients for A
-            if needs_grad[1]: # Gradient for b
+
+        if needs_grad[0] or needs_grad[1] or needs_grad[2]:  # Gradients for A
+            if needs_grad[1]:  # Gradient for b
                 grad_b = -y * x
 
-            if needs_grad[2]: # Gradient for c
+            if needs_grad[2]:  # Gradient for c
                 grad_c = -y[:, :-1] * x[:, 1:]
 
-            if needs_grad[0]: # Gradient for a
+            if needs_grad[0]:  # Gradient for a
                 grad_a = -y[:, 1:] * x[:, :-1]
-        
+
         # Return gradients in the same order as forward inputs
         return grad_a, grad_b, grad_c, grad_d
 
@@ -179,8 +193,8 @@ def thomas_solve_cuda_t(a, b, c, d):
     common_device = b.device
     for t, name in zip([a, b, c, d], ["a", "b", "c", "d"]):
         if not isinstance(t, torch.Tensor):
-             raise TypeError(f"Input '{name}' must be a torch.Tensor.")
+            raise TypeError(f"Input '{name}' must be a torch.Tensor.")
         if t.device != common_device or t.dtype != common_dtype:
-             raise ValueError("All input tensors must have the same dtype and device.")
-    
+            raise ValueError("All input tensors must have the same dtype and device.")
+
     return ThomasSolve.apply(a, b, c, d)

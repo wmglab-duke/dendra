@@ -48,7 +48,6 @@ def _as_index_tensor(indices, n):
 
 
 class IntraStim(torch.nn.Module):
-
     def __init__(self, model, stims):
         """
         Initialize intracellular stimulation handler.
@@ -68,14 +67,11 @@ class IntraStim(torch.nn.Module):
 
         for stim, shape, idx in stims:
             if isinstance(stim, Waveform):
-                stim = stim.to(
-                    device=self.device, dtype=self.dtype
-                )
+                stim = stim.to(device=self.device, dtype=self.dtype)
                 stim = stim.expand(shape).reshape_for_intra()
             else:
                 raise TypeError(
-                    f"Unsupported stimulation type: {type(stim)}. "
-                    "Expected Waveform."
+                    f"Unsupported stimulation type: {type(stim)}. Expected Waveform."
                 )
             self.indices.append(idx)
             self.stims.append(stim)
@@ -113,8 +109,6 @@ class IntraStim(torch.nn.Module):
         for stim, idx in zip(stims, inds):
             intra[idx] += stim.squeeze()
         return intra
-
-
 
 
 class _IntraStim:

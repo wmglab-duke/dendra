@@ -8,10 +8,7 @@ import torch
 
 def expand_into_shape(src, index, shape, fill_value=torch.nan):
     # out is just temporary storage → no grad required
-    out = torch.full(shape,
-                     fill_value,
-                     dtype=src.dtype,
-                     device=src.device)
+    out = torch.full(shape, fill_value, dtype=src.dtype, device=src.device)
     out[index] = src
     return out
 
@@ -35,6 +32,7 @@ class IndexSpec:
     out_shape : Tuple[int, ...]
         What `array[key]` would return, **including** new axes.
     """
+
     index: Tuple[IndexElement, ...]
     is_scalar: bool
     shape: Tuple[int, ...]
@@ -62,14 +60,12 @@ def parse_key(key: Any, shape: Sequence[int], device) -> IndexSpec:
 
 
 class Slice:
-
     def __init__(self, model, index_spec: IndexSpec, base_shape=None):
-        self.model : torch.nn.Module = model
+        self.model: torch.nn.Module = model
         self.base_shape = base_shape
         if base_shape is None:
             self.base_shape = model.shape
         self.index_spec = index_spec
-
 
     @property
     def index(self) -> Tuple[IndexElement, ...]:
@@ -84,7 +80,7 @@ class Slice:
         Return the shape of the slice.
         """
         return self.index_spec.shape
-    
+
     @property
     def is_scalar(self) -> bool:
         """
@@ -102,7 +98,6 @@ class Slice:
     def name(self) -> str:
         return self.model.name
 
-
     def inspect(self, var: str, mechanism: Optional[str] = None) -> Any:
         """
         Inspect the variable in the model or a specific mechanism.
@@ -112,7 +107,9 @@ class Slice:
             mech = self.model.mech.mechanisms[mechanism]
             if mech.key is None:
                 return getattr(mech, var)[self.index_spec.index]
-            dummy = torch.tensor(torch.nan, device=self.model.device(), dtype=self.model.dtype())
+            dummy = torch.tensor(
+                torch.nan, device=self.model.device(), dtype=self.model.dtype()
+            )
             dummy = mech.put(getattr(mech, var), dummy, self.model.v)
             return dummy[self.index_spec.index]
         return getattr(self.model, var)[self.index_spec.index]
@@ -131,7 +128,9 @@ class Slice:
                 getattr(mech, var)[self.index_spec.index] = value
                 getattr(mech, var).detach_()
                 return
-            dummy = torch.tensor(torch.nan, device=self.model.device(), dtype=self.model.dtype())
+            dummy = torch.tensor(
+                torch.nan, device=self.model.device(), dtype=self.model.dtype()
+            )
             dummy = mech.put(getattr(mech, var), dummy, self.model.v)
             dummy[self.index_spec.index] = value
             getattr(mech, var).copy_(mech.get(dummy))
@@ -141,7 +140,9 @@ class Slice:
         getattr(self.model, var).detach_()
 
     def inject(self, waveform):
-        self.model.injections.append((waveform, self.index_spec.shape, self.index_spec.index))
+        self.model.injections.append(
+            (waveform, self.index_spec.shape, self.index_spec.index)
+        )
 
     def insert(self, mechanism, alias=None, ic=None, **kwargs):
         self.model.insert(mechanism, alias=alias, index_spec=self.index_spec, **kwargs)

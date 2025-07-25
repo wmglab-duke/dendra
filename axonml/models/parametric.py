@@ -12,14 +12,14 @@ def to_param(val):
     return torch.nn.Parameter(torch.as_tensor(val), requires_grad=False)
 
 
-def distribute_over(val, over='a'):
-    valid = {'p', 'c', 'pc'}
+def distribute_over(val, over="a"):
+    valid = {"p", "c", "pc"}
     if over not in valid:
-        raise ValueError('over must be one of {}'.format(valid))
+        raise ValueError("over must be one of {}".format(valid))
     val = torch.as_tensor(val)
-    if over == 'p':
+    if over == "p":
         return val[:, None]
-    elif over == 'c':
+    elif over == "c":
         return val[None, :]
     else:
         return val
@@ -31,13 +31,13 @@ class Functional(torch.nn.Module):
     This is useful for cases where you want to use a function as a parameter,
     such as in a neural network layer.
     """
-    
+
     def __init__(self, func: torch.nn.Module, fill=None, key=None):
         super(Functional, self).__init__()
         self.func = func
         self.fill = fill
         if key is not None:
-            self.register_buffer('key', torch.as_tensor(key, dtype=torch.long))
+            self.register_buffer("key", torch.as_tensor(key, dtype=torch.long))
         else:
             self.key = None
 
@@ -51,10 +51,7 @@ class Functional(torch.nn.Module):
 
 
 def build_parametrization(
-    module,
-    output,
-    key: torch.LongTensor,
-    main_shape: tuple[int, int]
+    module, output, key: torch.LongTensor, main_shape: tuple[int, int]
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     if key is None:
         return Functional(module)
@@ -63,9 +60,7 @@ def build_parametrization(
 
 
 def create_param_expander(
-    param: torch.Tensor,
-    key: torch.LongTensor,
-    main_shape: tuple[int, int]
+    param: torch.Tensor, key: torch.LongTensor, main_shape: tuple[int, int]
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Creates a specialized, efficient function to expand a parameter for indexed assignment.
@@ -105,6 +100,7 @@ def create_param_expander(
         # This is the simplest case. The expander is an identity function (with a reshape for safety).
         def expander(p: torch.Tensor) -> torch.Tensor:
             return p.reshape(num_keys)
+
         return expander
 
     # --- Condition 2: Scalar Parameter ---
@@ -112,11 +108,12 @@ def create_param_expander(
         # Expand the scalar to all key locations.
         def expander(p: torch.Tensor) -> torch.Tensor:
             return p.expand(num_keys)
+
         return expander
 
     # --- For broadcast cases, we need to know the unique rows/cols in the key ---
     # This setup is done only once, making the returned expander fast.
-    rows = torch.div(key, main_shape[1], rounding_mode='floor')
+    rows = torch.div(key, main_shape[1], rounding_mode="floor")
     cols = key % main_shape[1]
 
     unique_rows, row_inverse = torch.unique(rows, return_inverse=True)
@@ -129,6 +126,7 @@ def create_param_expander(
         def expander(p: torch.Tensor) -> torch.Tensor:
             # p[row_inverse] selects the correct row value for each key
             return p[row_inverse.to(p.device)].squeeze(-1)
+
         return expander
 
     # --- Condition 4: Column-Broadcast ---
@@ -138,6 +136,7 @@ def create_param_expander(
         def expander(p: torch.Tensor) -> torch.Tensor:
             # p[0, col_inverse] selects the correct column value for each key
             return p[0, col_inverse.to(p.device)]
+
         return expander
 
     # If none of the conditions were met, raise a helpful error.
@@ -151,20 +150,22 @@ def create_param_expander(
 
 class staticproperty:
     """A property whose value is independent of the instance."""
+
     def __init__(self, func):
-        self.func = func              # zero‑argument callable
+        self.func = func  # zero‑argument callable
 
     def __get__(self, obj, objtype=None):
-        return self.func()            # ignore obj / objtype
+        return self.func()  # ignore obj / objtype
 
 
 def add_instance_property(obj, name, func):
-    sub = type(f"_{obj.__class__.__name__}Proxy", (obj.__class__,), {
-        name: staticproperty(func)
-    })
-    obj.__class__ = sub           # replace the instance’s class in‑place
+    sub = type(
+        f"_{obj.__class__.__name__}Proxy",
+        (obj.__class__,),
+        {name: staticproperty(func)},
+    )
+    obj.__class__ = sub  # replace the instance’s class in‑place
 
-    
 
 class Referency(torch.nn.Module):
     def setreference(self, name, func):
@@ -172,7 +173,6 @@ class Referency(torch.nn.Module):
 
 
 class SimpleParameterized(Referency):
-    
     _params = {}
     _params_declarations = []
 
@@ -182,7 +182,7 @@ class SimpleParameterized(Referency):
         new_params = {}
 
         for base in reversed(cls.__mro__):
-            if '_params' in base.__dict__:
+            if "_params" in base.__dict__:
                 new_params.update(base._params)
 
         if SimpleParameterized._params_declarations:
@@ -197,13 +197,17 @@ class SimpleParameterized(Referency):
         self._check_kwargs(kwargs)
         self.params = self.__class__._params.copy()
         if kwargs:
-            self.params = {key: kwargs.get(key, value) for key, value in self.params.items()}
+            self.params = {
+                key: kwargs.get(key, value) for key, value in self.params.items()
+            }
         self.instantiate_parameters(**self.params)
 
     def _check_kwargs(self, kwargs):
         for key in kwargs:
             if key not in self._params:
-                raise ValueError(f"Unknown parameter: {key} for {self.__class__.__name__}. Valid parameters are: {list(self._params.keys())}")
+                raise ValueError(
+                    f"Unknown parameter: {key} for {self.__class__.__name__}. Valid parameters are: {list(self._params.keys())}"
+                )
 
     def instantiate_parameters(self, **kwargs):
         """
@@ -235,6 +239,7 @@ class Parameterized(Referency):
     A base class that allows subclasses to declare parameters which are
     automatically inherited and aggregated.
     """
+
     _global = {}
     _global_declarations = []
 
@@ -249,30 +254,30 @@ class Parameterized(Referency):
         # Call the parent's __init_subclass__ WITHOUT our custom kwargs,
         # as the base 'object' class does not accept them.
         super().__init_subclass__()
-        
+
         # Start with a fresh dictionary for the new class's parameters.
         new_global = {}
         new_range = {}
-        
+
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
             # We look for a _global attribute defined directly on the base
-            if '_global' in base.__dict__:
+            if "_global" in base.__dict__:
                 new_global.update(base._global)
-            if '_range' in base.__dict__:
+            if "_range" in base.__dict__:
                 new_range.update(base._range)
-        
+
         # Add parameters declared via the GLOBAL() method
         if Parameterized._global_declarations:
             for p_dict in Parameterized._global_declarations:
                 new_global.update(p_dict)
-            Parameterized._global_declarations = [] # Clear for next class
+            Parameterized._global_declarations = []  # Clear for next class
         # Add range declarations
         if Parameterized._range_declarations:
             for r_dict in Parameterized._range_declarations:
                 new_range.update(r_dict)
             Parameterized._range_declarations = []
-        
+
         # Add parameters from class definition keywords (e.g., a=10)
         # These will override anything set by parents.
         new_global.update(kwargs)
@@ -299,22 +304,26 @@ class Parameterized(Referency):
 
     def __init__(self, shape, additional_parameters=None, **kwargs):
         super().__init__()
-        self.shape  = shape
+        self.shape = shape
         self.params = self.__class__._global.copy()
-        self.range  = self.__class__._range.copy()
+        self.range = self.__class__._range.copy()
 
         self.in_graph_parametrizations = {}
 
         if kwargs:
-            self.params = {key: kwargs.get(key, value) for key, value in self.params.items()}
-            self.range  = {key: kwargs.get(key, value) for key, value in self.range.items()}
+            self.params = {
+                key: kwargs.get(key, value) for key, value in self.params.items()
+            }
+            self.range = {
+                key: kwargs.get(key, value) for key, value in self.range.items()
+            }
 
         self.keys = {}
         self.additional_parameters = {}
         self.instantiate_parameters(**self.params)
         self.instantiate_range(**self.range)
         self.instantiate_additional_parameters(additional_parameters)
-            
+
     def instantiate_parameters(self, **kwargs):
         # this is only called once, on __init__
         if kwargs is not None:
@@ -355,7 +364,7 @@ class Parameterized(Referency):
                 if name in self.range:
                     count = 0
                     keys = []
-                    for (alias, value, key) in list_of_aliases_values_and_keys:
+                    for alias, value, key in list_of_aliases_values_and_keys:
                         if alias is not None:
                             p_name = f"{name}_{alias}"
                         else:
@@ -365,13 +374,19 @@ class Parameterized(Referency):
                         parameter = to_param(value)
                         if isinstance(parameter, torch.nn.Module):
                             p = parameter(torch.empty(self.shape))
-                            parametrization = build_parametrization(p, parameter, key, self.shape)
-                            self.register_parametrization_in_graph(name, parametrization)
+                            parametrization = build_parametrization(
+                                p, parameter, key, self.shape
+                            )
+                            self.register_parametrization_in_graph(
+                                name, parametrization
+                            )
                             setattr(self, p_name, parameter)
                         else:
                             setattr(self, p_name, parameter)
                             fill = create_param_expander(parameter, key, self.shape)
-                            self.additional_parameters.setdefault(name, []).append((fill, getattr(self, p_name)))
+                            self.additional_parameters.setdefault(name, []).append(
+                                (fill, getattr(self, p_name))
+                            )
                             keys.append(key)
                     self.keys[name] = torch.cat(keys).to(torch.long)
 
@@ -384,8 +399,7 @@ class Parameterized(Referency):
 
     def populate_parameter_buffers(self):
         keys_to_process = itertools.chain(
-            self.__class__._global.keys(),
-            self.__class__._range.keys()
+            self.__class__._global.keys(), self.__class__._range.keys()
         )
         for name in keys_to_process:
             if not torch.is_tensor(getattr(self, name)):

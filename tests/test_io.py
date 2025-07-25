@@ -17,13 +17,17 @@ def test_is_neuron_installed_checker():
     # This will be True or False depending on the test environment
     assert isinstance(io.is_neuron_installed(), bool)
 
+
 @patch("axonml.models.io.NEURON_INSTALLED", False)
-@pytest.mark.parametrize("func, args", [
-    (io.lambda_f, (MagicMock(), 100)),
-    (io.apply_d_lambda, ([], 0.1)),
-    (io.read_swc, ("file.swc",)),
-    (io.read_neurolucida, ("file.asc",)),
-])
+@pytest.mark.parametrize(
+    "func, args",
+    [
+        (io.lambda_f, (MagicMock(), 100)),
+        (io.apply_d_lambda, ([], 0.1)),
+        (io.read_swc, ("file.swc",)),
+        (io.read_neurolucida, ("file.asc",)),
+    ],
+)
 def test_functions_raise_importerror_when_neuron_is_missing(func, args):
     """
     Verify that all NEURON-dependent functions raise ImportError if NEURON is not available.
@@ -52,13 +56,13 @@ def test_reorder_graph_by_patterns():
     G.add_node(4, name="other_part")
 
     patterns = {
-        'SOMA': r'soma',
-        'UNMYELIN': r'unmyelin',
-        'MYELIN': r'\bmyelin\b',
-        'AXON': r'axon',
+        "SOMA": r"soma",
+        "UNMYELIN": r"unmyelin",
+        "MYELIN": r"\bmyelin\b",
+        "AXON": r"axon",
     }
     # Note the order: SOMA, AXON, UNMYELIN, MYELIN
-    group_order = ['SOMA', 'AXON', 'UNMYELIN', 'MYELIN']
+    group_order = ["SOMA", "AXON", "UNMYELIN", "MYELIN"]
 
     G_reordered, mapping = io.reorder_graph_by_patterns(G, patterns, group_order)
 
@@ -69,8 +73,8 @@ def test_reorder_graph_by_patterns():
     # 3 (myelin) -> 3
     # 4 (other) -> 4
     assert list(G_reordered.nodes) == [0, 1, 2, 3, 4]
-    
-    original_names = {mapping[old_id]: G.nodes[old_id]['name'] for old_id in mapping}
+
+    original_names = {mapping[old_id]: G.nodes[old_id]["name"] for old_id in mapping}
     assert "soma" in original_names[0]
     assert "axon" in original_names[1] and "unmyelin" not in original_names[1]
     assert "unmyelin" in original_names[2]

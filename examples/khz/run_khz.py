@@ -20,7 +20,7 @@ def deltax(diam):
     return -8.215284e00 * diam**2 + 2.724201e02 * diam + -7.802411e02
 
 
-s_idx = 0    # deliver stimulation from contact 0
+s_idx = 0  # deliver stimulation from contact 0
 nodes = 101  # nodes of Ranvier per fiber
 
 
@@ -87,7 +87,9 @@ for _ in frequencies:
     input_diams.append(torch.tensor(diam, device="cuda").float())
 input_diams = torch.cat(input_diams)
 
-stim = ax.sin(amp=1.0, freq=np.repeat(frequencies, len(field_stack))[:, None], delay=0.5)
+stim = ax.sin(
+    amp=1.0, freq=np.repeat(frequencies, len(field_stack))[:, None], delay=0.5
+)
 field_stack = torch.tensor(field_stack).repeat(len(frequencies), 1)
 
 tstop = 100
@@ -97,16 +99,16 @@ dt = 0.001
 mrg = ax.SMF(input_diams, nodes).cuda().load("MRG")
 
 # intracellular stim to generate activity
-intra = ax.mono_rect(amp=2*nA, pw=0.1*ms).repeat(100*Hz, delay=50*ms)
+intra = ax.mono_rect(amp=2 * nA, pw=0.1 * ms).repeat(100 * Hz, delay=50 * ms)
 mrg[:, 5].inject(intra)
 
 count.reset()
 mrg.longrun(
-    tstop=tstop, 
-    dt=dt, 
-    extra=(field_stack, stim), 
-    chunklength=int(tstop/dt/args.chunks), 
-    callbacks=[count]
+    tstop=tstop,
+    dt=dt,
+    extra=(field_stack, stim),
+    chunklength=int(tstop / dt / args.chunks),
+    callbacks=[count],
 )
 all_n = count.numpy()
 

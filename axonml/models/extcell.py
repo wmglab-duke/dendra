@@ -23,9 +23,15 @@ class ExtCell(Axon):
         self.x[:] = self._x()
 
     def _register_buffers(self):
-        self.register_buffer("xraxial",     torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
-        self.register_buffer("xc",          torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0))
-        self.register_buffer("xg",          torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9))
+        self.register_buffer(
+            "xraxial", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9)
+        )
+        self.register_buffer(
+            "xc", torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0)
+        )
+        self.register_buffer(
+            "xg", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9)
+        )
 
     def _x(self):
         node_l = torch.atleast_2d(self.dx.squeeze())

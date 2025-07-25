@@ -4,24 +4,16 @@ from contextlib import ContextDecorator
 from axonml.helpers import DEBUG
 
 # default reversal potentials from NEURON
-REVERSAL = {
-    "ena": 50.0, 
-    "ek" : -77.0, 
-    "eca": 132.0
-}
+REVERSAL = {"ena": 50.0, "ek": -77.0, "eca": 132.0}
 
-VALENCES = {
-    "na": 1.0,
-    "k" : 1.0,
-    "ca": 2.0
-}
+VALENCES = {"na": 1.0, "k": 1.0, "ca": 2.0}
 
 # default initial concentrations from NEURON
 CINIT = {
     "nao0": 140.0,
     "nai0": 10.0,
-    "ko0" : 2.5,
-    "ki0" : 54.4,
+    "ko0": 2.5,
+    "ki0": 54.4,
     "cao0": 2.0,
     "cai0": 5e-5,
 }
@@ -130,7 +122,6 @@ FARADAY = 96485.33212331001
 
 
 class Ion(torch.nn.Module):
-
     __constants__ = "init_e_reversal", "advance_e"
 
     def __init__(self, name, shape, cstyle, estyle, einit, eadvance, cinit):
@@ -156,13 +147,27 @@ class Ion(torch.nn.Module):
         e = getattr(self, f"e{name}")
         ioni = getattr(self, f"{name}i")
         iono = getattr(self, f"{name}o")
-        setattr(self, f"i{name}", torch.full(i.shape, 0.0, dtype=i.dtype, device=i.device))
-        setattr(self, f"e{name}", torch.full(e.shape, self.e_init, dtype=e.dtype, device=e.device))
-        setattr(self, f"{name}i", torch.full(ioni.shape, self.i_init, dtype=ioni.dtype, device=ioni.device))
-        setattr(self, f"{name}o", torch.full(iono.shape, self.o_init, dtype=iono.dtype, device=iono.device))
+        setattr(
+            self, f"i{name}", torch.full(i.shape, 0.0, dtype=i.dtype, device=i.device)
+        )
+        setattr(
+            self,
+            f"e{name}",
+            torch.full(e.shape, self.e_init, dtype=e.dtype, device=e.device),
+        )
+        setattr(
+            self,
+            f"{name}i",
+            torch.full(ioni.shape, self.i_init, dtype=ioni.dtype, device=ioni.device),
+        )
+        setattr(
+            self,
+            f"{name}o",
+            torch.full(iono.shape, self.o_init, dtype=iono.dtype, device=iono.device),
+        )
         self.einit(celsius)
         self.detach()
-    
+
     def detach(self):
         name = self.name
         getattr(self, f"i{name}").detach_()
@@ -187,11 +192,15 @@ class Ion(torch.nn.Module):
         ioni_t = self._buffers[ioni]
 
         iono_t = torch.where(
-            iono_t <= 0, torch.tensor(1e-9, device=iono_t.device, dtype=iono_t.dtype), iono_t
+            iono_t <= 0,
+            torch.tensor(1e-9, device=iono_t.device, dtype=iono_t.dtype),
+            iono_t,
         )
         self._buffers[iono] = iono_t
         ioni_t = torch.where(
-            ioni_t <= 0, torch.tensor(1e-9, device=ioni_t.device, dtype=ioni_t.dtype), ioni_t
+            ioni_t <= 0,
+            torch.tensor(1e-9, device=ioni_t.device, dtype=ioni_t.dtype),
+            ioni_t,
         )
         self._buffers[ioni] = ioni_t
 

@@ -24,6 +24,7 @@ import pickle
 
 # --- This is the core logic ---
 
+
 def _cache_cpu_isa_list():
     """
     Checks for a cached CPU ISA string. If not found, runs the slow
@@ -35,9 +36,9 @@ def _cache_cpu_isa_list():
     platform_file = cache_dir / "platform.txt"
 
     def get_valid_vec_isa_list():
-        with open(cache_file, 'rb') as f:
+        with open(cache_file, "rb") as f:
             return pickle.load(f)
-    
+
     # --- Cache Hit ---
     if cache_file.exists():
         # Check if the PyTorch version matches the one used to create the cache.
@@ -54,13 +55,16 @@ def _cache_cpu_isa_list():
         start = time.time()
         valid_vec_isa_list = torch._inductor.cpu_vec_isa.valid_vec_isa_list()
         print(f"AxonML: CPU capability check took {(time.time() - start):.3f}s.")
-        with open(cache_file, 'wb') as f:
+        with open(cache_file, "wb") as f:
             pickle.dump(valid_vec_isa_list, f)
         platform_file.write_text(f"{torch.__version__}")
     except Exception as e:
-        warnings.warn(f"AxonML: CPU capability check failed: {e}. Falling back to default behavior.")
+        warnings.warn(
+            f"AxonML: CPU capability check failed: {e}. Falling back to default behavior."
+        )
         return
-    
+
+
 _cache_cpu_isa_list()
 
 # register trained models

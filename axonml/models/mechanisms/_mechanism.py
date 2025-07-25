@@ -13,7 +13,6 @@ from ..slice import Slice
 
 
 class Mechanism(Parameterized):
-
     """
     Mechanism is the base class for all mechanisms in AxonML.
     It provides a framework for defining state variables, ion channels,
@@ -62,7 +61,7 @@ class Mechanism(Parameterized):
         # Call the parent's __init_subclass__ WITHOUT our custom kwargs,
         # as the base 'object' class does not accept them.
         super().__init_subclass__(**kwargs)
-        
+
         # Start with a fresh dictionary for the new class's parameters.
         new_state = set()
         new_ion = set()
@@ -76,35 +75,35 @@ class Mechanism(Parameterized):
 
         new_currents = {}
         new_init = {}
-        
+
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
             # We look for a _params attribute defined directly on the base
-            if '_state' in base.__dict__:
+            if "_state" in base.__dict__:
                 new_state.update(base._state)
-            if '_ion' in base.__dict__:
+            if "_ion" in base.__dict__:
                 new_ion.update(base._ion)
-            if '_save' in base.__dict__:
+            if "_save" in base.__dict__:
                 new_save.update(base._save)
-            if '_assigned' in base.__dict__:
+            if "_assigned" in base.__dict__:
                 new_assigned.update(base._assigned)
-            if '_read_ion' in base.__dict__:
+            if "_read_ion" in base.__dict__:
                 new_read_ion.update(base._read_ion)
-            if '_write_ion' in base.__dict__:
+            if "_write_ion" in base.__dict__:
                 new_write_ion.update(base._write_ion)
-            if '_write_ion_c' in base.__dict__:
+            if "_write_ion_c" in base.__dict__:
                 new_write_ion_c.update(base._write_ion_c)
-            if '_currents' in base.__dict__:
+            if "_currents" in base.__dict__:
                 new_currents.update(base._currents)
-            if '_init' in base.__dict__:
+            if "_init" in base.__dict__:
                 new_init.update(base._init)
-            if '_explicit' in base.__dict__:
+            if "_explicit" in base.__dict__:
                 new_explicit.update(base._explicit)
 
         if Mechanism._state_declarations:
             for s_list in Mechanism._state_declarations:
                 new_state.update(s_list)
-            Mechanism._state_declarations = [] # Clear for next class
+            Mechanism._state_declarations = []  # Clear for next class
         if Mechanism._ion_declarations:
             for i_list in Mechanism._ion_declarations:
                 new_ion.update(i_list)
@@ -131,7 +130,7 @@ class Mechanism(Parameterized):
             Mechanism._write_ion_c_declarations = []
         if Mechanism._currents_declarations:
             for c_list in Mechanism._currents_declarations:
-                new_currents.setdefault('nonspecific', []).extend(c_list)
+                new_currents.setdefault("nonspecific", []).extend(c_list)
             Mechanism._currents_declarations = []
         if Mechanism._init_declarations:
             for i_dict in Mechanism._init_declarations:
@@ -156,15 +155,15 @@ class Mechanism(Parameterized):
 
     def __init__(
         self,
-        name:str, 
-        celsius, 
-        diameters, 
-        shape, 
+        name: str,
+        celsius,
+        diameters,
+        shape,
         key=None,
         is_composable=False,
         additional_parameters=None,
         ic: dict = None,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize the Mechanism with parameters and declarations.
@@ -174,15 +173,15 @@ class Mechanism(Parameterized):
             name = self.__class__._name or self.__class__.__name__
 
         self.name = name
-        
-        self.register_buffer('celsius', celsius)
+
+        self.register_buffer("celsius", celsius)
         self.base_ndim = 2
 
         if key is not None:
             if is_composable:
                 self.key = key
             else:
-                self.register_buffer('key', torch.tensor(key, dtype=torch.long))
+                self.register_buffer("key", torch.tensor(key, dtype=torch.long))
         else:
             self.key = None
 
@@ -193,14 +192,14 @@ class Mechanism(Parameterized):
                 # If tensor is scalar, return it directly
                 return tensor
             # Preserves batch dimensions by only flattening the base dimensions
-            batch_shape = tensor.shape[:-self.base_ndim]
+            batch_shape = tensor.shape[: -self.base_ndim]
             flat_tensor = tensor.reshape(*batch_shape, -1)
             # Select along the last dimension (the flattened base dimension)
             return flat_tensor.index_select(-1, self.key)
 
         def add_fancy_(tensor, what):
             # Use scatter_add_ for batched index_add_
-            batch_shape = tensor.shape[:-self.base_ndim]
+            batch_shape = tensor.shape[: -self.base_ndim]
             flat_tensor = tensor.reshape(*batch_shape, -1)
 
             what = what.expand_as(self.key)
@@ -208,65 +207,64 @@ class Mechanism(Parameterized):
             # Expand key to match batch dimensions for scatter
             # e.g., key shape [N] -> [B1, B2, ..., N]
             expanded_key = self.key.expand(*batch_shape, -1)
-            
+
             # what should have shape [B1, B2, ..., N]
             flat_tensor.scatter_add_(-1, expanded_key, what)
-            return tensor # Return original tensor for chaining
+            return tensor  # Return original tensor for chaining
 
         def add_fancy(tensor, what):
             # Use scatter_add for batched index_add
-            batch_shape = tensor.shape[:-self.base_ndim]
+            batch_shape = tensor.shape[: -self.base_ndim]
             flat_tensor = tensor.reshape(*batch_shape, -1)
 
             what = what.expand_as(self.key)
 
             # Expand key to match batch dimensions for scatter
             expanded_key = self.key.expand(*batch_shape, -1)
-            
+
             # what should have shape [B1, B2, ..., N]
             return flat_tensor.scatter_add(-1, expanded_key, what).reshape_as(tensor)
 
-
         if self.key is None:
-            self.get  = lambda tensor: tensor
+            self.get = lambda tensor: tensor
             self.add_ = lambda add_to, add_what: add_to.add_(add_what)
-            self.add  = lambda add_to, add_what: add_to.add(add_what)
-            self.put  = self.put_no_op
+            self.add = lambda add_to, add_what: add_to.add(add_what)
+            self.put = self.put_no_op
         elif self.is_composable:
-            self.get  = lambda tensor: tensor[..., *self.key] if tensor.ndim > 0 else tensor
+            self.get = (
+                lambda tensor: tensor[..., *self.key] if tensor.ndim > 0 else tensor
+            )
             self.add_ = lambda add_to, add_what: add_to[..., *self.key].add_(add_what)
-            self.add  = lambda add_to, add_what: add_to[..., *self.key].add(add_what)
-            self.put  = self.put_slice
+            self.add = lambda add_to, add_what: add_to[..., *self.key].add(add_what)
+            self.put = self.put_slice
         else:
-            self.get  = get_fancy
+            self.get = get_fancy
             self.add_ = add_fancy_
-            self.add  = add_fancy
-            self.put  = self.put_fancy
+            self.add = add_fancy
+            self.put = self.put_fancy
 
-        self.read_ion    = self._read_ion
+        self.read_ion = self._read_ion
         self.write_ion_c = self._write_ion_c
 
         states = [
             state(
-                self.get(celsius), 
-                self.get(diameters), 
-                key, 
-                shape, 
-                additional_parameters=additional_parameters, 
-                **kwargs
+                self.get(celsius),
+                self.get(diameters),
+                key,
+                shape,
+                additional_parameters=additional_parameters,
+                **kwargs,
             )
             for state in self._state
         ]
 
-        self.DE = torch.nn.ModuleDict(
-            {state._name: state for state in states}
-        )
+        self.DE = torch.nn.ModuleDict({state._name: state for state in states})
 
         self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
         if ic is not None:
             self._init_params.update(ic)
 
-        self.register_buffer('diam', diameters)
+        self.register_buffer("diam", diameters)
         for state in self.DE.values():
             for state_name in state._state:
                 self.register_buffer(state_name, torch.zeros(shape))
@@ -307,7 +305,7 @@ class Mechanism(Parameterized):
         ion_conc_o = ion_conc_o.expand_as(v)
         if clone:
             ion_conc_o = ion_conc_o.clone()
-            
+
         # Apply the update using Ellipsis
         ion_conc_o[..., self.key] = ion_conc_u
         return ion_conc_o
@@ -323,24 +321,24 @@ class Mechanism(Parameterized):
         # ion_conc_u: The new values to put, shape [..., len(key)]
         # ion_conc_o: The destination tensor, shape [..., *base_shape]
         # v: Reference tensor for shape
-        
+
         ion_conc_o = ion_conc_o.expand_as(v)
         if clone:
             ion_conc_o = ion_conc_o.clone()
-            
+
         # Get batch shape from the destination tensor
-        batch_shape = ion_conc_o.shape[:-self.base_ndim]
-        
+        batch_shape = ion_conc_o.shape[: -self.base_ndim]
+
         # Reshape destination to [B, S]
         flat_dest = ion_conc_o.view(*batch_shape, -1)
-        
+
         # Expand key to match batch dimensions for scatter
         expanded_key = self.key.expand(*batch_shape, -1)
-        
+
         # Use scatter to place the values from ion_conc_u into flat_dest
         # scatter_(dim, index, src)
         flat_dest.scatter_(-1, expanded_key, ion_conc_u)
-        
+
         # The original ion_conc_o tensor is modified in place, so we can just return it
         return ion_conc_o
 
@@ -349,7 +347,7 @@ class Mechanism(Parameterized):
         if name in self.read_ion:
             for v in self.read_ion[name]:
                 q = getattr(ion, v)
-                if (k:=self.key) is not None and q.ndim > 0:
+                if (k := self.key) is not None and q.ndim > 0:
                     self.register_buffer(v, self.get(q))
                     for _, s in self.DE.items():
                         s.register_buffer(v, self.get(q))
@@ -361,9 +359,11 @@ class Mechanism(Parameterized):
         if name in self.write_ion_c:
             for v in self.write_ion_c[name]:
                 q = getattr(ion, v)
-                if (k:=self.key) is not None and q.ndim > 0:
+                if (k := self.key) is not None and q.ndim > 0:
                     qk = self.get(q)
-                    self.register_buffer(v, torch.empty(qk.shape, device=qk.device, dtype=qk.dtype))
+                    self.register_buffer(
+                        v, torch.empty(qk.shape, device=qk.device, dtype=qk.dtype)
+                    )
                     getattr(self, v).copy_(qk)
                 else:
                     self.register_buffer(v, q)
@@ -373,13 +373,19 @@ class Mechanism(Parameterized):
             state_names = state_module._state
             for state_name in state_names:
                 if state_name in self._init_params:
-                    buffer_tensor = torch.tensor(
-                        self._init_params[state_name], device=v_init.device, dtype=v_init.dtype
-                    ).expand_as(v_init).clone()
+                    buffer_tensor = (
+                        torch.tensor(
+                            self._init_params[state_name],
+                            device=v_init.device,
+                            dtype=v_init.dtype,
+                        )
+                        .expand_as(v_init)
+                        .clone()
+                    )
                     setattr(self, state_name, buffer_tensor)
                     buffer_tensor.detach_()
                 else:
-                    if hasattr(state_module, 'inf'):
+                    if hasattr(state_module, "inf"):
                         inf = state_module.inf(v_init)
                         buffer_tensor = inf[state_name]
                         setattr(self, state_name, buffer_tensor)
@@ -411,8 +417,10 @@ class Mechanism(Parameterized):
 
         if not read and not write:
             return
-        
-        assert ion in VALENCES, f"Unknown ion {ion}. Valid ions are {list(VALENCES.keys())}."
+
+        assert ion in VALENCES, (
+            f"Unknown ion {ion}. Valid ions are {list(VALENCES.keys())}."
+        )
 
         if f"e{ion}" in write:
             raise ValueError(f"e{ion} cannot be written")
@@ -426,7 +434,7 @@ class Mechanism(Parameterized):
             assert r in valid, f"read {r} is not valid"
         for w in write or []:
             assert w in valid, f"write {w} is not valid"
-        
+
         if read:
             Mechanism._read_ion_declarations.append({ion: read})
 
@@ -470,7 +478,10 @@ class Mechanism(Parameterized):
 
     def _advance(self, v, dt):
         for state_module in self.DE.values():
-            states = {state_name: self._buffers[state_name] for state_name in state_module._state}
+            states = {
+                state_name: self._buffers[state_name]
+                for state_name in state_module._state
+            }
             local = state_module.advance(v, dt, states)
             self._buffers.update(local)
 
@@ -548,13 +559,14 @@ class VoltageProcess(Mechanism):
 class PointProcess(Mechanism):
     """
     A PointProcess is a Mechanism that delivers a lumped current (units nA)
-    to a single point in space. Channel conductances must be in units uS. 
-    
+    to a single point in space. Channel conductances must be in units uS.
+
     Implementing a Mechanism as PointProcess simply instructs AxonML to scale
     the currents and conductances by the area of the relevant compartments to translate
-    them to densities. As such, unlike in NEURON, they cannot be inserted at branchpoints 
+    them to densities. As such, unlike in NEURON, they cannot be inserted at branchpoints
     (which have 0 area).
     """
+
     pass
 
 
@@ -563,10 +575,10 @@ class Synapse(Mechanism):
         """
         This method is called when the synapse receives a spike.
         It should be overridden in subclasses to implement specific behavior.
-        
+
         Args:
             weight (torch.Tensor): The weight of the synapse.
-        
+
         Returns:
             None
         """
@@ -604,15 +616,15 @@ def rename(mechanism, new_name=None, suffix=None):
     if suffix is not None:
         if not isinstance(suffix, str):
             raise TypeError("Suffix must be a string.")
-        new_name += f'_{suffix}'
-    
+        new_name += f"_{suffix}"
+
     # Copy the original class's namespace dictionary.
     class_dict = dict(mechanism.__dict__)
 
     # The __dict__ of a class doesn't always include '__module__',
     # so we copy it over explicitly to make the new class look authentic.
-    if '__module__' not in class_dict:
-        class_dict['__module__'] = mechanism.__module__
+    if "__module__" not in class_dict:
+        class_dict["__module__"] = mechanism.__module__
 
     new_class = type(new_name, mechanism.__bases__, class_dict)
     new_class._name = new_name  # Set the new name attribute

@@ -260,10 +260,10 @@ def interp1d(x, y, xnew, out=None):
         # now build the linear interpolation
         ynew = sel("y") + sel("slopes") * (v["xnew"] - sel("x"))
 
-        x_min = v["x"][:, :1]          # shape (D,1)
-        x_max = v["x"][:, -1:]         # shape (D,1)
-        y_min = v["y"][:, :1]          # first column of y (same row as x)
-        y_max = v["y"][:, -1:]         # last  column of y
+        x_min = v["x"][:, :1]  # shape (D,1)
+        x_max = v["x"][:, -1:]  # shape (D,1)
+        y_min = v["y"][:, :1]  # first column of y (same row as x)
+        y_max = v["y"][:, -1:]  # last  column of y
 
         # left of domain → y_min, right of domain → y_max
         ynew = torch.where(v["xnew"] < x_min, y_min.expand_as(ynew), ynew)
@@ -428,7 +428,6 @@ def interp1d_z(x, y, xnew, out=None):
             ynew = ynew.view(original_xnew_shape)
 
     return ynew
-
 
 
 import time

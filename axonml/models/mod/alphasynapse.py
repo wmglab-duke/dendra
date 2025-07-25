@@ -6,7 +6,7 @@ from ..mechanisms.ops import *
 
 
 class alphasynapse(M):
-    M.RANGE(onset=0.0, tau=0.1, gmax=0.0, e=0.0)    
+    M.RANGE(onset=0.0, tau=0.1, gmax=0.0, e=0.0)
     M.NONSPECIFIC_CURRENT("i")
 
     @property
@@ -32,7 +32,7 @@ def alpha(x: torch.Tensor) -> torch.Tensor:
     """
     # Calculate the value for the 'else' case: x * exp(1 - x)
     y_calc = x * torch.exp(1.0 - x)
-    
+
     # Define the condition for the 'if' case.
     condition = (x < 0.0) | (x > 10.0)
 

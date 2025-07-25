@@ -3,6 +3,7 @@ from IPython import get_ipython
 from IPython.core.oinspect import Inspector
 from typing import Any, Optional, List, Tuple
 
+
 # ---------------------------------------------------------------------------
 # tiny helpers for the inspector fall-back
 # ---------------------------------------------------------------------------
@@ -10,7 +11,7 @@ def _ipython_source(obj) -> Optional[str]:
     """Return source text via IPython Inspector, or None if unavailable."""
     insp = Inspector()
     # Newer IPython (≥ 7.17) ----------------------------
-    if hasattr(insp, "getsourcelines"):          # returns (lines, lineno)
+    if hasattr(insp, "getsourcelines"):  # returns (lines, lineno)
         try:
             lines, _ = insp.getsourcelines(obj)
             return "".join(lines)
@@ -51,7 +52,7 @@ def safe_source(obj: Any, *, strip_decorators: bool = False) -> str:
     # 3. Pull the defining cell from history --------------------------------
     ip = get_ipython()
     if ip and hasattr(obj, "__code__"):
-        fn = obj.__code__.co_filename         # e.g. "<ipython-input-17-abc123>"
+        fn = obj.__code__.co_filename  # e.g. "<ipython-input-17-abc123>"
         if fn.startswith("<ipython-input-"):
             m = re.match(r"<ipython-input-(\d+)-", fn)
             if m:
@@ -59,8 +60,7 @@ def safe_source(obj: Any, *, strip_decorators: bool = False) -> str:
                 src = ip.user_ns["In"][cell_num]
                 if strip_decorators:
                     src = "\n".join(
-                        l for l in src.splitlines()
-                        if not l.lstrip().startswith("@")
+                        l for l in src.splitlines() if not l.lstrip().startswith("@")
                     )
                 return src
 

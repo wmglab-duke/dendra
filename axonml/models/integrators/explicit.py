@@ -44,10 +44,12 @@ class _euler(Integrator):
             p.requires_grad = False
 
     def initialize(self, model, dt) -> None:
-        dx = model.dx / 10000.0                                  # Convert to cm
-        area = torch.pi * (model.diam / 10000.0) * dx            # Convert to cm^2
-        cm = model.cm / 1000.0 * area                            # Convert to F/cm^2
-        ra = (model.rhoa * dx) / (torch.pi * (model.diameters[:, None] / 20000.0) ** 2) # Convert to Ohm
+        dx = model.dx / 10000.0  # Convert to cm
+        area = torch.pi * (model.diam / 10000.0) * dx  # Convert to cm^2
+        cm = model.cm / 1000.0 * area  # Convert to F/cm^2
+        ra = (model.rhoa * dx) / (
+            torch.pi * (model.diameters[:, None] / 20000.0) ** 2
+        )  # Convert to Ohm
         self.cm_inv = 1.0 / cm
         self.ra_inv = 1.0 / ra
         self.cm_c = cm
@@ -184,14 +186,7 @@ def ssd_df(v_c, v_p, v_e):
     v_c_p = F.pad(v_c, (1, 1), "reflect")
     v_e_p = F.pad(v_e, (1, 1), "reflect")
 
-    ret = (
-        v_c_p[:, :-2]
-        + v_c_p[:, 2:]
-        - v_p
-        + v_e_p[:, 2:]
-        + v_e_p[:, :-2]
-        - 2 * v_e
-    )
+    ret = v_c_p[:, :-2] + v_c_p[:, 2:] - v_p + v_e_p[:, 2:] + v_e_p[:, :-2] - 2 * v_e
 
     return ret
 
@@ -199,11 +194,7 @@ def ssd_df(v_c, v_p, v_e):
 def ssd_df_no_ve(v_c, v_p):
     v_c_p = F.pad(v_c, (1, 1), "reflect")
 
-    ret = (
-        v_c_p[:, :-2]
-        + v_c_p[:, 2:]
-        - v_p
-    )
+    ret = v_c_p[:, :-2] + v_c_p[:, 2:] - v_p
 
     return ret
 
@@ -239,15 +230,13 @@ class _dufort_frankel_homogeneous(Integrator):
     def __init__(self, model, mech, beta=1.0, smooth_every=100, conv=False, imem=None):
         super().__init__(model, mech, imem)
 
-        model.register_buffer(
-            "v_prev", torch.full((model.np, model.nc), model.v_init)
-        )
+        model.register_buffer("v_prev", torch.full((model.np, model.nc), model.v_init))
 
         self.register_buffer("area", torch.tensor(0.0))
-        self.register_buffer("s1",   torch.tensor(0.0))
-        self.register_buffer("s2",   torch.tensor(0.0))
-        self.register_buffer("s3",   torch.tensor(0.0))
-        self.register_buffer("s4",   torch.tensor(0.0))
+        self.register_buffer("s1", torch.tensor(0.0))
+        self.register_buffer("s2", torch.tensor(0.0))
+        self.register_buffer("s3", torch.tensor(0.0))
+        self.register_buffer("s4", torch.tensor(0.0))
 
         self.smooth_every = smooth_every
         self.beta = beta
@@ -284,7 +273,7 @@ class _dufort_frankel_homogeneous(Integrator):
         cm = (model.cm / 1e3) * self.area
         dx = model.dx / 10000
         radii = model.diam / 20000
-        ra = (model.rhoa * dx) / (torch.pi * radii ** 2)
+        ra = (model.rhoa * dx) / (torch.pi * radii**2)
         self.s1 = 2 * dt / cm
         self.s2 = self.s1 / ra
         self.s3 = self.area * self.s1
@@ -292,10 +281,10 @@ class _dufort_frankel_homogeneous(Integrator):
         self.f64 = model.dtype() == torch.float64
         self.ve_zero = torch.zeros_like(model.v)
         if self.conv:
-            self.method_intra    = self._step_intra_conv
+            self.method_intra = self._step_intra_conv
             self.method_no_intra = self._step_no_intra_conv
         else:
-            self.method_intra    = self._step_intra
+            self.method_intra = self._step_intra
             self.method_no_intra = self._step_no_intra
 
     def step(self, model, dt, ve=None, intra=None):
@@ -329,13 +318,12 @@ class _dufort_frankel_homogeneous(Integrator):
                 dt,
                 model.celsius,
                 intra,
-                model.t_ind
+                model.t_ind,
             )
 
     def _step_no_intra(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-    
         if ve is None:
             d2v = ssd_df_no_ve(v, v_prev)
         else:
@@ -382,7 +370,6 @@ class _dufort_frankel_homogeneous(Integrator):
     def _step_intra(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         if ve is None:
             d2v = s2 * ssd_df_no_ve(v, v_prev)
         else:
@@ -431,12 +418,23 @@ class _dufort_frankel_homogeneous(Integrator):
         return v_new, v
 
     def init_v(self, model):
-        model.v = torch.full(model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device)
+        model.v = torch.full(
+            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
+        )
         model.v.detach_()
-        model.v_prev = torch.full(model.v_prev.shape, model.v_init, dtype=model.v_prev.dtype, device=model.v_prev.device)
+        model.v_prev = torch.full(
+            model.v_prev.shape,
+            model.v_init,
+            dtype=model.v_prev.dtype,
+            device=model.v_prev.device,
+        )
         model.v_prev.detach_()
         if self.imem:
-            model.i_membrane = torch.zeros(model.i_membrane.shape, dtype=model.i_membrane.dtype, device=model.i_membrane.device)
+            model.i_membrane = torch.zeros(
+                model.i_membrane.shape,
+                dtype=model.i_membrane.dtype,
+                device=model.i_membrane.device,
+            )
             model.i_membrane.detach_()
 
     def detach(self, model):
@@ -457,19 +455,17 @@ class _dufort_frankel(Integrator):
     def __init__(self, model, mech, beta=1.0, smooth_every=100, imem=None):
         super().__init__(model, mech, imem)
 
-        model.register_buffer(
-            "v_prev", torch.full((model.np, model.nc), model.v_init)
-        )
+        model.register_buffer("v_prev", torch.full((model.np, model.nc), model.v_init))
 
         self.register_buffer("area", torch.tensor(0.0))
-        self.register_buffer("s1",   torch.tensor(0.0))
-        self.register_buffer("s3",   torch.tensor(0.0))
-        
+        self.register_buffer("s1", torch.tensor(0.0))
+        self.register_buffer("s3", torch.tensor(0.0))
+
         # These coefficients will hold the heterogeneous coupling factors.
         self.register_buffer("c_axial", torch.tensor(0.0))
-        self.register_buffer("c_left",  torch.tensor(0.0))
+        self.register_buffer("c_left", torch.tensor(0.0))
         self.register_buffer("c_right", torch.tensor(0.0))
-        
+
         self.smooth_every = smooth_every
         self.beta = beta
         self.f64 = False
@@ -487,7 +483,7 @@ class _dufort_frankel(Integrator):
 
     def initialize(self, model, dt) -> None:
         # Units are critical here. We'll work in [V, A, s, F, Ohm, cm].
-        
+
         # Total area of each compartment [cm^2]
         self.area = torch.pi * (model.diam / 10000.0) * (model.dx / 10000.0)
         # Total capacitance of each compartment [F]
@@ -497,22 +493,22 @@ class _dufort_frankel(Integrator):
         dx_cm = model.dx / 10000.0
         radii_cm = model.diam / 20000.0
         # rhoa [Ohm-cm], dx [cm], radii [cm] -> ra [Ohm]
-        ra_comp = (model.rhoa * dx_cm) / (torch.pi * radii_cm ** 2)
+        ra_comp = (model.rhoa * dx_cm) / (torch.pi * radii_cm**2)
 
         # Resistance between compartment centers [Ohm]
         # This is the average of two half-compartment resistances.
         ra_padded = F.pad(ra_comp, (1, 1), "reflect")
-        r_left  = 0.5 * (ra_padded[:, :-2] + ra_padded[:, 1:-1])
+        r_left = 0.5 * (ra_padded[:, :-2] + ra_padded[:, 1:-1])
         r_right = 0.5 * (ra_padded[:, 1:-1] + ra_padded[:, 2:])
-        
+
         # Conductance between compartment centers [S, or 1/Ohm]
-        g_left  = 1.0 / r_left
+        g_left = 1.0 / r_left
         g_right = 1.0 / r_right
-        
+
         # --- Define the core Dufort-Frankel coefficients ---
         # s1 is a coefficient used for scaling currents.
         self.s1 = (2 * dt) / cm_total
-        self.s3 = self.area * self.s1 # Scales current density [uA/cm^2]
+        self.s3 = self.area * self.s1  # Scales current density [uA/cm^2]
 
         # C_left/C_right are the coupling terms for neighboring voltages.
         self.c_left = self.s1 * g_left
@@ -537,22 +533,20 @@ class _dufort_frankel(Integrator):
     def _step_no_intra(
         self, v, v_prev, ve, dt, temp, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-    
-        v_padded  = F.pad(v, (1, 1), "reflect")
+        v_padded = F.pad(v, (1, 1), "reflect")
 
         # --- Numerator Calculation ---
         # Contribution from previous voltage (v_prev)
         num_v_prev = v_prev * (1 - self.c_axial)
-        
+
         # Contribution from neighboring voltages (v)
         num_axial_v = self.c_left * v_padded[:, :-2] + self.c_right * v_padded[:, 2:]
-        
+
         # Contribution from external potential (ve) - this is a standard central difference
         if ve is not None:
             ve_padded = F.pad(ve, (1, 1), "reflect")
-            num_axial_ve = (
-                self.c_left * (ve_padded[:, :-2] - ve) +
-                self.c_right * (ve_padded[:, 2:] - ve)
+            num_axial_ve = self.c_left * (ve_padded[:, :-2] - ve) + self.c_right * (
+                ve_padded[:, 2:] - ve
             )
             num = num_v_prev + num_axial_v + num_axial_ve
         else:
@@ -574,7 +568,9 @@ class _dufort_frankel(Integrator):
 
         if self.smoothing and (t_ind + 1) % self.smooth_every == 0:
             # unsqueeze/squeeze needed for Conv1d which expects (N, C, L)
-            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new.unsqueeze(1)).squeeze(1)
+            v_new = self.beta * v_new + (1 - self.beta) * self.filter(
+                v_new.unsqueeze(1)
+            ).squeeze(1)
 
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
@@ -585,7 +581,6 @@ class _dufort_frankel(Integrator):
     def _step_intra(
         self, v, v_prev, ve, dt, temp, intra, t_ind: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         # This method is identical to _step_no_intra, with one change:
         # The stimulus current `intra` is added to the numerator.
         v_padded = F.pad(v, (1, 1), "reflect")
@@ -595,18 +590,19 @@ class _dufort_frankel(Integrator):
 
         if ve is not None:
             ve_padded = F.pad(ve, (1, 1), "reflect")
-            num_axial_ve = (
-                self.c_left * (ve_padded[:, :-2] - ve) +
-                self.c_right * (ve_padded[:, 2:] - ve)
+            num_axial_ve = self.c_left * (ve_padded[:, :-2] - ve) + self.c_right * (
+                ve_padded[:, 2:] - ve
             )
             num = num_v_prev + num_axial_v + num_axial_ve
         else:
             num = num_v_prev + num_axial_v
 
-        self.mech.advance(v, dt, temp)        
+        self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
         i_ion_stim = i_ion * self.area - intra
-        num_ion = -self.s1 * i_ion_stim  # Note: we use s1 here since i_ion_stim is in Amps
+        num_ion = (
+            -self.s1 * i_ion_stim
+        )  # Note: we use s1 here since i_ion_stim is in Amps
 
         numerator = num + num_ion
 
@@ -617,7 +613,9 @@ class _dufort_frankel(Integrator):
         self.mech.itot(v)
 
         if self.smoothing and (t_ind + 1) % self.smooth_every == 0:
-            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new.unsqueeze(1)).squeeze(1)
+            v_new = self.beta * v_new + (1 - self.beta) * self.filter(
+                v_new.unsqueeze(1)
+            ).squeeze(1)
 
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
@@ -627,12 +625,23 @@ class _dufort_frankel(Integrator):
 
     # The rest of the class methods (init_v, detach) do not need changes.
     def init_v(self, model):
-        model.v = torch.full(model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device)
+        model.v = torch.full(
+            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
+        )
         model.v.detach_()
-        model.v_prev = torch.full(model.v_prev.shape, model.v_init, dtype=model.v_prev.dtype, device=model.v_prev.device)
+        model.v_prev = torch.full(
+            model.v_prev.shape,
+            model.v_init,
+            dtype=model.v_prev.dtype,
+            device=model.v_prev.device,
+        )
         model.v_prev.detach_()
         if self.imem:
-            model.i_membrane = torch.zeros(model.i_membrane.shape, dtype=model.i_membrane.dtype, device=model.i_membrane.device)
+            model.i_membrane = torch.zeros(
+                model.i_membrane.shape,
+                dtype=model.i_membrane.dtype,
+                device=model.i_membrane.device,
+            )
             model.i_membrane.detach_()
 
     def detach(self, model):

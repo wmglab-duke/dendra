@@ -43,7 +43,7 @@ def undirected_weighted_lengths(G: nx.DiGraph, origin, targets, weight_attr="L")
         An iterable of node labels for which you want distances.
     weight_attr : str, optional
         Name of the edge attribute that stores the length/weight. Default: "L".
-    
+
     Returns
     -------
     dict
@@ -55,10 +55,9 @@ def undirected_weighted_lengths(G: nx.DiGraph, origin, targets, weight_attr="L")
     UG = G.to_undirected(as_view=True)
 
     # One Dijkstra run from the origin gives all lengths in O((V+E) log V)
-    lengths = nx.single_source_dijkstra_path_length(UG,
-                                                    source=origin,
-                                                    weight=weight_attr)
+    lengths = nx.single_source_dijkstra_path_length(
+        UG, source=origin, weight=weight_attr
+    )
 
     # Return only the distances you asked for
     return torch.tensor([lengths.get(t, float("inf")) for t in targets])
-    

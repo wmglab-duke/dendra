@@ -34,10 +34,16 @@ class Integrator(torch.nn.Module):
         return (np, nc)
 
     def init_v(self, model):
-        model.v = torch.full(model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device)
+        model.v = torch.full(
+            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
+        )
         model.v.detach_()
         if self.imem:
-            model.i_membrane = torch.zeros(model.i_membrane.shape, dtype=model.i_membrane.dtype, device=model.i_membrane.device)
+            model.i_membrane = torch.zeros(
+                model.i_membrane.shape,
+                dtype=model.i_membrane.dtype,
+                device=model.i_membrane.device,
+            )
             model.i_membrane.detach_()
 
     def detach(self, model):
@@ -63,10 +69,16 @@ class SCIntegrator(torch.nn.Module):
         return (np, nc)
 
     def init_v(self, model):
-        model.v = torch.full(model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device)
+        model.v = torch.full(
+            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
+        )
         model.v.detach_()
         if self.imem:
-            model.i_membrane = torch.zeros(model.i_membrane.shape, dtype=model.i_membrane.dtype, device=model.i_membrane.device)
+            model.i_membrane = torch.zeros(
+                model.i_membrane.shape,
+                dtype=model.i_membrane.dtype,
+                device=model.i_membrane.device,
+            )
             model.i_membrane.detach_()
 
     def detach(self, model):

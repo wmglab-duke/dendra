@@ -291,7 +291,7 @@ class _krylov_etd1(Integrator):
 
         if intra is not None:
             f_n = f_n + intra
-        
+
         diag = self.diag - gtot
         v_lin = self._expm(
             v,
@@ -314,7 +314,7 @@ class _krylov_etd1(Integrator):
             self.H_buf,
             self.eye_m,
         )
-        return (v_lin + v_nl)
+        return v_lin + v_nl
 
     def detach(self, model):
         model.v = model.v.detach()

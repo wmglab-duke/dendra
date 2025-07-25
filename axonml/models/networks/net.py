@@ -45,7 +45,13 @@ def step_pop(integrator, model, dt, ve=None, intra=None):
     model.t = model.t + dt
 
 
-def step(populations, synapses, dt, ve: Dict[str, torch.Tensor | None]={}, intra: Dict[str, torch.Tensor | None]={}):
+def step(
+    populations,
+    synapses,
+    dt,
+    ve: Dict[str, torch.Tensor | None] = {},
+    intra: Dict[str, torch.Tensor | None] = {},
+):
     for s in synapses.values():
         s.advance()
     for n, pop in populations.items():
@@ -53,9 +59,17 @@ def step(populations, synapses, dt, ve: Dict[str, torch.Tensor | None]={}, intra
 
 
 def get_local_index(population, mech, index):
-    indices = torch.full_like(population.v, -1, dtype=torch.long, device=population.device()).flatten()
+    indices = torch.full_like(
+        population.v, -1, dtype=torch.long, device=population.device()
+    ).flatten()
     mech_key_flat = to_flat_idx_torch(population.v, mech.key)
-    indices.index_copy_(0, mech_key_flat, torch.arange(mech_key_flat.numel(), device=population.device(), dtype=torch.long))
+    indices.index_copy_(
+        0,
+        mech_key_flat,
+        torch.arange(
+            mech_key_flat.numel(), device=population.device(), dtype=torch.long
+        ),
+    )
     return indices.index_select(0, index)
 
 
@@ -72,15 +86,19 @@ def prepare_indices_one_one(source, target, synapse):
     post_idx = to_flat_idx_torch(target_model.v, target.index)
 
     if not torch.all(torch.isin(post_idx, indices_in_synapse)):
-        raise ValueError(f"Target population '{target.name}' does not have the synapse '{synapse}' at all target locations.")
-    
+        raise ValueError(
+            f"Target population '{target.name}' does not have the synapse '{synapse}' at all target locations."
+        )
+
     pre_idx = to_flat_idx_torch(source_model.v, source.index)
     post_idx = get_local_index(target_model, syn, post_idx)
 
     return pre_idx, post_idx
 
 
-def prepare_indices_one_one_flat(source_model, source_index, target_model, target_index, synapse):
+def prepare_indices_one_one_flat(
+    source_model, source_index, target_model, target_index, synapse
+):
     """
     Prepares indices for a one-to-one connection between source and target populations.
     This function assumes that the synapse exists at all target locations.
@@ -97,7 +115,9 @@ def prepare_indices_one_one_flat(source_model, source_index, target_model, targe
     post_idx = target_index
 
     if not torch.all(torch.isin(post_idx, indices_in_synapse)):
-        raise ValueError(f"Target population '{target_model.name}' does not have the synapse '{synapse}' at all target locations.")
+        raise ValueError(
+            f"Target population '{target_model.name}' does not have the synapse '{synapse}' at all target locations."
+        )
 
     post_idx = get_local_index(target_model, syn, post_idx)
 
@@ -122,10 +142,14 @@ def check_weight_shape(weight, pre_idx):
                 return len(pre_idx)
             if weight.shape[0] == len(pre_idx):
                 return 1
-            raise ValueError(f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}.")
+            raise ValueError(
+                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
+            )
     if hasattr(weight, "__len__"):
         if len(weight) != len(pre_idx):
-            raise ValueError(f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}.")
+            raise ValueError(
+                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
+            )
         return 1
     raise TypeError(f"Unsupported type for weight: {type(weight)}.")
 
@@ -137,14 +161,14 @@ def expand(value, n):
 
 
 def make_weight(weights, n):
-
     class ParameterOrDistributionWrapper(torch.nn.Module):
         """A simple wrapper for parameters or distributions that can be sampled."""
+
         def __init__(self, param):
             super().__init__()
             # nn.Parameter() is idempotent, so it's safe to call on an existing parameter.
             self.param = param
-            
+
         def sample(self, n):
             if isinstance(self.param, torch.Tensor):
                 return self.param.repeat(n)
@@ -154,15 +178,15 @@ def make_weight(weights, n):
     class WeightExpander(torch.nn.Module):
         def __init__(self, weights, n):
             super(WeightExpander, self).__init__()
-            self.weights = torch.nn.ModuleList([
-                ParameterOrDistributionWrapper(w) for w in weights
-            ])
+            self.weights = torch.nn.ModuleList(
+                [ParameterOrDistributionWrapper(w) for w in weights]
+            )
             self.n = n
             self.register_buffer("w", torch.empty(0))
 
         def forward(self):
             return self.w
-        
+
         def init(self, reinit=True):
             if reinit or not self.w.numel():
                 self.w = torch.cat([w.sample(n) for w, n in zip(self.weights, self.n)])
@@ -174,6 +198,7 @@ class Network(torch.nn.Module):
     """
     Base class for networks in AxonML.
     """
+
     def __init__(self, populations: Dict[str, Population]):
         super(Network, self).__init__()
         self.populations = populations
@@ -192,24 +217,24 @@ class Network(torch.nn.Module):
         self.fullgraph = bool(FULLGRAPH)
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
-        self.compile_mode = COMPILE_MODE.value 
+        self.compile_mode = COMPILE_MODE.value
 
         torch._dynamo.reset()
 
         if self.jit:
             self._step = torch.compile(
-                step, 
-                backend   = self.backend,
-                fullgraph = self.fullgraph,
-                dynamic   = self.dynamic, 
-                mode      = self.compile_mode,
+                step,
+                backend=self.backend,
+                fullgraph=self.fullgraph,
+                dynamic=self.dynamic,
+                mode=self.compile_mode,
             )
         else:
             self._step = torch.compile(
                 step,
-                backend   = 'eager',
+                backend="eager",
             )
-        
+
         self.eval()
 
     def train(self, mode=True):
@@ -230,7 +255,7 @@ class Network(torch.nn.Module):
             pop.eval()
         self.training = False
         return self
-    
+
     def eval_(self):
         self.eval()
 
@@ -254,8 +279,17 @@ class Network(torch.nn.Module):
         self.synapses.clear()
         self.built = False
 
-    def _connect(self, source_pop, source_idx, target_pop, target_idx, synapse: str,
-                 threshold=0.0, weight=1.0, delay=0.0):
+    def _connect(
+        self,
+        source_pop,
+        source_idx,
+        target_pop,
+        target_idx,
+        synapse,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+    ):
         """
         Internal method to connect two populations with a synapse.
         """
@@ -263,14 +297,24 @@ class Network(torch.nn.Module):
         n_weight = check_weight_shape(weight, source_idx)
         n_delay = check_weight_shape(delay, source_idx)
 
-
         # Add the connection to the synapse specification
-        self.synapse_spec.setdefault((source_pop.name, target_pop.name, synapse), []).append(
-            (source_idx, target_idx, threshold, n_threshold, to_param(weight), n_weight, delay, n_delay)
+        self.synapse_spec.setdefault(
+            (source_pop.name, target_pop.name, synapse), []
+        ).append(
+            (
+                source_idx,
+                target_idx,
+                threshold,
+                n_threshold,
+                to_param(weight),
+                n_weight,
+                delay,
+                n_delay,
+            )
         )
 
     def connect_one_to_one(
-        self, source, target, synapse: str, threshold=0.0, weight=1.0, delay=0.0
+        self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
     ):
         if isinstance(source, Population):
             source = source[:]  # Ensure source is a slice if it's a Population
@@ -280,25 +324,32 @@ class Network(torch.nn.Module):
         # 1. validate that the synapse exists at all the target locations
         pre_idx, post_idx = prepare_indices_one_one(source, target, synapse)
         self._connect(
-            source.model, pre_idx, target.model, post_idx, synapse, threshold, weight, delay
+            source.model,
+            pre_idx,
+            target.model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
         )
 
     def connect_dense(
-        self, source, target, synapse: str, threshold=0.0, weight=1.0, delay=0.0
+        self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
     ):
         if isinstance(source, Population):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
             target = target[:]  # Ensure target is a slice if it's a Population
-        
+
         # every target compartment receives input from every source compartment
         source_model = source.model
         target_model = target.model
-        pre_idx  = to_flat_idx_torch(source_model.v, source.index)
+        pre_idx = to_flat_idx_torch(source_model.v, source.index)
         post_idx = to_flat_idx_torch(target_model.v, target.index)
 
         # 1. Get the original number of elements
-        num_pre  = pre_idx.numel()
+        num_pre = pre_idx.numel()
         num_post = post_idx.numel()
 
         # 2. Expand the first tensor to repeat its elements
@@ -315,11 +366,18 @@ class Network(torch.nn.Module):
 
         # now connect
         self._connect(
-            source_model, pre_idx, target_model, post_idx, synapse, threshold, weight, delay
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
         )
 
     def connect_sparse(
-        self, source, target, synapse: str, prob: float, threshold=0.0, weight=1.0, delay=0.0
+        self, source, target, synapse, prob: float, threshold=0.0, weight=1.0, delay=0.0
     ):
         if isinstance(source, Population):
             source = source[:]  # Ensure source is a slice if it's a Population
@@ -329,11 +387,11 @@ class Network(torch.nn.Module):
         # every target compartment receives input from every source compartment
         source_model = source.model
         target_model = target.model
-        pre_idx  = to_flat_idx_torch(source_model.v, source.index)
+        pre_idx = to_flat_idx_torch(source_model.v, source.index)
         post_idx = to_flat_idx_torch(target_model.v, target.index)
 
         # 1. Get the original number of elements
-        num_pre  = pre_idx.numel()
+        num_pre = pre_idx.numel()
         num_post = post_idx.numel()
 
         # 2. Expand the first tensor to repeat its elements
@@ -355,8 +413,14 @@ class Network(torch.nn.Module):
 
         # now connect
         self._connect(
-            source_model, pre_idx, target_model, post_idx, 
-            synapse, threshold, weight, delay
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
         )
 
     def build_synapses(self, dt):
@@ -378,7 +442,7 @@ class Network(torch.nn.Module):
                 post_syn=synapse,
                 weight=weights,
                 delay=delay,
-                dt=dt
+                dt=dt,
             ).to(device=self.device(), dtype=self.dtype())
             self.synapses[f"{pre_name}_{post_name}_{synapse.name}"] = syn
 
@@ -407,7 +471,7 @@ class Network(torch.nn.Module):
         self.init_synapses(reinit_weights=reinit_weights)
         self.t_ind = 0
         return self
-    
+
     def initialize_(self, dt: float, reinit_weights: bool = True):
         """
         Initialize the network. This method should be overridden by subclasses.
@@ -437,7 +501,10 @@ class Network(torch.nn.Module):
             n_steps = int(tstop / self.dt)
 
             if with_intra:
-                intra = {n: (intra_, *self.populations[n].prep_intra(intra_, n_steps, dt)) for n, intra_ in intra.items()}
+                intra = {
+                    n: (intra_, *self.populations[n].prep_intra(intra_, n_steps, dt))
+                    for n, intra_ in intra.items()
+                }
 
             if callbacks is None:
                 callbacks = []
@@ -448,12 +515,13 @@ class Network(torch.nn.Module):
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
-                    progressbar = tqdm(total=n_steps, desc=f"{self.t_ind*dt_f:.3f} ms")
+                    progressbar = tqdm(
+                        total=n_steps, desc=f"{self.t_ind * dt_f:.3f} ms"
+                    )
 
             local_ind = 0
 
             for _ in range(n_steps):
-
                 intra_c = {}
 
                 if with_intra:
@@ -467,10 +535,10 @@ class Network(torch.nn.Module):
                 if progressbar:
                     progressbar.update(1)
                     if self.t_ind % 100 == 0:
-                        progressbar.set_description(f"{self.t_ind*dt_f:.1f} ms")
-            
+                        progressbar.set_description(f"{self.t_ind * dt_f:.1f} ms")
+
             if progressbar:
-                progressbar.close()    
+                progressbar.close()
 
             post_loop_hook(callbacks, self)
 
@@ -489,18 +557,23 @@ def prepare_intra(intra_c, intra, local_ind):
 def pre_loop_hook(c, m):
     c.pre_loop_hook(m)
 
+
 def post_loop_hook(c, m):
     c.post_loop_hook(m)
 
+
 def pre_step_hook(c, m):
     c.pre_step_hook(m)
+
 
 @torch.compile
 def post_step_hook(c, m):
     c.post_step_hook(m)
 
+
 def pre_chunk_hook(c, m, n):
     c.pre_chunk_hook(m, n)
+
 
 def post_chunk_hook(c, m, n):
     c.post_chunk_hook(m, n)

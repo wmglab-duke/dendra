@@ -6,6 +6,7 @@ import re
 from ..ops import all_ops
 from .source import safe_source
 
+
 def transform_function(source: str, assign_return: bool = True) -> str:
     # Parse the source into an AST
     tree = ast.parse(source)

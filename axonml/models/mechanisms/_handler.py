@@ -13,35 +13,37 @@ def make_scaler(mech, area):
 
     The returned scaler intelligently returns a single value for a single
     input, or a tuple for multiple inputs.
-    """     
+    """
     if isinstance(mech, PointProcess):
         # Calculate the scaling factor once. This is a closure.
         # The 'arr' variable will be remembered by the _scaler function.
         arr = 1e6 * mech.get(area)
-        
+
         # Add a check to prevent division by zero.
         if torch.any(arr == 0):
-            raise ValueError("Calculated area factor is zero, perhaps you inserted a PointProcess at a branchpoint?")
+            raise ValueError(
+                "Calculated area factor is zero, perhaps you inserted a PointProcess at a branchpoint?"
+            )
 
         def _scaler(*args):
             # Scale all incoming arguments
             scaled_values = tuple(a / arr for a in args)
-            
+
             # If only one argument was passed, return the single scaled value.
             if len(scaled_values) == 1:
                 return scaled_values[0]
             # Otherwise, return the tuple of scaled values.
             return scaled_values
-        
+
         return _scaler
-            
+
     def _scaler(*args):
         # If only one argument was passed, return it directly.
         if len(args) == 1:
             return args[0]
         # Otherwise, return the tuple of arguments.
         return args
-        
+
     return _scaler
 
 
@@ -53,14 +55,14 @@ class MechanismHandler(torch.nn.Module):
     """
 
     def __init__(
-        self, 
+        self,
         celsius,
-        area, 
+        area,
         mechs,
-        ions=None, 
-        write_ion_c=None, 
-        read_ion=None, 
-        currents=None
+        ions=None,
+        write_ion_c=None,
+        read_ion=None,
+        currents=None,
     ):
         super().__init__()
         self.mechanisms = torch.nn.ModuleDict()
@@ -80,7 +82,9 @@ class MechanismHandler(torch.nn.Module):
                 setattr(self, mech_name, mech)
             else:
                 if not isinstance(mech, Mechanism):
-                    raise TypeError(f"Mechanism {mech_name} must be an instance of Mechanism or VoltageProcess.")
+                    raise TypeError(
+                        f"Mechanism {mech_name} must be an instance of Mechanism or VoltageProcess."
+                    )
             self.mechanisms[mech_name] = mech
             setattr(self, mech_name, mech)
 
@@ -108,8 +112,12 @@ class MechanismHandler(torch.nn.Module):
                 mech = self.mechanisms[mech_name]
                 scale_f = make_scaler(mech, self.area)
                 for ion in ions:
-                    self._map.append( (c_idx, mech, getattr(mech, f"{ion}_with_g"), scale_f) )
-                    self._map_exp.append( (c_idx, mech, getattr(mech, f"{ion}"), scale_f) )
+                    self._map.append(
+                        (c_idx, mech, getattr(mech, f"{ion}_with_g"), scale_f)
+                    )
+                    self._map_exp.append(
+                        (c_idx, mech, getattr(mech, f"{ion}"), scale_f)
+                    )
 
     def initialize(self, v, celsius, diameters):
         self.make_maps()
@@ -149,7 +157,7 @@ class MechanismHandler(torch.nn.Module):
     def ion_init(self, temp) -> None:
         for ion in self.ions.values():
             ion.initialize(temp)
-    
+
     def write_to_ions(self, v):
         for ion, ion_c_write in self.write_ion_c.items():
             for k, conc_list in ion_c_write.items():
@@ -175,7 +183,7 @@ class MechanismHandler(torch.nn.Module):
 
         # write ion concentrations
         self.write_to_ions(v)
-        
+
         # update equilibrium potentials
         for ion in self.ions.values():
             ion.advance(temp)
@@ -183,13 +191,11 @@ class MechanismHandler(torch.nn.Module):
         # read ion concentrations & equilibria
         self.read_from_ions()
 
-
     def detach(self):
         for mech in self.mechanisms.values():
             mech.detach()
         for ion in self.ions.values():
             ion.detach()
-
 
     def i(self, v):
         if not self.currents:
@@ -209,17 +215,16 @@ class MechanismHandler(torch.nn.Module):
             i, g = scale_f(*fn(mech.get(v)))
             mech.add_(self._buf_i[c_idx], i)
             mech.add_(self._buf_g[c_idx], g)
-        
+
         # sum up currents and conductances
         tot_i = sum(self._buf_i)
         tot_g = sum(self._buf_g)
 
         # expose per-ion currents
-        for (ion, ion_h) in self.ions.items():
+        for ion, ion_h in self.ions.items():
             ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
         return tot_i, tot_g
-
 
     def iexp(self, v):
         if not self.currents:
@@ -235,16 +240,15 @@ class MechanismHandler(torch.nn.Module):
         for c_idx, mech, fn, scale_f in self._map_exp:
             i = scale_f(fn(mech.get(v)))
             mech.add_(self._buf_i[c_idx], i)
-        
+
         # sum up currents and conductances
         tot_i = sum(self._buf_i)
 
         # expose per-ion currents
-        for (ion, ion_h) in self.ions.items():
+        for ion, ion_h in self.ions.items():
             ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
         return tot_i
-
 
     def idf(self, v, v_prev):
         if not self.currents:
@@ -268,7 +272,7 @@ class MechanismHandler(torch.nn.Module):
             i, g = scale_f(*fn(mech.get(v_in)))
             mech.add_(self._buf_i[c_idx], i)
             mech.add_(self._buf_g[c_idx], g)
-        
+
         # sum up currents and conductances
         tot_i = sum(self._buf_i)
         tot_g = sum(self._buf_g)
@@ -289,7 +293,6 @@ class MechanismHandler(torch.nn.Module):
         for ion, ion_h in self.ions.items():
             ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
-
     def set_buffers(self, diameters):
         for m in self.mechanisms.values():
             m.diam.set_(diameters)
@@ -300,11 +303,15 @@ class MechanismHandler(torch.nn.Module):
                 for quantity in quantities:
                     q = m.get(getattr(self.ions[ion], quantity))
                     nd = q.ndim
-                    setattr(m, quantity, torch.empty(q.shape, device=q.device, dtype=q.dtype))
+                    setattr(
+                        m,
+                        quantity,
+                        torch.empty(q.shape, device=q.device, dtype=q.dtype),
+                    )
                     getattr(m, quantity).copy_(q)
                     for _, s in self.mechanisms[mech].DE.items():
                         setattr(s, quantity, getattr(m, quantity))
-        
+
     def compute_initial_conditions(self, v):
         for m, mech in self.mechanisms.items():
             mech._init_buffers_s(mech.get(v))

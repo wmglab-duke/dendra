@@ -47,7 +47,6 @@ def _var_to_sympy(var_str):
         return var_str, sp.symbols(var_str, real=True)
 
 
-
 def _sympify_diff_eq(diff_string, vars):
     """Parse differential equation into sympy expression
 

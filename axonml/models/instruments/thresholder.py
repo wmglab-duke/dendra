@@ -14,11 +14,11 @@ from axonml.models.callbacks import Recorder, ThresholdCallback
 class Thresholder:
     def __init__(
         self,
-        model:  Population,
+        model: Population,
         active: ThresholdCallback,
-        space:  Optional[Union[npt.NDArray, Tensor]] = None,
-        time:   Optional[Waveform] = None,
-        bases:  Optional[Union[npt.NDArray, Tensor]] = None,
+        space: Optional[Union[npt.NDArray, Tensor]] = None,
+        time: Optional[Waveform] = None,
+        bases: Optional[Union[npt.NDArray, Tensor]] = None,
         ub=None,
         fix_bound_up=5.0,
         fix_bound_down=0.1,
@@ -43,14 +43,18 @@ class Thresholder:
 
         if bases is not None:
             if chunklength is not None:
-                raise ValueError("Cannot use chunklength with bases. Supply space and time instead.")
+                raise ValueError(
+                    "Cannot use chunklength with bases. Supply space and time instead."
+                )
             bases = torch.as_tensor(bases)
             bases = bases.permute(1, 0, 2)
             self.bases = bases.to(device=model.device(), dtype=model.dtype())
             self.check_active = self._check_active_bases
             self.functional = False
         else:
-            self.space = torch.as_tensor(space).to(device=model.device(), dtype=model.dtype())
+            self.space = torch.as_tensor(space).to(
+                device=model.device(), dtype=model.dtype()
+            )
             self.time = time.to(device=model.device(), dtype=model.dtype())
             self.check_active = self._check_active_space_time
             self.functional = True
@@ -286,7 +290,9 @@ class Thresholder:
             self.ub[self.ignore] = 1
             self.lb[self.ignore] = 1
 
-    def calculate_thresholds(self, tstop, dt, block_possible=False) -> Tuple[Tensor, Tensor]:
+    def calculate_thresholds(
+        self, tstop, dt, block_possible=False
+    ) -> Tuple[Tensor, Tensor]:
         """Calculate thresholds.
 
         Returns
@@ -302,7 +308,7 @@ class Thresholder:
             ub = self.ub
             lb = self.lb
 
-            awindow = (ub - lb)
+            awindow = ub - lb
             rwindow = awindow / ub
             msk = self.check_tolerance(awindow, rwindow)
             tries = 0
@@ -314,7 +320,7 @@ class Thresholder:
                 b_thr = msk & ~mask
                 ub[a_thr] = stimamp[a_thr]
                 lb[b_thr] = stimamp[b_thr]
-                awindow = (ub - lb) 
+                awindow = ub - lb
                 rwindow = awindow / ub
                 msk = self.check_tolerance(awindow, rwindow)
                 tries += 1

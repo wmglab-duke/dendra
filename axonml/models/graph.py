@@ -18,12 +18,12 @@ def get_area_from_graph(G: nx.DiGraph) -> torch.Tensor:
     """
     areas = []
     for n in range(len(G.nodes)):
-        area = G.nodes[n].get('area', None)
+        area = G.nodes[n].get("area", None)
         if area is not None:
             areas.append(area)
         else:
             return None  # If any node lacks area, return None
 
     # area in µm² -> convert to cm²
-    # 1 cm² = 1e8 µm²   
+    # 1 cm² = 1e8 µm²
     return 1e-8 * torch.tensor(areas)

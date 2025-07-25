@@ -10,7 +10,7 @@ def calculate_quasipotentials_batched_coords(
     x_batch: torch.Tensor,
     y_batch: torch.Tensor,
     z_batch: torch.Tensor,
-    e_fields_batch: torch.Tensor
+    e_fields_batch: torch.Tensor,
 ) -> torch.Tensor:
     """
     Calculates extracellular quasipotentials (ψ) for a BATCH of E-fields and
@@ -46,16 +46,20 @@ def calculate_quasipotentials_batched_coords(
     device = e_fields_batch.device  # Use the device of the input tensors
 
     if not (x_batch.shape == y_batch.shape == z_batch.shape == (batch_size, num_nodes)):
-        raise ValueError(f"Shape mismatch: x, y, z batches must have shape ({batch_size}, {num_nodes}).")
+        raise ValueError(
+            f"Shape mismatch: x, y, z batches must have shape ({batch_size}, {num_nodes})."
+        )
     if e_fields_batch.shape != (batch_size, num_nodes, 3):
-        raise ValueError(f"Shape mismatch: e_fields_batch must have shape ({batch_size}, {num_nodes}, 3).")
+        raise ValueError(
+            f"Shape mismatch: e_fields_batch must have shape ({batch_size}, {num_nodes}, 3)."
+        )
 
     # Stack coordinates into a single (B, N, 3) tensor for easier indexing.
     coords_batch = torch.stack([x_batch, y_batch, z_batch], dim=2)
 
     # --- Step 2: Unit Conversion ---
     coords_batch_m = coords_batch * 1e-6  # Convert µm to m
-    volts_to_millivolts = 1000.0          # Convert V to mV
+    volts_to_millivolts = 1000.0  # Convert V to mV
 
     # --- Step 3: Find Root and Initialize Data Structures ---
     # The graph traversal logic remains on the CPU
@@ -68,9 +72,9 @@ def calculate_quasipotentials_batched_coords(
         (batch_size, num_nodes),
         torch.nan,
         dtype=coords_batch.dtype,  # Use the same dtype as coordinates
-        device=device
+        device=device,
     )
-    
+
     # The queue for the BFS is a standard Python object
     queue = deque()
 
@@ -85,14 +89,14 @@ def calculate_quasipotentials_batched_coords(
         visited_count += 1
 
         # Get parent data for the entire batch (these are tensor slices)
-        psi_p = psi_batch[:, parent_id]                # Shape: (B,)
-        pos_p = coords_batch_m[:, parent_id, :]        # Shape: (B, 3)
-        E_p = e_fields_batch[:, parent_id, :]          # Shape: (B, 3)
+        psi_p = psi_batch[:, parent_id]  # Shape: (B,)
+        pos_p = coords_batch_m[:, parent_id, :]  # Shape: (B, 3)
+        E_p = e_fields_batch[:, parent_id, :]  # Shape: (B, 3)
 
         for child_id in G.successors(parent_id):
             # Get child data for the entire batch
-            pos_c = coords_batch_m[:, child_id, :]     # Shape: (B, 3)
-            E_c = e_fields_batch[:, child_id, :]       # Shape: (B, 3)
+            pos_c = coords_batch_m[:, child_id, :]  # Shape: (B, 3)
+            E_c = e_fields_batch[:, child_id, :]  # Shape: (B, 3)
 
             # --- Step 5: Fully Batched Calculation using PyTorch ---
             # Displacement vector s_pc, shape (B, 3)
@@ -103,7 +107,9 @@ def calculate_quasipotentials_batched_coords(
 
             # Batched row-wise dot product.
             # (B, 3) * (B, 3) -> element-wise product, then sum along component dimension.
-            dot_product_batch = torch.sum(E_avg_batch * s_pc_batch, dim=1) # Shape: (B,)
+            dot_product_batch = torch.sum(
+                E_avg_batch * s_pc_batch, dim=1
+            )  # Shape: (B,)
 
             # Convert result from Volts to mV
             dot_product_mv = dot_product_batch * volts_to_millivolts
@@ -114,8 +120,10 @@ def calculate_quasipotentials_batched_coords(
             # Store results and enqueue the child
             psi_batch[:, child_id] = psi_child_batch
             queue.append(child_id)
-            
+
     if visited_count != num_nodes:
-        print(f"Warning: Traversal visited {visited_count} nodes, but graph has {num_nodes} nodes.")
+        print(
+            f"Warning: Traversal visited {visited_count} nodes, but graph has {num_nodes} nodes."
+        )
 
     return psi_batch

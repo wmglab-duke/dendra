@@ -101,7 +101,9 @@ class anisotropic_point(Point):
 
         # Calculate anisotropic distance term
         r_aniso = torch.sqrt(
-            (dx**2) / (self.rhoy * self.rhoz) + (dy**2) / (self.rhox * self.rhoz) + (dz**2) / (self.rhox * self.rhoy)
+            (dx**2) / (self.rhoy * self.rhoz)
+            + (dy**2) / (self.rhox * self.rhoz)
+            + (dz**2) / (self.rhox * self.rhoy)
         )
 
         # Calculate potential in mV
@@ -128,6 +130,7 @@ class parametric_efield(torch.nn.Module):
         values to be tested. A positive value means the E-field magnitude
         increases from the soma towards negative z.
     """
+
     def __init__(
         self,
         n_azimuthal: int,
@@ -142,27 +145,31 @@ class parametric_efield(torch.nn.Module):
             mag_changes = [float(relative_mag_change_per_mm)]
         else:
             mag_changes = list(relative_mag_change_per_mm)
-        
-        self.register_buffer("mag_changes", torch.tensor(mag_changes, dtype=torch.float32))
+
+        self.register_buffer(
+            "mag_changes", torch.tensor(mag_changes, dtype=torch.float32)
+        )
         self.n_mag_changes = len(self.mag_changes)
 
-        phi_vals   = torch.linspace(0, 360, self.n_phi + 1)[:-1]
+        phi_vals = torch.linspace(0, 360, self.n_phi + 1)[:-1]
         theta_vals = torch.linspace(0, 180, self.n_theta)
-        
-        grid_phi, grid_theta = torch.meshgrid(phi_vals, theta_vals, indexing='ij')
-        
+
+        grid_phi, grid_theta = torch.meshgrid(phi_vals, theta_vals, indexing="ij")
+
         # Shape: (n_phi, n_theta, 2)
         spherical_directions = torch.stack([grid_phi, grid_theta], dim=-1)
         self.register_buffer("spherical_directions", spherical_directions)
 
         angles = spherical_directions.reshape(-1, 2)
-        phi   = angles[:, 0] * (torch.pi / 180.0)
+        phi = angles[:, 0] * (torch.pi / 180.0)
         theta = angles[:, 1] * (torch.pi / 180.0)
 
         self.register_buffer("phi", phi)
         self.register_buffer("theta", theta)
 
-    def __forward(self, model: object, e_field_strength_Vm: float = 1.0) -> torch.Tensor:
+    def __forward(
+        self, model: object, e_field_strength_Vm: float = 1.0
+    ) -> torch.Tensor:
         """
         Calculates the E-field vectors for all compartments and conditions.
 
@@ -184,29 +191,35 @@ class parametric_efield(torch.nn.Module):
 
         z_coords = z[0]
         n_compartments = len(z_coords)
-        
+
         # Reshape tensors for broadcasting to the final shape:
         # (n_phi, n_theta, n_mag_changes, n_compartments)
-        
+
         # mag_changes: (1, 1, n_mag_changes, 1)
         mag_change_factor = (self.mag_changes / 100.0).view(1, 1, self.n_mag_changes, 1)
-        
+
         # z_coords: (1, 1, 1, n_compartments)
-        z_reshaped = z_coords.view(1, 1, 1, n_compartments) / 1000.0  # Convert from µm to mm
+        z_reshaped = (
+            z_coords.view(1, 1, 1, n_compartments) / 1000.0
+        )  # Convert from µm to mm
 
         # Calculate magnitude at each compartment for each condition
         magnitude = 1 - z_reshaped * mag_change_factor
-        
+
         # Clamp magnitude to be non-negative, as in the original code
-        magnitude = torch.clamp(magnitude, min=0).unsqueeze(-1)  # Shape: (n_phi, n_theta, n_mag_changes, n_compartments, 1)
+        magnitude = torch.clamp(magnitude, min=0).unsqueeze(
+            -1
+        )  # Shape: (n_phi, n_theta, n_mag_changes, n_compartments, 1)
 
         # --- Assemble the final spherical vectors ---
         # We need a tensor of shape (n_phi, n_theta, n_mag_changes, n_compartments, 3)
         # to hold [phi, theta, r] for every case.
 
         # Base phi and theta directions: (n_phi, n_theta, 1, 1, 2)
-        base_directions = self.spherical_directions.view(self.n_phi, self.n_theta, 1, 1, 2)
-        
+        base_directions = self.spherical_directions.view(
+            self.n_phi, self.n_theta, 1, 1, 2
+        )
+
         # Create the final spherical tensor by broadcasting
         # This is more efficient than creating a large empty tensor and filling it.
         final_spherical_vecs = base_directions.expand(
@@ -214,10 +227,13 @@ class parametric_efield(torch.nn.Module):
         )
         # Now we have [phi, theta]. We need to add magnitude (r).
         final_spherical_vecs = torch.cat(
-            [final_spherical_vecs, magnitude.expand(
-                self.n_phi, self.n_theta, self.n_mag_changes, n_compartments, 1
-            )],
-            dim=-1
+            [
+                final_spherical_vecs,
+                magnitude.expand(
+                    self.n_phi, self.n_theta, self.n_mag_changes, n_compartments, 1
+                ),
+            ],
+            dim=-1,
         )
 
         e_fields_normalized = spherical_to_cartesian(final_spherical_vecs)
@@ -228,7 +244,7 @@ class parametric_efield(torch.nn.Module):
 
         # 3. Reshape for batching
         e_fields_batched = e_fields_physical_Vm.view(-1, n_compartments, 3)
-        
+
         # --- (The rest is the same) ---
         num_conditions = e_fields_batched.shape[0]
         x_batch = x.expand(num_conditions, -1)
@@ -240,11 +256,11 @@ class parametric_efield(torch.nn.Module):
             x_batch=x_batch,
             y_batch=y_batch,
             z_batch=z_batch,
-            e_fields_batch=e_fields_batched
+            e_fields_batch=e_fields_batched,
         )
 
         return e_fields_batched, quasi_potentials.contiguous()
-    
+
     def forward(self, model: object, e_field_strength_Vm: float = 1.0) -> torch.Tensor:
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
@@ -255,8 +271,14 @@ class parametric_efield(torch.nn.Module):
         phi = self.phi.view(-1, 1)
         theta = self.theta.view(-1, 1)
 
-        ve = -e_field_strength_Vm * (x * torch.sin(theta) * torch.cos(phi) +
-                                     y * torch.sin(theta) * torch.sin(phi) +
-                                     z * torch.cos(theta)) * 1000.0  # Convert to mV
-        
+        ve = (
+            -e_field_strength_Vm
+            * (
+                x * torch.sin(theta) * torch.cos(phi)
+                + y * torch.sin(theta) * torch.sin(phi)
+                + z * torch.cos(theta)
+            )
+            * 1000.0
+        )  # Convert to mV
+
         return ve

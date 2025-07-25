@@ -23,10 +23,10 @@ class UnderscoreLHS(ast.NodeTransformer):
         """Recursively prefixes the appropriate part of an assignment target."""
         if isinstance(target_node, ast.Name):
             # This is a simple variable name like 'a'.
-            target_node.id = '_' + target_node.id
+            target_node.id = "_" + target_node.id
         elif isinstance(target_node, ast.Attribute):
             # This is an attribute like 'obj.value'. We change 'value' to '_value'.
-            target_node.attr = '_' + target_node.attr
+            target_node.attr = "_" + target_node.attr
         elif isinstance(target_node, (ast.Tuple, ast.List)):
             # This is unpacking like 'a, b = ...'. Recurse on each element.
             for element in target_node.elts:
@@ -37,14 +37,14 @@ class UnderscoreLHS(ast.NodeTransformer):
         elif isinstance(target_node, ast.Starred):
             # This is a starred assignment like 'a, *b = ...'. Recurse on 'b'.
             self._prefix_target(target_node.value)
-        
+
         return target_node
 
     def visit_Assign(self, node: ast.Assign) -> ast.AST:
         """Handles simple assignments: a = b"""
         for target in node.targets:
             self._prefix_target(target)
-        self.generic_visit(node) # Ensure we visit children on the right-hand side too
+        self.generic_visit(node)  # Ensure we visit children on the right-hand side too
         return node
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
@@ -59,6 +59,7 @@ class UnderscoreLHS(ast.NodeTransformer):
         self.generic_visit(node)
         return node
 
+
 def add_underscore_to_lhs(code_string: str) -> str:
     """
     Parses a Python code string, adds an underscore to all variables on the
@@ -69,20 +70,20 @@ def add_underscore_to_lhs(code_string: str) -> str:
 
     Returns:
         The modified code string.
-    
+
     Requires Python 3.9+ for ast.unparse().
     """
     try:
         # 1. Parse the string into an Abstract Syntax Tree
         tree = ast.parse(code_string)
-        
+
         # 2. Instantiate our transformer and have it visit the tree
         transformer = UnderscoreLHS()
         new_tree = transformer.visit(tree)
-        
+
         # 3. Add line numbers and other metadata back to the new tree
         ast.fix_missing_locations(new_tree)
-        
+
         # 4. Unparse the modified tree back into a string
         return ast.unparse(new_tree)
     except (SyntaxError, ValueError) as e:
@@ -152,13 +153,12 @@ def modify_operations(input_string: str) -> str:
 
     def replacer(match):
         func_name = match.group(1)
-        if (func_name in torch_operations):
+        if func_name in torch_operations:
             return f"torch.{func_name}("
         return match.group(0)
 
     modified_string = re.sub(pattern, replacer, input_string)
     return modified_string
-
 
 
 def convert(deriv, state, states, assigned, use_pade_approx=False):
@@ -200,6 +200,7 @@ def solve(self, dt, {states_and_assigned}):
     return {returns}
 """
 
+
 def match_derivative_to_states(derivative, states):
     matched = {}
     for state in states:
@@ -210,11 +211,12 @@ def match_derivative_to_states(derivative, states):
                 break
     return matched
 
+
 def build_integration_func(states, assigned, derivative, method, pade=False):
     """
     Build the integration function for the states and assigned variables.
     """
-    if method == 'cnexp':
+    if method == "cnexp":
         return build_cnexp(states, assigned, derivative, pade=pade)
     else:
         raise ValueError(f"Unknown integration method: {method}")
@@ -223,7 +225,9 @@ def build_integration_func(states, assigned, derivative, method, pade=False):
 def build_cnexp(states, assigned, derivative, pade=False):
     for state in states:
         if state in assigned:
-            raise ValueError(f"State {state} cannot be assigned and used as a state variable.")
+            raise ValueError(
+                f"State {state} cannot be assigned and used as a state variable."
+            )
     states_and_assigned = ", ".join(set(states).union(assigned))
     solves = []
     returns = []
@@ -235,14 +239,20 @@ def build_cnexp(states, assigned, derivative, pade=False):
 
     derivative = match_derivative_to_states(derivative, states)
     for state in states:
-        solves.append(convert(derivative[state], state, states, assigned, use_pade_approx=use_pade_approx))
+        solves.append(
+            convert(
+                derivative[state],
+                state,
+                states,
+                assigned,
+                use_pade_approx=use_pade_approx,
+            )
+        )
         returns.append(f"'{state}' : _{state}")
     solves = "\n    ".join(solves)
     returns = f"{{{', '.join(returns)}}}"
     f = cnexp_template.format(
-        states_and_assigned=states_and_assigned,
-        solves=solves,
-        returns=returns
+        states_and_assigned=states_and_assigned, solves=solves, returns=returns
     )
     if DEBUG:
         print(f"Function:\n{f}")
@@ -253,7 +263,6 @@ def build_cnexp(states, assigned, derivative, pade=False):
 
 
 class State(Parameterized):
-
     _state_buffers = set()
     _state_buffers_declarations = []
 
@@ -267,7 +276,7 @@ class State(Parameterized):
     _assigned_declarations = []
 
     has_q10 = False
-    method = 'cnexp'
+    method = "cnexp"
 
     def __init_subclass__(cls, **kwargs):
         """
@@ -287,20 +296,20 @@ class State(Parameterized):
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
             # We look for a _params attribute defined directly on the base
-            if '_state' in base.__dict__:
+            if "_state" in base.__dict__:
                 new_state.update(base._state)
-            if '_state_buffers' in base.__dict__:
+            if "_state_buffers" in base.__dict__:
                 new_buffers.update(base._state_buffers)
-            if '_derivative' in base.__dict__:
+            if "_derivative" in base.__dict__:
                 new_derivative.update(base._derivative)
-            if '_assigned' in base.__dict__:
+            if "_assigned" in base.__dict__:
                 new_assigned.update(base._assigned)
 
         if State._state_declarations:
             for s_list in State._state_declarations:
                 new_state.update(s_list)
             State._state_declarations = []
-        
+
         if State._state_buffers_declarations:
             for b_list in State._state_buffers_declarations:
                 new_buffers.update(b_list)
@@ -322,23 +331,19 @@ class State(Parameterized):
         cls._assigned = list(new_assigned)
 
     def __init__(
-        self,
-        celsius,
-        diameters,
-        key,
-        shape,
-        additional_parameters=None,
-        **kwargs
+        self, celsius, diameters, key, shape, additional_parameters=None, **kwargs
     ):
         if not self._state:
-            raise ValueError(f"State {self.__class__.__name__} has no state variables defined."
-                              "Use State.STATE(<state vars>) in State implementation to define them.")
+            raise ValueError(
+                f"State {self.__class__.__name__} has no state variables defined."
+                "Use State.STATE(<state vars>) in State implementation to define them."
+            )
         super().__init__(shape, additional_parameters=additional_parameters, **kwargs)
         self._name = self.__class__.__name__
         self.key = key
 
-        self.register_buffer('celsius', celsius)
-        self.register_buffer('diam', diameters)
+        self.register_buffer("celsius", celsius)
+        self.register_buffer("diam", diameters)
 
         for b in self._state_buffers:
             self.register_buffer(b, torch.tensor(0.0))
@@ -358,7 +363,7 @@ class State(Parameterized):
                 self.q10 = self.calc_q10
             else:
                 self.q10 = self.return_q10_cache
-                self.register_buffer('q10_cache', self.calc_q10())
+                self.register_buffer("q10_cache", self.calc_q10())
 
     @staticmethod
     def to_column(tensor: torch.Tensor) -> torch.Tensor:

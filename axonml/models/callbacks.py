@@ -78,7 +78,7 @@ class Callback(torch.nn.Module):
             System states.
         """
         pass
-    
+
     def pre_chunk_hook(self, model, timesteps=None):
         """Execute before processing each chunk of the simulation.
 
@@ -102,7 +102,7 @@ class Callback(torch.nn.Module):
             Number of timesteps in the chunk.
         """
         pass
-    
+
     def pre_step_hook(self, model):
         """Execute before each loop of solver (advance of
         single timestep.)
@@ -139,7 +139,11 @@ class Callback(torch.nn.Module):
 class CallbackList(torch.nn.Module):
     def __init__(self, callbacks=None) -> None:
         super().__init__()
-        self.callbacks = torch.nn.ModuleList(callbacks) if callbacks is not None else torch.nn.ModuleList()
+        self.callbacks = (
+            torch.nn.ModuleList(callbacks)
+            if callbacks is not None
+            else torch.nn.ModuleList()
+        )
 
     def __iter__(self):
         return iter(self.callbacks)
@@ -161,7 +165,7 @@ class CallbackList(torch.nn.Module):
     def pre_chunk_hook(self, model, timesteps):
         for c in self.callbacks:
             c.pre_chunk_hook(model, timesteps)
-    
+
     def post_chunk_hook(self, model, timesteps):
         for c in self.callbacks:
             c.post_chunk_hook(model, timesteps)
@@ -228,7 +232,9 @@ def append_tenor_max(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
     record.append(torch.amax(tensor, -1, keepdim=True))
 
 
-def append_tensor_indexed(tensor, record: List[torch.Tensor], node_indices: torch.Tensor) -> None:
+def append_tensor_indexed(
+    tensor, record: List[torch.Tensor], node_indices: torch.Tensor
+) -> None:
     """
     Append a tensor indexed by node_indices to a list of tensors.
 
@@ -323,11 +329,10 @@ def detect_anomalies(x: torch.Tensor, prev) -> torch.Tensor:
 
 
 class AnomalyDetector(Callback):
-
     def __init__(self):
         super().__init__()
         self.rec = None
-    
+
     def pre_loop_hook(self, model):
         self.rec = torch.zeros(model.n_ax, dtype=torch.bool, device=model.device())
 
@@ -337,7 +342,9 @@ class AnomalyDetector(Callback):
 
     def reset(self):
         if self.rec is not None:
-            self.rec = torch.zeros(self.rec.shape, dtype=torch.bool, device=self.rec.device())
+            self.rec = torch.zeros(
+                self.rec.shape, dtype=torch.bool, device=self.rec.device()
+            )
 
     def numpy(self):
         if self.rec is not None:
@@ -397,11 +404,11 @@ class Recorder(Callback):
     """
 
     def __init__(
-        self, 
-        states, 
-        max_only=False, 
-        node_indices=None, 
-        dt=None, 
+        self,
+        states,
+        max_only=False,
+        node_indices=None,
+        dt=None,
         sliding_window=None,
     ):
         super().__init__()
@@ -709,7 +716,9 @@ class RecorderLambda(Callback):
         """
         if var is not None:
             return torch.stack(self.rec.get(var, []))
-        return torch.stack([torch.stack(tensors) for tensors in self.rec.values()], dim=2)
+        return torch.stack(
+            [torch.stack(tensors) for tensors in self.rec.values()], dim=2
+        )
 
     def numpy(self, var: str = None) -> np.ndarray:
         if var is not None:
@@ -717,7 +726,10 @@ class RecorderLambda(Callback):
             if not v:
                 return np.array([])
             return torch.stack(v).detach().cpu().numpy()
-        return {name: torch.stack(tensors).detach().cpu().numpy() for name, tensors in self.rec.items()}
+        return {
+            name: torch.stack(tensors).detach().cpu().numpy()
+            for name, tensors in self.rec.items()
+        }
 
 
 def _hdf5_write(queue: Queue, path: str):
@@ -793,7 +805,7 @@ class LFP(Callback):
         super().__init__()
         self._lfp = []
         self._t = []
-        self.register_buffer('v_unit', torch.stack(v_unit))
+        self.register_buffer("v_unit", torch.stack(v_unit))
 
     def pre_loop_hook(self, model):
         if not model.integrator.imem:
@@ -802,17 +814,13 @@ class LFP(Callback):
             )
         self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
         self._lfp.append(
-            torch.einsum(
-                "ij,nij->n", model.integrator.i_membrane, self.v_unit
-            )
+            torch.einsum("ij,nij->n", model.integrator.i_membrane, self.v_unit)
         )
         return super().pre_loop_hook(model)
 
     def post_step_hook(self, model):
         self._lfp.append(
-            torch.einsum(
-                "ij,nij->n", model.integrator.i_membrane, self.v_unit
-            )
+            torch.einsum("ij,nij->n", model.integrator.i_membrane, self.v_unit)
         )
 
     @property
@@ -899,7 +907,7 @@ class ThresholdCallback(Callback):
         self.node_check = torch.as_tensor(
             self.node_check, dtype=torch.long, device=model.device()
         )
-        
+
         # convert negative to positive index
         nc = model.nc
         self.node_check = self.node_check.remainder(nc)
@@ -1294,15 +1302,17 @@ class Raster(ThresholdCallback):
 
     def numpy(self):
         return self.stack().detach().cpu().numpy()
-    
-    def plot(self, 
-             var,
-             varname: str,
-             dt=None, 
-             ax=None, 
-             cmap=None, 
-             node_idx=None, 
-             axon_idx=None):
+
+    def plot(
+        self,
+        var,
+        varname: str,
+        dt=None,
+        ax=None,
+        cmap=None,
+        node_idx=None,
+        axon_idx=None,
+    ):
         """
         Plot the raster plot of spiking activity.
 
@@ -1346,7 +1356,9 @@ class Raster(ThresholdCallback):
             fig, ax = plt.subplots(dpi=300, figsize=(10, 6))
 
         num_fibers, num_timepoints = binary_array.shape
-        assert len(var) == num_fibers, "Length of var must match the number of axons selected to plot."
+        assert len(var) == num_fibers, (
+            "Length of var must match the number of axons selected to plot."
+        )
 
         # Build a list of spike-time arrays. Each entry in data_for_eventplot
         # corresponds to a single fiber's event times.
@@ -1360,16 +1372,17 @@ class Raster(ThresholdCallback):
         # Convert each diameter to an RGBA color using the colormap + normalization
         line_colors = [cmap(norm(d)) for d in var]
         ax.eventplot(
-            data_for_eventplot, 
-            lineoffsets=var, 
-            linelengths=0.8*min(var[1:]-var[:-1]), 
-            colors=line_colors)
+            data_for_eventplot,
+            lineoffsets=var,
+            linelengths=0.8 * min(var[1:] - var[:-1]),
+            colors=line_colors,
+        )
         tstop = num_timepoints * dt
         range_var = var.max() - var.min()
         y_min = var.min() - 0.02 * range_var
         y_max = var.max() + 0.02 * range_var
         ax.set_ylim(y_min, y_max)
-        ax.set_xlim(0-0.02*tstop, tstop+0.02*tstop)
+        ax.set_xlim(0 - 0.02 * tstop, tstop + 0.02 * tstop)
         ax.set_xlabel("Time (ms)")
         ax.set_ylabel(f"{varname}")
         return ax
@@ -1377,22 +1390,25 @@ class Raster(ThresholdCallback):
 
 @torch.jit.script
 def increment_count(vm, vm_new, record, threshold: float):
-    m = (vm_new >= threshold) 
-    mask = m & vm                              # fused compare + and
-    record = record + mask.to(record.dtype)    # one fused kernel
-    next_mask = ~m                             # can tag-on to same kernel
+    m = vm_new >= threshold
+    mask = m & vm  # fused compare + and
+    record = record + mask.to(record.dtype)  # one fused kernel
+    next_mask = ~m  # can tag-on to same kernel
     return next_mask, record
 
 
 @torch.jit.script
 def increment_act(vm, vm_new, threshold: float):
-    m = (vm_new >= threshold) 
-    mask = m & vm                              # fused compare + and
-    next_mask = ~m                             # can tag-on to same kernel
+    m = vm_new >= threshold
+    mask = m & vm  # fused compare + and
+    next_mask = ~m  # can tag-on to same kernel
     return next_mask, mask
 
+
 @torch.jit.script
-def update_active(vm, vm_new, record, threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
+def update_active(
+    vm, vm_new, record, threshold: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
     ge = vm_new >= threshold
     record = torch.logical_or(record, torch.any(torch.logical_and(ge, vm), dim=1))
     return ~ge, record

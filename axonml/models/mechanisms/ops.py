@@ -16,7 +16,9 @@ def exprelr(x, y):
     approx = y - (x / 2)
     return torch.where(q.abs() < 1e-6, approx, val)
 
+
 vtrap = exprelr
+
 
 def expinv(x):
     val = x / torch.expm1(x)
@@ -26,8 +28,20 @@ def expinv(x):
 
 def safe_exp(x):
     exp_ = torch.exp(x)
-    return torch.where(torch.isfinite(exp_), exp_, torch.tensor(1e20, device=x.device, dtype=x.dtype))
+    return torch.where(
+        torch.isfinite(exp_), exp_, torch.tensor(1e20, device=x.device, dtype=x.dtype)
+    )
 
 
 def all_ops():
-    return {"exp", "expm1", "expit", "sigmoid", "log", "exprelr", "expinv", "safe_exp", "vtrap"}
+    return {
+        "exp",
+        "expm1",
+        "expit",
+        "sigmoid",
+        "log",
+        "exprelr",
+        "expinv",
+        "safe_exp",
+        "vtrap",
+    }
