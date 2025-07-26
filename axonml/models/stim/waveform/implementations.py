@@ -141,7 +141,7 @@ class mono_rect(Waveform):
     >>> values = waveform(t)
     """
 
-    Waveform.PARAMETER(amp=-1.0, delay=0.0, pw=1.0)
+    Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0)
 
     def fn(self, t):
         return self.amp * torch.where(

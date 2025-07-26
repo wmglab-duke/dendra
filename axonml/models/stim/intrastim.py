@@ -3,7 +3,6 @@ import torch
 from axonml.models.backend import Backend as A
 
 from .waveform import Waveform
-from .synapse import Synapse
 
 
 def avoid_smart_indexing(node_indices):

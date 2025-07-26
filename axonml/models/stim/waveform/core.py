@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+import numpy as np
 
 from axonml.models.parametric import SimpleParameterized
 
@@ -89,6 +90,18 @@ class Waveform(SimpleParameterized):
 
     def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
         return _repeat(self, freq, delay, off)
+    
+    def poisson(
+        self,
+        interval: float,
+        n: Optional[int] = 10,
+        start: float = 0.0,
+        noise: float = 1.0,
+        off: float = torch.inf,
+        **kwargs,
+    ):
+        """Return a Poisson-scheduled copy of *this* waveform."""
+        return _poisson(self, interval, n, start, noise, off, **kwargs)
 
     def assemble(self, start, end, dt):
         t = torch.arange(start, end, dt, device=self.device())
@@ -131,3 +144,101 @@ class Sum(Waveform):
 
     def __repr__(self):
         return f"Sum({', '.join(map(repr, self.waveforms))})"
+
+
+class _poisson(Waveform):
+    """
+    Wrap a single-waveform generator so that it is emitted at
+    irregular, Poisson-distributed onset times.
+
+    Parameters
+    ----------
+    waveform : Waveform
+        The (single-shot) wave shape to replicate - e.g. a
+        rectangular pulse, a biphasic stim, …
+    interval : float
+        Mean inter-spike-interval Δt  [ms].
+        (Think 10 ms  ⇒ 100 Hz mean rate.)
+    n : Optional[int]
+        Optional upper bound on the number of spikes.  If given,
+        generation stops after this many onsets even if `off`
+        has not been reached.
+    start : float
+        Most-likely time of the first spike [ms].
+    noise : float ∈ [0,1]
+        0 → perfectly periodic (Δt = interval every time)  
+        1 → pure Poisson (Δt ~Exp(rate=1/interval))  
+        values in between give a convex mixture:
+            Δt = (1-noise)*interval + noise*Exp(...)
+    off : float
+        Do not schedule spikes at or beyond this time [ms].
+    """
+    def __init__(
+        self,
+        waveform: Waveform,
+        interval: float,
+        n: Optional[int] = None,
+        start: float = 0.0,
+        noise: float = 1.0,
+        off: float = torch.inf,
+        generator: Optional[torch.Generator] = None,
+    ):
+        super().__init__()                        # <- no kwargs
+        self.waveform = waveform
+        self.interval = float(interval)
+        self.n        = n
+        self.start    = float(start)
+        self.noise    = float(noise)
+        self.off      = float(off)
+        if np.isinf(self.off) and self.n is None:
+            raise ValueError(
+                "Poisson schedule needs a finite `off` time or a finite `n` "
+                "(number of spikes) to terminate."
+            )
+        self.register_buffer(
+            "_spike_times",
+            self._make_schedule(generator or torch.default_generator)
+        )
+
+    def reshape_for_intra(self):
+        super().reshape_for_intra()
+        self._spike_times = self._spike_times.unsqueeze(-1).unsqueeze(-1)
+        return self
+
+    # ---------- helper ---------------------------------------------------
+    def _next_dt(self, gen: torch.Generator):
+        """Draw the next Δt according to noise parameter."""
+        if self.noise == 0.0:
+            # perfectly regular
+            return self.interval
+        # exponential sample (mean = interval)
+        u = torch.rand((), generator=gen)   # uniform (0,1)
+        exp_sample = -u.log() * self.interval              # Exp(λ=1/interval)
+        return (1.0 - self.noise) * self.interval + self.noise * exp_sample.item()
+
+    def _make_schedule(self, gen: torch.Generator) -> torch.Tensor:
+        """Generate all spike onset times once, store as buffer."""
+        times = []
+        t = self.start
+        k = 0
+        while t < self.off and (self.n is None or k < self.n):
+            times.append(t)
+            t += self._next_dt(gen)
+            k += 1
+        if not times:            # handle edge‑case: no spikes at all
+            times.append(torch.inf)
+        return torch.tensor(times)
+
+    # ---------- core -----------------------------------------------------
+    def fn(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Sum a copy of `waveform` at every scheduled spike time.
+        Assumes the wrapped waveform returns 0 for t<0 or t>duration.
+        """
+        # broadcast: (#spikes, |t|)  – never moves _spike_times to CPU
+        tt = t.unsqueeze(0) - self._spike_times.unsqueeze(-1)
+        return self.waveform.fn(tt).sum(dim=0)
+
+    def __repr__(self):
+        return (f"Poisson({self.waveform},"
+                f" interval={self.interval}, noise={self.noise})")
