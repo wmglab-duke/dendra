@@ -34,6 +34,15 @@ class ExtCell(Axon):
         )
 
     def _x(self):
-        node_l = torch.atleast_2d(self.dx.squeeze())
-        x = node_l.cumsum(dim=1) - node_l / 2
-        return x - torch.sum(node_l, dim=1, keepdim=True) / 2
+        dx = self.dx
+        starts = torch.zeros_like(dx)
+        starts[:, 1:] = torch.cumsum(dx, dim=1)[:, :-1]
+
+        raw_midpoints = starts + dx / 2.0
+
+        total_lengths = torch.sum(dx, dim=1, keepdim=True)
+        offsets = (total_lengths / 2.0)
+
+        centered_midpoints = raw_midpoints - offsets
+
+        return centered_midpoints
