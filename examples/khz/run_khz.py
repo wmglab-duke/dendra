@@ -5,12 +5,13 @@ from tqdm import tqdm
 import numpy as np
 
 import axonml as ax
+from axonml.units import nA, Hz, ms
 
 
 torch.set_default_dtype(torch.float32)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--chunks", type=int, default=200)
+parser.add_argument("--chunks", type=int, default=1000)
 
 args = parser.parse_args()
 
@@ -72,114 +73,42 @@ field_stack = np.vstack(field_stack)
 diam = np.concatenate(diams)
 
 
-# waveforms
-
-from functools import partial
-
-
-def waveform(stim, **kwargs):
-    return partial(stim, **kwargs)
-
-
-def sine(t, amp, freq, delay):
-    sig = np.sin(2 * np.pi * freq * (t - delay))
-    sig[t < delay] = 0
-    return sig
-
-
-def rect(T):
-    """create a centered rectangular pulse of width $T"""
-    return lambda t: (0 <= t) & (t < T)
-
-
-def pulse_train(t, at, shape):
-    """create a train of pulses over $t at times $at and shape $shape"""
-    return np.sum(shape(t - at[:, np.newaxis]), axis=0)
-
-
 # code to run and count APs
 
-count = ax.callbacks.APCount(node_check=[-5], threshold=-20.0, t_start_check=50, dt=0.001)
-
-
-def longrun(
-    model,
-    tstop,
-    dt,
-    stims,
-    field_stack,
-    chunks=20,
-    intra=None,
-    warmup=True,
-):
-    field_stack = torch.tensor(field_stack, device="cuda").float()
-
-    if warmup:
-        print("warming up...")
-
-        ve = torch.rand(1, len(field_stack) * len(stims), nodes).float().cuda()
-
-        for _ in range(5):
-            with torch.no_grad():
-                _ = model.run(ve, intra=intra, dt=dt, progressbar=False, reinit=True)
-
-    t_vec = np.arange(0, tstop, dt)
-    views = np.array_split(t_vec, chunks)
-
-    for i, t_chunk in enumerate(tqdm(views, desc="Running")):
-        input_ve = []
-
-        for stim in stims:
-            tc = stim(t=t_chunk).astype(np.float32)
-            t_course = torch.tensor(tc, device="cuda")
-            ve = torch.einsum("i, jl -> ijl", t_course, field_stack)
-            input_ve.append(ve)
-
-        input_ve = torch.cat(input_ve, 1)
-
-        with torch.no_grad():
-            reinit = False
-            if i == 0:
-                reinit = True
-            _ = model.run(
-                input_ve,
-                intra=intra,
-                dt=dt,
-                callbacks=[count],
-                reinit=reinit,
-                progressbar=False,
-            )
-
-    return 0
+count = ax.callbacks.APCount(node_check=[-5], threshold=-20.0, t_start_check=50)
 
 
 # run
 
 frequencies = [1, 2, 5, 10]
-stims = [waveform(sine, amp=1.0, freq=freq, delay=0.5) for freq in frequencies]
-
 
 input_diams = []
-for _ in stims:
+for _ in frequencies:
     input_diams.append(torch.tensor(diam, device="cuda").float())
 input_diams = torch.cat(input_diams)
 
+stim = ax.sin(
+    amp=1.0, freq=np.repeat(frequencies, len(field_stack))[:, None], delay=0.5
+)
+field_stack = torch.tensor(field_stack).repeat(len(frequencies), 1)
+
 tstop = 100
 dt = 0.001
-
-t_vec = np.arange(0, tstop, dt)
 
 # fiber model
 mrg = ax.SMF(input_diams, nodes).cuda().load("MRG")
 
 # intracellular stim to generate activity
-intra = ax.IntraStim(mrg)
-i_stim = 2e-6 * pulse_train(t_vec, np.array([50, 60, 70, 80, 90]), rect(0.1))
-intra.insert(i_stim, nodes=5)
+intra = ax.mono_rect(amp=2 * nA, pw=0.1 * ms).repeat(100 * Hz, delay=50 * ms)
+mrg[:, 5].inject(intra)
 
 count.reset()
-_ = longrun(
-    mrg, tstop, dt, stims, field_stack, intra=intra, chunks=args.chunks, warmup=True
+mrg.longrun(
+    tstop=tstop,
+    dt=dt,
+    extra=(field_stack, stim),
+    chunklength=int(tstop / dt / args.chunks),
+    callbacks=[count],
 )
 all_n = count.numpy()
 
@@ -231,7 +160,7 @@ for frequency, n in zip(frequencies, all_n):
 
 data_df = pd.DataFrame(data)
 
-cols = ["5.7 $\mu m$", "8.7 $\mu m$", "14.0 $\mu m$"]
+cols = [r"5.7 $\mu m$", r"8.7 $\mu m$", r"14.0 $\mu m$"]
 rows = ["1 kHz", "2 kHz", "5 kHz", "10 kHz"]
 
 fig, axes = plt.subplots(4, 3, dpi=200, figsize=(5, 5), sharex="col", sharey=True)

@@ -1,7 +1,6 @@
 from queue import Queue
 from typing import Tuple, Dict, List
 from types import MethodType
-import threading
 import multiprocessing as mp
 
 from h5py import File
@@ -11,13 +10,16 @@ import torch
 import torch.nn.functional as F
 
 from .backend import Backend as A
-from .interfaces import AxonInterface
+from ..helpers import nojit
 
 
-TRANSFERSTREAM = torch.cuda.Stream()
+if torch.cuda.is_available():
+    TRANSFERSTREAM = torch.cuda.Stream()
+else:
+    TRANSFERSTREAM = None
 
 
-class Callback:
+class Callback(torch.nn.Module):
     """
     Base class for simulation callbacks in AxonML.
 
@@ -30,6 +32,12 @@ class Callback:
     -------
     pre_loop_hook(model)
         Called once before starting the simulation loop.
+    pre_chunk_hook(model)
+        Called before processing each chunk of the simulation when longrunning.
+    post_chunk_hook(model)
+        Called after processing each chunk of the simulation when longrunning.
+    pre_step_hook(model)
+        Called before each simulation time step.
     post_step_hook(model)
         Called after each simulation time step.
     post_loop_hook(model)
@@ -61,7 +69,7 @@ class Callback:
     >>> model.run(ve, callbacks=[callback])
     """
 
-    def pre_loop_hook(self, model: AxonInterface):
+    def pre_loop_hook(self, model):
         """Execute before entering solver loop.
 
         Parameters
@@ -71,7 +79,42 @@ class Callback:
         """
         pass
 
-    def post_step_hook(self, model: AxonInterface):
+    def pre_chunk_hook(self, model, timesteps=None):
+        """Execute before processing each chunk of the simulation.
+
+        Parameters
+        ----------
+        model
+            The axon model being simulated.
+        timesteps : int, optional
+            Number of timesteps in the chunk.
+        """
+        pass
+
+    def post_chunk_hook(self, model, timesteps=None):
+        """Execute after processing each chunk of the simulation.
+
+        Parameters
+        ----------
+        model
+            The axon model being simulated.
+        timesteps : int, optional
+            Number of timesteps in the chunk.
+        """
+        pass
+
+    def pre_step_hook(self, model):
+        """Execute before each loop of solver (advance of
+        single timestep.)
+
+        Parameters
+        ----------
+        states : Tensor
+            System states.
+        """
+        pass
+
+    def post_step_hook(self, model):
         """Execute after each loop of solver (advance of
         single timestep.)
 
@@ -82,7 +125,7 @@ class Callback:
         """
         pass
 
-    def post_loop_hook(self, model: AxonInterface):
+    def post_loop_hook(self, model):
         """Execute after solver loop completes.
 
         Parameters
@@ -93,9 +136,14 @@ class Callback:
         pass
 
 
-class CallbackList:
+class CallbackList(torch.nn.Module):
     def __init__(self, callbacks=None) -> None:
-        self.callbacks = callbacks if callbacks is not None else []
+        super().__init__()
+        self.callbacks = (
+            torch.nn.ModuleList(callbacks)
+            if callbacks is not None
+            else torch.nn.ModuleList()
+        )
 
     def __iter__(self):
         return iter(self.callbacks)
@@ -106,17 +154,29 @@ class CallbackList:
     def __next__(self):
         return next(self.callbacks)
 
-    def pre_loop_hook(self, model: AxonInterface):
-        for c in self:
+    def pre_loop_hook(self, model):
+        for c in self.callbacks:
             c.pre_loop_hook(model)
 
-    def post_step_hook(self, model: AxonInterface):
-        for c in self:
-            c.post_step_hook(model)
-
-    def post_loop_hook(self, model: AxonInterface):
-        for c in self:
+    def post_loop_hook(self, model):
+        for c in self.callbacks:
             c.post_loop_hook(model)
+
+    def pre_chunk_hook(self, model, timesteps):
+        for c in self.callbacks:
+            c.pre_chunk_hook(model, timesteps)
+
+    def post_chunk_hook(self, model, timesteps):
+        for c in self.callbacks:
+            c.post_chunk_hook(model, timesteps)
+
+    def pre_step_hook(self, model):
+        for c in self.callbacks:
+            c.pre_step_hook(model)
+
+    def post_step_hook(self, model):
+        for c in self.callbacks:
+            c.post_step_hook(model)
 
 
 template = """
@@ -134,23 +194,16 @@ impl_template = """
     {implementation}
 """
 
-max_only = "append_tensor_max(states, self.rec['{full_state}'])"
-indexed = "append_tensor_indexed(states, self.rec['{full_state}'], self.node_indices)"
-base = "append_tensor(states, self.rec['{full_state}'])"
+max_only_t = "append_tensor_max(states, self.rec['{full_state}'])"
+indexed_t = "append_tensor_indexed(states, self.rec['{full_state}'], self.node_indices)"
+base_t = "append_tensor(states, self.rec['{full_state}'])"
 
 m_template = """
     states = model.{val}
-    if self.max_only:
-      self.rec['{val}'].append(torch.amax(states, -1, keepdim=True))
-    else:
-      if self.node_indices is not None:
-        self.rec['{val}'].append(atleast_3d(states[..., self.node_indices]))
-      else:
-        self.rec['{val}'].append(states)
+    {implementation}
 """
 
 
-@torch.jit.script
 def append_tensor(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
     """
     Append a tensor to a list of tensors.
@@ -165,7 +218,6 @@ def append_tensor(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
     record.append(tensor)
 
 
-@torch.jit.script
 def append_tenor_max(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
     """
     Append the maximum value of a tensor to a list of tensors.
@@ -180,8 +232,9 @@ def append_tenor_max(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
     record.append(torch.amax(tensor, -1, keepdim=True))
 
 
-@torch.jit.script
-def append_tensor_indexed(tensor, record: List[torch.Tensor], node_indices: torch.Tensor) -> None:
+def append_tensor_indexed(
+    tensor, record: List[torch.Tensor], node_indices: torch.Tensor
+) -> None:
     """
     Append a tensor indexed by node_indices to a list of tensors.
 
@@ -204,20 +257,31 @@ def is_state(s):
 def parse_template(full_state, max_only=False, indexed=False):
     mech, state = full_state.split(".")
     if max_only:
-        impl = max_only
+        impl = max_only_t
     elif indexed:
-        impl = indexed
+        impl = indexed_t
     else:
-        impl = base
+        impl = base_t
     implementation = impl.format(full_state=full_state)
     return impl_template.format(mech=mech, state=state, implementation=implementation)
+
+
+def parse_template_m(state, max_only=False, indexed=False):
+    if max_only:
+        impl = max_only_t
+    elif indexed:
+        impl = indexed_t
+    else:
+        impl = base_t
+    implementation = impl.format(full_state=state)
+    return m_template.format(val=state, implementation=implementation)
 
 
 def build_recorder_func(states, max_only, indexed, network=False):
     res = []
     for s in states:
         if not is_state(s) or network:
-            res.append(m_template.format(val=s))
+            res.append(parse_template_m(s, max_only, indexed))
         else:
             res.append(parse_template(s, max_only, indexed))
     impl = "".join(res)
@@ -237,8 +301,8 @@ def avoid_smart_indexing(node_indices):
 
 def n(node_indices, model):
     if node_indices is None:
-        return model.n_comp
-    if isinstance(node_indices, int):
+        return model.nc
+    if node_indices.ndim == 0:
         return 1
     return len(node_indices)
 
@@ -265,20 +329,22 @@ def detect_anomalies(x: torch.Tensor, prev) -> torch.Tensor:
 
 
 class AnomalyDetector(Callback):
-
     def __init__(self):
         super().__init__()
         self.rec = None
-    
+
     def pre_loop_hook(self, model):
         self.rec = torch.zeros(model.n_ax, dtype=torch.bool, device=model.device())
 
     def post_step_hook(self, model):
-        self.rec = detect_anomalies(model.v, self.rec)
+        with torch.no_grad():
+            self.rec = detect_anomalies(model.v, self.rec)
 
     def reset(self):
         if self.rec is not None:
-            self.rec = torch.zeros(self.rec.shape, dtype=torch.bool, device=self.rec.device())
+            self.rec = torch.zeros(
+                self.rec.shape, dtype=torch.bool, device=self.rec.device()
+            )
 
     def numpy(self):
         if self.rec is not None:
@@ -338,13 +404,12 @@ class Recorder(Callback):
     """
 
     def __init__(
-        self, 
-        states, 
-        max_only=False, 
-        node_indices=None, 
-        dt=None, 
+        self,
+        states,
+        max_only=False,
+        node_indices=None,
+        dt=None,
         sliding_window=None,
-        network=False
     ):
         super().__init__()
         self.states = states
@@ -352,11 +417,13 @@ class Recorder(Callback):
         self.max_only: bool = max_only
 
         self.indexed = node_indices is not None
+        self.node_indices = None
+
         if self.indexed:
             self.node_indices = torch.as_tensor(node_indices, dtype=torch.long)
 
         self.sliding_window = sliding_window
-        rfunc = build_recorder_func(states, self.max_only, self.indexed, network=network)
+        rfunc = build_recorder_func(states, self.max_only, self.indexed)
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
 
@@ -431,7 +498,6 @@ class Recorder(Callback):
     def pre_loop_hook(self, model):
         if self.indexed:
             self.node_indices = self.node_indices.to(model.device())
-        self.dt = float(model.dt)
         self._pre_loop_hook(model)
         if self.cache_with_hdf5:
             self.i += 1
@@ -458,6 +524,7 @@ class Recorder(Callback):
             )
         self.save_count += 1
 
+    @nojit
     def post_step_hook(self, model):
         self._post_step_hook(model)
         self.i += 1
@@ -587,6 +654,84 @@ class Recorder(Callback):
         return self.stack().detach().cpu().numpy()
 
 
+class RecorderLambda(Callback):
+    """
+    A callback that records model states using a user-defined functions.
+
+    This callback allows users to specify a custom function that takes the model
+    as input and returns the data to be recorded. It is useful for recording
+    complex or derived states that are not directly accessible as model attributes.
+
+    Parameters
+    ----------
+    func : callable
+        A function that takes the model as input and returns the data to be recorded.
+        The function should return a tensor or a list of tensors.
+
+    Attributes
+    ----------
+    func : callable
+        The user-defined function for recording data.
+    rec : list
+        List to store recorded data.
+
+    Notes
+    -----
+    The function should be designed to work with the model's current state.
+    """
+
+    def __init__(self, funcs):
+        super().__init__()
+        self.funcs = funcs
+        self.rec = {}
+
+    def pre_loop_hook(self, model):
+        self.post_step_hook(model)
+
+    @nojit
+    def post_step_hook(self, model):
+        for name, func in self.funcs.items():
+            self.rec.setdefault(name, []).append(func(model))
+
+    def reset(self):
+        self.rec = {}
+
+    def stack(self, var: str = None) -> torch.Tensor:
+        """
+        Stack recorded tensors into a single tensor.
+
+        If a specific variable name is provided, only that variable's data is stacked.
+        Otherwise, all recorded variables are stacked and concatenated.
+
+        Parameters
+        ----------
+        var : str, optional
+            Name of the specific variable to stack. If None, all recorded variables
+            are stacked and concatenated along dimension 2. Default is None.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor containing the stacked recorded data.
+        """
+        if var is not None:
+            return torch.stack(self.rec.get(var, []))
+        return torch.stack(
+            [torch.stack(tensors) for tensors in self.rec.values()], dim=2
+        )
+
+    def numpy(self, var: str = None) -> np.ndarray:
+        if var is not None:
+            v = self.rec.get(var, [])
+            if not v:
+                return np.array([])
+            return torch.stack(v).detach().cpu().numpy()
+        return {
+            name: torch.stack(tensors).detach().cpu().numpy()
+            for name, tensors in self.rec.items()
+        }
+
+
 def _hdf5_write(queue: Queue, path: str):
     with File(path, "w", libver="latest") as f:
         while True:
@@ -660,29 +805,23 @@ class LFP(Callback):
         super().__init__()
         self._lfp = []
         self._t = []
-        self.v_unit = v_unit
+        self.register_buffer("v_unit", torch.stack(v_unit))
 
     def pre_loop_hook(self, model):
         if not model.integrator.imem:
             raise RuntimeError(
-                "Axon must be compiled with IMEM=1. Use with axonml.helpers.ctx(IMEM=1): model = ..."
+                "Axon must be compiled with IMEM=1. Use with ax.ctx(IMEM=1): model = ..."
             )
         self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
         self._lfp.append(
-            torch.einsum(
-                "ij,ij->", torch.atleast_2d(model.integrator.i_membrane.squeeze()), self.v_unit
-            )
+            torch.einsum("ij,nij->n", model.integrator.i_membrane, self.v_unit)
         )
-        self._t.append(model.t)
         return super().pre_loop_hook(model)
 
     def post_step_hook(self, model):
         self._lfp.append(
-            torch.einsum(
-                "ij,ij->", torch.atleast_2d(model.integrator.i_membrane.squeeze()), self.v_unit
-            )
+            torch.einsum("ij,nij->n", model.integrator.i_membrane, self.v_unit)
         )
-        self._t.append(model.t)
 
     @property
     def lfp(self):
@@ -758,9 +897,29 @@ class ThresholdCallback(Callback):
         self.state_cache: torch.Tensor = None
         self.threshold: float = threshold
         self.t_start_check: float = t_start_check
-        self.node_check: List[int] = avoid_smart_indexing(node_check)
+        self.node_check: List[int] = node_check
+
         self.i: int = 0
-        self.dt: float = dt if dt is not None else A.dt
+        self._dt: float = dt if dt is not None else A.dt
+        self.ind_start = int(self.t_start_check / self._dt)
+
+    def pre_loop_hook(self, model):
+        self.node_check = torch.as_tensor(
+            self.node_check, dtype=torch.long, device=model.device()
+        )
+
+        # convert negative to positive index
+        nc = model.nc
+        self.node_check = self.node_check.remainder(nc)
+
+    @property
+    def dt(self):
+        return self._dt
+
+    @dt.setter
+    def dt(self, value):
+        self._dt = value
+        self.ind_start = int(self.t_start_check / self._dt)
 
     def reset_timer(self):
         """
@@ -856,15 +1015,17 @@ class APCount(ThresholdCallback):
     >>> ap_counts = ap_counter.numpy()  # Get AP counts for each axon
     """
 
-    def pre_loop_hook(self, model: AxonInterface):
+    def pre_loop_hook(self, model):
         """
         Initialize record and state_cache tensors before simulation.
 
         Parameters
         ----------
-        model : AxonInterface
+        model : Axon
             The axon model being simulated.
         """
+        super().pre_loop_hook(model)
+
         if self.record is None:
             self.record = torch.zeros(
                 model.n(),
@@ -880,19 +1041,21 @@ class APCount(ThresholdCallback):
                 device=model.device(),
             )
 
-    def post_step_hook(self, model: AxonInterface):
+    @torch._dynamo.disable
+    def post_step_hook(self, model):
         """
         Update AP counts after each simulation step.
 
         Parameters
         ----------
-        model : AxonInterface
+        model : Axon
             The axon model being simulated.
         """
-        if self.i * self.dt >= self.t_start_check:
-            vm_new = atleast_2d(model.v[:, self.node_check].squeeze())
-            vm = self.state_cache
-            self.state_cache = increment_count_(vm, vm_new, self.record, self.threshold)
+        if self.i >= self.ind_start:
+            vm_new = model.v.index_select(-1, self.node_check)
+            self.state_cache, self.record = increment_count(
+                self.state_cache, vm_new, self.record, self.threshold
+            )
         self.i += 1
 
 
@@ -1021,6 +1184,7 @@ class Active(ThresholdCallback):
     """
 
     def pre_loop_hook(self, model):
+        super().pre_loop_hook(model)
         if self.record is None:
             self.record = torch.zeros(
                 model.n(), dtype=torch.bool, device=model.device()
@@ -1033,12 +1197,13 @@ class Active(ThresholdCallback):
                 device=model.device(),
             )
 
-    def post_step_hook(self, model: AxonInterface):
-        if self.i * self.dt >= self.t_start_check:
-            vm_new = atleast_2d(model.v[:, self.node_check].squeeze())
-            vm = self.state_cache
-            self.state_cache, la = update_active(vm, vm_new, self.threshold)
-            self.record[la] = True
+    @nojit
+    def post_step_hook(self, model):
+        if self.i >= self.ind_start:
+            vm_new = model.v.index_select(-1, self.node_check)
+            self.state_cache, self.record = update_active(
+                self.state_cache, vm_new, self.record, self.threshold
+            )
         self.i += 1
 
     def is_active(self):
@@ -1097,18 +1262,22 @@ class Raster(ThresholdCallback):
     Examples
     --------
     >>> raster = Raster(threshold=20.0)  # Record when v crosses +20 mV
-    >>> model.run(ve, callbacks=[raster])
+    >>> dt = 0.005 * ms
+    >>> model.run(ve, dt=dt, callbacks=[raster])
     >>> spike_data = raster.numpy()  # Get spike data for plotting
     >>>
     >>> # Plot raster
     >>> import matplotlib.pyplot as plt
     >>> fig, axis = plt.subplots(dpi=200, figsize=(5,5))
     >>> diams = model.diam.cpu().numpy()
-    >>> raster.plot(diams, dt=model.dt, ax=axis)
+    >>> raster.plot(diams, dt=dt, ax=axis)
     >>> plt.show()
     """
 
-    def pre_loop_hook(self, model: AxonInterface):
+    def pre_loop_hook(self, model):
+        self.node_check = torch.as_tensor(
+            self.node_check, dtype=torch.long, device=model.device()
+        )
         if self.record is None:
             self.record = []
         if self.state_cache is None:
@@ -1119,11 +1288,12 @@ class Raster(ThresholdCallback):
                 device=model.device(),
             )
 
-    def post_step_hook(self, model: AxonInterface):
-        if self.i * self.dt >= self.t_start_check:
+    @nojit
+    def post_step_hook(self, model):
+        if self.i >= self.ind_start:
             vm_new = atleast_2d(model.v[:, self.node_check])
             vm = self.state_cache
-            self.state_cache, la = increment_count(vm, vm_new, self.threshold)
+            self.state_cache, la = increment_act(vm, vm_new, self.threshold)
             self.record.append(la)
         self.i += 1
 
@@ -1132,15 +1302,17 @@ class Raster(ThresholdCallback):
 
     def numpy(self):
         return self.stack().detach().cpu().numpy()
-    
-    def plot(self, 
-             var,
-             varname: str,
-             dt=None, 
-             ax=None, 
-             cmap=None, 
-             node_idx=None, 
-             axon_idx=None):
+
+    def plot(
+        self,
+        var,
+        varname: str,
+        dt=None,
+        ax=None,
+        cmap=None,
+        node_idx=None,
+        axon_idx=None,
+    ):
         """
         Plot the raster plot of spiking activity.
 
@@ -1184,7 +1356,9 @@ class Raster(ThresholdCallback):
             fig, ax = plt.subplots(dpi=300, figsize=(10, 6))
 
         num_fibers, num_timepoints = binary_array.shape
-        assert len(var) == num_fibers, "Length of var must match the number of axons selected to plot."
+        assert len(var) == num_fibers, (
+            "Length of var must match the number of axons selected to plot."
+        )
 
         # Build a list of spike-time arrays. Each entry in data_for_eventplot
         # corresponds to a single fiber's event times.
@@ -1198,49 +1372,52 @@ class Raster(ThresholdCallback):
         # Convert each diameter to an RGBA color using the colormap + normalization
         line_colors = [cmap(norm(d)) for d in var]
         ax.eventplot(
-            data_for_eventplot, 
-            lineoffsets=var, 
-            linelengths=0.8*min(var[1:]-var[:-1]), 
-            colors=line_colors)
+            data_for_eventplot,
+            lineoffsets=var,
+            linelengths=0.8 * min(var[1:] - var[:-1]),
+            colors=line_colors,
+        )
         tstop = num_timepoints * dt
         range_var = var.max() - var.min()
         y_min = var.min() - 0.02 * range_var
         y_max = var.max() + 0.02 * range_var
         ax.set_ylim(y_min, y_max)
-        ax.set_xlim(0-0.02*tstop, tstop+0.02*tstop)
+        ax.set_xlim(0 - 0.02 * tstop, tstop + 0.02 * tstop)
         ax.set_xlabel("Time (ms)")
         ax.set_ylabel(f"{varname}")
         return ax
 
 
 @torch.jit.script
-def increment_count(vm, vm_new, threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    ge = vm_new >= threshold
-    l_and = torch.logical_and(ge, vm)
-    return ~ge, l_and
+def increment_count(vm, vm_new, record, threshold: float):
+    m = vm_new >= threshold
+    mask = m & vm  # fused compare + and
+    record = record + mask.to(record.dtype)  # one fused kernel
+    next_mask = ~m  # can tag-on to same kernel
+    return next_mask, record
 
 
 @torch.jit.script
-def increment_count_(vm, vm_new, record, threshold: float) -> torch.Tensor:
-    ge = vm_new >= threshold
-    l_and = torch.logical_and(ge, vm)
-    record[l_and] += 1
-    return ~ge
+def increment_act(vm, vm_new, threshold: float):
+    m = vm_new >= threshold
+    mask = m & vm  # fused compare + and
+    next_mask = ~m  # can tag-on to same kernel
+    return next_mask, mask
 
 
 @torch.jit.script
-def update_active(vm, vm_new, threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
+def update_active(
+    vm, vm_new, record, threshold: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
     ge = vm_new >= threshold
-    l_and = torch.any(torch.logical_and(ge, vm), dim=1)
-    return ~ge, l_and
+    record = torch.logical_or(record, torch.any(torch.logical_and(ge, vm), dim=1))
+    return ~ge, record
 
 
-@torch.jit.script
 def is_active(record, at_least: int) -> torch.Tensor:
     return torch.count_nonzero(record, dim=1) >= at_least
 
 
-@torch.jit.script
 def sliding_window_average(x, window_size: int):
     """
     Compute the sliding (moving) window average along axis 0 for a 4D array/tensor,

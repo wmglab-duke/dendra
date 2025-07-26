@@ -89,7 +89,6 @@ if __name__ == "__main__":
         from cajal.nrn.sources import PreComputedInterpolate1D
         from cajal.nrn.stimuli import MonophasicPulse
 
-
         class MyMRG(MRG):
             def init_AP_monitors(self):
                 self.set_AP_monitors(axonnodes=args.node_check)

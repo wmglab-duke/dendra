@@ -1,10 +1,14 @@
 """Precomputed fields."""
 
+import torch
+
 import glob
 from natsort import natsorted
 import numpy as np
 from scipy.interpolate import interp1d
 from tqdm.auto import tqdm
+
+from .quasipotentials import calculate_quasipotentials_batched_coords
 
 
 class PreComputed:
@@ -169,3 +173,101 @@ class PreComputedInterpolate1D(PreComputed):
 # -- aliases --
 FEMExact = PreComputedExact
 FEMInterpolate1D = PreComputedInterpolate1D
+
+
+class EfieldInterpolate3D(torch.nn.Module):
+    def __init__(self, xyz, efield, *, k: int | None = 8, eps: float = 1e-9):
+        """
+        Initialize the EfieldInterpolate3D module.
+
+        Parameters
+        ----------
+        xyz : torch.Tensor
+            A tensor of shape (N, 3) containing the coordinates (x, y, z) in μm.
+        efield : torch.Tensor
+            A tensor of shape (N, 3) containing the electric field vectors at the coordinates.
+        k : int, optional
+            The number of nearest neighbors to consider for interpolation. Default is 8.
+        eps : float, optional
+            A small value to avoid division by zero in interpolation. Default is 1e-9.
+
+        Forward
+        -------
+        forward(x, y, z) → (B, K, 3) tensor
+            `x`, `y`, `z` are each (B, K) tensors of coordinates.  The output
+            is the interpolated E-field at every query point using
+            inverse-distance weighting.
+
+        Notes
+        -----
+        *  All operations remain on the same device/dtype as the inputs.
+        *  The module is differentiable w.r.t. *query* coordinates; the
+           sample points/values are treated as constants (buffers).
+        """
+        super().__init__()
+        assert xyz.shape == efield.shape and xyz.shape[1] == 3
+        N = xyz.shape[0]
+        if k is not None and (k < 1 or k > N):
+            raise ValueError(f"k must be in [1, N={N}] or None.")
+
+        xyz = torch.as_tensor(xyz)
+        efield = torch.as_tensor(efield)
+
+        # store as buffers so they move with .to(device) / .half() calls
+        self.register_buffer("xyz", xyz.clone())
+        self.register_buffer("efield", efield.clone())
+        self.k = k
+        self.eps = eps
+
+    # ------------------------------------------------------------------
+    # core helper: inverse‑distance weighting on last dim
+    # ------------------------------------------------------------------
+    def _idw(self, dist2: torch.Tensor, vecs: torch.Tensor) -> torch.Tensor:
+        """
+        dist2 : (..., M) squared distances
+        vecs  : (..., M, 3) corresponding vectors
+        Returns
+        -------
+        (..., 3) weighted average
+        """
+        w = 1.0 / (dist2 + self.eps)
+        w = w / w.sum(dim=-1, keepdim=True)
+        return (w.unsqueeze(-1) * vecs).sum(dim=-2)
+
+    # ------------------------------------------------------------------
+    # user‑facing API
+    # ------------------------------------------------------------------
+    def _interp(
+        self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        x, y, z : (B, K) query coordinates
+        Returns  (B, K, 3) interpolated E-field
+        """
+        if x.shape != y.shape or x.shape != z.shape:
+            raise ValueError("x, y, z must have identical shapes (B, K)")
+
+        B, K = x.shape
+        xyz_q = torch.stack((x, y, z), dim=-1)  # (B, K, 3)
+
+        # ---------- pair‑wise squared distances ----------
+        #   diff → (B, K, N, 3)
+        diff = xyz_q[..., None, :] - self.xyz  # broadcast N
+        dist2 = (diff**2).sum(dim=-1)  # (B, K, N)
+
+        # ---------- pick k nearest neighbours if requested ----------
+        if self.k is not None and self.k < self.xyz.shape[0]:
+            dist2, idx = torch.topk(dist2, self.k, dim=-1, largest=False)
+            vecs = self.efield[idx]  # (B, K, k, 3)
+        else:  # use all N
+            vecs = self.efield.expand(B, K, -1, -1)  # broadcast to (B, K, N, 3)
+
+        # ---------- inverse‑distance weighted average ----------
+        return self._idw(dist2, vecs)
+
+    def forward(self, model):
+        self.to(device=model.device(), dtype=model.dtype())
+        x, y, z = model.x, model.y, model.z
+        G = model.G
+        efield = self._interp(x, y, z)
+        return calculate_quasipotentials_batched_coords(G, x, y, z, efield)

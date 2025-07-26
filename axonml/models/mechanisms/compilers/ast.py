@@ -4,6 +4,8 @@ from sympy import symbols, sympify, Poly, expand, factor
 from functools import lru_cache
 
 from axonml.helpers import DEBUG
+from .source import safe_source
+
 
 # helper: Python‑AST → SymPy
 def _ast_to_sympy(node: ast.AST, local_syms: dict[str, sp.Expr]) -> sp.Expr:
@@ -11,21 +13,29 @@ def _ast_to_sympy(node: ast.AST, local_syms: dict[str, sp.Expr]) -> sp.Expr:
         return local_syms.setdefault(node.id, sp.symbols(node.id))
     if isinstance(node, ast.Constant):
         return sp.sympify(node.value)
-    if isinstance(node, ast.Attribute):                            # self.x → self_x
+    if isinstance(node, ast.Attribute):  # self.x → self_x
         base = _ast_to_sympy(node.value, local_syms)
         if isinstance(base, sp.Symbol) and base.name == "self":
-            return local_syms.setdefault(f"self_{node.attr}",
-                                          sp.symbols(f"self_{node.attr}"))
+            return local_syms.setdefault(
+                f"self_{node.attr}", sp.symbols(f"self_{node.attr}")
+            )
         raise NotImplementedError("Only `self.attr` attributes supported.")
     if isinstance(node, ast.BinOp):
-        l, r = (_ast_to_sympy(node.left, local_syms),
-                _ast_to_sympy(node.right, local_syms))
-        return {ast.Add: l + r, ast.Sub: l - r,
-                ast.Mult: l * r, ast.Div: l / r, ast.Pow: l**r}[type(node.op)]
+        l, r = (
+            _ast_to_sympy(node.left, local_syms),
+            _ast_to_sympy(node.right, local_syms),
+        )
+        return {
+            ast.Add: l + r,
+            ast.Sub: l - r,
+            ast.Mult: l * r,
+            ast.Div: l / r,
+            ast.Pow: l**r,
+        }[type(node.op)]
     if isinstance(node, ast.UnaryOp):
         o = _ast_to_sympy(node.operand, local_syms)
         return {ast.UAdd: +o, ast.USub: -o}[type(node.op)]
-    if isinstance(node, ast.Call):                                 # pow(a, b)
+    if isinstance(node, ast.Call):  # pow(a, b)
         if isinstance(node.func, ast.Name) and node.func.id == "pow":
             a, b = (_ast_to_sympy(arg, local_syms) for arg in node.args[:2])
             return a**b
@@ -42,20 +52,21 @@ def factorize_linear_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
     source-code string containing exactly one class definition.
     """
     # 1. obtain the source text of the class
-    if isinstance(obj_or_src, str):                                # already text
+    if isinstance(obj_or_src, str):  # already text
         src = textwrap.dedent(obj_or_src)
-    else:                                                          # a class object
+    else:  # a class object
         try:
-            src = inspect.getsource(obj_or_src)
-        except OSError as e:       # happens e.g. for built‑ins or eval‑crafted
+            src = safe_source(obj_or_src)
+        except OSError as e:  # happens e.g. for built‑ins or eval‑crafted
             raise ValueError("Can't retrieve source for the supplied class") from e
         src = textwrap.dedent(src)
 
     # 2. parse, locate target method, record simple assignments
     tree = ast.parse(src)
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
-    fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
-              and n.name == method)
+    fn = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == method
+    )
 
     env: dict[str, ast.AST] = {}
     return_expr = None
@@ -96,9 +107,9 @@ def factorize_linear_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
     if A == 0:
         raise ZeroDivisionError("A is identically zero; cannot factor B = A*C")
     C = sp.simplify(B / A)
-    
+
     def _dotify(expr: sp.Expr) -> str:
-        return re.sub(r'\bself_(\w+)\b', r'self.\1', str(expr))
+        return re.sub(r"\bself_(\w+)\b", r"self.\1", str(expr))
 
     return _dotify(A), _dotify(C)
 

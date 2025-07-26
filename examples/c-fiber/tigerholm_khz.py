@@ -28,7 +28,7 @@ if __name__ == "__main__":
     # -- run & record --
     indices = model.c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
     states = [
-        'v',
+        "v",
     ]
     rec = ax.callbacks.Recorder(states, node_indices=indices).set_hdf5(
         "tigerholm_voltage.h5", cache_every=args.cache_every

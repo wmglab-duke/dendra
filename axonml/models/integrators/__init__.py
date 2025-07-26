@@ -8,13 +8,21 @@ from .explicit import (
     _rk2,
     _rk4,
     _dufort_frankel,
+    _dufort_frankel_homogeneous,
 )
 
 from .implicit import (
-    _krylov_etd1, 
-    _bwd_euler_sc, 
+    _bwd_euler_sc,
     _bwd_euler_ub,
     _bwd_euler_bt,
+)
+
+from .imex import (
+    _krylov_etd1,
+)
+
+from .tree import (
+    _dhs,
 )
 
 
@@ -28,22 +36,28 @@ def partial_class(cls: Type[Any], /, *args, **kwargs) -> Type[Any]:
     class _Partial(cls):
         __init__ = partialmethod(cls.__init__, *args, **kwargs)
 
-    _Partial.__name__ = f"{cls.__name__}Partial"
+    _Partial.__name__ = f"{cls.__name__}_solver"
     _Partial.__qualname__ = _Partial.__name__
     return _Partial
 
 
-euler           = partial(partial_class, _euler)
-rk1             = partial(partial_class, _rk1)
-rk2             = partial(partial_class, _rk2)
-rk4             = partial(partial_class, _rk4)
-dufort_frankel  = partial(partial_class, _dufort_frankel)
-eulerv1         = partial(partial_class, _eulerv1)
+euler = partial(partial_class, _euler)
+rk1 = partial(partial_class, _rk1)
+rk2 = partial(partial_class, _rk2)
+rk4 = partial(partial_class, _rk4)
+dufort_frankel = partial(partial_class, _dufort_frankel)
+dufort_frankel_homogeneous = partial(partial_class, _dufort_frankel_homogeneous)
+eulerv1 = partial(partial_class, _eulerv1)
 
-krylov_etd1  = partial(partial_class, _krylov_etd1)
+krylov_etd1 = partial(partial_class, _krylov_etd1)
 bwd_euler_sc = partial(partial_class, _bwd_euler_sc)
 bwd_euler_ub = partial(partial_class, _bwd_euler_ub)
 bwd_euler_bt = partial(partial_class, _bwd_euler_bt)
+
+dhs = partial(partial_class, _dhs)
+
+df = dufort_frankel
+dfh = dufort_frankel_homogeneous
 
 
 __all__ = [
@@ -53,8 +67,12 @@ __all__ = [
     "rk2",
     "rk4",
     "dufort_frankel",
+    "dufort_frankel_homogeneous",
     "krylov_etd1",
     "bwd_euler_sc",
     "bwd_euler_ub",
     "bwd_euler_bt",
+    "dhs",
+    "df",
+    "dfh",
 ]

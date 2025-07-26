@@ -1,703 +1,579 @@
-import linecache
-from typing import List, Dict
+from contextlib import nullcontext
+from typing import Dict
 
 from tqdm.auto import tqdm
-import torch, torch.nn as nn, math
 
-from axonml.helpers import DEBUG
-from axonml.models.callbacks import CallbackList, Callback
+import torch
 
-from .population import assemble_global_adjacencies, blocks_by_projection
-from ..mechanisms.compilers.utils import indent
-
-
-advance_v_template = """
-self.{pop}.v = self.{pop}.integrator._step_no_intra(self.{pop}.v, self.dt, self.{pop}.temp_c)
-"""
+from ..core import Population, make_intra
+from ..parametric import to_param
+from ..callbacks import CallbackList
+from .delaydelivery import NetCon
+from axonml.helpers import BACKEND, FULLGRAPH, DYNAMIC, JIT, COMPILE_MODE
 
 
-net_receive_template = """
-self.{pop}.mech.net_receive(weights_{pop})
-"""
-
-
-compute_spikes_template = """
-spikes_{pop} = self.check_active_{pop}(self.{pop}.v)
-"""
-
-
-compute_weights_template = """
-{pre}_{post}_weights = self.synapses_{pre}_{post}(spikes_{pre})
-"""
-
-
-init_v_template = """
-self.{pop}.integrator.init_v(self.{pop})
-"""
-
-
-init_mech_template = """
-self.{pop}.integrator.mech.initialize(self.{pop}.v, self.{pop}.v_init_c, self.{pop}.temp_c)
-"""
-
-
-init_integrator_template = """
-self.{pop}.integrator.initialize(self.{pop}, self.dt)
-"""
-
-
-def advance_v(populations):
+def to_flat_idx_torch(arr, idx):
     """
-    Generate the code to advance the voltage of each population.
+    Converts any valid PyTorch index into a 1D tensor of flat indices.
+
+    Args:
+        arr (torch.Tensor): The original tensor, used for its shape and device.
+        idx: The index to be converted. Can be a slice, int, tuple,
+             boolean tensor, or integer tensor.
+
+    Returns:
+        torch.LongTensor: A 1D tensor containing the flat indices that
+                          correspond to the elements selected by `arr[idx]`.
     """
-    advance_v = []
-    for pop in populations:
-        advance_v.append(advance_v_template.format(pop=pop))
-    return indent("\n".join(advance_v), 2)
+    if not isinstance(arr, torch.Tensor):
+        raise TypeError("Input 'arr' must be a torch.Tensor.")
+
+    # 1. Create a grid of flat indices with the same shape as the input array.
+    #    e.g., for a (2, 3) tensor, this becomes [[0, 1, 2], [3, 4, 5]]
+    indices_grid = torch.arange(arr.numel(), device=arr.device).view(arr.shape)
+
+    # 2. Apply the user's index to this grid. PyTorch's indexing logic
+    #    will select the corresponding flat indices for us.
+    selected_indices = indices_grid[idx]
+
+    # 3. Flatten the result to get a 1D tensor of flat indices.
+    return selected_indices.flatten()
 
 
-def compute_spikes(populations):
-    """
-    Generate the code to compute the spikes of each population.
-    """
-    compute_spikes = []
-    for pop in populations:
-        compute_spikes.append(compute_spikes_template.format(pop=pop))
-    return indent("\n".join(compute_spikes), 2)
+def step_pop(integrator, model, dt, ve=None, intra=None):
+    integrator.step(model, dt, ve, intra)
+    model.t = model.t + dt
 
 
-def compute_weights(connections):
-    """
-    Generate the code to compute the weights for each connection.
-    """
-    compute_weights = []
-    for c in connections:
-        compute_weights.append(compute_weights_template.format(pre=c['pre'], post=c['post']))
-    return indent("\n".join(compute_weights), 2)
+def step(
+    populations,
+    synapses,
+    dt,
+    ve: Dict[str, torch.Tensor | None] = {},
+    intra: Dict[str, torch.Tensor | None] = {},
+):
+    for s in synapses.values():
+        s.advance()
+    for n, pop in populations.items():
+        step_pop(pop.integrator, pop, dt, ve.get(n, None), intra.get(n, None))
 
 
-def total_weights(populations, connections, intrinsic):
-    """
-    Generate the code to compute the total weights for each population.
-    """
-    total_weights = []
-    no_act = []
-    for pop in populations:
-        relevant_weights = []
-        for c in connections:
-            if c['post'] == pop:
-                relevant_weights.append(f"{c['pre']}_{c['post']}_weights")
-        if not relevant_weights:
-            if not pop in intrinsic:
-                no_act.append(pop)
-                continue
-            total_weights.append(f"weights_{pop} = self.{pop}_intrinsic()")
-            continue
-        relevant_weights_sum = f" + ".join(relevant_weights)
-        if pop in intrinsic:
-            relevant_weights_sum = f"self.{pop}_intrinsic() + {relevant_weights_sum}"
-        total_weights.append(f"weights_{pop} = {relevant_weights_sum}")
-    return indent("\n".join(total_weights), 2), no_act
-
-
-def split_weights(populations):
-    """
-    Generate the code to split the weights for each population.
-    """
-    split_weights = []
-    for pop in populations:
-        split_weights.append(f"{pop}_weights")
-    split_weights = split_weights_template.format(
-        split_weights=", ".join(split_weights)
+def get_local_index(population, mech, index):
+    indices = torch.full_like(
+        population.v, -1, dtype=torch.long, device=population.device()
+    ).flatten()
+    mech_key_flat = to_flat_idx_torch(population.v, mech.key)
+    indices.index_copy_(
+        0,
+        mech_key_flat,
+        torch.arange(
+            mech_key_flat.numel(), device=population.device(), dtype=torch.long
+        ),
     )
-    return indent(split_weights, 2)
+    return indices.index_select(0, index)
 
 
-def net_receive(populations, no_act):
+def prepare_indices_one_one(source, target, synapse):
+    source_model = source.model
+    target_model = target.model
+    syn = synapse
+
+    index_arr = torch.arange(
+        target_model.v.numel(), device=target_model.device(), dtype=target_model.dtype()
+    ).view_as(target_model.v)
+
+    indices_in_synapse = syn.get(index_arr).flatten()
+    post_idx = to_flat_idx_torch(target_model.v, target.index)
+
+    if not torch.all(torch.isin(post_idx, indices_in_synapse)):
+        raise ValueError(
+            f"Target population '{target.name}' does not have the synapse '{synapse}' at all target locations."
+        )
+
+    pre_idx = to_flat_idx_torch(source_model.v, source.index)
+    post_idx = get_local_index(target_model, syn, post_idx)
+
+    return pre_idx, post_idx
+
+
+def prepare_indices_one_one_flat(
+    source_model, source_index, target_model, target_index, synapse
+):
     """
-    Generate the code to advance the voltage of each population.
+    Prepares indices for a one-to-one connection between source and target populations.
+    This function assumes that the synapse exists at all target locations.
     """
-    net_receive = []
-    for pop in populations:
-        if pop in no_act:
-            continue
-        net_receive.append(net_receive_template.format(pop=pop))
-    return indent("\n".join(net_receive), 2)
+    syn = synapse
+
+    index_arr = torch.arange(
+        target_model.v.numel(), device=target_model.device(), dtype=target_model.dtype()
+    ).view_as(target_model.v)
+
+    indices_in_synapse = syn.get(index_arr).flatten()
+
+    pre_idx = source_index
+    post_idx = target_index
+
+    if not torch.all(torch.isin(post_idx, indices_in_synapse)):
+        raise ValueError(
+            f"Target population '{target_model.name}' does not have the synapse '{synapse}' at all target locations."
+        )
+
+    post_idx = get_local_index(target_model, syn, post_idx)
+
+    return pre_idx, post_idx
 
 
-def init_v(populations):
+def check_weight_shape(weight, pre_idx):
     """
-    Generate the code to advance the voltage of each population.
+    Checks the shape of the weight tensor against the pre-synaptic indices.
+    If the weight is a scalar, it returns the number of pre-synaptic indices.
+    If the weight is a tensor, it checks if its shape matches the number of pre-synaptic indices.
     """
-    init_v = []
-    for pop in populations:
-        init_v.append(init_v_template.format(pop=pop))
-    return indent("\n".join(init_v), 2)
+    if isinstance(weight, float):
+        return len(pre_idx)
+    if isinstance(weight, torch.nn.Module):
+        return len(pre_idx)
+    if isinstance(weight, torch.Tensor):
+        if weight.ndim == 0:
+            return len(pre_idx)
+        if weight.ndim == 1:
+            if len(weight) == 1:
+                return len(pre_idx)
+            if weight.shape[0] == len(pre_idx):
+                return 1
+            raise ValueError(
+                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
+            )
+    if hasattr(weight, "__len__"):
+        if len(weight) != len(pre_idx):
+            raise ValueError(
+                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
+            )
+        return 1
+    raise TypeError(f"Unsupported type for weight: {type(weight)}.")
 
 
-def init_mech(populations):
+def expand(value, n):
+    if isinstance(value, torch.nn.Module):
+        return value.sample(n)
+    return torch.tensor(value).repeat(n)
+
+
+def make_weight(weights, n):
+    class ParameterOrDistributionWrapper(torch.nn.Module):
+        """A simple wrapper for parameters or distributions that can be sampled."""
+
+        def __init__(self, param):
+            super().__init__()
+            # nn.Parameter() is idempotent, so it's safe to call on an existing parameter.
+            self.param = param
+
+        def sample(self, n):
+            if isinstance(self.param, torch.Tensor):
+                return self.param.repeat(n)
+            else:
+                return self.param.sample(n)
+
+    class WeightExpander(torch.nn.Module):
+        def __init__(self, weights, n):
+            super(WeightExpander, self).__init__()
+            self.weights = torch.nn.ModuleList(
+                [ParameterOrDistributionWrapper(w) for w in weights]
+            )
+            self.n = n
+            self.register_buffer("w", torch.empty(0))
+
+        def forward(self):
+            return self.w
+
+        def init(self, reinit=True):
+            if reinit or not self.w.numel():
+                self.w = torch.cat([w.sample(n) for w, n in zip(self.weights, self.n)])
+
+    return WeightExpander(weights, n)
+
+
+class Network(torch.nn.Module):
     """
-    Generate the code to advance the voltage of each population.
+    Base class for networks in AxonML.
     """
-    init_mech = []
-    for pop in populations:
-        init_mech.append(init_mech_template.format(pop=pop))
-    return indent("\n".join(init_mech), 2)
 
-
-def init_integrator(populations):
-    """
-    Generate the code to advance the voltage of each population.
-    """
-    init_integrator = []
-    for pop in populations:
-        init_integrator.append(init_integrator_template.format(pop=pop))
-    return indent("\n".join(init_integrator), 2)
-
-
-def synapses_init(synapses):
-    """
-    Generate the code to advance the voltage of each population.
-    """
-    synapses_init = []
-    for s in synapses:
-        synapses_init.append(f"self.synapses_{s}.initialize()")
-    return indent("\n".join(synapses_init), 2)
-
-
-def initrinsic_init(intrinsic):
-    """
-    Generate the code to advance the voltage of each population.
-    """
-    intrinsic_init = []
-    for i in intrinsic:
-        intrinsic_init.append(f"self.{i}_intrinsic.initialize()")
-    return indent("\n".join(intrinsic_init), 2)
-
-
-def check_active_init(populations):
-    """
-    Generate the code to advance the voltage of each population.
-    """
-    check_active_init = []
-    for pop in populations:
-        check_active_init.append(f"self.check_active_{pop}.above_threshold.zero_()")
-    return indent("\n".join(check_active_init), 2)
-
-
-template = """
-class _network(torch.nn.Module):
-    def __init__(self, populations, synapses, check_active, intrinsic, dt):
-        super().__init__()
-
-        for name, synapse in synapses.items():
-            setattr(self, f"synapses_{{name}}", synapse)
-
-        for name, check in check_active.items():
-            setattr(self, f"check_active_{{name}}", check)
-
+    def __init__(self, populations: Dict[str, Population]):
+        super(Network, self).__init__()
+        self.populations = populations
         for name, pop in populations.items():
+            pop.build()
+            pop.name = name
             setattr(self, name, pop)
 
-        if intrinsic is not None:
-            for name, intrinsic in intrinsic.items():
-                setattr(self, f"{{name}}_intrinsic", intrinsic)
+        self.synapse_spec = {}
+        self.synapses = torch.nn.ModuleDict()
+        self.dt = None
+        self.built = False
+        self.t_ind = 0
 
-        self.register_buffer("dt", torch.as_tensor(dt))
-        self.n_per_pop: List[int] = [pop.v.shape[-1] for pop in populations.values()]
+        self.backend = BACKEND.value
+        self.fullgraph = bool(FULLGRAPH)
+        self.dynamic = bool(DYNAMIC)
+        self.jit = bool(JIT)
+        self.compile_mode = COMPILE_MODE.value
 
-    def step(self):
-{advance_v}
-{compute_spikes}
-{compute_weights}
-{total_weights}
-{net_receive}
+        torch._dynamo.reset()
 
-    @torch.jit.ignore
-    def initialize(self):
-{synapses_init}
-{intrinsic_init}
-{check_active_init}
-{init_v}
-{init_integrator}
-{init_mech}
-"""
-
-
-def weights_by_delay_(weight: torch.Tensor, delay: torch.Tensor) -> torch.Tensor:
-    D_max = int(delay.max().item())
-    Wd: List[torch.Tensor] = []
-    for d in range(1, D_max + 1):
-        Wd.append(weight * (delay == d))
-    return torch.stack(Wd, dim=0)  # (D,N,C,C)
-
-
-def weights_by_delay(
-    W: torch.Tensor,          # (N, n_pre, n_post)  float / half
-    D: torch.Tensor           # (N, n_pre, n_post)  int64
-) -> torch.Tensor:
-    """
-    Rearranges a weight matrix `W` and its corresponding delay matrix `D`
-    into a delay-indexed tensor suitable for VariableDelaySynapse.
-
-    Returns
-    -------
-    W_by_D : (D_max, N, n_pre, n_post)
-             W_by_D[d-1, n, i, j] holds W[n,i,j] **iff** D[n,i,j] == d,
-             otherwise 0.  (Delay values must be >= 1.)
-    """
-    if W.shape != D.shape:
-        raise ValueError("W and D must have the same shape")
-
-    if not torch.is_floating_point(W):
-        raise TypeError("W must be a floating-point tensor")
-    if D.dtype != torch.int64:
-        raise TypeError("D must be int64 (torch.long)")
-
-    D_max = int(D.max().item())        # largest delay present
-    if D_max < 1:
-        raise ValueError("all delays must be ≥ 1")
-
-    # Broadcast masks & zero-out in one pass per delay
-    blocks = []
-    for d in range(1, D_max + 1):
-        mask = (D == d)
-        blocks.append(W.masked_fill(~mask, 0.0))
-
-    # → (D_max, N, n_pre, n_post)
-    return torch.stack(blocks, dim=0)
-
-
-class VariableDelaySynapse(torch.jit.ScriptModule):
-    """
-    Forward signature
-    -----------------
-    spikes : (N, P, C)  bool / 0-1
-    returns: (N, P, C)  float
-    """
-
-    def __init__(
-        self,
-        W: torch.Tensor,  # (N,C,C)
-        M: torch.Tensor,  # (N,C,C)
-        D: torch.Tensor,  # (N,C,C)
-        P: int,
-        dt: float,
-    ):
-        super().__init__()
-
-        self.W = torch.nn.Parameter(W, requires_grad=False)  # (N,C,C)
-        self.register_buffer("D", D)  # (N,C,C)
-
-        W_by_delay = weights_by_delay(W, D)  # (D,N,C,C)
-
-        # parameters
-        self.register_buffer("M", M)         # (D,N,C,C)
-        self.D_max = W_by_delay.size(0)
-        self.D_buf = self.D_max + 1 
-        self.N = W_by_delay.size(1)
-        self.C = W_by_delay.size(3)
-        self.P = int(P)
-
-        Wd = W_by_delay.contiguous()
-        
-        self.register_buffer("Wd", Wd)
-    
-        # circular delay line  (D, N, P, C)
-        self.register_buffer(
-            "queue",
-            torch.zeros(
-                self.D_buf,
-                self.N,
-                self.P,
-                self.C,
-                dtype=W_by_delay.dtype,
-                device=W_by_delay.device,
-            ),
-        )
-        self.register_buffer("head", torch.zeros((), dtype=torch.long))
-
-        # pre-compute tensor of slot offsets  [1,2,…,D_max]
-        self.register_buffer(
-            "delay_offsets",
-            torch.arange(self.D_max, dtype=torch.long, device=W_by_delay.device) + 1
-        )
+        if self.jit:
+            self._step = torch.compile(
+                step,
+                backend=self.backend,
+                fullgraph=self.fullgraph,
+                dynamic=self.dynamic,
+                mode=self.compile_mode,
+            )
+        else:
+            self._step = torch.compile(
+                step,
+                backend="eager",
+            )
 
         self.eval()
 
-    @torch.jit.export
-    def initialize(self) -> None:
+    def train(self, mode=True):
         """
-        Initialize the synapse state.
+        Set the network to training mode.
         """
-        self.queue.zero_().detach_()
-        self.head.zero_().detach_()
-        if self.training:
-            self.Wd.detach_()
-            self.Wd = weights_by_delay(self.W, self.D)  # (D,N,C,C)
+        for pop in self.populations.values():
+            pop.train(mode)
+        self.training = mode
+        return self
 
-    @torch.jit.export
-    def float16(self) -> None:
-        """
-        Convert the synapse weights to float16.
-        """
-        self.Wd = self.Wd.to(torch.float16)
-        self.M = self.M.to(torch.float16)
-        self.D = self.D.to(torch.float16)
-        self.W = self.W.to(torch.float16)
-        self.rate_int = self.rate_int.to(torch.float16)
-        self.w_int = self.w_int.to(torch.float16)
-        self.queue = self.queue.to(torch.float16)
+    def train_(self, mode=True):
+        self.train(mode)
 
-    @torch.jit.export
-    def bfloat16(self) -> None:
-        """
-        Convert the synapse weights to bfloat16.
-        """
-        self.Wd = self.Wd.to(torch.bfloat16)
-        self.M = self.M.to(torch.bfloat16)
-        self.D = self.D.to(torch.bfloat16)
-        self.W = self.W.to(torch.bfloat16)
-        self.rate_int = self.rate_int.to(torch.bfloat16)
-        self.w_int = self.w_int.to(torch.bfloat16)
-        self.queue = self.queue.to(torch.bfloat16)
+    def eval(self):
+        super(Network, self).eval()
+        for pop in self.populations.values():
+            pop.eval()
+        self.training = False
+        return self
 
-    @torch.jit.export
-    def set_weights(self, W: torch.Tensor, D: torch.Tensor) -> None:
-        """
-        Set weights and delays for all synapses.
-        """
-        W = W * self.M
-        W_by_delay = weights_by_delay(W, D)  # (D,N,C,C)
-        self.Wd.copy_(W_by_delay)  # (D,N,C,C)
-
-    # ------------------------------------------------------------------
-    def forward(self, spikes: torch.Tensor) -> torch.Tensor:
-        """
-        spikes : (N,P,C_pre)
-        returns: (N,P,C_post)
-        """
-
-        # ── 1. advance head, deliver, clear ─────────────────
-        h = (self.head + 1) % self.D_buf              # NEW head slot
-        out = self.queue[h].clone()                   # deliver
-        self.queue[h] = 0.0                           # clear for reuse
-        self.head = h                                 # save back
-
-            # --- path A: batched GEMM (einsum)  fast when P is long -------
-        contrib = torch.einsum(           # (D,N,P,C)
-            'npj,dnji->dnpi',
-            spikes.to(self.Wd.dtype),
-            self.Wd
-        )
-
-        #  scatter-add into the ring buffer (no loop)
-        slots = (h + self.delay_offsets) % self.D_buf         # (D,)
-        self.queue.view(self.D_buf, -1).index_add_(
-            0,
-            slots,
-            contrib.reshape(self.D_max, -1)
-        )
-
-        return out
-
-
-class Intrinsic(torch.nn.Module):
-
-    scheduled_stimuli: Dict[int, torch.Tensor]
-
-    def __init__(
-        self,
-        N: int,
-        P: int,
-        C: int,
-        dt: float,
-        rate_int: torch.Tensor,  # (N,C) or scalar
-        w_int: torch.Tensor,     # (N,C) or scalar
-    ):
-        super().__init__()
-        self.N = N
-        self.P = P
-        self.C = C
-
-        self.dt : float = float(dt)
-        self.t_ind : int = 0
-        self.register_buffer(
-            "rate_int",
-            torch.as_tensor(rate_int, dtype=torch.float).expand(self.N, self.C).clone(),
-        )  # (N,C)
-        self.register_buffer(
-            "w_int",
-            torch.as_tensor(w_int, dtype=torch.float).expand(self.N, self.C).clone(),
-        )  # (N,C)
-
-        self.scheduled_stimuli = {}
-
-    @torch.jit.export
-    def initialize(self) -> None:
-        """
-        Initialize the intrinsic state.
-        """
-        self.t_ind = 0
-
-    @torch.jit.export
-    def schedule_stimulus(self, weight, time: float) -> None:
-        time_int = int(time / self.dt)
-        if time_int in self.scheduled_stimuli:
-            raise ValueError(f"Stimulus at time {time} already scheduled.")
-        self.scheduled_stimuli[time_int] = weight
-
-    @torch.jit.export
-    def forward(self):
-        """
-        intrinsic : (N,P,C)
-        """
-        p = 1.0 - torch.exp(-self.rate_int * self.dt)
-        p = p.unsqueeze(1)  # (N,1,C)
-        w_i = self.w_int.unsqueeze(1)  # (N,1,C)
-        rand = torch.rand(self.N, self.P, self.C,
-                          dtype=self.w_int.dtype, device=self.w_int.device)
-        intrinsic = (rand < p).to(self.w_int.dtype) * w_i  # (N,P,C)
-        if self.t_ind in self.scheduled_stimuli:
-            intrinsic += self.scheduled_stimuli[self.t_ind].to(intrinsic.dtype)
-        self.t_ind += 1
-        return intrinsic
-
-
-class IntrinsicStimOnly(torch.nn.Module):
-
-    scheduled_stimuli: Dict[int, torch.Tensor]
-
-    def __init__(
-        self,
-        N: int,
-        P: int,
-        C: int,
-        dt: float,
-    ):
-        super().__init__()
-        self.N = N
-        self.P = P
-        self.C = C
-
-        self.dt : float = float(dt)
-        self.t_ind : int = 0
-
-        self.scheduled_stimuli = {}
-        self.register_buffer("stimulus", torch.zeros((N, P, C), dtype=torch.float))
-
-    @torch.jit.export
-    def initialize(self) -> None:
-        """
-        Initialize the intrinsic state.
-        """
-        self.t_ind = 0
-
-    @torch.jit.export
-    def schedule_stimulus(self, weight, time: float) -> None:
-        time_int = int(time / self.dt)
-        if time_int in self.scheduled_stimuli:
-            raise ValueError(f"Stimulus at time {time} already scheduled.")
-        self.scheduled_stimuli[time_int] = weight
-
-    @torch.jit.export
-    def forward(self):
-        """
-        intrinsic : (N,P,C)
-        """
-        intrinsic = self.stimulus
-        if self.t_ind in self.scheduled_stimuli:
-            intrinsic = intrinsic + self.scheduled_stimuli[self.t_ind].to(intrinsic.dtype)
-        self.t_ind += 1
-        return intrinsic
-
-
-class CheckActive(torch.jit.ScriptModule):
-    def __init__(self, N, P, C, threshold: float = 0.0):
-        super().__init__()
-        self.threshold = threshold
-        self.register_buffer("above_threshold", torch.zeros((N, P, C), dtype=torch.bool))
-
-    @torch.jit.script_method
-    def forward(self, v: torch.Tensor) -> torch.Tensor:
-        """
-        v : (N,P,C)  float
-        """
-        # check if above threshold
-        above_threshold = v >= self.threshold
-        active = above_threshold & ~self.above_threshold
-        self.above_threshold = above_threshold
-
-        return active
-
-
-class Network(torch.jit.ScriptModule):
-    """
-    Network class for AxonML.
-    """
-
-    def __init__(self, net):
-        super().__init__()
-        self.net = net
-        self.dt : float = net.dt.item()
-        self.t_ind : int = 0
+    def eval_(self):
         self.eval()
 
-    @property
-    def t(self):
+    def device(self):
         """
-        Current time in the network.
+        Returns the device on which the network is located.
         """
-        return self.t_ind * self.dt
+        return next(iter(self.populations.values())).device()
 
-    def s(self, pre, post):
+    def dtype(self):
         """
-        Get the synapse object for a given pre and post population.
+        Returns the data type of the network's populations.
         """
-        return getattr(self.net, f"synapses_{pre}_{post}")
+        return next(iter(self.populations.values())).dtype()
 
-    def p(self, name):
+    def clear_synapses(self):
         """
-        Get the population object for a given name.
+        Clears all synapse specifications in the network.
         """
-        return getattr(self.net, name)
+        self.synapse_spec = {}
+        self.synapses.clear()
+        self.built = False
 
-    def schedule_stimulus(self, pop, weight, time: float) -> None:
+    def _connect(
+        self,
+        source_pop,
+        source_idx,
+        target_pop,
+        target_idx,
+        synapse,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+    ):
         """
-        Schedule a stimulus for a given time.
+        Internal method to connect two populations with a synapse.
         """
-        if not hasattr(self.net, f"{pop}_intrinsic"):
-            raise ValueError(f"Population {pop} does not have intrinsic.")
-        getattr(self.net, f"{pop}_intrinsic").schedule_stimulus(weight, time)
+        n_threshold = check_weight_shape(threshold, source_idx)
+        n_weight = check_weight_shape(weight, source_idx)
+        n_delay = check_weight_shape(delay, source_idx)
 
-    @torch.jit.script_method
-    def step(self) -> None:
+        # Add the connection to the synapse specification
+        self.synapse_spec.setdefault(
+            (source_pop.name, target_pop.name, synapse), []
+        ).append(
+            (
+                source_idx,
+                target_idx,
+                threshold,
+                n_threshold,
+                to_param(weight),
+                n_weight,
+                delay,
+                n_delay,
+            )
+        )
+
+    def connect_one_to_one(
+        self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
+    ):
+        if isinstance(source, Population):
+            source = source[:]  # Ensure source is a slice if it's a Population
+        if isinstance(target, Population):
+            target = target[:]  # Ensure target is a slice if it's a Population
+        # every target compartment receives input from exactly one source compartment
+        # 1. validate that the synapse exists at all the target locations
+        pre_idx, post_idx = prepare_indices_one_one(source, target, synapse)
+        self._connect(
+            source.model,
+            pre_idx,
+            target.model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
+        )
+
+    def connect_dense(
+        self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
+    ):
+        if isinstance(source, Population):
+            source = source[:]  # Ensure source is a slice if it's a Population
+        if isinstance(target, Population):
+            target = target[:]  # Ensure target is a slice if it's a Population
+
+        # every target compartment receives input from every source compartment
+        source_model = source.model
+        target_model = target.model
+        pre_idx = to_flat_idx_torch(source_model.v, source.index)
+        post_idx = to_flat_idx_torch(target_model.v, target.index)
+
+        # 1. Get the original number of elements
+        num_pre = pre_idx.numel()
+        num_post = post_idx.numel()
+
+        # 2. Expand the first tensor to repeat its elements
+        # Shape becomes [3, 1] -> [3, 4] -> [12]
+        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
+
+        # 3. Expand the second tensor to repeat the whole sequence
+        # Shape becomes [1, 4] -> [3, 4] -> [12]
+        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
+
+        pre_idx, post_idx = prepare_indices_one_one_flat(
+            source_model, pre_idx, target_model, post_idx, synapse
+        )
+
+        # now connect
+        self._connect(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
+        )
+
+    def connect_sparse(
+        self, source, target, synapse, prob: float, threshold=0.0, weight=1.0, delay=0.0
+    ):
+        if isinstance(source, Population):
+            source = source[:]  # Ensure source is a slice if it's a Population
+        if isinstance(target, Population):
+            target = target[:]  # Ensure target is a slice if it's a Population
+
+        # every target compartment receives input from every source compartment
+        source_model = source.model
+        target_model = target.model
+        pre_idx = to_flat_idx_torch(source_model.v, source.index)
+        post_idx = to_flat_idx_torch(target_model.v, target.index)
+
+        # 1. Get the original number of elements
+        num_pre = pre_idx.numel()
+        num_post = post_idx.numel()
+
+        # 2. Expand the first tensor to repeat its elements
+        # Shape becomes [3, 1] -> [3, 4] -> [12]
+        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
+
+        # 3. Expand the second tensor to repeat the whole sequence
+        # Shape becomes [1, 4] -> [3, 4] -> [12]
+        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
+
+        # randomly select connections based on the probability
+        mask = torch.rand(pre_idx.numel(), device=source_model.device()) < prob
+        pre_idx = pre_idx[mask]
+        post_idx = post_idx[mask]
+
+        pre_idx, post_idx = prepare_indices_one_one_flat(
+            source_model, pre_idx, target_model, post_idx, synapse
+        )
+
+        # now connect
+        self._connect(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
+        )
+
+    def build_synapses(self, dt):
+        for (pre_name, post_name, synapse), specs in self.synapse_spec.items():
+            pre = self.populations[pre_name]
+            post = self.populations[post_name]
+            pre_idx = torch.cat([s[0] for s in specs])
+            post_idx = torch.cat([s[1] for s in specs])
+            thresholds = torch.cat([expand(s[2], s[3]) for s in specs])
+            weights = make_weight([s[4] for s in specs], [s[5] for s in specs])
+            delay = torch.cat([expand(s[6], s[7]) for s in specs])
+
+            syn = NetCon(
+                pre=pre,
+                pre_idx=pre_idx,
+                thresholds=thresholds,
+                post=post,
+                post_idx=post_idx,
+                post_syn=synapse,
+                weight=weights,
+                delay=delay,
+                dt=dt,
+            ).to(device=self.device(), dtype=self.dtype())
+            self.synapses[f"{pre_name}_{post_name}_{synapse.name}"] = syn
+
+    def build(self, dt):
         """
-        Step the network forward in time.
+        Build the network by initializing populations and synapses.
+        This method should be called before running the network.
         """
-        self.net.step()
+        if not self.built or self.dt != dt:
+            torch._dynamo.reset()
+            self.dt = dt
+            self.build_synapses(dt)
+            self.built = True
+        return self
 
-    def run(self, tstop: float, progressbar=True, reinit=False, callbacks=None) -> None:
+    def initialize(self, dt: float, reinit_weights: bool = True):
         """
-        Run the network for a given time.
+        Initialize the network. This method should be overridden by subclasses.
         """
-        dt = self.dt
-        n_steps = int(math.ceil(tstop / dt))
+        self.build(dt)
+        dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
+        for pop in self.populations.values():
+            pop.initialize()
+            pop.integrator.initialize(pop, dt)
+            pop.intra = pop.build_intra()
+        self.init_synapses(reinit_weights=reinit_weights)
+        self.t_ind = 0
+        return self
 
-        with torch.set_grad_enabled(self.training):
+    def initialize_(self, dt: float, reinit_weights: bool = True):
+        """
+        Initialize the network. This method should be overridden by subclasses.
+        """
+        self.initialize(dt, reinit_weights=reinit_weights)
 
-            if reinit:
-                self.net.initialize()
-                self.t_ind = 0
+    def init_synapses(self, reinit_weights: bool = True):
+        for syn in self.synapses.values():
+            syn.zero()
+            syn.detach()
+            syn.weight.init(reinit=reinit_weights)
 
-            if callbacks is not None:
-                for callback in callbacks:
-                    callback.dt = dt
+    def run(self, tstop, callbacks=None, progressbar=False):
+        dt = torch.tensor(self.dt, device=self.device(), dtype=self.dtype())
+        dt_f = self.dt
 
-            if not isinstance(callbacks, CallbackList):
-                callbacks = CallbackList(callbacks)
+        ctx = nullcontext() if self.training else torch.no_grad()
 
-            callbacks.pre_loop_hook(self)
+        intra = {}
+        for n, p in self.populations.items():
+            if p is not None:
+                intra[n] = p.intra
+
+        with_intra = bool(intra)
+
+        with ctx:
+            n_steps = int(tstop / self.dt)
+
+            if with_intra:
+                intra = {
+                    n: (intra_, *self.populations[n].prep_intra(intra_, n_steps, dt))
+                    for n, intra_ in intra.items()
+                }
+
+            if callbacks is None:
+                callbacks = []
+            for c in callbacks:
+                c.dt = self.dt
+            callbacks = CallbackList(callbacks)
+            pre_loop_hook(callbacks, self)
 
             if progressbar:
-                progressbar = tqdm(total=n_steps, desc=f"{self.t:.3f} ms")
+                if not isinstance(progressbar, tqdm):
+                    progressbar = tqdm(
+                        total=n_steps, desc=f"{self.t_ind * dt_f:.3f} ms"
+                    )
+
+            local_ind = 0
 
             for _ in range(n_steps):
-                self.step()
-                callbacks.post_step_hook(self)
+                intra_c = {}
+
+                if with_intra:
+                    intra_c = prepare_intra(intra_c, intra, local_ind)
+
+                self._step(self.populations, self.synapses, dt, intra=intra_c)
+                post_step_hook(callbacks, self)
                 self.t_ind += 1
+                local_ind += 1
 
                 if progressbar:
                     progressbar.update(1)
                     if self.t_ind % 100 == 0:
-                        progressbar.set_description(f"{self.t:.3f} ms")
+                        progressbar.set_description(f"{self.t_ind * dt_f:.1f} ms")
 
             if progressbar:
                 progressbar.close()
-            
-            callbacks.post_loop_hook(self)
+
+            post_loop_hook(callbacks, self)
 
 
-def build_network(
-    populations,
-    connections,
-    dt,
-    N=1,
-    P=1,
-    max_delay=None,
-    threshold=0.0,
-    intrinsic=None,
-):
-    n = {
-        pop.name: pop.n for pop in populations
-    }
+def prepare_intra(intra_c, intra, local_ind):
+    """
+    Prepares the intra-cellular data for the current step.
+    """
+    for n, (intra_, stims, indices) in intra.items():
+        s = [st[local_ind] for st in stims]
+        intra_c[n] = make_intra(intra_, s, indices)
+    return intra_c
 
-    if not isinstance(threshold, dict):
-        threshold = {pop.name: threshold for pop in populations}
 
-    check_active = {
-        pop.name: CheckActive(N, P, pop.n, threshold[pop.name]) for pop in populations
-    }
+# callback helpers
+def pre_loop_hook(c, m):
+    c.pre_loop_hook(m)
 
-    synapse_data = blocks_by_projection(connections, n, dt, max_delay)
 
-    synapses = {}
+def post_loop_hook(c, m):
+    c.post_loop_hook(m)
 
-    for name, (W, D) in synapse_data.items():
-        M = (W != 0).float()
-        W = torch.tile(W, (N, 1, 1))  # (N, n_pre, n_post)
-        D = torch.tile(D, (N, 1, 1))  # (N, n_pre, n_post)
-        M = torch.tile(M, (N, 1, 1))  # (N, n_pre, n_post)
-        synapses[name] = VariableDelaySynapse(
-            W=W,
-            M=M,
-            D=D,
-            P=P,
-            dt=dt,
-        )
 
-    intrinsic_ = {}
+def pre_step_hook(c, m):
+    c.pre_step_hook(m)
 
-    if intrinsic is not None:
-        for name, (r, w) in intrinsic.items():
-            intrinsic_[name] = Intrinsic(N, P, n[name], dt, r, w)
 
-    for name in n:
-        if name not in intrinsic_:
-            intrinsic_[name] = IntrinsicStimOnly(N, P, n[name], dt)
+@torch.compile
+def post_step_hook(c, m):
+    c.post_step_hook(m)
 
-    populations = {pop.name: pop.build(N, P) for pop in populations}
 
-    tw, no_act = total_weights(populations, connections, intrinsic_)
+def pre_chunk_hook(c, m, n):
+    c.pre_chunk_hook(m, n)
 
-    forward = template.format(
-        advance_v=advance_v(populations),
-        compute_spikes=compute_spikes(populations),
-        compute_weights=compute_weights(connections),
-        total_weights=tw,
-        net_receive=net_receive(populations, no_act),
-        synapses_init=synapses_init(synapses),
-        intrinsic_init=initrinsic_init(intrinsic),
-        check_active_init=check_active_init(populations),
-        init_v=init_v(populations),
-        init_integrator=init_integrator(populations),
-        init_mech=init_mech(populations),
-    )
 
-    if DEBUG: print(forward)
-
-    # Create the network class
-    filename = f"<_network_template>"
-    code = compile(forward, filename, "exec")
-    exec(code)
-
-    lines = [line + "\n" for line in forward.splitlines()]
-    linecache.cache[filename] = (len(forward), None, lines, filename)
-
-    n = locals()["_network"](
-        populations, synapses, check_active, intrinsic_, dt
-    )
-
-    net = Network(n)
-
-    return net
+def post_chunk_hook(c, m, n):
+    c.post_chunk_hook(m, n)

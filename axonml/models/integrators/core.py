@@ -13,7 +13,7 @@ def get_init_defaults(cls):
     }
 
 
-class Integrator(torch.jit.ScriptModule):
+class Integrator(torch.nn.Module):
     """
     Base class for all integrators.
     """
@@ -24,21 +24,26 @@ class Integrator(torch.jit.ScriptModule):
         super().__init__()
         imem = imem if imem is not None else IMEM
         self.imem = bool(imem)
-        model.register_buffer(
-            "v", torch.full((model.n_ax, model.n_comp), model.v_init)
-        )
-        self.register_buffer("i_membrane", torch.zeros((model.n_ax, model.n_comp)))
         self.mech = mech
+        self.register_buffer("i_membrane", torch.zeros(model.np, model.nc))
+        self.initialized = False
+        self.dt = None
 
     @classmethod
-    def shape(cls, n_ax, n_comp):
-        return (n_ax, n_comp)
+    def shape(cls, np, nc):
+        return (np, nc)
 
     def init_v(self, model):
-        model.v[:] = model.v_init
+        model.v = torch.full(
+            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
+        )
         model.v.detach_()
         if self.imem:
-            model.i_membrane[:] = 0.0
+            model.i_membrane = torch.zeros(
+                model.i_membrane.shape,
+                dtype=model.i_membrane.dtype,
+                device=model.i_membrane.device,
+            )
             model.i_membrane.detach_()
 
     def detach(self, model):
@@ -48,26 +53,32 @@ class Integrator(torch.jit.ScriptModule):
         self.mech.detach()
 
 
-class SCIntegrator(torch.jit.ScriptModule):
-    def __init__(self, model, mech, imem=None, N=1, P=1, C=1):
+class SCIntegrator(torch.nn.Module):
+    def __init__(self, model, mech, imem=None):
         super().__init__()
         self.mech = mech
         imem = imem if imem is not None else IMEM
         self.imem = bool(imem)
         self.register_buffer("cmdt", torch.tensor(0.0))
-        self.register_buffer("i_membrane", torch.tensor(0.0))
-        model.register_buffer("v", torch.full((N, P, C), model.v_init))
+        self.register_buffer("i_membrane", torch.zeros(model.np, model.nc))
+        self.initialized = False
+        self.dt = None
 
     @classmethod
-    def shape(cls, n_ax, n_comp):
-        defaults = get_init_defaults(cls)
-        return (defaults["N"], defaults["P"], defaults["C"])
+    def shape(cls, np, nc):
+        return (np, nc)
 
     def init_v(self, model):
-        model.v[:] = model.v_init
+        model.v = torch.full(
+            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
+        )
         model.v.detach_()
         if self.imem:
-            model.i_membrane[:] = 0.0
+            model.i_membrane = torch.zeros(
+                model.i_membrane.shape,
+                dtype=model.i_membrane.dtype,
+                device=model.i_membrane.device,
+            )
             model.i_membrane.detach_()
 
     def detach(self, model):

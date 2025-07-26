@@ -4,6 +4,7 @@ import string
 import random
 import textwrap
 
+
 def multiply_return_value(code_string, multiplier_expr: str) -> str:
     """
     Given a function body in a string,
