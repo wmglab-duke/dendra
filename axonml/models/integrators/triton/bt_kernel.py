@@ -26,25 +26,25 @@ def inv3x3(a0, a1, a2, a3, a4, a5, a6, a7, a8):
 # ---------------------------------------------------------------------
 # one warp handles up to 32 fibres, K and B arbitrary -----------------
 # ---------------------------------------------------------------------
-BLOCK_FIBRES = 32              # fibres handled per warp (== warp size)
+BLOCK_FIBRES = 32  # fibres handled per warp (== warp size)
+
 
 @triton.jit
 def thomas_bt3_kernel(
-    L_ptr, M_ptr, U_ptr, D_ptr, X_ptr, Minv_ptr, 
-    B, K: tl.constexpr, BLOCK: tl.constexpr
+    L_ptr, M_ptr, U_ptr, D_ptr, X_ptr, Minv_ptr, B, K: tl.constexpr, BLOCK: tl.constexpr
 ):
     # ------- map lanes → global fibre IDs ---------------------
-    wid      = tl.program_id(0)         # warp / CTA id
-    lane_id  = tl.arange(0, BLOCK)      # [0, …, 31]
-    fid      = wid * BLOCK + lane_id    # global fibre indices
-    mask     = fid < B                  # some lanes may be inactive
+    wid = tl.program_id(0)  # warp / CTA id
+    lane_id = tl.arange(0, BLOCK)  # [0, …, 31]
+    fid = wid * BLOCK + lane_id  # global fibre indices
+    mask = fid < B  # some lanes may be inactive
 
     # stride = (#blocks −1)·3  or  K·{3,9}
-    L = L_ptr   + fid * (K - 1) * 3
-    M = M_ptr   + fid *  K      * 9
-    U = U_ptr   + fid * (K - 1) * 3
-    D = D_ptr   + fid *  K      * 3
-    X = X_ptr   + fid *  K      * 3
+    L = L_ptr + fid * (K - 1) * 3
+    M = M_ptr + fid * K * 9
+    U = U_ptr + fid * (K - 1) * 3
+    D = D_ptr + fid * K * 3
+    X = X_ptr + fid * K * 3
     Minv = Minv_ptr + fid * K * 9
 
     # ---------------- forward elimination ---------------------
@@ -59,9 +59,7 @@ def thomas_bt3_kernel(
     a7 = tl.load(M + 7, mask=mask)
     a8 = tl.load(M + 8, mask=mask)
 
-    i0, i1, i2, i3, i4, i5, i6, i7, i8 = inv3x3(
-        a0, a1, a2, a3, a4, a5, a6, a7, a8
-    )
+    i0, i1, i2, i3, i4, i5, i6, i7, i8 = inv3x3(a0, a1, a2, a3, a4, a5, a6, a7, a8)
 
     tl.store(Minv + 0, i0, mask=mask)
     tl.store(Minv + 1, i1, mask=mask)

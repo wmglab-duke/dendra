@@ -126,22 +126,22 @@ class _bwd_euler_ub(Integrator):
         g_right = g_edge / Cm[:, 1:]  # affects row i+1   (B,K-1)
 
         g_edge_Cinv = g_edge / Cm[:, :-1]  # (B, K-1)   1/s
-        self.g_edge_Cinv.copy_(g_edge_Cinv)
+        self.g_edge_Cinv = g_edge_Cinv
 
         # ── fill solver buffers ─────────────────────────────────────
         # diagonal of the diffusive operator (base part, no ion channels yet)
         diag = torch.zeros(B, K, device=model.device())
         diag[:, :-1] -= g_left
         diag[:, 1:] -= g_right
-        self.diag_base.copy_(diag)
+        self.diag_base = diag
 
         # time-scaled banded matrix (Thomas / DHS will overwrite main diag later)
-        self.lower.copy_(-dt_s * g_left)  # (B,K-1)
-        self.upper.copy_(-dt_s * g_right)  # (B,K-1)
+        self.lower = -dt_s * g_left  # (B,K-1)
+        self.upper = -dt_s * g_right  # (B,K-1)
 
         # misc pre-computed factors used elsewhere
-        self.cm_inv.copy_(Cm_inv)  # (B,K)
-        self.scale.copy_(area_cm2 * Cm_inv)  # A·s / C == 1, but keep for code reuse
+        self.cm_inv = Cm_inv  # (B,K)
+        self.scale = area_cm2 * Cm_inv  # A·s / C == 1, but keep for code reuse
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)
@@ -193,12 +193,6 @@ class _bwd_euler_ub(Integrator):
         v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
         # advance gating
         return v_np1
-
-    def detach(self, model):
-        model.v = model.v.detach()
-        if self.imem:
-            model.i_membrane.detach_()
-        self.mech.detach()
 
 
 class _bwd_euler_bt(torch.nn.Module):

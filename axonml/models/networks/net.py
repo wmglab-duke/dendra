@@ -8,7 +8,7 @@ import torch
 from ..core import Population, make_intra
 from ..parametric import to_param
 from ..callbacks import CallbackList
-from .delaydelivery import NetCon
+from .netcon import NetCon
 from axonml.helpers import BACKEND, FULLGRAPH, DYNAMIC, JIT, COMPILE_MODE
 
 
@@ -199,7 +199,7 @@ class Network(torch.nn.Module):
     Base class for networks in AxonML.
     """
 
-    def __init__(self, populations: Dict[str, Population]):
+    def __init__(self, populations: Dict[str, Population], netstim=None):
         super(Network, self).__init__()
         self.populations = populations
         for name, pop in populations.items():
@@ -207,11 +207,12 @@ class Network(torch.nn.Module):
             pop.name = name
             setattr(self, name, pop)
 
+        self.netstim = netstim
+
         self.synapse_spec = {}
         self.synapses = torch.nn.ModuleDict()
         self.dt = None
         self.built = False
-        self.t_ind = 0
 
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
@@ -234,6 +235,10 @@ class Network(torch.nn.Module):
                 step,
                 backend="eager",
             )
+
+        self.register_buffer(
+            "t", torch.tensor(0.0, device=self.device(), dtype=self.dtype())
+        )
 
         self.eval()
 
@@ -469,6 +474,8 @@ class Network(torch.nn.Module):
             pop.integrator.initialize(pop, dt)
             pop.intra = pop.build_intra()
         self.init_synapses(reinit_weights=reinit_weights)
+        if self.netstim is not None:
+            self.netstim.initialize()
         self.t_ind = 0
         return self
 
@@ -484,7 +491,7 @@ class Network(torch.nn.Module):
             syn.detach()
             syn.weight.init(reinit=reinit_weights)
 
-    def run(self, tstop, callbacks=None, progressbar=False):
+    def run(self, tstop, ve=None, callbacks=None, progressbar=False):
         dt = torch.tensor(self.dt, device=self.device(), dtype=self.dtype())
         dt_f = self.dt
 
@@ -495,7 +502,22 @@ class Network(torch.nn.Module):
             if p is not None:
                 intra[n] = p.intra
 
+        ve = ve if ve is not None else {}
+        ve = {
+            n: (
+                v.to(device=self.device(), dtype=self.dtype()),
+                t.to(device=self.device(), dtype=self.dtype()),
+            )
+            for n, (v, t) in ve.items()
+        }
+        ve = {
+            n: (v, t.assemble(self.t, self.t + tstop, dt)) for n, (v, t) in ve.items()
+        }
+
         with_intra = bool(intra)
+        with_ve = bool(ve)
+
+        tstart = self.t.item()
 
         with ctx:
             n_steps = int(tstop / self.dt)
@@ -516,31 +538,40 @@ class Network(torch.nn.Module):
             if progressbar:
                 if not isinstance(progressbar, tqdm):
                     progressbar = tqdm(
-                        total=n_steps, desc=f"{self.t_ind * dt_f:.3f} ms"
+                        total=n_steps, desc=f"{tstart:.1f} ms"
                     )
 
             local_ind = 0
 
             for _ in range(n_steps):
                 intra_c = {}
+                ve_c = {}
 
                 if with_intra:
                     intra_c = prepare_intra(intra_c, intra, local_ind)
 
-                self._step(self.populations, self.synapses, dt, intra=intra_c)
+                if with_ve:
+                    ve_c = prepare_ve(ve, local_ind)
+
+                self._step_netstim()
+                self._step(self.populations, self.synapses, dt, ve=ve_c, intra=intra_c)
+                self.t = self.t + dt
                 post_step_hook(callbacks, self)
-                self.t_ind += 1
                 local_ind += 1
 
                 if progressbar:
                     progressbar.update(1)
-                    if self.t_ind % 100 == 0:
-                        progressbar.set_description(f"{self.t_ind * dt_f:.1f} ms")
+                    if local_ind % 100 == 0:
+                        progressbar.set_description(f"{tstart + local_ind * dt_f:.1f} ms")
 
             if progressbar:
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
+
+    def _step_netstim(self):
+        if self.netstim is not None:
+            self.netstim(self.t)
 
 
 def prepare_intra(intra_c, intra, local_ind):
@@ -551,6 +582,14 @@ def prepare_intra(intra_c, intra, local_ind):
         s = [st[local_ind] for st in stims]
         intra_c[n] = make_intra(intra_, s, indices)
     return intra_c
+
+
+@torch.compile
+def prepare_ve(ve, local_ind: int):
+    """
+    Prepares the voltage and time data for the current step.
+    """
+    return {n: v * t[local_ind] for n, (v, t) in ve.items()}
 
 
 # callback helpers

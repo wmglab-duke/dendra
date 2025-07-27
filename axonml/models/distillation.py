@@ -111,15 +111,14 @@ def generator(
     device = model.device()
     t = torch.arange(0, tstop, dt, device=device)
 
-    x = model.x()
+    x = model.x[0].view(1, -1)  # Ensure x is (1, n_coords)
     n_a = model.n_ax
 
     for _ in range(n):
         ve_s = random_sinusoid_sum(x, n_a, 5, f_bounds_s)
         ve_t = random_sinusoid_sum_time(t, n_a, 5, f_bounds_Hz)
 
-        ve = torch.einsum("ac, at -> tac", ve_s, ve_t) * scale
-        ve = ve.unsqueeze(2)
+        ve = torch.einsum("ac, at -> tac", ve_s, ve_t).detach() * scale
 
         yield ve
 
@@ -137,14 +136,13 @@ def distill(
     optimizer,
     lambduh=0.001,
     alpha=0.75,
-    randomize_diameters=True,
     **kwargs,
 ):
     student.train()
     teacher.eval()
 
-    parameters = student.collect_parameters(*params)
-    l1_parameters = student.collect_parameters(*l1_params)
+    parameters = list(student.collect_parameters(*params))
+    l1_parameters = list(student.collect_parameters(*l1_params))
 
     for p in parameters:
         p.requires_grad = True
@@ -168,69 +166,65 @@ def distill(
     n_splits = int(n_t / chunk_length)
 
     for j, inputs in enumerate(input_generator):
-        if randomize_diameters:
-            new_diams = 0.5 + 2.5 * torch.rand(student.n_ax, device=student.device())
-            student.set_diameters(new_diams)
-            teacher.set_diameters(new_diams)
-
         inputs = inputs.to(student.device())
         input_chunks = torch.tensor_split(inputs, n_splits, dim=0)
 
-        # if j % 2 == 0:
-        #    loss = lambduh * torch.sum(torch.stack([torch.abs(p) for p in l1_parameters])) # L1 regularization
-        #    loss.backward()
+        for i, chunk in enumerate(input_chunks):
+            reinit = i == 0
 
-        if True:
-            for i, chunk in enumerate(input_chunks):
-                reinit = i == 0
+            rec_v_student.reset()
+            rec_v_teacher.reset()
 
-                rec_v_student.reset()
-                rec_v_teacher.reset()
-
-                # Forward pass through the teacher model
-                with torch.no_grad():
-                    teacher.run(
-                        ve=chunk,
-                        callbacks=[rec_v_teacher],
-                        progressbar=False,
-                        reinit=reinit,
-                    )
-                    teacher_outputs = rec_v_teacher.stack("v")
-                    if torch.isnan(teacher_outputs).any():
-                        pbar.set_description(f"Chunk {i}: NaN teacher output; skipping")
-                        continue
-
-                # Forward pass through the student model
-                student.run(
+            # Forward pass through the teacher model
+            with torch.no_grad():
+                if reinit:
+                    teacher.initialize()
+                teacher.run(
                     ve=chunk,
-                    callbacks=[rec_v_student],
+                    callbacks=[rec_v_teacher],
                     progressbar=False,
-                    reinit=reinit,
                 )
-                student_outputs = rec_v_student.stack("v")
-
-                # Compute the distillation loss
-                loss = criterion(student_outputs, teacher_outputs)
-                if torch.isnan(loss).any():
-                    pbar.set_description(f"Chunk {i}: NaN loss; skipping")
+                teacher_outputs = rec_v_teacher.stack("v")
+                if torch.isnan(teacher_outputs).any():
+                    pbar.set_description(f"Chunk {i}: NaN teacher output; skipping")
                     continue
 
-                pbar.set_description(f"Chunk {i}: {loss.item():.4f}")
-                loss += (
-                    lambduh
-                    * alpha
-                    * torch.sum(torch.stack([torch.abs(p) for p in l1_parameters]))
-                )
-                loss += (
-                    lambduh
-                    / 2
-                    * (1 - alpha)
-                    * torch.sum(torch.stack([torch.square(p) for p in l1_parameters]))
-                )
+            # Forward pass through the student model
+            if reinit:
+                student.initialize()
+            else:
+                student.detach()
+                student.populate()
+            student.run(
+                ve=chunk,
+                callbacks=[rec_v_student],
+                progressbar=False,
+            )
 
-                loss = loss / n_splits
-                # Backward pass and optimization
-                loss.backward()
+            student_outputs = rec_v_student.stack("v")
+
+            # Compute the distillation loss
+            loss = criterion(student_outputs, teacher_outputs)
+            if torch.isnan(loss).any():
+                pbar.set_description(f"Chunk {i}: NaN loss; skipping")
+                continue
+
+            pbar.set_description(f"Chunk {i}: {loss.item():.4f}")
+            loss = loss + (
+                lambduh
+                * alpha
+                * torch.sum(torch.stack([torch.abs(p) for p in l1_parameters]))
+            )
+            loss = loss + (
+                lambduh
+                / 2
+                * (1 - alpha)
+                * torch.sum(torch.stack([torch.square(p) for p in l1_parameters]))
+            )
+
+            loss = loss / n_splits
+            # Backward pass and optimization
+            loss.backward()
 
         optimizer.step()
         optimizer.zero_grad()

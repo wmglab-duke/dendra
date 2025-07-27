@@ -1,7 +1,6 @@
 from typing import Tuple
 
 import torch
-import numpy as np
 
 
 def update_active(has_spiked, vm_new, threshold) -> Tuple[torch.Tensor, torch.Tensor]:

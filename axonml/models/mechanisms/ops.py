@@ -44,4 +44,7 @@ def all_ops():
         "expinv",
         "safe_exp",
         "vtrap",
+        "log10",
+        "log2",
+        "log1p",
     }

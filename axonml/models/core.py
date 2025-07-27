@@ -29,20 +29,11 @@ from axonml.helpers import (
     op_mc,
     op_sc,
     ve_from_s_t,
-    IMEM,
-    CUDA,
-    DTWARN,
-    DEBUG,
-    DETECT_ANOMALIES,
-    PADE,
     BACKEND,
     FULLGRAPH,
     DYNAMIC,
     JIT,
     COMPILE_MODE,
-    ctx,
-    tic,
-    toc,
 )
 
 
@@ -178,9 +169,6 @@ class Population(P):
         self._mech_everywhere = {}
 
         self._labels = {}
-
-        self.t_ind: int = 0
-        self.t_cache: float = 0.0
 
         self._m_list = []
         self._m_name = []
@@ -425,27 +413,14 @@ class Population(P):
             If ve is provided, tstop is determined by the shape of ve.
         dt : float, optional
             Time step size in milliseconds. If None, uses the default from backend.
-        intra : IntraStim, optional
-            Intracellular stimulation object.
         callbacks : list of Callback, optional
             List of callback objects to execute during simulation steps.
-        reinit : bool, optional
-            If True, reinitialize the model state before running. If steady state is
-            cached, it will be restored instead of initializing from scratch.
-            Default is False.
         progressbar : bool or tqdm, optional
             If True, displays a progress bar during simulation. Can also be a
             tqdm instance for custom progress tracking. Default is True.
         multicontact : bool, optional
             If True, handles multiple electrode contacts for ve construction.
             Default is False.
-        first : bool, optional
-            If True, indicates this is the first run in a sequence, triggering
-            pre-loop hooks for callbacks. Default is True.
-        longrunning : bool, optional
-            If True, indicates this run is part of a longer simulation sequence,
-            affecting progress bar behavior. Default is False.
-
         Raises
         ------
         ValueError
@@ -455,7 +430,7 @@ class Population(P):
         Notes
         -----
         The simulation updates the model's internal state (v, v_prev for DF method, etc.)
-        and advances the model's time index (t_ind).
+        and advances the model's time.
         """
 
         if self.intra is None:
@@ -483,6 +458,8 @@ class Population(P):
             time = time.assemble(self.t, self.t + tstop, dt)
 
         ctx = nullcontext() if self.training else torch.no_grad()
+
+        tstart = self.t.item()
 
         with ctx:
             if ve is None:
@@ -515,7 +492,7 @@ class Population(P):
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
-                    progressbar = tqdm(total=n, desc=f"{self.t_ind * dt_f:.3f} ms")
+                    progressbar = tqdm(total=n, desc=f"{tstart + local_ind * dt_f:.1f} ms")
 
             for i in range(n):
                 ve_c = ve[i] if ve is not None else None
@@ -530,20 +507,17 @@ class Population(P):
                 self.t = self.t + dt
 
                 post_step_hook(callbacks, self)
-                self.t_ind += 1
                 local_ind += 1
 
                 if progressbar:
                     progressbar.update(1)
-                    if self.t_ind % 100 == 0:
-                        progressbar.set_description(f"{self.t_ind * dt_f:.1f} ms")
+                    if local_ind % 100 == 0:
+                        progressbar.set_description(f"{tstart + local_ind * dt_f:.1f} ms")
 
             if progressbar:
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
-
-            self.t_cache = self.t_ind * dt_f
 
     def longrun(
         self,
@@ -577,9 +551,6 @@ class Population(P):
             - The first element (ve_s) is a tensor representing spatial voltage components.
             - The second element (time) is either a Waveform object or a tensor representing time.
             These values are used to construct the extracellular voltage.
-        reinit : bool, optional
-            If True, reinitializes the model state before running the simulation.
-            This is useful when you want to start fresh rather than continuing from a previous run.
         callbacks : list of Callback, optional
             A list of callback objects to be executed during simulation, allowing for
             customized processing at various stages (e.g., pre-loop, post-step, post-loop).
@@ -598,8 +569,6 @@ class Population(P):
         -----
         - When `extra` is provided, the method uses it to assemble the extracellular
         voltage (ve) for the simulation.
-        - The method initializes or detaches the model state before running the simulation
-        depending on whether the model has been previously initialized or reinitialized.
         - Chunk processing helps manage memory usage during extended simulations by
         processing data in manageable segments.
         """
@@ -668,7 +637,7 @@ class Population(P):
 
                 if progressbar:
                     progressbar = tqdm(
-                        total=n_chunks, desc=f"{self.t_ind * dt_f:.1f} ms"
+                        total=n_chunks, desc=f"{self.t.item():.1f} ms"
                     )
 
                 self.integrator.initialize(self, dt)
@@ -706,19 +675,18 @@ class Population(P):
                         self._step(self.integrator, self, dt, ve_c, intra_c)
                         post_step_hook(callbacks, self)
 
-                        self.t_ind += 1
                         self.t = self.t + dt
 
                     if progressbar:
                         progressbar.update(1)
-                        progressbar.set_description(f"{self.t_ind * dt_f:.1f} ms")
+                        progressbar.set_description(f"{self.t.item():.1f} ms")
 
                 post_loop_hook(callbacks, self)
 
                 if progressbar:
                     progressbar.close()
 
-    def steady_state(self, dt=0.2, tstop=200.0, with_ve=True):
+    def steady_state(self, dt=0.2, tstop=200.0, with_ve=True, with_intra=True):
         """
         Run the model until it reaches a steady state and cache the result.
 
@@ -732,8 +700,7 @@ class Population(P):
         Notes
         -----
         This method clears any previous steady state cache before creating a new one.
-        The steady state can be restored later by setting reinit=True when calling
-        the run method.
+        The steady state can be restored later by calling model.initialize().
         """
 
         self.clear_steady_state()
@@ -748,13 +715,18 @@ class Population(P):
                 ve = torch.zeros_like(self.v).contiguous()
             else:
                 ve = None
+
+            if with_intra:
+                intra = torch.zeros_like(self.v).contiguous()
+            else:
+                intra = None
+
             dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
-            for i in tqdm(range(maxiter), desc=f"Steady state "):
-                self._step(self.integrator, self, dt, ve, None)
+            for _ in tqdm(range(maxiter), desc=f"Steady state "):
+                self._step(self.integrator, self, dt, ve, intra)
 
         self.cache("_steady_state")
         self.t.detach().zero_()
-        self.t_ind = 0
         return self
 
     def clear_steady_state(self):
@@ -771,6 +743,21 @@ class Population(P):
             for h in self.pre_initialize_hooks:
                 h(self)
 
+    def populate(self):
+        """
+        Populate the model with mechanisms and parameters.
+
+        This method is called after the model is built to ensure that all
+        mechanisms and parameters are properly initialized and ready for use.
+        It should be called after the model's build() method.
+        """
+        self.populate_parameter_buffers()
+        self.mech.populate()
+        return self
+
+    def populate_(self):
+        self.populate()
+
     def initialize(self):
         self.build()
         self.populate_parameter_buffers()
@@ -778,7 +765,6 @@ class Population(P):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
             self.post_initialize()
-            self.t_ind = 0
             self.t.detach().zero_()
             self.initialized = True
             return self
@@ -787,7 +773,6 @@ class Population(P):
         self.integrator.mech.initialize(self.v, self.celsius, self.diam)
         self.post_initialize()
         self.integrator.mech.initialize(self.v, self.celsius, self.diam)
-        self.t_ind = 0
         self.t.detach().zero_()
         self.initialized = True
         return self
@@ -1100,7 +1085,14 @@ class Population(P):
     def register_parametrization(self, name: str, parametrization: torch.nn.Module):
         torch.nn.utils.parametrize.register_parametrization(self, name, parametrization)
 
-    def slice(self, include=None, exclude="branchpoint", fuzzy=True, match_case=False):
+    def slice(
+        self,
+        include=None,
+        exclude="branchpoint",
+        fuzzy=True,
+        match_case=False,
+        loc=None,
+    ):
         """
         Finds all indices in the tree structure based on inclusion and exclusion criteria.
 
@@ -1114,11 +1106,15 @@ class Population(P):
             If True, performs fuzzy matching. Default is True.
         match_case : bool, optional
             If True, matches case sensitively. Default is False.
+        loc : float, optional
+            If provided, refines the search to the compartment whose
+            ( … )-location is closest to `loc` (a float in [0, 1]).
+            If None, no refinement is done.
 
         Returns
         -------
-        List[int]
-            A list of indices that match the criteria.
+        Slice
+            A slice object containing the indices of the matches.
         """
         return self[
             :,
@@ -1128,6 +1124,7 @@ class Population(P):
                 fuzzy=fuzzy,
                 match_case=match_case,
                 full_report=False,
+                loc=loc,
             ),
         ]
 
@@ -1149,6 +1146,7 @@ class Population(P):
         match_case=False,
         full_report=False,
         as_list=False,
+        loc=None,
     ):
         indices = find_indices_smart(
             self.names,
@@ -1157,6 +1155,7 @@ class Population(P):
             fuzzy=fuzzy,
             match_case=match_case,
             device=self.device(),
+            loc=loc,
         )
         if full_report:
             return indices
@@ -1267,6 +1266,9 @@ def find_indices_smart(
     fuzzy: bool = True,
     match_case: bool = False,
     device: Optional[torch.device] = None,
+    *,
+    loc: Optional[float] = None,  #
+    _tol: float = 1e-9,  # tolerance for loc comparisons
 ) -> FindResult:
     """
     Finds indices based on criteria and returns detailed results including local indices
@@ -1276,99 +1278,120 @@ def find_indices_smart(
     - A simple pattern like 'axon' will match 'axon', 'axon[0]', but not 'taxons'.
     - A complex pattern like 'axon[0]' will match strings containing the literal 'axon[0]'.
 
-    Args:
-        data (List[str]): The list of strings to search through.
-        include (Optional[Union[str, List[str]]]): Patterns to include.
-        exclude (Optional[Union[str, List[str]]]): Patterns to exclude.
-        fuzzy (bool): If True, performs smart whole-word/substring matching. If False, an exact match.
-        match_case (bool): If True, the matching is case-sensitive.
-        device (Optional[torch.device]): PyTorch device for resulting tensors.
+    Parameters
+    ----------
+    data (List[str]):
+        The list of strings to search through.
+    include (Optional[Union[str, List[str]]]):
+        Patterns to include.
+    exclude (Optional[Union[str, List[str]]]):
+        Patterns to exclude.
+    fuzzy (bool):
+        If True, performs smart whole-word/substring matching. If False, an exact match.
+    match_case (bool):
+        If True, the matching is case-sensitive.
+    device (Optional[torch.device]):
+        PyTorch device for resulting tensors.
+    loc (Optional[float]):
+        If provided, refines the search to the compartment whose
+        ( … )-location is closest to `loc` (a float in [0, 1]).
+        If None, no refinement is done.
+    _tol (float):
+        Tolerance for comparing `loc` values, default is 1e-9.
 
-    Returns:
-        FindResult: A named tuple with detailed matching results.
+    Returns
+    -------
+    FindResult:
+        A named tuple with detailed matching results.
     """
-    empty_result = FindResult(slice(0, 0), {}, {}, 0)
+    empty = FindResult(slice(0, 0), {}, {}, 0)
     if not data:
-        return empty_result
+        return empty
 
+    # ------------------------------------------------------------------ #
+    # 0. basic include / exclude filtering                               #
+    # ------------------------------------------------------------------ #
     s = pd.Series(data, dtype="string")
     final_mask = pd.Series(True, index=s.index)
 
-    local_indices_map = {}
-    local_sizes_map = {}
-    pattern_masks: Dict[str, pd.Series] = {}
+    local_idx_map, local_sz_map, pattern_masks = {}, {}, {}
 
-    def get_mask_for_pattern(pattern: str) -> pd.Series:
-        """Helper to generate a boolean mask for a given pattern."""
+    def _make_mask(pat: str) -> pd.Series:
         if fuzzy:
-            # If pattern contains non-word chars (e.g., 'axon[0]'), treat as literal substring.
-            if re.search(r"[^a-zA-Z0-9_]", pattern):
-                regex_pattern = re.escape(pattern)
-            # Otherwise, it's a simple name (e.g., 'axon'). Match as a "root" word.
-            # Use a negative lookahead to allow suffixes like '[0]' but not more letters.
+            if re.search(r"[^a-zA-Z0-9_]", pat):
+                rgx = re.escape(pat)
             else:
-                regex_pattern = rf"\b{re.escape(pattern)}(?![a-zA-Z0-9])"
-            return s.str.contains(regex_pattern, case=match_case, regex=True, na=False)
-        else:  # Exact match
-            series_to_compare = s.str.lower() if not match_case else s
-            pattern_to_compare = pattern.lower() if not match_case else pattern
-            return series_to_compare == pattern_to_compare
+                rgx = rf"\b{re.escape(pat)}(?![a-zA-Z0-9])"
+            return s.str.contains(rgx, case=match_case, regex=True, na=False)
+        else:
+            a = s.str.lower() if not match_case else s
+            b = pat.lower() if not match_case else pat
+            return a == b
 
-    if include:
-        include_patterns = [include] if isinstance(include, str) else include
-        for pattern in include_patterns:
-            pattern_masks[pattern] = get_mask_for_pattern(pattern)
-        if pattern_masks:
-            combined_include_mask = pd.concat(pattern_masks.values(), axis=1).any(
-                axis=1
-            )
-            final_mask &= combined_include_mask
-    else:
-        include_patterns = []
+    include_pats = [include] if isinstance(include, str) else (include or [])
+    for pat in include_pats:
+        pattern_masks[pat] = _make_mask(pat)
+    if pattern_masks:
+        final_mask &= pd.concat(pattern_masks.values(), axis=1).any(axis=1)
 
     if exclude:
-        exclude_patterns = [exclude] if isinstance(exclude, str) else exclude
-        combined_exclude_mask = pd.Series(False, index=s.index)
-        for pattern in exclude_patterns:
-            combined_exclude_mask |= get_mask_for_pattern(pattern)
-        final_mask &= ~combined_exclude_mask
+        exclude_pats = [exclude] if isinstance(exclude, str) else exclude
+        exc_mask = pd.Series(False, index=s.index)
+        for pat in exclude_pats:
+            exc_mask |= _make_mask(pat)
+        final_mask &= ~exc_mask
 
-    numpy_indices = s.index[final_mask].to_numpy()
-    total_size = len(numpy_indices)
+    if not final_mask.any():
+        return empty
 
-    if total_size == 0:
-        return empty_result
+    # ------------------------------------------------------------------ #
+    # 1. optional loc‑based refinement                                   #
+    # ------------------------------------------------------------------ #
+    idx_arr = s.index[final_mask].to_numpy()
 
-    total_indices_result = _indices_to_slice_or_tensor(numpy_indices, device)
-
-    if include_patterns:
-        global_to_local_map = {
-            global_idx: local_idx for local_idx, global_idx in enumerate(numpy_indices)
-        }
-
-        for pattern in include_patterns:
-            pattern_final_mask = pattern_masks[pattern] & final_mask
-            pattern_global_indices = s.index[pattern_final_mask].to_numpy()
-
-            if len(pattern_global_indices) > 0:
-                local_indices_list = [
-                    global_to_local_map[g_idx] for g_idx in pattern_global_indices
-                ]
-                local_numpy_indices = np.array(local_indices_list, dtype=np.int64)
-                local_indices_map[pattern] = _indices_to_slice_or_tensor(
-                    local_numpy_indices, device
-                )
-                local_sizes_map[pattern] = len(local_indices_list)
+    if loc is not None:
+        if not (0.0 <= loc <= 1.0):
+            raise ValueError("loc must be within [0, 1].")
+        # Parse candidate ( … ) positions
+        cand = []
+        for gi in idx_arr:
+            m = re.search(r"\(([\d.]+)\)$", s.iloc[gi])
+            if m:
+                cand.append((gi, float(m.group(1))))
+        if cand:  # only refine if we found any
+            # Exclude terminal 0 / 1 unless requested exactly
+            if abs(loc) > _tol:
+                cand = [(gi, x) for gi, x in cand if abs(x) > _tol]
+            if abs(loc - 1.0) > _tol:
+                cand = [(gi, x) for gi, x in cand if abs(x - 1.0) > _tol]
+            if not cand:  # nothing left → fall back
+                pass
             else:
-                local_indices_map[pattern] = slice(0, 0)
-                local_sizes_map[pattern] = 0
+                gi_best, _ = min(cand, key=lambda t: abs(t[1] - loc))
+                idx_arr = np.array([gi_best], dtype=np.int64)
+                final_mask = pd.Series(False, index=s.index)
+                final_mask[idx_arr[0]] = True
 
-    return FindResult(
-        indices=total_indices_result,
-        local_indices=local_indices_map,
-        local_sizes=local_sizes_map,
-        total_size=total_size,
-    )
+    # ------------------------------------------------------------------ #
+    # 2. build return object                                             #
+    # ------------------------------------------------------------------ #
+    total_idx = _indices_to_slice_or_tensor(idx_arr, device)
+    total_sz = len(idx_arr)
+
+    if include_pats:
+        g2l = {g: l for l, g in enumerate(idx_arr)}
+        for pat in include_pats:
+            pat_mask = pattern_masks[pat] & final_mask
+            g_idx = s.index[pat_mask].to_numpy()
+            if len(g_idx):
+                l_idx = np.fromiter((g2l[g] for g in g_idx), dtype=np.int64)
+                local_idx_map[pat] = _indices_to_slice_or_tensor(l_idx, device)
+                local_sz_map[pat] = len(l_idx)
+            else:
+                local_idx_map[pat] = slice(0, 0)
+                local_sz_map[pat] = 0
+
+    return FindResult(total_idx, local_idx_map, local_sz_map, total_sz)
 
 
 class Axon(Population):
@@ -1377,35 +1400,6 @@ class Axon(Population):
 
     This is the base class for axon models, implementing common functionality
     for simulating action potential propagation along 1D fibers.
-
-    Parameters
-    ----------
-    diameters : array_like
-        Diameters of the axons in μm.
-    n_comp : int
-        Number of nodes in the axon model.
-    temp : float, optional
-        Temperature in degrees Celsius. Default is 37.0.
-    v_init : float, optional
-        Initial membrane potential in mV. Default is -80.0.
-    integrator: Integrator
-
-    Attributes
-    ----------
-    n_ax : int
-        Number of axons in the model.
-    n_comp : int
-        Number of compartments in each axon.
-    temp : float
-        Temperature in degrees Celsius.
-    v_init : float
-        Initial membrane potential in mV.
-    mech : MechanismHandler
-        Responsible for integrating all membrane mechanism states.
-    t_ind : int
-        Current time index.
-    dt : float
-        Time step in ms.
     """
 
     __constants__ = [

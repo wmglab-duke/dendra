@@ -1,6 +1,4 @@
 from .compilers.ast import factorize_linear_in_v
-from .compilers.compile_f import convert_func
-
 from axonml.helpers import logger, DEBUG
 
 

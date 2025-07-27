@@ -41,7 +41,7 @@ def _single_dhs_kernel(
     for l in range(0, L):
         s = tl.load(LAYER_PTR + l)
         e = tl.load(LAYER_PTR + l + 1)
-        
+
         offset = s + lane
         m = lane < (e - s)
 
@@ -54,16 +54,18 @@ def _single_dhs_kernel(
         # The new diagonal value is the old value (returned by atomic_add) + the value added.
         old_d_i = tl.atomic_add(D + idx, g_i, mask=m)
         d_i = old_d_i + g_i
-        
+
         valid_parent_mask = m & (parent >= 0)
-        safe_parent = tl.where(valid_parent_mask, parent, 0) # Keep safe_parent for pointer arithmetic
+        safe_parent = tl.where(
+            valid_parent_mask, parent, 0
+        )  # Keep safe_parent for pointer arithmetic
 
         # This atomic_add finalizes the parent's diagonal for the connection to this child (g_i).
         tl.atomic_add(D + safe_parent, g_i, mask=valid_parent_mask)
 
         # --- Elimination Step ---
         b_i = tl.load(B + idx, mask=m, other=0.0)
-        
+
         # Invert d_i once. Use a safe divide to avoid 0/0 -> NaN.
         inv_d_i = 1.0 / d_i
         fac = -g_i * inv_d_i
@@ -86,7 +88,7 @@ def _single_dhs_kernel(
 
         idx = tl.load(ORDER + offset, mask=m, other=0)
         parent = tl.load(P + idx, mask=m, other=-1)
-        
+
         valid_parent_mask = m & (parent >= 0)
         safe_parent = tl.where(valid_parent_mask, parent, 0)
 
@@ -94,9 +96,9 @@ def _single_dhs_kernel(
         # This is generally fine, as re-loading is cheaper than spilling to/from shared memory
         # across the tl.debug_barrier().
         g_i = tl.load(A + idx, mask=m, other=0.0)
-        
+
         # Load the final, eliminated values of D and B from the forward pass.
-        d_i_elim = tl.load(D + idx, mask=m, other=1.0) # other=1.0 to avoid div by zero
+        d_i_elim = tl.load(D + idx, mask=m, other=1.0)  # other=1.0 to avoid div by zero
         b_i_elim = tl.load(B + idx, mask=m, other=0.0)
 
         # Load the already-computed voltage of the parent.
@@ -104,7 +106,7 @@ def _single_dhs_kernel(
 
         # Substitute to find the voltage of the current compartment.
         v_i = (b_i_elim + g_i * v_parent) / d_i_elim
-        
+
         tl.store(V + idx, v_i, mask=m)
 
 

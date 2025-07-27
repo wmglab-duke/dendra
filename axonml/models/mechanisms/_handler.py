@@ -191,11 +191,20 @@ class MechanismHandler(torch.nn.Module):
         # read ion concentrations & equilibria
         self.read_from_ions()
 
+    def detach_i_g_bufs(self):
+        if not self.i_g_buffers_initialized:
+            return
+        for buf in self._buf_i:
+            buf.detach_()
+        for buf in self._buf_g:
+            buf.detach_()
+
     def detach(self):
         for mech in self.mechanisms.values():
             mech.detach()
         for ion in self.ions.values():
             ion.detach()
+        self.detach_i_g_bufs()
 
     def i(self, v):
         if not self.currents:

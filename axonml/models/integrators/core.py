@@ -48,6 +48,11 @@ class Integrator(torch.nn.Module):
 
     def detach(self, model):
         model.v.detach_()
+        for n, b in model.named_buffers():
+            try:
+                b.detach_()
+            except:
+                setattr(model, n, b.detach())
         if self.imem:
             model.i_membrane.detach_()
         self.mech.detach()
@@ -83,6 +88,8 @@ class SCIntegrator(torch.nn.Module):
 
     def detach(self, model):
         model.v.detach_()
+        for n, b in model.named_buffers():
+            setattr(model, n, b.detach())
         if self.imem:
             model.i_membrane.detach_()
         self.mech.detach()

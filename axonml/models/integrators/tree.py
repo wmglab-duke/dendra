@@ -303,17 +303,17 @@ class _dhs(Integrator):
         self.register_buffer("layer_ptr", layer_ptr.to(device))  # (L+1,)
         self.order.copy_(order.to(dtype=torch.int32, device=device))
         self.parent_idx.copy_(parent_idx.to(dtype=torch.int32, device=device))  # (N,)
-        self.a_geom.copy_(a_geom_t.expand(B, -1))
+        self.a_geom = a_geom_t.expand(B, -1)
 
         K = parent_idx.numel()
 
         # add children contributions to their parent’s diagonal
         valid = parent_idx >= 0
 
-        self.scale.copy_(area_cm2)
+        self.scale = area_cm2
 
         cm = 1e-6 * model.cm * area_cm2  # convert from µF / cm2 to F
-        self.cmdt.copy_(cm / dt_s)  # (B,N) (F/s = S)
+        self.cmdt = cm / dt_s  # (B,N) (F/s = S)
 
         # extracellular
         # We will need the original node IDs from the graph for this

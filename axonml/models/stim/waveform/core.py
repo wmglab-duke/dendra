@@ -90,7 +90,7 @@ class Waveform(SimpleParameterized):
 
     def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
         return _repeat(self, freq, delay, off)
-    
+
     def poisson(
         self,
         interval: float,
@@ -166,13 +166,14 @@ class _poisson(Waveform):
     start : float
         Most-likely time of the first spike [ms].
     noise : float ∈ [0,1]
-        0 → perfectly periodic (Δt = interval every time)  
-        1 → pure Poisson (Δt ~Exp(rate=1/interval))  
+        0 → perfectly periodic (Δt = interval every time)
+        1 → pure Poisson (Δt ~Exp(rate=1/interval))
         values in between give a convex mixture:
             Δt = (1-noise)*interval + noise*Exp(...)
     off : float
         Do not schedule spikes at or beyond this time [ms].
     """
+
     def __init__(
         self,
         waveform: Waveform,
@@ -183,21 +184,20 @@ class _poisson(Waveform):
         off: float = torch.inf,
         generator: Optional[torch.Generator] = None,
     ):
-        super().__init__()                        # <- no kwargs
+        super().__init__()  # <- no kwargs
         self.waveform = waveform
         self.interval = float(interval)
-        self.n        = n
-        self.start    = float(start)
-        self.noise    = float(noise)
-        self.off      = float(off)
+        self.n = n
+        self.start = float(start)
+        self.noise = float(noise)
+        self.off = float(off)
         if np.isinf(self.off) and self.n is None:
             raise ValueError(
                 "Poisson schedule needs a finite `off` time or a finite `n` "
                 "(number of spikes) to terminate."
             )
         self.register_buffer(
-            "_spike_times",
-            self._make_schedule(generator or torch.default_generator)
+            "_spike_times", self._make_schedule(generator or torch.default_generator)
         )
 
     def reshape_for_intra(self):
@@ -212,8 +212,8 @@ class _poisson(Waveform):
             # perfectly regular
             return self.interval
         # exponential sample (mean = interval)
-        u = torch.rand((), generator=gen)   # uniform (0,1)
-        exp_sample = -u.log() * self.interval              # Exp(λ=1/interval)
+        u = torch.rand((), generator=gen)  # uniform (0,1)
+        exp_sample = -u.log() * self.interval  # Exp(λ=1/interval)
         return (1.0 - self.noise) * self.interval + self.noise * exp_sample.item()
 
     def _make_schedule(self, gen: torch.Generator) -> torch.Tensor:
@@ -225,7 +225,7 @@ class _poisson(Waveform):
             times.append(t)
             t += self._next_dt(gen)
             k += 1
-        if not times:            # handle edge‑case: no spikes at all
+        if not times:  # handle edge‑case: no spikes at all
             times.append(torch.inf)
         return torch.tensor(times)
 
@@ -240,5 +240,4 @@ class _poisson(Waveform):
         return self.waveform.fn(tt).sum(dim=0)
 
     def __repr__(self):
-        return (f"Poisson({self.waveform},"
-                f" interval={self.interval}, noise={self.noise})")
+        return f"Poisson({self.waveform}, interval={self.interval}, noise={self.noise})"
