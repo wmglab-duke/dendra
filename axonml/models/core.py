@@ -24,6 +24,8 @@ from axonml.units import mm
 from axonml.models.integrators import bwd_euler_ub, bwd_euler_sc
 from axonml.models.graph import get_area_from_graph
 
+from .slice import Sliceable
+
 
 from axonml.helpers import (
     op_mc,
@@ -35,9 +37,6 @@ from axonml.helpers import (
     JIT,
     COMPILE_MODE,
 )
-
-
-from .slice import parse_key, Slice
 
 
 def get_unique_keys(list_of_dicts):
@@ -124,7 +123,7 @@ def make_intra(intra, stims, indices):
     return intra(stims, indices)
 
 
-class Population(P):
+class Population(P, Sliceable):
     """
     Base class for a population of multicompartment neurons.
     """
@@ -492,7 +491,9 @@ class Population(P):
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
-                    progressbar = tqdm(total=n, desc=f"{tstart + local_ind * dt_f:.1f} ms")
+                    progressbar = tqdm(
+                        total=n, desc=f"{tstart + local_ind * dt_f:.1f} ms"
+                    )
 
             for i in range(n):
                 ve_c = ve[i] if ve is not None else None
@@ -512,7 +513,9 @@ class Population(P):
                 if progressbar:
                     progressbar.update(1)
                     if local_ind % 100 == 0:
-                        progressbar.set_description(f"{tstart + local_ind * dt_f:.1f} ms")
+                        progressbar.set_description(
+                            f"{tstart + local_ind * dt_f:.1f} ms"
+                        )
 
             if progressbar:
                 progressbar.close()
@@ -636,9 +639,7 @@ class Population(P):
                 callbacks = CallbackList(callbacks)
 
                 if progressbar:
-                    progressbar = tqdm(
-                        total=n_chunks, desc=f"{self.t.item():.1f} ms"
-                    )
+                    progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
                 self.integrator.initialize(self, dt)
                 einsum = torch.compile(einsum)
@@ -890,10 +891,6 @@ class Population(P):
 
     def restore_(self, name: str = None):
         self.restore(name)
-
-    def __getitem__(self, key):
-        index = parse_key(key, self.shape, self.device())
-        return Slice(self, index)
 
     def delete_injections(self):
         self.injections = []

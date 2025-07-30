@@ -38,7 +38,7 @@ class IndexSpec:
     shape: Tuple[int, ...]
 
 
-def parse_key(key: Any, shape: Sequence[int], device) -> IndexSpec:
+def parse_key(key: Any, shape: Sequence[int]) -> IndexSpec:
     """
     Turn *any* valid key plus `shape` into a reusable IndexSpec.
     Works for NumPy **and** PyTorch rules (they're identical here).
@@ -50,7 +50,7 @@ def parse_key(key: Any, shape: Sequence[int], device) -> IndexSpec:
     >>> spec
     IndexSpec(index=(slice(None), slice(None), 2), new_axes=(3,), ...)
     """
-    out = torch.empty(shape, device=device)[key]  # type: ignore
+    out = torch.empty(shape)[key]  # type: ignore
 
     return IndexSpec(
         index=key,
@@ -153,3 +153,9 @@ class Slice:
 
     def __repr__(self):
         return f"Slice(index={self.index_spec.index}, shape={self.index_spec.shape}, is_scalar={self.index_spec.is_scalar})"
+
+
+class Sliceable:
+    def __getitem__(self, key):
+        index = parse_key(key, self.shape)
+        return Slice(self, index)

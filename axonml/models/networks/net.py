@@ -12,7 +12,7 @@ from .netcon import NetCon
 from axonml.helpers import BACKEND, FULLGRAPH, DYNAMIC, JIT, COMPILE_MODE
 
 
-def to_flat_idx_torch(arr, idx):
+def to_flat_idx_torch(shape, idx, device):
     """
     Converts any valid PyTorch index into a 1D tensor of flat indices.
 
@@ -25,12 +25,12 @@ def to_flat_idx_torch(arr, idx):
         torch.LongTensor: A 1D tensor containing the flat indices that
                           correspond to the elements selected by `arr[idx]`.
     """
-    if not isinstance(arr, torch.Tensor):
-        raise TypeError("Input 'arr' must be a torch.Tensor.")
 
     # 1. Create a grid of flat indices with the same shape as the input array.
     #    e.g., for a (2, 3) tensor, this becomes [[0, 1, 2], [3, 4, 5]]
-    indices_grid = torch.arange(arr.numel(), device=arr.device).view(arr.shape)
+    indices_grid = torch.arange(torch.prod(torch.tensor(shape)), device=device).view(
+        shape
+    )
 
     # 2. Apply the user's index to this grid. PyTorch's indexing logic
     #    will select the corresponding flat indices for us.
@@ -48,10 +48,14 @@ def step_pop(integrator, model, dt, ve=None, intra=None):
 def step(
     populations,
     synapses,
+    netstim,
+    t,
     dt,
     ve: Dict[str, torch.Tensor | None] = {},
     intra: Dict[str, torch.Tensor | None] = {},
 ):
+    if netstim is not None:
+        netstim(t)
     for s in synapses.values():
         s.advance()
     for n, pop in populations.items():
@@ -62,7 +66,7 @@ def get_local_index(population, mech, index):
     indices = torch.full_like(
         population.v, -1, dtype=torch.long, device=population.device()
     ).flatten()
-    mech_key_flat = to_flat_idx_torch(population.v, mech.key)
+    mech_key_flat = to_flat_idx_torch(population.shape, mech.key, population.device())
     indices.index_copy_(
         0,
         mech_key_flat,
@@ -83,14 +87,16 @@ def prepare_indices_one_one(source, target, synapse):
     ).view_as(target_model.v)
 
     indices_in_synapse = syn.get(index_arr).flatten()
-    post_idx = to_flat_idx_torch(target_model.v, target.index)
+    post_idx = to_flat_idx_torch(
+        target_model.shape, target.index, target_model.device()
+    )
 
     if not torch.all(torch.isin(post_idx, indices_in_synapse)):
         raise ValueError(
             f"Target population '{target.name}' does not have the synapse '{synapse}' at all target locations."
         )
 
-    pre_idx = to_flat_idx_torch(source_model.v, source.index)
+    pre_idx = to_flat_idx_torch(source_model.shape, source.index, source_model.device())
     post_idx = get_local_index(target_model, syn, post_idx)
 
     return pre_idx, post_idx
@@ -166,7 +172,6 @@ def make_weight(weights, n):
 
         def __init__(self, param):
             super().__init__()
-            # nn.Parameter() is idempotent, so it's safe to call on an existing parameter.
             self.param = param
 
         def sample(self, n):
@@ -350,8 +355,12 @@ class Network(torch.nn.Module):
         # every target compartment receives input from every source compartment
         source_model = source.model
         target_model = target.model
-        pre_idx = to_flat_idx_torch(source_model.v, source.index)
-        post_idx = to_flat_idx_torch(target_model.v, target.index)
+        pre_idx = to_flat_idx_torch(
+            source_model.shape, source.index, source_model.device()
+        )
+        post_idx = to_flat_idx_torch(
+            target_model.shape, target.index, target_model.device()
+        )
 
         # 1. Get the original number of elements
         num_pre = pre_idx.numel()
@@ -392,8 +401,12 @@ class Network(torch.nn.Module):
         # every target compartment receives input from every source compartment
         source_model = source.model
         target_model = target.model
-        pre_idx = to_flat_idx_torch(source_model.v, source.index)
-        post_idx = to_flat_idx_torch(target_model.v, target.index)
+        pre_idx = to_flat_idx_torch(
+            source_model.shape, source.index, source_model.device()
+        )
+        post_idx = to_flat_idx_torch(
+            target_model.shape, target.index, target_model.device()
+        )
 
         # 1. Get the original number of elements
         num_pre = pre_idx.numel()
@@ -430,7 +443,7 @@ class Network(torch.nn.Module):
 
     def build_synapses(self, dt):
         for (pre_name, post_name, synapse), specs in self.synapse_spec.items():
-            pre = self.populations[pre_name]
+            pre = getattr(self, pre_name)
             post = self.populations[post_name]
             pre_idx = torch.cat([s[0] for s in specs])
             post_idx = torch.cat([s[1] for s in specs])
@@ -476,7 +489,8 @@ class Network(torch.nn.Module):
         self.init_synapses(reinit_weights=reinit_weights)
         if self.netstim is not None:
             self.netstim.initialize()
-        self.t_ind = 0
+        self.t = self.t.detach()
+        self.t.zero_()
         return self
 
     def initialize_(self, dt: float, reinit_weights: bool = True):
@@ -499,7 +513,7 @@ class Network(torch.nn.Module):
 
         intra = {}
         for n, p in self.populations.items():
-            if p is not None:
+            if p.intra is not None:
                 intra[n] = p.intra
 
         ve = ve if ve is not None else {}
@@ -537,9 +551,7 @@ class Network(torch.nn.Module):
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
-                    progressbar = tqdm(
-                        total=n_steps, desc=f"{tstart:.1f} ms"
-                    )
+                    progressbar = tqdm(total=n_steps, desc=f"{tstart:.1f} ms")
 
             local_ind = 0
 
@@ -553,8 +565,15 @@ class Network(torch.nn.Module):
                 if with_ve:
                     ve_c = prepare_ve(ve, local_ind)
 
-                self._step_netstim()
-                self._step(self.populations, self.synapses, dt, ve=ve_c, intra=intra_c)
+                self._step(
+                    self.populations,
+                    self.synapses,
+                    self.netstim,
+                    self.t,
+                    dt,
+                    ve=ve_c,
+                    intra=intra_c,
+                )
                 self.t = self.t + dt
                 post_step_hook(callbacks, self)
                 local_ind += 1
@@ -562,16 +581,14 @@ class Network(torch.nn.Module):
                 if progressbar:
                     progressbar.update(1)
                     if local_ind % 100 == 0:
-                        progressbar.set_description(f"{tstart + local_ind * dt_f:.1f} ms")
+                        progressbar.set_description(
+                            f"{tstart + local_ind * dt_f:.1f} ms"
+                        )
 
             if progressbar:
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
-
-    def _step_netstim(self):
-        if self.netstim is not None:
-            self.netstim(self.t)
 
 
 def prepare_intra(intra_c, intra, local_ind):

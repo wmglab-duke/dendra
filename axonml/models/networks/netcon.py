@@ -2,6 +2,8 @@ from typing import Tuple
 
 import torch
 
+from .netstim import NetStim
+
 
 def update_active(has_spiked, vm_new, threshold) -> Tuple[torch.Tensor, torch.Tensor]:
     ge = vm_new >= threshold
@@ -39,9 +41,7 @@ class NetCon(torch.nn.Module):
 
         self.register_buffer(
             "n",
-            torch.tensor(self.pre.v.view(-1).index_select(0, self.pre_idx).shape[0]).to(
-                self.device, dtype=torch.long
-            ),
+            torch.tensor(self.pre_idx.numel()).to(self.device, dtype=torch.long),
         )
         n_pre = self.n.item()
         assert len(self.threshold) == n_pre, (
@@ -117,10 +117,7 @@ class NetCon(torch.nn.Module):
         self.event_queue.index_fill_(0, self.current_time_step, False)
 
         # 2. SPIKE & SCHEDULE: Check for new spikes and schedule their future delivery
-        v_selected = self.pre.v.view(-1).index_select(0, self.pre_idx)
-        self.has_spiked, self.is_spiking = update_active(
-            self.has_spiked, v_selected, self.threshold
-        )
+        self.determine_spiking(self.pre)
 
         # Get the weights of the connections that are currently spiking
         # The float conversion is essential for the multiplication
@@ -143,6 +140,17 @@ class NetCon(torch.nn.Module):
 
         # 3. INCREMENT TIME: Move to the next time step
         self.current_time_step.add_(1).remainder_(self.max_delay_steps)
+
+    def determine_spiking(self, pre):
+        if isinstance(pre, NetStim):
+            # If pre is a NetStim, we can directly use its spikes
+            self.is_spiking = pre.spikes.view(-1).index_select(0, self.pre_idx)
+        else:
+            # Otherwise, we need to compute spiking based on the pre-synaptic membrane potential
+            v_selected = pre.v.view(-1).index_select(0, self.pre_idx)
+            self.has_spiked, self.is_spiking = update_active(
+                self.has_spiked, v_selected, self.threshold
+            )
 
     def zero(self):
         """
