@@ -1,11 +1,9 @@
 import argparse
 
+import config
 import h5py
 import natsort
 from tqdm import tqdm
-
-import config
-
 
 parser = argparse.ArgumentParser()
 required = parser.add_argument_group("required named arguments")

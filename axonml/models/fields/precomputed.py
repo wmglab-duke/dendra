@@ -1,10 +1,10 @@
 """Precomputed fields."""
 
-import torch
-
 import glob
-from natsort import natsorted
+
 import numpy as np
+import torch
+from natsort import natsorted
 from scipy.interpolate import interp1d
 from tqdm.auto import tqdm
 

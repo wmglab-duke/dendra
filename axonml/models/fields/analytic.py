@@ -2,9 +2,9 @@ from typing import List, Union
 
 import torch
 
-from .spherical_cartesian import spherical_to_cartesian
-from .quasipotentials import calculate_quasipotentials_batched_coords
 from ..parametric import SimpleParameterized as P
+from .quasipotentials import calculate_quasipotentials_batched_coords
+from .spherical_cartesian import spherical_to_cartesian
 
 
 class Point(P):

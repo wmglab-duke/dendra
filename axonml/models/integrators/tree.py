@@ -1,14 +1,15 @@
 from collections import deque
 from functools import partial
-from typing import NamedTuple, List, Tuple
+from typing import List, NamedTuple, Tuple
 
+import networkx as nx
 import numpy as np
-import torch, networkx as nx
+import torch
+
+from axonml.helpers import tic, toc
 
 from .core import Integrator
 from .triton import dhs_solve_cuda
-
-from axonml.helpers import tic, toc
 
 try:
     import axonml_solvers

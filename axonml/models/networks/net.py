@@ -1,15 +1,15 @@
 from contextlib import nullcontext
 from typing import Dict
 
+import torch
 from tqdm.auto import tqdm
 
-import torch
+from axonml.helpers import BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT
 
+from ..callbacks import CallbackList
 from ..core import Population, make_intra
 from ..parametric import to_param
-from ..callbacks import CallbackList
 from .netcon import NetCon
-from axonml.helpers import BACKEND, FULLGRAPH, DYNAMIC, JIT, COMPILE_MODE
 
 
 def to_flat_idx_torch(shape, idx, device):

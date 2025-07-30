@@ -1,15 +1,14 @@
-from typing import Dict
-
 import colorsys
 import random
+from typing import Dict
 
-import torch
-import matplotlib.pyplot as plt
-from matplotlib import cm
-from matplotlib.colors import LinearSegmentedColormap
 import matplotlib as mpl
+import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
+import torch
+from matplotlib import cm
+from matplotlib.colors import LinearSegmentedColormap
 from scipy.interpolate import griddata
 
 

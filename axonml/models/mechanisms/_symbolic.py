@@ -1,6 +1,6 @@
-from .compilers.ast import factorize_linear_in_v
-from axonml.helpers import logger, DEBUG
+from axonml.helpers import DEBUG, logger
 
+from .compilers.ast import factorize_linear_in_v
 
 implicit_equation_template = """
 def {k}(self, v):

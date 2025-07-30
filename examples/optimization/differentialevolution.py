@@ -1,26 +1,20 @@
 import argparse
 import datetime
 
+import de_config as config
 import numpy as np
 import torch
-
 from cajal.mpi import ANNGPURunner
-from cajal.nrn.stimuli import SymmetricBiphasic
 from cajal.nrn.sources import PreComputedInterpolate1D
+from cajal.nrn.stimuli import SymmetricBiphasic
 from cajal.opt.differentialevolution import DEBASE
-from cajal.opt.differentialevolution.callbacks import Logger, EarlyStopping, Timer
+from cajal.opt.differentialevolution.callbacks import (EarlyStopping, Logger,
+                                                       Timer)
+from utils import (WeightedBinaryCrossEntropy, deltax,
+                   percent_off_target_active, percent_on_target_active)
 
 from axonml.models import SMF
 from axonml.models.callbacks import Active
-
-import de_config as config
-from utils import (
-    percent_off_target_active,
-    percent_on_target_active,
-    deltax,
-    WeightedBinaryCrossEntropy,
-)
-
 
 torch.set_default_dtype(torch.float32)
 
@@ -182,8 +176,8 @@ if __name__ == "__main__":
 
     # validate with NEURON
     if args.validate:
-        from cajal.nrn import MRG
         from cajal.mpi import NeuronModel
+        from cajal.nrn import MRG
         from cajal.nrn.specs import Mutable as Mut
 
         class MyMRG(MRG):

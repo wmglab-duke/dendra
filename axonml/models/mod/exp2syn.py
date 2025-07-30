@@ -1,4 +1,5 @@
-from ..mechanisms._mechanism import PointProcess as PP, Synapse as Syn
+from ..mechanisms._mechanism import PointProcess as PP
+from ..mechanisms._mechanism import Synapse as Syn
 from ..mechanisms._state import State as S
 from ..mechanisms.ops import *
 

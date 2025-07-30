@@ -1,5 +1,5 @@
-import h5py
 import dask.array as da
+import h5py
 from natsort import natsorted
 
 

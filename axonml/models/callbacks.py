@@ -1,17 +1,15 @@
-from queue import Queue
-from typing import Tuple, Dict, List
-from types import MethodType
 import multiprocessing as mp
-
-from h5py import File
+from queue import Queue
+from types import MethodType
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from h5py import File
 
-from .backend import Backend as A
 from ..helpers import nojit
-
+from .backend import Backend as A
 
 if torch.cuda.is_available():
     TRANSFERSTREAM = torch.cuda.Stream()
@@ -1338,8 +1336,8 @@ class Raster(ThresholdCallback):
         matplotlib.figure.Figure
             The figure containing the raster plot.
         """
-        import matplotlib.pyplot as plt
         import matplotlib as mpl
+        import matplotlib.pyplot as plt
 
         if dt is None:
             dt = self.dt

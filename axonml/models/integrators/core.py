@@ -1,7 +1,8 @@
-import torch
-from axonml.helpers import IMEM
-
 import inspect
+
+import torch
+
+from axonml.helpers import IMEM
 
 
 def get_init_defaults(cls):

@@ -4,8 +4,8 @@ from typing import List
 
 import torch
 
-from axonml.models import Backend as A, Axon, SMF
-
+from axonml.models import SMF, Axon
+from axonml.models import Backend as A
 
 # model specification
 model: Axon = SMF

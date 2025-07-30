@@ -1,12 +1,12 @@
+import math
 from typing import Tuple
 
 import torch
-import math
 from tqdm.auto import tqdm
 
-from .core import Axon
-from .callbacks import Recorder
 from .backend import Backend as A
+from .callbacks import Recorder
+from .core import Axon
 
 
 def num_rows_to_zero(A: int, x: float) -> int:

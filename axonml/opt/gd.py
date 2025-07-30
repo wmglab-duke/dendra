@@ -7,16 +7,15 @@ from dataclasses import dataclass
 from typing import List, Union
 
 import numpy as np
-from pytorch_optimizer import Ranger
 import torch
+from cajal.nrn.sources import PreComputedInterpolate1D
+from cajal.nrn.stimuli import MonophasicPulse, Stimulus
+from cajal.opt.loss import PredictionLoss
+from pytorch_optimizer import Ranger
 from tqdm import trange
 
-from cajal.nrn.sources import PreComputedInterpolate1D
-from cajal.nrn.stimuli import Stimulus, MonophasicPulse
-from cajal.opt.loss import PredictionLoss
-
-from axonml.models.callbacks import Recorder
 from axonml.models import Axon
+from axonml.models.callbacks import Recorder
 
 
 class WeightedQuotient(torch.jit.ScriptModule):

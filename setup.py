@@ -1,9 +1,8 @@
 from pathlib import Path
-from setuptools import setup, Extension
 
-from Cython.Build import cythonize
 import numpy as np
-
+from Cython.Build import cythonize
+from setuptools import Extension, setup
 
 ext_modules = cythonize(
     [
@@ -30,7 +29,6 @@ setup(
         "dask",
     ],
     extras_require={
-        "jupyter": ["jupyter"],
         "doc": [
             "jupyter_contrib_nbextensions",
             "notebook <= 6.4.12",
@@ -50,6 +48,13 @@ setup(
             "jupytext",
             "sphinx-book-theme",
         ],
+        "dev": [
+            "pre-commit",
+            "pytest",
+            "pytest-cov",
+            "hypothesis",
+            "pytest-xdist",
+        ]
     },
     ext_modules=ext_modules,
 )

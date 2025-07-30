@@ -1,6 +1,6 @@
 import torch
 
-from ._mechanism import Mechanism, VoltageProcess, PointProcess
+from ._mechanism import Mechanism, PointProcess, VoltageProcess
 
 
 def make_scaler(mech, area):

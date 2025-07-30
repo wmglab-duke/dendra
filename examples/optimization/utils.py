@@ -1,8 +1,6 @@
 import numpy as np
 import torch
-
 from cajal.opt.loss import PredictionLoss
-
 
 # activation statistics
 

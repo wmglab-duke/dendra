@@ -1,14 +1,13 @@
-from typing import List, Tuple, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
-
 import torch
 from torch import Tensor
 
 from axonml.models import Population
-from axonml.models.stim import Waveform
 from axonml.models.callbacks import Recorder, ThresholdCallback
+from axonml.models.stim import Waveform
 
 
 class Thresholder:

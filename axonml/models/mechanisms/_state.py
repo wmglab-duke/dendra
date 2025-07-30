@@ -1,13 +1,14 @@
-import re
-from typing import List
-from types import MethodType
-import torch
 import ast
+import re
+from types import MethodType
+from typing import List
+
+import torch
+
+from axonml.helpers import DEBUG, PADE
+from axonml.models.parametric import Parameterized
 
 from .ode import integrate2c
-from axonml.models.parametric import Parameterized
-from axonml.helpers import DEBUG, PADE
-
 
 # PyTorch operations
 torch_operations = set(dir(torch))

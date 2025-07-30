@@ -1,7 +1,8 @@
 import torch
 
-from .core import Distribution
 from axonml.models.parametric import to_param
+
+from .core import Distribution
 
 
 class Normal(Distribution):

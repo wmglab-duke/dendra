@@ -1,9 +1,16 @@
 from __future__ import annotations
-import ast, inspect, textwrap, sympy as sp, re
-from sympy import symbols, sympify, Poly, expand, factor
+
+import ast
+import inspect
+import re
+import textwrap
 from functools import lru_cache
 
+import sympy as sp
+from sympy import Poly, expand, factor, symbols, sympify
+
 from axonml.helpers import DEBUG
+
 from .source import safe_source
 
 

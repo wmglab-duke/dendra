@@ -1,19 +1,17 @@
-import pickle
 import os
+import pickle
 
 import numpy as np
-from natsort import natsorted
 import torch
-
 from cajal.common.logging import tic, toc
-from cajal.nrn.stimuli import SymmetricBiphasic
 from cajal.nrn.sources import PreComputedInterpolate1D
+from cajal.nrn.stimuli import SymmetricBiphasic
+from gd_parser import parser
+from natsort import natsorted
+from utils import deltax, percent_off_target_active, percent_on_target_active
 
 from axonml.models.implementations import SMF
-from axonml.opt.gd import AxonSpec, FieldSpec, GDProblemUniform, GD
-
-from gd_parser import parser
-from utils import deltax, percent_on_target_active, percent_off_target_active
+from axonml.opt.gd import GD, AxonSpec, FieldSpec, GDProblemUniform
 
 args = parser.parse_args()
 
@@ -88,10 +86,10 @@ if __name__ == "__main__":
     time = toc()
 
     if args.validate:
-        from cajal.nrn import MRG
         from cajal.mpi import NeuronModel
-        from cajal.nrn.specs import Mutable as Mut
+        from cajal.nrn import MRG
         from cajal.nrn import Backend as N
+        from cajal.nrn.specs import Mutable as Mut
 
         class MyMRG(MRG):
             def init_AP_monitors(self):

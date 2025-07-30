@@ -9,7 +9,6 @@ version = "0.2"
 dynamic = ["dependencies"]
 
 [project.optional-dependencies]
-jupyter = ["jupyter"]
 doc = [
     "jupyter_contrib_nbextensions",
     "notebook <= 6.4.12",
@@ -28,6 +27,13 @@ doc = [
     "myst-nb",
     "jupytext",
     "sphinx-book-theme",
+]
+dev = [
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "hypothesis",
+    "pytest-xdist",
 ]
 
 [tool.setuptools.packages.find]

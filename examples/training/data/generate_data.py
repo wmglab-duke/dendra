@@ -9,18 +9,15 @@ Author: Minhaj Hussain
 
 import argparse
 
+import config
 import numpy as np
-
-from cajal.mpi import NeuronModel, RNG
-from cajal.common.logging import logger, DisableLogger
+from cajal.common.logging import DisableLogger, logger
+from cajal.mpi import RNG, NeuronModel
 from cajal.nrn import Backend as N
 from cajal.nrn.cells import MRG
 from cajal.nrn.sources import RANDPreComputedInterpolate1D
 from cajal.nrn.specs import Mutable as Mut
 from cajal.nrn.stimuli import MonophasicPulse
-
-import config
-
 
 parser = argparse.ArgumentParser()
 

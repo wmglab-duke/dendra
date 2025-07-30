@@ -1,14 +1,14 @@
-from typing import List
 import os
+from typing import List
 
 import torch
-from torch.optim import Optimizer
 from torch.nn.modules.loss import _Loss
+from torch.optim import Optimizer
 from tqdm import tqdm
 
-from .dataloader import DataLoader
-from ..models.callbacks import Recorder
 from ..models import Axon
+from ..models.callbacks import Recorder
+from .dataloader import DataLoader
 
 
 class NaNError(Exception):

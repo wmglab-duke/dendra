@@ -1,7 +1,10 @@
-import inspect, textwrap, re
+import inspect
+import re
+import textwrap
+from typing import Any, List, Optional, Tuple
+
 from IPython import get_ipython
 from IPython.core.oinspect import Inspector
-from typing import Any, Optional, List, Tuple
 
 
 # ---------------------------------------------------------------------------

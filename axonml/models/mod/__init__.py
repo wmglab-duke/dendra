@@ -1,14 +1,12 @@
 import importlib
-
-import sys
 import importlib.util
+import sys
 from pathlib import Path
 
-
-from .hh import hh
+from .alphasynapse import alphasynapse
 from .exp2syn import exp2syn
 from .expsyn import expsyn
-from .alphasynapse import alphasynapse
+from .hh import hh
 from .pas import pas
 
 

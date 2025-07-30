@@ -1,42 +1,30 @@
-from contextlib import nullcontext
-import math
-from typing import List, Tuple, Optional, Dict, Callable, NamedTuple, Union
-import re
 import itertools
+import math
+import re
+from contextlib import nullcontext
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
-import torch
-from torch import Tensor
 import numpy as np
 import pandas as pd
-
+import torch
+from torch import Tensor
 from tqdm.auto import tqdm
 
+from axonml.helpers import (BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT,
+                            op_mc, op_sc, ve_from_s_t)
+from axonml.models.backend import Backend as A
+from axonml.models.callbacks import Callback, CallbackList
+from axonml.models.graph import get_area_from_graph
+from axonml.models.integrators import bwd_euler_sc, bwd_euler_ub
+from axonml.models.mechanisms._handler import MechanismHandler
+from axonml.models.mechanisms._ions import Ion, valid_ions
+from axonml.models.mechanisms.core import validate
+from axonml.models.parametric import Parameterized as P
 from axonml.models.stim.intrastim import IntraStim
 from axonml.models.stim.waveform import Waveform
-
-from axonml.models.callbacks import CallbackList, Callback
-from axonml.models.backend import Backend as A
-from axonml.models.parametric import Parameterized as P
-from axonml.models.mechanisms.core import validate
-from axonml.models.mechanisms._handler import MechanismHandler
-from axonml.models.mechanisms._ions import valid_ions, Ion
 from axonml.units import mm
-from axonml.models.integrators import bwd_euler_ub, bwd_euler_sc
-from axonml.models.graph import get_area_from_graph
 
 from .slice import Sliceable
-
-
-from axonml.helpers import (
-    op_mc,
-    op_sc,
-    ve_from_s_t,
-    BACKEND,
-    FULLGRAPH,
-    DYNAMIC,
-    JIT,
-    COMPILE_MODE,
-)
 
 
 def get_unique_keys(list_of_dicts):
@@ -1737,8 +1725,9 @@ def post_chunk_hook(c, m, n):
     c.post_chunk_hook(m, n)
 
 
+from typing import Any, List, Tuple, Union
+
 import numpy as np
-from typing import List, Tuple, Union, Any
 
 
 # Helper for the super-fast path: Merges overlapping/adjacent 1D intervals

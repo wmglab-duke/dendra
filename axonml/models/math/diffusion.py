@@ -1,6 +1,8 @@
-from axonml.models.math.dct import idct1, dct1
-import torch
 import math
+
+import torch
+
+from axonml.models.math.dct import dct1, idct1
 
 
 @torch.jit.script

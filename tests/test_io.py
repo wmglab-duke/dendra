@@ -1,6 +1,7 @@
-import pytest
+from unittest.mock import MagicMock, call, patch
+
 import networkx as nx
-from unittest.mock import MagicMock, patch, call
+import pytest
 
 # Import the code you want to test
 import axonml.models.io as io

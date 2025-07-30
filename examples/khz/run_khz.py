@@ -1,12 +1,11 @@
 import argparse
 
+import numpy as np
 import torch
 from tqdm import tqdm
-import numpy as np
 
 import axonml as ax
-from axonml.units import nA, Hz, ms
-
+from axonml.units import Hz, ms, nA
 
 torch.set_default_dtype(torch.float32)
 
@@ -115,10 +114,10 @@ all_n = count.numpy()
 
 # visualize
 
-import pandas as pd
-import seaborn as sns
 import matplotlib
 import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
 
 # matplotlib.use("TKAgg")
 

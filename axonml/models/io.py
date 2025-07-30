@@ -1,16 +1,15 @@
 try:
-    from neuron import h
-    from neuron import nrn
+    from neuron import h, nrn
 
     NEURON_INSTALLED = True
 except ImportError:
     NEURON_INSTALLED = False
 
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
 import networkx as nx
 import numpy as np
-
-from typing import Dict, Tuple, Optional, List, Any
-import re
 
 
 def is_neuron_installed() -> bool:
@@ -52,7 +51,7 @@ def lambda_f(sec, freq_hz):
     if not is_neuron_installed():
         raise ImportError("NEURON is not installed. Cannot apply d_lambda.")
 
-    from math import sqrt, pi
+    from math import pi, sqrt
 
     # make sure diam/3‑D info are up to date
     h.define_shape()

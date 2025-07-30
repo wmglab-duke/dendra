@@ -1,8 +1,9 @@
+import math
+
 import torch
 import torch.nn as nn
 from torch.distributions import Normal as _Normal
 
-import math
 from .parametric import to_param
 
 

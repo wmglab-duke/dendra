@@ -1,9 +1,10 @@
+import contextlib
 import functools
-import os, contextlib
+import os
 from typing import ClassVar
 
-import torch
 import numpy as np
+import torch
 
 
 @functools.lru_cache(maxsize=None)
@@ -430,8 +431,8 @@ def interp1d_z(x, y, xnew, out=None):
     return ynew
 
 
-import time
 import logging
+import time
 
 TIME_STACK = []
 

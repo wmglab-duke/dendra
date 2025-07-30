@@ -1,6 +1,6 @@
-import torch
-
 import random
+
+import torch
 
 
 class Distribution(torch.nn.Module):

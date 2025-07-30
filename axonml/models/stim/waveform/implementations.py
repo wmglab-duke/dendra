@@ -1,8 +1,8 @@
 import torch
 
-from .core import Waveform
 from axonml.helpers import interp1d_z
 
+from .core import Waveform
 
 __all__ = [
     "sin",

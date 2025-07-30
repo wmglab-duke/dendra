@@ -1,18 +1,17 @@
 import inspect
-from typing import Tuple, List, Optional
+from typing import List, Optional, Tuple
 
 import torch
-from torch.nn import functional as F
 from torch import Tensor
-
+from torch.nn import functional as F
 from tqdm.auto import tqdm
 
 import axonml as ax
-from axonml.models.stim.intrastim import IntraStim
-from axonml.models.backend import Backend as A
-from axonml.models.callbacks import CallbackList, Callback
-from axonml.models.core import Axon
 from axonml.helpers import ve_from_s_t
+from axonml.models.backend import Backend as A
+from axonml.models.callbacks import Callback, CallbackList
+from axonml.models.core import Axon
+from axonml.models.stim.intrastim import IntraStim
 
 
 class Heterogeneous(Axon):

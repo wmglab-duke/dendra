@@ -3,10 +3,9 @@ import argparse
 import numpy as np
 import torch
 
-from axonml.models.instruments.thresholder import Thresholder
 from axonml.models.callbacks import Active
 from axonml.models.implementations import SMF
-
+from axonml.models.instruments.thresholder import Thresholder
 
 parser = argparse.ArgumentParser()
 

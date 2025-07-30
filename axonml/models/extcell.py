@@ -1,7 +1,7 @@
 import torch
 
-from .integrators import bwd_euler_bt
 from .core import Axon
+from .integrators import bwd_euler_bt
 
 
 class ExtCell(Axon):

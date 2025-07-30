@@ -1,29 +1,11 @@
 from functools import partial, partialmethod
 from typing import Any, Type
 
-from .explicit import (
-    _euler,
-    _eulerv1,
-    _rk1,
-    _rk2,
-    _rk4,
-    _dufort_frankel,
-    _dufort_frankel_homogeneous,
-)
-
-from .implicit import (
-    _bwd_euler_sc,
-    _bwd_euler_ub,
-    _bwd_euler_bt,
-)
-
-from .imex import (
-    _krylov_etd1,
-)
-
-from .tree import (
-    _dhs,
-)
+from .explicit import (_dufort_frankel, _dufort_frankel_homogeneous, _euler,
+                       _eulerv1, _rk1, _rk2, _rk4)
+from .imex import _krylov_etd1
+from .implicit import _bwd_euler_bt, _bwd_euler_sc, _bwd_euler_ub
+from .tree import _dhs
 
 
 def partial_class(cls: Type[Any], /, *args, **kwargs) -> Type[Any]:

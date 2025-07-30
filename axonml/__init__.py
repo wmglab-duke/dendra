@@ -1,25 +1,23 @@
-from importlib.resources import files
-
 import glob
 import os
+import pickle
+import time
+import warnings
+from importlib.resources import files
+from pathlib import Path
+
 import torch
-
-from .helpers import *
-
-from .models import *
-from .models.mod import load_mechanisms
-from .models.stim.waveform import *
-from .models.fields import *
-from .models.integrators import *
-from .const import *
 
 import axonml.models.callbacks as callbacks
 import axonml.models.mod as mod
 
-import time
-from pathlib import Path
-import warnings
-import pickle
+from .const import *
+from .helpers import *
+from .models import *
+from .models.fields import *
+from .models.integrators import *
+from .models.mod import load_mechanisms
+from .models.stim.waveform import *
 
 # --- This is the core logic ---
 

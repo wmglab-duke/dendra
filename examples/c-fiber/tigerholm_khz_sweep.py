@@ -1,13 +1,12 @@
 import itertools
 
-import torch
 import numpy as np
 import pandas as pd
+import torch
 
 import axonml as ax
 from axonml.models.parametric import distributed
-from axonml.units import mm, um, nA, Hz, ms
-
+from axonml.units import Hz, mm, ms, nA, um
 
 # decide if you want to retry with slower numerical methods if some
 # of the simulations fail. Default = False (won't rerun).

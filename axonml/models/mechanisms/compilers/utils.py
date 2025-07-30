@@ -1,7 +1,7 @@
-import re
 import inspect
-import string
 import random
+import re
+import string
 import textwrap
 
 

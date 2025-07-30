@@ -1,5 +1,6 @@
-import torch
 from contextlib import ContextDecorator
+
+import torch
 
 from axonml.helpers import DEBUG
 

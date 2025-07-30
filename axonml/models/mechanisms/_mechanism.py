@@ -1,23 +1,24 @@
 import inspect
 import textwrap
-
-from typing import Dict
 from types import MethodType
+from typing import Dict
+
 import torch
 
 from axonml.helpers import classproperty
 from axonml.models.parametric import Parameterized
+
+from ..slice import Slice
 from ._ions import VALENCES
 from ._symbolic import build_current_eq
-from ..slice import Slice
 
 
 class Mechanism(Parameterized):
     """
-    Mechanism is the base class for all mechanisms in AxonML.
+    `Mechanism` is the base class for all mechanisms in AxonML.
     It provides a framework for defining state variables, ion channels,
     and currents, and for managing the parameters of these mechanisms.
-    Mechanism is a subclass of Parameterized, which provides the
+    `Mechanism` is a subclass of `Parameterized`, which provides the
     functionality for handling parameters and their declarations.
 
     Mechanisms are responsible for keeping track of where in the model

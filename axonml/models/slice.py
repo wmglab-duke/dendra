@@ -1,8 +1,9 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Sequence, Tuple, Union, Optional
-import numpy as np
 
+from dataclasses import dataclass
+from typing import Any, Optional, Sequence, Tuple, Union
+
+import numpy as np
 import torch
 
 

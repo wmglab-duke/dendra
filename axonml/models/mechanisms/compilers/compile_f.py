@@ -1,7 +1,7 @@
 import ast
-import textwrap
 import inspect
 import re
+import textwrap
 
 from ..ops import all_ops
 from .source import safe_source
