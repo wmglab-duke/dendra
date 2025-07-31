@@ -18,7 +18,7 @@ def _thomas_solve_kernel(
     x_stride_b,
     x_stride_k,
     K: tl.constexpr,
-):
+):  # pragma: no cover
     batch_idx = tl.program_id(0)
 
     a_b_ptr = a_ptr + batch_idx * a_stride_b

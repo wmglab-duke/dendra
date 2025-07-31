@@ -139,57 +139,72 @@ def replace(input_string: str, replace_list: List[str]) -> str:
     return input_string
 
 
-def _find_local_defs(code: str) -> Set[str]:
-    """Return {name, …} for all defs/assignments in *code*.
-    Falls back to ∅ if the snippet isn't valid Python."""
+def _find_local_defs(src: str) -> Set[str]:
+    """Collect names defined by `def`, `class`, or simple assignment."""
     try:
-        tree = ast.parse(textwrap.dedent(code))
+        tree = ast.parse(textwrap.dedent(src))
     except SyntaxError:
         return set()
 
-    defs: set[str] = set()
+    names: set[str] = set()
 
-    class _Visitor(ast.NodeVisitor):
-        def visit_FunctionDef(self, n):  # def foo(…
-            defs.add(n.name)
+    class V(ast.NodeVisitor):
+        def visit_FunctionDef(self, n):  # def foo():
+            names.add(n.name)
 
-        visit_AsyncFunctionDef = visit_FunctionDef  # same for async def
+        visit_AsyncFunctionDef = visit_FunctionDef
 
-        def visit_ClassDef(self, n):
-            defs.add(n.name)  # class Foo:
+        def visit_ClassDef(self, n):  # class Foo:
+            names.add(n.name)
 
         def visit_Assign(self, n):  # x = …
             for t in n.targets:
                 if isinstance(t, ast.Name):
-                    defs.add(t.id)
+                    names.add(t.id)
 
-        # you can add more (AnnAssign, import as …) if needed
-
-    _Visitor().visit(tree)
-    return defs
+    V().visit(tree)
+    return names
 
 
-# ----------------------------------------------------------------------
-# main transformer (token-based, comment-preserving)
-# ----------------------------------------------------------------------
+# ─────────────────────── main transformation ──────────────────────────
 def modify_operations(
     code: str,
     torch_operations: Iterable[str] = TORCH_OPS,
 ) -> str:
-    """Prefix bare calls to *torch_operations* with ``torch.`` while
-    preserving comments, f-strings, local shadowing, layout -- and while
-    gracefully doing nothing when the snippet cannot be tokenised."""
-    ops = set(torch_operations)
-    local_defs = _find_local_defs(code)
+    """
+    Prefix bare calls to *torch_operations* with ``torch.`` while preserving
+    whitespace, comments, and strings.
 
-    # 1️⃣  Try to tokenise the snippet.  Bail out on TokenError.
+    If *code* cannot be parsed as valid Python (e.g. because Hypothesis
+    injected unmatched quotes, stray control bytes, etc.), it is returned
+    **unchanged**.
+    """
+    # ── 0. Bail out early on syntactically invalid snippets ────────────
     try:
-        tok = list(tokenize.generate_tokens(io.StringIO(code).readline))
-    except tokenize.TokenError:
-        # e.g. NULL byte or other unrecoverable lexical issue
+        ast.parse(textwrap.dedent(code))
+    except SyntaxError:
         return code
 
-    SIGNIFICANT = {
+    # ── 1. local defs for shadowing detection ──────────────────────────
+    local_defs = _find_local_defs(code)
+    ops = set(torch_operations)
+
+    # ── 2. Tokenise; leave untouched on lexical errors (NULL byte, …) ──
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
+    except (tokenize.TokenError, UnicodeDecodeError):
+        return code
+
+    # Build line-offset table for fast (line, col) → absolute_index
+    line_offsets = [0]
+    for ln in code.splitlines(keepends=True):
+        line_offsets.append(line_offsets[-1] + len(ln))
+
+    def abs_index(pos):
+        line, col = pos
+        return line_offsets[line - 1] + col
+
+    SIGNIF = {
         tokenize.NAME,
         tokenize.NUMBER,
         tokenize.OP,
@@ -197,54 +212,62 @@ def modify_operations(
         tokenize.ERRORTOKEN,
     }
 
-    def next_sig(i: int) -> int:
-        j = i + 1
-        while j < len(tok) and tok[j].type not in SIGNIFICANT:
+    def next_sig(idx):
+        j = idx + 1
+        while j < len(tokens) and tokens[j].type not in SIGNIF:
             j += 1
         return j
 
-    def prev_sig(i: int) -> int:
-        j = i - 1
-        while j >= 0 and tok[j].type not in SIGNIFICANT:
+    def prev_sig(idx):
+        j = idx - 1
+        while j >= 0 and tokens[j].type not in SIGNIF:
             j -= 1
         return j
 
-    out: list[tokenize.TokenInfo] = []
-    fdepth = 0  # nesting level inside an f-string expression
+    out, cursor, fdepth = [], 0, 0
 
-    for i, t in enumerate(tok):
-        if t.type == tokenize.FSTRING_START:
+    for i, tok in enumerate(tokens):
+        ttype, tstr, (sl, sc), (el, ec), _ = tok
+
+        # Track f-string expression nesting
+        if ttype == tokenize.FSTRING_START:
             fdepth += 1
-        elif t.type == tokenize.FSTRING_END:
+        elif ttype == tokenize.FSTRING_END:
             fdepth -= 1
 
-        if (
-            t.type == tokenize.NAME
+        # Absolute positions in the *original* source
+        start = abs_index((sl, sc))
+        end = abs_index((el, ec))
+
+        # Copy text that lies *before* this token (whitespace, comments …)
+        if cursor < start:
+            out.append(code[cursor:start])
+
+        # Decide whether to rewrite this NAME
+        is_candidate = (
+            ttype == tokenize.NAME
             and fdepth == 0
-            and t.string in ops
-            and t.string not in local_defs
-        ):
+            and tstr in ops
+            and tstr not in local_defs
+        )
+        if is_candidate:
             j = next_sig(i)
             k = prev_sig(i)
-            call_follows = j < len(tok) and tok[j].string == "("
-            dot_before = k >= 0 and tok[k].string == "."
+            call_follows = j < len(tokens) and tokens[j].string == "("
+            dot_before = k >= 0 and tokens[k].string == "."
+            string_before = k >= 0 and tokens[k].type == tokenize.STRING
+            if call_follows and not dot_before and not string_before:
+                out.append(f"torch.{tstr}")
+                cursor = end
+                continue  # done with this token
 
-            if call_follows and not dot_before:
-                # emit torch . NAME
-                out.extend(
-                    [
-                        tokenize.TokenInfo(
-                            tokenize.NAME, "torch", t.start, t.start, t.line
-                        ),
-                        tokenize.TokenInfo(tokenize.OP, ".", t.start, t.start, t.line),
-                        t,  # original NAME
-                    ]
-                )
-                continue  # skip default append
+        # default: keep token text verbatim
+        out.append(code[start:end])
+        cursor = end
 
-        out.append(t)
-
-    return tokenize.untokenize(out)
+    # trailing text (e.g. final newline)
+    out.append(code[cursor:])
+    return "".join(out)
 
 
 def convert(deriv, state, states, assigned, use_pade_approx=False):

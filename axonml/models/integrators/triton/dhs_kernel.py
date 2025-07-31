@@ -19,7 +19,7 @@ def _single_dhs_kernel(
     K: tl.constexpr,
     L: tl.constexpr,
     K_THREADS: tl.constexpr,
-):
+):  # pragma: no cover
     """
     Optimized Triton kernel for a fused Dendritic Hierarchical Scheduling (DHS) solve.
     """

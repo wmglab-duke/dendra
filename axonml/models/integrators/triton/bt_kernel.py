@@ -7,7 +7,7 @@ import triton.language as tl
 # 3×3 analytic inverse ------------------------------------------------
 # ---------------------------------------------------------------------
 @triton.jit
-def inv3x3(a0, a1, a2, a3, a4, a5, a6, a7, a8):
+def inv3x3(a0, a1, a2, a3, a4, a5, a6, a7, a8):  # pragma: no cover
     det = a0 * (a4 * a8 - a5 * a7) - a1 * (a3 * a8 - a5 * a6) + a2 * (a3 * a7 - a4 * a6)
     invd = 1.0 / det
     return (
@@ -32,7 +32,7 @@ BLOCK_FIBRES = 32  # fibres handled per warp (== warp size)
 @triton.jit
 def thomas_bt3_kernel(
     L_ptr, M_ptr, U_ptr, D_ptr, X_ptr, Minv_ptr, B, K: tl.constexpr, BLOCK: tl.constexpr
-):
+):  # pragma: no cover
     # ------- map lanes → global fibre IDs ---------------------
     wid = tl.program_id(0)  # warp / CTA id
     lane_id = tl.arange(0, BLOCK)  # [0, …, 31]

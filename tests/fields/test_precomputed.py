@@ -79,7 +79,7 @@ def test_interpolate1d_truncate_limit():
 
 
 def _manual_idw(dist2: np.ndarray, vecs: np.ndarray, eps: float = 1e-9) -> np.ndarray:
-    """Reference inverse‑distance weighting (numpy implementation)."""
+    """Reference inverse-distance weighting (numpy implementation)."""
     w = 1.0 / (dist2 + eps)
     w = w / w.sum(axis=-1, keepdims=True)
     return (w[..., None] * vecs).sum(axis=-2)
@@ -98,7 +98,7 @@ def _manual_idw(dist2: np.ndarray, vecs: np.ndarray, eps: float = 1e-9) -> np.nd
 )
 @settings(deadline=None, max_examples=25)
 def test_idw_matches_manual(N, B, K, k):
-    """`_interp` should match a pure‑numpy reference implementation."""
+    """`_interp` should match a pure-numpy reference implementation."""
     k = min(k, N)
     xyz = _rand_xyz(N, dtype=torch.float64)
     efield = _rand_vec(N, dtype=torch.float64)
