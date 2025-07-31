@@ -392,7 +392,7 @@ class Tree(Population):
         s_mat = s.view(self.np, 1, 1)
         c_mat = c.view(self.np, 1, 1)
 
-        I = torch.eye(3, device=device).expand(self.np, -1, -1)
+        I = torch.eye(3, device=device).expand(self.np, -1, -1)  # noqa: E741
         R = I + s_mat * K + (1 - c_mat) * (K @ K)
 
         # --- Apply special cases using the (B,) shaped masks ---
@@ -458,7 +458,7 @@ class Tree(Population):
         s = s.view(self.np, 1, 1)
         c = c.view(self.np, 1, 1)
 
-        I = torch.eye(3, device=device).expand(self.np, -1, -1)
+        I = torch.eye(3, device=device).expand(self.np, -1, -1)  # noqa: E741
         R = I + s * K + (1 - c) * (K @ K)
 
         self._apply_rotation(R, origin)

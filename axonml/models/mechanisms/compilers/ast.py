@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import inspect
 import re
 import textwrap
 from functools import lru_cache
@@ -28,16 +27,16 @@ def _ast_to_sympy(node: ast.AST, local_syms: dict[str, sp.Expr]) -> sp.Expr:
             )
         raise NotImplementedError("Only `self.attr` attributes supported.")
     if isinstance(node, ast.BinOp):
-        l, r = (
+        left, right = (
             _ast_to_sympy(node.left, local_syms),
             _ast_to_sympy(node.right, local_syms),
         )
         return {
-            ast.Add: l + r,
-            ast.Sub: l - r,
-            ast.Mult: l * r,
-            ast.Div: l / r,
-            ast.Pow: l**r,
+            ast.Add: left + right,
+            ast.Sub: left - right,
+            ast.Mult: left * right,
+            ast.Div: left / right,
+            ast.Pow: left**right,
         }[type(node.op)]
     if isinstance(node, ast.UnaryOp):
         o = _ast_to_sympy(node.operand, local_syms)

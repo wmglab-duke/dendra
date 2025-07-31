@@ -1,7 +1,7 @@
 from ..mechanisms import *
 from ..mechanisms._mechanism import Mechanism as M
 from ..mechanisms._state import State as S
-from ..mechanisms.ops import *
+from ..mechanisms.ops import exp, vtrap
 
 
 class mhn(S):

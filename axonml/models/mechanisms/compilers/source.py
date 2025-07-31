@@ -1,7 +1,7 @@
 import inspect
 import re
 import textwrap
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 from IPython import get_ipython
 from IPython.core.oinspect import Inspector
@@ -63,7 +63,9 @@ def safe_source(obj: Any, *, strip_decorators: bool = False) -> str:
                 src = ip.user_ns["In"][cell_num]
                 if strip_decorators:
                     src = "\n".join(
-                        l for l in src.splitlines() if not l.lstrip().startswith("@")
+                        line
+                        for line in src.splitlines()
+                        if not line.lstrip().startswith("@")
                     )
                 return src
 

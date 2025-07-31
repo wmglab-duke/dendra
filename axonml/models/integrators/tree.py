@@ -1,18 +1,16 @@
 from collections import deque
 from functools import partial
-from typing import List, NamedTuple, Tuple
+from typing import List, Tuple
 
 import networkx as nx
 import numpy as np
 import torch
 
-from axonml.helpers import tic, toc
-
 from .core import Integrator
 from .triton import dhs_solve_cuda
 
 try:
-    import axonml_solvers
+    import axonml_solvers  # noqa: F401
 
     AXONML_SOLVERS_AVAILABLE = True
 except ImportError:
@@ -268,7 +266,7 @@ class _dhs(Integrator):
         self.register_buffer("cmdt", torch.empty(B, N))  # (B,N) capacitance * dt
 
     def initialize(self, model, dt):
-        B, N = model.np, model.nc
+        B = model.np
         dt_s = dt * 1e-3
 
         device = model.device()
@@ -297,19 +295,12 @@ class _dhs(Integrator):
         )  # (N,)
         self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))  # (N,)
 
-        radius_cm = 1e-4 * model.diam / 2.0  # µm → cm   (N,)
-        dx_cm = 1e-4 * model.dx  # µm → cm   (N,)
         area_cm2 = model.area  # cm²
 
         self.register_buffer("layer_ptr", layer_ptr.to(device))  # (L+1,)
         self.order.copy_(order.to(dtype=torch.int32, device=device))
         self.parent_idx.copy_(parent_idx.to(dtype=torch.int32, device=device))  # (N,)
         self.a_geom = a_geom_t.expand(B, -1)
-
-        K = parent_idx.numel()
-
-        # add children contributions to their parent’s diagonal
-        valid = parent_idx >= 0
 
         self.scale = area_cm2
 
@@ -329,7 +320,7 @@ class _dhs(Integrator):
 
         node_order_list = node_order
 
-        for child_node, data in model.graph.nodes(data=True):
+        for child_node, _ in model.graph.nodes(data=True):
             preds = list(model.graph.predecessors(child_node))
             if not preds:
                 continue  # Skip root nodes

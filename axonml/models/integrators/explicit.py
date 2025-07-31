@@ -3,8 +3,6 @@ from typing import Tuple
 import torch
 from torch.nn import functional as F
 
-from axonml.helpers import IMEM
-
 from .core import Integrator
 
 

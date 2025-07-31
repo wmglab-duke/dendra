@@ -1,6 +1,8 @@
 import contextlib
 import functools
+import logging
 import os
+import time
 from typing import ClassVar
 
 import numpy as np
@@ -115,9 +117,6 @@ def op_sc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
 
 
 nojit = torch._dynamo.disable
-
-
-import contextlib
 
 
 def interp1d(x, y, xnew, out=None):
@@ -430,9 +429,6 @@ def interp1d_z(x, y, xnew, out=None):
 
     return ynew
 
-
-import logging
-import time
 
 TIME_STACK = []
 

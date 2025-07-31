@@ -1,7 +1,4 @@
 # -- adapted from now defunct bluebrain/nmodl repository --
-
-import itertools
-import re
 from importlib import import_module
 
 import sympy as sp

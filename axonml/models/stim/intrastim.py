@@ -117,8 +117,6 @@ def n(obj):
 
     Raises ValueError for unsupported types.
     """
-    import sys
-
     # 1) If the object is an integer, length = 1
     if isinstance(obj, int):
         return 1

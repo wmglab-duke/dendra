@@ -8,13 +8,11 @@ import torch.nn.functional as F
 from torch import Tensor
 
 try:
-    import axonml_solvers
+    import axonml_solvers  # noqa: F401
 
     AXONML_SOLVERS_AVAILABLE = True
 except ImportError:
     AXONML_SOLVERS_AVAILABLE = False
-
-from axonml.helpers import IMEM
 
 from .core import Integrator, SCIntegrator
 from .tridiag import pcr_solve_t
@@ -203,7 +201,7 @@ class _bwd_euler_bt(torch.nn.Module):
     def __init__(self, model, mech, method="triton", **kwargs):
         if not AXONML_SOLVERS_AVAILABLE:
             logging.warning(
-                f"only CUDA-based solvers available, using triton Thomas solver."
+                "Only CUDA-based solvers available, using triton Thomas solver. "
                 "CPU models will not work. Install axonml_solvers for CPU support."
             )
             method = "triton"

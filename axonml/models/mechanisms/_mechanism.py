@@ -8,7 +8,6 @@ import torch
 from axonml.helpers import classproperty
 from axonml.models.parametric import Parameterized
 
-from ..slice import Slice
 from ._ions import VALENCES
 from ._symbolic import build_current_eq
 
@@ -348,7 +347,7 @@ class Mechanism(Parameterized):
         if name in self.read_ion:
             for v in self.read_ion[name]:
                 q = getattr(ion, v)
-                if (k := self.key) is not None and q.ndim > 0:
+                if self.key is not None and q.ndim > 0:
                     self.register_buffer(v, self.get(q))
                     for _, s in self.DE.items():
                         s.register_buffer(v, self.get(q))
@@ -360,7 +359,7 @@ class Mechanism(Parameterized):
         if name in self.write_ion_c:
             for v in self.write_ion_c[name]:
                 q = getattr(ion, v)
-                if (k := self.key) is not None and q.ndim > 0:
+                if self.key is not None and q.ndim > 0:
                     qk = self.get(q)
                     self.register_buffer(
                         v, torch.empty(qk.shape, device=qk.device, dtype=qk.dtype)

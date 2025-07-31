@@ -87,9 +87,9 @@ class ThomasSolve(torch.autograd.Function):
         # --- Input Validation ---
         B, K = b.shape
         # Basic checks, more can be added if needed
-        assert a.shape == (B, K - 1), f"Shape mismatch for 'a'"
-        assert c.shape == (B, K - 1), f"Shape mismatch for 'c'"
-        assert d.shape == (B, K), f"Shape mismatch for 'd'"
+        assert a.shape == (B, K - 1), "Shape mismatch for 'a'"
+        assert c.shape == (B, K - 1), "Shape mismatch for 'c'"
+        assert d.shape == (B, K), "Shape mismatch for 'd'"
 
         # --- Ensure Contiguous Inputs ---
         a = a.contiguous()

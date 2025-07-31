@@ -1,7 +1,9 @@
+import torch
+
 from ..mechanisms._mechanism import PointProcess as PP
 from ..mechanisms._mechanism import Synapse as Syn
 from ..mechanisms._state import State as S
-from ..mechanisms.ops import *
+from ..mechanisms.ops import exp, log
 
 
 class A(S):

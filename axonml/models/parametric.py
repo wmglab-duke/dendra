@@ -424,7 +424,7 @@ class Parameterized(Referency):
         for n, b in self.named_buffers():
             try:
                 b.detach_()
-            except Exception as e:
+            except Exception:
                 setattr(self, n, b.detach())
 
     def check_kwargs(self, kwargs):

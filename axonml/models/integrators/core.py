@@ -52,7 +52,7 @@ class Integrator(torch.nn.Module):
         for n, b in model.named_buffers():
             try:
                 b.detach_()
-            except:
+            except RuntimeError:
                 setattr(model, n, b.detach())
         if self.imem:
             model.i_membrane.detach_()

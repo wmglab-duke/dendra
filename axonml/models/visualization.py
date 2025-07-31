@@ -284,14 +284,14 @@ def _register_parula(name="parula", N=256):
     parula = LinearSegmentedColormap.from_list(name, anchor, N=N)
     try:
         mpl.colormaps.register(name=name, cmap=parula)
-    except:
+    except ValueError:
         pass
 
     parula_r = parula.reversed(name + "_r")
 
     try:
         mpl.colormaps.register(name=name + "_r", cmap=parula_r)
-    except:
+    except ValueError:
         pass
 
     return parula

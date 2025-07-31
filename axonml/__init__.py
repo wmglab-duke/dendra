@@ -18,7 +18,7 @@ from .const import (
     E,
     R,
 )
-from .helpers import ctx
+from .helpers import TF32, allow_tf32, ctx
 from .models import (
     Axon,
     Myelinated,

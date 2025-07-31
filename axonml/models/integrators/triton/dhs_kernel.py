@@ -38,9 +38,9 @@ def _single_dhs_kernel(
     LAYER_PTR = LAYER_PTR_ptr
 
     # --- 1. FUSED INITIALIZATION & FORWARD ELIMINATION ---
-    for l in range(0, L):
-        s = tl.load(LAYER_PTR + l)
-        e = tl.load(LAYER_PTR + l + 1)
+    for layer in range(0, L):
+        s = tl.load(LAYER_PTR + layer)
+        e = tl.load(LAYER_PTR + layer + 1)
 
         offset = s + lane
         m = lane < (e - s)
@@ -79,9 +79,9 @@ def _single_dhs_kernel(
 
     # --- 2. BACKWARD SUBSTITUTION ---
     # Looping backwards from the second-to-last layer down to the root layer.
-    for l in range(L - 1, -1, -1):
-        s = tl.load(LAYER_PTR + l)
-        e = tl.load(LAYER_PTR + l + 1)
+    for layer in range(L - 1, -1, -1):
+        s = tl.load(LAYER_PTR + layer)
+        e = tl.load(LAYER_PTR + layer + 1)
 
         offset = s + lane
         m = lane < (e - s)

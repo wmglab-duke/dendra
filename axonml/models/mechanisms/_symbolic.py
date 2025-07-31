@@ -63,8 +63,8 @@ def build_current_eq(mechanism, k, assign=False):
         gtot, irev = factorize_linear_in_v(mechanism.__class__, method=k)
         code = build_implicit_equation(k, gtot, irev, assign)
         factorable = True
-    except Exception as e:
-        if not k in mechanism._explicit:
+    except Exception:
+        if k not in mechanism._explicit:
             code = build_numerical_equation(k)
             factorable = True
         else:

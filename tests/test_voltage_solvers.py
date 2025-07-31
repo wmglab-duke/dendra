@@ -24,7 +24,6 @@ def test_dhs_cuda_forward_pass():
     Tests the forward pass of the CUDA DHS solver.
     This is identical to the CPU test, just with tensors moved to the 'cuda' device.
     """
-    B, K = 1, 2
     device = "cuda:0"  # Explicitly use a CUDA device
 
     # Inputs
@@ -98,7 +97,7 @@ def test_thomas_cuda_t_forward_pass():
     """
     Tests the forward pass of the CUDA Thomas solver with a simple, known case.
     """
-    B, K = 1, 3
+    K = 3
     device = "cuda:0"
 
     # Inputs for a 3x3 system
@@ -295,7 +294,7 @@ def test_block_thomas_cuda_backward_pass_gradcheck():
     upper.requires_grad_(True)
     rhs.requires_grad_(True)
 
-    def solve_fn(l, m, u, r):
+    def solve_fn(l, m, u, r):  # noqa: E741
         return thomas_solve_cuda_bt(l, m, u, r)
 
     inputs_to_check = (lower, main, upper, rhs)

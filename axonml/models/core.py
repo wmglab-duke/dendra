@@ -2,7 +2,7 @@ import itertools
 import math
 import re
 from contextlib import nullcontext
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -26,7 +26,7 @@ from axonml.models.graph import get_area_from_graph
 from axonml.models.integrators import bwd_euler_sc, bwd_euler_ub
 from axonml.models.mechanisms._handler import MechanismHandler
 from axonml.models.mechanisms._ions import Ion, valid_ions
-from axonml.models.mechanisms.core import validate
+from axonml.models.mechanisms.validate import validate
 from axonml.models.parametric import Parameterized as P
 from axonml.models.stim.intrastim import IntraStim
 from axonml.models.stim.waveform import Waveform
@@ -62,9 +62,6 @@ def follows_pattern(base_pattern, target_string):
         + r"\b"
     )
     return re.search(regex_pattern, target_string) is not None
-
-
-import re
 
 
 def matches_any_pattern(base_patterns, target_string):
@@ -719,7 +716,7 @@ class Population(P, Sliceable):
                 intra = None
 
             dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
-            for _ in tqdm(range(maxiter), desc=f"Steady state "):
+            for _ in tqdm(range(maxiter), desc="Steady state "):
                 self._step(self.integrator, self, dt, ve, intra)
 
         self.cache("_steady_state")
@@ -1372,7 +1369,7 @@ def find_indices_smart(
     total_sz = len(idx_arr)
 
     if include_pats:
-        g2l = {g: l for l, g in enumerate(idx_arr)}
+        g2l = {g: i for i, g in enumerate(idx_arr)}
         for pat in include_pats:
             pat_mask = pattern_masks[pat] & final_mask
             g_idx = s.index[pat_mask].to_numpy()
@@ -1569,8 +1566,8 @@ class Unmyelinated(Axon):
         self.dx[:] = self.dx_
 
     def _x(self) -> torch.Tensor:  # x in um
-        l = (self.n_comp - 1) * self.dx_
-        x = torch.linspace(-l / 2, l / 2, self.n_comp, device=self.device())
+        length = (self.n_comp - 1) * self.dx_
+        x = torch.linspace(-length / 2, length / 2, self.n_comp, device=self.device())
         return torch.atleast_2d(x)
 
 
@@ -1699,11 +1696,11 @@ class Myelinated(Axon):
         return deltax
 
     def _x(self) -> torch.Tensor:  # x in um
-        l = (self.n_comp - 1) * self.deltax(self.diameters).unsqueeze(1)
-        start = -l / 2
-        end = l / 2
+        length = (self.n_comp - 1) * self.deltax(self.diameters).unsqueeze(1)
+        start = -length / 2
+        end = length / 2
         steps = self.n_comp
-        t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(0)
+        t = torch.linspace(0, 1, steps, device=length.device).unsqueeze(0)
         return (1 - t) * start + t * end
 
 
@@ -1731,11 +1728,6 @@ def pre_chunk_hook(c, m, n):
 
 def post_chunk_hook(c, m, n):
     c.post_chunk_hook(m, n)
-
-
-from typing import Any, List, Tuple, Union
-
-import numpy as np
 
 
 # Helper for the super-fast path: Merges overlapping/adjacent 1D intervals

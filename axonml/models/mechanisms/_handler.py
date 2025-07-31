@@ -311,7 +311,6 @@ class MechanismHandler(torch.nn.Module):
                 m = self.mechanisms[mech]
                 for quantity in quantities:
                     q = m.get(getattr(self.ions[ion], quantity))
-                    nd = q.ndim
                     setattr(
                         m,
                         quantity,

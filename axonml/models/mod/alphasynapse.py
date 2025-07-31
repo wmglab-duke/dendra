@@ -1,7 +1,6 @@
 import torch
 
 from ..mechanisms._mechanism import PointProcess as M
-from ..mechanisms._state import State as S
 from ..mechanisms.ops import *
 
 
