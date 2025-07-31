@@ -287,7 +287,7 @@ class _dhs(Integrator):
             )
 
         parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(model.graph)
-        parent_idx, children, depth = build_morphology(parent_idx_t.tolist())
+        parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
         order, layer_ptr = build_dhs_layers(depth, self.threads)
 
         self.solver_order.copy_(
@@ -300,7 +300,9 @@ class _dhs(Integrator):
         self.register_buffer("layer_ptr", layer_ptr.to(device))  # (L+1,)
         self.order.copy_(order.to(dtype=torch.int32, device=device))
         self.parent_idx.copy_(parent_idx.to(dtype=torch.int32, device=device))  # (N,)
-        self.a_geom = a_geom_t.expand(B, -1)
+        self.a_geom = a_geom_t.expand(B, -1).to(
+            device=device, dtype=model.dtype()
+        )  # (B,N)
 
         self.scale = area_cm2
 

@@ -10,7 +10,6 @@ from .core import Axon
 
 
 def num_rows_to_zero(A: int, x: float) -> int:
-    # floor(x * A) rows will be zeroed; you can also use round() if you prefer
     return int(torch.floor(torch.tensor(x * A)).item())
 
 

@@ -1,7 +1,10 @@
 import ast
+import io
 import re
+import textwrap
+import tokenize
 from types import MethodType
-from typing import List
+from typing import Iterable, List, Set
 
 import torch
 
@@ -11,7 +14,7 @@ from axonml.models.parametric import Parameterized
 from .ode import integrate2c
 
 # PyTorch operations
-torch_operations = set(dir(torch))
+TORCH_OPS = set(dir(torch))
 
 
 class UnderscoreLHS(ast.NodeTransformer):
@@ -136,30 +139,112 @@ def replace(input_string: str, replace_list: List[str]) -> str:
     return input_string
 
 
-def modify_operations(input_string: str) -> str:
-    """
-    Modify operations in the input string by prefixing PyTorch operations with 'torch.'.
+def _find_local_defs(code: str) -> Set[str]:
+    """Return {name, …} for all defs/assignments in *code*.
+    Falls back to ∅ if the snippet isn't valid Python."""
+    try:
+        tree = ast.parse(textwrap.dedent(code))
+    except SyntaxError:
+        return set()
 
-    Parameters
-    ----------
-    input_string : str
-        The input string containing code with function calls.
+    defs: set[str] = set()
 
-    Returns
-    -------
-    str
-        The modified string with PyTorch operations prefixed by 'torch.'.
-    """
-    pattern = r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\("
+    class _Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, n):  # def foo(…
+            defs.add(n.name)
 
-    def replacer(match):
-        func_name = match.group(1)
-        if func_name in torch_operations:
-            return f"torch.{func_name}("
-        return match.group(0)
+        visit_AsyncFunctionDef = visit_FunctionDef  # same for async def
 
-    modified_string = re.sub(pattern, replacer, input_string)
-    return modified_string
+        def visit_ClassDef(self, n):
+            defs.add(n.name)  # class Foo:
+
+        def visit_Assign(self, n):  # x = …
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    defs.add(t.id)
+
+        # you can add more (AnnAssign, import as …) if needed
+
+    _Visitor().visit(tree)
+    return defs
+
+
+# ----------------------------------------------------------------------
+# main transformer (token-based, comment-preserving)
+# ----------------------------------------------------------------------
+def modify_operations(
+    code: str,
+    torch_operations: Iterable[str] = TORCH_OPS,
+) -> str:
+    """Prefix bare calls to *torch_operations* with ``torch.`` while
+    preserving comments, f-strings, local shadowing, layout -- and while
+    gracefully doing nothing when the snippet cannot be tokenised."""
+    ops = set(torch_operations)
+    local_defs = _find_local_defs(code)
+
+    # 1️⃣  Try to tokenise the snippet.  Bail out on TokenError.
+    try:
+        tok = list(tokenize.generate_tokens(io.StringIO(code).readline))
+    except tokenize.TokenError:
+        # e.g. NULL byte or other unrecoverable lexical issue
+        return code
+
+    SIGNIFICANT = {
+        tokenize.NAME,
+        tokenize.NUMBER,
+        tokenize.OP,
+        tokenize.STRING,
+        tokenize.ERRORTOKEN,
+    }
+
+    def next_sig(i: int) -> int:
+        j = i + 1
+        while j < len(tok) and tok[j].type not in SIGNIFICANT:
+            j += 1
+        return j
+
+    def prev_sig(i: int) -> int:
+        j = i - 1
+        while j >= 0 and tok[j].type not in SIGNIFICANT:
+            j -= 1
+        return j
+
+    out: list[tokenize.TokenInfo] = []
+    fdepth = 0  # nesting level inside an f-string expression
+
+    for i, t in enumerate(tok):
+        if t.type == tokenize.FSTRING_START:
+            fdepth += 1
+        elif t.type == tokenize.FSTRING_END:
+            fdepth -= 1
+
+        if (
+            t.type == tokenize.NAME
+            and fdepth == 0
+            and t.string in ops
+            and t.string not in local_defs
+        ):
+            j = next_sig(i)
+            k = prev_sig(i)
+            call_follows = j < len(tok) and tok[j].string == "("
+            dot_before = k >= 0 and tok[k].string == "."
+
+            if call_follows and not dot_before:
+                # emit torch . NAME
+                out.extend(
+                    [
+                        tokenize.TokenInfo(
+                            tokenize.NAME, "torch", t.start, t.start, t.line
+                        ),
+                        tokenize.TokenInfo(tokenize.OP, ".", t.start, t.start, t.line),
+                        t,  # original NAME
+                    ]
+                )
+                continue  # skip default append
+
+        out.append(t)
+
+    return tokenize.untokenize(out)
 
 
 def convert(deriv, state, states, assigned, use_pade_approx=False):
