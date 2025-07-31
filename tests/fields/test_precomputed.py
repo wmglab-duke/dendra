@@ -5,15 +5,20 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from hypothesis.extra.numpy import arrays
 
-from axonml.models.fields.precomputed import (EfieldInterpolate3D,
-                                              PreComputedExact,
-                                              PreComputedInterpolate1D)
+from axonml.models.fields.precomputed import (
+    EfieldInterpolate3D,
+    PreComputedExact,
+    PreComputedInterpolate1D,
+)
 
 # -----------------------------------------------------------------------------
 # Helper factories
 # -----------------------------------------------------------------------------
 
-def _rand_xyz(N: int, *, low: float = -1_000.0, high: float = 1_000.0, dtype=torch.float32):
+
+def _rand_xyz(
+    N: int, *, low: float = -1_000.0, high: float = 1_000.0, dtype=torch.float32
+):
     """Random Nx3 coordinates in the given range."""
     rng = torch.empty(N, 3, dtype=dtype).uniform_(low, high)
     return rng
@@ -29,6 +34,7 @@ def _rand_vec(N: int, *, dtype=torch.float32):
 # PreComputedExact
 # -----------------------------------------------------------------------------
 
+
 def test_precomputed_exact_get_in_memory():
     """`get_in_memory` should round-trip the data row-by-row."""
     data = np.arange(12).reshape(4, 3)
@@ -40,6 +46,7 @@ def test_precomputed_exact_get_in_memory():
 # -----------------------------------------------------------------------------
 # PreComputedInterpolate1D
 # -----------------------------------------------------------------------------
+
 
 def test_interpolate1d_exact_recovery():
     """Interpolating at sample points should reproduce the FEM vector exactly."""
@@ -70,6 +77,7 @@ def test_interpolate1d_truncate_limit():
 # -----------------------------------------------------------------------------
 # EfieldInterpolate3D — core helper for manual IDW
 # -----------------------------------------------------------------------------
+
 
 def _manual_idw(dist2: np.ndarray, vecs: np.ndarray, eps: float = 1e-9) -> np.ndarray:
     """Reference inverse‑distance weighting (numpy implementation)."""
@@ -119,6 +127,7 @@ def test_idw_matches_manual(N, B, K, k):
 # EfieldInterpolate3D — gradients
 # -----------------------------------------------------------------------------
 
+
 def test_efield_gradients():
     """Output should be differentiable w.r.t. query coords."""
     xyz = torch.tensor(
@@ -148,6 +157,7 @@ def test_efield_gradients():
 # -----------------------------------------------------------------------------
 # EfieldInterpolate3D — validation & error handling
 # -----------------------------------------------------------------------------
+
 
 def test_invalid_k_raises():
     xyz = _rand_xyz(5)

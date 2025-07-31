@@ -54,7 +54,7 @@ setup(
             "pytest-cov",
             "hypothesis",
             "pytest-xdist",
-        ]
+        ],
     },
     ext_modules=ext_modules,
 )

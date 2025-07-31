@@ -14,8 +14,9 @@ from hypothesis.extra import numpy as hnp
 # -----------------------------------------------------------------------------#
 # 1.  SUT import (adjust the import path if you keep the function elsewhere)
 # -----------------------------------------------------------------------------#
-from axonml.models.fields.quasipotentials import \
-    calculate_quasipotentials_batched_coords
+from axonml.models.fields.quasipotentials import (
+    calculate_quasipotentials_batched_coords,
+)
 
 # -----------------------------------------------------------------------------#
 # 2.  Helpers & Hypothesis strategies
@@ -23,7 +24,7 @@ from axonml.models.fields.quasipotentials import \
 
 FLOAT_DTYPES = (torch.float32, torch.float64)  # both dtypes supported by torch.linalg
 COORD_RANGE_UM = 2_000  # ±2 mm in µm
-EFIELD_RANGE = 1_000     # ±1 kV / m
+EFIELD_RANGE = 1_000  # ±1 kV / m
 
 
 def _torch_from_numpy(arr: np.ndarray, dtype: torch.dtype, device: torch.device):
@@ -47,7 +48,9 @@ def _graph_and_tensor_batches(draw) -> Tuple[nx.DiGraph, torch.Tensor, torch.Ten
     # --- graph ---
     n_nodes = draw(st.integers(min_value=2, max_value=10))
     root_id = 0
-    undirected_tree = nx.random_labeled_tree(n_nodes, seed=draw(st.integers(0, 2**32 - 1)))
+    undirected_tree = nx.random_labeled_tree(
+        n_nodes, seed=draw(st.integers(0, 2**32 - 1))
+    )
     G = nx.DiGraph()
     G.add_nodes_from(range(n_nodes))
     # orient edges outwards from the root to guarantee a single root
@@ -89,8 +92,8 @@ def _expected_child_potential(
     """
     s_pc = pos_c_m - pos_p_m
     E_avg = 0.5 * (E_p + E_c.to(E_p.dtype))  # ensure same dtype
-    dot = (E_avg * s_pc).sum(dim=1)          # (B,)
-    return psi_p - 1_000.0 * dot             # convert V→mV
+    dot = (E_avg * s_pc).sum(dim=1)  # (B,)
+    return psi_p - 1_000.0 * dot  # convert V→mV
 
 
 def _all_close(a: torch.Tensor, b: torch.Tensor, rtol=1e-4, atol=1e-4) -> bool:
@@ -117,15 +120,15 @@ def test_edgewise_formula_holds(data, dtype: torch.dtype, device: str):
     G, coords_np, efields_np = data
 
     # Convert to torch
-    coords = _torch_from_numpy(coords_np, dtype=dtype, device=device)          # (B,N,3)
-    efields = _torch_from_numpy(efields_np, dtype=dtype, device=device)        # (B,N,3)
+    coords = _torch_from_numpy(coords_np, dtype=dtype, device=device)  # (B,N,3)
+    efields = _torch_from_numpy(efields_np, dtype=dtype, device=device)  # (B,N,3)
     B, N, _ = coords.shape
 
     # Split coordinate tensor for API
     x, y, z = (coords[..., i].clone() for i in range(3))
 
     # SUT
-    psi = calculate_quasipotentials_batched_coords(G, x, y, z, efields)        # (B,N)
+    psi = calculate_quasipotentials_batched_coords(G, x, y, z, efields)  # (B,N)
 
     # Path-wise checks ---------------------------------------------------------
     coords_m = coords * 1e-6  # µm → m
@@ -201,7 +204,7 @@ def test_large_batch_cuda_smoke():
     """
     torch.manual_seed(0)
     B = 8
-    r, h = 2, 6                         # 2^7-1 = 127 nodes -- fits nicely in one warp
+    r, h = 2, 6  # 2^7-1 = 127 nodes -- fits nicely in one warp
     G_undirected = nx.balanced_tree(r=r, h=h)
 
     # Orient every edge away from the root (node 0) so we have a single root
@@ -209,7 +212,7 @@ def test_large_batch_cuda_smoke():
     G.add_nodes_from(G_undirected.nodes)
     G.add_edges_from(nx.bfs_edges(G_undirected, source=0))
 
-    N = G.number_of_nodes()             # 127
+    N = G.number_of_nodes()  # 127
     coords = torch.randn(B, N, 3, dtype=torch.float32, device="cuda") * COORD_RANGE_UM
     efields = torch.randn(B, N, 3, dtype=torch.float32, device="cuda") * EFIELD_RANGE
     x, y, z = (coords[..., i] for i in range(3))
@@ -217,4 +220,3 @@ def test_large_batch_cuda_smoke():
     psi = calculate_quasipotentials_batched_coords(G, x, y, z, efields)
 
     assert psi.shape == (B, N) and psi.is_cuda
-

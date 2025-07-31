@@ -8,10 +8,13 @@ from cajal.mpi import ANNGPURunner
 from cajal.nrn.sources import PreComputedInterpolate1D
 from cajal.nrn.stimuli import SymmetricBiphasic
 from cajal.opt.differentialevolution import DEBASE
-from cajal.opt.differentialevolution.callbacks import (EarlyStopping, Logger,
-                                                       Timer)
-from utils import (WeightedBinaryCrossEntropy, deltax,
-                   percent_off_target_active, percent_on_target_active)
+from cajal.opt.differentialevolution.callbacks import EarlyStopping, Logger, Timer
+from utils import (
+    WeightedBinaryCrossEntropy,
+    deltax,
+    percent_off_target_active,
+    percent_on_target_active,
+)
 
 from axonml.models import SMF
 from axonml.models.callbacks import Active

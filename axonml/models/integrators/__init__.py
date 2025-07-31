@@ -1,8 +1,15 @@
 from functools import partial, partialmethod
 from typing import Any, Type
 
-from .explicit import (_dufort_frankel, _dufort_frankel_homogeneous, _euler,
-                       _eulerv1, _rk1, _rk2, _rk4)
+from .explicit import (
+    _dufort_frankel,
+    _dufort_frankel_homogeneous,
+    _euler,
+    _eulerv1,
+    _rk1,
+    _rk2,
+    _rk4,
+)
 from .imex import _krylov_etd1
 from .implicit import _bwd_euler_bt, _bwd_euler_sc, _bwd_euler_ub
 from .tree import _dhs

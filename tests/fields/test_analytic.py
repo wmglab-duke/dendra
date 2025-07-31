@@ -61,6 +61,8 @@ def test_isotropic_point_scalar():
 
 
 coord = st.floats(min_value=-2e4, max_value=2e4).filter(lambda v: abs(v) > 1.0)
+
+
 @given(x=coord, y=coord, z=coord)
 def test_isotropic_point_grad(x, y, z):
     """Ensure gradients exist & are finite except at the source."""
@@ -110,7 +112,7 @@ def test_parametric_efield_forward_values(phi, theta, z_um):
         dtype=torch.float32,
     )
 
-    out = efield(model, e_field_strength_Vm=1.0)          # (φ·θ, 1)
+    out = efield(model, e_field_strength_Vm=1.0)  # (φ·θ, 1)
     assert out.shape == (phi * theta, 1)
 
     # ---- build analytic expectation ---------------------------------------
@@ -119,10 +121,10 @@ def test_parametric_efield_forward_values(phi, theta, z_um):
         * math.pi
         / 180.0
     )
-    z_m = z_um / 1e6                                      # µm → m
+    z_m = z_um / 1e6  # µm → m
     expected_theta = -z_m * torch.cos(theta_vals) * 1000  # (θ,)
 
-    expected = expected_theta.repeat(phi)                 # (φ·θ,)
+    expected = expected_theta.repeat(phi)  # (φ·θ,)
     # -----------------------------------------------------------------------
 
     assert torch.allclose(out.squeeze(-1), expected, atol=1e-6)

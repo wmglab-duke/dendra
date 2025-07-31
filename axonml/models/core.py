@@ -10,8 +10,16 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
-from axonml.helpers import (BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT,
-                            op_mc, op_sc, ve_from_s_t)
+from axonml.helpers import (
+    BACKEND,
+    COMPILE_MODE,
+    DYNAMIC,
+    FULLGRAPH,
+    JIT,
+    op_mc,
+    op_sc,
+    ve_from_s_t,
+)
 from axonml.models.backend import Backend as A
 from axonml.models.callbacks import Callback, CallbackList
 from axonml.models.graph import get_area_from_graph
