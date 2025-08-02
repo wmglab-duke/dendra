@@ -64,6 +64,7 @@ class Waveform(SimpleParameterized):
     """
 
     def __init__(self, **kwargs):
+        self.check_kwargs(kwargs)
         super(Waveform, self).__init__(**kwargs)
 
     def expand(self, shape):

@@ -194,7 +194,6 @@ class SimpleParameterized(Referency):
 
     def __init__(self, **kwargs):
         super(SimpleParameterized, self).__init__()
-        self._check_kwargs(kwargs)
         self.params = self.__class__._params.copy()
         if kwargs:
             self.params = {
@@ -202,12 +201,19 @@ class SimpleParameterized(Referency):
             }
         self.instantiate_parameters(**self.params)
 
-    def _check_kwargs(self, kwargs):
+    def check_kwargs(self, kwargs):
+        """
+        Check if the provided keyword arguments match the declared parameters.
+        Raises ValueError if any unknown parameter is found.
+        """
+        if not self._params:
+            return True
         for key in kwargs:
             if key not in self._params:
                 raise ValueError(
                     f"Unknown parameter: {key} for {self.__class__.__name__}. Valid parameters are: {list(self._params.keys())}"
                 )
+        return True
 
     def instantiate_parameters(self, **kwargs):
         """
@@ -234,7 +240,7 @@ class SimpleParameterized(Referency):
         return ", ".join(f"{k}={v}" for k, v in self.named_parameters())
 
 
-class Parameterized(Referency):
+class Parameterized(SimpleParameterized):
     """
     A base class that allows subclasses to declare parameters which are
     automatically inherited and aggregated.
@@ -303,7 +309,7 @@ class Parameterized(Referency):
         Parameterized._range_declarations.append(kwargs)
 
     def __init__(self, shape, additional_parameters=None, **kwargs):
-        super().__init__()
+        super().__init__(**kwargs)
         self.shape = shape
         self.globals = self.__class__._global.copy()
         self.range = self.__class__._range.copy()
@@ -320,11 +326,11 @@ class Parameterized(Referency):
 
         self.keys = {}
         self.additional_parameters = {}
-        self.instantiate_parameters(**self.globals)
+        self.instantiate_global(**self.globals)
         self.instantiate_range(**self.range)
         self.instantiate_additional_parameters(additional_parameters)
 
-    def instantiate_parameters(self, **kwargs):
+    def instantiate_global(self, **kwargs):
         # this is only called once, on __init__
         if kwargs is not None:
             for name, value in kwargs.items():
