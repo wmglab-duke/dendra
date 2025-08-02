@@ -115,6 +115,9 @@ def read_swc(
         def __init__(self, importer):
             importer.instantiate(self)
 
+        def __repr__(self):
+            return "SWCCell"
+
     reader = h.Import3d_SWC_read()
     reader.input(file_path)
     importer = h.Import3d_GUI(reader, 0)
@@ -140,6 +143,9 @@ def read_neurolucida(
     class Cell:
         def __init__(self, importer):
             importer.instantiate(self)
+
+        def __repr__(self):
+            return "NerolucidaCell"
 
     reader = h.Import3d_Neurolucida3()
     reader.quiet = 1

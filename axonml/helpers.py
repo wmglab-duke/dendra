@@ -155,7 +155,6 @@ def interp1d(x, y, xnew, out=None):
     require_grad = {}
     v = {}
     device = []
-    eps = torch.finfo(y.dtype).eps
     for name, vec in {"x": x, "y": y, "xnew": xnew}.items():
         assert len(vec.shape) <= 2, "interp1d: all inputs must be at most 2-D."
         if len(vec.shape) == 1:
@@ -166,6 +165,7 @@ def interp1d(x, y, xnew, out=None):
         require_grad[name] = vec.requires_grad
         device = list(set(device + [str(vec.device)]))
     assert len(device) == 1, "All parameters must be on the same device."
+
     device = device[0]
 
     # Checking for the dimensions
@@ -253,9 +253,11 @@ def interp1d(x, y, xnew, out=None):
     # now we have found the indices of the neighbors, we start building the
     # output. Hence, we start also activating gradient tracking
     with torch.enable_grad() if enable_grad else contextlib.suppress():
-        v["slopes"] = (v["y"][:, 1:] - v["y"][:, :-1]) / (
-            eps + (v["x"][:, 1:] - v["x"][:, :-1])
+        dx = v["x"][:, 1:] - v["x"][:, :-1]
+        safe_dx = torch.where(
+            dx == 0, torch.full_like(dx, torch.finfo(dx.dtype).eps), dx
         )
+        v["slopes"] = (v["y"][:, 1:] - v["y"][:, :-1]) / safe_dx
 
         # now build the linear interpolation
         ynew = sel("y") + sel("slopes") * (v["xnew"] - sel("x"))
@@ -266,8 +268,8 @@ def interp1d(x, y, xnew, out=None):
         y_max = v["y"][:, -1:]  # last  column of y
 
         # left of domain → y_min, right of domain → y_max
-        ynew = torch.where(v["xnew"] < x_min, y_min.expand_as(ynew), ynew)
-        ynew = torch.where(v["xnew"] > x_max, y_max.expand_as(ynew), ynew)
+        ynew = torch.where(v["xnew"] <= x_min, y_min.expand_as(ynew), ynew)
+        ynew = torch.where(v["xnew"] >= x_max, y_max.expand_as(ynew), ynew)
 
         if reshaped_xnew:
             ynew = ynew.view(original_xnew_shape)
@@ -311,7 +313,6 @@ def interp1d_z(x, y, xnew, out=None):
     require_grad = {}
     v = {}
     device = []
-    eps = torch.finfo(y.dtype).eps
     for name, vec in {"x": x, "y": y, "xnew": xnew}.items():
         assert len(vec.shape) <= 2, "interp1d: all inputs must be at most 2-D."
         if len(vec.shape) == 1:
@@ -322,6 +323,7 @@ def interp1d_z(x, y, xnew, out=None):
         require_grad[name] = vec.requires_grad
         device = list(set(device + [str(vec.device)]))
     assert len(device) == 1, "All parameters must be on the same device."
+
     device = device[0]
 
     # Checking for the dimensions
@@ -409,9 +411,11 @@ def interp1d_z(x, y, xnew, out=None):
     # now we have found the indices of the neighbors, we start building the
     # output. Hence, we start also activating gradient tracking
     with torch.enable_grad() if enable_grad else contextlib.suppress():
-        v["slopes"] = (v["y"][:, 1:] - v["y"][:, :-1]) / (
-            eps + (v["x"][:, 1:] - v["x"][:, :-1])
+        dx = v["x"][:, 1:] - v["x"][:, :-1]
+        safe_dx = torch.where(
+            dx == 0, torch.full_like(dx, torch.finfo(dx.dtype).eps), dx
         )
+        v["slopes"] = (v["y"][:, 1:] - v["y"][:, :-1]) / safe_dx
 
         # now build the linear interpolation
         ynew = sel("y") + sel("slopes") * (v["xnew"] - sel("x"))

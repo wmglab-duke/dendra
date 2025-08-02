@@ -192,14 +192,14 @@ impl_template = """
     {implementation}
 """
 
-max_only_t = "append_tensor_max(states, self.rec['{full_state}'])"
-indexed_t = "append_tensor_indexed(states, self.rec['{full_state}'], self.node_indices)"
-base_t = "append_tensor(states, self.rec['{full_state}'])"
-
 m_template = """
     states = model.{val}
     {implementation}
 """
+
+max_only_t = "append_tensor_max(states, self.rec['{full_state}'])"
+indexed_t = "append_tensor_indexed(states, self.rec['{full_state}'], self.node_indices)"
+base_t = "append_tensor(states, self.rec['{full_state}'])"
 
 
 def append_tensor(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
@@ -216,7 +216,7 @@ def append_tensor(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
     record.append(tensor)
 
 
-def append_tenor_max(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
+def append_tensor_max(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
     """
     Append the maximum value of a tensor to a list of tensors.
 
@@ -275,10 +275,10 @@ def parse_template_m(state, max_only=False, indexed=False):
     return m_template.format(val=state, implementation=implementation)
 
 
-def build_recorder_func(states, max_only, indexed, network=False):
+def build_recorder_func(states, max_only, indexed):
     res = []
     for s in states:
-        if not is_state(s) or network:
+        if not is_state(s):
             res.append(parse_template_m(s, max_only, indexed))
         else:
             res.append(parse_template(s, max_only, indexed))
@@ -618,8 +618,6 @@ class Recorder(Callback):
             vs = torch.stack(self.rec[var])
             if self.sliding_window is not None:
                 vs = sliding_window_average(vs, self.sliding_window)
-            if self.max_only:
-                return torch.amax(vs, 0)
             return vs
         vs = torch.stack([torch.stack(self.rec[s]) for s in self.rec], dim=2)
         if self.sliding_window is not None:
@@ -735,7 +733,8 @@ def _hdf5_write(queue: Queue, path: str):
         while True:
             item = queue.get()
             if item == "flush":
-                TRANSFERSTREAM.synchronize()
+                if TRANSFERSTREAM is not None:
+                    TRANSFERSTREAM.synchronize()
                 queue.task_done()
                 continue
             if item is None:
@@ -1387,7 +1386,7 @@ class Raster(ThresholdCallback):
 
 
 @torch.jit.script
-def increment_count(vm, vm_new, record, threshold: float):
+def increment_count(vm, vm_new, record, threshold: float):  # pragma: no cover
     m = vm_new >= threshold
     mask = m & vm  # fused compare + and
     record = record + mask.to(record.dtype)  # one fused kernel
@@ -1396,7 +1395,7 @@ def increment_count(vm, vm_new, record, threshold: float):
 
 
 @torch.jit.script
-def increment_act(vm, vm_new, threshold: float):
+def increment_act(vm, vm_new, threshold: float):  # pragma: no cover
     m = vm_new >= threshold
     mask = m & vm  # fused compare + and
     next_mask = ~m  # can tag-on to same kernel
@@ -1406,7 +1405,7 @@ def increment_act(vm, vm_new, threshold: float):
 @torch.jit.script
 def update_active(
     vm, vm_new, record, threshold: float
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:  # pragma: no cover
     ge = vm_new >= threshold
     record = torch.logical_or(record, torch.any(torch.logical_and(ge, vm), dim=1))
     return ~ge, record

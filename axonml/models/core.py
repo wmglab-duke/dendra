@@ -424,6 +424,8 @@ class Population(P, Sliceable):
         The simulation updates the model's internal state (v, v_prev for DF method, etc.)
         and advances the model's time.
         """
+        if not self.initialized:
+            raise ValueError("Model must be initialized before running.")
 
         if self.intra is None:
             intra = self.build_intra()
@@ -568,6 +570,9 @@ class Population(P, Sliceable):
         - Chunk processing helps manage memory usage during extended simulations by
         processing data in manageable segments.
         """
+
+        if not self.initialized:
+            raise ValueError("Model must be initialized before running.")
 
         # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
         # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
@@ -1826,7 +1831,7 @@ def _handle_pure_slice_union(
     return final_slice_tuple, True, final_shape, local_indices
 
 
-# The main entrypoint function, now a dispatcher
+# The main entrypoint function
 def compose_or_flatten_union(
     indices: List[Any], shape: Tuple[int, ...]
 ) -> Tuple[Union[Tuple[slice, ...], List[int]], bool, Tuple[int, ...], List[List[int]]]:

@@ -571,7 +571,7 @@ class PointProcess(Mechanism):
 
 
 class Synapse(Mechanism):
-    def net_receive(self, weight):
+    def net_receive(self, weights, netcon):
         """
         This method is called when the synapse receives a spike.
         It should be overridden in subclasses to implement specific behavior.

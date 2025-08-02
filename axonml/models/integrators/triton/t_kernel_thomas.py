@@ -137,7 +137,7 @@ class ThomasSolve(torch.autograd.Function):
         return x
 
     @staticmethod
-    def backward(ctx, grad_x):
+    def backward(ctx, grad_x):  # pragma: no cover
         """
         Backward pass: computes gradients for a, b, c, d.
         """

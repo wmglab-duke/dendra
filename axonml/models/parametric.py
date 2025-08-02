@@ -305,14 +305,14 @@ class Parameterized(Referency):
     def __init__(self, shape, additional_parameters=None, **kwargs):
         super().__init__()
         self.shape = shape
-        self.params = self.__class__._global.copy()
+        self.globals = self.__class__._global.copy()
         self.range = self.__class__._range.copy()
 
         self.in_graph_parametrizations = {}
 
         if kwargs:
-            self.params = {
-                key: kwargs.get(key, value) for key, value in self.params.items()
+            self.globals = {
+                key: kwargs.get(key, value) for key, value in self.globals.items()
             }
             self.range = {
                 key: kwargs.get(key, value) for key, value in self.range.items()
@@ -320,7 +320,7 @@ class Parameterized(Referency):
 
         self.keys = {}
         self.additional_parameters = {}
-        self.instantiate_parameters(**self.params)
+        self.instantiate_parameters(**self.globals)
         self.instantiate_range(**self.range)
         self.instantiate_additional_parameters(additional_parameters)
 
@@ -405,7 +405,7 @@ class Parameterized(Referency):
             if not torch.is_tensor(getattr(self, name)):
                 continue
             p_name = f"{name}_default"
-            getattr(self, name).detach_()
+            setattr(self, name, getattr(self, name).detach())
             getattr(self, name).copy_(getattr(self, p_name))
         self.load_additional_parameters()
         self.apply_parametrizations()

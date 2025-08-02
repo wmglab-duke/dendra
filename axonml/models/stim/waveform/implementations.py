@@ -145,7 +145,7 @@ class mono_rect(Waveform):
 
     def fn(self, t):
         return self.amp * torch.where(
-            (t > self.delay) & (t <= self.delay + self.pw), 1.0, 0.0
+            (t >= self.delay) & (t < self.delay + self.pw), 1.0, 0.0
         )
 
 

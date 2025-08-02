@@ -150,7 +150,7 @@ class DHSSolveStable(torch.autograd.Function):
         return x
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, grad_out):  # pragma: no cover
         """
         Computes the vector-Jacobian product for the DHS solve.
         This implementation is the one that correctly passes gradcheck.

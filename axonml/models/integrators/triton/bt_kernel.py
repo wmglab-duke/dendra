@@ -232,7 +232,7 @@ class ThomasSolve(torch.autograd.Function):
         return x
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, grad_out):  # pragma: no cover
         """
         grad_out = ∂L/∂x  (same shape as x)
         returns gradients w.r.t. (lower, main, upper, rhs)
