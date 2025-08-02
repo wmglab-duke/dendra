@@ -94,7 +94,6 @@ def test_parula_registered():
 def _fig_hash(fig: plt.Figure) -> str:
     """Render figure → png bytes → sha256 hex (stable across machines)."""
 
-    import base64
     import hashlib
     import io
 
@@ -107,7 +106,6 @@ def _fig_hash(fig: plt.Figure) -> str:
 @pytest.mark.parametrize("view", ["x", "y", "z"])
 def test_vis2d_runs_and_returns_unique_hash(dummy_cell, view):
     # ensure each view produces a picture (no errors) and hashes differ
-    fig = plt.figure()
     with contextlib.suppress(Exception):
         VIS.vis_2d(dummy_cell, view=view)
     new_hash = _fig_hash(plt.gcf())

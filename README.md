@@ -45,7 +45,7 @@ Fast and scalable neural fiber simulator with extracellular field support. Imple
 - If you want to build and run the documentation locally:
     - `python -m pip install '.[doc]'`
 
-🥳 You're all set! 
+🥳 You're all set!
 
 > [!NOTE]
 > Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive space.
@@ -54,7 +54,7 @@ Fast and scalable neural fiber simulator with extracellular field support. Imple
 ## 📜 License
 The copyrights of this software are owned by Duke University. As such, it is offered under a custom license (see LICENSE.md) whereby:
 
-1. DUKE grants YOU a royalty-free, non-transferable, non-exclusive, worldwide license under its copyright to use, reproduce, modify, publicly display, and perform the PROGRAM solely for non-commercial research and/or academic testing purposes.  
+1. DUKE grants YOU a royalty-free, non-transferable, non-exclusive, worldwide license under its copyright to use, reproduce, modify, publicly display, and perform the PROGRAM solely for non-commercial research and/or academic testing purposes.
 
 2. In order to obtain any further license rights, including the right to use the PROGRAM, any modifications or derivatives made by YOU, and/or PATENT RIGHTS for commercial purposes, (including using modifications as part of an industrially sponsored research project), YOU must contact DUKE’s Office for Translation and Commercialization (Digital Innovations Team) about additional commercial license agreements.
 

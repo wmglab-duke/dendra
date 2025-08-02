@@ -1,6 +1,6 @@
+dask
 h5py
+natsort
 numpy
 pytorch_optimizer
 tqdm
-natsort
-dask

@@ -2,7 +2,7 @@
 
 We implement the MRG axon model, however you may wish to simulate some other physics.
 
-To implement your own axon type, subclass `axonml.models.Axon`. 
+To implement your own axon type, subclass `axonml.models.Axon`.
 
 Parameters can be specified in the class attribute `params`, a dictionary consisting of subgroups, and parameter names and their values. For example, for the Hodgkin-Huxley model:
 

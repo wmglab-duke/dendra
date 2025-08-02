@@ -18,10 +18,10 @@ __all__ = [
 class sin(Waveform):
     """
     Sinusoidal waveform generator.
-    
+
     Generates a sine wave with configurable amplitude, frequency, phase,
     and delay. The waveform is zero before the specified delay time.
-    
+
     Parameters
     ----------
     amp : float, optional
@@ -32,18 +32,18 @@ class sin(Waveform):
         Phase offset in radians. Default is 0.0.
     delay : float, optional
         Time delay before the waveform starts in ms. Default is 0.0.
-        
+
     Notes
     -----
     The waveform is defined as:
 
     .. math::
-        f(t) = 
+        f(t) =
         \\begin{cases}
         \\text{amp} \\cdot \\sin(2\\pi \\cdot \\text{freq} \\cdot (t - \\text{delay}) + \\text{phase}) & \\text{if } t \\geq \\text{delay} \\\\
         0 & \\text{otherwise}
         \\end{cases}
-    
+
     Examples
     --------
     >>> import torch
@@ -63,10 +63,10 @@ class sin(Waveform):
 class cos(Waveform):
     """
     Cosine waveform generator.
-    
+
     Generates a cosine wave with configurable amplitude, frequency, phase,
     and delay. The waveform is zero before the specified delay time.
-    
+
     Parameters
     ----------
     amp : float, optional
@@ -77,18 +77,18 @@ class cos(Waveform):
         Phase offset in radians. Default is 0.0.
     delay : float, optional
         Time delay before the waveform starts in ms. Default is 0.0.
-        
+
     Notes
     -----
     The waveform is defined as:
 
     .. math::
-        f(t) = 
+        f(t) =
         \\begin{cases}
         \\text{amp} \\cdot \\cos(2\\pi \\cdot \\text{freq} \\cdot (t - \\text{delay}) + \\text{phase}) & \\text{if } t \\geq \\text{delay} \\\\
         0 & \\text{otherwise}
         \\end{cases}
-    
+
     Examples
     --------
     >>> import torch
@@ -108,10 +108,10 @@ class cos(Waveform):
 class mono_rect(Waveform):
     """
     Monophasic rectangular pulse waveform generator.
-    
+
     Generates a single rectangular pulse with configurable amplitude,
     delay, and duration. The waveform is zero outside the pulse duration.
-    
+
     Parameters
     ----------
     amp : float, optional
@@ -120,18 +120,18 @@ class mono_rect(Waveform):
         Time delay before the pulse starts in ms. Default is 0.0.
     pw : float, optional
         Width of the pulse in ms. Default is 1.0.
-        
+
     Notes
     -----
     The waveform is defined as:
 
     .. math::
-        f(t) = 
+        f(t) =
         \\begin{cases}
         \\text{amp} & \\text{if } \\text{delay} \\leq t \\leq \\text{delay} + \\text{duration} \\\\
         0 & \\text{otherwise}
         \\end{cases}
-    
+
     Examples
     --------
     >>> import torch
@@ -152,11 +152,11 @@ class mono_rect(Waveform):
 class bi_rect(Waveform):
     """
     Biphasic rectangular pulse waveform generator.
-    
+
     Generates a two-phase rectangular pulse with configurable amplitudes,
     pulse widths, delay, and inter-phase interval. The waveform is zero
     outside the pulse durations.
-    
+
     Parameters
     ----------
     amp1 : float, optional
@@ -171,19 +171,19 @@ class bi_rect(Waveform):
         Pulse width of the second phase in ms. Default is 1.0.
     interval : float, optional
         Time interval between the two phases in ms. Default is 0.0.
-        
+
     Notes
     -----
     The waveform is defined as:
 
     .. math::
-        f(t) = 
+        f(t) =
         \\begin{cases}
         \\text{amp1} & \\text{if } \\text{delay} \\leq t \\leq \\text{delay} + \\text{pw1} \\\\
         \\text{amp2} & \\text{if } \\text{delay} + \\text{pw1} + \\text{interval} \\leq t \\leq \\text{delay} + \\text{pw1} + \\text{interval} + \\text{pw2} \\\\
         0 & \\text{otherwise}
         \\end{cases}
-    
+
     Examples
     --------
     >>> import torch
@@ -209,11 +209,11 @@ class bi_rect(Waveform):
 class bi_rect_balanced(Waveform):
     """
     Charge-balanced biphasic rectangular pulse waveform generator.
-    
-    Generates a two-phase rectangular pulse where the second phase amplitude 
+
+    Generates a two-phase rectangular pulse where the second phase amplitude
     is automatically adjusted to maintain charge balance based on the pulse widths.
     The waveform is zero outside the pulse durations.
-    
+
     Parameters
     ----------
     amp : float, optional
@@ -226,13 +226,13 @@ class bi_rect_balanced(Waveform):
         Pulse width of the second phase in ms. Default is 1.0.
     interval : float, optional
         Time interval between the two phases in ms. Default is 0.0.
-        
+
     Notes
     -----
     The waveform is defined as:
 
     .. math::
-        f(t) = 
+        f(t) =
         \\begin{cases}
         \\text{amp} & \\text{if } \\text{delay} \\leq t \\leq \\text{delay} + \\text{pw1} \\\\
         -\\text{amp} \\cdot \\frac{\\text{pw1}}{\\text{pw2}} & \\text{if } \\text{delay} + \\text{pw1} + \\text{interval} \\leq t \\leq \\text{delay} + \\text{pw1} + \\text{interval} + \\text{pw2} \\\\
@@ -243,7 +243,7 @@ class bi_rect_balanced(Waveform):
 
     .. math::
         \\text{amp2} = -\\text{amp} \\cdot \\frac{\\text{pw1}}{\\text{pw2}}
-    
+
     Examples
     --------
     >>> import torch
@@ -269,10 +269,10 @@ class bi_rect_balanced(Waveform):
 class bi_rect_symm(Waveform):
     """
     Symmetric biphasic rectangular pulse waveform generator.
-    
+
     Generates a two-phase rectangular pulse with equal but opposite amplitudes
     and identical pulse widths. The waveform is zero outside the pulse durations.
-    
+
     Parameters
     ----------
     amp : float, optional
@@ -283,13 +283,13 @@ class bi_rect_symm(Waveform):
         Pulse width for each phase in ms. Default is 1.0.
     interval : float, optional
         Time interval between the two phases in ms. Default is 0.0.
-        
+
     Notes
     -----
     The waveform is defined as:
 
     .. math::
-        f(t) = 
+        f(t) =
         \\begin{cases}
         \\text{amp} & \\text{if } \\text{delay} \\leq t \\leq \\text{delay} + \\text{pw} \\\\
         -\\text{amp} & \\text{if } \\text{delay} + \\text{pw} + \\text{interval} \\leq t \\leq \\text{delay} + 2\\text{pw} + \\text{interval} \\\\
@@ -298,7 +298,7 @@ class bi_rect_symm(Waveform):
 
     This waveform is charge-balanced by design due to the equal duration and
     opposite amplitude of the two phases.
-    
+
     Examples
     --------
     >>> import torch

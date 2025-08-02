@@ -4,9 +4,9 @@ Welcome to AxonML!
 ``AxonML`` is a differentiable simulator for biophysical neuron fiber models in `PyTorch <https://github.com/pytorch/pytorch>`_, with an emphasis on effects of extracellular stimulation. Its key features are:
 
 - support for CPU and GPU
-- automatic differentiation, allowing gradient-based optimization of thousands of parameters  
+- automatic differentiation, allowing gradient-based optimization of thousands of parameters
 - implementations of a range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more
-- ``jit``-compilation, making it blazing fast while being fully written in python  
+- ``jit``-compilation, making it blazing fast while being fully written in python
 - a simple API, making it easy to use for beginners and experts alike
 
 ``AxonML`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please let us know by opening an issue on our `GitHub repository <https://github.com/wmglab-duke/axonml>`_.
@@ -63,7 +63,7 @@ Citation
 If you use `AxonML`, consider citing the `corresponding paper <https://www.nature.com/articles/s41467-024-51709-8>`_:
 
 .. code-block:: console
-   
+
     @article{hussain_highly_2024,
         title = {Highly efficient modeling and optimization of neural fiber responses to electrical stimulation},
         volume = {15},

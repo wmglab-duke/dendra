@@ -1,6 +1,6 @@
 ## :rocket: Training a model
 
-In the provided example, `axonml` trains approximations to the MRG[^2] myelinated fiber model. Check `axonml/models/README.md` for instructions on how to implement approximations of other fiber models. 
+In the provided example, `axonml` trains approximations to the MRG[^2] myelinated fiber model. Check `axonml/models/README.md` for instructions on how to implement approximations of other fiber models.
 
 Training configurations can be modified by changing the relevant values in `config.py`:
 
