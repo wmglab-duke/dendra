@@ -2,10 +2,17 @@
 import math
 import types
 
-import pytest
 import torch
 from hypothesis import given
 from hypothesis import strategies as st
+
+from axonml.models.callbacks import (
+    Active,
+    AnomalyDetector,
+    APCount,
+    Recorder,
+    sliding_window_average,
+)
 
 
 # ----------------------------------------------------------------------
@@ -39,18 +46,6 @@ class _DummyModel:
         if item == "v":
             return self.v
         raise AttributeError(item)
-
-
-# ----------------------------------------------------------------------
-# import the callbacks you want to test
-# ----------------------------------------------------------------------
-from axonml.models.callbacks import (
-    Active,
-    AnomalyDetector,
-    APCount,
-    Recorder,
-    sliding_window_average,
-)
 
 
 # ----------------------------------------------------------------------

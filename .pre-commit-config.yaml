@@ -2,7 +2,13 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.12.7          # pin an exact Ruff release
     hooks:
-      - id: ruff-format   # Black-compatible code formatter
+    # Run the linter.
+    - id: ruff-check
+      types_or: [ python, pyi ]
+      args: [ --fix ]
+    # Run the formatter.
+    - id: ruff-format
+      types_or: [ python, pyi ]
   - repo: https://github.com/pycqa/isort
     rev: 6.0.1
     hooks:
