@@ -1,6 +1,20 @@
 repos:
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+    - id: check-yaml
+    - id: check-toml
+    - id: requirements-txt-fixer
+    - id: end-of-file-fixer           # newline at end of file
+    - id: trailing-whitespace
+    - id: check-merge-conflict
+    - id: check-case-conflict
+    - id: check-illegal-windows-names
+    - id: no-commit-to-branch         # no direct commits to main / master
+
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.12.7          # pin an exact Ruff release
+    rev: v0.12.7
     hooks:
     # Run the linter.
     - id: ruff-check
@@ -9,6 +23,7 @@ repos:
     # Run the formatter.
     - id: ruff-format
       types_or: [ python, pyi ]
+
   - repo: https://github.com/pycqa/isort
     rev: 6.0.1
     hooks:
