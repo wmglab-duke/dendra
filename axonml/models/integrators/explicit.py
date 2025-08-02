@@ -79,8 +79,8 @@ class _euler(Integrator):
             )
 
     def _step_no_intra(self, v, ve, area, dt, temp, cm):
-        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         self.mech.advance(v, dt, temp)
+        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         v_n = v + K1 * dt
         if self.imem:
             i_cap = cm * (v_n - v) / dt
@@ -88,8 +88,8 @@ class _euler(Integrator):
         return v_n
 
     def _step_intra(self, v, ve, area, dt, temp, cm, intra):
-        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         self.mech.advance(v, dt, temp)
+        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         v_n = v + K1 * dt
         if self.imem:
             i_cap = cm * (v_n - v) / dt
@@ -130,8 +130,8 @@ class _rk2(_euler):
     """
 
     def _step_no_intra(self, v, ve, area, dt, temp, cm):
-        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         self.mech.advance(v, dt, temp)
+        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         K2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         v_n = v + K2 * dt
         if self.imem:
@@ -140,8 +140,8 @@ class _rk2(_euler):
         return v_n
 
     def _step_intra(self, v, ve, area, dt, temp, cm, intra):
-        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         self.mech.advance(v, dt, temp)
+        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         K2 = self.FRK_intra(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         v_n = v + K2 * dt
         if self.imem:
@@ -156,8 +156,8 @@ class _rk4(_euler):
     """
 
     def _step_no_intra(self, v, ve, area, dt, temp, cm):
-        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         self.mech.advance(v, dt, temp)
+        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
         K2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         K3 = self.FRK(v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         K4 = self.FRK(v + K3 * dt, ve, area, self.cm_inv, self.ra_inv)
@@ -168,8 +168,8 @@ class _rk4(_euler):
         return v_n
 
     def _step_intra(self, v, ve, area, dt, temp, cm, intra):
-        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         self.mech.advance(v, dt, temp)
+        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         K2 = self.FRK_intra(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         K3 = self.FRK_intra(v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
         K4 = self.FRK_intra(v + K3 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
