@@ -141,8 +141,7 @@ class Mechanism(Parameterized):
                 new_explicit.update(v_list)
             Mechanism._explicit_declarations = []
 
-        for s in new_state:
-            setattr(cls, s.__name__, s)
+        cls.state_classes = {s.__name__: s for s in new_state}
 
         cls._state = new_state
         cls._ion = new_ion
