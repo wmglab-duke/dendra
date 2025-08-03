@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 from neuron import h
 
 import axonml as ax
@@ -55,6 +56,45 @@ def test_against_neuron(d_lambda):
     asc_file = str(Path(__file__).parent / "111200A.asc")
 
     cell = ax.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3).double()
+    cell.insert(hh)
+    cell.soma.inject(ax.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
+    r_ind = cell.find("soma", loc=0.5, as_list=True)
+    r_ind += cell.find("dend[86]", loc=0.5, as_list=True)
+
+    rec = ax.callbacks.Recorder(states=["v"], node_indices=r_ind)
+
+    cell.initialize()
+    cell.run(tstop=10.0, dt=0.025, callbacks=[rec])
+    v = rec.numpy("v")
+
+    r1 = v[:, 0, 0]
+    r2 = v[:, 0, 1]
+
+    assert np.allclose(r1, rec1[:-1], atol=1e-6), (
+        f"Mismatch in soma voltage: {r1} vs {rec1}"
+    )
+    assert np.allclose(r2, rec2[:-1], atol=1e-6), (
+        f"Mismatch in dend[86] voltage: {r2} vs {rec2}"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("d_lambda", [0.1, 0.5, 1.0])
+@pytest.mark.parametrize("threads", [8, 16, 32])
+@pytest.mark.parametrize("N", [1, 2, 4])
+def test_against_neuron_cuda(d_lambda, threads, N):
+    rec1, rec2 = sim_and_rec_neuron(d_lambda)
+    asc_file = str(Path(__file__).parent / "111200A.asc")
+
+    integrator = ax.dhs(threads=threads)
+
+    cell = (
+        ax.Tree.from_asc(
+            asc_file, N=N, d_lambda=d_lambda, celsius=6.3, integrator=integrator
+        )
+        .cuda()
+        .double()
+    )
     cell.insert(hh)
     cell.soma.inject(ax.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
     r_ind = cell.find("soma", loc=0.5, as_list=True)

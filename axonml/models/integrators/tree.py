@@ -17,6 +17,9 @@ except ImportError:
     AXONML_SOLVERS_AVAILABLE = False
 
 
+THREADS_PER_WARP = 32
+
+
 def build_morphology(
     parent_idx: List[int],
 ) -> Tuple[
@@ -243,7 +246,10 @@ class _dhs(Integrator):
         https://doi.org/10.1038/s41467-023-41553-7
     """
 
-    def __init__(self, model, mech, imem=None, threads=32):
+    def __init__(self, model, mech, imem=None, threads=16):
+        assert THREADS_PER_WARP % threads == 0, "threads must divide 32 (warp size)"
+        assert threads <= 32, "threads must be ≤ 32 (warp size)"
+
         super().__init__(model, mech, imem)
         self.threads = threads
 
@@ -270,6 +276,7 @@ class _dhs(Integrator):
         dt_s = dt * 1e-3
 
         device = model.device()
+        self.to(device)
 
         if device.type == "cpu" and not AXONML_SOLVERS_AVAILABLE:
             raise ImportError(

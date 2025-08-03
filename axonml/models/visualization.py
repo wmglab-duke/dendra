@@ -8,7 +8,7 @@ import networkx as nx
 import numpy as np
 import torch
 from matplotlib import cm
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 from scipy.interpolate import griddata
 
 
@@ -437,9 +437,7 @@ def vis_2d(cell, idx=0, view="y", node_scale=8, dpi=200):
     plt.show()
 
 
-def vis_3d_plotly(
-    cell, idx=0, node_scale: float = 10.0, height=800.0, width=None
-) -> None:
+def vis_3d(cell, idx=0, node_scale: float = 10.0, height=800.0, width=None) -> None:
     import plotly.graph_objects as go
 
     """
@@ -448,7 +446,7 @@ def vis_3d_plotly(
 
     Parameters
     ----------
-    cell : Your AxonML Population-like object
+    cell : AxonML Population-like object
         Must have .graph, .device, ._labels, and .find() attributes.
     node_scale : float, optional
         Factor that converts compartment diameter (µm) to Plotly's marker size.
@@ -578,7 +576,7 @@ def vis_3d_plotly(
     fig.show()
 
 
-def vis_voltage_3d_plotly(x, y, z, voltage, height=800, width=None):
+def vis_voltage_3d(x, y, z, voltage, height=800, width=None):
     import plotly.graph_objects as go
 
     # 1. Create the 3D scatter plot object
@@ -845,3 +843,161 @@ def vis_threshold_mollweide_2d(
             every_deg=30,
         )
     return ax
+
+
+def vis_morphology_by_layer(
+    cell,
+    *,
+    threads: int = 32,
+    palette_name: str = "parula",  # any qualitative palette works
+    bar_fraction: float = 0.01,  # colour-bar width (fraction of plot)
+    ax=None,
+):
+    """
+    Tree layout + DHS layer colouring.
+    Sequential layers cycle through a fixed qualitative palette.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Build helpers
+    # ------------------------------------------------------------------
+    def graph_to_parent(G: nx.DiGraph):
+        # ------------------------------------------------------------------
+        # 0. topological order and quick look‑ups
+        # ------------------------------------------------------------------
+        nodes = list(nx.topological_sort(G))  # length K
+        idx_of = {n: i for i, n in enumerate(nodes)}
+        K = len(nodes)
+
+        parent_idx = np.full(K, -1, dtype=np.int32)
+
+        # ------------------------------------------------------------------
+        # 1. iterate over all nodes except the roots
+        # ------------------------------------------------------------------
+        for child in nodes:
+            i = idx_of[child]
+            preds = list(G.predecessors(child))
+
+            if not preds:  # soma / root compartment
+                continue
+            if len(preds) > 1:
+                raise ValueError(
+                    f"Node {child} has {len(preds)} parents — "
+                    "morphology must be a rooted tree for the Hines matrix."
+                )
+
+            parent = preds[0]
+            p = idx_of[parent]
+            parent_idx[i] = p
+
+        return parent_idx.tolist()
+
+    def build_morphology(pi):
+        K = len(pi)
+        children = [[] for _ in range(K)]
+        root = None
+        for i, p in enumerate(pi):
+            if p == -1:
+                root = i
+            else:
+                children[p].append(i)
+        depth = torch.zeros(K, dtype=torch.int32)
+        from collections import deque
+
+        q = deque([root])
+        while q:
+            u = q.popleft()
+            for c in children[u]:
+                depth[c] = depth[u] + 1
+                q.append(c)
+        return children, depth, root
+
+    def build_dhs_layers(depth, k_threads=32):
+        depth_cpu = depth.cpu().numpy()
+        max_d = int(depth_cpu.max())
+        order, layer_ptr = [], [0]
+        bins = [[] for _ in range(max_d + 1)]
+        for i, d in enumerate(depth_cpu):
+            bins[d].append(i)
+        for d in range(max_d, -1, -1):
+            bucket = bins[d]
+            for s in range(0, len(bucket), k_threads):
+                chunk = bucket[s : s + k_threads]
+                order.extend(chunk)
+                layer_ptr.append(len(order))
+        return torch.tensor(order), torch.tensor(layer_ptr)
+
+    def compute_positions(children, root):
+        pos, x_cursor = {}, 0
+
+        def dfs(u, d):
+            nonlocal x_cursor
+            if not children[u]:
+                pos[u] = (x_cursor, -d)
+                x_cursor += 1
+            else:
+                for c in children[u]:
+                    dfs(c, d + 1)
+                xs = [pos[c][0] for c in children[u]]
+                pos[u] = (sum(xs) / len(xs), -d)
+
+        dfs(root, 0)
+        return pos
+
+    parent_idx = graph_to_parent(cell.graph)
+
+    # ------------------------------------------------------------------
+    # 2. Build the schedule information
+    # ------------------------------------------------------------------
+    children, depth, root = build_morphology(parent_idx)
+    order, layer_ptr = build_dhs_layers(depth, k_threads=threads)
+    num_layers = layer_ptr.numel() - 1
+
+    layer_of_node = torch.full_like(depth, -1)
+    for layer in range(num_layers):
+        s, e = layer_ptr[layer].item(), layer_ptr[layer + 1].item()
+        layer_of_node[order[s:e]] = layer
+
+    # ------------------------------------------------------------------
+    # 3. Colour map: cycle through N distinct qualitative colours
+    # ------------------------------------------------------------------
+    base = plt.get_cmap(palette_name)
+    base_N = base.N
+    if base_N > 32:
+        base_N = 32
+    colour_list = [base((i % base_N) / base_N) for i in range(num_layers)]
+    cmap = ListedColormap(colour_list)
+    # norm = BoundaryNorm(range(num_layers + 1), base_N)
+
+    # ------------------------------------------------------------------
+    # 4. Layout & drawing
+    # ------------------------------------------------------------------
+    pos = compute_positions(children, root)
+    xs = [pos[i][0] for i in range(len(parent_idx))]
+    ys = [pos[i][1] for i in range(len(parent_idx))]
+    layers = layer_of_node.numpy()
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8, 15), dpi=200)
+
+    # edges
+    for child, p in enumerate(parent_idx):
+        if p != -1:
+            x1, y1 = pos[p]
+            x2, y2 = pos[child]
+            ax.plot([x1, x2], [y1, y2], color="lightgray", lw=0.7, zorder=0)
+
+    scatter = ax.scatter(xs, ys, c=layers, cmap=cmap, s=15, zorder=1)
+
+    ax.set_aspect("equal", "datalim")
+    ax.axis("off")
+
+    # narrow colour-bar
+    cbar = plt.colorbar(
+        scatter,
+        fraction=bar_fraction,
+        pad=0.02,
+        ticks=range(0, num_layers, max(1, num_layers // 10)),
+    )
+    cbar.set_label("DHS layer(earlier → later)", rotation=90, labelpad=15)
+    plt.show()

@@ -1,3 +1,5 @@
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -110,6 +112,107 @@ def _single_dhs_kernel(
         tl.store(V + idx, v_i, mask=m)
 
 
+@triton.jit
+def _single_dhs_kernel_packed(
+    D_ptr,  # (B, K) float32
+    A_ptr,  # (B, K) float32
+    B_ptr,  # (B, K) float32
+    V_ptr,  # (B, K) float32
+    P_ptr,  # (K,) int32          – parent indices
+    ORDER_ptr,  # (K,) int32          – topological order
+    LAYER_PTR_ptr,  # (L + 1,) int32      – layer start - end
+    B_total: tl.constexpr,  # scalar  – total neurons in the *whole* batch
+    K: tl.constexpr,  # compartments / neuron
+    L: tl.constexpr,  # number of layers
+    K_THREADS: tl.constexpr,  # threads / neuron within a warp  (≤32)
+    WARP_SIZE: tl.constexpr,
+):
+    NEURONS_PER_WARP = WARP_SIZE // K_THREADS  # 2 if K_THREADS == 16, etc.
+
+    # ----------------------------------------------------------
+    # Lane bookkeeping: split the 32-lane warp into sub-tiles
+    # ----------------------------------------------------------
+    lane_abs = tl.arange(0, WARP_SIZE)  # 0 … 31
+    n_in_warp = lane_abs // K_THREADS  # 0 … NEURONS_PER_WARP-1
+    lane_local = lane_abs % K_THREADS  # 0 … K_THREADS-1
+
+    # Global neuron index this lane is responsible for
+    b = tl.program_id(0) * NEURONS_PER_WARP + n_in_warp
+
+    # Mask off lanes whose neuron index spills past B_total
+    valid_neuron = b < B_total
+
+    # Safe `b` for pointer arithmetic (never out-of-bounds)
+    b_safe = tl.where(valid_neuron, b, 0)
+
+    # Per-lane base pointers ---------------------------------------------------
+    D = D_ptr + b_safe * K
+    A = A_ptr + b_safe * K
+    B = B_ptr + b_safe * K
+    V = V_ptr + b_safe * K
+
+    P = P_ptr
+    ORDER = ORDER_ptr
+    LAYER_PTR = LAYER_PTR_ptr
+
+    # ==========================================================
+    # 1. Fused initialisation + forward elimination
+    # ==========================================================
+    for layer in range(0, L):
+        s = tl.load(LAYER_PTR + layer)
+        e = tl.load(LAYER_PTR + layer + 1)
+
+        offset = s + lane_local
+        in_range = lane_local < (e - s)
+        m = in_range & valid_neuron  # final mask
+
+        idx = tl.load(ORDER + offset, mask=m, other=0)
+        parent = tl.load(P + idx, mask=m, other=-1)
+        g_i = tl.load(A + idx, mask=m, other=0.0)
+
+        # --- JIT diagonal finalisation
+        old_d_i = tl.atomic_add(D + idx, g_i, mask=m)
+        d_i = old_d_i + g_i
+
+        valid_parent_mask = m & (parent >= 0)
+        safe_parent = tl.where(valid_parent_mask, parent, 0)
+
+        tl.atomic_add(D + safe_parent, g_i, mask=valid_parent_mask)
+
+        # --- elimination update
+        b_i = tl.load(B + idx, mask=m, other=0.0)
+        fac = -g_i / d_i
+        tl.atomic_add(D + safe_parent, fac * g_i, mask=valid_parent_mask)
+        tl.atomic_add(B + safe_parent, -fac * b_i, mask=valid_parent_mask)
+
+    tl.debug_barrier()  # ensure forward phase completed
+
+    # ==========================================================
+    # 2. Back-substitution
+    # ==========================================================
+    for layer in range(L - 1, -1, -1):
+        s = tl.load(LAYER_PTR + layer)
+        e = tl.load(LAYER_PTR + layer + 1)
+
+        offset = s + lane_local
+        in_range = lane_local < (e - s)
+        m = in_range & valid_neuron
+
+        idx = tl.load(ORDER + offset, mask=m, other=0)
+        parent = tl.load(P + idx, mask=m, other=-1)
+
+        valid_parent_mask = m & (parent >= 0)
+        safe_parent = tl.where(valid_parent_mask, parent, 0)
+
+        g_i = tl.load(A + idx, mask=m, other=0.0)
+        d_i_elim = tl.load(D + idx, mask=m, other=1.0)
+        b_i_elim = tl.load(B + idx, mask=m, other=0.0)
+        v_parent = tl.load(V + safe_parent, mask=valid_parent_mask, other=0.0)
+
+        v_i = (b_i_elim + g_i * v_parent) / d_i_elim
+        tl.store(V + idx, v_i, mask=m)
+
+
 # ==============================================================================
 # 2. The Autograd Function (The PyTorch Bridge)
 # ==============================================================================
@@ -196,10 +299,97 @@ class DHSSolveStable(torch.autograd.Function):
 
         # Second, explicitly compute the correct gradient for the root node(s) and
         # overwrite the value calculated by the general formula. The parameter a_geom[root]
-        # only affects the diagonal A[root,root], so its gradient is -g[root]*x[root].
+        # only affects the diagonal A[root, root], so its gradient is -g[root]*x[root].
         grad_a_geom[:, is_root] = -(g[:, is_root] * x[:, is_root])
 
         # The return signature must match the forward inputs in order.
+        return grad_d_mem, grad_a_geom, grad_b, None, None, None, None
+
+
+class DHSSolvePacked(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, d_mem, a_geom, b, parent_idx, order, layer_ptr, threads: int):
+        """
+        Parameters
+        ----------
+        d_mem : (B, K)   diagonal values   (will be overwritten in-kernel)
+        a_geom: (B, K)   off-diagonal conductances
+        b     : (B, K)   RHS
+        parent_idx, order, layer_ptr : topology tables (shared across batch)
+        threads : int    K_THREADS - lanes per neuron inside a warp (≤ 32)
+        """
+        B, K = d_mem.shape
+        L = layer_ptr.numel() - 1
+
+        V_out = torch.empty_like(b)
+
+        # How many neurons each 32-lane warp can handle
+        NEURONS_PER_WARP = 32 // threads
+        grid_x = math.ceil(B / NEURONS_PER_WARP)
+
+        _single_dhs_kernel_packed[(grid_x,)](
+            d_mem.clone(),
+            a_geom,
+            b.clone(),
+            V_out,
+            parent_idx,
+            order,
+            layer_ptr,
+            B_total=B,
+            K=K,
+            L=L,
+            K_THREADS=threads,
+            WARP_SIZE=32,
+            num_warps=1,  # one warp per block – already fully occupied
+            num_stages=4,
+        )
+
+        # Save everything autograd needs
+        ctx.save_for_backward(d_mem, a_geom, V_out, parent_idx, order, layer_ptr)
+        ctx.threads = threads
+        return V_out
+
+    @staticmethod
+    def backward(ctx, grad_out):  # identical trick: reuse the forward kernel
+        d_mem, a_geom, V, parent_idx, order, layer_ptr = ctx.saved_tensors
+        threads = ctx.threads
+        B, K = d_mem.shape
+        L = layer_ptr.numel() - 1
+
+        NEURONS_PER_WARP = 32 // threads
+        grid_x = math.ceil(B / NEURONS_PER_WARP)
+
+        g = torch.empty_like(grad_out)
+        _single_dhs_kernel_packed[(grid_x,)](
+            d_mem.clone(),  # rebuild identical matrix
+            a_geom,
+            grad_out.clone(),  # RHS = upstream grad
+            g,
+            parent_idx,
+            order,
+            layer_ptr,
+            B_total=B,
+            K=K,
+            L=L,
+            K_THREADS=threads,
+            WARP_SIZE=32,
+            num_warps=1,
+            num_stages=4,
+        )
+
+        # Gradients wrt original inputs
+        grad_b = g
+        grad_d_mem = -(g * V)
+
+        is_root = parent_idx < 0
+        parent_clamped = parent_idx.clamp_min(0)
+
+        V_parent = V.gather(1, parent_clamped.expand_as(V))
+        g_parent = g.gather(1, parent_clamped.expand_as(g))
+
+        grad_a_geom = -(g - g_parent) * (V - V_parent)
+        grad_a_geom[:, is_root] = -(g[:, is_root] * V[:, is_root])
+
         return grad_d_mem, grad_a_geom, grad_b, None, None, None, None
 
 
@@ -216,4 +406,4 @@ def dhs_solve_cuda(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads=32):
     wraps the `autograd.Function` to handle the solver's execution and gradient
     computation.
     """
-    return DHSSolveStable.apply(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads)
+    return DHSSolvePacked.apply(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads)
