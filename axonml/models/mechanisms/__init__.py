@@ -1,4 +1,6 @@
 from ._ions import concentrations, equilibria, ion_register
+from ._mechanism import Mechanism, PointProcess, Synapse, VoltageProcess
+from ._state import State
 from .validate import validate
 
 __all__ = [
@@ -6,4 +8,9 @@ __all__ = [
     "concentrations",
     "equilibria",
     "validate",
+    "Mechanism",
+    "PointProcess",
+    "VoltageProcess",
+    "Synapse",
+    "State",
 ]

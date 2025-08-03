@@ -1,8 +1,8 @@
 import torch
 
-from ..mechanisms._mechanism import PointProcess as PP
-from ..mechanisms._mechanism import Synapse as Syn
-from ..mechanisms._state import State as S
+from ..mechanisms import PointProcess as PP
+from ..mechanisms import State as S
+from ..mechanisms import Synapse as Syn
 from ..mechanisms.ops import exp, log
 
 

@@ -1,6 +1,6 @@
 import torch
 
-from ..mechanisms._mechanism import PointProcess as M
+from ..mechanisms import PointProcess as M
 from ..mechanisms.ops import *
 
 

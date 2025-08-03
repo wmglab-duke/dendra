@@ -1,4 +1,5 @@
 import ast
+import inspect
 import io
 import re
 import textwrap
@@ -11,6 +12,7 @@ import torch
 from axonml.helpers import DEBUG, PADE
 from axonml.models.parametric import Parameterized
 
+from ._mechanism import classproperty
 from .ode import integrate2c
 
 # PyTorch operations
@@ -526,3 +528,12 @@ class State(Parameterized):
         Initial function to be called after the state is created.
         """
         pass
+
+    @classproperty
+    def code(cls):
+        """
+        Returns the source code of the mechanism.
+        This is useful for debugging and introspection.
+        """
+        source_code = inspect.getsource(cls)
+        return textwrap.dedent(source_code)

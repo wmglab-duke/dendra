@@ -1,6 +1,6 @@
 import torch
 
-from ..mechanisms._mechanism import VoltageProcess
+from ..mechanisms import VoltageProcess
 
 
 class fire_r(VoltageProcess):

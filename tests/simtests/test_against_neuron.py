@@ -69,9 +69,9 @@ def test_against_neuron(d_lambda):
     r1 = v[:, 0, 0]
     r2 = v[:, 0, 1]
 
-    assert np.allclose(r1, rec1[:-1], atol=1e-3), (
+    assert np.allclose(r1, rec1[:-1], atol=1e-6), (
         f"Mismatch in soma voltage: {r1} vs {rec1}"
     )
-    assert np.allclose(r2, rec2[:-1], atol=1e-3), (
+    assert np.allclose(r2, rec2[:-1], atol=1e-6), (
         f"Mismatch in dend[86] voltage: {r2} vs {rec2}"
     )

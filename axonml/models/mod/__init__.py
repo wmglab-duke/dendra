@@ -11,7 +11,7 @@ from .pas import pas
 
 
 class MechanismContainer:
-    """Simple attribute / dict‑style container."""
+    """Simple attribute / dict-style container."""
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():

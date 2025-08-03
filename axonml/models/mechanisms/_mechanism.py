@@ -141,6 +141,9 @@ class Mechanism(Parameterized):
                 new_explicit.update(v_list)
             Mechanism._explicit_declarations = []
 
+        for s in new_state:
+            setattr(cls, s.__name__, s)
+
         cls._state = new_state
         cls._ion = new_ion
         cls._save = new_save
@@ -539,16 +542,28 @@ class Mechanism(Parameterized):
 
 
 class VoltageProcess(Mechanism):
+    """
+    A VoltageProcess is a Mechanism that updates the membrane potential `v`.
+    VoltageProcesses implement the `update_v` method, which is called during the
+    simulation to update the membrane potential based on the mechanism's dynamics.
+    It is a no-op by default, but can be overridden in subclasses to implement
+    specific behavior.
+    """
+
     def update_v(self, v, dt):
         """
         A no-op update for voltage processes.
         This method can be overridden in subclasses to implement specific behavior.
         Any modifications to the membrane potential should not be in-place,
         but rather return a new tensor.
-        Args:
+
+        Parameters
+        ----------
             v (torch.Tensor): The membrane potential tensor.
-            dt (float): The time step for the update.
-        Returns:
+            dt (torch.Tensor): The time step for the update.
+
+        Returns
+        -------
             v (torch.Tensor): The updated membrane potential tensor.
         """
         raise NotImplementedError(
@@ -571,6 +586,20 @@ class PointProcess(Mechanism):
 
 
 class Synapse(Mechanism):
+    """
+    A Synapse is a Mechanism that receives spikes and delivers a synaptic current.
+    Synapses implement the `net_receive` method, which is called every timestep
+    and accepts `weights` (the sum of all incoming weighted spike events at that
+    timestep) and `netcon` (the `NetCon` instance for which the synapse is the target)
+    as arguments.
+
+    Note that a given synapse may be the target for multiple `NetCon`s, and as such its
+    `net_receive` method may be executed multiple times per timestep.
+
+    The `net_receive` method must be overridden in subclasses to implement
+    specific behavior for how the synapse responds to incoming spikes.
+    """
+
     def net_receive(self, weights, netcon):
         """
         This method is called when the synapse receives a spike.

@@ -1,4 +1,4 @@
-from ..mechanisms._mechanism import Mechanism as M
+from ..mechanisms import Mechanism as M
 
 
 class pas(M):

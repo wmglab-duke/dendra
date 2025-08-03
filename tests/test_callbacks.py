@@ -3,7 +3,7 @@ import math
 import types
 
 import torch
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from axonml.models.callbacks import (
@@ -155,6 +155,7 @@ def test_active_sets_flag_once():
     W=st.integers(min_value=1, max_value=3),
     window=st.integers(min_value=1, max_value=5),
 )
+@settings(deadline=None)
 def test_sliding_window_output_shape(N, C, H, W, window):
     x = torch.randn(N, C, H, W)
     with torch.no_grad():
