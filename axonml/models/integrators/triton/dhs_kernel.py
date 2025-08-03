@@ -114,18 +114,18 @@ def _single_dhs_kernel(
 
 @triton.jit
 def _single_dhs_kernel_packed(
-    D_ptr,  # (B, K) float32
-    A_ptr,  # (B, K) float32
-    B_ptr,  # (B, K) float32
-    V_ptr,  # (B, K) float32
-    P_ptr,  # (K,) int32          – parent indices
-    ORDER_ptr,  # (K,) int32          – topological order
-    LAYER_PTR_ptr,  # (L + 1,) int32      – layer start - end
+    D_ptr,  # (B, K)
+    A_ptr,  # (B, K)
+    B_ptr,  # (B, K)
+    V_ptr,  # (B, K)
+    P_ptr,  # (K,)                    – parent indices
+    ORDER_ptr,  # (K,)                – topological order
+    LAYER_PTR_ptr,  # (L + 1,)        – layer start - end
     B_total: tl.constexpr,  # scalar  – total neurons in the *whole* batch
     K: tl.constexpr,  # compartments / neuron
     L: tl.constexpr,  # number of layers
     K_THREADS: tl.constexpr,  # threads / neuron within a warp  (≤32)
-    WARP_SIZE: tl.constexpr,
+    WARP_SIZE: tl.constexpr,  # 32, the number of lanes in a warp
 ):
     NEURONS_PER_WARP = WARP_SIZE // K_THREADS  # 2 if K_THREADS == 16, etc.
 
