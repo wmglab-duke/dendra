@@ -9,14 +9,21 @@ class apcount(M):
     """
 
     M.RANGE(threshold=0.0)  # Threshold for spike detection
-    M.ASSIGNED("n", "active")
+    M.ASSIGNED("_n", "active")
 
     def initial(self, v):
-        self.n = torch.zeros_like(v, dtype=torch.int)
+        self._n = torch.zeros_like(v, dtype=torch.float32)
         self.active = torch.zeros_like(v, dtype=torch.bool)
 
     def breakpoint(self, v):
         above_threshold = v > self.threshold
         spikes = above_threshold & ~self.active
-        self.n += spikes.int()
+        self._n += spikes.float()
         self.active = above_threshold
+
+    @property
+    def n(self):
+        """
+        Returns the number of action potentials (spikes) counted.
+        """
+        return self._n.int()

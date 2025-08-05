@@ -1027,7 +1027,7 @@ class APCount(ThresholdCallback):
             self.record = torch.zeros(
                 model.n(),
                 n(self.node_check, model),
-                dtype=torch.int32,
+                dtype=torch.float,
                 device=model.device(),
             )
         if self.state_cache is None:
@@ -1038,7 +1038,7 @@ class APCount(ThresholdCallback):
                 device=model.device(),
             )
 
-    @torch._dynamo.disable
+    @nojit
     def post_step_hook(self, model):
         """
         Update AP counts after each simulation step.
@@ -1054,6 +1054,18 @@ class APCount(ThresholdCallback):
                 self.state_cache, vm_new, self.record, self.threshold
             )
         self.i += 1
+
+    @property
+    def n(self):
+        """
+        Return the number of axons being monitored.
+
+        Returns
+        -------
+        int
+            Number of axons in the model.
+        """
+        return self.record.int()
 
 
 class ActiveAL(APCount):

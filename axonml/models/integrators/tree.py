@@ -255,9 +255,9 @@ class _dhs(Integrator):
 
         B, N = model.np, model.nc
 
-        self.register_buffer("parent_idx", torch.empty(N, dtype=torch.int32))
+        self.register_buffer("parent_idx", torch.empty(N, dtype=torch.int64))
         self.register_buffer(
-            "order", torch.empty(N, dtype=torch.int32)
+            "order", torch.empty(N, dtype=torch.int64)
         )  # order of forward elimination
 
         self.register_buffer(
@@ -304,9 +304,11 @@ class _dhs(Integrator):
 
         area_cm2 = model.area  # cm²
 
-        self.register_buffer("layer_ptr", layer_ptr.to(device))  # (L+1,)
-        self.order.copy_(order.to(dtype=torch.int32, device=device))
-        self.parent_idx.copy_(parent_idx.to(dtype=torch.int32, device=device))  # (N,)
+        self.register_buffer(
+            "layer_ptr", layer_ptr.to(dtype=torch.int64, device=device)
+        )  # (L+1,)
+        self.order.copy_(order.to(dtype=torch.int64, device=device))
+        self.parent_idx.copy_(parent_idx.to(dtype=torch.int64, device=device))  # (N,)
         self.a_geom = a_geom_t.expand(B, -1).to(
             device=device, dtype=model.dtype()
         )  # (B,N)
@@ -401,9 +403,9 @@ class _dhs(Integrator):
             d_,
             a,
             b_,
-            self.parent_idx.to(d_.device, dtype=torch.int64),
-            self.order.to(d_.device, dtype=torch.int64),
-            self.layer_ptr.to(d_.device, dtype=torch.int64),
+            self.parent_idx,
+            self.order,
+            self.layer_ptr,
         )
 
         v = v_out.index_select(-1, self.inv_solver_order)  # (B, N)
