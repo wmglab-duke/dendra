@@ -5,6 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "axonml"
 version = "0.2"
+requires-python = ">=3.11"
+readme = "README.md"
 
 dynamic = ["dependencies"]
 
