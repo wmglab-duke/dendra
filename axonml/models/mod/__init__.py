@@ -4,8 +4,11 @@ import sys
 from pathlib import Path
 
 from .alphasynapse import alphasynapse
+from .apcount import apcount
 from .exp2syn import exp2syn
 from .expsyn import expsyn
+from .fire import fire
+from .fire_r import fire_r
 from .hh import hh
 from .pas import pas
 

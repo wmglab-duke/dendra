@@ -11,7 +11,7 @@ class Point(P):
     P.PARAMETER(x=0.0, y=0.0, z=0.0)
 
     def fn(self, x, y, z):
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def forward(self, model):
         self.to(model.device())

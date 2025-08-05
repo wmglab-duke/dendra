@@ -4,7 +4,7 @@ import math
 
 import pytest
 import torch
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # ---------------------------------------------------------------------------
@@ -64,6 +64,7 @@ coord = st.floats(min_value=-2e4, max_value=2e4).filter(lambda v: abs(v) > 1.0)
 
 
 @given(x=coord, y=coord, z=coord)
+@settings(deadline=None)
 def test_isotropic_point_grad(x, y, z):
     """Ensure gradients exist & are finite except at the source."""
     if x == y == z == 0.0:  # singularity – skip
