@@ -977,8 +977,11 @@ def vis_morphology_by_layer(
     ys = [pos[i][1] for i in range(len(parent_idx))]
     layers = layer_of_node.numpy()
 
+    no_ax = False
+
     if ax is None:
-        _, ax = plt.subplots(figsize=(8, 15), dpi=200)
+        no_ax = True
+        fig, ax = plt.subplots(figsize=(8, 15), dpi=200)
 
     # edges
     for child, p in enumerate(parent_idx):
@@ -999,5 +1002,9 @@ def vis_morphology_by_layer(
         pad=0.02,
         ticks=range(0, num_layers, max(1, num_layers // 10)),
     )
-    cbar.set_label("DHS layer(earlier → later)", rotation=90, labelpad=15)
+    cbar.set_label("DHS layer (earlier → later)", rotation=90, labelpad=15)
     plt.show()
+
+    if no_ax:
+        return fig, ax
+    return ax  # return the axis for further customization if needed

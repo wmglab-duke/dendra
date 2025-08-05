@@ -25,7 +25,7 @@ from axonml.models.callbacks import Callback, CallbackList
 from axonml.models.graph import get_area_from_graph
 from axonml.models.integrators import bwd_euler_sc, bwd_euler_ub
 from axonml.models.mechanisms._handler import MechanismHandler
-from axonml.models.mechanisms._ions import Ion, valid_ions
+from axonml.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
 from axonml.models.mechanisms.validate import validate
 from axonml.models.parametric import Parameterized as P
 from axonml.models.stim.intrastim import IntraStim
@@ -180,6 +180,9 @@ class Population(P, Sliceable):
         self._all_write = {}
         self._all_write_c = {}
 
+        self._equilibria = {}
+        self._concentrations = {}
+
         self._ion_style = {}
 
         self.pre_initialize_hooks: List[Callable] = []
@@ -209,6 +212,12 @@ class Population(P, Sliceable):
 
         self.initialized: bool = False
         self.eval()
+
+    def equilibria(self, **kwargs):
+        self._equilibria.update(kwargs)
+
+    def concentrations(self, **kwargs):
+        self._concentrations.update(kwargs)
 
     @property
     def graph(self):
@@ -1001,6 +1010,36 @@ class Population(P, Sliceable):
         for k, v in mech._write_ion_c.items():
             self._ion_write_c.setdefault(k, {}).update({name: v})
 
+    # -- Device and dtype methods --
+
+    def cuda(self, device=None):
+        self.build()
+        return super().cuda(device=device)
+
+    def cpu(self):
+        self.build()
+        return super().cpu()
+
+    def float(self):
+        self.build()
+        return super().float()
+
+    def double(self):
+        self.build()
+        return super().double()
+
+    def half(self):
+        self.build()
+        return super().half()
+
+    def bfloat16(self):
+        self.build()
+        return super().bfloat16()
+
+    def to(self, *args, **kwargs):
+        self.build()
+        return super().to(*args, **kwargs)
+
     def build(self):
         if self.is_built:
             return self
@@ -1009,55 +1048,67 @@ class Population(P, Sliceable):
             strings_only = [item for item in data if item is not None]
             return len(strings_only) == len(set(strings_only))
 
-        for mech, (name, ic, kwargs) in self._mech_everywhere.items():
-            key = None
-            shape = self.shape
-            m = mech(name, self.celsius, self.diam, shape, key, ic=ic, **kwargs)
-            self.register_mech(m, shape, key)
+        conc = eq = nullcontext()
 
-        for mech, data in self._mech_data.items():
-            aliases, kwargs_list, keys = tuple(map(list, zip(*data)))
-            if not are_strings_unique(aliases):
-                raise ValueError(
-                    f"Duplicate aliases found for mechanism {mech.__name__}."
+        if self._concentrations:
+            conc = concentrations(**self._concentrations)
+        if self._equilibria:
+            eq = equilibria(**self._equilibria)
+
+        with conc, eq:
+            for mech, (name, ic, kwargs) in self._mech_everywhere.items():
+                key = None
+                shape = self.shape
+                m = mech(name, self.celsius, self.diam, shape, key, ic=ic, **kwargs)
+                self.register_mech(m, shape, key)
+
+            for mech, data in self._mech_data.items():
+                aliases, kwargs_list, keys = tuple(map(list, zip(*data)))
+                if not are_strings_unique(aliases):
+                    raise ValueError(
+                        f"Duplicate aliases found for mechanism {mech.__name__}."
+                    )
+                m, shape, key = compile_mechanism(
+                    self, mech, keys, aliases, kwargs_list
                 )
-            m, shape, key = compile_mechanism(self, mech, keys, aliases, kwargs_list)
-            self.register_mech(m, shape, key)
+                self.register_mech(m, shape, key)
 
-        all_ions = get_unique_keys([self._ion_read, self._ion_write, self._ion_write_c])
-
-        _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
-        self._m_curr.update(_ion_write)
-
-        ions = {}
-        for ion in all_ions:
-            ion_style = self.get_ion_style(ion)
-            ions[ion] = Ion(
-                ion,
-                self.shape,
-                *ion_style,
+            all_ions = get_unique_keys(
+                [self._ion_read, self._ion_write, self._ion_write_c]
             )
-            for m in self._m_list:
-                m.register_ion(ions[ion])
 
-        mechs = {n: m for n, m in zip(self._m_name, self._m_list)}
-        keys = {n: k for n, k in zip(self._m_name, self._m_keys)}
-        mech = MechanismHandler(
-            self.celsius,
-            self.area,
-            mechs,
-            ions,
-            self._ion_write_c,
-            self._ion_read,
-            self._m_curr,
-        )
+            _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
+            self._m_curr.update(_ion_write)
 
-        for m in mech.mechanisms.values():
-            m.setreference("t", lambda: self.t)
+            ions = {}
+            for ion in all_ions:
+                ion_style = self.get_ion_style(ion)
+                ions[ion] = Ion(
+                    ion,
+                    self.shape,
+                    *ion_style,
+                )
+                for m in self._m_list:
+                    m.register_ion(ions[ion])
 
-        self.integrator = self.integrator(self, mech)
-        self.is_built = True
-        self.eval()
+            mechs = {n: m for n, m in zip(self._m_name, self._m_list)}
+            keys = {n: k for n, k in zip(self._m_name, self._m_keys)}
+            mech = MechanismHandler(
+                self.celsius,
+                self.area,
+                mechs,
+                ions,
+                self._ion_write_c,
+                self._ion_read,
+                self._m_curr,
+            )
+
+            for m in mech.mechanisms.values():
+                m.setreference("t", lambda: self.t)
+
+            self.integrator = self.integrator(self, mech)
+            self.is_built = True
+            self.eval()
         return self
 
     def build_(self):

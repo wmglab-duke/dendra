@@ -37,10 +37,7 @@ Fast and scalable neural fiber simulator with extracellular field support. Imple
 > python -m pip install .
 ```
 - To install in development mode:
-    - `python -m pip install --editable .`
-
-- You can also install with jupyter support:
-    - `python -m pip install '.[jupyter]'`
+    - `python -m pip install --editable '.[dev]'`
 
 - If you want to build and run the documentation locally:
     - `python -m pip install '.[doc]'`
@@ -50,6 +47,12 @@ Fast and scalable neural fiber simulator with extracellular field support. Imple
 > [!NOTE]
 > Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive space.
 
+> [!IMPORTANT]
+> To use implicit euler when solving the voltage **on CPU**, install [axonml-solvers](https://gitlab.oit.duke.edu/mah148/axonml-solvers). GPU implementation is available by default.
+
+## 🗄️ Pre-implemented models
+
+Cell models are available at https://gitlab.oit.duke.edu/mah148/axonml-models.
 
 ## 📜 License
 The copyrights of this software are owned by Duke University. As such, it is offered under a custom license (see LICENSE.md) whereby:

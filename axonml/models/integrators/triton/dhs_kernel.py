@@ -126,7 +126,7 @@ def _single_dhs_kernel_packed(
     L: tl.constexpr,  # number of layers
     K_THREADS: tl.constexpr,  # threads / neuron within a warp  (≤32)
     WARP_SIZE: tl.constexpr,  # 32, the number of lanes in a warp
-):
+):  # pragma: no cover
     NEURONS_PER_WARP = WARP_SIZE // K_THREADS  # 2 if K_THREADS == 16, etc.
 
     # ----------------------------------------------------------
@@ -225,7 +225,9 @@ class DHSSolveStable(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, d_mem, a_geom, b, parent_idx, order, layer_ptr, threads):
+    def forward(
+        ctx, d_mem, a_geom, b, parent_idx, order, layer_ptr, threads
+    ):  # pragma: no cover
         B, K = d_mem.shape
         L = layer_ptr.numel() - 1
         x = torch.empty_like(b)
@@ -350,7 +352,7 @@ class DHSSolvePacked(torch.autograd.Function):
         return V_out
 
     @staticmethod
-    def backward(ctx, grad_out):  # identical trick: reuse the forward kernel
+    def backward(ctx, grad_out):  # pragma: no cover
         d_mem, a_geom, V, parent_idx, order, layer_ptr = ctx.saved_tensors
         threads = ctx.threads
         B, K = d_mem.shape

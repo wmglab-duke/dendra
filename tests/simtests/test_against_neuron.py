@@ -55,7 +55,7 @@ def test_against_neuron(d_lambda):
     rec1, rec2 = sim_and_rec_neuron(d_lambda)
     asc_file = str(Path(__file__).parent / "111200A.asc")
 
-    cell = ax.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3).double()
+    cell = ax.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
     cell.insert(hh)
     cell.soma.inject(ax.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
     r_ind = cell.find("soma", loc=0.5, as_list=True)
@@ -63,8 +63,36 @@ def test_against_neuron(d_lambda):
 
     rec = ax.callbacks.Recorder(states=["v"], node_indices=r_ind)
 
-    cell.initialize()
+    cell.double().initialize()
     cell.run(tstop=10.0, dt=0.025, callbacks=[rec])
+    v = rec.numpy("v")
+
+    r1 = v[:, 0, 0]
+    r2 = v[:, 0, 1]
+
+    assert np.allclose(r1, rec1[:-1], atol=1e-6), (
+        f"Mismatch in soma voltage: {r1} vs {rec1}"
+    )
+    assert np.allclose(r2, rec2[:-1], atol=1e-6), (
+        f"Mismatch in dend[86] voltage: {r2} vs {rec2}"
+    )
+
+
+@pytest.mark.parametrize("d_lambda", [0.1, 0.5, 1.0])
+def test_against_neuron_longrun(d_lambda):
+    rec1, rec2 = sim_and_rec_neuron(d_lambda)
+    asc_file = str(Path(__file__).parent / "111200A.asc")
+
+    cell = ax.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
+    cell.insert(hh)
+    cell.soma.inject(ax.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
+    r_ind = cell.find("soma", loc=0.5, as_list=True)
+    r_ind += cell.find("dend[86]", loc=0.5, as_list=True)
+
+    rec = ax.callbacks.Recorder(states=["v"], node_indices=r_ind)
+
+    cell.double().initialize()
+    cell.longrun(tstop=10.0, dt=0.025, chunklength=100, callbacks=[rec])
     v = rec.numpy("v")
 
     r1 = v[:, 0, 0]
@@ -88,12 +116,8 @@ def test_against_neuron_cuda(d_lambda, threads, N):
 
     integrator = ax.dhs(threads=threads)
 
-    cell = (
-        ax.Tree.from_asc(
-            asc_file, N=N, d_lambda=d_lambda, celsius=6.3, integrator=integrator
-        )
-        .cuda()
-        .double()
+    cell = ax.Tree.from_asc(
+        asc_file, N=N, d_lambda=d_lambda, celsius=6.3, integrator=integrator
     )
     cell.insert(hh)
     cell.soma.inject(ax.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
@@ -102,7 +126,7 @@ def test_against_neuron_cuda(d_lambda, threads, N):
 
     rec = ax.callbacks.Recorder(states=["v"], node_indices=r_ind)
 
-    cell.initialize()
+    cell.cuda().double().initialize()
     cell.run(tstop=10.0, dt=0.025, callbacks=[rec])
     v = rec.numpy("v")
 

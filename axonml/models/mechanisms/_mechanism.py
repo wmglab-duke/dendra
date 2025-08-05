@@ -266,7 +266,7 @@ class Mechanism(Parameterized):
         if ic is not None:
             self._init_params.update(ic)
 
-        self.register_buffer("diam", diameters)
+        self.register_buffer("diam", self.get(diameters))
         for state in self.DE.values():
             for state_name in state._state:
                 self.register_buffer(state_name, torch.zeros(shape))

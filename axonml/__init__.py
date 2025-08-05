@@ -129,10 +129,5 @@ def _cache_cpu_isa_list():
 
 _cache_cpu_isa_list()
 
-# register trained models
-__this = files(__package__) / "trained"
-all_trained = glob.glob(str(__this) + "/*.pt")
-all_trained = {os.path.split(t)[1][:-3]: t for t in all_trained}
-
 # setup environment
 allow_tf32(bool(TF32))
