@@ -381,7 +381,7 @@ class Parameterized(SimpleParameterized):
                         if isinstance(parameter, torch.nn.Module):
                             p = parameter(torch.empty(self.shape))
                             parametrization = build_parametrization(
-                                p, parameter, key, self.shape
+                                parameter, p, key, self.shape
                             )
                             self.register_parametrization_in_graph(
                                 name, parametrization

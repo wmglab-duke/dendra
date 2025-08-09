@@ -21,18 +21,18 @@ class Callback(torch.nn.Module):
     """
     Base class for simulation callbacks in AxonML.
 
-    This class defines the interface for callbacks that can be registered with
-    axon models to monitor and interact with the simulation at specific points
-    in the execution flow. Subclasses should override the hook methods to
-    implement specific functionality.
+    This class defines the interface for callbacks that can be passed to
+    `run` or `longrun` methods of models to monitor and interact with the
+    simulation at specific points in the execution flow. Subclasses should
+    override the hook methods to implement specific functionality.
 
     Methods
     -------
     pre_loop_hook(model)
         Called once before starting the simulation loop.
-    pre_chunk_hook(model)
+    pre_chunk_hook(model, timesteps=None)
         Called before processing each chunk of the simulation when longrunning.
-    post_chunk_hook(model)
+    post_chunk_hook(model, timesteps=None)
         Called after processing each chunk of the simulation when longrunning.
     pre_step_hook(model)
         Called before each simulation time step.
@@ -77,27 +77,27 @@ class Callback(torch.nn.Module):
         """
         pass
 
-    def pre_chunk_hook(self, model, timesteps=None):
+    def pre_chunk_hook(self, model, timepoints=None):
         """Execute before processing each chunk of the simulation.
 
         Parameters
         ----------
         model
             The axon model being simulated.
-        timesteps : int, optional
-            Number of timesteps in the chunk.
+        timepoints : torch.Tensor, optional
+            The timepoints in the chunk to be processed.
         """
         pass
 
-    def post_chunk_hook(self, model, timesteps=None):
+    def post_chunk_hook(self, model, timepoints=None):
         """Execute after processing each chunk of the simulation.
 
         Parameters
         ----------
         model
             The axon model being simulated.
-        timesteps : int, optional
-            Number of timesteps in the chunk.
+        timepoints : torch.Tensor, optional
+            The timepoints in the chunk just processed.
         """
         pass
 

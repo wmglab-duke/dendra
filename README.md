@@ -10,7 +10,7 @@
 
 Fast, scalable, and differentiable neural simulator with support for extracellular fields. Useful to implement and train high-throughput GPU-compatible models.
 
-## ❗Requirements
+## Requirements
 
 ### OS requirements
 `axonml` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).

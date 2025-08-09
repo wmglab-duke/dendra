@@ -669,6 +669,8 @@ class Population(P, Sliceable):
                             t = t_chunks[i]
                         ve_ = einsum(ve_s, t).contiguous().unbind(dim=0)
 
+                    pre_chunk_hook(callbacks, self, t_c_f[i])
+
                     for j in range(len(t_c_f[i])):
                         if with_extra:
                             ve_c = ve_[j]
@@ -684,6 +686,8 @@ class Population(P, Sliceable):
                         post_step_hook(callbacks, self)
 
                         self.t = self.t + dt
+
+                    post_chunk_hook(callbacks, self, t_c_f[i])
 
                     if progressbar:
                         progressbar.update(1)
@@ -1778,12 +1782,12 @@ def post_step_hook(c, m):
     c.post_step_hook(m)
 
 
-def pre_chunk_hook(c, m, n):
-    c.pre_chunk_hook(m, n)
+def pre_chunk_hook(c, m, t):
+    c.pre_chunk_hook(m, t)
 
 
-def post_chunk_hook(c, m, n):
-    c.post_chunk_hook(m, n)
+def post_chunk_hook(c, m, t):
+    c.post_chunk_hook(m, t)
 
 
 # Helper for the super-fast path: Merges overlapping/adjacent 1D intervals
