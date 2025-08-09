@@ -28,7 +28,7 @@ from axonml.models.mechanisms._handler import MechanismHandler
 from axonml.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
 from axonml.models.mechanisms.validate import validate
 from axonml.models.parametric import Parameterized as P
-from axonml.models.stim.intrastim import IntraStim
+from axonml.models.stim.intra import Intra
 from axonml.models.stim.waveform import Waveform
 from axonml.units import mm
 
@@ -422,11 +422,6 @@ class Population(P, Sliceable):
         multicontact : bool, optional
             If True, handles multiple electrode contacts for ve construction.
             Default is False.
-        Raises
-        ------
-        ValueError
-            If neither ve nor (space and time) nor intra is provided.
-            If intra is provided but is not an instance of IntraStim.
 
         Notes
         -----
@@ -909,7 +904,7 @@ class Population(P, Sliceable):
 
     def build_intra(self):
         if self.injections:
-            return IntraStim(self, self.injections)
+            return Intra(self, self.injections)
         return None
 
     def insert(self, mechanism, alias=None, index_spec=None, ic=None, **kwargs):
@@ -1132,8 +1127,12 @@ class Population(P, Sliceable):
     def detach_(self):
         self.detach()
 
-    def register_parametrization(self, name: str, parametrization: torch.nn.Module):
-        torch.nn.utils.parametrize.register_parametrization(self, name, parametrization)
+    def register_parametrization(
+        self, name: str, parametrization: torch.nn.Module, unsafe=True
+    ):
+        torch.nn.utils.parametrize.register_parametrization(
+            self, name, parametrization, unsafe=unsafe
+        )
 
     def slice(
         self,

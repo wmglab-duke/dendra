@@ -44,7 +44,7 @@ def _as_index_tensor(indices, n):
         raise TypeError(f"Unsupported index type: {type(indices)}")
 
 
-class IntraStim(torch.nn.Module):
+class Intra(torch.nn.Module):
     def __init__(self, model, stims):
         """
         Initialize intracellular stimulation handler.
@@ -54,7 +54,7 @@ class IntraStim(torch.nn.Module):
         model : Axon
             The axon model to which this stimulation will be applied.
         """
-        super(IntraStim, self).__init__()
+        super(Intra, self).__init__()
         self.shape = model.v.shape
         self.dtype = model.dtype()
         self.device = model.device()

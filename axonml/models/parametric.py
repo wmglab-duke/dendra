@@ -174,6 +174,7 @@ class Referency(torch.nn.Module):
 
 class SimpleParameterized(Referency):
     _params = {}
+    _params_defined_here = {}
     _params_declarations = []
 
     def __init_subclass__(cls, **kwargs):
@@ -185,10 +186,14 @@ class SimpleParameterized(Referency):
             if "_params" in base.__dict__:
                 new_params.update(base._params)
 
+        cls._params_defined_here = {}
+
         if SimpleParameterized._params_declarations:
             for p_dict in SimpleParameterized._params_declarations:
-                new_params.update(p_dict)
+                cls._params_defined_here.update(p_dict)
             SimpleParameterized._params_declarations = []
+
+        new_params.update(cls._params_defined_here)
 
         cls._params = new_params
 
@@ -240,6 +245,154 @@ class SimpleParameterized(Referency):
         return ", ".join(f"{k}={v}" for k, v in self.named_parameters())
 
 
+def check_conflicts(global_params, range_params, params_defined_here):
+    """
+    Check for conflicts between global parameters, range parameters, and
+    parameters defined in the current class.
+
+    Raises ValueError if any parameter is defined in more than one category.
+    """
+    all_params = (
+        set(global_params.keys())
+        .union(range_params.keys())
+        .union(params_defined_here.keys())
+    )
+    duplicates = set()
+
+    for param in all_params:
+        count = (
+            (param in global_params)
+            + (param in range_params)
+            + (param in params_defined_here)
+        )
+        if count > 1:
+            duplicates.add(param)
+
+    if duplicates:
+        raise ValueError(
+            f"Parameter conflict detected: {duplicates}. "
+            "A parameter cannot be defined in multiple categories."
+        )
+
+
+def assign_precendence(cls):
+    """
+    Resolve parameters that appear in more than one of:
+        cls._global, cls._range, cls._params.
+
+    Rule:
+      (1) If a duplicated parameter is marked "defined here" in this *class*
+          in any of *_defined_here, keep that category and remove it from the others.
+      (2) Otherwise walk the MRO (nearest first). The first class whose
+          *_defined_here contains the parameter determines the winning category.
+      (3) If no class in the MRO marks it as defined_here anywhere, fall back
+          to a fixed category order ('_params' > '_range' > '_global') among the
+          categories where the parameter currently appears.
+
+    Mutates cls._global / cls._range / cls._params in place.
+    Returns a dict {param_name: kept_category_name} for inspection.
+    """
+
+    # --- helpers -------------------------------------------------------------
+    def _as_names(x):
+        """Accept set/dict/iterable; return a set of parameter names."""
+        if x is None:
+            return set()
+        if isinstance(x, set):
+            return set(x)
+        if isinstance(x, dict):
+            return set(x.keys())
+        try:
+            return set(x)
+        except TypeError:
+            return set()
+
+    # Containers on the class; treat missing as empty dicts
+    containers = {
+        "_global": getattr(cls, "_global", {}) or {},
+        "_range": getattr(cls, "_range", {}) or {},
+        "_params": getattr(cls, "_params", {}) or {},
+    }
+
+    # Which params are present where?
+    present = {k: set(v.keys()) for k, v in containers.items()}
+    all_params = present["_global"] | present["_range"] | present["_params"]
+    dupes = {p for p in all_params if sum(p in present[k] for k in present) > 1}
+    if not dupes:
+        return {}
+
+    # Category preference only for tie-breaking when nobody "defined_here" it.
+    FALLBACK_ORDER = ("_params", "_range", "_global")
+
+    kept = {}
+
+    # Precompute "defined here" sets for *this* class
+    defined_here_cls = {
+        "_global": _as_names(getattr(cls, "_global_defined_here", None)),
+        "_range": _as_names(getattr(cls, "_range_defined_here", None)),
+        "_params": _as_names(getattr(cls, "_params_defined_here", None)),
+    }
+
+    for p in dupes:
+        # 1) Check if *this* class defines it here in any category
+        here_hits = [cat for cat, s in defined_here_cls.items() if p in s]
+        if here_hits:
+            # If (pathologically) multiple categories say "defined here", choose a stable order.
+            if len(here_hits) > 1:
+                # Pick the first that also currently contains p; prefer FALLBACK_ORDER among them.
+                candidates = [
+                    cat
+                    for cat in FALLBACK_ORDER
+                    if cat in here_hits and p in present[cat]
+                ]
+                winner = candidates[0] if candidates else here_hits[0]
+            else:
+                winner = here_hits[0]
+        else:
+            # 2) Walk the MRO; the first class that "defined_here" picks the category
+            winner = None
+            for base in cls.__mro__:  # includes cls itself; fine (we already checked)
+                if base is object:
+                    continue
+                dh = {
+                    "_global": _as_names(getattr(base, "_global_defined_here", None)),
+                    "_range": _as_names(getattr(base, "_range_defined_here", None)),
+                    "_params": _as_names(getattr(base, "_params_defined_here", None)),
+                }
+                hits = [cat for cat, s in dh.items() if p in s]
+                if hits:
+                    # Prefer a hit that actually exists in this class' containers;
+                    # otherwise use a stable category order.
+                    candidates = [cat for cat in hits if p in present[cat]]
+                    if candidates:
+                        # If multiple, use FALLBACK_ORDER to break ties deterministically
+                        for cat in FALLBACK_ORDER:
+                            if cat in candidates:
+                                winner = cat
+                                break
+                    else:
+                        # None of the hits exist here (rare); keep looking.
+                        pass
+                    if winner is not None:
+                        break
+
+            # 3) If nobody in the MRO "defined_here" it, fall back to category priority
+            if winner is None:
+                for cat in FALLBACK_ORDER:
+                    if p in present[cat]:
+                        winner = cat
+                        break
+
+        # Remove from non-winners
+        for cat, mapping in containers.items():
+            if cat != winner and p in mapping:
+                mapping.pop(p, None)
+
+        kept[p] = winner
+
+    return kept
+
+
 class Parameterized(SimpleParameterized):
     """
     A base class that allows subclasses to declare parameters which are
@@ -247,9 +400,11 @@ class Parameterized(SimpleParameterized):
     """
 
     _global = {}
+    _global_defined_here = {}
     _global_declarations = []
 
     _range = {}
+    _range_defined_here = {}
     _range_declarations = []
 
     def __init_subclass__(cls, **kwargs):
@@ -267,30 +422,43 @@ class Parameterized(SimpleParameterized):
 
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
-            # We look for a _global attribute defined directly on the base
+            # We look for _global and _range attributes defined directly on the base
             if "_global" in base.__dict__:
                 new_global.update(base._global)
             if "_range" in base.__dict__:
                 new_range.update(base._range)
 
+        cls._global_defined_here = {}
+        cls._range_defined_here = {}
+
         # Add parameters declared via the GLOBAL() method
         if Parameterized._global_declarations:
             for p_dict in Parameterized._global_declarations:
-                new_global.update(p_dict)
+                cls._global_defined_here.update(p_dict)
             Parameterized._global_declarations = []  # Clear for next class
         # Add range declarations
         if Parameterized._range_declarations:
             for r_dict in Parameterized._range_declarations:
-                new_range.update(r_dict)
+                cls._range_defined_here.update(r_dict)
             Parameterized._range_declarations = []
+
+        # Update the new global and range dictionaries with the class-specific declarations
+        new_global.update(cls._global_defined_here)
+        new_range.update(cls._range_defined_here)
+
+        check_conflicts(
+            cls._global_defined_here, cls._range_defined_here, cls._params_defined_here
+        )
 
         # Add parameters from class definition keywords (e.g., a=10)
         # These will override anything set by parents.
-        new_global.update(kwargs)
-        new_range.update(kwargs)
+        new_global.update({k: v for k, v in kwargs.items() if k in new_global})
+        new_range.update({k: v for k, v in kwargs.items() if k in new_range})
 
         cls._global = new_global
         cls._range = new_range
+
+        assign_precendence(cls)
 
     @staticmethod
     def GLOBAL(**kwargs):
@@ -410,6 +578,10 @@ class Parameterized(SimpleParameterized):
         for name in keys_to_process:
             if not torch.is_tensor(getattr(self, name)):
                 continue
+            if hasattr(self, "parametrizations"):
+                if name in self.parametrizations:
+                    # If the parameter has parametrizations, we skip it
+                    continue
             p_name = f"{name}_default"
             setattr(self, name, getattr(self, name).detach())
             getattr(self, name).copy_(getattr(self, p_name))
