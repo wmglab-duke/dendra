@@ -13,6 +13,7 @@ from .explicit import (
 from .imex import _krylov_etd1
 from .implicit import _bwd_euler_bt, _bwd_euler_sc, _bwd_euler_ub
 from .tree import _dhs
+from .tree_bt import _dhs_bt
 
 
 def partial_class(cls: Type[Any], /, *args, **kwargs) -> Type[Any]:
@@ -44,6 +45,7 @@ bwd_euler_ub = partial(partial_class, _bwd_euler_ub)
 bwd_euler_bt = partial(partial_class, _bwd_euler_bt)
 
 dhs = partial(partial_class, _dhs)
+dhs_bt = partial(partial_class, _dhs_bt)
 
 df = dufort_frankel
 dfh = dufort_frankel_homogeneous
@@ -62,6 +64,7 @@ __all__ = [
     "bwd_euler_ub",
     "bwd_euler_bt",
     "dhs",
+    "dhs_bt",
     "df",
     "dfh",
 ]

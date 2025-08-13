@@ -20,13 +20,13 @@ def gather_morphology(graph):
         y.append(attrs.get("y", 0.0))
         z.append(attrs.get("z", 0.0))
     return {
-        "dx": torch.tensor(L, dtype=torch.float32).unsqueeze(0),
-        "diam": torch.tensor(diam, dtype=torch.float32).unsqueeze(0),
-        "rhoa": torch.tensor(rhoa, dtype=torch.float32).unsqueeze(0),
-        "cm": torch.tensor(cm, dtype=torch.float32).unsqueeze(0),
-        "x": torch.tensor(x, dtype=torch.float32).unsqueeze(0),
-        "y": torch.tensor(y, dtype=torch.float32).unsqueeze(0),
-        "z": torch.tensor(z, dtype=torch.float32).unsqueeze(0),
+        "dx": torch.tensor(L).unsqueeze(0),
+        "diam": torch.tensor(diam).unsqueeze(0),
+        "rhoa": torch.tensor(rhoa).unsqueeze(0),
+        "cm": torch.tensor(cm).unsqueeze(0),
+        "x": torch.tensor(x).unsqueeze(0),
+        "y": torch.tensor(y).unsqueeze(0),
+        "z": torch.tensor(z).unsqueeze(0),
     }
 
 
@@ -110,6 +110,10 @@ class Tree(Population):
         for key, value in data.items():
             tree.register_buffer(key, value.expand(N, -1))
         tree.set_value("cm", data["cm"])
+        tree[:, tree.find("soma")].label("soma")
+        tree[:, tree.find("axon")].label("axon")
+        tree[:, tree.find("dend")].label("dend")
+        tree[:, tree.find("apic")].label("apic")
         return tree
 
     @classmethod
@@ -135,10 +139,6 @@ class Tree(Population):
 
         graph, _ = neuron_to_axonml_graph(root_sec)
         cell = cls.from_graph(graph, N, integrator, **kwargs)
-        cell[:, cell.find("soma")].label("soma")
-        cell[:, cell.find("axon")].label("axon")
-        cell[:, cell.find("dend")].label("dend")
-        cell[:, cell.find("apic")].label("apic")
         return cell
 
     @classmethod
@@ -166,10 +166,6 @@ class Tree(Population):
 
         graph, _ = read_swc(file_path, d_lambda=d_lambda, freq=freq)
         cell = cls.from_graph(graph, N, integrator, **kwargs)
-        cell[:, cell.find("soma")].label("soma")
-        cell[:, cell.find("axon")].label("axon")
-        cell[:, cell.find("dend")].label("dend")
-        cell[:, cell.find("apic")].label("apic")
         return cell
 
     @classmethod
@@ -197,10 +193,6 @@ class Tree(Population):
 
         graph, _ = read_neurolucida(file_path, d_lambda=d_lambda, freq=freq)
         cell = cls.from_graph(graph, N, integrator, **kwargs)
-        cell[:, cell.find("soma")].label("soma")
-        cell[:, cell.find("axon")].label("axon")
-        cell[:, cell.find("dend")].label("dend")
-        cell[:, cell.find("apic")].label("apic")
         return cell
 
     from_asc = from_neurolucida

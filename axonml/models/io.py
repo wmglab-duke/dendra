@@ -6,6 +6,7 @@ except ImportError:
     NEURON_INSTALLED = False
 
 import re
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
@@ -17,7 +18,7 @@ def is_neuron_installed() -> bool:
     return NEURON_INSTALLED
 
 
-def xyz(seg):
+def xyz(seg, extcell=None):
     sec = seg.sec
     seg_x = seg.x
     x_arr = []
@@ -32,7 +33,17 @@ def xyz(seg):
     x = np.interp(seg_x, arc_l, x_arr)
     y = np.interp(seg_x, arc_l, y_arr)
     z = np.interp(seg_x, arc_l, z_arr)
-    return {"x": x, "y": y, "z": z}
+    dat = {"x": x, "y": y, "z": z}
+    if extcell is not None:
+        xraxial, xc, xg = [], [], []
+        for i in range(extcell):
+            xraxial.append(seg.xraxial[i])
+            xc.append(seg.xc[i])
+            xg.append(seg.xg[i])
+        dat["xraxial"] = xraxial
+        dat["xc"] = xc
+        dat["xg"] = xg
+    return dat
 
 
 def lambda_f(sec, freq_hz):
@@ -48,7 +59,7 @@ def lambda_f(sec, freq_hz):
     -------
     float  -- space constant λ (microns) for `sec` at `freq_hz`
     """
-    if not is_neuron_installed():
+    if not NEURON_INSTALLED:
         raise ImportError("NEURON is not installed. Cannot apply d_lambda.")
 
     from math import pi, sqrt
@@ -88,7 +99,7 @@ def apply_d_lambda(
         d_lambda (float): The d_lambda value to apply.
         freq (float): The frequency for the d_lambda application.
     """
-    if not is_neuron_installed():
+    if not NEURON_INSTALLED:
         raise ImportError("NEURON is not installed. Cannot apply d_lambda.")
 
     h.define_shape()
@@ -100,10 +111,13 @@ def apply_d_lambda(
 
 
 def read_swc(
-    file_path: str, d_lambda=0.1, freq=100.0, data_func=None
+    file_path: str,
+    d_lambda=0.1,
+    freq=100.0,
+    data_func=None,
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read an SWC file and return the contents."""
-    if not is_neuron_installed():
+    if not NEURON_INSTALLED:
         raise ImportError("NEURON is not installed. Cannot read SWC files.")
 
     if data_func is None:
@@ -132,7 +146,7 @@ def read_neurolucida(
     file_path: str, d_lambda=0.1, freq=100.0, data_func=None
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read a Neurolucida file and return the contents."""
-    if not is_neuron_installed():
+    if not NEURON_INSTALLED:
         raise ImportError("NEURON is not installed. Cannot read Neurolucida files.")
 
     if data_func is None:
@@ -211,6 +225,7 @@ def neuron_to_axonml_graph(
     *,
     attach_objects: bool = True,
     data_func=None,
+    extcell=None,
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """
     Build a directed acyclic graph whose nodes are NEURON compartments.
@@ -226,7 +241,7 @@ def neuron_to_axonml_graph(
         segment's ``seg.ri()`` (which returns megohms) and scaled by 1e6.
     """
     if data_func is None:
-        data_func = xyz
+        data_func = partial(xyz, extcell=extcell)
 
     # 0. discover root sections -------------------------------------------------
     if root_sec is None:

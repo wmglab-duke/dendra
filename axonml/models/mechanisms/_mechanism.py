@@ -606,6 +606,7 @@ class Synapse(Mechanism):
 
         Args:
             weight (torch.Tensor): The weight of the synapse.
+            netcon (NetCon): The `NetCon` instance that delivered the spikes.
 
         Returns:
             None

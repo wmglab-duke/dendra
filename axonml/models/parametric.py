@@ -478,7 +478,11 @@ class Parameterized(SimpleParameterized):
 
     def __init__(self, shape, additional_parameters=None, **kwargs):
         super().__init__(**kwargs)
-        self.shape = shape
+        try:
+            self.shape = tuple(int(s) for s in shape)
+        except Exception as e:
+            raise TypeError(f"'shape' must be a tuple of ints, got {shape!r}") from e
+
         self.globals = self.__class__._global.copy()
         self.range = self.__class__._range.copy()
 
@@ -622,11 +626,9 @@ class Parameterized(SimpleParameterized):
         return {name: param for name, param in self.named_parameters()}
 
     def batch(self, batch_size: int):
-        """
-        Returns a new instance of the model with the parameters
-        distributed over the specified batch size.
-        """
         for name in self.__class__._params:
-            p = getattr(self, name)
-            p = p.unsqueeze(0)
-            setattr(self, name, p)
+            p = getattr(self, name)  # nn.Parameter
+            new_p = torch.nn.Parameter(
+                p.detach().unsqueeze(0), requires_grad=p.requires_grad
+            )
+            setattr(self, name, new_p)

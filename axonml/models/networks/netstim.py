@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Iterable, Optional
 
 import torch
 
@@ -18,10 +18,10 @@ class NetStim(torch.nn.Module, Sliceable):
     def __init__(
         self,
         N: int = 1,
-        interval: float | list[float] = 10.0,
-        start: float | list[float] = 0.0,
-        noise: float | list[float] = 0.0,
-        max_spikes: int | list[int] = 1e9,
+        interval: float | Iterable[float] = 10.0,
+        start: float | Iterable[float] = 0.0,
+        noise: float | Iterable[float] = 0.0,
+        max_spikes: int | Iterable[int] = 1e9,
         seed: Optional[int] = None,
     ):
         """
@@ -45,6 +45,8 @@ class NetStim(torch.nn.Module, Sliceable):
         """
         super().__init__()
 
+        self._validate_parameters(N, interval, start, noise, max_spikes)
+
         self.name = "netstim"
 
         # Store parameters
@@ -52,17 +54,14 @@ class NetStim(torch.nn.Module, Sliceable):
 
         self.shape = (N,)
 
-        if noise < 0:
-            noise = 0.0
-        if noise > 1:
-            noise = 1.0
-
-        self.register_buffer("noise", torch.as_tensor(noise, dtype=torch.float32))
-        self.register_buffer("interval", torch.as_tensor(interval, dtype=torch.float32))
-        self.register_buffer("start", torch.as_tensor(start, dtype=torch.float32))
+        self.register_buffer("noise", torch.as_tensor(noise))
+        self.register_buffer("interval", torch.as_tensor(interval))
+        self.register_buffer("start", torch.as_tensor(start))
         self.register_buffer(
             "max_spikes", torch.as_tensor(max_spikes, dtype=torch.long)
         )
+
+        self.noise.clamp_(0.0, 1.0)
 
         self.seed: Optional[int] = seed
 
@@ -72,6 +71,31 @@ class NetStim(torch.nn.Module, Sliceable):
         self.register_buffer("next_spike_time", torch.zeros(self.N))
         self.register_buffer("spike_counts", torch.zeros(self.N, dtype=torch.long))
         self.register_buffer("spikes", torch.zeros(self.N, dtype=torch.bool))
+
+    def _validate_parameters(
+        self,
+        N: int,
+        interval: float | Iterable[float],
+        start: float | Iterable[float],
+        noise: float | Iterable[float],
+        max_spikes: int | Iterable[int],
+    ):
+        if N <= 0:
+            raise ValueError(
+                "Number of independent event generators (N) must be positive."
+            )
+        if isinstance(interval, Iterable) and len(interval) != N:
+            raise ValueError(
+                f"Interval must be a single value or a list of length {N}."
+            )
+        if isinstance(start, Iterable) and len(start) != N:
+            raise ValueError(f"Start must be a single value or a list of length {N}.")
+        if isinstance(noise, Iterable) and len(noise) != N:
+            raise ValueError(f"Noise must be a single value or a list of length {N}.")
+        if isinstance(max_spikes, Iterable) and len(max_spikes) != N:
+            raise ValueError(
+                f"Max spikes must be a single value or a list of length {N}."
+            )
 
     def device(self):
         """
@@ -142,7 +166,7 @@ class NetStim(torch.nn.Module, Sliceable):
         # so that E[next_spike_time] = start + noise * interval.
         self.next_spike_time.copy_(self.start)
 
-        if self.noise > 0:
+        if torch.any(self.noise > 0):
             # Draw from Exp(1 / (noise*interval)) so that mean = noise*interval
             randvals = torch.rand(
                 (self.N,), generator=self._rng, device=device, dtype=dtype
