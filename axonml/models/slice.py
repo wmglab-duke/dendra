@@ -138,7 +138,7 @@ class Slice:
             getattr(mech, var).detach_()
             return
         getattr(self.model, var)[self.index_spec.index] = value
-        getattr(self.model, var).detach_()
+        setattr(self.model, var, self.model.getattr(self.model, var).detach())
 
     def inject(self, waveform):
         self.model.injections.append(

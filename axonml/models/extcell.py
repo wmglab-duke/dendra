@@ -40,13 +40,13 @@ class ExtCell(Axon):
         return x - torch.sum(node_l, dim=1, keepdim=True) / 2
 
 
-def gather_extcell(graph, nlayers=2):
+def gather_extcell(graph, n_layers=2):
     xraxial, xc, xg = [], [], []
     for i in range(len(graph.nodes)):
         attrs = graph.nodes[i]
-        xraxial.append(attrs.get("xraxial", [1e9] * nlayers))
-        xc.append(attrs.get("xc", [0.0] * nlayers))
-        xg.append(attrs.get("xg", [1e9] * nlayers))
+        xraxial.append(attrs.get("xraxial", [1e9] * n_layers))
+        xc.append(attrs.get("xc", [0.0] * n_layers))
+        xg.append(attrs.get("xg", [1e9] * n_layers))
     return {
         "xraxial": torch.tensor(xraxial).unsqueeze(0),
         "xc": torch.tensor(xc).unsqueeze(0),
@@ -73,7 +73,7 @@ class ExtCellTree(Tree):
 
     def load_extcell(self, extcell):
         for key, value in extcell.items():
-            getattr(self, key).copy_(value.expand(self.np, -1))
+            getattr(self, key).copy_(value.expand(self.np, -1, -1))
 
     def load_morphology(self, morphology):
         for key, value in morphology.items():

@@ -299,7 +299,7 @@ class Mechanism(Parameterized):
         ion_conc_o = ion_conc_o.expand_as(v)
         if clone:
             ion_conc_o = ion_conc_o.clone()
-        ion_conc_o[self.key] = ion_conc_u
+        ion_conc_o[..., *self.key] = ion_conc_u
         return ion_conc_o
 
     def put_slice(self, ion_conc_u, ion_conc_o, v, clone=True):
@@ -309,7 +309,7 @@ class Mechanism(Parameterized):
             ion_conc_o = ion_conc_o.clone()
 
         # Apply the update using Ellipsis
-        ion_conc_o[..., self.key] = ion_conc_u
+        ion_conc_o[..., *self.key] = ion_conc_u
         return ion_conc_o
 
     def put_fancy_(self, ion_conc_u, ion_conc_o, v, clone=True):

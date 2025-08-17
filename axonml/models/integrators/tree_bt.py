@@ -7,25 +7,14 @@ import torch
 from .core import Integrator
 from .triton import dhs_bt_solve_cuda
 
-try:
-    import axonml_solvers  # noqa: F401
 
-    AXONML_SOLVERS_AVAILABLE = True
-except ImportError:
-    AXONML_SOLVERS_AVAILABLE = False
-
-
-THREADS_PER_WARP = 32
-
-
+# ---------------- Topology helpers (local, to avoid extra deps) ----------------
 def _topo_parent_depth(G: nx.DiGraph) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
     nodes = list(nx.topological_sort(G))
     idx_of = {n: i for i, n in enumerate(nodes)}
     K = len(nodes)
     parent_idx = torch.full((K,), -1, dtype=torch.int64)
     depth = torch.zeros(K, dtype=torch.int64)
-
-    # BFS from roots to get depth (for multi-root graphs, treat each root)
     roots = [n for n in nodes if G.in_degree(n) == 0]
     q = deque((r, 0) for r in roots)
     seen = set()
@@ -38,7 +27,6 @@ def _topo_parent_depth(G: nx.DiGraph) -> Tuple[torch.Tensor, torch.Tensor, List[
             parent_idx[idx_of[v]] = idx_of[u]
             depth[idx_of[v]] = d + 1
             q.append((v, d + 1))
-
     return parent_idx, depth, nodes
 
 
@@ -62,92 +50,43 @@ def _build_layers(
     )
 
 
-def _harmonic_edge_g_to_parent(
-    val_node: torch.Tensor, parent_idx: torch.Tensor
-) -> torch.Tensor:
-    """
-    Given per-node positive values `val_node` (shape: (B, K, ...)),
-    compute edge value to parent using series-half rule:
-        R_edge = 0.5 * (R_node + R_parent)   then g = 1/R_edge
-    For roots, return zeros.
-    """
-    B, K = val_node.shape[:2]
-
-    parent_clamped = parent_idx.clamp_min(0)
-    # Broadcast to match remaining dims
-    gather_idx = parent_clamped.view(1, -1, *([1] * (val_node.dim() - 2))).expand(
-        B, -1, *val_node.shape[2:]
-    )
-    parent_vals = val_node.gather(1, gather_idx)
-    R_edge = 0.5 * (val_node + parent_vals)  # series half
-    with torch.no_grad():
-        # Avoid div-by-zero – assume large R⇒small g when R==0 is not physical
-        mask_pos = R_edge > 0
-    g = torch.zeros_like(R_edge)
-    g[mask_pos] = 1.0 / R_edge[mask_pos]
-    # zero out roots
-    is_root = parent_idx < 0
-    if is_root.any():
-        root_mask = is_root.view(1, -1, *([1] * (g.dim() - 2))).expand(
-            B, -1, *g.shape[2:]
-        )
-        g[root_mask] = 0.0
-    return g
-
-
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
-    """
-    Copy of helper from implicit._bwd_euler_bt for building RHS of the block system.
-    v_prev : (B,K,M) previous [vi, ve0, ..., ve_{M-1}]
-    c_rad  : (B,K,M) radial capacitances scaled by 1/dt  [cm^2*µF / s], first entry is cm_dt
-    d      : (B,K)   ionic linear term  (gtot*v - itot)*area  (+ intra)
-    xg     : (B,K,M-1) radial conductances (membrane & shells) [S]
-    e_ext  : (B,K) or None  driving field for outermost shell (bath)
+    """RHS for block system (vi, ve0, ve1) following _bwd_euler_bt.
+    Only *capacitive* radial terms appear in the RHS (cm_dt, xc_dt). Resistive xg
+    is handled on the LHS, except for the outer-bath driving term xg[...,1]*e_ext.
     """
     rhs = torch.zeros_like(v_prev)
-    # flows between consecutive shells (including vi↔ve0)
-    v_c = c_rad[:, :, :-1] * (v_prev[:, :, :-1] - v_prev[:, :, 1:])
-    rhs[:, :, :-1] += v_c
-    rhs[:, :, 1:] -= v_c
 
-    # ionic current acts as +d on vi and -d on ve0 (matches vi - ve0 potential diff)
-    rhs[:, :, 0] += d
-    rhs[:, :, 1] -= d
+    # vi <-> ve0 via cm_dt (capacitive)
+    v_c0 = c_rad[..., 0] * (v_prev[..., 0] - v_prev[..., 1])
+    rhs[..., 0] += v_c0
+    rhs[..., 1] -= v_c0
 
+    # ve0 <-> ve1 via xc_dt[...,0] (capacitive)
+    v_c1 = c_rad[..., 1] * (v_prev[..., 1] - v_prev[..., 2])
+    rhs[..., 1] += v_c1
+    rhs[..., 2] -= v_c1
+
+    # ionic linearization: +d on vi, -d on ve0
+    rhs[..., 0] += d
+    rhs[..., 1] -= d
+
+    # outer bath: driving + capacitive carry-over on last shell
     if e_ext is not None:
-        rhs[:, :, -1] += xg[:, :, -1] * e_ext + c_rad[:, :, -1] * v_prev[:, :, -1]
+        rhs[..., 2] += xg[..., 1] * e_ext + c_rad[..., 2] * v_prev[..., 2]
     else:
-        rhs[:, :, -1] += c_rad[:, :, -1] * v_prev[:, :, -1]
+        rhs[..., 2] += c_rad[..., 2] * v_prev[..., 2]
 
     return rhs
 
 
 class _dhs_bt(Integrator):
-    """
-    DHS on trees with *block* unknowns per compartment (vi, ve0, ve1).
-
-    This combines the scalar DHS solver structure with the 3×3 block assembly
-    used by the unbranched block-tridiagonal integrator.
-    """
-
     def __init__(self, model, mech, imem=None, threads=16):
-        assert THREADS_PER_WARP % threads == 0, (
-            f"threads must divide THREADS_PER_WARP ({THREADS_PER_WARP})"
-        )
-        assert threads <= THREADS_PER_WARP, (
-            f"threads must be less than or equal to THREADS_PER_WARP ({THREADS_PER_WARP})"
-        )
+        assert 32 % threads == 0 and threads <= 32
         super().__init__(model, mech, imem)
         self.threads = threads
 
         _, K = model.np, model.nc
-        M = getattr(model, "n_layers", 2) + 1  # include vi
-        if M != 3:
-            raise NotImplementedError(
-                "Current DHS block implementation supports exactly M=3 (vi, ve0, ve1)."
-            )
-
-        # Topology tables
         self.register_buffer("parent_idx", torch.empty(K, dtype=torch.int64))
         self.register_buffer("order", torch.empty(K, dtype=torch.int64))
         self.register_buffer("layer_ptr", torch.empty(1, dtype=torch.int64))
@@ -157,118 +96,122 @@ class _dhs_bt(Integrator):
         # Geometry-dependent buffers
         self.register_buffer("area", torch.empty(1, K))  # (1,K)
         self.register_buffer("cm_dt", torch.empty(1, K))  # (1,K)
-        self.register_buffer("xc_dt", torch.empty(1, K, M - 1))  # (1,K,2)
-        self.register_buffer("xg", torch.empty(1, K, M - 1))  # (1,K,2)
+        self.register_buffer("xc_dt", torch.empty(1, K, 2))  # (1,K,2)
+        self.register_buffer("xg", torch.empty(1, K, 2))  # (1,K,2)
 
-        # Block matrix and edge conductances → parent
-        self.register_buffer("main_blocks", torch.empty(1, K, M, M))
-        self.register_buffer(
-            "g_to_parent", torch.empty(1, K, M)
-        )  # diag per edge (0 at roots)
+        # Per-node radial block (no axial degree baked in)
+        self.register_buffer("main_blocks", torch.empty(1, K, 3, 3))
+        # Per-edge diag g to parent (0:vi, 1:ve0, 2:ve1), 0 for roots
+        self.register_buffer("g_to_parent", torch.empty(1, K, 3))
 
     def initialize(self, model, dt):
         dev, dtyp = model.device(), model.dtype()
         self.to(dev)
 
-        if dev.type == "cpu" and not AXONML_SOLVERS_AVAILABLE:
-            raise ImportError("DHS block solver on CPU requires 'axonml_solvers'.")
-
-        # --- Topology ---
+        # Topology
         parent_idx, depth, node_order = _topo_parent_depth(model.graph)
         order, layer_ptr = _build_layers(depth.to(torch.int32), self.threads)
-
         self.solver_order.copy_(
             torch.as_tensor(node_order, dtype=torch.int64, device=dev)
         )
         self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))
-
         self.parent_idx.copy_(parent_idx.to(device=dev, dtype=torch.int64))
         self.order.copy_(order.to(device=dev, dtype=torch.int64))
-        self.layer_ptr.copy_(layer_ptr.to(device=dev, dtype=torch.int64))
+        self.layer_ptr = layer_ptr.to(device=dev, dtype=torch.int64)
 
         B, K = model.np, model.nc
-        dt_s = dt * 1e-3  # ms→s
+        dt_s = dt * 1e-3  # convert to seconds for capacitance
 
-        # --- Radial / capacitance terms ---
-        # Area (cm²) per compartment is expected to be provided (as in scalar DHS)
-        area = model.area  # (1,K) or (B,K) – broadcast OK
-        if area.dim() == 2 and area.shape[0] == 1:
-            area_cm2 = area
-        else:
-            area_cm2 = area  # assume already broadcasted
+        # Areas: recompute from geometry to guarantee cm² (matches unbranched BT)
+        area_cm2 = model.area
+        self.area = area_cm2
 
-        Cm = 1e-6 * model.cm * area_cm2  # F
-        cm_dt = Cm / dt_s  # F/s
-        xc_dt = 1e-6 * model.xc * area_cm2.unsqueeze(-1) / dt_s  # F/s, (B,K,M-1)
-        xg = model.xg * area_cm2.unsqueeze(-1)  # S, (B,K,M-1)
+        # Capacitances / conductances (per node)
+        cm_dt = 1e-6 * model.cm * area_cm2 / dt_s  # (B,K)   F/s -> S
+        xc_dt = 1e-6 * model.xc * area_cm2.unsqueeze(-1) / dt_s  # (B,K,2) F/s -> S
+        xg = model.xg * area_cm2.unsqueeze(-1)  # (B,K,2) S
 
-        # --- Assemble per-node 3×3 radial block (WITHOUT axial degree terms) ---
-        # Unknowns per node: [vi, ve0, ve1]
-        Bsz = B
-        M = 3
-        main = torch.zeros(Bsz, K, M, M, device=dev, dtype=dtyp)
+        # Zero-area branch points: explicitly zero radial terms (prevents NaNs)
+        area_zero = area_cm2 == 0
+        if area_zero.any():
+            cm_dt = cm_dt.masked_fill(area_zero, 0.0)
+            xc_dt = xc_dt.masked_fill(area_zero.unsqueeze(-1), 0.0)
+            xg = xg.masked_fill(area_zero.unsqueeze(-1), 0.0)
 
-        # Diagonals
-        # vi
+        # Assemble radial 3x3 block
+        main = torch.zeros(B, K, 3, 3, device=dev, dtype=dtyp)
+        # diags
         main[..., 0, 0] = cm_dt
-        # ve0: membrane + shell-0
         main[..., 1, 1] = cm_dt + xc_dt[..., 0] + xg[..., 0]
-        # ve1: shell-0 inward + shell-1 outward
         main[..., 2, 2] = xc_dt[..., 0] + xg[..., 0] + xc_dt[..., 1] + xg[..., 1]
-
-        # Off-diagonals (radial couplings)
-        # vi <-> ve0
+        # off-diags
         main[..., 0, 1] = -cm_dt
         main[..., 1, 0] = -cm_dt
-        # ve0 <-> ve1
         coup01 = -(xc_dt[..., 0] + xg[..., 0])
         main[..., 1, 2] = coup01
         main[..., 2, 1] = coup01
 
-        # --- Edge conductances to parent per component ---
-        # (0) intracellular uses geometry-based axial conductance
-        from .tree import graph_to_parent_and_axial  # reuse tested util
+        # ------------------ Per-edge conductances (to parent) ------------------
+        from .tree import graph_to_parent_and_axial
 
-        parent_idx_t, a_geom_t, _ = graph_to_parent_and_axial(
+        # Intracellular axial (returned in SOLVER order)
+        _, g_intra_solver, _ = graph_to_parent_and_axial(
             model.graph, dtype_axial=dtyp
+        )  # (K,) S
+        g_intra_solver = g_intra_solver.to(device=dev)
+        # Map to MECHANISM order so it matches dx/area/xraxial layout
+        # solver_order[s] == mechanism index of the s-th topo (solver) node
+        g_intra_mech = torch.empty_like(g_intra_solver)
+        g_intra_mech.index_copy_(0, self.solver_order, g_intra_solver)
+
+        # parent_idx is in SOLVER order. Map it to MECHANISM order for geometry gathers.
+        parent_solver = self.parent_idx.to(torch.long)  # (K,) solver index space
+        solver2mech = self.solver_order.to(torch.long)  # maps solver -> mechanism
+        parent_mech = torch.full_like(parent_solver, -1)  # (K,)
+        mask_nr = parent_solver >= 0
+        parent_mech[mask_nr] = solver2mech[
+            parent_solver[mask_nr]
+        ]  # (K,) mechanism index space
+
+        # Masks in mechanism order
+        non_root = (parent_mech >= 0).view(1, -1, 1)  # (1,K,1)
+
+        # Child/parent edge lengths (cm), mechanism order
+        dx_cm = 1e-4 * model.dx  # (B,K)
+        dx_parent = dx_cm.gather(
+            1, parent_mech.clamp_min(0).view(1, -1).expand(B, -1)
+        )  # (B,K)
+
+        # Per-shell resistivities per side (Ω·cm), mechanism order
+        xrax_child = model.xraxial  # (B,K,2)
+        xrax_parent = xrax_child.gather(
+            1, parent_mech.clamp_min(0).view(1, -1, 1).expand(B, -1, 2)
+        )  # (B,K,2)
+
+        # Edge resistance = average of half-segments (Ω); then conductance (S)
+        # R_edge = 0.5 * (xrax_child * dx_child + xrax_parent * dx_parent) * 1e6 [Ω]
+        R_edge = (
+            0.5
+            * (xrax_child * dx_cm.unsqueeze(-1) + xrax_parent * dx_parent.unsqueeze(-1))
+            * 1e6
         )
+        g_layers = torch.zeros_like(R_edge)
+        good = non_root & torch.isfinite(R_edge) & (R_edge > 0)
+        g_layers[good] = 1.0 / R_edge[good]  # (B,K,2) S
 
-        g0_to_parent = a_geom_t.expand(Bsz, -1).to(device=dev, dtype=dtyp)  # (B,K)
+        # Package per-edge g to parent (mechanism order). Reindex to solver order at solve time.
+        g_to_parent = torch.zeros(B, K, 3, device=dev, dtype=dtyp)
+        g_to_parent[..., 0] = g_intra_mech.expand(B, -1)  # intracellular S
+        g_to_parent[..., 1:] = g_layers  # shells S
 
-        # (1,2) extracellular shells – use harmonic mean of per-node axial *resistance* to parent
-        # R_node = xraxial * L (Ω). Try to infer L: prefer model.dx (µm); fall back to area/(π*diam).
-        if hasattr(model, "dx"):
-            L_cm = 1e-4 * model.dx  # (B,K)
-        elif hasattr(model, "diam"):
-            # L = area / (π * diam)
-            diam_cm = 1e-4 * model.diam
-            L_cm = area_cm2 / (torch.pi * diam_cm).clamp_min(1e-12)
-        else:
-            raise AttributeError(
-                "Need model.dx or model.diam to compute extracellular axial resistances."
-            )
-
-        # node-level resistance per layer
-        R_layers = model.xraxial * L_cm.unsqueeze(-1) * 1e6  # Ω, (B,K,2)
-        # Edge conductance to parent
-        g_layers_to_parent = _harmonic_edge_g_to_parent(
-            R_layers, self.parent_idx
-        )  # (B,K,2) after conversion inside
-
-        # Combine to (B,K,3)
-        g_to_parent = torch.zeros(Bsz, K, 3, device=dev, dtype=dtyp)
-        g_to_parent[..., 0] = g0_to_parent
-        g_to_parent[..., 1:] = g_layers_to_parent
-
-        # Save buffers (broadcast B if necessary)
-        self.area = area_cm2
+        # Save
         self.cm_dt = cm_dt
         self.xc_dt = xc_dt
         self.xg = xg
         self.main_blocks = main
         self.g_to_parent = g_to_parent
 
-        # Allocate model state vectors (block unknowns)
+        # State vectors
         if not hasattr(model, "vc"):
             model.register_buffer("vc", torch.zeros(B, K, 3, device=dev, dtype=dtyp))
             model.vc[..., 0] = model.v_init
@@ -282,39 +225,40 @@ class _dhs_bt(Integrator):
         model.vc, model.v = self._step(model.vc, model.v, dt, model.celsius, ve, intra)
 
     def _step(self, vc, v, dt, temp, ve=None, intra=None):
-        # Update mechanisms (ionic) on the *membrane* voltage
+        # Update mechanisms in mV / mA/cm^2 using the model's standard API
         v = self.mech.update_v(v, dt)
         self.mech.advance(v, dt, temp)
-        itot, gtot = self.mech.i(v)  # (B,K)
+        itot, gtot = self.mech.i(v)  # itot: mA/cm^2, gtot: S/cm^2
 
-        # Ionic linear term scaled to currents [A] via area
-        d_lin = (gtot * v - itot) * self.area  # (B,K)
+        # RHS (mechanism order), keep everything in mV/mA/S:
+        # d_lin = (g*v - itot) * area  [mA]
+        d_lin = (gtot * v - itot) * self.area
         if intra is not None:
-            d_lin = d_lin + intra
+            d_lin = d_lin + intra  # assume intra is already in mA
 
-        # Assemble RHS in Mechanism/Model order first
-        c_rad = torch.cat([self.cm_dt.unsqueeze(-1), self.xc_dt], dim=-1)  # (B,K,3)
-        rhs_mech = assemble_rhs(vc, c_rad, d_lin, self.xg, ve)  # (B,K,3)
+        # Capacitive+shell terms (S) operate on mV to yield mA
+        c_rad = torch.cat(
+            [self.cm_dt.unsqueeze(-1), self.xc_dt], dim=-1
+        )  # (B,K,3) in S
+        rhs_mech = assemble_rhs(vc, c_rad, d_lin, self.xg, ve)  # (B,K,3) in mA
 
-        # Reorder *all per-node arrays* into solver order expected by DHS
+        # Reorder into solver order
         idx = self.solver_order
         rhs_ = rhs_mech.index_select(1, idx)  # (B,K,3)
         D_ = self.main_blocks.index_select(1, idx)  # (B,K,3,3)
         G_ = self.g_to_parent.index_select(1, idx)  # (B,K,3)
 
-        # Solve in solver order
+        # Inject membrane gtot (scaled by area) into [vi, ve0] block (solver order)
+        g_mech = gtot * self.area  # (B,K) S (mechanism order)
+        g_ = g_mech.index_select(1, idx)  # (B,K) S (solver order)
 
-        # Incorporate ionic conductance gtot into the per-node 3×3 blocks
-        # (radial membrane term coupling vi ↔ ve0), exactly like unbranched BT:
-        #   B[...,0,0] += g; B[...,1,1] += g; B[...,0,1] -= g; B[...,1,0] -= g
-        g = gtot * self.area  # (B,K)
         Dm = D_.clone()
-        Dm[..., 0, 0] += g
-        Dm[..., 1, 1] += g
-        Dm[..., 0, 1] -= g
-        Dm[..., 1, 0] -= g
+        Dm[..., 0, 0] += g_
+        Dm[..., 1, 1] += g_
+        Dm[..., 0, 1] -= g_
+        Dm[..., 1, 0] -= g_
 
-        # Solve in solver order
+        # Solve in solver order (kernel expects S @ mV = mA)
         X_ = dhs_bt_solve_cuda(
             Dm,
             G_,
@@ -323,10 +267,11 @@ class _dhs_bt(Integrator):
             self.order,
             self.layer_ptr,
             threads=self.threads,
-        )  # (B,K,3) in solver order
+        )  # (B,K,3) in mV
 
-        # Bring solution back to Mechanism order
+        # Map solution back to mechanism order
         inv = self.inv_solver_order
-        vc_out = X_.index_select(1, inv)  # (B,K,3)
-        v_out = vc_out[..., 0] - vc_out[..., 1]  # (B,K)
+        vc_out = X_.index_select(1, inv)  # (B,K,3) mV
+        v_out = vc_out[..., 0] - vc_out[..., 1]  # membrane (mV)
+
         return vc_out, v_out

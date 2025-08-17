@@ -21,6 +21,8 @@ from .const import (
 from .helpers import TF32, allow_tf32, ctx
 from .models import (
     Axon,
+    ExtCell,
+    ExtCellTree,
     Myelinated,
     Population,
     Tree,
@@ -66,6 +68,8 @@ __all__ = [
     "Unmyelinated",
     "Myelinated",
     "Tree",
+    "ExtCell",
+    "ExtCellTree",
     "anisotropic_point",
     "isotropic_point",
     "parametric_efield",
