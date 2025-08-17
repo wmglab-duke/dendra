@@ -110,10 +110,10 @@ class Tree(Population):
         for key, value in data.items():
             tree.register_buffer(key, value.expand(N, -1))
         tree.set_value("cm", data["cm"])
-        tree[:, tree.find("soma")].label("soma")
-        tree[:, tree.find("axon")].label("axon")
-        tree[:, tree.find("dend")].label("dend")
-        tree[:, tree.find("apic")].label("apic")
+        tree.slice("soma").label("soma")
+        tree.slice("axon").label("axon")
+        tree.slice("dend").label("dend")
+        tree.slice("apic").label("apic")
         return tree
 
     @classmethod

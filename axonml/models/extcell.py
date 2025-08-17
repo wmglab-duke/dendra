@@ -87,10 +87,10 @@ class ExtCellTree(Tree):
         tree = cls(N, C, graph, n_layers=n_layers, integrator=integrator, **kwargs)
         tree.load_morphology(morphology)
         tree.load_extcell(extcell)
-        tree[:, tree.find("soma")].label("soma")
-        tree[:, tree.find("axon")].label("axon")
-        tree[:, tree.find("dend")].label("dend")
-        tree[:, tree.find("apic")].label("apic")
+        tree.slice("soma").label("soma")
+        tree.slice("axon").label("axon")
+        tree.slice("dend").label("dend")
+        tree.slice("apic").label("apic")
         return tree
 
     @classmethod
