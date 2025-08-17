@@ -5,7 +5,7 @@ from .integrators import bwd_euler_bt, dhs_bt
 from .tree import Tree, gather_morphology
 
 
-class ExtCell(Axon):
+class ExtCellAxon(Axon):
     def __init__(
         self,
         diameters=[10.0],

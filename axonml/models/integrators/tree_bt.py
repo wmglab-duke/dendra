@@ -208,8 +208,8 @@ class _dhs_bt(Integrator):
         self.cm_dt = cm_dt
         self.xc_dt = xc_dt
         self.xg = xg
-        self.main_blocks = main
-        self.g_to_parent = g_to_parent
+        self.main_blocks = main.index_select(1, self.solver_order)
+        self.g_to_parent = g_to_parent.index_select(1, self.solver_order)
 
         # State vectors
         if not hasattr(model, "vc"):
@@ -245,14 +245,13 @@ class _dhs_bt(Integrator):
         # Reorder into solver order
         idx = self.solver_order
         rhs_ = rhs_mech.index_select(1, idx)  # (B,K,3)
-        D_ = self.main_blocks.index_select(1, idx)  # (B,K,3,3)
-        G_ = self.g_to_parent.index_select(1, idx)  # (B,K,3)
+        G_ = self.g_to_parent
 
         # Inject membrane gtot (scaled by area) into [vi, ve0] block (solver order)
         g_mech = gtot * self.area  # (B,K) S (mechanism order)
         g_ = g_mech.index_select(1, idx)  # (B,K) S (solver order)
 
-        Dm = D_.clone()
+        Dm = self.main_blocks.clone()
         Dm[..., 0, 0] += g_
         Dm[..., 1, 1] += g_
         Dm[..., 0, 1] -= g_
