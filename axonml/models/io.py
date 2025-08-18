@@ -159,7 +159,7 @@ def read_neurolucida(
             importer.instantiate(self)
 
         def __repr__(self):
-            return "NerolucidaCell"
+            return "NeurolucidaCell"
 
     reader = h.Import3d_Neurolucida3()
     reader.quiet = 1
@@ -229,6 +229,10 @@ def neuron_to_axonml_graph(
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """
     Build a directed acyclic graph whose nodes are NEURON compartments.
+    If `data_func` is provided, it will be used to extract compartment data. Otherwise,
+    a default function will be used (extracts xyz coordinates, and extracellular mechanism
+    properties for extcell # of layers if extcell is provided). cm, Ra, L, diam are
+    always extracted.
 
     Edge attributes
     ---------------

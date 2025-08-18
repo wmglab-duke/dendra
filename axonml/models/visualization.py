@@ -977,11 +977,21 @@ def vis_morphology_by_layer(
     ys = [pos[i][1] for i in range(len(parent_idx))]
     layers = layer_of_node.numpy()
 
+    x_span = np.ptp(xs)
+    y_span = np.ptp(ys)
+
+    ratio = x_span / y_span if y_span > 0 else 1
+
+    if ratio > 1:
+        figsize = (8 * ratio, 8)
+    else:
+        figsize = (8, 8 / ratio)
+
     no_ax = False
 
     if ax is None:
         no_ax = True
-        fig, ax = plt.subplots(figsize=(8, 15), dpi=200)
+        fig, ax = plt.subplots(figsize=figsize, dpi=200)
 
     # edges
     for child, p in enumerate(parent_idx):

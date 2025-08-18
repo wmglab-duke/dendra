@@ -1,4 +1,5 @@
 from collections import deque
+from functools import partial
 from typing import List, Tuple
 
 import networkx as nx
@@ -6,6 +7,13 @@ import torch
 
 from .core import Integrator
 from .triton import dhs_bt_solve_cuda
+
+try:
+    import axonml_solvers  # noqa:F401
+
+    AXONML_SOLVERS_AVAILABLE = True
+except ImportError:
+    AXONML_SOLVERS_AVAILABLE = False
 
 
 # ---------------- Topology helpers (local, to avoid extra deps) ----------------
@@ -53,7 +61,7 @@ def _build_layers(
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
     """RHS for block system (vi, ve0, ve1) following _bwd_euler_bt.
     Only *capacitive* radial terms appear in the RHS (cm_dt, xc_dt). Resistive xg
-    is handled on the LHS, except for the outer-bath driving term xg[...,1]*e_ext.
+    is handled on the LHS, except for the outer-bath driving term xg[..., 1] * e_ext.
     """
     rhs = torch.zeros_like(v_prev)
 
@@ -107,6 +115,19 @@ class _dhs_bt(Integrator):
     def initialize(self, model, dt):
         dev, dtyp = model.device(), model.dtype()
         self.to(dev)
+
+        if dev.type == "cpu" and not AXONML_SOLVERS_AVAILABLE:
+            raise ImportError(
+                "DHS_BT integrator requires axonml_solvers package for CPU execution. "
+                "Please install it with `pip install axonml_solvers`."
+            )
+
+        if dev.type == "cuda":
+            self.solve = partial(dhs_bt_solve_cuda, threads=self.threads)
+        elif dev.type == "cpu":
+            self.solve = torch.ops.axonml_solvers.dhs_bt_solve
+        else:
+            raise NotImplementedError(f"Unsupported device type: {dev.type}")
 
         # Topology
         parent_idx, depth, node_order = _topo_parent_depth(model.graph)
@@ -225,7 +246,7 @@ class _dhs_bt(Integrator):
         model.vc, model.v = self._step(model.vc, model.v, dt, model.celsius, ve, intra)
 
     def _step(self, vc, v, dt, temp, ve=None, intra=None):
-        # Update mechanisms in mV / mA/cm^2 using the model's standard API
+        # Update mechanisms in mV / mA/cm^2
         v = self.mech.update_v(v, dt)
         self.mech.advance(v, dt, temp)
         itot, gtot = self.mech.i(v)  # itot: mA/cm^2, gtot: S/cm^2
@@ -258,14 +279,13 @@ class _dhs_bt(Integrator):
         Dm[..., 1, 0] -= g_
 
         # Solve in solver order (kernel expects S @ mV = mA)
-        X_ = dhs_bt_solve_cuda(
+        X_ = self.solve(
             Dm,
             G_,
             rhs_,
             self.parent_idx,
             self.order,
             self.layer_ptr,
-            threads=self.threads,
         )  # (B,K,3) in mV
 
         # Map solution back to mechanism order
