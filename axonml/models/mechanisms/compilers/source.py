@@ -3,8 +3,13 @@ import re
 import textwrap
 from typing import Any, List, Optional
 
-from IPython import get_ipython
-from IPython.core.oinspect import Inspector
+try:
+    from IPython import get_ipython
+    from IPython.core.oinspect import Inspector
+
+    IPYTHON_AVAILABLE = True
+except ImportError:
+    IPYTHON_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +51,9 @@ def safe_source(obj: Any, *, strip_decorators: bool = False) -> str:
         return inspect.getsource(obj)
     except (OSError, TypeError):
         pass
+
+    if not IPYTHON_AVAILABLE:
+        raise RuntimeError("IPython is not available")
 
     # 2. IPython Inspector ---------------------------------------------------
     ip_src = _ipython_source(obj)

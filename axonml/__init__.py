@@ -1,4 +1,3 @@
-import glob
 import os
 import pickle
 import time
@@ -102,8 +101,7 @@ def _cache_cpu_isa_list():
     """
     # Use a standard cache location.
     cache_dir = Path.home() / ".cache" / "axonml"
-    cache_file = cache_dir / "cpu_isa_list"
-    platform_file = cache_dir / "platform.txt"
+    cache_file = cache_dir / f"cpu_isa_list_{torch.__version__}"
 
     def get_valid_vec_isa_list():
         with open(cache_file, "rb") as f:
@@ -112,11 +110,8 @@ def _cache_cpu_isa_list():
     # --- Cache Hit ---
     if cache_file.exists():
         # Check if the PyTorch version matches the one used to create the cache.
-        # This helps invalidate the cache if the user updates PyTorch.
-        content = platform_file.read_text()
-        if content == torch.__version__:
-            torch._inductor.cpu_vec_isa.valid_vec_isa_list = get_valid_vec_isa_list
-            return
+        torch._inductor.cpu_vec_isa.valid_vec_isa_list = get_valid_vec_isa_list
+        return
 
     # --- Cache Miss or Stale Cache ---
     print("AxonML: Performing one-time CPU capability check. This may take a minute...")
@@ -127,7 +122,6 @@ def _cache_cpu_isa_list():
         print(f"AxonML: CPU capability check took {(time.time() - start):.3f}s.")
         with open(cache_file, "wb") as f:
             pickle.dump(valid_vec_isa_list, f)
-        platform_file.write_text(f"{torch.__version__}")
     except Exception as e:
         warnings.warn(
             f"AxonML: CPU capability check failed: {e}. Falling back to default behavior."

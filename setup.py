@@ -21,10 +21,13 @@ setup(
         "torch >= 2.7.0",
         "scipy",
         "h5py",
-        "pytorch_optimizer",
         "tqdm",
         "natsort",
         "dask",
+        "networkx",
+        "pandas",
+        "neuron",
+        "matplotlib",
     ],
     extras_require={
         "doc": [

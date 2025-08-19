@@ -301,7 +301,6 @@ class _dufort_frankel_homogeneous(Integrator):
                 self.area,
                 dt,
                 model.celsius,
-                model.t_ind,
             )
         else:
             model.v, model.v_prev = self.method_intra(
@@ -316,11 +315,10 @@ class _dufort_frankel_homogeneous(Integrator):
                 dt,
                 model.celsius,
                 intra,
-                model.t_ind,
             )
 
     def _step_no_intra(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
+        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if ve is None:
             d2v = ssd_df_no_ve(v, v_prev)
@@ -334,8 +332,7 @@ class _dufort_frankel_homogeneous(Integrator):
         self.mech.itot(v)
 
         if self.smoothing:
-            if (t_ind + 1) % self.smooth_every == 0:
-                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
 
         if self.imem:
             i_cap = (v_new - v_prev) / s1
@@ -344,7 +341,7 @@ class _dufort_frankel_homogeneous(Integrator):
         return v_new, v
 
     def _step_no_intra_conv(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, t_ind: int
+        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = torch.stack([v, v_prev, ve], dim=1)
         d2v = self.ssd(x).squeeze(1)
@@ -356,8 +353,7 @@ class _dufort_frankel_homogeneous(Integrator):
         self.mech.itot(v)
 
         if self.smoothing:
-            if (t_ind + 1) % self.smooth_every == 0:
-                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
 
         if self.imem:
             i_cap = (v_new - v_prev) / s1
@@ -366,7 +362,7 @@ class _dufort_frankel_homogeneous(Integrator):
         return v_new, v
 
     def _step_intra(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
+        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if ve is None:
             d2v = s2 * ssd_df_no_ve(v, v_prev)
@@ -382,8 +378,7 @@ class _dufort_frankel_homogeneous(Integrator):
         self.mech.itot(v)
 
         if self.smoothing:
-            if (t_ind + 1) % self.smooth_every == 0:
-                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
 
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
@@ -392,7 +387,18 @@ class _dufort_frankel_homogeneous(Integrator):
         return v_new, v
 
     def _step_intra_conv(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra, t_ind: int
+        self,
+        v,
+        v_prev,
+        ve,
+        s1,
+        s2,
+        s3,
+        s4,
+        area,
+        dt,
+        temp,
+        intra,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = torch.stack([v, v_prev, ve], dim=1)
         d2v = s2 * self.ssd(x).squeeze(1)
@@ -406,8 +412,7 @@ class _dufort_frankel_homogeneous(Integrator):
         self.mech.itot(v)
 
         if self.smoothing:
-            if (t_ind + 1) % self.smooth_every == 0:
-                v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
 
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
@@ -521,15 +526,29 @@ class _dufort_frankel(Integrator):
         # The step logic is simplified as we no longer branch on `conv`
         if intra is None:
             model.v, model.v_prev = self._step_no_intra(
-                model.v, model.v_prev, ve, dt, model.celsius, model.t_ind
+                model.v,
+                model.v_prev,
+                ve,
+                dt,
+                model.celsius,
             )
         else:
             model.v, model.v_prev = self._step_intra(
-                model.v, model.v_prev, ve, dt, model.celsius, intra, model.t_ind
+                model.v,
+                model.v_prev,
+                ve,
+                dt,
+                model.celsius,
+                intra,
             )
 
     def _step_no_intra(
-        self, v, v_prev, ve, dt, temp, t_ind: int
+        self,
+        v,
+        v_prev,
+        ve,
+        dt,
+        temp,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         v_padded = F.pad(v, (1, 1), "reflect")
 
@@ -564,7 +583,7 @@ class _dufort_frankel(Integrator):
 
         self.mech.itot(v)
 
-        if self.smoothing and (t_ind + 1) % self.smooth_every == 0:
+        if self.smoothing:
             # unsqueeze/squeeze needed for Conv1d which expects (N, C, L)
             v_new = self.beta * v_new + (1 - self.beta) * self.filter(
                 v_new.unsqueeze(1)
@@ -577,7 +596,13 @@ class _dufort_frankel(Integrator):
         return v_new, v
 
     def _step_intra(
-        self, v, v_prev, ve, dt, temp, intra, t_ind: int
+        self,
+        v,
+        v_prev,
+        ve,
+        dt,
+        temp,
+        intra,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # This method is identical to _step_no_intra, with one change:
         # The stimulus current `intra` is added to the numerator.
@@ -610,7 +635,7 @@ class _dufort_frankel(Integrator):
 
         self.mech.itot(v)
 
-        if self.smoothing and (t_ind + 1) % self.smooth_every == 0:
+        if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * self.filter(
                 v_new.unsqueeze(1)
             ).squeeze(1)

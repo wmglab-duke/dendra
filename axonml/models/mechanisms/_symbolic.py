@@ -22,8 +22,7 @@ numerical_template = """
 def {k}(self, v):
     i = self.{k}(v)
     i_d = self.{k}(v + 1e-3)
-    i_b = self.{k}(v - 1e-3)
-    return i, (i_d - i_b) / (2 * 1e-3)
+    return i, (i_d - i) / (1e-3)
 """
 
 
