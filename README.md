@@ -16,16 +16,16 @@ Fast, scalable, and differentiable neural simulator with support for extracellul
 `axonml` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).
 
 ### Python dependencies
-`axonml` requires Python 3.10+ and PyTorch 2.7+. For GPU support, CUDA 12.8+ is required for best performance.
+`axonml` requires Python 3.10+ and PyTorch 2.7+. For GPU support, CUDA 12.9+ is required for best performance.
 
 ## 🖥️ Installation
 
 > [!TIP]
 > We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.12`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
 
-1. Install PyTorch (+ CUDA 12.8 if you're running on GPU).
+1. Install PyTorch (+ CUDA 12.9 if you're running on GPU).
 ```bash
-> pip install torch --index-url https://download.pytorch.org/whl/cu128
+> pip install torch --index-url https://download.pytorch.org/whl/cu129
 ```
 
 2. Clone this repository.
