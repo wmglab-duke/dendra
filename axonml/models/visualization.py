@@ -850,7 +850,7 @@ def vis_morphology_by_layer(
     *,
     threads: int = 32,
     palette_name: str = "parula",  # any qualitative palette works
-    bar_fraction: float = 0.01,  # colour-bar width (fraction of plot)
+    bar_fraction: float = 0.02,  # colour-bar width (fraction of plot)
     ax=None,
 ):
     """
