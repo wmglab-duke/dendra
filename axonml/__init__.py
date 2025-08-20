@@ -30,8 +30,10 @@ from .models import (
     Unmyelinated,
 )
 from .models.fields import (
+    EfieldInterpolate3D,
     PreComputedInterpolate1D,
     anisotropic_point,
+    efield_interpolate_3d,
     isotropic_point,
     parametric_efield,
     precomputed_interpolate_1d,
@@ -78,6 +80,8 @@ __all__ = [
     "parametric_efield",
     "PreComputedInterpolate1D",
     "precomputed_interpolate_1d",
+    "EfieldInterpolate3D",
+    "efield_interpolate_3d",
     "euler",
     "eulerv1",
     "rk1",

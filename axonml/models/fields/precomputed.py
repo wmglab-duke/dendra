@@ -311,6 +311,6 @@ class EfieldInterpolate3D(torch.nn.Module):
     def forward(self, model):
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
-        G = model.G
+        G = model.graph
         efield = self._interp(x, y, z)
         return calculate_quasipotentials_batched_coords(G, x, y, z, efield)
