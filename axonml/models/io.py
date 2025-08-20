@@ -1,9 +1,7 @@
 try:
-    from neuron import h, nrn
-
-    NEURON_INSTALLED = True
+    from neuron import h, nrn  # type: ignore
 except ImportError:
-    NEURON_INSTALLED = False
+    pass
 
 import re
 from functools import partial
@@ -12,10 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import networkx as nx
 import numpy as np
 
-
-def is_neuron_installed() -> bool:
-    """Check if NEURON is installed."""
-    return NEURON_INSTALLED
+from ..helpers import requires_packages
 
 
 def xyz(seg, extcell=None):
@@ -46,6 +41,7 @@ def xyz(seg, extcell=None):
     return dat
 
 
+@requires_packages("neuron")
 def lambda_f(sec, freq_hz):
     """
     Python clone of the HOC function `lambda_f()`.
@@ -59,9 +55,6 @@ def lambda_f(sec, freq_hz):
     -------
     float  -- space constant λ (microns) for `sec` at `freq_hz`
     """
-    if not NEURON_INSTALLED:
-        raise ImportError("NEURON is not installed. Cannot apply d_lambda.")
-
     from math import pi, sqrt
 
     # make sure diam/3‑D info are up to date
@@ -88,20 +81,16 @@ def lambda_f(sec, freq_hz):
     return sec.L / lam
 
 
-def apply_d_lambda(
-    all_sections: List["nrn.Section"], d_lambda: float = 0.1, freq: float = 100.0
-):
+@requires_packages("neuron")
+def apply_d_lambda(all_sections: List, d_lambda: float = 0.1, freq: float = 100.0):
     """
     Apply a d_lambda value to all sections in the NEURON model.
 
     Parameters:
-        all_sections (List[h.Section]): List of all sections in the NEURON model.
+        all_sections (List[nrn.Section]): List of all sections in the NEURON model.
         d_lambda (float): The d_lambda value to apply.
         freq (float): The frequency for the d_lambda application.
     """
-    if not NEURON_INSTALLED:
-        raise ImportError("NEURON is not installed. Cannot apply d_lambda.")
-
     h.define_shape()
 
     for sec in all_sections:
@@ -110,6 +99,7 @@ def apply_d_lambda(
         sec.nseg = max(1, nseg)  # safeguard: nseg must be ≥ 1
 
 
+@requires_packages("neuron")
 def read_swc(
     file_path: str,
     d_lambda=0.1,
@@ -117,8 +107,6 @@ def read_swc(
     data_func=None,
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read an SWC file and return the contents."""
-    if not NEURON_INSTALLED:
-        raise ImportError("NEURON is not installed. Cannot read SWC files.")
 
     if data_func is None:
         data_func = xyz
@@ -142,12 +130,11 @@ def read_swc(
     return neuron_to_axonml_graph(root_sec=cell.all[0], data_func=data_func)
 
 
+@requires_packages("neuron")
 def read_neurolucida(
     file_path: str, d_lambda=0.1, freq=100.0, data_func=None
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read a Neurolucida file and return the contents."""
-    if not NEURON_INSTALLED:
-        raise ImportError("NEURON is not installed. Cannot read Neurolucida files.")
 
     if data_func is None:
         data_func = xyz
@@ -220,6 +207,7 @@ def r_ohm(parent_seg, child_seg):
         return child_seg.ri() * 1e6
 
 
+@requires_packages("neuron")
 def neuron_to_axonml_graph(
     root_sec: Optional["nrn.Section"] = None,
     *,

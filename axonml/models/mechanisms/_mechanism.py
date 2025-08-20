@@ -465,8 +465,10 @@ class Mechanism(Parameterized):
     @staticmethod
     def EXPLICIT(*args):
         """
-        Marks the mechanism as independent of voltage for the given methods.
-        This means that the method does not depend on the membrane potential `v`.
+        Marks the mechanism as independent of voltage for the given currents.
+        This means that the current does not depend on the membrane potential `v`.
+        Instead of contributing a conductance to the LHS, it is handled entirely
+        on the RHS.
         """
         Mechanism._explicit_declarations.append(args)
 
@@ -545,14 +547,12 @@ class VoltageProcess(Mechanism):
     A VoltageProcess is a Mechanism that updates the membrane potential `v`.
     VoltageProcesses implement the `update_v` method, which is called during the
     simulation to update the membrane potential based on the mechanism's dynamics.
-    It is a no-op by default, but can be overridden in subclasses to implement
-    specific behavior.
+    It must be overridden in subclasses to implement specific behavior.
     """
 
     def update_v(self, v, dt):
         """
-        A no-op update for voltage processes.
-        This method can be overridden in subclasses to implement specific behavior.
+        This method must be overridden in subclasses to implement specific behavior.
         Any modifications to the membrane potential should not be in-place,
         but rather return a new tensor.
 
@@ -578,7 +578,7 @@ class PointProcess(Mechanism):
     Implementing a Mechanism as PointProcess simply instructs AxonML to scale
     the currents and conductances by the area of the relevant compartments to translate
     them to densities. As such, unlike in NEURON, they cannot be inserted at branchpoints
-    (which have 0 area).
+    (which have 0 area), and doing so will produce a numerical error.
     """
 
     pass

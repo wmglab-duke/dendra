@@ -1,5 +1,6 @@
 import colorsys
 import random
+import warnings
 from typing import Dict
 
 import matplotlib as mpl
@@ -10,6 +11,13 @@ import torch
 from matplotlib import cm
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 from scipy.interpolate import griddata
+
+try:
+    import plotly.graph_objects as go
+except ImportError:
+    pass
+
+from ..helpers import requires_packages
 
 
 def _register_parula(name="parula", N=256):
@@ -437,9 +445,8 @@ def vis_2d(cell, idx=0, view="y", node_scale=8, dpi=200):
     plt.show()
 
 
+@requires_packages("plotly")
 def vis_3d(cell, idx=0, node_scale: float = 10.0, height=800.0, width=None) -> None:
-    import plotly.graph_objects as go
-
     """
     Plots a 3D NetworkX graph interactively using Plotly.
     Correctly aligns hover text with plotted nodes.
@@ -576,9 +583,8 @@ def vis_3d(cell, idx=0, node_scale: float = 10.0, height=800.0, width=None) -> N
     fig.show()
 
 
+@requires_packages("plotly")
 def vis_voltage_3d(x, y, z, voltage, height=800, width=None):
-    import plotly.graph_objects as go
-
     # 1. Create the 3D scatter plot object
     #    The configuration is done inside the 'go.Scatter3d' call.
     trace = go.Scatter3d(
@@ -843,6 +849,292 @@ def vis_threshold_mollweide_2d(
             every_deg=30,
         )
     return ax
+
+
+# Optional: use Matplotlib colormaps if you pass a Matplotlib name
+def _mpl_to_plotly_colorscale(cmap_name_or_obj="viridis", n=256):
+    try:
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+
+        cm_obj = cm.get_cmap(cmap_name_or_obj)
+        return [[i / (n - 1), mcolors.to_hex(cm_obj(i / (n - 1)))] for i in range(n)]
+    except Exception:
+        # Fallback to a sensible Plotly scale if matplotlib isn't available
+        return "Viridis"
+
+
+@requires_packages("plotly")
+def _spherical_cap_patch(
+    x0,
+    y0,
+    z0,
+    *,
+    R=1.0,
+    alpha_deg=6.0,
+    eps=1e-3,
+    n=64,
+    color="white",
+    outline=True,
+    outline_color="black",
+):
+    """
+    Build a small spherical-cap Mesh3d centered at (x0,y0,z0) on the sphere.
+    - alpha_deg: geodesic radius of the cap, in degrees
+    - eps: lifts the cap slightly above the sphere (avoid z-fighting)
+    - n: polygon resolution (number of segments around the rim)
+    """
+    # unit normal at the cap center
+    nvec = np.array([x0, y0, z0], dtype=float)
+    nvec /= np.linalg.norm(nvec)
+
+    # build an orthonormal basis (u,v) in the tangent plane
+    a = np.array([0.0, 0.0, 1.0]) if abs(nvec[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    u = np.cross(a, nvec)
+    u /= np.linalg.norm(u)
+    v = np.cross(nvec, u)
+
+    alpha = np.deg2rad(alpha_deg)
+    Rcap = R * (1.0 + eps)
+
+    # center vertex
+    center = Rcap * nvec
+
+    # ring vertices at geodesic radius alpha around the center
+    t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    ring = np.cos(alpha) * nvec[None, :] + np.sin(alpha) * (
+        np.cos(t)[:, None] * u[None, :] + np.sin(t)[:, None] * v[None, :]
+    )
+    ring = Rcap * ring  # scale to lifted radius
+
+    # assemble vertices
+    verts = np.vstack([center, ring])  # shape (n+1, 3)
+    x, y, z = verts[:, 0], verts[:, 1], verts[:, 2]
+
+    # triangle fan from center -> ring
+    tri_i = np.zeros(n, dtype=int)
+    tri_j = np.arange(1, n + 1, dtype=int)
+    tri_k = np.where(tri_j < n, tri_j + 1, 1)
+
+    traces = [
+        go.Mesh3d(
+            x=x,
+            y=y,
+            z=z,
+            i=tri_i,
+            j=tri_j,
+            k=tri_k,
+            color=color,
+            opacity=0.9,
+            flatshading=True,
+            hoverinfo="skip",
+            showscale=False,
+            lighting=dict(ambient=0.8, specular=0.2, roughness=1.0),
+            name="min patch",
+        )
+    ]
+
+    if outline:
+        # close the loop by repeating the first ring point
+        x_ring = np.r_[ring[:, 0], ring[0, 0]]
+        y_ring = np.r_[ring[:, 1], ring[0, 1]]
+        z_ring = np.r_[ring[:, 2], ring[0, 2]]
+        traces.append(
+            go.Scatter3d(
+                x=x_ring,
+                y=y_ring,
+                z=z_ring,
+                mode="lines",
+                line=dict(width=4, color=outline_color),
+                hoverinfo="skip",
+                name=None,
+                showlegend=False,
+            )
+        )
+    return traces
+
+
+@requires_packages("plotly")
+def vis_threshold_3d(
+    phi,
+    theta,
+    thr,
+    *,
+    # ───────── data options ─────────
+    angles_in_degrees=False,
+    flip_polar=True,
+    azimuth_offset=-np.pi / 2,
+    offset_in_degrees=False,
+    normalize_to_min=False,
+    mark_min=False,
+    # ───────── interpolation ────────
+    grid_res_deg=2.0,
+    interp_method="cubic",
+    # ───────── appearance ───────────
+    cmap="viridis",
+    vmin=None,
+    vmax=None,
+    ax=None,  # ignored (Plotly), kept for signature parity
+):
+    """
+    3D spherical visualization of thresholds using Plotly.
+
+    Parameters
+    ----------
+    Same as vis_threshold_mollweide_2d, but returns a Plotly Figure.
+    """
+    if ax is not None:
+        warnings.warn("`ax` is ignored for Plotly output; returning a Plotly Figure.")
+
+    # ──────────────────────────────────────────────────────────────
+    # 0.  Input conversion & optional normalisation
+    # ──────────────────────────────────────────────────────────────
+    phi = np.asarray(phi, dtype=float)
+    theta = np.asarray(theta, dtype=float)
+    thr = np.asarray(thr, dtype=float)
+
+    if angles_in_degrees:
+        phi = np.deg2rad(phi)
+        theta = np.deg2rad(theta)
+
+    if normalize_to_min:
+        m = np.nanmin(thr)
+        thr = thr / m if m != 0 else thr
+
+    n_pts = len(phi)
+
+    # Optional polar flip (θ → π − θ)
+    if flip_polar:
+        theta = np.pi - theta
+
+    # Optional azimuthal rotation
+    if azimuth_offset is not None:
+        dλ = np.deg2rad(azimuth_offset) if offset_in_degrees else float(azimuth_offset)
+        phi = phi + dλ
+
+    # ──────────────────────────────────────────────────────────────
+    # 1.  Convert to lon/lat (radians)
+    # ──────────────────────────────────────────────────────────────
+    lon = (phi + np.pi) % (2 * np.pi) - np.pi  # wrap to [-π, π]
+    lat = 0.5 * np.pi - theta  # latitude
+
+    # ──────────────────────────────────────────────────────────────
+    # 2.  Periodic extension in longitude (seam-free interpolation)
+    # ──────────────────────────────────────────────────────────────
+    lon_aug = np.concatenate([lon, lon + 2 * np.pi, lon - 2 * np.pi])
+    lat_aug = np.concatenate([lat, lat, lat])
+    thr_aug = np.concatenate([thr, thr, thr])
+
+    # ──────────────────────────────────────────────────────────────
+    # 3.  Regular lon/lat grid
+    # ──────────────────────────────────────────────────────────────
+    d = np.deg2rad(grid_res_deg)
+    lon_grid = np.arange(-np.pi, np.pi + 1e-12, d)
+    lat_grid = np.arange(-0.5 * np.pi, 0.5 * np.pi + 1e-12, d)
+    Lon, Lat = np.meshgrid(lon_grid, lat_grid)  # shapes (n_lat, n_lon)
+
+    # ──────────────────────────────────────────────────────────────
+    # 4.  Interpolate thresholds onto the lon/lat grid
+    # ──────────────────────────────────────────────────────────────
+    Thr = griddata((lon_aug, lat_aug), thr_aug, (Lon, Lat), method=interp_method)
+    Thr = np.ma.masked_invalid(Thr)
+
+    thr_grid = np.asarray(Thr, dtype=float)
+    if isinstance(Thr, np.ma.MaskedArray):
+        thr_grid = Thr.filled(np.nan)
+
+    # ──────────────────────────────────────────────────────────────
+    # 5.  Map spherical → Cartesian (unit sphere)
+    # ──────────────────────────────────────────────────────────────
+    R = 1.0
+    X = R * np.cos(Lat) * np.cos(Lon)
+    Y = R * np.cos(Lat) * np.sin(Lon)
+    Z = R * np.sin(Lat)
+
+    # ──────────────────────────────────────────────────────────────
+    # 6.  Colorscale handling
+    # ──────────────────────────────────────────────────────────────
+    colorscale = _mpl_to_plotly_colorscale(cmap)
+
+    # Default color limits
+    cmin = np.min(Thr) if vmin is None else vmin
+    cmax = np.max(Thr) if vmax is None else vmax
+
+    # ──────────────────────────────────────────────────────────────
+    # 7.  Build Plotly surface
+    # ──────────────────────────────────────────────────────────────
+    lon_deg = np.rad2deg(Lon)
+    lat_deg = np.rad2deg(Lat)
+
+    flat = np.column_stack((lon_deg.ravel(), lat_deg.ravel(), thr_grid.ravel()))
+    hover_text = np.array(
+        [
+            f"lon={ld:.1f}°, lat={lt:.1f}°<br>thr={tv:.3g}" if np.isfinite(tv) else ""
+            for ld, lt, tv in flat
+        ],
+        dtype=object,
+    ).reshape(thr_grid.shape)
+
+    surf = go.Surface(
+        x=X,
+        y=Y,
+        z=Z,
+        surfacecolor=thr_grid,
+        text=hover_text,  # ← use preformatted labels
+        hoverinfo="text",  # ← tell Plotly to show `text`
+        cmin=cmin,
+        cmax=cmax,
+        colorscale=colorscale,
+        colorbar=dict(
+            title=(
+                "Threshold |E| (V/m)" if not normalize_to_min else "Threshold |E| / min"
+            ),
+            len=0.75,
+        ),
+        showscale=True,
+    )
+    fig = go.Figure(data=[surf])
+
+    # Optional: mark the global minimum (from original sample points only)
+    if mark_min and np.isfinite(thr[:n_pts]).any():
+        min_idx = np.nanargmin(thr[:n_pts])
+        lon_min = lon[min_idx]
+        lat_min = lat[min_idx]
+        x0 = R * np.cos(lat_min) * np.cos(lon_min)
+        y0 = R * np.cos(lat_min) * np.sin(lon_min)
+        z0 = R * np.sin(lat_min)
+        cap_traces = _spherical_cap_patch(
+            x0,
+            y0,
+            z0,
+            R=R,
+            alpha_deg=6.0,  # size of the patch on the sphere (try 4–10°)
+            eps=1.5e-3,  # lift; increase to 3e-3 if you still see z-fighting
+            n=64,
+            color="white",
+            outline=True,
+            outline_color="black",
+        )
+        for tr in cap_traces:
+            fig.add_trace(tr)
+
+    # ──────────────────────────────────────────────────────────────
+    # 8.  Layout: equal aspect, clean axes, nice camera
+    # ──────────────────────────────────────────────────────────────
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+            aspectmode="data",
+        ),
+        margin=dict(l=0, r=0, t=30, b=0),
+    )
+
+    # A gentle default camera to see the sphere well
+    fig.update_layout(scene_camera=dict(eye=dict(x=1.4, y=1.4, z=0.9)))
+
+    return fig
 
 
 def vis_morphology_by_layer(

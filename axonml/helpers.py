@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import importlib
 import logging
 import os
 import time
@@ -82,6 +83,24 @@ COMPILE_MODE = ContextVar("COMPILE_MODE", "default")
 
 def numpify(x):
     return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+
+
+# --- function decorator to check if package available ---
+def requires_packages(*pkgs: str):
+    missing = [p for p in pkgs if importlib.util.find_spec(p) is None]
+
+    def decorator(func):
+        if not missing:
+            return func
+
+        @functools.wraps(func)
+        def _missing(*args, **kwargs):
+            names = "', '".join(missing)
+            raise ImportError(f"{func.__name__} requires '{names}'.")
+
+        return _missing
+
+    return decorator
 
 
 # --- pytorch functions --
