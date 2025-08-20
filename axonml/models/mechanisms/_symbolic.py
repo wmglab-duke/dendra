@@ -58,6 +58,8 @@ def build_unfactorable_equation(current):
 
 
 def build_current_eq(mechanism, k, assign=False):
+    if hasattr(mechanism, f"{k}_with_conductance"):
+        return getattr(mechanism, f"{k}_with_conductance"), True
     try:
         gtot, irev = factorize_linear_in_v(mechanism.__class__, method=k)
         code = build_implicit_equation(k, gtot, irev, assign)

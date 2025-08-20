@@ -288,7 +288,7 @@ class Mechanism(Parameterized):
             assign = k in self._save
             eq, factorable = build_current_eq(self, k, assign=assign)
             setattr(self, f"{k}_with_g", MethodType(eq, self))
-            self.factorable = factorable
+            setattr(getattr(self.__class__, k), "factorable", factorable)
 
         self.populate()
 
