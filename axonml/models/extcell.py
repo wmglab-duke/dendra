@@ -15,6 +15,8 @@ class ExtCellAxon(Axon):
         n_layers=2,
         integrator=None,
     ):
+        if n_layers != 2:
+            raise ValueError("Only 2 layers are currently supported.")
         if integrator is None:
             integrator = bwd_euler_bt()
         super().__init__(diameters, n_comp, celsius, v_init, integrator)
@@ -56,11 +58,11 @@ def gather_extcell(graph, n_layers=2):
 
 class ExtCellTree(Tree):
     def __init__(self, N, C, graph, n_layers=2, integrator=None, **kwargs):
+        if n_layers != 2:
+            raise ValueError("Only 2 layers are currently supported.")
         if integrator is None:
             integrator = dhs_bt()
         super().__init__(N, C, graph, integrator, **kwargs)
-        if n_layers != 2:
-            raise ValueError("Only 2 layers are currently supported.")
         self.n_layers = n_layers
         self._register_buffers()
 

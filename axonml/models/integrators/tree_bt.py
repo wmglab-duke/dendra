@@ -65,25 +65,18 @@ def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
     """
     rhs = torch.zeros_like(v_prev)
 
-    # vi <-> ve0 via cm_dt (capacitive)
-    v_c0 = c_rad[..., 0] * (v_prev[..., 0] - v_prev[..., 1])
-    rhs[..., 0] += v_c0
-    rhs[..., 1] -= v_c0
+    v_c = c_rad[..., :-1] * (v_prev[..., :-1] - v_prev[..., 1:])
 
-    # ve0 <-> ve1 via xc_dt[...,0] (capacitive)
-    v_c1 = c_rad[..., 1] * (v_prev[..., 1] - v_prev[..., 2])
-    rhs[..., 1] += v_c1
-    rhs[..., 2] -= v_c1
+    rhs[..., :-1] += v_c
+    rhs[..., 1:] -= v_c
 
-    # ionic linearization: +d on vi, -d on ve0
     rhs[..., 0] += d
     rhs[..., 1] -= d
 
-    # outer bath: driving + capacitive carry-over on last shell
     if e_ext is not None:
-        rhs[..., 2] += xg[..., 1] * e_ext + c_rad[..., 2] * v_prev[..., 2]
+        rhs[..., -1] += xg[..., -1] * e_ext + c_rad[..., -1] * v_prev[..., -1]
     else:
-        rhs[..., 2] += c_rad[..., 2] * v_prev[..., 2]
+        rhs[..., -1] += c_rad[..., -1] * v_prev[..., -1]
 
     return rhs
 

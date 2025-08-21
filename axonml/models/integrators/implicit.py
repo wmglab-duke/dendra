@@ -437,17 +437,17 @@ class _bwd_euler_bt(torch.nn.Module):
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
     rhs = torch.zeros_like(v_prev)
 
-    v_c = c_rad[:, :, :-1] * (v_prev[:, :, :-1] - v_prev[:, :, 1:])
+    v_c = c_rad[..., :-1] * (v_prev[..., :-1] - v_prev[..., 1:])
 
-    rhs[:, :, :-1] += v_c
-    rhs[:, :, 1:] -= v_c
+    rhs[..., :-1] += v_c
+    rhs[..., 1:] -= v_c
 
-    rhs[:, :, 0] += d
-    rhs[:, :, 1] -= d
+    rhs[..., 0] += d
+    rhs[..., 1] -= d
 
     if e_ext is not None:
-        rhs[:, :, -1] += xg * e_ext + c_rad[:, :, -1] * v_prev[:, :, -1]
+        rhs[..., -1] += xg * e_ext + c_rad[..., -1] * v_prev[..., -1]
     else:
-        rhs[:, :, -1] += c_rad[:, :, -1] * v_prev[:, :, -1]
+        rhs[..., -1] += c_rad[..., -1] * v_prev[..., -1]
 
     return rhs
