@@ -54,9 +54,9 @@ class NetStim(torch.nn.Module, Sliceable):
 
         self.shape = (N,)
 
-        self.register_buffer("noise", torch.as_tensor(float(noise)))
-        self.register_buffer("interval", torch.as_tensor(float(interval)))
-        self.register_buffer("start", torch.as_tensor(float(start)))
+        self.register_buffer("noise", torch.as_tensor(noise).float())
+        self.register_buffer("interval", torch.as_tensor(interval).float())
+        self.register_buffer("start", torch.as_tensor(start).float())
         self.register_buffer(
             "max_spikes", torch.as_tensor(max_spikes, dtype=torch.long)
         )

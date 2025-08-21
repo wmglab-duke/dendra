@@ -14,8 +14,8 @@ def update_active(has_spiked, vm_new, threshold) -> Tuple[torch.Tensor, torch.Te
 class NetCon(torch.nn.Module):
     """
     `NetCon`s are responsible for managing all synaptic connections.
-    They are generated automatically by instances of axonml.Net
-    when `build()` is called.
+    They are generated automatically by instances of axonml.Network
+    when `net.build()` is called.
     """
 
     def __init__(

@@ -12,6 +12,7 @@ import torch
 from axonml.helpers import DEBUG, PADE
 from axonml.models.parametric import Parameterized
 
+from ._kinetic import kinetic_to_derivatives
 from ._mechanism import classproperty
 from .ode import integrate2c
 
@@ -95,6 +96,12 @@ def add_underscore_to_lhs(code_string: str) -> str:
     except (SyntaxError, ValueError) as e:
         print(f"Error processing code string: {e}")
         return code_string
+
+
+def add_underscore_to_states(expression: str, states: List[str]) -> str:
+    for state in states:
+        expression = re.sub(rf"\b{state}\b", f"_{state}", expression)
+    return expression
 
 
 # -- function parsers & code emitters --
@@ -323,17 +330,21 @@ def match_derivative_to_states(derivative, states):
     return matched
 
 
-def build_integration_func(states, assigned, derivative, method, pade=False):
+def build_integration_func(
+    states, assigned, derivative, method, eliminate=None, pade=False
+):
     """
     Build the integration function for the states and assigned variables.
     """
     if method == "cnexp":
-        return build_cnexp(states, assigned, derivative, pade=pade)
+        return build_cnexp(states, assigned, derivative, eliminate=eliminate, pade=pade)
     else:
-        raise ValueError(f"Unknown integration method: {method}")
+        raise ValueError(
+            f"Unknown integration method: {method}. Valid methods are: cnexp."
+        )
 
 
-def build_cnexp(states, assigned, derivative, pade=False):
+def build_cnexp(states, assigned, derivative, eliminate=None, pade=False):
     for state in states:
         if state in assigned:
             raise ValueError(
@@ -343,6 +354,11 @@ def build_cnexp(states, assigned, derivative, pade=False):
     solves = []
     returns = []
 
+    if eliminate is None:
+        eliminate = {}
+    else:
+        eliminate = {s: expression for s, expression in eliminate}
+
     if PADE.value == -1:
         use_pade_approx = pade
     else:
@@ -350,15 +366,18 @@ def build_cnexp(states, assigned, derivative, pade=False):
 
     derivative = match_derivative_to_states(derivative, states)
     for state in states:
-        solves.append(
-            convert(
-                derivative[state],
-                state,
-                states,
-                assigned,
-                use_pade_approx=use_pade_approx,
+        if state not in eliminate:
+            solves.append(
+                convert(
+                    derivative[state],
+                    state,
+                    states,
+                    assigned,
+                    use_pade_approx=use_pade_approx,
+                )
             )
-        )
+        else:
+            solves.append(add_underscore_to_states(eliminate[state], states))
         returns.append(f"'{state}' : _{state}")
     solves = "\n    ".join(solves)
     returns = f"{{{', '.join(returns)}}}"
@@ -383,6 +402,9 @@ class State(Parameterized):
     _derivative = set()
     _derivative_declarations = []
 
+    _kinetic = set()
+    _kinetic_declarations = []
+
     _assigned = set()
     _assigned_declarations = []
 
@@ -403,6 +425,7 @@ class State(Parameterized):
         new_buffers = set()
         new_derivative = set()
         new_assigned = set()
+        new_kinetic = set()
 
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
@@ -413,6 +436,8 @@ class State(Parameterized):
                 new_buffers.update(base._state_buffers)
             if "_derivative" in base.__dict__:
                 new_derivative.update(base._derivative)
+            if "_kinetic" in base.__dict__:
+                new_kinetic.update(base._kinetic)
             if "_assigned" in base.__dict__:
                 new_assigned.update(base._assigned)
 
@@ -431,6 +456,11 @@ class State(Parameterized):
                 new_derivative.update(d_list)
             State._derivative_declarations = []
 
+        if State._kinetic_declarations:
+            for k_list in State._kinetic_declarations:
+                new_kinetic.update(k_list)
+            State._kinetic_declarations = []
+
         if State._assigned_declarations:
             for a_list in State._assigned_declarations:
                 new_assigned.update(a_list)
@@ -439,6 +469,7 @@ class State(Parameterized):
         cls._state = list(new_state)
         cls._state_buffers = new_buffers
         cls._derivative = new_derivative
+        cls._kinetic = new_kinetic
         cls._assigned = list(new_assigned)
 
     def __init__(
@@ -456,6 +487,15 @@ class State(Parameterized):
         self.register_buffer("celsius", celsius)
         self.register_buffer("diam", diameters)
 
+        _derivative = list(self._derivative)
+
+        cinfo = None
+
+        if self._kinetic:
+            _kinetic = list(self._kinetic)
+            deriv_list, _, cinfo = kinetic_to_derivatives(self._state, _kinetic)
+            _derivative.extend(deriv_list)
+
         for b in self._state_buffers:
             self.register_buffer(b, torch.tensor(0.0))
 
@@ -463,7 +503,7 @@ class State(Parameterized):
         self.include_q10_in_comp_graph = kwargs.get("include_q10_in_comp_graph", False)
 
         ifunc = build_integration_func(
-            self._state, self._assigned, self._derivative, self.method, pade
+            self._state, self._assigned, _derivative, self.method, cinfo, pade
         )
         setattr(self, "solve", MethodType(ifunc, self))
 
@@ -512,6 +552,10 @@ class State(Parameterized):
     @staticmethod
     def DERIVATIVE(*args):
         State._derivative_declarations.append(args)
+
+    @staticmethod
+    def KINETIC(*args):
+        State._kinetic_declarations.append(args)
 
     @staticmethod
     def ASSIGNED(*args):
