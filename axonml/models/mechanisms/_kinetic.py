@@ -2,8 +2,6 @@
 import re
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
-# ---------- parsing utilities ----------
-
 _SPEC_RE = re.compile(r"^\s*(?:(\d+)\s*)?([A-Za-z_]\w*)\s*$")
 
 
@@ -77,12 +75,12 @@ def _mass_action_factor(stoich: Dict[str, int]) -> str:
     return " * ".join(terms) if terms else "1"
 
 
-# ---------- CONSERVE handling ----------
+# ------------------------- CONSERVE parsing/apply -------------------------
 
 
 class ConserveSpec(NamedTuple):
     weights: Dict[str, int]  # e.g., {'C':1, 'O':1, 'I':1}
-    const: str  # e.g., '1' or 'Total'
+    const: str  # e.g., '1' or 'Tot'
 
 
 def _parse_conserve(line: str, states: List[str]) -> ConserveSpec:
@@ -104,21 +102,24 @@ def _parse_conserve(line: str, states: List[str]) -> ConserveSpec:
 
 def _apply_conserve_to_derivs(
     states: List[str],
-    deriv_map: Dict[str, str],  # X -> RHS(X) string (no outer parens)
+    amount_map: Dict[str, str],  # X -> (amount/time) RHS (pre-divide by compartment)
+    comp: Dict[str, str],  # X -> compartment expr (or "1")
     cons: ConserveSpec,
     eliminate_var: Optional[str] = None,
 ) -> Tuple[Dict[str, str], str]:
     """
-    Enforce sum_i w_i x_i' = 0 by setting one x_j' = -(1/w_j) * sum_{i≠j} w_i x_i'.
-    Returns (new_deriv_map, eliminated_var_name).
+    Enforce   sum_i w_i * (amount_i) = 0,   where amount_i = comp_i * x_i'
+    by solving for the eliminated state's amount term.
+
+    amount_j = -(1/w_j) * sum_{i≠j} w_i * amount_i
     """
-    involved = [s for s in states if s in cons.weights and cons.weights[s] != 0]
+    involved = [s for s in states if cons.weights.get(s, 0) != 0]
     if not involved:
         raise ValueError("CONSERVE has no overlap with states")
-    elim = eliminate_var or involved[-1]  # default: last by 'states' order
-    if elim not in cons.weights or cons.weights[elim] == 0:
+    elim = eliminate_var or involved[-1]
+    if cons.weights.get(elim, 0) == 0:
         raise ValueError(
-            f"Chosen eliminate='{elim}' not in CONSERVE variables (or weight=0)"
+            f"Chosen eliminate='{elim}' not in CONSERVE vars (or weight=0)"
         )
 
     wj = cons.weights[elim]
@@ -127,107 +128,158 @@ def _apply_conserve_to_derivs(
         if X == elim:
             continue
         wi = cons.weights[X]
-        rhsX = deriv_map.get(X, "0")
-        parts.append(f"{wi}*({rhsX})")
-    elim_rhs = f"-({' + '.join(parts)})/{wj}" if parts else "0"
+        parts.append(f"{wi}*({amount_map.get(X, '0')})")
+    rhs_amount_elim = f"-({' + '.join(parts)})/({wj})" if parts else "0"
 
-    new_map = dict(deriv_map)
-    new_map[elim] = elim_rhs
+    new_map = dict(amount_map)
+    new_map[elim] = rhs_amount_elim
     return new_map, elim
 
 
-def make_conserve_enforcer(cons: ConserveSpec, eliminate_var: Optional[str] = None):
+def make_conserve_enforcer(
+    cons: ConserveSpec, comp: Dict[str, str], eliminate_var: Optional[str] = None
+):
     """
-    Build a runtime enforcer for sum_i w_i x_i = const:
-      x_elim = (const - sum_{i≠elim} w_i x_i) / w_elim
-    Returns (elim_var, algebraic_assignment_str, enforcer(mapping, env)).
+    Build a runtime enforcer for:  sum_i w_i * comp_i * x_i = const
+      x_elim = (const - sum_{i≠elim} w_i*comp_i*x_i) / (w_elim*comp_elim)
+    Returns (elim_var, algebraic_assignment_str)
     """
-    weights = dict(cons.weights)
-    names = [k for k, w in weights.items() if w != 0]
+    names = [k for k, w in cons.weights.items() if w != 0]
     if not names:
         raise ValueError("All weights are zero in CONSERVE")
-
     elim_var = eliminate_var or names[-1]
-    if elim_var not in weights or weights[elim_var] == 0:
+    if cons.weights.get(elim_var, 0) == 0:
         raise ValueError(f"Eliminated variable '{elim_var}' missing or has zero weight")
 
+    wj = cons.weights[elim_var]
+    cj = comp.get(elim_var, "1")
     others = [n for n in names if n != elim_var]
     if others:
         sum_others = " + ".join(
-            [f"{weights[n]}*{n}" if weights[n] != 1 else f"{n}" for n in others]
+            [f"{cons.weights[n]}*({comp.get(n, '1')})*{n}" for n in others]
         )
         num = f"({cons.const} - ({sum_others}))"
     else:
         num = f"({cons.const})"
-    denom = f"{weights[elim_var]}"
+    denom = f"{wj}*({cj})"
     assign_str = f"{elim_var} = {num} / ({denom})"
-
-    def enforcer(mapping: Dict[str, object], env: Optional[Dict[str, object]] = None):
-        scope = {}
-        scope.update(mapping)
-        if env:
-            scope.update(env)
-        const_val = eval(cons.const, {}, scope)  # trusted strings only
-        total = None
-        for n in others:
-            wi = weights[n]
-            term = mapping[n]
-            total = wi * term if total is None else total + wi * term
-        numer = const_val if total is None else const_val - total
-        mapping[elim_var] = numer / weights[elim_var]
-
-    return elim_var, assign_str, enforcer
+    return elim_var, assign_str
 
 
-# ---------- main: reactions + CONSERVE-in-kinetic ----------
+# --------------------------- COMPARTMENT parsing ---------------------------
+
+
+def _parse_compartment(line: str, states: List[str]) -> Dict[str, str]:
+    """
+    Parse 'COMPARTMENT vol {a b c}' or 'COMPARTMENT i, vol[i] {a}'.
+    Returns mapping {state: vol_expr}. Later statements override earlier ones.
+    """
+    s = line.strip()
+    if not s.upper().startswith("COMPARTMENT"):
+        raise ValueError("Not a COMPARTMENT line")
+    s = s[len("COMPARTMENT") :].strip()
+    lb = s.find("{")
+    rb = s.rfind("}")
+    if lb < 0 or rb < 0 or rb < lb:
+        raise ValueError("COMPARTMENT must specify states inside braces {...}")
+    states_str = s[lb + 1 : rb].strip()
+    vol_part = s[:lb].strip()
+    if "," in vol_part:
+        vol_expr = vol_part.split(",", 1)[1].strip()
+    else:
+        vol_expr = vol_part
+    if not vol_expr:
+        raise ValueError("Empty volume expression in COMPARTMENT")
+    names = [t for t in states_str.replace(",", " ").split() if t]
+    known = set(states)
+    out = {}
+    for n in names:
+        if n not in known:
+            raise ValueError(f"Unknown state '{n}' in COMPARTMENT")
+        out[n] = vol_expr
+    return out
+
+
+# ----------------------- main: reactions/flux + CONSERVE + COMP -----------
 
 
 def kinetic_to_derivatives(
     states: List[str],
     kinetic: List[str],
-    eliminate: Optional[Dict[int, str]] = None,  # map CONSERVE-index -> var name
+    eliminate: Optional[Dict[int, str]] = None,  # map CONSERVE-index -> eliminated var
 ):
     """
-    Parse NMODL-style KINETIC lines (reactions + CONSERVE) into derivative statements.
-
-    Args
-    ----
-    states    : list of species names.
-    kinetic   : list of lines; each is either a reaction starting with '~'
-                or a CONSERVE line ('CONSERVE ...' or 'conserve ...').
-    eliminate : optional dict telling which variable to eliminate for each CONSERVE,
-                keyed by the order that CONSERVE lines appear in `kinetic` (0-based).
+    Parse NMODL-style KINETIC lines (reactions '~', explicit flux '<<',
+    COMPARTMENT, CONSERVE) into:
+      - concentration ODEs,
+      - amount (pre-divide) RHS,
+      - compartment map,
+      - CONSERVE algebraic assignments,
+      - an ordered 'flux_log' describing each reaction/flux.
 
     Returns
     -------
-    deriv_list    : ["X' = (...)", ...] in the order of `states`.
-    deriv_map     : {X: "(...)"}
-    conserve_info : list of (elim_var, algebraic_assignment_str) in the same order
-                    as CONSERVE lines encountered.
+    deriv_list    : ["X' = (...)", ...]  (concentration ODEs)
+    deriv_map     : {X: "(amount/time RHS BEFORE dividing by compartment)"}
+    conserve_info : [(elim_var, "elim_var = ...")]
+    comp_map      : {X: "compartment_expr_or_1"}
+    flux_log      : [ { ... }, ... ]   (see below)
     """
     known = set(states)
-    rhs_terms: Dict[str, List[str]] = {s: [] for s in states}
+    rhs_amount_terms: Dict[str, List[str]] = {s: [] for s in states}
+    comp_map: Dict[str, str] = {s: "1" for s in states}
     conserve_specs: List[ConserveSpec] = []
-    conserve_order: List[int] = []  # indices in original kinetic list (optional info)
+    flux_log: List[Dict[str, str]] = []
 
-    for idx, raw in enumerate(kinetic):
-        s = raw.strip()
-        if not s:
+    for raw in kinetic:
+        line = raw.strip()
+        if not line:
             continue
 
-        # CONSERVE line?
-        if s.upper().startswith("CONSERVE"):
-            cons = _parse_conserve(s, states)
-            conserve_specs.append(cons)
-            conserve_order.append(idx)
+        U = line.upper()
+        if U.startswith("CONSERVE"):
+            conserve_specs.append(_parse_conserve(line, states))
+            continue
+        if U.startswith("COMPARTMENT"):
+            comp_map.update(_parse_compartment(line, states))
+            continue
+        if U.startswith("LONGITUDINAL_DIFFUSION"):
+            # Axial coupling (ignored here; contributes to global sparse solve, not local ODE).
             continue
 
-        # Reaction line must start with '~'
-        if not s.startswith("~"):
-            raise ValueError(f"Expected '~' reaction or 'CONSERVE' line: {raw!r}")
-        s = s[1:].strip()
+        # Reaction/flux lines must start with '~'
+        if not line.startswith("~"):
+            raise ValueError(
+                f"Expected '~' reaction/flux, 'COMPARTMENT', or 'CONSERVE': {raw!r}"
+            )
+        s = line[1:].strip()
 
-        # Choose arrow
+        # Explicit flux: "~ X << expr"  (exactly one target, with optional integer coeff)
+        if "<<" in s and ("->" not in s and "<->" not in s):
+            lhs, flux = s.split("<<", 1)
+            lhs = lhs.strip()
+            flux = flux.strip()
+            sto = _parse_side(lhs, known)
+            if not sto or len(sto) != 1:
+                raise ValueError(
+                    f"Flux '<<' must target exactly one state; got '{lhs}'"
+                )
+            ((X, coeff),) = sto.items()
+            term = f"{coeff}*({flux})"
+            rhs_amount_terms[X].append(term)
+            flux_log.append(
+                {
+                    "kind": "explicit_flux",
+                    "raw": raw,
+                    "target": X,
+                    "coeff": str(coeff),
+                    "flux": flux,
+                    "amount_term": term,
+                }
+            )
+            continue
+
+        # Mass-action reaction: "<->" or "->"
         if "<->" in s:
             arrow = "<->"
         elif "->" in s:
@@ -256,38 +308,58 @@ def kinetic_to_derivatives(
 
         fac_f = _mass_action_factor(nu_L)
         v_f = f"({kf})" if fac_f == "1" else f"({kf}*{fac_f})"
-        v_b = None
         if kb is not None:
             fac_b = _mass_action_factor(nu_R)
             v_b = f"({kb})" if fac_b == "1" else f"({kb}*{fac_b})"
+        else:
+            v_b = "0"
 
+        # Bookkeeping log for this reaction
+        flux_log.append(
+            {
+                "kind": "reaction",
+                "raw": raw,
+                "lhs": nu_L,
+                "rhs": nu_R,
+                "kf": kf,
+                "kb": (kb if kb is not None else "0"),
+                "f_flux": v_f,
+                "b_flux": v_b,
+            }
+        )
+
+        # Amount-balance contributions: dX/dt (amount) += (nu_R[X]-nu_L[X]) * (f_flux - b_flux)
+        contrib = f"(({v_f}) - ({v_b}))"
         for X in states:
             d = nu_R.get(X, 0) - nu_L.get(X, 0)
-            if d == 0:
-                continue
-            if v_b is None:
-                rhs_terms[X].append(f"{d}*{v_f}")
-            else:
-                rhs_terms[X].append(f"{d}*({v_f} - {v_b})")
+            if d != 0:
+                rhs_amount_terms[X].append(f"{d}*{contrib}")
 
-    deriv_map: Dict[str, str] = {
-        X: (" + ".join(rhs_terms[X]) if rhs_terms[X] else "0") for X in states
+    # Unscaled amount map
+    amount_map: Dict[str, str] = {
+        X: (" + ".join(rhs_amount_terms[X]) if rhs_amount_terms[X] else "0")
+        for X in states
     }
 
+    # Apply CONSERVE constraints in amount form
     conserve_info: List[Tuple[str, str]] = []
     for j, cons in enumerate(conserve_specs):
         elim_var = (eliminate or {}).get(j, None)
-        deriv_map, eliminated = _apply_conserve_to_derivs(
-            states, deriv_map, cons, eliminate_var=elim_var
+        amount_map, eliminated = _apply_conserve_to_derivs(
+            states, amount_map, comp_map, cons, eliminate_var=elim_var
         )
-        elim2, assign_str, _ = make_conserve_enforcer(
-            cons, eliminate_var=elim_var or eliminated
+        elim2, assign_str = make_conserve_enforcer(
+            cons, comp_map, eliminate_var=elim_var or eliminated
         )
         conserve_info.append((elim2, assign_str))
 
+    # Divide by compartments to get concentration ODEs
+    deriv_map: Dict[str, str] = {
+        X: f"({amount_map[X]})/({comp_map.get(X, '1')})" for X in states
+    }
     deriv_list = [f"{X}' = ({deriv_map[X]})" for X in states]
 
     if not conserve_info:
         conserve_info = None
 
-    return deriv_list, deriv_map, conserve_info
+    return deriv_list, amount_map, conserve_info, comp_map, flux_log

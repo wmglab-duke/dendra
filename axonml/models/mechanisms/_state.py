@@ -493,7 +493,7 @@ class State(Parameterized):
 
         if self._kinetic:
             _kinetic = list(self._kinetic)
-            deriv_list, _, cinfo = kinetic_to_derivatives(self._state, _kinetic)
+            deriv_list, _, cinfo, _, _ = kinetic_to_derivatives(self._state, _kinetic)
             _derivative.extend(deriv_list)
 
         for b in self._state_buffers:
