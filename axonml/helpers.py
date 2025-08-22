@@ -81,6 +81,12 @@ JIT = ContextVar("JIT", 1)
 COMPILE_MODE = ContextVar("COMPILE_MODE", "default")
 
 
+def set_jit_enabled(enable=True):
+    global JIT
+    JIT.value = int(enable)
+    return
+
+
 def numpify(x):
     return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
 

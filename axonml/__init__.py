@@ -2,7 +2,6 @@ import os
 import pickle
 import time
 import warnings
-from importlib.resources import files
 from pathlib import Path
 
 import torch
@@ -17,7 +16,7 @@ from .const import (
     E,
     R,
 )
-from .helpers import TF32, allow_tf32, ctx
+from .helpers import TF32, allow_tf32, ctx, set_jit_enabled
 from .models import (
     Axon,
     ExtCellAxon,
@@ -63,6 +62,7 @@ __all__ = [
     "R",
     "FARADAY",
     "ctx",
+    "set_jit_enabled",
     "callbacks",
     "mod",
     "load_mechanisms",
