@@ -3,6 +3,7 @@ import math
 import warnings
 from typing import Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -14,18 +15,19 @@ try:
 except ImportError:
     AXONML_SOLVERS_AVAILABLE = False
 
-from .core import Integrator, SCIntegrator
+from .core import Integrator
 from .tridiag import pcr_solve_t
 from .triton import thomas_solve_cuda_bt, thomas_solve_cuda_t
 
 
-class _bwd_euler_sc(SCIntegrator):
+class _bwd_euler_sc(Integrator):
     """
     Implicit Euler method.
     """
 
     def __init__(self, model, mech, imem=None):
         super().__init__(model, mech, imem)
+        self.register_buffer("cmdt", torch.tensor(0.0))
 
     def initialize(self, model, dt):
         self.dt = float(dt)
@@ -198,19 +200,19 @@ class _bwd_euler_bt(torch.nn.Module):
     Implicit Euler method for block tridiagonal system.
     """
 
+    v_vars = ["v", "vc"]
+
     def __init__(self, model, mech, method="triton", **kwargs):
         if not AXONML_SOLVERS_AVAILABLE:
             logging.warning(
                 "Only CUDA-based solvers available, using triton Thomas solver. "
                 "CPU models will not work. Install axonml_solvers for CPU support."
             )
-            method = "triton"
         super().__init__()
 
         self.mech = mech
 
-        B, K, M = model.n_ax, model.n_comp, model.n_layers
-        M = M + 1
+        B, K, M = np.prod(model.shape[:-1]), model.n_comp, model.n_layers + 1
         self.B = B
         self.K = K
         self.M = M
@@ -227,18 +229,13 @@ class _bwd_euler_bt(torch.nn.Module):
 
         self.register_buffer("i_membrane", torch.zeros(1))
 
-        model.register_buffer("v", torch.zeros(B, K))
         model.register_buffer("vc", torch.zeros(B, K, M))
+
         model.vc[..., 0] = model.v_init
         model.v[:] = model.v_init
 
         self.initialized = False
         self.dt = None
-
-        if method == "triton":
-            self._solve = thomas_solve_cuda_bt
-        else:
-            raise ValueError(f"Unknown method: {method}")
 
     @classmethod
     def shape(cls, np, nc):
@@ -286,8 +283,8 @@ class _bwd_euler_bt(torch.nn.Module):
         B, K, M = self.B, self.K, self.M
         dev, dtyp = model.device(), model.dtype()
 
-        L = model.dx * 1e-4  # μm → cm
-        diam = model.diam * 1e-4  # μm → cm
+        L = model.dx.expand(B, K) * 1e-4  # μm → cm
+        diam = model.diam.expand(B, K) * 1e-4  # μm → cm
         radius = 0.5 * diam  # cm
         area = torch.pi * diam * L  # cm² for each segment
 
@@ -299,7 +296,7 @@ class _bwd_euler_bt(torch.nn.Module):
         gi = 1.0 / ri  # S
         gi = F.pad(gi, (1, 1))  # (B,K+1)
 
-        raxial = model.xraxial * L.unsqueeze(-1) * 1e6  # Ω
+        raxial = model.xraxial.expand(B, K, 2) * L.unsqueeze(-1) * 1e6  # Ω
         raxial = 0.5 * (raxial[:, :-1, :] + raxial[:, 1:, :])
         gaxial = 1.0 / raxial  # S, (B,K-1,M-1)
         zeros_G = torch.zeros((B, 1, M - 1), device=dev, dtype=dtyp)
@@ -314,10 +311,11 @@ class _bwd_euler_bt(torch.nn.Module):
         # ------------------------------------------------------------------
         # Radial (membrane + shell) elements
         # ------------------------------------------------------------------
-        cm_dt = model.cm * 1e-6 * area / dt  # F/s, (B,K)
+        area_cm2 = model.area
+        cm_dt = model.cm * 1e-6 * area_cm2 / dt  # F/s, (B,K)
 
-        xc_dt = model.xc * 1e-6 * area.unsqueeze(-1) / dt  # F/s, (B,K,M-1)
-        xg = model.xg * area.unsqueeze(-1)  # S  , (B,K,M-1)
+        xc_dt = model.xc * 1e-6 * area_cm2.unsqueeze(-1) / dt  # F/s, (B,K,M-1)
+        xg = model.xg * area_cm2.unsqueeze(-1)  # S  , (B,K,M-1)
 
         # ------------------------------------------------------------------
         # Allocate blocks
@@ -394,10 +392,14 @@ class _bwd_euler_bt(torch.nn.Module):
         self.lower = lower
         self.upper = upper
 
+        self.base_shape = tuple(list(model.shape) + [self.M])
+
         self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
-        model.vc, model.v = self._step(model.vc, model.v, dt, model.celsius, ve, intra)
+        model.vc, model.v = self._step(
+            model.vc.view(-1, self.K, 3), model.v, dt, model.celsius, ve, intra
+        )
 
     def _step(self, vc, v, dt, temp, ve=None, intra=None) -> Tuple[Tensor, Tensor]:
         xg = self.xg[..., -1]
@@ -411,11 +413,11 @@ class _bwd_euler_bt(torch.nn.Module):
         itot, gtot = self.mech.i(v)
 
         # linearized ionic conductances & reversal
-        gtot = gtot * self.area
+        gtot = gtot.view(-1, self.K) * self.area
 
-        itot = itot * self.area  # (B, K)
+        itot = itot.view(-1, self.K) * self.area  # (B, K)
 
-        d = gtot * v - itot
+        d = gtot * v.view(-1, self.K) - itot
 
         if intra is not None:
             d = d + intra
@@ -429,7 +431,9 @@ class _bwd_euler_bt(torch.nn.Module):
         D = assemble_rhs(vc, self.c_rad, d, xg, ve)
 
         # solve tridiagonal system
-        vc = self._solve(self.lower, B, self.upper, D)  # (B, K)
+        vc = self._solve(self.lower, B, self.upper, D).reshape(
+            self.base_shape
+        )  # (B, K)
         v = vc[..., 0] - vc[..., 1]  # v = vi - ve0
         return vc, v
 

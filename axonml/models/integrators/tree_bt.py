@@ -3,6 +3,7 @@ from functools import partial
 from typing import List, Tuple
 
 import networkx as nx
+import numpy as np
 import torch
 
 from .core import Integrator
@@ -82,12 +83,17 @@ def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
 
 
 class _dhs_bt(Integrator):
+    v_vars = ["v", "vc"]
+
     def __init__(self, model, mech, imem=None, threads=16):
         assert 32 % threads == 0 and threads <= 32
         super().__init__(model, mech, imem)
         self.threads = threads
 
         _, K = model.np, model.nc
+
+        self.K = K
+
         self.register_buffer("parent_idx", torch.empty(K, dtype=torch.int64))
         self.register_buffer("order", torch.empty(K, dtype=torch.int64))
         self.register_buffer("layer_ptr", torch.empty(1, dtype=torch.int64))
@@ -133,7 +139,8 @@ class _dhs_bt(Integrator):
         self.order.copy_(order.to(device=dev, dtype=torch.int64))
         self.layer_ptr = layer_ptr.to(device=dev, dtype=torch.int64)
 
-        B, K = model.np, model.nc
+        B = np.prod(model.shape[:-1])
+        K = self.K
         dt_s = dt * 1e-3  # convert to seconds for capacitance
 
         # Areas: recompute from geometry to guarantee cm² (matches unbranched BT)
@@ -141,7 +148,9 @@ class _dhs_bt(Integrator):
         self.area = area_cm2
 
         # Capacitances / conductances (per node)
-        cm_dt = 1e-6 * model.cm * area_cm2 / dt_s  # (B,K)   F/s -> S
+        cm_dt = (
+            (1e-6 * model.cm * area_cm2 / dt_s).expand(model.shape).view(B, self.K)
+        )  # (B,K)   F/s -> S
         xc_dt = 1e-6 * model.xc * area_cm2.unsqueeze(-1) / dt_s  # (B,K,2) F/s -> S
         xg = model.xg * area_cm2.unsqueeze(-1)  # (B,K,2) S
 
@@ -191,13 +200,13 @@ class _dhs_bt(Integrator):
         non_root = (parent_mech >= 0).view(1, -1, 1)  # (1,K,1)
 
         # Child/parent edge lengths (cm), mechanism order
-        dx_cm = 1e-4 * model.dx  # (B,K)
+        dx_cm = 1e-4 * model.dx.expand(B, K)  # (B,K)
         dx_parent = dx_cm.gather(
             1, parent_mech.clamp_min(0).view(1, -1).expand(B, -1)
         )  # (B,K)
 
         # Per-shell resistivities per side (Ω·cm), mechanism order
-        xrax_child = model.xraxial  # (B,K,2)
+        xrax_child = model.xraxial.expand(B, K, 2)  # (B,K,2)
         xrax_parent = xrax_child.gather(
             1, parent_mech.clamp_min(0).view(1, -1, 1).expand(B, -1, 2)
         )  # (B,K,2)
@@ -225,18 +234,26 @@ class _dhs_bt(Integrator):
         self.main_blocks = main.index_select(1, self.solver_order)
         self.g_to_parent = g_to_parent.index_select(1, self.solver_order)
 
+        self.base_shape = tuple(list(model.shape) + [3])
+
         # State vectors
         if not hasattr(model, "vc"):
-            model.register_buffer("vc", torch.zeros(B, K, 3, device=dev, dtype=dtyp))
+            model.register_buffer(
+                "vc", torch.zeros(*model.shape, 3, device=dev, dtype=dtyp)
+            )
             model.vc[..., 0] = model.v_init
             model.vc[..., 1] = 0.0
             model.vc[..., 2] = 0.0
         if not hasattr(model, "v"):
-            model.register_buffer("v", torch.zeros(B, K, device=dev, dtype=dtyp))
+            model.register_buffer(
+                "v", torch.zeros(*model.shape, device=dev, dtype=dtyp)
+            )
             model.v[:] = model.v_init
 
     def step(self, model, dt, ve=None, intra=None):
-        model.vc, model.v = self._step(model.vc, model.v, dt, model.celsius, ve, intra)
+        model.vc, model.v = self._step(
+            model.vc.view(-1, self.K, 3), model.v, dt, model.celsius, ve, intra
+        )
 
     def _step(self, vc, v, dt, temp, ve=None, intra=None):
         # Update mechanisms in mV / mA/cm^2
@@ -246,7 +263,7 @@ class _dhs_bt(Integrator):
 
         # RHS (mechanism order), keep everything in mV/mA/S:
         # d_lin = (g*v - itot) * area  [mA]
-        d_lin = (gtot * v - itot) * self.area
+        d_lin = (gtot * v - itot).view(-1, self.K) * self.area
         if intra is not None:
             d_lin = d_lin + intra  # assume intra is already in mA
 
@@ -262,10 +279,10 @@ class _dhs_bt(Integrator):
         G_ = self.g_to_parent
 
         # Inject membrane gtot (scaled by area) into [vi, ve0] block (solver order)
-        g_mech = gtot * self.area  # (B,K) S (mechanism order)
+        g_mech = gtot.view(-1, self.K) * self.area  # (B,K) S (mechanism order)
         g_ = g_mech.index_select(1, idx)  # (B,K) S (solver order)
 
-        Dm = self.main_blocks.clone()
+        Dm = self.main_blocks.clone()  # (B, K, 3, 3)
         Dm[..., 0, 0] += g_
         Dm[..., 1, 1] += g_
         Dm[..., 0, 1] -= g_
@@ -283,7 +300,14 @@ class _dhs_bt(Integrator):
 
         # Map solution back to mechanism order
         inv = self.inv_solver_order
-        vc_out = X_.index_select(1, inv)  # (B,K,3) mV
+        vc_out = X_.index_select(1, inv).reshape(self.base_shape)  # (B,K,3) mV
         v_out = vc_out[..., 0] - vc_out[..., 1]  # membrane (mV)
 
         return vc_out, v_out
+
+    def init_v(self, model):
+        model.vc.zero_()
+        model.vc[..., 0] = model.v_init
+        model.v[:] = model.v_init
+        model.vc = model.vc.detach()
+        model.v = model.v.detach()

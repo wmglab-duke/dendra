@@ -161,6 +161,7 @@ class Mechanism(Parameterized):
         celsius,
         diameters,
         shape,
+        shape_f,
         key=None,
         is_composable=False,
         additional_parameters=None,
@@ -170,7 +171,9 @@ class Mechanism(Parameterized):
         """
         Initialize the Mechanism with parameters and declarations.
         """
-        super().__init__(shape, additional_parameters=additional_parameters, **kwargs)
+        super().__init__(
+            shape, shape_f, additional_parameters=additional_parameters, **kwargs
+        )
         if name is None:
             name = self.__class__._name or self.__class__.__name__
 
@@ -204,11 +207,11 @@ class Mechanism(Parameterized):
             batch_shape = tensor.shape[: -self.base_ndim]
             flat_tensor = tensor.reshape(*batch_shape, -1)
 
-            what = what.expand_as(self.key)
-
             # Expand key to match batch dimensions for scatter
             # e.g., key shape [N] -> [B1, B2, ..., N]
             expanded_key = self.key.expand(*batch_shape, -1)
+
+            what = what.expand_as(expanded_key)
 
             # what should have shape [B1, B2, ..., N]
             flat_tensor.scatter_add_(-1, expanded_key, what)
@@ -254,6 +257,7 @@ class Mechanism(Parameterized):
                 self.get(diameters),
                 key,
                 shape,
+                shape_f,
                 additional_parameters=additional_parameters,
                 **kwargs,
             )

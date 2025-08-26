@@ -125,7 +125,7 @@ class Population(P, Sliceable):
     P.GLOBAL(celsius=37.0)
 
     def __init__(self, N: int, C: int, integrator=None, v_init=-65.0, **kwargs):
-        super().__init__((N, C), **kwargs)
+        super().__init__((N, C), (N, C), **kwargs)
         self.np = N
         self.nc = C
         self.v_init = v_init
@@ -136,11 +136,9 @@ class Population(P, Sliceable):
         if integrator is None:
             integrator = bwd_euler_sc()
 
-        self.shape = integrator.shape(self.np, self.nc) if integrator else (N, C)
-
         self.register_buffer("_dummy", torch.zeros(1))
 
-        self.register_buffer("v", torch.full(self.shape, self.v_init))
+        self.register_buffer("v", torch.full((N, C), self.v_init))
         self.register_buffer("diam", torch.full(self.shape, 500.0))
         self.register_buffer("dx", torch.full(self.shape, 100.0))
         self.register_buffer("t", torch.zeros(()))
@@ -212,6 +210,10 @@ class Population(P, Sliceable):
 
         self.initialized: bool = False
         self.eval()
+
+    @property
+    def shape(self):
+        return tuple(self.v.shape)
 
     def equilibria(self, **kwargs):
         self._equilibria.update(kwargs)
@@ -719,12 +721,14 @@ class Population(P, Sliceable):
 
         with torch.no_grad():
             if with_ve:
-                ve = torch.zeros_like(self.v).contiguous()
+                ve = torch.zeros_like(self.v).reshape(self.batched_shape()).contiguous()
             else:
                 ve = None
 
             if with_intra:
-                intra = torch.zeros_like(self.v).contiguous()
+                intra = (
+                    torch.zeros_like(self.v).reshape(self.batched_shape()).contiguous()
+                )
             else:
                 intra = None
 
@@ -1039,8 +1043,8 @@ class Population(P, Sliceable):
         self.build()
         return super().to(*args, **kwargs)
 
-    def build(self):
-        if self.is_built:
+    def build(self, force_rebuild=False):
+        if self.is_built and not force_rebuild:
             return self
 
         def are_strings_unique(data: list) -> bool:
@@ -1057,8 +1061,11 @@ class Population(P, Sliceable):
         with conc, eq:
             for mech, (name, ic, kwargs) in self._mech_everywhere.items():
                 key = None
-                shape = self.shape
-                m = mech(name, self.celsius, self.diam, shape, key, ic=ic, **kwargs)
+                shape = self.calc_shape_p()
+                shape_f = self.shape
+                m = mech(
+                    name, self.celsius, self.diam, shape, shape_f, key, ic=ic, **kwargs
+                )
                 self.register_mech(m, shape, key)
 
             for mech, data in self._mech_data.items():
@@ -1110,8 +1117,8 @@ class Population(P, Sliceable):
             self.eval()
         return self
 
-    def build_(self):
-        self.build()
+    def build_(self, force_rebuild=False):
+        self.build(force_rebuild=force_rebuild)
 
     def detach(self):
         """
@@ -1269,6 +1276,33 @@ class Population(P, Sliceable):
                 raise AttributeError(f"Model has no attribute '{name}' to set.")
 
         self.register_post_initialize_hook(_set_value)
+
+    # -- batching stuff --
+    def is_batched(self):
+        return len(self.shape) > 2
+
+    def core_shape(self):
+        return self.shape[-2:]
+
+    def batched_shape(self):
+        B = np.prod(self.shape[:-1])
+        return (B, self.shape[-1])
+
+    def n_batch_dimensions(self):
+        return len(self.shape) - 2
+
+    def calc_shape_p(self):
+        return tuple([1] * self.n_batch_dimensions() + list(self.core_shape()))
+
+    def batch(self, n):
+        self.v = self.v.unsqueeze(0).expand(n, *self.v.shape).clone()
+        if hasattr(self, "v_prev"):
+            self.v_prev = self.v_prev.unsqueeze(0).expand(n, *self.v_prev.shape).clone()
+        self.reshape(self.calc_shape_p(), self.shape)
+        return self
+
+    def batch_(self, n):
+        self.batch(n)
 
 
 # Define the return type for clarity
@@ -1970,9 +2004,21 @@ def compose_or_flatten_union(
 
 
 def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
-    total_index, is_composable, final_shape, local_indices = compose_or_flatten_union(
-        indices, model.shape
+    total_index, is_composable, shape, local_indices = compose_or_flatten_union(
+        indices, model.core_shape()
     )
+
+    shape_p = shape
+    shape_f = shape
+
+    if model.is_batched():
+        n_batch_dimensions = len(model.shape) - 2
+        shape_p = tuple(([1] * n_batch_dimensions) + (list(shape_p)))
+        shape_f = []
+        for i in range(n_batch_dimensions):
+            shape_f.append(model.shape[i])
+        shape_f += list(shape)
+        shape_f = tuple(shape_f)
 
     # local indices is now a list of lists, where each sublist corresponds to the
     # local indices of the original indices in the final selection.
@@ -1988,10 +2034,11 @@ def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
         None,
         model.celsius,
         model.diam,
-        final_shape,
+        shape_p,
+        shape_f,
         key=total_index,
         is_composable=is_composable,
         additional_parameters=additional_parameters,
     )
 
-    return m, final_shape, total_index
+    return m, shape_p, total_index

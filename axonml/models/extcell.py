@@ -2,7 +2,7 @@ import torch
 
 from .core import Axon
 from .integrators import bwd_euler_bt, dhs_bt
-from .tree import Tree, gather_morphology
+from .tree import Tree, gather_membrane, gather_morphology
 
 
 class ExtCellAxon(Axon):
@@ -85,8 +85,10 @@ class ExtCellTree(Tree):
     def from_graph(cls, graph, N=1, n_layers=2, integrator=None, **kwargs):
         C = len(graph.nodes)
         morphology = gather_morphology(graph)
+        membrane = gather_membrane(graph)
+        membrane.update(kwargs)
         extcell = gather_extcell(graph, n_layers=n_layers)
-        tree = cls(N, C, graph, n_layers=n_layers, integrator=integrator, **kwargs)
+        tree = cls(N, C, graph, n_layers=n_layers, integrator=integrator, **membrane)
         tree.load_morphology(morphology)
         tree.load_extcell(extcell)
         tree.slice("soma").label("soma")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Tuple, Union
 
@@ -39,7 +40,7 @@ class IndexSpec:
     shape: Tuple[int, ...]
 
 
-def parse_key(key: Any, shape: Sequence[int]) -> IndexSpec:
+def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
     """
     Turn *any* valid key plus `shape` into a reusable IndexSpec.
     Works for NumPy **and** PyTorch rules (they're identical here).
@@ -51,7 +52,7 @@ def parse_key(key: Any, shape: Sequence[int]) -> IndexSpec:
     >>> spec
     IndexSpec(index=(slice(None), slice(None), 2), new_axes=(3,), ...)
     """
-    out = torch.empty(shape)[key]  # type: ignore
+    out = torch.empty(shape, device=device)[key]  # type: ignore
 
     return IndexSpec(
         index=key,
@@ -152,8 +153,36 @@ class Slice:
         setattr(self.model, name, self)
         self.model._labels[name] = self
 
+    def __getitem__(self, key):
+        idx = compose_indices(
+            self.model.shape, self.index, key, device=self.model.device()
+        )
+        idx = parse_key(idx, self.model.shape, device=self.model.device())
+        return Slice(self.model, idx)
+
     def __repr__(self):
         return f"Slice(index={self.index_spec.index}, shape={self.index_spec.shape}, is_scalar={self.index_spec.is_scalar})"
+
+
+def compose_indices(shape, idx1, idx2, *, device="cpu"):
+    """
+    Return idx3 (a tuple of index tensors) such that for any tensor
+    t with the given shape:  t[idx1][idx2] == t[idx3].
+
+    Works with ints, slices, ellipsis, None (newaxis), boolean masks,
+    and long/bool tensor indices.
+    """
+    # 1) Build a flat index map shaped like `shape`
+    numel = math.prod(shape)
+    base = torch.arange(numel, device=device).reshape(shape)
+
+    # 2) Apply the two-stage indexing to the map
+    flat = base[idx1][idx2]  # same shape as t[idx1][idx2]
+
+    # 3) Convert selected flat positions back to per-dimension indices
+    idx3 = torch.unravel_index(flat, shape)  # tuple of tensors
+
+    return idx3  # use as t[idx3]
 
 
 class Sliceable:

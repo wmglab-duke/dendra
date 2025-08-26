@@ -112,6 +112,11 @@ def requires_packages(*pkgs: str):
 # --- pytorch functions --
 
 
+def detach_vars(obj, vars: list[str]):
+    for v in vars:
+        setattr(obj, v, getattr(obj, v).detach())
+
+
 def allow_tf32(allow=True):
     torch.backends.cuda.matmul.allow_tf32 = allow
     torch.backends.cudnn.allow_tf32 = allow

@@ -10,6 +10,7 @@ from ..callbacks import CallbackList
 from ..core import Population, make_intra
 from ..parametric import to_param
 from .netcon import NetCon
+from .netstim import NetStim
 
 
 def to_flat_idx_torch(shape, idx, device):
@@ -326,7 +327,7 @@ class Network(torch.nn.Module):
     def connect_one_to_one(
         self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
     ):
-        if isinstance(source, Population):
+        if isinstance(source, Population) or isinstance(source, NetStim):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
             target = target[:]  # Ensure target is a slice if it's a Population
@@ -347,7 +348,7 @@ class Network(torch.nn.Module):
     def connect_dense(
         self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
     ):
-        if isinstance(source, Population):
+        if isinstance(source, Population) or isinstance(source, NetStim):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
             target = target[:]  # Ensure target is a slice if it's a Population
@@ -390,10 +391,15 @@ class Network(torch.nn.Module):
             delay,
         )
 
+    def connect_prob(
+        self, source, target, synapse, prob: float, threshold=0.0, weight=1.0, delay=0.0
+    ):
+        self.connect_sparse(source, target, synapse, prob, threshold, weight, delay)
+
     def connect_sparse(
         self, source, target, synapse, prob: float, threshold=0.0, weight=1.0, delay=0.0
     ):
-        if isinstance(source, Population):
+        if isinstance(source, Population) or isinstance(source, NetStim):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
             target = target[:]  # Ensure target is a slice if it's a Population
@@ -422,6 +428,11 @@ class Network(torch.nn.Module):
 
         # randomly select connections based on the probability
         mask = torch.rand(pre_idx.numel(), device=source_model.device()) < prob
+
+        if mask.sum() == 0:
+            # If no connections are selected, return early
+            return
+
         pre_idx = pre_idx[mask]
         post_idx = post_idx[mask]
 
@@ -589,6 +600,16 @@ class Network(torch.nn.Module):
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
+
+    def batch(self, n):
+        for p in self.populations.values():
+            device = p.device()
+            p.batch(n)
+            p.build(force_rebuild=True)
+            p.to(device)
+        self.clear_synapses()
+        self.built = False
+        return self
 
 
 def prepare_intra(intra_c, intra, local_ind):

@@ -61,7 +61,7 @@ Cell models are available at https://gitlab.oit.duke.edu/mah148/axonml-models.
 
 ## 🔍 Citation
 
-Topological surrogates and gradient-based design of neurostimulation are discussed and `AxonML` is introduced in
+Geometric / topological surrogates and gradient-based design of neurostimulation are discussed in, and `AxonML` is introduced in
 
 Minhaj A. Hussain, Warren M. Grill, Nicole A. Pelot. "Highly efficient modeling and optimization of neural fiber responses to electrical stimulation." *Nature Communications.* 2024. [(nature.com)](https://www.nature.com/articles/s41467-024-51709-8)
 
@@ -74,6 +74,9 @@ Minhaj A. Hussain, Warren M. Grill, Nicole A. Pelot. "Highly efficient modeling 
     year = {2024}
 }
 ```
+
+AxonML v2, adding support for branched morphologies, multiple layers of extracellular field, and network simulations, is described in...(paper forthcoming).
+
 
 ## 📜 License
 The copyrights of this software are owned by Duke University. As such, it is offered under a custom license (see LICENSE.md) whereby:

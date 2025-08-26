@@ -253,7 +253,11 @@ class _dhs(Integrator):
         super().__init__(model, mech, imem)
         self.threads = threads
 
-        B, N = model.np, model.nc
+        N = model.shape[-1]
+        B = np.prod(model.shape[:-1])
+        self.B = B
+        self.K = N
+        self.base_shape = model.shape
 
         self.register_buffer("parent_idx", torch.empty(N, dtype=torch.int64))
         self.register_buffer(
@@ -268,11 +272,11 @@ class _dhs(Integrator):
         )  # (N,) inverse node order
         self.register_buffer("scale", torch.empty(1, N))  # (1, N) scale factor
 
-        self.register_buffer("a_geom", torch.empty(B, N))  # (B,N) axial conductance
-        self.register_buffer("cmdt", torch.empty(B, N))  # (B,N) capacitance * dt
+        self.register_buffer("a_geom", torch.empty(1, N))  # (B,N) axial conductance
+        self.register_buffer("cmdt", torch.empty(1, N))  # (B,N) capacitance * dt
 
     def initialize(self, model, dt):
-        B = model.np
+        B = self.B
         dt_s = dt * 1e-3
 
         device = model.device()
@@ -316,7 +320,7 @@ class _dhs(Integrator):
         self.scale = area_cm2
 
         cm = 1e-6 * model.cm * area_cm2  # convert from µF / cm2 to F
-        self.cmdt = cm / dt_s  # (B,N) (F/s = S)
+        self.cmdt = (cm / dt_s).expand(model.shape).view(B, self.K)  # (B,N) (F/s = S)
 
         # extracellular
         # We will need the original node IDs from the graph for this
@@ -374,7 +378,7 @@ class _dhs(Integrator):
         self.mech.advance(v, dt, temp)
         itot, gtot = self.mech.i(v)
 
-        f_n = (gtot * v - itot) * self.scale
+        f_n = (gtot * v - itot).view(-1, self.K) * self.scale
 
         if ve is not None:
             I_edge = _edge_currents(
@@ -392,8 +396,8 @@ class _dhs(Integrator):
         if intra is not None:
             f_n += intra
 
-        RHS = f_n + (self.cmdt * v)  # mA
-        main = self.cmdt + (gtot * self.scale)  # S
+        RHS = f_n + (self.cmdt * v.view(-1, self.K))  # mA
+        main = self.cmdt + (gtot.view(-1, self.K) * self.scale)  # S
 
         d_ = main.index_select(-1, self.solver_order)  # (B, N)
         b_ = RHS.index_select(-1, self.solver_order)  # (B, N)
@@ -408,6 +412,8 @@ class _dhs(Integrator):
             self.layer_ptr,
         )
 
-        v = v_out.index_select(-1, self.inv_solver_order)  # (B, N)
+        v = v_out.index_select(-1, self.inv_solver_order).reshape(
+            self.base_shape
+        )  # (B, N)
 
         return v  # (B, N) mV

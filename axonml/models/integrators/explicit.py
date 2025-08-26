@@ -224,6 +224,7 @@ class _dufort_frankel_homogeneous(Integrator):
     """
 
     __constants__ = ["beta", "smoothing", "smooth_every", "imem"]
+    v_vars = ["v", "v_prev"]
 
     def __init__(self, model, mech, beta=1.0, smooth_every=100, conv=False, imem=None):
         super().__init__(model, mech, imem)
@@ -423,29 +424,19 @@ class _dufort_frankel_homogeneous(Integrator):
     def init_v(self, model):
         model.v = torch.full(
             model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
-        )
-        model.v.detach_()
+        ).detach()
         model.v_prev = torch.full(
             model.v_prev.shape,
             model.v_init,
             dtype=model.v_prev.dtype,
             device=model.v_prev.device,
-        )
-        model.v_prev.detach_()
+        ).detach()
         if self.imem:
             model.i_membrane = torch.zeros(
                 model.i_membrane.shape,
                 dtype=model.i_membrane.dtype,
                 device=model.i_membrane.device,
-            )
-            model.i_membrane.detach_()
-
-    def detach(self, model):
-        model.v.detach_()
-        model.v_prev.detach_()
-        if self.imem:
-            model.i_membrane.detach_()
-        self.mech.detach()
+            ).detach()
 
 
 class _dufort_frankel(Integrator):
@@ -454,6 +445,7 @@ class _dufort_frankel(Integrator):
     """
 
     __constants__ = ["beta", "smoothing", "smooth_every", "imem"]
+    v_vars = ["v", "v_prev"]
 
     def __init__(self, model, mech, beta=1.0, smooth_every=100, imem=None):
         super().__init__(model, mech, imem)
@@ -666,10 +658,3 @@ class _dufort_frankel(Integrator):
                 device=model.i_membrane.device,
             )
             model.i_membrane.detach_()
-
-    def detach(self, model):
-        model.v.detach_()
-        model.v_prev.detach_()
-        if self.imem:
-            model.i_membrane.detach_()
-        self.mech.detach()

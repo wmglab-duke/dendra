@@ -476,12 +476,15 @@ class Parameterized(SimpleParameterized):
         """
         Parameterized._range_declarations.append(kwargs)
 
-    def __init__(self, shape, additional_parameters=None, **kwargs):
+    def __init__(self, shape, shape_f, additional_parameters=None, **kwargs):
         super().__init__(**kwargs)
         try:
-            self.shape = tuple(int(s) for s in shape)
+            shape_p = [int(s) for s in shape]
+            shape_f = [int(s) for s in shape_f]
+            self.shape_p = tuple(shape_p)
+            self.shape_f = tuple(shape_f)
         except Exception as e:
-            raise TypeError(f"'shape' must be a tuple of ints, got {shape!r}") from e
+            raise TypeError(f"error assigning shape {shape!r}") from e
 
         self.globals = self.__class__._global.copy()
         self.range = self.__class__._range.copy()
@@ -501,6 +504,11 @@ class Parameterized(SimpleParameterized):
         self.instantiate_global(**self.globals)
         self.instantiate_range(**self.range)
         self.instantiate_additional_parameters(additional_parameters)
+
+    def reshape(self, shape_p, shape_f):
+        self.shape_p = shape_p
+        self.shape_f = shape_f
+        self.instantiate_range(**self.range)
 
     def instantiate_global(self, **kwargs):
         # this is only called once, on __init__
@@ -523,7 +531,7 @@ class Parameterized(SimpleParameterized):
             for name, value in kwargs.items():
                 p_name = f"{name}_default"
                 setattr(self, p_name, to_param(value))
-                self.register_buffer(name, torch.empty(self.shape))
+                self.register_buffer(name, torch.empty(self.shape_p))
                 getattr(self, name).copy_(getattr(self, p_name))
 
     def register_parametrization_in_graph(self, name: str, param: Callable, args=None):
@@ -551,9 +559,9 @@ class Parameterized(SimpleParameterized):
                         key = torch.as_tensor(key, dtype=torch.long)
                         parameter = to_param(value)
                         if isinstance(parameter, torch.nn.Module):
-                            p = parameter(torch.empty(self.shape))
+                            p = parameter(torch.empty(self.shape_p))
                             parametrization = build_parametrization(
-                                parameter, p, key, self.shape
+                                parameter, p, key, self.shape_p[-2:]
                             )
                             self.register_parametrization_in_graph(
                                 name, parametrization
@@ -561,7 +569,9 @@ class Parameterized(SimpleParameterized):
                             setattr(self, p_name, parameter)
                         else:
                             setattr(self, p_name, parameter)
-                            fill = create_param_expander(parameter, key, self.shape)
+                            fill = create_param_expander(
+                                parameter, key, self.shape_p[-2:]
+                            )
                             self.additional_parameters.setdefault(name, []).append(
                                 (fill, getattr(self, p_name))
                             )
@@ -624,11 +634,3 @@ class Parameterized(SimpleParameterized):
         Returns a dictionary of all parameters in the model.
         """
         return {name: param for name, param in self.named_parameters()}
-
-    def batch(self, batch_size: int):
-        for name in self.__class__._params:
-            p = getattr(self, name)  # nn.Parameter
-            new_p = torch.nn.Parameter(
-                p.detach().unsqueeze(0), requires_grad=p.requires_grad
-            )
-            setattr(self, name, new_p)

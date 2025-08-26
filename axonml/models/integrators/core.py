@@ -2,7 +2,7 @@ import inspect
 
 import torch
 
-from axonml.helpers import IMEM
+from axonml.helpers import IMEM, detach_vars
 
 
 def get_init_defaults(cls):
@@ -20,6 +20,7 @@ class Integrator(torch.nn.Module):
     """
 
     __constants__ = {"imem"}
+    v_vars = ["v"]
 
     def __init__(self, model, mech, imem=None):
         super().__init__()
@@ -30,67 +31,21 @@ class Integrator(torch.nn.Module):
         self.initialized = False
         self.dt = None
 
-    @classmethod
-    def shape(cls, np, nc):
-        return (np, nc)
-
     def init_v(self, model):
         model.v = torch.full(
             model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
-        )
-        model.v.detach_()
+        ).detach()
         if self.imem:
             model.i_membrane = torch.zeros(
                 model.i_membrane.shape,
                 dtype=model.i_membrane.dtype,
                 device=model.i_membrane.device,
-            )
-            model.i_membrane.detach_()
+            ).detach()
 
     def detach(self, model):
-        model.v.detach_()
-        for n, b in model.named_buffers():
-            try:
-                b.detach_()
-            except RuntimeError:
-                setattr(model, n, b.detach())
-        if self.imem:
-            model.i_membrane.detach_()
-        self.mech.detach()
-
-
-class SCIntegrator(torch.nn.Module):
-    def __init__(self, model, mech, imem=None):
-        super().__init__()
-        self.mech = mech
-        imem = imem if imem is not None else IMEM
-        self.imem = bool(imem)
-        self.register_buffer("cmdt", torch.tensor(0.0))
-        self.register_buffer("i_membrane", torch.zeros(model.np, model.nc))
-        self.initialized = False
-        self.dt = None
-
-    @classmethod
-    def shape(cls, np, nc):
-        return (np, nc)
-
-    def init_v(self, model):
-        model.v = torch.full(
-            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
-        )
-        model.v.detach_()
-        if self.imem:
-            model.i_membrane = torch.zeros(
-                model.i_membrane.shape,
-                dtype=model.i_membrane.dtype,
-                device=model.i_membrane.device,
-            )
-            model.i_membrane.detach_()
-
-    def detach(self, model):
-        model.v.detach_()
+        detach_vars(self, self.v_vars)
         for n, b in model.named_buffers():
             setattr(model, n, b.detach())
         if self.imem:
-            model.i_membrane.detach_()
+            model.i_membrane = model.i_membrane.detach()
         self.mech.detach()

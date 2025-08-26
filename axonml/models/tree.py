@@ -8,25 +8,33 @@ from .core import Population
 
 def gather_morphology(graph):
     # iterate through nodes and gather morphology data
-    L, diam, rhoa, cm, x, y, z = [], [], [], [], [], [], []
+    L, diam, x, y, z = [], [], [], [], []
 
     for i in range(len(graph.nodes)):
         attrs = graph.nodes[i]
         L.append(attrs.get("L"))
         diam.append(attrs.get("diam"))
-        rhoa.append(attrs.get("Ra"))
-        cm.append(attrs.get("cm"))
         x.append(attrs.get("x", 0.0))
         y.append(attrs.get("y", 0.0))
         z.append(attrs.get("z", 0.0))
     return {
         "dx": torch.tensor(L).unsqueeze(0),
         "diam": torch.tensor(diam).unsqueeze(0),
-        "rhoa": torch.tensor(rhoa).unsqueeze(0),
-        "cm": torch.tensor(cm).unsqueeze(0),
         "x": torch.tensor(x).unsqueeze(0),
         "y": torch.tensor(y).unsqueeze(0),
         "z": torch.tensor(z).unsqueeze(0),
+    }
+
+
+def gather_membrane(graph):
+    rhoa, cm = [], []
+    for i in range(len(graph.nodes)):
+        attrs = graph.nodes[i]
+        rhoa.append(attrs.get("Ra"))
+        cm.append(attrs.get("cm"))
+    return {
+        "rhoa": torch.tensor(rhoa).unsqueeze(0),
+        "cm": torch.tensor(cm).unsqueeze(0),
     }
 
 
@@ -106,10 +114,11 @@ class Tree(Population):
         """
         C = len(graph.nodes)
         data = gather_morphology(graph)
-        tree = cls(N, C, graph, integrator, **kwargs)
+        membrane = gather_membrane(graph)
+        membrane.update(kwargs)
+        tree = cls(N, C, graph, integrator, **membrane)
         for key, value in data.items():
             tree.register_buffer(key, value.expand(N, -1))
-        tree.set_value("cm", data["cm"])
         tree.slice("soma").label("soma")
         tree.slice("axon").label("axon")
         tree.slice("dend").label("dend")
@@ -209,9 +218,9 @@ class Tree(Population):
         z : float, optional
             Z-coordinate of the new center. Default is 0.0.
         """
-        x = torch.as_tensor(x, dtype=self.x.dtype, device=self.x.device).reshape(-1, 1)
-        y = torch.as_tensor(y, dtype=self.y.dtype, device=self.y.device).reshape(-1, 1)
-        z = torch.as_tensor(z, dtype=self.z.dtype, device=self.z.device).reshape(-1, 1)
+        x = torch.as_tensor(x, dtype=self.x.dtype, device=self.x.device)
+        y = torch.as_tensor(y, dtype=self.y.dtype, device=self.y.device)
+        z = torch.as_tensor(z, dtype=self.z.dtype, device=self.z.device)
 
         if origin is None:
             origin = self.find("soma", as_list=True)
@@ -243,15 +252,9 @@ class Tree(Population):
             Offset in the z-direction. Default is 0.0.
         """
 
-        dx = torch.as_tensor(dx, dtype=self.x.dtype, device=self.x.device).reshape(
-            -1, 1
-        )
-        dy = torch.as_tensor(dy, dtype=self.y.dtype, device=self.y.device).reshape(
-            -1, 1
-        )
-        dz = torch.as_tensor(dz, dtype=self.z.dtype, device=self.z.device).reshape(
-            -1, 1
-        )
+        dx = torch.as_tensor(dx, dtype=self.x.dtype, device=self.x.device)
+        dy = torch.as_tensor(dy, dtype=self.y.dtype, device=self.y.device)
+        dz = torch.as_tensor(dz, dtype=self.z.dtype, device=self.z.device)
 
         self.x += dx
         self.y += dy

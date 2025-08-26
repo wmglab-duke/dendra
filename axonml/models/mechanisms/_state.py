@@ -473,14 +473,23 @@ class State(Parameterized):
         cls._assigned = list(new_assigned)
 
     def __init__(
-        self, celsius, diameters, key, shape, additional_parameters=None, **kwargs
+        self,
+        celsius,
+        diameters,
+        key,
+        shape,
+        shape_f,
+        additional_parameters=None,
+        **kwargs,
     ):
         if not self._state:
             raise ValueError(
                 f"State {self.__class__.__name__} has no state variables defined."
                 "Use State.STATE(<state vars>) in State implementation to define them."
             )
-        super().__init__(shape, additional_parameters=additional_parameters, **kwargs)
+        super().__init__(
+            shape, shape_f, additional_parameters=additional_parameters, **kwargs
+        )
         self._name = self.__class__.__name__
         self.key = key
 
