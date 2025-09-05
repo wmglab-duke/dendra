@@ -3,6 +3,7 @@ import numpy as np
 import torch
 
 import axonml as ax
+from axonml.helpers import CUDA
 from axonml.models.callbacks import RecorderLambda
 from axonml.models.mod import exp2syn, hh
 from axonml.units import ms
@@ -29,9 +30,10 @@ pop[0, 500:].label("P2")
 
 # you can set base rate, randomness, and max # spikes as with NEURON's NetStim
 ns = ax.NetStim(N=100, interval=5.0, noise=1.0, seed=0, max_spikes=10)
-net = ax.Network(
-    {"all": pop}, netstim=ns
-).cuda()  # .cuda() to run on GPU - remove to run on CPU
+net = ax.Network({"all": pop}, netstim=ns)
+if CUDA:
+    net = net.cuda()
+
 
 net.clear_synapses()
 
