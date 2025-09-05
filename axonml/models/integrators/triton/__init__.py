@@ -1,4 +1,18 @@
-from .bt_kernel import thomas_solve_cuda_bt
-from .dhs_kernel import dhs_solve_cuda
-from .dhs_kernel_bt import dhs_bt_solve_cuda
-from .t_kernel_thomas import thomas_solve_cuda_t
+try:
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+
+if TRITON_AVAILABLE:
+    from .bt_kernel import thomas_solve_cuda_bt
+    from .dhs_kernel import dhs_solve_cuda
+    from .dhs_kernel_bt import dhs_bt_solve_cuda
+    from .dhs_kernel_multi import dhs_solve_multi_cuda
+    from .t_kernel_thomas import thomas_solve_cuda_t
+else:
+    thomas_solve_cuda_bt = None
+    dhs_solve_cuda = None
+    dhs_bt_solve_cuda = None
+    dhs_solve_multi_cuda = None
+    thomas_solve_cuda_t = None

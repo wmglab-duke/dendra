@@ -27,6 +27,7 @@ from .models import (
     Population,
     Tree,
     Unmyelinated,
+    concat,
 )
 from .models.fields import (
     EfieldInterpolate3D,
@@ -75,6 +76,7 @@ __all__ = [
     "ExtCellTree",
     "NetStim",
     "Network",
+    "concat",
     "anisotropic_point",
     "isotropic_point",
     "parametric_efield",

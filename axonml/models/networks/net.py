@@ -327,6 +327,59 @@ class Network(torch.nn.Module):
     def connect_one_to_one(
         self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
     ):
+        """
+        Connect source to target one-to-one.
+
+        Each selected source element connects to exactly one selected target
+        element (pairwise). The target locations must already host the given
+        synapse mechanism.
+
+        Parameters
+        ----------
+        source : Population | NetStim | PopulationSlice | NetStimSlice
+            Source population (or a slice produced via source[...]).
+            If a Population/NetStim is passed, it is converted to source[:].
+        target : Population | PopulationSlice
+            Target population (or a slice via target[...]). Converted to target[:]
+            if a Population is passed.
+        synapse : object
+            Target-side synapse mechanism attached to the target population. It
+            must be present at all target locations selected by `target`.
+        threshold : float | torch.Tensor | torch.nn.Module, optional
+            Spike threshold(s) for the pre-synaptic units. A scalar applies to
+            all connections. A length-N tensor/module output provides one value
+            per pre-synaptic unit. Default is 0.0.
+        weight : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic weight(s). A scalar applies to all connections. A tensor of
+            length N (number of pre-synaptic indices) supplies per-connection
+            weights. A torch.nn.Module is expected to implement .sample(N).
+            Default is 1.0.
+        delay : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic delay(s) in ms. Same broadcasting rules as `weight`.
+            Default is 0.0.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the synapse is not present at all specified target locations, or
+            if provided tensors have incompatible shapes with the selected
+            indices.
+
+        Notes
+        -----
+        - The number of selected source elements must match the number of
+          selected target elements for a one-to-one mapping.
+        - The connection specifications are queued and materialized during
+          build()/initialize().
+
+        Examples
+        --------
+        >>> net.connect_one_to_one(pop_pre, pop_post, pop_post.mech.syn)
+        """
         if isinstance(source, Population) or isinstance(source, NetStim):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
@@ -348,6 +401,52 @@ class Network(torch.nn.Module):
     def connect_dense(
         self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
     ):
+        """
+        Connect source to target densely (all-to-all between selections).
+
+        Every selected target element receives input from every selected source
+        element. Target locations must already host the given synapse mechanism.
+
+        Parameters
+        ----------
+        source : Population | NetStim | PopulationSlice | NetStimSlice
+            Source population (or a slice produced via source[...]). If a
+            Population/NetStim is passed, it is converted to source[:].
+        target : Population | PopulationSlice
+            Target population (or a slice via target[...]). Converted to target[:]
+            if a Population is passed.
+        synapse : object
+            Target-side synapse mechanism attached to the target population.
+        threshold : float | torch.Tensor | torch.nn.Module, optional
+            Spike threshold(s) for the pre-synaptic units. See connect_one_to_one
+            for broadcasting rules. Default is 0.0.
+        weight : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic weight(s). See connect_one_to_one for broadcasting rules.
+            Default is 1.0.
+        delay : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic delay(s) in ms. See connect_one_to_one for broadcasting
+            rules. Default is 0.0.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the synapse is not present at some target locations, or if
+            provided tensors have incompatible shapes.
+
+        Notes
+        -----
+        - Forms a complete bipartite connectivity between the selected pre and
+          post indices (all pairs).
+        - Connection specs are queued and built during build()/initialize().
+
+        Examples
+        --------
+        >>> net.connect_dense(pop_pre[:], pop_post[:], pop_post.mech.syn)
+        """
         if isinstance(source, Population) or isinstance(source, NetStim):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
@@ -391,14 +490,54 @@ class Network(torch.nn.Module):
             delay,
         )
 
-    def connect_prob(
-        self, source, target, synapse, prob: float, threshold=0.0, weight=1.0, delay=0.0
-    ):
-        self.connect_sparse(source, target, synapse, prob, threshold, weight, delay)
-
     def connect_sparse(
         self, source, target, synapse, prob: float, threshold=0.0, weight=1.0, delay=0.0
     ):
+        """
+        Connect source to target sparsely via Bernoulli sampling over all pairs.
+
+        Starting from the dense all-to-all candidate set between `source` and
+        `target`, keep each candidate connection independently with probability
+        `prob`. Target locations must already host the given synapse mechanism.
+
+        Parameters
+        ----------
+        source : Population | NetStim | PopulationSlice | NetStimSlice
+            Source selection; converted to source[:] if a full Population/NetStim
+            is provided.
+        target : Population | PopulationSlice
+            Target selection; converted to target[:] if a full Population.
+        synapse : object
+            Target-side synapse mechanism attached to the target population.
+        prob : float
+            Independent probability (0 ≤ prob ≤ 1) of keeping each candidate
+            pre-post pair.
+        threshold : float | torch.Tensor | torch.nn.Module, optional
+            Spike threshold(s); broadcasting as in connect_one_to_one.
+        weight : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic weight(s); broadcasting as in connect_one_to_one.
+        delay : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic delay(s); broadcasting as in connect_one_to_one.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the synapse is not present at some target locations, or if
+            provided tensors have incompatible shapes.
+
+        Notes
+        -----
+        - If no connections are sampled, no specs are added (early return).
+        - Randomness comes from torch.rand on the source device.
+
+        Examples
+        --------
+        >>> net.connect_sparse(pop_pre[:], pop_post[:], pop_post.mech.syn, prob=0.2)
+        """
         if isinstance(source, Population) or isinstance(source, NetStim):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
@@ -451,6 +590,112 @@ class Network(torch.nn.Module):
             weight,
             delay,
         )
+
+    connect_prob = connect_sparse
+
+    def connect_prob_n(
+        self, source, target, synapse, n: int, threshold=0.0, weight=1.0, delay=0.0
+    ):
+        """
+        Connect exactly n random pre-post pairs (without replacement).
+
+        From the dense all-to-all candidate set between `source` and `target`,
+        sample n unique pairs uniformly without replacement. Target locations
+        must already host the given synapse mechanism.
+
+        Parameters
+        ----------
+        source : Population | NetStim | PopulationSlice | NetStimSlice
+            Source selection; converted to source[:] if a full Population/NetStim
+            is provided.
+        target : Population | PopulationSlice
+            Target selection; converted to target[:] if a full Population.
+        synapse : object
+            Target-side synapse mechanism attached to the target population.
+        n : int
+            Number of connections to sample. If n <= 0, no connections are added.
+            If n exceeds the number of possible pairs, all pairs are selected.
+        threshold : float | torch.Tensor | torch.nn.Module, optional
+            Spike threshold(s); broadcasting as in connect_one_to_one.
+        weight : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic weight(s); broadcasting as in connect_one_to_one.
+        delay : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic delay(s); broadcasting as in connect_one_to_one.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the synapse is not present at some target locations, or if
+            provided tensors have incompatible shapes.
+
+        Notes
+        -----
+        - Sampling uses torch.randperm on the source device.
+        - n is effectively clipped by the number of candidate pairs.
+
+        Examples
+        --------
+        >>> net.connect_prob_n(pop_pre[:], pop_post[:], pop_post.mech.syn, n=1000)
+        """
+        """
+        Connect the source population to the target population with a fixed number of connections.
+        """
+        if n <= 0:
+            return
+        if isinstance(source, Population) or isinstance(source, NetStim):
+            source = source[:]
+        if isinstance(target, Population):
+            target = target[:]
+
+        # every target compartment receives input from every source compartment
+        source_model = source.model
+        target_model = target.model
+        pre_idx = to_flat_idx_torch(
+            source_model.shape, source.index, source_model.device()
+        )
+        post_idx = to_flat_idx_torch(
+            target_model.shape, target.index, target_model.device()
+        )
+
+        # 1. Get the original number of elements
+        num_pre = pre_idx.numel()
+        num_post = post_idx.numel()
+
+        # 2. Expand the first tensor to repeat its elements
+        # Shape becomes [3, 1] -> [3, 4] -> [12]
+        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
+
+        # 3. Expand the second tensor to repeat the whole sequence
+        # Shape becomes [1, 4] -> [3, 4] -> [12]
+        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
+
+        # randomly select connections based on the probability
+        mask = torch.randperm(pre_idx.numel(), device=source_model.device())[:n]
+
+        pre_idx = pre_idx[mask]
+        post_idx = post_idx[mask]
+
+        pre_idx, post_idx = prepare_indices_one_one_flat(
+            source_model, pre_idx, target_model, post_idx, synapse
+        )
+
+        # now connect
+        self._connect(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
+        )
+
+    connect_sparse_n = connect_prob_n
 
     def build_synapses(self, dt):
         for (pre_name, post_name, synapse), specs in self.synapse_spec.items():
