@@ -71,7 +71,7 @@ class MultiPopulation(Population):
                 index = index.flatten()
                 self[:, index].insert(m_class, alias=alias, **kwargs)
             # now do _mech_data
-            for index, (m_class, data) in zip(all_indices, pop._mech_data.items()):
+            for m_class, data in pop._mech_data.items():
                 alias, kwargs, key = data
                 index_f = key_to_flat_index(index, key)
                 alias = f"{name}_{alias}"
