@@ -121,8 +121,84 @@ def _multi_dhs_kernel_warp_hom(
 
 
 # ------------------------------------------------------------------------------
-# Autograd bridge (forward implemented; backward TODO — mirror single-morph)
+# Autograd bridge (forward & backward mirrors single-morph)
 # ------------------------------------------------------------------------------
+
+
+# ============================
+# Backward: grad_a kernel
+# ============================
+
+
+@triton.jit
+def _multi_dhs_grad_a_kernel(
+    V_ptr,  # (B_total, K_STRIDE)  solver order
+    G_ptr,  # (B_total, K_STRIDE)  solver order (adjoint solution)
+    Agrad_ptr,  # (B_total, K_STRIDE)  OUT: grad wrt a_geom (solver order)
+    P_cat,
+    ORDER_cat,
+    LAYER_PTR_cat,  # concatenated topology
+    WARP_P_OFF,
+    WARP_ORDER_OFF,
+    WARP_LPTR_OFF,
+    WARP_L,
+    WARP_ROW_BASE,
+    WARP_ROW_COUNT,  # per-warp plan
+    K_STRIDE: tl.constexpr,
+    L_MAX: tl.constexpr,
+    K_THREADS: tl.constexpr,
+    WARP_SIZE: tl.constexpr,
+):  # pragma: no cover
+    warp_id = tl.program_id(0)
+    lane_abs = tl.arange(0, WARP_SIZE)
+    n_in_warp = lane_abs // K_THREADS
+    lane_loc = lane_abs % K_THREADS
+
+    # per-warp morphology
+    P = P_cat + tl.load(WARP_P_OFF + warp_id)
+    ORDER = ORDER_cat + tl.load(WARP_ORDER_OFF + warp_id)
+    LPTR = LAYER_PTR_cat + tl.load(WARP_LPTR_OFF + warp_id)
+    L_g = tl.load(WARP_L + warp_id)
+
+    # rows covered by this warp
+    row0 = tl.load(WARP_ROW_BASE + warp_id)
+    row_count = tl.load(WARP_ROW_COUNT + warp_id)
+    valid_row = n_in_warp < row_count
+    row_idx = row0 + n_in_warp
+    row_safe = tl.where(valid_row, row_idx, 0)
+
+    V = V_ptr + row_safe * K_STRIDE
+    G = G_ptr + row_safe * K_STRIDE
+    dA = Agrad_ptr + row_safe * K_STRIDE
+
+    # per-layer sweep (read-only topology; write dA)
+    for layer in range(0, L_MAX):
+        active_layer = layer < L_g
+
+        s = tl.load(LPTR + layer, mask=active_layer, other=0)
+        e = tl.load(LPTR + layer + 1, mask=active_layer, other=0)
+
+        offset = s + lane_loc
+        in_range = lane_loc < (e - s)
+        m = in_range & valid_row & active_layer
+
+        idx = tl.load(ORDER + offset, mask=m, other=0)
+        par = tl.load(P + idx, mask=m, other=-1)
+
+        has_par = m & (par >= 0)
+        p_safe = tl.where(has_par, par, 0)
+
+        v_i = tl.load(V + idx, mask=m, other=0.0)
+        g_i = tl.load(G + idx, mask=m, other=0.0)
+
+        v_p = tl.load(V + p_safe, mask=has_par, other=0.0)
+        g_p = tl.load(G + p_safe, mask=has_par, other=0.0)
+
+        grad_nonroot = -((g_i - g_p) * (v_i - v_p))
+        grad_root = -(g_i * v_i)
+
+        grad = tl.where(has_par, grad_nonroot, grad_root)
+        tl.store(dA + idx, grad, mask=m)
 
 
 class DHSSolveMultiPacked(torch.autograd.Function):
@@ -131,37 +207,29 @@ class DHSSolveMultiPacked(torch.autograd.Function):
         ctx,
         d_mem,
         a_geom,
-        b,  # (B_total, K_stride) planes (SOLVER order; row-padded)
+        b,  # (B_total, K_stride), solver order
         P_cat,
         ORDER_cat,
-        LAYER_PTR_cat,  # concatenated topology
+        LAYER_PTR_cat,
         WARP_P_OFF,
         WARP_ORDER_OFF,
         WARP_LPTR_OFF,
         WARP_L,
         WARP_ROW_BASE,
-        WARP_ROW_COUNT,  # per-warp plan
+        WARP_ROW_COUNT,
         K_stride: int,
         L_max: int,
         threads: int,
         grid_x: int = None,
     ):
-        """
-        Runs the warp-homogeneous multi-morph DHS solve in one launch.
-        All inputs are assumed already prepared by `_dhs_multi.initialize(...)`
-        and `_dhs_multi.step(...)` (i.e., in SOLVER order and row-padded).
-        """
-        assert d_mem.shape == a_geom.shape == b.shape, "d/a/b planes must share shape"
-        B_total, Kp = d_mem.shape
-        assert Kp == K_stride
-
+        assert d_mem.shape == a_geom.shape == b.shape
         V_out = torch.empty_like(b)
 
         if grid_x is None:
             grid_x = WARP_ROW_BASE.numel()
 
         _multi_dhs_kernel_warp_hom[(grid_x,)](
-            d_mem.clone(),  # cloned: kernel overwrites D and B
+            d_mem.clone(),
             a_geom,
             b.clone(),
             V_out,
@@ -182,7 +250,7 @@ class DHSSolveMultiPacked(torch.autograd.Function):
             num_stages=4,
         )
 
-        # save for (future) backward
+        # save for backward
         ctx.save_for_backward(
             d_mem,
             a_geom,
@@ -205,13 +273,96 @@ class DHSSolveMultiPacked(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        # You can mirror your single-morph adjoint:
-        # 1) run the same kernel with RHS = grad_out to get g
-        # 2) grad_b = g
-        # 3) grad_d = -(g * V_out)
-        # 4) grad_a via parent gathers in solver order.
-        # Leaving unimplemented here to keep scope focused on the forward kernel.
-        raise NotImplementedError("DHSSolveMultiPacked backward not implemented yet.")
+        (
+            d_mem,
+            a_geom,
+            V_out,
+            P_cat,
+            ORDER_cat,
+            LAYER_PTR_cat,
+            WARP_P_OFF,
+            WARP_ORDER_OFF,
+            WARP_LPTR_OFF,
+            WARP_L,
+            WARP_ROW_BASE,
+            WARP_ROW_COUNT,
+        ) = ctx.saved_tensors
+        K_stride, L_max, threads, grid_x = (
+            ctx.K_stride,
+            ctx.L_max,
+            ctx.threads,
+            ctx.grid_x,
+        )
+
+        # 1) adjoint solve: g = A^{-1} * grad_out   (solver order, row-padded)
+        g = torch.empty_like(grad_out)
+        _multi_dhs_kernel_warp_hom[(grid_x,)](
+            d_mem.clone(),
+            a_geom,
+            grad_out.clone(),
+            g,
+            P_cat,
+            ORDER_cat,
+            LAYER_PTR_cat,
+            WARP_P_OFF,
+            WARP_ORDER_OFF,
+            WARP_LPTR_OFF,
+            WARP_L,
+            WARP_ROW_BASE,
+            WARP_ROW_COUNT,
+            K_STRIDE=K_stride,
+            L_MAX=L_max,
+            K_THREADS=threads,
+            WARP_SIZE=32,
+            num_warps=1,
+            num_stages=4,
+        )
+
+        # 2) grads wrt inputs (all in solver order)
+        grad_b = g
+        grad_d = -(g * V_out)
+
+        grad_a = torch.zeros_like(a_geom)
+        _multi_dhs_grad_a_kernel[(grid_x,)](
+            V_out,
+            g,
+            grad_a,
+            P_cat,
+            ORDER_cat,
+            LAYER_PTR_cat,
+            WARP_P_OFF,
+            WARP_ORDER_OFF,
+            WARP_LPTR_OFF,
+            WARP_L,
+            WARP_ROW_BASE,
+            WARP_ROW_COUNT,
+            K_STRIDE=K_stride,
+            L_MAX=L_max,
+            K_THREADS=threads,
+            WARP_SIZE=32,
+            num_warps=1,
+            num_stages=2,
+        )
+
+        # Return grads for each forward input (tensors only)
+        return (
+            grad_d,  # d_mem
+            grad_a,  # a_geom
+            grad_b,  # b
+            None,
+            None,
+            None,  # P_cat, ORDER_cat, LAYER_PTR_cat
+            None,
+            None,
+            None,
+            None,  # WARP_*
+            None,
+            None,  # WARP_ROW_BASE, WARP_ROW_COUNT
+            None,
+            None,
+            None,
+            None,  # K_stride, L_max, threads, grid_x
+        )
 
 
 def dhs_solve_multi_cuda(

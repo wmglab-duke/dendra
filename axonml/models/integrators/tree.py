@@ -691,6 +691,92 @@ class _dhs_multi(Integrator):
         self.register_buffer("CMDT_MECH", torch.cat(cmdt_mech_flat, 0))
         self.register_buffer("SCALE_MECH", torch.cat(scale_mech_flat, 0))
 
+        # ---------- extracellular edge maps (for ve) ----------
+        edge_child_idx_flat_all = []
+        edge_parent_idx_flat_all = []
+        edge_gax_flat_all = []
+
+        for g, (mdl, B_g, K_g) in enumerate(zip(models, self.group_B, self.group_K)):
+            G = mdl.graph
+
+            # Build mapping: node_label -> solver index (fast lookup)
+            # `self.SOLVER_cat[soff:soff+K_g]` maps solver_index -> original_node_label
+            soff = int(self.SOLVER_OFF[g])
+            solver_nodes = self.SOLVER_cat[soff : soff + K_g].tolist()
+            solver_idx_of = {node_label: s for s, node_label in enumerate(solver_nodes)}
+
+            # Edge lists in ORIGINAL node order
+            edge_child = []
+            edge_parent = []
+            edge_gax = []
+
+            # If nodes are 0..K_g-1 (typical), this is O(E). If labels differ, this still works.
+            for child_node, _data in G.nodes(data=True):
+                preds = list(G.predecessors(child_node))
+                if not preds:
+                    continue
+                parent_node = preds[0]
+
+                # original indices (mechanism columns) are the node labels
+                child_idx_orig = int(child_node)
+                parent_idx_orig = int(parent_node)
+
+                edge_child.append(child_idx_orig)
+                edge_parent.append(parent_idx_orig)
+
+                # axial for the child's connection: take from a_geom_t at child's solver index
+                s_child = solver_idx_of[child_node]
+                edge_gax.append(
+                    a_rows[g][0, s_child].item()
+                )  # (B_g,K_g) -> any row, same geom
+
+            if len(edge_child) == 0:
+                continue  # degenerate, no edges
+
+            edge_child = torch.tensor(
+                edge_child, dtype=torch.int64, device=dev0
+            )  # (E_g,)
+            edge_parent = torch.tensor(
+                edge_parent, dtype=torch.int64, device=dev0
+            )  # (E_g,)
+            edge_gax = torch.tensor(edge_gax, dtype=dtype0, device=dev0)  # (E_g,)
+
+            # Repeat across batch rows and convert to FLAT mechanism indices
+            rows = torch.arange(B_g, device=dev0, dtype=torch.int64).repeat_interleave(
+                edge_child.numel()
+            )  # (B_g*E_g,)
+            child_cols = edge_child.repeat(B_g)  # (B_g*E_g,)
+            parent_cols = edge_parent.repeat(B_g)  # (B_g*E_g,)
+            g_mech_off = int(self.MECH_OFF[g])
+
+            child_flat = g_mech_off + rows * K_g + child_cols
+            parent_flat = g_mech_off + rows * K_g + parent_cols
+            gax_flat = edge_gax.repeat(B_g)  # (B_g*E_g,)
+
+            edge_child_idx_flat_all.append(child_flat)
+            edge_parent_idx_flat_all.append(parent_flat)
+            edge_gax_flat_all.append(gax_flat)
+
+        if edge_child_idx_flat_all:
+            self.register_buffer(
+                "EDGE_CHILD_IDX_FLAT", torch.cat(edge_child_idx_flat_all, 0)
+            )
+            self.register_buffer(
+                "EDGE_PARENT_IDX_FLAT", torch.cat(edge_parent_idx_flat_all, 0)
+            )
+            self.register_buffer("EDGE_GAX_FLAT", torch.cat(edge_gax_flat_all, 0))
+        else:
+            # empty placeholders
+            self.register_buffer(
+                "EDGE_CHILD_IDX_FLAT", torch.empty(0, dtype=torch.int64, device=dev0)
+            )
+            self.register_buffer(
+                "EDGE_PARENT_IDX_FLAT", torch.empty(0, dtype=torch.int64, device=dev0)
+            )
+            self.register_buffer(
+                "EDGE_GAX_FLAT", torch.empty(0, dtype=dtype0, device=dev0)
+            )
+
         # ---------- allocate step scratch ----------
         self._d_plane = torch.empty(
             (self.B_total, self.K_stride), device=dev0, dtype=dtype0
@@ -719,6 +805,21 @@ class _dhs_multi(Integrator):
 
         # 2) assemble in mechanism order
         f_n_flat = (gtot_flat * v_flat - itot_flat) * self.SCALE_MECH + intra_flat
+
+        # --- extracellular coupling (ve), vectorized on flattened indices) ---
+        if ve is not None and self.EDGE_CHILD_IDX_FLAT.numel() > 0:
+            ve_flat = ve.reshape(1, -1)
+            # edge potential differences per (row, edge)
+            dV_edge = ve_flat.index_select(
+                1, self.EDGE_PARENT_IDX_FLAT
+            ) - ve_flat.index_select(1, self.EDGE_CHILD_IDX_FLAT)
+            I_edge = dV_edge * self.EDGE_GAX_FLAT  # (sum_g B_g*E_g,)
+
+            S_flat = torch.zeros_like(f_n_flat)
+            S_flat.scatter_add_(1, self.EDGE_CHILD_IDX_FLAT, -I_edge)
+            S_flat.scatter_add_(1, self.EDGE_PARENT_IDX_FLAT, I_edge)
+            f_n_flat = f_n_flat + S_flat
+
         RHS_flat = f_n_flat + self.CMDT_MECH * v_flat
         MAIN_flat = self.CMDT_MECH + gtot_flat * self.SCALE_MECH
 
