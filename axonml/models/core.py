@@ -211,6 +211,9 @@ class Population(P, Sliceable):
         self.initialized: bool = False
         self.eval()
 
+    def numel(self):
+        return self.v.numel()
+
     @property
     def shape(self):
         return tuple(self.v.shape)

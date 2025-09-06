@@ -3,11 +3,12 @@ import math
 import torch
 
 from .core import Population
+from .integrators import dhs_multi
 from .tree import Tree
 
 
-def concat(**kwargs):
-    return MultiPopulation(**kwargs)
+def concat(threads=16, **kwargs):
+    return MultiPopulation(integrator=dhs_multi(threads=threads), **kwargs)
 
 
 def offsets(populations):
@@ -31,9 +32,11 @@ def key_to_flat_index(indices, key):
 
 
 class MultiPopulation(Population):
-    def __init__(self, **kwargs):
+    def __init__(self, integrator=None, **kwargs):
+        if integrator is None:
+            integrator = dhs_multi()
         C = sum(math.prod(pop.shape) for pop in kwargs.values())
-        super().__init__(1, C)
+        super().__init__(1, C, integrator=integrator)
 
         self.populations = kwargs
         for name, pop in self.populations.items():
@@ -50,11 +53,14 @@ class MultiPopulation(Population):
     def __iter__(self):
         return iter(self.populations.values())
 
+    def __len__(self):
+        return len(self.populations)
+
     def device(self):
-        return next(iter(self.populations.values())).device
+        return next(iter(self.populations.values())).device()
 
     def dtype(self):
-        return next(iter(self.populations.values())).dtype
+        return next(iter(self.populations.values())).dtype()
 
     def reinsert_all(self):
         all_indices = indices(self.populations)

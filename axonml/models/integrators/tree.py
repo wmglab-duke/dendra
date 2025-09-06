@@ -426,180 +426,104 @@ class _dhs_multi(Integrator):
     Packs all morphology/geometry into padded, flat buffers with a global
     row pitch K_stride = max(K_g) and records per-group offsets so a single
     GPU kernel can process all groups in one launch.
-
-    After `initialize`, the following attributes are ready for a single-launch solve:
-      - B_total, K_stride, L_max
-      - Per-group B, K, L, offsets: ROW_OFF[g], MECH_OFF[g]
-      - Concatenated topology tables: P_cat, ORDER_cat, LAYER_PTR_cat
-      - Per-group topology offsets: P_OFF, ORDER_OFF, LPTR_OFF, L_per_group
-      - Flat parameter planes (padded to K_stride): a_geom_flat, cmdt_flat, scale_flat
-      - Per-group solver<->mechanism mappings: SOLVER_cat, INV_SOLVER_cat, SOLVER_OFF
     """
 
-    def __init__(self, model: List, mech, imem=None, threads: int = 16):
+    def __init__(self, model, mech, imem=None, threads: int = 16):
         assert THREADS_PER_WARP % threads == 0, "threads must divide 32 (warp size)"
         assert threads <= 32, "threads must be ≤ 32 (warp size)"
-        assert isinstance(model, (list, tuple)) and len(model) > 0, (
-            "model must be a non-empty list of per-morph models"
-        )
+        assert len(model) > 0, "model must be a non-empty MultiPopulation instance"
 
-        # It is ok to pass the list upstream; Integrator typically stores it.
         super().__init__(model, mech, imem)
 
         self.threads = threads
         self.num_groups = len(model)
 
-        # Basic per-group shapes (filled in initialize)
+        # Per-group shapes (filled in initialize)
         self.group_B: List[int] = []
         self.group_K: List[int] = []
         self.group_L: List[int] = []
+        self.base_shapes: List[Tuple[int, int]] = []  # [(B_g, K_g), ...]
 
         # Global packed shapes (filled in initialize)
         self.B_total: int = 0
         self.K_stride: int = 0
         self.L_max: int = 0
 
-        # Per-group row and mechanism offsets (filled in initialize)
-        # ROW_OFF[g] = starting neuron row for group g in flat (B_total, K_stride) planes
-        # MECH_OFF[g] = starting index in concatenated mechanism-order vector (sum B_g*K_g)
-        self.ROW_OFF: torch.Tensor = None  # int64[num_groups]
-        self.MECH_OFF: torch.Tensor = None  # int64[num_groups]
-
-        # Topology (concatenated) + per-group offsets (registered in initialize)
-        self.P_cat = None  # int64[sum K_g]
-        self.ORDER_cat = None  # int64[sum K_g]
-        self.LAYER_PTR_cat = None  # int64[sum (L_g+1)]
-        self.P_OFF = None  # int64[num_groups]
-        self.ORDER_OFF = None  # int64[num_groups]
-        self.LPTR_OFF = None  # int64[num_groups]
-        self.L_per_group = None  # int32[num_groups]
-
-        # Solver<->mechanism maps (concatenated over groups)
-        self.SOLVER_cat = None  # int64[sum K_g]  (solver_order per group, catted)
-        self.INV_SOLVER_cat = None  # int64[sum K_g]
-        self.SOLVER_OFF = None  # int64[num_groups]  (offsets into *_cat above)
-
-        # Padded, flat parameter planes with row pitch K_stride
-        # Shapes: (B_total, K_stride); dtype/device = first group's
-        self.a_geom_flat = None
-        self.cmdt_flat = None
-        self.scale_flat = None
-
-        # Keep per-group base shapes for convenient reshaping/scattering later
-        self.base_shapes: List[Tuple[int, int]] = []  # [(B_g, K_g), ...]
-
+        # Launch geometry
         self.NPW = THREADS_PER_WARP // self.threads  # neurons per warp
-        # Per-warp descriptors (set in initialize)
-        self.WARP_P_OFF = self.WARP_ORDER_OFF = self.WARP_LPTR_OFF = None  # int64[W]
-        self.WARP_L = None  # int32[W]
-        self.WARP_ROW_BASE = None  # int64[W]  (starting row index in [0, B_total))
-        self.WARP_ROW_COUNT = (
-            None  # int32[W]  (1..NPW, how many valid neurons in this warp)
-        )
-        self.grid_x = 0  # number of warps to launch
+        self.grid_x = 0
 
-        # (Optional future hookup)
-        self.solve = None  # will be set in initialize if you plug in a kernel
+        # Will be set in initialize
+        self.solve = None
 
-    def initialize(self, models: List, dt: float):
-        assert isinstance(models, (list, tuple)) and len(models) == self.num_groups
+        # Step-time scratch planes (allocated in initialize)
+        self._d_plane = None
+        self._b_plane = None
 
-        # ---------------------------------------------------------------------
-        # 0) Device / dtype sanity
-        # ---------------------------------------------------------------------
-        dev0 = models[0].device()
-        dtype0 = models[0].dtype()
+    def initialize(self, models, dt: float):
+        assert len(models) == self.num_groups
+
+        # --- device / dtype from first group ---
+        dev0 = models.device()
+        dtype0 = models.dtype()
         for m in models:
             assert m.device().type == dev0.type, "All models must be on the same device"
             assert m.dtype() == dtype0, "All models must share the same dtype"
-
         self.to(dev0)
 
-        # (Optional) choose solver backend — left as a placeholder per request
+        # Backend
         if dev0.type == "cuda":
-            # from .triton import dhs_solve_multi_cuda
             self.solve = partial(dhs_solve_multi_cuda, threads=self.threads)
-        elif dev0.type == "cpu":
-            # self.solve = torch.ops.axonml_solvers.dhs_solve_multi  # if/when available
-            raise NotImplementedError("CPU support is not implemented.")
         else:
-            raise NotImplementedError(f"Device type {dev0.type} is not supported.")
+            raise NotImplementedError("CPU support is not implemented for _dhs_multi.")
 
-        # Time-step in seconds for cmdt
         dt_s = dt * 1e-3
 
-        # Scratch collectors
         P_list, ORDER_list, LPTR_list = [], [], []
-        L_list = []  # scalar L_g per group
+        L_list = []
         SOLVER_list, INV_SOLVER_list = [], []
         B_list, K_list = [], []
-
-        # Parameter planes per group
         a_rows, cmdt_rows, scale_rows = [], [], []
+        row_off, mech_off, solver_off = [], [], []
+        row_cursor = 0
+        mech_cursor = 0
+        solver_cursor = 0
 
-        # Offsets
-        row_off = []
-        mech_off = []
-        solver_off = []
-
-        # Running cursors
-        row_cursor = 0  # over B_total
-        mech_cursor = 0  # over sum(B_g*K_g)
-        p_cursor = 0  # over sum K_g
-        o_cursor = 0  # over sum K_g
-        lptr_cursor = 0  # over sum (L_g+1)
-        solver_cursor = 0  # over sum K_g
-
-        # ---------------------------------------------------------------------
-        # 1) Per-group topology & parameters
-        # ---------------------------------------------------------------------
-        for g, model in enumerate(models):
-            # Shapes
-            K_g = int(model.shape[-1])
-            B_g = int(np.prod(model.shape[:-1])) if len(model.shape) > 1 else 1
-
+        # ---------- per-group topology & params ----------
+        for g, mdl in enumerate(models):
+            K_g = int(mdl.shape[-1])
+            B_g = int(np.prod(mdl.shape[:-1])) if len(mdl.shape) > 1 else 1
+            self.base_shapes.append((B_g, K_g))
             B_list.append(B_g)
             K_list.append(K_g)
-            self.base_shapes.append((B_g, K_g))
 
-            # Morphology/geometry
             parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(
-                model.graph, dtype_axial=model.dtype()
+                mdl.graph, dtype_axial=mdl.dtype()
             )
             parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
             order_g, layer_ptr_g = build_dhs_layers(depth, self.threads)
 
-            # Solver <-> mechanism maps
-            solver_order_g = torch.as_tensor(
-                node_order, dtype=torch.int64, device=dev0
-            )  # (K_g,)
-            inv_solver_g = torch.argsort(solver_order_g, dim=0)  # (K_g,)
+            solver_order_g = torch.as_tensor(node_order, dtype=torch.int64, device=dev0)
+            inv_solver_g = torch.argsort(solver_order_g, dim=0)
 
-            # Area, cm, cmdt, scale
-            area_cm2 = model.area.to(device=dev0, dtype=model.dtype())  # (1, K_g)
-            cm = (
-                1e-6 * model.cm.to(device=dev0, dtype=model.dtype()) * area_cm2
-            )  # (1, K_g) [F]
-            cmdt_g = (cm / dt_s).expand(B_g, -1).contiguous()  # (B_g, K_g) [S]
-            a_geom_g = a_geom_t.expand(B_g, -1).to(device=dev0, dtype=model.dtype())
+            area_cm2 = mdl.area.to(device=dev0, dtype=mdl.dtype())  # (1, K_g)
+            cm = 1e-6 * mdl.cm.to(device=dev0, dtype=mdl.dtype()) * area_cm2
+            cmdt_g = (cm / dt_s).expand(B_g, -1).contiguous()  # (B_g, K_g)
+            a_geom_g = a_geom_t.expand(B_g, -1).to(device=dev0, dtype=mdl.dtype())
             scale_g = area_cm2.expand(B_g, -1).contiguous()  # (B_g, K_g)
 
-            # Stash topology (device int64)
-            P_list.append(parent_idx.to(dtype=torch.int64, device=dev0))  # (K_g,)
-            ORDER_list.append(order_g.to(dtype=torch.int64, device=dev0))  # (K_g,)
-            LPTR_list.append(layer_ptr_g.to(dtype=torch.int64, device=dev0))  # (L_g+1,)
+            P_list.append(parent_idx.to(dtype=torch.int64, device=dev0))
+            ORDER_list.append(order_g.to(dtype=torch.int64, device=dev0))
+            LPTR_list.append(layer_ptr_g.to(dtype=torch.int64, device=dev0))
             L_list.append(int(layer_ptr_g.numel() - 1))
 
-            # Stash solver maps
             SOLVER_list.append(solver_order_g)
             INV_SOLVER_list.append(inv_solver_g)
 
-            # Stash parameter planes (will pad to K_stride later)
             a_rows.append(a_geom_g)
             cmdt_rows.append(cmdt_g)
             scale_rows.append(scale_g)
 
-            # Record offsets
             row_off.append(row_cursor)
             mech_off.append(mech_cursor)
             solver_off.append(solver_cursor)
@@ -607,60 +531,50 @@ class _dhs_multi(Integrator):
             row_cursor += B_g
             mech_cursor += B_g * K_g
             solver_cursor += K_g
-            p_cursor += K_g
-            o_cursor += K_g
-            lptr_cursor += layer_ptr_g.numel()
 
-        # ---------------------------------------------------------------------
-        # 2) Global shapes & constants
-        # ---------------------------------------------------------------------
-        self.group_B = B_list
-        self.group_K = K_list
-        self.group_L = L_list
-
+        # ---------- globals ----------
+        self.group_B, self.group_K, self.group_L = B_list, K_list, L_list
         self.B_total = int(sum(B_list))
-        self.K_stride = int(max(K_list)) if len(K_list) > 0 else 0
-        self.L_max = int(max(L_list)) if len(L_list) > 0 else 0
+        self.K_stride = int(max(K_list)) if K_list else 0
+        self.L_max = int(max(L_list)) if L_list else 0
 
-        # Offsets as buffers
-        self.ROW_OFF = torch.as_tensor(row_off, dtype=torch.int64, device=dev0)  # (G,)
-        self.MECH_OFF = torch.as_tensor(
-            mech_off, dtype=torch.int64, device=dev0
-        )  # (G,)
-        self.SOLVER_OFF = torch.as_tensor(
-            solver_off, dtype=torch.int64, device=dev0
-        )  # (G,)
+        self.register_buffer(
+            "ROW_OFF", torch.as_tensor(row_off, dtype=torch.int64, device=dev0)
+        )
+        self.register_buffer(
+            "MECH_OFF", torch.as_tensor(mech_off, dtype=torch.int64, device=dev0)
+        )
+        self.register_buffer(
+            "SOLVER_OFF", torch.as_tensor(solver_off, dtype=torch.int64, device=dev0)
+        )
 
-        # ---------------------------------------------------------------------
-        # 3) Concatenate topology and solver maps; register as buffers
-        # ---------------------------------------------------------------------
+        # ---------- concat topology ----------
         P_cat = (
-            torch.cat(P_list, dim=0)
-            if len(P_list)
+            torch.cat(P_list, 0)
+            if P_list
             else torch.empty(0, dtype=torch.int64, device=dev0)
         )
         ORDER_cat = (
-            torch.cat(ORDER_list, dim=0)
-            if len(ORDER_list)
+            torch.cat(ORDER_list, 0)
+            if ORDER_list
             else torch.empty(0, dtype=torch.int64, device=dev0)
         )
         LAYER_PTR_cat = (
-            torch.cat(LPTR_list, dim=0)
-            if len(LPTR_list)
+            torch.cat(LPTR_list, 0)
+            if LPTR_list
             else torch.empty(0, dtype=torch.int64, device=dev0)
         )
         SOLVER_cat = (
-            torch.cat(SOLVER_list, dim=0)
-            if len(SOLVER_list)
+            torch.cat(SOLVER_list, 0)
+            if SOLVER_list
             else torch.empty(0, dtype=torch.int64, device=dev0)
         )
         INV_SOLVER_cat = (
-            torch.cat(INV_SOLVER_list, dim=0)
-            if len(INV_SOLVER_list)
+            torch.cat(INV_SOLVER_list, 0)
+            if INV_SOLVER_list
             else torch.empty(0, dtype=torch.int64, device=dev0)
         )
 
-        # Per-group offsets into concatenated topology
         P_OFF = torch.as_tensor(
             np.cumsum([0] + K_list[:-1]).tolist(), dtype=torch.int64, device=dev0
         )
@@ -674,7 +588,6 @@ class _dhs_multi(Integrator):
         )
         L_per_group = torch.as_tensor(L_list, dtype=torch.int32, device=dev0)
 
-        # Register buffers so they move with .to()
         self.register_buffer("P_cat", P_cat)
         self.register_buffer("ORDER_cat", ORDER_cat)
         self.register_buffer("LAYER_PTR_cat", LAYER_PTR_cat)
@@ -682,22 +595,20 @@ class _dhs_multi(Integrator):
         self.register_buffer("ORDER_OFF", ORDER_OFF)
         self.register_buffer("LPTR_OFF", LPTR_OFF)
         self.register_buffer("L_per_group", L_per_group)
-
         self.register_buffer("SOLVER_cat", SOLVER_cat)
         self.register_buffer("INV_SOLVER_cat", INV_SOLVER_cat)
-        self.register_buffer("SOLVER_OFF", self.SOLVER_OFF)
 
+        # ---------- warp plan (one morphology per warp) ----------
         NPW = self.NPW
         warp_p_off, warp_o_off, warp_lptr_off = [], [], []
         warp_L, warp_row_base, warp_row_count = [], [], []
-
         for g in range(self.num_groups):
             B_g = int(self.group_B[g])
             n_warps_g = (B_g + NPW - 1) // NPW
-            p_off = int(self.P_OFF[g].item())
-            o_off = int(self.ORDER_OFF[g].item())
-            lptr_off = int(self.LPTR_OFF[g].item())
-            Lg = int(self.L_per_group[g].item())
+            p_off = int(P_OFF[g].item())
+            o_off = int(ORDER_OFF[g].item())
+            lptr_off = int(LPTR_OFF[g].item())
+            Lg = int(L_per_group[g].item())
             row0 = int(self.ROW_OFF[g].item())
 
             for t in range(n_warps_g):
@@ -705,16 +616,12 @@ class _dhs_multi(Integrator):
                 warp_o_off.append(o_off)
                 warp_lptr_off.append(lptr_off)
                 warp_L.append(Lg)
-
                 base = row0 + t * NPW
                 cnt = min(NPW, B_g - t * NPW)
                 warp_row_base.append(base)
                 warp_row_count.append(cnt)
 
         self.grid_x = len(warp_row_base)
-
-        # Register buffers
-        dev0 = self.a_geom_flat.device
         self.register_buffer(
             "WARP_P_OFF", torch.tensor(warp_p_off, dtype=torch.int64, device=dev0)
         )
@@ -735,14 +642,8 @@ class _dhs_multi(Integrator):
             torch.tensor(warp_row_count, dtype=torch.int32, device=dev0),
         )
 
-        # ---------------------------------------------------------------------
-        # 4) Allocate padded flat planes and materialize parameters
-        #     Layout: rows enumerate neurons across all groups:
-        #       rows [ROW_OFF[g] : ROW_OFF[g] + B_g] belong to group g,
-        #       columns [0:K_g] active, [K_g:K_stride] are padding.
-        # ---------------------------------------------------------------------
+        # ---------- padded flat planes ----------
         if self.B_total == 0 or self.K_stride == 0:
-            # Degenerate case; keep empty planes
             self.register_buffer(
                 "a_geom_flat", torch.empty(0, 0, device=dev0, dtype=dtype0)
             )
@@ -757,62 +658,48 @@ class _dhs_multi(Integrator):
         a_flat = torch.zeros((self.B_total, self.K_stride), device=dev0, dtype=dtype0)
         c_flat = torch.zeros((self.B_total, self.K_stride), device=dev0, dtype=dtype0)
         s_flat = torch.zeros((self.B_total, self.K_stride), device=dev0, dtype=dtype0)
-
         for g, (B_g, K_g) in enumerate(zip(B_list, K_list)):
             r0 = int(self.ROW_OFF[g])
             r1 = r0 + B_g
-            # Fill leading K_g columns; remainder stays zero (padding)
-            a_flat[r0:r1, :K_g].copy_(a_rows[g])
-            c_flat[r0:r1, :K_g].copy_(cmdt_rows[g])
-            s_flat[r0:r1, :K_g].copy_(scale_rows[g])
+            a_flat[r0:r1, :K_g].copy_(a_rows[g])  # solver order
+            c_flat[r0:r1, :K_g].copy_(cmdt_rows[g])  # mechanism order
+            s_flat[r0:r1, :K_g].copy_(scale_rows[g])  # mechanism order
+        self.register_buffer("a_geom_flat", a_flat)
+        self.register_buffer("cmdt_flat", c_flat)
+        self.register_buffer("scale_flat", s_flat)
 
-        self.register_buffer("a_geom_flat", a_flat)  # (B_total, K_stride)
-        self.register_buffer("cmdt_flat", c_flat)  # (B_total, K_stride)
-        self.register_buffer("scale_flat", s_flat)  # (B_total, K_stride)
-
-        mech_rows = []
-        mech_cols_solver = []
-        cmdt_mech_flat = []
-        scale_mech_flat = []
-
+        # ---------- vectorized mech↔solver mapping ----------
+        mech_rows, cmdt_mech_flat, scale_mech_flat = [], [], []
+        mech_cols_inv = []
         for g, (B_g, K_g) in enumerate(zip(self.group_B, self.group_K)):
             r0 = int(self.ROW_OFF[g])
             r1 = r0 + B_g
-            # per-group (B_g, K_g) → 1D mechanism-order segment of length B_g*K_g
-            # rows: repeat each row index K_g times
-            rows_g = torch.arange(r0, r1, device=self.device).repeat_interleave(
+            rows_g = torch.arange(r0, r1, device=dev0).repeat_interleave(
                 K_g
             )  # (B_g*K_g,)
-
-            # cols in SOLVER order: solver permutation repeated across rows
-            soff = int(self.SOLVER_OFF[g])
-            solver_cols = self.SOLVER_cat[soff : soff + K_g]  # (K_g,)
-            cols_g = solver_cols.repeat(B_g)  # (B_g*K_g,)
-
             mech_rows.append(rows_g)
-            mech_cols_solver.append(cols_g)
 
-            # pull active columns (0:K_g) from the padded planes, then flatten in mechanism order
+            soff = int(self.SOLVER_OFF[g])
+            inv_cols = self.INV_SOLVER_cat[soff : soff + K_g]  # mechanism m -> solver s
+            mech_cols_inv.append(inv_cols.repeat(B_g))  # (B_g*K_g,)
+
             cmdt_mech_flat.append(self.cmdt_flat[r0:r1, :K_g].reshape(-1))
             scale_mech_flat.append(self.scale_flat[r0:r1, :K_g].reshape(-1))
 
-        # Concatenate across groups once
-        MECH_ROWS = torch.cat(mech_rows, dim=0)  # (sum B_g*K_g,)
-        MECH_COLS_SOLVER = torch.cat(mech_cols_solver, dim=0)  # (sum B_g*K_g,)
-        CMDT_MECH = torch.cat(cmdt_mech_flat, dim=0)  # (sum B_g*K_g,)
-        SCALE_MECH = torch.cat(scale_mech_flat, dim=0)  # (sum B_g*K_g,)
+        self.register_buffer("MECH_ROWS", torch.cat(mech_rows, 0))
+        self.register_buffer("MECH_COLS_INV", torch.cat(mech_cols_inv, 0))
+        self.register_buffer("CMDT_MECH", torch.cat(cmdt_mech_flat, 0))
+        self.register_buffer("SCALE_MECH", torch.cat(scale_mech_flat, 0))
 
-        self.register_buffer("MECH_ROWS", MECH_ROWS)
-        self.register_buffer("MECH_COLS_SOLVER", MECH_COLS_SOLVER)
-        self.register_buffer("CMDT_MECH", CMDT_MECH)
-        self.register_buffer("SCALE_MECH", SCALE_MECH)
+        # ---------- allocate step scratch ----------
+        self._d_plane = torch.empty(
+            (self.B_total, self.K_stride), device=dev0, dtype=dtype0
+        )
+        self._b_plane = torch.empty(
+            (self.B_total, self.K_stride), device=dev0, dtype=dtype0
+        )
 
     def step(self, model, dt, ve=None, intra=None):
-        """
-        model.v is a 1-D flattened vector in MECHANISM order, formed by
-        concatenating all groups' (B_g, K_g) rows: [g0, g1, ..., g_{G-1}].
-        After solving, we write back the same 1-D layout.
-        """
         model.v = self._step(model.v, dt, getattr(model, "celsius", None), ve, intra)
 
     def _step(self, v_flat, dt, temp=None, ve=None, intra=None):
@@ -821,39 +708,31 @@ class _dhs_multi(Integrator):
         if self.solve is None:
             raise NotImplementedError("Multi-morph kernel not connected.")
 
-        device, dtype = v_flat.device, v_flat.dtype
-        Btot, Kstride = int(self.B_total), int(self.K_stride)
+        orig_shape = v_flat.shape  # keep whatever the caller gave us (N,) or (1,N)
 
-        # --- 1) Mechanisms on the flat, concatenated vector ---
+        # 1) mechanisms on flattened vector
         v_flat = self.mech.update_v(v_flat, dt)
         self.mech.advance(v_flat, dt, temp)
-        itot_flat, gtot_flat = self.mech.i(v_flat)  # 1-D, mech order
+        itot_flat, gtot_flat = self.mech.i(v_flat)  # both flattened
 
-        # Optional additive current in mech order
-        if intra is None:
-            intra_flat = 0.0
-        else:
-            intra_flat = intra
+        intra_flat = 0.0 if intra is None else intra.reshape(1, -1)
 
-        # --- 2) Assemble RHS/main in mechanism order (all vectorized) ---
-        # f_n = (gtot * v - itot) * scale + intra
+        # 2) assemble in mechanism order
         f_n_flat = (gtot_flat * v_flat - itot_flat) * self.SCALE_MECH + intra_flat
         RHS_flat = f_n_flat + self.CMDT_MECH * v_flat
         MAIN_flat = self.CMDT_MECH + gtot_flat * self.SCALE_MECH
 
-        # --- 3) Scatter once into padded solver-order planes ---
-        d_plane = torch.zeros((Btot, Kstride), device=device, dtype=dtype)
-        b_plane = torch.zeros((Btot, Kstride), device=device, dtype=dtype)
+        # 3) scatter into solver planes (vectorized; reuse scratch)
+        self._d_plane.zero_()
+        self._b_plane.zero_()
+        self._b_plane[self.MECH_ROWS, self.MECH_COLS_INV] = RHS_flat
+        self._d_plane[self.MECH_ROWS, self.MECH_COLS_INV] = MAIN_flat
 
-        # elementwise (row, col) assignment; no loops
-        b_plane[self.MECH_ROWS, self.MECH_COLS_SOLVER] = RHS_flat
-        d_plane[self.MECH_ROWS, self.MECH_COLS_SOLVER] = MAIN_flat
-
-        # --- 4) Single multi-morph solve (solver-order planes) ---
+        # 4) single multi-morph solve (solver order)
         v_out_solver = self.solve(
-            d_plane,
+            self._d_plane,
             self.a_geom_flat,
-            b_plane,
+            self._b_plane,
             self.P_cat,
             self.ORDER_cat,
             self.LAYER_PTR_cat,
@@ -865,12 +744,9 @@ class _dhs_multi(Integrator):
             self.WARP_ROW_COUNT,
             K_stride=self.K_stride,
             L_max=self.L_max,
-            threads=self.threads,
             grid_x=self.grid_x,
         )
-        # Expected: (B_total, K_stride), solver order
 
-        # --- 5) Gather back to mechanism order in one shot ---
-        v_new_flat = v_out_solver[self.MECH_ROWS, self.MECH_COLS_SOLVER]
-
-        return v_new_flat
+        # 5) gather back to mechanism order and match caller shape
+        v_new_flat = v_out_solver[self.MECH_ROWS, self.MECH_COLS_INV]
+        return v_new_flat.reshape(orig_shape)
