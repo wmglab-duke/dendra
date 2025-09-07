@@ -491,7 +491,12 @@ class _dhs_multi(Integrator):
         if dev0.type == "cuda":
             self.solve = partial(dhs_solve_multi_cuda, threads=self.threads)
         else:
-            raise NotImplementedError("CPU support is not implemented for _dhs_multi.")
+            if not AXONML_SOLVERS_AVAILABLE:
+                raise ImportError(
+                    "DHS integrator requires axonml_solvers package for CPU execution. "
+                    "Please install it with `pip install axonml_solvers`."
+                )
+            self.solve = torch.ops.axonml_solvers.dhs_multi_solve
 
         dt_s = dt * 1e-3
 
