@@ -7,9 +7,13 @@ from .integrators import dhs_multi
 from .tree import Tree
 
 
-def concat(threads=16, celsius=37.0, **kwargs):
+def concat(
+    populations: dict[str, Population], threads=16, write_back=True, celsius=37.0
+):
     return MultiPopulation(
-        integrator=dhs_multi(threads=threads), celsius=celsius, **kwargs
+        integrator=dhs_multi(threads=threads, write_back=write_back),
+        celsius=celsius,
+        **populations,
     )
 
 
@@ -34,13 +38,13 @@ def key_to_flat_index(indices, key):
 
 
 class MultiPopulation(Population):
-    def __init__(self, integrator=None, celsius=37.0, **kwargs):
+    def __init__(self, integrator=None, celsius=37.0, **populations):
         if integrator is None:
             integrator = dhs_multi()
-        C = sum(math.prod(pop.shape) for pop in kwargs.values())
+        C = sum(math.prod(pop.shape) for pop in populations.values())
         super().__init__(1, C, integrator=integrator, celsius=celsius)
 
-        self.populations = kwargs
+        self.populations = populations
         for name, pop in self.populations.items():
             if not isinstance(pop, Tree):
                 raise TypeError(f"Expected Tree instance for '{name}', got {type(pop)}")

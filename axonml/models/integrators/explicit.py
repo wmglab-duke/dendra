@@ -54,6 +54,9 @@ class _euler(Integrator):
         self.area_c = area
         self.ve_zero = torch.zeros_like(model.v)
 
+        self.dt = dt
+        self.initialized = True
+
     def FRK(self, v, ve, area, cm, ra):
         x = torch.stack([v, ve], dim=1)
         d2v = self.ssd(x).squeeze(1)
@@ -513,6 +516,8 @@ class _dufort_frankel(Integrator):
 
         self.f64 = model.dtype() == torch.float64
         self.ve_zero = torch.zeros_like(model.v)
+
+        self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
         # The step logic is simplified as we no longer branch on `conv`

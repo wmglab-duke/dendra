@@ -103,6 +103,8 @@ class _bwd_euler_ub(Integrator):
                     )
                     self._solve = pcr_solve_t
 
+        self.dt = dt
+
         B, K = model.np, model.nc
         dt_s = dt * 1e-3  # s
 
@@ -142,6 +144,8 @@ class _bwd_euler_ub(Integrator):
         # misc pre-computed factors used elsewhere
         self.cm_inv = Cm_inv  # (B,K)
         self.scale = area_cm2 * Cm_inv  # A·s / C == 1, but keep for code reuse
+
+        self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)

@@ -279,6 +279,8 @@ class _dhs(Integrator):
         B = self.B
         dt_s = dt * 1e-3
 
+        self.dt = dt
+
         device = model.device()
         self.to(device)
 
@@ -369,16 +371,23 @@ class _dhs(Integrator):
             "edge_gax_orig",
             torch.tensor(edge_gax_orig_list, dtype=a_geom_t.dtype, device=device),
         )
+        self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)
 
     def _step(self, v, dt, temp, ve=None, intra=None):
         v = self.mech.update_v(v, dt)  # apply voltage processes
-        self.mech.advance(v, dt, temp)
-        itot, gtot = self.mech.i(v)
 
-        f_n = (gtot * v - itot).view(-1, self.K) * self.scale
+        self.mech.advance(v, dt, temp)
+
+        if self.mech.currents:
+            itot, gtot = self.mech.i(v)
+            f_n = (gtot * v - itot).view(-1, self.K) * self.scale
+            gtot = gtot.view(-1, self.K)
+        else:
+            gtot = torch.tensor(0.0, dtype=v.dtype, device=v.device)
+            f_n = torch.tensor(0.0, dtype=v.dtype, device=v.device)
 
         if ve is not None:
             I_edge = _edge_currents(
@@ -397,7 +406,7 @@ class _dhs(Integrator):
             f_n += intra
 
         RHS = f_n + (self.cmdt * v.view(-1, self.K))  # mA
-        main = self.cmdt + (gtot.view(-1, self.K) * self.scale)  # S
+        main = self.cmdt + (gtot * self.scale)  # S
 
         d_ = main.index_select(-1, self.solver_order)  # (B, N)
         b_ = RHS.index_select(-1, self.solver_order)  # (B, N)
@@ -428,7 +437,9 @@ class _dhs_multi(Integrator):
     GPU kernel can process all groups in one launch.
     """
 
-    def __init__(self, model, mech, imem=None, threads: int = 16):
+    def __init__(
+        self, model, mech, imem=None, threads: int = 16, write_back: bool = True
+    ):
         assert THREADS_PER_WARP % threads == 0, "threads must divide 32 (warp size)"
         assert threads <= 32, "threads must be ≤ 32 (warp size)"
         assert len(model) > 0, "model must be a non-empty MultiPopulation instance"
@@ -436,6 +447,10 @@ class _dhs_multi(Integrator):
         super().__init__(model, mech, imem)
 
         self.threads = threads
+        self.write_back = write_back
+        split_lengths = [m.numel() for m in model]
+        split_at = torch.cumsum(torch.tensor(split_lengths), dim=0)[:-1]
+        self.split_at = split_at.tolist()
         self.num_groups = len(model)
 
         # Per-group shapes (filled in initialize)
@@ -462,6 +477,7 @@ class _dhs_multi(Integrator):
 
     def initialize(self, models, dt: float):
         assert len(models) == self.num_groups
+        self.dt = dt
 
         # --- device / dtype from first group ---
         dev0 = models.device()
@@ -784,6 +800,7 @@ class _dhs_multi(Integrator):
         self._b_plane = torch.empty(
             (self.B_total, self.K_stride), device=dev0, dtype=dtype0
         )
+        self.initialized = True
 
     def init_v(self, model):
         model.v = model.v_init.clone().detach().reshape_as(model.v)
@@ -796,10 +813,10 @@ class _dhs_multi(Integrator):
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, getattr(model, "celsius", None), ve, intra)
+        if self.write_back:
+            _write_back(model, self.split_at)
 
     def _step(self, v_flat, dt, temp=None, ve=None, intra=None):
-        if ve is not None:
-            raise NotImplementedError("ve support is not wired yet in _dhs_multi.step")
         if self.solve is None:
             raise NotImplementedError("Multi-morph kernel not connected.")
 
@@ -860,3 +877,12 @@ class _dhs_multi(Integrator):
         # 5) gather back to mechanism order and match caller shape
         v_new_flat = v_out_solver[self.MECH_ROWS, self.MECH_COLS_INV]
         return v_new_flat.reshape(orig_shape)
+
+
+@torch.compile
+def _write_back(model, split_at):
+    # write v back to the constituent populations
+    v_f = model.v.flatten()
+    splits = torch.tensor_split(v_f, split_at)
+    for split, pop in zip(splits, model.populations.values()):
+        pop.v = split.reshape_as(pop.v)

@@ -208,7 +208,9 @@ class MechanismHandler(torch.nn.Module):
 
     def i(self, v):
         if not self.currents:
-            return 0.0, 0.0
+            return torch.tensor(0.0, dtype=v.dtype, device=v.device), torch.tensor(
+                0.0, dtype=v.dtype, device=v.device
+            )
 
         for mech in self.mechanisms.values():
             mech.breakpoint(mech.get(v))
