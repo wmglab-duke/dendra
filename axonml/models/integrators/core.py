@@ -27,7 +27,7 @@ class Integrator(torch.nn.Module):
         imem = imem if imem is not None else IMEM
         self.imem = bool(imem)
         self.mech = mech
-        self.register_buffer("i_membrane", torch.zeros(model.np, model.nc))
+        self.register_buffer("i_membrane", torch.zeros(model.shape))
         self.initialized = False
         self.dt = None
 

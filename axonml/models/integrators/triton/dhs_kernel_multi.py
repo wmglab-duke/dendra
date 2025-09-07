@@ -250,21 +250,20 @@ class DHSSolveMultiPacked(torch.autograd.Function):
             num_stages=4,
         )
 
-        # save for backward
-        ctx.save_for_backward(
-            d_mem,
-            a_geom,
-            V_out,
-            P_cat,
-            ORDER_cat,
-            LAYER_PTR_cat,
-            WARP_P_OFF,
-            WARP_ORDER_OFF,
-            WARP_LPTR_OFF,
-            WARP_L,
-            WARP_ROW_BASE,
-            WARP_ROW_COUNT,
-        )
+        # Save ONLY dynamic things as "saved tensors"
+        ctx.save_for_backward(d_mem, a_geom, V_out)
+
+        # Stash static plan/topology as plain attributes (tiny ref cost, no copies)
+        ctx.P_cat = P_cat
+        ctx.ORDER_cat = ORDER_cat
+        ctx.LAYER_PTR_cat = LAYER_PTR_cat
+        ctx.WARP_P_OFF = WARP_P_OFF
+        ctx.WARP_ORDER_OFF = WARP_ORDER_OFF
+        ctx.WARP_LPTR_OFF = WARP_LPTR_OFF
+        ctx.WARP_L = WARP_L
+        ctx.WARP_ROW_BASE = WARP_ROW_BASE
+        ctx.WARP_ROW_COUNT = WARP_ROW_COUNT
+
         ctx.K_stride = K_stride
         ctx.L_max = L_max
         ctx.threads = threads
@@ -273,20 +272,19 @@ class DHSSolveMultiPacked(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        (
-            d_mem,
-            a_geom,
-            V_out,
-            P_cat,
-            ORDER_cat,
-            LAYER_PTR_cat,
-            WARP_P_OFF,
-            WARP_ORDER_OFF,
-            WARP_LPTR_OFF,
-            WARP_L,
-            WARP_ROW_BASE,
-            WARP_ROW_COUNT,
-        ) = ctx.saved_tensors
+        d_mem, a_geom, V_out = ctx.saved_tensors
+
+        # Recover static tensors from ctx attrs (no save_for_backward used)
+        P_cat = ctx.P_cat
+        ORDER_cat = ctx.ORDER_cat
+        LAYER_PTR_cat = ctx.LAYER_PTR_cat
+        WARP_P_OFF = ctx.WARP_P_OFF
+        WARP_ORDER_OFF = ctx.WARP_ORDER_OFF
+        WARP_LPTR_OFF = ctx.WARP_LPTR_OFF
+        WARP_L = ctx.WARP_L
+        WARP_ROW_BASE = ctx.WARP_ROW_BASE
+        WARP_ROW_COUNT = ctx.WARP_ROW_COUNT
+
         K_stride, L_max, threads, grid_x = (
             ctx.K_stride,
             ctx.L_max,

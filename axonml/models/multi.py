@@ -7,8 +7,10 @@ from .integrators import dhs_multi
 from .tree import Tree
 
 
-def concat(threads=16, **kwargs):
-    return MultiPopulation(integrator=dhs_multi(threads=threads), **kwargs)
+def concat(threads=16, celsius=37.0, **kwargs):
+    return MultiPopulation(
+        integrator=dhs_multi(threads=threads), celsius=celsius, **kwargs
+    )
 
 
 def offsets(populations):
@@ -32,11 +34,11 @@ def key_to_flat_index(indices, key):
 
 
 class MultiPopulation(Population):
-    def __init__(self, integrator=None, **kwargs):
+    def __init__(self, integrator=None, celsius=37.0, **kwargs):
         if integrator is None:
             integrator = dhs_multi()
         C = sum(math.prod(pop.shape) for pop in kwargs.values())
-        super().__init__(1, C, integrator=integrator)
+        super().__init__(1, C, integrator=integrator, celsius=celsius)
 
         self.populations = kwargs
         for name, pop in self.populations.items():
@@ -47,6 +49,16 @@ class MultiPopulation(Population):
         for pop in self.populations.values():
             self._equilibria.update(pop._equilibria)
             self._concentrations.update(pop._concentrations)
+
+        delattr(self, "v_init")
+        v_init = torch.cat(
+            [
+                torch.full(pop.shape, pop.v_init).flatten()
+                for pop in self.populations.values()
+            ],
+            dim=0,
+        )
+        self.register_buffer("v_init", v_init)
 
         self.reinsert_all()
 
@@ -71,8 +83,7 @@ class MultiPopulation(Population):
                 index = index.flatten()
                 self[:, index].insert(m_class, alias=alias, **kwargs)
             # now do _mech_data
-            for m_class, data in pop._mech_data.items():
-                alias, kwargs, key = data
+            for m_class, (alias, kwargs, key) in pop._mech_data.items():
                 index_f = key_to_flat_index(index, key)
                 alias = f"{name}_{alias}"
                 self[:, index_f].insert(m_class, alias=alias, **kwargs)

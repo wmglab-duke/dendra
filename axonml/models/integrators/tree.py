@@ -785,6 +785,15 @@ class _dhs_multi(Integrator):
             (self.B_total, self.K_stride), device=dev0, dtype=dtype0
         )
 
+    def init_v(self, model):
+        model.v = model.v_init.clone().detach().reshape_as(model.v)
+        if self.imem:
+            model.i_membrane = torch.zeros(
+                model.i_membrane.shape,
+                dtype=model.i_membrane.dtype,
+                device=model.i_membrane.device,
+            ).detach()
+
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, getattr(model, "celsius", None), ve, intra)
 
