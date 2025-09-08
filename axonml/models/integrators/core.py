@@ -30,6 +30,20 @@ class Integrator(torch.nn.Module):
         self.register_buffer("i_membrane", torch.zeros(model.shape))
         self.initialized = False
         self.dt = None
+        self.shape = None
+
+    def initialize(self, model, dt):
+        raise NotImplementedError
+
+    def needs_to_be_initialized(self, model, dt):
+        return not self.initialized or self.dt != float(dt) or self.shape != model.shape
+
+    def _initialize(self, model, dt):
+        if self.needs_to_be_initialized(model, dt):
+            self.dt = float(dt)
+            self.shape = model.shape
+            self.initialize(model, dt)
+            self.initialized = True
 
     def init_v(self, model):
         model.v = torch.full(

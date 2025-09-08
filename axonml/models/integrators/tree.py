@@ -276,10 +276,12 @@ class _dhs(Integrator):
         self.register_buffer("cmdt", torch.empty(1, N))  # (B,N) capacitance * dt
 
     def initialize(self, model, dt):
+        self.B = np.prod(model.shape[:-1])
         B = self.B
-        dt_s = dt * 1e-3
 
-        self.dt = dt
+        self.base_shape = model.shape
+
+        dt_s = dt * 1e-3
 
         device = model.device()
         self.to(device)
@@ -308,7 +310,7 @@ class _dhs(Integrator):
         )  # (N,)
         self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))  # (N,)
 
-        area_cm2 = model.area  # cm²
+        area_cm2 = model.area.to(device=device)  # cm²
 
         self.register_buffer(
             "layer_ptr", layer_ptr.to(dtype=torch.int64, device=device)
@@ -321,8 +323,10 @@ class _dhs(Integrator):
 
         self.scale = area_cm2
 
-        cm = 1e-6 * model.cm * area_cm2  # convert from µF / cm2 to F
-        self.cmdt = (cm / dt_s).expand(model.shape).view(B, self.K)  # (B,N) (F/s = S)
+        cm = 1e-6 * model.cm.to(device=device) * area_cm2  # convert from µF / cm2 to F
+        self.cmdt = (
+            (cm / dt_s).expand(model.shape).reshape(B, self.K)
+        )  # (B,N) (F/s = S)
 
         # extracellular
         # We will need the original node IDs from the graph for this
@@ -371,7 +375,6 @@ class _dhs(Integrator):
             "edge_gax_orig",
             torch.tensor(edge_gax_orig_list, dtype=a_geom_t.dtype, device=device),
         )
-        self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)
@@ -448,9 +451,7 @@ class _dhs_multi(Integrator):
 
         self.threads = threads
         self.write_back = write_back
-        split_lengths = [m.numel() for m in model]
-        split_at = torch.cumsum(torch.tensor(split_lengths), dim=0)[:-1]
-        self.split_at = split_at.tolist()
+        self.split_at = None
         self.num_groups = len(model)
 
         # Per-group shapes (filled in initialize)
@@ -475,9 +476,19 @@ class _dhs_multi(Integrator):
         self._d_plane = None
         self._b_plane = None
 
+        # --- plan & scratch caches (filled lazily in _step) ---
+        self._plan_cache = {}  # key: (P, device) -> dict with tiled plan
+        self._scratch_sig = None
+
+    def _calc_splits(self, models):
+        split_lengths = [m.numelc() for m in models]
+        self.split_at = torch.cumsum(torch.tensor(split_lengths), dim=0)[:-1].tolist()
+
     def initialize(self, models, dt: float):
         assert len(models) == self.num_groups
-        self.dt = dt
+
+        if self.write_back:
+            self._calc_splits(models)
 
         # --- device / dtype from first group ---
         dev0 = models.device()
@@ -513,7 +524,12 @@ class _dhs_multi(Integrator):
         # ---------- per-group topology & params ----------
         for g, mdl in enumerate(models):
             K_g = int(mdl.shape[-1])
-            B_g = int(np.prod(mdl.shape[:-1])) if len(mdl.shape) > 1 else 1
+            B_g = int(mdl.shape[-2]) if len(mdl.shape) > 1 else 1
+
+            n_batch_dims = len(mdl.shape) - 2
+            if n_batch_dims > 0:
+                selection = tuple([0] * n_batch_dims)
+
             self.base_shapes.append((B_g, K_g))
             B_list.append(B_g)
             K_list.append(K_g)
@@ -528,7 +544,10 @@ class _dhs_multi(Integrator):
             inv_solver_g = torch.argsort(solver_order_g, dim=0)
 
             area_cm2 = mdl.area.to(device=dev0, dtype=mdl.dtype())  # (1, K_g)
-            cm = 1e-6 * mdl.cm.to(device=dev0, dtype=mdl.dtype()) * area_cm2
+            cm = 1e-6 * mdl.cm.to(device=dev0, dtype=mdl.dtype())
+            if n_batch_dims > 0:
+                cm = cm[selection]
+            cm = cm * area_cm2
             cmdt_g = (cm / dt_s).expand(B_g, -1).contiguous()  # (B_g, K_g)
             a_geom_g = a_geom_t.expand(B_g, -1).to(device=dev0, dtype=mdl.dtype())
             scale_g = area_cm2.expand(B_g, -1).contiguous()  # (B_g, K_g)
@@ -712,6 +731,16 @@ class _dhs_multi(Integrator):
         self.register_buffer("CMDT_MECH", torch.cat(cmdt_mech_flat, 0))
         self.register_buffer("SCALE_MECH", torch.cat(scale_mech_flat, 0))
 
+        self.N_mech = int(
+            self.CMDT_MECH.numel()
+        )  # total # of mechanism elements (sum_g B_g*K_g)
+        PLANE_LIN_BASE = self.MECH_ROWS * self.K_stride + self.MECH_COLS_INV
+        self.register_buffer("PLANE_LIN_BASE", PLANE_LIN_BASE.to(torch.long))
+
+        # reset caches whenever we (re)initialize
+        self._plan_cache.clear()
+        self._scratch_sig = None
+
         # ---------- extracellular edge maps (for ve) ----------
         edge_child_idx_flat_all = []
         edge_parent_idx_flat_all = []
@@ -805,11 +834,92 @@ class _dhs_multi(Integrator):
         self._b_plane = torch.empty(
             (self.B_total, self.K_stride), device=dev0, dtype=dtype0
         )
-        self.initialized = True
+
+        P = int(np.prod(models.shape[:-2])) if len(models.shape) > 2 else 1
+        self._get_tiled_plan(P, dev0)
+
+        if models.is_batched():
+            Btot, Kstride = self.B_total, self.K_stride
+            rows_total = P * Btot
+            if (
+                self._d_plane is None
+                or self._d_plane.shape[0] != rows_total
+                or self._d_plane.shape[1] != Kstride
+            ):
+                self._d_plane = torch.empty(
+                    (rows_total, Kstride), device=dev0, dtype=dtype0
+                )
+                self._b_plane = torch.empty_like(self._d_plane)
+
+    def _get_tiled_plan(self, P: int, device: torch.device):
+        """
+        Returns a dict with:
+          a_geom_eff, WARP_P_OFF, WARP_ORDER_OFF, WARP_LPTR_OFF, WARP_L,
+          WARP_ROW_BASE, WARP_ROW_COUNT, grid_x, PLIN_flat, rows_total
+        All tensors are on `device`; a_geom_eff uses `dtype`.
+        """
+        key = (int(P), str(device))
+        cached = self._plan_cache.get(key, None)
+        if cached is not None:
+            return cached
+
+        Btot, Kstride = self.B_total, self.K_stride
+        plane_stride = Btot * Kstride
+        rows_total = P * Btot
+
+        # Batched linear indices for (P, N_mech) -> (rows_total, Kstride)
+        # PLIN[b, j] = PLANE_LIN_BASE[j] + b * plane_stride
+        batch_offsets = (
+            torch.arange(P, device=device, dtype=torch.long) * plane_stride
+        ).unsqueeze(1)  # (P,1)
+        PLIN_flat = (self.PLANE_LIN_BASE.unsqueeze(0) + batch_offsets).reshape(
+            -1
+        )  # (P*N_mech,)
+
+        if P == 1:
+            plan = dict(
+                a_geom_eff=self.a_geom_flat,  # (Btot, Kstride)
+                WARP_P_OFF=self.WARP_P_OFF,
+                WARP_ORDER_OFF=self.WARP_ORDER_OFF,
+                WARP_LPTR_OFF=self.WARP_LPTR_OFF,
+                WARP_L=self.WARP_L,
+                WARP_ROW_BASE=self.WARP_ROW_BASE,
+                WARP_ROW_COUNT=self.WARP_ROW_COUNT,
+                grid_x=self.grid_x,
+                PLIN_flat=PLIN_flat,
+                rows_total=rows_total,
+            )
+        else:
+            # Tile geometry rows and warp plan P times
+            a_geom_eff = self.a_geom_flat.repeat(
+                P, 1
+            ).contiguous()  # materialize – kernel expects proper row stride
+
+            W = int(self.grid_x)
+            row_base_offsets = (
+                torch.arange(P, device=device, dtype=torch.long) * Btot
+            ).repeat_interleave(W)  # (P*W,)
+
+            plan = dict(
+                a_geom_eff=a_geom_eff,
+                WARP_P_OFF=self.WARP_P_OFF.repeat(P),
+                WARP_ORDER_OFF=self.WARP_ORDER_OFF.repeat(P),
+                WARP_LPTR_OFF=self.WARP_LPTR_OFF.repeat(P),
+                WARP_L=self.WARP_L.repeat(P),
+                WARP_ROW_BASE=self.WARP_ROW_BASE.repeat(P) + row_base_offsets,
+                WARP_ROW_COUNT=self.WARP_ROW_COUNT.repeat(P),
+                grid_x=W * P,
+                PLIN_flat=PLIN_flat,
+                rows_total=rows_total,
+            )
+
+        self._plan_cache[key] = plan
+        return plan
 
     def init_v(self, model):
-        model.v = model.v_init.clone().detach().reshape_as(model.v)
+        model.v = model.v_init.expand_as(model.v).clone().detach().contiguous()
         if self.write_back:
+            self._calc_splits(model)
             _write_back(model, self.split_at)
         if self.imem:
             model.i_membrane = torch.zeros(
@@ -823,21 +933,30 @@ class _dhs_multi(Integrator):
         if self.write_back:
             _write_back(model, self.split_at)
 
-    def _step(self, v_flat, dt, temp=None, ve=None, intra=None):
+    def _step(self, v, dt, temp=None, ve=None, intra=None):
         if self.solve is None:
             raise NotImplementedError("Multi-morph kernel not connected.")
 
-        orig_shape = v_flat.shape  # keep whatever the caller gave us (N,) or (1,N)
+        orig_shape = v.shape  # keep whatever the caller gave us
+        assert orig_shape[-2] == 1, "expect shape (..., 1, N_total)"
+        N_total = orig_shape[-1]
+
+        # Flatten leading batch dims into P
+        P = int(np.prod(orig_shape[:-2])) if len(orig_shape) > 2 else 1
 
         # 1) mechanisms on flattened vector
-        v_flat = self.mech.update_v(v_flat, dt)
-        self.mech.advance(v_flat, dt, temp)
-        itot_flat, gtot_flat = self.mech.i(v_flat)  # both flattened
+        v = self.mech.update_v(v, dt)
+        self.mech.advance(v, dt, temp)
+        itot_flat, gtot_flat = self.mech.i(v)  # both original shape
 
-        intra_flat = 0.0 if intra is None else intra.reshape(1, -1)
+        intra_flat = 0.0 if intra is None else intra.reshape(P, N_total)
+
+        SCALE_MECH = self.SCALE_MECH.reshape(1, -1)
 
         # 2) assemble in mechanism order
-        f_n_flat = (gtot_flat * v_flat - itot_flat) * self.SCALE_MECH + intra_flat
+        f_n_flat = (gtot_flat * v - itot_flat).reshape(
+            P, N_total
+        ) * SCALE_MECH + intra_flat
 
         # --- extracellular coupling (ve), vectorized on flattened indices) ---
         if ve is not None and self.EDGE_CHILD_IDX_FLAT.numel() > 0:
@@ -853,43 +972,46 @@ class _dhs_multi(Integrator):
             S_flat.scatter_add_(1, self.EDGE_PARENT_IDX_FLAT, I_edge)
             f_n_flat = f_n_flat + S_flat
 
-        RHS_flat = f_n_flat + self.CMDT_MECH * v_flat
-        MAIN_flat = self.CMDT_MECH + gtot_flat * self.SCALE_MECH
+        CMDT_MECH = self.CMDT_MECH.reshape(1, -1)
 
-        # 3) scatter into solver planes (vectorized; reuse scratch)
-        self._d_plane.zero_()
-        self._b_plane.zero_()
-        self._b_plane[self.MECH_ROWS, self.MECH_COLS_INV] = RHS_flat
-        self._d_plane[self.MECH_ROWS, self.MECH_COLS_INV] = MAIN_flat
+        RHS_flat = f_n_flat + CMDT_MECH * v.reshape(P, N_total)
+        MAIN_flat = CMDT_MECH + gtot_flat * SCALE_MECH
 
-        # 4) single multi-morph solve (solver order)
+        device = v.device
+        plan = self._get_tiled_plan(P, device)
+        PLIN_flat = plan["PLIN_flat"]
+
+        # Zero & scatter by linear indices (fast, vectorized)
+        self._b_plane.view(-1).zero_().index_copy_(0, PLIN_flat, RHS_flat.view(-1))
+        self._d_plane.view(-1).zero_().index_copy_(0, PLIN_flat, MAIN_flat.view(-1))
+
         v_out_solver = self.solve(
             self._d_plane,
-            self.a_geom_flat,
+            plan["a_geom_eff"],
             self._b_plane,
             self.P_cat,
             self.ORDER_cat,
             self.LAYER_PTR_cat,
-            self.WARP_P_OFF,
-            self.WARP_ORDER_OFF,
-            self.WARP_LPTR_OFF,
-            self.WARP_L,
-            self.WARP_ROW_BASE,
-            self.WARP_ROW_COUNT,
+            plan["WARP_P_OFF"],
+            plan["WARP_ORDER_OFF"],
+            plan["WARP_LPTR_OFF"],
+            plan["WARP_L"],
+            plan["WARP_ROW_BASE"],
+            plan["WARP_ROW_COUNT"],
             K_stride=self.K_stride,
             L_max=self.L_max,
-            grid_x=self.grid_x,
-        )
+            grid_x=plan["grid_x"],
+        )  # -> (rows_total, K_stride)
 
-        # 5) gather back to mechanism order and match caller shape
-        v_new_flat = v_out_solver[self.MECH_ROWS, self.MECH_COLS_INV]
-        return v_new_flat.reshape(orig_shape)
+        # 6) gather back to mechanism order with the same index map
+        v_sel = v_out_solver.view(-1).index_select(0, PLIN_flat)  # (P * N_total,)
+        return v_sel.reshape(orig_shape)
 
 
 @torch.compile
 def _write_back(model, split_at):
     # write v back to the constituent populations
-    v_f = model.v.flatten()
-    splits = torch.tensor_split(v_f, split_at)
+    v_f = model.v
+    splits = torch.tensor_split(v_f, split_at, dim=-1)
     for split, pop in zip(splits, model.populations.values()):
         pop.v = split.reshape_as(pop.v)

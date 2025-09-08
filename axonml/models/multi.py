@@ -39,6 +39,8 @@ def key_to_flat_index(indices, key):
 
 class MultiPopulation(Population):
     def __init__(self, integrator=None, celsius=37.0, **populations):
+        if any(b.is_batched() for b in populations.values()):
+            raise ValueError("All populations must be unbatched.")
         if integrator is None:
             integrator = dhs_multi()
         C = sum(math.prod(pop.shape) for pop in populations.values())
@@ -61,7 +63,7 @@ class MultiPopulation(Population):
                 for pop in self.populations.values()
             ],
             dim=0,
-        )
+        ).unsqueeze(0)
         self.register_buffer("v_init", v_init)
 
         self.reinsert_all()
@@ -91,3 +93,13 @@ class MultiPopulation(Population):
                 index_f = key_to_flat_index(index, key)
                 alias = f"{name}_{alias}"
                 self[:, index_f].insert(m_class, alias=alias, **kwargs)
+
+    def batch(self, batch_size: int):
+        super().batch(batch_size)
+        self.v_init.unsqueeze(0)
+        for pop in self.populations.values():
+            pop.batch(batch_size)
+        return self
+
+    def batch_(self, batch_size: int):
+        self.batch(batch_size)

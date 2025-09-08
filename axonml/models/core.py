@@ -211,8 +211,13 @@ class Population(P, Sliceable):
         self.initialized: bool = False
         self.eval()
 
-    def numel(self):
+    def numel(self, include_batch_dimensions=True):
+        if not include_batch_dimensions:
+            return math.prod(self.core_shape())
         return self.v.numel()
+
+    def numelc(self):
+        return self.numel(include_batch_dimensions=False)
 
     @property
     def shape(self):
@@ -485,13 +490,7 @@ class Population(P, Sliceable):
                     c.dt = dt_f
 
             pre_loop_hook(callbacks, self)
-
-            if (
-                not self.integrator.initialized
-                or self.integrator.dt != dt_f
-                or self.training
-            ):
-                self.integrator.initialize(self, dt)
+            self.integrator._initialize(self, dt)
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):

@@ -30,10 +30,8 @@ class _bwd_euler_sc(Integrator):
         self.register_buffer("cmdt", torch.tensor(0.0))
 
     def initialize(self, model, dt):
-        self.dt = float(dt)
         self.cmdt = (1e-6 * model.cm) / (1e-3 * dt)
         self.area = 2 * math.pi * (1e-4 * model.diam / 2.0) * (1e-4 * model.dx)  # cm²
-        self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._solve(model.v, dt, model.celsius, intra)
@@ -103,8 +101,6 @@ class _bwd_euler_ub(Integrator):
                     )
                     self._solve = pcr_solve_t
 
-        self.dt = dt
-
         B, K = model.np, model.nc
         dt_s = dt * 1e-3  # s
 
@@ -144,8 +140,6 @@ class _bwd_euler_ub(Integrator):
         # misc pre-computed factors used elsewhere
         self.cm_inv = Cm_inv  # (B,K)
         self.scale = area_cm2 * Cm_inv  # A·s / C == 1, but keep for code reuse
-
-        self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)
@@ -278,8 +272,6 @@ class _bwd_euler_bt(torch.nn.Module):
         elif model.device().type == "cuda":
             self._solve = thomas_solve_cuda_bt
 
-        self.dt = dt
-
         # ------------------------------------------------------------------
         # Geometry-dependent scalars
         # ------------------------------------------------------------------
@@ -397,8 +389,6 @@ class _bwd_euler_bt(torch.nn.Module):
         self.upper = upper
 
         self.base_shape = tuple(list(model.shape) + [self.M])
-
-        self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
         model.vc, model.v = self._step(

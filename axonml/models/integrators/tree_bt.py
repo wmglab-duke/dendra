@@ -115,8 +115,6 @@ class _dhs_bt(Integrator):
         dev, dtyp = model.device(), model.dtype()
         self.to(dev)
 
-        self.dt = dt
-
         if dev.type == "cpu" and not AXONML_SOLVERS_AVAILABLE:
             raise ImportError(
                 "DHS_BT integrator requires axonml_solvers package for CPU execution. "
@@ -251,7 +249,6 @@ class _dhs_bt(Integrator):
                 "v", torch.zeros(*model.shape, device=dev, dtype=dtyp)
             )
             model.v[:] = model.v_init
-        self.initialized = True
 
     def step(self, model, dt, ve=None, intra=None):
         model.vc, model.v = self._step(
