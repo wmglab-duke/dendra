@@ -809,6 +809,8 @@ class _dhs_multi(Integrator):
 
     def init_v(self, model):
         model.v = model.v_init.clone().detach().reshape_as(model.v)
+        if self.write_back:
+            _write_back(model, self.split_at)
         if self.imem:
             model.i_membrane = torch.zeros(
                 model.i_membrane.shape,
