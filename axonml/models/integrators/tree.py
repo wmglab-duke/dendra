@@ -433,7 +433,7 @@ class _dhs(Integrator):
 
 class _dhs_multi(Integrator):
     """
-    Multi-model DHS initializer.
+    Multi-model DHS integrator.
 
     Packs all morphology/geometry into padded, flat buffers with a global
     row pitch K_stride = max(K_g) and records per-group offsets so a single
@@ -443,9 +443,13 @@ class _dhs_multi(Integrator):
     def __init__(
         self, model, mech, imem=None, threads: int = 16, write_back: bool = True
     ):
+        from ..multi import MultiPopulation
+
         assert THREADS_PER_WARP % threads == 0, "threads must divide 32 (warp size)"
         assert threads <= 32, "threads must be ≤ 32 (warp size)"
-        assert len(model) > 0, "model must be a non-empty MultiPopulation instance"
+        assert len(model) > 0 and isinstance(model, MultiPopulation), (
+            "model must be a non-empty MultiPopulation instance"
+        )
 
         super().__init__(model, mech, imem)
 
@@ -464,6 +468,7 @@ class _dhs_multi(Integrator):
         self.B_total: int = 0
         self.K_stride: int = 0
         self.L_max: int = 0
+        self.P: int = 1
 
         # Launch geometry
         self.NPW = THREADS_PER_WARP // self.threads  # neurons per warp
@@ -836,6 +841,7 @@ class _dhs_multi(Integrator):
         )
 
         P = int(np.prod(models.shape[:-2])) if len(models.shape) > 2 else 1
+        self.P = P
         self._get_tiled_plan(P, dev0)
 
         if models.is_batched():
@@ -942,7 +948,7 @@ class _dhs_multi(Integrator):
         N_total = orig_shape[-1]
 
         # Flatten leading batch dims into P
-        P = int(np.prod(orig_shape[:-2])) if len(orig_shape) > 2 else 1
+        P = self.P
 
         # 1) mechanisms on flattened vector
         v = self.mech.update_v(v, dt)
