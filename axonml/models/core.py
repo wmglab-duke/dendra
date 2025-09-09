@@ -35,6 +35,10 @@ from axonml.units import mm
 from .slice import Sliceable
 
 
+class NotInitializedError(AttributeError):
+    """Accessed attribute before initialization."""
+
+
 def get_unique_keys(list_of_dicts):
     """
     Get all unique keys from a list of dictionaries.
@@ -249,9 +253,24 @@ class Population(P, Sliceable):
                 return area.to(self.device(), dtype=self.dtype())
         return self.diam * 1e-4 * torch.pi * self.dx * 1e-4  # in cm²
 
-    @property
-    def mech(self):
-        return self.integrator.mech
+    def __getattr__(self, name):
+        if name == "mech":
+            # Let PyTorch resolve 'integrator' (it may be in _modules/_buffers/_parameters)
+            try:
+                integ = getattr(self, "integrator")
+            except AttributeError:
+                raise NotInitializedError(
+                    "Mechanisms & integrator have not been instantiated. Call initialize() first."
+                ) from None
+
+            if integ is None or not hasattr(integ, "mech"):
+                raise NotInitializedError(
+                    "Mechanisms & integrator have not been instantiated. Call initialize() first."
+                ) from None
+            return integ.mech
+
+        # Defer everything else to nn.Module's __getattr__
+        return super().__getattr__(name)
 
     @property
     def i_membrane(self):

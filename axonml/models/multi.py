@@ -95,7 +95,7 @@ class MultiPopulation(Population):
         for index, (name, pop) in zip(all_indices, self.populations.items()):
             for label, slice in pop._labels.items():
                 index_f = key_to_flat_index(index, slice.index)
-                self[:, index_f].label(f"{label}_{name}")
+                self[:, index_f].label(f"{name}_{label}")
 
     def reinsert_all(self):
         all_indices = indices(self.populations)

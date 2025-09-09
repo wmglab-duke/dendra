@@ -19,7 +19,7 @@ def expand_into_shape(src, index, shape, fill_value=torch.nan):
 IndexElement = Union[int, slice, np.ndarray, list, tuple]
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
 class IndexSpec:
     """
     Canonical description of one indexing request.
