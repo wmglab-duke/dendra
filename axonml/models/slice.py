@@ -163,6 +163,23 @@ class Slice:
     def __repr__(self):
         return f"Slice(index={self.index_spec.index}, shape={self.index_spec.shape}, is_scalar={self.index_spec.is_scalar})"
 
+    def _batch(self):
+        current_index = self.index_spec.index
+        if current_index[0] is Ellipsis:
+            new_index = current_index
+        else:
+            new_index = (slice(None),) + current_index
+
+        self.index_spec.index = new_index
+
+        test = torch.empty(
+            self.model.shape, device=self.model.device(), dtype=self.model.dtype()
+        )
+        test = test[new_index]
+
+        self.index_spec.is_scalar = test.ndim == 0
+        self.index_spec.shape = test.shape
+
 
 def compose_indices(shape, idx1, idx2, *, device="cpu"):
     """

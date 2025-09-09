@@ -3,15 +3,26 @@ import math
 import torch
 
 from .core import Population
-from .integrators import dhs_multi
+from .integrators import bwd_euler_sc_multi, dhs_multi
 from .tree import Tree
+
+
+def assess_type_and_make_integrator(populations, threads=16, write_back=True):
+    if all(isinstance(pop, Tree) for pop in populations.values()):
+        return dhs_multi(threads=threads, write_back=write_back)
+    if all(type(pop) is Population for pop in populations.values()):
+        return bwd_euler_sc_multi(write_back=write_back)
+    raise TypeError("Incompatible population types.")
 
 
 def concat(
     populations: dict[str, Population], threads=16, write_back=True, celsius=37.0
 ):
+    integrator = assess_type_and_make_integrator(
+        populations, threads=threads, write_back=write_back
+    )
     return MultiPopulation(
-        integrator=dhs_multi(threads=threads, write_back=write_back),
+        integrator=integrator,
         celsius=celsius,
         **populations,
     )
@@ -42,14 +53,12 @@ class MultiPopulation(Population):
         if any(b.is_batched() for b in populations.values()):
             raise ValueError("All populations must be unbatched.")
         if integrator is None:
-            integrator = dhs_multi()
+            integrator = assess_type_and_make_integrator(populations)
         C = sum(math.prod(pop.shape) for pop in populations.values())
         super().__init__(1, C, integrator=integrator, celsius=celsius)
 
         self.populations = populations
         for name, pop in self.populations.items():
-            if not isinstance(pop, Tree):
-                raise TypeError(f"Expected Tree instance for '{name}', got {type(pop)}")
             setattr(self, name, pop)
 
         for pop in self.populations.values():
@@ -67,6 +76,7 @@ class MultiPopulation(Population):
         self.register_buffer("v_init", v_init)
 
         self.reinsert_all()
+        self.register_labels()
 
     def __iter__(self):
         return iter(self.populations.values())
@@ -80,6 +90,13 @@ class MultiPopulation(Population):
     def dtype(self):
         return next(iter(self.populations.values())).dtype()
 
+    def register_labels(self):
+        all_indices = indices(self.populations)
+        for index, (name, pop) in zip(all_indices, self.populations.items()):
+            for label, slice in pop._labels.items():
+                index_f = key_to_flat_index(index, slice.index)
+                self[:, index_f].label(f"{label}_{name}")
+
     def reinsert_all(self):
         all_indices = indices(self.populations)
         for index, (name, pop) in zip(all_indices, self.populations.items()):
@@ -89,10 +106,11 @@ class MultiPopulation(Population):
                 index = index.flatten()
                 self[:, index].insert(m_class, alias=alias, **kwargs)
             # now do _mech_data
-            for m_class, (alias, kwargs, key) in pop._mech_data.items():
-                index_f = key_to_flat_index(index, key)
-                alias = f"{name}_{alias}"
-                self[:, index_f].insert(m_class, alias=alias, **kwargs)
+            for m_class, list_of_aliases_kwargs_keys in pop._mech_data.items():
+                for alias, kwargs, key in list_of_aliases_kwargs_keys:
+                    index_f = key_to_flat_index(index, key)
+                    alias = f"{name}_{alias}"
+                    self[:, index_f].insert(m_class, alias=alias, **kwargs)
 
     def batch(self, batch_size: int):
         super().batch(batch_size)

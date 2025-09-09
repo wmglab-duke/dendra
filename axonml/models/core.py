@@ -1301,6 +1301,8 @@ class Population(P, Sliceable):
         if hasattr(self, "v_prev"):
             self.v_prev = self.v_prev.unsqueeze(0).expand(n, *self.v_prev.shape).clone()
         self.reshape(self.calc_shape_p(), self.shape)
+        for slice in self._labels.values():
+            slice._batch()
         return self
 
     def batch_(self, n):

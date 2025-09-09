@@ -12,7 +12,7 @@ from .explicit import (
 )
 
 #from .imex import _krylov_etd1
-from .implicit import _bwd_euler_bt, _bwd_euler_sc, _bwd_euler_ub
+from .implicit import _bwd_euler_bt, _bwd_euler_sc, _bwd_euler_sc_multi, _bwd_euler_ub
 from .tree import _dhs, _dhs_multi
 from .tree_bt import _dhs_bt
 
@@ -42,6 +42,7 @@ eulerv1 = partial(partial_class, _eulerv1)
 
 #krylov_etd1 = partial(partial_class, _krylov_etd1)
 bwd_euler_sc = partial(partial_class, _bwd_euler_sc)
+bwd_euler_sc_multi = partial(partial_class, _bwd_euler_sc_multi)
 bwd_euler_ub = partial(partial_class, _bwd_euler_ub)
 bwd_euler_bt = partial(partial_class, _bwd_euler_bt)
 
@@ -63,6 +64,7 @@ __all__ = [
     "dufort_frankel_homogeneous",
     #"krylov_etd1",
     "bwd_euler_sc",
+    "bwd_euler_sc_multi",
     "bwd_euler_ub",
     "bwd_euler_bt",
     "dhs",

@@ -6,7 +6,7 @@ import networkx as nx
 import numpy as np
 import torch
 
-from .core import Integrator
+from .core import Integrator, MultiIntegrator
 from .triton import dhs_solve_cuda, dhs_solve_multi_cuda
 
 try:
@@ -431,7 +431,7 @@ class _dhs(Integrator):
         return v  # (B, N) mV
 
 
-class _dhs_multi(Integrator):
+class _dhs_multi(MultiIntegrator):
     """
     Multi-model DHS integrator.
 
@@ -451,11 +451,9 @@ class _dhs_multi(Integrator):
             "model must be a non-empty MultiPopulation instance"
         )
 
-        super().__init__(model, mech, imem)
+        super().__init__(model, mech, imem, write_back)
 
         self.threads = threads
-        self.write_back = write_back
-        self.split_at = None
         self.num_groups = len(model)
 
         # Per-group shapes (filled in initialize)
@@ -484,10 +482,6 @@ class _dhs_multi(Integrator):
         # --- plan & scratch caches (filled lazily in _step) ---
         self._plan_cache = {}  # key: (P, device) -> dict with tiled plan
         self._scratch_sig = None
-
-    def _calc_splits(self, models):
-        split_lengths = [m.numelc() for m in models]
-        self.split_at = torch.cumsum(torch.tensor(split_lengths), dim=0)[:-1].tolist()
 
     def initialize(self, models, dt: float):
         assert len(models) == self.num_groups
@@ -922,22 +916,9 @@ class _dhs_multi(Integrator):
         self._plan_cache[key] = plan
         return plan
 
-    def init_v(self, model):
-        model.v = model.v_init.expand_as(model.v).clone().detach().contiguous()
-        if self.write_back:
-            self._calc_splits(model)
-            _write_back(model, self.split_at)
-        if self.imem:
-            model.i_membrane = torch.zeros(
-                model.i_membrane.shape,
-                dtype=model.i_membrane.dtype,
-                device=model.i_membrane.device,
-            ).detach()
-
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, getattr(model, "celsius", None), ve, intra)
-        if self.write_back:
-            _write_back(model, self.split_at)
+        self._write_back(model)
 
     def _step(self, v, dt, temp=None, ve=None, intra=None):
         if self.solve is None:
@@ -1012,12 +993,3 @@ class _dhs_multi(Integrator):
         # 6) gather back to mechanism order with the same index map
         v_sel = v_out_solver.view(-1).index_select(0, PLIN_flat)  # (P * N_total,)
         return v_sel.reshape(orig_shape)
-
-
-@torch.compile
-def _write_back(model, split_at):
-    # write v back to the constituent populations
-    v_f = model.v
-    splits = torch.tensor_split(v_f, split_at, dim=-1)
-    for split, pop in zip(splits, model.populations.values()):
-        pop.v = split.reshape_as(pop.v)

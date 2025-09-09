@@ -15,7 +15,7 @@ try:
 except ImportError:
     AXONML_SOLVERS_AVAILABLE = False
 
-from .core import Integrator
+from .core import Integrator, MultiIntegrator
 from .tridiag import pcr_solve_t
 from .triton import thomas_solve_cuda_bt, thomas_solve_cuda_t
 
@@ -57,6 +57,15 @@ class _bwd_euler_sc(Integrator):
             v_new = v_new + external_update
 
         return v_new
+
+
+class _bwd_euler_sc_multi(MultiIntegrator, _bwd_euler_sc):
+    def __init__(self, model, mech, imem=None, write_back=True):
+        super().__init__(model, mech, imem, write_back)
+
+    def step(self, model, dt, ve=None, intra=None):
+        model.v = self._solve(model.v, dt, model.celsius, intra)
+        self._write_back(model)
 
 
 class _bwd_euler_ub(Integrator):

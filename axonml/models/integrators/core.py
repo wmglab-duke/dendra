@@ -63,3 +63,39 @@ class Integrator(torch.nn.Module):
         if self.imem:
             model.i_membrane = model.i_membrane.detach()
         self.mech.detach()
+
+
+@torch.compile
+def _write_back(model, split_at):
+    # write v back to the constituent populations
+    v_f = model.v
+    splits = torch.tensor_split(v_f, split_at, dim=-1)
+    for split, pop in zip(splits, model.populations.values()):
+        pop.v = split.reshape_as(pop.v)
+
+
+class MultiIntegrator(Integrator):
+    def __init__(self, model, mech, imem=None, write_back=True):
+        super().__init__(model, mech, imem)
+        self.write_back = write_back
+        self.split_at = None
+
+    def _write_back(self, model):
+        if self.write_back:
+            _write_back(model, self.split_at)
+
+    def _calc_splits(self, models):
+        split_lengths = [m.numelc() for m in models]
+        self.split_at = torch.cumsum(torch.tensor(split_lengths), dim=0)[:-1].tolist()
+
+    def init_v(self, model):
+        model.v = model.v_init.expand_as(model.v).clone().detach().contiguous()
+        if self.write_back:
+            self._calc_splits(model)
+            _write_back(model, self.split_at)
+        if self.imem:
+            model.i_membrane = torch.zeros(
+                model.i_membrane.shape,
+                dtype=model.i_membrane.dtype,
+                device=model.i_membrane.device,
+            ).detach()
