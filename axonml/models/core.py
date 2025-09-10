@@ -135,6 +135,7 @@ class Population(P, Sliceable):
         self.v_init = v_init
 
         self.is_built = False
+        self._flag_rebuild = False
         self.key = None
 
         if integrator is None:
@@ -154,7 +155,8 @@ class Population(P, Sliceable):
         self.jit = bool(JIT)
         self.compile_mode = COMPILE_MODE.value
 
-        self.integrator = integrator
+        self._integ = integrator
+        self.integrator = None  # type: ignore
 
         self.injections = []
         self.intra = None
@@ -169,10 +171,6 @@ class Population(P, Sliceable):
         self._m_keys = []
         self._m_curr = {}
         self._m_shape = {}
-        self._m_unfactorable = {}
-        self._m_count = {}
-        self._m_has_gtot = {}
-        self._m_divide_by_two = {}
 
         self._ion_read = {}
         self._ion_write = {}
@@ -953,9 +951,8 @@ class Population(P, Sliceable):
         **kwargs
             Additional keyword arguments to be passed to the compile_mechanism function.
         """
-
         if self.is_built:
-            raise RuntimeError("Cannot insert mechanisms after the model is built.")
+            self._flag_rebuild = True
 
         validate(mechanism)
 
@@ -1023,10 +1020,6 @@ class Population(P, Sliceable):
         self._m_keys.append(key)
         self._m_shape[name] = shape
 
-        self._m_unfactorable[name] = None
-        self._m_has_gtot[name] = None
-        self._m_divide_by_two[name] = None
-
         for k, v in mech._currents.items():
             self._m_curr.setdefault(k, {}).update({name: v})
 
@@ -1070,7 +1063,7 @@ class Population(P, Sliceable):
         return super().to(*args, **kwargs)
 
     def build(self, force_rebuild=False):
-        if self.is_built and not force_rebuild:
+        if self.is_built and not (force_rebuild or self._flag_rebuild):
             return self
 
         def are_strings_unique(data: list) -> bool:
@@ -1138,9 +1131,12 @@ class Population(P, Sliceable):
             for m in mech.mechanisms.values():
                 m.setreference("t", lambda: self.t)
 
-            self.integrator = self.integrator(self, mech)
-            self.is_built = True
-            self.eval()
+            self.integrator = self._integ(self, mech)
+
+        self.is_built = True
+        self._flag_rebuild = False
+        self.to(device=self.device(), dtype=self.dtype())
+        self.eval()
         return self
 
     def build_(self, force_rebuild=False):

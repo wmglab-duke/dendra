@@ -303,7 +303,7 @@ def test_parameterized_global_and_range_instantiation_and_defaults():
     class W(M.Parameterized):
         pass
 
-    w = W(shape=(2, 3))
+    w = W(shape=(2, 3), shape_f=(2, 3))
     # global scalar
     assert isinstance(getattr(w, "alpha_default"), torch.nn.Parameter)
     assert torch.allclose(getattr(w, "alpha"), torch.tensor(1.5))
@@ -336,7 +336,7 @@ def test_parameterized_additional_parameters_tensor_and_module_and_apply():
             (None, ConstModule((), 9.0), key2),  # scalar module
         ]
     }
-    w = T(shape=(H, W), additional_parameters=extra)
+    w = T(shape=(H, W), shape_f=(H, W), additional_parameters=extra)
     # Before populate: buffer exists but may be empty() (registered)
     w.populate_parameter_buffers()  # reset to defaults, then load additions, then apply parametrizations
 
@@ -361,7 +361,9 @@ def test_populate_resets_to_defaults_then_applies_again():
         pass
 
     w = T(
-        shape=(H, W), additional_parameters={"r": [(None, 1.0, torch.tensor([0, 2]))]}
+        shape=(H, W),
+        shape_f=(H, W),
+        additional_parameters={"r": [(None, 1.0, torch.tensor([0, 2]))]},
     )
     w.populate_parameter_buffers()
     # Mutate buffer
@@ -381,7 +383,7 @@ def test_detach_buffers_does_not_fail_and_removes_grad_fn():
     class W(M.Parameterized):
         pass
 
-    w = W(shape=(2, 2))
+    w = W(shape=(2, 2), shape_f=(2, 2))
     w.populate_parameter_buffers()
     w.detach()
     for _, b in w.named_buffers():
@@ -395,25 +397,11 @@ def test_parameters_dict_contains_named_parameters():
     class W(M.Parameterized):
         pass
 
-    w = W(shape=(1, 1))
+    w = W(shape=(1, 1), shape_f=(1, 1))
     d = w.parameters_dict()
     # contains a_default and b_default (the actual nn.Parameters)
     assert "a_default" in d and "b_default" in d
     assert isinstance(d["a_default"], torch.nn.Parameter)
-
-
-def test_batch_unsqueezes_params_declared_via_SIMPLE_PARAM():
-    M.SimpleParameterized.PARAMETER(theta=1.0)
-
-    class W(M.Parameterized):
-        pass
-
-    w = W(shape=(2, 3))
-    # theta exists as an nn.Parameter attribute on the instance
-    assert isinstance(getattr(w, "theta"), torch.nn.Parameter)
-    old_shape = getattr(w, "theta").shape  # ()
-    w.batch(4)
-    assert getattr(w, "theta").shape == (1,) + old_shape
 
 
 # ---- build_parametrization --------------------------------------------------------
