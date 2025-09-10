@@ -13,6 +13,38 @@ try:
     import axonml_solvers  # noqa: F401
 
     AXONML_SOLVERS_AVAILABLE = True
+
+    def _dhs_multi_solve_cpu(
+        d_mem,
+        a_geom,
+        b,
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+        K_stride: int,
+        L_max: int,
+        grid_x: int = None,
+    ):
+        return torch.ops.axonml_solvers.dhs_multi_solve(
+            d_mem,
+            a_geom,
+            b,
+            P_cat,
+            ORDER_cat,
+            LAYER_PTR_cat,
+            WARP_P_OFF,
+            WARP_ORDER_OFF,
+            WARP_LPTR_OFF,
+            WARP_L,
+            WARP_ROW_BASE,
+            WARP_ROW_COUNT,
+        )
 except ImportError:
     AXONML_SOLVERS_AVAILABLE = False
 
@@ -506,7 +538,7 @@ class _dhs_multi(MultiIntegrator):
                     "DHS integrator requires axonml_solvers package for CPU execution. "
                     "Please install it with `pip install axonml_solvers`."
                 )
-            self.solve = torch.ops.axonml_solvers.dhs_multi_solve
+            self.solve = _dhs_multi_solve_cpu
 
         dt_s = dt * 1e-3
 

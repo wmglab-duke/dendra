@@ -62,12 +62,15 @@ def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
 
 
 class Slice:
-    def __init__(self, model, index_spec: IndexSpec, base_shape=None):
+    def __init__(
+        self, model, index_spec: IndexSpec, base_shape=None, parent_slice=None
+    ):
         self.model: torch.nn.Module = model
         self.base_shape = base_shape
         if base_shape is None:
             self.base_shape = model.shape
         self.index_spec = index_spec
+        self.parent_slice = parent_slice
 
     @property
     def index(self) -> Tuple[IndexElement, ...]:
@@ -150,6 +153,9 @@ class Slice:
         self.model.insert(mechanism, alias=alias, index_spec=self.index_spec, **kwargs)
 
     def label(self, name: str):
+        if self.parent_slice is not None:
+            setattr(self.parent_slice, name, self)
+            return
         setattr(self.model, name, self)
         self.model._labels[name] = self
 
@@ -158,7 +164,7 @@ class Slice:
             self.model.shape, self.index, key, device=self.model.device()
         )
         idx = parse_key(idx, self.model.shape, device=self.model.device())
-        return Slice(self.model, idx)
+        return Slice(self.model, idx, parent_slice=self)
 
     def __repr__(self):
         return f"Slice(index={self.index_spec.index}, shape={self.index_spec.shape}, is_scalar={self.index_spec.is_scalar})"

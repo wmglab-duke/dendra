@@ -91,8 +91,10 @@ class MultiPopulation(Population):
         return next(iter(self.populations.values())).dtype()
 
     def register_labels(self):
+        self.clear_labels()
         all_indices = indices(self.populations)
         for index, (name, pop) in zip(all_indices, self.populations.items()):
+            self[:, index.flatten()].label(f"{name}_")
             for label, slice in pop._labels.items():
                 index_f = key_to_flat_index(index, slice.index)
                 self[:, index_f].label(f"{name}_{label}")

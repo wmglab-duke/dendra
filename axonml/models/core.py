@@ -790,15 +790,20 @@ class Population(P, Sliceable):
     def populate_(self):
         self.populate()
 
-    def initialize(self):
-        self.build()
-        self.populate_parameter_buffers()
-        self.intra = self.build_intra()
+    def _restore_steady_state(self):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
             self.post_initialize()
             self.t.detach().zero_()
             self.initialized = True
+            return True
+        return False
+
+    def initialize(self, force_rebuild=False):
+        self.build(force_rebuild)
+        self.populate_parameter_buffers()
+        self.intra = self.build_intra()
+        if self._restore_steady_state():
             return self
         self.integrator.init_v(self)
         self.pre_initialize()
@@ -1326,6 +1331,12 @@ class Population(P, Sliceable):
 
     def batch_(self, n):
         self.batch(n)
+
+    # -- labeling stuff --
+    def clear_labels(self):
+        for name in self._labels.keys():
+            delattr(self, name)
+        self._labels.clear()
 
 
 # Define the return type for clarity
