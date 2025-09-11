@@ -244,3 +244,37 @@ class NetStim(torch.nn.Module, Sliceable):
         Returns the total number of elements in the spike generator.
         """
         return self.N
+
+    def batch(self, n):
+        """
+        Batch the NetStim to create n independent copies.
+
+        Parameters
+        ----------
+        n : int
+            Number of independent copies to create.
+
+        Returns
+        -------
+        self : NetStim
+            Returns self for method chaining.
+        """
+        if n <= 0:
+            raise ValueError("Batch size n must be positive.")
+
+        device = self.device()
+        dtype = self.dtype()
+
+        self.N *= n
+        self.shape = (self.N,)
+
+        self.noise = self.noise.repeat(n)
+        self.interval = self.interval.repeat(n)
+        self.start = self.start.repeat(n)
+        self.max_spikes = self.max_spikes.repeat(n)
+
+        self.next_spike_time = torch.zeros(self.N, device=device, dtype=dtype)
+        self.spike_counts = torch.zeros(self.N, device=device, dtype=torch.long)
+        self.spikes = torch.zeros(self.N, device=device, dtype=torch.bool)
+
+        return self

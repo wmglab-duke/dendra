@@ -1,3 +1,5 @@
+import gc
+import math
 from contextlib import nullcontext
 from typing import Dict
 
@@ -167,6 +169,33 @@ def expand(value, n):
     return torch.tensor(value).repeat(n)
 
 
+def batchify_index(old_shape, n: int, i: torch.Tensor) -> torch.Tensor:
+    """
+    Build i_n so that:
+        t_n = t.unsqueeze(0).repeat(n, *([1]*len(old_shape)))   # n copies of t
+        # (Assuming t_n is contiguous; if you used expand(), call .contiguous() before .view)
+        t_n.view(-1)[i_n] == t_n.reshape(n, -1)[..., i].reshape(-1)
+
+    Args:
+        old_shape: shape of t BEFORE adding the batch (tuple/torch.Size)
+        n:         batch size
+        i:         LongTensor of indices into the last dim of t_n.reshape(n, -1)
+                   (any shape; negatives allowed; broadcast across the n rows)
+
+    Returns:
+        i_n: LongTensor of shape (n, *i.shape) — flat indices into t_n.view(-1)
+    """
+    M = math.prod(tuple(old_shape))  # width of the last dim in t_n.reshape(n, -1)
+    if i.dtype != torch.long:
+        i = i.to(torch.long)
+    i = i % M  # normalize negatives
+
+    # row offsets: 0, M, 2M, ..., (n-1)M; broadcast across i's shape
+    r = torch.arange(n, device=i.device, dtype=torch.long).view((n,) + (1,) * i.ndim)
+    i_n = r * M + i
+    return i_n.reshape(-1)
+
+
 def make_weight(weights, n):
     class ParameterOrDistributionWrapper(torch.nn.Module):
         """A simple wrapper for parameters or distributions that can be sampled."""
@@ -206,6 +235,10 @@ class Network(torch.nn.Module):
     """
 
     def __init__(self, populations: Dict[str, Population], netstim=None):
+        if any(pop.is_batched() for pop in populations.values()):
+            raise ValueError(
+                "Batched populations are not supported. Implement your networks with unbatched populations and then call .batch(batch_size)."
+            )
         super(Network, self).__init__()
         self.populations = populations
         for name, pop in populations.items():
@@ -846,15 +879,50 @@ class Network(torch.nn.Module):
 
             post_loop_hook(callbacks, self)
 
-    def batch(self, n):
-        for p in self.populations.values():
+    def batch(self, n, include_netstim=True):
+        _synapse_spec = self.synapse_spec.copy()
+        self.clear_synapses()
+        _old_shapes = {}
+        for name, p in self.populations.items():
+            _old_shapes[name] = p.shape
             device = p.device()
             p.batch(n)
             p.build(force_rebuild=True)
             p.to(device)
-        self.clear_synapses()
+        if include_netstim and self.netstim is not None:
+            _old_shapes["netstim"] = self.netstim.shape
+            self.netstim.batch(n)
+        for k, v in _synapse_spec.items():
+            source_name, target_name, synapse = k
+            source_pop = getattr(self, source_name)
+            target_pop = getattr(self, target_name)
+            synapse = getattr(target_pop.mech, synapse.name)
+            for data in v:
+                source_idx, target_idx = data[0], data[1]
+                threshold, weight, delay = data[2], data[4], data[6]
+                if source_name == "netstim" and not include_netstim:
+                    new_source_idx = source_idx.repeat(n)
+                else:
+                    new_source_idx = batchify_index(
+                        _old_shapes[source_name], n, source_idx
+                    )
+                new_target_idx = batchify_index(_old_shapes[target_name], n, target_idx)
+                self._connect(
+                    source_pop,
+                    new_source_idx,
+                    target_pop,
+                    new_target_idx,
+                    synapse,
+                    threshold,
+                    weight,
+                    delay,
+                )
         self.built = False
+        gc.collect()
         return self
+
+    def batch_(self, n, include_netstim=True):
+        self.batch(n, include_netstim=include_netstim)
 
 
 def prepare_intra(intra_c, intra, local_ind):
