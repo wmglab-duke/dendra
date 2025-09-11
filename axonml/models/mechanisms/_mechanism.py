@@ -274,6 +274,7 @@ class Mechanism(Parameterized):
         for state in self.DE.values():
             for state_name in state._state:
                 self.register_buffer(state_name, torch.zeros(shape))
+                #getattr(self, state_name).requires_grad_(True)
 
         for r in self._save:
             self.register_buffer(r, torch.zeros(shape))
@@ -390,12 +391,14 @@ class Mechanism(Parameterized):
                     )
                     setattr(self, state_name, buffer_tensor)
                     buffer_tensor.detach_()
+                    #buffer_tensor.requires_grad_(True)
                 else:
                     if hasattr(state_module, "inf"):
                         inf = state_module.inf(v_init)
                         buffer_tensor = inf[state_name]
                         setattr(self, state_name, buffer_tensor)
                         buffer_tensor.detach_()
+                        #buffer_tensor.requires_grad_(True)
 
         self.initial(v_init)
 

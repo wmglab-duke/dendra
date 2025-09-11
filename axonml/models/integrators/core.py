@@ -46,15 +46,11 @@ class Integrator(torch.nn.Module):
             self.initialized = True
 
     def init_v(self, model):
-        model.v = torch.full(
-            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
-        ).detach()
+        model.v[:] = model.v_init
+        model.v = model.v.detach().contiguous()
         if self.imem:
-            model.i_membrane = torch.zeros(
-                model.i_membrane.shape,
-                dtype=model.i_membrane.dtype,
-                device=model.i_membrane.device,
-            ).detach()
+            model.i_membrane.zero_()
+            model.i_membrane = model.i_membrane.detach()
 
     def detach(self, model):
         detach_vars(self, self.v_vars)

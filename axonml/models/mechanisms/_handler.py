@@ -113,10 +113,10 @@ class MechanismHandler(torch.nn.Module):
                 scale_f = make_scaler(mech, self.area)
                 for ion in ions:
                     self._map.append(
-                        (c_idx, mech, getattr(mech, f"{ion}_with_g"), scale_f)
+                        (c_idx, mech, f"{ion}_with_g", scale_f)
                     )
                     self._map_exp.append(
-                        (c_idx, mech, getattr(mech, f"{ion}"), scale_f)
+                        (c_idx, mech, f"{ion}", scale_f)
                     )
 
     def initialize(self, v, celsius, diameters):
@@ -223,7 +223,7 @@ class MechanismHandler(torch.nn.Module):
 
         # core loop: minimal Python, pure aten ops inside
         for c_idx, mech, fn, scale_f in self._map:
-            i, g = scale_f(*fn(mech.get(v)))
+            i, g = scale_f(*getattr(mech, fn)(mech.get(v)))
             mech.add_(self._buf_i[c_idx], i)
             mech.add_(self._buf_g[c_idx], g)
 
@@ -239,7 +239,7 @@ class MechanismHandler(torch.nn.Module):
 
     def iexp(self, v):
         if not self.currents:
-            return 0.0
+            return torch.tensor(0.0, dtype=v.dtype, device=v.device)
 
         for mech in self.mechanisms.values():
             mech.breakpoint(mech.get(v))
@@ -249,7 +249,7 @@ class MechanismHandler(torch.nn.Module):
 
         # core loop: minimal Python, pure aten ops inside
         for c_idx, mech, fn, scale_f in self._map_exp:
-            i = scale_f(fn(mech.get(v)))
+            i = scale_f(getattr(mech, fn)(mech.get(v)))
             mech.add_(self._buf_i[c_idx], i)
 
         # sum up currents and conductances
@@ -263,7 +263,9 @@ class MechanismHandler(torch.nn.Module):
 
     def idf(self, v, v_prev):
         if not self.currents:
-            return 0.0, 0.0
+            return torch.tensor(0.0, dtype=v.dtype, device=v.device), torch.tensor(
+                0.0, dtype=v.dtype, device=v.device
+            )
 
         v_half = 0.5 * v_prev
 
@@ -280,7 +282,7 @@ class MechanismHandler(torch.nn.Module):
                 v_in = v_half
             else:
                 v_in = v
-            i, g = scale_f(*fn(mech.get(v_in)))
+            i, g = scale_f(getattr(mech, fn)(mech.get(v_in)))
             mech.add_(self._buf_i[c_idx], i)
             mech.add_(self._buf_g[c_idx], g)
 

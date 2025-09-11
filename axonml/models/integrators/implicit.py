@@ -202,20 +202,20 @@ class _bwd_euler_ub(Integrator):
         return v_np1
 
 
-class _bwd_euler_bt(torch.nn.Module):
+class _bwd_euler_bt(Integrator):
     """
     Implicit Euler method for block tridiagonal system.
     """
 
     v_vars = ["v", "vc"]
 
-    def __init__(self, model, mech, method="triton", **kwargs):
+    def __init__(self, model, mech, imem=None, method="triton", **kwargs):
         if not AXONML_SOLVERS_AVAILABLE:
             logging.warning(
                 "Only CUDA-based solvers available, using triton Thomas solver. "
                 "CPU models will not work. Install axonml_solvers for CPU support."
             )
-        super().__init__()
+        super().__init__(model, mech, imem)
 
         self.mech = mech
 
