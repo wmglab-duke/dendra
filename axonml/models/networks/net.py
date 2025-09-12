@@ -10,6 +10,7 @@ from axonml.helpers import BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT
 
 from ..callbacks import CallbackList
 from ..core import Population, make_intra
+from ..multi import concat, indices
 from ..parametric import to_param
 from .netcon import NetCon
 from .netstim import NetStim
@@ -239,6 +240,8 @@ class Network(torch.nn.Module):
             raise ValueError(
                 "Batched populations are not supported. Implement your networks with unbatched populations and then call .batch(batch_size)."
             )
+        if netstim is not None and not isinstance(netstim, NetStim):
+            raise TypeError("netstim must be an instance of NetStim or None.")
         super(Network, self).__init__()
         self.populations = populations
         for name, pop in populations.items():
@@ -258,6 +261,8 @@ class Network(torch.nn.Module):
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
         self.compile_mode = COMPILE_MODE.value
+
+        self.is_batched = False
 
         torch._dynamo.reset()
 
@@ -767,7 +772,7 @@ class Network(torch.nn.Module):
 
     def initialize(self, dt: float, reinit_weights: bool = True):
         """
-        Initialize the network. This method should be overridden by subclasses.
+        Initialize the network. Builds synapses, initializes populations and netstim (if exists).
         """
         self.build(dt)
         dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
@@ -784,7 +789,7 @@ class Network(torch.nn.Module):
 
     def initialize_(self, dt: float, reinit_weights: bool = True):
         """
-        Initialize the network. This method should be overridden by subclasses.
+        Initialize the network without returning self.
         """
         self.initialize(dt, reinit_weights=reinit_weights)
 
@@ -918,20 +923,78 @@ class Network(torch.nn.Module):
                     delay,
                 )
         self.built = False
+        self.is_batched = True
         gc.collect()
         return self
 
     def batch_(self, n, include_netstim=True):
         self.batch(n, include_netstim=include_netstim)
 
+    def concat(self, name, pops_to_concatenate=None):
+        if pops_to_concatenate is None:
+            pops_to_concatenate = []
+        already_used = [
+            n for n in self.populations.keys() if n not in pops_to_concatenate
+        ]
+        if name in already_used:
+            raise ValueError(f"Population '{name}' is already in use.")
+        if self.is_batched:
+            raise ValueError("Cannot concatenate populations in a batched network.")
+        if not pops_to_concatenate:
+            pops_to_concatenate = list(self.populations.keys())
+
+        concat_pops = {n: self.populations[n] for n in pops_to_concatenate}
+        p_type = type(self.populations[pops_to_concatenate[0]])
+        assert all(type(self.populations[n]) is p_type for n in pops_to_concatenate), (
+            "All populations must be of the same type."
+        )
+        concatenated = concat(concat_pops)
+        new_populations = {
+            n: p for n, p in self.populations.items() if n not in pops_to_concatenate
+        }
+        new_populations[name] = concatenated
+        new_net = Network(new_populations, netstim=self.netstim)
+
+        all_indices = indices(concat_pops)
+        all_indices = {n: i.flatten() for n, i in zip(pops_to_concatenate, all_indices)}
+
+        # now reapply connections
+        for k, v in self.synapse_spec.items():
+            source_name, target_name, synapse = k
+            source_pop = new_net.populations.get(source_name, getattr(new_net, name))
+            target_pop = new_net.populations.get(target_name, getattr(new_net, name))
+            synapse = getattr(target_pop.mech, synapse.name)
+
+            for data in v:
+                source_idx, target_idx = data[0], data[1]
+                threshold, weight, delay = data[2], data[4], data[6]
+
+                if source_name in pops_to_concatenate:
+                    source_idx = all_indices[source_name][source_idx]
+                if target_name in pops_to_concatenate:
+                    target_idx = all_indices[target_name][target_idx]
+
+                new_net._connect(
+                    source_pop,
+                    source_idx,
+                    target_pop,
+                    target_idx,
+                    synapse,
+                    threshold,
+                    weight,
+                    delay,
+                )
+
+        return new_net
+
 
 def prepare_intra(intra_c, intra, local_ind):
     """
     Prepares the intra-cellular data for the current step.
     """
-    for n, (intra_, stims, indices) in intra.items():
+    for n, (intra_, stims, indexes) in intra.items():
         s = [st[local_ind] for st in stims]
-        intra_c[n] = make_intra(intra_, s, indices)
+        intra_c[n] = make_intra(intra_, s, indexes)
     return intra_c
 
 

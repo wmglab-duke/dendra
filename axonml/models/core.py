@@ -1323,6 +1323,10 @@ class Population(P, Sliceable):
         self.reshape(self.calc_shape_p(), self.shape)
         for slice in self._labels.values():
             slice._batch()
+        # now batch x, y, z
+        self.x = self.x.unsqueeze(0).expand(n, *self.x.shape).clone()
+        self.y = self.y.unsqueeze(0).expand(n, *self.y.shape).clone()
+        self.z = self.z.unsqueeze(0).expand(n, *self.z.shape).clone()
         return self
 
     def batch_(self, n):

@@ -222,13 +222,32 @@ class Tree(Population):
         y = torch.as_tensor(y, dtype=self.y.dtype, device=self.y.device)
         z = torch.as_tensor(z, dtype=self.z.dtype, device=self.z.device)
 
+        ndim_required = self.x.ndim - 1
+
+        assert x.ndim == ndim_required or x.ndim == 0, (
+            f"Expected x.ndim to be {ndim_required} or 0, but got {x.ndim}"
+        )
+        assert y.ndim == ndim_required or y.ndim == 0, (
+            f"Expected y.ndim to be {ndim_required} or 0, but got {y.ndim}"
+        )
+        assert z.ndim == ndim_required or z.ndim == 0, (
+            f"Expected z.ndim to be {ndim_required} or 0, but got {z.ndim}"
+        )
+
+        if x.ndim != 0:
+            x = x.unsqueeze(-1)
+        if y.ndim != 0:
+            y = y.unsqueeze(-1)
+        if z.ndim != 0:
+            z = z.unsqueeze(-1)
+
         if origin is None:
             origin = self.find("soma", as_list=True)
             origin = origin[int(len(origin) / 2)]
 
-        current_centre_x = self.x[:, origin][:, None]
-        current_centre_y = self.y[:, origin][:, None]
-        current_centre_z = self.z[:, origin][:, None]
+        current_centre_x = self.x[..., origin].unsqueeze(-1)
+        current_centre_y = self.y[..., origin].unsqueeze(-1)
+        current_centre_z = self.z[..., origin].unsqueeze(-1)
 
         offsets = [x - current_centre_x, y - current_centre_y, z - current_centre_z]
 
@@ -255,6 +274,25 @@ class Tree(Population):
         dx = torch.as_tensor(dx, dtype=self.x.dtype, device=self.x.device)
         dy = torch.as_tensor(dy, dtype=self.y.dtype, device=self.y.device)
         dz = torch.as_tensor(dz, dtype=self.z.dtype, device=self.z.device)
+
+        ndim_required = self.x.ndim - 1
+
+        assert dx.ndim == ndim_required or dx.ndim == 0, (
+            f"Expected dx.ndim to be {ndim_required} or 0, but got {dx.ndim}"
+        )
+        assert dy.ndim == ndim_required or dy.ndim == 0, (
+            f"Expected dy.ndim to be {ndim_required} or 0, but got {dy.ndim}"
+        )
+        assert dz.ndim == ndim_required or dz.ndim == 0, (
+            f"Expected dz.ndim to be {ndim_required} or 0, but got {dz.ndim}"
+        )
+
+        if dx.ndim != 0:
+            dx = dx.unsqueeze(-1)
+        if dy.ndim != 0:
+            dy = dy.unsqueeze(-1)
+        if dz.ndim != 0:
+            dz = dz.unsqueeze(-1)
 
         self.x += dx
         self.y += dy

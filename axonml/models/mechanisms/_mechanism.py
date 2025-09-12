@@ -53,6 +53,8 @@ class Mechanism(Parameterized):
     _write_ion_declarations = []
     _write_ion_c_declarations = []
 
+    _renamed_aliases = {}
+
     def __init_subclass__(cls, **kwargs):
         """
         This special method is called automatically whenever a class
@@ -274,7 +276,7 @@ class Mechanism(Parameterized):
         for state in self.DE.values():
             for state_name in state._state:
                 self.register_buffer(state_name, torch.zeros(shape))
-                #getattr(self, state_name).requires_grad_(True)
+                # getattr(self, state_name).requires_grad_(True)
 
         for r in self._save:
             self.register_buffer(r, torch.zeros(shape))
@@ -391,14 +393,14 @@ class Mechanism(Parameterized):
                     )
                     setattr(self, state_name, buffer_tensor)
                     buffer_tensor.detach_()
-                    #buffer_tensor.requires_grad_(True)
+                    # buffer_tensor.requires_grad_(True)
                 else:
                     if hasattr(state_module, "inf"):
                         inf = state_module.inf(v_init)
                         buffer_tensor = inf[state_name]
                         setattr(self, state_name, buffer_tensor)
                         buffer_tensor.detach_()
-                        #buffer_tensor.requires_grad_(True)
+                        # buffer_tensor.requires_grad_(True)
 
         self.initial(v_init)
 
@@ -518,7 +520,22 @@ class Mechanism(Parameterized):
         Returns:
             type: A new class, identical in behavior to the original but with a new name.
         """
-        return rename(cls, new_name=new_name, suffix=suffix)
+        if new_name is None and suffix is None:
+            raise ValueError("Either new_name or suffix must be provided.")
+
+        if new_name is None:
+            new_name = cls.__name__
+
+        if suffix is not None:
+            if not isinstance(suffix, str):
+                raise TypeError("Suffix must be a string.")
+            new_name += f"_{suffix}"
+
+        if new_name in cls._renamed_aliases:
+            return cls._renamed_aliases[new_name]
+
+        cls._renamed_aliases[new_name] = rename(cls, new_name=new_name)
+        return cls._renamed_aliases[new_name]
 
     def batch(self, batch_size: int):
         """
@@ -623,16 +640,14 @@ class Synapse(Mechanism):
         )
 
 
-def rename(mechanism, new_name=None, suffix=None):
+def rename(mechanism, new_name=None):
     """
-    Returns a new mechanism that is an exact copy of `original_class` but with a
+    Returns a new mechanism that is an exact copy of `mechanism` but with a
     different name.
 
     Args:
-        original_class (type): The class to be copied.
-        new_name (str): The name of the new class. If None, the original class's
-                        name will be used with an optional suffix.
-        suffix (str): An optional suffix to append to the new class name.
+        mechanism (Mechanism): The mechanism to be copied.
+        new_name (str): The name of the new class.
 
     Returns:
         type: A new class, identical in behavior to the original but with a new name.
@@ -642,17 +657,6 @@ def rename(mechanism, new_name=None, suffix=None):
     # 2. bases: A tuple of the original class's base classes.
     # 3. dict: A dictionary containing the attributes and methods of the
     #          original class. We create a copy to avoid side effects.
-
-    if new_name is None and suffix is None:
-        raise ValueError("Either new_name or suffix must be provided.")
-
-    if new_name is None:
-        new_name = mechanism.__name__
-
-    if suffix is not None:
-        if not isinstance(suffix, str):
-            raise TypeError("Suffix must be a string.")
-        new_name += f"_{suffix}"
 
     # Copy the original class's namespace dictionary.
     class_dict = dict(mechanism.__dict__)
