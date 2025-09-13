@@ -679,9 +679,7 @@ class Network(torch.nn.Module):
         --------
         >>> net.connect_prob_n(pop_pre[:], pop_post[:], pop_post.mech.syn, n=1000)
         """
-        """
-        Connect the source population to the target population with a fixed number of connections.
-        """
+
         if n <= 0:
             return
         if isinstance(source, Population) or isinstance(source, NetStim):
@@ -930,7 +928,47 @@ class Network(torch.nn.Module):
     def batch_(self, n, include_netstim=True):
         self.batch(n, include_netstim=include_netstim)
 
-    def concat(self, name, pops_to_concatenate=None):
+    def concat(self, **kwargs):
+        """
+        Concatenates populations to solve with fewer kernel launches.
+        All connections are preserved.
+
+        Parameters
+        ----------
+        **kwargs : dict
+            Populations to concatenate, where keys are the new population names
+            and values are lists of population names to concatenate. If no
+            populations are specified, all populations will be concatenated into
+            'all_populations'.
+
+        Returns
+        -------
+        Network
+            A new network with the concatenated populations.
+
+        Examples
+        --------
+        >>> net = Network(...)
+        >>> print(list(net.populations.keys()))
+        ['exc1', 'exc2', 'inh']
+        >>> net0 = net.concat()
+        >>> print(list(net0.populations.keys()))
+        ['all_populations']
+        >>> net1 = net.concat(all=['exc1', 'exc2', 'inh'])
+        >>> print(list(net1.populations.keys()))
+        ['all']
+        >>> net2 = net.concat(exc=['exc1', 'exc2'])
+        >>> print(list(net2.populations.keys()))
+        ['exc', 'inh']
+        """
+        if not kwargs:
+            return self._concat("all_populations")
+        net = self
+        for name, pops_to_concatenate in kwargs.items():
+            net = net._concat(name, pops_to_concatenate)
+        return net
+
+    def _concat(self, name, pops_to_concatenate=None):
         if pops_to_concatenate is None:
             pops_to_concatenate = []
         already_used = [
