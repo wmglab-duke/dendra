@@ -2,6 +2,7 @@ import math
 
 import torch
 
+from ..helpers import logger
 from .core import Population
 from .integrators import bwd_euler_sc_multi, dhs_multi
 from .tree import Tree
@@ -15,9 +16,19 @@ def assess_type_and_make_integrator(populations, threads=16, write_back=True):
     raise TypeError("Incompatible population types.")
 
 
+def _check_celsius(celsius, populations):
+    if not isinstance(celsius, (int, float)):
+        raise TypeError("celsius must be a number.")
+    if any(abs(pop.celsius - celsius) > 1e-6 for pop in populations.values()):
+        logger.warning(
+            "Inconsistent celsius values found in populations. When concatenating populations, the single value provided to concat is used, however at least one population has a different celsius value."
+        )
+
+
 def concat(
     populations: dict[str, Population], threads=16, write_back=True, celsius=37.0
 ):
+    _check_celsius(celsius, populations)
     integrator = assess_type_and_make_integrator(
         populations, threads=threads, write_back=write_back
     )
