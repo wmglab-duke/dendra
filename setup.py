@@ -28,7 +28,7 @@ setup(
         "pandas",
         "neuron",
         "matplotlib",
-        "ninja"
+        "ninja",
     ],
     extras_require={
         "doc": [

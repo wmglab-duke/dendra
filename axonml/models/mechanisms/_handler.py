@@ -114,12 +114,8 @@ class MechanismHandler(torch.nn.Module):
                 mech = self.mechanisms[mech_name]
                 scale_f = make_scaler(mech, self.area)
                 for ion in ions:
-                    self._map.append(
-                        (c_idx, mech, f"{ion}_with_g", scale_f)
-                    )
-                    self._map_exp.append(
-                        (c_idx, mech, f"{ion}", scale_f)
-                    )
+                    self._map.append((c_idx, mech, f"{ion}_with_g", scale_f))
+                    self._map_exp.append((c_idx, mech, f"{ion}", scale_f))
 
     def initialize(self, v, celsius, diameters):
         self.make_maps()

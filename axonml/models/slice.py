@@ -64,7 +64,9 @@ def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
 class Slice:
     _RESERVED = ("model", "index_spec", "base_shape", "parent_slice")
 
-    def __init__(self, model, index_spec: IndexSpec, base_shape=None, parent_slice=None):
+    def __init__(
+        self, model, index_spec: IndexSpec, base_shape=None, parent_slice=None
+    ):
         # Bypass interception for internal fields
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "index_spec", index_spec)
@@ -120,7 +122,9 @@ class Slice:
         if getattr(model, "key", None) is not None:
             v = getattr(model, var)
             dummy = torch.tensor(torch.nan, device=v.device, dtype=v.dtype)
-            dummy = model.put(v, dummy, torch.empty(base_shape, device=v.device, dtype=v.dtype))
+            dummy = model.put(
+                v, dummy, torch.empty(base_shape, device=v.device, dtype=v.dtype)
+            )
             return dummy[idx]
         return getattr(model, var)[idx]
 
@@ -158,7 +162,10 @@ class Slice:
 
     def insert(self, mechanism, alias=None, ic=None, **kwargs):
         object.__getattribute__(self, "model").insert(
-            mechanism, alias=alias, index_spec=object.__getattribute__(self, "index_spec"), **kwargs
+            mechanism,
+            alias=alias,
+            index_spec=object.__getattribute__(self, "index_spec"),
+            **kwargs,
         )
 
     def label(self, name: str):
@@ -173,9 +180,19 @@ class Slice:
 
     def __getitem__(self, key):
         model = object.__getattribute__(self, "model")
-        idx = compose_indices(model.shape, object.__getattribute__(self, "index"), key, device=model.device())
+        idx = compose_indices(
+            model.shape,
+            object.__getattribute__(self, "index"),
+            key,
+            device=model.device(),
+        )
         idx = parse_key(idx, model.shape, device=model.device())
-        return type(self)(model, idx, parent_slice=self, base_shape=object.__getattribute__(self, "base_shape"))
+        return type(self)(
+            model,
+            idx,
+            parent_slice=self,
+            base_shape=object.__getattribute__(self, "base_shape"),
+        )
 
     # -------------------------
     # Interceptors
@@ -234,20 +251,27 @@ class Slice:
     # -------------------------
     def __repr__(self):
         spec = object.__getattribute__(self, "index_spec")
-        return f"Slice(index={spec.index}, shape={spec.shape}, is_scalar={spec.is_scalar})"
+        return (
+            f"Slice(index={spec.index}, shape={spec.shape}, is_scalar={spec.is_scalar})"
+        )
 
     def _batch(self):
         model = object.__getattribute__(self, "model")
         index_spec = object.__getattribute__(self, "index_spec")
 
         current_index = index_spec.index
-        new_index = current_index if (current_index and current_index[0] is Ellipsis) else (slice(None),) + current_index
+        new_index = (
+            current_index
+            if (current_index and current_index[0] is Ellipsis)
+            else (slice(None),) + current_index
+        )
         index_spec.index = new_index
 
-        test = torch.empty(model.shape, device=model.device(), dtype=model.dtype())[new_index]
+        test = torch.empty(model.shape, device=model.device(), dtype=model.dtype())[
+            new_index
+        ]
         index_spec.is_scalar = test.ndim == 0
         index_spec.shape = test.shape
-
 
 
 def compose_indices(shape, idx1, idx2, *, device="cpu"):
