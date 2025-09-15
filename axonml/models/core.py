@@ -210,6 +210,8 @@ class Population(P, Sliceable):
         self.register_buffer("y", torch.zeros(self.shape))
         self.register_buffer("z", torch.zeros(self.shape))
 
+        self.mech: MechanismHandler = None  # type: ignore
+
         self.initialized: bool = False
         self.eval()
 
@@ -250,25 +252,6 @@ class Population(P, Sliceable):
             if area is not None:
                 return area.to(self.device(), dtype=self.dtype())
         return self.diam * 1e-4 * torch.pi * self.dx * 1e-4  # in cm²
-
-    def __getattr__(self, name):
-        if name == "mech":
-            # Let PyTorch resolve 'integrator' (it may be in _modules/_buffers/_parameters)
-            try:
-                integ = getattr(self, "integrator")
-            except AttributeError:
-                raise NotInitializedError(
-                    "Mechanisms & integrator have not been instantiated. Call initialize() first."
-                ) from None
-
-            if integ is None or not hasattr(integ, "mech"):
-                raise NotInitializedError(
-                    "Mechanisms & integrator have not been instantiated. Call initialize() first."
-                ) from None
-            return integ.mech
-
-        # Defer everything else to nn.Module's __getattr__
-        return super().__getattr__(name)
 
     @property
     def i_membrane(self):
@@ -1132,6 +1115,7 @@ class Population(P, Sliceable):
                 m.setreference("t", lambda: self.t)
 
             self.integrator = self._integ(self, mech)
+            self.mech = self.integrator.mech
 
         self.is_built = True
         self._flag_rebuild = False

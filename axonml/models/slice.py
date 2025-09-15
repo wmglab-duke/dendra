@@ -62,129 +62,192 @@ def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
 
 
 class Slice:
-    def __init__(
-        self, model, index_spec: IndexSpec, base_shape=None, parent_slice=None
-    ):
-        self.model: torch.nn.Module = model
-        self.base_shape = base_shape
-        if base_shape is None:
-            self.base_shape = model.shape
-        self.index_spec = index_spec
-        self.parent_slice = parent_slice
+    _RESERVED = ("model", "index_spec", "base_shape", "parent_slice")
 
+    def __init__(self, model, index_spec: IndexSpec, base_shape=None, parent_slice=None):
+        # Bypass interception for internal fields
+        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "index_spec", index_spec)
+        object.__setattr__(self, "parent_slice", parent_slice)
+        if base_shape is None:
+            base_shape = model.shape
+        object.__setattr__(self, "base_shape", base_shape)
+
+    # -------------------------
+    # Simple, safe properties
+    # -------------------------
     @property
     def index(self) -> Tuple[IndexElement, ...]:
-        """
-        Return the index of the slice.
-        """
-        return self.index_spec.index
+        return object.__getattribute__(self, "index_spec").index
 
     @property
     def shape(self):
-        """
-        Return the shape of the slice.
-        """
-        return self.index_spec.shape
+        return object.__getattribute__(self, "index_spec").shape
 
     @property
     def is_scalar(self) -> bool:
-        """
-        Return True if the slice is scalar.
-        """
-        return self.index_spec.is_scalar
+        return object.__getattribute__(self, "index_spec").is_scalar
 
     def numel(self) -> int:
-        """
-        Return the number of elements in the slice.
-        """
-        return int(np.prod(self.index_spec.shape))
+        return int(np.prod(object.__getattribute__(self, "index_spec").shape))
 
     @property
     def name(self) -> str:
-        return self.model.name
+        return object.__getattribute__(self, "model").name
 
+    # -------------------------
+    # Public API
+    # -------------------------
     def inspect(self, var: str, mechanism: Optional[str] = None) -> Any:
-        """
-        Inspect the variable in the model or a specific mechanism.
-        Note: Most of the time, this will involve a memory allocation.
-        """
+        model = object.__getattribute__(self, "model")
+        idx = object.__getattribute__(self, "index_spec").index
+
         if mechanism is not None:
-            mech = self.model.mech.mechanisms[mechanism]
+            mech = model.mech.mechanisms[mechanism]
             if mech.key is None:
-                return getattr(mech, var)[self.index_spec.index]
-            dummy = torch.tensor(
-                torch.nan, device=self.model.device(), dtype=self.model.dtype()
-            )
-            dummy = mech.put(getattr(mech, var), dummy, self.model.v)
-            return dummy[self.index_spec.index]
-        return getattr(self.model, var)[self.index_spec.index]
+                return getattr(mech, var)[idx]
+            dummy = torch.tensor(torch.nan, device=model.device(), dtype=model.dtype())
+            dummy = mech.put(getattr(mech, var), dummy, model.v)
+            return dummy[idx]
+
+        return getattr(model, var)[idx]
+
+    def _inspect(self, var: str):
+        model = object.__getattribute__(self, "model")
+        base_shape = object.__getattribute__(self, "base_shape")
+        idx = object.__getattribute__(self, "index_spec").index
+
+        if getattr(model, "key", None) is not None:
+            v = getattr(model, var)
+            dummy = torch.tensor(torch.nan, device=v.device, dtype=v.dtype)
+            dummy = model.put(v, dummy, torch.empty(base_shape, device=v.device, dtype=v.dtype))
+            return dummy[idx]
+        return getattr(model, var)[idx]
 
     def get(self, var: str, mechanism: Optional[str] = None) -> torch.Tensor:
         return self.inspect(var, mechanism)
 
     def set(self, var: str, value: torch.Tensor, mechanism: Optional[str] = None):
-        """
-        Set the variable in the model or a specific mechanism.
-        The value must match the shape of the slice.
-        """
+        model = object.__getattribute__(self, "model")
+        idx = object.__getattribute__(self, "index_spec").index
+
         if mechanism is not None:
-            mech = self.model.mech.mechanisms[mechanism]
+            mech = model.mech.mechanisms[mechanism]
             if mech.key is None:
-                getattr(mech, var)[self.index_spec.index] = value
-                getattr(mech, var).detach_()
+                with torch.no_grad():
+                    getattr(mech, var)[idx] = value
+                    getattr(mech, var).detach_()
                 return
-            dummy = torch.tensor(
-                torch.nan, device=self.model.device(), dtype=self.model.dtype()
-            )
-            dummy = mech.put(getattr(mech, var), dummy, self.model.v)
-            dummy[self.index_spec.index] = value
-            getattr(mech, var).copy_(mech.get(dummy))
-            getattr(mech, var).detach_()
+
+            dummy = torch.tensor(torch.nan, device=model.device(), dtype=model.dtype())
+            dummy = mech.put(getattr(mech, var), dummy, model.v)
+            with torch.no_grad():
+                dummy[idx] = value
+                getattr(mech, var).copy_(mech.get(dummy))
+                getattr(mech, var).detach_()
             return
-        getattr(self.model, var)[self.index_spec.index] = value
-        setattr(self.model, var, self.model.getattr(self.model, var).detach())
+
+        with torch.no_grad():
+            getattr(model, var)[idx] = value
+            getattr(model, var).detach_()  # keep identity, drop history
 
     def inject(self, waveform):
-        self.model.injections.append(
-            (waveform, self.index_spec.shape, self.index_spec.index)
-        )
+        model = object.__getattribute__(self, "model")
+        index_spec = object.__getattribute__(self, "index_spec")
+        model.injections.append((waveform, index_spec.shape, index_spec.index))
 
     def insert(self, mechanism, alias=None, ic=None, **kwargs):
-        self.model.insert(mechanism, alias=alias, index_spec=self.index_spec, **kwargs)
+        object.__getattribute__(self, "model").insert(
+            mechanism, alias=alias, index_spec=object.__getattribute__(self, "index_spec"), **kwargs
+        )
 
     def label(self, name: str):
-        if self.parent_slice is not None:
-            setattr(self.parent_slice, name, self)
+        parent_slice = object.__getattribute__(self, "parent_slice")
+        if parent_slice is not None:
+            # Attach label to the *wrapper* safely (avoid buffer interception)
+            object.__setattr__(parent_slice, name, self)
             return
-        setattr(self.model, name, self)
-        self.model._labels[name] = self
+        model = object.__getattribute__(self, "model")
+        setattr(model, name, self)
+        model._labels[name] = self
 
     def __getitem__(self, key):
-        idx = compose_indices(
-            self.model.shape, self.index, key, device=self.model.device()
-        )
-        idx = parse_key(idx, self.model.shape, device=self.model.device())
-        return Slice(self.model, idx, parent_slice=self)
+        model = object.__getattribute__(self, "model")
+        idx = compose_indices(model.shape, object.__getattribute__(self, "index"), key, device=model.device())
+        idx = parse_key(idx, model.shape, device=model.device())
+        return type(self)(model, idx, parent_slice=self, base_shape=object.__getattribute__(self, "base_shape"))
 
+    # -------------------------
+    # Interceptors
+    # -------------------------
+    def __setattr__(self, name, value):
+        # Always allow internal fields
+        if name in Slice._RESERVED:
+            object.__setattr__(self, name, value)
+            return
+
+        # Safely fetch model without triggering our __getattr__
+        model = object.__getattribute__(self, "model")
+
+        # Intercept writes to model buffers
+        buffers = model._buffers  # nn.Module guarantee
+        if name in buffers:
+            buf = buffers[name]
+            idx = object.__getattribute__(self, "index_spec").index
+            with torch.no_grad():
+                buf[idx] = value
+                buf.detach_()  # drop history but keep identity
+            return
+
+        # Otherwise set on this wrapper
+        object.__setattr__(self, name, value)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only runs if normal lookup failed
+        try:
+            model = object.__getattribute__(self, "model")
+        except AttributeError:
+            raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
+
+        # Buffers: return sliced/inspected view
+        if name in model._buffers:
+            return self._inspect(name)
+
+        # Submodules: return a wrapped Slice
+        if name in model._modules:
+            sub = model._modules[name]
+            return type(self)(
+                sub,
+                object.__getattribute__(self, "index_spec"),
+                base_shape=object.__getattribute__(self, "base_shape"),
+            )
+
+        # Parameters (optional): often handy to read through
+        if name in model._parameters:
+            return self._inspect(name)
+
+        # Fallback: delegate to the wrapped model (methods, attrs, etc.)
+        return getattr(model, name)
+
+    # -------------------------
+    # Misc
+    # -------------------------
     def __repr__(self):
-        return f"Slice(index={self.index_spec.index}, shape={self.index_spec.shape}, is_scalar={self.index_spec.is_scalar})"
+        spec = object.__getattribute__(self, "index_spec")
+        return f"Slice(index={spec.index}, shape={spec.shape}, is_scalar={spec.is_scalar})"
 
     def _batch(self):
-        current_index = self.index_spec.index
-        if current_index[0] is Ellipsis:
-            new_index = current_index
-        else:
-            new_index = (slice(None),) + current_index
+        model = object.__getattribute__(self, "model")
+        index_spec = object.__getattribute__(self, "index_spec")
 
-        self.index_spec.index = new_index
+        current_index = index_spec.index
+        new_index = current_index if (current_index and current_index[0] is Ellipsis) else (slice(None),) + current_index
+        index_spec.index = new_index
 
-        test = torch.empty(
-            self.model.shape, device=self.model.device(), dtype=self.model.dtype()
-        )
-        test = test[new_index]
+        test = torch.empty(model.shape, device=model.device(), dtype=model.dtype())[new_index]
+        index_spec.is_scalar = test.ndim == 0
+        index_spec.shape = test.shape
 
-        self.index_spec.is_scalar = test.ndim == 0
-        self.index_spec.shape = test.shape
 
 
 def compose_indices(shape, idx1, idx2, *, device="cpu"):

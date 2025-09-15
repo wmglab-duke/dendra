@@ -100,6 +100,8 @@ class MechanismHandler(torch.nn.Module):
         self.ion_to_buff_idx = {}
         self.i_g_buffers_initialized = False
 
+        self.shape = None
+
     def make_maps(self):
         """
         Create the mapping of current indices to mechanisms and their functions.
