@@ -81,6 +81,11 @@ def get_local_index(population, mech, index):
     return indices.index_select(0, index)
 
 
+def _last_celsius(populations):
+    pops = [pop for pop in populations.values()]
+    return pops[-1].celsius if pops else None
+
+
 def prepare_indices_one_one(source, target, synapse):
     source_model = source.model
     target_model = target.model
@@ -968,7 +973,7 @@ class Network(torch.nn.Module):
             net = net._concat(name, pops_to_concatenate)
         return net
 
-    def _concat(self, name, pops_to_concatenate=None):
+    def _concat(self, name, pops_to_concatenate=None, threads=16):
         if pops_to_concatenate is None:
             pops_to_concatenate = []
         already_used = [
@@ -986,7 +991,8 @@ class Network(torch.nn.Module):
         assert all(type(self.populations[n]) is p_type for n in pops_to_concatenate), (
             "All populations must be of the same type."
         )
-        concatenated = concat(concat_pops)
+        celsius = _last_celsius(concat_pops).item()
+        concatenated = concat(concat_pops, threads=threads, celsius=celsius)
         new_populations = {
             n: p for n, p in self.populations.items() if n not in pops_to_concatenate
         }
@@ -999,8 +1005,10 @@ class Network(torch.nn.Module):
         # now reapply connections
         for k, v in self.synapse_spec.items():
             source_name, target_name, synapse = k
-            source_pop = new_net.populations.get(source_name, getattr(new_net, name))
-            target_pop = new_net.populations.get(target_name, getattr(new_net, name))
+            if (source_pop := new_net.populations.get(name)) is None:
+                source_pop = getattr(new_net, source_name)
+            if (target_pop := new_net.populations.get(name)) is None:
+                target_pop = getattr(new_net, target_name)
             synapse = getattr(target_pop.mech, synapse.name)
 
             for data in v:
