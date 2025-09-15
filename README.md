@@ -40,11 +40,15 @@ Fast, scalable, and differentiable neural simulator with support for extracellul
 > cd axonml
 > python -m pip install .
 ```
-- To install in development mode:
-    - `python -m pip install --editable '.[dev]'`
 
 - If you want to build and run the documentation locally:
     - `python -m pip install '.[doc]'`
+
+### ⚙️ Installing for development
+- Install `--editable` with dev dependencies & install `pre-commit`:
+    - `python -m pip install --editable '.[dev]'`
+    - `python -m pre-commit install`s
+
 
 🥳 You're all set!
 
