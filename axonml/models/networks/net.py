@@ -759,7 +759,7 @@ class Network(torch.nn.Module):
                 delay=delay,
                 dt=dt,
             ).to(device=self.device(), dtype=self.dtype())
-            self.synapses[f"{pre_name}_{post_name}_{synapse.name}"] = syn
+            self.synapses[f"{pre_name}->{post_name}:{synapse.name}"] = syn
 
     def build(self, dt):
         """

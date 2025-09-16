@@ -59,6 +59,11 @@ def key_to_flat_index(indices, key):
     return indices[key].flatten()
 
 
+def flatten_key(n, shape, key):
+    indices = torch.arange(n).reshape(shape)
+    return indices[key].flatten()
+
+
 class MultiPopulation(Population):
     def __init__(self, integrator=None, celsius=37.0, **populations):
         if any(b.is_batched() for b in populations.values()):
@@ -69,8 +74,6 @@ class MultiPopulation(Population):
         super().__init__(1, C, integrator=integrator, celsius=celsius)
 
         self.populations = populations
-        for name, pop in self.populations.items():
-            setattr(self, name, pop)
 
         for pop in self.populations.values():
             self._equilibria.update(pop._equilibria)
@@ -105,10 +108,12 @@ class MultiPopulation(Population):
         self.clear_labels()
         all_indices = indices(self.populations)
         for index, (name, pop) in zip(all_indices, self.populations.items()):
-            self[:, index.flatten()].label(f"{name}_")
+            label_name = name
+            self[:, index.flatten()].label(label_name)
             for label, slice in pop._labels.items():
-                index_f = key_to_flat_index(index, slice.index)
-                self[:, index_f].label(f"{name}_{label}")
+                getattr(self, label_name)[
+                    :, flatten_key(pop.numel(), pop.shape, slice.index)
+                ].label(label)
 
     def reinsert_all(self):
         all_indices = indices(self.populations)
