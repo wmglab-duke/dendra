@@ -224,6 +224,7 @@ class _bwd_euler_ub(Integrator):
 class _bwd_euler_bt(Integrator):
     """
     Implicit Euler method for block tridiagonal system.
+    This integrator is only appropriate for ExtCellAxon models.
     """
 
     v_vars = ["v", "vc"]
@@ -339,6 +340,7 @@ class _bwd_euler_bt(Integrator):
             * 1e6
         )  # Ω
         raxial = 0.5 * (raxial[:, :-1, :] + raxial[:, 1:, :])
+        self.register_buffer("raxial", raxial[..., 0])
         gaxial = 1.0 / raxial  # S, (B,K-1,M-1)
         zeros_G = torch.zeros((B, 1, M - 1), device=dev, dtype=dtyp)
         gaxial = torch.cat([zeros_G, gaxial, zeros_G], dim=1)  # (B,K+1,M-1)
@@ -486,7 +488,7 @@ class _bwd_euler_bt(Integrator):
         # solve tridiagonal system
         vc_new = self._solve(self.lower, B, self.upper, D).reshape(
             self.base_shape
-        )  # (B, K)
+        )  # (model.shape)
         v = vc_new[..., 0] - vc_new[..., 1]  # v = vi - ve0
 
         i_membrane = None
@@ -495,9 +497,17 @@ class _bwd_euler_bt(Integrator):
             vprev_mem = vc[..., 0] - vc[..., 1]
             d_mem = self.cm_dt + gtot  # (B, K)  A/V
             rhs_mem = self.cm_dt * vprev_mem.view(-1, self.K) + d
-            i_membrane = (d_mem * v.view(-1, self.K) - rhs_mem).reshape_as(v)
+            i_membrane = d_mem * v.view(-1, self.K) - rhs_mem
+            periaxonal = torch.zeros_like(i_membrane)
+            periaxonal[:, :-1] += (vc[:, 1:, 1] - vc[:, :-1, 1]).view(
+                -1, self.K - 1
+            ) / self.raxial
+            periaxonal[:, 1:] += (vc[:, :-1, 1] - vc[:, 1:, 1]).view(
+                -1, self.K - 1
+            ) / self.raxial
+            i_membrane = i_membrane + periaxonal
 
-        return vc_new, v, i_membrane
+        return vc_new, v, i_membrane.reshape_as(v)
 
 
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
