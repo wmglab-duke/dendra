@@ -15,6 +15,7 @@ try:
 except ImportError:
     AXONML_SOLVERS_AVAILABLE = False
 
+from ..batching import expand_and_reshape
 from .core import Integrator, MultiIntegrator
 from .tridiag import pcr_solve_t
 from .triton import thomas_solve_cuda_bt, thomas_solve_cuda_t
@@ -76,7 +77,7 @@ class _bwd_euler_ub(Integrator):
     def __init__(self, model, mech, method="thomas", **kw):
         super().__init__(model, mech, **kw)
         self.method = method
-        B, K = model.n_ax, model.n_comp
+        B, K = model.np, model.nc
 
         # Buffers for diffusive diag, axonal conductance, membrane scale
         self.register_buffer("diag_base", torch.zeros(B, K))
@@ -150,8 +151,10 @@ class _bwd_euler_ub(Integrator):
         self.cm_inv = Cm_inv  # (B,K)
         self.scale = area_cm2 * Cm_inv  # A·s / C == 1, but keep for code reuse
 
+        self.base_shape = model.shape
+
     def step(self, model, dt, ve=None, intra=None):
-        model.v = self._step(model.v, dt, model.celsius, ve, intra)
+        model.v, model.i_membrane = self._step(model.v, dt, model.celsius, ve, intra)
 
     def _step(self, v, dt, temp, ve=None, intra=None) -> Tensor:
         dt_s = dt * 1e-3
@@ -167,11 +170,11 @@ class _bwd_euler_ub(Integrator):
 
         if ve is not None:
             # diffusive extracellular coupling
-            flux = self.g_edge_Cinv * (ve[:, 1:] - ve[:, :-1])  # (B, K-1)
+            flux = self.g_edge_Cinv * (ve[..., 1:] - ve[..., :-1])  # (B, K-1)
             S = torch.zeros_like(ve)  # (B, K)
-            S[:, 1:-1] = -flux[:, :-1] + flux[:, 1:]
-            S[:, 0] = -flux[:, 0]
-            S[:, -1] = flux[:, -1]
+            S[..., 1:-1] = -flux[..., :-1] + flux[..., 1:]
+            S[..., 0] = -flux[..., 0]
+            S[..., -1] = flux[..., -1]
 
             # form RHS: v_n + dt*(linear_reversal + S - residual)
             f_n = f_n + S
@@ -198,8 +201,24 @@ class _bwd_euler_ub(Integrator):
 
         # solve tridiagonal system
         v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
-        # advance gating
-        return v_np1
+
+        i_membrane = None
+
+        # --- fast_imem-style recovery (cheap O(N) saxpy) ---
+        if self.imem:
+            # area and Cm from existing buffers (no extra storage needed)
+            area = self.scale / self.cm_inv  # cm^2
+            Cm = 1.0 / self.cm_inv  # F
+            Cdt = Cm / dt_s  # A/V
+            g_abs = gtot * area  # S = A/V
+            i_abs = itot * area  # A
+            dmem = Cdt + g_abs  # A/V
+
+            # Using the Δv form to avoid an extra RHS build:
+            # I_mem_abs = dmem * (v_np1 - v) + i_abs
+            i_membrane = dmem * (v_np1 - v) + i_abs
+
+        return v_np1, i_membrane
 
 
 class _bwd_euler_bt(Integrator):
@@ -234,8 +253,6 @@ class _bwd_euler_bt(Integrator):
         self.register_buffer("c_rad", torch.zeros(B, K, M))
         self.register_buffer("xg", torch.zeros(B, K, M))
 
-        self.register_buffer("i_membrane", torch.zeros(1))
-
         model.register_buffer("vc", torch.zeros(B, K, M))
 
         model.vc[..., 0] = model.v_init
@@ -254,6 +271,8 @@ class _bwd_euler_bt(Integrator):
         model.v[:] = model.v_init
         model.vc = model.vc.detach()
         model.v = model.v.detach()
+        if self.imem:
+            model.i_membrane = torch.zeros_like(model.v).detach()
 
     def detach(self, model):
         model.vc = model.vc.detach()
@@ -288,20 +307,37 @@ class _bwd_euler_bt(Integrator):
         B, K, M = self.B, self.K, self.M
         dev, dtyp = model.device(), model.dtype()
 
-        L = model.dx.expand(B, K) * 1e-4  # μm → cm
-        diam = model.diam.expand(B, K) * 1e-4  # μm → cm
+        n_batch_dims = len(model.shape) - 2
+        L = (
+            expand_and_reshape(model.dx, model.shape, n_batch_dims, (B, K)) * 1e-4
+        )  # μm → cm
+        diam = (
+            expand_and_reshape(model.diam, model.shape, n_batch_dims, (B, K)) * 1e-4
+        )  # μm → cm
         radius = 0.5 * diam  # cm
         area = torch.pi * diam * L  # cm² for each segment
 
         # ------------------------------------------------------------------
         # Axial conductances (left/right padding → K+1)
         # ------------------------------------------------------------------
-        ri = model.rhoa * L / (torch.pi * radius**2)  # Ω
+        ri = (
+            expand_and_reshape(model.rhoa, model.shape, n_batch_dims, (B, K))
+            * L
+            / (torch.pi * radius**2)
+        )  # Ω
         ri = 0.5 * (ri[:, :-1] + ri[:, 1:])  # (B,K-1)
         gi = 1.0 / ri  # S
         gi = F.pad(gi, (1, 1))  # (B,K+1)
 
-        raxial = model.xraxial.expand(B, K, 2) * L.unsqueeze(-1) * 1e6  # Ω
+        batched_shape_for_vectors = tuple(list(model.shape) + [M - 1])
+
+        raxial = (
+            expand_and_reshape(
+                model.xraxial, batched_shape_for_vectors, n_batch_dims, (B, K, M - 1)
+            )
+            * L.unsqueeze(-1)
+            * 1e6
+        )  # Ω
         raxial = 0.5 * (raxial[:, :-1, :] + raxial[:, 1:, :])
         gaxial = 1.0 / raxial  # S, (B,K-1,M-1)
         zeros_G = torch.zeros((B, 1, M - 1), device=dev, dtype=dtyp)
@@ -316,11 +352,25 @@ class _bwd_euler_bt(Integrator):
         # ------------------------------------------------------------------
         # Radial (membrane + shell) elements
         # ------------------------------------------------------------------
-        area_cm2 = model.area
-        cm_dt = model.cm * 1e-6 * area_cm2 / dt  # F/s, (B,K)
+        area_cm2 = area  # cm²
+        cm_dt = (
+            expand_and_reshape(model.cm, model.shape, n_batch_dims, (B, K))
+            * 1e-6
+            * area_cm2
+            / dt
+        )  # F/s, (B,K)
 
-        xc_dt = model.xc * 1e-6 * area_cm2.unsqueeze(-1) / dt  # F/s, (B,K,M-1)
-        xg = model.xg * area_cm2.unsqueeze(-1)  # S  , (B,K,M-1)
+        xc_dt = (
+            expand_and_reshape(
+                model.xc, batched_shape_for_vectors, n_batch_dims, (B, K, M - 1)
+            )
+            * 1e-6
+            * area_cm2.unsqueeze(-1)
+            / dt
+        )  # F/s, (B,K,M-1)
+        xg = expand_and_reshape(
+            model.xg, batched_shape_for_vectors, n_batch_dims, (B, K, M - 1)
+        ) * area_cm2.unsqueeze(-1)  # S  , (B,K,M-1)
 
         # ------------------------------------------------------------------
         # Allocate blocks
@@ -400,7 +450,7 @@ class _bwd_euler_bt(Integrator):
         self.base_shape = tuple(list(model.shape) + [self.M])
 
     def step(self, model, dt, ve=None, intra=None):
-        model.vc, model.v = self._step(
+        model.vc, model.v, model.i_membrane = self._step(
             model.vc.view(-1, self.K, 3), model.v, dt, model.celsius, ve, intra
         )
 
@@ -423,7 +473,7 @@ class _bwd_euler_bt(Integrator):
         d = gtot * v.view(-1, self.K) - itot
 
         if intra is not None:
-            d = d + intra
+            d = d + intra.view(-1, self.K)
 
         B = self.maind.clone()  # (B, K, M, M)
         B[..., 0, 0] += gtot
@@ -434,11 +484,20 @@ class _bwd_euler_bt(Integrator):
         D = assemble_rhs(vc, self.c_rad, d, xg, ve)
 
         # solve tridiagonal system
-        vc = self._solve(self.lower, B, self.upper, D).reshape(
+        vc_new = self._solve(self.lower, B, self.upper, D).reshape(
             self.base_shape
         )  # (B, K)
-        v = vc[..., 0] - vc[..., 1]  # v = vi - ve0
-        return vc, v
+        v = vc_new[..., 0] - vc_new[..., 1]  # v = vi - ve0
+
+        i_membrane = None
+
+        if self.imem:
+            vprev_mem = vc[..., 0] - vc[..., 1]
+            d_mem = self.cm_dt + gtot  # (B, K)  A/V
+            rhs_mem = self.cm_dt * vprev_mem.view(-1, self.K) + d
+            i_membrane = (d_mem * v.view(-1, self.K) - rhs_mem).reshape_as(v)
+
+        return vc_new, v, i_membrane
 
 
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):

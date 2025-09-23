@@ -32,7 +32,11 @@ class Extra(torch.nn.Module):
     Handles extracellular stimulation for models.
     """
 
-    def __init__(self, field_waveform_tuples: list[tuple[torch.Tensor, Waveform]]):
+    def __init__(
+        self,
+        field_waveform_tuples: list[tuple[torch.Tensor, Waveform]],
+        precomputed=None,
+    ):
         """
         Initialize extracellular stimulation handler.
 
@@ -45,6 +49,13 @@ class Extra(torch.nn.Module):
         super(Extra, self).__init__()
         self.fields = []
         self.waveforms = []
+
+        self.is_precomputed = False
+
+        if precomputed is not None:
+            self.register_buffer("precomputed", precomputed)
+            self.is_precomputed = True
+            return
 
         for field, waveform in field_waveform_tuples:
             if not isinstance(field, torch.Tensor):
@@ -59,19 +70,19 @@ class Extra(torch.nn.Module):
             self.fields.append(field)
             self.waveforms.append(waveform)
 
-        self.n_fields = len(self.fields)
         self.device = None
         self.dtype = None
-        self.n_cell = None  # to be set later
 
         fields = torch.stack(self.fields, dim=0)
         self.register_buffer("fields", fields)
         self.register_buffer("waveform_stacked", torch.zeros((self.n_fields, 1)))
 
-    def set_device_dtype_ncell(self, model):
+        self.register_buffer("idx", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("increment", torch.ones(1, dtype=torch.long))
+
+    def set_device_dtype(self, model):
         self.device = model.device()
         self.dtype = model.dtype()
-        self.n_cell = model.np
 
         self.fields = self.fields.to(device=self.device, dtype=self.dtype)
         self.waveforms = [
@@ -94,26 +105,23 @@ class Extra(torch.nn.Module):
         Extra
             An instance of the Extra class.
         """
-        if precomputed_extracellular.ndim != 3:
-            raise ValueError(
-                "Precomputed extracellular data must be 3-D (n_field, n_cell, n_timepoints)."
-            )
+        return cls(field_waveform_tuples=[], precomputed=precomputed_extracellular)
 
-    def init(self, t):
-        n_cell = self.n_cell
-        device = self.device
-        dtype = self.dtype
-        if self.fields.shape[1] != n_cell or self.fields.ndim != 2:
-            raise ValueError(
-                f"Field tensors must have shape (n_field, n_cell, n_compartments), got {self.fields.shape} instead."
-            )
+    def forward(self):
+        if self.is_precomputed:
+            e = self.precomputed[..., self.idx]
+            self.idx += self.increment
+            return e
+        t = self.waveform_stacked[..., self.idx]
+        e = torch.einsum("i...,i...->i...", self.fields, t)
+        self.idx += self.increment
+        return e
 
-        self.fields = self.fields.to(device=device, dtype=dtype)
-        self.waveforms = [
-            waveform.to(device=device, dtype=dtype) for waveform in self.waveforms
-        ]
-
-        t = torch.as_tensor(t, device=self.device, dtype=self.dtype).unsqueeze(0)
-        self.waveform_stacked = torch.stack(
-            [waveform(t).expand(n_cell, -1) for waveform in self.waveforms], dim=0
-        )  # shape (n_field, n_cell, n_timepoints)
+    def initialize(self, model, t):
+        self.idx.zero_()
+        self.set_device_dtype(model)
+        t = torch.as_tensor(t, device=self.device, dtype=self.dtype)
+        if not self.is_precomputed:
+            self.waveform_stacked = torch.stack(
+                [waveform(t) for waveform in self.waveforms], dim=0
+            )  # shape (model.shape[:], n_timepoints)

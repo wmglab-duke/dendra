@@ -2,66 +2,105 @@ import torch
 
 
 def pcr_solve_t(
-    a: torch.Tensor,  # (B,K-1) sub-diag
-    b: torch.Tensor,  # (B,K)   main diag
-    c: torch.Tensor,  # (B,K-1) super-diag
-    d: torch.Tensor,  # (B,K)   RHS
+    a: torch.Tensor,  # (B, K-1) subdiag
+    b: torch.Tensor,  # (B, K)   diag
+    c: torch.Tensor,  # (B, K-1) superdiag
+    d: torch.Tensor,  # (B, K)   RHS
+    switch_to_thomas_at: int | None = None,  # e.g., 64 or 32
 ) -> torch.Tensor:
     """
-    Parallel Cyclic Reduction (PCR) batched tridiagonal solver.
-    Handles any length K (no power-of-two restriction) and runs in
-    O(logK) sequential stages while using only tensor ops.
-
-    Returns x of shape (B, K).
+    Parallel Cyclic Reduction (PCR) tridiagonal solver, batched over B.
+    O(log K) stages; avoids torch.roll, uses slice updates; in-place where safe.
     """
     B, K = b.shape
     dev, dtype = b.device, b.dtype
 
-    # ───── embed sub / super so that a[:,0] = c[:,-1] = 0 ─────
+    # Embed a,c to (B,K) with zeros at boundaries
     a_full = torch.zeros(B, K, device=dev, dtype=dtype)
-    c_full = torch.zeros_like(a_full)
-    a_full[:, 1:] = a  # a_0 … a_{K-1}
-    c_full[:, :-1] = c  # c_1 … c_{K-2}
+    c_full = torch.zeros(B, K, device=dev, dtype=dtype)
+    a_full[:, 1:] = a
+    c_full[:, :-1] = c
 
-    b_full, d_full = b.clone(), d.clone()
-
-    idx = torch.arange(K, device=dev)
+    b_full = b.clone()
+    d_full = d.clone()
 
     stride = 1
     while stride < K:
-        # roll(stride) gives the neighbour values (dummy for out-of-range rows)
-        a_L, b_L, c_L, d_L = (
-            torch.roll(a_full, stride, dims=1),
-            torch.roll(b_full, stride, dims=1),
-            torch.roll(c_full, stride, dims=1),
-            torch.roll(d_full, stride, dims=1),
-        )
-        a_R, b_R, c_R, d_R = (
-            torch.roll(a_full, -stride, dims=1),
-            torch.roll(b_full, -stride, dims=1),
-            torch.roll(c_full, -stride, dims=1),
-            torch.roll(d_full, -stride, dims=1),
-        )
+        # Optional hybrid switch: stop PCR when the effective segment size is small
+        if switch_to_thomas_at is not None and stride >= switch_to_thomas_at:
+            break
 
-        # rows that *really* have those neighbours
-        has_L = idx >= stride
-        has_R = idx < K - stride
+        # Interior indices where both neighbors exist
+        iL = slice(stride, K - stride)  # current rows
+        iLL = slice(0, K - 2 * stride)  # left neighbor rows aligned
+        iRR = slice(2 * stride, K)  # right neighbor rows aligned
 
-        # broadcast to (B,K)
-        has_L = has_L.expand(B, -1)
-        has_R = has_R.expand(B, -1)
+        # Precompute scalars on interior
+        # alpha = a[i] / b[i - stride]; gamma = c[i] / b[i + stride]
+        alpha = a_full[:, iL] / b_full[:, iLL]
+        gamma = c_full[:, iL] / b_full[:, iRR]
 
-        # coefficients a, g set to 0 where the neighbour is absent
-        alpha = torch.where(has_L, a_full / b_L, torch.zeros_like(a_full))
-        gamma = torch.where(has_R, c_full / b_R, torch.zeros_like(c_full))
+        # Cache neighbor coeffs/RHS
+        aL = a_full[:, iLL]
+        cL = c_full[:, iLL]
+        dL = d_full[:, iLL]
 
-        b_full = b_full - c_L * alpha - a_R * gamma
-        d_full = d_full - d_L * alpha - d_R * gamma
-        a_full = -a_L * alpha
-        c_full = -c_R * gamma
+        aR = a_full[:, iRR]
+        cR = c_full[:, iRR]
+        dR = d_full[:, iRR]
 
-        stride <<= 1  # next distance (x2)
+        # Update central row (i): b,d,a,c — all in-place on the interior slice
+        # b_i <- b_i - c_L*alpha - a_R*gamma
+        b_full[:, iL].addcmul_(cL, -alpha).addcmul_(aR, -gamma)
+        # d_i <- d_i - d_L*alpha - d_R*gamma
+        d_full[:, iL].addcmul_(dL, -alpha).addcmul_(dR, -gamma)
+        # a_i <- -a_L*alpha
+        a_full[:, iL].copy_(-aL * alpha)
+        # c_i <- -c_R*gamma
+        c_full[:, iL].copy_(-cR * gamma)
 
-    # after log2(K) stages  a_full[:,1:], c_full[:,:-1] -> 0 => purely diagonal
-    x = d_full / b_full
-    return x
+        # Edges: rows [0:stride) and (K-stride:K) lose one neighbor; their alpha/gamma are zero
+        # We only need to zero their a/c to keep the invariant tight.
+        if stride > 0:
+            a_full[:, :stride].zero_()
+            c_full[:, -stride:].zero_()
+
+        stride <<= 1
+
+    # If we broke out early, finish each independent segment with Thomas
+    if stride < K:
+        # Segment length is at most 2*stride; solve each contiguous block independently.
+        seg = 2 * stride
+        # Iterate blocks [s : s+seg)
+        for s in range(0, K, seg):
+            e = min(s + seg, K)
+            # Extract views
+            bb = b_full[:, s:e]
+            dd = d_full[:, s:e]
+            aa = a_full[:, s:e]
+            cc = c_full[:, s:e]
+            # Run batched Thomas on this small band (in-place)
+            _batched_thomas_inplace(aa, bb, cc, dd)  # defines x in dd via back-sub
+        return d_full / b_full  # dd now contains x*diag; divide by diag
+
+    # Pure PCR path: diagonal system
+    return d_full / b_full
+
+
+def _batched_thomas_inplace(a_full, b_full, c_full, d_full):
+    """
+    In-place Thomas on blocks: a_full has size (B, m) with a_full[:,0]==0,
+    c_full[:,m-1]==0. Writes solution into d_full; keeps b_full as diag.
+    """
+    B, m = b_full.shape
+    # forward sweep
+    c_full[:, 0] = c_full[:, 0] / b_full[:, 0]
+    d_full[:, 0] = d_full[:, 0] / b_full[:, 0]
+    for i in range(1, m):
+        denom = b_full[:, i] - a_full[:, i] * c_full[:, i - 1]
+        if i < m - 1:
+            c_full[:, i] = c_full[:, i] / denom
+        d_full[:, i] = (d_full[:, i] - a_full[:, i] * d_full[:, i - 1]) / denom
+    # back substitution
+    for i in range(m - 2, -1, -1):
+        d_full[:, i] = d_full[:, i] - c_full[:, i] * d_full[:, i + 1]

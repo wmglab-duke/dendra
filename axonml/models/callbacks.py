@@ -1,3 +1,4 @@
+import gc
 import multiprocessing as mp
 from queue import Queue
 from types import MethodType
@@ -756,9 +757,13 @@ class LFP(Callback):
 
     Parameters
     ----------
-    v_unit : array_like
-        Unit vector representing the contribution of each compartment to the LFP
-        measurement. Shape should match the axon's membrane current distribution.
+    v_unit : list of torch.Tensor
+        List of tensors representing the unit vector for the electrode configuration.
+        Each tensor should have the same shaape as model.shape == model.i_membrane.shape.
+    rule : str, optional
+        Einstein summation rule for computing the dot product. Default is None,
+        which uses the rule '...,n...->n' which sums over all dimensions except
+        the field index.
 
     Attributes
     ----------
@@ -798,27 +803,27 @@ class LFP(Callback):
     >>> lfp_tensor = lfp_callback.lfp
     """
 
-    def __init__(self, v_unit):
+    def __init__(self, v_unit: list[torch.Tensor], rule=None):
         super().__init__()
         self._lfp = []
         self._t = []
         self.register_buffer("v_unit", torch.stack(v_unit))
+        if rule is None:
+            rule = "...,n...->n"
+        self.rule = rule
 
     def pre_loop_hook(self, model):
         if not model.integrator.imem:
             raise RuntimeError(
-                "Axon must be compiled with IMEM=1. Use with ax.ctx(IMEM=1): model = ..."
+                "Model must be compiled with IMEM=1. Use with ax.ctx(IMEM=1): model = ..."
             )
         self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
-        self._lfp.append(
-            torch.einsum("ij,nij->n", model.integrator.i_membrane, self.v_unit)
-        )
+        self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))
         return super().pre_loop_hook(model)
 
+    @nojit
     def post_step_hook(self, model):
-        self._lfp.append(
-            torch.einsum("ij,nij->n", model.integrator.i_membrane, self.v_unit)
-        )
+        self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))
 
     @property
     def lfp(self):
@@ -834,6 +839,7 @@ class LFP(Callback):
     def reset(self):
         self._lfp = []
         self._t = []
+        gc.collect()
 
 
 class ThresholdCallback(Callback):

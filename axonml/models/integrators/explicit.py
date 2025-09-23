@@ -54,47 +54,32 @@ class _euler(Integrator):
         self.area_c = area
         self.ve_zero = torch.zeros_like(model.v)
 
-    def FRK(self, v, ve, area, cm, ra):
+    def FRK(self, v, ve, area, cm, ra, intra=None):
         x = torch.stack([v, ve], dim=1)
         d2v = self.ssd(x).squeeze(1)
-        i_ion = self.mech.iexp(v)
-        return cm * ((ra * d2v) - i_ion * area)
-
-    def FRK_intra(self, v, ve, area, cm, ra, intra):
-        x = torch.stack([v, ve], dim=1)
-        d2v = self.ssd(x).squeeze(1)
-        i_ion = self.mech.iexp(v)
-        return cm * ((ra * d2v) - i_ion * area + intra)
+        if intra is None:
+            i_ion = self.mech.iexp(v) * area
+            return cm * ((ra * d2v) - i_ion), i_ion
+        else:
+            i_ion = self.mech.iexp(v) * area - intra
+            return cm * ((ra * d2v) - i_ion), i_ion
 
     def step(self, model, dt, ve=None, intra=None):
         if ve is None:
             ve = self.ve_zero
-        if intra is None:
-            model.v = self._step_no_intra(
-                model.v, ve, self.area_c, dt, model.celsius, self.cm_c
-            )
-        else:
-            model.v = self._step_intra(
-                model.v, ve, self.area_c, dt, model.celsius, self.cm_c, intra
-            )
+        model.v, model.i_membrane = self._step(
+            model.v, ve, self.area_c, dt, model.celsius, self.cm_c, intra
+        )
 
-    def _step_no_intra(self, v, ve, area, dt, temp, cm):
+    def _step(self, v, ve, area, dt, temp, cm, intra):
         self.mech.advance(v, dt, temp)
-        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
+        K1, i_ion = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
         v_n = v + K1 * dt
+        i_membrane = None
         if self.imem:
             i_cap = cm * (v_n - v) / dt
-            self.i_membrane = i_cap + self.mech.imem * area
-        return v_n
-
-    def _step_intra(self, v, ve, area, dt, temp, cm, intra):
-        self.mech.advance(v, dt, temp)
-        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        v_n = v + K1 * dt
-        if self.imem:
-            i_cap = cm * (v_n - v) / dt
-            self.i_membrane = i_cap + self.mech.imem * area
-        return v_n
+            i_membrane = i_cap + i_ion
+        return v_n, i_membrane
 
 
 class _eulerv1(_euler):
@@ -102,82 +87,47 @@ class _eulerv1(_euler):
     Euler integrator with first-order correction.
     """
 
-    def _step_no_intra(self, v, ve, area, dt, temp, cm):
+    def _step(self, v, ve, area, dt, temp, cm, intra=None):
         self.mech.advance(v, dt, temp)
-        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
+        K1, i_ion = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
         v_n = v + K1 * dt
+        i_membrane = None
         if self.imem:
             i_cap = cm * (v_n - v) / dt
-            self.i_membrane = i_cap + self.mech.imem * area
-        return v_n
-
-    def _step_intra(self, v, ve, area, dt, temp, cm, intra):
-        self.mech.advance(v, dt, temp)
-        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        v_n = v + K1 * dt
-        if self.imem:
-            i_cap = cm * (v_n - v) / dt
-            self.i_membrane = i_cap + self.mech.imem * area
-        return v_n
+            i_membrane = i_cap + i_ion
+        return v_n, i_membrane
 
 
 _rk1 = _euler
 
 
 class _rk2(_euler):
-    """
-    Second-order Runge-Kutta integrator.
-    """
-
-    def _step_no_intra(self, v, ve, area, dt, temp, cm):
+    def _step(self, v, ve, area, dt, temp, cm, intra=None):
         self.mech.advance(v, dt, temp)
-        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
-        K2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
+        K1, _ = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
+        K2, i2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra)
         v_n = v + K2 * dt
+        i_membrane = None
         if self.imem:
             i_cap = cm * (v_n - v) / dt
-            self.i_membrane = i_cap + self.mech.imem * area
-        return v_n
-
-    def _step_intra(self, v, ve, area, dt, temp, cm, intra):
-        self.mech.advance(v, dt, temp)
-        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        K2 = self.FRK_intra(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
-        v_n = v + K2 * dt
-        if self.imem:
-            i_cap = cm * (v_n - v) / dt
-            self.i_membrane = i_cap + self.mech.imem * area
-        return v_n
+            i_membrane = i_cap + i2
+        return v_n, i_membrane
 
 
 class _rk4(_euler):
-    """
-    Fourth-order Runge-Kutta integrator.
-    """
-
-    def _step_no_intra(self, v, ve, area, dt, temp, cm):
+    def _step(self, v, ve, area, dt, temp, cm, intra=None):
         self.mech.advance(v, dt, temp)
-        K1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv)
-        K2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
-        K3 = self.FRK(v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
-        K4 = self.FRK(v + K3 * dt, ve, area, self.cm_inv, self.ra_inv)
+        K1, i1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
+        K2, i2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra)
+        K3, i3 = self.FRK(v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra)
+        K4, i4 = self.FRK(v + K3 * dt, ve, area, self.cm_inv, self.ra_inv, intra)
         v_n = v + (K1 + 2 * K2 + 2 * K3 + K4) * dt / 6.0
+        i_membrane = None
         if self.imem:
             i_cap = cm * (v_n - v) / dt
-            self.i_membrane = i_cap + self.mech.imem * area
-        return v_n
-
-    def _step_intra(self, v, ve, area, dt, temp, cm, intra):
-        self.mech.advance(v, dt, temp)
-        K1 = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        K2 = self.FRK_intra(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
-        K3 = self.FRK_intra(v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
-        K4 = self.FRK_intra(v + K3 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv)
-        v_n = v + (K1 + 2 * K2 + 2 * K3 + K4) * dt / 6.0
-        if self.imem:
-            i_cap = cm * (v_n - v) / dt
-            self.i_membrane = i_cap + self.mech.imem * area
-        return v_n
+            i_rk4 = (i1 + 2 * i2 + 2 * i3 + i4) / 6.0
+            i_membrane = i_cap + i_rk4
+        return v_n, i_membrane
 
 
 def ssd_df(v_c, v_p, v_e):
@@ -280,90 +230,30 @@ class _dufort_frankel_homogeneous(Integrator):
         self.f64 = model.dtype() == torch.float64
         self.ve_zero = torch.zeros_like(model.v)
         if self.conv:
-            self.method_intra = self._step_intra_conv
-            self.method_no_intra = self._step_no_intra_conv
+            self.method = self._step_conv
         else:
-            self.method_intra = self._step_intra
-            self.method_no_intra = self._step_no_intra
+            self.method = self._step
 
     def step(self, model, dt, ve=None, intra=None):
         if ve is None:
             if self.conv:
                 ve = self.ve_zero
-        if intra is None:
-            model.v, model.v_prev = self.method_no_intra(
-                model.v,
-                model.v_prev,
-                ve,
-                self.s1,
-                self.s2,
-                self.s3,
-                self.s4,
-                self.area,
-                dt,
-                model.celsius,
-            )
-        else:
-            model.v, model.v_prev = self.method_intra(
-                model.v,
-                model.v_prev,
-                ve,
-                self.s1,
-                self.s2,
-                self.s3,
-                self.s4,
-                self.area,
-                dt,
-                model.celsius,
-                intra,
-            )
+        model.v, model.v_prev, model.i_membrane = self.method(
+            model.v,
+            model.v_prev,
+            ve,
+            self.s1,
+            self.s2,
+            self.s3,
+            self.s4,
+            self.area,
+            dt,
+            model.celsius,
+            intra,
+        )
 
-    def _step_no_intra(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if ve is None:
-            d2v = ssd_df_no_ve(v, v_prev)
-        else:
-            d2v = ssd_df(v, v_prev, ve)
-
-        self.mech.advance(v, dt, temp)
-        i_ion, gtot = self.mech.idf(v, v_prev)
-        v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * 0.5 * gtot)
-
-        self.mech.itot(v)
-
-        if self.smoothing:
-            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
-
-        if self.imem:
-            i_cap = (v_new - v_prev) / s1
-            self.i_membrane = i_cap + self.mech.imem * area
-
-        return v_new, v
-
-    def _step_no_intra_conv(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.stack([v, v_prev, ve], dim=1)
-        d2v = self.ssd(x).squeeze(1)
-
-        self.mech.advance(v, dt, temp)
-        i_ion, gtot = self.mech.idf(v, v_prev)
-        v_new = (v_prev + s2 * d2v - s3 * i_ion) / (s4 + s3 * 0.5 * gtot)
-
-        self.mech.itot(v)
-
-        if self.smoothing:
-            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
-
-        if self.imem:
-            i_cap = (v_new - v_prev) / s1
-            self.i_membrane = i_cap + self.mech.imem * area
-
-        return v_new, v
-
-    def _step_intra(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra
+    def _step(
+        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if ve is None:
             d2v = s2 * ssd_df_no_ve(v, v_prev)
@@ -372,22 +262,30 @@ class _dufort_frankel_homogeneous(Integrator):
 
         self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
-        i_ion = i_ion * area - intra
+
+        if intra is not None:
+            i_ion = i_ion * area - intra
+        else:
+            i_ion = i_ion * area
 
         v_new = (v_prev + d2v - s1 * i_ion) / (s4 + 0.5 * gtot * s3)
 
-        self.mech.itot(v)
+        i_mem = self.mech.itot(v)
 
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
 
+        i_membrane = None
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
-            self.i_membrane = i_cap + self.mech.imem * area
+            if intra is not None:
+                i_membrane = i_cap + i_mem * area - intra
+            else:
+                i_membrane = i_cap + i_mem * area
 
-        return v_new, v
+        return v_new, v, i_membrane
 
-    def _step_intra_conv(
+    def _step_conv(
         self,
         v,
         v_prev,
@@ -399,27 +297,35 @@ class _dufort_frankel_homogeneous(Integrator):
         area,
         dt,
         temp,
-        intra,
+        intra=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = torch.stack([v, v_prev, ve], dim=1)
         d2v = s2 * self.ssd(x).squeeze(1)
 
         self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
-        i_ion = i_ion * area - intra
+
+        if intra is not None:
+            i_ion = i_ion * area - intra
+        else:
+            i_ion = i_ion * area
 
         v_new = (v_prev + d2v - s1 * i_ion) / (s4 + 0.5 * gtot * s3)
 
-        self.mech.itot(v)
+        i_mem = self.mech.itot(v)
 
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
 
+        i_membrane = None
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
-            self.i_membrane = i_cap + self.mech.imem * area
+            if intra is not None:
+                i_membrane = i_cap + i_mem * area - intra
+            else:
+                i_membrane = i_cap + i_mem * area
 
-        return v_new, v
+        return v_new, v, i_membrane
 
     def init_v(self, model):
         model.v = torch.full(
@@ -432,11 +338,7 @@ class _dufort_frankel_homogeneous(Integrator):
             device=model.v_prev.device,
         ).detach()
         if self.imem:
-            model.i_membrane = torch.zeros(
-                model.i_membrane.shape,
-                dtype=model.i_membrane.dtype,
-                device=model.i_membrane.device,
-            ).detach()
+            model.i_membrane = torch.zeros_like(model.v).detach()
 
 
 class _dufort_frankel(Integrator):
@@ -518,85 +420,23 @@ class _dufort_frankel(Integrator):
 
     def step(self, model, dt, ve=None, intra=None):
         # The step logic is simplified as we no longer branch on `conv`
-        if intra is None:
-            model.v, model.v_prev = self._step_no_intra(
-                model.v,
-                model.v_prev,
-                ve,
-                dt,
-                model.celsius,
-            )
-        else:
-            model.v, model.v_prev = self._step_intra(
-                model.v,
-                model.v_prev,
-                ve,
-                dt,
-                model.celsius,
-                intra,
-            )
+        model.v, model.v_prev, model.i_membrane = self._step(
+            model.v,
+            model.v_prev,
+            ve,
+            dt,
+            model.celsius,
+            intra,
+        )
 
-    def _step_no_intra(
+    def _step(
         self,
         v,
         v_prev,
         ve,
         dt,
         temp,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        v_padded = F.pad(v, (1, 1), "reflect")
-
-        # --- Numerator Calculation ---
-        # Contribution from previous voltage (v_prev)
-        num_v_prev = v_prev * (1 - self.c_axial)
-
-        # Contribution from neighboring voltages (v)
-        num_axial_v = self.c_left * v_padded[:, :-2] + self.c_right * v_padded[:, 2:]
-
-        # Contribution from external potential (ve) - this is a standard central difference
-        if ve is not None:
-            ve_padded = F.pad(ve, (1, 1), "reflect")
-            num_axial_ve = self.c_left * (ve_padded[:, :-2] - ve) + self.c_right * (
-                ve_padded[:, 2:] - ve
-            )
-            num = num_v_prev + num_axial_v + num_axial_ve
-        else:
-            num = num_v_prev + num_axial_v
-
-        self.mech.advance(v, dt, temp)
-        i_ion, gtot = self.mech.idf(v, v_prev)
-        num_ion = -self.s3 * i_ion
-
-        numerator = num + num_ion
-
-        # --- Denominator Calculation ---
-        # Implicit contribution from axial current and total ionic conductance
-        denominator = 1 + self.c_axial + (0.5 * self.s3 * gtot)
-
-        v_new = numerator / denominator
-
-        self.mech.itot(v)
-
-        if self.smoothing:
-            # unsqueeze/squeeze needed for Conv1d which expects (N, C, L)
-            v_new = self.beta * v_new + (1 - self.beta) * self.filter(
-                v_new.unsqueeze(1)
-            ).squeeze(1)
-
-        if self.imem:
-            i_cap = (v_new - v_prev) / self.s1
-            self.i_membrane = i_cap + self.mech.imem * self.area
-
-        return v_new, v
-
-    def _step_intra(
-        self,
-        v,
-        v_prev,
-        ve,
-        dt,
-        temp,
-        intra,
+        intra=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # This method is identical to _step_no_intra, with one change:
         # The stimulus current `intra` is added to the numerator.
@@ -616,10 +456,10 @@ class _dufort_frankel(Integrator):
 
         self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
-        i_ion_stim = i_ion * self.area - intra
-        num_ion = (
-            -self.s1 * i_ion_stim
-        )  # Note: we use s1 here since i_ion_stim is in Amps
+        i_ion_stim = (
+            i_ion * self.area - intra if intra is not None else i_ion * self.area
+        )
+        num_ion = -self.s1 * i_ion_stim
 
         numerator = num + num_ion
 
@@ -627,18 +467,23 @@ class _dufort_frankel(Integrator):
 
         v_new = numerator / denominator
 
-        self.mech.itot(v)
+        i_mem = self.mech.itot(v)
 
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * self.filter(
                 v_new.unsqueeze(1)
             ).squeeze(1)
 
+        i_membrane = None
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
-            self.i_membrane = i_cap + self.mech.imem * self.area
+            i_membrane = (
+                i_cap + i_mem * self.area - intra
+                if intra is not None
+                else i_cap + i_mem * self.area
+            )
 
-        return v_new, v
+        return v_new, v, i_membrane
 
     # The rest of the class methods (init_v, detach) do not need changes.
     def init_v(self, model):
@@ -654,9 +499,4 @@ class _dufort_frankel(Integrator):
         )
         model.v_prev.detach_()
         if self.imem:
-            model.i_membrane = torch.zeros(
-                model.i_membrane.shape,
-                dtype=model.i_membrane.dtype,
-                device=model.i_membrane.device,
-            )
-            model.i_membrane.detach_()
+            model.i_membrane = torch.zeros_like(model.v).detach()

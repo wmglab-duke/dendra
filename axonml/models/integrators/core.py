@@ -27,7 +27,6 @@ class Integrator(torch.nn.Module):
         imem = imem if imem is not None else IMEM
         self.imem = bool(imem)
         self.mech = mech
-        self.register_buffer("i_membrane", torch.zeros(model.shape))
         self.initialized = False
         self.dt = None
         self.shape = None
@@ -49,8 +48,7 @@ class Integrator(torch.nn.Module):
         model.v[:] = model.v_init
         model.v = model.v.detach().contiguous()
         if self.imem:
-            model.i_membrane.zero_()
-            model.i_membrane = model.i_membrane.detach()
+            model.i_membrane = torch.zeros_like(model.v).detach()
 
     def detach(self, model):
         detach_vars(self, self.v_vars)
@@ -90,8 +88,4 @@ class MultiIntegrator(Integrator):
             self._calc_splits(model)
             _write_back(model, self.split_at)
         if self.imem:
-            model.i_membrane = torch.zeros(
-                model.i_membrane.shape,
-                dtype=model.i_membrane.dtype,
-                device=model.i_membrane.device,
-            ).detach()
+            model.i_membrane = torch.zeros_like(model.v).detach()

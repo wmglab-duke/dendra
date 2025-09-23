@@ -4,6 +4,7 @@ import re
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
+import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
@@ -15,6 +16,7 @@ from axonml.helpers import (
     COMPILE_MODE,
     DYNAMIC,
     FULLGRAPH,
+    IMEM,
     JIT,
     op_mc,
     op_sc,
@@ -115,7 +117,6 @@ def step(integrator, model, dt, ve=None, intra=None):
     integrator.step(model, dt, ve, intra)
 
 
-@torch.compile(dynamic=True)
 def make_intra(intra, stims, indices):
     return intra(stims, indices)
 
@@ -148,11 +149,14 @@ class Population(P, Sliceable):
         self.register_buffer("dx", torch.full(self.shape, 100.0))
         self.register_buffer("t", torch.zeros(()))
 
+        self.register_buffer("i_membrane", torch.zeros(self.shape))
+
         # compiler stuff
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
+        self.imem = bool(IMEM)
         self.compile_mode = COMPILE_MODE.value
 
         self._integ = integrator
@@ -204,6 +208,11 @@ class Population(P, Sliceable):
                 backend="eager",
             )
 
+        if self.jit:
+            self.make_intra = torch.compile(make_intra)
+        else:
+            self.make_intra = make_intra
+
         self._caches = {}
 
         self.register_buffer("x", torch.zeros(self.shape))
@@ -252,10 +261,6 @@ class Population(P, Sliceable):
             if area is not None:
                 return area.to(self.device(), dtype=self.dtype())
         return self.diam * 1e-4 * torch.pi * self.dx * 1e-4  # in cm²
-
-    @property
-    def i_membrane(self):
-        return self.integrator.i_membrane
 
     def collect_parameters(self, *names):
         """
@@ -390,7 +395,7 @@ class Population(P, Sliceable):
         t_ = torch.arange(start, end, dt, device=self.device(), dtype=self.dtype())
         t_ = t_.to(self.device(), dtype=self.dtype())
         stims, indices = intra.init(t_)
-        stims = [s.unbind(0) for s in stims]
+        stims = [s.unbind(-1) for s in stims]
         return stims, indices
 
     def run(
@@ -503,7 +508,7 @@ class Population(P, Sliceable):
 
                 if with_intra:
                     s = [st[local_ind] for st in stims]
-                    intra_c = make_intra(intra, s, indices)
+                    intra_c = self.make_intra(intra, s, indices)
                 else:
                     intra_c = None
 
@@ -1114,7 +1119,7 @@ class Population(P, Sliceable):
             for m in mech.mechanisms.values():
                 m.setreference("t", lambda: self.t)
 
-            self.integrator = self._integ(self, mech)
+            self.integrator = self._integ(self, mech, imem=self.imem)
             self.mech = self.integrator.mech
 
         self.is_built = True
@@ -1304,6 +1309,10 @@ class Population(P, Sliceable):
         self.v = self.v.unsqueeze(0).expand(n, *self.v.shape).clone()
         if hasattr(self, "v_prev"):
             self.v_prev = self.v_prev.unsqueeze(0).expand(n, *self.v_prev.shape).clone()
+        if hasattr(self, "i_membrane"):
+            self.i_membrane = (
+                self.i_membrane.unsqueeze(0).expand(n, *self.i_membrane.shape).clone()
+            )
         self.reshape(self.calc_shape_p(), self.shape)
         for slice in self._labels.values():
             slice._batch()
@@ -1546,6 +1555,22 @@ class Axon(Population):
 
         # -- biophysics --
         self.biophysics()
+
+    def assemble_graphs(self):
+        graphs = []
+        for i in range(self.n_ax):
+            G = nx.path_graph(self.n_comp).to_directed()
+            for node in G.nodes:
+                G.nodes[node]["name"] = f"axon[{i}]({node / (self.n_comp - 1):.2f})"
+                G.nodes[node]["x"] = self.x[i, node].item()
+                G.nodes[node]["y"] = 0.0
+                G.nodes[node]["z"] = 0.0
+                G.nodes[node]["diam"] = self.diam[i, node].item()
+                G.nodes[node]["L"] = self.dx[i, node].item()
+                G.nodes[node]["Ra"] = self.rhoa[i, node].item()
+                G.nodes[node]["Cm"] = self.cm[i, node].item()
+            graphs.append(G)
+        return graphs
 
     def biophysics(self):
         """
