@@ -1,5 +1,12 @@
+from __future__ import annotations
+
+from collections import Counter
+from typing import Iterable, Tuple, Union
+
 import networkx as nx
 import torch
+
+GraphLike = Union[nx.Graph, nx.DiGraph, nx.MultiGraph, nx.MultiDiGraph]
 
 
 def get_area_from_graph(G: nx.DiGraph) -> torch.Tensor:
@@ -27,3 +34,92 @@ def get_area_from_graph(G: nx.DiGraph) -> torch.Tensor:
     # area in µm² -> convert to cm²
     # 1 cm² = 1e8 µm²
     return 1e-8 * torch.tensor(areas)
+
+
+def _edge_signature(G: GraphLike):
+    """
+    A label-sensitive edge signature for quick equality checks across graphs
+    of the same directed/multigraph kind. Ignores attributes.
+    - Simple graphs: frozenset of edges (undirected normalized).
+    - Multi* graphs : Counter of multiplicities per (u,v) (undirected normalized).
+    """
+    if G.is_multigraph():
+        c = Counter()
+        if G.is_directed():
+            for u, v in G.edges():
+                c[(u, v)] += 1
+        else:
+            for u, v in G.edges():
+                a, b = (u, v) if u <= v else (v, u)
+                c[(a, b)] += 1
+        return c
+    else:
+        if G.is_directed():
+            return frozenset(G.edges())
+        else:
+            return frozenset((min(u, v), max(u, v)) for u, v in G.edges())
+
+
+def share_topology_labeled(graphs: Iterable[GraphLike]) -> Tuple[bool, str]:
+    """
+    Return (ok, msg). True iff all graphs have the same node set and the same edges
+    between those very nodes (ignoring attributes).
+    """
+    graphs = list(graphs)
+    if not graphs:
+        return False, "No graphs provided."
+
+    g0 = graphs[0]
+    kind0 = (g0.is_directed(), g0.is_multigraph())
+    nodes0 = set(g0.nodes())
+    sig0 = _edge_signature(g0)
+
+    for i, g in enumerate(graphs[1:], 1):
+        kind = (g.is_directed(), g.is_multigraph())
+        if kind != kind0:
+            return (
+                False,
+                f"Type mismatch at index {i}: directed/multigraph flags differ.",
+            )
+        if set(g.nodes()) != nodes0:
+            return False, f"Node set mismatch at index {i}."
+        if _edge_signature(g) != sig0:
+            return False, f"Edge set mismatch at index {i}."
+    return True, "All graphs share the same labeled topology."
+
+
+def _is_isomorphic_unlabeled(g1: GraphLike, g2: GraphLike) -> bool:
+    """
+    Label-agnostic isomorphism (ignores attributes, respects direction and multiplicity).
+    """
+    directed = g1.is_directed()
+    multi = g1.is_multigraph()
+    if (g2.is_directed() != directed) or (g2.is_multigraph() != multi):
+        return False
+
+    if multi and directed:
+        GM = nx.algorithms.isomorphism.MultiDiGraphMatcher
+    elif multi and not directed:
+        GM = nx.algorithms.isomorphism.MultiGraphMatcher
+    elif not multi and directed:
+        GM = nx.algorithms.isomorphism.DiGraphMatcher
+    else:
+        GM = nx.algorithms.isomorphism.GraphMatcher
+
+    return GM(g1, g2).is_isomorphic()
+
+
+def share_topology_isomorphic(graphs: Iterable[GraphLike]) -> Tuple[bool, str]:
+    """
+    Return (ok, msg). True iff all graphs are mutually isomorphic (same connectivity
+    up to node relabeling), ignoring all attributes.
+    """
+    graphs = list(graphs)
+    if not graphs:
+        return False, "No graphs provided."
+
+    g0 = graphs[0]
+    for i, g in enumerate(graphs[1:], 1):
+        if not _is_isomorphic_unlabeled(g0, g):
+            return False, f"Not isomorphic to graph 0 at index {i}."
+    return True, "All graphs are isomorphic (same unlabeled topology)."

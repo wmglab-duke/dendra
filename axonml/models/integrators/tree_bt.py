@@ -311,3 +311,5 @@ class _dhs_bt(Integrator):
         model.v[:] = model.v_init
         model.vc = model.vc.detach()
         model.v = model.v.detach()
+        if self.imem:
+            model.i_membrane = torch.zeros_like(model.v).detach()

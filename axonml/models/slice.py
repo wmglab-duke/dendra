@@ -97,6 +97,10 @@ class Slice:
     def name(self) -> str:
         return object.__getattribute__(self, "model").name
 
+    @property
+    def is_empty(self) -> bool:
+        return self.numel() == 0
+
     # -------------------------
     # Public API
     # -------------------------
@@ -156,11 +160,15 @@ class Slice:
             getattr(model, var).detach_()  # keep identity, drop history
 
     def inject(self, waveform):
+        if self.is_empty:
+            return  # no-op for empty slices
         model = object.__getattribute__(self, "model")
         index_spec = object.__getattribute__(self, "index_spec")
         model.injections.append((waveform, index_spec.shape, index_spec.index))
 
     def insert(self, mechanism, alias=None, ic=None, **kwargs):
+        if self.is_empty:
+            return  # no-op for empty slices
         object.__getattribute__(self, "model").insert(
             mechanism,
             alias=alias,

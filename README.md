@@ -47,7 +47,7 @@ Fast, scalable, and differentiable neural simulator with support for extracellul
 ### ⚙️ Installing for development
 - Install `--editable` with dev dependencies & install `pre-commit`:
     - `python -m pip install --editable '.[dev]'`
-    - `python -m pre-commit install`s
+    - `python -m pre-commit install`
 
 
 🥳 You're all set!

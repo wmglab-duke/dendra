@@ -20,6 +20,8 @@ def xyz(seg, extcell=None):
     y_arr = []
     z_arr = []
     arc_l = []
+    if sec.n3d() < 1:
+        return {"x": 0.0, "y": 0.0, "z": 0.0}
     for i in range(sec.n3d()):
         x_arr.append(sec.x3d(i))
         y_arr.append(sec.y3d(i))

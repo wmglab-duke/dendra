@@ -6,6 +6,7 @@ import networkx as nx
 import numpy as np
 import torch
 
+from ..graph import share_topology_isomorphic
 from .core import Integrator, MultiIntegrator
 from .triton import dhs_solve_cuda, dhs_solve_multi_cuda
 
@@ -91,7 +92,7 @@ def build_morphology(
 
 
 def graph_to_parent_and_axial(
-    G: nx.DiGraph, dtype_axial: torch.dtype = torch.float32
+    G: list[nx.DiGraph], dtype_axial: torch.dtype = torch.float32
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a compartmental morphology stored in a DiGraph into
@@ -108,15 +109,16 @@ def graph_to_parent_and_axial(
     The topological sort guarantees that every parent index < child index,
     matching the requirements of DHS / Hines matrix preprocessing.
     """
+    assert share_topology_isomorphic(G), "All graphs must share the same topology."
     # ------------------------------------------------------------------
     # 0. topological order and quick look‑ups
     # ------------------------------------------------------------------
-    nodes = list(nx.topological_sort(G))  # length K
+    nodes = list(nx.topological_sort(G[0]))  # length K
     idx_of = {n: i for i, n in enumerate(nodes)}
     K = len(nodes)
 
     parent_idx = np.full(K, -1, dtype=np.int32)
-    a_geom = np.zeros(K, dtype=np.float32)
+    a_geom = np.zeros((len(G), K), dtype=np.float32)
 
     # constant: 1 µm = 1 e‑4 cm
     microns_to_cm = 1e-4
@@ -125,59 +127,60 @@ def graph_to_parent_and_axial(
     # ------------------------------------------------------------------
     # 1. iterate over all nodes except the roots
     # ------------------------------------------------------------------
-    for child in nodes:
-        i = idx_of[child]
-        preds = list(G.predecessors(child))
+    for j, g in enumerate(G):
+        for child in nodes:
+            i = idx_of[child]
+            preds = list(g.predecessors(child))
 
-        if not preds:  # soma / root compartment
-            continue
-        if len(preds) > 1:
-            raise ValueError(
-                f"Node {child} has {len(preds)} parents — "
-                "morphology must be a rooted tree for the Hines matrix."
-            )
+            if not preds:  # soma / root compartment
+                continue
+            if len(preds) > 1:
+                raise ValueError(
+                    f"Node {child} has {len(preds)} parents — "
+                    "morphology must be a rooted tree for the Hines matrix."
+                )
 
-        parent = preds[0]
-        p = idx_of[parent]
-        parent_idx[i] = p
+            parent = preds[0]
+            p = idx_of[parent]
+            parent_idx[i] = p
 
-        # --------------------------------------------------------------
-        # 1a.  Attempt to use the pre‑computed exact resistance
-        # --------------------------------------------------------------
-        edge_data = G.get_edge_data(parent, child, default={})
-        R_total = edge_data.get("R_ohm", None)  # Ω or None
+            # --------------------------------------------------------------
+            # 1a.  Attempt to use the pre‑computed exact resistance
+            # --------------------------------------------------------------
+            edge_data = g.get_edge_data(parent, child, default={})
+            R_total = edge_data.get("R_ohm", None)  # Ω or None
 
-        # --------------------------------------------------------------
-        # 1b.  If not present, fall back to geometric half‑segment calc
-        # --------------------------------------------------------------
-        if R_total is None:
-            try:
-                # child geometry
-                L_i = G.nodes[child]["L"] * microns_to_cm  # cm
-                d_i_cm = G.nodes[child]["diam"] * microns_to_cm
-                r_i_cm = 0.5 * d_i_cm
-                rho_i = G.nodes[child]["Ra"]  # Ω·cm
+            # --------------------------------------------------------------
+            # 1b.  If not present, fall back to geometric half‑segment calc
+            # --------------------------------------------------------------
+            if R_total is None:
+                try:
+                    # child geometry
+                    L_i = g.nodes[child]["L"] * microns_to_cm  # cm
+                    d_i_cm = g.nodes[child]["diam"] * microns_to_cm
+                    r_i_cm = 0.5 * d_i_cm
+                    rho_i = g.nodes[child]["Ra"]  # Ω·cm
 
-                # parent geometry
-                L_p = G.nodes[parent]["L"] * microns_to_cm
-                d_p_cm = G.nodes[parent]["diam"] * microns_to_cm
-                r_p_cm = 0.5 * d_p_cm
-                rho_p = G.nodes[parent]["Ra"]  # Ω·cm
-            except KeyError as err:
-                raise KeyError(
-                    f"Missing geometry attribute {err} on node; "
-                    "cannot compute axial resistance and no R_ohm present "
-                    "on the edge."
-                ) from err
+                    # parent geometry
+                    L_p = g.nodes[parent]["L"] * microns_to_cm
+                    d_p_cm = g.nodes[parent]["diam"] * microns_to_cm
+                    r_p_cm = 0.5 * d_p_cm
+                    rho_p = g.nodes[parent]["Ra"]  # Ω·cm
+                except KeyError as err:
+                    raise KeyError(
+                        f"Missing geometry attribute {err} on node; "
+                        "cannot compute axial resistance and no R_ohm present "
+                        "on the edge."
+                    ) from err
 
-            R_half_i = rho_i * (L_i / 2) / (pi * r_i_cm**2)
-            R_half_p = rho_p * (L_p / 2) / (pi * r_p_cm**2)
-            R_total = R_half_i + R_half_p  # Ω
+                R_half_i = rho_i * (L_i / 2) / (pi * r_i_cm**2)
+                R_half_p = rho_p * (L_p / 2) / (pi * r_p_cm**2)
+                R_total = R_half_i + R_half_p  # Ω
 
-        # --------------------------------------------------------------
-        # 1c.  Store axial conductance  (Siemens = 1 / Ω)
-        # --------------------------------------------------------------
-        a_geom[i] = 1.0 / R_total
+            # --------------------------------------------------------------
+            # 1c.  Store axial conductance  (Siemens = 1 / Ω)
+            # --------------------------------------------------------------
+            a_geom[j, i] = 1.0 / R_total
 
     # ------------------------------------------------------------------
     # 2. cast to torch tensors
@@ -308,7 +311,7 @@ class _dhs(Integrator):
         self.register_buffer("cmdt", torch.empty(1, N))  # (B,N) capacitance * dt
 
     def initialize(self, model, dt):
-        self.B = np.prod(model.shape[:-1])
+        self.B = int(np.prod(model.shape[:-1]))
         B = self.B
 
         self.base_shape = model.shape
@@ -333,7 +336,17 @@ class _dhs(Integrator):
                 f"DHS integrator is not implemented for device type {device.type}."
             )
 
-        parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(model.graph)
+        graph = [model.graph]
+        if graph is None:
+            try:
+                graph = model.assemble_graphs()
+            except Exception as err:
+                raise ValueError(
+                    "Model must have a `graph` attribute or implement "
+                    "`assemble_graphs()` method returning a list of graphs."
+                ) from err
+
+        parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(graph)
         parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
         order, layer_ptr = build_dhs_layers(depth, self.threads)
 
@@ -349,8 +362,11 @@ class _dhs(Integrator):
         )  # (L+1,)
         self.order.copy_(order.to(dtype=torch.int64, device=device))
         self.parent_idx.copy_(parent_idx.to(dtype=torch.int64, device=device))  # (N,)
-        self.a_geom = a_geom_t.expand(B, -1).to(
-            device=device, dtype=model.dtype()
+        self.a_geom = (
+            a_geom_t.expand(B, -1)
+            .to(device=device, dtype=model.dtype())
+            .clone()
+            .contiguous()
         )  # (B,N)
 
         self.scale = area_cm2
@@ -373,26 +389,44 @@ class _dhs(Integrator):
 
         node_order_list = node_order
 
-        for child_node, _ in model.graph.nodes(data=True):
-            preds = list(model.graph.predecessors(child_node))
-            if not preds:
-                continue  # Skip root nodes
+        for i, g in enumerate(graph):
+            edge_gax_orig_list_ = []
+            for child_node, _ in g.nodes(data=True):
+                preds = list(g.predecessors(child_node))
+                if not preds:
+                    continue  # Skip root nodes
 
-            parent_node = preds[0]
+                parent_node = preds[0]
 
-            # Get the ORIGINAL index (0 to N-1) of the parent and child
-            child_idx_orig = original_idx_of[child_node]
-            parent_idx_orig = original_idx_of[parent_node]
+                # Get the ORIGINAL index (0 to N-1) of the parent and child
+                child_idx_orig = original_idx_of[child_node]
+                parent_idx_orig = original_idx_of[parent_node]
 
-            edge_child_orig_list.append(child_idx_orig)
-            edge_parent_orig_list.append(parent_idx_orig)
+                if i == 0:
+                    edge_child_orig_list.append(child_idx_orig)
+                    edge_parent_orig_list.append(parent_idx_orig)
 
-            # a_geom_t is in solver_order, so we need to find the child's
-            # index in the solver order to get its correct conductance.
-            # We can use the list `node_order_list` returned from graph_to_parent_and_axial
-            # which maps solver_order_index -> original_node_id
-            solver_idx_of_child = node_order_list.index(child_node)
-            edge_gax_orig_list.append(a_geom_t[solver_idx_of_child])
+                # a_geom_t is in solver_order, so we need to find the child's
+                # index in the solver order to get its correct conductance.
+                # We can use the list `node_order_list` returned from graph_to_parent_and_axial
+                # which maps solver_order_index -> original_node_id
+                solver_idx_of_child = node_order_list.index(child_node)
+                edge_gax_orig_list_.append(a_geom_t[i, solver_idx_of_child].item())
+            edge_gax_orig_list.append(edge_gax_orig_list_)
+
+        edge_gax_orig = torch.tensor(
+            edge_gax_orig_list, dtype=a_geom_t.dtype, device=device
+        )
+
+        n_batch_dims = len(model.shape) - 2
+        for _ in range(n_batch_dims):
+            edge_gax_orig = edge_gax_orig.unsqueeze(0)
+        edge_gax_orig = (
+            edge_gax_orig.expand((*model.shape[:-1], -1))
+            .reshape(B, -1)
+            .clone()
+            .contiguous()
+        )
 
         # Convert lists to tensors and register them as buffers
         self.register_buffer(
@@ -403,10 +437,7 @@ class _dhs(Integrator):
             "edge_parent_orig",
             torch.tensor(edge_parent_orig_list, dtype=torch.int64, device=device),
         )
-        self.register_buffer(
-            "edge_gax_orig",
-            torch.tensor(edge_gax_orig_list, dtype=a_geom_t.dtype, device=device),
-        )
+        self.register_buffer("edge_gax_orig", edge_gax_orig)
 
     def step(self, model, dt, ve=None, intra=None):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)
@@ -565,8 +596,18 @@ class _dhs_multi(MultiIntegrator):
             B_list.append(B_g)
             K_list.append(K_g)
 
+            graph = mdl.graph
+            if graph is None:
+                try:
+                    graph = mdl.assemble_graphs()
+                except Exception as err:
+                    raise ValueError(
+                        "Each model must have a `graph` attribute or implement "
+                        "`assemble_graphs()` method returning a list of graphs."
+                    ) from err
+
             parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(
-                mdl.graph, dtype_axial=mdl.dtype()
+                graph, dtype_axial=mdl.dtype()
             )
             parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
             order_g, layer_ptr_g = build_dhs_layers(depth, self.threads)

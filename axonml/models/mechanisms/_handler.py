@@ -304,6 +304,8 @@ class MechanismHandler(torch.nn.Module):
         for ion, ion_h in self.ions.items():
             ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
+        return sum(self._buf_i)
+
     def set_buffers(self, diameters):
         for m in self.mechanisms.values():
             m.diam.set_(diameters)

@@ -32,11 +32,19 @@ def concat(
     integrator = assess_type_and_make_integrator(
         populations, threads=threads, write_back=write_back
     )
-    return MultiPopulation(
+    # concatenate x, y, z
+    x = torch.cat([pop.x.flatten() for pop in populations.values()], dim=1)
+    y = torch.cat([pop.y.flatten() for pop in populations.values()], dim=1)
+    z = torch.cat([pop.z.flatten() for pop in populations.values()], dim=1)
+    mp = MultiPopulation(
         integrator=integrator,
         celsius=celsius,
         **populations,
     )
+    mp.x.copy_(x)
+    mp.y.copy_(y)
+    mp.z.copy_(z)
+    return mp
 
 
 def offsets(populations):
