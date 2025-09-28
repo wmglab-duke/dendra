@@ -505,9 +505,9 @@ class _bwd_euler_bt(Integrator):
             periaxonal[:, 1:] += (vc[:, :-1, 1] - vc[:, 1:, 1]).view(
                 -1, self.K - 1
             ) / self.raxial
-            i_membrane = i_membrane + periaxonal
+            i_membrane = (i_membrane + periaxonal).reshape_as(v)
 
-        return vc_new, v, i_membrane.reshape_as(v)
+        return vc_new, v, i_membrane
 
 
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):

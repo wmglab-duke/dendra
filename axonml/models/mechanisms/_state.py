@@ -122,7 +122,7 @@ def extract_vars(f: str, exclude: set) -> List[str]:
         A list of variable names found in the input string, excluding the specified names.
     """
     pattern = r"\b[a-zA-Z_]\w*\b"
-    all_variables = re.findall(pattern, f)
+    all_variables = set(re.findall(pattern, f))
     filtered_variables = [var for var in all_variables if var not in exclude]
     return filtered_variables
 
@@ -570,11 +570,11 @@ class State(Parameterized):
     def ASSIGNED(*args):
         State._assigned_declarations.append(args)
 
-    def breakpoint(self, v):
+    def breakpoint(self, v, states):
         return {}
 
     def advance(self, v, dt, states):
-        return self.solve(dt, **self.breakpoint(v), **states)
+        return self.solve(dt, **self.breakpoint(v, states), **states)
 
     def initial(self, v):
         """

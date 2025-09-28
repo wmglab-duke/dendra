@@ -129,7 +129,7 @@ class Population(P, Sliceable):
     P.RANGE(cm=1.0, rhoa=35.4)
     P.GLOBAL(celsius=37.0)
 
-    def __init__(self, N: int, C: int, integrator=None, v_init=-65.0, **kwargs):
+    def __init__(self, N: int = 1, C: int = 1, integrator=None, v_init=-65.0, **kwargs):
         super().__init__((N, C), (N, C), **kwargs)
         self.np = N
         self.nc = C
@@ -149,8 +149,6 @@ class Population(P, Sliceable):
         self.register_buffer("dx", torch.full(self.shape, 100.0))
         self.register_buffer("t", torch.zeros(()))
 
-        self.register_buffer("i_membrane", torch.zeros(self.shape))
-
         # compiler stuff
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
@@ -159,7 +157,12 @@ class Population(P, Sliceable):
         self.imem = bool(IMEM)
         self.compile_mode = COMPILE_MODE.value
 
-        self._integ = integrator
+        if self.imem:
+            self.register_buffer("i_membrane", torch.zeros(self.shape))
+        else:
+            self.i_membrane = None  # type: ignore
+
+        self._integrator_class = integrator
         self.integrator = None  # type: ignore
 
         self.injections = []
@@ -652,7 +655,7 @@ class Population(P, Sliceable):
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
-                self.integrator.initialize(self, dt)
+                self.integrator._initialize(self, dt)
                 einsum = torch.compile(einsum)
 
                 pre_loop_hook(callbacks, self)
@@ -722,7 +725,7 @@ class Population(P, Sliceable):
         self.clear_steady_state()
 
         self.initialize()
-        self.integrator.initialize(self, dt)
+        self.integrator._initialize(self, dt)
 
         maxiter = int(tstop / dt)
 
@@ -1119,7 +1122,7 @@ class Population(P, Sliceable):
             for m in mech.mechanisms.values():
                 m.setreference("t", lambda: self.t)
 
-            self.integrator = self._integ(self, mech, imem=self.imem)
+            self.integrator = self._integrator_class(self, mech, imem=self.imem)
             self.mech = self.integrator.mech
 
         self.is_built = True

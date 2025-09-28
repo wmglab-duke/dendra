@@ -248,10 +248,10 @@ class MechanismHandler(torch.nn.Module):
         # core loop: minimal Python, pure aten ops inside
         for c_idx, mech, fn, scale_f in self._map_exp:
             i = scale_f(getattr(mech, fn)(mech.get(v)))
-            mech.add_(self._buf_i[c_idx], i)
+            self._buf_i[c_idx] = mech.add(self._buf_i[c_idx], i)
 
         # sum up currents and conductances
-        tot_i = sum(self._buf_i)
+        tot_i = torch.stack(self._buf_i).sum(dim=0)
 
         # expose per-ion currents
         for ion, ion_h in self.ions.items():

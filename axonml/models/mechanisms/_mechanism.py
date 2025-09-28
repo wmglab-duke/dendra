@@ -481,7 +481,7 @@ class Mechanism(Parameterized):
         """
         Mechanism._explicit_declarations.append(args)
 
-    def breakpoint(self, v):
+    def breakpoint(self, v, states):
         return
 
     def detach(self):
@@ -564,6 +564,21 @@ class Mechanism(Parameterized):
         """
         source_code = inspect.getsource(cls)
         return textwrap.dedent(source_code)
+
+    @classproperty
+    def file_code(cls) -> str:
+        """Full source of the .py file that defines this class."""
+        mod = inspect.getmodule(cls)
+        if mod is None:
+            raise RuntimeError(f"Cannot locate module for {cls.__qualname__}")
+        return inspect.getsource(mod)  # whole file
+
+    def states_dict(self):
+        """
+        Returns a dictionary of all state names in the Mechanism
+        mapped to their corresponding tensors.
+        """
+        return {state: self._buffers[state] for state in self.DE.keys()}
 
 
 class VoltageProcess(Mechanism):

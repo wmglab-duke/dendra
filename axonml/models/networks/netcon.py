@@ -3,6 +3,7 @@ from typing import Tuple
 import torch
 
 from .netstim import NetStim
+from .utils import make_getattr
 
 
 def update_active(has_spiked, vm_new, threshold) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -19,7 +20,17 @@ class NetCon(torch.nn.Module):
     """
 
     def __init__(
-        self, pre, pre_idx, thresholds, post, post_idx, post_syn, weight, delay, dt
+        self,
+        pre,
+        pre_idx,
+        thresholds,
+        post,
+        post_idx,
+        post_syn,
+        weight,
+        delay,
+        dt,
+        pre_var=None,
     ):
         super().__init__()
 
@@ -29,6 +40,16 @@ class NetCon(torch.nn.Module):
         self.post = post
         self.device = self.pre.device()
         self.dtype = self.pre.dtype()
+
+        if pre_var is None:
+            pre_var = "v"
+
+        self.get_pre_var = make_getattr(pre_var)
+
+        if isinstance(pre, NetStim):
+            self.determine_spiking = self.determine_spiking_ns
+        else:
+            self.determine_spiking = self.determine_spiking_var
 
         self.register_buffer(
             "pre_idx", pre_idx.flatten().to(self.device, dtype=torch.long)
@@ -149,16 +170,16 @@ class NetCon(torch.nn.Module):
         # 3. INCREMENT TIME: Move to the next time step
         self.current_time_step.add_(1).remainder_(self.max_delay_steps)
 
-    def determine_spiking(self, pre):
-        if isinstance(pre, NetStim):
-            # If pre is a NetStim, we can directly use its spikes
-            self.is_spiking = pre.spikes.view(-1).index_select(0, self.pre_idx)
-        else:
-            # Otherwise, we need to compute spiking based on the pre-synaptic membrane potential
-            v_selected = pre.v.view(-1).index_select(0, self.pre_idx)
-            self.has_spiked, self.is_spiking = update_active(
-                self.has_spiked, v_selected, self.threshold
-            )
+    def determine_spiking_ns(self, pre: NetStim):
+        # If pre is a NetStim, we can directly use its spikes
+        self.is_spiking = pre.spikes.view(-1).index_select(0, self.pre_idx)
+
+    def determine_spiking_var(self, pre):
+        # Otherwise, we need to compute spiking based on the pre-synaptic membrane potential
+        v_selected = self.get_pre_var(pre).view(-1).index_select(0, self.pre_idx)
+        self.has_spiked, self.is_spiking = update_active(
+            self.has_spiked, v_selected, self.threshold
+        )
 
     def zero(self):
         """
