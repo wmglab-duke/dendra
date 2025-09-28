@@ -47,18 +47,20 @@ class Tree(Population):
     the Population class, allowing it to utilize population-level features.
     """
 
-    def __init__(self, N, C, graph, integrator=None, **kwargs):
+    def __init__(self, N, C, graph=None, integrator=None, **kwargs):
         if integrator is None:
             integrator = dhs()
         super().__init__(N, C, integrator=integrator, **kwargs)
         self._graph = graph
         names = []
-        for i in range(len(graph.nodes)):
-            attrs = graph.nodes[i]
-            name = attrs.get("name")
-            if "branchpoint" in name:
-                name = name.replace("_", ".")
-            names.append(name)
+
+        if graph is not None:
+            for i in range(len(graph.nodes)):
+                attrs = graph.nodes[i]
+                name = attrs.get("name")
+                if "branchpoint" in name:
+                    name = name.replace("_", ".")
+                names.append(name)
         self.names = names
 
         self.register_buffer(
