@@ -280,10 +280,7 @@ class Network(torch.nn.Module):
                 mode=self.compile_mode,
             )
         else:
-            self._step = torch.compile(
-                step,
-                backend="eager",
-            )
+            self._step = step
 
         self.register_buffer(
             "t", torch.tensor(0.0, device=self.device(), dtype=self.dtype())
@@ -343,6 +340,7 @@ class Network(torch.nn.Module):
         threshold=0.0,
         weight=1.0,
         delay=0.0,
+        pre_var=None,
     ):
         """
         Internal method to connect two populations with a synapse.
@@ -353,7 +351,7 @@ class Network(torch.nn.Module):
 
         # Add the connection to the synapse specification
         self.synapse_spec.setdefault(
-            (source_pop.name, target_pop.name, synapse), []
+            (source_pop.name, target_pop.name, synapse, pre_var), []
         ).append(
             (
                 source_idx,
@@ -368,7 +366,14 @@ class Network(torch.nn.Module):
         )
 
     def connect_one_to_one(
-        self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
+        self,
+        source,
+        target,
+        synapse,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
     ):
         """
         Connect source to target one-to-one.
@@ -439,10 +444,18 @@ class Network(torch.nn.Module):
             threshold,
             weight,
             delay,
+            pre_var,
         )
 
     def connect_dense(
-        self, source, target, synapse, threshold=0.0, weight=1.0, delay=0.0
+        self,
+        source,
+        target,
+        synapse,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
     ):
         """
         Connect source to target densely (all-to-all between selections).
@@ -531,10 +544,19 @@ class Network(torch.nn.Module):
             threshold,
             weight,
             delay,
+            pre_var,
         )
 
     def connect_sparse(
-        self, source, target, synapse, prob: float, threshold=0.0, weight=1.0, delay=0.0
+        self,
+        source,
+        target,
+        synapse,
+        prob: float,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
     ):
         """
         Connect source to target sparsely via Bernoulli sampling over all pairs.
@@ -632,12 +654,21 @@ class Network(torch.nn.Module):
             threshold,
             weight,
             delay,
+            pre_var,
         )
 
     connect_prob = connect_sparse
 
     def connect_prob_n(
-        self, source, target, synapse, n: int, threshold=0.0, weight=1.0, delay=0.0
+        self,
+        source,
+        target,
+        synapse,
+        n: int,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
     ):
         """
         Connect exactly n random pre-post pairs (without replacement).
@@ -734,12 +765,13 @@ class Network(torch.nn.Module):
             threshold,
             weight,
             delay,
+            pre_var,
         )
 
     connect_sparse_n = connect_prob_n
 
     def build_synapses(self, dt):
-        for (pre_name, post_name, synapse), specs in self.synapse_spec.items():
+        for (pre_name, post_name, synapse, pre_var), specs in self.synapse_spec.items():
             pre = getattr(self, pre_name)
             post = self.populations[post_name]
             pre_idx = torch.cat([s[0] for s in specs])
@@ -758,6 +790,7 @@ class Network(torch.nn.Module):
                 weight=weights,
                 delay=delay,
                 dt=dt,
+                pre_var=pre_var,
             ).to(device=self.device(), dtype=self.dtype())
             self.synapses[f"{pre_name}_{post_name}_{synapse.name}"] = syn
 

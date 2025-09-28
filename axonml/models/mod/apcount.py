@@ -15,7 +15,7 @@ class apcount(M):
         self._n = torch.zeros_like(v, dtype=torch.float32)
         self.active = torch.zeros_like(v, dtype=torch.bool)
 
-    def breakpoint(self, v):
+    def breakpoint(self, v, states):
         above_threshold = v > self.threshold
         spikes = above_threshold & ~self.active
         self._n += spikes.float()

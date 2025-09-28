@@ -14,7 +14,9 @@ def {k}(self, v):
 
 implicit_equation_unfactorable_template = """
 def {k}(self, v):
-    return self.{k}(v), 0.0
+    i = self.{k}(v)
+    {assign_to_buffer}
+    return i, 0.0
 """
 
 
@@ -22,6 +24,7 @@ numerical_template = """
 def {k}(self, v):
     i = self.{k}(v)
     i_d = self.{k}(v + 1e-3)
+    {assign_to_buffer}
     return i, (i_d - i) / (1e-3)
 """
 
@@ -45,15 +48,25 @@ def build_implicit_equation(current, gtot, irev, assign):
     )
 
 
-def build_numerical_equation(current):
+def build_numerical_equation(current, assign):
+    if assign:
+        assign_to_buffer = f"self.{current}_ = i"
+    else:
+        assign_to_buffer = ""
     return numerical_template.format(
         k=current,
+        assign_to_buffer=assign_to_buffer,
     )
 
 
-def build_unfactorable_equation(current):
+def build_unfactorable_equation(current, assign):
+    if assign:
+        assign_to_buffer = f"self.{current}_ = i"
+    else:
+        assign_to_buffer = ""
     return implicit_equation_unfactorable_template.format(
         k=current,
+        assign_to_buffer=assign_to_buffer,
     )
 
 
@@ -66,10 +79,10 @@ def build_current_eq(mechanism, k, assign=False):
         factorable = True
     except Exception:
         if k not in mechanism._explicit:
-            code = build_numerical_equation(k)
+            code = build_numerical_equation(k, assign)
             factorable = True
         else:
-            code = build_unfactorable_equation(k)
+            code = build_unfactorable_equation(k, assign)
             factorable = False
     if DEBUG > 0:
         logger.info(f"Generated code for {k}:\n{code}")

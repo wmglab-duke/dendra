@@ -16,7 +16,7 @@ class mhn(S):
     def calc_q10(self):
         return 3.0 ** ((self.celsius - 6.3) / 10.0)
 
-    def breakpoint(self, v):
+    def breakpoint(self, v, states):
         q10 = self.q10()
         alpha_m = 0.1 * vtrap(-(v + 40), 10)
         beta_m = 4 * exp(-(v + 65) / 18)

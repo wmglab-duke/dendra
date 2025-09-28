@@ -43,8 +43,7 @@ def exprelr(x, y):
     -----
     - Exactly: f(x, y) = x / (e^{x / y} - 1).
     - For small q = x / y: f ≈ y - x/2 + x^2/(12 y) - ... .
-    - This function is commonly known as a stable implementation of
-      the Hodgkin-Huxley "vtrap" helper.
+    - Often this function will be referred to as 'vtrap' in e.g. NMODL files.
 
     Examples
     --------
