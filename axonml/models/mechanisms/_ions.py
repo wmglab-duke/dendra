@@ -171,10 +171,10 @@ class Ion(torch.nn.Module):
 
     def detach(self):
         name = self.name
-        getattr(self, f"i{name}").detach_()
-        getattr(self, f"{name}i").detach_()
-        getattr(self, f"{name}o").detach_()
-        getattr(self, f"e{name}").detach_()
+        setattr(self, f"i{name}", getattr(self, f"i{name}").detach())
+        setattr(self, f"{name}i", getattr(self, f"{name}i").detach())
+        setattr(self, f"{name}o", getattr(self, f"{name}o").detach())
+        setattr(self, f"e{name}", getattr(self, f"e{name}").detach())
 
     def einit(self, celsius) -> None:
         if self.init_e_reversal:

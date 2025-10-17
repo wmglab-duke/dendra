@@ -12,7 +12,13 @@ from .explicit import (
 )
 
 #from .imex import _krylov_etd1
-from .implicit import _bwd_euler_bt, _bwd_euler_sc, _bwd_euler_sc_multi, _bwd_euler_ub
+from .implicit import (
+    _bwd_euler_bt,
+    _bwd_euler_sc,
+    _bwd_euler_sc_multi,
+    _bwd_euler_sc_skip,
+    _bwd_euler_ub,
+)
 from .tree import _dhs, _dhs_multi
 from .tree_bt import _dhs_bt
 
@@ -45,6 +51,7 @@ bwd_euler_sc = partial(partial_class, _bwd_euler_sc)
 bwd_euler_sc_multi = partial(partial_class, _bwd_euler_sc_multi)
 bwd_euler_ub = partial(partial_class, _bwd_euler_ub)
 bwd_euler_bt = partial(partial_class, _bwd_euler_bt)
+scnv = partial(partial_class, _bwd_euler_sc_skip)
 
 dhs = partial(partial_class, _dhs)
 dhs_multi = partial(partial_class, _dhs_multi)
@@ -72,4 +79,5 @@ __all__ = [
     "dhs_bt",
     "df",
     "dfh",
+    "scnv",
 ]

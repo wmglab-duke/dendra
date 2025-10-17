@@ -60,6 +60,30 @@ class _bwd_euler_sc(Integrator):
         return v_new
 
 
+class _bwd_euler_sc_skip(Integrator):
+    """
+    Implicit Euler method with skip of ionic current calculation.
+    """
+
+    v_vars = []
+
+    def __init__(self, model, mech, imem=None):
+        super().__init__(model, mech, imem)
+
+    def initialize(self, model, dt):
+        pass
+
+    def step(self, model, dt, ve=None, intra=None):
+        model.v = self._solve(model.v, dt, model.celsius, intra)
+
+    def _solve(self, v, dt, temp, intra=None):
+        # apply voltage processes
+        v = self.mech.update_v(v, dt)
+        self.mech.advance(v, dt, temp)
+        _ = self.mech.i(v)  # calculate currents but not conductances
+        return v
+
+
 class _bwd_euler_sc_multi(MultiIntegrator, _bwd_euler_sc):
     def __init__(self, model, mech, imem=None, write_back=True):
         super().__init__(model, mech, imem, write_back)

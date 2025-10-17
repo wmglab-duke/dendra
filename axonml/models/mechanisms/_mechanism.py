@@ -279,7 +279,7 @@ class Mechanism(Parameterized):
                 # getattr(self, state_name).requires_grad_(True)
 
         for r in self._save:
-            self.register_buffer(r, torch.zeros(shape))
+            self.register_buffer(f"{r}_", torch.zeros(shape))
 
         for a in self._assigned:
             self.register_buffer(a, torch.zeros(shape))
@@ -481,7 +481,7 @@ class Mechanism(Parameterized):
         """
         Mechanism._explicit_declarations.append(args)
 
-    def breakpoint(self, v, states):
+    def breakpoint(self, v):
         return
 
     def detach(self):

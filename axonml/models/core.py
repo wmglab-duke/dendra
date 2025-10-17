@@ -131,6 +131,7 @@ class Population(P, Sliceable):
 
     def __init__(self, N: int = 1, C: int = 1, integrator=None, v_init=-65.0, **kwargs):
         super().__init__((N, C), (N, C), **kwargs)
+        Sliceable.__init__(self)
         self.np = N
         self.nc = C
         self.v_init = v_init
@@ -170,8 +171,6 @@ class Population(P, Sliceable):
 
         self._mech_data = {}
         self._mech_everywhere = {}
-
-        self._labels = {}
 
         self._m_list = []
         self._m_name = []

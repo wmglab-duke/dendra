@@ -2,6 +2,7 @@ import itertools
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 
 
 def to_param(val):
@@ -23,6 +24,55 @@ def distribute_over(val, over="a"):
         return val[None, :]
     else:
         return val
+
+
+def softplus_inv(y, beta=1.0, threshold=20.0):
+    # y > 0 assumed (add a tiny eps if needed)
+    y = torch.as_tensor(y)
+    by = beta * y
+    # For large by, softplus(x) ≈ x  ⇒  x ≈ y (no exp needed)
+    return torch.where(by > threshold, y, (1.0 / beta) * torch.log(torch.expm1(by)))
+
+
+class cacheable(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._cache = None
+
+    def clear_cache(self):
+        self._cache = None
+
+    def forward(self, cache=True, *args, **kwargs):
+        if not cache:
+            return self._compute(*args, **kwargs)
+        if self._cache is None:
+            self._cache = self._compute(*args, **kwargs)
+        return self._cache
+
+
+class PositiveParam(cacheable):
+    def __init__(self, init, min_val=0.0, beta=1.0, threshold=20.0):
+        super().__init__()
+        self.min_val = float(min_val)
+        self.beta = float(beta)
+        self.threshold = float(threshold)
+        init = torch.as_tensor(init, dtype=torch.float32)
+        # ensure strictly > min_val for the inverse
+        y = torch.clamp(init - self.min_val, min=1e-12)
+        rho0 = softplus_inv(y, beta=self.beta, threshold=self.threshold)
+        self.rho = torch.nn.Parameter(rho0)
+
+    def repeat(self, n):
+        with torch.no_grad():
+            new_rho = self.rho.detach().repeat(n)
+        self.rho = torch.nn.Parameter(new_rho)  # keep it a leaf Parameter
+        return self
+
+    def _compute(self):
+        # Positive, unbounded above; for large rho returns ~rho (no overflow)
+        return self.min_val + F.softplus(
+            self.rho, beta=self.beta, threshold=self.threshold
+        )
 
 
 class Functional(torch.nn.Module):

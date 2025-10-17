@@ -304,6 +304,9 @@ def compose_indices(shape, idx1, idx2, *, device="cpu"):
 
 
 class Sliceable:
+    def __init__(self):
+        self._labels = {}
+
     def __getitem__(self, key):
         index = parse_key(key, self.shape)
         return Slice(self, index)

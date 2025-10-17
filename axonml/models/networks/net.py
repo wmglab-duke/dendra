@@ -1,7 +1,7 @@
 import gc
 import math
 from contextlib import nullcontext
-from typing import Dict
+from typing import Dict, Literal, Optional
 
 import torch
 from tqdm.auto import tqdm
@@ -59,7 +59,7 @@ def step(
     intra: Dict[str, torch.Tensor | None] = {},
 ):
     if netstim is not None:
-        netstim(t)
+        netstim(t, bptt=netstim.training)
     for s in synapses.values():
         s.advance()
     for n, pop in populations.items():
@@ -235,6 +235,99 @@ def make_weight(weights, n):
     return WeightExpander(weights, n)
 
 
+def dilate(
+    event_deliveries: torch.Tensor,
+    dt_old: float,
+    dt_new: float,
+    *,
+    mode: Literal["nearest", "floor", "ceil"] = "nearest",
+    horizon_ms: Optional[float] = None,
+    n_limit: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Re-bin a (T, E) event buffer from dt_old to dt_new by mapping each old
+    time bin t=k*dt_old to a new row index on the dt_new grid and summing
+    collisions.
+
+    Parameters
+    ----------
+    event_deliveries : (T, E) torch.Tensor
+        Rows are time bins; columns are event channels. Any numeric dtype works.
+        If dtype == bool, counts will be summed as integers.
+    dt_old : float
+        Original bin width (ms).
+    dt_new : float
+        Target bin width (ms), must be > 0.
+    mode : {"nearest","floor","ceil"}, default "nearest"
+        How to choose the new bin for each original time:
+          - "nearest": half-up rounding (i.e., round(x) via floor(x+0.5) for x >= 0)
+          - "floor":   lower bin
+          - "ceil":    upper bin
+    horizon : int, optional
+        If provided, forces the output to cover [0, horizon) on the new grid.
+        If omitted, the output length is just enough to include the last mapped bin.
+
+    Returns
+    -------
+    (T_new, E) torch.Tensor
+        Re-binned tensor on the dt_new grid, with rows summed where multiple
+        old bins map to the same new bin.
+    """
+    if event_deliveries.ndim != 2:
+        raise ValueError("event_deliveries must be 2D (T, E).")
+    if not (dt_old > 0 and dt_new > 0):
+        raise ValueError("dt_old and dt_new must be > 0.")
+    if dt_old == dt_new:
+        return event_deliveries
+
+    T, E = event_deliveries.shape
+    device = event_deliveries.device
+
+    # old times: t_k = k * dt_old ; compute fractional new indices t_k / dt_new
+    idx_f = torch.arange(T, device=device, dtype=torch.float64) * (dt_old / dt_new)
+
+    if mode == "nearest":
+        # half-up rounding for nonnegative times (avoids banker's rounding)
+        idx = torch.floor(idx_f + 0.5).to(torch.long)
+    elif mode == "floor":
+        idx = torch.floor(idx_f).to(torch.long)
+    elif mode == "ceil":
+        idx = torch.ceil(idx_f).to(torch.long)
+    else:
+        raise ValueError(f"Unknown mode={mode!r}")
+
+    # Determine output length
+    if T == 0:
+        T_new = 0
+    else:
+        idx_max = int(idx.max().item())
+        if horizon_ms is not None:
+            forced_len = int(math.ceil(horizon_ms / dt_new))
+            T_new = max(idx_max + 1, forced_len)
+        else:
+            T_new = idx_max + 1
+
+    if n_limit is not None:
+        T_new = n_limit
+
+    idx = idx.clamp(0, n_limit - 1) if n_limit is not None else idx
+
+    out_dtype = event_deliveries.dtype
+    # For boolean inputs, sum counts as integers (you can .bool() after if you want OR semantics)
+    if out_dtype == torch.bool:
+        src = event_deliveries.to(torch.int64)
+        out = torch.zeros((T_new, E), device=device, dtype=torch.int64)
+    else:
+        src = event_deliveries
+        out = torch.zeros((T_new, E), device=device, dtype=out_dtype)
+
+    # Sum rows that map to the same new bin. O(T*E) with efficient fused add.
+    if T_new > 0:
+        out.index_add_(0, idx, src)
+
+    return out
+
+
 class Network(torch.nn.Module):
     """
     Base class for networks in AxonML.
@@ -286,6 +379,9 @@ class Network(torch.nn.Module):
             "t", torch.tensor(0.0, device=self.device(), dtype=self.dtype())
         )
 
+        self._state_cache = {}
+        self._syn_cache = {}
+
         self.eval()
 
     def train(self, mode=True):
@@ -294,6 +390,8 @@ class Network(torch.nn.Module):
         """
         for pop in self.populations.values():
             pop.train(mode)
+        for syn in self.synapses.values():
+            syn.train(mode)
         self.training = mode
         return self
 
@@ -304,6 +402,8 @@ class Network(torch.nn.Module):
         super(Network, self).eval()
         for pop in self.populations.values():
             pop.eval()
+        for syn in self.synapses.values():
+            syn.eval()
         self.training = False
         return self
 
@@ -456,6 +556,7 @@ class Network(torch.nn.Module):
         weight=1.0,
         delay=0.0,
         pre_var=None,
+        auto_expand=False,
     ):
         """
         Connect source to target densely (all-to-all between selections).
@@ -482,6 +583,13 @@ class Network(torch.nn.Module):
         delay : float | torch.Tensor | torch.nn.Module, optional
             Synaptic delay(s) in ms. See connect_one_to_one for broadcasting
             rules. Default is 0.0.
+        pre_var : str, optional
+            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
+            for triggering synaptic events. Default is None (use voltage / spikes).
+        auto_expand : bool, optional
+            If True, automatically expand scalar/tensor weights & delays to the full
+            number of connections. If False, the weight & delays tensors must match the
+            number of pre-synaptic indices or be a scalar. Default is False.
 
         Returns
         -------
@@ -534,6 +642,12 @@ class Network(torch.nn.Module):
             source_model, pre_idx, target_model, post_idx, synapse
         )
 
+        if auto_expand:
+            n_connections = len(pre_idx)
+            threshold = expand(threshold, n_connections)
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
         # now connect
         self._connect(
             source_model,
@@ -557,6 +671,7 @@ class Network(torch.nn.Module):
         weight=1.0,
         delay=0.0,
         pre_var=None,
+        auto_expand=False,
     ):
         """
         Connect source to target sparsely via Bernoulli sampling over all pairs.
@@ -583,6 +698,13 @@ class Network(torch.nn.Module):
             Synaptic weight(s); broadcasting as in connect_one_to_one.
         delay : float | torch.Tensor | torch.nn.Module, optional
             Synaptic delay(s); broadcasting as in connect_one_to_one.
+        pre_var : str, optional
+            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
+            for triggering synaptic events. Default is None (use voltage / spikes).
+        auto_expand : bool, optional
+            If True, automatically expand scalar/tensor weights & delays to the full
+            number of connections. If False, the weight & delays tensors must match the
+            number of pre-synaptic indices or be a scalar. Default is False.
 
         Returns
         -------
@@ -644,6 +766,12 @@ class Network(torch.nn.Module):
             source_model, pre_idx, target_model, post_idx, synapse
         )
 
+        if auto_expand:
+            n_connections = len(pre_idx)
+            threshold = expand(threshold, n_connections)
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
         # now connect
         self._connect(
             source_model,
@@ -669,6 +797,7 @@ class Network(torch.nn.Module):
         weight=1.0,
         delay=0.0,
         pre_var=None,
+        auto_expand=False,
     ):
         """
         Connect exactly n random pre-post pairs (without replacement).
@@ -695,6 +824,13 @@ class Network(torch.nn.Module):
             Synaptic weight(s); broadcasting as in connect_one_to_one.
         delay : float | torch.Tensor | torch.nn.Module, optional
             Synaptic delay(s); broadcasting as in connect_one_to_one.
+        pre_var : str, optional
+            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
+            for triggering synaptic events. Default is None (use voltage / spikes).
+        auto_expand : bool, optional
+            If True, automatically expand scalar/tensor weights & delays to the full
+            number of connections. If False, the weight & delays tensors must match the
+            number of pre-synaptic indices or be a scalar. Default is False.
 
         Returns
         -------
@@ -755,6 +891,12 @@ class Network(torch.nn.Module):
             source_model, pre_idx, target_model, post_idx, synapse
         )
 
+        if auto_expand:
+            n_connections = len(pre_idx)
+            threshold = expand(threshold, n_connections)
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
         # now connect
         self._connect(
             source_model,
@@ -772,6 +914,11 @@ class Network(torch.nn.Module):
 
     def build_synapses(self, dt):
         for (pre_name, post_name, synapse, pre_var), specs in self.synapse_spec.items():
+            pre_var = (
+                pre_var
+                if pre_var is not None
+                else ("v" if pre_name != "netstim" else "spike")
+            )
             pre = getattr(self, pre_name)
             post = self.populations[post_name]
             pre_idx = torch.cat([s[0] for s in specs])
@@ -792,7 +939,15 @@ class Network(torch.nn.Module):
                 dt=dt,
                 pre_var=pre_var,
             ).to(device=self.device(), dtype=self.dtype())
-            self.synapses[f"{pre_name}->{post_name}:{synapse.name}"] = syn
+
+            syn.setreference("t", lambda: self.t)
+
+            if self.training:
+                syn.train()
+            else:
+                syn.eval()
+
+            self.synapses[f"{pre_name}:{pre_var}->{post_name}:{synapse.name}"] = syn
 
     def build(self, dt):
         """
@@ -806,22 +961,50 @@ class Network(torch.nn.Module):
             self.built = True
         return self
 
-    def initialize(self, dt: float, reinit_weights: bool = True):
+    def initialize(self, dt: float, reinit_weights: bool = True, t=0.0):
         """
         Initialize the network. Builds synapses, initializes populations and netstim (if exists).
         """
         self.build(dt)
+        self.t = self.t.detach()
+        self.t.fill_(t)
+        for pop in self.populations.values():
+            pop.t = pop.t.detach()
+            pop.t.fill_(t)
+        if self._state_cache:
+            self.initialize_pops_from_state_cache()
+            self.initialize_synapses_from_state_cache()
+            clear_deliveries = False
+        else:
+            clear_deliveries = True
         dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
         for pop in self.populations.values():
-            pop.initialize()
+            if not self._state_cache:
+                pop.initialize()
             pop.integrator.initialize(pop, dt)
             pop.intra = pop.build_intra()
-        self.init_synapses(reinit_weights=reinit_weights)
+        self.init_synapses(
+            reinit_weights=reinit_weights, clear_deliveries=clear_deliveries
+        )
         if self.netstim is not None:
             self.netstim.initialize()
-        self.t = self.t.detach()
-        self.t.zero_()
         return self
+
+    def initialize_pops_from_state_cache(self):
+        for name, pop in self.populations.items():
+            pop.load_state_dict(self._state_cache[name])
+            pop.detach()
+
+    def initialize_synapses_from_state_cache(self):
+        for name, syn in self.synapses.items():
+            old_dt, has_spiked, is_spiking, delivery_buffer = self._syn_cache[name]
+            n_limit = syn.delivery_buffer.shape[0]
+            delivery_buffer = dilate(
+                delivery_buffer, float(old_dt), float(self.dt), n_limit=n_limit
+            )
+            syn.has_spiked = syn.has_spiked.detach().copy_(has_spiked)
+            syn.is_spiking = syn.is_spiking.detach().copy_(is_spiking)
+            syn.delivery_buffer = syn.delivery_buffer.detach().copy_(delivery_buffer)
 
     def initialize_(self, dt: float, reinit_weights: bool = True):
         """
@@ -829,11 +1012,11 @@ class Network(torch.nn.Module):
         """
         self.initialize(dt, reinit_weights=reinit_weights)
 
-    def init_synapses(self, reinit_weights: bool = True):
+    def init_synapses(self, reinit_weights: bool = True, clear_deliveries: bool = True):
         for syn in self.synapses.values():
-            syn.zero()
-            syn.detach()
-            syn.weight.init(reinit=reinit_weights)
+            syn.initialize(
+                reinit_weights=reinit_weights, clear_deliveries=clear_deliveries
+            )
 
     def run(self, tstop, ve=None, callbacks=None, progressbar=False):
         dt = torch.tensor(self.dt, device=self.device(), dtype=self.dtype())
@@ -1065,6 +1248,69 @@ class Network(torch.nn.Module):
                 )
 
         return new_net
+
+    def steady_state(self, tstop=1000, dt=0.025, progressbar=False):
+        """
+        Run the network until it reaches a steady state.
+
+        Parameters
+        ----------
+        tstop : float, optional
+            Total time to run the network in ms. Default is 1000 ms.
+        dt : float, optional
+            Time step in ms. Default is 0.025 ms.
+
+        Returns
+        -------
+        Network
+            The network after running to steady state.
+        """
+        was_training = self.training
+        with torch.no_grad():
+            if self.netstim is not None:
+                self.netstim._prep_start_for_steady_state(tstop)
+            self.initialize(dt, t=-tstop)
+            self.eval()
+            self.run(tstop, progressbar=progressbar)
+            if self.netstim is not None:
+                self.netstim._reset_start_times()
+            self.cache_state()
+        if was_training:
+            self.train()
+        return self
+
+    def cache_state(self):
+        self._state_cache.clear()
+        self._syn_cache.clear()
+        for name, pop in self.populations.items():
+            self._state_cache[name] = pop.state_dict()
+        for name, syn in self.synapses.items():
+            self._syn_cache[name] = (
+                syn.dt,
+                syn.has_spiked.clone(),
+                syn.is_spiking.clone(),
+                torch.roll(
+                    syn.delivery_buffer, -syn.current_time_step.item(), dims=0
+                ).clone(),
+            )
+
+    def clear_state_cache(self):
+        self._state_cache.clear()
+        self._syn_cache.clear()
+
+    def set_synaptic_diff_config(
+        self,
+        diff_weights: bool = True,
+        diff_delays: bool = True,
+        diff_spiking: bool = True,
+        taps: int = 2,
+        sigma: float = 0.35,  # used for taps=3 (in steps),
+        tau: float = 0.1,  # temperature for surrogate spiking
+    ):
+        for syn in self.synapses.values():
+            syn.set_diff_config(
+                diff_weights, diff_delays, diff_spiking, taps, sigma, tau
+            )
 
 
 def prepare_intra(intra_c, intra, local_ind):

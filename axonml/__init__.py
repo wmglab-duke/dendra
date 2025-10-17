@@ -52,6 +52,7 @@ from .models.integrators import (
     rk1,
     rk2,
     rk4,
+    scnv,
 )
 from .models.mod import load_mechanisms
 from .models.stim.waveform import *
@@ -97,6 +98,7 @@ __all__ = [
     "dhs",
     "df",
     "dfh",
+    "scnv",
 ]
 
 

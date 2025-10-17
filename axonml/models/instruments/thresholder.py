@@ -62,7 +62,10 @@ class Thresholder:
 
         if diams is not None:
             if hasattr(diams, "__iter__"):
-                assert len(diams) == self.bases.shape[1]
+                if self.bases is not None:
+                    assert len(diams) == self.bases.shape[1]
+                elif self.functional:
+                    assert len(diams) == self.space.shape[0]
 
             elif isinstance(diams, float):
                 diams = np.atleast_1d(np.full(self.bases.shape[1], diams))
