@@ -74,7 +74,7 @@ class NetCon(Referency):
         self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
 
         self.delay_ms = delay
-        delay = delay()
+        delay = delay.init().w
 
         if pre_var is None:
             pre_var = "v"
@@ -201,6 +201,16 @@ class NetCon(Referency):
             "sched_weight_idx", torch.empty(0, device=self.device, dtype=torch.long)
         )
 
+        self.sched_time_ms = torch.empty(
+            0, device=self.device, dtype=self.dtype
+        )  # NOT a buffer
+
+        # optional reference-mode source + indices for times
+        self._sched_t_source = None
+        self.register_buffer(
+            "sched_time_idx", torch.empty(0, device=self.device, dtype=torch.long)
+        )
+
         # optional introspection (per-connection)
         self.register_buffer(
             "sched_wsum",
@@ -264,6 +274,8 @@ class NetCon(Referency):
         taps: int = 2,
         sigma: float = 0.35,  # used for taps=3 (in steps),
         tau: float = 0.1,  # temperature for surrogate spiking
+        diff_scheduled_times: bool = True,
+        sched_width: float = 1.0,  # kernel half-width in *steps*
     ):
         self.train_flags = (
             diff_weights,
@@ -272,6 +284,8 @@ class NetCon(Referency):
             taps,
             sigma,
             tau,
+            diff_scheduled_times,
+            float(sched_width),
         )
 
     @property
@@ -323,67 +337,88 @@ class NetCon(Referency):
         """
         Schedule VALUE-MODE events. Provide exactly one of (con_indices, pre_indices).
         'weight' scales the NetCon's existing per-connection weight for that event.
+        Times are stored as floats (ms) to enable optional differentiability.
         """
         if (con_indices is None) == (pre_indices is None):
             raise ValueError("Provide exactly one of con_indices or pre_indices")
-
         if times_ms is None:
             raise ValueError("times_ms is required")
 
         device, dtype = self.device, self.dtype
-        # -> connection indices
+
+        # → connection indices (raw, before any filtering)
         if pre_indices is not None:
-            con_idx = self._expand_pre_to_con(pre_indices)
+            con_idx_raw = self._expand_pre_to_con(pre_indices)
         else:
-            con_idx = torch.as_tensor(
+            con_idx_raw = torch.as_tensor(
                 con_indices, device=device, dtype=torch.long
             ).view(-1)
 
-        tms = torch.as_tensor(times_ms, device=device, dtype=torch.float32).view(-1)
-        if con_idx.numel() != tms.numel():
-            raise ValueError("con_indices/pre_indices and times_ms must match length")
+        tms_raw = torch.as_tensor(times_ms, device=device, dtype=torch.float32).view(-1)
 
-        if (con_idx < 0).any() or (con_idx >= self.pre_idx.numel()).any():
+        if con_idx_raw.numel() != tms_raw.numel():
+            raise ValueError("con_indices/pre_indices and times_ms must match length")
+        if (con_idx_raw < 0).any() or (con_idx_raw >= self.pre_idx.numel()).any():
             raise IndexError("connection index out of range")
 
-        steps = torch.round(tms / self.dt.to(tms.dtype)).to(torch.long)
+        # legacy step field (used when diff_scheduled_times=False)
+        steps_raw = torch.round(tms_raw / self.dt.to(tms_raw.dtype)).to(torch.long)
+
+        # optional filtering of past events
         if not allow_past:
             cur = self.global_step.view(())
-            keep = steps >= cur
-            con_idx, steps = con_idx[keep], steps[keep]
-            if con_idx.numel() == 0:
+            keep = steps_raw >= cur
+            if not bool(keep.any()):
                 return
-
-        # weights → tensor, keep autograd to producers
-        if torch.is_tensor(weight):
-            w = weight.to(device=device, dtype=dtype).view(-1)
-            if w.numel() not in (1, con_idx.numel()):
-                raise ValueError(
-                    "weight must be scalar or same length as indices/times"
-                )
-            if w.numel() == 1:
-                w = w.expand_as(con_idx)
+            con_idx = con_idx_raw[keep]
+            tms = tms_raw[keep]
+            steps = steps_raw[keep]
         else:
-            w = torch.full(
-                (con_idx.numel(),), float(weight), device=device, dtype=dtype
-            )
+            con_idx = con_idx_raw
+            tms = tms_raw
+            steps = steps_raw
 
-        # append (schedule happens outside compiled loop, changing E is fine here)
+        E_before = con_idx_raw.numel()
+        E_after = con_idx.numel()
+
+        # Normalize weight (supports scalar, pre-filter length, or post-filter length)
+        if torch.is_tensor(weight):
+            w_raw = weight.to(device=device, dtype=dtype).view(-1)
+            if w_raw.numel() == 1:
+                w = w_raw.expand(E_after)  # scalar → broadcast
+            elif w_raw.numel() == E_before:
+                w = (
+                    w_raw[keep] if not allow_past else w_raw
+                )  # per-event (pre-filter) → slice if filtered
+            elif w_raw.numel() == E_after:
+                w = w_raw  # per-event (post-filter) already aligned
+            else:
+                raise ValueError(
+                    f"weight tensor length must be 1, {E_before} (pre-filter), or {E_after} (post-filter)"
+                )
+        else:
+            w = torch.full((E_after,), float(weight), device=device, dtype=dtype)
+
+        # append (outside compiled loop: changing E is fine)
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
+        self.sched_time_ms = torch.cat([self.sched_time_ms, tms], dim=0)
         self.sched_weight = torch.cat([self.sched_weight, w], dim=0)
-        self.sched_weight_idx = torch.cat(
-            [
-                self.sched_weight_idx,
-                torch.full((con_idx.numel(),), -1, device=device, dtype=torch.long),
-            ],
-            dim=0,
-        )
+
+        # keep ref-index arrays aligned (sentinel -1)
+        filler = torch.full((E_after,), -1, device=device, dtype=torch.long)
+        self.sched_weight_idx = torch.cat([self.sched_weight_idx, filler], dim=0)
+        self.sched_time_idx = torch.cat([self.sched_time_idx, filler], dim=0)
 
     def bind_weight_source(self, source: torch.Tensor):
         if source.device != self.device:
             raise ValueError("weight source must be on same device")
         self._sched_w_source = source
+
+    def bind_time_source(self, source: torch.Tensor):
+        if source.device != self.device:
+            raise ValueError("time source must be on same device")
+        self._sched_t_source = source
 
     def schedule_ref(
         self,
@@ -441,22 +476,110 @@ class NetCon(Referency):
         )
         self.sched_weight_idx = torch.cat([self.sched_weight_idx, widx], dim=0)
 
+    def schedule_time_ref(
+        self,
+        *,
+        con_indices=None,
+        pre_indices=None,
+        time_idx=None,
+        weight=1.0,
+        allow_past: bool = False,
+    ):
+        """
+        Schedule events whose times come by REFERENCE from a bound tensor.
+        You may still pass a value-mode 'weight' (scalar or per-event).
+        """
+        if self._sched_t_source is None:
+            raise RuntimeError(
+                "call bind_time_source(...) before schedule_time_ref(...)"
+            )
+        if (con_indices is None) == (pre_indices is None):
+            raise ValueError("Provide exactly one of con_indices or pre_indices")
+        if time_idx is None:
+            raise ValueError("time_idx is required")
+
+        device, dtype = self.device, self.dtype
+
+        # -> connection indices
+        if pre_indices is not None:
+            con_idx = self._expand_pre_to_con(pre_indices)
+        else:
+            con_idx = torch.as_tensor(
+                con_indices, device=device, dtype=torch.long
+            ).view(-1)
+
+        tidx = torch.as_tensor(time_idx, device=device, dtype=torch.long).view(-1)
+        if con_idx.numel() != tidx.numel():
+            raise ValueError("con_indices/pre_indices and time_idx must match length")
+
+        if (con_idx < 0).any() or (con_idx >= self.pre_idx.numel()).any():
+            raise IndexError("connection index out of range")
+        if (tidx < 0).any() or (tidx >= self._sched_t_source.numel()).any():
+            raise IndexError("time_idx out of range for bound time source")
+
+        # use a zeros value-slot for times, and record the indices in sched_time_idx
+        # legacy step field still populated from current source values (for non-diff path)
+        tms_now = self._sched_t_source.index_select(0, tidx).to(torch.float32)
+        steps = torch.round(tms_now / self.dt.to(torch.float32)).to(torch.long)
+        if not allow_past:
+            cur = self.global_step.view(())
+            keep = steps >= cur
+            con_idx, steps, tidx, tms_now = (
+                con_idx[keep],
+                steps[keep],
+                tidx[keep],
+                tms_now[keep],
+            )
+            if con_idx.numel() == 0:
+                return
+
+        # weight value-mode (optional)
+        if torch.is_tensor(weight):
+            w = weight.to(device=device, dtype=dtype).view(-1)
+            if w.numel() not in (1, con_idx.numel()):
+                raise ValueError("weight must be scalar or same length as con_indices")
+            if w.numel() == 1:
+                w = w.expand_as(con_idx)
+        else:
+            w = torch.full(
+                (con_idx.numel(),), float(weight), device=device, dtype=dtype
+            )
+
+        self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
+        self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
+        self.sched_time_ms = torch.cat(
+            [self.sched_time_ms, torch.zeros_like(tms_now)], dim=0
+        )  # value slot 0
+        self.sched_time_idx = torch.cat([self.sched_time_idx, tidx], dim=0)
+        self.sched_weight = torch.cat([self.sched_weight, w], dim=0)
+
+        # keep weight ref index aligned (no weight-ref here, so -1)
+        self.sched_weight_idx = torch.cat(
+            [
+                self.sched_weight_idx,
+                torch.full((con_idx.numel(),), -1, device=device, dtype=torch.long),
+            ],
+            dim=0,
+        )
+
     def clear_schedule(self):
         device, dtype = self.device, self.dtype
         self.sched_con_idx = torch.empty(0, device=device, dtype=torch.long)
         self.sched_abs_step = torch.empty(0, device=device, dtype=torch.long)
         self.sched_weight = torch.empty(0, device=device, dtype=dtype)
         self.sched_weight_idx = torch.empty(0, device=device, dtype=torch.long)
+        self.sched_time_ms = torch.empty(0, device=device, dtype=torch.float32)
+        self.sched_time_idx = torch.empty(0, device=device, dtype=torch.long)
         self.sched_wsum.zero_()
         self.sched_counts.zero_()
 
-    def _scheduled_gate_this_step(self, gs_long: torch.Tensor):
+    def _scheduled_gate_this_step(self, gs_long: torch.Tensor, *, use_tri_kernel: bool):
         """
         Build per-connection scheduled amplitude for the current absolute step.
-        All shapes are fixed; no boolean indexing or shape-changing ops.
+        Shapes are fixed; no boolean indexing that changes sizes.
         Returns:
-            sched_wsum_conn: [n_conn] float
-            sched_count_conn: [n_conn] int32
+            sched_wsum_conn:   [n_conn] float
+            sched_counts_conn: [n_conn] int32
         """
         n_conn = self._n_conn
         device, dtype = self.device, self.dtype
@@ -467,36 +590,65 @@ class NetCon(Referency):
                 torch.zeros(n_conn, device=device, dtype=torch.int32),
             )
 
-        # fixed-length mask for "fires now"
-        now_mask = self.sched_abs_step == gs_long.view(())  # [E]
-        now_f = now_mask.to(dtype)  # [E] float 0/1
-
-        # value-mode part
-        w_val = self.sched_weight * now_f  # [E]
-
-        # reference-mode part (no boolean filtering)
+        # --- scheduled weights (value + ref) ---
+        w_val = self.sched_weight
         if self._sched_w_source is not None:
-            idx_clamped = torch.clamp(self.sched_weight_idx, min=0)  # [E]
-            w_src = self._sched_w_source.index_select(0, idx_clamped)  # [E]
-            ref_valid = (self.sched_weight_idx >= 0).to(dtype)  # [E]
-            w_ref = w_src * now_f * ref_valid  # [E]
-            w_e = w_val + w_ref
-        else:
-            w_e = w_val
+            idxw = torch.clamp(self.sched_weight_idx, min=0)
+            w_src = self._sched_w_source.index_select(0, idxw)
+            w_ref_mask = (self.sched_weight_idx >= 0).to(dtype)
+            w_val = w_val + w_src * w_ref_mask  # combine if both present
 
-        # accumulate to connections (constant target size)
+        # --- scheduled times (value + ref) -> float ms ---
+        t_val = self.sched_time_ms  # may be zeros if using time-by-ref only
+        if self._sched_t_source is not None:
+            idxt = torch.clamp(self.sched_time_idx, min=0)
+            t_src = self._sched_t_source.index_select(0, idxt).to(torch.float32)
+            t_ref_mask = (self.sched_time_idx >= 0).to(t_src.dtype)
+            t_val = t_val + t_src * t_ref_mask
+
+        if use_tri_kernel:
+            # Differentiable triangular kernel in *steps*
+            lam = t_val.to(dtype) / self.dt.to(dtype)  # [E] float
+            # gs_long is int64; cast to float
+            x = lam - gs_long.to(dtype).view(())
+            # width in steps (half-width). <=0 disables contribution
+            _, _, _, _, _, _, _, sched_width = self.train_flags
+            tri = (1.0 - (x.abs() / (sched_width + 1e-6))).clamp(
+                min=0.0, max=1.0
+            )  # [E]
+            amp_evt = w_val * tri  # [E]
+            # counts (bookkeeping): event "active" if tri>0
+            cnt_evt = (tri > 0).to(torch.int32)  # [E]
+        else:
+            # Step-exact firing: round(lam) == gs
+            lam = t_val.to(dtype) / self.dt.to(dtype)
+            abs_step = lam.round().to(torch.long)
+            now_mask = abs_step == gs_long.view(())
+            amp_evt = w_val * now_mask.to(dtype)  # [E]
+            cnt_evt = now_mask.to(torch.int32)  # [E]
+
+        # Aggregate to connections
         sched_wsum_conn = torch.zeros(n_conn, device=device, dtype=dtype)
-        sched_count_conn = torch.zeros(n_conn, device=device, dtype=torch.int32)
-        sched_wsum_conn.index_add_(0, self.sched_con_idx, w_e)
-        sched_count_conn.index_add_(0, self.sched_con_idx, now_mask.to(torch.int32))
-        return sched_wsum_conn, sched_count_conn
+        sched_counts_conn = torch.zeros(n_conn, device=device, dtype=torch.int32)
+        sched_wsum_conn.index_add_(0, self.sched_con_idx, amp_evt)
+        sched_counts_conn.index_add_(0, self.sched_con_idx, cnt_evt)
+        return sched_wsum_conn, sched_counts_conn
 
     def advance_diff(self):
         if self.train_flags is None:
             raise RuntimeError(
                 "NetCon.train(...) must be called before advance_diff()."
             )
-        diff_weights, diff_delays, diff_spiking, taps, sigma, tau = self.train_flags
+        (
+            diff_weights,
+            diff_delays,
+            diff_spiking,
+            taps,
+            sigma,
+            tau,
+            diff_sched_times,
+            _,
+        ) = self.train_flags
         device, dtype = self.device, self.dtype
 
         # snapshot indices for this step (avoid version bumps)
@@ -515,7 +667,9 @@ class NetCon(Referency):
         intrinsic_gate = self.is_spiking.to(dtype)  # [n_conn]
 
         # scheduled additions per connection (constant shapes)
-        sched_wsum_conn, sched_counts_conn = self._scheduled_gate_this_step(gs)
+        sched_wsum_conn, sched_counts_conn = self._scheduled_gate_this_step(
+            gs, use_tri_kernel=bool(diff_sched_times)
+        )
 
         # expose (non-diff)
         with torch.no_grad():
@@ -644,7 +798,9 @@ class NetCon(Referency):
 
         # scheduled contributions (constant shape)
         gs = self.global_step
-        sched_wsum_conn, sched_counts_conn = self._scheduled_gate_this_step(gs)
+        sched_wsum_conn, sched_counts_conn = self._scheduled_gate_this_step(
+            gs, use_tri_kernel=False
+        )
         with torch.no_grad():
             self.sched_wsum.copy_(sched_wsum_conn)
             self.sched_counts.copy_(sched_counts_conn)

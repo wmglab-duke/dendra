@@ -231,6 +231,7 @@ def make_weight(weights, n):
         def init(self, reinit=True):
             if reinit or not self.w.numel():
                 self.w = torch.cat([w.sample(n) for w, n in zip(self.weights, self.n)])
+            return self
 
     return WeightExpander(weights, n)
 
@@ -1309,19 +1310,9 @@ class Network(torch.nn.Module):
         self._state_cache.clear()
         self._syn_cache.clear()
 
-    def set_synaptic_diff_config(
-        self,
-        diff_weights: bool = True,
-        diff_delays: bool = True,
-        diff_spiking: bool = True,
-        taps: int = 2,
-        sigma: float = 0.35,  # used for taps=3 (in steps),
-        tau: float = 0.1,  # temperature for surrogate spiking
-    ):
+    def set_synaptic_diff_config(self, **kwargs):
         for syn in self.synapses.values():
-            syn.set_diff_config(
-                diff_weights, diff_delays, diff_spiking, taps, sigma, tau
-            )
+            syn.set_diff_config(**kwargs)
 
 
 def prepare_intra(intra_c, intra, local_ind):
