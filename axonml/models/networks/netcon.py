@@ -73,6 +73,9 @@ class NetCon(Referency):
         self.dtype = self.pre.dtype()
         self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
 
+        self.delay_ms = delay
+        delay = delay()
+
         if pre_var is None:
             pre_var = "v"
 
@@ -228,6 +231,30 @@ class NetCon(Referency):
             self._csr_starts = starts  # [n_pre_used]
             self._csr_counts = counts  # [n_pre_used]
             self._csr_conidx_sorted = order  # [n_conn]
+
+    def _rebuild_delay_buffers(self):
+        with torch.no_grad():
+            delay_steps = (self.delay_ms() / self.dt.to(self.dtype)).round().long()
+            self.delay_steps.copy_(delay_steps.flatten().to(self.device))
+
+            self.max_delay_steps = (
+                int(self.delay_steps.max().item()) + 1
+                if len(self.delay_steps) > 0
+                else 1
+            )
+
+            buffer_shape = (self.max_delay_steps, self.syn_numel.item())
+            self.delivery_buffer = torch.zeros(
+                buffer_shape, device=self.device, dtype=self.dtype
+            )
+            self.event_queue = torch.zeros(
+                (self.max_delay_steps, self.n.item()),
+                device=self.device,
+                dtype=torch.int32,
+            )
+            self.time_indices = torch.arange(
+                self.max_delay_steps, device=self.device, dtype=torch.long
+            )
 
     def set_diff_config(
         self,
@@ -679,13 +706,18 @@ class NetCon(Referency):
         for n, b in self.named_buffers():
             setattr(self, n, b.detach())
 
-    def initialize(self, reinit_weights=True, clear_deliveries=True):
+    def initialize(
+        self, reinit_weights=True, reinit_delays=True, clear_deliveries=True
+    ):
         if self.training:
             self.advance = self.advance_diff
         else:
             self.advance = self.advance_non_diff
         self.zero(clear_delivery_buffers=clear_deliveries)
         self.weight.init(reinit=reinit_weights)
+        self.delay_ms.init(reinit=reinit_delays)
+        if reinit_delays:
+            self._rebuild_delay_buffers()
         with torch.no_grad():
             self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
         self.detach()

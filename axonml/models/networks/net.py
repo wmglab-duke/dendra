@@ -460,7 +460,7 @@ class Network(torch.nn.Module):
                 n_threshold,
                 to_param(weight),
                 n_weight,
-                delay,
+                to_param(delay),
                 n_delay,
             )
         )
@@ -925,7 +925,7 @@ class Network(torch.nn.Module):
             post_idx = torch.cat([s[1] for s in specs])
             thresholds = torch.cat([expand(s[2], s[3]) for s in specs])
             weights = make_weight([s[4] for s in specs], [s[5] for s in specs])
-            delay = torch.cat([expand(s[6], s[7]) for s in specs])
+            delay = make_weight([s[6] for s in specs], [s[7] for s in specs])
 
             syn = NetCon(
                 pre=pre,
@@ -961,7 +961,9 @@ class Network(torch.nn.Module):
             self.built = True
         return self
 
-    def initialize(self, dt: float, reinit_weights: bool = True, t=0.0):
+    def initialize(
+        self, dt: float, reinit_weights: bool = True, reinit_delays: bool = True, t=0.0
+    ):
         """
         Initialize the network. Builds synapses, initializes populations and netstim (if exists).
         """
@@ -984,7 +986,9 @@ class Network(torch.nn.Module):
             pop.integrator.initialize(pop, dt)
             pop.intra = pop.build_intra()
         self.init_synapses(
-            reinit_weights=reinit_weights, clear_deliveries=clear_deliveries
+            reinit_weights=reinit_weights,
+            reinit_delays=reinit_delays,
+            clear_deliveries=clear_deliveries,
         )
         if self.netstim is not None:
             self.netstim.initialize()
@@ -1012,10 +1016,17 @@ class Network(torch.nn.Module):
         """
         self.initialize(dt, reinit_weights=reinit_weights)
 
-    def init_synapses(self, reinit_weights: bool = True, clear_deliveries: bool = True):
+    def init_synapses(
+        self,
+        reinit_weights: bool = True,
+        reinit_delays: bool = True,
+        clear_deliveries: bool = True,
+    ):
         for syn in self.synapses.values():
             syn.initialize(
-                reinit_weights=reinit_weights, clear_deliveries=clear_deliveries
+                reinit_weights=reinit_weights,
+                reinit_delays=reinit_delays,
+                clear_deliveries=clear_deliveries,
             )
 
     def run(self, tstop, ve=None, callbacks=None, progressbar=False):
