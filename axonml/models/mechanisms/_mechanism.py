@@ -578,7 +578,11 @@ class Mechanism(Parameterized):
         Returns a dictionary of all state names in the Mechanism
         mapped to their corresponding tensors.
         """
-        return {state: self._buffers[state] for state in self.DE.keys()}
+        dct = {}
+        for state_module in self.DE.values():
+            for state_name in state_module._state:
+                dct[state_name] = self._buffers[state_name]
+        return dct
 
 
 class VoltageProcess(Mechanism):

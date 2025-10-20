@@ -1,46 +1,9 @@
-from typing import Tuple
-
 import torch
 
 from ..parametric import Referency
 from .netstim import NetStim
+from .spiking import update_active, update_active_diff
 from .utils import make_getattr
-
-
-def update_active(has_spiked, vm_new, threshold) -> Tuple[torch.Tensor, torch.Tensor]:
-    ge = vm_new >= threshold
-    spiked = torch.logical_and(ge, ~has_spiked)
-    return ge, spiked
-
-
-def update_active_diff(
-    has_spiked: torch.Tensor,  # previous "ge" (bool)
-    vm_new: torch.Tensor,  # float
-    threshold: torch.Tensor,  # float
-    tau: float = 0.1,  # temperature for the surrogate
-):
-    """
-    Returns:
-      ge_hard:     bool  (vm_new >= threshold)
-      spiked_hard: bool  (rising edge: ge & ~has_spiked)
-      ge_gate:     float in [0,1] with STE (forward==ge_hard, backward==sigmoid)
-      spk_gate:    float in [0,1] with STE for *rising edge*
-    """
-    x = (vm_new - threshold) / tau
-    s = torch.sigmoid(x)  # smooth "is-above-threshold"
-
-    ge_hard = vm_new >= threshold  # bool
-    spiked_hard = ge_hard & (~has_spiked)  # bool rising edge
-
-    # Straight-through gates:
-    # - ge_gate forward equals ge_hard; backward follows s
-    ge_gate = ge_hard.to(s.dtype) + (s - s.detach())
-
-    # - rising-edge gate: soft approx is s * (1 - has_spiked)
-    s_rise = s * (1.0 - has_spiked.to(s.dtype))
-    spk_gate = spiked_hard.to(s.dtype) + (s_rise - s_rise.detach())
-
-    return ge_gate, spk_gate
 
 
 class NetCon(Referency):
@@ -93,8 +56,15 @@ class NetCon(Referency):
             "post_idx", post_idx.flatten().to(self.device, dtype=torch.long)
         )
         self.register_buffer(
-            "threshold", thresholds.flatten().to(self.device, dtype=self.dtype)
+            "threshold",
+            torch.nan_to_num(thresholds).flatten().to(self.device, dtype=self.dtype),
         )
+
+        nan_thresh = torch.isnan(thresholds).to(self.device)
+        self.register_buffer("thresh_is_nan", nan_thresh)
+
+        self.skip_thresholding = bool(nan_thresh.all())
+        self.apply_masking = bool(nan_thresh.any()) and not self.skip_thresholding
 
         self.register_buffer(
             "syn_numel",
@@ -568,7 +538,7 @@ class NetCon(Referency):
         self.sched_abs_step = torch.empty(0, device=device, dtype=torch.long)
         self.sched_weight = torch.empty(0, device=device, dtype=dtype)
         self.sched_weight_idx = torch.empty(0, device=device, dtype=torch.long)
-        self.sched_time_ms = torch.empty(0, device=device, dtype=torch.float32)
+        self.sched_time_ms = torch.empty(0, device=device, dtype=dtype)
         self.sched_time_idx = torch.empty(0, device=device, dtype=torch.long)
         self.sched_wsum.zero_()
         self.sched_counts.zero_()
@@ -829,19 +799,32 @@ class NetCon(Referency):
             self.is_spiking = pre.spike_gate.view(-1).index_select(0, self.pre_idx)
         else:
             self.is_spiking = pre.spikes.view(-1).index_select(0, self.pre_idx)
+        return
 
     def determine_spiking_var(self, pre, diff_spiking: bool = True, tau=0.1):
         # Otherwise, we need to compute spiking based on the pre-synaptic membrane potential
         v_selected = self.get_pre_var(pre).view(-1).index_select(0, self.pre_idx)
 
+        if self.skip_thresholding:
+            self.is_spiking = v_selected
+            return
+
         if diff_spiking:
-            self.has_spiked, self.is_spiking = update_active_diff(
+            self.has_spiked, _, self.is_spiking = update_active_diff(
                 self.has_spiked, v_selected, self.threshold, tau=tau
             )
         else:
             self.has_spiked, self.is_spiking = update_active(
                 self.has_spiked, v_selected, self.threshold
             )
+
+        if self.apply_masking:
+            self.is_spiking = torch.where(
+                self.thresh_is_nan,
+                v_selected,
+                self.is_spiking,
+            )
+        return
 
     def zero(self, clear_delivery_buffers=True):
         """

@@ -536,6 +536,10 @@ class Network(torch.nn.Module):
         # every target compartment receives input from exactly one source compartment
         # 1. validate that the synapse exists at all the target locations
         pre_idx, post_idx = prepare_indices_one_one(source, target, synapse)
+
+        if threshold is None:
+            threshold = torch.nan
+
         self._connect(
             source.model,
             pre_idx,
@@ -616,6 +620,9 @@ class Network(torch.nn.Module):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
             target = target[:]  # Ensure target is a slice if it's a Population
+
+        if threshold is None:
+            threshold = torch.nan
 
         # every target compartment receives input from every source compartment
         source_model = source.model
@@ -730,6 +737,9 @@ class Network(torch.nn.Module):
             source = source[:]  # Ensure source is a slice if it's a Population
         if isinstance(target, Population):
             target = target[:]  # Ensure target is a slice if it's a Population
+
+        if threshold is None:
+            threshold = torch.nan
 
         # every target compartment receives input from every source compartment
         source_model = source.model
@@ -859,6 +869,9 @@ class Network(torch.nn.Module):
             source = source[:]
         if isinstance(target, Population):
             target = target[:]
+
+        if threshold is None:
+            threshold = torch.nan
 
         # every target compartment receives input from every source compartment
         source_model = source.model
@@ -993,6 +1006,7 @@ class Network(torch.nn.Module):
         )
         if self.netstim is not None:
             self.netstim.initialize()
+            self.netstim.detach()
         return self
 
     def initialize_pops_from_state_cache(self):
@@ -1277,6 +1291,7 @@ class Network(torch.nn.Module):
         Network
             The network after running to steady state.
         """
+        self.clear_state_cache()
         was_training = self.training
         with torch.no_grad():
             if self.netstim is not None:
