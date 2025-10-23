@@ -1,6 +1,7 @@
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 
 
 def update_active(has_spiked, vm_new, threshold) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -39,19 +40,10 @@ def update_active_diff(
     return ge_hard, ge_gate, spk_gate
 
 
-def sigmoid_ste(x, tau):
-    # Straight-Through Estimator: forward hard step, backward sigmoid
-    # We implement as: y = (x>0).float() with custom grad via sigmoid
-    class _STE(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, x, tau):
-            ctx.save_for_backward(x, tau)
-            return (x >= 0).to(x.dtype)
+def sigmoid_ste(x: torch.Tensor, tau: torch.Tensor):
+    # Ensure positivity without clamp-induced flat regions (optional)
+    tau = F.softplus(tau) + 1e-6
 
-        @staticmethod
-        def backward(ctx, grad_output):
-            x, tau = ctx.saved_tensors
-            s = torch.sigmoid(x / tau.clamp_min(1e-6))
-            return grad_output * s * (1 - s) / tau.clamp_min(1e-6), None
-
-    return _STE.apply(x, tau)
+    s = torch.sigmoid(x / tau)  # surrogate
+    h = (x >= 0).to(x.dtype)  # hard forward
+    return (h - s).detach() + s  # forward==h, grad==∂s/∂x and ∂s/∂tau

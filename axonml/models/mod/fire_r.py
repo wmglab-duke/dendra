@@ -11,10 +11,12 @@ class fire_r(VoltageProcess):
         self.is_refractory = torch.zeros_like(v, dtype=torch.bool)
         self.time_refractory = torch.zeros_like(v, dtype=v.dtype)
 
-    def update_v(self, v, dt):
+    def update_v(self, v):
         still_ref = self.is_refractory
         time_refractory = self.time_refractory
-        time_refractory = torch.where(still_ref, time_refractory - dt, time_refractory)
+        time_refractory = torch.where(
+            still_ref, time_refractory - self.dt, time_refractory
+        )
 
         # cells whose timer expired leave refractory state
         recovered = still_ref & (time_refractory <= 0)

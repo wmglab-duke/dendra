@@ -257,7 +257,7 @@ class _dhs_bt(Integrator):
 
     def _step(self, vc, v, dt, temp, ve=None, intra=None):
         # Update mechanisms in mV / mA/cm^2
-        v = self.mech.update_v(v, dt)
+        v = self.mech.update_v(v)
         self.mech.advance(v, dt, temp)
         itot, gtot = self.mech.i(v)  # itot: mA/cm^2, gtot: S/cm^2
 

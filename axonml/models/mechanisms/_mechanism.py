@@ -184,6 +184,8 @@ class Mechanism(Parameterized):
         self.register_buffer("celsius", celsius)
         self.base_ndim = 2
 
+        self.register_buffer("dt", torch.tensor(0.0))
+
         if key is not None:
             if is_composable:
                 self.key = key
@@ -298,6 +300,9 @@ class Mechanism(Parameterized):
             setattr(getattr(self.__class__, k), "factorable", factorable)
 
         self.populate()
+
+    def set_dt(self, dt):
+        self.dt = self.dt.fill_(dt).detach()
 
     def put_no_op(self, ion_conc_u, ion_conc_o, v, clone=True):
         return ion_conc_u
@@ -593,7 +598,7 @@ class VoltageProcess(Mechanism):
     It must be overridden in subclasses to implement specific behavior.
     """
 
-    def update_v(self, v, dt):
+    def update_v(self, v: torch.Tensor) -> torch.Tensor:
         """
         This method must be overridden in subclasses to implement specific behavior.
         Any modifications to the membrane potential should not be in-place,

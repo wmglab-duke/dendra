@@ -41,6 +41,8 @@ class Integrator(torch.nn.Module):
         if self.needs_to_be_initialized(model, dt):
             self.dt = float(dt)
             self.shape = model.shape
+            for mech in self.mech.mechanisms.values():
+                mech.set_dt(dt)
             self.initialize(model, dt)
             self.initialized = True
 

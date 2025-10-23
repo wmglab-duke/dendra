@@ -39,7 +39,7 @@ class _bwd_euler_sc(Integrator):
 
     def _solve(self, v, dt, temp, intra=None):
         # apply voltage processes
-        v = self.mech.update_v(v, dt)
+        v = self.mech.update_v(v)
         self.mech.advance(v, dt, temp)
         itot, gtot = self.mech.i(v)
 
@@ -78,7 +78,7 @@ class _bwd_euler_sc_skip(Integrator):
 
     def _solve(self, v, dt, temp, intra=None):
         # apply voltage processes
-        v = self.mech.update_v(v, dt)
+        v = self.mech.update_v(v)
         self.mech.advance(v, dt, temp)
         _ = self.mech.i(v)  # calculate currents but not conductances
         return v
@@ -183,7 +183,7 @@ class _bwd_euler_ub(Integrator):
     def _step(self, v, dt, temp, ve=None, intra=None) -> Tensor:
         dt_s = dt * 1e-3
 
-        v = self.mech.update_v(v, dt)  # apply voltage processes
+        v = self.mech.update_v(v)  # apply voltage processes
 
         self.mech.advance(v, dt, temp)
 
@@ -484,7 +484,7 @@ class _bwd_euler_bt(Integrator):
         xg = self.xg[..., -1]
 
         # apply voltage processes
-        v = self.mech.update_v(v, dt)
+        v = self.mech.update_v(v)
 
         # advance gating
         self.mech.advance(v, dt, temp)

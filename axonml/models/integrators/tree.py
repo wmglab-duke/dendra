@@ -443,7 +443,7 @@ class _dhs(Integrator):
         model.v = self._step(model.v, dt, model.celsius, ve, intra)
 
     def _step(self, v, dt, temp, ve=None, intra=None):
-        v = self.mech.update_v(v, dt)  # apply voltage processes
+        v = self.mech.update_v(v)  # apply voltage processes
 
         self.mech.advance(v, dt, temp)
 
@@ -1005,7 +1005,7 @@ class _dhs_multi(MultiIntegrator):
         P = self.P
 
         # 1) mechanisms on flattened vector
-        v = self.mech.update_v(v, dt)
+        v = self.mech.update_v(v)
         self.mech.advance(v, dt, temp)
         itot_flat, gtot_flat = self.mech.i(v)  # both original shape
 

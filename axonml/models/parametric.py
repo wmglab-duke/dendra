@@ -5,12 +5,22 @@ import torch
 import torch.nn.functional as F
 
 
-def to_param(val):
+def to_param(val, positive=False):
     if isinstance(val, torch.nn.Parameter):
         return val
     if isinstance(val, torch.nn.Module):
         return val
-    return torch.nn.Parameter(torch.as_tensor(val), requires_grad=False)
+    val = torch.as_tensor(val)
+    if positive:
+        val = torch.clamp(val, min=0.0)
+        return PositiveParam(val)
+    param = torch.nn.Parameter(val, requires_grad=False)
+    return param
+
+
+def is_parametric(val):
+    _parametric_types = (torch.nn.Parameter, PositiveParam)
+    return isinstance(val, _parametric_types)
 
 
 def distribute_over(val, over="a"):
@@ -63,10 +73,8 @@ class PositiveParam(cacheable):
         self.rho = torch.nn.Parameter(rho0)
 
     def repeat(self, n):
-        with torch.no_grad():
-            new_rho = self.rho.detach().repeat(n)
-        self.rho = torch.nn.Parameter(new_rho)  # keep it a leaf Parameter
-        return self
+        p = self(cache=(not self.training))
+        return p.repeat(n)
 
     def _compute(self):
         # Positive, unbounded above; for large rho returns ~rho (no overflow)

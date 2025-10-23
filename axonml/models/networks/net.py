@@ -11,7 +11,8 @@ from axonml.helpers import BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT
 from ..callbacks import CallbackList
 from ..core import Population, make_intra
 from ..multi import concat, indices
-from ..parametric import to_param
+from ..parametric import is_parametric, to_param
+from ..rng import RNGMixin
 from .netcon import NetCon
 from .netstim import NetStim
 
@@ -211,7 +212,7 @@ def make_weight(weights, n):
             self.param = param
 
         def sample(self, n):
-            if isinstance(self.param, torch.Tensor):
+            if is_parametric(self.param):
                 return self.param.repeat(n)
             else:
                 return self.param.sample(n)
@@ -329,19 +330,19 @@ def dilate(
     return out
 
 
-class Network(torch.nn.Module):
+class Network(RNGMixin):
     """
     Base class for networks in AxonML.
     """
 
-    def __init__(self, populations: Dict[str, Population], netstim=None):
+    def __init__(self, populations: Dict[str, Population], netstim=None, seed=None):
         if any(pop.is_batched() for pop in populations.values()):
             raise ValueError(
                 "Batched populations are not supported. Implement your networks with unbatched populations and then call .batch(batch_size)."
             )
         if netstim is not None and not isinstance(netstim, NetStim):
             raise TypeError("netstim must be an instance of NetStim or None.")
-        super(Network, self).__init__()
+        super(Network, self).__init__(seed=seed)
         self.populations = populations
         for name, pop in populations.items():
             pop.build()
@@ -459,9 +460,9 @@ class Network(torch.nn.Module):
                 target_idx,
                 threshold,
                 n_threshold,
-                to_param(weight),
+                to_param(weight, positive=True),
                 n_weight,
-                to_param(delay),
+                to_param(delay, positive=True),
                 n_delay,
             )
         )
@@ -764,7 +765,11 @@ class Network(torch.nn.Module):
         post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
 
         # randomly select connections based on the probability
-        mask = torch.rand(pre_idx.numel(), device=source_model.device()) < prob
+        device = source_model.device()
+        mask = (
+            torch.rand(pre_idx.numel(), device=device, generator=self._rng(device))
+            < prob
+        )
 
         if mask.sum() == 0:
             # If no connections are selected, return early
@@ -896,7 +901,11 @@ class Network(torch.nn.Module):
         post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
 
         # randomly select connections based on the probability
-        mask = torch.randperm(pre_idx.numel(), device=source_model.device())[:n]
+        device = source_model.device()
+        total_connections = pre_idx.numel()
+        mask = torch.randperm(
+            total_connections, device=device, generator=self._rng(device)
+        )[:n]
 
         pre_idx = pre_idx[mask]
         post_idx = post_idx[mask]
@@ -997,7 +1006,7 @@ class Network(torch.nn.Module):
         for pop in self.populations.values():
             if not self._state_cache:
                 pop.initialize()
-            pop.integrator.initialize(pop, dt)
+            pop.integrator._initialize(pop, dt)
             pop.intra = pop.build_intra()
         self.init_synapses(
             reinit_weights=reinit_weights,

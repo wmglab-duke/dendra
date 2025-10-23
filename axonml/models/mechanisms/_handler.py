@@ -131,9 +131,9 @@ class MechanismHandler(torch.nn.Module):
             ion.advance(celsius)
         self.read_from_ions()
 
-    def update_v(self, v, dt):
+    def update_v(self, v):
         for vp in self.voltage_processes.values():
-            v = vp.update_v(v, dt)
+            v = vp.update_v(v)
         return v
 
     def init_i_g_bufs(self, v):
