@@ -4,9 +4,9 @@ from typing import Tuple
 import torch
 from tqdm.auto import tqdm
 
-from .backend import Backend as A
-from .callbacks import Recorder
-from .core import Axon
+from ..axonml.models.backend import Backend as A
+from ..axonml.models.callbacks import Recorder
+from ..axonml.models.core import Axon
 
 
 def num_rows_to_zero(A: int, x: float) -> int:
