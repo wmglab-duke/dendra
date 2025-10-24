@@ -19,6 +19,11 @@ class RNGMixin(nn.Module):
         # One CPU generator (always exists) + lazily-created device-specific generators
         self._cpu_gen = torch.Generator(device="cpu").manual_seed(self._base_seed)
         self._device_gens: dict[torch.device, torch.Generator] = {}
+        self._ignore_rng_on_load = False
+
+    def ignore_rng_on_load(self, ignore: bool = True) -> None:
+        """If set, RNG state is not restored when loading module state_dict."""
+        self._ignore_rng_on_load = ignore
 
     # ---------- public API ----------
     def reseed(self, seed: int) -> None:
@@ -58,6 +63,8 @@ class RNGMixin(nn.Module):
         return {"base_seed": self._base_seed, "rng_state": self.rng_state()}
 
     def set_extra_state(self, extra_state):
+        if self._ignore_rng_on_load:
+            return
         self._base_seed = int(extra_state.get("base_seed", 0))
         self.reseed(self._base_seed)
         if "rng_state" in extra_state:

@@ -34,11 +34,13 @@ class Integrator(torch.nn.Module):
     def initialize(self, model, dt):
         raise NotImplementedError
 
-    def needs_to_be_initialized(self, model, dt):
+    def needs_to_be_initialized(self, model, dt, force=False):
+        if force:
+            return True
         return not self.initialized or self.dt != float(dt) or self.shape != model.shape
 
-    def _initialize(self, model, dt):
-        if self.needs_to_be_initialized(model, dt):
+    def _initialize(self, model, dt, force=False):
+        if self.needs_to_be_initialized(model, dt, force):
             self.dt = float(dt)
             self.shape = model.shape
             for mech in self.mech.mechanisms.values():
@@ -53,7 +55,7 @@ class Integrator(torch.nn.Module):
             model.i_membrane = torch.zeros_like(model.v).detach()
 
     def detach(self, model):
-        detach_vars(self, self.v_vars)
+        detach_vars(model, self.v_vars)
         for n, b in model.named_buffers():
             setattr(model, n, b.detach())
         if self.imem:

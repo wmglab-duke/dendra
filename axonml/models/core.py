@@ -205,10 +205,7 @@ class Population(P, Sliceable):
                 mode=self.compile_mode,
             )
         else:
-            self._step = torch.compile(
-                step,
-                backend="eager",
-            )
+            self._step = step
 
         if self.jit:
             self.make_intra = torch.compile(make_intra)
@@ -379,6 +376,22 @@ class Population(P, Sliceable):
     def freeze_group_(self, *groups):
         self.freeze_group(*groups)
 
+    def retain_grad(self, *names):
+        """
+        Retain gradients for model buffers.
+
+        Parameters
+        ----------
+        *names : str
+            Variable length argument list of buffer names.
+            If empty, all buffers will have their gradients retained.
+            Otherwise, only buffers matching any of these names will have their gradients retained.
+        """
+        for n, b in self.named_buffers():
+            if not names or matches_any_pattern(names, n):
+                if b.requires_grad:
+                    b.retain_grad()
+
     def register_post_initialize_hook(self, fn: Callable):
         self.post_initialize_hooks.append(fn)
 
@@ -497,7 +510,7 @@ class Population(P, Sliceable):
                     c.dt = dt_f
 
             pre_loop_hook(callbacks, self)
-            self.integrator._initialize(self, dt)
+            self.integrator._initialize(self, dt, force=self.training)
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
@@ -654,7 +667,7 @@ class Population(P, Sliceable):
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
-                self.integrator._initialize(self, dt)
+                self.integrator._initialize(self, dt, force=self.training)
                 einsum = torch.compile(einsum)
 
                 pre_loop_hook(callbacks, self)
@@ -798,7 +811,7 @@ class Population(P, Sliceable):
         self.integrator.mech.initialize(self.v, self.celsius, self.diam)
         self.post_initialize()
         self.integrator.mech.initialize(self.v, self.celsius, self.diam)
-        self.t.detach().zero_()
+        self.t = self.t.zero_().detach()
         self.initialized = True
         return self
 
