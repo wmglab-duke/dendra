@@ -14,15 +14,18 @@ from ._symbolic import build_current_eq
 
 class Mechanism(Parameterized):
     """
-    `Mechanism` is the base class for all mechanisms in AxonML.
-    It provides a framework for defining state variables, ion channels,
-    and currents, and for managing the parameters of these mechanisms.
-    `Mechanism` is a subclass of `Parameterized`, which provides the
-    functionality for handling parameters and their declarations.
+    Base class for AxonML mechanisms.
 
-    Mechanisms are responsible for keeping track of where in the model
-    they are inserted, which facilitates AxonML's sparse internal representations
-    of states and parameters.
+    Mechanisms encapsulate state variables, ionic currents, and parameter
+    declarations that can be attached to neuronal morphologies. They extend
+    :class:`axonml.models.parametric.Parameterized` to leverage the shared
+    parameter declaration and population infrastructure.
+
+    Notes
+    -----
+    Subclasses typically declare state, assigned, and ionic variables using the
+    :meth:`STATE`, :meth:`ASSIGNED`, :meth:`SAVE`, :meth:`USEION`, and
+    :meth:`NONSPECIFIC_CURRENT` helpers during class definition.
     """
 
     _state = set()
@@ -171,7 +174,31 @@ class Mechanism(Parameterized):
         **kwargs,
     ):
         """
-        Initialize the Mechanism with parameters and declarations.
+        Initialize a mechanism instance and register declared buffers.
+
+        Parameters
+        ----------
+        name : str
+            Mechanism alias. If ``None``, falls back to the class name.
+        celsius : Tensor or float
+            Temperature values broadcastable to the mechanism shape.
+        diameters : Tensor
+            Compartment diameters shared with sub-components.
+        shape : tuple of int
+            Base shape for parameter tensors (without batch dimensions).
+        shape_f : tuple of int
+            Full shape including batch dimensions.
+        key : Any, optional
+            Index selector identifying the attached compartments.
+        is_composable : bool, optional
+            Whether ``key`` represents a tuple of slices instead of flat indices.
+        additional_parameters : dict, optional
+            Additional parameter declarations injected by the parent population.
+        ic : dict, optional
+            Initial condition overrides for state buffers.
+        **kwargs
+            Extra keyword arguments forwarded to
+            :class:`axonml.models.parametric.Parameterized`.
         """
         super().__init__(
             shape, shape_f, additional_parameters=additional_parameters, **kwargs
@@ -302,12 +329,58 @@ class Mechanism(Parameterized):
         self.populate()
 
     def set_dt(self, dt):
+        """
+        Update the per-mechanism time-step buffer.
+
+        Parameters
+        ----------
+        dt : float or Tensor
+            New integration step size in milliseconds.
+        """
         self.dt = self.dt.fill_(dt).detach()
 
     def put_no_op(self, ion_conc_u, ion_conc_o, v, clone=True):
+        """
+        Return ionic concentrations unchanged.
+
+        Parameters
+        ----------
+        ion_conc_u : Tensor
+            Updated ionic concentrations (ignored).
+        ion_conc_o : Tensor
+            Original ionic concentrations.
+        v : Tensor
+            Voltage reference tensor (ignored).
+        clone : bool, optional
+            Unused for the no-op path.
+
+        Returns
+        -------
+        Tensor
+            ``ion_conc_o`` unchanged.
+        """
         return ion_conc_u
 
     def put_slice_(self, ion_conc_u, ion_conc_o, v, clone=True):
+        """
+        Write ionic concentrations into a slice in place.
+
+        Parameters
+        ----------
+        ion_conc_u : Tensor
+            Updated ionic concentrations matching the slice length.
+        ion_conc_o : Tensor
+            Original ionic concentrations to be updated.
+        v : Tensor
+            Voltage tensor used for broadcasting shape.
+        clone : bool, optional
+            If True, operate on a cloned copy of ``ion_conc_o``.
+
+        Returns
+        -------
+        Tensor
+            Tensor with the slice replaced by ``ion_conc_u``.
+        """
         ion_conc_o = ion_conc_o.expand_as(v)
         if clone:
             ion_conc_o = ion_conc_o.clone()
@@ -315,6 +388,25 @@ class Mechanism(Parameterized):
         return ion_conc_o
 
     def put_slice(self, ion_conc_u, ion_conc_o, v, clone=True):
+        """
+        Write ionic concentrations into a slice and return a new tensor.
+
+        Parameters
+        ----------
+        ion_conc_u : Tensor
+            Updated ionic concentrations matching the slice length.
+        ion_conc_o : Tensor
+            Original ionic concentrations to be updated.
+        v : Tensor
+            Voltage tensor used for broadcasting shape.
+        clone : bool, optional
+            If True, operate on a cloned copy of ``ion_conc_o``.
+
+        Returns
+        -------
+        Tensor
+            Tensor with the slice replaced by ``ion_conc_u``.
+        """
         # ion_conc_o is the full tensor, v is a reference for shape, ion_conc_u is the update
         ion_conc_o = ion_conc_o.expand_as(v)
         if clone:
@@ -325,6 +417,25 @@ class Mechanism(Parameterized):
         return ion_conc_o
 
     def put_fancy_(self, ion_conc_u, ion_conc_o, v, clone=True):
+        """
+        Write ionic concentrations using flattened fancy indexing in place.
+
+        Parameters
+        ----------
+        ion_conc_u : Tensor
+            Updated ionic concentrations with length ``len(self.key)``.
+        ion_conc_o : Tensor
+            Original ionic concentrations to be updated.
+        v : Tensor
+            Voltage tensor used for broadcasting shape.
+        clone : bool, optional
+            If True, operate on a cloned copy of ``ion_conc_o``.
+
+        Returns
+        -------
+        Tensor
+            Tensor with entries replaced at ``self.key`` indices.
+        """
         ion_conc_o = ion_conc_o.expand_as(v)
         if clone:
             ion_conc_o = ion_conc_o.clone()
@@ -332,6 +443,25 @@ class Mechanism(Parameterized):
         return ion_conc_o
 
     def put_fancy(self, ion_conc_u, ion_conc_o, v, clone=True):
+        """
+        Write ionic concentrations using flattened fancy indexing.
+
+        Parameters
+        ----------
+        ion_conc_u : Tensor
+            Updated ionic concentrations with length ``len(self.key)``.
+        ion_conc_o : Tensor
+            Original ionic concentrations to be updated.
+        v : Tensor
+            Voltage tensor used for broadcasting shape.
+        clone : bool, optional
+            If True, operate on a cloned copy of ``ion_conc_o`` before writing.
+
+        Returns
+        -------
+        Tensor
+            Tensor with entries replaced at ``self.key`` indices.
+        """
         # ion_conc_u: The new values to put, shape [..., len(key)]
         # ion_conc_o: The destination tensor, shape [..., *base_shape]
         # v: Reference tensor for shape
@@ -357,6 +487,14 @@ class Mechanism(Parameterized):
         return ion_conc_o
 
     def register_ion(self, ion):
+        """
+        Attach shared ion buffers used by the mechanism.
+
+        Parameters
+        ----------
+        ion : Ion
+            Ion descriptor exposing concentration and reversal potential tensors.
+        """
         name = ion.name
         if name in self.read_ion:
             for v in self.read_ion[name]:
@@ -416,18 +554,61 @@ class Mechanism(Parameterized):
 
     @staticmethod
     def STATE(*args):
+        """
+        Declare state variables for the mechanism class body.
+
+        Parameters
+        ----------
+        *args : type
+            State module classes registered to ``Mechanism._state``.
+        """
         Mechanism._state_declarations.append(args)
 
     @staticmethod
     def ASSIGNED(*args):
+        """
+        Declare assigned variables for the mechanism class body.
+
+        Parameters
+        ----------
+        *args : str
+            Names of assigned buffers to allocate per instance.
+        """
         Mechanism._assigned_declarations.append(args)
 
     @staticmethod
     def SAVE(*args):
+        """
+        Declare state variables that must be saved each time step.
+
+        Parameters
+        ----------
+        *args : str
+            Names of buffers mirrored with a trailing underscore.
+        """
         Mechanism._save_declarations.append(args)
 
     @staticmethod
     def USEION(ion, read=None, write=None):
+        """
+        Declare ionic read/write dependencies for the mechanism class body.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier (e.g., ``'na'``).
+        read : Sequence[str], optional
+            Ion variables to be read (e.g., ``['nai', 'nao']``).
+        write : Sequence[str], optional
+            Ion variables to be written.
+
+        Raises
+        ------
+        AssertionError
+            If the ion name is unknown or a read/write symbol is invalid.
+        ValueError
+            If reversal potentials are written or a variable is both read and written.
+        """
         read = read or []
         write = write or []
 
@@ -470,31 +651,70 @@ class Mechanism(Parameterized):
 
     @staticmethod
     def NONSPECIFIC_CURRENT(*args):
+        """
+        Declare non-specific (leak) currents produced by the mechanism.
+
+        Parameters
+        ----------
+        *args : str
+            Current names to register as non-specific.
+        """
         Mechanism._currents_declarations.append(args)
 
     @staticmethod
     def INIT(**kwargs):
+        """
+        Declare initial buffer values for state variables.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping from state names to scalar initial conditions.
+        """
         Mechanism._init_declarations.append(kwargs)
 
     @staticmethod
     def EXPLICIT(*args):
         """
-        Marks the mechanism as independent of voltage for the given currents.
-        This means that the current does not depend on the membrane potential `v`.
-        Instead of contributing a conductance to the LHS, it is handled entirely
-        on the RHS.
+        Mark currents as voltage independent when assembling the RHS.
+
+        Parameters
+        ----------
+        *args : str
+            Current names that should not contribute to conductance terms.
         """
         Mechanism._explicit_declarations.append(args)
 
     def breakpoint(self, v):
+        """
+        Evaluate mechanism currents at the breakpoint stage.
+
+        Parameters
+        ----------
+        v : Tensor
+            Membrane potential values for the local compartments.
+        """
         return
 
     def detach(self):
+        """
+        Detach mechanism buffers and nested state modules from autograd.
+        """
         super().detach()
         for state_module in self.DE.values():
             state_module.detach()
 
     def _advance(self, v, dt):
+        """
+        Advance nested state modules by one time step.
+
+        Parameters
+        ----------
+        v : Tensor
+            Membrane potentials for the local compartments.
+        dt : Tensor
+            Time-step tensor propagated from the integrator.
+        """
         for state_module in self.DE.values():
             states = {
                 state_name: self._buffers[state_name]
@@ -504,26 +724,47 @@ class Mechanism(Parameterized):
             self._buffers.update(local)
 
     def populate(self):
+        """
+        Populate mechanism and nested state parameter buffers.
+        """
         self.populate_parameter_buffers()
         for state_module in self.DE.values():
             state_module.populate_parameter_buffers()
 
     def initial(self, v):
+        """
+        Hook for subclasses to initialize state from membrane potential.
+
+        Parameters
+        ----------
+        v : Tensor
+            Membrane potential values used for state initialization.
+        """
         return
 
     @classmethod
     def rename(cls, new_name=None, suffix=None):
         """
-        Returns a new mechanism class that is an exact copy of `cls` but with a
-        different name.
+        Create a renamed clone of the current mechanism class.
 
-        Args:
-            new_name (str): The name of the new class. If None, the original class's
-                            name will be used with an optional suffix.
-            suffix (str): An optional suffix to append to the new class name.
+        Parameters
+        ----------
+        new_name : str, optional
+            Explicit name for the cloned class. Required when ``suffix`` is ``None``.
+        suffix : str, optional
+            Suffix appended to the original class name when ``new_name`` is omitted.
 
-        Returns:
-            type: A new class, identical in behavior to the original but with a new name.
+        Returns
+        -------
+        type
+            Mechanism subclass identical to ``cls`` but with a new ``__name__``.
+
+        Raises
+        ------
+        ValueError
+            If both ``new_name`` and ``suffix`` are ``None``.
+        TypeError
+            If ``suffix`` is provided but not a string.
         """
         if new_name is None and suffix is None:
             raise ValueError("Either new_name or suffix must be provided.")
@@ -544,8 +785,17 @@ class Mechanism(Parameterized):
 
     def batch(self, batch_size: int):
         """
-        Returns a new instance of the mechanism with the parameters
-        distributed over the specified batch size.
+        Broadcast mechanism buffers across an explicit batch dimension.
+
+        Parameters
+        ----------
+        batch_size : int
+            Size of the leading batch dimension to materialize.
+
+        Returns
+        -------
+        Mechanism
+            The mechanism instance with batched buffers.
         """
         super().batch(batch_size)
         for state_module in self.DE.values():
@@ -554,7 +804,12 @@ class Mechanism(Parameterized):
 
     def states(self):
         """
-        Returns a list of all state names in the Mechanism.
+        Collect fully qualified state names.
+
+        Returns
+        -------
+        list of str
+            Names in the form ``\"{mechanism}.{state}\"``.
         """
         states = []
         for state_module in self.DE.values():
@@ -564,15 +819,31 @@ class Mechanism(Parameterized):
     @classproperty
     def code(cls):
         """
-        Returns the source code of the mechanism.
-        This is useful for debugging and introspection.
+        Source code of the mechanism class.
+
+        Returns
+        -------
+        str
+            Dedented string containing the class definition.
         """
         source_code = inspect.getsource(cls)
         return textwrap.dedent(source_code)
 
     @classproperty
     def file_code(cls) -> str:
-        """Full source of the .py file that defines this class."""
+        """
+        Source text of the Python module defining the class.
+
+        Returns
+        -------
+        str
+            Entire module contents containing ``cls``.
+
+        Raises
+        ------
+        RuntimeError
+            If the module where ``cls`` is defined cannot be located.
+        """
         mod = inspect.getmodule(cls)
         if mod is None:
             raise RuntimeError(f"Cannot locate module for {cls.__qualname__}")
@@ -580,8 +851,12 @@ class Mechanism(Parameterized):
 
     def states_dict(self):
         """
-        Returns a dictionary of all state names in the Mechanism
-        mapped to their corresponding tensors.
+        Map state names to their underlying buffers.
+
+        Returns
+        -------
+        dict
+            Dictionary from raw state names to tensors.
         """
         dct = {}
         for state_module in self.DE.values():
@@ -592,26 +867,25 @@ class Mechanism(Parameterized):
 
 class VoltageProcess(Mechanism):
     """
-    A VoltageProcess is a Mechanism that updates the membrane potential `v`.
-    VoltageProcesses implement the `update_v` method, which is called during the
-    simulation to update the membrane potential based on the mechanism's dynamics.
-    It must be overridden in subclasses to implement specific behavior.
+    Mechanism subtype that updates the membrane potential ``v``.
+
+    Subclasses must implement :meth:`update_v` to return a new membrane potential
+    tensor each time step.
     """
 
     def update_v(self, v: torch.Tensor) -> torch.Tensor:
         """
-        This method must be overridden in subclasses to implement specific behavior.
-        Any modifications to the membrane potential should not be in-place,
-        but rather return a new tensor.
+        Compute the updated membrane potential.
 
         Parameters
         ----------
-            v (torch.Tensor): The membrane potential tensor.
-            dt (torch.Tensor): The time step for the update.
+        v : torch.Tensor
+            Membrane potential tensor to be advanced.
 
         Returns
         -------
-            v (torch.Tensor): The updated membrane potential tensor.
+        torch.Tensor
+            New membrane potential values.
         """
         raise NotImplementedError(
             "VoltageProcess.update_v() must be implemented in subclasses."
@@ -649,15 +923,14 @@ class Synapse(Mechanism):
 
     def net_receive(self, weights, netcon):
         """
-        This method is called when the synapse receives a spike.
-        It should be overridden in subclasses to implement specific behavior.
+        Handle weighted spike arrivals.
 
-        Args:
-            weight (torch.Tensor): The weight of the synapse.
-            netcon (NetCon): The `NetCon` instance that delivered the spikes.
-
-        Returns:
-            None
+        Parameters
+        ----------
+        weights : torch.Tensor
+            Aggregate weights of incoming spike events at the current step.
+        netcon : NetCon
+            Connectivity handle delivering the spikes.
         """
         raise NotImplementedError(
             "Synapse.net_receive() must be implemented in subclasses."
@@ -666,15 +939,19 @@ class Synapse(Mechanism):
 
 def rename(mechanism, new_name=None):
     """
-    Returns a new mechanism that is an exact copy of `mechanism` but with a
-    different name.
+    Clone a mechanism class under a new name.
 
-    Args:
-        mechanism (Mechanism): The mechanism to be copied.
-        new_name (str): The name of the new class.
+    Parameters
+    ----------
+    mechanism : type
+        Mechanism subclass to be cloned.
+    new_name : str, optional
+        Name assigned to the cloned class. Defaults to the original name.
 
-    Returns:
-        type: A new class, identical in behavior to the original but with a new name.
+    Returns
+    -------
+    type
+        Mechanism subclass with identical behavior but a different ``__name__``.
     """
     # The three-argument form of type(): type(name, bases, dict)
     # 1. name: The new class name (a string).

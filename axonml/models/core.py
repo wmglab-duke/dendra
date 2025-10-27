@@ -62,6 +62,22 @@ def get_unique_keys(list_of_dicts):
 
 
 def follows_pattern(base_pattern, target_string):
+    """
+    Check whether a dotted name pattern appears in a target string.
+
+    Parameters
+    ----------
+    base_pattern : str
+        Pattern consisting of dot-separated tokens that must appear in order.
+    target_string : str
+        Candidate string evaluated against the pattern.
+
+    Returns
+    -------
+    bool
+        True if the pattern tokens occur in order inside the target string,
+        False otherwise.
+    """
     regex_pattern = (
         r"\b"
         + r"\b.*?\b".join(re.escape(part) for part in base_pattern.split("."))
@@ -72,16 +88,32 @@ def follows_pattern(base_pattern, target_string):
 
 def matches_any_pattern(base_patterns, target_string):
     """
-    Checks if a target string matches any of the provided base patterns.
+    Check whether a target string matches any dotted base pattern.
 
-    A match occurs if the parts of a base_pattern (split by '.') appear in order
-    in the target_string. All parts except the last must be whole words.
-    The last part can be a prefix of a word.
+    A match occurs when each token in a pattern appears in order in the target
+    string. All tokens except the final one must match entire words; the final
+    token may match a word prefix.
 
-    For example:
-    - base_pattern 'hh.gbar' will match target_string 'hh.gbar_default'.
-    - base_pattern 'foo' will match 'a.foo_bar'.
-    - base_pattern 'a.b' will NOT match 'a_b.c'.
+    Parameters
+    ----------
+    base_patterns : Iterable[str]
+        Collection of dot-separated pattern strings to test.
+    target_string : str
+        Candidate string evaluated against each pattern.
+
+    Returns
+    -------
+    bool
+        True if any pattern matches the target string, False otherwise.
+
+    Examples
+    --------
+    >>> matches_any_pattern(['hh.gbar'], 'hh.gbar_default')
+    True
+    >>> matches_any_pattern(['foo'], 'a.foo_bar')
+    True
+    >>> matches_any_pattern(['a.b'], 'a_b.c')
+    False
     """
     for base_pattern in base_patterns:
         # Split the pattern by '.' and escape each part to treat special
@@ -105,7 +137,22 @@ def matches_any_pattern(base_patterns, target_string):
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
+    """1D convolution layer with weights symmetrized during training."""
+
     def forward(self, x):
+        """
+        Apply the symmetric convolution operation.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input tensor of shape ``(batch, channels, length)``.
+
+        Returns
+        -------
+        Tensor
+            Convolved tensor with the same shape as the input.
+        """
         if self.training:
             weight_ = (self.weight + torch.flip(self.weight, [-1])) / 2
         else:
@@ -114,10 +161,43 @@ class SymmetricConv1D(torch.nn.Conv1d):
 
 
 def step(integrator, model, dt, ve=None, intra=None):
+    """
+    Execute a single integration step for a population model.
+
+    Parameters
+    ----------
+    integrator : Integrator
+        Integrator instance providing the ``step`` routine.
+    model : Population
+        Population model whose state is advanced.
+    dt : float or Tensor
+        Simulation time step in milliseconds.
+    ve : Tensor, optional
+        Extracellular potential applied during the step.
+    intra : Any, optional
+        Intra-cellular stimulation payload forwarded to the integrator.
+    """
     integrator.step(model, dt, ve, intra)
 
 
 def make_intra(intra, stims, indices):
+    """
+    Instantiate intra-cellular stimulation payload for a time step.
+
+    Parameters
+    ----------
+    intra : Intra
+        Intra-cellular stimulus model.
+    stims : list of Tensor
+        Sequence of per-channel stimulation tensors for the current step.
+    indices : Any
+        Index structure describing the electrodes addressed by ``stims``.
+
+    Returns
+    -------
+    Any
+        Instantiated stimulation payload compatible with the integrator.
+    """
     return intra(stims, indices)
 
 
@@ -224,21 +304,67 @@ class Population(P, Sliceable):
         self.eval()
 
     def numel(self, include_batch_dimensions=True):
+        """
+        Count elements in the population state tensor.
+
+        Parameters
+        ----------
+        include_batch_dimensions : bool, optional
+            If True, include batch dimensions in the count. If False,
+            only the core neuron/compartment axes are considered.
+
+        Returns
+        -------
+        int
+            Total number of elements in ``self.v`` according to the flag.
+        """
         if not include_batch_dimensions:
             return math.prod(self.core_shape())
         return self.v.numel()
 
     def numelc(self):
+        """
+        Count elements per cell, excluding batch dimensions.
+
+        Returns
+        -------
+        int
+            Number of elements across the neuron and compartment axes.
+        """
         return self.numel(include_batch_dimensions=False)
 
     @property
     def shape(self):
+        """
+        Shape tuple of the membrane potential tensor.
+
+        Returns
+        -------
+        tuple of int
+            Dimensions of ``self.v`` including any batch axes.
+        """
         return tuple(self.v.shape)
 
     def equilibria(self, **kwargs):
+        """
+        Register reversal potential configuration for ionic species.
+
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments forwarded to ``axonml.models.mechanisms._ions.equilibria``.
+        """
         self._equilibria.update(kwargs)
 
     def concentrations(self, **kwargs):
+        """
+        Register ionic concentration configuration.
+
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments forwarded to ``axonml.models.mechanisms._ions.concentrations``.
+        """
         self._concentrations.update(kwargs)
 
     @property
@@ -338,9 +464,30 @@ class Population(P, Sliceable):
         return self
 
     def unfreeze_(self, *names):
+        """
+        In-place alias of :meth:`unfreeze`.
+
+        Parameters
+        ----------
+        *names : str
+            Optional name patterns forwarded to :meth:`unfreeze`.
+        """
         self.unfreeze(*names)
 
     def unfreeze_group(self, *groups):
+        """
+        Unfreeze parameter groups stored as module attributes.
+
+        Parameters
+        ----------
+        *groups : str
+            Attribute names of iterable parameter collections to unfreeze.
+
+        Returns
+        -------
+        Population
+            The population instance for chaining.
+        """
         for g in groups:
             group = getattr(self, g)
             print(f"Unfreezing group '{g}'")
@@ -349,9 +496,31 @@ class Population(P, Sliceable):
         return self
 
     def unfreeze_group_(self, *groups):
+        """
+        In-place alias of :meth:`unfreeze_group`.
+
+        Parameters
+        ----------
+        *groups : str
+            Attribute names forwarded to :meth:`unfreeze_group`.
+        """
         self.unfreeze_group(*groups)
 
     def freeze(self, *names):
+        """
+        Freeze parameters to disable gradient computation.
+
+        Parameters
+        ----------
+        *names : str
+            Optional name patterns selecting parameters to freeze. When omitted,
+            all parameters are frozen.
+
+        Returns
+        -------
+        Population
+            The population instance for chaining.
+        """
         if not names:
             for p in self.parameters():
                 p.requires_grad = False
@@ -363,9 +532,30 @@ class Population(P, Sliceable):
         return self
 
     def freeze_(self, *names):
+        """
+        In-place alias of :meth:`freeze`.
+
+        Parameters
+        ----------
+        *names : str
+            Optional name patterns forwarded to :meth:`freeze`.
+        """
         self.freeze(*names)
 
     def freeze_group(self, *groups):
+        """
+        Freeze parameter groups stored as module attributes.
+
+        Parameters
+        ----------
+        *groups : str
+            Attribute names of iterable parameter collections to freeze.
+
+        Returns
+        -------
+        Population
+            The population instance for chaining.
+        """
         for g in groups:
             group = getattr(self, g)
             print(f"Freezing group '{g}'")
@@ -374,6 +564,14 @@ class Population(P, Sliceable):
         return self
 
     def freeze_group_(self, *groups):
+        """
+        In-place alias of :meth:`freeze_group`.
+
+        Parameters
+        ----------
+        *groups : str
+            Attribute names forwarded to :meth:`freeze_group`.
+        """
         self.freeze_group(*groups)
 
     def retain_grad(self, *names):
@@ -393,18 +591,70 @@ class Population(P, Sliceable):
                     b.retain_grad()
 
     def register_post_initialize_hook(self, fn: Callable):
+        """
+        Register a hook executed after model initialization.
+
+        Parameters
+        ----------
+        fn : Callable
+            Callback invoked with the population instance once initialization
+            completes.
+        """
         self.post_initialize_hooks.append(fn)
 
     def register_pre_initialize_hook(self, fn: Callable):
+        """
+        Register a hook executed before model initialization.
+
+        Parameters
+        ----------
+        fn : Callable
+            Callback invoked with the population instance just prior to
+            mechanism initialization.
+        """
         self.pre_initialize_hooks.append(fn)
 
     def device(self):
+        """
+        Device on which population buffers reside.
+
+        Returns
+        -------
+        torch.device
+            Device handle inferred from the registered dummy buffer.
+        """
         return self._dummy.device
 
     def dtype(self):
+        """
+        Default tensor dtype for the population.
+
+        Returns
+        -------
+        torch.dtype
+            Data type inferred from the registered dummy buffer.
+        """
         return self._dummy.dtype
 
     def prep_intra(self, intra, n, dt):
+        """
+        Prepare intra-cellular stimulus batches for simulation.
+
+        Parameters
+        ----------
+        intra : Intra
+            Intra-cellular stimulation provider.
+        n : int
+            Number of time steps to generate stimuli for.
+        dt : float
+            Simulation time step in milliseconds.
+
+        Returns
+        -------
+        tuple
+            Pair ``(stims, indices)`` where ``stims`` is a list of sequences
+            of stimuli and ``indices`` encodes electrode mapping metadata.
+        """
         start = self.t
         end = start + n * dt
         t_ = torch.arange(start, end, dt, device=self.device(), dtype=self.dtype())
@@ -763,15 +1013,28 @@ class Population(P, Sliceable):
         return self
 
     def clear_steady_state(self):
+        """
+        Remove cached steady-state snapshot, if present.
+
+        Returns
+        -------
+        None
+        """
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
 
     def post_initialize(self):
+        """
+        Run registered post-initialization hooks with gradients disabled.
+        """
         with torch.no_grad():
             for h in self.post_initialize_hooks:
                 h(self)
 
     def pre_initialize(self):
+        """
+        Run registered pre-initialization hooks with gradients disabled.
+        """
         with torch.no_grad():
             for h in self.pre_initialize_hooks:
                 h(self)
@@ -789,6 +1052,9 @@ class Population(P, Sliceable):
         return self
 
     def populate_(self):
+        """
+        In-place alias of :meth:`populate`.
+        """
         self.populate()
 
     def _restore_steady_state(self):
@@ -800,22 +1066,44 @@ class Population(P, Sliceable):
             return True
         return False
 
-    def initialize(self, force_rebuild=False):
+    def initialize(self, force_rebuild=False, populate_parameter_buffers=True):
+        """
+        Build, populate, and initialize mechanisms for simulation.
+
+        Parameters
+        ----------
+        force_rebuild : bool, optional
+            If True, force rebuilding of mechanisms even if a built graph
+            already exists.
+
+        Returns
+        -------
+        Population
+            The initialized population instance.
+        """
         self.build(force_rebuild)
-        self.populate_parameter_buffers()
+        if populate_parameter_buffers:
+            self.populate_parameter_buffers()
         self.intra = self.build_intra()
         if self._restore_steady_state():
             return self
         self.integrator.init_v(self)
         self.pre_initialize()
-        self.integrator.mech.initialize(self.v, self.celsius, self.diam)
+        self.integrator.mech.initialize(
+            self.v, self.celsius, self.diam, populate=populate_parameter_buffers
+        )
         self.post_initialize()
-        self.integrator.mech.initialize(self.v, self.celsius, self.diam)
+        self.integrator.mech.initialize(
+            self.v, self.celsius, self.diam, populate=populate_parameter_buffers
+        )
         self.t = self.t.zero_().detach()
         self.initialized = True
         return self
 
     def initialize_(self):
+        """
+        In-place alias of :meth:`initialize`.
+        """
         self.initialize()
 
     def load(self, state_dict):
@@ -850,9 +1138,25 @@ class Population(P, Sliceable):
         return self
 
     def load_(self, state_dict):
+        """
+        In-place alias of :meth:`load`.
+
+        Parameters
+        ----------
+        state_dict : Union[str, Mapping]
+            Argument forwarded to :meth:`load`.
+        """
         self.load(state_dict)
 
     def state_names(self) -> List[str]:
+        """
+        Enumerate state tensor names managed by the population.
+
+        Returns
+        -------
+        list of str
+            Ordered state names starting with ``'v'``.
+        """
         out = ["v"]
         return out + self.integrator.mech.all_states()
 
@@ -890,6 +1194,14 @@ class Population(P, Sliceable):
         return self
 
     def cache_(self, name: str = None):
+        """
+        In-place alias of :meth:`cache`.
+
+        Parameters
+        ----------
+        name : str, optional
+            Cache key forwarded to :meth:`cache`.
+        """
         self.cache(name)
 
     def restore(self, name: str = None):
@@ -927,13 +1239,36 @@ class Population(P, Sliceable):
         return self
 
     def restore_(self, name: str = None):
+        """
+        In-place alias of :meth:`restore`.
+
+        Parameters
+        ----------
+        name : str, optional
+            Cache key forwarded to :meth:`restore`.
+        """
         self.restore(name)
 
     def delete_injections(self):
+        """
+        Remove all registered intra-cellular injections.
+
+        Returns
+        -------
+        None
+        """
         self.injections = []
         self.intra = None
 
     def build_intra(self):
+        """
+        Build the intra-cellular stimulation handler.
+
+        Returns
+        -------
+        Intra or None
+            Intra stimulus object when injections are configured, otherwise None.
+        """
         if self.injections:
             return Intra(self, self.injections)
         return None
@@ -973,19 +1308,76 @@ class Population(P, Sliceable):
         self._mech_data.setdefault(mechanism, []).append((alias, kwargs, key))
 
     def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
+        """
+        Register explicit ion handling style parameters.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier (e.g., ``'na'``).
+        c_style : int
+            Style flag for concentration handling.
+        e_style : int
+            Style flag for reversal potential handling.
+        einit : int
+            Initialization flag for equilibration.
+        eadvance : int
+            Advance-time flag for equilibration updates.
+        cinit : int
+            Initialization flag for concentration updates.
+        """
         assert ion in valid_ions(), f"Invalid ion: {ion}"
         self._ion_style[ion] = (c_style, e_style, einit, eadvance, cinit)
 
     def get_ion_style(self, ion):
+        """
+        Retrieve the ion style tuple for a species.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        tuple
+            Ion style tuple ``(c_style, e_style, einit, eadvance, cinit)``.
+        """
         if ion in self._ion_style:
             return self._ion_style[ion]
         return self.calc_ion_style(ion)
 
     def c_is_written(self, ion):
+        """
+        Determine whether concentration values are written for an ion.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        bool
+            True if any mechanism writes concentrations for the ion.
+        """
         d = self._ion_write_c.get(ion, {})
         return bool(d)
 
     def c_is_read(self, ion):
+        """
+        Determine whether concentration values are read for an ion.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        bool
+            True if any mechanism reads intra- or extracellular concentration.
+        """
         d = self._ion_read.get(ion, {})
         if not d:
             return False
@@ -993,12 +1385,38 @@ class Population(P, Sliceable):
         return f"{ion}i" in check or f"{ion}o" in check
 
     def e_is_read(self, ion):
+        """
+        Determine whether reversal potentials are read for an ion.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        bool
+            True if any mechanism reads the ion's equilibrium potential.
+        """
         d = self._ion_read.get(ion, {})
         if not d:
             return False
         return f"e{ion}" in list(itertools.chain(*d.values()))
 
     def calc_ion_style(self, ion):
+        """
+        Infer ion style flags based on current read/write registrations.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        tuple
+            Tuple of style flags ``(c_style, e_style, einit, eadvance, cinit)``.
+        """
         c_is_written = self.c_is_written(ion)
         c_is_read = self.c_is_read(ion)
         e_is_read = self.e_is_read(ion)
@@ -1016,6 +1434,18 @@ class Population(P, Sliceable):
         return (0, 0, 0, 0, 0)
 
     def register_mech(self, m, shape, key):
+        """
+        Register a compiled mechanism with the population.
+
+        Parameters
+        ----------
+        m : Mechanism
+            Mechanism instance produced by ``compile_mechanism``.
+        shape : tuple of int
+            Shape tuple describing the mechanism's parameter layout.
+        key : Any
+            Indexing metadata describing where the mechanism applies.
+        """
         name = m.name
         mech = m.__class__
         self._m_name.append(name)
@@ -1038,34 +1468,115 @@ class Population(P, Sliceable):
     # -- Device and dtype methods --
 
     def cuda(self, device=None):
+        """
+        Move the population to a CUDA device, rebuilding mechanisms if needed.
+
+        Parameters
+        ----------
+        device : int or torch.device, optional
+            CUDA device identifier.
+
+        Returns
+        -------
+        Population
+            The population instance on the requested device.
+        """
         self.build()
         return super().cuda(device=device)
 
     def cpu(self):
+        """
+        Move the population to CPU memory, rebuilding mechanisms if needed.
+
+        Returns
+        -------
+        Population
+            The population instance on CPU.
+        """
         self.build()
         return super().cpu()
 
     def float(self):
+        """
+        Cast population parameters and buffers to ``torch.float32``.
+
+        Returns
+        -------
+        Population
+            The population instance with converted dtype.
+        """
         self.build()
         return super().float()
 
     def double(self):
+        """
+        Cast population parameters and buffers to ``torch.float64``.
+
+        Returns
+        -------
+        Population
+            The population instance with converted dtype.
+        """
         self.build()
         return super().double()
 
     def half(self):
+        """
+        Cast population parameters and buffers to ``torch.float16``.
+
+        Returns
+        -------
+        Population
+            The population instance with converted dtype.
+        """
         self.build()
         return super().half()
 
     def bfloat16(self):
+        """
+        Cast population parameters and buffers to ``torch.bfloat16``.
+
+        Returns
+        -------
+        Population
+            The population instance with converted dtype.
+        """
         self.build()
         return super().bfloat16()
 
     def to(self, *args, **kwargs):
+        """
+        Move the population to a new device or dtype, rebuilding if necessary.
+
+        Parameters
+        ----------
+        *args : Any
+            Positional arguments forwarded to :meth:`torch.nn.Module.to`.
+        **kwargs : Any
+            Keyword arguments forwarded to :meth:`torch.nn.Module.to`.
+
+        Returns
+        -------
+        Population
+            The population instance after conversion.
+        """
         self.build()
         return super().to(*args, **kwargs)
 
     def build(self, force_rebuild=False):
+        """
+        Compile and register mechanisms, assembling ion bookkeeping.
+
+        Parameters
+        ----------
+        force_rebuild : bool, optional
+            If True, rebuild even when a compiled configuration already exists.
+
+        Returns
+        -------
+        Population
+            The population instance, ready for simulation.
+        """
         if self.is_built and not (force_rebuild or self._flag_rebuild):
             return self
 
@@ -1144,25 +1655,49 @@ class Population(P, Sliceable):
         return self
 
     def build_(self, force_rebuild=False):
+        """
+        In-place alias of :meth:`build`.
+
+        Parameters
+        ----------
+        force_rebuild : bool, optional
+            Forwarded to :meth:`build`.
+        """
         self.build(force_rebuild=force_rebuild)
 
     def detach(self):
         """
-        Detach the model from the current computation graph.
+        Detach parameters and buffers from the autograd graph.
 
-        This method is used to detach the model's parameters and buffers
-        from the current computation graph, which is useful for preventing
-        gradients from being computed during backpropagation.
+        Returns
+        -------
+        Population
+            The population instance with detached states.
         """
         self.integrator.detach(self)
         return self
 
     def detach_(self):
+        """
+        In-place alias of :meth:`detach`.
+        """
         self.detach()
 
     def register_parametrization(
         self, name: str, parametrization: torch.nn.Module, unsafe=True
     ):
+        """
+        Register a parametrization hook on a parameter tensor.
+
+        Parameters
+        ----------
+        name : str
+            Name of the parameter to parametrize.
+        parametrization : torch.nn.Module
+            Module providing the parametrization transform.
+        unsafe : bool, optional
+            Forwarded to :func:`torch.nn.utils.parametrize.register_parametrization`.
+        """
         torch.nn.utils.parametrize.register_parametrization(
             self, name, parametrization, unsafe=unsafe
         )
@@ -1211,6 +1746,23 @@ class Population(P, Sliceable):
         ]
 
     def find_not(self, exclude=None, fuzzy=True, match_case=False):
+        """
+        Find indices that do not match provided patterns.
+
+        Parameters
+        ----------
+        exclude : str or list of str, optional
+            Patterns describing compartments to omit.
+        fuzzy : bool, optional
+            If True, enable fuzzy matching. Default is True.
+        match_case : bool, optional
+            If True, perform case-sensitive matching. Default is False.
+
+        Returns
+        -------
+        list or slice
+            Indices of entries that do not match ``exclude``.
+        """
         indices = find_indices_smart(
             self.names,
             exclude=exclude,
@@ -1230,6 +1782,31 @@ class Population(P, Sliceable):
         as_list=False,
         loc=None,
     ):
+        """
+        Locate compartment indices matching inclusion/exclusion rules.
+
+        Parameters
+        ----------
+        include : str or list of str, optional
+            Patterns that must be present.
+        exclude : str or list of str, optional
+            Patterns that must not be present. Defaults to ``'branchpoint'``.
+        fuzzy : bool, optional
+            If True, enable fuzzy matching. Default is True.
+        match_case : bool, optional
+            If True, perform case-sensitive matching. Default is False.
+        full_report : bool, optional
+            If True, return the full :class:`FindResult`. Default is False.
+        as_list : bool, optional
+            If True and the result is a slice, convert it to a list.
+        loc : float, optional
+            Optional location refinement parameter in ``[0, 1]``.
+
+        Returns
+        -------
+        FindResult or Union[list, slice]
+            Either the result object or the indices, depending on ``full_report``.
+        """
         indices = find_indices_smart(
             self.names,
             include=include,
@@ -1259,9 +1836,12 @@ class Population(P, Sliceable):
 
     def terminal_indices(self):
         """
-        Returns the indices of terminal nodes in the tree.
+        Indices of terminal nodes in the morphology tree.
 
-        A terminal node is defined as a node that has no children in the graph.
+        Returns
+        -------
+        list of int
+            Node indices that have no outgoing edges in ``self.graph``.
         """
         terminal_mask = torch.tensor(
             [
@@ -1273,12 +1853,26 @@ class Population(P, Sliceable):
         return torch.nonzero(terminal_mask, as_tuple=False).squeeze(1).tolist()
 
     def init_v(self):
+        """
+        Initialize membrane potential buffers via the integrator.
+        """
         self.integrator.init_v(self)
 
     def init_v_(self):
+        """
+        In-place alias of :meth:`init_v`.
+        """
         self.init_v()
 
     def n(self) -> int:
+        """
+        Number of compartments per neuron.
+
+        Returns
+        -------
+        int
+            Size of the penultimate dimension in ``self.v``.
+        """
         return self.v.shape[-2]
 
     def set_value(self, name: str, value: torch.Tensor):
@@ -1305,22 +1899,75 @@ class Population(P, Sliceable):
 
     # -- batching stuff --
     def is_batched(self):
+        """
+        Check whether the population has explicit batch dimensions.
+
+        Returns
+        -------
+        bool
+            True when ``self.v`` has more than two dimensions.
+        """
         return len(self.shape) > 2
 
     def core_shape(self):
+        """
+        Shape of the neuron/compartment dimensions.
+
+        Returns
+        -------
+        tuple of int
+            Final two dimensions of ``self.v``.
+        """
         return self.shape[-2:]
 
     def batched_shape(self):
+        """
+        Flattened shape suitable for batched integrator operations.
+
+        Returns
+        -------
+        tuple of int
+            Pair ``(batch_size, n_compartments)`` compatible with mechanism calls.
+        """
         B = np.prod(self.shape[:-1])
         return (B, self.shape[-1])
 
     def n_batch_dimensions(self):
+        """
+        Number of leading batch dimensions in ``self.v``.
+
+        Returns
+        -------
+        int
+            Count of batch axes.
+        """
         return len(self.shape) - 2
 
     def calc_shape_p(self):
+        """
+        Compute per-parameter broadcast shape accounting for batching.
+
+        Returns
+        -------
+        tuple of int
+            Shape with singleton batch dimensions followed by the core shape.
+        """
         return tuple([1] * self.n_batch_dimensions() + list(self.core_shape()))
 
     def batch(self, n):
+        """
+        Materialize explicit batch copies of state tensors.
+
+        Parameters
+        ----------
+        n : int
+            Number of batch replicas to create.
+
+        Returns
+        -------
+        Population
+            The population instance with replicated buffers.
+        """
         self.v = self.v.unsqueeze(0).expand(n, *self.v.shape).clone()
         if hasattr(self, "v_prev"):
             self.v_prev = self.v_prev.unsqueeze(0).expand(n, *self.v_prev.shape).clone()
@@ -1338,10 +1985,21 @@ class Population(P, Sliceable):
         return self
 
     def batch_(self, n):
+        """
+        In-place alias of :meth:`batch`.
+
+        Parameters
+        ----------
+        n : int
+            Number of batch replicas forwarded to :meth:`batch`.
+        """
         self.batch(n)
 
     # -- labeling stuff --
     def clear_labels(self):
+        """
+        Remove cached slice labels for compartments.
+        """
         for name in self._labels.keys():
             delattr(self, name)
         self._labels.clear()
@@ -1349,6 +2007,8 @@ class Population(P, Sliceable):
 
 # Define the return type for clarity
 class FindResult(NamedTuple):
+    """Container for compartment search results."""
+
     indices: Union[slice, torch.Tensor]
     local_indices: Dict[str, Union[slice, torch.Tensor]]
     local_sizes: Dict[str, int]
@@ -1572,6 +2232,14 @@ class Axon(Population):
         self.biophysics()
 
     def assemble_graphs(self):
+        """
+        Construct directed path graphs for each axon.
+
+        Returns
+        -------
+        list of networkx.DiGraph
+            Morphology graphs annotated with geometry metadata.
+        """
         graphs = []
         for i in range(self.n_ax):
             G = nx.path_graph(self.n_comp).to_directed()
@@ -1596,6 +2264,14 @@ class Axon(Population):
         pass
 
     def register_cid(self, cid):
+        """
+        Register a compartment identifier table for slicing utilities.
+
+        Parameters
+        ----------
+        cid : Any
+            Object exposing ``names`` used for label-based slicing.
+        """
         self.cid = cid
         self.names = self.cid.names.tolist()
         for name in np.unique(self.names):
@@ -1781,6 +2457,8 @@ class Myelinated(Axon):
     )
 
     class myelinated_rhoa(torch.nn.Module):
+        """Parametrization module that scales axial resistivity."""
+
         def __init__(self, deltax1, deltax2, deltax3, axond1, axond2, axond3):
             super().__init__()
             self.deltax1 = deltax1
@@ -1791,6 +2469,23 @@ class Myelinated(Axon):
             self.axond3 = axond3
 
         def forward(self, rhoa, dx, diameters):
+            """
+            Compute scaled axial resistivity parameters.
+
+            Parameters
+            ----------
+            rhoa : Tensor
+                Baseline axial resistivity.
+            dx : Tensor
+                Segment lengths in μm.
+            diameters : Tensor
+                Fiber diameters in μm.
+
+            Returns
+            -------
+            Tensor
+                Scaled axial resistivity values.
+            """
             diameters = diameters.unsqueeze(1) if diameters.ndim == 1 else diameters
             axon_d = self.axond1 * diameters**2 + self.axond2 * diameters + self.axond3
             deltax = (
@@ -1802,6 +2497,8 @@ class Myelinated(Axon):
             return rhoa
 
     class myelinated_node_d(torch.nn.Module):
+        """Parametrization module for node diameters."""
+
         def __init__(self, noded1, noded2, noded3):
             super().__init__()
             self.noded1 = noded1
@@ -1809,6 +2506,19 @@ class Myelinated(Axon):
             self.noded3 = noded3
 
         def forward(self, diam):
+            """
+            Compute node diameter from fiber diameter.
+
+            Parameters
+            ----------
+            diam : Tensor
+                Fiber diameters in μm.
+
+            Returns
+            -------
+            Tensor
+                Node diameters in μm.
+            """
             node_d = self.noded1 * diam**2 + self.noded2 * diam + self.noded3
             return node_d
 
@@ -1843,6 +2553,19 @@ class Myelinated(Axon):
         )
 
     def deltax(self, diameters):
+        """
+        Evaluate internodal spacing polynomial.
+
+        Parameters
+        ----------
+        diameters : Tensor
+            Fiber diameters in μm.
+
+        Returns
+        -------
+        Tensor
+            Internodal spacing in μm.
+        """
         deltax = self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
         return deltax
 
@@ -1857,27 +2580,91 @@ class Myelinated(Axon):
 
 # callback helpers
 def pre_loop_hook(c, m):
+    """
+    Invoke the registered pre-loop hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    """
     c.pre_loop_hook(m)
 
 
 def post_loop_hook(c, m):
+    """
+    Invoke the registered post-loop hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    """
     c.post_loop_hook(m)
 
 
 def pre_step_hook(c, m):
+    """
+    Invoke the registered pre-step hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    """
     c.pre_step_hook(m)
 
 
 @torch.compile
 def post_step_hook(c, m):
+    """
+    Invoke the registered post-step hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    """
     c.post_step_hook(m)
 
 
 def pre_chunk_hook(c, m, t):
+    """
+    Invoke the registered pre-chunk hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    t : Sequence[float]
+        Time values for the current chunk.
+    """
     c.pre_chunk_hook(m, t)
 
 
 def post_chunk_hook(c, m, t):
+    """
+    Invoke the registered post-chunk hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    t : Sequence[float]
+        Time values for the current chunk.
+    """
     c.post_chunk_hook(m, t)
 
 
@@ -1908,6 +2695,8 @@ def _merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
 
 # Custom exception to signal fallback to the slower method
 class NotComposableError(Exception):
+    """Raised when slice unions cannot be composed into a single slice."""
+
     pass
 
 
@@ -2062,6 +2851,28 @@ def compose_or_flatten_union(
 
 
 def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
+    """
+    Compile a mechanism over a set of indices with alias-specific parameters.
+
+    Parameters
+    ----------
+    model : Population
+        Population providing shape and batching information.
+    mechanism : type
+        Mechanism class to instantiate.
+    indices : list
+        Collection of index selectors describing placement of each alias.
+    aliases : list of str
+        Aliases assigned to each mechanism instance.
+    kwargs_list : list of dict
+        Additional keyword arguments for each aliased mechanism.
+
+    Returns
+    -------
+    tuple
+        Tuple ``(mechanism_instance, parameter_shape, total_index)`` ready for
+        registration via :meth:`Population.register_mech`.
+    """
     total_index, is_composable, shape, local_indices = compose_or_flatten_union(
         indices, model.core_shape()
     )

@@ -935,7 +935,7 @@ class Network(RNGMixin):
 
     connect_sparse_n = connect_prob_n
 
-    def build_synapses(self, dt):
+    def build_synapses(self, dt, max_delay_ms=None):
         for (pre_name, post_name, synapse, pre_var), specs in self.synapse_spec.items():
             pre_var = (
                 pre_var
@@ -961,6 +961,7 @@ class Network(RNGMixin):
                 delay=delay,
                 dt=dt,
                 pre_var=pre_var,
+                max_delay=max_delay_ms,
             ).to(device=self.device(), dtype=self.dtype())
 
             syn.setreference("t", lambda: self.t)
@@ -972,7 +973,7 @@ class Network(RNGMixin):
 
             self.synapses[f"{pre_name}:{pre_var}->{post_name}:{synapse.name}"] = syn
 
-    def build(self, dt):
+    def build(self, dt, max_delay_ms=None):
         """
         Build the network by initializing populations and synapses.
         This method should be called before running the network.
@@ -980,17 +981,22 @@ class Network(RNGMixin):
         if not self.built or self.dt != dt:
             torch._dynamo.reset()
             self.dt = dt
-            self.build_synapses(dt)
+            self.build_synapses(dt, max_delay_ms=max_delay_ms)
             self.built = True
         return self
 
     def initialize(
-        self, dt: float, reinit_weights: bool = True, reinit_delays: bool = True, t=0.0
+        self,
+        dt: float,
+        reinit_weights: bool = True,
+        reinit_delays: bool = True,
+        t=0.0,
+        max_delay_ms=None,
     ):
         """
         Initialize the network. Builds synapses, initializes populations and netstim (if exists).
         """
-        self.build(dt)
+        self.build(dt, max_delay_ms=max_delay_ms)
         self.t = self.t.detach()
         self.t.fill_(t)
         for pop in self.populations.values():

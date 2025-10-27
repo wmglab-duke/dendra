@@ -1522,3 +1522,32 @@ def sliding_window_average(x, window_size: int):
     # Remove the extra batch dimension (squeeze dimension 0)
     out = out_perm.squeeze(0)
     return out
+
+
+class ResolventPenalty(Callback):
+    def __init__(self, margin=1e-4, weight=1e-6):
+        super().__init__()
+        self.margin = float(margin)
+        self.weight = float(weight)
+
+    def pre_loop_hook(self, model):
+        self.penalty = torch.zeros((), device=model.device(), dtype=model.dtype())
+
+    def post_step_hook(self, model):
+        a_s, b_s, c_s = model.integrator._last_bands  # tensors with grad
+
+        # Align sub/super with main diagonal
+        padL = torch.nn.functional.pad(a_s.abs(), (0, 1))
+        padU = torch.nn.functional.pad(c_s.abs(), (1, 0))
+
+        # Dimensionless dominance:  dom* = 1 - (|a|+|c|)/|b|
+        dom_star = 1.0 - (padL + padU) / (b_s.abs() + 1e-12)
+
+        # Target a tiny positive margin in dimensionless units
+        eps = getattr(self, "margin", 5e-2)  # e.g., 0.05
+        alpha = getattr(self, "weight", 1e-9)  # start VERY small
+        dt_s = self.dt * 1e-3  # scale penalty by dt in seconds
+
+        # Smooth hinge that’s zero when dom* >= eps
+        res_pen = alpha * torch.nn.functional.softplus(eps - dom_star).mean() * dt_s
+        self.penalty = self.penalty + res_pen

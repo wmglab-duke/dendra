@@ -98,9 +98,16 @@ class _bwd_euler_ub(Integrator):
     Implicit Euler method.
     """
 
-    def __init__(self, model, mech, method="thomas", **kw):
+    def __init__(self, model, mech, method="thomas", clip_scale_backward=None, **kw):
         super().__init__(model, mech, **kw)
         self.method = method
+
+        self.use_gc_variant = False
+        if clip_scale_backward is not None:
+            self.register_buffer("clip_scale", torch.tensor(clip_scale_backward))
+            self.use_gc_variant = True
+
+        self._last_bands: Tuple[Tensor, Tensor, Tensor] = None
         B, K = model.np, model.nc
 
         # Buffers for diffusive diag, axonal conductance, membrane scale
@@ -127,7 +134,10 @@ class _bwd_euler_ub(Integrator):
                 self._solve = thomas_solve_cuda_t
             elif model.device().type == "cpu":
                 if AXONML_SOLVERS_AVAILABLE:
-                    self._solve = torch.ops.axonml_solvers.thomas_solve_t
+                    if self.use_gc_variant:
+                        self._solve = torch.ops.axonml_solvers.thomas_solve_t_gc
+                    else:
+                        self._solve = torch.ops.axonml_solvers.thomas_solve_t
                 else:
                     warnings.warn(
                         "Using `bwd_euler_ub` solver on CPU without axonml_solvers installed. "
@@ -220,11 +230,16 @@ class _bwd_euler_ub(Integrator):
         c_s = self.upper
         b_s = main
 
+        self._last_bands = (a_s, b_s, c_s)
+
         # scale RHS
         d_s = RHS  # divide each equation by its pivot b_i
 
         # solve tridiagonal system
-        v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
+        if self.use_gc_variant:
+            v_np1 = self._solve(a_s, b_s, c_s, d_s, self.clip_scale)  # (B, K)
+        else:
+            v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
 
         i_membrane = None
 
@@ -253,7 +268,7 @@ class _bwd_euler_bt(Integrator):
 
     v_vars = ["v", "vc"]
 
-    def __init__(self, model, mech, imem=None, method="triton", **kwargs):
+    def __init__(self, model, mech, imem=None, **kwargs):
         if not AXONML_SOLVERS_AVAILABLE:
             logging.warning(
                 "Only CUDA-based solvers available, using triton Thomas solver. "

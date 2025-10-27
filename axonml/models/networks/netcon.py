@@ -25,6 +25,7 @@ class NetCon(Referency):
         delay,
         dt,
         pre_var=None,
+        max_delay=None,
     ):
         super().__init__()
 
@@ -35,6 +36,7 @@ class NetCon(Referency):
         self.device = self.pre.device()
         self.dtype = self.pre.dtype()
         self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
+        self.max_delay = max_delay
 
         self.delay_ms = delay
         delay = delay.init().w
@@ -101,9 +103,7 @@ class NetCon(Referency):
         delay_steps = (delay / dt).round().long()
         self.register_buffer("delay_steps", delay_steps.flatten().to(self.device))
 
-        self.max_delay_steps = (
-            int(self.delay_steps.max().item()) + 1 if len(self.delay_steps) > 0 else 1
-        )
+        self.max_delay_steps = self._compute_max_delay_steps()
 
         buffer_shape = (self.max_delay_steps, self.syn_numel.item())
         self.register_buffer(
@@ -212,16 +212,22 @@ class NetCon(Referency):
             self._csr_counts = counts  # [n_pre_used]
             self._csr_conidx_sorted = order  # [n_conn]
 
+    def _commpute_max_delay_steps(self):
+        if self.max_delay is not None:
+            return int(self.max_delay / self.dt.item()) + 1
+        else:
+            return (
+                int(self.delay_steps.max().item()) + 1
+                if len(self.delay_steps) > 0
+                else 1
+            )
+
     def _rebuild_delay_buffers(self):
         with torch.no_grad():
             delay_steps = (self.delay_ms() / self.dt.to(self.dtype)).round().long()
             self.delay_steps.copy_(delay_steps.flatten().to(self.device))
 
-            self.max_delay_steps = (
-                int(self.delay_steps.max().item()) + 1
-                if len(self.delay_steps) > 0
-                else 1
-            )
+            self.max_delay_steps = self._commpute_max_delay_steps()
 
             buffer_shape = (self.max_delay_steps, self.syn_numel.item())
             self.delivery_buffer = torch.zeros(

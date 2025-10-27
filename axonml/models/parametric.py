@@ -36,12 +36,22 @@ def distribute_over(val, over="a"):
         return val
 
 
-def softplus_inv(y, beta=1.0, threshold=20.0):
-    # y > 0 assumed (add a tiny eps if needed)
+def softplus_inv(y, beta: float = 1.0, threshold: float = 20.0, eps: float = 1e-12):
+    """
+    Numerically stable inverse of softplus: x s.t. softplus(x, beta) = y.
+    - Uses log(expm1(.)) for small by to avoid cancellation.
+    - Uses by + log1p(-exp(-by)) for large by to avoid overflow.
+    - Clamps y to avoid -inf at exactly 0 during initialization.
+    """
     y = torch.as_tensor(y)
+    y = torch.clamp(y, min=eps)  # safer for init; prevents -inf params
     by = beta * y
-    # For large by, softplus(x) ≈ x  ⇒  x ≈ y (no exp needed)
-    return torch.where(by > threshold, y, (1.0 / beta) * torch.log(torch.expm1(by)))
+
+    small = by <= threshold
+    x_small = torch.log(torch.expm1(by)) / beta
+    x_large = (by + torch.log1p(-torch.exp(-by))) / beta  # stable for large by
+
+    return torch.where(small, x_small, x_large)
 
 
 class cacheable(torch.nn.Module):
@@ -59,27 +69,201 @@ class cacheable(torch.nn.Module):
             self._cache = self._compute(*args, **kwargs)
         return self._cache
 
-
-class PositiveParam(cacheable):
-    def __init__(self, init, min_val=0.0, beta=1.0, threshold=20.0):
-        super().__init__()
-        self.min_val = float(min_val)
-        self.beta = float(beta)
-        self.threshold = float(threshold)
-        init = torch.as_tensor(init, dtype=torch.float32)
-        # ensure strictly > min_val for the inverse
-        y = torch.clamp(init - self.min_val, min=1e-12)
-        rho0 = softplus_inv(y, beta=self.beta, threshold=self.threshold)
-        self.rho = torch.nn.Parameter(rho0)
-
-    def repeat(self, n):
+    def repeat(self, n: int):
         p = self(cache=(not self.training))
         return p.repeat(n)
 
+
+def ste_clamp(y, *, lo=None, hi=None, alpha_lo: float = 1.0, alpha_hi: float = 1.0):
+    """
+    Forward: hard clamp to [lo, hi].
+    Backward: use surrogate with slope 1 in-range; slope alpha_lo/alpha_hi when clamped.
+    """
+    y_sur = y
+    if lo is not None:
+        y_sur = torch.where(y < lo, lo + alpha_lo * (y - lo), y_sur)
+    if hi is not None:
+        y_sur = torch.where(y > hi, hi + alpha_hi * (y - hi), y_sur)
+
+    y_fwd = y
+    if lo is not None:
+        lo_t = torch.as_tensor(lo, device=y.device, dtype=y.dtype)
+        y_fwd = torch.maximum(y_fwd, lo_t)
+    if hi is not None:
+        hi_t = torch.as_tensor(hi, device=y.device, dtype=y.dtype)
+        y_fwd = torch.minimum(y_fwd, hi_t)
+
+    return y_sur + (y_fwd - y_sur).detach()
+
+
+# --- modules ---
+class Bounded(cacheable):
+    """
+    Trainable tensor with optional lower/upper bounds.
+
+    Bounds & modes:
+      - min=None, max=None:            identity
+      - min!=None, max=None:           lower bound via:
+           lower_mode="softplus"  ->  min + softplus(rho)      (exclusive)
+           lower_mode="hard-ste"  ->  ste_clamp(rho, lo=min)   (inclusive)
+           lower_mode="leaky-ste" ->  ste_clamp(..., alpha_lo=lower_alpha)
+      - min=None,  max!=None:          upper bound via:
+           cap_mode="softcap"    ->  max - softplus(max - y)
+           cap_mode="hard-ste"   ->  ste_clamp(y, hi=max)
+      - min!=None, max!=None:
+           cap_mode="sigmoid"    ->  min + (max-min)*sigmoid(beta*rho)
+           cap_mode="hard-ste"   ->  ste_clamp(y, lo=min, hi=max)
+
+    Args:
+        init, min_val, max_val, beta, threshold as before
+        lower_mode: "softplus" | "hard-ste" | "leaky-ste"
+        lower_alpha: slope used when clamped below min (for leaky-ste)
+        cap_mode: "auto"|"softcap"|"sigmoid"|"hard-ste"
+        cap_beta: temperature for softcap
+    """
+
+    def __init__(
+        self,
+        init,
+        *,
+        min_val: float | None = None,
+        max_val: float | None = None,
+        beta: float = 1.0,
+        threshold: float = 20.0,
+        lower_mode: str = "softplus",
+        lower_alpha: float = 0.1,
+        cap_mode: str = "auto",
+        cap_beta: float | None = None,
+    ):
+        super().__init__()
+        self.min_val = None if min_val is None else float(min_val)
+        self.max_val = None if max_val is None else float(max_val)
+        if (
+            self.min_val is not None
+            and self.max_val is not None
+            and not (self.min_val < self.max_val)
+        ):
+            raise ValueError("Require min_val < max_val when both bounds are set.")
+
+        self.beta = float(beta)
+        self.threshold = float(threshold)
+        self.lower_mode = lower_mode
+        self.lower_alpha = float(lower_alpha)
+        self.cap_mode = cap_mode
+        self.cap_beta = float(cap_beta) if cap_beta is not None else float(beta)
+
+        init = torch.as_tensor(init, dtype=torch.float32)
+
+        # ---- init rho consistent with forward mapping ----
+        if self.min_val is None and self.max_val is None:
+            rho0 = init
+
+        elif self.min_val is not None and self.max_val is None:
+            if self.lower_mode == "softplus":
+                y = torch.clamp(init - self.min_val, min=1e-12)
+                rho0 = softplus_inv(y, beta=self.beta, threshold=self.threshold)
+            else:
+                # STE lower modes use identity param
+                rho0 = init
+
+        elif self.min_val is None and self.max_val is not None:
+            if self._upper_mode(upper_only=True) == "hard-ste":
+                rho0 = init
+            else:
+                y = torch.clamp(self.max_val - init, min=1e-12)
+                rho0 = softplus_inv(y, beta=self.cap_beta, threshold=self.threshold)
+
+        else:
+            if self._upper_mode(upper_only=False) == "hard-ste":
+                rho0 = init
+            else:
+                rng = max(self.max_val - self.min_val, 1e-12)
+                t = torch.clamp((init - self.min_val) / rng, 1e-6, 1 - 1e-6)
+                rho0 = torch.special.logit(t) / self.beta
+
+        self.rho = torch.nn.Parameter(rho0)
+
+    def _upper_mode(self, *, upper_only: bool) -> str:
+        if self.max_val is None:
+            return "none"
+        if self.cap_mode == "auto":
+            return "softcap" if upper_only else "sigmoid"
+        if self.cap_mode not in {"softcap", "sigmoid", "hard-ste"}:
+            raise ValueError(f"Unknown cap_mode: {self.cap_mode}")
+        return self.cap_mode
+
+    def _apply_upper(self, y: torch.Tensor) -> torch.Tensor:
+        if self.max_val is None:
+            return y
+        mode = self._upper_mode(upper_only=(self.min_val is None))
+        if mode == "hard-ste":
+            return ste_clamp(y, hi=self.max_val)
+        if mode == "softcap":
+            return self.max_val - F.softplus(
+                self.max_val - y, beta=self.cap_beta, threshold=self.threshold
+            )
+        # sigmoid mode handled in both-bounds path
+        return y
+
     def _compute(self):
-        # Positive, unbounded above; for large rho returns ~rho (no overflow)
-        return self.min_val + F.softplus(
-            self.rho, beta=self.beta, threshold=self.threshold
+        # No bounds
+        if self.min_val is None and self.max_val is None:
+            return self.rho
+
+        # Lower-only
+        if self.min_val is not None and self.max_val is None:
+            if self.lower_mode == "softplus":
+                return self.min_val + F.softplus(
+                    self.rho, beta=self.beta, threshold=self.threshold
+                )
+            elif self.lower_mode in {"hard-ste", "leaky-ste"}:
+                alpha = 1.0 if self.lower_mode == "hard-ste" else self.lower_alpha
+                return ste_clamp(self.rho, lo=self.min_val, alpha_lo=alpha)
+            else:
+                raise ValueError(f"Unknown lower_mode: {self.lower_mode}")
+
+        # Upper-only
+        if self.min_val is None and self.max_val is not None:
+            return self._apply_upper(self.rho)
+
+        # Both bounds
+        if self._upper_mode(upper_only=False) == "hard-ste":
+            # inclusive [min,max] with STE
+            return ste_clamp(self.rho, lo=self.min_val, hi=self.max_val)
+        else:
+            # default: sigmoid to (min,max)
+            s = torch.sigmoid(self.beta * self.rho)
+            return self.min_val + (self.max_val - self.min_val) * s
+
+
+class PositiveParam(Bounded):
+    """
+    Special case of Bounded with min_val=0 by default.
+    Set include_zero=True to make the lower bound inclusive (via STE).
+    """
+
+    def __init__(
+        self,
+        init,
+        *,
+        include_zero: bool = False,
+        max_val: float | None = None,
+        beta: float = 1.0,
+        threshold: float = 20.0,
+        lower_alpha: float = 0.1,  # used only if include_zero=True (leaky-ste)
+        cap_mode: str = "auto",
+        cap_beta: float | None = None,
+    ):
+        super().__init__(
+            init,
+            min_val=0.0,
+            max_val=max_val,
+            beta=beta,
+            threshold=threshold,
+            lower_mode=("leaky-ste" if include_zero else "softplus"),
+            lower_alpha=lower_alpha,
+            cap_mode=cap_mode,
+            cap_beta=cap_beta,
         )
 
 

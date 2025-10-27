@@ -117,9 +117,10 @@ class MechanismHandler(torch.nn.Module):
                     self._map.append((c_idx, mech, f"{ion}_with_g", scale_f))
                     self._map_exp.append((c_idx, mech, f"{ion}", scale_f))
 
-    def initialize(self, v, celsius, diameters):
+    def initialize(self, v, celsius, diameters, populate=True):
         self.make_maps()
-        self.populate()
+        if populate:
+            self.populate()
         self.ion_init(celsius)
         self.set_buffers(diameters)
         self.init_i_g_bufs(v)
@@ -308,7 +309,7 @@ class MechanismHandler(torch.nn.Module):
 
     def set_buffers(self, diameters):
         for m in self.mechanisms.values():
-            m.diam.set_(diameters)
+            m.diam = m.diam.set_(diameters).detach().clone()
 
         for ion, dict_of_mech_and_quantities in self.write_ion_c.items():
             for mech, quantities in dict_of_mech_and_quantities.items():
@@ -318,9 +319,8 @@ class MechanismHandler(torch.nn.Module):
                     setattr(
                         m,
                         quantity,
-                        torch.empty(q.shape, device=q.device, dtype=q.dtype),
+                        torch.empty(q.shape, device=q.device, dtype=q.dtype).copy(q),
                     )
-                    getattr(m, quantity).copy_(q)
                     for _, s in self.mechanisms[mech].DE.items():
                         setattr(s, quantity, getattr(m, quantity))
 

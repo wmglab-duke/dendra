@@ -49,8 +49,7 @@ class Integrator(torch.nn.Module):
             self.initialized = True
 
     def init_v(self, model):
-        model.v[:] = model.v_init
-        model.v = model.v.detach().contiguous()
+        model.v = model.v.detach().clone().contiguous().copy_(model.v_init)
         if self.imem:
             model.i_membrane = torch.zeros_like(model.v).detach()
 
