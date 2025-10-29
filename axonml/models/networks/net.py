@@ -148,8 +148,6 @@ def check_weight_shape(weight, pre_idx):
     """
     if isinstance(weight, float):
         return len(pre_idx)
-    if isinstance(weight, torch.nn.Module):
-        return len(pre_idx)
     if isinstance(weight, torch.Tensor):
         if weight.ndim == 0:
             return len(pre_idx)
@@ -167,6 +165,8 @@ def check_weight_shape(weight, pre_idx):
                 f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
             )
         return 1
+    if isinstance(weight, torch.nn.Module):
+        return len(pre_idx)
     raise TypeError(f"Unsupported type for weight: {type(weight)}.")
 
 
@@ -971,14 +971,16 @@ class Network(RNGMixin):
             else:
                 syn.eval()
 
-            self.synapses[f"{pre_name}:{pre_var}->{post_name}:{synapse.name}"] = syn
+            self.synapses[
+                f"{pre_name}:{pre_var.replace('.', '_')}->{post_name}:{synapse.name}"
+            ] = syn
 
-    def build(self, dt, max_delay_ms=None):
+    def build(self, dt, max_delay_ms=None, force_rebuild=False):
         """
         Build the network by initializing populations and synapses.
         This method should be called before running the network.
         """
-        if not self.built or self.dt != dt:
+        if not self.built or self.dt != dt or force_rebuild:
             torch._dynamo.reset()
             self.dt = dt
             self.build_synapses(dt, max_delay_ms=max_delay_ms)
@@ -992,11 +994,12 @@ class Network(RNGMixin):
         reinit_delays: bool = True,
         t=0.0,
         max_delay_ms=None,
+        force_rebuild: bool = False,
     ):
         """
         Initialize the network. Builds synapses, initializes populations and netstim (if exists).
         """
-        self.build(dt, max_delay_ms=max_delay_ms)
+        self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
         self.t = self.t.detach()
         self.t.fill_(t)
         for pop in self.populations.values():
@@ -1036,15 +1039,16 @@ class Network(RNGMixin):
             delivery_buffer = dilate(
                 delivery_buffer, float(old_dt), float(self.dt), n_limit=n_limit
             )
-            syn.has_spiked = syn.has_spiked.detach().copy_(has_spiked)
-            syn.is_spiking = syn.is_spiking.detach().copy_(is_spiking)
-            syn.delivery_buffer = syn.delivery_buffer.detach().copy_(delivery_buffer)
+            if not syn.skip_thresholding:
+                syn.has_spiked = (has_spiked).detach()
+                syn.is_spiking = (is_spiking).detach()
+            syn.delivery_buffer = syn.delivery_buffer.copy_(delivery_buffer).detach()
 
-    def initialize_(self, dt: float, reinit_weights: bool = True):
+    def initialize_(self, *args, **kwargs):
         """
         Initialize the network without returning self.
         """
-        self.initialize(dt, reinit_weights=reinit_weights)
+        self.initialize(*args, **kwargs)
 
     def init_synapses(
         self,
@@ -1311,8 +1315,8 @@ class Network(RNGMixin):
         with torch.no_grad():
             if self.netstim is not None:
                 self.netstim._prep_start_for_steady_state(tstop)
-            self.initialize(dt, t=-tstop)
             self.eval()
+            self.initialize(dt, t=-tstop, force_rebuild=True)
             self.run(tstop, progressbar=progressbar)
             if self.netstim is not None:
                 self.netstim._reset_start_times()
@@ -1343,6 +1347,25 @@ class Network(RNGMixin):
     def set_synaptic_diff_config(self, **kwargs):
         for syn in self.synapses.values():
             syn.set_diff_config(**kwargs)
+
+    # utilities
+    def concatenated_weights(self):
+        """
+        Returns the concatenated weights of all synapses.
+        """
+        return torch.cat([syn.w.flatten() for syn in self.synapses.values()])
+
+    def weights(self):
+        """
+        Returns the weights of all synapses as a dictionary.
+        """
+        return {name: syn.w for name, syn in self.synapses.items()}
+
+    def weight_modules(self):
+        """
+        Returns the weight modules of all synapses as a dictionary.
+        """
+        return {name: syn.weight for name, syn in self.synapses.items()}
 
 
 def prepare_intra(intra_c, intra, local_ind):

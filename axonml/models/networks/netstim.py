@@ -109,7 +109,7 @@ class NetStim(torch.nn.Module, Sliceable):
             self._rng.manual_seed(self.seed)
 
     def _prep_start_for_steady_state(self, tstop):
-        self.start.fill_(-tstop)
+        self.start.fill_(-tstop + self.start_cache)
 
     def _reset_start_times(self):
         self.start.detach().copy_(self.start_cache)

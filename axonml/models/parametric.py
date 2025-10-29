@@ -235,6 +235,9 @@ class Bounded(cacheable):
             s = torch.sigmoid(self.beta * self.rho)
             return self.min_val + (self.max_val - self.min_val) * s
 
+    def __len__(self):
+        return self.rho.numel()
+
 
 class PositiveParam(Bounded):
     """

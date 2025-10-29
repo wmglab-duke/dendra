@@ -212,7 +212,7 @@ class NetCon(Referency):
             self._csr_counts = counts  # [n_pre_used]
             self._csr_conidx_sorted = order  # [n_conn]
 
-    def _commpute_max_delay_steps(self):
+    def _compute_max_delay_steps(self):
         if self.max_delay is not None:
             return int(self.max_delay / self.dt.item()) + 1
         else:
@@ -227,7 +227,7 @@ class NetCon(Referency):
             delay_steps = (self.delay_ms() / self.dt.to(self.dtype)).round().long()
             self.delay_steps.copy_(delay_steps.flatten().to(self.device))
 
-            self.max_delay_steps = self._commpute_max_delay_steps()
+            self.max_delay_steps = self._compute_max_delay_steps()
 
             buffer_shape = (self.max_delay_steps, self.syn_numel.item())
             self.delivery_buffer = torch.zeros(
