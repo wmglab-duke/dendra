@@ -1,3 +1,5 @@
+"""Core data structures and utilities for AxonML population models."""
+
 import itertools
 import math
 import re

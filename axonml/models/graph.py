@@ -1,3 +1,5 @@
+"""Graph utilities for analysing AxonML morphologies."""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -37,11 +39,18 @@ def get_area_from_graph(G: nx.DiGraph) -> torch.Tensor:
 
 
 def _edge_signature(G: GraphLike):
-    """
-    A label-sensitive edge signature for quick equality checks across graphs
-    of the same directed/multigraph kind. Ignores attributes.
-    - Simple graphs: frozenset of edges (undirected normalized).
-    - Multi* graphs : Counter of multiplicities per (u,v) (undirected normalized).
+    """Generate a hashable signature for a graph's edge structure.
+
+    Parameters
+    ----------
+    G : GraphLike
+        Input graph.
+
+    Returns
+    -------
+    collections.Counter or frozenset
+        Signature capturing edge multiplicity and direction appropriate for
+        the graph type.
     """
     if G.is_multigraph():
         c = Counter()
@@ -61,9 +70,17 @@ def _edge_signature(G: GraphLike):
 
 
 def share_topology_labeled(graphs: Iterable[GraphLike]) -> Tuple[bool, str]:
-    """
-    Return (ok, msg). True iff all graphs have the same node set and the same edges
-    between those very nodes (ignoring attributes).
+    """Check whether graphs share an identical labeled topology.
+
+    Parameters
+    ----------
+    graphs : Iterable[GraphLike]
+        Collection of graphs to compare.
+
+    Returns
+    -------
+    tuple of (bool, str)
+        Tuple containing a success flag and diagnostic message.
     """
     graphs = list(graphs)
     if not graphs:
@@ -89,8 +106,19 @@ def share_topology_labeled(graphs: Iterable[GraphLike]) -> Tuple[bool, str]:
 
 
 def _is_isomorphic_unlabeled(g1: GraphLike, g2: GraphLike) -> bool:
-    """
-    Label-agnostic isomorphism (ignores attributes, respects direction and multiplicity).
+    """Check unlabeled isomorphism ignoring node identities.
+
+    Parameters
+    ----------
+    g1 : GraphLike
+        First graph to compare.
+    g2 : GraphLike
+        Second graph to compare.
+
+    Returns
+    -------
+    bool
+        ``True`` if the graphs are isomorphic after relabeling, ``False`` otherwise.
     """
     directed = g1.is_directed()
     multi = g1.is_multigraph()
@@ -110,9 +138,17 @@ def _is_isomorphic_unlabeled(g1: GraphLike, g2: GraphLike) -> bool:
 
 
 def share_topology_isomorphic(graphs: Iterable[GraphLike]) -> Tuple[bool, str]:
-    """
-    Return (ok, msg). True iff all graphs are mutually isomorphic (same connectivity
-    up to node relabeling), ignoring all attributes.
+    """Check whether graphs are mutually isomorphic.
+
+    Parameters
+    ----------
+    graphs : Iterable[GraphLike]
+        Collection of graphs to compare.
+
+    Returns
+    -------
+    tuple of (bool, str)
+        Tuple containing a success flag and diagnostic message.
     """
     graphs = list(graphs)
     if not graphs:

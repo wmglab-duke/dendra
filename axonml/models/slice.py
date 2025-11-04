@@ -1,3 +1,5 @@
+"""Helpers for slicing neural populations and mechanisms."""
+
 from __future__ import annotations
 
 import math
@@ -9,7 +11,24 @@ import torch
 
 
 def expand_into_shape(src, index, shape, fill_value=torch.nan):
-    # out is just temporary storage → no grad required
+    """Scatter a source tensor into a larger target shape.
+
+    Parameters
+    ----------
+    src : torch.Tensor
+        Source tensor to insert into ``out``.
+    index : tuple
+        Index tuple compatible with ``shape``.
+    shape : Sequence[int]
+        Target tensor shape.
+    fill_value : float, optional
+        Value used to initialise the output tensor. Defaults to ``torch.nan``.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor with ``src`` written at ``index``.
+    """
     out = torch.full(shape, fill_value, dtype=src.dtype, device=src.device)
     out[index] = src
     return out
@@ -21,18 +40,16 @@ IndexElement = Union[int, slice, np.ndarray, list, tuple]
 
 @dataclass(slots=True)
 class IndexSpec:
-    """
-    Canonical description of one indexing request.
+    """Canonical description of a single indexing request.
 
     Attributes
     ----------
-    index : Tuple[IndexElement, ...]
-        Exactly `ndim` elements, no Ellipsis, no `None` (new-axis) —
-        safe to pass straight to `array.__getitem__`.
+    index : tuple of IndexElement
+        Expanded index without ellipsis or ``None`` axes.
     is_scalar : bool
-        True if the result collapses to a scalar.
-    out_shape : Tuple[int, ...]
-        What `array[key]` would return, **including** new axes.
+        ``True`` when the result is scalar valued.
+    shape : tuple of int
+        Shape produced by applying ``index`` to a tensor.
     """
 
     index: Tuple[IndexElement, ...]
@@ -41,16 +58,21 @@ class IndexSpec:
 
 
 def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
-    """
-    Turn *any* valid key plus `shape` into a reusable IndexSpec.
-    Works for NumPy **and** PyTorch rules (they're identical here).
+    """Normalise an indexing key for a tensor with ``shape``.
 
-    Examples
-    --------
-    >>> shape = (4, 5, 6)
-    >>> spec = parse_key((Ellipsis, 2, None), shape)
-    >>> spec
-    IndexSpec(index=(slice(None), slice(None), 2), new_axes=(3,), ...)
+    Parameters
+    ----------
+    key : Any
+        Index compatible with PyTorch/NumPy semantics.
+    shape : Sequence[int]
+        Shape of the array to index.
+    device : torch.device or None, optional
+        Device used for temporary tensor allocation.
+
+    Returns
+    -------
+    IndexSpec
+        Structured description of the indexing request.
     """
     out = torch.empty(shape, device=device)[key]  # type: ignore
 
@@ -62,6 +84,20 @@ def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
 
 
 class Slice:
+    """View onto a subset of a population or mechanism.
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Underlying model providing data accessors.
+    index_spec : IndexSpec
+        Normalised indexing information.
+    base_shape : tuple of int, optional
+        Shape of the parent tensor before slicing.
+    parent_slice : Slice or None, optional
+        Parent slice if this view is derived from another slice.
+    """
+
     _RESERVED = ("model", "index_spec", "base_shape", "parent_slice")
 
     def __init__(
@@ -91,6 +127,7 @@ class Slice:
         return object.__getattribute__(self, "index_spec").is_scalar
 
     def numel(self) -> int:
+        """Return the number of selected elements."""
         return int(np.prod(object.__getattribute__(self, "index_spec").shape))
 
     @property
@@ -105,6 +142,20 @@ class Slice:
     # Public API
     # -------------------------
     def inspect(self, var: str, mechanism: Optional[str] = None) -> Any:
+        """Return a read-only view of ``var`` constrained to the slice.
+
+        Parameters
+        ----------
+        var : str
+            Attribute name to inspect.
+        mechanism : str or None, optional
+            Mechanism identifier when querying mechanism state.
+
+        Returns
+        -------
+        Any
+            Sliced value of the requested attribute.
+        """
         model = object.__getattribute__(self, "model")
         idx = object.__getattribute__(self, "index_spec").index
 
@@ -119,6 +170,7 @@ class Slice:
         return getattr(model, var)[idx]
 
     def _inspect(self, var: str):
+        """Inspect ``var`` on the wrapped model without mechanism handling."""
         model = object.__getattribute__(self, "model")
         base_shape = object.__getattribute__(self, "base_shape")
         idx = object.__getattribute__(self, "index_spec").index
@@ -133,9 +185,21 @@ class Slice:
         return getattr(model, var)[idx]
 
     def get(self, var: str, mechanism: Optional[str] = None) -> torch.Tensor:
+        """Alias for :meth:`inspect` returning a tensor."""
         return self.inspect(var, mechanism)
 
     def set(self, var: str, value: torch.Tensor, mechanism: Optional[str] = None):
+        """Write ``value`` into ``var`` constrained to the slice.
+
+        Parameters
+        ----------
+        var : str
+            Attribute name to mutate.
+        value : torch.Tensor
+            Tensor data to assign.
+        mechanism : str or None, optional
+            Mechanism identifier when writing mechanism state.
+        """
         model = object.__getattribute__(self, "model")
         idx = object.__getattribute__(self, "index_spec").index
 
@@ -160,6 +224,7 @@ class Slice:
             getattr(model, var).detach_()  # keep identity, drop history
 
     def inject(self, waveform):
+        """Register an injected waveform targeting this slice."""
         if self.is_empty:
             return  # no-op for empty slices
         model = object.__getattribute__(self, "model")
@@ -167,6 +232,7 @@ class Slice:
         model.injections.append((waveform, index_spec.shape, index_spec.index))
 
     def insert(self, mechanism, alias=None, ic=None, **kwargs):
+        """Insert a mechanism restricted to this slice."""
         if self.is_empty:
             return  # no-op for empty slices
         object.__getattribute__(self, "model").insert(
@@ -177,6 +243,7 @@ class Slice:
         )
 
     def label(self, name: str):
+        """Attach a label to the slice for convenient access."""
         parent_slice = object.__getattribute__(self, "parent_slice")
         if parent_slice is not None:
             # Attach label to the *wrapper* safely (avoid buffer interception)
@@ -187,6 +254,7 @@ class Slice:
         model._labels[name] = self
 
     def __getitem__(self, key):
+        """Return a nested slice produced by applying ``key``."""
         model = object.__getattribute__(self, "model")
         idx = compose_indices(
             model.shape,
@@ -206,6 +274,7 @@ class Slice:
     # Interceptors
     # -------------------------
     def __setattr__(self, name, value):
+        """Intercept assignments to pass through to the underlying model."""
         # Always allow internal fields
         if name in Slice._RESERVED:
             object.__setattr__(self, name, value)
@@ -228,6 +297,7 @@ class Slice:
         object.__setattr__(self, name, value)
 
     def __getattr__(self, name: str) -> Any:
+        """Delegate attribute access to the underlying model when necessary."""
         # Only runs if normal lookup failed
         try:
             model = object.__getattribute__(self, "model")
@@ -258,12 +328,14 @@ class Slice:
     # Misc
     # -------------------------
     def __repr__(self):
+        """Return a developer-friendly representation."""
         spec = object.__getattribute__(self, "index_spec")
         return (
             f"Slice(index={spec.index}, shape={spec.shape}, is_scalar={spec.is_scalar})"
         )
 
     def _batch(self):
+        """Promote the slice to include a leading batch dimension."""
         model = object.__getattribute__(self, "model")
         index_spec = object.__getattribute__(self, "index_spec")
 
@@ -283,12 +355,23 @@ class Slice:
 
 
 def compose_indices(shape, idx1, idx2, *, device="cpu"):
-    """
-    Return idx3 (a tuple of index tensors) such that for any tensor
-    t with the given shape:  t[idx1][idx2] == t[idx3].
+    """Compose two successive indexing operations.
 
-    Works with ints, slices, ellipsis, None (newaxis), boolean masks,
-    and long/bool tensor indices.
+    Parameters
+    ----------
+    shape : Sequence[int]
+        Shape of the original tensor.
+    idx1 : tuple
+        First index applied to the tensor.
+    idx2 : tuple
+        Second index applied to the intermediate result ``tensor[idx1]``.
+    device : str or torch.device, optional
+        Device for intermediate tensors.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        Tuple ``idx3`` satisfying ``tensor[idx1][idx2] == tensor[idx3]``.
     """
     # 1) Build a flat index map shaped like `shape`
     numel = math.prod(shape)
@@ -304,9 +387,12 @@ def compose_indices(shape, idx1, idx2, *, device="cpu"):
 
 
 class Sliceable:
+    """Mixin enabling convenient slicing of population attributes."""
+
     def __init__(self):
         self._labels = {}
 
     def __getitem__(self, key):
+        """Return a :class:`Slice` corresponding to ``key``."""
         index = parse_key(key, self.shape)
         return Slice(self, index)

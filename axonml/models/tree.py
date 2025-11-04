@@ -1,3 +1,5 @@
+"""Tree-shaped population models and supporting utilities."""
+
 import torch
 import torch.nn.functional as F
 
@@ -7,7 +9,18 @@ from .core import Population
 
 
 def gather_morphology(graph):
-    # iterate through nodes and gather morphology data
+    """Extract morphology tensors from a graph.
+
+    Parameters
+    ----------
+    graph : networkx.DiGraph
+        Morphology graph whose nodes provide geometric attributes.
+
+    Returns
+    -------
+    dict
+        Mapping from attribute names to tensors shaped ``(1, n_comp)``.
+    """
     L, diam, x, y, z = [], [], [], [], []
 
     for i in range(len(graph.nodes)):
@@ -27,6 +40,18 @@ def gather_morphology(graph):
 
 
 def gather_membrane(graph):
+    """Extract membrane parameters from a graph.
+
+    Parameters
+    ----------
+    graph : networkx.DiGraph
+        Morphology graph whose nodes provide membrane attributes.
+
+    Returns
+    -------
+    dict
+        Mapping from attribute names to tensors shaped ``(1, n_comp)``.
+    """
     rhoa, cm = [], []
     for i in range(len(graph.nodes)):
         attrs = graph.nodes[i]
@@ -39,12 +64,20 @@ def gather_membrane(graph):
 
 
 class Tree(Population):
-    """
-    Base class for tree-like structures.
+    """Base class for tree-like population models.
 
-    This class serves as a foundation for creating tree structures that can
-    represent branching axons or dendrites in neural models. It inherits from
-    the Population class, allowing it to utilize population-level features.
+    Parameters
+    ----------
+    N : int
+        Number of population instances.
+    C : int
+        Number of compartments per population.
+    graph : networkx.DiGraph, optional
+        Morphology graph describing tree structure.
+    integrator : callable, optional
+        Integrator factory used for simulation.
+    **kwargs
+        Additional parameters forwarded to :class:`Population`.
     """
 
     def __init__(self, N, C, graph=None, integrator=None, **kwargs):
@@ -87,32 +120,28 @@ class Tree(Population):
 
     @property
     def graph(self):
-        """
-        Returns the graph structure of the tree.
-
-        Returns
-        -------
-        networkx.DiGraphs
-            The directed graph representing the tree structure.
-        """
+        """networkx.DiGraph: Underlying morphology graph."""
         return self._graph
 
     @classmethod
     def from_graph(cls, graph, N=1, integrator=None, **kwargs):
-        """
-        Create a Tree instance from a graph structure.
+        """Instantiate a tree population from a morphology graph.
 
         Parameters
         ----------
         graph : networkx.DiGraph
-            A graph representing the tree structure.
-        integrator : Integrator, optional
-            The integrator to use for the model. Defaults to None.
+            Graph describing compartment connectivity.
+        N : int, optional
+            Number of population instances. Defaults to ``1``.
+        integrator : callable, optional
+            Integrator factory. Defaults to :func:`axonml.models.integrators.dhs`.
+        **kwargs
+            Additional membrane parameters forwarded to :class:`Tree`.
 
         Returns
         -------
         Tree
-            An instance of the Tree class.
+            Configured tree population.
         """
         C = len(graph.nodes)
         data = gather_morphology(graph)
@@ -129,22 +158,23 @@ class Tree(Population):
 
     @classmethod
     def from_NEURON(cls, root_sec=None, N=1, integrator=None, **kwargs):
-        """
-        Create a Tree instance from a NEURON root section.
+        """Construct a tree population from a NEURON root section.
 
         Parameters
         ----------
-        root_sec : h.Section
-            The root section of the NEURON model.
+        root_sec : neuron.h.Section, optional
+            Root section of a NEURON morphology.
         N : int, optional
-            Number of instances of the tree. Default is 1.
-        integrator : Integrator, optional
-            The integrator to use for the model. Defaults to None.
+            Number of population instances. Defaults to ``1``.
+        integrator : callable, optional
+            Integrator factory for the population.
+        **kwargs
+            Additional keyword arguments forwarded to :meth:`from_graph`.
 
         Returns
         -------
         Tree
-            An instance of the Tree class.
+            Configured tree population.
         """
         from axonml.models.io import neuron_to_axonml_graph
 
@@ -156,22 +186,27 @@ class Tree(Population):
     def from_swc(
         cls, file_path, d_lambda=0.1, freq=100.0, N=1, integrator=None, **kwargs
     ):
-        """
-        Create a Tree instance from an SWC file.
+        """Construct a tree population from an SWC file.
 
         Parameters
         ----------
         file_path : str
-            Path to the SWC file.
+            Path to the SWC morphology file.
+        d_lambda : float, optional
+            Spatial discretisation factor for tree reconstruction.
+        freq : float, optional
+            Temporal sampling frequency in Hz.
         N : int, optional
-            Number of instances of the tree. Default is 1.
-        integrator : Integrator, optional
-            The integrator to use for the model. Defaults to None.
+            Number of population instances. Defaults to ``1``.
+        integrator : callable, optional
+            Integrator factory for the population.
+        **kwargs
+            Additional keyword arguments forwarded to :meth:`from_graph`.
 
         Returns
         -------
         Tree
-            An instance of the Tree class.
+            Configured tree population.
         """
         from axonml.models.io import read_swc
 
@@ -183,22 +218,27 @@ class Tree(Population):
     def from_neurolucida(
         cls, file_path, d_lambda=0.1, freq=100.0, N=1, integrator=None, **kwargs
     ):
-        """
-        Create a Tree instance from a Neurolucida file.
+        """Construct a tree population from a Neurolucida file.
 
         Parameters
         ----------
         file_path : str
-            Path to the Neurolucida file.
+            Path to the Neurolucida morphology file.
+        d_lambda : float, optional
+            Spatial discretisation factor for tree reconstruction.
+        freq : float, optional
+            Temporal sampling frequency in Hz.
         N : int, optional
-            Number of instances of the tree. Default is 1.
-        integrator : Integrator, optional
-            The integrator to use for the model. Defaults to None.
+            Number of population instances. Defaults to ``1``.
+        integrator : callable, optional
+            Integrator factory for the population.
+        **kwargs
+            Additional keyword arguments forwarded to :meth:`from_graph`.
 
         Returns
         -------
         Tree
-            An instance of the Tree class.
+            Configured tree population.
         """
         from axonml.models.io import read_neurolucida
 
@@ -209,16 +249,23 @@ class Tree(Population):
     from_asc = from_neurolucida
 
     def recentre(self, x=0.0, y=0.0, z=0.0, origin=None):
-        """
-        Recenters the tree structure so soma is at the origin.
+        """Recentre the morphology so the soma matches ``origin``.
+
         Parameters
         ----------
-        x : float, optional
-            X-coordinate of the new center. Default is 0.0.
-        y : float, optional
-            Y-coordinate of the new center. Default is 0.0.
-        z : float, optional
-            Z-coordinate of the new center. Default is 0.0.
+        x : float or torch.Tensor, optional
+            Target x-coordinate for the soma.
+        y : float or torch.Tensor, optional
+            Target y-coordinate for the soma.
+        z : float or torch.Tensor, optional
+            Target z-coordinate for the soma.
+        origin : int or None, optional
+            Compartment index of the soma. Defaults to the middle soma node.
+
+        Returns
+        -------
+        Tree
+            Modified instance for chaining.
         """
         x = torch.as_tensor(x, dtype=self.x.dtype, device=self.x.device)
         y = torch.as_tensor(y, dtype=self.y.dtype, device=self.y.device)
@@ -260,17 +307,21 @@ class Tree(Population):
         return self
 
     def shift(self, dx=0.0, dy=0.0, dz=0.0):
-        """
-        Shifts the tree structure by specified offsets.
+        """Translate the morphology by the specified offsets.
 
         Parameters
         ----------
-        dx : float, optional
-            Offset in the x-direction. Default is 0.0.
-        dy : float, optional
-            Offset in the y-direction. Default is 0.0.
-        dz : float, optional
-            Offset in the z-direction. Default is 0.0.
+        dx : float or torch.Tensor, optional
+            Offset along the x-axis.
+        dy : float or torch.Tensor, optional
+            Offset along the y-axis.
+        dz : float or torch.Tensor, optional
+            Offset along the z-axis.
+
+        Returns
+        -------
+        Tree
+            Modified instance for chaining.
         """
 
         dx = torch.as_tensor(dx, dtype=self.x.dtype, device=self.x.device)
@@ -303,17 +354,12 @@ class Tree(Population):
         return self
 
     def move_to(self, x=0.0, y=0.0, z=0.0, origin=None):
-        """
-        Moves the tree structure to a new position.
+        """Move the morphology so the soma lies at ``(x, y, z)``.
 
-        Parameters
-        ----------
-        x : float, optional
-            New x-coordinate. Default is 0.0.
-        y : float, optional
-            New y-coordinate. Default is 0.0.
-        z : float, optional
-            New z-coordinate. Default is 0.0.
+        Returns
+        -------
+        Tree
+            Modified instance for chaining.
         """
         return self.recentre(x, y, z, origin)
 

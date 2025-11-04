@@ -1,3 +1,5 @@
+"""Learnable probability distributions used in AxonML models."""
+
 import math
 
 import torch
@@ -8,17 +10,53 @@ from .parametric import to_param
 
 
 class Distribution(nn.Module):
-    """Abstract base class for re-parameterised distributions."""
+    """Abstract base class for re-parameterised probability distributions.
+
+    Subclasses must implement :meth:`rsample` and :meth:`log_prob` following the
+    PyTorch distribution API to support differentiable sampling.
+    """
 
     def rsample(self, sample_shape=torch.Size()):
+        """Draw differentiable samples.
+
+        Parameters
+        ----------
+        sample_shape : torch.Size, optional
+            Leading sample shape prepended to the distribution event shape.
+
+        Returns
+        -------
+        torch.Tensor
+            Reparameterised sample tensor.
+        """
         raise NotImplementedError
 
     def log_prob(self, value):
+        """Evaluate the log-likelihood of a given value.
+
+        Parameters
+        ----------
+        value : torch.Tensor
+            Value at which to evaluate the log-density.
+
+        Returns
+        -------
+        torch.Tensor
+            Log-probability broadcast to ``value.shape``.
+        """
         raise NotImplementedError
 
 
 class Normal(Distribution):
-    r"""Diagonal Normal with trainable $\mu$ and $\sigma$ confined to (0, ∞)."""
+    r"""Diagonal normal distribution with learnable mean and scale.
+
+    Parameters
+    ----------
+    mean : float or torch.Tensor or torch.nn.Parameter, optional
+        Location parameter :math:`\mu`. Broadcast across event dimensions.
+    std : float or torch.Tensor or torch.nn.Parameter, optional
+        Positive scale parameter :math:`\sigma`.
+    """
 
     def __init__(self, mean=0.0, std=1.0):
         super().__init__()
@@ -41,13 +79,38 @@ class Normal(Distribution):
 
     # -------- required API ------------------------------------------------
     def rsample(self, sample_shape=torch.Size()):
+        """Draw a differentiable sample.
+
+        Parameters
+        ----------
+        sample_shape : torch.Size, optional
+            Leading shape of independent samples.
+
+        Returns
+        -------
+        torch.Tensor
+            Sample tensor with shape ``sample_shape + mean.shape``.
+        """
         return self._dist.rsample(sample_shape)
 
     def log_prob(self, value):
+        """Compute the log-density of ``value``.
+
+        Parameters
+        ----------
+        value : torch.Tensor
+            Sample locations broadcastable to ``mean.shape``.
+
+        Returns
+        -------
+        torch.Tensor
+            Log-likelihood of ``value``.
+        """
         return self._dist.log_prob(value)
 
     # convenient shorthand identical to your `sample(n)`
     def sample(self, n):
+        """Draw ``n`` independent non-differentiable samples."""
         return self.rsample((n,))
 
 
@@ -55,11 +118,12 @@ class Normal(Distribution):
 # helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _standard_normal_cdf(x):
+    """Evaluate the CDF of the standard normal distribution."""
     return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
 
 
 def _standard_normal_icdf(u):
-    # inverse CDF (a.k.a. quantile) of N(0,1)
+    """Evaluate the inverse CDF (quantile) of the standard normal."""
     return math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
 
 
@@ -67,13 +131,18 @@ def _standard_normal_icdf(u):
 # main class
 # ──────────────────────────────────────────────────────────────────────────────
 class TruncatedNormal(Distribution):
-    r"""
-    N(μ, σ²) *restricted to* [low, high]  with reparameterised sampling.
+    r"""Normal distribution truncated to a bounded interval.
 
-    Args
-    ----
-    mean, std     : initial parameters (float, tensor or nn.Parameter)
-    low, high     : scalars or tensors broadcastable to `mean`
+    Parameters
+    ----------
+    mean : float or torch.Tensor or torch.nn.Parameter, optional
+        Location parameter :math:`\mu`.
+    std : float or torch.Tensor or torch.nn.Parameter, optional
+        Positive scale parameter :math:`\sigma`.
+    low : float or torch.Tensor, optional
+        Inclusive lower truncation bound.
+    high : float or torch.Tensor, optional
+        Inclusive upper truncation bound.
     """
 
     def __init__(self, mean=0.0, std=1.0, *, low=0.0, high=math.inf):
@@ -106,12 +175,17 @@ class TruncatedNormal(Distribution):
 
     # ---------- API ---------------------------------------------------------
     def rsample(self, sample_shape=torch.Size()):
-        """
-        Differentiable sample using inverse-CDF reparameterisation:
-            1. u ~ Uniform[0,1]
-            2. p = Φ(a) + u * Z
-            3. z = Φ⁻¹(p)
-            4. x = μ + σ z
+        """Draw differentiable samples using inverse-CDF reparameterisation.
+
+        Parameters
+        ----------
+        sample_shape : torch.Size, optional
+            Leading shape of independent samples.
+
+        Returns
+        -------
+        torch.Tensor
+            Sample tensor with shape ``sample_shape + mean.shape``.
         """
         u = torch.rand(sample_shape + self.mean.shape, device=self.mean.device)
         p = _standard_normal_cdf(self._a) + u * self._Z
@@ -119,6 +193,18 @@ class TruncatedNormal(Distribution):
         return self.mean + self.std * z
 
     def log_prob(self, value):
+        """Compute the log-density of ``value`` under the truncated normal.
+
+        Parameters
+        ----------
+        value : torch.Tensor
+            Points at which to evaluate the log-density.
+
+        Returns
+        -------
+        torch.Tensor
+            Log-probabilities with values outside ``[low, high]`` set to ``-inf``.
+        """
         base_logp = -0.5 * ((value - self.mean) / self.std) ** 2 - torch.log(
             self.std * math.sqrt(2 * math.pi)
         )
@@ -129,4 +215,5 @@ class TruncatedNormal(Distribution):
 
     # alias for symmetry with your Normal
     def sample(self, n):
+        """Draw ``n`` independent non-differentiable samples."""
         return self.rsample((n,))

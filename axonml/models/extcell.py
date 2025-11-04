@@ -1,3 +1,5 @@
+"""Extended extracellular coupling models."""
+
 import torch
 
 from .core import Axon
@@ -6,6 +8,24 @@ from .tree import Tree, gather_membrane, gather_morphology
 
 
 class ExtCellAxon(Axon):
+    """Axon model with two-layer extracellular coupling.
+
+    Parameters
+    ----------
+    diameters : Sequence[float], optional
+        Compartment diameters in micrometers.
+    n_comp : int, optional
+        Number of compartments per axon.
+    celsius : float, optional
+        Simulation temperature in degrees Celsius.
+    v_init : float, optional
+        Initial membrane voltage in millivolts.
+    n_layers : int, optional
+        Number of extracellular layers. Only ``2`` is currently supported.
+    integrator : callable, optional
+        Integrator factory used to create the simulation solver.
+    """
+
     def __init__(
         self,
         diameters=[10.0],
@@ -26,6 +46,7 @@ class ExtCellAxon(Axon):
         self.x[:] = self._x()
 
     def _register_buffers(self):
+        """Initialise extracellular parameter buffers."""
         self.register_buffer(
             "xraxial", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9)
         )
@@ -37,12 +58,27 @@ class ExtCellAxon(Axon):
         )
 
     def _x(self):
+        """Compute compartment midpoints centered along the axon."""
         node_l = torch.atleast_2d(self.dx.squeeze())
         x = node_l.cumsum(dim=1) - node_l / 2
         return x - torch.sum(node_l, dim=1, keepdim=True) / 2
 
 
 def gather_extcell(graph, n_layers=2):
+    """Collect extracellular parameters from a morphology graph.
+
+    Parameters
+    ----------
+    graph : networkx.Graph
+        Morphology graph whose nodes contain extracellular attributes.
+    n_layers : int, optional
+        Number of extracellular layers to gather. Defaults to ``2``.
+
+    Returns
+    -------
+    dict
+        Mapping of parameter names to tensors shaped ``(1, n_comp, n_layers)``.
+    """
     xraxial, xc, xg = [], [], []
     for i in range(len(graph.nodes)):
         attrs = graph.nodes[i]
@@ -57,6 +93,24 @@ def gather_extcell(graph, n_layers=2):
 
 
 class ExtCellTree(Tree):
+    """Tree model supporting extracellular coupling layers.
+
+    Parameters
+    ----------
+    N : int
+        Number of tree instances (populations).
+    C : int
+        Number of compartments per tree.
+    graph : networkx.Graph
+        Morphology graph describing compartment connections.
+    n_layers : int, optional
+        Number of extracellular layers. Only ``2`` is currently supported.
+    integrator : callable, optional
+        Integrator factory used to create the solver.
+    **kwargs
+        Additional parameters forwarded to :class:`Tree`.
+    """
+
     def __init__(self, N, C, graph, n_layers=2, integrator=None, **kwargs):
         if n_layers != 2:
             raise ValueError("Only 2 layers are currently supported.")
@@ -67,6 +121,7 @@ class ExtCellTree(Tree):
         self._register_buffers()
 
     def _register_buffers(self):
+        """Initialise extracellular buffers for the tree morphology."""
         self.register_buffer(
             "xraxial", torch.full((self.np, self.nc, self.n_layers), 1e9)
         )
@@ -74,15 +129,51 @@ class ExtCellTree(Tree):
         self.register_buffer("xg", torch.full((self.np, self.nc, self.n_layers), 1e9))
 
     def load_extcell(self, extcell):
+        """Load extracellular parameters into buffers.
+
+        Parameters
+        ----------
+        extcell : dict[str, torch.Tensor]
+            Mapping of extracellular parameter names to tensors shaped
+            ``(1, n_comp, n_layers)``.
+        """
         for key, value in extcell.items():
             getattr(self, key).copy_(value.expand(self.np, -1, -1))
 
     def load_morphology(self, morphology):
+        """Register morphology tensors as buffers.
+
+        Parameters
+        ----------
+        morphology : dict[str, torch.Tensor]
+            Mapping of morphology parameter names to tensors shaped
+            ``(1, n_comp)``.
+        """
         for key, value in morphology.items():
             self.register_buffer(key, value.expand(self.np, -1))
 
     @classmethod
     def from_graph(cls, graph, N=1, n_layers=2, integrator=None, **kwargs):
+        """Construct an extracellular tree model from a morphology graph.
+
+        Parameters
+        ----------
+        graph : networkx.Graph
+            Morphology graph with extracellular attributes.
+        N : int, optional
+            Number of population instances. Defaults to ``1``.
+        n_layers : int, optional
+            Number of extracellular layers. Supports only ``2`` at present.
+        integrator : callable, optional
+            Integrator factory. Defaults to backward Euler branching tree.
+        **kwargs
+            Additional membrane parameters forwarded to :class:`Tree`.
+
+        Returns
+        -------
+        ExtCellTree
+            Configured tree population with extracellular coupling.
+        """
         C = len(graph.nodes)
         morphology = gather_morphology(graph)
         membrane = gather_membrane(graph)
@@ -99,6 +190,26 @@ class ExtCellTree(Tree):
 
     @classmethod
     def from_NEURON(cls, root_sec=None, N=1, n_layers=2, integrator=None, **kwargs):
+        """Construct an extracellular tree from a NEURON section.
+
+        Parameters
+        ----------
+        root_sec : neuron.h.Section, optional
+            Root section from a NEURON model.
+        N : int, optional
+            Number of population instances. Defaults to ``1``.
+        n_layers : int, optional
+            Number of extracellular layers. Supports only ``2`` at present.
+        integrator : callable, optional
+            Integrator factory to use for the tree.
+        **kwargs
+            Additional keyword arguments forwarded to :meth:`from_graph`.
+
+        Returns
+        -------
+        ExtCellTree
+            Constructed extracellular tree instance.
+        """
         from axonml.models.io import neuron_to_axonml_graph
 
         graph, _ = neuron_to_axonml_graph(root_sec, extcell=n_layers)

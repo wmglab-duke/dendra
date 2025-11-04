@@ -1,3 +1,5 @@
+"""Utilities for composing multiple population models into a single system."""
+
 import math
 
 import torch
@@ -9,6 +11,27 @@ from .tree import Tree
 
 
 def assess_type_and_make_integrator(populations, threads=16, write_back=True):
+    """Select an integrator compatible with the provided populations.
+
+    Parameters
+    ----------
+    populations : dict[str, Population]
+        Mapping of population names to instances.
+    threads : int, optional
+        Number of solver threads for dendritic tree models.
+    write_back : bool, optional
+        Whether integrators should write-back states in-place.
+
+    Returns
+    -------
+    callable
+        Integrator factory compatible with the population types.
+
+    Raises
+    ------
+    TypeError
+        If populations are heterogeneous in a way that is not supported.
+    """
     if all(isinstance(pop, Tree) for pop in populations.values()):
         return dhs_multi(threads=threads, write_back=write_back)
     if all(type(pop) is Population for pop in populations.values()):
@@ -17,6 +40,7 @@ def assess_type_and_make_integrator(populations, threads=16, write_back=True):
 
 
 def _check_celsius(celsius, populations):
+    """Validate that all populations share the same temperature."""
     if not isinstance(celsius, (int, float)):
         raise TypeError("celsius must be a number.")
     if any(abs(pop.celsius - celsius) > 1e-6 for pop in populations.values()):
@@ -28,6 +52,24 @@ def _check_celsius(celsius, populations):
 def concat(
     populations: dict[str, Population], threads=16, write_back=True, celsius=37.0
 ):
+    """Concatenate multiple populations into a :class:`MultiPopulation`.
+
+    Parameters
+    ----------
+    populations : dict[str, Population]
+        Mapping of names to populations to concatenate.
+    threads : int, optional
+        Number of solver threads for dendritic tree models.
+    write_back : bool, optional
+        Whether integrators should write-back states in-place.
+    celsius : float, optional
+        Common simulation temperature.
+
+    Returns
+    -------
+    MultiPopulation
+        Combined population.
+    """
     _check_celsius(celsius, populations)
     integrator = assess_type_and_make_integrator(
         populations, threads=threads, write_back=write_back
@@ -48,12 +90,14 @@ def concat(
 
 
 def offsets(populations):
+    """Compute flattened offsets for each population in the concatenation."""
     sizes = [math.prod(p.shape) for p in populations.values()]
     off = [0] + list(torch.cumsum(torch.tensor(sizes), dim=0).numpy().astype(int))[:-1]
     return off
 
 
 def indices(populations):
+    """Return per-population index arrays aligned with the concatenation."""
     off = offsets(populations)
     sizes = [math.prod(p.shape) for p in populations.values()]
     indices = [
@@ -64,15 +108,29 @@ def indices(populations):
 
 
 def key_to_flat_index(indices, key):
+    """Convert a structured key into flattened indices."""
     return indices[key].flatten()
 
 
 def flatten_key(n, shape, key):
+    """Compute flattened indices for ``key`` within a tensor of ``shape``."""
     indices = torch.arange(n).reshape(shape)
     return indices[key].flatten()
 
 
 class MultiPopulation(Population):
+    """Population composed of multiple independent sub-populations.
+
+    Parameters
+    ----------
+    integrator : callable, optional
+        Integrator factory. Selected automatically when ``None``.
+    celsius : float, optional
+        Shared simulation temperature.
+    **populations
+        Mapping of population names to instances.
+    """
+
     def __init__(self, integrator=None, celsius=37.0, **populations):
         if any(b.is_batched() for b in populations.values()):
             raise ValueError("All populations must be unbatched.")
@@ -113,6 +171,7 @@ class MultiPopulation(Population):
         return next(iter(self.populations.values())).dtype()
 
     def register_labels(self):
+        """Propagate labels from component populations to the composite."""
         self.clear_labels()
         all_indices = indices(self.populations)
         for index, (name, pop) in zip(all_indices, self.populations.items()):
@@ -124,6 +183,7 @@ class MultiPopulation(Population):
                 ].label(label)
 
     def reinsert_all(self):
+        """Recreate mechanisms for all component populations."""
         all_indices = indices(self.populations)
         for index, (name, pop) in zip(all_indices, self.populations.items()):
             # first do _mech_everywhere
@@ -139,6 +199,7 @@ class MultiPopulation(Population):
                     self[:, index_f].insert(m_class, alias=alias, **kwargs)
 
     def batch(self, batch_size: int):
+        """Create a batched view of the multi-population."""
         super().batch(batch_size)
         self.v_init.unsqueeze(0)
         for pop in self.populations.values():
@@ -146,4 +207,5 @@ class MultiPopulation(Population):
         return self
 
     def batch_(self, batch_size: int):
+        """In-place variant of :meth:`batch`."""
         self.batch(batch_size)

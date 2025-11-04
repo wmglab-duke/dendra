@@ -1,3 +1,5 @@
+"""Per-module random number generation helpers."""
+
 import os
 
 import torch
@@ -5,9 +7,13 @@ from torch import nn
 
 
 class RNGMixin(nn.Module):
-    """
-    Mixin that provides a per-module RNG (one Generator per device).
-    Use self._rng(device) to get the right Generator and pass it to random ops.
+    """Mixin providing per-device random number generators.
+
+    Parameters
+    ----------
+    seed : int or None, optional
+        Base seed used to initialise all derived :class:`torch.Generator`
+        instances. A random seed is chosen when ``None``.
     """
 
     def __init__(self, seed: int | None = None):
@@ -22,12 +28,24 @@ class RNGMixin(nn.Module):
         self._ignore_rng_on_load = False
 
     def ignore_rng_on_load(self, ignore: bool = True) -> None:
-        """If set, RNG state is not restored when loading module state_dict."""
+        """Toggle restoration of RNG state when loading a checkpoint.
+
+        Parameters
+        ----------
+        ignore : bool, optional
+            If ``True``, RNG state is ignored during :meth:`load_state_dict`.
+        """
         self._ignore_rng_on_load = ignore
 
     # ---------- public API ----------
     def reseed(self, seed: int) -> None:
-        """Reset this module's RNGs (CPU + any created device gens)."""
+        """Reset all generators with a new base seed.
+
+        Parameters
+        ----------
+        seed : int
+            Base seed used to initialise every generator.
+        """
         self._base_seed = int(seed)
         self._cpu_gen.manual_seed(self._base_seed)
         # Derive stable, distinct seeds per device from the base seed
@@ -37,14 +55,26 @@ class RNGMixin(nn.Module):
             gen.manual_seed(self._base_seed + 0x9E3779B97F4A7C15 * (1 + off))
 
     def rng_state(self) -> dict:
-        """Snapshot current generator states (so sequences continue after save/load)."""
+        """Snapshot the state of every generator.
+
+        Returns
+        -------
+        dict
+            Mapping of device identifier to tensor-encoded RNG state.
+        """
         state = {"cpu": self._cpu_gen.get_state().cpu()}
         for dev, gen in self._device_gens.items():
             state[str(dev)] = gen.get_state().cpu()
         return state
 
     def set_rng_state(self, state: dict) -> None:
-        """Restore generator states."""
+        """Restore the state of every generator.
+
+        Parameters
+        ----------
+        state : dict
+            Mapping created by :meth:`rng_state`.
+        """
         if "cpu" in state:
             self._cpu_gen.set_state(state["cpu"].cpu())
         for k, v in state.items():
@@ -59,10 +89,23 @@ class RNGMixin(nn.Module):
 
     # ---------- serialization hooks ----------
     def get_extra_state(self):
-        # Persist base seed and the live generator states (so sequences resume exactly)
+        """Return RNG metadata for PyTorch serialization.
+
+        Returns
+        -------
+        dict
+            Dictionary containing the base seed and generator states.
+        """
         return {"base_seed": self._base_seed, "rng_state": self.rng_state()}
 
     def set_extra_state(self, extra_state):
+        """Load RNG metadata produced by :meth:`get_extra_state`.
+
+        Parameters
+        ----------
+        extra_state : dict
+            Serialized dictionary containing RNG state and base seed.
+        """
         if self._ignore_rng_on_load:
             return
         self._base_seed = int(extra_state.get("base_seed", 0))
@@ -72,6 +115,18 @@ class RNGMixin(nn.Module):
 
     # ---------- internal helper ----------
     def _rng(self, device: torch.device | str | None) -> torch.Generator:
+        """Return the generator associated with ``device``.
+
+        Parameters
+        ----------
+        device : torch.device or str or None
+            Device identifier. ``None`` selects the CPU generator.
+
+        Returns
+        -------
+        torch.Generator
+            Generator tied to the specified device.
+        """
         dev = torch.device(device) if device is not None else torch.device("cpu")
         if dev.type == "cpu":
             return self._cpu_gen

@@ -1,3 +1,5 @@
+"""Parameter handling utilities and mixins for AxonML models."""
+
 import itertools
 from typing import Callable
 
@@ -6,6 +8,22 @@ import torch.nn.functional as F
 
 
 def to_param(val, positive=False):
+    """
+    Convert a value into a parameter-like object.
+
+    Parameters
+    ----------
+    val : Any
+        Input value to coerce into a tensor-backed parameter.
+    positive : bool, optional
+        If True, clamp the value to non-negative range and wrap it in
+        :class:`PositiveParam`.
+
+    Returns
+    -------
+    torch.nn.Parameter or PositiveParam or torch.nn.Module
+        Parameterized representation of ``val`` suitable for registration.
+    """
     if isinstance(val, torch.nn.Parameter):
         return val
     if isinstance(val, torch.nn.Module):
@@ -19,11 +37,45 @@ def to_param(val, positive=False):
 
 
 def is_parametric(val):
-    _parametric_types = (torch.nn.Parameter, PositiveParam)
+    """
+    Check whether a value is treated as a parametric object.
+
+    Parameters
+    ----------
+    val : Any
+        Value to inspect.
+
+    Returns
+    -------
+    bool
+        True if ``val`` is a parameter or :class:`Bounded`.
+    """
+    _parametric_types = (torch.nn.Parameter, Parametric)
     return isinstance(val, _parametric_types)
 
 
 def distribute_over(val, over="a"):
+    """
+    Broadcast values across population or compartment dimensions.
+
+    Parameters
+    ----------
+    val : array_like
+        Values to broadcast.
+    over : {'p', 'c', 'pc'}, optional
+        Axis selection: ``'p'`` expands over populations, ``'c'`` over
+        compartments, ``'pc'`` leaves shape unchanged.
+
+    Returns
+    -------
+    torch.Tensor
+        Broadcast tensor with the selected layout.
+
+    Raises
+    ------
+    ValueError
+        If ``over`` is not one of the supported selectors.
+    """
     valid = {"p", "c", "pc"}
     if over not in valid:
         raise ValueError("over must be one of {}".format(valid))
@@ -38,10 +90,23 @@ def distribute_over(val, over="a"):
 
 def softplus_inv(y, beta: float = 1.0, threshold: float = 20.0, eps: float = 1e-12):
     """
-    Numerically stable inverse of softplus: x s.t. softplus(x, beta) = y.
-    - Uses log(expm1(.)) for small by to avoid cancellation.
-    - Uses by + log1p(-exp(-by)) for large by to avoid overflow.
-    - Clamps y to avoid -inf at exactly 0 during initialization.
+    Numerically stable inverse of softplus.
+
+    Parameters
+    ----------
+    y : Tensor or array_like
+        Softplus outputs to invert.
+    beta : float, optional
+        Softplus sharpness parameter.
+    threshold : float, optional
+        Transition threshold between small and large branches.
+    eps : float, optional
+        Minimum clamp to avoid ``-inf`` when ``y`` equals zero.
+
+    Returns
+    -------
+    torch.Tensor
+        Values ``x`` such that ``softplus(x, beta) = y``.
     """
     y = torch.as_tensor(y)
     y = torch.clamp(y, min=eps)  # safer for init; prevents -inf params
@@ -54,15 +119,79 @@ def softplus_inv(y, beta: float = 1.0, threshold: float = 20.0, eps: float = 1e-
     return torch.where(small, x_small, x_large)
 
 
-class cacheable(torch.nn.Module):
+class Parametric(torch.nn.Module):
+    """
+    Base class for modules that implement parameterized behavior.
+    """
+
+    def __init__(self):
+        super().__init__()
+        assert hasattr(self, "__len__"), "Parametric subclasses must implement __len__."
+        assert hasattr(self, "repeat"), "Parametric subclasses must implement repeat()."
+
+
+class cacheable(Parametric):
+    """
+    Module mixin that caches the most recent forward computation.
+
+    The cache is cleared automatically when switching between train/eval modes.
+    """
+
     def __init__(self):
         super().__init__()
         self._cache = None
 
+    def train(self, mode: bool = True):
+        """
+        Toggle training mode and clear any cached outputs.
+
+        Parameters
+        ----------
+        mode : bool, optional
+            If True, set the module to training mode; otherwise evaluation.
+
+        Returns
+        -------
+        cacheable
+            Self for chaining.
+        """
+        self.clear_cache()
+        return super().train(mode)
+
+    def eval(self):
+        """
+        Switch to evaluation mode and clear cached outputs.
+
+        Returns
+        -------
+        cacheable
+            Self for chaining.
+        """
+        self.clear_cache()
+        return super().eval()
+
     def clear_cache(self):
+        """
+        Invalidate the stored forward result.
+        """
         self._cache = None
 
     def forward(self, cache=True, *args, **kwargs):
+        """
+        Compute the module output, optionally reusing cached results.
+
+        Parameters
+        ----------
+        cache : bool, optional
+            If True, reuse the previous result when inputs are unchanged.
+        *args, **kwargs
+            Positional and keyword arguments forwarded to ``_compute``.
+
+        Returns
+        -------
+        Any
+            Cached or freshly computed output.
+        """
         if not cache:
             return self._compute(*args, **kwargs)
         if self._cache is None:
@@ -70,14 +199,47 @@ class cacheable(torch.nn.Module):
         return self._cache
 
     def repeat(self, n: int):
+        """
+        Repeat the cached value along a new leading dimension.
+
+        Parameters
+        ----------
+        n : int
+            Number of repeats.
+
+        Returns
+        -------
+        torch.Tensor
+            Repeated cached output.
+        """
         p = self(cache=(not self.training))
         return p.repeat(n)
+
+    def __len__(self):
+        raise NotImplementedError("Subclasses must implement __len__().")
 
 
 def ste_clamp(y, *, lo=None, hi=None, alpha_lo: float = 1.0, alpha_hi: float = 1.0):
     """
-    Forward: hard clamp to [lo, hi].
-    Backward: use surrogate with slope 1 in-range; slope alpha_lo/alpha_hi when clamped.
+    Straight-through estimator clamp with configurable slopes.
+
+    Parameters
+    ----------
+    y : torch.Tensor
+        Input tensor to clamp.
+    lo : float or Tensor, optional
+        Lower bound. When omitted, no lower clamp is applied.
+    hi : float or Tensor, optional
+        Upper bound. When omitted, no upper clamp is applied.
+    alpha_lo : float, optional
+        Backward slope used below ``lo``.
+    alpha_hi : float, optional
+        Backward slope used above ``hi``.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor that is clamped in the forward pass but keeps surrogate gradients.
     """
     y_sur = y
     if lo is not None:
@@ -99,27 +261,33 @@ def ste_clamp(y, *, lo=None, hi=None, alpha_lo: float = 1.0, alpha_hi: float = 1
 # --- modules ---
 class Bounded(cacheable):
     """
-    Trainable tensor with optional lower/upper bounds.
+    Trainable tensor constrained by optional lower and upper bounds.
 
-    Bounds & modes:
-      - min=None, max=None:            identity
-      - min!=None, max=None:           lower bound via:
-           lower_mode="softplus"  ->  min + softplus(rho)      (exclusive)
-           lower_mode="hard-ste"  ->  ste_clamp(rho, lo=min)   (inclusive)
-           lower_mode="leaky-ste" ->  ste_clamp(..., alpha_lo=lower_alpha)
-      - min=None,  max!=None:          upper bound via:
-           cap_mode="softcap"    ->  max - softplus(max - y)
-           cap_mode="hard-ste"   ->  ste_clamp(y, hi=max)
-      - min!=None, max!=None:
-           cap_mode="sigmoid"    ->  min + (max-min)*sigmoid(beta*rho)
-           cap_mode="hard-ste"   ->  ste_clamp(y, lo=min, hi=max)
+    Parameters
+    ----------
+    init : array_like
+        Initial value for the unconstrained parameter ``rho``.
+    min_val : float, optional
+        Lower bound. When ``None``, no lower constraint is enforced.
+    max_val : float, optional
+        Upper bound. When ``None``, no upper constraint is enforced.
+    beta : float, optional
+        Sharpness parameter used by softplus or sigmoid transforms.
+    threshold : float, optional
+        Softplus threshold used for numerical stability.
+    lower_mode : {'softplus', 'hard-ste', 'leaky-ste'}, optional
+        Strategy for enforcing the lower bound.
+    lower_alpha : float, optional
+        Surrogate slope used in ``'leaky-ste'`` mode below the bound.
+    cap_mode : {'auto', 'softcap', 'sigmoid', 'hard-ste'}, optional
+        Strategy for enforcing the upper bound.
+    cap_beta : float, optional
+        Softcap temperature. Defaults to ``beta`` when ``None``.
 
-    Args:
-        init, min_val, max_val, beta, threshold as before
-        lower_mode: "softplus" | "hard-ste" | "leaky-ste"
-        lower_alpha: slope used when clamped below min (for leaky-ste)
-        cap_mode: "auto"|"softcap"|"sigmoid"|"hard-ste"
-        cap_beta: temperature for softcap
+    Notes
+    -----
+    ``cap_mode='auto'`` selects ``'softcap'`` when only an upper bound exists and
+    ``'sigmoid'`` when both bounds are present.
     """
 
     def __init__(
@@ -241,8 +409,26 @@ class Bounded(cacheable):
 
 class PositiveParam(Bounded):
     """
-    Special case of Bounded with min_val=0 by default.
-    Set include_zero=True to make the lower bound inclusive (via STE).
+    Bounded parameter constrained to non-negative values.
+
+    Parameters
+    ----------
+    init : array_like
+        Initial value for the parameter.
+    include_zero : bool, optional
+        If True, make the zero bound inclusive using a leaky STE transform.
+    max_val : float, optional
+        Optional upper bound.
+    beta : float, optional
+        Softplus/sigmoid sharpness parameter.
+    threshold : float, optional
+        Softplus threshold for numerical stability.
+    lower_alpha : float, optional
+        Surrogate slope below zero when ``include_zero`` is True.
+    cap_mode : {'auto', 'softcap', 'sigmoid', 'hard-ste'}, optional
+        Strategy for the optional upper bound.
+    cap_beta : float, optional
+        Softcap temperature. Defaults to ``beta`` when ``None``.
     """
 
     def __init__(
@@ -272,9 +458,16 @@ class PositiveParam(Bounded):
 
 class Functional(torch.nn.Module):
     """
-    A functional that can be used as a parameter in a model.
-    This is useful for cases where you want to use a function as a parameter,
-    such as in a neural network layer.
+    Wrapper turning a module into a parameter-update callable.
+
+    Parameters
+    ----------
+    func : torch.nn.Module
+        Module applied to incoming buffers.
+    fill : Callable, optional
+        Function used to expand results into the flattened parameter space.
+    key : array_like, optional
+        Flat indices targeted by the fill function.
     """
 
     def __init__(self, func: torch.nn.Module, fill=None, key=None):
@@ -287,6 +480,19 @@ class Functional(torch.nn.Module):
             self.key = None
 
     def forward(self, buffer):
+        """
+        Apply the wrapped module and optionally scatter the result.
+
+        Parameters
+        ----------
+        buffer : torch.Tensor
+            Parameter tensor to transform.
+
+        Returns
+        -------
+        torch.Tensor
+            Updated tensor with values written at ``key`` locations when provided.
+        """
         p = self.func(buffer)
         if self.key is None:
             return p
@@ -298,6 +504,25 @@ class Functional(torch.nn.Module):
 def build_parametrization(
     module, output, key: torch.LongTensor, main_shape: tuple[int, int]
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    """
+    Construct a parametrization callable for in-graph updates.
+
+    Parameters
+    ----------
+    module : torch.nn.Module
+        Module producing updated values.
+    output : torch.Tensor
+        Example output used to infer broadcasting behavior.
+    key : torch.LongTensor
+        Flat indices where updates should be applied.
+    main_shape : tuple of int
+        Shape of the target parameter grid.
+
+    Returns
+    -------
+    Callable[[torch.Tensor], torch.Tensor]
+        Functional wrapper applying ``module`` and scattering results.
+    """
     if key is None:
         return Functional(module)
     fill = create_param_expander(output, key, main_shape)
@@ -308,34 +533,31 @@ def create_param_expander(
     param: torch.Tensor, key: torch.LongTensor, main_shape: tuple[int, int]
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
-    Creates a specialized, efficient function to expand a parameter for indexed assignment.
+    Create a specialized function that expands parameters for indexed assignment.
 
-    This function analyzes the relationship between a parameter's shape, a flat
-    index key, and a target 2D shape. It returns a new function, `expander(p)`,
-    optimized for the specific parameterization scheme.
+    Parameters
+    ----------
+    param : torch.Tensor
+        Prototype parameter tensor defining expansion semantics.
+    key : torch.LongTensor
+        Flat index tensor selecting assignment positions.
+    main_shape : tuple of int
+        Height and width of the conceptual 2D grid addressed by ``key``.
 
-    The intended use is:
-    `flat_target[key].copy_(expander(new_param_value))`
+    Returns
+    -------
+    Callable[[torch.Tensor], torch.Tensor]
+        Function that maps an input tensor to a flattened vector aligned with ``key``.
 
-    Supported Parameterization Schemes:
-    1.  **Scalar (0-dim):** The parameter is a single value applied to all key locations.
-    2.  **Pre-Sized (1D):** The parameter is a 1D tensor with the same number of elements
-        as `key`, providing a one-to-one mapping. `param.numel() == key.numel()`.
-    3.  **Row-Broadcast (shape `(N, 1)`):** The `key` indexes into `N` unique rows. The
-        parameter provides a single value for each unique row, which is broadcast
-        across all columns for that row. `param.shape == (N, 1)`.
-    4.  **Column-Broadcast (shape `(1, M)`):** The `key` indexes into `M` unique columns.
-        The parameter provides a single value for each unique column, which is
-        broadcast down all rows for that column. `param.shape == (1, M)`.
+    Raises
+    ------
+    ValueError
+        If ``param`` does not match any supported broadcasting scheme.
 
-    Args:
-        param (torch.Tensor): The parameter tensor whose shape defines the expansion logic.
-        key (torch.LongTensor): A 1D tensor of flat indices.
-        main_shape (tuple[int, int]): The HxW shape of the conceptual 2D tensor.
-
-    Returns:
-        Callable[[torch.Tensor], torch.Tensor]:
-            A new function that takes a tensor `p` and returns the expanded 1D tensor.
+    Notes
+    -----
+    Supported patterns include scalar, pre-sized, row-broadcast, and column-broadcast
+    parameterizations.
     """
     num_keys = key.numel()
 
@@ -404,6 +626,18 @@ class staticproperty:
 
 
 def add_instance_property(obj, name, func):
+    """
+    Attach a computed property to a single instance.
+
+    Parameters
+    ----------
+    obj : object
+        Instance receiving the property.
+    name : str
+        Property name to install.
+    func : Callable[[], Any]
+        Zero-argument callable returning the property value.
+    """
     sub = type(
         f"_{obj.__class__.__name__}Proxy",
         (obj.__class__,),
@@ -413,11 +647,30 @@ def add_instance_property(obj, name, func):
 
 
 class Referency(torch.nn.Module):
+    """Mixin that allows modules to expose dynamic property references."""
+
     def setreference(self, name, func):
+        """
+        Bind a lazily evaluated property to the instance.
+
+        Parameters
+        ----------
+        name : str
+            Property name to expose.
+        func : Callable[[], Any]
+            Zero-argument callable invoked when the property is accessed.
+        """
         add_instance_property(self, name, func)
 
 
 class SimpleParameterized(Referency):
+    """
+    Mixin that manages a flat set of named parameters for subclasses.
+
+    Subclasses declare parameters via :meth:`PARAMETER` and receive automatic
+    instantiation of buffers or modules via :func:`to_param`.
+    """
+
     _params = {}
     _params_defined_here = {}
     _params_declarations = []
@@ -453,8 +706,22 @@ class SimpleParameterized(Referency):
 
     def check_kwargs(self, kwargs):
         """
-        Check if the provided keyword arguments match the declared parameters.
-        Raises ValueError if any unknown parameter is found.
+        Validate keyword arguments against declared parameters.
+
+        Parameters
+        ----------
+        kwargs : dict
+            Keyword arguments passed to the constructor.
+
+        Returns
+        -------
+        bool
+            True when all keys are known.
+
+        Raises
+        ------
+        ValueError
+            If an unexpected parameter name is encountered.
         """
         if not self._params:
             return True
@@ -467,19 +734,36 @@ class SimpleParameterized(Referency):
 
     def instantiate_parameters(self, **kwargs):
         """
-        Instantiate parameters using the provided keyword arguments.
-        This method is called during initialization to set up the waveform's parameters.
+        Materialize parameters declared for the subclass.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping from parameter names to initial values.
         """
         for key, value in kwargs.items():
             setattr(self, key, to_param(value))
 
     @staticmethod
     def PARAMETER(**kwargs):
+        """
+        Declare parameters for the next subclass initialization.
+
+        Parameters
+        ----------
+        **kwargs
+            Parameter names with default values.
+        """
         SimpleParameterized._params_declarations.append(kwargs)
 
     def device(self):
         """
-        Returns the device of the first parameter.
+        Device hosting the module's parameters.
+
+        Returns
+        -------
+        torch.device
+            Device of the first registered parameter.
         """
         return next(iter(self.parameters())).device
 
@@ -487,6 +771,14 @@ class SimpleParameterized(Referency):
         return f"{self.__class__.__name__}({self.parameters_repr()})"
 
     def parameters_repr(self):
+        """
+        String representation of named parameters.
+
+        Returns
+        -------
+        str
+            Comma-separated key/value pairs for parameters.
+        """
         return ", ".join(f"{k}={v}" for k, v in self.named_parameters())
 
 
@@ -751,12 +1043,29 @@ class Parameterized(SimpleParameterized):
         self.instantiate_additional_parameters(additional_parameters)
 
     def reshape(self, shape_p, shape_f):
+        """
+        Update population and full shapes, reinitializing range buffers.
+
+        Parameters
+        ----------
+        shape_p : tuple of int
+            Shape used for per-compartment parameters.
+        shape_f : tuple of int
+            Full tensor shape including batch axes.
+        """
         self.shape_p = shape_p
         self.shape_f = shape_f
         self.instantiate_range(**self.range)
 
     def instantiate_global(self, **kwargs):
-        # this is only called once, on __init__
+        """
+        Instantiate global (scalar) parameters and default buffers.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of global parameter names to initial values or dictionaries.
+        """
         if kwargs is not None:
             for name, value in kwargs.items():
                 if isinstance(value, dict):
@@ -771,7 +1080,14 @@ class Parameterized(SimpleParameterized):
                     getattr(self, name).copy_(getattr(self, p_name))
 
     def instantiate_range(self, **kwargs):
-        # this is only called once, on __init__
+        """
+        Instantiate range parameters over the population shape.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter names to initial values broadcast over ``shape_p``.
+        """
         if kwargs is not None:
             for name, value in kwargs.items():
                 p_name = f"{name}_default"
@@ -780,6 +1096,18 @@ class Parameterized(SimpleParameterized):
                 getattr(self, name).copy_(getattr(self, p_name))
 
     def register_parametrization_in_graph(self, name: str, param: Callable, args=None):
+        """
+        Register a parametrization to be applied during buffer population.
+
+        Parameters
+        ----------
+        name : str
+            Buffer name receiving the parametrization.
+        param : Callable or torch.nn.Module
+            Transform producing updated values given the buffer and optional args.
+        args : Sequence[str], optional
+            Names of additional buffers passed to the parametrization.
+        """
         if name not in self.in_graph_parametrizations:
             self.in_graph_parametrizations[name] = []
         if not isinstance(param, torch.nn.Module):
@@ -790,6 +1118,15 @@ class Parameterized(SimpleParameterized):
         self.in_graph_parametrizations[name].append((param, args))
 
     def instantiate_additional_parameters(self, additional_parameters=None):
+        """
+        Materialize alias-specific parameter overrides provided at build time.
+
+        Parameters
+        ----------
+        additional_parameters : dict, optional
+            Mapping from parameter names to lists of ``(alias, value, key)`` tuples
+            describing indexed overrides.
+        """
         if additional_parameters is not None:
             for name, list_of_aliases_values_and_keys in additional_parameters.items():
                 if name in self.range:
@@ -824,6 +1161,9 @@ class Parameterized(SimpleParameterized):
                     self.keys[name] = torch.cat(keys).to(torch.long)
 
     def load_additional_parameters(self):
+        """
+        Scatter alias-specific parameter overrides into their buffers.
+        """
         for name, list_of_parameters in self.additional_parameters.items():
             buffer = getattr(self, name)
             additional_params = torch.cat([fill(p) for fill, p in list_of_parameters])
@@ -831,6 +1171,9 @@ class Parameterized(SimpleParameterized):
             buffer.view(-1).index_copy_(0, key, additional_params)
 
     def populate_parameter_buffers(self):
+        """
+        Reset parameter buffers to defaults, then apply overrides and parametrizations.
+        """
         keys_to_process = itertools.chain(
             self.__class__._global.keys(), self.__class__._range.keys()
         )
@@ -858,6 +1201,9 @@ class Parameterized(SimpleParameterized):
             setattr(self, name, b)
 
     def detach(self):
+        """
+        Detach registered buffers from the computation graph.
+        """
         for n, b in self.named_buffers():
             try:
                 b.detach_()
@@ -865,6 +1211,24 @@ class Parameterized(SimpleParameterized):
                 setattr(self, n, b.detach())
 
     def check_kwargs(self, kwargs):
+        """
+        Validate keyword arguments against declared mechanism parameters.
+
+        Parameters
+        ----------
+        kwargs : dict
+            Keyword arguments supplied to the initializer.
+
+        Returns
+        -------
+        bool
+            True when all names are valid.
+
+        Raises
+        ------
+        ValueError
+            If an unexpected parameter name is provided.
+        """
         _params = self.__class__._params
         if _params is not None:
             for name in kwargs.keys():
