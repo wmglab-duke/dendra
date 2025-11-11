@@ -32,6 +32,10 @@ class sin(Waveform):
         Phase offset in radians. Default is 0.0.
     delay : float, optional
         Time delay before the waveform starts in ms. Default is 0.0.
+    off : float, optional
+        Time at which the waveform turns off in ms. Default is infinity.
+    off_after : float, optional
+        Time at which waveform turns of after delay. Default is infinity.
 
     Notes
     -----
@@ -53,11 +57,14 @@ class sin(Waveform):
     >>> values = waveform(t)
     """
 
-    Waveform.PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf)
+    Waveform.PARAMETER(
+        amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf, off_after=torch.inf
+    )
 
     def fn(self, t):
+        off = torch.minimum(self.off, self.off_after + self.delay)
         w = torch.sin(2 * torch.pi * self.freq * (t - self.delay) + self.phase)
-        return self.amp * torch.where((t >= self.delay) & (t < self.off), w, 0.0)
+        return self.amp * torch.where((t >= self.delay) & (t < off), w, 0.0)
 
 
 class cos(Waveform):
@@ -77,6 +84,10 @@ class cos(Waveform):
         Phase offset in radians. Default is 0.0.
     delay : float, optional
         Time delay before the waveform starts in ms. Default is 0.0.
+    off : float, optional
+        Time at which the waveform turns off in ms. Default is infinity.
+    off_after : float, optional
+        Time at which waveform turns of after delay. Default is infinity.
 
     Notes
     -----
@@ -98,11 +109,14 @@ class cos(Waveform):
     >>> values = waveform(t)
     """
 
-    Waveform.PARAMETER(amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf)
+    Waveform.PARAMETER(
+        amp=1.0, freq=1.0, phase=0.0, delay=0.0, off=torch.inf, off_after=torch.inf
+    )
 
     def fn(self, t):
+        off = torch.minimum(self.off, self.off_after + self.delay)
         w = torch.cos(2 * torch.pi * self.freq * (t - self.delay) + self.phase)
-        return self.amp * torch.where((t >= self.delay) & (t < self.off), w, 0.0)
+        return self.amp * torch.where((t >= self.delay) & (t < off), w, 0.0)
 
 
 class mono_rect(Waveform):

@@ -114,6 +114,17 @@ class Waveform(SimpleParameterized):
         for t_ in t:
             yield self(t_)
 
+    def __add__(self, other):
+        if not isinstance(other, Waveform):
+            raise TypeError(
+                f"Can only add Waveform instances together, got {type(other)}"
+            )
+        if isinstance(other, Sum):
+            return Sum(self, *other.waveforms)
+        if isinstance(self, Sum):
+            return Sum(*self.waveforms, other)
+        return Sum(self, other)
+
 
 class _repeat(Waveform):
     def __init__(

@@ -16,7 +16,7 @@ ext_modules = cythonize(
 
 setup(
     install_requires=[
-        "numpy",
+        "numpy >= 2.3.0",
         "sympy >= 1.2",
         "torch >= 2.7.0",
         "scipy",
