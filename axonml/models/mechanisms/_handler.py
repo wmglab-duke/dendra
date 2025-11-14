@@ -214,11 +214,11 @@ class MechanismHandler(torch.nn.Module):
         for mech in self.mechanisms.values():
             mech.breakpoint(mech.get(v))
 
-        # reset buffers in-place (no realloc)
-        for buf in self._buf_i:
-            buf.detach().zero_()
-        for buf in self._buf_g:
-            buf.detach().zero_()
+        # reset buffers
+        for i, buf in enumerate(self._buf_i):
+            self._buf_i[i] = torch.zeros_like(buf)
+        for i, buf in enumerate(self._buf_g):
+            self._buf_g[i] = torch.zeros_like(buf)
 
         # core loop: minimal Python, pure aten ops inside
         for c_idx, mech, fn, scale_f in self._map:
@@ -243,8 +243,8 @@ class MechanismHandler(torch.nn.Module):
         for mech in self.mechanisms.values():
             mech.breakpoint(mech.get(v))
 
-        for buf in self._buf_i:
-            buf.detach().zero_()
+        for i, buf in enumerate(self._buf_i):
+            self._buf_i[i] = torch.zeros_like(buf)
 
         # core loop: minimal Python, pure aten ops inside
         for c_idx, mech, fn, scale_f in self._map_exp:
@@ -271,10 +271,11 @@ class MechanismHandler(torch.nn.Module):
         for mech in self.mechanisms.values():
             mech.breakpoint(mech.get(v))
 
-        for buf in self._buf_i:
-            buf.detach().zero_()
-        for buf in self._buf_g:
-            buf.detach().zero_()
+        # reset buffers
+        for i, buf in enumerate(self._buf_i):
+            self._buf_i[i] = torch.zeros_like(buf)
+        for i, buf in enumerate(self._buf_g):
+            self._buf_g[i] = torch.zeros_like(buf)
 
         for c_idx, mech, fn, scale_f in self._map:
             if mech.factorable:
@@ -286,8 +287,8 @@ class MechanismHandler(torch.nn.Module):
             mech.add_(self._buf_g[c_idx], g)
 
         # sum up currents and conductances
-        tot_i = sum(self._buf_i)
-        tot_g = sum(self._buf_g)
+        tot_i = torch.stack(self._buf_i).sum(dim=0)
+        tot_g = torch.stack(self._buf_g).sum(dim=0)
 
         return tot_i, tot_g
 
@@ -295,8 +296,8 @@ class MechanismHandler(torch.nn.Module):
         if not self.currents:
             return
 
-        for buf in self._buf_i:
-            buf.detach().zero_()
+        for i, buf in enumerate(self._buf_i):
+            self._buf_i[i] = torch.zeros_like(buf)
 
         for c_idx, mech, fn, scale_f in self._map_exp:
             i = scale_f(fn(mech.get(v)))
@@ -305,7 +306,7 @@ class MechanismHandler(torch.nn.Module):
         for ion, ion_h in self.ions.items():
             ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
-        return sum(self._buf_i)
+        return torch.stack(self._buf_i).sum(dim=0)
 
     def set_buffers(self, diameters):
         for m in self.mechanisms.values():

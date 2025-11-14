@@ -1,7 +1,7 @@
 import logging
 import math
 import warnings
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -95,17 +95,31 @@ class _bwd_euler_sc_multi(MultiIntegrator, _bwd_euler_sc):
 
 class _bwd_euler_ub(Integrator):
     """
-    Implicit Euler method.
+    Implicit Euler method for single-layer cable (unbounded bath).
+
+    method: "thomas" (default), "spd", or "pcr"
+      - "thomas": classic Thomas solver (CPU via axonml_solvers, CUDA via custom kernel)
+      - "spd":    SPD tridiagonal solver (CPU only; uses cached Cholesky factors under the hood)
+      - "pcr":    parallel cyclic reduction (CPU/CUDA), used as fallback
     """
 
-    def __init__(self, model, mech, method="thomas", clip_scale_backward=None, **kw):
+    def __init__(
+        self, model, mech, method: str = "thomas", clip_scale_backward=None, **kw
+    ):
         super().__init__(model, mech, **kw)
-        self.method = method
+        self.method = method.lower()
 
+        # GC-variant (gradient clipping inside Thomas kernel) only makes sense for method="thomas"
         self.use_gc_variant = False
         if clip_scale_backward is not None:
-            self.register_buffer("clip_scale", torch.tensor(clip_scale_backward))
-            self.use_gc_variant = True
+            if self.method != "thomas":
+                warnings.warn(
+                    f"clip_scale_backward is only supported for method='thomas'; "
+                    f"ignoring for method='{self.method}'."
+                )
+            else:
+                self.register_buffer("clip_scale", torch.tensor(clip_scale_backward))
+                self.use_gc_variant = True
 
         self._last_bands: Tuple[Tensor, Tensor, Tensor] = None
         B, K = model.np, model.nc
@@ -119,31 +133,71 @@ class _bwd_euler_ub(Integrator):
         self.register_buffer("upper", torch.zeros(B, K - 1))
         self.register_buffer("g_edge_Cinv", torch.zeros(B, K - 1))
 
-        if method == "pcr":
-            self._solve = pcr_solve_t
-        elif method == "thomas":
-            self._solve = thomas_solve_cuda_t
-        else:
-            raise ValueError(f"Unknown method: {method}")
+    def _select_solver(self, model):
+        dev = model.device().type  # "cpu" or "cuda"
 
-    def initialize(self, model, dt):
+        # -------- explicit PCR --------
         if self.method == "pcr":
             self._solve = pcr_solve_t
-        elif self.method == "thomas":
-            if model.device().type == "cuda":
-                self._solve = thomas_solve_cuda_t
-            elif model.device().type == "cpu":
-                if AXONML_SOLVERS_AVAILABLE:
-                    if self.use_gc_variant:
-                        self._solve = torch.ops.axonml_solvers.thomas_solve_t_gc
-                    else:
-                        self._solve = torch.ops.axonml_solvers.thomas_solve_t
-                else:
+            return
+
+        # -------- SPD option (CPU only) --------
+        if self.method == "spd":
+            if dev == "cuda":
+                warnings.warn(
+                    "method='spd' is not implemented on CUDA; falling back to method='thomas' (CUDA)."
+                )
+                self.method = "thomas"  # fall through
+            elif dev == "cpu":
+                # We need axonml_solvers + solve_tri_spd
+                try:
+                    from axonml_solvers import solve_tri_spd
+                except ImportError:
                     warnings.warn(
-                        "Using `bwd_euler_ub` solver on CPU without axonml_solvers installed. "
-                        "Falling back to PCR solver."
+                        "method='spd' requested on CPU but solve_tri_spd / axonml_solvers "
+                        "is not available; falling back to method='thomas' (CPU) or PCR."
                     )
-                    self._solve = pcr_solve_t
+                    if AXONML_SOLVERS_AVAILABLE:
+                        self._solve = torch.ops.axonml_solvers.thomas_solve_t
+                    else:
+                        self._solve = pcr_solve_t
+                    return
+                else:
+                    # SPD solver is usable
+                    self._solve = solve_tri_spd
+                    return
+
+        # -------- default / THOMAS path --------
+        if self.method != "thomas":
+            warnings.warn(
+                f"Unknown or unsupported solver method '{self.method}', "
+                f"falling back to method='thomas'."
+            )
+            self.method = "thomas"
+
+        if dev == "cuda":
+            # CUDA: always use your CUDA Thomas implementation
+            self._solve = thomas_solve_cuda_t
+        elif dev == "cpu":
+            if AXONML_SOLVERS_AVAILABLE:
+                if self.use_gc_variant:
+                    self._solve = torch.ops.axonml_solvers.thomas_solve_t_gc
+                else:
+                    self._solve = torch.ops.axonml_solvers.thomas_solve_t
+            else:
+                warnings.warn(
+                    "Using `bwd_euler_ub` on CPU without axonml_solvers installed. "
+                    "Falling back to PCR solver."
+                )
+                self._solve = pcr_solve_t
+
+    def initialize(self, model, dt):
+        """
+        Compute geometry-dependent coefficients and select tridiagonal solver
+        based on `self.method` and device.
+        """
+        # Select solver first (depends on device and method)
+        self._select_solver(model)
 
         B, K = model.np, model.nc
         dt_s = dt * 1e-3  # s
@@ -177,13 +231,13 @@ class _bwd_euler_ub(Integrator):
         diag[:, 1:] -= g_right
         self.diag_base = diag
 
-        # time-scaled banded matrix (Thomas / DHS will overwrite main diag later)
-        self.lower = -dt_s * g_left  # (B,K-1)
-        self.upper = -dt_s * g_right  # (B,K-1)
+        # time-scaled banded matrix (Thomas / SPD will overwrite main diag later)
+        self.lower = -dt_s * g_left  # (B,K-1)  subdiag
+        self.upper = -dt_s * g_right  # (B,K-1)  superdiag
 
         # misc pre-computed factors used elsewhere
         self.cm_inv = Cm_inv  # (B,K)
-        self.scale = area_cm2 * Cm_inv  # A·s / C == 1, but keep for code reuse
+        self.scale = area_cm2 * Cm_inv  # A·s/C ≈ 1, but kept for code reuse
 
         self.base_shape = model.shape
 
@@ -194,7 +248,6 @@ class _bwd_euler_ub(Integrator):
         dt_s = dt * 1e-3
 
         v = self.mech.update_v(v)  # apply voltage processes
-
         self.mech.advance(v, dt, temp)
 
         itot, gtot = self.mech.i(v)  # (B,K)
@@ -209,8 +262,6 @@ class _bwd_euler_ub(Integrator):
             S[..., 1:-1] = -flux[..., :-1] + flux[..., 1:]
             S[..., 0] = -flux[..., 0]
             S[..., -1] = flux[..., -1]
-
-            # form RHS: v_n + dt*(linear_reversal + S - residual)
             f_n = f_n + S
 
         if intra is not None:
@@ -220,41 +271,33 @@ class _bwd_euler_ub(Integrator):
 
         # build tridiagonal system M v_{n+1} = RHS
         A_diag = self.diag_base - gtot * self.scale
-        main = 1.0 - dt_s * A_diag
+        main = 1.0 - dt_s * A_diag  # (B,K)
 
-        # a: (B, K-1), b: (B, K), c: (B, K-1), d: (B, K)
-        # inv_b = 1.0 / main  # shape (B, K)
-
-        # scale the three diagonals
-        a_s = self.lower
-        c_s = self.upper
-        b_s = main
+        # diagonals
+        a_s = self.lower  # (B,K-1)
+        c_s = self.upper  # (B,K-1)
+        b_s = main  # (B,K)
 
         self._last_bands = (a_s, b_s, c_s)
 
-        # scale RHS
-        d_s = RHS  # divide each equation by its pivot b_i
+        d_s = RHS
 
         # solve tridiagonal system
         if self.use_gc_variant:
-            v_np1 = self._solve(a_s, b_s, c_s, d_s, self.clip_scale)  # (B, K)
+            # GC variant only valid for Thomas solver
+            v_np1 = self._solve(a_s, b_s, c_s, d_s, self.clip_scale)
         else:
-            v_np1 = self._solve(a_s, b_s, c_s, d_s)  # (B, K)
+            v_np1 = self._solve(a_s, b_s, c_s, d_s)
 
         i_membrane = None
 
-        # --- fast_imem-style recovery (cheap O(N) saxpy) ---
         if self.imem:
-            # area and Cm from existing buffers (no extra storage needed)
             area = self.scale / self.cm_inv  # cm^2
             Cm = 1.0 / self.cm_inv  # F
             Cdt = Cm / dt_s  # A/V
-            g_abs = gtot * area  # S = A/V
+            g_abs = gtot * area  # S
             i_abs = itot * area  # A
             dmem = Cdt + g_abs  # A/V
-
-            # Using the Δv form to avoid an extra RHS build:
-            # I_mem_abs = dmem * (v_np1 - v) + i_abs
             i_membrane = dmem * (v_np1 - v) + i_abs
 
         return v_np1, i_membrane
@@ -268,13 +311,20 @@ class _bwd_euler_bt(Integrator):
 
     v_vars = ["v", "vc"]
 
-    def __init__(self, model, mech, imem=None, **kwargs):
+    def __init__(self, model, mech, imem=None, method="spd", **kwargs):
         if not AXONML_SOLVERS_AVAILABLE:
             logging.warning(
                 "Only CUDA-based solvers available, using triton Thomas solver. "
                 "CPU models will not work. Install axonml_solvers for CPU support."
             )
         super().__init__(model, mech, imem)
+
+        valid_methods = ["spd", "inv"]
+        if method not in valid_methods:
+            raise ValueError(
+                f"Unknown method: {method}, must be one of {valid_methods}"
+            )
+        self.method = method
 
         self.mech = mech
 
@@ -336,7 +386,14 @@ class _bwd_euler_bt(Integrator):
                 raise RuntimeError(
                     "CPU models require axonml_solvers to be installed for implicit integration."
                 )
-            self._solve = torch.ops.axonml_solvers.solve_bt
+            from axonml_solvers import solve_bt_spd
+
+            if self.M != 3:
+                raise ValueError(f"CPU block-Thomas (3x3) requires M=3, got M={self.M}")
+            if self.method == "spd":
+                self._solve = solve_bt_spd
+            elif self.method == "inv":
+                self._solve = torch.ops.axonml_solvers.solve_bt
         elif model.device().type == "cuda":
             self._solve = thomas_solve_cuda_bt
 
@@ -566,3 +623,33 @@ def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
         rhs[..., -1] += c_rad[..., -1] * v_prev[..., -1]
 
     return rhs
+
+
+def assemble_rhs_into(
+    out: torch.Tensor,
+    v_prev: torch.Tensor,
+    c_rad: torch.Tensor,
+    d: torch.Tensor,
+    xg: torch.Tensor,
+    e_ext: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    In-place variant of assemble_rhs. Fills `out` (shape = v_prev.shape = [B,K,3]).
+    """
+    out.zero_()
+
+    # v_c on radial edges
+    v_c = c_rad[..., :-1] * (v_prev[..., :-1] - v_prev[..., 1:])
+    out[..., :-1] += v_c
+    out[..., 1:] -= v_c
+
+    # membrane coupling vi<->ve0:
+    out[..., 0] += d
+    out[..., 1] -= d
+
+    # outermost shell / boundary term
+    if e_ext is not None:
+        out[..., -1] += xg * e_ext + c_rad[..., -1] * v_prev[..., -1]
+    else:
+        out[..., -1] += c_rad[..., -1] * v_prev[..., -1]
+    return out

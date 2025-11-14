@@ -1,3 +1,4 @@
+from numbers import Number
 from typing import Optional
 
 import numpy as np
@@ -114,16 +115,87 @@ class Waveform(SimpleParameterized):
         for t_ in t:
             yield self(t_)
 
+    # ----- + and - -----
     def __add__(self, other):
-        if not isinstance(other, Waveform):
-            raise TypeError(
-                f"Can only add Waveform instances together, got {type(other)}"
-            )
-        if isinstance(other, Sum):
-            return Sum(self, *other.waveforms)
-        if isinstance(self, Sum):
-            return Sum(*self.waveforms, other)
-        return Sum(self, other)
+        if isinstance(other, Waveform):
+            return Sum(self, other)
+        elif isinstance(other, Number):
+            return Sum(self, Constant(other))
+        return NotImplemented
+
+    def __radd__(self, other):
+        return self.__add__(other)
+
+    def __sub__(self, other):
+        if isinstance(other, Waveform):
+            return Sum(self, other, scale=[1.0, -1.0])
+        elif isinstance(other, Number):
+            return Sum(self, Constant(other), scale=[1.0, -1.0])
+        return NotImplemented
+
+    def __rsub__(self, other):
+        if isinstance(other, Number):
+            return Sum(Constant(other), self, scale=[1.0, -1.0])
+        return NotImplemented
+
+    # ----- * and / -----
+    def __mul__(self, other):
+        if isinstance(other, Waveform):
+            return Product(self, other)
+        elif isinstance(other, Number):
+            return Product(self, gain=float(other))
+        return NotImplemented
+
+    def __rmul__(self, other):
+        return self.__mul__(other)
+
+    def __truediv__(self, other):
+        if isinstance(other, Waveform):
+            return Product(self, Reciprocal(other))
+        elif isinstance(other, Number):
+            return Product(self, gain=1.0 / float(other))
+        return NotImplemented
+
+    def __rtruediv__(self, other):
+        if isinstance(other, Number):
+            return Product(Constant(other), Reciprocal(self))
+        return NotImplemented
+
+    def __neg__(self):
+        return (-1.0) * self
+
+
+# --- Primitives -------------------------------------------------------
+
+
+class Constant(Waveform):
+    def __init__(self, c: float):
+        super().__init__()
+        self.c = float(c)
+
+    def fn(self, t):
+        # Matches device/dtype/shape via broadcasting
+        return torch.full_like(t, self.c)
+
+    def __repr__(self):
+        return f"Constant({self.c})"
+
+
+class Reciprocal(Waveform):
+    """Represents 1 / wf."""
+
+    def __init__(self, wf: Waveform, eps: float = 1e-12):
+        super().__init__()
+        self.wf = wf
+        self.eps = float(eps)  # optional stabilizer if you ever want it
+
+    def fn(self, t):
+        return 1.0 / (self.wf.fn(t) + self.eps)
+
+    def __repr__(self):
+        if self.eps == 0.0:
+            return f"Reciprocal({repr(self.wf)})"
+        return f"Reciprocal({repr(self.wf)}, eps={self.eps})"
 
 
 class _repeat(Waveform):
@@ -147,15 +219,114 @@ class _repeat(Waveform):
 
 
 class Sum(Waveform):
-    def __init__(self, *waveforms):
-        super(Sum, self).__init__()
-        self.waveforms = torch.nn.ModuleList(waveforms)
+    def __init__(self, *waveforms, scale=None):
+        super().__init__()
+
+        if scale is None:
+            scale = [1.0] * len(waveforms)
+        else:
+            if len(scale) != len(waveforms):
+                raise ValueError("Scale length must match number of waveforms.")
+
+        flat_wfs = []
+        flat_scales = []
+
+        def _add(wf, s):
+            if isinstance(wf, Sum):
+                for child, child_s in zip(wf.waveforms, wf.scale):
+                    _add(child, s * child_s)
+            else:
+                flat_wfs.append(wf)
+                flat_scales.append(float(s))
+
+        for wf, s in zip(waveforms, scale):
+            _add(wf, s)
+
+        self.waveforms = torch.nn.ModuleList(flat_wfs)
+        self.scale = flat_scales
 
     def fn(self, t):
-        return sum(waveform.fn(t) for waveform in self.waveforms)
+        out = None
+        for s, wf in zip(self.scale, self.waveforms):
+            term = s * wf.fn(t)
+            out = term if out is None else out + term
+        return out
 
     def __repr__(self):
-        return f"Sum({', '.join(map(repr, self.waveforms))})"
+        parts = [f"{s}*{repr(wf)}" for s, wf in zip(self.scale, self.waveforms)]
+        return "Sum(" + ", ".join(parts) + ")"
+
+    # Scale-aware overrides make scalar ops cheaper than building Product
+    def __mul__(self, other):
+        if isinstance(other, Number):
+            return Sum(*self.waveforms, scale=[other * s for s in self.scale])
+        return super().__mul__(other)
+
+    def __truediv__(self, other):
+        if isinstance(other, Number):
+            inv = 1.0 / float(other)
+            return Sum(*self.waveforms, scale=[inv * s for s in self.scale])
+        return super().__truediv__(other)
+
+
+# --- Product (auto-flatten + gain) -----------------------------------
+
+
+class Product(Waveform):
+    """
+    Product of factors with an overall scalar gain.
+    - Auto-flattens nested Product.
+    - Scalars are absorbed into `gain`.
+    """
+
+    def __init__(self, *waveforms, gain: float = 1.0):
+        super().__init__()
+        flat = []
+        total_gain = float(gain)
+
+        def _add(wf):
+            nonlocal total_gain
+            if isinstance(wf, Product):
+                # absorb child's gain and flatten its factors
+                total_gain *= wf.gain
+                for child in wf.waveforms:
+                    _add(child)
+            elif isinstance(wf, Constant):
+                # Constant factor can fold into gain
+                total_gain *= wf.c
+            else:
+                flat.append(wf)
+
+        for wf in waveforms:
+            if isinstance(wf, Number):
+                total_gain *= float(wf)
+            else:
+                _add(wf)
+
+        self.gain = float(total_gain)
+        self.waveforms = torch.nn.ModuleList(flat)
+
+    def fn(self, t):
+        result = torch.full_like(t, self.gain)
+        for wf in self.waveforms:
+            result = result * wf.fn(t)
+        return result
+
+    def __repr__(self):
+        parts = [repr(wf) for wf in self.waveforms]
+        head = f"{self.gain}*" if self.gain != 1.0 else ""
+        return f"Product({head}{', '.join(parts)})"
+
+    # Cheap scalar tweaks
+    def __mul__(self, other):
+        if isinstance(other, Number):
+            return Product(*self.waveforms, gain=self.gain * float(other))
+        return super().__mul__(other)
+
+    def __truediv__(self, other):
+        if isinstance(other, Number):
+            return Product(*self.waveforms, gain=self.gain / float(other))
+        return super().__truediv__(other)
 
 
 class _poisson(Waveform):
