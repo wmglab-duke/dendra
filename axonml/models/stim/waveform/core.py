@@ -88,7 +88,7 @@ class Waveform(SimpleParameterized):
         raise NotImplementedError
 
     def forward(self, t):
-        return self.fn(t)
+        return self.fn(torch.as_tensor(t))
 
     def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
         return _repeat(self, freq, delay, off)

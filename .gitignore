@@ -140,3 +140,6 @@ examples/*/*.pkl
 # h5
 *.h5
 !examples/training/data/example_datasets/*.h5
+
+# macOS
+*.DS_Store
