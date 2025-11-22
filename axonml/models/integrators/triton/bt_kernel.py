@@ -2,9 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
+from torch.library import triton_op, wrap_triton
+
 
 # ---------------------------------------------------------------------
-# 3×3 analytic inverse ------------------------------------------------
+# 3x3 analytic inverse ------------------------------------------------
 # ---------------------------------------------------------------------
 @triton.jit
 def inv3x3(a0, a1, a2, a3, a4, a5, a6, a7, a8):  # pragma: no cover
@@ -178,93 +180,92 @@ def thomas_bt3_kernel(
 
 
 # ---------------------------------------------------------------------
-# python launcher -----------------------------------------------------
+# triton_op wrapper (forward) -----------------------------------------
 # ---------------------------------------------------------------------
-def _thomas_triton(lower, main, upper, rhs):
+@triton_op("axonml_triton::thomas_bt3_solve", mutates_args={})
+def thomas_bt3_solve(lower: torch.Tensor,
+                     main: torch.Tensor,
+                     upper: torch.Tensor,
+                     rhs: torch.Tensor) -> torch.Tensor:
     """
+    Block-Thomas solve for 3x3 blocks (GPU / Triton implementation).
+
     lower : (B, K-1, 3)
-    main  : (B, K,   3,3)
+    main  : (B, K,   3, 3)
     upper : (B, K-1, 3)
     rhs   : (B, K,   3)
+
+    returns
+    -------
+    x     : (B, K,   3)
     """
     B, K = rhs.shape[:2]
     out = torch.empty_like(rhs)
-
-    # main_c = main.clone()
-    rhs_c = rhs.clone()
-    minv_c = torch.empty(B, K, 9, device=main.device, dtype=main.dtype)
+    minv = torch.empty(B, K, 9, device=main.device, dtype=main.dtype)
 
     grid = ((B + BLOCK_FIBRES - 1) // BLOCK_FIBRES,)
 
-    thomas_bt3_kernel[grid](  # “one warp solves up to 32 fibres”
+    # Launch Triton kernel through wrap_triton so torch.compile understands it
+    wrap_triton(thomas_bt3_kernel)[grid](
         lower.reshape(B, -1),
         main.reshape(B, -1),
         upper.reshape(B, -1),
-        rhs_c.reshape(B, -1),
+        rhs.reshape(B, -1),
         out.reshape(B, -1),
-        minv_c.reshape(B, -1),
+        minv.reshape(B, -1),
         B,
         K=K,
         BLOCK=BLOCK_FIBRES,
         num_warps=1,
         num_stages=4,
     )
-
     return out
 
 
+# FakeTensor / meta implementation: just propagate shape/dtype/device
+@thomas_bt3_solve.register_fake
+def _(lower, main, upper, rhs):
+    return rhs.new_empty(rhs.shape)
+
+
 # ---------------------------------------------------------------------
-# autograd wrapper ----------------------------------------------------
+# autograd registration -----------------------------------------------
 # ---------------------------------------------------------------------
-class ThomasSolve(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, lower, main, upper, rhs):
-        """
-        lower : (B, K-1, 3)
-        main  : (B, K,   3,3)
-        upper : (B, K-1, 3)
-        rhs   : (B, K,   3)
-        returns x       : (B, K,   3)
-        """
-        x = _thomas_triton(lower, main, upper, rhs)
-        # save for backward
-        ctx.save_for_backward(lower, main, upper, x)
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_out):  # pragma: no cover
-        """
-        grad_out = ∂L/∂x  (same shape as x)
-        returns gradients w.r.t. (lower, main, upper, rhs)
-        """
-        lower, main, upper, x = ctx.saved_tensors
-        B, K = x.shape[:2]
-
-        # ------ 1. adjoint solve:  Aᵀ g = grad_out -------------------
-        main_T = main.transpose(-1, -2).contiguous()  # (B,K,3,3)
-        # swap lower <-> upper
-        g = _thomas_triton(
-            upper,  # acts as new lower
-            main_T,
-            lower,  # acts as new upper
-            grad_out,
-        )
-
-        # ------ 2. compute parameter gradients -----------------------
-        # rhs
-        grad_rhs = g
-
-        # main blocks (B,K,3,3)
-        grad_main = -(g.unsqueeze(-1) * x.unsqueeze(-2))
-
-        # upper & lower bands
-        grad_upper = -(g[:, :-1] * x[:, 1:])  # (B,K-1,3)
-        grad_lower = -(g[:, 1:] * x[:, :-1])  # (B,K-1,3)
-
-        return grad_lower, grad_main, grad_upper, grad_rhs
+def _bt3_setup_context(ctx, inputs, output):
+    lower, main, upper, rhs = inputs
+    x = output
+    ctx.save_for_backward(lower, main, upper, x)
 
 
-# convenience function -------------------------------------------------
+def _bt3_backward(ctx, grad_x):
+    """
+    grad_x = dL/dx, shape (B, K, 3)
+    Returns grads w.r.t. (lower, main, upper, rhs).
+    """
+    lower, main, upper, x = ctx.saved_tensors
+
+    # 1) Adjoint solve: Aᵀ g = grad_x
+    # Aᵀ has main blocks main^T and bands swapped (upper<->lower).
+    main_T = main.transpose(-1, -2).contiguous()  # (B, K, 3, 3)
+    g = thomas_bt3_solve(upper, main_T, lower, grad_x)      # (B, K, 3)
+
+    # 2) Parameter gradients
+    grad_rhs = g
+
+    # main blocks: -(g ⊗ x)
+    grad_main = -(g.unsqueeze(-1) * x.unsqueeze(-2))         # (B, K, 3, 3)
+
+    # bands: only diagonals are non-zero so we keep them as (B, K-1, 3)
+    grad_upper = -(g[:, :-1] * x[:, 1:])                     # (B, K-1, 3)
+    grad_lower = -(g[:, 1:] * x[:, :-1])                     # (B, K-1, 3)
+
+    return grad_lower, grad_main, grad_upper, grad_rhs
+
+
+thomas_bt3_solve.register_autograd(_bt3_backward, setup_context=_bt3_setup_context)
+
+
+# Backwards-compatible alias used by integrators / __init__.py
 def thomas_solve_cuda_bt(lower, main, upper, rhs):
-    """differentiable wrapper"""
-    return ThomasSolve.apply(lower, main, upper, rhs)
+    """Backward-compatible alias for the Triton block-Thomas solver."""
+    return thomas_bt3_solve(lower, main, upper, rhs)

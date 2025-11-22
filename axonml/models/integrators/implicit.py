@@ -18,7 +18,10 @@ except ImportError:
 from ..batching import expand_and_reshape
 from .core import Integrator, MultiIntegrator
 from .tridiag import pcr_solve_t
-from .triton import thomas_solve_cuda_bt, thomas_solve_cuda_t
+from .triton import (
+    thomas_solve_cuda_bt, solve_bt_spd_cuda,
+    thomas_solve_cuda_t, pcr_solve_cuda_t
+)
 
 
 class _bwd_euler_sc(Integrator):
@@ -98,15 +101,17 @@ class _bwd_euler_ub(Integrator):
     Implicit Euler method for single-layer cable (unbounded bath).
 
     method: "thomas" (default), "spd", or "pcr"
-      - "thomas": classic Thomas solver (CPU via axonml_solvers, CUDA via custom kernel)
-      - "spd":    SPD tridiagonal solver (CPU only; uses cached Cholesky factors under the hood)
-      - "pcr":    parallel cyclic reduction (CPU/CUDA), used as fallback
+      - "thomas" / "inv":   classic Thomas solver (CPU via axonml_solvers, CUDA via custom kernel)
+      - "spd":              SPD tridiagonal solver (CPU only; uses cached Cholesky factors under the hood)
+      - "pcr":              parallel cyclic reduction (CPU/CUDA), used as fallback
     """
 
     def __init__(
-        self, model, mech, method: str = "thomas", clip_scale_backward=None, **kw
+        self, model, mech, method: str = "inv", clip_scale_backward=None, **kw
     ):
         super().__init__(model, mech, **kw)
+        if method == "inv":
+            method = "thomas"
         self.method = method.lower()
 
         # GC-variant (gradient clipping inside Thomas kernel) only makes sense for method="thomas"
@@ -138,7 +143,10 @@ class _bwd_euler_ub(Integrator):
 
         # -------- explicit PCR --------
         if self.method == "pcr":
-            self._solve = pcr_solve_t
+            if dev == "cuda":
+                self._solve = pcr_solve_cuda_t
+            else:
+                self._solve = pcr_solve_t
             return
 
         # -------- SPD option (CPU only) --------
@@ -311,7 +319,7 @@ class _bwd_euler_bt(Integrator):
 
     v_vars = ["v", "vc"]
 
-    def __init__(self, model, mech, imem=None, method="spd", **kwargs):
+    def __init__(self, model, mech, imem=None, method="inv", **kwargs):
         if not AXONML_SOLVERS_AVAILABLE:
             logging.warning(
                 "Only CUDA-based solvers available, using triton Thomas solver. "
@@ -395,7 +403,10 @@ class _bwd_euler_bt(Integrator):
             elif self.method == "inv":
                 self._solve = torch.ops.axonml_solvers.solve_bt
         elif model.device().type == "cuda":
-            self._solve = thomas_solve_cuda_bt
+            if self.method == "spd":
+                self._solve = solve_bt_spd_cuda
+            else:
+                self._solve = thomas_solve_cuda_bt
 
         # ------------------------------------------------------------------
         # Geometry-dependent scalars

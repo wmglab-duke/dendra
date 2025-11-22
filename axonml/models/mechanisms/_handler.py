@@ -300,7 +300,7 @@ class MechanismHandler(torch.nn.Module):
             self._buf_i[i] = torch.zeros_like(buf)
 
         for c_idx, mech, fn, scale_f in self._map_exp:
-            i = scale_f(fn(mech.get(v)))
+            i = scale_f(getattr(mech, fn)(mech.get(v)))
             mech.add_(self._buf_i[c_idx], i)
 
         for ion, ion_h in self.ions.items():
@@ -320,7 +320,7 @@ class MechanismHandler(torch.nn.Module):
                     setattr(
                         m,
                         quantity,
-                        torch.empty(q.shape, device=q.device, dtype=q.dtype).copy(q),
+                        q.clone(),
                     )
                     for _, s in self.mechanisms[mech].DE.items():
                         setattr(s, quantity, getattr(m, quantity))
