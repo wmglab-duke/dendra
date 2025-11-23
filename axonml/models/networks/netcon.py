@@ -95,8 +95,9 @@ class NetCon(Referency):
         self.register_buffer(
             "has_spiked", torch.zeros(n_pre, device=self.device, dtype=torch.bool)
         )
+        # Store a *gate* in the same dtype as the rest of the module (float)
         self.register_buffer(
-            "is_spiking", torch.zeros(n_pre, device=self.device, dtype=torch.bool)
+            "is_spiking", torch.zeros(n_pre, device=self.device, dtype=self.dtype)
         )
 
         # --- Delay Handling Logic (Compiler-Friendly) ---
@@ -802,35 +803,49 @@ class NetCon(Referency):
         # If the pre-synaptic source is a NetStim, we can directly use its spikes
         # (or spikes_gate for differentiable spiking)
         if diff_spiking:
-            self.is_spiking = pre.spike_gate.view(-1).index_select(0, self.pre_idx)
+            # surrogate / soft gate, already float
+            gate = pre.spike_gate.view(-1).index_select(0, self.pre_idx)
         else:
-            self.is_spiking = pre.spikes.view(-1).index_select(0, self.pre_idx)
-        return
+            # hard spikes; usually bool → cast to float gate {0, 1}
+            gate = pre.spikes.view(-1).index_select(0, self.pre_idx).to(self.dtype)
+
+        # Ensure dtype is always self.dtype
+        self.is_spiking = gate.to(self.dtype)
 
     def determine_spiking_var(self, pre, diff_spiking: bool = True, tau=0.1):
-        # Otherwise, we need to compute spiking based on the pre-synaptic membrane potential
+        # Always work in the module's float dtype
         v_selected = self.get_pre_var(pre).view(-1).index_select(0, self.pre_idx)
+        v_selected = v_selected.to(self.dtype)
 
         if self.skip_thresholding:
+            # Just mirror v as a continuous "gate"
             self.is_spiking = v_selected
             return
 
         if diff_spiking:
-            self.has_spiked, _, self.is_spiking = update_active_diff(
+            # Surrogate / differentiable spiking
+            self.has_spiked, _, gate = update_active_diff(
                 self.has_spiked, v_selected, self.threshold, tau=tau
             )
+            # gate is typically float already, but enforce dtype
+            gate = gate.to(self.dtype)
         else:
-            self.has_spiked, self.is_spiking = update_active(
+            # Hard threshold spiking; usually returns Bool spikes
+            self.has_spiked, spikes = update_active(
                 self.has_spiked, v_selected, self.threshold
             )
+            # Turn {False,True} into {0.0,1.0} float gate
+            gate = spikes.to(self.dtype)
 
         if self.apply_masking:
-            self.is_spiking = torch.where(
+            # thresh_is_nan: bool mask; choose between v_selected and gate (both float)
+            gate = torch.where(
                 self.thresh_is_nan,
                 v_selected,
-                self.is_spiking,
+                gate,
             )
-        return
+
+        self.is_spiking = gate
 
     def zero(self, clear_delivery_buffers=True):
         """
@@ -841,7 +856,7 @@ class NetCon(Referency):
         if clear_delivery_buffers:
             self.delivery_buffer.zero_()
             self.has_spiked.fill_(False)
-            self.is_spiking.fill_(False)
+            self.is_spiking.zero_()  # float buffer, reset to 0.0
 
     def detach(self):
         """

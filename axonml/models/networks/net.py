@@ -366,16 +366,29 @@ class Network(RNGMixin):
 
         torch._dynamo.reset()
 
-        if self.jit:
-            self._step = torch.compile(
-                step,
-                backend=self.backend,
-                fullgraph=self.fullgraph,
-                dynamic=self.dynamic,
-                mode=self.compile_mode,
-            )
-        else:
-            self._step = step
+        with torch.set_grad_enabled(True):
+            if self.jit:
+                self._step_train = torch.compile(
+                    step,
+                    backend=self.backend,
+                    fullgraph=self.fullgraph,
+                    dynamic=self.dynamic,
+                    mode=self.compile_mode,
+                )
+            else:
+                self._step_train = step
+
+        with torch.set_grad_enabled(False):
+            if self.jit:
+                self._step_eval = torch.compile(
+                    step,
+                    backend=self.backend,
+                    fullgraph=self.fullgraph,
+                    dynamic=self.dynamic,
+                    mode=self.compile_mode,
+                )
+            else:
+                self._step_eval = step
 
         self.register_buffer(
             "t", torch.tensor(0.0, device=self.device(), dtype=self.dtype())
@@ -395,6 +408,7 @@ class Network(RNGMixin):
         for syn in self.synapses.values():
             syn.train(mode)
         self.training = mode
+        self._step = self._step_train
         return self
 
     def train_(self, mode=True):
@@ -407,6 +421,7 @@ class Network(RNGMixin):
         for syn in self.synapses.values():
             syn.eval()
         self.training = False
+        self._step = self._step_eval
         return self
 
     def eval_(self):

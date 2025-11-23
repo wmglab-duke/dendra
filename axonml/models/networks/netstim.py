@@ -85,10 +85,11 @@ class NetStim(torch.nn.Module, Sliceable):
 
         self.register_buffer("spike_counts", torch.zeros(self.N, dtype=torch.long))
         self.register_buffer("spikes", torch.zeros(self.N, dtype=torch.bool))
-        self.register_buffer("spike_gate", torch.zeros(self.N))
         self.register_buffer(
             "t_last", torch.tensor(-float("inf"))
         )  # last time seen in forward()
+
+        self.spike_gate = torch.zeros(self.N)  # differentiable spike gate
 
         # Per-generator min-heaps of future scheduled times (CPU-side metadata)
         self._sched_heaps: list[list[float]] = [[] for _ in range(self.N)]
@@ -148,24 +149,27 @@ class NetStim(torch.nn.Module, Sliceable):
         self.init_rng()
         device, dtype = self.device(), self.dtype()
 
-        self.next_stoch_time.detach().copy_(self.start)
+        with torch.no_grad():
+            # start time baseline
+            self.next_stoch_time.copy_(self.start)
 
-        if torch.any(self.noise > 0):
-            U = torch.rand((self.N,), generator=self._rng, device=device, dtype=dtype)
-            # Exp(mean = noise*interval) = -log(U) * (noise*interval)
-            init_offsets = -(
-                self.noise * self.interval(cache=(not self.training))
-            ) * torch.log(U)
-            self.next_stoch_time = self.next_stoch_time + init_offsets
+            if torch.any(self.noise > 0):
+                U = torch.rand(
+                    (self.N,), generator=self._rng, device=device, dtype=dtype
+                )
+                # Use a detached interval here; we don't want grads through this random kick
+                interval0 = self.interval(cache=(not self.training)).detach()
+                init_offsets = -(self.noise * interval0) * torch.log(U)
+                self.next_stoch_time.add_(init_offsets)
 
-        # recompute next_sched_time from heaps
-        self._refresh_next_sched_time_tensor()
+            # recompute next_sched_time from heaps
+            self._refresh_next_sched_time_tensor()
 
-        # spike_counts: how many spikes each synapse has emitted
-        self.spike_counts = self.spike_counts.detach().zero_()
-        self.spikes = self.spikes.detach().zero_()
-        self.spike_gate = self.spike_gate.detach().zero_()
-        self.t_last = self.t_last.detach().fill_(-float("inf"))
+            # spike_counts: how many spikes each synapse has emitted
+            self.spike_counts.zero_()
+            self.spikes.zero_()
+            self.spike_gate = self.spike_gate.detach().zero_().to(dtype=dtype)
+            self.t_last.fill_(-float("inf"))
 
         return self
 

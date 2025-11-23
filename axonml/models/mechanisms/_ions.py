@@ -186,27 +186,25 @@ class Ion(torch.nn.Module):
 
     def advance(self, celsius) -> None:
         name = self.name
-        iono = f"{name}o"
-        ioni = f"{name}i"
+        iono_name = f"{name}o"
+        ioni_name = f"{name}i"
+        e_name = f"e{name}"
 
-        iono_t = self._buffers[iono]
-        ioni_t = self._buffers[ioni]
+        # Read current buffers via attributes
+        iono_t = getattr(self, iono_name)
+        ioni_t = getattr(self, ioni_name)
 
-        iono_t = torch.where(
-            iono_t <= 0,
-            torch.tensor(1e-9, device=iono_t.device, dtype=iono_t.dtype),
-            iono_t,
-        )
-        self._buffers[iono] = iono_t
-        ioni_t = torch.where(
-            ioni_t <= 0,
-            torch.tensor(1e-9, device=ioni_t.device, dtype=ioni_t.dtype),
-            ioni_t,
-        )
-        self._buffers[ioni] = ioni_t
+        # Safeguard against <= 0
+        min_val = torch.tensor(1e-9, device=iono_t.device, dtype=iono_t.dtype)
+        iono_t = torch.where(iono_t <= 0, min_val, iono_t)
+        ioni_t = torch.where(ioni_t <= 0, min_val, ioni_t)
+
+        # Rebind attributes with the new tensors (no in-place)
+        setattr(self, iono_name, iono_t)
+        setattr(self, ioni_name, ioni_t)
 
         if not self.advance_e:
             return
 
-        new_val = torch.log(iono_t / ioni_t) * self.rzf * (273.15 + celsius)
-        self._buffers[f"e{name}"] = new_val
+        new_e = torch.log(iono_t / ioni_t) * self.rzf * (273.15 + celsius)
+        setattr(self, e_name, new_e)

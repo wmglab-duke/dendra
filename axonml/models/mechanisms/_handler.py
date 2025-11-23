@@ -1,4 +1,5 @@
 import torch
+import torch._dynamo as dynamo
 
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
 
@@ -157,6 +158,7 @@ class MechanismHandler(torch.nn.Module):
         for ion in self.ions.values():
             ion.initialize(temp)
 
+    @dynamo.disable
     def write_to_ions(self, v):
         for ion, ion_c_write in self.write_ion_c.items():
             for k, conc_list in ion_c_write.items():
