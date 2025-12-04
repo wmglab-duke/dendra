@@ -854,8 +854,8 @@ class Population(P, Sliceable):
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
 
-        # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
-        # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
+        # ve_s : [n_p, n_comp] or [1, n_comp] or [n_contacts, *]
+        # ve_t : [n_p, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
 
         intra = self.intra
 
@@ -872,9 +872,9 @@ class Population(P, Sliceable):
             ).contiguous()
 
             if multicontact:
-                ve_s = ve_s.expand(-1, self.n_ax, -1)
+                ve_s = ve_s.expand(-1, self.np, -1)
             else:
-                ve_s = ve_s.expand(self.n_ax, -1)
+                ve_s = ve_s.expand(self.np, -1)
 
             if isinstance(time, Waveform):
                 time = time.to(device=self.device(), dtype=self.dtype())
@@ -884,9 +884,9 @@ class Population(P, Sliceable):
                 functional = False
 
                 if multicontact:
-                    time = time.expand(-1, self.n_ax, -1)
+                    time = time.expand(-1, self.np, -1)
                 else:
-                    time = time.expand(self.n_ax, -1)
+                    time = time.expand(self.np, -1)
 
         dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
 
@@ -933,9 +933,9 @@ class Population(P, Sliceable):
                         if functional:
                             t = time(t_chunks[i]).to(self.dtype())
                             if multicontact:
-                                t = t.unsqueeze(0).expand(-1, self.n_ax, -1)
+                                t = t.unsqueeze(0).expand(-1, self.np, -1)
                             else:
-                                t = t.expand(self.n_ax, -1)
+                                t = t.expand(self.np, -1)
                         else:
                             t = t_chunks[i]
                         ve_ = einsum(ve_s, t).contiguous().unbind(dim=0)
