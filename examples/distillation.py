@@ -14,15 +14,18 @@ def num_rows_to_zero(A: int, x: float) -> int:
 
 
 def random_sinusoid_sum(
-    x: torch.Tensor,
+    x_student: torch.Tensor,
+    x_teacher: torch.Tensor,
     A: int,
     N: int,
     f_bounds: Tuple[float, float],
     *,
     seed: int | None = None,
 ) -> torch.Tensor:
-    if x.ndim != 2 or x.shape[0] != 1:
-        raise ValueError("x must have shape (1, n_coords)")
+    if x_student.ndim != 2 or x_student.shape[0] != 1:
+        raise ValueError("x_student must have shape (1, n_coords)")
+    if x_teacher.ndim != 2 or x_teacher.shape[0] != 1:
+        raise ValueError("x_teacher must have shape (1, n_coords)")
 
     f_min, f_max = f_bounds
     if f_min >= f_max:
@@ -30,15 +33,18 @@ def random_sinusoid_sum(
 
     # Ensure generator uses the same device/dtype as `x`.
     if seed is not None:
-        g = torch.Generator(device=x.device).manual_seed(seed)
+        g = torch.Generator(device=x_student.device).manual_seed(seed)
     else:
         g = None
 
+    dtype = x_student.dtype
+    device = x_student.device
+
     # Draw random frequencies (A, N) and phases (A, N)
-    freqs = torch.empty((A, N), dtype=x.dtype, device=x.device).uniform_(
+    freqs = torch.empty((A, N), dtype=dtype, device=device).uniform_(
         f_min, f_max, generator=g
     )
-    phases = torch.empty((A, N), dtype=x.dtype, device=x.device).uniform_(
+    phases = torch.empty((A, N), dtype=dtype, device=device).uniform_(
         0.0, 2 * math.pi, generator=g
     )
 
@@ -47,9 +53,10 @@ def random_sinusoid_sum(
     phases = phases.unsqueeze(-1)
 
     # Compute sinusoids and sum over N
-    signals = torch.sin(2 * math.pi * freqs * x + phases).sum(dim=1)
+    signals_student = torch.sin(2 * math.pi * freqs * x_student + phases).sum(dim=1)
+    signals_teacher = torch.sin(2 * math.pi * freqs * x_teacher + phases).sum(dim=1)
 
-    return signals
+    return signals_student, signals_teacher
 
 
 def random_sinusoid_sum_time(
@@ -96,7 +103,8 @@ def random_sinusoid_sum_time(
 
 
 def generator(
-    model: Axon,
+    student: Axon,
+    teacher: Axon,
     f_bounds_Hz=(0, 1000),
     f_bounds_s=(5e-5, 5e-4),
     tstop=2.5,
@@ -107,19 +115,23 @@ def generator(
     if dt is None:
         dt = A.dt
 
-    device = model.device()
+    device = student.device()
     t = torch.arange(0, tstop, dt, device=device)
 
-    x = model.x[0].view(1, -1)  # Ensure x is (1, n_coords)
-    n_a = model.n_ax
+    x_student = student.x[0].view(1, -1)  # Ensure x is (1, n_coords)
+    x_teacher = teacher.x[0].view(1, -1)  # Ensure x is (1, n_coords)
+    n_a = student.np
 
     for _ in range(n):
-        ve_s = random_sinusoid_sum(x, n_a, 5, f_bounds_s)
+        ve_s_student, ve_s_teacher = random_sinusoid_sum(
+            x_student, x_teacher, n_a, 5, f_bounds_s
+        )
         ve_t = random_sinusoid_sum_time(t, n_a, 5, f_bounds_Hz)
 
-        ve = torch.einsum("ac, at -> tac", ve_s, ve_t).detach() * scale
+        ve_student = torch.einsum("ac, at -> tac", ve_s_student, ve_t).detach() * scale
+        ve_teacher = torch.einsum("ac, at -> tac", ve_s_teacher, ve_t).detach() * scale
 
-        yield ve
+        yield ve_student, ve_teacher
 
 
 def distill(
@@ -164,11 +176,17 @@ def distill(
 
     n_splits = int(n_t / chunk_length)
 
-    for j, inputs in enumerate(input_generator):
-        inputs = inputs.to(student.device())
-        input_chunks = torch.tensor_split(inputs, n_splits, dim=0)
+    for j, (inputs_student, inputs_teacher) in enumerate(input_generator):
+        inputs_student = inputs_student.to(student.device())
+        inputs_teacher = inputs_teacher.to(teacher.device())
+        input_chunks_student = torch.tensor_split(inputs_student, n_splits, dim=0)
+        input_chunks_teacher = torch.tensor_split(inputs_teacher, n_splits, dim=0)
 
-        for i, chunk in enumerate(input_chunks):
+        subsample = teacher.nc // student.nc
+
+        for i, (chunk_student, chunk_teacher) in enumerate(
+            zip(input_chunks_student, input_chunks_teacher)
+        ):
             reinit = i == 0
 
             rec_v_student.reset()
@@ -179,11 +197,11 @@ def distill(
                 if reinit:
                     teacher.initialize()
                 teacher.run(
-                    ve=chunk,
+                    ve=chunk_teacher,
                     callbacks=[rec_v_teacher],
                     progressbar=False,
                 )
-                teacher_outputs = rec_v_teacher.stack("v")
+                teacher_outputs = rec_v_teacher.stack("v")[..., ::subsample]
                 if torch.isnan(teacher_outputs).any():
                     pbar.set_description(f"Chunk {i}: NaN teacher output; skipping")
                     continue
@@ -195,7 +213,7 @@ def distill(
                 student.detach()
                 student.populate()
             student.run(
-                ve=chunk,
+                ve=chunk_student,
                 callbacks=[rec_v_student],
                 progressbar=False,
             )

@@ -3,6 +3,7 @@
 import itertools
 import math
 import re
+from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
@@ -88,7 +89,7 @@ def follows_pattern(base_pattern, target_string):
     return re.search(regex_pattern, target_string) is not None
 
 
-def matches_any_pattern(base_patterns, target_string):
+def matches_any_pattern(base_patterns: Iterable[str], target_string: str) -> bool:
     """
     Check whether a target string matches any dotted base pattern.
 
@@ -96,10 +97,14 @@ def matches_any_pattern(base_patterns, target_string):
     string. All tokens except the final one must match entire words; the final
     token may match a word prefix.
 
+    Additionally, the '*' character inside a pattern token is treated as a
+    wildcard matching any sequence of characters (including empty).
+
     Parameters
     ----------
     base_patterns : Iterable[str]
-        Collection of dot-separated pattern strings to test.
+        Collection of dot-separated pattern strings to test. Tokens may
+        contain '*' as a wildcard.
     target_string : str
         Candidate string evaluated against each pattern.
 
@@ -116,23 +121,32 @@ def matches_any_pattern(base_patterns, target_string):
     True
     >>> matches_any_pattern(['a.b'], 'a_b.c')
     False
+    >>> matches_any_pattern(['*aug'], 'aug_default')
+    True
+    >>> matches_any_pattern(['*aug'], 'raug_default')
+    True
+    >>> matches_any_pattern(['*aug'], 'ina_aug_default')
+    True
     """
+
+    def _pattern_part_to_regex(part: str) -> str:
+        # Escape everything, then turn escaped '*' (r'\*') back into '.*'
+        escaped = re.escape(part)
+        return escaped.replace(r"\*", ".*")
+
     for base_pattern in base_patterns:
-        # Split the pattern by '.' and escape each part to treat special
-        # regex characters (like '.') as literal characters.
-        escaped_parts = [re.escape(part) for part in base_pattern.split(".")]
+        # Split the pattern by '.' and convert each part, treating '*' as wildcard.
+        regex_parts = [_pattern_part_to_regex(part) for part in base_pattern.split(".")]
 
         # The separator `\b.*?\b` ensures that all intermediate parts are
         # treated as whole words.
         regex_pattern = (
             r"\b"  # The pattern must start at a word boundary.
-            + r"\b.*?\b".join(escaped_parts)
-            # The final r"\b" is removed from here!
+            + r"\b.*?\b".join(regex_parts)
+            # No trailing \b so the final token may match a word prefix.
         )
 
-        if re.search(
-            regex_pattern, target_string, re.IGNORECASE
-        ):  # Added re.IGNORECASE for more robust matching
+        if re.search(regex_pattern, target_string, re.IGNORECASE):
             return True
 
     return False
