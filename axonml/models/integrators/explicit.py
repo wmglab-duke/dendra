@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch.nn import functional as F
@@ -437,8 +437,7 @@ class _dufort_frankel(Integrator):
         dt,
         temp,
         intra=None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # This method is identical to _step_no_intra, with one change:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         # The stimulus current `intra` is added to the numerator.
         v_padded = F.pad(v, (1, 1), "reflect")
 

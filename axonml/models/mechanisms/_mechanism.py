@@ -900,7 +900,7 @@ class PointProcess(Mechanism):
 
     Implementing a Mechanism as PointProcess simply instructs AxonML to scale
     the currents and conductances by the area of the relevant compartments to translate
-    them to densities. As such, unlike in NEURON, they cannot be inserted at branchpoints
+    them to densities. As such, they cannot be inserted at branchpoints
     (which have 0 area), and doing so will produce a numerical error.
     """
 

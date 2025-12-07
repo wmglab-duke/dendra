@@ -243,7 +243,7 @@ class NetStim(torch.nn.Module, Sliceable):
         device, dtype = self.device(), self.dtype()
         t = torch.as_tensor(t, device=device, dtype=dtype)
 
-        # ---- 1) SNAPSHOT (avoid using live buffers directly in the graph) ----
+        # SNAPSHOT (avoid using live buffers directly in the graph)
         stoch_snap = (
             self.next_stoch_time if bptt else self.next_stoch_time.detach()
         ).clone()
@@ -259,9 +259,7 @@ class NetStim(torch.nn.Module, Sliceable):
         can_spike = self.spike_counts < self.max_spikes
         s_hard = torch.logical_and(s_hard, can_spike)
         self.spikes = s_hard  # bool view; fine to keep as is
-        self.spike_gate = gate * can_spike.to(
-            gate.dtype
-        )  # keep grad if you use it in loss
+        self.spike_gate = gate * can_spike.to(gate.dtype)  # keep grad if used in loss
 
         # 2) stochastic interval draw (grad will flow to interval via this)
         U = torch.rand((self.N,), generator=self._rng, device=device, dtype=dtype)
@@ -286,7 +284,7 @@ class NetStim(torch.nn.Module, Sliceable):
 
         new_stoch = stoch_snap + delta  # <- no in-place on the buffer used in 'minimum'
 
-        # ---- 3) COMMIT state safely (no version-bump hazards) ----
+        # COMMIT state safely (no version-bump hazards)
         if bptt:
             # keep graph across steps: replace the buffer with the new tensor
             self._buffers["next_stoch_time"] = new_stoch
