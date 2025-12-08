@@ -6,6 +6,8 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from .rng import RNGModule
+
 
 def to_param(val, positive=False):
     """
@@ -782,17 +784,22 @@ class SimpleParameterized(Referency):
         return ", ".join(f"{k}={v}" for k, v in self.named_parameters())
 
 
-def check_conflicts(global_params, range_params, params_defined_here):
+def check_conflicts(
+    global_params, range_params, params_defined_here, rng_defined_here=None
+):
     """
     Check for conflicts between global parameters, range parameters, and
     parameters defined in the current class.
 
     Raises ValueError if any parameter is defined in more than one category.
     """
+    if rng_defined_here is None:
+        rng_defined_here = set()
     all_params = (
         set(global_params.keys())
         .union(range_params.keys())
         .union(params_defined_here.keys())
+        .union(rng_defined_here)
     )
     duplicates = set()
 
@@ -801,6 +808,7 @@ def check_conflicts(global_params, range_params, params_defined_here):
             (param in global_params)
             + (param in range_params)
             + (param in params_defined_here)
+            + (param in rng_defined_here)
         )
         if count > 1:
             duplicates.add(param)
@@ -944,6 +952,10 @@ class Parameterized(SimpleParameterized):
     _range_defined_here = {}
     _range_declarations = []
 
+    _rng = {}
+    _rng_defined_here = {}
+    _rng_declarations = []
+
     def __init_subclass__(cls, **kwargs):
         """
         This special method is called automatically whenever a class
@@ -956,17 +968,21 @@ class Parameterized(SimpleParameterized):
         # Start with a fresh dictionary for the new class's parameters.
         new_global = {}
         new_range = {}
+        new_rng = {}
 
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
-            # We look for _global and _range attributes defined directly on the base
+            # We look for _global, _range, _rng attributes defined directly on the base
             if "_global" in base.__dict__:
                 new_global.update(base._global)
             if "_range" in base.__dict__:
                 new_range.update(base._range)
+            if "_rng" in base.__dict__:
+                new_rng.update(base._rng)
 
         cls._global_defined_here = {}
         cls._range_defined_here = {}
+        cls._rng_defined_here = {}
 
         # Add parameters declared via the GLOBAL() method
         if Parameterized._global_declarations:
@@ -978,13 +994,22 @@ class Parameterized(SimpleParameterized):
             for r_dict in Parameterized._range_declarations:
                 cls._range_defined_here.update(r_dict)
             Parameterized._range_declarations = []
+        # Add rng declarations
+        if Parameterized._rng_declarations:
+            for rng_dict in Parameterized._rng_declarations:
+                cls._rng_defined_here.update(rng_dict)
+            Parameterized._rng_declarations = []
 
         # Update the new global and range dictionaries with the class-specific declarations
         new_global.update(cls._global_defined_here)
         new_range.update(cls._range_defined_here)
+        new_rng.update(cls._rng_defined_here)
 
         check_conflicts(
-            cls._global_defined_here, cls._range_defined_here, cls._params_defined_here
+            cls._global_defined_here,
+            cls._range_defined_here,
+            cls._params_defined_here,
+            cls._rng_defined_here,
         )
 
         # Add parameters from class definition keywords (e.g., a=10)
@@ -994,6 +1019,7 @@ class Parameterized(SimpleParameterized):
 
         cls._global = new_global
         cls._range = new_range
+        cls._rng = new_rng
 
         assign_precendence(cls)
 
@@ -1013,6 +1039,14 @@ class Parameterized(SimpleParameterized):
         """
         Parameterized._range_declarations.append(kwargs)
 
+    @staticmethod
+    def RNG(*args):
+        """
+        A static method to declare rng parameters. This has the side effect of
+        appending the rng names to a temporary class-level list.
+        """
+        Parameterized._rng_declarations.append(set(args))
+
     def __init__(self, shape, shape_f, additional_parameters=None, **kwargs):
         super().__init__(**kwargs)
         try:
@@ -1025,6 +1059,7 @@ class Parameterized(SimpleParameterized):
 
         self.globals = self.__class__._global.copy()
         self.range = self.__class__._range.copy()
+        self.rng = self.__class__._rng.copy()
 
         self.in_graph_parametrizations = {}
 
@@ -1040,6 +1075,7 @@ class Parameterized(SimpleParameterized):
         self.additional_parameters = {}
         self.instantiate_global(**self.globals)
         self.instantiate_range(**self.range)
+        self.instantiate_rng(**self.rng)
         self.instantiate_additional_parameters(additional_parameters)
 
     def reshape(self, shape_p, shape_f):
@@ -1094,6 +1130,29 @@ class Parameterized(SimpleParameterized):
                 setattr(self, p_name, to_param(value))
                 self.register_buffer(name, torch.empty(self.shape_p))
                 getattr(self, name).copy_(getattr(self, p_name))
+
+    def instantiate_rng(self, **kwargs):
+        for name, value in kwargs.items():
+            rng = RNGModule(value, shape_p=self.shape_p, shape_f=self.shape_f)
+            setattr(self, name, rng)
+
+    def init_rng(self):
+        """
+        Initialize all RNG modules.
+        """
+        for name in self.__class__._rng.keys():
+            rng_module = getattr(self, name)
+            if isinstance(rng_module, RNGModule):
+                rng_module.init()
+
+    def reset_rng(self):
+        """
+        Reseed all RNG modules.
+        """
+        for name in self.__class__._rng.keys():
+            rng_module = getattr(self, name)
+            if isinstance(rng_module, RNGModule):
+                rng_module.reset()
 
     def register_parametrization_in_graph(self, name: str, param: Callable, args=None):
         """

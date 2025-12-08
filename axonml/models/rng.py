@@ -138,3 +138,39 @@ class RNGMixin(nn.Module):
             g.manual_seed(self._base_seed + 0x9E3779B97F4A7C15 * (1 + off))
             self._device_gens[dev] = g
         return g
+
+
+class RNGModule(RNGMixin):
+    def __init__(self, seed, shape_p, shape_f):
+        super().__init__(seed)
+        self.shape_p = shape_p
+        self.shape_f = shape_f
+        self.rng = None
+
+    def init(self, device: torch.device | str | None = None):
+        """Initialize the RNG for a specific device."""
+        self.rng = self._rng(device)
+
+    def rand(self, shape=None):
+        """Generate uniform random numbers in [0, 1)."""
+        if shape is None:
+            shape = self.shape_f
+        return torch.rand(shape, generator=self.rng)
+
+    def randn(self, shape=None):
+        """Generate standard normal random numbers."""
+        if shape is None:
+            shape = self.shape_f
+        return torch.randn(shape, generator=self.rng)
+
+    def binomial(self, n, p, shape=None):
+        """Generate binomial random numbers."""
+        if shape is None:
+            shape = self.shape_f
+        n = torch.as_tensor(n, device=self.rng.device).expand(shape)
+        p = torch.as_tensor(p, device=self.rng.device).expand(shape)
+        return torch.binomial(n, p, generator=self.rng)
+
+    def reset(self):
+        """Reseed the RNG to its initial state."""
+        self.rng.manual_seed(self._base_seed)

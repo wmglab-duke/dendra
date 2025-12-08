@@ -120,6 +120,7 @@ class MechanismHandler(torch.nn.Module):
 
     def initialize(self, v, celsius, diameters, populate=True):
         self.make_maps()
+        self.init_rng()
         if populate:
             self.populate()
         self.ion_init(celsius)
@@ -146,6 +147,14 @@ class MechanismHandler(torch.nn.Module):
             idx = current_names.index(f"i{ion}")
             self.ion_to_buff_idx[ion] = idx
         self.i_g_buffers_initialized = True
+
+    def init_rng(self):
+        for mech in self.mechanisms.values():
+            mech.init_rng()
+
+    def reset_rng(self):
+        for mech in self.mechanisms.values():
+            mech.reset_rng()
 
     def populate(self, mech=None) -> None:
         if mech is not None:

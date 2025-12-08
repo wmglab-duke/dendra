@@ -865,6 +865,17 @@ class Mechanism(Parameterized):
                 dct[state_name] = self._buffers[state_name]
         return dct
 
+    # -- rng --
+    def init_rng(self):
+        for state_module in self.DE.values():
+            state_module.init_rng()
+        super().init_rng()
+
+    def reset_rng(self):
+        for state_module in self.DE.values():
+            state_module.reset_rng()
+        super().reset_rng()
+
 
 class VoltageProcess(Mechanism):
     """
