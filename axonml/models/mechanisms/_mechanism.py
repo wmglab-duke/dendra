@@ -23,7 +23,7 @@ class Mechanism(Parameterized):
 
     Notes
     -----
-    Subclasses typically declare state, assigned, and ionic variables using the
+    Subclasses declare state, assigned, and ionic variables using the
     :meth:`STATE`, :meth:`ASSIGNED`, :meth:`SAVE`, :meth:`USEION`, and
     :meth:`NONSPECIFIC_CURRENT` helpers during class definition.
     """

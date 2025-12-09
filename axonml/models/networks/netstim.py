@@ -20,6 +20,24 @@ class NetStim(torch.nn.Module, Sliceable):
 
     This class generates spike events according to a stochastic process with
     configurable timing parameters, similar to NEURON's NetStim mechanism.
+
+    Parameters
+    ----------
+    N : int, optional
+        Number of independent event generators. Default is 1.
+    interval : float | list[float], optional
+        Mean inter-spike interval in ms. Default is 10.0.
+    start : float | list[float], optional
+        Start time (ms) after which synapses can begin spiking. Default is 0.0.
+    noise : float | list[float], optional
+        Controls randomness of intervals, between 0 and 1. Default is 0.0.
+    max_spikes : int | list[int], optional
+        Maximum number of spikes each synapse can deliver. Default is 1e9.
+    tau : float, optional
+        Time constant (ms) for the differentiable spike gate. Default is 0.1
+    seed : int, optional
+        Seed for reproducible random number generation. If None,
+        uses non-deterministic seeding. Default is None.
     """
 
     __constants__ = ["seed"]
@@ -34,25 +52,6 @@ class NetStim(torch.nn.Module, Sliceable):
         tau: float = 0.1,
         seed: Optional[int] = None,
     ):
-        """
-        Initialize the NetStim spike generator.
-
-        Parameters
-        ----------
-        N : int, optional
-            Number of independent event generators. Default is 1.
-        interval : float | list[float], optional
-            Mean inter-spike interval in ms. Default is 10.0.
-        start : float | list[float], optional
-            Start time (ms) after which synapses can begin spiking. Default is 0.0.
-        noise : float | list[float], optional
-            Controls randomness of intervals, between 0 and 1. Default is 0.0.
-        max_spikes : int | list[int], optional
-            Maximum number of spikes each synapse can deliver. Default is 1e9.
-        seed : int, optional
-            Seed for reproducible random number generation. If None,
-            uses non-deterministic seeding. Default is None.
-        """
         super().__init__()
         Sliceable.__init__(self)
         self._validate_parameters(N, interval, start, noise, max_spikes)

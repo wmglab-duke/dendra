@@ -1,5 +1,5 @@
 (installation)=
-# 🖥️ Installation
+# Installation
 
 > 💡 We recommend using a dedicated environment (e.g., `conda`) for AxonML.
 > AxonML targets Python 3.11+; the examples below use Python 3.12.

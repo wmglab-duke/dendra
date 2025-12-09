@@ -1,8 +1,8 @@
-This Agreement, effective as of the date the software is downloaded (ìEFFECTIVE DATEî) is between Duke University ("DUKE"), a non-profit institution of higher education, and you (ìYOUî), an individual accessing, downloading, or using the software.
+This Agreement, effective as of the date the software is downloaded (‚ÄúEFFECTIVE DATE‚Äù) is between Duke University ("DUKE"), a non-profit institution of higher education, and you (‚ÄúYOU‚Äù), an individual accessing, downloading, or using the software.
 
-WHEREAS, DUKE owns and holds certain rights, title and interest to copyrighted software pertaining to OTC File T-008477 (ìPROGRAMî); and
+WHEREAS, DUKE owns and holds certain rights, title and interest to copyrighted software pertaining to OTC File T-008477 (‚ÄúPROGRAM‚Äù); and
 
-WHEREAS, DUKE owns and holds certain rights, title, and interest to the following patent application/issued patent (PATENT APPLICATION NO. 18/182,018)  for the technology described in OTC File T-007793 (ìPATENT RIGHTS"); and
+WHEREAS, DUKE owns and holds certain rights, title, and interest to the following patent application/issued patent (PATENT APPLICATION NO. 18/182,018)  for the technology described in OTC File T-007793 (‚ÄúPATENT RIGHTS"); and
 
 WHEREAS, DUKE desires to distribute the PROGRAM for academic, non-commercial research use and testing, and to promote marketing and commercialization of the PATENT RIGHTS, DUKE herein agrees to grant a limited license to the PROGRAM for research, non-commercial purposes only, with DUKE retaining all other rights and uses to both the PATENT RIGHTS and the PROGRAM;
 
@@ -12,13 +12,13 @@ THEREFORE, DUKE hereby agrees to make the PROGRAM available to YOU, subject to t
 
     (a) Subject to the terms of this Agreement, DUKE hereby grants YOU a royalty-free, non-transferable, non-exclusive, worldwide license under its copyright to use, reproduce, modify, publicly display, and perform the PROGRAM solely for non-commercial research and/or academic testing purposes.
 
-    (b) In order to obtain any further license rights, including the right to use the PROGRAM, any modifications or derivatives made by YOU, and/or PATENT RIGHTS for commercial purposes, (including using modifications as part of an industrially sponsored research project), YOU must contact DUKEís Office for Translation and Commercialization (Digital Innovations Team) about additional commercial license agreements.
+    (b) In order to obtain any further license rights, including the right to use the PROGRAM, any modifications or derivatives made by YOU, and/or PATENT RIGHTS for commercial purposes, (including using modifications as part of an industrially sponsored research project), YOU must contact DUKE‚Äôs Office for Translation and Commercialization (Digital Innovations Team) about additional commercial license agreements.
 
 2.  Disclaimer.   THE PROGRAM MADE AVAILABLE HEREUNDER IS "AS IS", WITHOUT WARRANTY OF ANY KIND EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE, NOR REPRESENTATION THAT THE PROGRAM DOES NOT INFRINGE THE INTELLECTUAL PROPERTY RIGHTS OF ANY THIRD PARTY. DUKE has no obligation to assist in your installation or use of the PROGRAM or to provide services or maintenance of any type with respect to the PROGRAM.  The entire risk as to the quality and performance of the PROGRAM is borne by YOU.  YOU acknowledge that the PROGRAM may contain errors or bugs. YOU must determine whether the PROGRAM sufficiently meets your requirements.  This disclaimer of warranty constitutes an essential part of this Agreement.
 
 3. No Consequential Damages; Indemnification.  IN NO EVENT SHALL DUKE BE LIABLE TO YOU FOR ANY LOST PROFITS OR OTHER DIRECT, INDIRECT, PUNITIVE, INCIDENTAL OR CONSEQUENTIAL DAMAGES RELATING TO THE SUBJECT MATTER OF THIS AGREEMENT.
 
-4. Copyright.  YOU agree to retain DUKEíS copyright notice: ìCopyright 2024 Duke University. All Rights Reservedî on all copies of the PROGRAM or portions thereof.
+4. Copyright.  YOU agree to retain DUKE‚ÄôS copyright notice: ‚ÄúCopyright 2024 Duke University. All Rights Reserved‚Äù on all copies of the PROGRAM or portions thereof.
 
 5.  Term and Termination.    The Term of this Agreement shall be five (5) years from the date YOU accept the terms of this license.  If YOU at any time fail to abide by the terms of this Agreement, DUKE shall have the right to immediately terminate the license granted herein, require the return or destruction of all copies of the PROGRAM from YOU, and obtain certification in writing as to such return or destruction, and pursue any other legal or equitable remedies available.
 

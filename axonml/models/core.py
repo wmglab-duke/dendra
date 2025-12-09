@@ -319,6 +319,38 @@ class Population(P, Sliceable):
         self.initialized: bool = False
         self.eval()
 
+    @property
+    def shape(self):
+        """
+        Shape tuple of the membrane potential tensor.
+
+        Returns
+        -------
+        tuple of int
+            Dimensions of ``self.v`` including any batch axes.
+        """
+        return tuple(self.v.shape)
+
+    @property
+    def graph(self):
+        """
+        Returns the graph of the population.
+        This is a placeholder for future graph-related functionality.
+        """
+        return None
+
+    @property
+    def area(self):
+        """
+        Returns the area of the population.
+        This is a placeholder for future area-related functionality.
+        """
+        if self.graph is not None:
+            area = get_area_from_graph(self.graph)
+            if area is not None:
+                return area.to(self.device(), dtype=self.dtype())
+        return self.diam * 1e-4 * torch.pi * self.dx * 1e-4  # in cm²
+
     def numel(self, include_batch_dimensions=True):
         """
         Count elements in the population state tensor.
@@ -349,18 +381,6 @@ class Population(P, Sliceable):
         """
         return self.numel(include_batch_dimensions=False)
 
-    @property
-    def shape(self):
-        """
-        Shape tuple of the membrane potential tensor.
-
-        Returns
-        -------
-        tuple of int
-            Dimensions of ``self.v`` including any batch axes.
-        """
-        return tuple(self.v.shape)
-
     def equilibria(self, **kwargs):
         """
         Register reversal potential configuration for ionic species.
@@ -382,26 +402,6 @@ class Population(P, Sliceable):
             Keyword arguments forwarded to ``axonml.models.mechanisms._ions.concentrations``.
         """
         self._concentrations.update(kwargs)
-
-    @property
-    def graph(self):
-        """
-        Returns the graph of the population.
-        This is a placeholder for future graph-related functionality.
-        """
-        return None
-
-    @property
-    def area(self):
-        """
-        Returns the area of the population.
-        This is a placeholder for future area-related functionality.
-        """
-        if self.graph is not None:
-            area = get_area_from_graph(self.graph)
-            if area is not None:
-                return area.to(self.device(), dtype=self.dtype())
-        return self.diam * 1e-4 * torch.pi * self.dx * 1e-4  # in cm²
 
     def collect_parameters(self, *names):
         """
@@ -697,7 +697,7 @@ class Population(P, Sliceable):
         ----------
         ve : Tensor, optional
             Extracellular voltage tensor. Shape should be
-            [timesteps, n_ax, 1, n_comp] or compatible.
+            [timesteps, model.np, model.nc] or compatible.
         space : Tensor, optional
             Spatial components when ve is not directly provided.
             Used with time to construct ve.
@@ -821,12 +821,12 @@ class Population(P, Sliceable):
         progressbar=True,
         multicontact=False,
     ):
-        """
+        r"""
         Run a long simulation by dividing it into multiple smaller chunks.
 
         This method splits the overall simulation into chunks of a given length,
         allowing for more efficient memory management during long simulations.
-        The model's state (e.g., voltage variables, v_prev, etc.) is maintained
+        The model's state (e.g., voltage variables, ``v_prev``, etc.) is maintained
         between chunks, ensuring continuity across the entire simulation period.
 
         Parameters
@@ -836,33 +836,36 @@ class Population(P, Sliceable):
         chunklength : int
             The number of time steps to process in each chunk.
         dt : float, optional
-            The simulation time step in milliseconds. If None, the default value
+            The simulation time step in milliseconds. If ``None``, the default value
             from the backend will be used.
         extra : tuple of (Tensor, Waveform), optional
             A tuple containing extra input parameters:
-            - The first element (ve_s) is a tensor representing spatial voltage components.
-            - The second element (time) is either a Waveform object or a tensor representing time.
+
+            * The first element (``ve_s``) is a tensor representing spatial
+              voltage components.
+
+            * The second element (``time``) is either a :class:`Waveform` object
+              or a tensor representing time.
+
             These values are used to construct the extracellular voltage.
         callbacks : list of Callback, optional
             A list of callback objects to be executed during simulation, allowing for
-            customized processing at various stages (e.g., pre-loop, post-step, post-loop).
+            customized processing at various stages (e.g., pre-loop, post-step,
+            post-loop).
         progressbar : bool or tqdm, optional
-            If True (or if a tqdm instance is provided), displays a progress bar to
-            track simulation progress across chunks.
+            If ``True`` (or if a :class:`tqdm.tqdm` instance is provided), displays
+            a progress bar to track simulation progress across chunks.
         multicontact : bool, optional
-            If True, configures the handling of multiple electrode contacts for
-            constructing the extracellular voltage input.
-
-        Returns
-        -------
-        None
+            If ``True``, configures the handling of multiple electrode contacts for
+            constructing the extracellular voltage input. Default is ``False``.
 
         Notes
         -----
-        - When `extra` is provided, the method uses it to assemble the extracellular
-        voltage (ve) for the simulation.
-        - Chunk processing helps manage memory usage during extended simulations by
-        processing data in manageable segments.
+        * When ``extra`` is provided, the method uses it to assemble the extracellular
+          voltage (``ve``) for the simulation.
+
+        * Chunk processing helps manage memory usage during extended simulations by
+          processing data in manageable segments.
         """
 
         if not self.initialized:
@@ -1361,9 +1364,9 @@ class Population(P, Sliceable):
         """
         if ion in self._ion_style:
             return self._ion_style[ion]
-        return self.calc_ion_style(ion)
+        return self._calc_ion_style(ion)
 
-    def c_is_written(self, ion):
+    def _c_is_written(self, ion):
         """
         Determine whether concentration values are written for an ion.
 
@@ -1380,7 +1383,7 @@ class Population(P, Sliceable):
         d = self._ion_write_c.get(ion, {})
         return bool(d)
 
-    def c_is_read(self, ion):
+    def _c_is_read(self, ion):
         """
         Determine whether concentration values are read for an ion.
 
@@ -1400,7 +1403,7 @@ class Population(P, Sliceable):
         check = list(itertools.chain(*d.values()))
         return f"{ion}i" in check or f"{ion}o" in check
 
-    def e_is_read(self, ion):
+    def _e_is_read(self, ion):
         """
         Determine whether reversal potentials are read for an ion.
 
@@ -1419,7 +1422,7 @@ class Population(P, Sliceable):
             return False
         return f"e{ion}" in list(itertools.chain(*d.values()))
 
-    def calc_ion_style(self, ion):
+    def _calc_ion_style(self, ion):
         """
         Infer ion style flags based on current read/write registrations.
 
@@ -1433,23 +1436,23 @@ class Population(P, Sliceable):
         tuple
             Tuple of style flags ``(c_style, e_style, einit, eadvance, cinit)``.
         """
-        c_is_written = self.c_is_written(ion)
-        c_is_read = self.c_is_read(ion)
-        e_is_read = self.e_is_read(ion)
+        _c_is_written = self._c_is_written(ion)
+        _c_is_read = self._c_is_read(ion)
+        _e_is_read = self._e_is_read(ion)
 
-        if c_is_written:
-            if e_is_read:
+        if _c_is_written:
+            if _e_is_read:
                 return (3, 2, 1, 1, 1)
             return (3, 0, 0, 0, 1)
-        if c_is_read:
-            if e_is_read:
+        if _c_is_read:
+            if _e_is_read:
                 return (1, 2, 1, 0, 0)
             return (1, 0, 0, 0, 0)
-        if e_is_read:
+        if _e_is_read:
             return (0, 1, 0, 0, 0)
         return (0, 0, 0, 0, 0)
 
-    def register_mech(self, m, shape, key):
+    def _register_mech(self, m, shape, key):
         """
         Register a compiled mechanism with the population.
 
@@ -1610,12 +1613,12 @@ class Population(P, Sliceable):
         with conc, eq:
             for mech, (name, ic, kwargs) in self._mech_everywhere.items():
                 key = None
-                shape = self.calc_shape_p()
+                shape = self._calc_shape_p()
                 shape_f = self.shape
                 m = mech(
                     name, self.celsius, self.diam, shape, shape_f, key, ic=ic, **kwargs
                 )
-                self.register_mech(m, shape, key)
+                self._register_mech(m, shape, key)
 
             for mech, data in self._mech_data.items():
                 aliases, kwargs_list, keys = tuple(map(list, zip(*data)))
@@ -1626,7 +1629,7 @@ class Population(P, Sliceable):
                 m, shape, key = compile_mechanism(
                     self, mech, keys, aliases, kwargs_list
                 )
-                self.register_mech(m, shape, key)
+                self._register_mech(m, shape, key)
 
             all_ions = get_unique_keys(
                 [self._ion_read, self._ion_write, self._ion_write_c]
@@ -1959,7 +1962,7 @@ class Population(P, Sliceable):
         """
         return len(self.shape) - 2
 
-    def calc_shape_p(self):
+    def _calc_shape_p(self):
         """
         Compute per-parameter broadcast shape accounting for batching.
 
@@ -1991,7 +1994,7 @@ class Population(P, Sliceable):
             self.i_membrane = (
                 self.i_membrane.unsqueeze(0).expand(n, *self.i_membrane.shape).clone()
             )
-        self.reshape(self.calc_shape_p(), self.shape)
+        self.reshape(self._calc_shape_p(), self.shape)
         for slice in self._labels.values():
             slice._batch()
         # now batch x, y, z
@@ -2019,6 +2022,17 @@ class Population(P, Sliceable):
         for name in self._labels.keys():
             delattr(self, name)
         self._labels.clear()
+
+
+class SingleCompartment(Population):
+    """
+    A Population subclass representing single compartment neuron(s).
+
+    This class is a convenience wrapper around the Population class,
+    pre-configured for a single compartment model.
+    """
+
+    pass
 
 
 # Define the return type for clarity
@@ -2244,9 +2258,6 @@ class Axon(Population):
         self.diam[:] = diameters
         self.diam.detach_()
 
-        # -- biophysics --
-        self.biophysics()
-
     def assemble_graphs(self):
         """
         Construct directed path graphs for each axon.
@@ -2270,14 +2281,6 @@ class Axon(Population):
                 G.nodes[node]["Cm"] = self.cm[i, node].item()
             graphs.append(G)
         return graphs
-
-    def biophysics(self):
-        """
-        Placeholder for biophysics-related initializations.
-        This method can be overridden in subclasses to add specific
-        biophysics-related parameters or configurations.
-        """
-        pass
 
     def register_cid(self, cid):
         """
@@ -2887,7 +2890,7 @@ def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
     -------
     tuple
         Tuple ``(mechanism_instance, parameter_shape, total_index)`` ready for
-        registration via :meth:`Population.register_mech`.
+        registration via :meth:`Population._register_mech`.
     """
     total_index, is_composable, shape, local_indices = compose_or_flatten_union(
         indices, model.core_shape()

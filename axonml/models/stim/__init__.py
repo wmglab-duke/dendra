@@ -1,4 +1,4 @@
 from .intra import Intra
-from .waveform import Waveform
+from .waveform import *
 
 __all__ = ["Intra", "Waveform"]

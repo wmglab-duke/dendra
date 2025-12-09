@@ -15,8 +15,25 @@ def get_init_defaults(cls):
 
 
 class Integrator(torch.nn.Module):
-    """
+    r"""
     Base class for all integrators.
+
+    Parameters
+    ----------
+    model : axonml.models.Population
+        The population model to be integrated.
+    mech : axonml.mechanisms.MechanismHandler
+        The mechanism handler containing all mechanisms.
+    imem : bool, optional
+        Whether to use membrane current tracking. Default is None, which
+        uses the global default defined by `axonml.helpers.IMEM`.
+
+    Notes
+    -----
+    Subclasses should implement the :meth:`initialize` and :meth:`step` methods.
+    These methods define how the integrator initializes its own state (e.g., pre-computes
+    relevant constants) and advances the model state by one time step, respectively.
+
     """
 
     __constants__ = {"imem"}
@@ -32,6 +49,31 @@ class Integrator(torch.nn.Module):
         self.shape = None
 
     def initialize(self, model, dt):
+        r"""Initializes the integrator state. Must be implemented by subclasses.
+
+        Parameters
+        ----------
+        model : axonml.models.Population
+            The population model to be integrated.
+        dt : float
+            The time step for integration.
+        """
+        raise NotImplementedError
+
+    def step(self, model, dt, ve=None, intra=None):
+        r"""Advances the model state by one time step. Must be implemented by subclasses.
+
+        Parameters
+        ----------
+        model : axonml.models.Population
+            The population model to be integrated.
+        dt : float
+            The time step for integration.
+        ve : torch.Tensor, optional
+            The extracellular potential at each compartment (in mV). Default is None.
+        intra : torch.Tensor, optional
+            The intracellular current at each compartment (in mA). Default is None.
+        """
         raise NotImplementedError
 
     def needs_to_be_initialized(self, model, dt, force=False):
@@ -54,6 +96,14 @@ class Integrator(torch.nn.Module):
             model.i_membrane = torch.zeros_like(model.v).detach()
 
     def detach(self, model):
+        """Detach model state variables from the computation graph.
+
+        Parameters
+        ----------
+        model : axonml.models.Population
+            The model whose state variables are to be detached.
+        """
+
         detach_vars(model, self.v_vars)
         for n, b in model.named_buffers():
             setattr(model, n, b.detach())

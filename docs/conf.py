@@ -14,6 +14,8 @@
 # import sys
 # sys.path.insert(0, os.path.abspath('.'))
 
+import inspect
+from pathlib import Path
 
 # -- Project information -----------------------------------------------------
 
@@ -41,7 +43,12 @@ intersphinx_mapping = {
     "pytorch": ("https://pytorch.org/docs/stable", None),
 }
 
-source_suffix = {".rst": "restructuredtext", ".myst": "myst-nb", ".ipynb": "myst-nb"}
+source_suffix = {
+    ".rst": "restructuredtext",
+    ".md": "myst-nb",
+    ".myst": "myst-nb",
+    ".ipynb": "myst-nb",
+}
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ["_templates"]
@@ -57,9 +64,15 @@ myst_enable_extensions = [
     "amsmath",
     "deflist",
     "colon_fence",
+    "substitution",
 ]
 nb_execution_timeout = 600
 nb_execution_mode = "cache"
+_here = Path(__file__).resolve().parent
+_root = _here.parent
+myst_substitutions = {
+    "license_text": (_root / "LICENSE.md").read_text(encoding="utf-8"),
+}
 
 # -- Options for HTML output -------------------------------------------------
 
@@ -68,7 +81,7 @@ nb_execution_mode = "cache"
 #
 html_title = ""
 html_logo = "banner2.png"
-html_theme = "sphinx_book_theme"
+html_theme = "shibuya"
 html_theme_options = {
     "repository_url": "https://gitlab.oit.duke.edu/mah148/axonml",
     "use_repository_button": True,
@@ -94,3 +107,21 @@ autosummary_generate = True
 autodoc_typehints = "description"
 add_module_names = False
 autodoc_member_order = "bysource"
+
+
+def skip_inplace_methods(app, what, name, obj, skip, options):
+    # Only touch class members
+    if what == "class":
+        # Skip methods like `initialize_`, `fit_`, etc.
+        # but do NOT skip dunder methods like __init__
+        if name.endswith("_") and not name.endswith("__"):
+            # Optionally also ensure it's a routine (method/function)
+            if inspect.isroutine(obj):
+                return True  # tell Sphinx to skip this member
+
+    # Fall back to the default behavior for everything else
+    return None  # or `return skip` is also acceptable
+
+
+def setup(app):
+    app.connect("autodoc-skip-member", skip_inplace_methods)

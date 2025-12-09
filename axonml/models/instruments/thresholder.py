@@ -11,6 +11,189 @@ from axonml.models.stim import Waveform
 
 
 class Thresholder:
+    r"""Compute activation thresholds for a :class:`Population` model.
+
+    This helper class wraps a :class:`~axonml.models.Population` together with
+    a :class:`~axonml.models.callbacks.ThresholdCallback` and computes, for
+    each element in the population, the stimulus amplitude at which an action
+    potential is first detected.
+
+    The stimulus is assumed to have a fixed spatiotemporal *shape* and an
+    unknown scalar *amplitude* per population element. The shape can be
+    specified in one of two ways:
+
+    * By providing ``space`` and ``time`` (functional mode), where
+      ``space`` encodes the spatial distribution of extracellular potential and ``time`` is a
+      :class:`Waveform` describing the temporal profile; or
+    * By providing precomputed spatiotemporal ``bases`` (basis mode), in
+      which case each element's extracellular potential is obtained by
+      scaling the corresponding basis function with that element's amplitude.
+
+    For each element, the thresholder maintains a lower bound ``lb`` and
+    an upper bound ``ub`` on the required amplitude:
+
+    * ``lb`` is guaranteed to be subthreshold (no action potential).
+    * ``ub`` is intended to be suprathreshold (action potential present).
+
+    Threshold computation proceeds in two stages:
+
+    1. **Bound fixing** (:meth:`_fix_bounds`):
+       The initial ``ub`` values are checked, and, if necessary, iteratively
+       adjusted so that they produce a suprathreshold response for each
+       element. If ``block_possible=True`` is passed to
+       :meth:`calculate_thresholds`, the bound-fixing stage uses both the
+       activity callback and a :class:`Recorder` trace to distinguish
+       between purely subthreshold responses and putative conduction block
+       (large depolarisation without a successful spike as reported by the
+       callback). In that case, ``ub`` may be either increased
+       (clearly subthreshold) or decreased (suspected block) using the
+       ``fix_bound_up`` and ``fix_bound_down`` factors. Elements whose
+       bounds cannot be repaired within ``max_tries_bound_fix`` iterations
+       are marked as ignored.
+
+    2. **Bisection search** (:meth:`calculate_thresholds`):
+       Once a valid bracketing interval ``[lb, ub]`` exists, a standard
+       per-element bisection is performed. On each iteration:
+
+       * Candidate amplitudes are chosen as ``stimamp = (lb + ub) / 2``.
+       * The model is simulated once with these amplitudes.
+       * Elements that spike at ``stimamp`` move their upper bound down
+         (``ub = stimamp``); elements that do not spike move their lower
+         bound up (``lb = stimamp``).
+
+       The loop continues independently for each element until both the
+       absolute and/or relative window sizes satisfy the requested
+       tolerances:
+
+       * Absolute window: ``awindow = ub - lb``
+       * Relative window: ``rwindow = (ub - lb) / ub``
+
+       Controlled by ``atol`` and ``rtol`` via :meth:`check_tolerance`.
+
+    All heavy computations are performed in ``torch.no_grad()`` mode and
+    on the same device and dtype as the underlying model. Convenience methods
+    :meth:`float` and :meth:`double` convert the thresholder, model, and
+    internal buffers between single- and double-precision.
+
+    Parameters
+    ----------
+    model : axonml.models.Population
+        The population model to compute thresholds for.
+    active : ThresholdCallback
+        Callback used to decide whether an action potential was generated for
+        each population element.
+    space : Optional[Union[npt.NDArray, Tensor]], optional
+        Spatial extracellular potential distribution of the stimulus. An array of
+        shape ``(model.np, model.nc)`` that encodes the coupling between each population
+        element and the stimulus source(s). Used together with ``time`` when
+        ``bases`` is not provided.
+    time : Optional[Waveform], optional
+        Temporal waveform of the stimulus. When used with ``space``, the
+        effective extracellular potential passed to the model is
+        ``space * amp[:, None]``, where ``amp`` is the per-element amplitude
+        vector.
+    bases : Optional[Union[npt.NDArray, Tensor]], optional
+        Precomputed spatiotemporal bases for the extracellular potential.
+        Expected shape is ``(model.np, nt, model.nc)`` (or broadcastable
+        to this shape) and multiplied by the per-element amplitude vector.
+        When ``bases`` is provided, ``space`` and ``time`` are ignored and
+        ``chunklength`` cannot be used.
+    ub : optional
+        Initial upper bound(s) on threshold amplitudes. If ``None``, upper
+        bounds are initialised heuristically from ``model.diameters`` using
+        ``0.2 / (diameter / 5)**2`` per element. Either ``ub`` must be
+        provided or ``model.diameters`` must be set.
+    fix_bound_up : float, optional
+        Multiplicative factor used to increase the upper bound during the
+        bound-fixing stage when a response is still clearly subthreshold,
+        by default ``5.0``.
+    fix_bound_down : float, optional
+        Multiplicative factor used to decrease the upper bound during the
+        bound-fixing stage in ``block_possible`` mode when a putative block
+        is detected, by default ``0.1``.
+    max_tries_bound_fix : int, optional
+        Maximum number of attempts to repair the upper bounds before giving
+        up and marking an element as ignored, by default ``10``.
+    max_tries_thresh : int, optional
+        Maximum number of bisection iterations per element, by default ``25``.
+    atol : optional
+        Absolute tolerance for the threshold interval ``ub - lb``. The search
+        stops for an element once the absolute window falls below this value
+        (and the relative criterion, if given, is also satisfied).
+    rtol : optional
+        Relative tolerance for the threshold interval, defined as
+        ``(ub - lb) / ub``. The search stops for an element once this falls
+        below ``rtol`` (and the absolute criterion, if given, is also
+        satisfied).
+    chunklength : optional
+        Chunk length (in time steps) to use when calling
+        :meth:`Population.longrun` instead of :meth:`Population.run` for
+        long simulations, by default ``None``.
+
+    Examples
+    --------
+    A typical usage pattern is to construct a :class:`Population`, define a
+    spatial field and temporal waveform, and then call
+    :meth:`calculate_thresholds`:
+
+    .. code-block:: python
+
+        import numpy as np
+        import axonml as ax
+
+        # Assume ``model`` is an existing Population with diameters defined
+        model = ...  # type: axonml.models.Population
+
+        # Build a simple temporal waveform (e.g., a Gaussian-like pulse)
+        tstop = 5.0
+        dt = 0.005
+        times = np.arange(0.0, tstop, dt)
+        values = np.exp(-0.5 * ((times - 1.0) / 0.2) ** 2)
+        stim = ax.arbitrary(values=values, tpoints=times)
+
+        # Compute the spatial extracellular potential at each compartment
+        field = ax.anisotropic_point(z=200.0, rhox=100.0, rhoz=100.0)
+        ve_space = field(model)  # shape (model.np, model.nc)
+
+        # Define an activity callback that detects spikes in a subset of nodes
+        active = ax.callbacks.ActiveAL(
+            threshold=20.0,
+            node_check=list(range(model.nc))[::20],
+            at_least=5,
+        )
+
+        # Set up the thresholder and compute thresholds to 1% relative accuracy
+        thresholder = Thresholder(
+            model=model,
+            active=active,
+            space=ve_space,
+            time=stim,
+            ub=1.0,
+            rtol=0.01,
+        )
+        thr_ub, thr_lb = thresholder.calculate_thresholds(tstop=tstop, dt=dt)
+
+        # ``thr_ub`` and ``thr_lb`` now contain per-element bounds on the
+        # stimulus amplitude required to elicit an action potential.
+
+    In more elaborate workflows, this pattern can be wrapped in an outer loop
+    over random waveforms and field parameters to build distributions of
+    thresholds, or applied in parallel to a detailed "model" and a
+    reduced "student" model to quantify distillation error, et cetera.
+
+    Notes
+    -----
+    Either ``atol`` or ``rtol`` (or both) must be provided. If neither
+    tolerance can be satisfied within ``max_tries_thresh`` iterations,
+    the corresponding thresholds are returned as ``NaN`` and the indices
+    are recorded in :attr:`ignore`.
+
+    When threshold computation fails during the bound-fixing stage, both
+    lower and upper bounds for that element are set to one and the element
+    is marked as ignored. Such elements also return ``NaN`` thresholds from
+    :meth:`calculate_thresholds`.
+    """
+
     def __init__(
         self,
         model: Population,
@@ -46,7 +229,6 @@ class Thresholder:
                     "Cannot use chunklength with bases. Supply space and time instead."
                 )
             bases = torch.as_tensor(bases)
-            bases = bases.permute(1, 0, 2)
             self.bases = bases.to(device=model.device(), dtype=model.dtype())
             self.check_active = self._check_active_bases
             self.functional = False
@@ -252,7 +434,7 @@ class Thresholder:
                     )
         return self.active.is_active(), self.rec.stack()
 
-    def fix_bounds(self, tstop, dt, block_possible=True):
+    def _fix_bounds(self, tstop, dt, block_possible=True):
         """Make sure upper bound generates AP."""
 
         with torch.no_grad():
@@ -295,14 +477,15 @@ class Thresholder:
     def calculate_thresholds(
         self, tstop, dt, block_possible=False
     ) -> Tuple[Tensor, Tensor]:
-        """Calculate thresholds.
+        """Calculate thresholds. If bases were provided on Thresholder
+        construction, they are used and tstop is ignored.
 
         Returns
         -------
         Tuple[Tensor, Tensor]
             Upper and lower bound on thresholds.
         """
-        self.fix_bounds(tstop, dt, block_possible)
+        self._fix_bounds(tstop, dt, block_possible)
         self.rec.reset()
         self.active.reset()
 

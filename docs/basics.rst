@@ -6,4 +6,4 @@ Basics
 .. toctree::
    :maxdepth: 1
 
-   basics/00_basics.ipynb
+   basics/00_overview.ipynb

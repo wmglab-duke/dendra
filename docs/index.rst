@@ -117,3 +117,4 @@ If you use `AxonML`, consider citing the `corresponding paper <https://www.natur
    :caption: Resources
 
    axonml
+   license
