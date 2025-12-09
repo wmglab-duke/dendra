@@ -1,7 +1,8 @@
 # Documentation
 
-To build the sphinx documentation, run
+To build the sphinx documentation, install the documentation extras and run:
 ```
+python -m pip install '.[doc]'  # from the repo root
 make html
 cd _build/html
 python -m http.server

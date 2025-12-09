@@ -345,7 +345,7 @@ class arbitrary(Waveform):
 
     Parameters
     ----------
-    amp : list or torch.Tensor, optional
+    values : list or torch.Tensor, optional
         List of amplitude values at specified time points. Default is [0.0, 0.0].
     tpoints : list or torch.Tensor, optional
         List of time points in ms corresponding to amplitude values. Default is [0.0, 1.0].
@@ -361,7 +361,7 @@ class arbitrary(Waveform):
     >>> import torch
     >>> import axonml as ax
     >>> # Create a triangular pulse
-    >>> waveform = ax.arbitrary(tpoints=[0.0, 0.5, 1.0], amp=[0.0, 1.0, 0.0])
+    >>> waveform = ax.arbitrary(tpoints=[0.0, 0.5, 1.0], values=[0.0, 1.0, 0.0])
     >>> t = torch.linspace(0, 1.5, 100)
     >>> values = waveform(t)
     """

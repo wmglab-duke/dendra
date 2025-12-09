@@ -25,6 +25,47 @@ class B(S):
 
 
 class exp2syn(PP, Syn):
+    r"""
+    A synaptic mechanism that uses a double-exponential function to model synaptic
+    conductance. The conductance is modeled using two state variables ``A`` and
+    ``B``, each following an exponential decay with different time constants.
+
+    Parameters
+    ----------
+    e : float
+        The reversal potential (in mV) of the synapse. Default is 0.0 mV.
+    tau1 : float
+        The rise time constant (in ms) of the synapse. Default is 0.1 ms.
+    tau2 : float
+        The decay time constant (in ms) of the synapse. Default is 10.0 ms.
+
+    Notes
+    -----
+    The synaptic conductance :math:`g` is calculated as the difference between the
+    two state variables :math:`B` and :math:`A`, scaled by the reversal potential
+    :math:`e`. Synaptic inputs are received as weights, which are added to both
+    state variables :math:`A` and :math:`B` to simulate synaptic activation.
+
+    The factor for scaling the weights is calculated based on the time constants
+    of the two states, following the formula
+
+    .. math::
+
+        \text{factor} =
+        \frac{1}{-\exp\left(-\frac{t_p}{\tau_1}\right)
+                + \exp\left(-\frac{t_p}{\tau_2}\right)}
+
+    where :math:`t_p` is the time point at which the two exponentials are equal:
+
+    .. math::
+
+        t_p = \frac{\tau_1 \tau_2}{\tau_2 - \tau_1}
+            \log\left(\frac{\tau_2}{\tau_1}\right)
+
+    This ensures that the synaptic response is properly normalized based on the
+    time constants.
+    """
+
     PP.STATE(A, B)
     PP.RANGE(e=0.0)
     PP.ASSIGNED("factor")

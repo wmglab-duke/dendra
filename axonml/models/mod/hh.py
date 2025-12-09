@@ -43,11 +43,32 @@ class mhn(S):
         }
 
     def inf(self, v):
-        states = self.breakpoint(v)
+        states = self.breakpoint(v, None)
         return {"m": states["minf"], "h": states["hinf"], "n": states["ninf"]}
 
 
 class hh(M):
+    """
+    The Hodgkin-Huxley neuron model with sodium, potassium, and leak channels.
+    This model includes the dynamics of the gating variables `m`, `h`, and `n`
+    which represent the activation and inactivation of sodium and potassium channels.
+
+    Parameters
+    ----------
+    gnabar : float
+        Maximum sodium conductance (in mS/cm^2). Default is 0.12.
+    gkbar : float
+        Maximum potassium conductance (in mS/cm^2). Default is 0.036.
+    gl : float
+        Leak conductance (in mS/cm^2). Default is 0.0003.
+    ena : float
+        Sodium reversal potential (in mV). Default is 50.0.
+    ek : float
+        Potassium reversal potential (in mV). Default is -77.0.
+    el : float
+        Leak reversal potential (in mV). Default is -54.3.
+    """
+
     M.STATE(mhn)
     M.GLOBAL(gnabar=0.12, gkbar=0.036, gl=0.0003, ena=50.0, ek=-77.0, el=-54.3)
 

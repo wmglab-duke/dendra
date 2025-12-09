@@ -4,6 +4,20 @@ from ..mechanisms import VoltageProcess
 
 
 class fire_r(VoltageProcess):
+    """A VoltageProcess that implements a leaky integrate-and-fire neuron model with refractory period.
+    When the membrane potential `v` crosses the specified threshold, it is reset to the
+    resting potential and enters a refractory period during which it cannot spike again.
+
+    Parameters
+    ----------
+    threshold : float
+        The membrane potential threshold for spike detection. Default is -50.0 mV.
+    rest : float
+        The resting membrane potential (in mV) to reset to after a spike. Default is -65.0 mV.
+    refractory : float
+        The duration (in ms) of the refractory period during which the neuron cannot spike again. Default is 5.0 ms.
+    """
+
     VoltageProcess.RANGE(threshold=-50.0, rest=-65.0, refractory=5.0)
     VoltageProcess.ASSIGNED("is_refractory", "time_refractory")
 

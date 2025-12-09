@@ -332,7 +332,32 @@ def dilate(
 
 class Network(RNGMixin):
     """
-    Base class for networks in AxonML.
+    Container for interacting populations, synaptic connections, and optional stimuli.
+
+    A ``Network`` bundles:
+
+    - **Populations**: named collections of axons/neurons (``Population`` instances).
+    - **NetCons**: directed connections materialized as :class:`NetCon` objects that
+      deliver events from pre- to post-synaptic compartments (including optional
+      weights, delays, thresholds, and alternate pre variables such as conductance).
+    - **NetStim**: an optional :class:`NetStim` source that injects spikes into the
+      network (treated as a special "population" named ``netstim``).
+
+    Connections are specified incrementally (e.g., via :meth:`connect_one_to_one`,
+    :meth:`connect_dense`, :meth:`connect_sparse`), then materialized when
+    :meth:`build`/:meth:`initialize` is called. Running the network steps each
+    population forward in time while advancing all synapses and optional NetStim.
+
+    Parameters
+    ----------
+    populations : dict[str, Population]
+        Mapping from population name to :class:`Population` instance. Populations
+        are built, registered as attributes, and used as sources/targets for
+        connectivity.
+    netstim : NetStim, optional
+        Optional spike generator attached under the name ``netstim``.
+    seed : int, optional
+        Seed for network-level RNG used in stochastic wiring utilities.
     """
 
     def __init__(self, populations: Dict[str, Population], netstim=None, seed=None):
@@ -401,7 +426,18 @@ class Network(RNGMixin):
 
     def train(self, mode=True):
         """
-        Set the network to training mode.
+        Switch populations and synapses into training mode.
+
+        Parameters
+        ----------
+        mode : bool, optional
+            If True, enable training mode (grad-enabled stepping). If False,
+            disable grads for faster inference. Default is True.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
         """
         for pop in self.populations.values():
             pop.train(mode)
@@ -412,9 +448,21 @@ class Network(RNGMixin):
         return self
 
     def train_(self, mode=True):
+        """In-place variant of :meth:`train` that returns ``None``."""
         self.train(mode)
 
     def eval(self):
+        """
+        Switch populations and synapses into evaluation mode.
+
+        Disables gradients for stepping and sets the compiled stepping function
+        to the eval variant.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
+        """
         super(Network, self).eval()
         for pop in self.populations.values():
             pop.eval()
@@ -425,23 +473,36 @@ class Network(RNGMixin):
         return self
 
     def eval_(self):
+        """In-place variant of :meth:`eval` that returns ``None``."""
         self.eval()
 
     def device(self):
         """
-        Returns the device on which the network is located.
+        Return the device of the first population.
+
+        Returns
+        -------
+        torch.device
+            Device on which the network is allocated.
         """
         return next(iter(self.populations.values())).device()
 
     def dtype(self):
         """
-        Returns the data type of the network's populations.
+        Return the dtype of the first population.
+
+        Returns
+        -------
+        torch.dtype
+            Data type used by populations and synapses.
         """
         return next(iter(self.populations.values())).dtype()
 
     def clear_synapses(self):
         """
-        Clears all synapse specifications in the network.
+        Remove all queued synapse specs and built NetCon modules.
+
+        Use when re-wiring the network before calling :meth:`build` again.
         """
         self.synapse_spec = {}
         self.synapses.clear()
@@ -951,6 +1012,16 @@ class Network(RNGMixin):
     connect_sparse_n = connect_prob_n
 
     def build_synapses(self, dt, max_delay_ms=None):
+        """
+        Materialize queued connection specs into :class:`NetCon` modules.
+
+        Parameters
+        ----------
+        dt : float
+            Simulation timestep (ms) for delivery buffers.
+        max_delay_ms : float, optional
+            Optional ceiling on allowable synaptic delay; passed to NetCon.
+        """
         for (pre_name, post_name, synapse, pre_var), specs in self.synapse_spec.items():
             pre_var = (
                 pre_var
@@ -992,8 +1063,21 @@ class Network(RNGMixin):
 
     def build(self, dt, max_delay_ms=None, force_rebuild=False):
         """
-        Build the network by initializing populations and synapses.
-        This method should be called before running the network.
+        Build synaptic modules for the current wiring spec.
+
+        Parameters
+        ----------
+        dt : float
+            Simulation timestep (ms) used for NetCon buffers.
+        max_delay_ms : float, optional
+            Maximum delay allowed for NetCons. Default is None (no cap).
+        force_rebuild : bool, optional
+            If True, rebuild even if dt has not changed. Default is False.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
         """
         if not self.built or self.dt != dt or force_rebuild:
             torch._dynamo.reset()
@@ -1012,7 +1096,27 @@ class Network(RNGMixin):
         force_rebuild: bool = False,
     ):
         """
-        Initialize the network. Builds synapses, initializes populations and netstim (if exists).
+        Initialize populations, synapses, and optional NetStim for simulation.
+
+        Parameters
+        ----------
+        dt : float
+            Simulation timestep (ms).
+        reinit_weights : bool, optional
+            Re-sample or reset synaptic weights. Default is True.
+        reinit_delays : bool, optional
+            Re-sample or reset synaptic delays. Default is True.
+        t : float, optional
+            Starting simulation time (ms). Default is 0.0.
+        max_delay_ms : float, optional
+            Maximum allowed synaptic delay. Default is None.
+        force_rebuild : bool, optional
+            If True, rebuild NetCons even if already built. Default is False.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
         """
         self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
         self.t = self.t.detach()
@@ -1060,9 +1164,7 @@ class Network(RNGMixin):
             syn.delivery_buffer = delivery_buffer.clone().detach()
 
     def initialize_(self, *args, **kwargs):
-        """
-        Initialize the network without returning self.
-        """
+        """In-place variant of :meth:`initialize` that returns ``None``."""
         self.initialize(*args, **kwargs)
 
     def init_synapses(
@@ -1071,6 +1173,18 @@ class Network(RNGMixin):
         reinit_delays: bool = True,
         clear_deliveries: bool = True,
     ):
+        """
+        Initialize all built synapses (NetCons).
+
+        Parameters
+        ----------
+        reinit_weights : bool, optional
+            If True, re-sample/reset weight parameters. Default is True.
+        reinit_delays : bool, optional
+            If True, re-sample/reset delay parameters. Default is True.
+        clear_deliveries : bool, optional
+            If True, zero the delivery buffers. Default is True.
+        """
         for syn in self.synapses.values():
             syn.initialize(
                 reinit_weights=reinit_weights,
@@ -1079,6 +1193,26 @@ class Network(RNGMixin):
             )
 
     def run(self, tstop, ve=None, callbacks=None, progressbar=False):
+        """
+        Advance the network for a fixed duration.
+
+        Parameters
+        ----------
+        tstop : float
+            Total simulation time (ms) to advance from current ``self.t``.
+        ve : dict[str, tuple[torch.Tensor, object]], optional
+            Optional mapping of population name to extracellular stimulus tuple
+            ``(v, t)`` where ``t`` is assembled against the current time; values
+            are moved to the network device/dtype.
+        callbacks : list[Callback], optional
+            Callbacks invoked each step (wrapped in :class:`CallbackList`).
+        progressbar : bool or tqdm.tqdm, optional
+            If truthy, show a progress bar (auto-created if True). Default False.
+
+        Returns
+        -------
+        None
+        """
         dt = torch.tensor(self.dt, device=self.device(), dtype=self.dtype())
         dt_f = self.dt
 
@@ -1164,6 +1298,21 @@ class Network(RNGMixin):
             post_loop_hook(callbacks, self)
 
     def batch(self, n, include_netstim=True):
+        """
+        Create a batched version of the network by tiling populations n times.
+
+        Parameters
+        ----------
+        n : int
+            Batch size (number of replicas).
+        include_netstim : bool, optional
+            If False, do not batch NetStim even if present. Default True.
+
+        Returns
+        -------
+        Network
+            Self, with populations and NetCons batched.
+        """
         _synapse_spec = self.synapse_spec.copy()
         self.clear_synapses()
         _old_shapes = {}
@@ -1207,6 +1356,7 @@ class Network(RNGMixin):
         return self
 
     def batch_(self, n, include_netstim=True):
+        """In-place variant of :meth:`batch` that returns ``None``."""
         self.batch(n, include_netstim=include_netstim)
 
     def concat(self, **kwargs):

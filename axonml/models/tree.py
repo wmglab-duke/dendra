@@ -65,6 +65,9 @@ def gather_membrane(graph):
 
 class Tree(Population):
     """Base class for tree-like population models.
+    All neuron morpholgies can be represented as trees of connected compartments.
+    `AxonML` Axon classes specifically model unbranched axons, while `Tree` models
+    can represent arbitrary tree-like morphologies with branching structures.
 
     Parameters
     ----------

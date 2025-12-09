@@ -9,7 +9,7 @@ Welcome to AxonML!
 - ``jit``-compilation, making it blazing fast while being fully written in python
 - a simple API, making it easy to use for beginners and experts alike
 
-``AxonML`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please let us know by opening an issue on our `GitHub repository <https://github.com/wmglab-duke/axonml>`_.
+``AxonML`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please let us know by opening an issue on our `GitLab repository <https://gitlab.oit.duke.edu/mah148/axonml>`_.
 
 Getting started
 ---------------
@@ -48,13 +48,28 @@ Getting started
 Installation
 ------------
 
-TODO: Add installation instructions.
+AxonML targets Python 3.11+ and PyTorch 2.7+ (CUDA 12.9 wheels recommended for GPU use). A typical setup is:
+
+1. Create and activate an isolated environment (optional): ``conda create -n axonml python=3.12 && conda activate axonml``.
+2. Install PyTorch (choose GPU or CPU wheels): ``python -m pip install torch --index-url https://download.pytorch.org/whl/cu129``.
+3. Clone the repo and install: ``git clone https://gitlab.oit.duke.edu/mah148/axonml.git && cd axonml && python -m pip install .``.
+
+To build these docs locally, install the extras (``python -m pip install '.[doc]'``) and run ``make html`` inside ``docs``.
+
+See :ref:`installation` for detailed guidance and optional extras (Jupyter, development tooling, and CPU implicit solver support via ``axonml-solvers``).
 
 
 Feedback and Contributions
 --------------------------
 
-TODO: Add information on how to contribute.
+We welcome issues and pull requests on GitLab. When reporting a bug, include your OS, Python/PyTorch versions, install method, and a minimal reproducible script. For feature requests, please describe the workflow you are trying to support.
+
+Contribution tips:
+
+- Use a fresh branch and keep changes focused.
+- Install development extras (``python -m pip install --editable '.[dev]'``) and run tests where applicable.
+- Follow the existing style conventions; ``pre-commit`` hooks are configured for you (``python -m pre-commit install``).
+- Documentation updates are appreciated—adding docstrings or short narrative sections to accompany new code is ideal.
 
 
 Citation
@@ -102,3 +117,4 @@ If you use `AxonML`, consider citing the `corresponding paper <https://www.natur
    :caption: Resources
 
    axonml
+   license

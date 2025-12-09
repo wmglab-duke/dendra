@@ -19,26 +19,17 @@ class Waveform(SimpleParameterized):
     ----------
     **kwargs : dict
         Parameter values to initialize the waveform. These are passed to
-        the Parameterized class's instantiate_parameters method.
-
-    Attributes
-    ----------
-    Any attributes defined using the PARAMETER decorator in subclasses.
-
-    Methods
-    -------
-    fn(t)
-        Core implementation method that calculates the waveform value at time t.
-        Must be implemented by subclasses.
-    repeat(freq, delay=0.0, off=torch.inf)
-        Creates a repeating version of the waveform. Frequency should be given in
-        kHz and delay and off in ms. Off is the time after which the waveform stops repeating.
+        the Parameterized class's instantiate_parameters method. These parameters
+        should be defined in subclasses using the PARAMETER class method. These parameters
+        can be scalars or tensors, allowing for flexible waveform definitions. They will
+        be automatically broadcasted to match the shape of the input time tensor `t`
+        when the waveform is evaluated. All parameters are accessible as attributes of the waveform instance.
 
     Notes
     -----
     When subclassing Waveform, you need to:
-    1. Define parameters using the PARAMETER decorator
-    2. Implement the fn(t) method to define the waveform's behavior
+        1. Define parameters using the PARAMETER class method
+        2. Implement the fn(t) method to define the waveform's behavior
 
     Examples
     --------
@@ -62,6 +53,19 @@ class Waveform(SimpleParameterized):
     >>> waveform = triangle(amp=2.0, freq=5.0)
     >>> t = torch.linspace(0, 1, 100)
     >>> values = waveform(t)
+
+    Waveform arithmetic:
+
+    You can perform arithmetic operations with waveforms. For example, you can add two waveforms together or add a constant to a waveform:
+
+    >>> w1 = triangle(amp=1.0, freq=2.0)
+    >>> w2 = triangle(amp=0.5, freq=2.0)
+    >>> w_sum = w1 + w2
+    >>> w_const = w1 + 3.0
+
+    This will create new waveform instances representing the sum of the two waveforms and the waveform with a constant added, respectively.
+    Arithmetic operations supported include addition (+), subtraction (-), multiplication (*), and division (/).
+
     """
 
     def __init__(self, **kwargs):
@@ -85,12 +89,36 @@ class Waveform(SimpleParameterized):
         return self
 
     def fn(self, t):
+        r"""Core waveform implementation. Must be implemented by subclasses.
+
+        .. note::
+            Although the waveform recipe needs to be defined within
+            this function, one should call the :class:`Waveform` instance
+            afterwards instead of this since the former takes care of
+            running any registered hooks while the latter silently ignores them.
+        """
         raise NotImplementedError
 
     def forward(self, t):
         return self.fn(torch.as_tensor(t))
 
     def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
+        """Return a periodically repeating copy of *this* waveform.
+
+        Parameters
+        ----------
+        freq : float
+            Frequency of repetition in kHz.
+        delay : float, optional
+            Delay before the first repetition in ms. Default is 0.0.
+        off : float, optional
+            Time after which the waveform stops repeating in ms. Default is infinity.
+
+        Returns
+        -------
+        _repeat
+            A waveform that repeats periodically according to the specified parameters.
+        """
         return _repeat(self, freq, delay, off)
 
     def poisson(
@@ -102,7 +130,26 @@ class Waveform(SimpleParameterized):
         off: float = torch.inf,
         **kwargs,
     ):
-        """Return a Poisson-scheduled copy of *this* waveform."""
+        """Return a Poisson-distributed copy of *this* waveform.
+
+        Parameters
+        ----------
+        interval : float
+            Mean interval between events in ms.
+        n : int, optional
+            Number of events to generate. Default is 10.
+        start : float, optional
+            Start time in ms. Default is 0.0.
+        noise : float, optional
+            Noise factor for interval variability. Default is 1.0.
+        off : float, optional
+            Time after which the waveform stops. Default is infinity.
+
+        Returns
+        -------
+        _poisson
+            A waveform that follows a Poisson distribution according to the specified parameters.
+        """
         return _poisson(self, interval, n, start, noise, off, **kwargs)
 
     def assemble(self, start, end, dt):
