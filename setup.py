@@ -48,7 +48,7 @@ setup(
             "sphinx-math-dollar",
             "myst-nb",
             "jupytext",
-            "sphinx-book-theme",
+            "shibuya",
         ],
         "dev": [
             "pre-commit",

@@ -33,8 +33,14 @@ class NetCon(Referency):
         self.syn = post_syn
         self.pre = pre
         self.post = post
-        self.device = self.pre.device()
-        self.dtype = self.pre.dtype()
+
+        # Track peer devices/dtypes and keep NetCon buffers aligned with them.
+        self._refresh_peer_devices()
+
+        # Ensure parameter modules live on the delivery (post/synapse) device.
+        self.weight = self.weight.to(device=self.device)
+        delay = delay.to(device=self.device)
+
         self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
         self.max_delay = max_delay
 
@@ -52,17 +58,19 @@ class NetCon(Referency):
             self.determine_spiking = self.determine_spiking_var
 
         self.register_buffer(
-            "pre_idx", pre_idx.flatten().to(self.device, dtype=torch.long)
+            "pre_idx", pre_idx.flatten().to(self.pre_device, dtype=torch.long)
         )
         self.register_buffer(
             "post_idx", post_idx.flatten().to(self.device, dtype=torch.long)
         )
         self.register_buffer(
             "threshold",
-            torch.nan_to_num(thresholds).flatten().to(self.device, dtype=self.dtype),
+            torch.nan_to_num(thresholds)
+            .flatten()
+            .to(self.pre_device, dtype=self.pre_dtype),
         )
 
-        nan_thresh = torch.isnan(thresholds).to(self.device)
+        nan_thresh = torch.isnan(thresholds).to(self.pre_device)
         self.register_buffer("thresh_is_nan", nan_thresh)
 
         self.skip_thresholding = bool(nan_thresh.all())
@@ -70,7 +78,7 @@ class NetCon(Referency):
 
         self.register_buffer(
             "syn_numel",
-            torch.prod(torch.tensor(self.syn.shape_f)).to(
+            torch.prod(torch.tensor(self.syn.shape_f, device=self.device)).to(
                 self.device, dtype=torch.long
             ),
         )
@@ -82,7 +90,7 @@ class NetCon(Referency):
         )
         self.register_buffer(
             "pre_range",
-            torch.arange(self.n.item(), device=self.device, dtype=torch.long),
+            torch.arange(self.n.item(), device=self.pre_device, dtype=torch.long),
         )
         n_pre = self.n.item()
         assert len(self.threshold) == n_pre, (
@@ -93,11 +101,12 @@ class NetCon(Referency):
         )
 
         self.register_buffer(
-            "has_spiked", torch.zeros(n_pre, device=self.device, dtype=torch.bool)
+            "has_spiked", torch.zeros(n_pre, device=self.pre_device, dtype=torch.bool)
         )
         # Store a *gate* in the same dtype as the rest of the module (float)
         self.register_buffer(
-            "is_spiking", torch.zeros(n_pre, device=self.device, dtype=self.dtype)
+            "is_spiking",
+            torch.zeros(n_pre, device=self.pre_device, dtype=self.pre_dtype),
         )
 
         # --- Delay Handling Logic (Compiler-Friendly) ---
@@ -213,6 +222,96 @@ class NetCon(Referency):
             self._csr_counts = counts  # [n_pre_used]
             self._csr_conidx_sorted = order  # [n_conn]
 
+        # Final sanity alignment (important if builder later calls .to()).
+        self._align_buffer_devices()
+
+    def _move_buffer(self, name: str, device: torch.device, dtype=None):
+        buf = getattr(self, name)
+        target_dtype = dtype if dtype is not None else buf.dtype
+        if buf.device != device or buf.dtype != target_dtype:
+            setattr(
+                self,
+                name,
+                buf.to(device=device, dtype=target_dtype),
+            )
+
+    def _refresh_peer_devices(self):
+        pre_device = self.pre.device()
+        pre_dtype = self.pre.dtype()
+        post_device = self.post.device()
+        post_dtype = self.post.dtype()
+        syn_device = self.syn.device() if hasattr(self.syn, "device") else post_device
+
+        pre_changed = (
+            getattr(self, "pre_device", None) != pre_device
+            or getattr(self, "pre_dtype", None) != pre_dtype
+        )
+        post_changed = (
+            getattr(self, "device", None) != syn_device
+            or getattr(self, "dtype", None) != post_dtype
+        )
+
+        self.pre_device = pre_device
+        self.pre_dtype = pre_dtype
+        self.post_device = post_device
+        self.device = syn_device
+        self.dtype = post_dtype
+
+        return pre_changed, post_changed
+
+    def _align_buffer_devices(self):
+        # Keep buffers that interact with pre-synaptic state on the pre device/dtype.
+        self._move_buffer("pre_idx", self.pre_device)
+        self._move_buffer("threshold", self.pre_device, self.pre_dtype)
+        self._move_buffer("thresh_is_nan", self.pre_device)
+        self._move_buffer("has_spiked", self.pre_device)
+        self._move_buffer("is_spiking", self.pre_device, self.pre_dtype)
+        self._move_buffer("pre_range", self.pre_device)
+
+        # Buffers that feed the post-synaptic delivery path live with the synapse.
+        for name in (
+            "post_idx",
+            "syn_numel",
+            "n",
+            "delay_steps",
+            "event_queue",
+            "events",
+            "current_time_step",
+            "time_indices",
+            "sched_pre_idx",
+            "sched_abs_step",
+            "sched_con_idx",
+            "sched_weight_idx",
+            "sched_time_idx",
+            "sched_counts",
+            "global_step",
+            "con_range",
+        ):
+            self._move_buffer(name, self.device)
+
+        self._move_buffer("delivery_buffer", self.device, self.dtype)
+        self._move_buffer("sched_wsum", self.device, self.dtype)
+        self.sched_weight = self.sched_weight.to(device=self.device, dtype=self.dtype)
+        self.sched_time_ms = self.sched_time_ms.to(device=self.device, dtype=self.dtype)
+
+        # Keep helper caches with the pre buffers.
+        if hasattr(self, "_csr_pre_ids"):
+            self._csr_pre_ids = self._csr_pre_ids.to(device=self.pre_device)
+            self._csr_starts = self._csr_starts.to(device=self.pre_device)
+            self._csr_counts = self._csr_counts.to(device=self.pre_device)
+            self._csr_conidx_sorted = self._csr_conidx_sorted.to(device=self.pre_device)
+
+        # dt and parameter modules should follow the synapse device.
+        self.dt = self.dt.to(device=self.device, dtype=torch.float32)
+        self.weight = self.weight.to(device=self.device, dtype=self.dtype)
+        self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
+
+    def to(self, *args, **kwargs):  # type: ignore[override]
+        super().to(*args, **kwargs)
+        self._refresh_peer_devices()
+        self._align_buffer_devices()
+        return self
+
     def _compute_max_delay_steps(self):
         if self.max_delay is not None:
             return int(self.max_delay / self.dt.item()) + 1
@@ -242,6 +341,7 @@ class NetCon(Referency):
             self.time_indices = torch.arange(
                 self.max_delay_steps, device=self.device, dtype=torch.long
             )
+            self._align_buffer_devices()
 
     def set_diff_config(
         self,
@@ -275,9 +375,9 @@ class NetCon(Referency):
 
     def _expand_pre_to_con(self, pre_indices: torch.Tensor | list[int]) -> torch.Tensor:
         # NOTE: schedule-time helper; not called inside compiled step.
-        pres = torch.as_tensor(pre_indices, device=self.device, dtype=torch.long).view(
-            -1
-        )
+        pres = torch.as_tensor(
+            pre_indices, device=self.pre_device, dtype=torch.long
+        ).view(-1)
         if pres.numel() == 0:
             return pres
 
@@ -287,7 +387,7 @@ class NetCon(Referency):
             self._csr_pre_ids.index_select(0, pos) == pres
         )
         if not bool(valid.any()):
-            return torch.empty(0, device=self.device, dtype=torch.long)
+            return torch.empty(0, device=self.pre_device, dtype=torch.long)
 
         pos = pos[valid]
         starts = self._csr_starts.index_select(0, pos)
@@ -299,7 +399,7 @@ class NetCon(Referency):
             if L > 0:
                 con_chunks.append(self._csr_conidx_sorted.narrow(0, s, L))
         if len(con_chunks) == 0:
-            return torch.empty(0, device=self.device, dtype=torch.long)
+            return torch.empty(0, device=self.pre_device, dtype=torch.long)
         return torch.cat(con_chunks, dim=0)  # [n_con_from_these_pres]
 
     def schedule(
@@ -325,7 +425,7 @@ class NetCon(Referency):
 
         # → connection indices (raw, before any filtering)
         if pre_indices is not None:
-            con_idx_raw = self._expand_pre_to_con(pre_indices)
+            con_idx_raw = self._expand_pre_to_con(pre_indices).to(device)
         else:
             con_idx_raw = torch.as_tensor(
                 con_indices, device=device, dtype=torch.long
@@ -418,7 +518,7 @@ class NetCon(Referency):
 
         device, dtype = self.device, self.dtype
         if pre_indices is not None:
-            con_idx = self._expand_pre_to_con(pre_indices)
+            con_idx = self._expand_pre_to_con(pre_indices).to(device)
         else:
             con_idx = torch.as_tensor(
                 con_indices, device=device, dtype=torch.long
@@ -479,7 +579,7 @@ class NetCon(Referency):
 
         # -> connection indices
         if pre_indices is not None:
-            con_idx = self._expand_pre_to_con(pre_indices)
+            con_idx = self._expand_pre_to_con(pre_indices).to(device)
         else:
             con_idx = torch.as_tensor(
                 con_indices, device=device, dtype=torch.long
@@ -641,7 +741,7 @@ class NetCon(Referency):
         self.determine_spiking(
             self.pre, diff_spiking, tau
         )  # self.is_spiking -> [n_conn] bool
-        intrinsic_gate = self.is_spiking.to(dtype)  # [n_conn]
+        intrinsic_gate = self.is_spiking.to(device=device, dtype=dtype)  # [n_conn]
 
         # scheduled additions per connection (constant shapes)
         sched_wsum_conn, sched_counts_conn = self._scheduled_gate_this_step(
@@ -771,7 +871,9 @@ class NetCon(Referency):
 
         # intrinsic spikes (hard)
         self.determine_spiking(self.pre, diff_spiking=False)
-        intrinsic_gate = self.is_spiking.to(self.dtype)  # [n_conn]
+        intrinsic_gate = self.is_spiking.to(
+            device=self.device, dtype=self.dtype
+        )  # [n_conn]
 
         # scheduled contributions (constant shape)
         gs = self.global_step
@@ -804,22 +906,38 @@ class NetCon(Referency):
         # (or spikes_gate for differentiable spiking)
         if diff_spiking:
             # surrogate / soft gate, already float
-            gate = pre.spike_gate.view(-1).index_select(0, self.pre_idx)
+            gate = (
+                pre.spike_gate.to(self.pre_device)
+                .view(-1)
+                .index_select(0, self.pre_idx)
+            )
         else:
             # hard spikes; usually bool → cast to float gate {0, 1}
-            gate = pre.spikes.view(-1).index_select(0, self.pre_idx).to(self.dtype)
+            gate = (
+                pre.spikes.to(self.pre_device)
+                .view(-1)
+                .index_select(0, self.pre_idx)
+                .to(self.pre_dtype)
+            )
 
         # Ensure dtype is always self.dtype
-        self.is_spiking = gate.to(self.dtype)
+        self.is_spiking = gate.to(device=self.pre_device, dtype=self.pre_dtype)
 
     def determine_spiking_var(self, pre, diff_spiking: bool = True, tau=0.1):
         # Always work in the module's float dtype
-        v_selected = self.get_pre_var(pre).view(-1).index_select(0, self.pre_idx)
-        v_selected = v_selected.to(self.dtype)
+        v_selected = (
+            self.get_pre_var(pre)
+            .to(self.pre_device)
+            .view(-1)
+            .index_select(0, self.pre_idx)
+            .to(self.pre_dtype)
+        )
 
         if self.skip_thresholding:
             # Just mirror v as a continuous "gate"
-            self.is_spiking = v_selected
+            self.is_spiking = v_selected.to(
+                device=self.pre_device, dtype=self.pre_dtype
+            )
             return
 
         if diff_spiking:
@@ -828,14 +946,14 @@ class NetCon(Referency):
                 self.has_spiked, v_selected, self.threshold, tau=tau
             )
             # gate is typically float already, but enforce dtype
-            gate = gate.to(self.dtype)
+            gate = gate.to(self.pre_dtype)
         else:
             # Hard threshold spiking; usually returns Bool spikes
             self.has_spiked, spikes = update_active(
                 self.has_spiked, v_selected, self.threshold
             )
             # Turn {False,True} into {0.0,1.0} float gate
-            gate = spikes.to(self.dtype)
+            gate = spikes.to(self.pre_dtype)
 
         if self.apply_masking:
             # thresh_is_nan: bool mask; choose between v_selected and gate (both float)
@@ -845,7 +963,7 @@ class NetCon(Referency):
                 gate,
             )
 
-        self.is_spiking = gate
+        self.is_spiking = gate.to(device=self.pre_device, dtype=self.pre_dtype)
 
     def zero(self, clear_delivery_buffers=True):
         """

@@ -172,9 +172,11 @@ m_template = """
     {implementation}
 """
 
-max_only_t = "append_tensor_max(states, self.rec['{full_state}'])"
-indexed_t = "append_tensor_indexed(states, self.rec['{full_state}'], self.node_indices)"
-base_t = "append_tensor(states, self.rec['{full_state}'])"
+max_only_t = "_append_tensor_max(states, self.rec['{full_state}'])"
+indexed_t = (
+    "_append_tensor_indexed(states, self.rec['{full_state}'], self.node_indices)"
+)
+base_t = "_append_tensor(states, self.rec['{full_state}'])"
 
 
 def _append_tensor(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:

@@ -331,7 +331,7 @@ def dilate(
 
 
 class Network(RNGMixin):
-    """
+    r"""
     Container for interacting populations, synaptic connections, and optional stimuli.
 
     A ``Network`` bundles:
@@ -347,6 +347,13 @@ class Network(RNGMixin):
     :meth:`connect_dense`, :meth:`connect_sparse`), then materialized when
     :meth:`build`/:meth:`initialize` is called. Running the network steps each
     population forward in time while advancing all synapses and optional NetStim.
+
+    .. note::
+        Device placement can be heterogeneous across populations and NetStim. NetCons
+        are built on each post-synaptic population's device. Device changes are
+        detected at :meth:`build` time and trigger rebuilds (as do ``dt`` changes or
+        ``force_rebuild=True``). Call :meth:`build` (and typically
+        :meth:`initialize`) after manual device moves to realign connectivity buffers.
 
     Parameters
     ----------
@@ -415,9 +422,13 @@ class Network(RNGMixin):
             else:
                 self._step_eval = step
 
+        # Network clock lives on CPU by default; move when needed.
         self.register_buffer(
-            "t", torch.tensor(0.0, device=self.device(), dtype=self.dtype())
+            "t", torch.tensor(0.0, device=torch.device("cpu"), dtype=torch.float32)
         )
+
+        # Track device signature to trigger rebuilds if placements change.
+        self._device_sig = self._device_signature()
 
         self._state_cache = {}
         self._syn_cache = {}
@@ -476,25 +487,33 @@ class Network(RNGMixin):
         """In-place variant of :meth:`eval` that returns ``None``."""
         self.eval()
 
+    def devices(self):
+        """
+        Return a mapping of population name -> device to support heterogeneous placement.
+        """
+        return {name: pop.device() for name, pop in self.populations.items()}
+
+    def dtypes(self):
+        """
+        Return a mapping of population name -> dtype to support heterogeneous placement.
+        """
+        return {name: pop.dtype() for name, pop in self.populations.items()}
+
+    def _device_signature(self):
+        sig = [(name, str(pop.device())) for name, pop in self.populations.items()]
+        if self.netstim is not None:
+            sig.append(("netstim", str(self.netstim.device())))
+        return tuple(sorted(sig))
+
     def device(self):
         """
-        Return the device of the first population.
-
-        Returns
-        -------
-        torch.device
-            Device on which the network is allocated.
+        Legacy aggregate device (first population). For multi-device setups, prefer devices().
         """
         return next(iter(self.populations.values())).device()
 
     def dtype(self):
         """
-        Return the dtype of the first population.
-
-        Returns
-        -------
-        torch.dtype
-            Data type used by populations and synapses.
+        Legacy aggregate dtype (first population). For multi-device setups, prefer dtypes().
         """
         return next(iter(self.populations.values())).dtype()
 
@@ -852,7 +871,7 @@ class Network(RNGMixin):
             return
 
         pre_idx = pre_idx[mask]
-        post_idx = post_idx[mask]
+        post_idx = post_idx.to(device)[mask].to(target_model.device())
 
         pre_idx, post_idx = prepare_indices_one_one_flat(
             source_model, pre_idx, target_model, post_idx, synapse
@@ -984,7 +1003,7 @@ class Network(RNGMixin):
         )[:n]
 
         pre_idx = pre_idx[mask]
-        post_idx = post_idx[mask]
+        post_idx = post_idx.to(device)[mask].to(target_model.device())
 
         pre_idx, post_idx = prepare_indices_one_one_flat(
             source_model, pre_idx, target_model, post_idx, synapse
@@ -1030,6 +1049,8 @@ class Network(RNGMixin):
             )
             pre = getattr(self, pre_name)
             post = self.populations[post_name]
+            post_device = post.device()
+            post_dtype = post.dtype()
             pre_idx = torch.cat([s[0] for s in specs])
             post_idx = torch.cat([s[1] for s in specs])
             thresholds = torch.cat([expand(s[2], s[3]) for s in specs])
@@ -1048,7 +1069,7 @@ class Network(RNGMixin):
                 dt=dt,
                 pre_var=pre_var,
                 max_delay=max_delay_ms,
-            ).to(device=self.device(), dtype=self.dtype())
+            ).to(device=post_device, dtype=post_dtype)
 
             syn.setreference("t", lambda: self.t)
 
@@ -1079,11 +1100,15 @@ class Network(RNGMixin):
         Network
             Self, for chaining.
         """
-        if not self.built or self.dt != dt or force_rebuild:
+        current_sig = self._device_signature()
+        devices_changed = current_sig != getattr(self, "_device_sig", None)
+
+        if not self.built or self.dt != dt or force_rebuild or devices_changed:
             torch._dynamo.reset()
             self.dt = dt
             self.build_synapses(dt, max_delay_ms=max_delay_ms)
             self.built = True
+            self._device_sig = self._device_signature()
         return self
 
     def initialize(
@@ -1130,11 +1155,13 @@ class Network(RNGMixin):
             clear_deliveries = False
         else:
             clear_deliveries = True
-        dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
+
+        dt_f = float(dt)
         for pop in self.populations.values():
             if not self._state_cache:
                 pop.initialize()
-            pop.integrator._initialize(pop, dt)
+            dt_pop = torch.tensor(dt_f, device=pop.device(), dtype=pop.dtype())
+            pop.integrator._initialize(pop, dt_pop)
             pop.intra = pop.build_intra()
         self.init_synapses(
             reinit_weights=reinit_weights,
@@ -1213,8 +1240,8 @@ class Network(RNGMixin):
         -------
         None
         """
-        dt = torch.tensor(self.dt, device=self.device(), dtype=self.dtype())
-        dt_f = self.dt
+        dt_f = float(self.dt)
+        dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
@@ -1224,16 +1251,17 @@ class Network(RNGMixin):
                 intra[n] = p.intra
 
         ve = ve if ve is not None else {}
-        ve = {
-            n: (
-                v.to(device=self.device(), dtype=self.dtype()),
-                t.to(device=self.device(), dtype=self.dtype()),
-            )
-            for n, (v, t) in ve.items()
-        }
-        ve = {
-            n: (v, t.assemble(self.t, self.t + tstop, dt)) for n, (v, t) in ve.items()
-        }
+        ve_prepped = {}
+        for n, (v, t) in ve.items():
+            pop = self.populations[n]
+            dev, dtp = pop.device(), pop.dtype()
+            v_dev = v.to(device=dev, dtype=dtp)
+            t_dev = t.to(device=dev, dtype=dtp)
+            t0 = self.t.to(device=dev, dtype=dtp)
+            dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
+            t1 = t0 + torch.tensor(tstop, device=dev, dtype=dtp)
+            ve_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
+        ve = ve_prepped
 
         with_intra = bool(intra)
         with_ve = bool(ve)
@@ -1245,7 +1273,7 @@ class Network(RNGMixin):
 
             if with_intra:
                 intra = {
-                    n: (intra_, *self.populations[n].prep_intra(intra_, n_steps, dt))
+                    n: (intra_, *self.populations[n].prep_intra(intra_, n_steps, dt_f))
                     for n, intra_ in intra.items()
                 }
 
@@ -1277,11 +1305,11 @@ class Network(RNGMixin):
                     self.synapses,
                     self.netstim,
                     self.t,
-                    dt,
+                    dt_f,
                     ve=ve_c,
                     intra=intra_c,
                 )
-                self.t = self.t + dt
+                self.t = self.t + dt_t
                 post_step_hook(callbacks, self)
                 local_ind += 1
 
