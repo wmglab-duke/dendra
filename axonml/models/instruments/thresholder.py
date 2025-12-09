@@ -46,7 +46,6 @@ class Thresholder:
                     "Cannot use chunklength with bases. Supply space and time instead."
                 )
             bases = torch.as_tensor(bases)
-            bases = bases.permute(1, 0, 2)
             self.bases = bases.to(device=model.device(), dtype=model.dtype())
             self.check_active = self._check_active_bases
             self.functional = False

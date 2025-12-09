@@ -1057,7 +1057,7 @@ class Network(RNGMixin):
             if not syn.skip_thresholding:
                 syn.has_spiked = (has_spiked).detach()
                 syn.is_spiking = (is_spiking).detach()
-            syn.delivery_buffer = syn.delivery_buffer.copy_(delivery_buffer).detach()
+            syn.delivery_buffer = delivery_buffer.clone().detach()
 
     def initialize_(self, *args, **kwargs):
         """

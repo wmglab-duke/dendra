@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 
-def to_param(val, positive=False):
+def to_param(val, positive=False, requires_grad=True):
     """
     Convert a value into a parameter-like object.
 
@@ -28,11 +28,11 @@ def to_param(val, positive=False):
         return val
     if isinstance(val, torch.nn.Module):
         return val
-    val = torch.as_tensor(val)
+    val = torch.as_tensor(val, dtype=torch.float32)
     if positive:
         val = torch.clamp(val, min=0.0)
         return PositiveParam(val)
-    param = torch.nn.Parameter(val, requires_grad=False)
+    param = torch.nn.Parameter(val, requires_grad=requires_grad)
     return param
 
 
