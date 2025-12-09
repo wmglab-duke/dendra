@@ -19,14 +19,31 @@ from ..batching import expand_and_reshape
 from .core import Integrator, MultiIntegrator
 from .tridiag import pcr_solve_t
 from .triton import (
-    thomas_solve_cuda_bt, solve_bt_spd_cuda,
-    thomas_solve_cuda_t, pcr_solve_cuda_t
+    pcr_solve_cuda_t,
+    solve_bt_spd_cuda,
+    thomas_solve_cuda_bt,
+    thomas_solve_cuda_t,
 )
 
 
 class _bwd_euler_sc(Integrator):
-    """
-    Implicit Euler method.
+    r"""
+    Single-compartment implicit (backward) Euler integrator.
+
+    Advances the membrane voltage with a fully implicit Euler step on the
+    ionic current term:
+
+    .. math::
+       v^{n+1} = v^{n} - \frac{\Delta t}{C_m} I_\mathrm{ion}(v^{n+1})
+
+    which is linearized through the mechanism's ``i`` call
+    (returning total current and conductance), yielding a closed-form update
+    per compartment without solving a spatial system.
+
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
     """
 
     def __init__(self, model, mech, imem=None):
@@ -64,8 +81,17 @@ class _bwd_euler_sc(Integrator):
 
 
 class _bwd_euler_sc_skip(Integrator):
-    """
-    Implicit Euler method with skip of ionic current calculation.
+    r"""
+    Single-compartment implicit Euler that skips storing conductances.
+
+    Applies the same implicit Euler step as :class:`_bwd_euler_sc` but only
+    evaluates ionic currents (discarding conductances) when stepping. Useful
+    when conductance outputs are unnecessary, reducing overhead.
+
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
     """
 
     v_vars = []
@@ -97,13 +123,23 @@ class _bwd_euler_sc_multi(MultiIntegrator, _bwd_euler_sc):
 
 
 class _bwd_euler_ub(Integrator):
-    """
-    Implicit Euler method for single-layer cable (unbounded bath).
+    r"""
+    Implicit Euler for a single-layer, unbranched cable morphology.
 
-    method: "thomas" (default), "spd", or "pcr"
-      - "thomas" / "inv":   classic Thomas solver (CPU via axonml_solvers, CUDA via custom kernel)
-      - "spd":              SPD tridiagonal solver (CPU only; uses cached Cholesky factors under the hood)
-      - "pcr":              parallel cyclic reduction (CPU/CUDA), used as fallback
+    Builds a tridiagonal system from the cable diffusion operator and ionic
+    linearization, then solves it each step with a selectable solver backend.
+    Supports optional gradient-clipped Thomas kernels on CUDA.
+
+    Parameters
+    ----------
+    method : {"thomas", "inv", "spd", "pcr"}, optional
+        Solver backend: Thomas (default; ``"inv"`` maps to ``"thomas"``),
+        SPD tridiagonal (CPU only), or PCR (CPU/CUDA fallback).
+    clip_scale_backward : float, optional
+        Enable gradient clipping in the CUDA Thomas kernel by this scale factor
+        (only applicable when ``method="thomas"``). Default None disables.
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
     """
 
     def __init__(
@@ -312,9 +348,23 @@ class _bwd_euler_ub(Integrator):
 
 
 class _bwd_euler_bt(Integrator):
-    """
-    Implicit Euler method for block tridiagonal system.
-    This integrator is only appropriate for ExtCellAxon models.
+    r"""
+    Implicit Euler for block tridiagonal systems (multi-layer extracellular).
+
+    Solves a block-tridiagonal linear system per step that couples the
+    intracellular voltage and multiple concentric extracellular shells (e.g.,
+    ExtCellAxon). Supports SPD or Thomas-like solvers on CPU (via
+    ``axonml_solvers``) and custom CUDA kernels.
+
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
+    method : {"spd", "inv"}, optional
+        Block solver backend. ``"inv"`` selects a Thomas-like block solver,
+        ``"spd"`` uses an SPD block solver where available. Default "inv".
+    **kwargs
+        Forwarded to base integrator; reserved for future solver options.
     """
 
     v_vars = ["v", "vc"]

@@ -1,7 +1,7 @@
 Welcome to AxonML!
 ===================
 
-``AxonML`` is a differentiable simulator for biophysical neuron fiber models in `PyTorch <https://github.com/pytorch/pytorch>`_, with an emphasis on effects of extracellular stimulation. Its key features are:
+``AxonML`` is a differentiable simulator for biophysical neuron fiber models in `PyTorch <https://github.com/pytorch/pytorch>`_, with an emphasis on effects of extracellular stimulation and event-based networks with synaptic delays. Its key features are:
 
 - support for CPU and GPU
 - automatic differentiation, allowing gradient-based optimization of thousands of parameters
@@ -22,17 +22,17 @@ Getting started
     import matplotlib.pyplot as plt
 
     import axonml as ax
+    from axonml_models.models import smolMRG
 
     # single 2.0 µm MRG model with extracellular stimulation
-    model = ax.smolMRG([2.0], n_node=201)
+    model = smolMRG([2.0], n_node=201)
 
     # point source extracellular kHz stimulation
     ve_s = ax.isotropic_point(z=100.0, rhoe=500.0)(model)
 
     dt, tstop = 0.001, 100
     f, amp = 5, 0.5
-    t = torch.arange(0, tstop, dt)
-    i_t = ax.sin(amp=amp, freq=f)(t)
+    i_t = ax.sin(amp=amp, freq=f)
 
     # run simulation
     rec = ax.callbacks.Recorder(['v'], node_indices=model.c(0.9))
@@ -41,7 +41,7 @@ Getting started
 
     # visualize
     v = rec.numpy('v')
-    plt.plot(v[:, 0, 0, 0]-v[0, 0, 0, 0])
+    plt.plot(v[:, 0, 0]-v[0, 0, 0])
     plt.show()
 
 

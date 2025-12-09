@@ -245,40 +245,25 @@ def _edge_currents(
 
 
 class _dhs(Integrator):
-    """
-    Implements Dendritic Hierarchical Scheduling (DHS) for efficient integration of dendritic tree models.
+    r"""
+    Dendritic Hierarchical Scheduling (DHS) integrator for tree morphologies.
 
-    This integrator leverages a hierarchical elimination order to solve the compartmental equations
-    of dendritic structures in a scalable, multi-threaded manner. It sets up buffers for various
-    morphological and biophysical properties, constructs a scheduling of computational layers, and
-    performs forward elimination on the system matrix, ultimately updating the membrane potentials.
+    Preprocesses a rooted tree into elimination layers and solves the resulting
+    Hines tridiagonal system with a warp-friendly DHS ordering. Supports CUDA
+    and CPU backends (CPU requires ``axonml_solvers``). Extracellular coupling
+    is included by accumulating edge currents into the RHS when ``ve`` is
+    provided.
 
-    Parameters:
-        model: Neural model object containing morphological (e.g., diameters, distances) and
-               biophysical properties.
-        mech: MechanismHandler to be advanced during simulation steps.
-        imem: Flag whether to store membrane current.
-        threads: Number of threads to use for parallel elimination in the hierarchical
-                 scheduling procedure (default is 32).
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
+    threads : int, optional
+        Threads per warp lane for DHS elimination (must divide 32). Default 16.
 
-    Core Methods:
-        initialize(model, dt):
-            Configures internal buffers by converting geometrical information to biophysical
-            parameters, constructing the dendritic morphology (parent indices and elimination
-            order), and setting up the computational layers.
-
-        step(model, dt, ve=None, intra=None):
-            Executes a simulation step by advancing the mechanism state and solving the
-            modified system using the DHS strategy.
-
-        _step(v, dt, temp, ve=None, intra=None):
-            Internal method that advances the simulation state by performing the forward
-            elimination via the DHS algorithm.
-
-    Reference:
-        Zhang, Y., He, G., Ma, L. et al. A GPU-based computational framework that bridges
-        neuron simulation and artificial intelligence. Nat Commun 14, 5798 (2023).
-        https://doi.org/10.1038/s41467-023-41553-7
+    Notes
+    -----
+    Based on Zhang et al., Nat. Commun. 14, 5798 (2023).
     """
 
     def __init__(self, model, mech, imem=None, threads=16):
@@ -495,12 +480,23 @@ class _dhs(Integrator):
 
 
 class _dhs_multi(MultiIntegrator):
-    """
-    Multi-model DHS integrator.
+    r"""
+    Multi-model DHS integrator for batches of tree morphologies.
 
-    Packs all morphology/geometry into padded, flat buffers with a global
-    row pitch K_stride = max(K_g) and records per-group offsets so a single
-    GPU kernel can process all groups in one launch.
+    Packs multiple morphologies into padded flat buffers (shared stride
+    ``K_stride = max K_g``) and records per-group offsets so a single CUDA/CPU
+    kernel can process all groups in one launch. Supports optional extracellular
+    coupling via edge currents when ``ve`` is supplied.
+
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
+    threads : int, optional
+        Threads per warp lane for DHS elimination (must divide 32). Default 16.
+    write_back : bool, optional
+        If True, write updated voltages back into each group's population after
+        stepping. Default True.
     """
 
     def __init__(

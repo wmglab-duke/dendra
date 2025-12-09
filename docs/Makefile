@@ -8,6 +8,15 @@ SPHINXBUILD   ?= sphinx-build
 SOURCEDIR     = .
 BUILDDIR      = _build
 
+# Remove build artifacts before generating HTML
+.PHONY: clean-build
+clean-build:
+	rm -rf "$(BUILDDIR)"
+
+.PHONY: html
+html: clean-build
+	@$(SPHINXBUILD) -M html "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+
 # Put it first so that "make" without argument is like "make help".
 help:
 	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)

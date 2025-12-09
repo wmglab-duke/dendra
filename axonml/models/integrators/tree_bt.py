@@ -83,6 +83,21 @@ def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
 
 
 class _dhs_bt(Integrator):
+    r"""
+    DHS integrator for block-tridiagonal (3x3 per node) tree systems.
+
+    Extends DHS to models with intracellular voltage and two extracellular
+    shells (vi, ve0, ve1) per node, assembling block diagonals and axial
+    conductances, then solving in DHS order with CUDA or CPU backends.
+
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
+    threads : int, optional
+        Threads per warp lane for DHS elimination (must divide 32). Default 16.
+    """
+
     v_vars = ["v", "vc"]
 
     def __init__(self, model, mech, imem=None, threads=16):

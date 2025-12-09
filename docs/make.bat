@@ -12,6 +12,11 @@ set BUILDDIR=_build
 
 if "%1" == "" goto help
 
+REM Clear previous build when generating HTML
+if /I "%1" == "html" (
+	if exist "%BUILDDIR%" rmdir /S /Q "%BUILDDIR%"
+)
+
 %SPHINXBUILD% >NUL 2>NUL
 if errorlevel 9009 (
 	echo.

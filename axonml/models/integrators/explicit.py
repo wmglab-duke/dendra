@@ -16,8 +16,22 @@ class SymmetricConv1D(torch.nn.Conv1d):
 
 
 class _euler(Integrator):
-    """
-    Forward Euler integrator.
+    r"""
+    Explicit forward Euler integrator for membrane voltage PDEs.
+
+    Uses a single-stage explicit update
+
+    .. math::
+       v^{n+1} = v^{n} + \Delta t \, f(v^{n}, t^{n})
+
+    where :math:`f` combines ionic currents and axial diffusion terms. The
+    operator relies on a symmetric convolution stencil to approximate the
+    spatial second derivative of the cable equation.
+
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
     """
 
     def __init__(self, model, mech, imem=None):
@@ -83,8 +97,18 @@ class _euler(Integrator):
 
 
 class _eulerv1(_euler):
-    """
-    Euler integrator with first-order correction.
+    r"""
+    Forward Euler integrator with a first-order Dufort-Frankel-style correction.
+
+    Uses the same explicit stencil as :class:`_euler` but applies the FRK update
+    to the current voltage rather than the stored inverse capacitance/axial
+    resistances, providing a slightly more stable first-order method for stiff
+    cable dynamics.
+
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
     """
 
     def _step(self, v, ve, area, dt, temp, cm, intra=None):
@@ -102,6 +126,25 @@ _rk1 = _euler
 
 
 class _rk2(_euler):
+    r"""
+    Two-stage explicit Runge-Kutta (midpoint) integrator.
+
+    Computes
+
+    .. math::
+       k_1 = f(v^n, t^n), \quad
+       k_2 = f\!\left(v^n + \tfrac{\Delta t}{2} k_1, t^n + \tfrac{\Delta t}{2}\right), \\
+       v^{n+1} = v^n + \Delta t \, k_2
+
+    providing second-order accuracy for the cable equation with explicit spatial
+    diffusion and ionic currents.
+
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
+    """
+
     def _step(self, v, ve, area, dt, temp, cm, intra=None):
         self.mech.advance(v, dt, temp)
         K1, _ = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
@@ -115,6 +158,19 @@ class _rk2(_euler):
 
 
 class _rk4(_euler):
+    r"""
+    Classical four-stage Runge-Kutta integrator.
+
+    Evaluates four slopes (:math:`k_1..k_4`) at staged voltage predictions and
+    combines them with the standard RK4 weights to yield fourth-order accuracy
+    for the explicit cable equation update.
+
+    Parameters
+    ----------
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
+    """
+
     def _step(self, v, ve, area, dt, temp, cm, intra=None):
         self.mech.advance(v, dt, temp)
         K1, i1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
@@ -169,8 +225,26 @@ def ssd_df_heterogeneous_no_ve(v_c, v_p, g_left, g_right):
 
 
 class _dufort_frankel_homogeneous(Integrator):
-    """
-    Dufort-Frankel integrator.
+    r"""
+    Dufort-Frankel explicit integrator for homogeneous morphologies.
+
+    Uses the Dufort-Frankel scheme on the cable diffusion term to achieve
+    unconditional stability for the linear part while keeping ionic currents
+    explicit. Optionally applies periodic spatial smoothing. Can compute with
+    either convolution-based or direct finite-difference stencils.
+
+    Parameters
+    ----------
+    beta : float, optional
+        Exponential smoothing factor (1.0 disables smoothing). Default 1.0.
+    smooth_every : int, optional
+        Apply smoothing every ``smooth_every`` steps when ``beta < 1``.
+        Default 100.
+    conv : bool, optional
+        If True, use a fixed convolution kernel for the spatial stencil;
+        otherwise use direct finite differences. Default False.
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
     """
 
     __constants__ = ["beta", "smoothing", "smooth_every", "imem"]
@@ -342,8 +416,23 @@ class _dufort_frankel_homogeneous(Integrator):
 
 
 class _dufort_frankel(Integrator):
-    """
-    Dufort-Frankel integrator for heterogeneous morphologies. (Corrected)
+    r"""
+    Dufort-Frankel explicit integrator for heterogeneous morphologies.
+
+    Extends the Dufort-Frankel scheme to non-uniform cable geometries by
+    computing compartment-specific axial conductances. The method maintains
+    unconditional stability for the linear diffusion term while treating ionic
+    currents explicitly and optionally smoothing voltages.
+
+    Parameters
+    ----------
+    beta : float, optional
+        Exponential smoothing factor (1.0 disables smoothing). Default 1.0.
+    smooth_every : int, optional
+        Apply smoothing every ``smooth_every`` steps when ``beta < 1``.
+        Default 100.
+    imem : bool or None, optional
+        If truthy, accumulate membrane currents each step. Default None.
     """
 
     __constants__ = ["beta", "smoothing", "smooth_every", "imem"]

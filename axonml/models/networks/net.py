@@ -344,7 +344,7 @@ class Network(RNGMixin):
       network (treated as a special "population" named ``netstim``).
 
     Connections are specified incrementally (e.g., via :meth:`connect_one_to_one`,
-    :meth:`connect_dense`, :meth:`connect_sparse`), then materialized when
+    :meth:`connect_dense`, :meth:`connect_prob`, :meth:`connect_prob_n`), then materialized when
     :meth:`build`/:meth:`initialize` is called. Running the network steps each
     population forward in time while advancing all synapses and optional NetStim.
 
@@ -765,7 +765,7 @@ class Network(RNGMixin):
             pre_var,
         )
 
-    def connect_sparse(
+    def connect_prob(
         self,
         source,
         target,
@@ -827,7 +827,7 @@ class Network(RNGMixin):
 
         Examples
         --------
-        >>> net.connect_sparse(pop_pre[:], pop_post[:], pop_post.mech.syn, prob=0.2)
+        >>> net.connect_prob(pop_pre[:], pop_post[:], pop_post.mech.syn, prob=0.2)
         """
         if isinstance(source, Population) or isinstance(source, NetStim):
             source = source[:]  # Ensure source is a slice if it's a Population
@@ -895,8 +895,6 @@ class Network(RNGMixin):
             delay,
             pre_var,
         )
-
-    connect_prob = connect_sparse
 
     def connect_prob_n(
         self,
@@ -1027,8 +1025,6 @@ class Network(RNGMixin):
             delay,
             pre_var,
         )
-
-    connect_sparse_n = connect_prob_n
 
     def build_synapses(self, dt, max_delay_ms=None):
         """
