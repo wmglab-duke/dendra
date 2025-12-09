@@ -16,28 +16,39 @@ def _ste_gate(x, tau):
 
 class NetStim(torch.nn.Module, Sliceable):
     """
-    A PyTorch implementation of NEURON's NetStim-like spike generator.
+    Differentiable spike generator modeled after NEURON's NetStim.
 
-    This class generates spike events according to a stochastic process with
-    configurable timing parameters, similar to NEURON's NetStim mechanism.
+    Each generator produces a renewal process with mean interval ``interval``.
+    A ``noise`` parameter blends deterministic intervals with exponential
+    variability:
+
+    .. math::
+
+        T_{k+1} = T_k + (1 - \\eta)\\,\\Delta + \\eta\\,\\Delta\\,E,
+
+    where ``Delta = interval``, ``eta = noise`` in ``[0,1]``, and ``E`` is
+    unit-rate exponential. When ``eta=0`` firing is periodic; when ``eta=1``
+    firing is Poisson with rate ``1/interval``. Initial spikes occur at
+    ``start``. A straight-through estimator gate provides a hard spike mask for
+    simulation while preserving gradients through the soft sigmoid surface,
+    enabling differentiation w.r.t. interval parameters.
 
     Parameters
     ----------
     N : int, optional
-        Number of independent event generators. Default is 1.
-    interval : float | list[float], optional
-        Mean inter-spike interval in ms. Default is 10.0.
-    start : float | list[float], optional
-        Start time (ms) after which synapses can begin spiking. Default is 0.0.
-    noise : float | list[float], optional
-        Controls randomness of intervals, between 0 and 1. Default is 0.0.
-    max_spikes : int | list[int], optional
-        Maximum number of spikes each synapse can deliver. Default is 1e9.
+        Number of independent generators. Default is 1.
+    interval : float or Iterable[float], optional
+        Mean inter-spike interval (ms). Can be per-generator. Default is 10.0.
+    start : float or Iterable[float], optional
+        Start time (ms) after which spikes may occur. Default is 0.0.
+    noise : float or Iterable[float], optional
+        Randomness in [0, 1]; 0=deterministic, 1=Poisson. Default is 0.0.
+    max_spikes : int or Iterable[int], optional
+        Maximum spikes per generator. Default is 1e9.
     tau : float, optional
-        Time constant (ms) for the differentiable spike gate. Default is 0.1
+        Sigmoid temperature for the straight-through gate (ms). Default is 0.1.
     seed : int, optional
-        Seed for reproducible random number generation. If None,
-        uses non-deterministic seeding. Default is None.
+        Seed for reproducible randomness. Default is None.
     """
 
     __constants__ = ["seed"]
@@ -95,12 +106,34 @@ class NetStim(torch.nn.Module, Sliceable):
 
     # ───────────────────────── misc API ─────────────────────────
     def device(self):
+        """
+        Device on which the generator state lives.
+
+        Returns
+        -------
+        torch.device
+            Device of internal buffers.
+        """
         return self.next_stoch_time.device
 
     def dtype(self):
+        """
+        Data type used by generator state.
+
+        Returns
+        -------
+        torch.dtype
+            Dtype of internal buffers.
+        """
         return self.next_stoch_time.dtype
 
     def init_rng(self):
+        """
+        Initialize or reseed the internal RNG on the correct device.
+
+        If ``seed`` is provided, the RNG is made deterministic; otherwise a
+        device-local generator is created with nondeterministic seeding.
+        """
         if self._rng.device != self.device():
             self._rng = torch.Generator(device=self.device()).manual_seed(
                 self._seeder.seed()
@@ -142,8 +175,14 @@ class NetStim(torch.nn.Module, Sliceable):
     # ───────────────────────── init/reset ─────────────────────────
     def initialize(self):
         """
-        Initializes next_stoch_time; scheduled heaps are preserved.
-        If noise>0: first stochastic spike = start + Exp(mean=noise*interval).
+        Reset generator state while preserving scheduled spikes.
+
+        Notes
+        -----
+        - ``next_stoch_time`` is set to ``start`` plus an exponential offset
+          when ``noise>0`` so the first interval is drawn from the same renewal
+          distribution used during stepping.
+        - Scheduled spikes already enqueued via :meth:`schedule` are retained.
         """
         self.init_rng()
         device, dtype = self.device(), self.dtype()
@@ -190,6 +229,13 @@ class NetStim(torch.nn.Module, Sliceable):
 
         - Ignores times <= t_last (already in the past given monotonic t).
         - Complexity: O(k log m) inserts total, where m is current # scheduled per generator.
+
+        Parameters
+        ----------
+        indices : int or Iterable[int]
+            Generator indices to receive scheduled spikes.
+        times : float or Iterable[float]
+            Spike times (ms) aligned with ``indices``. Past times are ignored.
         """
         # normalize to python lists on CPU for heapq
         if isinstance(indices, torch.Tensor):
@@ -217,7 +263,14 @@ class NetStim(torch.nn.Module, Sliceable):
 
     @torch.no_grad()
     def clear_schedule(self, indices: Optional[Iterable[int]] = None):
-        """Remove all scheduled spikes for selected generators (or all if None)."""
+        """
+        Remove all scheduled spikes for selected generators (or all if None).
+
+        Parameters
+        ----------
+        indices : Iterable[int], optional
+            Generators whose schedules should be cleared. Default None (all).
+        """
         if indices is None:
             indices = range(self.N)
         for i in indices:
@@ -239,6 +292,36 @@ class NetStim(torch.nn.Module, Sliceable):
             self.next_sched_time[i] = head
 
     def forward(self, t, *, bptt: bool = False):
+        """
+        Advance generator clocks to time ``t`` and emit spike mask.
+
+        The spike decision uses a straight-through estimator:
+
+        - Soft gate: ``sigmoid((t - t_next)/tau)`` (provides gradients).
+        - Hard mask: ``t >= t_next`` (used for simulation).
+        - Combined with ``max_spikes`` constraint.
+
+        For stochastic intervals, the next arrival is sampled as
+
+        .. math::
+
+            \\Delta t = (1-\\eta)\\,\\Delta + \\eta\\,\\Delta\\,E, \\quad E\\sim \\text{Exp}(1)
+
+        so gradients flow to ``interval`` through the linear mixing term.
+
+        Parameters
+        ----------
+        t : float or torch.Tensor
+            Current simulation time (ms).
+        bptt : bool, optional
+            If True, keep graph connections across steps (no detach) to enable
+            backprop-through-time. Default is False.
+
+        Returns
+        -------
+        torch.Tensor
+            Boolean tensor of shape ``(N,)`` indicating which generators fired.
+        """
         device, dtype = self.device(), self.dtype()
         t = torch.as_tensor(t, device=device, dtype=dtype)
 
@@ -306,13 +389,28 @@ class NetStim(torch.nn.Module, Sliceable):
 
     def numel(self):
         """
-        Returns the total number of elements in the spike generator.
+        Total number of generators.
+
+        Returns
+        -------
+        int
+            Number of generators (N).
         """
         return self.N
 
     def batch(self, n):
         """
-        Replicate this NetStim n times (independent copies).
+        Replicate this NetStim ``n`` times (independent copies).
+
+        Parameters
+        ----------
+        n : int
+            Batch size multiplier (must be positive).
+
+        Returns
+        -------
+        NetStim
+            Self, with state expanded to ``N*n`` generators.
         """
         if n <= 0:
             raise ValueError("Batch size n must be positive.")
@@ -340,6 +438,14 @@ class NetStim(torch.nn.Module, Sliceable):
         return self
 
     def detach(self):
+        """
+        Detach state tensors from any computation graph.
+
+        Returns
+        -------
+        NetStim
+            Self, detached in-place.
+        """
         with torch.no_grad():
             self.next_stoch_time = self.next_stoch_time.detach()
             self.next_sched_time = self.next_sched_time.detach()
@@ -350,4 +456,5 @@ class NetStim(torch.nn.Module, Sliceable):
         return self
 
     def detach_(self):
+        """In-place variant of :meth:`detach` that returns ``None``."""
         self.detach()

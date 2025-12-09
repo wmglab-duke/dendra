@@ -11,5 +11,6 @@ API Reference
    api/axonml.models.instruments
    api/axonml.models.integrators
    api/axonml.models.mod
+   api/axonml.models.networks
    api/axonml.models.stim
    api/axonml.units

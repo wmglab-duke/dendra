@@ -50,6 +50,8 @@
 
 - CPU implicit solvers: install the companion package `axonml-solvers` (required only for CPU implicit methods; GPU solvers are included by default).
 
+- Library of models: install the companion package `axonml-models` for additional pre-defined neuron & network models.
+
 ## Verify the install
 
 ```sh
