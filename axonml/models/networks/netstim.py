@@ -131,8 +131,8 @@ class NetStim(torch.nn.Module, Sliceable):
         """
         Initialize or reseed the internal RNG on the correct device.
 
-        If ``seed`` is provided, the RNG is made deterministic; otherwise a
-        device-local generator is created with nondeterministic seeding.
+        If ``seed`` was provided on initialization, the RNG is made deterministic;
+        otherwise a device-local generator is created with nondeterministic seeding.
         """
         if self._rng.device != self.device():
             self._rng = torch.Generator(device=self.device()).manual_seed(

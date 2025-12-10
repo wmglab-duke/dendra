@@ -393,6 +393,23 @@ def build_cnexp(states, assigned, derivative, eliminate=None, pade=False):
 
 
 class State(Parameterized):
+    """
+    Helper mixin for declaring per-compartment state variables and their dynamics.
+
+    Define subclasses inside a :class:`Mechanism` and register them with
+    :meth:`Mechanism.STATE`. Use uppercase classmethods (``STATE``, ``DERIVATIVE``,
+    ``KINETIC``, ``ASSIGNED``, ``BUFFER``, ``GLOBAL``, ``RANGE``) at class
+    definition time to declare state variables, ODEs/kinetics, per-compartment
+    parameters, and auxiliary buffers. Override lowercase hooks to implement
+    behavior:
+
+    - ``initial(self, v)``: populate buffers/states once at initialization.
+    - ``breakpoint(self, v, states=None)``: compute ASSIGNED/intermediates each step;
+      may return a dict mapping ASSIGNED names to values.
+    - ``inf(self, v)``: return steady-state values for states (used for init).
+    - ``calc_q10(self)``: optional temperature scaling when ``has_q10=True``.
+    """
+
     _state_buffers = set()
     _state_buffers_declarations = []
 
@@ -552,25 +569,74 @@ class State(Parameterized):
 
     @staticmethod
     def STATE(*args):
+        """
+        Declare state variables for the State subclass.
+
+        Parameters
+        ----------
+        *args : str
+            Names of state variables advanced by the integrator.
+        """
         State._state_declarations.append(args)
 
     @staticmethod
     def BUFFER(*args):
+        """
+        Declare auxiliary per-compartment buffers.
+
+        Buffers are allocated per instance and typically populated in
+        :meth:`initial`; they are not evolved by the ODE solver.
+
+        Parameters
+        ----------
+        *args : str
+            Buffer names to allocate.
+        """
         State._state_buffers_declarations.append(args)
 
     @staticmethod
     def DERIVATIVE(*args):
+        """
+        Declare ODEs for state variables using symbolic strings.
+
+        Parameters
+        ----------
+        *args : str
+            Derivative expressions like ``\"m' = (minf - m) / tau\"``.
+        """
         State._derivative_declarations.append(args)
 
     @staticmethod
     def KINETIC(*args):
+        """
+        Declare kinetic/Markov schemes between states.
+
+        Parameters
+        ----------
+        *args : str
+            Kinetic expressions like ``\"~ a <-> b (alpha, beta)\"``.
+        """
         State._kinetic_declarations.append(args)
 
     @staticmethod
     def ASSIGNED(*args):
+        """
+        Declare computed per-compartment variables used in derivatives.
+
+        Parameters
+        ----------
+        *args : str
+            Names of ASSIGNED variables to be set in :meth:`breakpoint`.
+        """
         State._assigned_declarations.append(args)
 
     def breakpoint(self, v, states):
+        """
+        Compute ASSIGNED/intermediate values for this state at the breakpoint.
+
+        Override in subclasses; may return a dict mapping ASSIGNED names to
+        values. Called each step before derivatives are evaluated.
+        """
         return {}
 
     def advance(self, v, dt, states):
@@ -578,9 +644,29 @@ class State(Parameterized):
 
     def initial(self, v):
         """
-        Initial function to be called after the state is created.
+        Hook invoked during initialization to populate buffers/states.
+
+        Override to set buffers declared via :meth:`BUFFER` or to customize
+        state initialization (may depend on morphology such as ``self.diam``).
         """
         pass
+
+    def inf(self, v):
+        """
+        Return steady-state values for state variables at voltage ``v``.
+
+        Used during initialization unless overridden by the caller.
+        """
+        return {}
+
+    def calc_q10(self):
+        """
+        Optional Q10 scaling helper when ``has_q10=True``.
+
+        Override to return a temperature-dependent multiplicative factor used
+        by ``self.q10()`` inside kinetics. Defaults to 1.0.
+        """
+        return 1.0
 
     @classproperty
     def code(cls):

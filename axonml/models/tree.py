@@ -83,7 +83,9 @@ class Tree(Population):
         Additional parameters forwarded to :class:`Population`.
     """
 
-    def __init__(self, N, C, graph=None, integrator=None, **kwargs):
+    def __init__(
+        self, N, C, graph=None, integrator=None, principal_axis=None, **kwargs
+    ):
         if integrator is None:
             integrator = dhs()
         super().__init__(N, C, integrator=integrator, **kwargs)
@@ -99,21 +101,26 @@ class Tree(Population):
                 names.append(name)
         self.names = names
 
-        self.register_buffer(
-            "directions",
-            torch.tensor(
+        if principal_axis is not None:
+            directions = (
+                torch.as_tensor(
+                    principal_axis, dtype=self.dtype(), device=self.device()
+                )
+                .reshape(1, 3)
+                .expand(N, -1)
+            )
+        else:
+            directions = torch.tensor(
                 [[0.0, 0.0, 1.0]], dtype=self.dtype(), device=self.device()
-            ).expand(N, -1),
-        )
+            ).expand(N, -1)
+
+        self.register_buffer("directions", directions)
         self.register_buffer(
             "azimuthal_rotations",
             torch.tensor(0.0, dtype=self.dtype(), device=self.device()).expand(N),
         )
 
-        self.register_buffer(
-            "base_direction",
-            torch.tensor([[0.0, 0.0, 1.0]], dtype=self.dtype(), device=self.device()),
-        )
+        self.register_buffer("base_direction", self.directions.clone())
         self.register_buffer(
             "base_azimuthal_rotation",
             torch.tensor(0.0, dtype=self.dtype(), device=self.device()),
@@ -152,7 +159,7 @@ class Tree(Population):
         membrane.update(kwargs)
         tree = cls(N, C, graph, integrator, **membrane)
         for key, value in data.items():
-            tree.register_buffer(key, value.expand(N, -1))
+            tree.register_buffer(key, value.expand(N, -1).to(tree.dtype()))
         tree.slice("soma").label("soma")
         tree.slice("axon").label("axon")
         tree.slice("dend").label("dend")
@@ -160,7 +167,9 @@ class Tree(Population):
         return tree
 
     @classmethod
-    def from_NEURON(cls, root_sec=None, N=1, integrator=None, **kwargs):
+    def from_NEURON(
+        cls, root_sec=None, N=1, integrator=None, principal_axis=None, **kwargs
+    ):
         """Construct a tree population from a NEURON root section.
 
         Parameters
@@ -182,12 +191,21 @@ class Tree(Population):
         from axonml.models.io import neuron_to_axonml_graph
 
         graph, _ = neuron_to_axonml_graph(root_sec)
-        cell = cls.from_graph(graph, N, integrator, **kwargs)
+        cell = cls.from_graph(
+            graph, N, integrator, principal_axis=principal_axis, **kwargs
+        )
         return cell
 
     @classmethod
     def from_swc(
-        cls, file_path, d_lambda=0.1, freq=100.0, N=1, integrator=None, **kwargs
+        cls,
+        file_path,
+        d_lambda=0.1,
+        freq=100.0,
+        N=1,
+        integrator=None,
+        principal_axis=None,
+        **kwargs,
     ):
         """Construct a tree population from an SWC file.
 
@@ -214,12 +232,21 @@ class Tree(Population):
         from axonml.models.io import read_swc
 
         graph, _ = read_swc(file_path, d_lambda=d_lambda, freq=freq)
-        cell = cls.from_graph(graph, N, integrator, **kwargs)
+        cell = cls.from_graph(
+            graph, N, integrator, principal_axis=principal_axis, **kwargs
+        )
         return cell
 
     @classmethod
     def from_neurolucida(
-        cls, file_path, d_lambda=0.1, freq=100.0, N=1, integrator=None, **kwargs
+        cls,
+        file_path,
+        d_lambda=0.1,
+        freq=100.0,
+        N=1,
+        integrator=None,
+        principal_axis=None,
+        **kwargs,
     ):
         """Construct a tree population from a Neurolucida file.
 
@@ -246,7 +273,9 @@ class Tree(Population):
         from axonml.models.io import read_neurolucida
 
         graph, _ = read_neurolucida(file_path, d_lambda=d_lambda, freq=freq)
-        cell = cls.from_graph(graph, N, integrator, **kwargs)
+        cell = cls.from_graph(
+            graph, N, integrator, principal_axis=principal_axis, **kwargs
+        )
         return cell
 
     from_asc = from_neurolucida
@@ -396,7 +425,9 @@ class Tree(Population):
         # 3. Apply the batch of rotations
         # (B, N, 3) @ (B, 3, 3) -> (B, N, 3)
         # We need to transpose the rotation matrices for matmul with (B,N,3)
-        rotated_points_centered = points_centered @ rotation_matrices.transpose(1, 2)
+        rotated_points_centered = points_centered @ rotation_matrices.transpose(
+            1, 2
+        ).to(points.dtype)
 
         # 4. Translate points back
         rotated_points = rotated_points_centered + origins

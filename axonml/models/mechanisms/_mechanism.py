@@ -21,11 +21,29 @@ class Mechanism(Parameterized):
     :class:`axonml.models.parametric.Parameterized` to leverage the shared
     parameter declaration and population infrastructure.
 
+    Use uppercase classmethods (``STATE``, ``GLOBAL``, ``RANGE``, ``ASSIGNED``,
+    ``USEION``, ``NONSPECIFIC_CURRENT``, etc.) at class definition time to
+    declare structure. Override lowercase hooks (``initial``, ``breakpoint``,
+    current methods) to implement behavior.
+
+    - ``STATE(StateSubclass, ...)``: register one or more State bundles. Each
+      State subclass manages its own state variables and derivatives. These are
+      accessible via the ``mechanism.DE`` ModuleDict.
+    - ``GLOBAL/RANGE``: shared vs per-compartment parameters.
+    - ``ASSIGNED``: mechanism-level buffers (analogous to State ``BUFFER``),
+      typically set in ``initial``/``breakpoint``.
+    - ``USEION``: ionic read/write dependencies.
+    - ``NONSPECIFIC_CURRENT`` / current methods: contribute to membrane balance.
+    - ``initial(self, v)``: one-time setup; set ASSIGNED buffers, etc.
+    - ``breakpoint(self, v)``: per-step computation of currents/ASSIGNED values.
+
     Notes
     -----
     Subclasses declare state, assigned, and ionic variables using the
     :meth:`STATE`, :meth:`ASSIGNED`, :meth:`SAVE`, :meth:`USEION`, and
-    :meth:`NONSPECIFIC_CURRENT` helpers during class definition.
+    :meth:`NONSPECIFIC_CURRENT` helpers during class definition. Override
+    :meth:`initial` and :meth:`breakpoint` to populate buffers and assemble
+    currents each step.
     """
 
     _state = set()
@@ -553,6 +571,7 @@ class Mechanism(Parameterized):
 
         return
 
+    # Classmethod declarations
     @staticmethod
     def STATE(*args):
         """
@@ -568,12 +587,13 @@ class Mechanism(Parameterized):
     @staticmethod
     def ASSIGNED(*args):
         """
-        Declare assigned variables for the mechanism class body.
+        Declare mechanism-level assigned buffers (analogous to State BUFFER).
 
         Parameters
         ----------
         *args : str
-            Names of assigned buffers to allocate per instance.
+            Names of assigned buffers to allocate per instance. Populate these
+            in :meth:`initial` or :meth:`breakpoint`.
         """
         Mechanism._assigned_declarations.append(args)
 
@@ -599,9 +619,11 @@ class Mechanism(Parameterized):
         ion : str
             Ion species identifier (e.g., ``'na'``).
         read : Sequence[str], optional
-            Ion variables to be read (e.g., ``['nai', 'nao']``).
+            Ion variables to be read; must be among ``{ion}i``, ``{ion}o``,
+            ``e{ion}``, or ``i{ion}`` (e.g., ``['nai', 'nao', 'ena']``).
         write : Sequence[str], optional
-            Ion variables to be written.
+            Ion variables to be written; same allowed set (e.g., ``['ina']`` for
+            current contribution, or ``['nai']`` to update concentration).
 
         Raises
         ------
@@ -694,6 +716,12 @@ class Mechanism(Parameterized):
         ----------
         v : Tensor
             Membrane potential values for the local compartments.
+
+        Notes
+        -----
+        Override to compute mechanism-level :meth:`ASSIGNED` buffers and
+        assemble currents (e.g., ``ina``, ``ik``, ``il``). Called each step
+        before current accumulation.
         """
         return
 
@@ -734,12 +762,17 @@ class Mechanism(Parameterized):
 
     def initial(self, v):
         """
-        Hook for subclasses to initialize state from membrane potential.
+        Hook for subclasses to initialize buffers from membrane potential.
 
         Parameters
         ----------
         v : Tensor
-            Membrane potential values used for state initialization.
+            Membrane potential values used for initialization.
+
+        Notes
+        -----
+        Use this to populate mechanism-level :meth:`ASSIGNED` buffers (e.g.,
+        cached conductances) or perform any one-time setup before stepping.
         """
         return
 

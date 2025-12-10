@@ -348,7 +348,7 @@ class Population(P, Sliceable):
         if self.graph is not None:
             area = get_area_from_graph(self.graph)
             if area is not None:
-                return area.to(self.device(), dtype=self.dtype())
+                return area.to(self.device(), dtype=self.dtype()).reshape(-1, self.nc)
         return self.diam * 1e-4 * torch.pi * self.dx * 1e-4  # in cm²
 
     def numel(self, include_batch_dimensions=True):

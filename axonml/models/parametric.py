@@ -675,8 +675,8 @@ class SimpleParameterized(Referency):
     """
     Mixin that manages a flat set of named parameters for subclasses.
 
-    Subclasses declare parameters via :meth:`PARAMETER` and receive automatic
-    instantiation of buffers or modules via :func:`to_param`.
+    Declare parameters with :meth:`PARAMETER` at class definition time; instances
+    receive automatic instantiation of buffers or modules via :func:`to_param`.
     """
 
     _params = {}
@@ -760,7 +760,9 @@ class SimpleParameterized(Referency):
         Parameters
         ----------
         **kwargs
-            Parameter names with default values.
+            Parameter names with default values. These are per-instance and
+            flattened (no shape metadata); use :class:`Parameterized` for
+            GLOBAL/RANGE/RNG categories when population-aware shapes are needed.
         """
         SimpleParameterized._params_declarations.append(kwargs)
 
@@ -948,6 +950,16 @@ class Parameterized(SimpleParameterized):
     """
     A base class that allows subclasses to declare parameters which are
     automatically inherited and aggregated.
+
+    Use uppercase classmethods at definition time:
+
+    - ``GLOBAL``: shared scalar parameters (broadcast across compartments).
+    - ``RANGE``: per-compartment parameters (shaped like ``shape_p``).
+    - ``PARAMETER``: flat per-instance parameters from :class:`SimpleParameterized`.
+    - ``RNG``: declare RNG seeds/generators to be instantiated.
+
+    Subclasses (e.g., :class:`Mechanism`, :class:`State`) build on these
+    declarations and expose additional lifecycle hooks.
     """
 
     _global = {}
@@ -1032,24 +1044,39 @@ class Parameterized(SimpleParameterized):
     @staticmethod
     def GLOBAL(**kwargs):
         """
-        A static method to declare parameters. This has the side effect of
-        appending the parameters to a temporary class-level list.
+        Declare scalar (compartment-independent) parameters.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            once per instance and broadcast across compartments.
         """
         Parameterized._global_declarations.append(kwargs)
 
     @staticmethod
     def RANGE(**kwargs):
         """
-        A static method to declare ranges. This has the side effect of
-        appending the ranges to a temporary class-level list.
+        Declare per-compartment parameters (range variables).
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            with shape matching the population ``shape_p``.
         """
         Parameterized._range_declarations.append(kwargs)
 
     @staticmethod
     def RNG(*args):
         """
-        A static method to declare rng parameters. This has the side effect of
-        appending the rng names to a temporary class-level list.
+        Declare RNG identifiers to instantiate device-local generators.
+
+        Parameters
+        ----------
+        *args : str
+            Names of RNG streams to create. Instances receive generator buffers
+            accessible via these names.
         """
         Parameterized._rng_declarations.append(set(args))
 
