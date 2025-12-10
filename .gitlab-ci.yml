@@ -43,6 +43,8 @@ build_docs:
 
 pages:
   stage: deploy
+  # override the global before_script
+  before_script: []
   dependencies:
     - build_docs
   script:
