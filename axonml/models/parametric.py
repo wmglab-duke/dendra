@@ -6,10 +6,12 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
+from axonml.helpers import REQUIRE_GRAD
+
 from .rng import RNGModule
 
 
-def to_param(val, positive=False, requires_grad=True):
+def to_param(val, positive=False, requires_grad=None):
     """
     Convert a value into a parameter-like object.
 
@@ -20,12 +22,16 @@ def to_param(val, positive=False, requires_grad=True):
     positive : bool, optional
         If True, clamp the value to non-negative range and wrap it in
         :class:`PositiveParam`.
+    requires_grad : bool, optional
+        If True, the created parameter will require gradients.
 
     Returns
     -------
     torch.nn.Parameter or PositiveParam or torch.nn.Module
         Parameterized representation of ``val`` suitable for registration.
     """
+    if requires_grad is None:
+        requires_grad = bool(REQUIRE_GRAD)
     if isinstance(val, torch.nn.Parameter):
         return val
     if isinstance(val, torch.nn.Module):

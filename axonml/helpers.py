@@ -80,6 +80,7 @@ FULLGRAPH = ContextVar("FULLGRAPH", 0)
 DYNAMIC = ContextVar("DYNAMIC", 0)
 JIT = ContextVar("JIT", 1)
 COMPILE_MODE = ContextVar("COMPILE_MODE", "default")
+REQUIRE_GRAD = ContextVar("REQUIRE_GRAD", 0)
 
 
 def set_jit_enabled(enable=True):
