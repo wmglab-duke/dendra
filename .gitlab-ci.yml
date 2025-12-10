@@ -6,6 +6,7 @@ stages:
 
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  DEBIAN_FRONTEND: noninteractive
 
 cache:
   key: "$CI_JOB_NAME"
@@ -13,30 +14,26 @@ cache:
     - .cache/pip
 
 before_script:
+  # Install git (and optionally compilers)
+  - apt-get update && apt-get install -y --no-install-recommends git build-essential
+  - rm -rf /var/lib/apt/lists/*
+
   - python -m pip install --upgrade pip
 
-  # 1) Install PyTorch FIRST (CPU build is usually enough for docs)
-  #    Pin version / index as you like.
+  # 1) Install PyTorch first
   - python -m pip install "torch==2.4.0" --index-url https://download.pytorch.org/whl/cpu
 
-  # 2) Clone and install axonml-solvers AFTER torch is installed
-  #    Use CI_JOB_TOKEN to authenticate to the same GitLab instance
-  - |
-    git clone \
-      "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/axonml-solvers.git"
-  - cd axonml-solvers
-  - python -m pip install --no-build-isolation .
-  - cd "$CI_PROJECT_DIR"
+  # 2) Clone and install axonml-solvers AFTER torch
+  - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/axonml-solvers.git"
+  - cd axonml-solvers && python -m pip install --no-build-isolation . && cd "$CI_PROJECT_DIR"
 
-  # 3) Install your package with the [doc] extra
+  # 3) Install your main package with [doc] extra
   - python -m pip install ".[doc]"
 
 build_docs:
   stage: build
   script:
-    # 4) Build the HTML docs
     - sphinx-build -b html docs docs/_build/html
-    # GitLab Pages expects ./public
     - mkdir -p public
     - cp -r docs/_build/html/* public/
   artifacts:
