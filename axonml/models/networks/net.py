@@ -593,7 +593,8 @@ class Network(RNGMixin):
         threshold : float | torch.Tensor | torch.nn.Module, optional
             Spike threshold(s) for the pre-synaptic units. A scalar applies to
             all connections. A length-N tensor/module output provides one value
-            per pre-synaptic unit. Default is 0.0.
+            per pre-synaptic unit. Default is 0.0. If None, no thresholding is applied
+            (raw presynaptic variable is used as event variable).
         weight : float | torch.Tensor | torch.nn.Module, optional
             Synaptic weight(s). A scalar applies to all connections. A tensor of
             length N (number of pre-synaptic indices) supplies per-connection
@@ -602,6 +603,9 @@ class Network(RNGMixin):
         delay : float | torch.Tensor | torch.nn.Module, optional
             Synaptic delay(s) in ms. Same broadcasting rules as `weight`.
             Default is 0.0.
+        pre_var : str, optional
+            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
+            for triggering synaptic events. Default is None (use voltage / spikes).
 
         Returns
         -------
@@ -677,7 +681,8 @@ class Network(RNGMixin):
             Target-side synapse mechanism attached to the target population.
         threshold : float | torch.Tensor | torch.nn.Module, optional
             Spike threshold(s) for the pre-synaptic units. See connect_one_to_one
-            for broadcasting rules. Default is 0.0.
+            for broadcasting rules. Default is 0.0. If None, no thresholding is applied
+            (raw presynaptic variable is used as event variable).
         weight : float | torch.Tensor | torch.nn.Module, optional
             Synaptic weight(s). See connect_one_to_one for broadcasting rules.
             Default is 1.0.
@@ -798,6 +803,8 @@ class Network(RNGMixin):
             pre-post pair.
         threshold : float | torch.Tensor | torch.nn.Module, optional
             Spike threshold(s); broadcasting as in connect_one_to_one.
+            Default is 0.0. If None, no thresholding is applied
+            (raw presynaptic variable is used as event variable).
         weight : float | torch.Tensor | torch.nn.Module, optional
             Synaptic weight(s); broadcasting as in connect_one_to_one.
         delay : float | torch.Tensor | torch.nn.Module, optional
@@ -929,6 +936,8 @@ class Network(RNGMixin):
             If n exceeds the number of possible pairs, all pairs are selected.
         threshold : float | torch.Tensor | torch.nn.Module, optional
             Spike threshold(s); broadcasting as in connect_one_to_one.
+            Default is 0.0. If None, no thresholding is applied
+            (raw presynaptic variable is used as event variable).
         weight : float | torch.Tensor | torch.nn.Module, optional
             Synaptic weight(s); broadcasting as in connect_one_to_one.
         delay : float | torch.Tensor | torch.nn.Module, optional
