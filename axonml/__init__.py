@@ -25,6 +25,7 @@ from .models import (
     NetStim,
     Network,
     Population,
+    SingleCompartment,
     Tree,
     Unmyelinated,
     concat,

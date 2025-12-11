@@ -51,11 +51,16 @@ class _bwd_euler_sc(Integrator):
         self.register_buffer("cmdt", torch.tensor(0.0))
 
     def initialize(self, model, dt):
+        # model.cm: uF/cm²
+        # dt: ms
         self.cmdt = (1e-6 * model.cm) / (1e-3 * dt)
         self.area = 2 * math.pi * (1e-4 * model.diam / 2.0) * (1e-4 * model.dx)  # cm²
 
     def step(self, model, dt, ve=None, intra=None):
-        model.v = self._solve(model.v, dt, model.celsius, intra)
+        v_new, i_membrane = self._solve(model.v, dt, model.celsius, intra)
+        model.v = v_new
+        if self.imem:
+            model.i_membrane = i_membrane
 
     def _solve(self, v, dt, temp, intra=None):
         # apply voltage processes
@@ -77,7 +82,15 @@ class _bwd_euler_sc(Integrator):
             external_update = (intra / self.area) / denom
             v_new = v_new + external_update
 
-        return v_new
+        i_membrane = None
+        if self.imem:
+            # capacitance term (mA/cm^2) using cmdt = Cm/dt_s per area
+            i_cap = self.cmdt * (v_new - v)  # mA/cm^2
+            i_ion = itot + gtot * (v_new - v)  # mA/cm^2
+            i_mem_dens = i_cap + i_ion
+            i_membrane = i_mem_dens * self.area  # mA
+
+        return v_new, i_membrane
 
 
 class _bwd_euler_sc_skip(Integrator):
@@ -118,7 +131,10 @@ class _bwd_euler_sc_multi(MultiIntegrator, _bwd_euler_sc):
         super().__init__(model, mech, imem, write_back)
 
     def step(self, model, dt, ve=None, intra=None):
-        model.v = self._solve(model.v, dt, model.celsius, intra)
+        v_new, i_membrane = self._solve(model.v, dt, model.celsius, intra)
+        model.v = v_new
+        if self.imem:
+            model.i_membrane = i_membrane
         self._write_back(model)
 
 
@@ -281,7 +297,7 @@ class _bwd_euler_ub(Integrator):
 
         # misc pre-computed factors used elsewhere
         self.cm_inv = Cm_inv  # (B,K)
-        self.scale = area_cm2 * Cm_inv  # A·s/C ≈ 1, but kept for code reuse
+        self.scale = area_cm2 * Cm_inv  # 1 / c_m (inverse specific capacitance, cm^2/F)
 
         self.base_shape = model.shape
 
@@ -336,11 +352,11 @@ class _bwd_euler_ub(Integrator):
         i_membrane = None
 
         if self.imem:
-            area = self.scale / self.cm_inv  # cm^2
-            Cm = 1.0 / self.cm_inv  # F
-            Cdt = Cm / dt_s  # A/V
-            g_abs = gtot * area  # S
-            i_abs = itot * area  # A
+            area = self.scale / self.cm_inv  # cm^2 (segment area)
+            Cm = 1.0 / self.cm_inv  # F (segment capacitance)
+            Cdt = Cm / dt_s  # A/V (capacitive 'conductance')
+            g_abs = gtot * area  # S (ionic conductance per segment)
+            i_abs = itot * area  # mA (ionic current per segment)
             dmem = Cdt + g_abs  # A/V
             i_membrane = dmem * (v_np1 - v) + i_abs
 

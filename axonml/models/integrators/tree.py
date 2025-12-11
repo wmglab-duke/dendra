@@ -425,20 +425,34 @@ class _dhs(Integrator):
         self.register_buffer("edge_gax_orig", edge_gax_orig)
 
     def step(self, model, dt, ve=None, intra=None):
-        model.v = self._step(model.v, dt, model.celsius, ve, intra)
+        v_new, i_membrane = self._step(model.v, dt, model.celsius, ve, intra)
+        model.v = v_new
+        if self.imem:
+            model.i_membrane = i_membrane
 
     def _step(self, v, dt, temp, ve=None, intra=None):
+        K = self.K
         v = self.mech.update_v(v)  # apply voltage processes
+        v_old = v
 
-        self.mech.advance(v, dt, temp)
+        self.mech.advance(v_old, dt, temp)
+
+        itot = None
+        gtot_flat = None
 
         if self.mech.currents:
-            itot, gtot = self.mech.i(v)
-            f_n = (gtot * v - itot).view(-1, self.K) * self.scale
-            gtot = gtot.view(-1, self.K)
+            itot, gtot = self.mech.i(v_old)  # shapes: base_shape
+            itot_flat = itot.view(-1, K)  # (B,K), mA/cm^2
+            gtot_flat = gtot.view(-1, K)  # (B,K), mA/(cm^2 mV)
+            scale = self.scale.view(-1, K)  # (B,K), cm^2
+
+            # ionic "reversal" term + scale to absolute mA
+            f_n = (gtot_flat * v_old.view(-1, K) - itot_flat) * scale  # (B,K), mA
         else:
-            gtot = torch.tensor(0.0, dtype=v.dtype, device=v.device)
-            f_n = torch.tensor(0.0, dtype=v.dtype, device=v.device)
+            # no ionic currents: zero contribution
+            itot_flat = None
+            gtot_flat = torch.zeros_like(self.cmdt)  # (B,K)
+            f_n = torch.zeros_like(self.cmdt)
 
         if ve is not None:
             I_edge = _edge_currents(
@@ -454,10 +468,13 @@ class _dhs(Integrator):
             f_n = f_n + S  # (B, K) mA
 
         if intra is not None:
-            f_n += intra
+            f_n = f_n + intra.view_as(f_n)
 
-        RHS = f_n + (self.cmdt * v.view(-1, self.K))  # mA
-        main = self.cmdt + (gtot * self.scale)  # S
+        v_old_flat = v_old.view(-1, K)  # (B,K)
+        RHS = f_n + (self.cmdt * v_old_flat)  # (B,K), mA
+
+        scale = self.scale.view(-1, K)  # (B,K), cm^2
+        main = self.cmdt + (gtot_flat * scale)
 
         d_ = main.index_select(-1, self.solver_order)  # (B, N)
         b_ = RHS.index_select(-1, self.solver_order)  # (B, N)
@@ -472,11 +489,28 @@ class _dhs(Integrator):
             self.layer_ptr,
         )
 
-        v = v_out.index_select(-1, self.inv_solver_order).reshape(
+        v_new = v_out.index_select(-1, self.inv_solver_order).reshape(
             self.base_shape
         )  # (B, N)
 
-        return v  # (B, N) mV
+        # ---- i_membrane: net membrane current (cap + ionic) in mA ----
+        i_membrane = None
+        if self.imem:
+            v_new_flat = v_new.view(-1, K)  # (B,K), mV
+            dv = v_new_flat - v_old_flat  # (B,K), mV
+
+            dmem = main  # (B,K), A/V
+            if self.mech.currents:
+                # absolute ionic current at old step (mA)
+                i_abs_old = itot_flat * scale  # (B,K), mA
+            else:
+                i_abs_old = torch.zeros_like(dmem)
+
+            # I_mem = (C/dt + G_abs)*Δv + I_ion_old   (mA, code units)
+            i_mem_flat = dmem * dv + i_abs_old  # (B,K), mA
+            i_membrane = i_mem_flat.reshape(self.base_shape)
+
+        return v_new, i_membrane
 
 
 class _dhs_multi(MultiIntegrator):
@@ -986,7 +1020,12 @@ class _dhs_multi(MultiIntegrator):
         return plan
 
     def step(self, model, dt, ve=None, intra=None):
-        model.v = self._step(model.v, dt, getattr(model, "celsius", None), ve, intra)
+        v_new, i_mem = self._step(
+            model.v, dt, getattr(model, "celsius", None), ve, intra
+        )
+        model.v = v_new
+        if self.imem:
+            model.i_membrane = i_mem
         self._write_back(model)
 
     def _step(self, v, dt, temp=None, ve=None, intra=None):
@@ -1002,7 +1041,9 @@ class _dhs_multi(MultiIntegrator):
 
         # 1) mechanisms on flattened vector
         v = self.mech.update_v(v)
-        self.mech.advance(v, dt, temp)
+        v_old = v
+
+        self.mech.advance(v_old, dt, temp)
         itot_flat, gtot_flat = self.mech.i(v)  # both original shape
 
         intra_flat = 0.0 if intra is None else intra.reshape(P, N_total)
@@ -1010,9 +1051,11 @@ class _dhs_multi(MultiIntegrator):
         SCALE_MECH = self.SCALE_MECH.reshape(1, -1)
 
         # 2) assemble in mechanism order
-        f_n_flat = (gtot_flat * v - itot_flat).reshape(
-            P, N_total
-        ) * SCALE_MECH + intra_flat
+        v_old_flat = v_old.reshape(P, N_total)  # (P, N_total)
+        itot_mech = itot_flat.reshape(P, N_total)
+        gtot_mech = gtot_flat.reshape(P, N_total)
+
+        f_n_flat = (gtot_mech * v_old_flat - itot_mech) * SCALE_MECH + intra_flat
 
         # --- extracellular coupling (ve), vectorized on flattened indices) ---
         if ve is not None and self.EDGE_CHILD_IDX_FLAT.numel() > 0:
@@ -1030,10 +1073,10 @@ class _dhs_multi(MultiIntegrator):
 
         CMDT_MECH = self.CMDT_MECH.reshape(1, -1)
 
-        RHS_flat = f_n_flat + CMDT_MECH * v.reshape(P, N_total)
-        MAIN_flat = CMDT_MECH + gtot_flat * SCALE_MECH
+        RHS_flat = f_n_flat + CMDT_MECH * v_old_flat
+        MAIN_flat = CMDT_MECH + gtot_mech * SCALE_MECH
 
-        device = v.device
+        device = v_old.device
         plan = self._get_tiled_plan(P, device)
         PLIN_flat = plan["PLIN_flat"]
 
@@ -1061,4 +1104,22 @@ class _dhs_multi(MultiIntegrator):
 
         # 6) gather back to mechanism order with the same index map
         v_sel = v_out_solver.view(-1).index_select(0, PLIN_flat)  # (P * N_total,)
-        return v_sel.reshape(orig_shape)
+        v_new = v_sel.reshape(orig_shape)
+
+        # --- net membrane current: cap + ionic, per mechanism index ---
+        i_mem = None
+        if self.imem:
+            v_new_flat = v_new.reshape(P, N_total)  # (P, N_total)
+            dv_flat = v_new_flat - v_old_flat  # ΔV, mV
+
+            # absolute ionic current at old step (mA)
+            i_abs_old_flat = itot_mech * SCALE_MECH  # (P, N_total), mA
+
+            # dmem = C/dt + G_abs (A/V)
+            dmem_flat = MAIN_flat  # (P, N_total), A/V
+
+            # I_mem = dmem * ΔV + I_ion_old  (mA, code units)
+            i_mem_flat = dmem_flat * dv_flat + i_abs_old_flat  # (P, N_total)
+            i_mem = i_mem_flat.reshape(orig_shape)  # (..., 1, N_total)
+
+        return v_new, i_mem
