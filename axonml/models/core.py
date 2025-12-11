@@ -994,12 +994,12 @@ class Population(P, Sliceable):
             Each specification is a tuple ``(ve_s, time)``:
 
             * ``ve_s``: spatial field tensor with shape ``[np, n_comp]`` or
-            ``[1, n_comp]``. A leading dimension of ``1`` is broadcast to ``np``.
+              ``[1, n_comp]``. A leading dimension of ``1`` is broadcast to ``np``.
 
             * ``time``: either a :class:`Waveform` object (functional specification)
-            or a tensor with shape ``[np, n_timesteps]`` or ``[1, n_timesteps]``.
-            A leading dimension of ``1`` is broadcast to ``np``. The last
-            dimension must match the number of simulation time steps.
+              or a tensor with shape ``[np, n_timesteps]`` or ``[1, n_timesteps]``.
+              A leading dimension of ``1`` is broadcast to ``np``. The last
+              dimension must match the number of simulation time steps.
 
             If a single tuple is provided, the method uses a single-contact
             formulation with :func:`op_sc`. If a sequence of tuples is provided,
@@ -1008,7 +1008,7 @@ class Population(P, Sliceable):
 
             * Spatial fields are stacked to shape ``[n_contacts, np, n_comp]``.
             * Functional (Waveform) inputs are evaluated per time step and
-            expanded/concatenated to shape ``[n_contacts, np, n_timesteps]``.
+              expanded/concatenated to shape ``[n_contacts, np, n_timesteps]``.
             * Non-functional (tensor) inputs are normalized once to that shape.
 
             Mixing :class:`Waveform` and tensor time specifications across contacts
@@ -1035,12 +1035,12 @@ class Population(P, Sliceable):
         Notes
         -----
         * ``run`` supports both precomputed ``ve`` and the higher-level
-        ``extra`` specification used by :meth:`longrun`.
+          ``extra`` specification used by :meth:`longrun`.
         * When ``extra`` is provided, the underlying construction of
-        extracellular voltage matches the semantics of :meth:`longrun`,
-        but the entire simulation is treated as a single chunk.
+          extracellular voltage matches the semantics of :meth:`longrun`,
+          but the entire simulation is treated as a single chunk.
         * The simulation updates the model's internal state (e.g. ``v``,
-        ``v_prev`` for DF methods) and advances the model's time ``self.t``.
+          ``v_prev`` for DF methods) and advances the model's time ``self.t``.
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
