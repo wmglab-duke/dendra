@@ -5,9 +5,13 @@ Welcome to AxonML!
 
 - support for CPU and GPU
 - automatic differentiation, allowing gradient-based optimization of thousands of parameters
-- implementations of a range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more
 - ``jit``-compilation, making it blazing fast while being (mostly) written in python
+- symbolic specification of ODE and kinetic schemes for easy implementation of new mechanisms
+- flexible extracellular stimulation with support for complex 3D fields
+- event-based network simulation with synaptic delays
 - a simple API, making it easy to use for beginners and experts alike
+- implementations of a range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more (via `AxonML Models <https://gitlab.oit.duke.edu/mah148/axonml-models>`_)
+
 
 ``AxonML`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please let us know by opening an issue on our `GitLab repository <https://gitlab.oit.duke.edu/mah148/axonml>`_.
 
