@@ -1,7 +1,5 @@
 import torch
 
-import random
-
 
 class Distribution(torch.nn.Module):
     __constants__ = ["once", "seeded"]

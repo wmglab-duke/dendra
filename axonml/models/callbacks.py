@@ -1,45 +1,37 @@
-from queue import Queue
-from typing import Tuple, Dict, List
-from types import MethodType
-import threading
+import gc
 import multiprocessing as mp
-
-from h5py import File
+from queue import Queue
+from types import MethodType
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from h5py import File
 
+from ..helpers import nojit
 from .backend import Backend as A
-from .interfaces import AxonInterface
+
+if torch.cuda.is_available():
+    TRANSFERSTREAM = torch.cuda.Stream()
+else:
+    TRANSFERSTREAM = None
 
 
-TRANSFERSTREAM = torch.cuda.Stream()
-
-
-class Callback:
+class Callback(torch.nn.Module):
     """
     Base class for simulation callbacks in AxonML.
 
-    This class defines the interface for callbacks that can be registered with
-    axon models to monitor and interact with the simulation at specific points
-    in the execution flow. Subclasses should override the hook methods to
-    implement specific functionality.
-
-    Methods
-    -------
-    pre_loop_hook(model)
-        Called once before starting the simulation loop.
-    post_step_hook(model)
-        Called after each simulation time step.
-    post_loop_hook(model)
-        Called once after the simulation loop completes.
+    This class defines the interface for callbacks that can be passed to
+    ``run`` or ``longrun`` methods of models to monitor and interact with the
+    simulation at specific points in the execution flow. Subclasses override
+    hook methods to record state, detect events, or stream data during a run.
 
     Notes
     -----
-    Custom callbacks should inherit from this class and override one or more
-    of the hook methods. Multiple callbacks can be used simultaneously by
-    passing them in a list to the model's run method.
+    The default implementations are no-ops; override only the hooks you need.
+    Multiple callbacks can be used simultaneously by passing them in a list to
+    the model's run method or by wrapping them in :class:`CallbackList`.
 
     See Also
     --------
@@ -61,41 +53,64 @@ class Callback:
     >>> model.run(ve, callbacks=[callback])
     """
 
-    def pre_loop_hook(self, model: AxonInterface):
-        """Execute before entering solver loop.
+    def pre_loop_hook(self, model):
+        """Run once before entering the solver loop.
 
-        Parameters
-        ----------
-        states : Tensor
-            System states.
-        """
+        Override to allocate buffers, move indices to the correct device, or
+        otherwise initialize state based on the provided ``model``."""
         pass
 
-    def post_step_hook(self, model: AxonInterface):
-        """Execute after each loop of solver (advance of
-        single timestep.)
+    def pre_chunk_hook(self, model, timepoints=None):
+        """Run before processing a chunk of timepoints.
 
-        Parameters
-        ----------
-        states : Tensor
-            System states.
-        """
+        Override to prepare per-chunk scratch space or bookkeeping using the
+        supplied ``timepoints``."""
         pass
 
-    def post_loop_hook(self, model: AxonInterface):
-        """Execute after solver loop completes.
+    def post_chunk_hook(self, model, timepoints=None):
+        """Run after finishing a chunk of timepoints.
 
-        Parameters
-        ----------
-        states : Tensor
-            System states.
-        """
+        Override to flush results accumulated during the chunk or to update
+        metrics that depend on the completed block."""
+        pass
+
+    def pre_step_hook(self, model):
+        """Run before each solver step (single timestep).
+
+        Override to inspect or modify model state just before integration."""
+        pass
+
+    def post_step_hook(self, model):
+        """Run after each solver step (single timestep).
+
+        Override to record outputs or update counters after the model advances."""
+        pass
+
+    def post_loop_hook(self, model):
+        """Run once after the solver loop completes.
+
+        Override to finalize results or free resources."""
         pass
 
 
-class CallbackList:
+class CallbackList(torch.nn.Module):
+    """
+    Lightweight container that forwards hook calls to multiple callbacks.
+
+    Parameters
+    ----------
+    callbacks : list[Callback], optional
+        Sequence of callback instances to run. The list is stored as a
+        :class:`torch.nn.ModuleList` so callbacks are registered buffers.
+    """
+
     def __init__(self, callbacks=None) -> None:
-        self.callbacks = callbacks if callbacks is not None else []
+        super().__init__()
+        self.callbacks = (
+            torch.nn.ModuleList(callbacks)
+            if callbacks is not None
+            else torch.nn.ModuleList()
+        )
 
     def __iter__(self):
         return iter(self.callbacks)
@@ -106,17 +121,35 @@ class CallbackList:
     def __next__(self):
         return next(self.callbacks)
 
-    def pre_loop_hook(self, model: AxonInterface):
-        for c in self:
+    def pre_loop_hook(self, model):
+        """Call ``pre_loop_hook`` on each callback in order."""
+        for c in self.callbacks:
             c.pre_loop_hook(model)
 
-    def post_step_hook(self, model: AxonInterface):
-        for c in self:
-            c.post_step_hook(model)
-
-    def post_loop_hook(self, model: AxonInterface):
-        for c in self:
+    def post_loop_hook(self, model):
+        """Call ``post_loop_hook`` on each callback in order."""
+        for c in self.callbacks:
             c.post_loop_hook(model)
+
+    def pre_chunk_hook(self, model, timesteps):
+        """Call ``pre_chunk_hook`` on each callback in order."""
+        for c in self.callbacks:
+            c.pre_chunk_hook(model, timesteps)
+
+    def post_chunk_hook(self, model, timesteps):
+        """Call ``post_chunk_hook`` on each callback in order."""
+        for c in self.callbacks:
+            c.post_chunk_hook(model, timesteps)
+
+    def pre_step_hook(self, model):
+        """Call ``pre_step_hook`` on each callback in order."""
+        for c in self.callbacks:
+            c.pre_step_hook(model)
+
+    def post_step_hook(self, model):
+        """Call ``post_step_hook`` on each callback in order."""
+        for c in self.callbacks:
+            c.post_step_hook(model)
 
 
 template = """
@@ -130,44 +163,102 @@ def recorder(self, model):
 """
 
 impl_template = """
-    states = model.mech.{mech}.{state}
-    if self.max_only:
-      self.rec['{full_state}'].append(torch.amax(states, -1, keepdim=True))
-    else:
-      if self.node_indices is not None:
-        self.rec['{full_state}'].append(states[:, :, self.node_indices])
-      else:
-        self.rec['{full_state}'].append(states)
+    states = model.integrator.mech.{mech}.{state}
+    {implementation}
 """
 
 m_template = """
     states = model.{val}
-    if self.max_only:
-      self.rec['{val}'].append(torch.amax(states, -1, keepdim=True))
-    else:
-      if self.node_indices is not None:
-        self.rec['{val}'].append(atleast_3d(states[:, :, self.node_indices]))
-      else:
-        self.rec['{val}'].append(states)
+    {implementation}
 """
 
+max_only_t = "_append_tensor_max(states, self.rec['{full_state}'])"
+indexed_t = (
+    "_append_tensor_indexed(states, self.rec['{full_state}'], self.node_indices)"
+)
+base_t = "_append_tensor(states, self.rec['{full_state}'])"
 
-def is_state(s):
+
+def _append_tensor(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
+    """
+    Append a tensor to a list of tensors.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        The tensor to append.
+    record : List[torch.Tensor]
+        The list to which the tensor will be appended.
+    """
+    record.append(tensor)
+
+
+def _append_tensor_max(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
+    """
+    Append the maximum value of a tensor to a list of tensors.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        The tensor from which the maximum will be taken.
+    record : List[torch.Tensor]
+        The list to which the maximum value will be appended.
+    """
+    record.append(torch.amax(tensor, -1, keepdim=True))
+
+
+def _append_tensor_indexed(
+    tensor, record: List[torch.Tensor], node_indices: torch.Tensor
+) -> None:
+    """
+    Append a tensor indexed by node_indices to a list of tensors.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        The tensor to append.
+    record : List[torch.Tensor]
+        The list to which the tensor will be appended.
+    node_indices : torch.Tensor
+        Indices of nodes to select from the tensor.
+    """
+    record.append(tensor.index_select(-1, node_indices))
+
+
+def _is_state(s):
     return "." in s
 
 
-def parse_template(full_state):
+def _parse_template(full_state, max_only=False, indexed=False):
     mech, state = full_state.split(".")
-    return impl_template.format(mech=mech, state=state, full_state=full_state)
+    if max_only:
+        impl = max_only_t
+    elif indexed:
+        impl = indexed_t
+    else:
+        impl = base_t
+    implementation = impl.format(full_state=full_state)
+    return impl_template.format(mech=mech, state=state, implementation=implementation)
 
 
-def build_recorder_func(states, network=False):
+def _parse_template_m(state, max_only=False, indexed=False):
+    if max_only:
+        impl = max_only_t
+    elif indexed:
+        impl = indexed_t
+    else:
+        impl = base_t
+    implementation = impl.format(full_state=state)
+    return m_template.format(val=state, implementation=implementation)
+
+
+def _build_recorder_func(states, max_only, indexed):
     res = []
     for s in states:
-        if not is_state(s) or network:
-            res.append(m_template.format(val=s))
+        if not _is_state(s):
+            res.append(_parse_template_m(s, max_only, indexed))
         else:
-            res.append(parse_template(s))
+            res.append(_parse_template(s, max_only, indexed))
     impl = "".join(res)
     forward_str = template.format(implementation=impl)
     filename = "<rec_template>"
@@ -176,29 +267,29 @@ def build_recorder_func(states, network=False):
     return locals()["recorder"]
 
 
-def avoid_smart_indexing(node_indices):
+def _avoid_smart_indexing(node_indices):
     if node_indices is not None:
         if len(node_indices) == 1:
             return node_indices[0]
     return node_indices
 
 
-def n(node_indices, model):
+def _n(node_indices, model):
     if node_indices is None:
-        return model.n_comp
-    if isinstance(node_indices, int):
+        return model.nc
+    if node_indices.ndim == 0:
         return 1
     return len(node_indices)
 
 
-def atleast_2d(x: torch.Tensor) -> torch.Tensor:
+def _atleast_2d(x: torch.Tensor) -> torch.Tensor:
     dims = x.dim()
     if dims == 1:
         return x.unsqueeze(-1)
     return x
 
 
-def atleast_3d(x: torch.Tensor) -> torch.Tensor:
+def _atleast_3d(x: torch.Tensor) -> torch.Tensor:
     dims = x.dim()
     if dims == 2:
         return x.unsqueeze(-1)
@@ -206,29 +297,43 @@ def atleast_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 @torch.jit.script
-def detect_anomalies(x: torch.Tensor, prev) -> torch.Tensor:
+def _detect_anomalies(x: torch.Tensor, prev) -> torch.Tensor:
     anomalous = (torch.isnan(x) | torch.isinf(x)).squeeze().any(-1)
     anomalous = torch.logical_or(anomalous, prev)
     return anomalous
 
 
 class AnomalyDetector(Callback):
+    """
+    Flag NaN/Inf occurrences in membrane voltage during simulation.
+
+    The detector keeps a boolean mask per axon indicating whether any invalid
+    values have appeared so far. The mask is updated every step and can be
+    retrieved as a tensor or NumPy array for inspection after a run.
+    """
 
     def __init__(self):
         super().__init__()
         self.rec = None
-    
+
     def pre_loop_hook(self, model):
+        """Allocate a boolean flag per axon on the model's device."""
         self.rec = torch.zeros(model.n_ax, dtype=torch.bool, device=model.device())
 
     def post_step_hook(self, model):
-        self.rec = detect_anomalies(model.v, self.rec)
+        """Update the anomaly mask after each step using :func:`_detect_anomalies`."""
+        with torch.no_grad():
+            self.rec = _detect_anomalies(model.v, self.rec)
 
     def reset(self):
+        """Clear the anomaly mask so the detector can be reused."""
         if self.rec is not None:
-            self.rec = torch.zeros(self.rec.shape, dtype=torch.bool, device=self.rec.device())
+            self.rec = torch.zeros(
+                self.rec.shape, dtype=torch.bool, device=self.rec.device()
+            )
 
     def numpy(self):
+        """Return the anomaly mask as a NumPy array."""
         if self.rec is not None:
             return self.rec.detach().cpu().numpy()
         return None
@@ -260,6 +365,11 @@ class Recorder(Callback):
         Size of sliding window for temporal averaging of recorded data.
         Default is None (no averaging).
 
+    Notes
+    -----
+    For large-scale simulations, use the set_hdf5 method to enable caching to an
+    HDF5 file, which helps manage memory usage.
+
     Attributes
     ----------
     states : list of str
@@ -279,28 +389,29 @@ class Recorder(Callback):
     cache_every : int
         Number of steps between HDF5 cache operations.
 
-    Notes
-    -----
-    For large-scale simulations, use the set_hdf5 method to enable caching to an
-    HDF5 file, which helps manage memory usage.
     """
 
     def __init__(
-        self, 
-        states, 
-        max_only=False, 
-        node_indices=None, 
-        dt=None, 
+        self,
+        states,
+        max_only=False,
+        node_indices=None,
+        dt=None,
         sliding_window=None,
-        network=False
     ):
         super().__init__()
         self.states = states
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
-        self.node_indices = node_indices
+
+        self.indexed = node_indices is not None
+        self.node_indices = None
+
+        if self.indexed:
+            self.node_indices = torch.as_tensor(node_indices, dtype=torch.long)
+
         self.sliding_window = sliding_window
-        rfunc = build_recorder_func(states, network=network)
+        rfunc = _build_recorder_func(states, self.max_only, self.indexed)
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
 
@@ -373,7 +484,17 @@ class Recorder(Callback):
         return self
 
     def pre_loop_hook(self, model):
-        self.dt = float(model.dt)
+        """
+        Prepare recording buffers before simulation starts.
+
+        - Moves ``node_indices`` to the model device if indexed recording is used.
+        - Executes the generated recorder function once to capture the initial
+          state (so ``t=0`` is included).
+        - Advances the internal step counter if HDF5 caching is enabled so that
+          cache flushing cadence aligns with subsequent ``post_step_hook`` calls.
+        """
+        if self.indexed:
+            self.node_indices = self.node_indices.to(model.device())
         self._pre_loop_hook(model)
         if self.cache_with_hdf5:
             self.i += 1
@@ -400,7 +521,18 @@ class Recorder(Callback):
             )
         self.save_count += 1
 
+    @nojit
     def post_step_hook(self, model):
+        """
+        Record states after each solver step and optionally flush to HDF5.
+
+        The generated recorder function pulls the requested states from the
+        model and appends them to in-memory lists. The step counter is then
+        incremented; if ``cache_with_hdf5`` is enabled and ``i`` hits a
+        multiple of ``cache_every``, the current buffer is transferred
+        (optionally via a CUDA stream) to the writer process and the in-memory
+        lists are cleared.
+        """
         self._post_step_hook(model)
         self.i += 1
         if self.cache_with_hdf5:
@@ -409,6 +541,12 @@ class Recorder(Callback):
                 self.rec = {s: [] for s in self.states}
 
     def post_loop_hook(self, model):
+        """
+        Finalize recording at the end of a run.
+
+        Flush any remaining buffered data to HDF5, then reset the per-run cache
+        counters so the recorder can be reused for subsequent runs.
+        """
         if self.cache_with_hdf5:
             self.cache_hdf5()
         self.save_count = 0
@@ -494,13 +632,11 @@ class Recorder(Callback):
         if var is not None:
             vs = torch.stack(self.rec[var])
             if self.sliding_window is not None:
-                vs = sliding_window_average(vs, self.sliding_window)
-            if self.max_only:
-                return torch.amax(vs, 0)
+                vs = _sliding_window_average(vs, self.sliding_window)
             return vs
-        vs = torch.cat([torch.stack(self.rec[s]) for s in self.rec], dim=2)
+        vs = torch.stack([torch.stack(self.rec[s]) for s in self.rec], dim=2)
         if self.sliding_window is not None:
-            vs = sliding_window_average(vs, self.sliding_window)
+            vs = _sliding_window_average(vs, self.sliding_window)
         if self.max_only:
             return torch.amax(vs, 0)
         return vs
@@ -529,12 +665,94 @@ class Recorder(Callback):
         return self.stack().detach().cpu().numpy()
 
 
+class RecorderLambda(Callback):
+    """
+    Record arbitrary derived values using user-defined callables.
+
+    Pass a mapping of ``name -> func`` where each ``func`` accepts the model and
+    returns a tensor (or list of tensors) to store. Useful for recording
+    composite metrics that are not direct model attributes.
+
+    Parameters
+    ----------
+    funcs : Mapping[str, Callable]
+        Dictionary of callables. Each is invoked every step with the model and
+        its output is appended to the list under the same key in ``rec``.
+
+    Notes
+    -----
+    Each function should be designed to work with the model's current state.
+
+    Attributes
+    ----------
+    funcs : Mapping[str, Callable]
+        User-defined functions for recording data.
+    rec : dict[str, list]
+        Per-key lists that collect outputs from ``funcs`` across steps.
+
+    """
+
+    def __init__(self, funcs):
+        super().__init__()
+        self.funcs = funcs
+        self.rec = {}
+
+    def pre_loop_hook(self, model):
+        """Prime recording by capturing the initial outputs of each function."""
+        self.post_step_hook(model)
+
+    @nojit
+    def post_step_hook(self, model):
+        """Call each user function and append its output to the keyed list."""
+        for name, func in self.funcs.items():
+            self.rec.setdefault(name, []).append(func(model))
+
+    def reset(self):
+        self.rec = {}
+
+    def stack(self, var: str = None) -> torch.Tensor:
+        """
+        Stack recorded tensors into a single tensor.
+
+        If a specific variable name is provided, only that variable's data is stacked.
+        Otherwise, all recorded variables are stacked and concatenated.
+
+        Parameters
+        ----------
+        var : str, optional
+            Name of the specific variable to stack. If None, all recorded variables
+            are stacked and concatenated along dimension 2. Default is None.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor containing the stacked recorded data.
+        """
+        if var is not None:
+            return torch.stack(self.rec.get(var, []))
+        return torch.stack(
+            [torch.stack(tensors) for tensors in self.rec.values()], dim=2
+        )
+
+    def numpy(self, var: str = None) -> np.ndarray:
+        if var is not None:
+            v = self.rec.get(var, [])
+            if not v:
+                return np.array([])
+            return torch.stack(v).detach().cpu().numpy()
+        return {
+            name: torch.stack(tensors).detach().cpu().numpy()
+            for name, tensors in self.rec.items()
+        }
+
+
 def _hdf5_write(queue: Queue, path: str):
     with File(path, "w", libver="latest") as f:
         while True:
             item = queue.get()
             if item == "flush":
-                TRANSFERSTREAM.synchronize()
+                if TRANSFERSTREAM is not None:
+                    TRANSFERSTREAM.synchronize()
                 queue.task_done()
                 continue
             if item is None:
@@ -556,9 +774,19 @@ class LFP(Callback):
 
     Parameters
     ----------
-    v_unit : array_like
-        Unit vector representing the contribution of each compartment to the LFP
-        measurement. Shape should match the axon's membrane current distribution.
+    v_unit : list of torch.Tensor
+        List of tensors representing the unit vector for the electrode configuration.
+        Each tensor should have the same shaape as model.shape == model.i_membrane.shape.
+    rule : str, optional
+        Einstein summation rule for computing the dot product. Default is None,
+        which uses the rule '...,n...->n' which sums over all dimensions except
+        the field index.
+
+    Notes
+    -----
+    Requires the axon model to be compiled with fast membrane current calculation
+    enabled (`IMEM=1`). Use `with axonml.ctx(IMEM=1): model = ...` when creating
+    the model.
 
     Attributes
     ----------
@@ -568,12 +796,6 @@ class LFP(Callback):
         Tensor of LFP values at each time step.
     t : torch.Tensor
         Tensor of timestamps corresponding to each LFP value.
-
-    Notes
-    -----
-    Requires the axon model to be compiled with fast membrane current calculation
-    enabled (`IMEM=1`). Use `with axonml.helpers.ctx(IMEM=1): model = ...` when creating
-    the model.
 
     Examples
     --------
@@ -598,33 +820,35 @@ class LFP(Callback):
     >>> lfp_tensor = lfp_callback.lfp
     """
 
-    def __init__(self, v_unit):
+    def __init__(self, v_unit: list[torch.Tensor], rule=None):
         super().__init__()
         self._lfp = []
         self._t = []
-        self.v_unit = v_unit
+        self.register_buffer("v_unit", torch.stack(v_unit))
+        if rule is None:
+            rule = "...,n...->n"
+        self.rule = rule
 
     def pre_loop_hook(self, model):
+        """
+        Validate IMEM availability and record the baseline LFP.
+
+        Moves ``v_unit`` to the model device, raises if the model was not
+        compiled with membrane current output, and stores the t=0 dot product
+        between ``model.i_membrane`` and ``v_unit``.
+        """
         if not model.integrator.imem:
             raise RuntimeError(
-                "Axon must be compiled with IMEM=1. Use with axonml.helpers.ctx(IMEM=1): model = ..."
+                "Model must be compiled with IMEM=1. Use with ax.ctx(IMEM=1): model = ..."
             )
         self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
-        self._lfp.append(
-            torch.einsum(
-                "ij,ij->", torch.atleast_2d(model.integrator.i_membrane.squeeze()), self.v_unit
-            )
-        )
-        self._t.append(model.t)
+        self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))
         return super().pre_loop_hook(model)
 
+    @nojit
     def post_step_hook(self, model):
-        self._lfp.append(
-            torch.einsum(
-                "ij,ij->", torch.atleast_2d(model.integrator.i_membrane.squeeze()), self.v_unit
-            )
-        )
-        self._t.append(model.t)
+        """Append the LFP after each step via ``torch.einsum`` with ``v_unit``."""
+        self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))
 
     @property
     def lfp(self):
@@ -640,6 +864,7 @@ class LFP(Callback):
     def reset(self):
         self._lfp = []
         self._t = []
+        gc.collect()
 
 
 class ThresholdCallback(Callback):
@@ -680,18 +905,6 @@ class ThresholdCallback(Callback):
     dt : float
         Time step size in ms.
 
-    Methods
-    -------
-    reset_timer()
-        Reset the time step counter.
-    reset_count()
-        Reset the detection record.
-    reset_state_cache()
-        Reset the state cache used for detection.
-    reset()
-        Reset all internal state (timer, count, and cache).
-    numpy()
-        Return detection results as a NumPy array.
     """
 
     def __init__(self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None):
@@ -700,9 +913,35 @@ class ThresholdCallback(Callback):
         self.state_cache: torch.Tensor = None
         self.threshold: float = threshold
         self.t_start_check: float = t_start_check
-        self.node_check: List[int] = avoid_smart_indexing(node_check)
+        self.node_check: List[int] = node_check
+
         self.i: int = 0
-        self.dt: float = dt if dt is not None else A.dt
+        self._dt: float = dt if dt is not None else A.dt
+        self.ind_start = int(self.t_start_check / self._dt)
+
+    def pre_loop_hook(self, model):
+        """
+        Normalize and move node indices to the model device.
+
+        Converts ``node_check`` to a tensor on the model device and wraps any
+        negative indices so they reference from the end of the cable.
+        """
+        self.node_check = torch.as_tensor(
+            self.node_check, dtype=torch.long, device=model.device()
+        )
+
+        # convert negative to positive index
+        nc = model.nc
+        self.node_check = self.node_check.remainder(nc)
+
+    @property
+    def dt(self):
+        return self._dt
+
+    @dt.setter
+    def dt(self, value):
+        self._dt = value
+        self.ind_start = int(self.t_start_check / self._dt)
 
     def reset_timer(self):
         """
@@ -768,24 +1007,6 @@ class APCount(ThresholdCallback):
     dt : float, optional
         Time step in ms. If None, uses the default from backend. Default is None.
 
-    Attributes
-    ----------
-    record : torch.Tensor
-        Integer tensor of shape [n_axons, n_check_nodes] storing AP counts.
-    state_cache : torch.Tensor
-        Boolean tensor tracking membrane potential state relative to threshold.
-
-    Methods
-    -------
-    pre_loop_hook(model)
-        Initialize record and state_cache tensors.
-    post_step_hook(model)
-        Update AP counts by detecting threshold crossings.
-    reset()
-        Reset AP counters and internal state.
-    numpy()
-        Return AP counts as a NumPy array.
-
     See Also
     --------
     Active : Callback for detecting if axons fire at any point during simulation
@@ -796,46 +1017,69 @@ class APCount(ThresholdCallback):
     >>> ap_counter = APCount(threshold=20.0)  # Count when v crosses +20 mV
     >>> model.run(ve, callbacks=[ap_counter])
     >>> ap_counts = ap_counter.numpy()  # Get AP counts for each axon
+
+    Attributes
+    ----------
+    record : torch.Tensor
+        Integer tensor of shape [n_axons, n_check_nodes] storing AP counts.
+    state_cache : torch.Tensor
+        Boolean tensor tracking membrane potential state relative to threshold.
     """
 
-    def pre_loop_hook(self, model: AxonInterface):
+    def pre_loop_hook(self, model):
         """
-        Initialize record and state_cache tensors before simulation.
+        Allocate per-axon spike counters and state cache.
 
-        Parameters
-        ----------
-        model : AxonInterface
-            The axon model being simulated.
+        ``record`` is created as a ``(n_axons, n_nodes_checked)`` float tensor
+        and ``state_cache`` starts as ``True`` so the first upward crossing is
+        counted. Negative indices in ``node_check`` have already been resolved
+        by :meth:`ThresholdCallback.pre_loop_hook`.
         """
+        super().pre_loop_hook(model)
+
         if self.record is None:
             self.record = torch.zeros(
                 model.n(),
-                n(self.node_check, model),
-                dtype=torch.int32,
+                _n(self.node_check, model),
+                dtype=torch.float,
                 device=model.device(),
             )
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                n(self.node_check, model),
+                _n(self.node_check, model),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
-    def post_step_hook(self, model: AxonInterface):
+    @nojit
+    def post_step_hook(self, model):
         """
-        Update AP counts after each simulation step.
+        Detect upward crossings and increment counters.
 
-        Parameters
-        ----------
-        model : AxonInterface
-            The axon model being simulated.
+        After ``t_start_check`` is reached, select the monitored nodes from
+        ``model.v``, update the boolean cache to reflect whether voltage is
+        currently below threshold, and add one to ``record`` wherever a rising
+        edge was observed this step.
         """
-        if self.i * self.dt >= self.t_start_check:
-            vm_new = atleast_2d(model.v[:, 0, self.node_check].squeeze())
-            vm = self.state_cache
-            self.state_cache = increment_count_(vm, vm_new, self.record, self.threshold)
+        if self.i >= self.ind_start:
+            vm_new = model.v.index_select(-1, self.node_check)
+            self.state_cache, self.record = _increment_count(
+                self.state_cache, vm_new, self.record, self.threshold
+            )
         self.i += 1
+
+    @property
+    def n(self):
+        """
+        Return the number of axons being monitored.
+
+        Returns
+        -------
+        int
+            Number of axons in the model.
+        """
+        return self.record.int()
 
 
 class ActiveAL(APCount):
@@ -862,22 +1106,6 @@ class ActiveAL(APCount):
         Minimum number of threshold crossings required to mark an axon as active.
         Default is 1.
 
-    Attributes
-    ----------
-    record : torch.Tensor
-        Integer tensor of shape [n_axons, n_check_nodes] storing spike counts.
-    state_cache : torch.Tensor
-        Boolean tensor tracking membrane potential state relative to threshold.
-    at_least : int
-        Minimum number of threshold crossings required to mark an axon as active.
-
-    Methods
-    -------
-    is_active()
-        Return boolean tensor indicating which axons fired at least the required number of times.
-    numpy()
-        Return activity status as a NumPy array.
-
     See Also
     --------
     APCount : Callback for counting total spikes during simulation
@@ -890,6 +1118,15 @@ class ActiveAL(APCount):
     >>> model.run(ve, callbacks=[detector])
     >>> active_axons = detector.numpy()  # Get boolean array of active axons
     >>> active_count = active_axons.sum()  # Count how many axons fired ≥3 times
+
+    Attributes
+    ----------
+    record : torch.Tensor
+        Integer tensor of shape [n_axons, n_check_nodes] storing spike counts.
+    state_cache : torch.Tensor
+        Boolean tensor tracking membrane potential state relative to threshold.
+    at_least : int
+        Minimum number of threshold crossings required to mark an axon as active.
     """
 
     def __init__(
@@ -900,7 +1137,7 @@ class ActiveAL(APCount):
 
     def is_active(self):
         if self.record is not None:
-            return is_active(self.record, self.at_least)
+            return _is_active(self.record, self.at_least)
         return self.record
 
     def numpy(self):
@@ -931,24 +1168,6 @@ class Active(ThresholdCallback):
     dt : float, optional
         Time step in ms. If None, uses the default from backend. Default is None.
 
-    Attributes
-    ----------
-    record : torch.Tensor
-        Boolean tensor of shape [n_axons] indicating which axons fired at least once.
-    state_cache : torch.Tensor
-        Boolean tensor tracking membrane potential state relative to threshold.
-
-    Methods
-    -------
-    pre_loop_hook(model)
-        Initialize record and state_cache tensors.
-    post_step_hook(model)
-        Update axon activity status at each simulation time step.
-    is_active()
-        Return boolean tensor indicating which axons are active.
-    numpy()
-        Return activity status as a NumPy array.
-
     See Also
     --------
     APCount : Callback for counting total spikes during simulation
@@ -960,9 +1179,24 @@ class Active(ThresholdCallback):
     >>> model.run(ve, callbacks=[active_detector])
     >>> active_axons = active_detector.numpy()  # Get boolean array of active axons
     >>> active_count = active_axons.sum()  # Count how many axons fired
+
+    Attributes
+    ----------
+    record : torch.Tensor
+        Boolean tensor of shape [n_axons] indicating which axons fired at least once.
+    state_cache : torch.Tensor
+        Boolean tensor tracking membrane potential state relative to threshold.
     """
 
     def pre_loop_hook(self, model):
+        """
+        Initialize boolean fire mask and cache for threshold detection.
+
+        Creates a ``record`` vector (one flag per axon) and a per-node
+        ``state_cache`` that tracks whether voltage was below threshold on the
+        previous step.
+        """
+        super().pre_loop_hook(model)
         if self.record is None:
             self.record = torch.zeros(
                 model.n(), dtype=torch.bool, device=model.device()
@@ -970,17 +1204,25 @@ class Active(ThresholdCallback):
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                n(self.node_check, model),
+                _n(self.node_check, model),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
-    def post_step_hook(self, model: AxonInterface):
-        if self.i * self.dt >= self.t_start_check:
-            vm_new = atleast_2d(model.v[:, 0, self.node_check].squeeze())
-            vm = self.state_cache
-            self.state_cache, la = update_active(vm, vm_new, self.threshold)
-            self.record[la] = True
+    @nojit
+    def post_step_hook(self, model):
+        """
+        Mark axons as active once they cross threshold.
+
+        After ``t_start_check`` is reached, evaluates monitored nodes for each
+        axon, updates ``record`` when a rising edge occurs, and updates
+        ``state_cache`` to reflect the new below-threshold mask.
+        """
+        if self.i >= self.ind_start:
+            vm_new = model.v.index_select(-1, self.node_check)
+            self.state_cache, self.record = _update_active(
+                self.state_cache, vm_new, self.record, self.threshold
+            )
         self.i += 1
 
     def is_active(self):
@@ -1011,26 +1253,6 @@ class Raster(ThresholdCallback):
     dt : float, optional
         Time step in ms. If None, uses the default from backend. Default is None.
 
-    Attributes
-    ----------
-    record : list of torch.Tensor
-        List of boolean tensors, one per time step, indicating which axons spiked.
-    state_cache : torch.Tensor
-        Boolean tensor tracking membrane potential state relative to threshold.
-
-    Methods
-    -------
-    pre_loop_hook(model)
-        Initialize record list and state_cache tensor.
-    post_step_hook(model)
-        Update spike record at each simulation time step.
-    stack()
-        Stack recorded tensors into a single tensor.
-    numpy()
-        Return spike events as a NumPy array.
-    reset()
-        Reset spike record and internal state.
-
     See Also
     --------
     APCount : Callback for counting total spikes during simulation
@@ -1039,33 +1261,59 @@ class Raster(ThresholdCallback):
     Examples
     --------
     >>> raster = Raster(threshold=20.0)  # Record when v crosses +20 mV
-    >>> model.run(ve, callbacks=[raster])
+    >>> dt = 0.005 * ms
+    >>> model.run(ve, dt=dt, callbacks=[raster])
     >>> spike_data = raster.numpy()  # Get spike data for plotting
     >>>
     >>> # Plot raster
     >>> import matplotlib.pyplot as plt
     >>> fig, axis = plt.subplots(dpi=200, figsize=(5,5))
     >>> diams = model.diam.cpu().numpy()
-    >>> raster.plot(diams, dt=model.dt, ax=axis)
+    >>> raster.plot(diams, dt=dt, ax=axis)
     >>> plt.show()
+
+    Attributes
+    ----------
+    record : list of torch.Tensor
+        List of boolean tensors, one per time step, indicating which axons spiked.
+    state_cache : torch.Tensor
+        Boolean tensor tracking membrane potential state relative to threshold.
     """
 
-    def pre_loop_hook(self, model: AxonInterface):
+    def pre_loop_hook(self, model):
+        """
+        Prepare storage for spike raster recording.
+
+        Ensures ``node_check`` lives on the model device, initializes the list
+        that will hold per-step spike masks, and seeds ``state_cache`` so the
+        first upward crossings are detected.
+        """
+        self.node_check = torch.as_tensor(
+            self.node_check, dtype=torch.long, device=model.device()
+        )
         if self.record is None:
             self.record = []
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 model.n(),
-                n(self.node_check, model),
+                _n(self.node_check, model),
                 dtype=torch.bool,
                 device=model.device(),
             )
 
-    def post_step_hook(self, model: AxonInterface):
-        if self.i * self.dt >= self.t_start_check:
-            vm_new = atleast_2d(model.v[:, 0, self.node_check])
+    @nojit
+    def post_step_hook(self, model):
+        """
+        Append a boolean spike mask for the current step.
+
+        After ``t_start_check`` is reached, selects the monitored nodes,
+        computes rising-edge events with :func:`_increment_act`, updates
+        ``state_cache``, and appends the resulting activity mask to ``record``.
+        """
+        if self.i >= self.ind_start:
+            vm_new = _atleast_2d(model.v[:, self.node_check])
             vm = self.state_cache
-            self.state_cache, la = increment_count(vm, vm_new, self.threshold)
+            self.state_cache, la = _increment_act(vm, vm_new, self.threshold)
             self.record.append(la)
         self.i += 1
 
@@ -1074,15 +1322,17 @@ class Raster(ThresholdCallback):
 
     def numpy(self):
         return self.stack().detach().cpu().numpy()
-    
-    def plot(self, 
-             var,
-             varname: str,
-             dt=None, 
-             ax=None, 
-             cmap=None, 
-             node_idx=None, 
-             axon_idx=None):
+
+    def plot(
+        self,
+        var,
+        varname: str,
+        dt=None,
+        ax=None,
+        cmap=None,
+        node_idx=None,
+        axon_idx=None,
+    ):
         """
         Plot the raster plot of spiking activity.
 
@@ -1108,8 +1358,8 @@ class Raster(ThresholdCallback):
         matplotlib.figure.Figure
             The figure containing the raster plot.
         """
-        import matplotlib.pyplot as plt
         import matplotlib as mpl
+        import matplotlib.pyplot as plt
 
         if dt is None:
             dt = self.dt
@@ -1126,7 +1376,9 @@ class Raster(ThresholdCallback):
             fig, ax = plt.subplots(dpi=300, figsize=(10, 6))
 
         num_fibers, num_timepoints = binary_array.shape
-        assert len(var) == num_fibers, "Length of var must match the number of axons selected to plot."
+        assert len(var) == num_fibers, (
+            "Length of var must match the number of axons selected to plot."
+        )
 
         # Build a list of spike-time arrays. Each entry in data_for_eventplot
         # corresponds to a single fiber's event times.
@@ -1140,50 +1392,53 @@ class Raster(ThresholdCallback):
         # Convert each diameter to an RGBA color using the colormap + normalization
         line_colors = [cmap(norm(d)) for d in var]
         ax.eventplot(
-            data_for_eventplot, 
-            lineoffsets=var, 
-            linelengths=0.8*min(var[1:]-var[:-1]), 
-            colors=line_colors)
+            data_for_eventplot,
+            lineoffsets=var,
+            linelengths=0.8 * min(var[1:] - var[:-1]),
+            colors=line_colors,
+        )
         tstop = num_timepoints * dt
         range_var = var.max() - var.min()
         y_min = var.min() - 0.02 * range_var
         y_max = var.max() + 0.02 * range_var
         ax.set_ylim(y_min, y_max)
-        ax.set_xlim(0-0.02*tstop, tstop+0.02*tstop)
+        ax.set_xlim(0 - 0.02 * tstop, tstop + 0.02 * tstop)
         ax.set_xlabel("Time (ms)")
         ax.set_ylabel(f"{varname}")
         return ax
 
 
 @torch.jit.script
-def increment_count(vm, vm_new, threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
-    ge = vm_new >= threshold
-    l_and = torch.logical_and(ge, vm)
-    return ~ge, l_and
+def _increment_count(vm, vm_new, record, threshold: float):  # pragma: no cover
+    m = vm_new >= threshold
+    mask = m & vm  # fused compare + and
+    record = record + mask.to(record.dtype)  # one fused kernel
+    next_mask = ~m  # can tag-on to same kernel
+    return next_mask, record
 
 
 @torch.jit.script
-def increment_count_(vm, vm_new, record, threshold: float) -> torch.Tensor:
-    ge = vm_new >= threshold
-    l_and = torch.logical_and(ge, vm)
-    record[l_and] += 1
-    return ~ge
+def _increment_act(vm, vm_new, threshold: float):  # pragma: no cover
+    m = vm_new >= threshold
+    mask = m & vm  # fused compare + and
+    next_mask = ~m  # can tag-on to same kernel
+    return next_mask, mask
 
 
 @torch.jit.script
-def update_active(vm, vm_new, threshold: float) -> Tuple[torch.Tensor, torch.Tensor]:
+def _update_active(
+    vm, vm_new, record, threshold: float
+) -> Tuple[torch.Tensor, torch.Tensor]:  # pragma: no cover
     ge = vm_new >= threshold
-    l_and = torch.any(torch.logical_and(ge, vm), dim=1)
-    return ~ge, l_and
+    record = torch.logical_or(record, torch.any(torch.logical_and(ge, vm), dim=1))
+    return ~ge, record
 
 
-@torch.jit.script
-def is_active(record, at_least: int) -> torch.Tensor:
+def _is_active(record, at_least: int) -> torch.Tensor:
     return torch.count_nonzero(record, dim=1) >= at_least
 
 
-@torch.jit.script
-def sliding_window_average(x, window_size: int):
+def _sliding_window_average(x, window_size: int):
     """
     Compute the sliding (moving) window average along axis 0 for a 4D array/tensor,
     with padding so that the output has the same shape as the input.

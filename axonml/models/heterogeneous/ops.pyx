@@ -12,13 +12,13 @@ cimport numpy as cnp
 @cython.boundscheck(True)
 @cython.wraparound(False)
 cpdef object calc_inl(
-    int n_ax, 
-    int nc, 
+    int n_ax,
+    int nc,
     int[:] n_comp_per_ax,
     int[:] n_internode_per_ax,
     int[:, ::1] internode_inds,
-    int[:, ::1] nc_per_node, 
-    float[:, ::1] node_l, 
+    int[:, ::1] nc_per_node,
+    float[:, ::1] node_l,
     float[:, ::1] inls
 ):
     """
@@ -33,7 +33,7 @@ cpdef object calc_inl(
         nc_per_node: number of compartments per node
         node_l: node lengths
         inls: internode lengths
-    
+
     Returns:
         A tuple of two 2D arrays:
         - internode lengths for each compartment
@@ -220,7 +220,7 @@ cdef distribute_compartments_single(double[:] lengths, int[:, ::1] buff, int row
 @cython.boundscheck(False)
 @cython.wraparound(False)
 cpdef cnp.ndarray[cnp.int32_t, ndim=2] distribute_compartments(
-    int n_ax, 
+    int n_ax,
     int max_n_unmyel,
     double[:, :] lengths,
     int nc,
@@ -235,7 +235,7 @@ cpdef cnp.ndarray[cnp.int32_t, ndim=2] distribute_compartments(
         lengths: 2D array of unmyelinated section lengths
         nc: number of compartments
         n_um: number of unmyelinated sections per axon
-    
+
     Returns:
         A 2D array of integers, where each row corresponds to an axon
         and each column corresponds to the number of compartments in an unmyelinated section.

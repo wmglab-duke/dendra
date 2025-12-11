@@ -1,38 +1,47 @@
-import math
-from typing import List, Tuple, Optional, Dict, Callable
-import re
+"""Core data structures and utilities for AxonML population models."""
+
 import itertools
-import warnings
+import math
+import re
+from collections.abc import Iterable
+from contextlib import nullcontext
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
 
+import networkx as nx
+import numpy as np
+import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch import Tensor
-
 from tqdm.auto import tqdm
 
-from axonml.models.stim.intrastim import IntraStim
-from axonml.models.stim.waveform import Waveform
-
-from axonml.models.callbacks import CallbackList, Callback
-from axonml.models.backend import Backend as A
-from axonml.models.parametric import Parameterized
-from axonml.models.mechanisms.core import Mechanism, validate
-from axonml.models.mechanisms import c_context, e_context
-from axonml.models.declarations import PARAMETER
-from axonml.models.mechanisms.handler.defaults import valid_ions
-from axonml.models.mechanisms.handler.handler import build_handler
-from axonml.models.mechanisms.handler.ions import build_ion
-from axonml.models.mechanisms.mech_compiler import compile_mechanism
-from axonml.units import mm, um
-from axonml.models.mechanisms.compilers.core import MechCompiler, DF_Compiler
-from axonml.models.interfaces import HandlerInterface
-from axonml.models.integrators import euler, dufort_frankel
-
 from axonml.helpers import (
-    op_mc, op_sc, ve_from_s_t, 
-    IMEM, CUDA, DTWARN, DEBUG, DETECT_ANOMALIES, PADE,
-    ctx
+    BACKEND,
+    COMPILE_MODE,
+    DYNAMIC,
+    FULLGRAPH,
+    IMEM,
+    JIT,
+    op_mc,
+    op_sc,
+    ve_from_s_t,
 )
+from axonml.models.backend import Backend as A
+from axonml.models.callbacks import Callback, CallbackList
+from axonml.models.graph import get_area_from_graph
+from axonml.models.integrators import bwd_euler_sc, bwd_euler_ub
+from axonml.models.mechanisms._handler import MechanismHandler
+from axonml.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
+from axonml.models.mechanisms.validate import validate
+from axonml.models.parametric import Parameterized as P
+from axonml.models.stim.intra import Intra
+from axonml.models.stim.waveform import Waveform
+from axonml.units import mm
+
+from .slice import Sliceable
+
+
+class NotInitializedError(AttributeError):
+    """Accessed attribute before initialization."""
 
 
 def get_unique_keys(list_of_dicts):
@@ -56,6 +65,22 @@ def get_unique_keys(list_of_dicts):
 
 
 def follows_pattern(base_pattern, target_string):
+    """
+    Check whether a dotted name pattern appears in a target string.
+
+    Parameters
+    ----------
+    base_pattern : str
+        Pattern consisting of dot-separated tokens that must appear in order.
+    target_string : str
+        Candidate string evaluated against the pattern.
+
+    Returns
+    -------
+    bool
+        True if the pattern tokens occur in order inside the target string,
+        False otherwise.
+    """
     regex_pattern = (
         r"\b"
         + r"\b.*?\b".join(re.escape(part) for part in base_pattern.split("."))
@@ -64,20 +89,86 @@ def follows_pattern(base_pattern, target_string):
     return re.search(regex_pattern, target_string) is not None
 
 
-def matches_any_pattern(base_patterns, target_string):
+def matches_any_pattern(base_patterns: Iterable[str], target_string: str) -> bool:
+    """
+    Check whether a target string matches any dotted base pattern.
+
+    A match occurs when each token in a pattern appears in order in the target
+    string. All tokens except the final one must match entire words; the final
+    token may match a word prefix.
+
+    Additionally, the '*' character inside a pattern token is treated as a
+    wildcard matching any sequence of characters (including empty).
+
+    Parameters
+    ----------
+    base_patterns : Iterable[str]
+        Collection of dot-separated pattern strings to test. Tokens may
+        contain '*' as a wildcard.
+    target_string : str
+        Candidate string evaluated against each pattern.
+
+    Returns
+    -------
+    bool
+        True if any pattern matches the target string, False otherwise.
+
+    Examples
+    --------
+    >>> matches_any_pattern(['hh.gbar'], 'hh.gbar_default')
+    True
+    >>> matches_any_pattern(['foo'], 'a.foo_bar')
+    True
+    >>> matches_any_pattern(['a.b'], 'a_b.c')
+    False
+    >>> matches_any_pattern(['*aug'], 'aug_default')
+    True
+    >>> matches_any_pattern(['*aug'], 'raug_default')
+    True
+    >>> matches_any_pattern(['*aug'], 'ina_aug_default')
+    True
+    """
+
+    def _pattern_part_to_regex(part: str) -> str:
+        # Escape everything, then turn escaped '*' (r'\*') back into '.*'
+        escaped = re.escape(part)
+        return escaped.replace(r"\*", ".*")
+
     for base_pattern in base_patterns:
+        # Split the pattern by '.' and convert each part, treating '*' as wildcard.
+        regex_parts = [_pattern_part_to_regex(part) for part in base_pattern.split(".")]
+
+        # The separator `\b.*?\b` ensures that all intermediate parts are
+        # treated as whole words.
         regex_pattern = (
-            r"\b"
-            + r"\b.*?\b".join(re.escape(part) for part in base_pattern.split("."))
-            + r"\b"
+            r"\b"  # The pattern must start at a word boundary.
+            + r"\b.*?\b".join(regex_parts)
+            # No trailing \b so the final token may match a word prefix.
         )
-        if re.search(regex_pattern, target_string):
+
+        if re.search(regex_pattern, target_string, re.IGNORECASE):
             return True
+
     return False
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
+    """1D convolution layer with weights symmetrized during training."""
+
     def forward(self, x):
+        """
+        Apply the symmetric convolution operation.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input tensor of shape ``(batch, channels, length)``.
+
+        Returns
+        -------
+        Tensor
+            Convolved tensor with the same shape as the input.
+        """
         if self.training:
             weight_ = (self.weight + torch.flip(self.weight, [-1])) / 2
         else:
@@ -85,87 +176,103 @@ class SymmetricConv1D(torch.nn.Conv1d):
         return self._conv_forward(x, weight_, self.bias)
 
 
-class Axon(Parameterized, torch.jit.ScriptModule):
+def step(integrator, model, dt, ve=None, intra=None):
     """
-    Base 1D fiber class.
-
-    This is the base class for axon models, implementing common functionality
-    for simulating action potential propagation along 1D fibers.
+    Execute a single integration step for a population model.
 
     Parameters
     ----------
-    diameters : array_like
-        Diameters of the axons in μm.
-    n_comp : int
-        Number of nodes in the axon model.
-    temp : float, optional
-        Temperature in degrees Celsius. Default is 37.0.
-    v_init : float, optional
-        Initial membrane potential in mV. Default is -80.0.
-    method : str, optional
-        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4',
-        'dufort-frankel', or 'df'. Default is 'rk1'.
-    beta : float, optional
-        Hyperdiffusion coefficient. Default is 0.0.
+    integrator : Integrator
+        Integrator instance providing the ``step`` routine.
+    model : Population
+        Population model whose state is advanced.
+    dt : float or Tensor
+        Simulation time step in milliseconds.
+    ve : Tensor, optional
+        Extracellular potential applied during the step.
+    intra : Any, optional
+        Intra-cellular stimulation payload forwarded to the integrator.
+    """
+    integrator.step(model, dt, ve, intra)
 
-    Attributes
+
+def make_intra(intra, stims, indices):
+    """
+    Instantiate intra-cellular stimulation payload for a time step.
+
+    Parameters
     ----------
-    n_ax : int
-        Number of axons in the model.
-    n_comp : int
-        Number of compartments in each axon.
-    temp : float
-        Temperature in degrees Celsius.
-    v_init : float
-        Initial membrane potential in mV.
-    method : str
-        Integration method.
-    mech : HandlerInterface
-        Handler for membrane mechanisms.
-    t_ind : int
-        Current time index.
-    dt : float
-        Time step in ms.
+    intra : Intra
+        Intra-cellular stimulus model.
+    stims : list of Tensor
+        Sequence of per-channel stimulation tensors for the current step.
+    indices : Any
+        Index structure describing the electrodes addressed by ``stims``.
+
+    Returns
+    -------
+    Any
+        Instantiated stimulation payload compatible with the integrator.
+    """
+    return intra(stims, indices)
+
+
+class Population(P, Sliceable):
+    """
+    Base class for a population of multicompartment neurons.
     """
 
-    _dt_lim = None
-    __constants__ = [
-        "n_ax",
-        "n_comp",
-        "temp",
-        "v_init",
-    ]
+    P.RANGE(cm=1.0, rhoa=35.4)
+    P.GLOBAL(celsius=37.0)
 
-    def __init__(
-        self, diameters, n_comp: int, temp=37.0, v_init=-80.0, integrator=euler()
-    ):
-        super().__init__()
-        
-        self.n_ax = len(diameters)
-        self.n_comp = n_comp
-        self.temp = temp
+    def __init__(self, N: int = 1, C: int = 1, integrator=None, v_init=-65.0, **kwargs):
+        super().__init__((N, C), (N, C), **kwargs)
+        Sliceable.__init__(self)
+        self.np = N
+        self.nc = C
         self.v_init = v_init
-        self.shape = integrator.shape(self.n_ax, self.n_comp)
+
+        self.is_built = False
+        self._flag_rebuild = False
+        self.key = None
+
+        if integrator is None:
+            integrator = bwd_euler_sc()
 
         self.register_buffer("_dummy", torch.zeros(1))
 
-        self.cid = None
+        self.register_buffer("v", torch.full((N, C), self.v_init))
+        self.register_buffer("diam", torch.full(self.shape, 500.0))
+        self.register_buffer("dx", torch.full(self.shape, 100.0))
+        self.register_buffer("t", torch.zeros(()))
 
-        self.compiler = integrator.compiler(DEBUG, DETECT_ANOMALIES, PADE)
-        self.builder = None
-        if integrator.builder is not None:
-            self.builder = integrator.builder(DEBUG, IMEM)
-        self.integrator = integrator
+        # compiler stuff
+        self.backend = BACKEND.value
+        self.fullgraph = bool(FULLGRAPH)
+        self.dynamic = bool(DYNAMIC)
+        self.jit = bool(JIT)
+        self.imem = bool(IMEM)
+        self.compile_mode = COMPILE_MODE.value
 
-        self.t_ind: int = 0
-        self.dt: float = A.dt
+        if self.imem:
+            self.register_buffer("i_membrane", torch.zeros(self.shape))
+        else:
+            self.i_membrane = None  # type: ignore
+
+        self._integrator_class = integrator
+        self.integrator = None  # type: ignore
+
+        self.injections = []
+        self.intra = None
+
+        self._mech_data = {}
+        self._mech_everywhere = {}
 
         self._m_list = []
         self._m_name = []
+        self._m_keys = []
         self._m_curr = {}
-        self._m_unfactorable = {}
-        self._m_has_gtot = {}
-        self._m_divide_by_two = {}
+        self._m_shape = {}
 
         self._ion_read = {}
         self._ion_write = {}
@@ -175,91 +282,130 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self._all_write = {}
         self._all_write_c = {}
 
+        self._equilibria = {}
+        self._concentrations = {}
+
         self._ion_style = {}
 
         self.pre_initialize_hooks: List[Callable] = []
         self.post_initialize_hooks: List[Callable] = []
 
+        torch._dynamo.reset()
+
+        if self.jit:
+            self._step = torch.compile(
+                step,
+                backend=self.backend,
+                fullgraph=self.fullgraph,
+                dynamic=self.dynamic,
+                mode=self.compile_mode,
+            )
+        else:
+            self._step = step
+
+        if self.jit:
+            self.make_intra = torch.compile(make_intra)
+        else:
+            self.make_intra = make_intra
+
         self._caches = {}
 
-        self.register_buffer("y", torch.zeros(self.n_ax, 1))
-        self.register_buffer("z", torch.zeros(self.n_ax, 1))
+        self.register_buffer("x", torch.zeros(self.shape))
+        self.register_buffer("y", torch.zeros(self.shape))
+        self.register_buffer("z", torch.zeros(self.shape))
 
-        if torch.is_tensor(diameters):
-            diameters = diameters.to(self.dtype()).clone().detach()
-        else:
-            diameters = torch.tensor(diameters, dtype=self.dtype())
-
-        self._register_buffers(diameters)
+        self.mech: MechanismHandler = None  # type: ignore
 
         self.initialized: bool = False
-
-        # -- biophysics --
-        self.biophysics()
-
-        # -- constants --
         self.eval()
 
-    def biophysics(self):
+    @property
+    def shape(self):
         """
-        Placeholder for biophysics-related initializations.
-        This method can be overridden in subclasses to add specific
-        biophysics-related parameters or configurations.
+        Shape tuple of the membrane potential tensor.
+
+        Returns
+        -------
+        tuple of int
+            Dimensions of ``self.v`` including any batch axes.
         """
-        pass
+        return tuple(self.v.shape)
 
     @property
-    def mech(self):
-        return self.integrator.mech
-    
+    def graph(self):
+        """
+        Returns the graph of the population.
+        This is a placeholder for future graph-related functionality.
+        """
+        return None
+
     @property
-    def i_membrane(self):
-        return self.integrator.i_membrane
+    def area(self):
+        """
+        Returns the area of the population.
+        This is a placeholder for future area-related functionality.
+        """
+        if self.graph is not None:
+            area = get_area_from_graph(self.graph)
+            if area is not None:
+                return (
+                    area.to(self.device(), dtype=self.dtype())
+                    .reshape(-1, self.nc)
+                    .expand(self.np, -1)
+                )
+        return self.diam * 1e-4 * torch.pi * self.dx * 1e-4  # in cm²
 
-    def __init_subclass__(cls, **kwargs):
-        def init_decorator(previous_init):
-            def new_init(self, *args, **kwargs):
-                previous_init(self, *args, **kwargs)
-                if type(self) == cls:
-                    Axon.__post_init__(self)
+    def numel(self, include_batch_dimensions=True):
+        """
+        Count elements in the population state tensor.
 
-            return new_init
+        Parameters
+        ----------
+        include_batch_dimensions : bool, optional
+            If True, include batch dimensions in the count. If False,
+            only the core neuron/compartment axes are considered.
 
-        cls.__init__ = init_decorator(cls.__init__)
+        Returns
+        -------
+        int
+            Total number of elements in ``self.v`` according to the flag.
+        """
+        if not include_batch_dimensions:
+            return math.prod(self.core_shape())
+        return self.v.numel()
 
-    def __post_init__(self):
-        changed = self.instantiate_parameters_lambda()
-        if changed:
-            self.calculate_geometric_params()
-        with (
-            e_context(use_last=True),
-            c_context(use_last=True),
-        ):
-            self._build()
-        if CUDA:
-            self.cuda()
+    def numelc(self):
+        """
+        Count elements per cell, excluding batch dimensions.
 
-    def _register_buffers(self, diameters):
-        self.register_buffer("diam", diameters)
-        self.register_buffer("area_c", self.area_(self.diam)[:, None, None])
-        self.register_buffer("cm_c", self.cm_(self.area_c))
-        self.register_buffer("ra_c", self.ra_(self.diam)[:, None, None])
-        self.register_buffer("v_init_c", torch.tensor(self.v_init))
-        self.register_buffer("temp_c", torch.tensor(self.temp))
+        Returns
+        -------
+        int
+            Number of elements across the neuron and compartment axes.
+        """
+        return self.numel(include_batch_dimensions=False)
 
-    def register_cid(self, cid):
-        self.cid = cid
+    def equilibria(self, **kwargs):
+        """
+        Register reversal potential configuration for ionic species.
 
-    def set_diam(self, diams):
-        diams = torch.as_tensor(diams, dtype=self.dtype())
-        self.diam[:] = diams
-        self.instantiate_parameters_lambda()
-        self.calculate_geometric_params()
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments forwarded to ``axonml.models.mechanisms._ions.equilibria``.
+        """
+        self._equilibria.update(kwargs)
 
-    def calculate_geometric_params(self):
-        self.area_c = self.area_(self.diam)[:, None, None]
-        self.cm_c = self.cm_(self.area_c)
-        self.ra_c = self.ra_(self.diam)[:, None, None]
+    def concentrations(self, **kwargs):
+        """
+        Register ionic concentration configuration.
+
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments forwarded to ``axonml.models.mechanisms._ions.concentrations``.
+        """
+        self._concentrations.update(kwargs)
 
     def collect_parameters(self, *names):
         """
@@ -280,8 +426,10 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if not names:
             return self.parameters()
         else:
-            return [p for n, p in self.named_parameters() if matches_any_pattern(names, n)]
-        
+            for n, p in self.named_parameters():
+                if matches_any_pattern(names, n):
+                    yield p
+
     def collect_named_parameters(self, *names):
         """
         Collects parameters from the model based on the provided names.
@@ -301,7 +449,9 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if not names:
             return self.named_parameters()
         else:
-            return [(n, p) for n, p in self.named_parameters() if matches_any_pattern(names, n)]
+            for n, p in self.named_parameters():
+                if matches_any_pattern(names, n):
+                    yield (n, p)
 
     def unfreeze(self, *names):
         """
@@ -331,15 +481,66 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 if matches_any_pattern(names, n):
                     print(f"Unfreezing {n}")
                     p.requires_grad = True
+        return self
+
+    def unfreeze_(self, *names):
+        """
+        In-place alias of :meth:`unfreeze`.
+
+        Parameters
+        ----------
+        *names : str
+            Optional name patterns forwarded to :meth:`unfreeze`.
+        """
+        self.unfreeze(*names)
 
     def unfreeze_group(self, *groups):
+        """
+        Unfreeze parameter groups stored as module attributes.
+
+        Parameters
+        ----------
+        *groups : str
+            Attribute names of iterable parameter collections to unfreeze.
+
+        Returns
+        -------
+        Population
+            The population instance for chaining.
+        """
         for g in groups:
             group = getattr(self, g)
             print(f"Unfreezing group '{g}'")
             for p in group:
                 p.requires_grad = True
+        return self
+
+    def unfreeze_group_(self, *groups):
+        """
+        In-place alias of :meth:`unfreeze_group`.
+
+        Parameters
+        ----------
+        *groups : str
+            Attribute names forwarded to :meth:`unfreeze_group`.
+        """
+        self.unfreeze_group(*groups)
 
     def freeze(self, *names):
+        """
+        Freeze parameters to disable gradient computation.
+
+        Parameters
+        ----------
+        *names : str
+            Optional name patterns selecting parameters to freeze. When omitted,
+            all parameters are frozen.
+
+        Returns
+        -------
+        Population
+            The population instance for chaining.
+        """
         if not names:
             for p in self.parameters():
                 p.requires_grad = False
@@ -348,256 +549,150 @@ class Axon(Parameterized, torch.jit.ScriptModule):
                 if matches_any_pattern(names, n):
                     print(f"Freezing {n}")
                     p.requires_grad = False
+        return self
+
+    def freeze_(self, *names):
+        """
+        In-place alias of :meth:`freeze`.
+
+        Parameters
+        ----------
+        *names : str
+            Optional name patterns forwarded to :meth:`freeze`.
+        """
+        self.freeze(*names)
 
     def freeze_group(self, *groups):
+        """
+        Freeze parameter groups stored as module attributes.
+
+        Parameters
+        ----------
+        *groups : str
+            Attribute names of iterable parameter collections to freeze.
+
+        Returns
+        -------
+        Population
+            The population instance for chaining.
+        """
         for g in groups:
             group = getattr(self, g)
             print(f"Freezing group '{g}'")
             for p in group:
                 p.requires_grad = False
+        return self
+
+    def freeze_group_(self, *groups):
+        """
+        In-place alias of :meth:`freeze_group`.
+
+        Parameters
+        ----------
+        *groups : str
+            Attribute names forwarded to :meth:`freeze_group`.
+        """
+        self.freeze_group(*groups)
+
+    def retain_grad(self, *names):
+        """
+        Retain gradients for model buffers.
+
+        Parameters
+        ----------
+        *names : str
+            Variable length argument list of buffer names.
+            If empty, all buffers will have their gradients retained.
+            Otherwise, only buffers matching any of these names will have their gradients retained.
+        """
+        for n, b in self.named_buffers():
+            if not names or matches_any_pattern(names, n):
+                if b.requires_grad:
+                    b.retain_grad()
 
     def register_post_initialize_hook(self, fn: Callable):
+        """
+        Register a hook executed after model initialization.
+
+        Parameters
+        ----------
+        fn : Callable
+            Callback invoked with the population instance once initialization
+            completes.
+        """
         self.post_initialize_hooks.append(fn)
 
     def register_pre_initialize_hook(self, fn: Callable):
+        """
+        Register a hook executed before model initialization.
+
+        Parameters
+        ----------
+        fn : Callable
+            Callback invoked with the population instance just prior to
+            mechanism initialization.
+        """
         self.pre_initialize_hooks.append(fn)
 
-    def set_y(self, y):
-        self.y[:] = torch.as_tensor(y)
-        return self
-
-    def set_z(self, z):
-        self.z[:] = torch.as_tensor(z)
-        return self
-
-    @torch.jit.export
-    def n(self) -> int:
-        return self.v.shape[0]
-
     def device(self):
+        """
+        Device on which population buffers reside.
+
+        Returns
+        -------
+        torch.device
+            Device handle inferred from the registered dummy buffer.
+        """
         return self._dummy.device
 
     def dtype(self):
+        """
+        Default tensor dtype for the population.
+
+        Returns
+        -------
+        torch.dtype
+            Data type inferred from the registered dummy buffer.
+        """
         return self._dummy.dtype
 
-    def insert(self, mechanism, ic=None, mask_out=None, mask_in=None, **kwargs):
+    def prep_intra(self, intra, n, dt):
         """
-        Insert a mechanism into the model.
+        Prepare intra-cellular stimulus batches for simulation.
 
         Parameters
         ----------
-        mechanism : Mechanism
-            The mechanism to be inserted into the model.
-        ic : dict, optional
-            Dictionary of initial conditions for the mechanism states.
-            Keys are state names and values are initial values.
-        mask_out : str, int, or slice, optional
-            Mask specifying compartments for which the mechanism will not
-            contribute to the current calculation.
-        mask_in : str, int, or slice, optional
-            Mask specifying compartments for which the mechanism will contribute
-            to the current calculation.
-        **kwargs
-            Additional keyword arguments to be passed to the compile_mechanism function.
-        """
-        if mechanism.__name__ in self._m_name:
-            raise ValueError(f"Mechanism {mechanism.__name__} already exists in the model.")
-
-        validate(mechanism)
-
-        m, unfactorable, has_gtot, divide_by_two = self.compiler.compile(
-            mechanism, 
-            self, 
-            ic=ic,
-            mask_in=mask_in,
-            **kwargs,
-        )
-
-        self._m_list.append(m)
-        self._m_name.append(mechanism.__name__)
-        self._m_unfactorable[mechanism.__name__] = unfactorable
-        self._m_has_gtot[mechanism.__name__] = has_gtot
-        self._m_divide_by_two[mechanism.__name__] = divide_by_two
-
-        for k, v in mechanism._currents.items():
-            self._m_curr.setdefault(k, {}).update({mechanism.__name__: v})
-
-        for k, v in mechanism._read_ion.items():
-            self._ion_read.setdefault(k, {}).update({mechanism.__name__: v})
-
-        for k, v in mechanism._write_ion.items():
-            self._ion_write.setdefault(k, {}).update({mechanism.__name__: v})
-
-        for k, v in mechanism._write_ion_c.items():
-            self._ion_write_c.setdefault(k, {}).update({mechanism.__name__: v})
-
-    def insert_at(self, index, mechanism, ic=None, **kwargs):
-        if isinstance(index, int):
-            index = [index]
-        if isinstance(index, str):
-            index = self.cid.loc(index)
-        if isinstance(index, list):
-            if all(isinstance(i, str) for i in index):
-                index = self.cid.locs(index)
-        self.insert(mechanism, ic=ic, mask_in=index, **kwargs)
-
-    def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
-        assert ion in valid_ions(), f"Invalid ion: {ion}"
-        self._ion_style[ion] = (c_style, e_style, einit, eadvance, cinit)
-
-    def get_ion_style(self, ion):
-        if ion in self._ion_style:
-            return self._ion_style[ion]
-        return self.calc_ion_style(ion)
-
-    def c_is_written(self, ion):
-        d = self._ion_write_c.get(ion, {})
-        return bool(d)
-
-    def c_is_read(self, ion):
-        d = self._ion_read.get(ion, {})
-        if not d:
-            return False
-        check = list(itertools.chain(*d.values()))
-        return f"{ion}i" in check or f"{ion}o" in check
-
-    def e_is_read(self, ion):
-        d = self._ion_read.get(ion, {})
-        if not d:
-            return False
-        return f"e{ion}" in list(itertools.chain(*d.values()))
-
-    def calc_ion_style(self, ion):
-        c_is_written = self.c_is_written(ion)
-        c_is_read = self.c_is_read(ion)
-        e_is_read = self.e_is_read(ion)
-
-        if c_is_written:
-            if e_is_read:
-                return (3, 2, 1, 1, 1)
-            return (3, 0, 0, 0, 1)
-        if c_is_read:
-            if e_is_read:
-                return (1, 2, 1, 0, 0)
-            return (1, 0, 0, 0, 0)
-        if e_is_read:
-            return (0, 1, 0, 0, 0)
-        return (0, 0, 0, 0, 0)
-
-    def _build(self):
-        all_ions = get_unique_keys([self._ion_read, self._ion_write, self._ion_write_c])
-
-        _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
-        self._m_curr.update(_ion_write)
-
-        df = self.integrator.is_df
-
-        ions = {}
-        for ion in all_ions:
-            ion_write_c = self._ion_write_c.get(ion, {})
-            ion_read = self._ion_read.get(ion, {})
-            ion_style = self.get_ion_style(ion)
-            ions[ion] = build_ion(
-                ion,
-                self.shape,
-                self.n_ax,
-                self.n_comp,
-                self._m_list,
-                self._m_name,
-                ion_read,
-                ion_write_c,
-                *ion_style,
-            )
-            for m in self._m_list:
-                m.register_ion(ions[ion])
-        if self.builder is None:
-            mech = build_handler(
-                self._m_list,
-                self._m_name,
-                self._m_curr,
-                self._m_unfactorable,
-                self._m_has_gtot,
-                self._m_divide_by_two,
-                self.temp,
-                ions,
-                df,
-            )
-        else:
-            mech = self.builder.build(
-                self._m_list,
-                self._m_name,
-                self._m_curr,
-                self._m_unfactorable,
-                self._m_has_gtot,
-                self._m_divide_by_two,
-                self.temp,
-                ions,
-            )
-
-        self.integrator = self.integrator(self, mech)
-
-    def area_(self, diameters):
-        raise NotImplementedError()
-
-    def ra_(self, diameters):
-        raise NotImplementedError()
-
-    def cm_(self, area):
-        return (self.cm / 1e3) * area
-
-    def init_v(self):
-        self.integrator.init_v(self)
-
-    def detach(self):
-        self.integrator.detach(self)
-
-    @property
-    def t(self):
-        """
-        Get the current simulation time.
+        intra : Intra
+            Intra-cellular stimulation provider.
+        n : int
+            Number of time steps to generate stimuli for.
+        dt : float
+            Simulation time step in milliseconds.
 
         Returns
         -------
-        float
-            Current simulation time in milliseconds.
+        tuple
+            Pair ``(stims, indices)`` where ``stims`` is a list of sequences
+            of stimuli and ``indices`` encodes electrode mapping metadata.
         """
-        return self.t_ind * self.dt
-
-    def c(self, *args):
-        """
-        Convert relative positions to node indices.
-
-        Parameters
-        ----------
-        *args : float
-            Variable number of float values between 0 and 1, representing
-            relative positions along the axon.
-
-        Returns
-        -------
-        list
-            List of integer node indices corresponding to the input positions.
-
-        Examples
-        --------
-        >>> model.c(0.25, 0.5, 0.75)
-        [25, 50, 75]  # For a model with n_comp=101
-        """
-        return [round((self.n_comp - 1) * i) for i in args]
+        start = self.t
+        end = start + n * dt
+        t_ = torch.arange(start, end, dt, device=self.device(), dtype=self.dtype())
+        t_ = t_.to(self.device(), dtype=self.dtype())
+        stims, indices = intra.init(t_)
+        stims = [s.unbind(-1) for s in stims]
+        return stims, indices
 
     def run(
         self,
         ve=None,
         space=None,
         time=None,
+        tstop=None,
         dt=None,
-        intra=None,
         callbacks=None,
-        reinit=False,
-        progressbar=True,
+        progressbar=False,
         multicontact=False,
-        first=True,
-        longrunning=False,
     ):
         """
         Run the axon model simulation.
@@ -606,266 +701,296 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         ----------
         ve : Tensor, optional
             Extracellular voltage tensor. Shape should be
-            [timesteps, n_ax, 1, n_comp] or compatible.
+            [timesteps, model.np, model.nc] or compatible.
         space : Tensor, optional
             Spatial components when ve is not directly provided.
             Used with time to construct ve.
         time : Tensor or Waveform, optional
             Temporal components when ve is not directly provided.
             Used with space to construct ve.
+        tstop : float, optional
+            Simulation stop time in milliseconds. If None, uses the default from backend.
+            If ve is provided, this is ignored.
+            If ve is provided, tstop is determined by the shape of ve.
         dt : float, optional
             Time step size in milliseconds. If None, uses the default from backend.
-        intra : IntraStim, optional
-            Intracellular stimulation object.
         callbacks : list of Callback, optional
             List of callback objects to execute during simulation steps.
-        reinit : bool, optional
-            If True, reinitialize the model state before running. If steady state is
-            cached, it will be restored instead of initializing from scratch.
-            Default is False.
         progressbar : bool or tqdm, optional
             If True, displays a progress bar during simulation. Can also be a
             tqdm instance for custom progress tracking. Default is True.
         multicontact : bool, optional
             If True, handles multiple electrode contacts for ve construction.
             Default is False.
-        first : bool, optional
-            If True, indicates this is the first run in a sequence, triggering
-            pre-loop hooks for callbacks. Default is True.
-        longrunning : bool, optional
-            If True, indicates this run is part of a longer simulation sequence,
-            affecting progress bar behavior. Default is False.
-
-        Raises
-        ------
-        ValueError
-            If neither ve nor (space and time) nor intra is provided.
-            If intra is provided but is not an instance of IntraStim.
 
         Notes
         -----
         The simulation updates the model's internal state (v, v_prev for DF method, etc.)
-        and advances the model's time index (t_ind).
+        and advances the model's time.
         """
+        if not self.initialized:
+            raise ValueError("Model must be initialized before running.")
+
+        if self.intra is None:
+            intra = self.build_intra()
+            self.intra = intra
+        else:
+            intra = self.intra
 
         with_intra = intra is not None
-        if with_intra:
-            if not isinstance(intra, IntraStim):
-                raise ValueError("intra must be an instance of IntraStim")
-
-        intra_only = False
-        if ve is None and (space is None and time is None):
-            if intra is None:
-                raise ValueError(
-                    "Either ve or ve_s and ve_t or intra must be provided."
-                )
-            intra_only = True
-        ve_zero = torch.zeros_like(self.v)
 
         device = self.device()
+
         if ve is not None:
             ve = torch.as_tensor(ve, device=device)
 
         dt = dt if dt is not None else A.dt
-        self.warn_about_dt(dt)
-        self.dt = dt
+        dt_f = float(dt)
+
+        dt = torch.tensor(dt, device=device, dtype=self.dtype())
+
+        local_ind = 0
 
         if isinstance(time, Waveform):
-            if time._tstop is None:
-                raise ValueError("Waveform must have a tstop value.")
-            time = time.assemble(dt)
+            time = time.to(device, dtype=self.dtype())
+            time = time.assemble(self.t, self.t + tstop, dt)
 
-        with torch.set_grad_enabled(self.training):
-            if ve is None and not intra_only:
-                ve = ve_from_s_t(space, time, self.n_ax, self.device(), multicontact)
+        ctx = nullcontext() if self.training else torch.no_grad()
 
-            if self.training:
-                self.calculate_geometric_params()
+        tstart = self.t.item()
 
-            if (not self.initialized) or reinit:
-                if "_steady_state" in self._caches:
-                    self.restore("_steady_state")
-                    self.t_ind = 0
-                else:
-                    self.integrator.init_v(self)
-                    self.pre_initialize()
-                    self.integrator.mech.initialize(self.v, self.v_init_c, self.temp_c)
-                    self.post_initialize()
-                    self.t_ind = 0
-                    self.initialized = True
-                if with_intra:
-                    intra.init(self)
+        with ctx:
+            if ve is None:
+                if space is not None and time is not None:
+                    ve = ve_from_s_t(space, time, self.np, self.device(), multicontact)
+
+            if ve is not None:
+                n = ve.shape[0]
             else:
-                self.detach()
+                n = int(tstop / dt_f)
 
-            if first:
-                if callbacks:
-                    for c in callbacks:
-                        c.dt = dt
+            if with_intra:
+                stims, indices = self.prep_intra(intra, n, dt_f)
 
-                if not isinstance(callbacks, CallbackList):
-                    callbacks = CallbackList(callbacks)
-                callbacks.pre_loop_hook(self)
+            if not isinstance(callbacks, CallbackList):
+                callbacks = CallbackList(callbacks)
 
-            dt = torch.as_tensor(dt, device=device)
+            if callbacks:
+                for c in callbacks:
+                    c.dt = dt_f
 
-            if first or self.training:
-                self.integrator.initialize(self, dt)
+            pre_loop_hook(callbacks, self)
+            self.integrator._initialize(self, dt, force=self.training)
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
-                    progressbar = tqdm(total=ve.shape[0], desc=f"{self.t:.3f} ms")
+                    progressbar = tqdm(
+                        total=n, desc=f"{tstart + local_ind * dt_f:.1f} ms"
+                    )
 
-            for i in range(ve.shape[0]):
-                ve_c = ve[i] if not intra_only else ve_zero
+            for i in range(n):
+                ve_c = ve[i] if ve is not None else None
+
                 if with_intra:
-                    intra_c = intra(self.t_ind, self.v)
-                    self.integrator.step_intra(self, ve_c, intra_c, dt, self.t_ind)
+                    s = [st[local_ind] for st in stims]
+                    intra_c = self.make_intra(intra, s, indices)
                 else:
-                    self.integrator.step(self, ve_c, dt, self.t_ind)
-                callbacks.post_step_hook(self)
-                self.t_ind += 1
+                    intra_c = None
+
+                self._step(self.integrator, self, dt, ve_c, intra_c)
+                self.t = self.t + dt
+
+                post_step_hook(callbacks, self)
+                local_ind += 1
 
                 if progressbar:
                     progressbar.update(1)
-                    if self.t_ind % 100 == 0:
-                        progressbar.set_description(f"{self.t:.1f} ms")
+                    if local_ind % 100 == 0:
+                        progressbar.set_description(
+                            f"{tstart + local_ind * dt_f:.1f} ms"
+                        )
 
-            if not longrunning:
-                if progressbar:
-                    progressbar.close()
-                callbacks.post_loop_hook(self)
+            if progressbar:
+                progressbar.close()
+
+            post_loop_hook(callbacks, self)
 
     def longrun(
         self,
-        space: Tensor,
-        time: Tensor,
+        tstop: float,
         chunklength: int,
-        tstop: float = None,
         dt: float = None,
-        reinit=False,
+        extra: Optional[Tuple[Tensor, Waveform]] = None,
         callbacks: List[Callback] = None,
-        intra: Optional[IntraStim] = None,
         progressbar=True,
         multicontact=False,
     ):
-        """
-        Run a long simulation by splitting it into multiple chunks.
+        r"""
+        Run a long simulation by dividing it into multiple smaller chunks.
+
+        This method splits the overall simulation into chunks of a given length,
+        allowing for more efficient memory management during long simulations.
+        The model's state (e.g., voltage variables, ``v_prev``, etc.) is maintained
+        between chunks, ensuring continuity across the entire simulation period.
 
         Parameters
         ----------
-        space : Tensor
-            Spatial components of extracellular voltage. Shape should be
-            [n_ax, n_comp] or [1, n_comp] or [n_contacts, ...] for multicontact mode.
-        time : Tensor or Waveform
-            Temporal components of extracellular voltage. Shape should be
-            [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, ...] for multicontact mode.
+        tstop : float
+            The simulation end time in milliseconds.
         chunklength : int
-            Length of chunks, in # timesteps, into which to split simulation.
+            The number of time steps to process in each chunk.
         dt : float, optional
-            Time step size in milliseconds. If None, uses the default from backend.
-        reinit : bool, optional
-            If True, reinitialize the model state before running the first chunk.
-            Subsequent chunks will not reinitialize. Default is False.
+            The simulation time step in milliseconds. If ``None``, the default value
+            from the backend will be used.
+        extra : tuple of (Tensor, Waveform), optional
+            A tuple containing extra input parameters:
+
+            * The first element (``ve_s``) is a tensor representing spatial
+              voltage components.
+
+            * The second element (``time``) is either a :class:`Waveform` object
+              or a tensor representing time.
+
+            These values are used to construct the extracellular voltage.
         callbacks : list of Callback, optional
-            List of callback objects to execute during simulation steps.
-        intra : IntraStim, optional
-            Intracellular stimulation object.
-        progressbar : bool, optional
-            If True, displays a progress bar during simulation. Default is True.
+            A list of callback objects to be executed during simulation, allowing for
+            customized processing at various stages (e.g., pre-loop, post-step,
+            post-loop).
+        progressbar : bool or tqdm, optional
+            If ``True`` (or if a :class:`tqdm.tqdm` instance is provided), displays
+            a progress bar to track simulation progress across chunks.
         multicontact : bool, optional
-            If True, handles multiple electrode contacts for ve construction.
-            Default is False.
+            If ``True``, configures the handling of multiple electrode contacts for
+            constructing the extracellular voltage input. Default is ``False``.
 
         Notes
         -----
-        This method uses the same numerical methods as the `run` method, but manages
-        memory more efficiently for long simulations by processing the data in chunks.
-        The state of the model (v, v_prev, etc.) is preserved between chunks.
+        * When ``extra`` is provided, the method uses it to assemble the extracellular
+          voltage (``ve``) for the simulation.
+
+        * Chunk processing helps manage memory usage during extended simulations by
+          processing data in manageable segments.
         """
 
+        if not self.initialized:
+            raise ValueError("Model must be initialized before running.")
+
+        # ve_s : [n_p, n_comp] or [1, n_comp] or [n_contacts, *]
+        # ve_t : [n_p, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
+
+        intra = self.intra
+
+        with_intra = intra is not None
+        with_extra = extra is not None
+
         dt = dt if dt is not None else A.dt
-        self.warn_about_dt(dt)
+        dt_f = float(dt)
 
-        ve_s = torch.as_tensor(space, device=self.device(), dtype=self.dtype())
-
-        functional = False
-
-        if tstop is not None:
-            if not isinstance(time, Waveform):
-                raise ValueError('`time` must be of type `Waveform`')
-            time = time.to(self.dtype())
-            functional = True
-            t = torch.arange(0, tstop, dt, dtype=self.dtype())
-            n_chunks = math.ceil(len(t) / chunklength)
-            t_chunks = torch.tensor_split(t, n_chunks)
-
-            ve_s = ve_s.expand(self.n_ax, -1)
-            einsum = op_sc
-
-            if progressbar:
-                progressbar = tqdm(total=len(t), desc=f"{self.t:.1f} ms")
-
-        else:
-            if isinstance(time, Waveform):
-                if time._tstop is None:
-                    raise ValueError("Waveform must have a tstop value.")
-                time = time.assemble(dt)
-
-            ve_t = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
-
-            n_chunks = math.ceil(ve_t.shape[-1] / chunklength)
-
-            # ve_s : [n_ax, n_comp] or [1, n_comp] or [n_contacts, *]
-            # ve_t : [n_ax, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
+        if with_extra:
+            ve_s, time = extra
+            ve_s = torch.as_tensor(
+                ve_s, device=self.device(), dtype=self.dtype()
+            ).contiguous()
 
             if multicontact:
-                ve_s = ve_s.expand(-1, self.n_ax, -1)
-                ve_t = ve_t.expand(-1, self.n_ax, -1)
-                einsum = op_mc
+                ve_s = ve_s.expand(-1, self.np, -1)
             else:
-                ve_s = ve_s.expand(self.n_ax, -1)
-                ve_t = ve_t.expand(self.n_ax, -1)
-                einsum = op_sc
+                ve_s = ve_s.expand(self.np, -1)
 
-            t_chunks = torch.tensor_split(ve_t, n_chunks, dim=-1)
-
-            if progressbar:
-                progressbar = tqdm(total=ve_t.shape[-1], desc=f"{self.t:.1f} ms")
-
-        if callbacks:
-            for c in callbacks:
-                c.dt = dt
-
-        callbacks = CallbackList(callbacks)
-
-        for i, t_chunk in enumerate(t_chunks):
-            if (i == 0) and reinit:
-                reinit = True
+            if isinstance(time, Waveform):
+                time = time.to(device=self.device(), dtype=self.dtype())
+                functional = True
             else:
-                reinit = False
-            if functional:
-                ve = einsum(ve_s, time(t_chunk).to(self.dtype()))
-            else:
-                ve = einsum(ve_s, t_chunk)
-            with ctx(DTWARN=0):
-                self.run(
-                    ve,
-                    dt=dt,
-                    intra=intra,
-                    callbacks=callbacks,
-                    reinit=reinit,
-                    progressbar=progressbar,
-                    first=(i == 0),
-                    longrunning=True,
+                time = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
+                functional = False
+
+                if multicontact:
+                    time = time.expand(-1, self.np, -1)
+                else:
+                    time = time.expand(self.np, -1)
+
+        dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
+
+        with torch.nn.utils.parametrize.cached():
+            with torch.set_grad_enabled(self.training):
+                t = torch.arange(
+                    self.t, self.t + tstop, dt, dtype=self.dtype(), device=self.device()
                 )
+                n_chunks = math.ceil(len(t) / chunklength)
 
-        callbacks.post_loop_hook(self)
+                t_c_f = torch.tensor_split(t, n_chunks)
 
-        if progressbar:
-            progressbar.close()
+                if with_extra:
+                    if functional:
+                        t_chunks = t_c_f
+                    else:
+                        t_chunks = torch.tensor_split(time, n_chunks, dim=-1)
 
-    def steady_state(self, dt=0.2, tstop=200.0):
+                if multicontact:
+                    einsum = op_mc
+                else:
+                    einsum = op_sc
+
+                if callbacks:
+                    for c in callbacks:
+                        c.dt = dt_f
+
+                callbacks = CallbackList(callbacks)
+
+                if progressbar:
+                    progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
+
+                self.integrator._initialize(self, dt, force=self.training)
+                einsum = torch.compile(einsum)
+
+                pre_loop_hook(callbacks, self)
+
+                for i in range(n_chunks):
+                    if with_intra:
+                        stims, indices = intra.init(t_c_f[i])
+                        stims = [s.unbind(0) for s in stims]
+
+                    if with_extra:
+                        if functional:
+                            t = time(t_chunks[i]).to(self.dtype())
+                            if multicontact:
+                                t = t.unsqueeze(0).expand(-1, self.np, -1)
+                            else:
+                                t = t.expand(self.np, -1)
+                        else:
+                            t = t_chunks[i]
+                        ve_ = einsum(ve_s, t).contiguous().unbind(dim=0)
+
+                    pre_chunk_hook(callbacks, self, t_c_f[i])
+
+                    for j in range(len(t_c_f[i])):
+                        if with_extra:
+                            ve_c = ve_[j]
+                        else:
+                            ve_c = None
+                        if with_intra:
+                            s = [st[j] for st in stims]
+                            intra_c = make_intra(intra, s, indices)
+                        else:
+                            intra_c = None
+
+                        self._step(self.integrator, self, dt, ve_c, intra_c)
+                        post_step_hook(callbacks, self)
+
+                        self.t = self.t + dt
+
+                    post_chunk_hook(callbacks, self, t_c_f[i])
+
+                    if progressbar:
+                        progressbar.update(1)
+                        progressbar.set_description(f"{self.t.item():.1f} ms")
+
+                post_loop_hook(callbacks, self)
+
+                if progressbar:
+                    progressbar.close()
+
+    def steady_state(self, dt=0.2, tstop=200.0, with_ve=True, with_intra=True):
         """
         Run the model until it reaches a steady state and cache the result.
 
@@ -879,54 +1004,146 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         Notes
         -----
         This method clears any previous steady state cache before creating a new one.
-        The steady state can be restored later by setting reinit=True when calling
-        the run method.
+        The steady state can be restored later by calling model.initialize().
         """
 
-        if "_steady_state" in self._caches:
-            self._caches.pop("_steady_state")
-        ve = torch.zeros(1, self.n_ax, 1, self.n_comp, device=self.device(), dtype=self.dtype())
+        self.clear_steady_state()
+
+        self.initialize()
+        self.integrator._initialize(self, dt)
+
         maxiter = int(tstop / dt)
-        with ctx(DTWARN=0):
-            for i in tqdm(range(maxiter), desc=f"Steady state [dt:{dt} ms, tstop:{tstop} ms]"):
-                reinit = i == 0
-                self.run(ve, dt=dt, reinit=reinit, progressbar=False)
+
+        with torch.no_grad():
+            if with_ve:
+                ve = torch.zeros_like(self.v).reshape(self.batched_shape()).contiguous()
+            else:
+                ve = None
+
+            if with_intra:
+                intra = (
+                    torch.zeros_like(self.v).reshape(self.batched_shape()).contiguous()
+                )
+            else:
+                intra = None
+
+            dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
+            for _ in tqdm(range(maxiter), desc="Steady state "):
+                self._step(self.integrator, self, dt, ve, intra)
+
         self.cache("_steady_state")
-        self.t_ind = 0
+        self.t.detach().zero_()
         return self
 
+    def clear_steady_state(self):
+        """
+        Remove cached steady-state snapshot, if present.
+
+        Returns
+        -------
+        None
+        """
+        if "_steady_state" in self._caches:
+            self._caches.pop("_steady_state")
+
     def post_initialize(self):
+        """
+        Run registered post-initialization hooks with gradients disabled.
+        """
         with torch.no_grad():
             for h in self.post_initialize_hooks:
                 h(self)
 
     def pre_initialize(self):
+        """
+        Run registered pre-initialization hooks with gradients disabled.
+        """
         with torch.no_grad():
             for h in self.pre_initialize_hooks:
                 h(self)
 
-    @torch.jit.script_method
-    def initialize(self, v, v_init, temp):
-        self.integrator.mech.initialize(v, v_init, temp)
+    def populate(self):
+        """
+        Populate the model with mechanisms and parameters.
+
+        This method is called after the model is built to ensure that all
+        mechanisms and parameters are properly initialized and ready for use.
+        It should be called after the model's build() method.
+        """
+        self.populate_parameter_buffers()
+        self.mech.populate()
+        return self
+
+    def populate_(self):
+        """
+        In-place alias of :meth:`populate`.
+        """
+        self.populate()
+
+    def _restore_steady_state(self):
+        if "_steady_state" in self._caches:
+            self.restore("_steady_state")
+            self.post_initialize()
+            self.t.detach().zero_()
+            self.initialized = True
+            return True
+        return False
+
+    def initialize(self, force_rebuild=False, populate_parameter_buffers=True):
+        """
+        Build, populate, and initialize mechanisms for simulation.
+
+        Parameters
+        ----------
+        force_rebuild : bool, optional
+            If True, force rebuilding of mechanisms even if a built graph
+            already exists.
+
+        Returns
+        -------
+        Population
+            The initialized population instance.
+        """
+        self.build(force_rebuild)
+        if populate_parameter_buffers:
+            self.populate_parameter_buffers()
+        self.intra = self.build_intra()
+        if self._restore_steady_state():
+            return self
+        self.integrator.init_v(self)
+        self.pre_initialize()
+        self.integrator.mech.initialize(
+            self.v, self.celsius, self.diam, populate=populate_parameter_buffers
+        )
+        self.post_initialize()
+        self.integrator.mech.initialize(
+            self.v, self.celsius, self.diam, populate=populate_parameter_buffers
+        )
+        self.t = self.t.zero_().detach()
+        self.initialized = True
+        return self
+
+    def initialize_(self):
+        """
+        In-place alias of :meth:`initialize`.
+        """
+        self.initialize()
 
     def load(self, state_dict):
         """
         Load model weights from a state dictionary.
 
         This method supports loading weights from:
-        1. A key from the predefined `all_trained` dictionary
-        2. A file path as a string
-        3. An actual state dictionary object
+        1. A file path as a string
+        2. An actual state dictionary object
 
         The loaded weights are matched to the model's current state dict structure
-        and only compatible weights are loaded. After loading, geometric parameters
-        are recalculated.
+        and only compatible weights are loaded.
 
         Parameters
         ----------
         state_dict : str or dict
             Can be one of:
-            - A key from the predefined `all_trained` dictionary
             - A file path to a saved model state
             - A state dictionary object
 
@@ -935,42 +1152,37 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         self
             The model instance with loaded weights
         """
-        from axonml import all_trained
-
-        if state_dict in all_trained:
-            state_dict = torch.load(
-                all_trained[state_dict], map_location=self.device(), weights_only=True
-            )
-        elif isinstance(state_dict, str):
+        if isinstance(state_dict, str):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
         matched, _ = _match_state_dict(self.state_dict(), state_dict)
         self.load_state_dict(matched, strict=False)
-        self.calculate_geometric_params()
         return self
 
-    def compile(self, callbacks: List[Callback] = None):
-        ve = torch.ones(
-            1, self.n_ax, 1, self.n_comp, device=self.device(), dtype=self.dtype()
-        )
-        for _ in range(5):
-            self.run(ve, callbacks=callbacks, progressbar=False)
-        self.initialized = False
-        if callbacks:
-            for c in callbacks:
-                c.reset()
-        return self
+    def load_(self, state_dict):
+        """
+        In-place alias of :meth:`load`.
 
-    def all_states(self) -> List[str]:
+        Parameters
+        ----------
+        state_dict : Union[str, Mapping]
+            Argument forwarded to :meth:`load`.
+        """
+        self.load(state_dict)
+
+    def state_names(self) -> List[str]:
+        """
+        Enumerate state tensor names managed by the population.
+
+        Returns
+        -------
+        list of str
+            Ordered state names starting with ``'v'``.
+        """
         out = ["v"]
         return out + self.integrator.mech.all_states()
 
-    @torch.jit.export
-    def set(self, key: str, value: float):
-        self.integrator.mech.set(key, value)
-
-    @torch.jit.export
     def cache(self, name: str = None):
         """
         Cache the current model state with an optional identifier.
@@ -1002,8 +1214,19 @@ class Axon(Parameterized, torch.jit.ScriptModule):
         if name is None:
             name = "latest"
         self._caches[name] = self.state_dict()
+        return self
 
-    @torch.jit.export
+    def cache_(self, name: str = None):
+        """
+        In-place alias of :meth:`cache`.
+
+        Parameters
+        ----------
+        name : str, optional
+            Cache key forwarded to :meth:`cache`.
+        """
+        self.cache(name)
+
     def restore(self, name: str = None):
         """
         Restore a previously cached model state.
@@ -1036,39 +1259,1068 @@ class Axon(Parameterized, torch.jit.ScriptModule):
             name = "latest"
         self.load_state_dict(self._caches[name])
         self.initialized = True
-
-    def cuda(self):
-        super().cuda()
-        self.integrator.mech.set_buffers(self.diam)
         return self
+
+    def restore_(self, name: str = None):
+        """
+        In-place alias of :meth:`restore`.
+
+        Parameters
+        ----------
+        name : str, optional
+            Cache key forwarded to :meth:`restore`.
+        """
+        self.restore(name)
+
+    def delete_injections(self):
+        """
+        Remove all registered intra-cellular injections.
+
+        Returns
+        -------
+        None
+        """
+        self.injections = []
+        self.intra = None
+
+    def build_intra(self):
+        """
+        Build the intra-cellular stimulation handler.
+
+        Returns
+        -------
+        Intra or None
+            Intra stimulus object when injections are configured, otherwise None.
+        """
+        if self.injections:
+            return Intra(self, self.injections)
+        return None
+
+    def insert(self, mechanism, alias=None, index_spec=None, ic=None, **kwargs):
+        """
+        Insert a mechanism into the model.
+
+        Parameters
+        ----------
+        mechanism : Mechanism
+            The mechanism to be inserted into the model.
+        alias : str, optional
+            An optional alias for the mechanism. If not provided, the mechanism's name will be used.
+        index_spec : IndexSpec, optional
+            An optional index specification that defines where the mechanism should be inserted.
+            If not provided, the mechanism will be inserted everywhere.
+        **kwargs
+            Additional keyword arguments to be passed to the compile_mechanism function.
+        """
+        if self.is_built:
+            self._flag_rebuild = True
+
+        validate(mechanism)
+
+        key = None
+
+        if index_spec is not None:
+            key = index_spec.index
+
+        if key is None:
+            self._mech_everywhere[mechanism] = (mechanism.__name__, ic, kwargs)
+            return
+
+        if mechanism in self._mech_everywhere:
+            raise ValueError(f"Mechanism {mechanism} is already inserted everywhere.")
+        self._mech_data.setdefault(mechanism, []).append((alias, kwargs, key))
+
+    def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
+        """
+        Register explicit ion handling style parameters.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier (e.g., ``'na'``).
+        c_style : int
+            Style flag for concentration handling.
+        e_style : int
+            Style flag for reversal potential handling.
+        einit : int
+            Initialization flag for equilibration.
+        eadvance : int
+            Advance-time flag for equilibration updates.
+        cinit : int
+            Initialization flag for concentration updates.
+        """
+        assert ion in valid_ions(), f"Invalid ion: {ion}"
+        self._ion_style[ion] = (c_style, e_style, einit, eadvance, cinit)
+
+    def get_ion_style(self, ion):
+        """
+        Retrieve the ion style tuple for a species.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        tuple
+            Ion style tuple ``(c_style, e_style, einit, eadvance, cinit)``.
+        """
+        if ion in self._ion_style:
+            return self._ion_style[ion]
+        return self._calc_ion_style(ion)
+
+    def _c_is_written(self, ion):
+        """
+        Determine whether concentration values are written for an ion.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        bool
+            True if any mechanism writes concentrations for the ion.
+        """
+        d = self._ion_write_c.get(ion, {})
+        return bool(d)
+
+    def _c_is_read(self, ion):
+        """
+        Determine whether concentration values are read for an ion.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        bool
+            True if any mechanism reads intra- or extracellular concentration.
+        """
+        d = self._ion_read.get(ion, {})
+        if not d:
+            return False
+        check = list(itertools.chain(*d.values()))
+        return f"{ion}i" in check or f"{ion}o" in check
+
+    def _e_is_read(self, ion):
+        """
+        Determine whether reversal potentials are read for an ion.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        bool
+            True if any mechanism reads the ion's equilibrium potential.
+        """
+        d = self._ion_read.get(ion, {})
+        if not d:
+            return False
+        return f"e{ion}" in list(itertools.chain(*d.values()))
+
+    def _calc_ion_style(self, ion):
+        """
+        Infer ion style flags based on current read/write registrations.
+
+        Parameters
+        ----------
+        ion : str
+            Ion species identifier.
+
+        Returns
+        -------
+        tuple
+            Tuple of style flags ``(c_style, e_style, einit, eadvance, cinit)``.
+        """
+        _c_is_written = self._c_is_written(ion)
+        _c_is_read = self._c_is_read(ion)
+        _e_is_read = self._e_is_read(ion)
+
+        if _c_is_written:
+            if _e_is_read:
+                return (3, 2, 1, 1, 1)
+            return (3, 0, 0, 0, 1)
+        if _c_is_read:
+            if _e_is_read:
+                return (1, 2, 1, 0, 0)
+            return (1, 0, 0, 0, 0)
+        if _e_is_read:
+            return (0, 1, 0, 0, 0)
+        return (0, 0, 0, 0, 0)
+
+    def _register_mech(self, m, shape, key):
+        """
+        Register a compiled mechanism with the population.
+
+        Parameters
+        ----------
+        m : Mechanism
+            Mechanism instance produced by ``compile_mechanism``.
+        shape : tuple of int
+            Shape tuple describing the mechanism's parameter layout.
+        key : Any
+            Indexing metadata describing where the mechanism applies.
+        """
+        name = m.name
+        mech = m.__class__
+        self._m_name.append(name)
+        self._m_list.append(m)
+        self._m_keys.append(key)
+        self._m_shape[name] = shape
+
+        for k, v in mech._currents.items():
+            self._m_curr.setdefault(k, {}).update({name: v})
+
+        for k, v in mech._read_ion.items():
+            self._ion_read.setdefault(k, {}).update({name: v})
+
+        for k, v in mech._write_ion.items():
+            self._ion_write.setdefault(k, {}).update({name: v})
+
+        for k, v in mech._write_ion_c.items():
+            self._ion_write_c.setdefault(k, {}).update({name: v})
+
+    # -- Device and dtype methods --
+
+    def cuda(self, device=None):
+        """
+        Move the population to a CUDA device, rebuilding mechanisms if needed.
+
+        Parameters
+        ----------
+        device : int or torch.device, optional
+            CUDA device identifier.
+
+        Returns
+        -------
+        Population
+            The population instance on the requested device.
+        """
+        self.build()
+        return super().cuda(device=device)
 
     def cpu(self):
-        super().cpu()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
+        """
+        Move the population to CPU memory, rebuilding mechanisms if needed.
+
+        Returns
+        -------
+        Population
+            The population instance on CPU.
+        """
+        self.build()
+        return super().cpu()
 
     def float(self):
-        super().float()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
+        """
+        Cast population parameters and buffers to ``torch.float32``.
+
+        Returns
+        -------
+        Population
+            The population instance with converted dtype.
+        """
+        self.build()
+        return super().float()
 
     def double(self):
-        super().double()
-        self.integrator.mech.set_buffers(self.diam)
-        return self
+        """
+        Cast population parameters and buffers to ``torch.float64``.
+
+        Returns
+        -------
+        Population
+            The population instance with converted dtype.
+        """
+        self.build()
+        return super().double()
+
+    def half(self):
+        """
+        Cast population parameters and buffers to ``torch.float16``.
+
+        Returns
+        -------
+        Population
+            The population instance with converted dtype.
+        """
+        self.build()
+        return super().half()
+
+    def bfloat16(self):
+        """
+        Cast population parameters and buffers to ``torch.bfloat16``.
+
+        Returns
+        -------
+        Population
+            The population instance with converted dtype.
+        """
+        self.build()
+        return super().bfloat16()
 
     def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        self.integrator.mech.set_buffers(self.diam)
+        """
+        Move the population to a new device or dtype, rebuilding if necessary.
+
+        Parameters
+        ----------
+        *args : Any
+            Positional arguments forwarded to :meth:`torch.nn.Module.to`.
+        **kwargs : Any
+            Keyword arguments forwarded to :meth:`torch.nn.Module.to`.
+
+        Returns
+        -------
+        Population
+            The population instance after conversion.
+        """
+        self.build()
+        return super().to(*args, **kwargs)
+
+    def build(self, force_rebuild=False):
+        """
+        Compile and register mechanisms, assembling ion bookkeeping.
+
+        Parameters
+        ----------
+        force_rebuild : bool, optional
+            If True, rebuild even when a compiled configuration already exists.
+
+        Returns
+        -------
+        Population
+            The population instance, ready for simulation.
+        """
+        if self.is_built and not (force_rebuild or self._flag_rebuild):
+            return self
+
+        def are_strings_unique(data: list) -> bool:
+            strings_only = [item for item in data if item is not None]
+            return len(strings_only) == len(set(strings_only))
+
+        conc = eq = nullcontext()
+
+        if self._concentrations:
+            conc = concentrations(**self._concentrations)
+        if self._equilibria:
+            eq = equilibria(**self._equilibria)
+
+        with conc, eq:
+            for mech, (name, ic, kwargs) in self._mech_everywhere.items():
+                key = None
+                shape = self._calc_shape_p()
+                shape_f = self.shape
+                m = mech(
+                    name, self.celsius, self.diam, shape, shape_f, key, ic=ic, **kwargs
+                )
+                self._register_mech(m, shape, key)
+
+            for mech, data in self._mech_data.items():
+                aliases, kwargs_list, keys = tuple(map(list, zip(*data)))
+                if not are_strings_unique(aliases):
+                    raise ValueError(
+                        f"Duplicate aliases found for mechanism {mech.__name__}."
+                    )
+                m, shape, key = compile_mechanism(
+                    self, mech, keys, aliases, kwargs_list
+                )
+                self._register_mech(m, shape, key)
+
+            all_ions = get_unique_keys(
+                [self._ion_read, self._ion_write, self._ion_write_c]
+            )
+
+            _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
+            self._m_curr.update(_ion_write)
+
+            ions = {}
+            for ion in all_ions:
+                ion_style = self.get_ion_style(ion)
+                ions[ion] = Ion(
+                    ion,
+                    self.shape,
+                    *ion_style,
+                )
+                for m in self._m_list:
+                    m.register_ion(ions[ion])
+
+            mechs = {n: m for n, m in zip(self._m_name, self._m_list)}
+            keys = {n: k for n, k in zip(self._m_name, self._m_keys)}
+            mech = MechanismHandler(
+                self.celsius,
+                self.area,
+                mechs,
+                ions,
+                self._ion_write_c,
+                self._ion_read,
+                self._m_curr,
+            )
+
+            for m in mech.mechanisms.values():
+                m.setreference("t", lambda: self.t)
+
+            self.integrator = self._integrator_class(self, mech, imem=self.imem)
+            self.mech = self.integrator.mech
+
+        self.is_built = True
+        self._flag_rebuild = False
+        self.to(device=self.device(), dtype=self.dtype())
+        self.eval()
         return self
 
-    def warn_about_dt(self, dt):
-        if DTWARN:
-            if self._dt_lim is not None:
-                if dt > self._dt_lim:
-                    warnings.warn(
-                        f"dt ({dt}) exceeds limit ({self._dt_lim}), solution may have large oscillations."
+    def build_(self, force_rebuild=False):
+        """
+        In-place alias of :meth:`build`.
+
+        Parameters
+        ----------
+        force_rebuild : bool, optional
+            Forwarded to :meth:`build`.
+        """
+        self.build(force_rebuild=force_rebuild)
+
+    def detach(self):
+        """
+        Detach parameters and buffers from the autograd graph.
+
+        Returns
+        -------
+        Population
+            The population instance with detached states.
+        """
+        self.integrator.detach(self)
+        return self
+
+    def detach_(self):
+        """
+        In-place alias of :meth:`detach`.
+        """
+        self.detach()
+
+    def register_parametrization(
+        self, name: str, parametrization: torch.nn.Module, unsafe=True
+    ):
+        """
+        Register a parametrization hook on a parameter tensor.
+
+        Parameters
+        ----------
+        name : str
+            Name of the parameter to parametrize.
+        parametrization : torch.nn.Module
+            Module providing the parametrization transform.
+        unsafe : bool, optional
+            Forwarded to :func:`torch.nn.utils.parametrize.register_parametrization`.
+        """
+        torch.nn.utils.parametrize.register_parametrization(
+            self, name, parametrization, unsafe=unsafe
+        )
+
+    def slice(
+        self,
+        include=None,
+        exclude="branchpoint",
+        fuzzy=True,
+        match_case=False,
+        loc=None,
+    ):
+        """
+        Finds all indices in the tree structure based on inclusion and exclusion criteria.
+
+        Parameters
+        ----------
+        include : str or list of str, optional
+            Patterns to include in the search.
+        exclude : str or list of str, optional
+            Patterns to exclude from the search.
+        fuzzy : bool, optional
+            If True, performs fuzzy matching. Default is True.
+        match_case : bool, optional
+            If True, matches case sensitively. Default is False.
+        loc : float, optional
+            If provided, refines the search to the compartment whose
+            ( … )-location is closest to `loc` (a float in [0, 1]).
+            If None, no refinement is done.
+
+        Returns
+        -------
+        Slice
+            A slice object containing the indices of the matches.
+        """
+        return self[
+            :,
+            self.find(
+                include=include,
+                exclude=exclude,
+                fuzzy=fuzzy,
+                match_case=match_case,
+                full_report=False,
+                loc=loc,
+            ),
+        ]
+
+    def find_not(self, exclude=None, fuzzy=True, match_case=False):
+        """
+        Find indices that do not match provided patterns.
+
+        Parameters
+        ----------
+        exclude : str or list of str, optional
+            Patterns describing compartments to omit.
+        fuzzy : bool, optional
+            If True, enable fuzzy matching. Default is True.
+        match_case : bool, optional
+            If True, perform case-sensitive matching. Default is False.
+
+        Returns
+        -------
+        list or slice
+            Indices of entries that do not match ``exclude``.
+        """
+        indices = find_indices_smart(
+            self.names,
+            exclude=exclude,
+            fuzzy=fuzzy,
+            match_case=match_case,
+            device=self.device(),
+        )
+        return indices.indices
+
+    def find(
+        self,
+        include=None,
+        exclude="branchpoint",
+        fuzzy=True,
+        match_case=False,
+        full_report=False,
+        as_list=False,
+        loc=None,
+    ):
+        """
+        Locate compartment indices matching inclusion/exclusion rules.
+
+        Parameters
+        ----------
+        include : str or list of str, optional
+            Patterns that must be present.
+        exclude : str or list of str, optional
+            Patterns that must not be present. Defaults to ``'branchpoint'``.
+        fuzzy : bool, optional
+            If True, enable fuzzy matching. Default is True.
+        match_case : bool, optional
+            If True, perform case-sensitive matching. Default is False.
+        full_report : bool, optional
+            If True, return the full :class:`FindResult`. Default is False.
+        as_list : bool, optional
+            If True and the result is a slice, convert it to a list.
+        loc : float, optional
+            Optional location refinement parameter in ``[0, 1]``.
+
+        Returns
+        -------
+        FindResult or Union[list, slice]
+            Either the result object or the indices, depending on ``full_report``.
+        """
+        indices = find_indices_smart(
+            self.names,
+            include=include,
+            exclude=exclude,
+            fuzzy=fuzzy,
+            match_case=match_case,
+            device=self.device(),
+            loc=loc,
+        )
+        if full_report:
+            return indices
+        else:
+            # Return only the indices of the matches
+            if isinstance(indices.indices, slice):
+                if as_list:
+                    return list(
+                        range(
+                            indices.indices.start,
+                            indices.indices.stop,
+                            indices.indices.step or 1,
+                        )
                     )
+                return indices.indices
+            else:
+                return indices.indices.tolist()
+        return indices
+
+    def terminal_indices(self):
+        """
+        Indices of terminal nodes in the morphology tree.
+
+        Returns
+        -------
+        list of int
+            Node indices that have no outgoing edges in ``self.graph``.
+        """
+        terminal_mask = torch.tensor(
+            [
+                len(list(self.graph.successors(i))) == 0
+                for i in range(len(self.graph.nodes))
+            ],
+            device=self.device(),
+        )
+        return torch.nonzero(terminal_mask, as_tuple=False).squeeze(1).tolist()
+
+    def init_v(self):
+        """
+        Initialize membrane potential buffers via the integrator.
+        """
+        self.integrator.init_v(self)
+
+    def init_v_(self):
+        """
+        In-place alias of :meth:`init_v`.
+        """
+        self.init_v()
+
+    def n(self) -> int:
+        """
+        Number of compartments per neuron.
+
+        Returns
+        -------
+        int
+            Size of the penultimate dimension in ``self.v``.
+        """
+        return self.v.shape[-2]
+
+    def set_value(self, name: str, value: torch.Tensor):
+        """
+        Set a parameter or state variable by name.
+
+        Parameters
+        ----------
+        name : str
+            The name of the parameter or state variable to set.
+        value : torch.Tensor
+            The value to set for the specified parameter or state variable.
+        """
+
+        def _set_value(model):
+            if hasattr(model, name):
+                getattr(model, name).copy_(
+                    value.to(device=model.device(), dtype=model.dtype())
+                )
+            else:
+                raise AttributeError(f"Model has no attribute '{name}' to set.")
+
+        self.register_post_initialize_hook(_set_value)
+
+    # -- batching stuff --
+    def is_batched(self):
+        """
+        Check whether the population has explicit batch dimensions.
+
+        Returns
+        -------
+        bool
+            True when ``self.v`` has more than two dimensions.
+        """
+        return len(self.shape) > 2
+
+    def core_shape(self):
+        """
+        Shape of the neuron/compartment dimensions.
+
+        Returns
+        -------
+        tuple of int
+            Final two dimensions of ``self.v``.
+        """
+        return self.shape[-2:]
+
+    def batched_shape(self):
+        """
+        Flattened shape suitable for batched integrator operations.
+
+        Returns
+        -------
+        tuple of int
+            Pair ``(batch_size, n_compartments)`` compatible with mechanism calls.
+        """
+        B = np.prod(self.shape[:-1])
+        return (B, self.shape[-1])
+
+    def n_batch_dimensions(self):
+        """
+        Number of leading batch dimensions in ``self.v``.
+
+        Returns
+        -------
+        int
+            Count of batch axes.
+        """
+        return len(self.shape) - 2
+
+    def _calc_shape_p(self):
+        """
+        Compute per-parameter broadcast shape accounting for batching.
+
+        Returns
+        -------
+        tuple of int
+            Shape with singleton batch dimensions followed by the core shape.
+        """
+        return tuple([1] * self.n_batch_dimensions() + list(self.core_shape()))
+
+    def batch(self, n):
+        """
+        Materialize explicit batch copies of state tensors.
+
+        Parameters
+        ----------
+        n : int
+            Number of batch replicas to create.
+
+        Returns
+        -------
+        Population
+            The population instance with replicated buffers.
+        """
+        self.v = self.v.unsqueeze(0).expand(n, *self.v.shape).clone()
+        if hasattr(self, "v_prev"):
+            self.v_prev = self.v_prev.unsqueeze(0).expand(n, *self.v_prev.shape).clone()
+        if hasattr(self, "i_membrane"):
+            self.i_membrane = (
+                self.i_membrane.unsqueeze(0).expand(n, *self.i_membrane.shape).clone()
+            )
+        self.reshape(self._calc_shape_p(), self.shape)
+        for slice in self._labels.values():
+            slice._batch()
+        # now batch x, y, z
+        self.x = self.x.unsqueeze(0).expand(n, *self.x.shape).clone()
+        self.y = self.y.unsqueeze(0).expand(n, *self.y.shape).clone()
+        self.z = self.z.unsqueeze(0).expand(n, *self.z.shape).clone()
+        return self
+
+    def batch_(self, n):
+        """
+        In-place alias of :meth:`batch`.
+
+        Parameters
+        ----------
+        n : int
+            Number of batch replicas forwarded to :meth:`batch`.
+        """
+        self.batch(n)
+
+    # -- labeling stuff --
+    def clear_labels(self):
+        """
+        Remove cached slice labels for compartments.
+        """
+        for name in self._labels.keys():
+            delattr(self, name)
+        self._labels.clear()
+
+
+class SingleCompartment(Population):
+    """
+    A Population subclass representing single compartment neuron(s).
+
+    This class is a convenience wrapper around the Population class,
+    pre-configured for a single compartment model.
+    """
+
+    pass
+
+
+# Define the return type for clarity
+class FindResult(NamedTuple):
+    """Container for compartment search results."""
+
+    indices: Union[slice, torch.Tensor]
+    local_indices: Dict[str, Union[slice, torch.Tensor]]
+    local_sizes: Dict[str, int]
+    total_size: int
+
+
+# Helper function to convert numpy indices to a slice or tensor
+def _indices_to_slice_or_tensor(
+    numpy_indices: np.ndarray, device: Optional[torch.device] = None
+) -> Union[slice, torch.Tensor]:
+    """Converts a 1D numpy array of indices into a slice if possible, else a tensor."""
+    num_indices = len(numpy_indices)
+
+    if num_indices == 0:
+        return slice(0, 0, None)
+
+    if num_indices == 1:
+        start = int(numpy_indices[0])
+        return slice(start, start + 1, None)
+
+    # Check if the step between all indices is constant
+    diffs = np.diff(numpy_indices)
+    step = int(diffs[0])
+
+    if np.all(diffs == step):
+        # The indices form an arithmetic progression. It can be a slice!
+        start = int(numpy_indices[0])
+        stop = int(numpy_indices[-1]) + step
+        return slice(start, stop, step if step != 1 else None)
+    else:
+        # Indices are not contiguous, fall back to returning a tensor
+        torch_indices = torch.from_numpy(numpy_indices)
+        return torch_indices.to(device) if device else torch_indices
+
+
+def find_indices_smart(
+    data: List[str],
+    include: Optional[Union[str, List[str]]] = None,
+    exclude: Optional[Union[str, List[str]]] = None,
+    fuzzy: bool = True,
+    match_case: bool = False,
+    device: Optional[torch.device] = None,
+    *,
+    loc: Optional[float] = None,  #
+    _tol: float = 1e-9,  # tolerance for loc comparisons
+) -> FindResult:
+    """
+    Finds indices based on criteria and returns detailed results including local indices
+    for each included pattern.
+
+    Handles complex patterns like 'axon[0]' correctly. If fuzzy=True:
+    - A simple pattern like 'axon' will match 'axon', 'axon[0]', but not 'taxons'.
+    - A complex pattern like 'axon[0]' will match strings containing the literal 'axon[0]'.
+
+    Parameters
+    ----------
+    data (List[str]):
+        The list of strings to search through.
+    include (Optional[Union[str, List[str]]]):
+        Patterns to include.
+    exclude (Optional[Union[str, List[str]]]):
+        Patterns to exclude.
+    fuzzy (bool):
+        If True, performs smart whole-word/substring matching. If False, an exact match.
+    match_case (bool):
+        If True, the matching is case-sensitive.
+    device (Optional[torch.device]):
+        PyTorch device for resulting tensors.
+    loc (Optional[float]):
+        If provided, refines the search to the compartment whose
+        ( … )-location is closest to `loc` (a float in [0, 1]).
+        If None, no refinement is done.
+    _tol (float):
+        Tolerance for comparing `loc` values, default is 1e-9.
+
+    Returns
+    -------
+    FindResult:
+        A named tuple with detailed matching results.
+    """
+    empty = FindResult(slice(0, 0), {}, {}, 0)
+    if not data:
+        return empty
+
+    # ------------------------------------------------------------------ #
+    # 0. basic include / exclude filtering                               #
+    # ------------------------------------------------------------------ #
+    s = pd.Series(data, dtype="string")
+    final_mask = pd.Series(True, index=s.index)
+
+    local_idx_map, local_sz_map, pattern_masks = {}, {}, {}
+
+    def _make_mask(pat: str) -> pd.Series:
+        if fuzzy:
+            if re.search(r"[^a-zA-Z0-9_]", pat):
+                rgx = re.escape(pat)
+            else:
+                rgx = rf"\b{re.escape(pat)}(?![a-zA-Z0-9])"
+            return s.str.contains(rgx, case=match_case, regex=True, na=False)
+        else:
+            a = s.str.lower() if not match_case else s
+            b = pat.lower() if not match_case else pat
+            return a == b
+
+    include_pats = [include] if isinstance(include, str) else (include or [])
+    for pat in include_pats:
+        pattern_masks[pat] = _make_mask(pat)
+    if pattern_masks:
+        final_mask &= pd.concat(pattern_masks.values(), axis=1).any(axis=1)
+
+    if exclude:
+        exclude_pats = [exclude] if isinstance(exclude, str) else exclude
+        exc_mask = pd.Series(False, index=s.index)
+        for pat in exclude_pats:
+            exc_mask |= _make_mask(pat)
+        final_mask &= ~exc_mask
+
+    if not final_mask.any():
+        return empty
+
+    # ------------------------------------------------------------------ #
+    # 1. optional loc‑based refinement                                   #
+    # ------------------------------------------------------------------ #
+    idx_arr = s.index[final_mask].to_numpy()
+
+    if loc is not None:
+        if not (0.0 <= loc <= 1.0):
+            raise ValueError("loc must be within [0, 1].")
+        # Parse candidate ( … ) positions
+        cand = []
+        for gi in idx_arr:
+            m = re.search(r"\(([\d.]+)\)$", s.iloc[gi])
+            if m:
+                cand.append((gi, float(m.group(1))))
+        if cand:  # only refine if we found any
+            # Exclude terminal 0 / 1 unless requested exactly
+            if abs(loc) > _tol:
+                cand = [(gi, x) for gi, x in cand if abs(x) > _tol]
+            if abs(loc - 1.0) > _tol:
+                cand = [(gi, x) for gi, x in cand if abs(x - 1.0) > _tol]
+            if not cand:  # nothing left → fall back
+                pass
+            else:
+                gi_best, _ = min(cand, key=lambda t: abs(t[1] - loc))
+                idx_arr = np.array([gi_best], dtype=np.int64)
+                final_mask = pd.Series(False, index=s.index)
+                final_mask[idx_arr[0]] = True
+
+    # ------------------------------------------------------------------ #
+    # 2. build return object                                             #
+    # ------------------------------------------------------------------ #
+    total_idx = _indices_to_slice_or_tensor(idx_arr, device)
+    total_sz = len(idx_arr)
+
+    if include_pats:
+        g2l = {g: i for i, g in enumerate(idx_arr)}
+        for pat in include_pats:
+            pat_mask = pattern_masks[pat] & final_mask
+            g_idx = s.index[pat_mask].to_numpy()
+            if len(g_idx):
+                l_idx = np.fromiter((g2l[g] for g in g_idx), dtype=np.int64)
+                local_idx_map[pat] = _indices_to_slice_or_tensor(l_idx, device)
+                local_sz_map[pat] = len(l_idx)
+            else:
+                local_idx_map[pat] = slice(0, 0)
+                local_sz_map[pat] = 0
+
+    return FindResult(total_idx, local_idx_map, local_sz_map, total_sz)
+
+
+class Axon(Population):
+    """
+    Base 1D fiber class.
+
+    This is the base class for axon models, implementing common functionality
+    for simulating action potential propagation along 1D fibers.
+    """
+
+    __constants__ = [
+        "n_ax",
+        "n_comp",
+        "temp",
+        "v_init",
+    ]
+
+    def __init__(
+        self, diameters, n_comp: int, celsius=37.0, v_init=-80.0, integrator=None
+    ):
+        if integrator is None:
+            integrator = bwd_euler_ub()
+        super().__init__(len(diameters), n_comp, integrator=integrator, celsius=celsius)
+
+        self.register_buffer(
+            "diameters", torch.as_tensor(diameters, dtype=self.dtype())
+        )
+
+        self.n_ax = self.np
+        self.n_comp = self.nc
+        self.temp = float(celsius)
+
+        self.v_init = v_init
+        self.v[:] = v_init
+        self.v.detach_()
+
+        self.x[:] = self._x()  # Initialize x positions
+
+        self.cid = None
+
+        if torch.is_tensor(diameters):
+            diameters = diameters.to(self.dtype()).clone().detach()
+        else:
+            diameters = torch.tensor(diameters, dtype=self.dtype())
+
+        if diameters.ndim == 1:
+            diameters = diameters.unsqueeze(1)
+
+        self.diam[:] = diameters
+        self.diam.detach_()
+
+    def assemble_graphs(self):
+        """
+        Construct directed path graphs for each axon.
+
+        Returns
+        -------
+        list of networkx.DiGraph
+            Morphology graphs annotated with geometry metadata.
+        """
+        graphs = []
+        for i in range(self.n_ax):
+            G = nx.path_graph(self.n_comp).to_directed()
+            for node in G.nodes:
+                G.nodes[node]["name"] = f"axon[{i}]({node / (self.n_comp - 1):.2f})"
+                G.nodes[node]["x"] = self.x[i, node].item()
+                G.nodes[node]["y"] = 0.0
+                G.nodes[node]["z"] = 0.0
+                G.nodes[node]["diam"] = self.diam[i, node].item()
+                G.nodes[node]["L"] = self.dx[i, node].item()
+                G.nodes[node]["Ra"] = self.rhoa[i, node].item()
+                G.nodes[node]["Cm"] = self.cm[i, node].item()
+            graphs.append(G)
+        return graphs
+
+    def register_cid(self, cid):
+        """
+        Register a compartment identifier table for slicing utilities.
+
+        Parameters
+        ----------
+        cid : Any
+            Object exposing ``names`` used for label-based slicing.
+        """
+        self.cid = cid
+        self.names = self.cid.names.tolist()
+        for name in np.unique(self.names):
+            self.slice(name).label(name)
+
+    def c(self, *args):
+        """
+        Convert relative positions to node indices.
+
+        Parameters
+        ----------
+        *args : float
+            Variable number of float values between 0 and 1, representing
+            relative positions along the axon.
+
+        Returns
+        -------
+        list
+            List of integer node indices corresponding to the input positions.
+
+        Examples
+        --------
+        >>> model.c(0.25, 0.5, 0.75)
+        [25, 50, 75]  # For a model with n_comp=101
+        """
+        return [round((self.n_comp - 1) * i) for i in args]
 
 
 def _match_state_dict(
@@ -1125,38 +2377,17 @@ class Unmyelinated(Axon):
         Length of the axon in mm (will be converted to μm internally). Default is 1.0 mm.
     dx : float, optional
         Spatial discretization step in μm. Default is 10.0 μm.
-    temp : float, optional
+    celsius : float, optional
         Temperature in degrees Celsius. Default is 37°C.
     v_init : float, optional
         Initial membrane potential in mV. Default is -80 mV.
-    method : str, optional
-        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4',
-        'dufort-frankel', or 'df'. Default is 'rk1'.
-
-    Attributes
-    ----------
-    dx : float
-        Spatial discretization step in μm.
-    n_comp : int
-        Number of compartments in the model (calculated based on L and dx).
-    cm : float
-        Membrane capacitance in μF/cm².
-    rhoa : float
-        Axial resistivity in Ω·cm.
-
-    Methods
-    -------
-    x()
-        Returns spatial positions of nodes in μm.
-    area_(diameters)
-        Calculates membrane surface area in cm² for given diameters.
-    ra_(diameters)
-        Calculates axial resistance in MΩ for given diameters.
+    integrator : Integrator, optional
+        The integrator to use for the simulation. If None, a default backward Euler integrator
+        will be used.
 
     Notes
     -----
-    The number of nodes is calculated to ensure it's odd (for a centered node at position 0)
-    and to maintain symmetry by rounding to the next even number of segments.
+    The number of nodes is calculated to ensure it's odd (for a centered node at position 0).
 
     See Also
     --------
@@ -1164,37 +2395,30 @@ class Unmyelinated(Axon):
     Myelinated : Companion class implementing myelinated axon models.
     """
 
-    PARAMETER(cm=1.0, rhoa=35.4)
+    Axon.RANGE(cm=1.0, rhoa=35.4)
+    Axon.GLOBAL(celsius=37.0)
 
     def __init__(
-            self, 
-            diameters, 
-            L=1.0*mm, 
-            dx=10.0, 
-            temp=37, 
-            v_init=-80,
-            integrator=dufort_frankel()
-        ):
+        self,
+        diameters,
+        L=1.0 * mm,
+        dx=10.0,
+        celsius=37.0,
+        v_init=-80.0,
+        integrator=None,
+    ):
         # L = L * 1000  # mm -> um
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
-        self.dx: float = dx
+        self.dx_: float = dx
         self.L: float = n_comp * dx
-        super().__init__(diameters, n_comp, temp, v_init, integrator)
+        super().__init__(diameters, n_comp, celsius, v_init, integrator)
+        self.dx[:] = self.dx_
 
-    def x(self) -> torch.Tensor:  # x in um
-        l = (self.n_comp - 1) * self.dx
-        x = torch.linspace(-l / 2, l / 2, self.n_comp, device=self.device())
+    def _x(self) -> torch.Tensor:  # x in um
+        length = (self.n_comp - 1) * self.dx_
+        x = torch.linspace(-length / 2, length / 2, self.n_comp, device=self.device())
         return torch.atleast_2d(x)
-
-    def area_(self, diameters) -> torch.Tensor:
-        dx = torch.full_like(diameters, self.dx / 10000)
-        return torch.pi * (diameters / 10000) * dx
-
-    def ra_(self, diameters) -> torch.Tensor:
-        dx = torch.full_like(diameters, self.dx / 10000)
-        radii = diameters / 20000
-        return (self.rhoa * dx) / (torch.pi * (radii**2))
 
 
 class Myelinated(Axon):
@@ -1209,52 +2433,17 @@ class Myelinated(Axon):
     ----------
     diameters : array_like
         Diameters of the axons in μm. Can be a single value, list, or tensor.
-    n_comp : int
-        Number of compartments (nodes) in the model.
-    temp : float, optional
+    n_node : int
+        Number of compartments (nodes of Ranvier) in the model.
+    node_length : float, optional
+        Length of the nodes of Ranvier in μm. Default is 2.0 μm.
+    celsius : float, optional
         Temperature in degrees Celsius. Default is 37°C.
     v_init : float, optional
         Initial membrane potential in mV. Default is -80 mV.
-    method : str, optional
-        Integration method. One of 'euler', 'rk1', 'heun', 'rk2', 'rk4',
-        'dufort-frankel', or 'df'. Default is 'rk1'.
-    beta : float, optional
-        Hyperdiffusion coefficient for numerical stability. Default is 0.0.
-
-    Attributes
-    ----------
-    node_l : float
-        Length of the nodes of Ranvier in μm. Default is 2.0 μm.
-    axond1, axond2, axond3 : float
-        Coefficients for the quadratic equation calculating axon diameter.
-        Default values are 0.0, 0.7, and 0.0, respectively.
-    noded1, noded2, noded3 : float
-        Coefficients for the quadratic equation calculating node diameter.
-        Default values are 0.0, 0.7, and 0.0, respectively.
-    deltax1, deltax2, deltax3 : float
-        Coefficients for the quadratic equation calculating internodal distance.
-        Default values are 0.0, 100.0, and 0.0, respectively.
-    cm : float
-        Membrane capacitance in μF/cm². Default is 1.0.
-    rhoa : float
-        Axial resistivity in Ω·cm. Default is 35.4.
-
-    Methods
-    -------
-    x()
-        Returns spatial positions of nodes in μm.
-    area_(diameters)
-        Calculates membrane surface area in cm² for given diameters.
-    ra_(diameters)
-        Calculates axial resistance in MΩ for given diameters.
-    axonD(diameters)
-        Calculates axon diameter based on fiber diameter.
-    nodeD(diameters)
-        Calculates node diameter based on fiber diameter.
-    deltax(diameters)
-        Calculates internodal distance based on fiber diameter.
-    rhoa_scale(diameters)
-        Calculates scaling factor for axial resistivity based on fiber diameter.
+    integrator : Integrator, optional
+        The integrator to use for the simulation. If None, a default backward Euler integrator
+        will be used.
 
     Notes
     -----
@@ -1267,8 +2456,11 @@ class Myelinated(Axon):
     Unmyelinated : Companion class implementing unmyelinated axon models.
     """
 
-    PARAMETER(
-        node_l=2.0,
+    Axon.RANGE(
+        cm=1.0,
+        rhoa=35.4,
+    )
+    Axon.GLOBAL(
         axon_d={
             "axond1": 0.0,
             "axond2": 0.7,
@@ -1284,40 +2476,461 @@ class Myelinated(Axon):
             "deltax2": 100.0,
             "deltax3": 0.0,
         },
-        membrane={
-            "cm": 1.0,
-            "rhoa": 35.4,  # ohm-cm
-        },
+        celsius=37.0,
     )
 
-    def area_(self, diameters):
-        lengths = self.node_l * torch.ones_like(diameters) / 10000
-        return torch.pi * self.nodeD(diameters) * lengths  # cm2
+    class myelinated_rhoa(torch.nn.Module):
+        """Parametrization module that scales axial resistivity."""
 
-    def ra_(self, diameters):
-        radii = diameters / 20000  # radius in cm
-        rhoa = self.rhoa * self.rhoa_scale(diameters)
-        return (rhoa * self.deltax(diameters)) / (torch.pi * (radii**2))
+        def __init__(self, deltax1, deltax2, deltax3, axond1, axond2, axond3):
+            super().__init__()
+            self.deltax1 = deltax1
+            self.deltax2 = deltax2
+            self.deltax3 = deltax3
+            self.axond1 = axond1
+            self.axond2 = axond2
+            self.axond3 = axond3
 
-    def rhoa_scale(self, diameters):
-        return 1 / ((self.axonD(diameters) / diameters) ** 2)
+        def forward(self, rhoa, dx, diameters):
+            """
+            Compute scaled axial resistivity parameters.
 
-    def axonD(self, diameters):
-        axond = self.axond1 * diameters**2 + self.axond2 * diameters + self.axond3
-        return axond
+            Parameters
+            ----------
+            rhoa : Tensor
+                Baseline axial resistivity.
+            dx : Tensor
+                Segment lengths in μm.
+            diameters : Tensor
+                Fiber diameters in μm.
+
+            Returns
+            -------
+            Tensor
+                Scaled axial resistivity values.
+            """
+            diameters = diameters.unsqueeze(1) if diameters.ndim == 1 else diameters
+            axon_d = self.axond1 * diameters**2 + self.axond2 * diameters + self.axond3
+            deltax = (
+                self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
+            )
+            deltax = deltax / dx
+            scale = 1 / ((axon_d / diameters) ** 2)
+            rhoa = rhoa * scale * deltax
+            return rhoa
+
+    class myelinated_node_d(torch.nn.Module):
+        """Parametrization module for node diameters."""
+
+        def __init__(self, noded1, noded2, noded3):
+            super().__init__()
+            self.noded1 = noded1
+            self.noded2 = noded2
+            self.noded3 = noded3
+
+        def forward(self, diam):
+            """
+            Compute node diameter from fiber diameter.
+
+            Parameters
+            ----------
+            diam : Tensor
+                Fiber diameters in μm.
+
+            Returns
+            -------
+            Tensor
+                Node diameters in μm.
+            """
+            node_d = self.noded1 * diam**2 + self.noded2 * diam + self.noded3
+            return node_d
+
+    def __init__(
+        self,
+        diameters,
+        n_node: int,
+        node_length=2.0,
+        celsius=37.0,
+        v_init=-80.0,
+        integrator=None,
+    ):
+        self.node_length = node_length  # length of the nodes of Ranvier in um
+        super().__init__(diameters, n_node, celsius, v_init, integrator)
+        self.dx[:] = self.node_length
+
+        self.register_parametrization(
+            "diam", self.myelinated_node_d(self.noded1, self.noded2, self.noded3)
+        )
+
+        self.register_parametrization_in_graph(
+            "rhoa",
+            self.myelinated_rhoa(
+                self.deltax1,
+                self.deltax2,
+                self.deltax3,
+                self.axond1,
+                self.axond2,
+                self.axond3,
+            ),
+            args=("dx", "diameters"),
+        )
 
     def deltax(self, diameters):
+        """
+        Evaluate internodal spacing polynomial.
+
+        Parameters
+        ----------
+        diameters : Tensor
+            Fiber diameters in μm.
+
+        Returns
+        -------
+        Tensor
+            Internodal spacing in μm.
+        """
         deltax = self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
-        return deltax / 10000
+        return deltax
 
-    def nodeD(self, diameters):
-        noded = self.noded1 * diameters**2 + self.noded2 * diameters + self.noded3
-        return noded / 10000
-
-    def x(self) -> torch.Tensor:  # x in um
-        l = (self.n_comp - 1) * self.deltax(self.diam) * 10000
-        start = -l / 2
-        end = l / 2
+    def _x(self) -> torch.Tensor:  # x in um
+        length = (self.n_comp - 1) * self.deltax(self.diameters).unsqueeze(1)
+        start = -length / 2
+        end = length / 2
         steps = self.n_comp
-        t = torch.linspace(0, 1, steps, device=l.device).unsqueeze(-1)
-        return ((1 - t) * start + t * end).T
+        t = torch.linspace(0, 1, steps, device=length.device).unsqueeze(0)
+        return (1 - t) * start + t * end
+
+
+# callback helpers
+def pre_loop_hook(c, m):
+    """
+    Invoke the registered pre-loop hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    """
+    c.pre_loop_hook(m)
+
+
+def post_loop_hook(c, m):
+    """
+    Invoke the registered post-loop hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    """
+    c.post_loop_hook(m)
+
+
+def pre_step_hook(c, m):
+    """
+    Invoke the registered pre-step hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    """
+    c.pre_step_hook(m)
+
+
+@torch.compile
+def post_step_hook(c, m):
+    """
+    Invoke the registered post-step hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    """
+    c.post_step_hook(m)
+
+
+def pre_chunk_hook(c, m, t):
+    """
+    Invoke the registered pre-chunk hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    t : Sequence[float]
+        Time values for the current chunk.
+    """
+    c.pre_chunk_hook(m, t)
+
+
+def post_chunk_hook(c, m, t):
+    """
+    Invoke the registered post-chunk hook on a callback list.
+
+    Parameters
+    ----------
+    c : CallbackList
+        Callback list to notify.
+    m : Population
+        Population instance being simulated.
+    t : Sequence[float]
+        Time values for the current chunk.
+    """
+    c.post_chunk_hook(m, t)
+
+
+# Helper for the super-fast path: Merges overlapping/adjacent 1D intervals
+def _merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Merges a list of [start, stop) intervals."""
+    if not intervals:
+        return []
+
+    # Sort intervals by their start point
+    intervals.sort(key=lambda x: x[0])
+
+    merged = [list(intervals[0])]  # Use list to allow modification
+
+    for current_start, current_stop in intervals[1:]:
+        last_start, last_stop = merged[-1]
+
+        # If the current interval overlaps with or is adjacent to the last one
+        if current_start <= last_stop:
+            # Merge them by extending the last one's stop
+            merged[-1][1] = max(last_stop, current_stop)
+        else:
+            # No overlap, start a new interval
+            merged.append([current_start, current_stop])
+
+    return [tuple(i) for i in merged]
+
+
+# Custom exception to signal fallback to the slower method
+class NotComposableError(Exception):
+    """Raised when slice unions cannot be composed into a single slice."""
+
+    pass
+
+
+def _handle_pure_slice_union(
+    indices: List[Tuple[slice, ...]], shape: Tuple[int, ...]
+) -> Tuple[Tuple[slice, ...], bool, Tuple[int, ...], List[List[int]]]:
+    """
+    SUPER FAST PATH: Calculates the union of pure slice tuples directly
+    without materializing flat indices.
+    """
+    ndim = len(shape)
+
+    # 1. Normalize all slices to have concrete start, stop, step
+    normalized_slices = []
+    for s_tuple in indices:
+        if len(s_tuple) > ndim:
+            raise NotComposableError("Slice tuple has more dimensions than shape")
+
+        # Pad with slice(None) if needed
+        s_tuple_full = s_tuple + (slice(None),) * (ndim - len(s_tuple))
+
+        current_norm = []
+        for i, s in enumerate(s_tuple_full):
+            start, stop, step = s.indices(shape[i])
+            if step != 1:
+                # This path only works for contiguous blocks (step=1)
+                raise NotComposableError("Slice with step != 1 found")
+            current_norm.append((start, stop))
+        normalized_slices.append(tuple(current_norm))
+
+    # 2. Merge intervals for each dimension
+    final_intervals = []
+    for i in range(ndim):
+        dim_intervals = [s[i] for s in normalized_slices]
+        merged_dim_intervals = _merge_intervals(dim_intervals)
+
+        # If any dimension results in a non-contiguous union (e.g., [0,5) and [10,15)),
+        # then the total union is not one single slice tuple.
+        if len(merged_dim_intervals) != 1:
+            raise NotComposableError("Union is not a single contiguous block")
+
+        final_intervals.append(merged_dim_intervals[0])
+
+    # 3. If we got here, the result is composable. Create final slice objects.
+    final_slice_tuple = tuple(slice(s, e) for s, e in final_intervals)
+    final_shape = tuple(e - s for s, e in final_intervals)
+
+    # 4. Calculate local_indices (the most complex part)
+    # We need to find where each original slice lives inside the final merged slice.
+    local_indices = []
+    final_slice_starts = [s.start for s in final_slice_tuple]
+
+    for original_norm_slice in normalized_slices:
+        # Create relative slices: (orig_start - final_start, orig_stop - final_start)
+        relative_slices = tuple(
+            slice(s - fs, e - fs)
+            for (s, e), fs in zip(original_norm_slice, final_slice_starts)
+        )
+
+        # Use mgrid and ravel_multi_index on the *final_shape* to get local indices
+        coords = np.mgrid[relative_slices]
+        flat_local = np.ravel_multi_index(
+            tuple(coords.reshape(ndim, -1)), dims=final_shape
+        )
+        local_indices.append(sorted(flat_local.tolist()))
+
+    return final_slice_tuple, True, final_shape, local_indices
+
+
+# The main entrypoint function
+def compose_or_flatten_union(
+    indices: List[Any], shape: Tuple[int, ...]
+) -> Tuple[Union[Tuple[slice, ...], List[int]], bool, Tuple[int, ...], List[List[int]]]:
+    """
+    Calculates the union of elements selected by a list of indices. Dispatches
+    to a highly optimized path for pure slice inputs or falls back to a general
+    method for complex/advanced indexing.
+    """
+    # --- Edge-Case Handling ---
+    empty_slice_tuple = tuple(slice(0, 0) for _ in shape)
+    empty_shape = tuple(0 for _ in shape) or (0,)
+    empty_locals = [[] for _ in indices]
+
+    if not indices:
+        return empty_slice_tuple, True, empty_shape, []
+
+    if not shape or not all(s > 0 for s in shape):
+        return empty_slice_tuple, True, empty_shape, empty_locals
+
+    # --- SUPER-FAST-PATH DISPATCHER ---
+    # Check if we can use the slice-domain optimization
+    is_pure_slice_case = all(
+        isinstance(idx, tuple) and all(isinstance(s, slice) for s in idx)
+        for idx in indices
+    )
+
+    if is_pure_slice_case:
+        try:
+            # Attempt the ultra-fast path that works directly on slices
+            return _handle_pure_slice_union(indices, shape)
+        except NotComposableError:
+            # This happens if slices have steps != 1 or their union is not a single
+            # rectangle. We must fall back to the slower, general method.
+            pass
+
+    # This path is for advanced indexing (lists, bools) or non-composable slices.
+    total_elements = int(np.prod(shape))
+    arr = np.arange(total_elements).reshape(shape)
+
+    contributions = []
+    for idx in indices:
+        try:
+            selected_elements = arr[idx]
+            contributions.append(sorted(list(set(selected_elements.flatten()))))
+        except IndexError as e:
+            raise IndexError(
+                f"Indexer invalid for shape. Idx: {idx}, Shape: {shape}. Error: {e}"
+            ) from e
+
+    all_flat_indices = set()
+    for contrib in contributions:
+        all_flat_indices.update(contrib)
+
+    if not all_flat_indices:
+        return empty_slice_tuple, True, empty_shape, empty_locals
+
+    sorted_union_indices = sorted(list(all_flat_indices))
+
+    global_to_local_map = {
+        g_idx: l_idx for l_idx, g_idx in enumerate(sorted_union_indices)
+    }
+    local_indices = [
+        [global_to_local_map[g_idx] for g_idx in contrib] for contrib in contributions
+    ]
+
+    multi_dim_coords = np.unravel_index(sorted_union_indices, shape)
+    min_coords = np.min(multi_dim_coords, axis=1)
+    max_coords = np.max(multi_dim_coords, axis=1)
+
+    bounding_box_dims = max_coords - min_coords + 1
+    if len(sorted_union_indices) == np.prod(bounding_box_dims):
+        composed_slices = tuple(
+            slice(int(min_c), int(max_c) + 1)
+            for min_c, max_c in zip(min_coords, max_coords)
+        )
+        final_shape = tuple(s.stop - s.start for s in composed_slices)
+        return composed_slices, True, final_shape, local_indices
+    else:
+        final_shape = (len(sorted_union_indices),)
+        result_indices = [int(i) for i in sorted_union_indices]
+        return result_indices, False, final_shape, local_indices
+
+
+def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
+    """
+    Compile a mechanism over a set of indices with alias-specific parameters.
+
+    Parameters
+    ----------
+    model : Population
+        Population providing shape and batching information.
+    mechanism : type
+        Mechanism class to instantiate.
+    indices : list
+        Collection of index selectors describing placement of each alias.
+    aliases : list of str
+        Aliases assigned to each mechanism instance.
+    kwargs_list : list of dict
+        Additional keyword arguments for each aliased mechanism.
+
+    Returns
+    -------
+    tuple
+        Tuple ``(mechanism_instance, parameter_shape, total_index)`` ready for
+        registration via :meth:`Population._register_mech`.
+    """
+    total_index, is_composable, shape, local_indices = compose_or_flatten_union(
+        indices, model.core_shape()
+    )
+
+    shape_p = shape
+    shape_f = shape
+
+    if model.is_batched():
+        n_batch_dimensions = len(model.shape) - 2
+        shape_p = tuple(([1] * n_batch_dimensions) + (list(shape_p)))
+        shape_f = []
+        for i in range(n_batch_dimensions):
+            shape_f.append(model.shape[i])
+        shape_f += list(shape)
+        shape_f = tuple(shape_f)
+
+    # local indices is now a list of lists, where each sublist corresponds to the
+    # local indices of the original indices in the final selection.
+    # We can now use these local indices to compile the mechanism.
+
+    additional_parameters = {}
+
+    for alias, kwargs, idx in zip(aliases, kwargs_list, local_indices):
+        for k, v in kwargs.items():
+            additional_parameters.setdefault(k, []).append((alias, v, idx))
+
+    m = mechanism(
+        None,
+        model.celsius,
+        model.diam,
+        shape_p,
+        shape_f,
+        key=total_index,
+        is_composable=is_composable,
+        additional_parameters=additional_parameters,
+    )
+
+    return m, shape_p, total_index

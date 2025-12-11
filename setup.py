@@ -1,9 +1,6 @@
-from pathlib import Path
-from setuptools import setup, Extension
-
-from Cython.Build import cythonize
 import numpy as np
-
+from Cython.Build import cythonize
+from setuptools import Extension, setup
 
 ext_modules = cythonize(
     [
@@ -19,18 +16,21 @@ ext_modules = cythonize(
 
 setup(
     install_requires=[
-        "numpy",
+        "numpy >= 2.3.0",
         "sympy >= 1.2",
-        "torch >= 2.6.0",
+        "torch >= 2.7.0",
         "scipy",
         "h5py",
-        "pytorch_optimizer",
         "tqdm",
         "natsort",
         "dask",
+        "networkx",
+        "pandas",
+        "neuron",
+        "matplotlib",
+        "ninja",
     ],
     extras_require={
-        "jupyter": ["jupyter"],
         "doc": [
             "jupyter_contrib_nbextensions",
             "notebook <= 6.4.12",
@@ -48,7 +48,14 @@ setup(
             "sphinx-math-dollar",
             "myst-nb",
             "jupytext",
-            "sphinx-book-theme",
+            "shibuya",
+        ],
+        "dev": [
+            "pre-commit",
+            "pytest",
+            "pytest-cov",
+            "hypothesis",
+            "pytest-xdist",
         ],
     },
     ext_modules=ext_modules,

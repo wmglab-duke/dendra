@@ -1,2 +1,6 @@
-lint.ignore = ["E701"]
-lint.unfixable = ["E701"]
+extend-exclude = ["__init__.py"]
+force-exclude  = true        # still exclude if the path is passed explicitly
+
+[lint]
+ignore = ["E701", "F403"]
+unfixable = ["E701"]

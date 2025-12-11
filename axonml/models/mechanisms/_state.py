@@ -1,0 +1,678 @@
+import ast
+import inspect
+import io
+import re
+import textwrap
+import tokenize
+from types import MethodType
+from typing import Iterable, List, Set
+
+import torch
+
+from axonml.helpers import DEBUG, PADE
+from axonml.models.parametric import Parameterized
+
+from ._kinetic import kinetic_to_derivatives
+from ._mechanism import classproperty
+from .ode import integrate2c
+
+# PyTorch operations
+TORCH_OPS = set(dir(torch))
+
+
+class UnderscoreLHS(ast.NodeTransformer):
+    """
+    An AST NodeTransformer that traverses an AST and prepends an underscore
+    to the variable names on the left-hand side of any assignment.
+    """
+
+    def _prefix_target(self, target_node):
+        """Recursively prefixes the appropriate part of an assignment target."""
+        if isinstance(target_node, ast.Name):
+            # This is a simple variable name like 'a'.
+            target_node.id = "_" + target_node.id
+        elif isinstance(target_node, ast.Attribute):
+            # This is an attribute like 'obj.value'. We change 'value' to '_value'.
+            target_node.attr = "_" + target_node.attr
+        elif isinstance(target_node, (ast.Tuple, ast.List)):
+            # This is unpacking like 'a, b = ...'. Recurse on each element.
+            for element in target_node.elts:
+                self._prefix_target(element)
+        elif isinstance(target_node, ast.Subscript):
+            # This is an item assignment like 'd[k] = v'. Recurse on the variable 'd'.
+            self._prefix_target(target_node.value)
+        elif isinstance(target_node, ast.Starred):
+            # This is a starred assignment like 'a, *b = ...'. Recurse on 'b'.
+            self._prefix_target(target_node.value)
+
+        return target_node
+
+    def visit_Assign(self, node: ast.Assign) -> ast.AST:
+        """Handles simple assignments: a = b"""
+        for target in node.targets:
+            self._prefix_target(target)
+        self.generic_visit(node)  # Ensure we visit children on the right-hand side too
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+        """Handles annotated assignments: a: int = b"""
+        self._prefix_target(node.target)
+        self.generic_visit(node)
+        return node
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        """Handles augmented assignments: a += b"""
+        self._prefix_target(node.target)
+        self.generic_visit(node)
+        return node
+
+
+def add_underscore_to_lhs(code_string: str) -> str:
+    """
+    Parses a Python code string, adds an underscore to all variables on the
+    left-hand side of assignments, and returns the modified code string.
+
+    Args:
+        code_string: A string containing one or more lines of Python code.
+
+    Returns:
+        The modified code string.
+
+    Requires Python 3.9+ for ast.unparse().
+    """
+    try:
+        # 1. Parse the string into an Abstract Syntax Tree
+        tree = ast.parse(code_string)
+
+        # 2. Instantiate our transformer and have it visit the tree
+        transformer = UnderscoreLHS()
+        new_tree = transformer.visit(tree)
+
+        # 3. Add line numbers and other metadata back to the new tree
+        ast.fix_missing_locations(new_tree)
+
+        # 4. Unparse the modified tree back into a string
+        return ast.unparse(new_tree)
+    except (SyntaxError, ValueError) as e:
+        print(f"Error processing code string: {e}")
+        return code_string
+
+
+def add_underscore_to_states(expression: str, states: List[str]) -> str:
+    for state in states:
+        expression = re.sub(rf"\b{state}\b", f"_{state}", expression)
+    return expression
+
+
+# -- function parsers & code emitters --
+def extract_vars(f: str, exclude: set) -> List[str]:
+    """
+    Extract variable names from a given string, excluding specified names.
+
+    Parameters
+    ----------
+    f : str
+        The input string from which to extract variable names.
+    exclude : set
+        A set of variable names to exclude from the result.
+
+    Returns
+    -------
+    List[str]
+        A list of variable names found in the input string, excluding the specified names.
+    """
+    pattern = r"\b[a-zA-Z_]\w*\b"
+    all_variables = set(re.findall(pattern, f))
+    filtered_variables = [var for var in all_variables if var not in exclude]
+    return filtered_variables
+
+
+def replace(input_string: str, replace_list: List[str]) -> str:
+    """
+    Replace occurrences of substrings in the input string with their 'self.' prefixed versions.
+
+    Parameters
+    ----------
+    input_string : str
+        The string in which to replace substrings.
+    replace_list : list of str
+        A list of substrings to be replaced.
+
+    Returns
+    -------
+    str
+        The modified string with specified substrings replaced by 'self.' prefixed versions.
+    """
+    for substring in replace_list:
+        input_string = re.sub(rf"\b{substring}\b", f"self.{substring}", input_string)
+    return input_string
+
+
+def _find_local_defs(src: str) -> Set[str]:
+    """Collect names defined by `def`, `class`, or simple assignment."""
+    try:
+        tree = ast.parse(textwrap.dedent(src))
+    except SyntaxError:
+        return set()
+
+    names: set[str] = set()
+
+    class V(ast.NodeVisitor):
+        def visit_FunctionDef(self, n):  # def foo():
+            names.add(n.name)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, n):  # class Foo:
+            names.add(n.name)
+
+        def visit_Assign(self, n):  # x = …
+            for t in n.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+
+    V().visit(tree)
+    return names
+
+
+# ─────────────────────── main transformation ──────────────────────────
+def modify_operations(
+    code: str,
+    torch_operations: Iterable[str] = TORCH_OPS,
+) -> str:
+    """
+    Prefix bare calls to *torch_operations* with ``torch.`` while preserving
+    whitespace, comments, and strings.
+
+    If *code* cannot be parsed as valid Python (e.g. because Hypothesis
+    injected unmatched quotes, stray control bytes, etc.), it is returned
+    **unchanged**.
+    """
+    # ── 0. Bail out early on syntactically invalid snippets ────────────
+    try:
+        ast.parse(textwrap.dedent(code))
+    except SyntaxError:
+        return code
+
+    # ── 1. local defs for shadowing detection ──────────────────────────
+    local_defs = _find_local_defs(code)
+    ops = set(torch_operations)
+
+    # ── 2. Tokenise; leave untouched on lexical errors (NULL byte, …) ──
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
+    except (tokenize.TokenError, UnicodeDecodeError):
+        return code
+
+    # Build line-offset table for fast (line, col) → absolute_index
+    line_offsets = [0]
+    for ln in code.splitlines(keepends=True):
+        line_offsets.append(line_offsets[-1] + len(ln))
+
+    def abs_index(pos):
+        line, col = pos
+        return line_offsets[line - 1] + col
+
+    SIGNIF = {
+        tokenize.NAME,
+        tokenize.NUMBER,
+        tokenize.OP,
+        tokenize.STRING,
+        tokenize.ERRORTOKEN,
+    }
+
+    def next_sig(idx):
+        j = idx + 1
+        while j < len(tokens) and tokens[j].type not in SIGNIF:
+            j += 1
+        return j
+
+    def prev_sig(idx):
+        j = idx - 1
+        while j >= 0 and tokens[j].type not in SIGNIF:
+            j -= 1
+        return j
+
+    out, cursor, fdepth = [], 0, 0
+
+    for i, tok in enumerate(tokens):
+        ttype, tstr, (sl, sc), (el, ec), _ = tok
+
+        # Track f-string expression nesting
+        if ttype == tokenize.FSTRING_START:
+            fdepth += 1
+        elif ttype == tokenize.FSTRING_END:
+            fdepth -= 1
+
+        # Absolute positions in the *original* source
+        start = abs_index((sl, sc))
+        end = abs_index((el, ec))
+
+        # Copy text that lies *before* this token (whitespace, comments …)
+        if cursor < start:
+            out.append(code[cursor:start])
+
+        # Decide whether to rewrite this NAME
+        is_candidate = (
+            ttype == tokenize.NAME
+            and fdepth == 0
+            and tstr in ops
+            and tstr not in local_defs
+        )
+        if is_candidate:
+            j = next_sig(i)
+            k = prev_sig(i)
+            call_follows = j < len(tokens) and tokens[j].string == "("
+            dot_before = k >= 0 and tokens[k].string == "."
+            string_before = k >= 0 and tokens[k].type == tokenize.STRING
+            if call_follows and not dot_before and not string_before:
+                out.append(f"torch.{tstr}")
+                cursor = end
+                continue  # done with this token
+
+        # default: keep token text verbatim
+        out.append(code[start:end])
+        cursor = end
+
+    # trailing text (e.g. final newline)
+    out.append(code[cursor:])
+    return "".join(out)
+
+
+def convert(deriv, state, states, assigned, use_pade_approx=False):
+    """
+    Convert a derivative expression into a form suitable for numerical integration.
+
+    Parameters
+    ----------
+    deriv : str
+        The derivative expression to be converted.
+    state : str
+        The state variable involved in the derivative.
+    assigned : set
+        A set of variables that are assigned values.
+    use_pade_approx : bool, optional
+        Whether to use Pade approximation for integration. Defaults to False.
+    diffusion : Tuple[float, str], optional
+        The diffusion to be added, if any. Defaults to None.
+    model : object, optional
+        The model object (subclass of Axon). Defaults to None.
+
+    Returns
+    -------
+    str
+        The modified derivative expression after integration and optional diffusion addition.
+    """
+
+    exclude = set([state]) | set(states) | set(assigned)
+    v = extract_vars(deriv, exclude)
+    f = integrate2c(deriv, "dt", v, use_pade_approx=use_pade_approx)
+    if DEBUG:
+        print(f)
+    return add_underscore_to_lhs(modify_operations(replace(f, v)))
+
+
+cnexp_template = """
+def solve(self, dt, {states_and_assigned}):
+    {solves}
+    return {returns}
+"""
+
+
+def match_derivative_to_states(derivative, states):
+    matched = {}
+    for state in states:
+        for d in derivative:
+            s, _ = d.split("'")
+            if s == state:
+                matched[state] = d
+                break
+    return matched
+
+
+def build_integration_func(
+    states, assigned, derivative, method, eliminate=None, pade=False
+):
+    """
+    Build the integration function for the states and assigned variables.
+    """
+    if method == "cnexp":
+        return build_cnexp(states, assigned, derivative, eliminate=eliminate, pade=pade)
+    else:
+        raise ValueError(
+            f"Unknown integration method: {method}. Valid methods are: cnexp."
+        )
+
+
+def build_cnexp(states, assigned, derivative, eliminate=None, pade=False):
+    for state in states:
+        if state in assigned:
+            raise ValueError(
+                f"State {state} cannot be assigned and used as a state variable."
+            )
+    states_and_assigned = ", ".join(set(states).union(assigned))
+    solves = []
+    returns = []
+
+    if eliminate is None:
+        eliminate = {}
+    else:
+        eliminate = {s: expression for s, expression in eliminate}
+
+    if PADE.value == -1:
+        use_pade_approx = pade
+    else:
+        use_pade_approx = bool(PADE)
+
+    derivative = match_derivative_to_states(derivative, states)
+    for state in states:
+        if state not in eliminate:
+            solves.append(
+                convert(
+                    derivative[state],
+                    state,
+                    states,
+                    assigned,
+                    use_pade_approx=use_pade_approx,
+                )
+            )
+        else:
+            solves.append(add_underscore_to_states(eliminate[state], states))
+        returns.append(f"'{state}' : _{state}")
+    solves = "\n    ".join(solves)
+    returns = f"{{{', '.join(returns)}}}"
+    f = cnexp_template.format(
+        states_and_assigned=states_and_assigned, solves=solves, returns=returns
+    )
+    if DEBUG:
+        print(f"Function:\n{f}")
+    filename = "<solve_function>"
+    code = compile(f, filename, "exec")
+    exec(code)
+    return locals()["solve"]
+
+
+class State(Parameterized):
+    """
+    Helper mixin for declaring per-compartment state variables and their dynamics.
+
+    Define subclasses inside a :class:`Mechanism` and register them with
+    :meth:`Mechanism.STATE`. Use uppercase classmethods (``STATE``, ``DERIVATIVE``,
+    ``KINETIC``, ``ASSIGNED``, ``BUFFER``, ``GLOBAL``, ``RANGE``) at class
+    definition time to declare state variables, ODEs/kinetics, per-compartment
+    parameters, and auxiliary buffers. Override lowercase hooks to implement
+    behavior:
+
+    - ``initial(self, v)``: populate buffers/states once at initialization.
+    - ``breakpoint(self, v, states=None)``: compute ASSIGNED/intermediates each step;
+      may return a dict mapping ASSIGNED names to values.
+    - ``inf(self, v)``: return steady-state values for states (used for init).
+    - ``calc_q10(self)``: optional temperature scaling when ``has_q10=True``.
+    """
+
+    _state_buffers = set()
+    _state_buffers_declarations = []
+
+    _state = set()
+    _state_declarations = []
+
+    _derivative = set()
+    _derivative_declarations = []
+
+    _kinetic = set()
+    _kinetic_declarations = []
+
+    _assigned = set()
+    _assigned_declarations = []
+
+    has_q10 = False
+    method = "cnexp"
+
+    def __init_subclass__(cls, **kwargs):
+        """
+        This special method is called automatically whenever a class
+        inherits from Parameterized.
+        """
+        # Call the parent's __init_subclass__ WITHOUT our custom kwargs,
+        # as the base 'object' class does not accept them.
+        super().__init_subclass__(**kwargs)
+
+        # Start with a fresh dictionary for the new class's parameters.
+        new_state = set()
+        new_buffers = set()
+        new_derivative = set()
+        new_assigned = set()
+        new_kinetic = set()
+
+        # Walk MRO in reverse to build up params from parent to child
+        for base in reversed(cls.__mro__):
+            # We look for a _params attribute defined directly on the base
+            if "_state" in base.__dict__:
+                new_state.update(base._state)
+            if "_state_buffers" in base.__dict__:
+                new_buffers.update(base._state_buffers)
+            if "_derivative" in base.__dict__:
+                new_derivative.update(base._derivative)
+            if "_kinetic" in base.__dict__:
+                new_kinetic.update(base._kinetic)
+            if "_assigned" in base.__dict__:
+                new_assigned.update(base._assigned)
+
+        if State._state_declarations:
+            for s_list in State._state_declarations:
+                new_state.update(s_list)
+            State._state_declarations = []
+
+        if State._state_buffers_declarations:
+            for b_list in State._state_buffers_declarations:
+                new_buffers.update(b_list)
+            State._state_buffers_declarations = []
+
+        if State._derivative_declarations:
+            for d_list in State._derivative_declarations:
+                new_derivative.update(d_list)
+            State._derivative_declarations = []
+
+        if State._kinetic_declarations:
+            for k_list in State._kinetic_declarations:
+                new_kinetic.update(k_list)
+            State._kinetic_declarations = []
+
+        if State._assigned_declarations:
+            for a_list in State._assigned_declarations:
+                new_assigned.update(a_list)
+            State._assigned_declarations = []
+
+        cls._state = list(new_state)
+        cls._state_buffers = new_buffers
+        cls._derivative = new_derivative
+        cls._kinetic = new_kinetic
+        cls._assigned = list(new_assigned)
+
+    def __init__(
+        self,
+        celsius,
+        diameters,
+        key,
+        shape,
+        shape_f,
+        additional_parameters=None,
+        **kwargs,
+    ):
+        if not self._state:
+            raise ValueError(
+                f"State {self.__class__.__name__} has no state variables defined."
+                "Use State.STATE(<state vars>) in State implementation to define them."
+            )
+        super().__init__(
+            shape, shape_f, additional_parameters=additional_parameters, **kwargs
+        )
+        self._name = self.__class__.__name__
+        self.key = key
+
+        self.register_buffer("celsius", celsius)
+        self.register_buffer("diam", diameters)
+
+        _derivative = list(self._derivative)
+
+        cinfo = None
+
+        if self._kinetic:
+            _kinetic = list(self._kinetic)
+            deriv_list, _, cinfo, _, _ = kinetic_to_derivatives(self._state, _kinetic)
+            _derivative.extend(deriv_list)
+
+        for b in self._state_buffers:
+            self.register_buffer(b, torch.tensor(0.0))
+
+        pade = kwargs.get("pade", False)
+        self.include_q10_in_comp_graph = kwargs.get("include_q10_in_comp_graph", False)
+
+        ifunc = build_integration_func(
+            self._state, self._assigned, _derivative, self.method, cinfo, pade
+        )
+        setattr(self, "solve", MethodType(ifunc, self))
+
+    def populate_parameter_buffers(self):
+        super().populate_parameter_buffers()
+        if self.has_q10:
+            if self.include_q10_in_comp_graph:
+                self.q10 = self.calc_q10
+            else:
+                self.q10 = self.return_q10_cache
+                self.register_buffer("q10_cache", self.calc_q10())
+
+    @staticmethod
+    def to_column(tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a 2D tensor to a column vector (2D tensor with one column).
+        """
+        return tensor.view(-1, 1)
+
+    def from_column(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a column vector (2D tensor with one column) back to its original shape.
+        """
+        return tensor.view(*self.shape)
+
+    def initialize(self, v):
+        self.initial(v)
+        return
+
+    def return_q10_cache(self):
+        return self.q10_cache
+
+    def set(self, key: str, value):
+        p = getattr(self, key)
+        if isinstance(p, torch.Tensor):
+            p.data = torch.as_tensor(value, dtype=p.data.dtype, device=p.device)
+
+    @staticmethod
+    def STATE(*args):
+        """
+        Declare state variables for the State subclass.
+
+        Parameters
+        ----------
+        *args : str
+            Names of state variables advanced by the integrator.
+        """
+        State._state_declarations.append(args)
+
+    @staticmethod
+    def BUFFER(*args):
+        """
+        Declare auxiliary per-compartment buffers.
+
+        Buffers are allocated per instance and typically populated in
+        :meth:`initial`; they are not evolved by the ODE solver.
+
+        Parameters
+        ----------
+        *args : str
+            Buffer names to allocate.
+        """
+        State._state_buffers_declarations.append(args)
+
+    @staticmethod
+    def DERIVATIVE(*args):
+        """
+        Declare ODEs for state variables using symbolic strings.
+
+        Parameters
+        ----------
+        *args : str
+            Derivative expressions like ``\"m' = (minf - m) / tau\"``.
+        """
+        State._derivative_declarations.append(args)
+
+    @staticmethod
+    def KINETIC(*args):
+        """
+        Declare kinetic/Markov schemes between states.
+
+        Parameters
+        ----------
+        *args : str
+            Kinetic expressions like ``\"~ a <-> b (alpha, beta)\"``.
+        """
+        State._kinetic_declarations.append(args)
+
+    @staticmethod
+    def ASSIGNED(*args):
+        """
+        Declare computed per-compartment variables used in derivatives.
+
+        Parameters
+        ----------
+        *args : str
+            Names of ASSIGNED variables to be set in :meth:`breakpoint`.
+        """
+        State._assigned_declarations.append(args)
+
+    def breakpoint(self, v, states):
+        """
+        Compute ASSIGNED/intermediate values for this state at the breakpoint.
+
+        Override in subclasses; may return a dict mapping ASSIGNED names to
+        values. Called each step before derivatives are evaluated.
+        """
+        return {}
+
+    def advance(self, v, dt, states):
+        return self.solve(dt, **self.breakpoint(v, states), **states)
+
+    def initial(self, v):
+        """
+        Hook invoked during initialization to populate buffers/states.
+
+        Override to set buffers declared via :meth:`BUFFER` or to customize
+        state initialization (may depend on morphology such as ``self.diam``).
+        """
+        pass
+
+    def inf(self, v):
+        """
+        Return steady-state values for state variables at voltage ``v``.
+
+        Used during initialization unless overridden by the caller.
+        """
+        return {}
+
+    def calc_q10(self):
+        """
+        Optional Q10 scaling helper when ``has_q10=True``.
+
+        Override to return a temperature-dependent multiplicative factor used
+        by ``self.q10()`` inside kinetics. Defaults to 1.0.
+        """
+        return 1.0
+
+    @classproperty
+    def code(cls):
+        """
+        Returns the source code of the mechanism.
+        This is useful for debugging and introspection.
+        """
+        source_code = inspect.getsource(cls)
+        return textwrap.dedent(source_code)

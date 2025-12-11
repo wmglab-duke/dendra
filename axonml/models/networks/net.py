@@ -1,703 +1,1601 @@
-import linecache
-from typing import List, Dict
+import gc
+import math
+from contextlib import nullcontext
+from typing import Dict, Literal, Optional
 
+import torch
 from tqdm.auto import tqdm
-import torch, torch.nn as nn, math
 
-from axonml.helpers import DEBUG
-from axonml.models.callbacks import CallbackList, Callback
+from axonml.helpers import BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT
 
-from .population import assemble_global_adjacencies, blocks_by_projection
-from ..mechanisms.compilers.utils import indent
-
-
-advance_v_template = """
-self.{pop}.v = self.{pop}.integrator._step_no_intra(self.{pop}.v, self.dt, self.{pop}.temp_c)
-"""
+from ..callbacks import CallbackList
+from ..core import Population, make_intra
+from ..multi import concat, indices
+from ..parametric import is_parametric, to_param
+from ..rng import RNGMixin
+from .netcon import NetCon
+from .netstim import NetStim
 
 
-net_receive_template = """
-self.{pop}.mech.net_receive(weights_{pop})
-"""
-
-
-compute_spikes_template = """
-spikes_{pop} = self.check_active_{pop}(self.{pop}.v)
-"""
-
-
-compute_weights_template = """
-{pre}_{post}_weights = self.synapses_{pre}_{post}(spikes_{pre})
-"""
-
-
-init_v_template = """
-self.{pop}.integrator.init_v(self.{pop})
-"""
-
-
-init_mech_template = """
-self.{pop}.integrator.mech.initialize(self.{pop}.v, self.{pop}.v_init_c, self.{pop}.temp_c)
-"""
-
-
-init_integrator_template = """
-self.{pop}.integrator.initialize(self.{pop}, self.dt)
-"""
-
-
-def advance_v(populations):
+def to_flat_idx_torch(shape, idx, device):
     """
-    Generate the code to advance the voltage of each population.
-    """
-    advance_v = []
-    for pop in populations:
-        advance_v.append(advance_v_template.format(pop=pop))
-    return indent("\n".join(advance_v), 2)
+    Converts any valid PyTorch index into a 1D tensor of flat indices.
 
+    Args:
+        arr (torch.Tensor): The original tensor, used for its shape and device.
+        idx: The index to be converted. Can be a slice, int, tuple,
+             boolean tensor, or integer tensor.
 
-def compute_spikes(populations):
+    Returns:
+        torch.LongTensor: A 1D tensor containing the flat indices that
+                          correspond to the elements selected by `arr[idx]`.
     """
-    Generate the code to compute the spikes of each population.
-    """
-    compute_spikes = []
-    for pop in populations:
-        compute_spikes.append(compute_spikes_template.format(pop=pop))
-    return indent("\n".join(compute_spikes), 2)
 
-
-def compute_weights(connections):
-    """
-    Generate the code to compute the weights for each connection.
-    """
-    compute_weights = []
-    for c in connections:
-        compute_weights.append(compute_weights_template.format(pre=c['pre'], post=c['post']))
-    return indent("\n".join(compute_weights), 2)
-
-
-def total_weights(populations, connections, intrinsic):
-    """
-    Generate the code to compute the total weights for each population.
-    """
-    total_weights = []
-    no_act = []
-    for pop in populations:
-        relevant_weights = []
-        for c in connections:
-            if c['post'] == pop:
-                relevant_weights.append(f"{c['pre']}_{c['post']}_weights")
-        if not relevant_weights:
-            if not pop in intrinsic:
-                no_act.append(pop)
-                continue
-            total_weights.append(f"weights_{pop} = self.{pop}_intrinsic()")
-            continue
-        relevant_weights_sum = f" + ".join(relevant_weights)
-        if pop in intrinsic:
-            relevant_weights_sum = f"self.{pop}_intrinsic() + {relevant_weights_sum}"
-        total_weights.append(f"weights_{pop} = {relevant_weights_sum}")
-    return indent("\n".join(total_weights), 2), no_act
-
-
-def split_weights(populations):
-    """
-    Generate the code to split the weights for each population.
-    """
-    split_weights = []
-    for pop in populations:
-        split_weights.append(f"{pop}_weights")
-    split_weights = split_weights_template.format(
-        split_weights=", ".join(split_weights)
+    # 1. Create a grid of flat indices with the same shape as the input array.
+    #    e.g., for a (2, 3) tensor, this becomes [[0, 1, 2], [3, 4, 5]]
+    indices_grid = torch.arange(torch.prod(torch.tensor(shape)), device=device).view(
+        shape
     )
-    return indent(split_weights, 2)
+
+    # 2. Apply the user's index to this grid. PyTorch's indexing logic
+    #    will select the corresponding flat indices for us.
+    selected_indices = indices_grid[idx]
+
+    # 3. Flatten the result to get a 1D tensor of flat indices.
+    return selected_indices.flatten()
 
 
-def net_receive(populations, no_act):
+def step_pop(integrator, model, dt, ve=None, intra=None):
+    integrator.step(model, dt, ve, intra)
+    model.t = model.t + dt
+
+
+def step(
+    populations,
+    synapses,
+    netstim,
+    t,
+    dt,
+    ve: Dict[str, torch.Tensor | None] = {},
+    intra: Dict[str, torch.Tensor | None] = {},
+):
+    if netstim is not None:
+        netstim(t, bptt=netstim.training)
+    for s in synapses.values():
+        s.advance()
+    for n, pop in populations.items():
+        step_pop(pop.integrator, pop, dt, ve.get(n, None), intra.get(n, None))
+
+
+def get_local_index(population, mech, index):
+    indices = torch.full_like(
+        population.v, -1, dtype=torch.long, device=population.device()
+    ).flatten()
+    mech_key_flat = to_flat_idx_torch(population.shape, mech.key, population.device())
+    indices.index_copy_(
+        0,
+        mech_key_flat,
+        torch.arange(
+            mech_key_flat.numel(), device=population.device(), dtype=torch.long
+        ),
+    )
+    return indices.index_select(0, index)
+
+
+def _last_celsius(populations):
+    pops = [pop for pop in populations.values()]
+    return pops[-1].celsius if pops else None
+
+
+def prepare_indices_one_one(source, target, synapse):
+    source_model = source.model
+    target_model = target.model
+    syn = synapse
+
+    index_arr = torch.arange(
+        target_model.v.numel(), device=target_model.device(), dtype=target_model.dtype()
+    ).view_as(target_model.v)
+
+    indices_in_synapse = syn.get(index_arr).flatten()
+    post_idx = to_flat_idx_torch(
+        target_model.shape, target.index, target_model.device()
+    )
+
+    if not torch.all(torch.isin(post_idx, indices_in_synapse)):
+        raise ValueError(
+            f"Target population '{target.name}' does not have the synapse '{synapse}' at all target locations."
+        )
+
+    pre_idx = to_flat_idx_torch(source_model.shape, source.index, source_model.device())
+    post_idx = get_local_index(target_model, syn, post_idx)
+
+    return pre_idx, post_idx
+
+
+def prepare_indices_one_one_flat(
+    source_model, source_index, target_model, target_index, synapse
+):
     """
-    Generate the code to advance the voltage of each population.
+    Prepares indices for a one-to-one connection between source and target populations.
+    This function assumes that the synapse exists at all target locations.
     """
-    net_receive = []
-    for pop in populations:
-        if pop in no_act:
-            continue
-        net_receive.append(net_receive_template.format(pop=pop))
-    return indent("\n".join(net_receive), 2)
+    syn = synapse
+
+    index_arr = torch.arange(
+        target_model.v.numel(), device=target_model.device(), dtype=target_model.dtype()
+    ).view_as(target_model.v)
+
+    indices_in_synapse = syn.get(index_arr).flatten()
+
+    pre_idx = source_index
+    post_idx = target_index
+
+    if not torch.all(torch.isin(post_idx, indices_in_synapse)):
+        raise ValueError(
+            f"Target population '{target_model.name}' does not have the synapse '{synapse}' at all target locations."
+        )
+
+    post_idx = get_local_index(target_model, syn, post_idx)
+
+    return pre_idx, post_idx
 
 
-def init_v(populations):
+def check_weight_shape(weight, pre_idx):
     """
-    Generate the code to advance the voltage of each population.
+    Checks the shape of the weight tensor against the pre-synaptic indices.
+    If the weight is a scalar, it returns the number of pre-synaptic indices.
+    If the weight is a tensor, it checks if its shape matches the number of pre-synaptic indices.
     """
-    init_v = []
-    for pop in populations:
-        init_v.append(init_v_template.format(pop=pop))
-    return indent("\n".join(init_v), 2)
+    if isinstance(weight, float):
+        return len(pre_idx)
+    if isinstance(weight, torch.Tensor):
+        if weight.ndim == 0:
+            return len(pre_idx)
+        if weight.ndim == 1:
+            if len(weight) == 1:
+                return len(pre_idx)
+            if weight.shape[0] == len(pre_idx):
+                return 1
+            raise ValueError(
+                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
+            )
+    if hasattr(weight, "__len__"):
+        if len(weight) != len(pre_idx):
+            raise ValueError(
+                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
+            )
+        return 1
+    if isinstance(weight, torch.nn.Module):
+        return len(pre_idx)
+    raise TypeError(f"Unsupported type for weight: {type(weight)}.")
 
 
-def init_mech(populations):
+def expand(value, n):
+    if isinstance(value, torch.nn.Module):
+        return value.sample(n)
+    return torch.tensor(value).repeat(n)
+
+
+def batchify_index(old_shape, n: int, i: torch.Tensor) -> torch.Tensor:
     """
-    Generate the code to advance the voltage of each population.
+    Build i_n so that:
+        t_n = t.unsqueeze(0).repeat(n, *([1]*len(old_shape)))   # n copies of t
+        # (Assuming t_n is contiguous; if you used expand(), call .contiguous() before .view)
+        t_n.view(-1)[i_n] == t_n.reshape(n, -1)[..., i].reshape(-1)
+
+    Args:
+        old_shape: shape of t BEFORE adding the batch (tuple/torch.Size)
+        n:         batch size
+        i:         LongTensor of indices into the last dim of t_n.reshape(n, -1)
+                   (any shape; negatives allowed; broadcast across the n rows)
+
+    Returns:
+        i_n: LongTensor of shape (n, *i.shape) — flat indices into t_n.view(-1)
     """
-    init_mech = []
-    for pop in populations:
-        init_mech.append(init_mech_template.format(pop=pop))
-    return indent("\n".join(init_mech), 2)
+    M = math.prod(tuple(old_shape))  # width of the last dim in t_n.reshape(n, -1)
+    if i.dtype != torch.long:
+        i = i.to(torch.long)
+    i = i % M  # normalize negatives
+
+    # row offsets: 0, M, 2M, ..., (n-1)M; broadcast across i's shape
+    r = torch.arange(n, device=i.device, dtype=torch.long).view((n,) + (1,) * i.ndim)
+    i_n = r * M + i
+    return i_n.reshape(-1)
 
 
-def init_integrator(populations):
-    """
-    Generate the code to advance the voltage of each population.
-    """
-    init_integrator = []
-    for pop in populations:
-        init_integrator.append(init_integrator_template.format(pop=pop))
-    return indent("\n".join(init_integrator), 2)
+def make_weight(weights, n):
+    class ParameterOrDistributionWrapper(torch.nn.Module):
+        """A simple wrapper for parameters or distributions that can be sampled."""
+
+        def __init__(self, param):
+            super().__init__()
+            self.param = param
+
+        def sample(self, n):
+            if is_parametric(self.param):
+                return self.param.repeat(n)
+            else:
+                return self.param.sample(n)
+
+    class WeightExpander(torch.nn.Module):
+        def __init__(self, weights, n):
+            super(WeightExpander, self).__init__()
+            self.weights = torch.nn.ModuleList(
+                [ParameterOrDistributionWrapper(w) for w in weights]
+            )
+            self.n = n
+            self.register_buffer("w", torch.empty(0))
+
+        def forward(self):
+            return self.w
+
+        def init(self, reinit=True):
+            if reinit or not self.w.numel():
+                self.w = torch.cat([w.sample(n) for w, n in zip(self.weights, self.n)])
+            return self
+
+    return WeightExpander(weights, n)
 
 
-def synapses_init(synapses):
-    """
-    Generate the code to advance the voltage of each population.
-    """
-    synapses_init = []
-    for s in synapses:
-        synapses_init.append(f"self.synapses_{s}.initialize()")
-    return indent("\n".join(synapses_init), 2)
-
-
-def initrinsic_init(intrinsic):
-    """
-    Generate the code to advance the voltage of each population.
-    """
-    intrinsic_init = []
-    for i in intrinsic:
-        intrinsic_init.append(f"self.{i}_intrinsic.initialize()")
-    return indent("\n".join(intrinsic_init), 2)
-
-
-def check_active_init(populations):
-    """
-    Generate the code to advance the voltage of each population.
-    """
-    check_active_init = []
-    for pop in populations:
-        check_active_init.append(f"self.check_active_{pop}.above_threshold.zero_()")
-    return indent("\n".join(check_active_init), 2)
-
-
-template = """
-class _network(torch.nn.Module):
-    def __init__(self, populations, synapses, check_active, intrinsic, dt):
-        super().__init__()
-
-        for name, synapse in synapses.items():
-            setattr(self, f"synapses_{{name}}", synapse)
-
-        for name, check in check_active.items():
-            setattr(self, f"check_active_{{name}}", check)
-
-        for name, pop in populations.items():
-            setattr(self, name, pop)
-
-        if intrinsic is not None:
-            for name, intrinsic in intrinsic.items():
-                setattr(self, f"{{name}}_intrinsic", intrinsic)
-
-        self.register_buffer("dt", torch.as_tensor(dt))
-        self.n_per_pop: List[int] = [pop.v.shape[-1] for pop in populations.values()]
-
-    def step(self):
-{advance_v}
-{compute_spikes}
-{compute_weights}
-{total_weights}
-{net_receive}
-
-    @torch.jit.ignore
-    def initialize(self):
-{synapses_init}
-{intrinsic_init}
-{check_active_init}
-{init_v}
-{init_integrator}
-{init_mech}
-"""
-
-
-def weights_by_delay_(weight: torch.Tensor, delay: torch.Tensor) -> torch.Tensor:
-    D_max = int(delay.max().item())
-    Wd: List[torch.Tensor] = []
-    for d in range(1, D_max + 1):
-        Wd.append(weight * (delay == d))
-    return torch.stack(Wd, dim=0)  # (D,N,C,C)
-
-
-def weights_by_delay(
-    W: torch.Tensor,          # (N, n_pre, n_post)  float / half
-    D: torch.Tensor           # (N, n_pre, n_post)  int64
+def dilate(
+    event_deliveries: torch.Tensor,
+    dt_old: float,
+    dt_new: float,
+    *,
+    mode: Literal["nearest", "floor", "ceil"] = "nearest",
+    horizon_ms: Optional[float] = None,
+    n_limit: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    Rearranges a weight matrix `W` and its corresponding delay matrix `D`
-    into a delay-indexed tensor suitable for VariableDelaySynapse.
+    Re-bin a (T, E) event buffer from dt_old to dt_new by mapping each old
+    time bin t=k*dt_old to a new row index on the dt_new grid and summing
+    collisions.
+
+    Parameters
+    ----------
+    event_deliveries : (T, E) torch.Tensor
+        Rows are time bins; columns are event channels. Any numeric dtype works.
+        If dtype == bool, counts will be summed as integers.
+    dt_old : float
+        Original bin width (ms).
+    dt_new : float
+        Target bin width (ms), must be > 0.
+    mode : {"nearest","floor","ceil"}, default "nearest"
+        How to choose the new bin for each original time:
+          - "nearest": half-up rounding (i.e., round(x) via floor(x+0.5) for x >= 0)
+          - "floor":   lower bin
+          - "ceil":    upper bin
+    horizon : int, optional
+        If provided, forces the output to cover [0, horizon) on the new grid.
+        If omitted, the output length is just enough to include the last mapped bin.
 
     Returns
     -------
-    W_by_D : (D_max, N, n_pre, n_post)
-             W_by_D[d-1, n, i, j] holds W[n,i,j] **iff** D[n,i,j] == d,
-             otherwise 0.  (Delay values must be >= 1.)
+    (T_new, E) torch.Tensor
+        Re-binned tensor on the dt_new grid, with rows summed where multiple
+        old bins map to the same new bin.
     """
-    if W.shape != D.shape:
-        raise ValueError("W and D must have the same shape")
+    if event_deliveries.ndim != 2:
+        raise ValueError("event_deliveries must be 2D (T, E).")
+    if not (dt_old > 0 and dt_new > 0):
+        raise ValueError("dt_old and dt_new must be > 0.")
+    if dt_old == dt_new:
+        return event_deliveries
 
-    if not torch.is_floating_point(W):
-        raise TypeError("W must be a floating-point tensor")
-    if D.dtype != torch.int64:
-        raise TypeError("D must be int64 (torch.long)")
+    T, E = event_deliveries.shape
+    device = event_deliveries.device
 
-    D_max = int(D.max().item())        # largest delay present
-    if D_max < 1:
-        raise ValueError("all delays must be ≥ 1")
+    # old times: t_k = k * dt_old ; compute fractional new indices t_k / dt_new
+    idx_f = torch.arange(T, device=device, dtype=torch.float64) * (dt_old / dt_new)
 
-    # Broadcast masks & zero-out in one pass per delay
-    blocks = []
-    for d in range(1, D_max + 1):
-        mask = (D == d)
-        blocks.append(W.masked_fill(~mask, 0.0))
+    if mode == "nearest":
+        # half-up rounding for nonnegative times (avoids banker's rounding)
+        idx = torch.floor(idx_f + 0.5).to(torch.long)
+    elif mode == "floor":
+        idx = torch.floor(idx_f).to(torch.long)
+    elif mode == "ceil":
+        idx = torch.ceil(idx_f).to(torch.long)
+    else:
+        raise ValueError(f"Unknown mode={mode!r}")
 
-    # → (D_max, N, n_pre, n_post)
-    return torch.stack(blocks, dim=0)
+    # Determine output length
+    if T == 0:
+        T_new = 0
+    else:
+        idx_max = int(idx.max().item())
+        if horizon_ms is not None:
+            forced_len = int(math.ceil(horizon_ms / dt_new))
+            T_new = max(idx_max + 1, forced_len)
+        else:
+            T_new = idx_max + 1
+
+    if n_limit is not None:
+        T_new = n_limit
+
+    idx = idx.clamp(0, n_limit - 1) if n_limit is not None else idx
+
+    out_dtype = event_deliveries.dtype
+    # For boolean inputs, sum counts as integers (you can .bool() after if you want OR semantics)
+    if out_dtype == torch.bool:
+        src = event_deliveries.to(torch.int64)
+        out = torch.zeros((T_new, E), device=device, dtype=torch.int64)
+    else:
+        src = event_deliveries
+        out = torch.zeros((T_new, E), device=device, dtype=out_dtype)
+
+    # Sum rows that map to the same new bin. O(T*E) with efficient fused add.
+    if T_new > 0:
+        out.index_add_(0, idx, src)
+
+    return out
 
 
-class VariableDelaySynapse(torch.jit.ScriptModule):
+class Network(RNGMixin):
+    r"""
+    Container for interacting populations, synaptic connections, and optional stimuli.
+
+    A ``Network`` bundles:
+
+    - **Populations**: named collections of axons/neurons (``Population`` instances).
+    - **NetCons**: directed connections materialized as :class:`NetCon` objects that
+      deliver events from pre- to post-synaptic compartments (including optional
+      weights, delays, thresholds, and alternate pre variables such as conductance).
+    - **NetStim**: an optional :class:`NetStim` source that injects spikes into the
+      network (treated as a special "population" named ``netstim``).
+
+    Connections are specified incrementally (e.g., via :meth:`connect_one_to_one`,
+    :meth:`connect_dense`, :meth:`connect_prob`, :meth:`connect_prob_n`), then materialized when
+    :meth:`build`/:meth:`initialize` is called. Running the network steps each
+    population forward in time while advancing all synapses and optional NetStim.
+
+    .. note::
+        Device placement can be heterogeneous across populations and NetStim. NetCons
+        are built on each post-synaptic population's device. Device changes are
+        detected at :meth:`build` time and trigger rebuilds (as do ``dt`` changes or
+        ``force_rebuild=True``). Call :meth:`build` (and typically
+        :meth:`initialize`) after manual device moves to realign connectivity buffers.
+
+    Parameters
+    ----------
+    populations : dict[str, Population]
+        Mapping from population name to :class:`Population` instance. Populations
+        are built, registered as attributes, and used as sources/targets for
+        connectivity.
+    netstim : NetStim, optional
+        Optional spike generator attached under the name ``netstim``.
+    seed : int, optional
+        Seed for network-level RNG used in stochastic wiring utilities.
     """
-    Forward signature
-    -----------------
-    spikes : (N, P, C)  bool / 0-1
-    returns: (N, P, C)  float
-    """
 
-    def __init__(
-        self,
-        W: torch.Tensor,  # (N,C,C)
-        M: torch.Tensor,  # (N,C,C)
-        D: torch.Tensor,  # (N,C,C)
-        P: int,
-        dt: float,
-    ):
-        super().__init__()
+    def __init__(self, populations: Dict[str, Population], netstim=None, seed=None):
+        if any(pop.is_batched() for pop in populations.values()):
+            raise ValueError(
+                "Batched populations are not supported. Implement your networks with unbatched populations and then call .batch(batch_size)."
+            )
+        if netstim is not None and not isinstance(netstim, NetStim):
+            raise TypeError("netstim must be an instance of NetStim or None.")
+        super(Network, self).__init__(seed=seed)
+        self.populations = populations
+        for name, pop in populations.items():
+            pop.build()
+            pop.name = name
+            setattr(self, name, pop)
 
-        self.W = torch.nn.Parameter(W, requires_grad=False)  # (N,C,C)
-        self.register_buffer("D", D)  # (N,C,C)
+        self.netstim = netstim
 
-        W_by_delay = weights_by_delay(W, D)  # (D,N,C,C)
+        self.synapse_spec = {}
+        self.synapses = torch.nn.ModuleDict()
+        self.dt = None
+        self.built = False
 
-        # parameters
-        self.register_buffer("M", M)         # (D,N,C,C)
-        self.D_max = W_by_delay.size(0)
-        self.D_buf = self.D_max + 1 
-        self.N = W_by_delay.size(1)
-        self.C = W_by_delay.size(3)
-        self.P = int(P)
+        self.backend = BACKEND.value
+        self.fullgraph = bool(FULLGRAPH)
+        self.dynamic = bool(DYNAMIC)
+        self.jit = bool(JIT)
+        self.compile_mode = COMPILE_MODE.value
 
-        Wd = W_by_delay.contiguous()
-        
-        self.register_buffer("Wd", Wd)
-    
-        # circular delay line  (D, N, P, C)
+        self.is_batched = False
+
+        torch._dynamo.reset()
+
+        with torch.set_grad_enabled(True):
+            if self.jit:
+                self._step_train = torch.compile(
+                    step,
+                    backend=self.backend,
+                    fullgraph=self.fullgraph,
+                    dynamic=self.dynamic,
+                    mode=self.compile_mode,
+                )
+            else:
+                self._step_train = step
+
+        with torch.set_grad_enabled(False):
+            if self.jit:
+                self._step_eval = torch.compile(
+                    step,
+                    backend=self.backend,
+                    fullgraph=self.fullgraph,
+                    dynamic=self.dynamic,
+                    mode=self.compile_mode,
+                )
+            else:
+                self._step_eval = step
+
+        # Network clock lives on CPU by default; move when needed.
         self.register_buffer(
-            "queue",
-            torch.zeros(
-                self.D_buf,
-                self.N,
-                self.P,
-                self.C,
-                dtype=W_by_delay.dtype,
-                device=W_by_delay.device,
-            ),
+            "t", torch.tensor(0.0, device=torch.device("cpu"), dtype=torch.float32)
         )
-        self.register_buffer("head", torch.zeros((), dtype=torch.long))
 
-        # pre-compute tensor of slot offsets  [1,2,…,D_max]
-        self.register_buffer(
-            "delay_offsets",
-            torch.arange(self.D_max, dtype=torch.long, device=W_by_delay.device) + 1
-        )
+        # Track device signature to trigger rebuilds if placements change.
+        self._device_sig = self._device_signature()
+
+        self._state_cache = {}
+        self._syn_cache = {}
 
         self.eval()
 
-    @torch.jit.export
-    def initialize(self) -> None:
+    def train(self, mode=True):
         """
-        Initialize the synapse state.
+        Switch populations and synapses into training mode.
+
+        Parameters
+        ----------
+        mode : bool, optional
+            If True, enable training mode (grad-enabled stepping). If False,
+            disable grads for faster inference. Default is True.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
         """
-        self.queue.zero_().detach_()
-        self.head.zero_().detach_()
-        if self.training:
-            self.Wd.detach_()
-            self.Wd = weights_by_delay(self.W, self.D)  # (D,N,C,C)
+        for pop in self.populations.values():
+            pop.train(mode)
+        for syn in self.synapses.values():
+            syn.train(mode)
+        self.training = mode
+        self._step = self._step_train
+        return self
 
-    @torch.jit.export
-    def float16(self) -> None:
+    def train_(self, mode=True):
+        """In-place variant of :meth:`train` that returns ``None``."""
+        self.train(mode)
+
+    def eval(self):
         """
-        Convert the synapse weights to float16.
+        Switch populations and synapses into evaluation mode.
+
+        Disables gradients for stepping and sets the compiled stepping function
+        to the eval variant.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
         """
-        self.Wd = self.Wd.to(torch.float16)
-        self.M = self.M.to(torch.float16)
-        self.D = self.D.to(torch.float16)
-        self.W = self.W.to(torch.float16)
-        self.rate_int = self.rate_int.to(torch.float16)
-        self.w_int = self.w_int.to(torch.float16)
-        self.queue = self.queue.to(torch.float16)
+        super(Network, self).eval()
+        for pop in self.populations.values():
+            pop.eval()
+        for syn in self.synapses.values():
+            syn.eval()
+        self.training = False
+        self._step = self._step_eval
+        return self
 
-    @torch.jit.export
-    def bfloat16(self) -> None:
-        """
-        Convert the synapse weights to bfloat16.
-        """
-        self.Wd = self.Wd.to(torch.bfloat16)
-        self.M = self.M.to(torch.bfloat16)
-        self.D = self.D.to(torch.bfloat16)
-        self.W = self.W.to(torch.bfloat16)
-        self.rate_int = self.rate_int.to(torch.bfloat16)
-        self.w_int = self.w_int.to(torch.bfloat16)
-        self.queue = self.queue.to(torch.bfloat16)
-
-    @torch.jit.export
-    def set_weights(self, W: torch.Tensor, D: torch.Tensor) -> None:
-        """
-        Set weights and delays for all synapses.
-        """
-        W = W * self.M
-        W_by_delay = weights_by_delay(W, D)  # (D,N,C,C)
-        self.Wd.copy_(W_by_delay)  # (D,N,C,C)
-
-    # ------------------------------------------------------------------
-    def forward(self, spikes: torch.Tensor) -> torch.Tensor:
-        """
-        spikes : (N,P,C_pre)
-        returns: (N,P,C_post)
-        """
-
-        # ── 1. advance head, deliver, clear ─────────────────
-        h = (self.head + 1) % self.D_buf              # NEW head slot
-        out = self.queue[h].clone()                   # deliver
-        self.queue[h] = 0.0                           # clear for reuse
-        self.head = h                                 # save back
-
-            # --- path A: batched GEMM (einsum)  fast when P is long -------
-        contrib = torch.einsum(           # (D,N,P,C)
-            'npj,dnji->dnpi',
-            spikes.to(self.Wd.dtype),
-            self.Wd
-        )
-
-        #  scatter-add into the ring buffer (no loop)
-        slots = (h + self.delay_offsets) % self.D_buf         # (D,)
-        self.queue.view(self.D_buf, -1).index_add_(
-            0,
-            slots,
-            contrib.reshape(self.D_max, -1)
-        )
-
-        return out
-
-
-class Intrinsic(torch.nn.Module):
-
-    scheduled_stimuli: Dict[int, torch.Tensor]
-
-    def __init__(
-        self,
-        N: int,
-        P: int,
-        C: int,
-        dt: float,
-        rate_int: torch.Tensor,  # (N,C) or scalar
-        w_int: torch.Tensor,     # (N,C) or scalar
-    ):
-        super().__init__()
-        self.N = N
-        self.P = P
-        self.C = C
-
-        self.dt : float = float(dt)
-        self.t_ind : int = 0
-        self.register_buffer(
-            "rate_int",
-            torch.as_tensor(rate_int, dtype=torch.float).expand(self.N, self.C).clone(),
-        )  # (N,C)
-        self.register_buffer(
-            "w_int",
-            torch.as_tensor(w_int, dtype=torch.float).expand(self.N, self.C).clone(),
-        )  # (N,C)
-
-        self.scheduled_stimuli = {}
-
-    @torch.jit.export
-    def initialize(self) -> None:
-        """
-        Initialize the intrinsic state.
-        """
-        self.t_ind = 0
-
-    @torch.jit.export
-    def schedule_stimulus(self, weight, time: float) -> None:
-        time_int = int(time / self.dt)
-        if time_int in self.scheduled_stimuli:
-            raise ValueError(f"Stimulus at time {time} already scheduled.")
-        self.scheduled_stimuli[time_int] = weight
-
-    @torch.jit.export
-    def forward(self):
-        """
-        intrinsic : (N,P,C)
-        """
-        p = 1.0 - torch.exp(-self.rate_int * self.dt)
-        p = p.unsqueeze(1)  # (N,1,C)
-        w_i = self.w_int.unsqueeze(1)  # (N,1,C)
-        rand = torch.rand(self.N, self.P, self.C,
-                          dtype=self.w_int.dtype, device=self.w_int.device)
-        intrinsic = (rand < p).to(self.w_int.dtype) * w_i  # (N,P,C)
-        if self.t_ind in self.scheduled_stimuli:
-            intrinsic += self.scheduled_stimuli[self.t_ind].to(intrinsic.dtype)
-        self.t_ind += 1
-        return intrinsic
-
-
-class IntrinsicStimOnly(torch.nn.Module):
-
-    scheduled_stimuli: Dict[int, torch.Tensor]
-
-    def __init__(
-        self,
-        N: int,
-        P: int,
-        C: int,
-        dt: float,
-    ):
-        super().__init__()
-        self.N = N
-        self.P = P
-        self.C = C
-
-        self.dt : float = float(dt)
-        self.t_ind : int = 0
-
-        self.scheduled_stimuli = {}
-        self.register_buffer("stimulus", torch.zeros((N, P, C), dtype=torch.float))
-
-    @torch.jit.export
-    def initialize(self) -> None:
-        """
-        Initialize the intrinsic state.
-        """
-        self.t_ind = 0
-
-    @torch.jit.export
-    def schedule_stimulus(self, weight, time: float) -> None:
-        time_int = int(time / self.dt)
-        if time_int in self.scheduled_stimuli:
-            raise ValueError(f"Stimulus at time {time} already scheduled.")
-        self.scheduled_stimuli[time_int] = weight
-
-    @torch.jit.export
-    def forward(self):
-        """
-        intrinsic : (N,P,C)
-        """
-        intrinsic = self.stimulus
-        if self.t_ind in self.scheduled_stimuli:
-            intrinsic = intrinsic + self.scheduled_stimuli[self.t_ind].to(intrinsic.dtype)
-        self.t_ind += 1
-        return intrinsic
-
-
-class CheckActive(torch.jit.ScriptModule):
-    def __init__(self, N, P, C, threshold: float = 0.0):
-        super().__init__()
-        self.threshold = threshold
-        self.register_buffer("above_threshold", torch.zeros((N, P, C), dtype=torch.bool))
-
-    @torch.jit.script_method
-    def forward(self, v: torch.Tensor) -> torch.Tensor:
-        """
-        v : (N,P,C)  float
-        """
-        # check if above threshold
-        above_threshold = v >= self.threshold
-        active = above_threshold & ~self.above_threshold
-        self.above_threshold = above_threshold
-
-        return active
-
-
-class Network(torch.jit.ScriptModule):
-    """
-    Network class for AxonML.
-    """
-
-    def __init__(self, net):
-        super().__init__()
-        self.net = net
-        self.dt : float = net.dt.item()
-        self.t_ind : int = 0
+    def eval_(self):
+        """In-place variant of :meth:`eval` that returns ``None``."""
         self.eval()
 
-    @property
-    def t(self):
+    def devices(self):
         """
-        Current time in the network.
+        Return a mapping of population name -> device to support heterogeneous placement.
         """
-        return self.t_ind * self.dt
+        return {name: pop.device() for name, pop in self.populations.items()}
 
-    def s(self, pre, post):
+    def dtypes(self):
         """
-        Get the synapse object for a given pre and post population.
+        Return a mapping of population name -> dtype to support heterogeneous placement.
         """
-        return getattr(self.net, f"synapses_{pre}_{post}")
+        return {name: pop.dtype() for name, pop in self.populations.items()}
 
-    def p(self, name):
-        """
-        Get the population object for a given name.
-        """
-        return getattr(self.net, name)
+    def _device_signature(self):
+        sig = [(name, str(pop.device())) for name, pop in self.populations.items()]
+        if self.netstim is not None:
+            sig.append(("netstim", str(self.netstim.device())))
+        return tuple(sorted(sig))
 
-    def schedule_stimulus(self, pop, weight, time: float) -> None:
+    def device(self):
         """
-        Schedule a stimulus for a given time.
+        Legacy aggregate device (first population). For multi-device setups, prefer devices().
         """
-        if not hasattr(self.net, f"{pop}_intrinsic"):
-            raise ValueError(f"Population {pop} does not have intrinsic.")
-        getattr(self.net, f"{pop}_intrinsic").schedule_stimulus(weight, time)
+        return next(iter(self.populations.values())).device()
 
-    @torch.jit.script_method
-    def step(self) -> None:
+    def dtype(self):
         """
-        Step the network forward in time.
+        Legacy aggregate dtype (first population). For multi-device setups, prefer dtypes().
         """
-        self.net.step()
+        return next(iter(self.populations.values())).dtype()
 
-    def run(self, tstop: float, progressbar=True, reinit=False, callbacks=None) -> None:
+    def clear_synapses(self):
         """
-        Run the network for a given time.
+        Remove all queued synapse specs and built NetCon modules.
+
+        Use when re-wiring the network before calling :meth:`build` again.
         """
-        dt = self.dt
-        n_steps = int(math.ceil(tstop / dt))
+        self.synapse_spec = {}
+        self.synapses.clear()
+        self.built = False
 
-        with torch.set_grad_enabled(self.training):
+    def _connect(
+        self,
+        source_pop,
+        source_idx,
+        target_pop,
+        target_idx,
+        synapse,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+    ):
+        """
+        Internal method to connect two populations with a synapse.
+        """
+        n_threshold = check_weight_shape(threshold, source_idx)
+        n_weight = check_weight_shape(weight, source_idx)
+        n_delay = check_weight_shape(delay, source_idx)
 
-            if reinit:
-                self.net.initialize()
-                self.t_ind = 0
+        # Add the connection to the synapse specification
+        self.synapse_spec.setdefault(
+            (source_pop.name, target_pop.name, synapse, pre_var), []
+        ).append(
+            (
+                source_idx,
+                target_idx,
+                threshold,
+                n_threshold,
+                to_param(weight, positive=True),
+                n_weight,
+                to_param(delay, positive=True),
+                n_delay,
+            )
+        )
 
-            if callbacks is not None:
-                for callback in callbacks:
-                    callback.dt = dt
+    def connect_one_to_one(
+        self,
+        source,
+        target,
+        synapse,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+    ):
+        """
+        Connect source to target one-to-one.
 
-            if not isinstance(callbacks, CallbackList):
-                callbacks = CallbackList(callbacks)
+        Each selected source element connects to exactly one selected target
+        element (pairwise). The target locations must already host the given
+        synapse mechanism.
 
-            callbacks.pre_loop_hook(self)
+        Parameters
+        ----------
+        source : Population | NetStim | PopulationSlice | NetStimSlice
+            Source population (or a slice produced via source[...]).
+            If a Population/NetStim is passed, it is converted to source[:].
+        target : Population | PopulationSlice
+            Target population (or a slice via target[...]). Converted to target[:]
+            if a Population is passed.
+        synapse : object
+            Target-side synapse mechanism attached to the target population. It
+            must be present at all target locations selected by `target`.
+        threshold : float | torch.Tensor | torch.nn.Module, optional
+            Spike threshold(s) for the pre-synaptic units. A scalar applies to
+            all connections. A length-N tensor/module output provides one value
+            per pre-synaptic unit. Default is 0.0.
+        weight : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic weight(s). A scalar applies to all connections. A tensor of
+            length N (number of pre-synaptic indices) supplies per-connection
+            weights. A torch.nn.Module is expected to implement .sample(N).
+            Default is 1.0.
+        delay : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic delay(s) in ms. Same broadcasting rules as `weight`.
+            Default is 0.0.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the synapse is not present at all specified target locations, or
+            if provided tensors have incompatible shapes with the selected
+            indices.
+
+        Notes
+        -----
+        - The number of selected source elements must match the number of
+          selected target elements for a one-to-one mapping.
+        - The connection specifications are queued and materialized during
+          build()/initialize().
+
+        Examples
+        --------
+        >>> net.connect_one_to_one(pop_pre, pop_post, pop_post.mech.syn)
+        """
+        if isinstance(source, Population) or isinstance(source, NetStim):
+            source = source[:]  # Ensure source is a slice if it's a Population
+        if isinstance(target, Population):
+            target = target[:]  # Ensure target is a slice if it's a Population
+        # every target compartment receives input from exactly one source compartment
+        # 1. validate that the synapse exists at all the target locations
+        pre_idx, post_idx = prepare_indices_one_one(source, target, synapse)
+
+        if threshold is None:
+            threshold = torch.nan
+
+        self._connect(
+            source.model,
+            pre_idx,
+            target.model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
+            pre_var,
+        )
+
+    def connect_dense(
+        self,
+        source,
+        target,
+        synapse,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+        auto_expand=False,
+    ):
+        """
+        Connect source to target densely (all-to-all between selections).
+
+        Every selected target element receives input from every selected source
+        element. Target locations must already host the given synapse mechanism.
+
+        Parameters
+        ----------
+        source : Population | NetStim | PopulationSlice | NetStimSlice
+            Source population (or a slice produced via source[...]). If a
+            Population/NetStim is passed, it is converted to source[:].
+        target : Population | PopulationSlice
+            Target population (or a slice via target[...]). Converted to target[:]
+            if a Population is passed.
+        synapse : object
+            Target-side synapse mechanism attached to the target population.
+        threshold : float | torch.Tensor | torch.nn.Module, optional
+            Spike threshold(s) for the pre-synaptic units. See connect_one_to_one
+            for broadcasting rules. Default is 0.0.
+        weight : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic weight(s). See connect_one_to_one for broadcasting rules.
+            Default is 1.0.
+        delay : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic delay(s) in ms. See connect_one_to_one for broadcasting
+            rules. Default is 0.0.
+        pre_var : str, optional
+            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
+            for triggering synaptic events. Default is None (use voltage / spikes).
+        auto_expand : bool, optional
+            If True, automatically expand scalar/tensor weights & delays to the full
+            number of connections. If False, the weight & delays tensors must match the
+            number of pre-synaptic indices or be a scalar. Default is False.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the synapse is not present at some target locations, or if
+            provided tensors have incompatible shapes.
+
+        Notes
+        -----
+        - Forms a complete bipartite connectivity between the selected pre and
+          post indices (all pairs).
+        - Connection specs are queued and built during build()/initialize().
+
+        Examples
+        --------
+        >>> net.connect_dense(pop_pre[:], pop_post[:], pop_post.mech.syn)
+        """
+        if isinstance(source, Population) or isinstance(source, NetStim):
+            source = source[:]  # Ensure source is a slice if it's a Population
+        if isinstance(target, Population):
+            target = target[:]  # Ensure target is a slice if it's a Population
+
+        if threshold is None:
+            threshold = torch.nan
+
+        # every target compartment receives input from every source compartment
+        source_model = source.model
+        target_model = target.model
+        pre_idx = to_flat_idx_torch(
+            source_model.shape, source.index, source_model.device()
+        )
+        post_idx = to_flat_idx_torch(
+            target_model.shape, target.index, target_model.device()
+        )
+
+        # 1. Get the original number of elements
+        num_pre = pre_idx.numel()
+        num_post = post_idx.numel()
+
+        # 2. Expand the first tensor to repeat its elements
+        # Shape becomes [3, 1] -> [3, 4] -> [12]
+        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
+
+        # 3. Expand the second tensor to repeat the whole sequence
+        # Shape becomes [1, 4] -> [3, 4] -> [12]
+        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
+
+        pre_idx, post_idx = prepare_indices_one_one_flat(
+            source_model, pre_idx, target_model, post_idx, synapse
+        )
+
+        if auto_expand:
+            n_connections = len(pre_idx)
+            threshold = expand(threshold, n_connections)
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
+        # now connect
+        self._connect(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
+            pre_var,
+        )
+
+    def connect_prob(
+        self,
+        source,
+        target,
+        synapse,
+        prob: float,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+        auto_expand=False,
+    ):
+        """
+        Connect source to target sparsely via Bernoulli sampling over all pairs.
+
+        Starting from the dense all-to-all candidate set between `source` and
+        `target`, keep each candidate connection independently with probability
+        `prob`. Target locations must already host the given synapse mechanism.
+
+        Parameters
+        ----------
+        source : Population | NetStim | PopulationSlice | NetStimSlice
+            Source selection; converted to source[:] if a full Population/NetStim
+            is provided.
+        target : Population | PopulationSlice
+            Target selection; converted to target[:] if a full Population.
+        synapse : object
+            Target-side synapse mechanism attached to the target population.
+        prob : float
+            Independent probability (0 ≤ prob ≤ 1) of keeping each candidate
+            pre-post pair.
+        threshold : float | torch.Tensor | torch.nn.Module, optional
+            Spike threshold(s); broadcasting as in connect_one_to_one.
+        weight : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic weight(s); broadcasting as in connect_one_to_one.
+        delay : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic delay(s); broadcasting as in connect_one_to_one.
+        pre_var : str, optional
+            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
+            for triggering synaptic events. Default is None (use voltage / spikes).
+        auto_expand : bool, optional
+            If True, automatically expand scalar/tensor weights & delays to the full
+            number of connections. If False, the weight & delays tensors must match the
+            number of pre-synaptic indices or be a scalar. Default is False.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the synapse is not present at some target locations, or if
+            provided tensors have incompatible shapes.
+
+        Notes
+        -----
+        - If no connections are sampled, no specs are added (early return).
+        - Randomness comes from torch.rand on the source device.
+
+        Examples
+        --------
+        >>> net.connect_prob(pop_pre[:], pop_post[:], pop_post.mech.syn, prob=0.2)
+        """
+        if isinstance(source, Population) or isinstance(source, NetStim):
+            source = source[:]  # Ensure source is a slice if it's a Population
+        if isinstance(target, Population):
+            target = target[:]  # Ensure target is a slice if it's a Population
+
+        if threshold is None:
+            threshold = torch.nan
+
+        # every target compartment receives input from every source compartment
+        source_model = source.model
+        target_model = target.model
+        pre_idx = to_flat_idx_torch(
+            source_model.shape, source.index, source_model.device()
+        )
+        post_idx = to_flat_idx_torch(
+            target_model.shape, target.index, target_model.device()
+        )
+
+        # 1. Get the original number of elements
+        num_pre = pre_idx.numel()
+        num_post = post_idx.numel()
+
+        # 2. Expand the first tensor to repeat its elements
+        # Shape becomes [3, 1] -> [3, 4] -> [12]
+        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
+
+        # 3. Expand the second tensor to repeat the whole sequence
+        # Shape becomes [1, 4] -> [3, 4] -> [12]
+        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
+
+        # randomly select connections based on the probability
+        device = source_model.device()
+        mask = (
+            torch.rand(pre_idx.numel(), device=device, generator=self._rng(device))
+            < prob
+        )
+
+        if mask.sum() == 0:
+            # If no connections are selected, return early
+            return
+
+        pre_idx = pre_idx[mask]
+        post_idx = post_idx.to(device)[mask].to(target_model.device())
+
+        pre_idx, post_idx = prepare_indices_one_one_flat(
+            source_model, pre_idx, target_model, post_idx, synapse
+        )
+
+        if auto_expand:
+            n_connections = len(pre_idx)
+            threshold = expand(threshold, n_connections)
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
+        # now connect
+        self._connect(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
+            pre_var,
+        )
+
+    def connect_prob_n(
+        self,
+        source,
+        target,
+        synapse,
+        n: int,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+        auto_expand=False,
+    ):
+        """
+        Connect exactly n random pre-post pairs (without replacement).
+
+        From the dense all-to-all candidate set between `source` and `target`,
+        sample n unique pairs uniformly without replacement. Target locations
+        must already host the given synapse mechanism.
+
+        Parameters
+        ----------
+        source : Population | NetStim | PopulationSlice | NetStimSlice
+            Source selection; converted to source[:] if a full Population/NetStim
+            is provided.
+        target : Population | PopulationSlice
+            Target selection; converted to target[:] if a full Population.
+        synapse : object
+            Target-side synapse mechanism attached to the target population.
+        n : int
+            Number of connections to sample. If n <= 0, no connections are added.
+            If n exceeds the number of possible pairs, all pairs are selected.
+        threshold : float | torch.Tensor | torch.nn.Module, optional
+            Spike threshold(s); broadcasting as in connect_one_to_one.
+        weight : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic weight(s); broadcasting as in connect_one_to_one.
+        delay : float | torch.Tensor | torch.nn.Module, optional
+            Synaptic delay(s); broadcasting as in connect_one_to_one.
+        pre_var : str, optional
+            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
+            for triggering synaptic events. Default is None (use voltage / spikes).
+        auto_expand : bool, optional
+            If True, automatically expand scalar/tensor weights & delays to the full
+            number of connections. If False, the weight & delays tensors must match the
+            number of pre-synaptic indices or be a scalar. Default is False.
+
+        Returns
+        -------
+        None
+
+        Raises
+        ------
+        ValueError
+            If the synapse is not present at some target locations, or if
+            provided tensors have incompatible shapes.
+
+        Notes
+        -----
+        - Sampling uses torch.randperm on the source device.
+        - n is effectively clipped by the number of candidate pairs.
+
+        Examples
+        --------
+        >>> net.connect_prob_n(pop_pre[:], pop_post[:], pop_post.mech.syn, n=1000)
+        """
+
+        if n <= 0:
+            return
+        if isinstance(source, Population) or isinstance(source, NetStim):
+            source = source[:]
+        if isinstance(target, Population):
+            target = target[:]
+
+        if threshold is None:
+            threshold = torch.nan
+
+        # every target compartment receives input from every source compartment
+        source_model = source.model
+        target_model = target.model
+        pre_idx = to_flat_idx_torch(
+            source_model.shape, source.index, source_model.device()
+        )
+        post_idx = to_flat_idx_torch(
+            target_model.shape, target.index, target_model.device()
+        )
+
+        # 1. Get the original number of elements
+        num_pre = pre_idx.numel()
+        num_post = post_idx.numel()
+
+        # 2. Expand the first tensor to repeat its elements
+        # Shape becomes [3, 1] -> [3, 4] -> [12]
+        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
+
+        # 3. Expand the second tensor to repeat the whole sequence
+        # Shape becomes [1, 4] -> [3, 4] -> [12]
+        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
+
+        # randomly select connections based on the probability
+        device = source_model.device()
+        total_connections = pre_idx.numel()
+        mask = torch.randperm(
+            total_connections, device=device, generator=self._rng(device)
+        )[:n]
+
+        pre_idx = pre_idx[mask]
+        post_idx = post_idx.to(device)[mask].to(target_model.device())
+
+        pre_idx, post_idx = prepare_indices_one_one_flat(
+            source_model, pre_idx, target_model, post_idx, synapse
+        )
+
+        if auto_expand:
+            n_connections = len(pre_idx)
+            threshold = expand(threshold, n_connections)
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
+        # now connect
+        self._connect(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            threshold,
+            weight,
+            delay,
+            pre_var,
+        )
+
+    def build_synapses(self, dt, max_delay_ms=None):
+        """
+        Materialize queued connection specs into :class:`NetCon` modules.
+
+        Parameters
+        ----------
+        dt : float
+            Simulation timestep (ms) for delivery buffers.
+        max_delay_ms : float, optional
+            Optional ceiling on allowable synaptic delay; passed to NetCon.
+        """
+        for (pre_name, post_name, synapse, pre_var), specs in self.synapse_spec.items():
+            pre_var = (
+                pre_var
+                if pre_var is not None
+                else ("v" if pre_name != "netstim" else "spike")
+            )
+            pre = getattr(self, pre_name)
+            post = self.populations[post_name]
+            post_device = post.device()
+            post_dtype = post.dtype()
+            pre_idx = torch.cat([s[0] for s in specs])
+            post_idx = torch.cat([s[1] for s in specs])
+            thresholds = torch.cat([expand(s[2], s[3]) for s in specs])
+            weights = make_weight([s[4] for s in specs], [s[5] for s in specs])
+            delay = make_weight([s[6] for s in specs], [s[7] for s in specs])
+
+            syn = NetCon(
+                pre=pre,
+                pre_idx=pre_idx,
+                thresholds=thresholds,
+                post=post,
+                post_idx=post_idx,
+                post_syn=synapse,
+                weight=weights,
+                delay=delay,
+                dt=dt,
+                pre_var=pre_var,
+                max_delay=max_delay_ms,
+            ).to(device=post_device, dtype=post_dtype)
+
+            syn.setreference("t", lambda: self.t)
+
+            if self.training:
+                syn.train()
+            else:
+                syn.eval()
+
+            self.synapses[
+                f"{pre_name}:{pre_var.replace('.', '_')}->{post_name}:{synapse.name}"
+            ] = syn
+
+    def build(self, dt, max_delay_ms=None, force_rebuild=False):
+        """
+        Build synaptic modules for the current wiring spec.
+
+        Parameters
+        ----------
+        dt : float
+            Simulation timestep (ms) used for NetCon buffers.
+        max_delay_ms : float, optional
+            Maximum delay allowed for NetCons. Default is None (no cap).
+        force_rebuild : bool, optional
+            If True, rebuild even if dt has not changed. Default is False.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
+        """
+        current_sig = self._device_signature()
+        devices_changed = current_sig != getattr(self, "_device_sig", None)
+
+        if not self.built or self.dt != dt or force_rebuild or devices_changed:
+            torch._dynamo.reset()
+            self.dt = dt
+            self.build_synapses(dt, max_delay_ms=max_delay_ms)
+            self.built = True
+            self._device_sig = self._device_signature()
+        return self
+
+    def initialize(
+        self,
+        dt: float,
+        reinit_weights: bool = True,
+        reinit_delays: bool = True,
+        t=0.0,
+        max_delay_ms=None,
+        force_rebuild: bool = False,
+    ):
+        """
+        Initialize populations, synapses, and optional NetStim for simulation.
+
+        Parameters
+        ----------
+        dt : float
+            Simulation timestep (ms).
+        reinit_weights : bool, optional
+            Re-sample or reset synaptic weights. Default is True.
+        reinit_delays : bool, optional
+            Re-sample or reset synaptic delays. Default is True.
+        t : float, optional
+            Starting simulation time (ms). Default is 0.0.
+        max_delay_ms : float, optional
+            Maximum allowed synaptic delay. Default is None.
+        force_rebuild : bool, optional
+            If True, rebuild NetCons even if already built. Default is False.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
+        """
+        self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
+        self.t = self.t.detach()
+        self.t.fill_(t)
+        for pop in self.populations.values():
+            pop.t = pop.t.detach()
+            pop.t.fill_(t)
+        if self._state_cache:
+            self.initialize_pops_from_state_cache()
+            self.initialize_synapses_from_state_cache()
+            clear_deliveries = False
+        else:
+            clear_deliveries = True
+
+        dt_f = float(dt)
+        for pop in self.populations.values():
+            if not self._state_cache:
+                pop.initialize()
+            dt_pop = torch.tensor(dt_f, device=pop.device(), dtype=pop.dtype())
+            pop.integrator._initialize(pop, dt_pop)
+            pop.intra = pop.build_intra()
+        self.init_synapses(
+            reinit_weights=reinit_weights,
+            reinit_delays=reinit_delays,
+            clear_deliveries=clear_deliveries,
+        )
+        if self.netstim is not None:
+            self.netstim.initialize()
+            self.netstim.detach()
+        return self
+
+    def initialize_pops_from_state_cache(self):
+        for name, pop in self.populations.items():
+            pop.load_state_dict(self._state_cache[name])
+            pop.detach()
+
+    def initialize_synapses_from_state_cache(self):
+        for name, syn in self.synapses.items():
+            old_dt, has_spiked, is_spiking, delivery_buffer = self._syn_cache[name]
+            n_limit = syn.delivery_buffer.shape[0]
+            delivery_buffer = dilate(
+                delivery_buffer, float(old_dt), float(self.dt), n_limit=n_limit
+            )
+            if not syn.skip_thresholding:
+                syn.has_spiked = (has_spiked).detach()
+                syn.is_spiking = (is_spiking).detach()
+            syn.delivery_buffer = delivery_buffer.clone().detach()
+
+    def initialize_(self, *args, **kwargs):
+        """In-place variant of :meth:`initialize` that returns ``None``."""
+        self.initialize(*args, **kwargs)
+
+    def init_synapses(
+        self,
+        reinit_weights: bool = True,
+        reinit_delays: bool = True,
+        clear_deliveries: bool = True,
+    ):
+        """
+        Initialize all built synapses (NetCons).
+
+        Parameters
+        ----------
+        reinit_weights : bool, optional
+            If True, re-sample/reset weight parameters. Default is True.
+        reinit_delays : bool, optional
+            If True, re-sample/reset delay parameters. Default is True.
+        clear_deliveries : bool, optional
+            If True, zero the delivery buffers. Default is True.
+        """
+        for syn in self.synapses.values():
+            syn.initialize(
+                reinit_weights=reinit_weights,
+                reinit_delays=reinit_delays,
+                clear_deliveries=clear_deliveries,
+            )
+
+    def run(self, tstop, ve=None, callbacks=None, progressbar=False):
+        """
+        Advance the network for a fixed duration.
+
+        Parameters
+        ----------
+        tstop : float
+            Total simulation time (ms) to advance from current ``self.t``.
+        ve : dict[str, tuple[torch.Tensor, object]], optional
+            Optional mapping of population name to extracellular stimulus tuple
+            ``(v, t)`` where ``t`` is assembled against the current time; values
+            are moved to the network device/dtype.
+        callbacks : list[Callback], optional
+            Callbacks invoked each step (wrapped in :class:`CallbackList`).
+        progressbar : bool or tqdm.tqdm, optional
+            If truthy, show a progress bar (auto-created if True). Default False.
+
+        Returns
+        -------
+        None
+        """
+        dt_f = float(self.dt)
+        dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
+
+        ctx = nullcontext() if self.training else torch.no_grad()
+
+        intra = {}
+        for n, p in self.populations.items():
+            if p.intra is not None:
+                intra[n] = p.intra
+
+        ve = ve if ve is not None else {}
+        ve_prepped = {}
+        for n, (v, t) in ve.items():
+            pop = self.populations[n]
+            dev, dtp = pop.device(), pop.dtype()
+            v_dev = v.to(device=dev, dtype=dtp)
+            t_dev = t.to(device=dev, dtype=dtp)
+            t0 = self.t.to(device=dev, dtype=dtp)
+            dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
+            t1 = t0 + torch.tensor(tstop, device=dev, dtype=dtp)
+            ve_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
+        ve = ve_prepped
+
+        with_intra = bool(intra)
+        with_ve = bool(ve)
+
+        tstart = self.t.item()
+
+        with ctx:
+            n_steps = int(tstop / self.dt)
+
+            if with_intra:
+                intra = {
+                    n: (intra_, *self.populations[n].prep_intra(intra_, n_steps, dt_f))
+                    for n, intra_ in intra.items()
+                }
+
+            if callbacks is None:
+                callbacks = []
+            for c in callbacks:
+                c.dt = self.dt
+            callbacks = CallbackList(callbacks)
+            pre_loop_hook(callbacks, self)
 
             if progressbar:
-                progressbar = tqdm(total=n_steps, desc=f"{self.t:.3f} ms")
+                if not isinstance(progressbar, tqdm):
+                    progressbar = tqdm(total=n_steps, desc=f"{tstart:.1f} ms")
+
+            local_ind = 0
 
             for _ in range(n_steps):
-                self.step()
-                callbacks.post_step_hook(self)
-                self.t_ind += 1
+                intra_c = {}
+                ve_c = {}
+
+                if with_intra:
+                    intra_c = prepare_intra(intra_c, intra, local_ind)
+
+                if with_ve:
+                    ve_c = prepare_ve(ve, local_ind)
+
+                self._step(
+                    self.populations,
+                    self.synapses,
+                    self.netstim,
+                    self.t,
+                    dt_f,
+                    ve=ve_c,
+                    intra=intra_c,
+                )
+                self.t = self.t + dt_t
+                post_step_hook(callbacks, self)
+                local_ind += 1
 
                 if progressbar:
                     progressbar.update(1)
-                    if self.t_ind % 100 == 0:
-                        progressbar.set_description(f"{self.t:.3f} ms")
+                    if local_ind % 100 == 0:
+                        progressbar.set_description(
+                            f"{tstart + local_ind * dt_f:.1f} ms"
+                        )
 
             if progressbar:
                 progressbar.close()
-            
-            callbacks.post_loop_hook(self)
 
+            post_loop_hook(callbacks, self)
 
-def build_network(
-    populations,
-    connections,
-    dt,
-    N=1,
-    P=1,
-    max_delay=None,
-    threshold=0.0,
-    intrinsic=None,
-):
-    n = {
-        pop.name: pop.n for pop in populations
-    }
+    def batch(self, n, include_netstim=True):
+        """
+        Create a batched version of the network by tiling populations n times.
 
-    if not isinstance(threshold, dict):
-        threshold = {pop.name: threshold for pop in populations}
+        Parameters
+        ----------
+        n : int
+            Batch size (number of replicas).
+        include_netstim : bool, optional
+            If False, do not batch NetStim even if present. Default True.
 
-    check_active = {
-        pop.name: CheckActive(N, P, pop.n, threshold[pop.name]) for pop in populations
-    }
+        Returns
+        -------
+        Network
+            Self, with populations and NetCons batched.
+        """
+        _synapse_spec = self.synapse_spec.copy()
+        self.clear_synapses()
+        _old_shapes = {}
+        for name, p in self.populations.items():
+            _old_shapes[name] = p.shape
+            device = p.device()
+            p.batch(n)
+            p.build(force_rebuild=True)
+            p.to(device)
+        if include_netstim and self.netstim is not None:
+            _old_shapes["netstim"] = self.netstim.shape
+            self.netstim.batch(n)
+        for k, v in _synapse_spec.items():
+            source_name, target_name, synapse = k
+            source_pop = getattr(self, source_name)
+            target_pop = getattr(self, target_name)
+            synapse = getattr(target_pop.mech, synapse.name)
+            for data in v:
+                source_idx, target_idx = data[0], data[1]
+                threshold, weight, delay = data[2], data[4], data[6]
+                if source_name == "netstim" and not include_netstim:
+                    new_source_idx = source_idx.repeat(n)
+                else:
+                    new_source_idx = batchify_index(
+                        _old_shapes[source_name], n, source_idx
+                    )
+                new_target_idx = batchify_index(_old_shapes[target_name], n, target_idx)
+                self._connect(
+                    source_pop,
+                    new_source_idx,
+                    target_pop,
+                    new_target_idx,
+                    synapse,
+                    threshold,
+                    weight,
+                    delay,
+                )
+        self.built = False
+        self.is_batched = True
+        gc.collect()
+        return self
 
-    synapse_data = blocks_by_projection(connections, n, dt, max_delay)
+    def batch_(self, n, include_netstim=True):
+        """In-place variant of :meth:`batch` that returns ``None``."""
+        self.batch(n, include_netstim=include_netstim)
 
-    synapses = {}
+    def concat(self, **kwargs):
+        """
+        Concatenates populations to solve with fewer kernel launches.
+        All connections are preserved.
 
-    for name, (W, D) in synapse_data.items():
-        M = (W != 0).float()
-        W = torch.tile(W, (N, 1, 1))  # (N, n_pre, n_post)
-        D = torch.tile(D, (N, 1, 1))  # (N, n_pre, n_post)
-        M = torch.tile(M, (N, 1, 1))  # (N, n_pre, n_post)
-        synapses[name] = VariableDelaySynapse(
-            W=W,
-            M=M,
-            D=D,
-            P=P,
-            dt=dt,
+        Parameters
+        ----------
+        **kwargs : dict
+            Populations to concatenate, where keys are the new population names
+            and values are lists of population names to concatenate. If no
+            populations are specified, all populations will be concatenated into
+            'all_populations'.
+
+        Returns
+        -------
+        Network
+            A new network with the concatenated populations.
+
+        Examples
+        --------
+        >>> net = Network(...)
+        >>> print(list(net.populations.keys()))
+        ['exc1', 'exc2', 'inh']
+        >>> net0 = net.concat()
+        >>> print(list(net0.populations.keys()))
+        ['all_populations']
+        >>> net1 = net.concat(all=['exc1', 'exc2', 'inh'])
+        >>> print(list(net1.populations.keys()))
+        ['all']
+        >>> net2 = net.concat(exc=['exc1', 'exc2'])
+        >>> print(list(net2.populations.keys()))
+        ['exc', 'inh']
+        """
+        if not kwargs:
+            return self._concat("all_populations")
+        net = self
+        for name, pops_to_concatenate in kwargs.items():
+            net = net._concat(name, pops_to_concatenate)
+        return net
+
+    def _concat(self, name, pops_to_concatenate=None, threads=16):
+        if pops_to_concatenate is None:
+            pops_to_concatenate = []
+        already_used = [
+            n for n in self.populations.keys() if n not in pops_to_concatenate
+        ]
+        if name in already_used:
+            raise ValueError(f"Population '{name}' is already in use.")
+        if self.is_batched:
+            raise ValueError("Cannot concatenate populations in a batched network.")
+        if not pops_to_concatenate:
+            pops_to_concatenate = list(self.populations.keys())
+
+        concat_pops = {n: self.populations[n] for n in pops_to_concatenate}
+        p_type = type(self.populations[pops_to_concatenate[0]])
+        assert all(type(self.populations[n]) is p_type for n in pops_to_concatenate), (
+            "All populations must be of the same type."
         )
+        celsius = _last_celsius(concat_pops).item()
+        concatenated = concat(concat_pops, threads=threads, celsius=celsius)
+        new_populations = {
+            n: p for n, p in self.populations.items() if n not in pops_to_concatenate
+        }
+        new_populations[name] = concatenated
+        new_net = Network(new_populations, netstim=self.netstim)
 
-    intrinsic_ = {}
+        all_indices = indices(concat_pops)
+        all_indices = {n: i.flatten() for n, i in zip(pops_to_concatenate, all_indices)}
 
-    if intrinsic is not None:
-        for name, (r, w) in intrinsic.items():
-            intrinsic_[name] = Intrinsic(N, P, n[name], dt, r, w)
+        # now reapply connections
+        for k, v in self.synapse_spec.items():
+            source_name, target_name, synapse = k
+            if (source_pop := new_net.populations.get(name)) is None:
+                source_pop = getattr(new_net, source_name)
+            if (target_pop := new_net.populations.get(name)) is None:
+                target_pop = getattr(new_net, target_name)
+            synapse = getattr(target_pop.mech, synapse.name)
 
-    for name in n:
-        if name not in intrinsic_:
-            intrinsic_[name] = IntrinsicStimOnly(N, P, n[name], dt)
+            for data in v:
+                source_idx, target_idx = data[0], data[1]
+                threshold, weight, delay = data[2], data[4], data[6]
 
-    populations = {pop.name: pop.build(N, P) for pop in populations}
+                if source_name in pops_to_concatenate:
+                    source_idx = all_indices[source_name][source_idx]
+                if target_name in pops_to_concatenate:
+                    target_idx = all_indices[target_name][target_idx]
 
-    tw, no_act = total_weights(populations, connections, intrinsic_)
+                new_net._connect(
+                    source_pop,
+                    source_idx,
+                    target_pop,
+                    target_idx,
+                    synapse,
+                    threshold,
+                    weight,
+                    delay,
+                )
 
-    forward = template.format(
-        advance_v=advance_v(populations),
-        compute_spikes=compute_spikes(populations),
-        compute_weights=compute_weights(connections),
-        total_weights=tw,
-        net_receive=net_receive(populations, no_act),
-        synapses_init=synapses_init(synapses),
-        intrinsic_init=initrinsic_init(intrinsic),
-        check_active_init=check_active_init(populations),
-        init_v=init_v(populations),
-        init_integrator=init_integrator(populations),
-        init_mech=init_mech(populations),
-    )
+        return new_net
 
-    if DEBUG: print(forward)
+    def steady_state(self, tstop=1000, dt=0.025, progressbar=False):
+        """
+        Run the network until it reaches a steady state.
 
-    # Create the network class
-    filename = f"<_network_template>"
-    code = compile(forward, filename, "exec")
-    exec(code)
+        Parameters
+        ----------
+        tstop : float, optional
+            Total time to run the network in ms. Default is 1000 ms.
+        dt : float, optional
+            Time step in ms. Default is 0.025 ms.
 
-    lines = [line + "\n" for line in forward.splitlines()]
-    linecache.cache[filename] = (len(forward), None, lines, filename)
+        Returns
+        -------
+        Network
+            The network after running to steady state.
+        """
+        self.clear_state_cache()
+        was_training = self.training
+        with torch.no_grad():
+            if self.netstim is not None:
+                self.netstim._prep_start_for_steady_state(tstop)
+            self.eval()
+            self.initialize(dt, t=-tstop, force_rebuild=True)
+            self.run(tstop, progressbar=progressbar)
+            if self.netstim is not None:
+                self.netstim._reset_start_times()
+            self.cache_state()
+        if was_training:
+            self.train()
+        return self
 
-    n = locals()["_network"](
-        populations, synapses, check_active, intrinsic_, dt
-    )
+    def cache_state(self):
+        self._state_cache.clear()
+        self._syn_cache.clear()
+        for name, pop in self.populations.items():
+            self._state_cache[name] = pop.state_dict()
+        for name, syn in self.synapses.items():
+            self._syn_cache[name] = (
+                syn.dt,
+                syn.has_spiked.clone(),
+                syn.is_spiking.clone(),
+                torch.roll(
+                    syn.delivery_buffer, -syn.current_time_step.item(), dims=0
+                ).clone(),
+            )
 
-    net = Network(n)
+    def clear_state_cache(self):
+        self._state_cache.clear()
+        self._syn_cache.clear()
 
-    return net
+    def set_synaptic_diff_config(self, **kwargs):
+        for syn in self.synapses.values():
+            syn.set_diff_config(**kwargs)
+
+    # utilities
+    def concatenated_weights(self):
+        """
+        Returns the concatenated weights of all synapses.
+        """
+        return torch.cat([syn.w.flatten() for syn in self.synapses.values()])
+
+    def weights(self):
+        """
+        Returns the weights of all synapses as a dictionary.
+        """
+        return {name: syn.w for name, syn in self.synapses.items()}
+
+    def weight_modules(self):
+        """
+        Returns the weight modules of all synapses as a dictionary.
+        """
+        return {name: syn.weight for name, syn in self.synapses.items()}
+
+
+def prepare_intra(intra_c, intra, local_ind):
+    """
+    Prepares the intra-cellular data for the current step.
+    """
+    for n, (intra_, stims, indexes) in intra.items():
+        s = [st[local_ind] for st in stims]
+        intra_c[n] = make_intra(intra_, s, indexes)
+    return intra_c
+
+
+@torch.compile
+def prepare_ve(ve, local_ind: int):
+    """
+    Prepares the voltage and time data for the current step.
+    """
+    return {n: v * t[local_ind] for n, (v, t) in ve.items()}
+
+
+# callback helpers
+def pre_loop_hook(c, m):
+    c.pre_loop_hook(m)
+
+
+def post_loop_hook(c, m):
+    c.post_loop_hook(m)
+
+
+def pre_step_hook(c, m):
+    c.pre_step_hook(m)
+
+
+@torch.compile
+def post_step_hook(c, m):
+    c.post_step_hook(m)
+
+
+def pre_chunk_hook(c, m, n):
+    c.pre_chunk_hook(m, n)
+
+
+def post_chunk_hook(c, m, n):
+    c.post_chunk_hook(m, n)

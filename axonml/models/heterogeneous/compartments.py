@@ -1,8 +1,8 @@
-from typing import Callable, List
 import re
+from typing import List
 
-import torch
 import numpy as np
+import torch
 
 
 class CompartmentID:

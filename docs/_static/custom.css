@@ -10,3 +10,28 @@
 body {
     font-family: var(--pst-font-family-sans-serif);
 }
+
+/* Fix MyST-NB code cells for Shibuya dark mode */
+
+/* Give MyST-NB input/output cells a sane dark background */
+html.dark .cell_input pre,
+html.dark .cell_input div.highlight,
+html.dark .cell_output .output,
+html.dark .cell_output .output pre,
+html.dark .cell_output div.highlight {
+  background-color: #111827 !important;  /* dark slate */
+  color: #e5e7eb !important;             /* light gray text */
+}
+
+/* Optional: soften the container background so there isn’t a light strip */
+html.dark div.cell,
+html.dark .cell_input,
+html.dark .cell_output {
+  background-color: transparent;
+  border-color: var(--sy-c-border, #374151);
+}
+
+/* Ensure inline code inside cells inherits readable color */
+html.dark .cell code {
+  color: inherit;
+}

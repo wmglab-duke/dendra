@@ -1,6 +1,0 @@
-h5py
-numpy
-pytorch_optimizer
-tqdm
-natsort
-dask

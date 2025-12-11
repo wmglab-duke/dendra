@@ -1,3 +1,4 @@
-from .intrastim import IntraStim
-from .synapse import ExpSyn, Exp2Syn
-from .netstim import NetStim
+from .intra import Intra
+from .waveform import *
+
+__all__ = ["Intra", "Waveform"]

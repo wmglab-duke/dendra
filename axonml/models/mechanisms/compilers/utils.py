@@ -1,8 +1,9 @@
-import re
 import inspect
-import string
 import random
+import re
+import string
 import textwrap
+
 
 def multiply_return_value(code_string, multiplier_expr: str) -> str:
     """

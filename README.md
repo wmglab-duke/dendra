@@ -1,163 +1,95 @@
 <div align="center">
-  <img src="docs/banner2.png">
+  <img src="docs/_static/logo-light.png">
 </div>
 
 ***
-Fast and scalable neural fiber simulator. Implement and train high-throughput GPU-compatible models.
 
-## ❗Requirements
+[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style-plastic&logo=PyTorch&logoColor=white)](https://pytorch.com)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/downloads/)
+[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-### Hardware requirements
-`axonml` requires a standard computer with an NVIDIA GPU (we ran all our simulations using an RTX A5000) and enough RAM to support the in-memory operations (loading data for training, constructing input voltage arrays, etc.).
+Fast, scalable, and differentiable neural simulator with support for extracellular fields. Useful to implement and train high-throughput GPU-compatible models.
+
+## Documentation
+Full documentation is available at [https://mah148.pages.oit.duke.edu/axonml](https://mah148.pages.oit.duke.edu/axonml).
+
+## Requirements
 
 ### OS requirements
 `axonml` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).
 
 ### Python dependencies
-`axonml` requires Python 3.11+ and PyTorch 2.0+ with GPU support (tested with PyTorch 2.5.0+ & CUDA 12.4).
-
+`axonml` requires Python 3.10+ and PyTorch 2.7+. For GPU support, CUDA 12.9+ is required for best performance.
 
 ## 🖥️ Installation
 
 > [!TIP]
-> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.11`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
+> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.12`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
 
-1. Clone this repository.
+1. Install PyTorch (+ CUDA 12.9 if you're running on GPU).
+```bash
+> pip install torch --index-url https://download.pytorch.org/whl/cu129
+```
+
+2. Clone this repository.
 
 ```bash
 > git clone https://gitlab.oit.duke.edu/mah148/axonml.git
 ```
 
-2. Install.
+3. Install.
 
 ```bash
 > cd axonml
 > python -m pip install .
 ```
-- To install in development mode:
-    - `python -m pip install --editable .`
-
-- You can also install with jupyter support:
-    - `python -m pip install '.[jupyter]'`
 
 - If you want to build and run the documentation locally:
     - `python -m pip install '.[doc]'`
 
-🥳 You're all set! 
+### ⚙️ Installing for development
+- Install `--editable` with dev dependencies & install `pre-commit`:
+    - `python -m pip install --editable '.[dev]'`
+    - `python -m pre-commit install`
+
+
+🥳 You're all set!
 
 > [!NOTE]
 > Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive space.
 
 > [!IMPORTANT]
-> The [`cajal`](https://github.com/minhajh/cajal) package is required to run some of the provided examples - to execute NEURON simulations, run the data generation script, and perform stimulus optimization (using Differential Evolution[^1] or Gradient Descent) for selective activation. Follow the installation instructions [in that repository](https://github.com/minhajh/cajal) (however do not create a separate `conda` environment for `cajal` - install all dependencies into `axonml`).
+> To enable implicit methods for solving $V_m$ **on CPU**, install [axonml-solvers](https://gitlab.oit.duke.edu/mah148/axonml-solvers). GPU implementations of all solvers are available by default.
 
-## 🗄️ Loading a model
-Trained `axonml.models.Axon` models can be loaded using the `load` method. We have included a trained version of the MRG fiber (the 'surrogate myelinated fiber', S-MF, pronounced 'smurf'):
+## 🗄️ Pre-implemented models
 
-```python
-# import surrogate myelinated fiber class
-from axonml.models import SMF
+Cell models are available at https://gitlab.oit.duke.edu/mah148/axonml-models.
 
-# instantiate model and load pre-trained parameters
-mrg = SMF().cuda().load('MRG')
 
-# ... use mrg for thresholding, modeling, stimulus optimization, etc.
+## 🔍 Citation
+
+Geometric / topological surrogates and gradient-based design of neurostimulation are discussed in, and `AxonML` is introduced in
+
+Minhaj A. Hussain, Warren M. Grill, Nicole A. Pelot. "Highly efficient modeling and optimization of neural fiber responses to electrical stimulation." *Nature Communications.* 2024. [(nature.com)](https://www.nature.com/articles/s41467-024-51709-8)
+
+```
+@article{hussain_highly_2024,
+    title = {Highly efficient modeling and optimization of neural fiber responses to electrical stimulation},
+    doi = {10.1038/s41467-024-51709-8},
+    journal = {Nature Communications},
+    author = {Hussain, Minhaj A. and Grill, Warren M. and Pelot, Nicole A.},
+    year = {2024}
+}
 ```
 
-To load from checkpoints generated by `train.py`:
+AxonML v2, adding support for branched morphologies, multiple layers of extracellular field, and network simulations, is described in...(paper forthcoming).
 
-```python
-# import pytorch
-import torch
-
-# import surrogate myelinated fiber class
-from axonml.models import SMF
-
-# load checkpoint
-checkpoint_path = '/path/to/checkpoint'
-checkpoint_params = torch.load(checkpoint_path)['model_state_dict']
-
-# instantiate model and load trained parameters
-mrg = SMF().cuda().load(checkpoint_params)
-
-... etc.
-```
-
-## 🤖 Running simulations
-
-You need to supply an extracellular potential boundary condition to run simulations. This must be a `torch.Tensor` of shape `(n_timesteps, n_axons, 1, n_comps)`; for example, if your goal is to simulate the response of 50 axons each with 51 nodes of Ranvier to extracellular stimulation over 5 ms with a timestep of 0.005 ms, the input `ve` should be shape `(1000, 50, 1, 51)`. `ve[100, 0, 0, 4]` is then $V_e$ in mV at node 5 for the 1st axon you're simulating at time t=0.5 ms.
-
-You must also specify the diameters of the fibers being simulated; this must be a 1D `torch.Tensor` of shape `n_axons`.
-
-Optionally, you can supply an array representing intracellular current simulation (in mA), e.g. to simulate synaptic input; this must also be a `torch.Tensor` of shape `(n_timesteps, n_axons, 1, n_comps)`.
-
-You can specify `dt`; by default, this is 0.005 ms. You can also set `dt` globally using the Backend.
-
-You can then run simulations:
-
-```python
-# set dt globally
-from axonml import Backend as A
-A.dt = 0.001
-
-n_axons, n_comps = 50, 51
-ve = build_ve(50, 51)             # implement this function yourself
-intra = build_intra()             # or None
-diams = 5.7 * torch.ones(n_axons) # we're simulating 5.7 um fibers
-
-model.run(ve=ve, diameters=diams, intra=intra)
-```
-
-You can continue running from where you left off, e.g. run without any extracellular stim for a further 1 ms:
-
-```python
-ve = torch.zeros(1000, n_axons, 1, n_comps)
-model.run(ve, diameters=diams)
-```
-
-or you can reinitialize and run from steady-state:
-```python
-ve = torch.zeros(1000, n_axons, 1, n_comps)
-model.run(ve, diameters=diams, reinit=True)
-```
-
-### Callbacks
-To extract information from these simulations, use `Callback`s. We have implemented `Recorder`, `Active`, `APCount`, and `Raster`.
-
-**`Recorder`** records the system state at every timestep of simulation:
-```python
-from axonml.models.callbacks import Recorder
-rec = Recorder()
-model.run(ve, diams, callbacks=[rec])
-
-record = rec.stack()
-```
-
-**`Active`** checks if any action potentials have occurred. You can specify threshold (by default 0 mV), time after which to start checking for activation (by default 0 ms), and node indices to monitor (by default [5, -5]). For example, to check if any APs exceeding $V_m$ = 20 mV arrived 10 internodal lengths from the proximal end of each fiber at least 5 ms after t=0 ms :
-```python
-from axonml.models.callbacks import Active
-
-active = Active(threshold=20.0, t_start_check=5, node_check=[10])
-model.run(ve, diams, callbacks=[active])
-print(active.record)
-```
-
-**APCount** counts the number of action potentials and **Raster** records when they occurred. For both of these, you can also specify threshold (by default 0 mV), time after which to start checking (by default 0 ms), and node indices to monitor (by default [5, -5]).
-
-You can use multiple callbacks at once.
-
-## 🌍 Other functionality
-Further instructions and examples of how to estimate thresholds, perform selective stimulus parameter optimization, and run other simulations can be found in `./examples`.
 
 ## 📜 License
 The copyrights of this software are owned by Duke University. As such, it is offered under a custom license (see LICENSE.md) whereby:
 
-1. DUKE grants YOU a royalty-free, non-transferable, non-exclusive, worldwide license under its copyright to use, reproduce, modify, publicly display, and perform the PROGRAM solely for non-commercial research and/or academic testing purposes.  
+1. DUKE grants YOU a royalty-free, non-transferable, non-exclusive, worldwide license under its copyright to use, reproduce, modify, publicly display, and perform the PROGRAM solely for non-commercial research and/or academic testing purposes.
 
 2. In order to obtain any further license rights, including the right to use the PROGRAM, any modifications or derivatives made by YOU, and/or PATENT RIGHTS for commercial purposes, (including using modifications as part of an industrially sponsored research project), YOU must contact DUKE’s Office for Translation and Commercialization (Digital Innovations Team) about additional commercial license agreements.
 
 Please note that this software is distributed AS IS, WITHOUT ANY WARRANTY; and without the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-
-[^1]: Storn, Rainer, and Kenneth Price. 1997. “Differential Evolution – A Simple and Efficient Heuristic for Global Optimization over Continuous Spaces.” Journal of Global Optimization 11 (4): 341–59. https://doi.org/10.1023/A:1008202821328.
-
-[^2]: McIntyre, Cameron C., Andrew G. Richardson, and Warren M. Grill. 2002. “Modeling the Excitability of Mammalian Nerve Fibers: Influence of Afterpotentials on the Recovery Cycle.” Journal of Neurophysiology 87 (2): 995–1006. https://doi.org/10.1152/jn.00353.2001.

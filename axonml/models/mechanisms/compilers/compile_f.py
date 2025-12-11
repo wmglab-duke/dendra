@@ -1,9 +1,9 @@
 import ast
-import textwrap
-import inspect
 import re
+import textwrap
 
 from ..ops import all_ops
+from .source import safe_source
 
 
 def transform_function(source: str, assign_return: bool = True) -> str:
@@ -171,7 +171,7 @@ def transform_function(source: str, assign_return: bool = True) -> str:
 
 
 def convert_func(f, assign_return=False, rename=None):
-    source = textwrap.dedent(inspect.getsource(f))
+    source = textwrap.dedent(safe_source(f))
     if rename is not None:
         source = source.replace(f.__name__, rename)
     return transform_function(source, assign_return)

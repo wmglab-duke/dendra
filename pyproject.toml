@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "axonml"
 version = "0.2"
+requires-python = ">=3.11"
+readme = "README.md"
 
 dynamic = ["dependencies"]
 
 [project.optional-dependencies]
-jupyter = ["jupyter"]
 doc = [
     "jupyter_contrib_nbextensions",
     "notebook <= 6.4.12",
@@ -27,7 +28,14 @@ doc = [
     "sphinx-math-dollar",
     "myst-nb",
     "jupytext",
-    "sphinx-book-theme",
+    "shibuya",
+]
+dev = [
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "hypothesis",
+    "pytest-xdist",
 ]
 
 [tool.setuptools.packages.find]

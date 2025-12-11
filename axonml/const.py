@@ -1,6 +1,7 @@
 """Constants."""
 
 import math
+
 import torch
 
 PI: torch.jit.Final[float] = math.pi
