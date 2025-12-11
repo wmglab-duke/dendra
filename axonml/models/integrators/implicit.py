@@ -236,7 +236,7 @@ class _bwd_euler_ub(Integrator):
             self.method = "thomas"
 
         if dev == "cuda":
-            # CUDA: always use your CUDA Thomas implementation
+            # CUDA: always use CUDA Thomas implementation
             self._solve = thomas_solve_cuda_t
         elif dev == "cpu":
             if AXONML_SOLVERS_AVAILABLE:

@@ -35,7 +35,7 @@ def undirected_weighted_lengths(G: nx.DiGraph, origin, targets, weight_attr="L")
     Parameters
     ----------
     G : nx.DiGraph
-        Your directed graph whose edges carry an attribute `weight_attr`
+        Directed graph whose edges carry an attribute `weight_attr`
         (e.g. "L").
     origin : node label
         The single source node.

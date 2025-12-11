@@ -48,7 +48,7 @@ from axonml.units import mm
 
 from .slice import Sliceable
 
-TensorLike = Union[torch.Tensor, "np.ndarray"]  # or narrower if you prefer
+TensorLike = Union[torch.Tensor, "np.ndarray"]  # torch or numpy are supported
 
 ExtraSpec = Union[
     Tuple[TensorLike, Union["Waveform", TensorLike]],

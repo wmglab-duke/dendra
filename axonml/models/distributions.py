@@ -108,7 +108,6 @@ class Normal(Distribution):
         """
         return self._dist.log_prob(value)
 
-    # convenient shorthand identical to your `sample(n)`
     def sample(self, n):
         """Draw ``n`` independent non-differentiable samples."""
         return self.rsample((n,))
@@ -213,7 +212,7 @@ class TruncatedNormal(Distribution):
         mask = (value < self.low) | (value > self.high)
         return torch.where(mask, torch.full_like(value, -math.inf), logp)
 
-    # alias for symmetry with your Normal
+    # alias for symmetry with Normal
     def sample(self, n):
         """Draw ``n`` independent non-differentiable samples."""
         return self.rsample((n,))

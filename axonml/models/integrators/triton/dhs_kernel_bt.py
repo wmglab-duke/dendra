@@ -310,6 +310,6 @@ class DHSBTSolve3(torch.autograd.Function):
 
 def dhs_bt_solve_cuda(D_blocks, G_vec, b, parent_idx, order, layer_ptr, threads=16):
     """Solve A x = b on a tree for 3-component unknowns (vi, ve0, ve1).
-    Inputs are expected in *solver order* (use your solver_order / inv_solver_order around this call).
+    Inputs are expected in *solver order* (use solver_order / inv_solver_order around this call).
     """
     return DHSBTSolve3.apply(D_blocks, G_vec, b, parent_idx, order, layer_ptr, threads)

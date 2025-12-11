@@ -8,7 +8,6 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # ---- Import the module under test -------------------------------------------------
-# Adjust this import to match your project layout if needed.
 import axonml.models.parametric as M
 
 # If the source file had a weird `import itertools` line, patch it here.
