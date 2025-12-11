@@ -128,6 +128,8 @@ class Waveform(SimpleParameterized):
         start: float = 0.0,
         noise: float = 1.0,
         off: float = torch.inf,
+        randomize_every_call: bool = False,
+        generator: Optional[torch.Generator] = None,
         **kwargs,
     ):
         """Return a Poisson-distributed copy of *this* waveform.
@@ -144,13 +146,27 @@ class Waveform(SimpleParameterized):
             Noise factor for interval variability. Default is 1.0.
         off : float, optional
             Time after which the waveform stops. Default is infinity.
+        randomize_every_call : bool, optional
+            If True, generates a new Poisson schedule on each call. Default is False.
+        generator : Optional[torch.Generator], optional
+            A PyTorch random number generator for reproducibility. Default is None.
 
         Returns
         -------
         _poisson
             A waveform that follows a Poisson distribution according to the specified parameters.
         """
-        return _poisson(self, interval, n, start, noise, off, **kwargs)
+        return _poisson(
+            self,
+            interval,
+            n,
+            start,
+            noise,
+            off,
+            randomize_every_call,
+            generator,
+            **kwargs,
+        )
 
     def assemble(self, start, end, dt):
         t = torch.arange(start, end, dt, device=self.device())
@@ -412,6 +428,7 @@ class _poisson(Waveform):
         start: float = 0.0,
         noise: float = 1.0,
         off: float = torch.inf,
+        randomize_every_call: bool = False,
         generator: Optional[torch.Generator] = None,
     ):
         super().__init__()  # <- no kwargs
@@ -421,14 +438,14 @@ class _poisson(Waveform):
         self.start = float(start)
         self.noise = float(noise)
         self.off = float(off)
+        self.randomize_every_call = bool(randomize_every_call)
+        self.generator = generator or torch.default_generator
         if np.isinf(self.off) and self.n is None:
             raise ValueError(
                 "Poisson schedule needs a finite `off` time or a finite `n` "
                 "(number of spikes) to terminate."
             )
-        self.register_buffer(
-            "_spike_times", self._make_schedule(generator or torch.default_generator)
-        )
+        self.register_buffer("_spike_times", self._make_schedule(self.generator))
 
     def reshape_for_intra(self):
         super().reshape_for_intra()
@@ -459,12 +476,19 @@ class _poisson(Waveform):
             times.append(torch.inf)
         return torch.tensor(times)
 
+    def regenerate_schedule_(self) -> None:
+        self._spike_times = self._make_schedule(self.generator)
+
     # ---------- core -----------------------------------------------------
     def fn(self, t: torch.Tensor) -> torch.Tensor:
         """
         Sum a copy of `waveform` at every scheduled spike time.
         Assumes the wrapped waveform returns 0 for t<0 or t>duration.
         """
+        if self.randomize_every_call:
+            self._spike_times = self._make_schedule(
+                self.generator
+            )  # re-generate on each call
         # broadcast: (#spikes, |t|)  – never moves _spike_times to CPU
         tt = t.unsqueeze(0) - self._spike_times.unsqueeze(-1)
         return self.waveform.fn(tt).sum(dim=0)
