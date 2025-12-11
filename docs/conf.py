@@ -78,11 +78,13 @@ myst_substitutions = {
 
 # The theme to use for HTML and HTML Help pages. See the documentation for
 # a list of builtin themes.
-#
+
 html_title = ""
-html_logo = "banner2.png"
+html_logo = "_static/logo-light.png"
 html_theme = "shibuya"
 html_theme_options = {
+    "light_logo": "logo-light.png",  # file is _static/logo-light.png
+    "dark_logo": "logo-dark.png",  # file is _static/logo-dark.png
     "repository_url": "https://gitlab.oit.duke.edu/mah148/axonml",
     "use_repository_button": True,
     "use_download_button": False,

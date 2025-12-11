@@ -40,15 +40,17 @@
 ## Optional extras
 
 - Jupyter support: `python -m pip install '.[jupyter]'`
+
+- CPU implicit solvers: install the companion package `axonml-solvers` (required only for CPU implicit methods; GPU solvers are included by default). Also required to build the documentation.
+
 - Documentation build dependencies: `python -m pip install '.[doc]'` then `cd docs && make html`
+
 - Development setup (editable install + lint/test tooling):
 
   ```sh
   python -m pip install --editable '.[dev]'
   python -m pre-commit install
   ```
-
-- CPU implicit solvers: install the companion package `axonml-solvers` (required only for CPU implicit methods; GPU solvers are included by default).
 
 - Library of models: install the companion package `axonml-models` for additional pre-defined neuron & network models.
 

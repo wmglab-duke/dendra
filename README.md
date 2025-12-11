@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/banner2.png">
+  <img src="docs/_static/logo-light.png">
 </div>
 
 ***
@@ -9,6 +9,9 @@
 [![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 Fast, scalable, and differentiable neural simulator with support for extracellular fields. Useful to implement and train high-throughput GPU-compatible models.
+
+## Documentation
+Full documentation is available at [https://mah148.pages.oit.duke.edu/axonml](https://mah148.pages.oit.duke.edu/axonml).
 
 ## Requirements
 
