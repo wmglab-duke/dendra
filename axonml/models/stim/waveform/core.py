@@ -418,6 +418,13 @@ class _poisson(Waveform):
             Δt = (1-noise)*interval + noise*Exp(...)
     off : float
         Do not schedule spikes at or beyond this time [ms].
+    randomize_every_call : bool
+        If True, generate a new Poisson schedule on each call to fn(t).
+        Otherwise, the schedule is generated once at init time and
+        re-used on every call.
+    generator : Optional[torch.Generator]
+        A PyTorch random number generator for reproducibility.
+        If None, the default generator is used.
     """
 
     def __init__(
