@@ -315,7 +315,7 @@ def dilate(
     idx = idx.clamp(0, n_limit - 1) if n_limit is not None else idx
 
     out_dtype = event_deliveries.dtype
-    # For boolean inputs, sum counts as integers (you can .bool() after if you want OR semantics)
+    # For boolean inputs, sum counts as integers (can .bool() after if you want OR semantics)
     if out_dtype == torch.bool:
         src = event_deliveries.to(torch.int64)
         out = torch.zeros((T_new, E), device=device, dtype=torch.int64)
