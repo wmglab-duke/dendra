@@ -5,13 +5,23 @@ import math
 import re
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
-from torch import Tensor
 from tqdm.auto import tqdm
 
 from axonml.helpers import (
@@ -23,7 +33,6 @@ from axonml.helpers import (
     JIT,
     op_mc,
     op_sc,
-    ve_from_s_t,
 )
 from axonml.models.backend import Backend as A
 from axonml.models.callbacks import Callback, CallbackList
@@ -38,6 +47,32 @@ from axonml.models.stim.waveform import Waveform
 from axonml.units import mm
 
 from .slice import Sliceable
+
+TensorLike = Union[torch.Tensor, "np.ndarray"]  # or narrower if you prefer
+
+ExtraSpec = Union[
+    Tuple[TensorLike, Union["Waveform", TensorLike]],
+    Sequence[Tuple[TensorLike, Union["Waveform", TensorLike]]],
+]
+
+
+@dataclass
+class _ExtraConfig:
+    enabled: bool
+    multicontact: bool
+    functional: bool
+    ve_s: Optional[torch.Tensor] = None  # [np, n_comp] or [n_contacts, np, n_comp]
+    einsum: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None
+
+    # If functional: list of Waveform (one per contact)
+    waveforms: Optional[List["Waveform"]] = None
+
+    # If non-functional, single contact: list of [np, n_t_chunk] tensors (len = n_chunks)
+    time_chunks_single: Optional[List[torch.Tensor]] = None
+
+    # If non-functional, multi-contact:
+    # list over contacts, each is list over chunks -> [np, n_t_chunk]
+    time_chunks_per_contact: Optional[List[List[torch.Tensor]]] = None
 
 
 class NotInitializedError(AttributeError):
@@ -683,16 +718,264 @@ class Population(P, Sliceable):
         stims = [s.unbind(-1) for s in stims]
         return stims, indices
 
+    # extracellular helpers
+    def _normalize_spatial(self, ve_s_raw: TensorLike) -> torch.Tensor:
+        """
+        Normalize a spatial field tensor to shape [np, n_comp].
+
+        Accepts:
+        - [n_comp]
+        - [1, n_comp]
+        - [np, n_comp]
+
+        Broadcasting from leading dimension 1 to np where needed.
+        """
+        ve_s = torch.as_tensor(
+            ve_s_raw,
+            device=self.device(),
+            dtype=self.dtype(),
+        ).contiguous()
+
+        if ve_s.dim() == 1:
+            # [n_comp] -> [1, n_comp]
+            ve_s = ve_s.unsqueeze(0)
+
+        if ve_s.size(0) == 1:
+            # [1, n_comp] -> [np, n_comp]
+            ve_s = ve_s.expand(self.np, -1)
+        elif ve_s.size(0) != self.np:
+            raise ValueError(
+                f"ve_s leading dimension ({ve_s.size(0)}) must be 1 or np ({self.np})."
+            )
+
+        return ve_s
+
+    def _normalize_time_tensor(
+        self, time_raw: TensorLike, t_global: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Normalize a time tensor to shape [np, n_t] matching the global time grid.
+
+        Accepts:
+        - [n_t]
+        - [1, n_t]
+        - [np, n_t]
+
+        Broadcasting from leading dimension 1 to np where needed.
+        """
+        t_tensor = torch.as_tensor(
+            time_raw,
+            device=self.device(),
+            dtype=self.dtype(),
+        )
+
+        if t_tensor.dim() == 1:
+            # [n_t] -> [1, n_t]
+            t_tensor = t_tensor.unsqueeze(0)
+
+        if t_tensor.size(0) == 1:
+            # [1, n_t] -> [np, n_t]
+            t_tensor = t_tensor.expand(self.np, -1)
+        elif t_tensor.size(0) != self.np:
+            raise ValueError(
+                f"time tensor leading dimension ({t_tensor.size(0)}) "
+                f"must be 1 or np ({self.np})."
+            )
+
+        if t_tensor.size(-1) != t_global.size(0):
+            raise ValueError(
+                f"time tensor length ({t_tensor.size(-1)}) must match "
+                f"the number of simulation steps ({t_global.size(0)})."
+            )
+
+        return t_tensor
+
+    def _prepare_extra(
+        self,
+        extra: Optional[ExtraSpec],
+        t_global: torch.Tensor,
+        n_chunks: int,
+    ) -> _ExtraConfig:
+        """
+        Normalize and stage 'extra' into an _ExtraConfig.
+
+        Supports:
+        - extra = (ve_s, time)
+        - extra = [(ve_s1, time1), (ve_s2, time2), ...]
+        """
+        if extra is None:
+            return _ExtraConfig(enabled=False, multicontact=False, functional=False)
+
+        # Normalize to list[(ve_s, time_spec)]
+        if isinstance(extra, tuple):
+            extra_pairs = [extra]
+        else:
+            extra_pairs = list(extra)
+
+        if not extra_pairs:
+            raise ValueError("If 'extra' is provided, it must not be empty.")
+
+        n_contacts = len(extra_pairs)
+        multicontact = n_contacts > 1
+
+        ve_s_list: List[torch.Tensor] = []
+        functional_flags: List[bool] = []
+        waveforms: List["Waveform"] = []
+        time_tensors: List[torch.Tensor] = []
+
+        for ve_s_raw, time_spec_raw in extra_pairs:
+            # Spatial field -> [np, n_comp]
+            ve_s_i = self._normalize_spatial(ve_s_raw)
+            ve_s_list.append(ve_s_i)
+
+            # Temporal spec: Waveform vs tensor
+            if isinstance(time_spec_raw, Waveform):
+                functional_flags.append(True)
+                waveforms.append(
+                    time_spec_raw.to(device=self.device(), dtype=self.dtype())
+                )
+                # Placeholder for alignment (not used when functional)
+                time_tensors.append(
+                    torch.empty(0, device=self.device(), dtype=self.dtype())
+                )
+            else:
+                functional_flags.append(False)
+                t_tensor = self._normalize_time_tensor(time_spec_raw, t_global)
+                time_tensors.append(t_tensor)
+                # Placeholder for alignment (not used when non-functional)
+                waveforms.append(None)  # type: ignore[arg-type]
+
+        any_functional = any(functional_flags)
+        all_functional = all(functional_flags)
+        if any_functional and not all_functional:
+            raise ValueError(
+                "All contacts in 'extra' must use the same temporal type; "
+                "mixing Waveform and tensor time specifications is not supported."
+            )
+        functional = any_functional
+
+        # Stack spatial fields
+        if multicontact:
+            # [n_contacts, np, n_comp]
+            ve_s = torch.stack(ve_s_list, dim=0)
+            einsum = op_mc
+        else:
+            # [np, n_comp]
+            ve_s = ve_s_list[0]
+            einsum = op_sc
+
+        time_chunks_single: Optional[List[torch.Tensor]] = None
+        time_chunks_per_contact: Optional[List[List[torch.Tensor]]] = None
+
+        if not functional:
+            if multicontact:
+                # Per-contact list of chunks
+                time_chunks_per_contact = [
+                    torch.tensor_split(t_tensor, n_chunks, dim=-1)
+                    for t_tensor in time_tensors
+                ]
+            else:
+                time_chunks_single = torch.tensor_split(
+                    time_tensors[0], n_chunks, dim=-1
+                )
+
+        return _ExtraConfig(
+            enabled=True,
+            multicontact=multicontact,
+            functional=functional,
+            ve_s=ve_s,
+            einsum=einsum,
+            waveforms=waveforms if functional else None,
+            time_chunks_single=time_chunks_single,
+            time_chunks_per_contact=time_chunks_per_contact,
+        )
+
+    def _expand_eval_time(self, t_eval: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize evaluated Waveform output to [np, n_t_chunk].
+
+        Accepts:
+        - [n_t_chunk]
+        - [1, n_t_chunk]
+        - [np, n_t_chunk]
+        """
+        if t_eval.dim() == 1:
+            t_eval = t_eval.unsqueeze(0)
+
+        if t_eval.size(0) == 1:
+            t_eval = t_eval.expand(self.np, -1)
+        elif t_eval.size(0) != self.np:
+            raise ValueError(
+                f"Waveform evaluation leading dimension ({t_eval.size(0)}) "
+                f"must be 1 or np ({self.np})."
+            )
+        return t_eval
+
+    def _compute_extra_chunk(
+        self,
+        cfg: _ExtraConfig,
+        chunk_idx: int,
+        t_chunk: torch.Tensor,
+    ) -> Optional[List[torch.Tensor]]:
+        """
+        Build ve_ list (one entry per time step in chunk) for the given chunk,
+        or return None if no 'extra' is configured.
+
+        Output:
+        - None
+        - or list of length len(t_chunk), each [np, n_comp]
+        """
+        if not cfg.enabled:
+            return None
+
+        assert cfg.ve_s is not None
+        assert cfg.einsum is not None
+
+        # Build temporal tensor for this chunk: t_extra
+        if cfg.functional:
+            assert cfg.waveforms is not None
+
+            if cfg.multicontact:
+                # [n_contacts, np, n_t_chunk]
+                t_per_contact: List[torch.Tensor] = []
+                for wf in cfg.waveforms:
+                    t_i = wf(t_chunk).to(self.dtype())
+                    t_i = self._expand_eval_time(t_i)
+                    t_per_contact.append(t_i.unsqueeze(0))  # [1, np, n_t_chunk]
+
+                t_extra = torch.cat(t_per_contact, dim=0)
+            else:
+                wf = cfg.waveforms[0]
+                t_extra = wf(t_chunk).to(self.dtype())
+                t_extra = self._expand_eval_time(t_extra)
+        else:
+            # Non-functional: use pre-split chunks
+            if cfg.multicontact:
+                assert cfg.time_chunks_per_contact is not None
+                t_per_contact = [
+                    cfg.time_chunks_per_contact[c][chunk_idx].unsqueeze(0)
+                    for c in range(len(cfg.time_chunks_per_contact))
+                ]
+                t_extra = torch.cat(t_per_contact, dim=0)  # [n_contacts, np, n_t_chunk]
+            else:
+                assert cfg.time_chunks_single is not None
+                t_extra = cfg.time_chunks_single[chunk_idx]  # [np, n_t_chunk]
+
+        # einsum:
+        #  - single-contact: ve_s [np, n_comp], t_extra [np, n_t_chunk]
+        #  - multi-contact : ve_s [n_contacts, np, n_comp],
+        #                    t_extra [n_contacts, np, n_t_chunk]
+        ve = cfg.einsum(cfg.ve_s, t_extra)  # [n_t_chunk, np, n_comp]
+        return ve.unbind(dim=0)
+
     def run(
         self,
-        ve=None,
-        space=None,
-        time=None,
-        tstop=None,
-        dt=None,
-        callbacks=None,
-        progressbar=False,
-        multicontact=False,
+        ve: Optional[TensorLike] = None,
+        extra: Optional[ExtraSpec] = None,
+        tstop: Optional[float] = None,
+        dt: Optional[float] = None,
+        callbacks: Optional[Sequence[Callback]] = None,
+        progressbar: bool = False,
     ):
         """
         Run the axon model simulation.
@@ -700,37 +983,69 @@ class Population(P, Sliceable):
         Parameters
         ----------
         ve : Tensor, optional
-            Extracellular voltage tensor. Shape should be
-            [timesteps, model.np, model.nc] or compatible.
-        space : Tensor, optional
-            Spatial components when ve is not directly provided.
-            Used with time to construct ve.
-        time : Tensor or Waveform, optional
-            Temporal components when ve is not directly provided.
-            Used with space to construct ve.
+            Precomputed extracellular voltage tensor. Shape should be
+            ``[n_timesteps, np, n_comp]`` or broadcast-compatible with that.
+            If provided, ``extra`` is ignored and the number of time steps
+            is inferred from ``ve.shape[0]``.
+        extra : (Tensor, Waveform or Tensor) or sequence of such tuples, optional
+            Extracellular input specification(s), with the same semantics as
+            :meth:`longrun`.
+
+            Each specification is a tuple ``(ve_s, time)``:
+
+            * ``ve_s``: spatial field tensor with shape ``[np, n_comp]`` or
+            ``[1, n_comp]``. A leading dimension of ``1`` is broadcast to ``np``.
+
+            * ``time``: either a :class:`Waveform` object (functional specification)
+            or a tensor with shape ``[np, n_timesteps]`` or ``[1, n_timesteps]``.
+            A leading dimension of ``1`` is broadcast to ``np``. The last
+            dimension must match the number of simulation time steps.
+
+            If a single tuple is provided, the method uses a single-contact
+            formulation with :func:`op_sc`. If a sequence of tuples is provided,
+            each tuple is treated as one electrode contact, and the method
+            automatically switches to multi-contact mode using :func:`op_mc`:
+
+            * Spatial fields are stacked to shape ``[n_contacts, np, n_comp]``.
+            * Functional (Waveform) inputs are evaluated per time step and
+            expanded/concatenated to shape ``[n_contacts, np, n_timesteps]``.
+            * Non-functional (tensor) inputs are normalized once to that shape.
+
+            Mixing :class:`Waveform` and tensor time specifications across contacts
+            is not supported and will raise a :class:`ValueError`.
+
+            If both ``ve`` and ``extra`` are provided, a :class:`ValueError` is
+            raised.
         tstop : float, optional
-            Simulation stop time in milliseconds. If None, uses the default from backend.
-            If ve is provided, this is ignored.
-            If ve is provided, tstop is determined by the shape of ve.
+            Simulation stop time in milliseconds when ``ve`` is not provided.
+            The number of simulation time steps is derived from the time grid
+            constructed from the current model time ``self.t``, ``tstop``, and
+            ``dt``. If ``ve`` is provided, this parameter is ignored.
         dt : float, optional
-            Time step size in milliseconds. If None, uses the default from backend.
-        callbacks : list of Callback, optional
-            List of callback objects to execute during simulation steps.
+            Time step size in milliseconds. If ``None``, the default value
+            ``A.dt`` from the backend is used.
+        callbacks : sequence of Callback, optional
+            Callback objects to execute during simulation (pre-loop, per-step,
+            post-loop, etc.). If not already a :class:`CallbackList`, it is
+            wrapped into one.
         progressbar : bool or tqdm, optional
-            If True, displays a progress bar during simulation. Can also be a
-            tqdm instance for custom progress tracking. Default is True.
-        multicontact : bool, optional
-            If True, handles multiple electrode contacts for ve construction.
-            Default is False.
+            If ``True``, displays a progress bar during simulation. Can also be
+            a :class:`tqdm.tqdm` instance for custom progress tracking.
 
         Notes
         -----
-        The simulation updates the model's internal state (v, v_prev for DF method, etc.)
-        and advances the model's time.
+        * ``run`` supports both precomputed ``ve`` and the higher-level
+        ``extra`` specification used by :meth:`longrun`.
+        * When ``extra`` is provided, the underlying construction of
+        extracellular voltage matches the semantics of :meth:`longrun`,
+        but the entire simulation is treated as a single chunk.
+        * The simulation updates the model's internal state (e.g. ``v``,
+        ``v_prev`` for DF methods) and advances the model's time ``self.t``.
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
 
+        # auto-build intra if missing
         if self.intra is None:
             intra = self.build_intra()
             self.intra = intra
@@ -739,39 +1054,64 @@ class Population(P, Sliceable):
 
         with_intra = intra is not None
 
+        if ve is not None and extra is not None:
+            raise ValueError("Provide either 've' or 'extra', not both.")
+
         device = self.device()
+        dtype = self.dtype()
 
         if ve is not None:
-            ve = torch.as_tensor(ve, device=device)
+            ve = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
 
+        # dt as scalar and tensor
         dt = dt if dt is not None else A.dt
         dt_f = float(dt)
-
-        dt = torch.tensor(dt, device=device, dtype=self.dtype())
+        dt_tensor = torch.tensor(dt, device=device, dtype=dtype)
 
         local_ind = 0
-
-        if isinstance(time, Waveform):
-            time = time.to(device, dtype=self.dtype())
-            time = time.assemble(self.t, self.t + tstop, dt)
+        tstart = self.t.item()
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
-        tstart = self.t.item()
-
         with ctx:
-            if ve is None:
-                if space is not None and time is not None:
-                    ve = ve_from_s_t(space, time, self.np, self.device(), multicontact)
-
+            # --------------------------------------------------------------
+            # Determine number of steps and global time grid
+            # --------------------------------------------------------------
             if ve is not None:
+                # Use ve length as authoritative time axis length
                 n = ve.shape[0]
-            else:
-                n = int(tstop / dt_f)
 
+                # Construct a matching time grid for 'extra'-style helpers if needed
+                t_global = torch.arange(
+                    self.t,
+                    self.t + n * dt_tensor,
+                    dt_tensor,
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                if tstop is None:
+                    raise ValueError("tstop must be provided when 've' is not given.")
+
+                t_global = torch.arange(
+                    self.t,
+                    self.t + tstop,
+                    dt_tensor,
+                    device=device,
+                    dtype=dtype,
+                )
+                n = t_global.size(0)
+
+            # --------------------------------------------------------------
+            # Prepare intra
+            # --------------------------------------------------------------
             if with_intra:
+                # Preserve existing intra preparation semantics
                 stims, indices = self.prep_intra(intra, n, dt_f)
 
+            # --------------------------------------------------------------
+            # Callbacks and integrator
+            # --------------------------------------------------------------
             if not isinstance(callbacks, CallbackList):
                 callbacks = CallbackList(callbacks)
 
@@ -780,29 +1120,58 @@ class Population(P, Sliceable):
                     c.dt = dt_f
 
             pre_loop_hook(callbacks, self)
-            self.integrator._initialize(self, dt, force=self.training)
+            self.integrator._initialize(self, dt_tensor, force=self.training)
 
+            # Progress bar setup
             if progressbar:
                 if not isinstance(progressbar, tqdm):
                     progressbar = tqdm(
-                        total=n, desc=f"{tstart + local_ind * dt_f:.1f} ms"
+                        total=n,
+                        desc=f"{tstart + local_ind * dt_f:.1f} ms",
                     )
 
-            for i in range(n):
-                ve_c = ve[i] if ve is not None else None
+            # --------------------------------------------------------------
+            # Prepare extracellular input via 'extra' if needed
+            # --------------------------------------------------------------
+            if ve is None and extra is not None:
+                # One "chunk" for the whole run
+                extra_cfg = self._prepare_extra(extra, t_global, n_chunks=1)
 
+                if extra_cfg.einsum is not None:
+                    extra_cfg.einsum = extra_cfg.einsum
+
+                # Single chunk index 0, over full time grid
+                ve_list = self._compute_extra_chunk(extra_cfg, 0, t_global)
+            else:
+                ve_list = None
+
+            # --------------------------------------------------------------
+            # Main time-stepping loop
+            # --------------------------------------------------------------
+            for i in range(n):
+                # Extracellular voltage for this step
+                if ve is not None:
+                    ve_c = ve[i]
+                elif ve_list is not None:
+                    ve_c = ve_list[i]
+                else:
+                    ve_c = None
+
+                # Intracellular stimulation for this step
                 if with_intra:
                     s = [st[local_ind] for st in stims]
                     intra_c = self.make_intra(intra, s, indices)
                 else:
                     intra_c = None
 
-                self._step(self.integrator, self, dt, ve_c, intra_c)
-                self.t = self.t + dt
+                # Integrator step
+                self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+                self.t = self.t + dt_tensor
 
                 post_step_hook(callbacks, self)
                 local_ind += 1
 
+                # Progress bar update
                 if progressbar:
                     progressbar.update(1)
                     if local_ind % 100 == 0:
@@ -820,10 +1189,9 @@ class Population(P, Sliceable):
         tstop: float,
         chunklength: int,
         dt: float = None,
-        extra: Optional[Tuple[Tensor, Waveform]] = None,
-        callbacks: List[Callback] = None,
-        progressbar=True,
-        multicontact=False,
+        extra: Optional[ExtraSpec] = None,
+        callbacks: Optional[Sequence[Callback]] = None,
+        progressbar=False,
     ):
         r"""
         Run a long simulation by dividing it into multiple smaller chunks.
@@ -842,95 +1210,96 @@ class Population(P, Sliceable):
         dt : float, optional
             The simulation time step in milliseconds. If ``None``, the default value
             from the backend will be used.
-        extra : tuple of (Tensor, Waveform), optional
-            A tuple containing extra input parameters:
+        extra : (Tensor, Waveform or Tensor) or sequence of such tuples, optional
+            Extracellular input specification(s).
 
-            * The first element (``ve_s``) is a tensor representing spatial
-              voltage components.
+            Each specification is a tuple ``(ve_s, time)``:
 
-            * The second element (``time``) is either a :class:`Waveform` object
-              or a tensor representing time.
+            * ``ve_s``: spatial field tensor with shape ``[n_p, n_comp]`` or
+              ``[1, n_comp]``. A leading dimension of ``1`` is broadcast to ``n_p``.
+            * ``time``: either a :class:`Waveform` object (functional specification)
+              or a tensor with shape ``[n_p, n_timesteps]`` or ``[1, n_timesteps]``.
+              A leading dimension of ``1`` is broadcast to ``n_p``. The last
+              dimension must match the number of simulation time steps.
 
-            These values are used to construct the extracellular voltage.
+            If a single tuple is provided, the method uses a single-contact
+            formulation with :func:`op_sc`. If a sequence of tuples is provided,
+            each tuple is treated as one electrode contact, and the method
+            automatically switches to multi-contact mode with :func:`op_mc`:
+
+            * In multi-contact mode, the spatial field tensors are stacked to shape
+              ``[n_contacts, n_p, n_comp]``.
+            * For a functional specification (all ``time`` are :class:`Waveform`),
+              each waveform is evaluated per chunk and per contact and then
+              expanded/concatenated to shape ``[n_contacts, n_p, n_t_chunk]``.
+            * For a non-functional specification (all ``time`` are tensors), the
+              raw time tensors are pre-split into chunks and concatenated to the
+              same shape ``[n_contacts, n_p, n_t_chunk]``.
+
+            Mixing :class:`Waveform` and tensor time specifications across
+            contacts is not supported and will raise a :class:`ValueError`.
         callbacks : list of Callback, optional
             A list of callback objects to be executed during simulation, allowing for
             customized processing at various stages (e.g., pre-loop, post-step,
             post-loop).
         progressbar : bool or tqdm, optional
             If ``True`` (or if a :class:`tqdm.tqdm` instance is provided), displays
-            a progress bar to track simulation progress across chunks.
-        multicontact : bool, optional
-            If ``True``, configures the handling of multiple electrode contacts for
-            constructing the extracellular voltage input. Default is ``False``.
+            a progress bar to track simulation progress across chunks. Default is ``False``.
 
         Notes
         -----
-        * When ``extra`` is provided, the method uses it to assemble the extracellular
-          voltage (``ve``) for the simulation.
-
-        * Chunk processing helps manage memory usage during extended simulations by
-          processing data in manageable segments.
+        * Multi-contact handling is inferred from the number of ``extra`` entries;
+          the ``multicontact`` flag is no longer required.
+        * When ``extra`` is provided, the method uses it to assemble the
+          extracellular voltage ``ve`` via :func:`op_sc` (single contact) or
+          :func:`op_mc` (multi-contact).
+        * Chunk processing helps manage memory usage during extended simulations
+          by processing data in manageable segments.
         """
 
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
 
-        # ve_s : [n_p, n_comp] or [1, n_comp] or [n_contacts, *]
-        # ve_t : [n_p, n_timesteps] or [1, n_timesteps] or [n_contacts, *]
-
         intra = self.intra
-
         with_intra = intra is not None
-        with_extra = extra is not None
 
+        # dt scalars
         dt = dt if dt is not None else A.dt
         dt_f = float(dt)
-
-        if with_extra:
-            ve_s, time = extra
-            ve_s = torch.as_tensor(
-                ve_s, device=self.device(), dtype=self.dtype()
-            ).contiguous()
-
-            if multicontact:
-                ve_s = ve_s.expand(-1, self.np, -1)
-            else:
-                ve_s = ve_s.expand(self.np, -1)
-
-            if isinstance(time, Waveform):
-                time = time.to(device=self.device(), dtype=self.dtype())
-                functional = True
-            else:
-                time = torch.as_tensor(time, device=self.device(), dtype=self.dtype())
-                functional = False
-
-                if multicontact:
-                    time = time.expand(-1, self.np, -1)
-                else:
-                    time = time.expand(self.np, -1)
-
-        dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
+        dt_tensor = torch.tensor(dt, device=self.device(), dtype=self.dtype())
 
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
+                # --------------------------------------------------------------
+                # Global time grid and chunking
+                # --------------------------------------------------------------
                 t = torch.arange(
-                    self.t, self.t + tstop, dt, dtype=self.dtype(), device=self.device()
+                    self.t,
+                    self.t + tstop,
+                    dt_tensor,
+                    dtype=self.dtype(),
+                    device=self.device(),
                 )
+
+                if t.numel() == 0:
+                    return
+
                 n_chunks = math.ceil(len(t) / chunklength)
+                t_chunks = torch.tensor_split(t, n_chunks)
 
-                t_c_f = torch.tensor_split(t, n_chunks)
+                # --------------------------------------------------------------
+                # Extracellular configuration (single vs multi-contact, functional)
+                # --------------------------------------------------------------
+                extra_cfg = self._prepare_extra(extra, t, n_chunks)
+                with_extra = extra_cfg.enabled
 
-                if with_extra:
-                    if functional:
-                        t_chunks = t_c_f
-                    else:
-                        t_chunks = torch.tensor_split(time, n_chunks, dim=-1)
+                # Compile einsum if we have one
+                if extra_cfg.einsum is not None:
+                    extra_cfg.einsum = extra_cfg.einsum
 
-                if multicontact:
-                    einsum = op_mc
-                else:
-                    einsum = op_sc
-
+                # --------------------------------------------------------------
+                # Callbacks, progress bar, integrator initialization
+                # --------------------------------------------------------------
                 if callbacks:
                     for c in callbacks:
                         c.dt = dt_f
@@ -940,46 +1309,39 @@ class Population(P, Sliceable):
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
-                self.integrator._initialize(self, dt, force=self.training)
-                einsum = torch.compile(einsum)
+                self.integrator._initialize(self, dt_tensor, force=self.training)
 
                 pre_loop_hook(callbacks, self)
 
-                for i in range(n_chunks):
+                # --------------------------------------------------------------
+                # Main chunk loop
+                # --------------------------------------------------------------
+                for i, t_chunk in enumerate(t_chunks):
                     if with_intra:
-                        stims, indices = intra.init(t_c_f[i])
+                        stims, indices = intra.init(t_chunk)
                         stims = [s.unbind(0) for s in stims]
 
                     if with_extra:
-                        if functional:
-                            t = time(t_chunks[i]).to(self.dtype())
-                            if multicontact:
-                                t = t.unsqueeze(0).expand(-1, self.np, -1)
-                            else:
-                                t = t.expand(self.np, -1)
-                        else:
-                            t = t_chunks[i]
-                        ve_ = einsum(ve_s, t).contiguous().unbind(dim=0)
+                        ve_list = self._compute_extra_chunk(extra_cfg, i, t_chunk)
+                    else:
+                        ve_list = None
 
-                    pre_chunk_hook(callbacks, self, t_c_f[i])
+                    pre_chunk_hook(callbacks, self, t_chunk)
 
-                    for j in range(len(t_c_f[i])):
-                        if with_extra:
-                            ve_c = ve_[j]
-                        else:
-                            ve_c = None
+                    for j in range(len(t_chunk)):
+                        ve_c = ve_list[j] if ve_list is not None else None
+
                         if with_intra:
                             s = [st[j] for st in stims]
-                            intra_c = make_intra(intra, s, indices)
+                            intra_c = self.make_intra(intra, s, indices)
                         else:
                             intra_c = None
 
-                        self._step(self.integrator, self, dt, ve_c, intra_c)
+                        self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
                         post_step_hook(callbacks, self)
+                        self.t = self.t + dt_tensor
 
-                        self.t = self.t + dt
-
-                    post_chunk_hook(callbacks, self, t_c_f[i])
+                    post_chunk_hook(callbacks, self, t_chunk)
 
                     if progressbar:
                         progressbar.update(1)
