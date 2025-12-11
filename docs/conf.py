@@ -79,30 +79,18 @@ myst_substitutions = {
 # The theme to use for HTML and HTML Help pages. See the documentation for
 # a list of builtin themes.
 
+html_static_path = ["_static"]
+
 html_title = ""
 html_logo = "_static/logo-light.png"
 html_theme = "shibuya"
 html_theme_options = {
     "light_logo": "logo-light.png",  # file is _static/logo-light.png
     "dark_logo": "logo-dark.png",  # file is _static/logo-dark.png
-    "repository_url": "https://gitlab.oit.duke.edu/mah148/axonml",
-    "use_repository_button": True,
-    "use_download_button": False,
-    "repository_branch": "main",
-    "path_to_docs": "docs",
-    "launch_buttons": {
-        "colab_url": "https://colab.research.google.com",
-        "binderhub_url": "https://mybinder.org",
-    },
-    "toc_title": "Navigation",
-    "show_navbar_depth": 1,
-    "show_toc_level": 3,
+    "accent_color": "cyan",
+    "gitlab_url": "https://gitlab.oit.duke.edu/mah148/axonml",
 }
 
-# Add any paths that contain custom static files (such as style sheets) here,
-# relative to this directory. They are copied after the builtin static files,
-# so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ["_static"]
 html_css_files = ["custom.css"]
 
 autosummary_generate = True
