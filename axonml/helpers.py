@@ -69,18 +69,16 @@ class ContextVar:
 
 DEBUG = ContextVar("DEBUG", 0)
 TF32 = ContextVar("TF32", 0)
-DFITOT = ContextVar("DFITOT", 1)
 IMEM = ContextVar("IMEM", 0)
 CUDA = ContextVar("CUDA", int(torch.cuda.is_available()))
-DTWARN = ContextVar("DTWARN", 1)
 PADE = ContextVar("PADE", -1)
-DETECT_ANOMALIES = ContextVar("DETECT_ANOMALIES", 0)
+REQUIRE_GRAD = ContextVar("REQUIRE_GRAD", 0)
+
 BACKEND = ContextVar("BACKEND", "inductor")
 FULLGRAPH = ContextVar("FULLGRAPH", 0)
 DYNAMIC = ContextVar("DYNAMIC", 0)
 JIT = ContextVar("JIT", 1)
 COMPILE_MODE = ContextVar("COMPILE_MODE", "default")
-REQUIRE_GRAD = ContextVar("REQUIRE_GRAD", 0)
 
 
 def set_jit_enabled(enable=True):

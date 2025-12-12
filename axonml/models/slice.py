@@ -1,4 +1,36 @@
-"""Helpers for slicing neural populations and mechanisms."""
+"""Helpers for slicing neural populations and mechanisms.
+
+This module provides the :class:`Slice` abstraction and related utilities for
+working with indexed views of neural populations in AxonML.
+
+A :class:`~axonml.models.core.Population` typically represents a collection of
+neuronal compartments arranged in a regular tensor shape
+(e.g. ``(n_cells, n_compartments)``). In AxonML, indexing a population with
+standard Python / NumPy / PyTorch semantics does **not** return a raw tensor;
+instead it returns a :class:`Slice` object:
+
+.. code-block:: python
+
+    pop = Population(...)
+    soma = pop[:, 0]       # Slice
+    first10 = pop[:10]     # Slice
+    subset = pop[mask]     # Slice
+
+A :class:`Slice` is a lightweight, logical view that:
+
+* Remembers the selection in a canonical :class:`IndexSpec` structure.
+* Provides convenience methods for reading and writing state restricted to
+  that subset of compartments.
+* Supports targeted intracellular current injections.
+* Restricts mechanism insertion and configuration to the selected region.
+* Can itself be sliced again (slices-of-slices) without materialising
+  intermediate tensors.
+
+The actual numerical state (voltages, gating variables, parameters, etc.)
+remains owned by the underlying :class:`~axonml.models.core.Population` or its
+mechanisms. :class:`Slice` simply routes reads and writes through the correct
+indices in a safe and convenient way.
+"""
 
 from __future__ import annotations
 
@@ -8,31 +40,6 @@ from typing import Any, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-
-
-def expand_into_shape(src, index, shape, fill_value=torch.nan):
-    """Scatter a source tensor into a larger target shape.
-
-    Parameters
-    ----------
-    src : torch.Tensor
-        Source tensor to insert into ``out``.
-    index : tuple
-        Index tuple compatible with ``shape``.
-    shape : Sequence[int]
-        Target tensor shape.
-    fill_value : float, optional
-        Value used to initialise the output tensor. Defaults to ``torch.nan``.
-
-    Returns
-    -------
-    torch.Tensor
-        Tensor with ``src`` written at ``index``.
-    """
-    out = torch.full(shape, fill_value, dtype=src.dtype, device=src.device)
-    out[index] = src
-    return out
-
 
 # Anything NumPy or PyTorch accepts in __getitem__
 IndexElement = Union[int, slice, np.ndarray, list, tuple]
@@ -57,45 +64,207 @@ class IndexSpec:
     shape: Tuple[int, ...]
 
 
-def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
-    """Normalise an indexing key for a tensor with ``shape``.
-
-    Parameters
-    ----------
-    key : Any
-        Index compatible with PyTorch/NumPy semantics.
-    shape : Sequence[int]
-        Shape of the array to index.
-    device : torch.device or None, optional
-        Device used for temporary tensor allocation.
-
-    Returns
-    -------
-    IndexSpec
-        Structured description of the indexing request.
-    """
-    out = torch.empty(shape, device=device)[key]  # type: ignore
-
-    return IndexSpec(
-        index=key,
-        is_scalar=out.ndim == 0,
-        shape=out.shape,
-    )
-
-
 class Slice:
-    """View onto a subset of a population or mechanism.
+    """
+    Indexed view onto a subset of a :class:`axonml.models.core.Population`.
 
-    Parameters
+    Overview
+    --------
+    A :class:`~axonml.models.core.Population` represents a collection of
+    neuronal compartments arranged in a tensor ``shape``
+    (e.g. ``(n_cells, n_compartments)``). Indexing a population with any
+    valid NumPy / PyTorch key (integers, slices, ellipses, boolean masks,
+    integer arrays, or tuples thereof) returns a :class:`Slice` rather than
+    a raw tensor:
+
+    .. code-block:: python
+
+        pop = Population(...)
+
+        # Basic indexing
+        soma = pop[:, 0]          # first compartment of every cell
+        first_ten = pop[:10]      # first 10 cells
+        distal = pop[:, 5:]       # distal compartments
+
+        # Advanced / fancy indexing
+        subset = pop[[0, 3, 7]]   # pick specific cells
+        masked = pop[cell_mask]   # boolean-mask selection
+
+    The :class:`Slice` object is a lightweight, logical view that:
+
+    * Stores a canonicalised :class:`IndexSpec` describing the selection.
+    * Provides methods for reading and writing model and mechanism state
+      restricted to that selection.
+    * Supports targeted intracellular current injections via :meth:`inject`.
+    * Restricts mechanism insertion to that subset via :meth:`insert`.
+    * Can itself be sliced again; see *Nested slices* below.
+
+    Importantly, a :class:`Slice` does **not** own any numerical state.
+    All tensors and parameters remain stored on the underlying population
+    or mechanisms. :class:`Slice` merely routes reads and writes through the
+    correct indices.
+
+    Creating slices
+    ---------------
+    Slices are created by indexing any :class:`Sliceable` object, typically
+    an :class:`axonml.models.core.Population`:
+
+    .. code-block:: python
+
+        # Standard Python / NumPy semantics
+        pop = Population(...)
+        soma = pop[:, 0]              # select soma compartment
+        dend = pop[:, 1:]             # all dendritic compartments
+        middle = pop[:, 2:4]          # compartments 2 and 3
+
+        # Explicit tuples of indices are also supported
+        band = pop[(slice(None), slice(2, 6))]
+
+    Advanced indexing mixes are handled by delegating to PyTorch's indexing rules.
+
+    Nested slices (slices of slices)
+    --------------------------------
+    Applying further indexing to an existing :class:`Slice` returns another
+    :class:`Slice` corresponding to the composition of the two selections:
+
+    .. code-block:: python
+
+        distal = pop[:, 5:]
+        distal_mid = distal[:, 2:4]
+
+        # Equivalent direct selection on the population
+        direct = pop[:, 7:9]
+        assert torch.allclose(distal_mid.v, direct.v)
+
+    Internally, :func:`compose_indices` is used to compute an equivalent index
+    into the original population without ever materialising intermediate
+    tensors. This keeps nested slicing both expressive and efficient.
+
+    Reading state: :meth:`inspect` and :meth:`get`
+    ----------------------------------------------
+    Use :meth:`inspect` (or its alias :meth:`get`) to read variables restricted
+    to the slice:
+
+    .. code-block:: python
+
+        # Read a model-level buffer/parameter
+        v_soma = pop[:, 0].get("v")              # membrane voltage in the soma
+
+        # Read a mechanism field
+        m_gate = pop[:, 0].get("m", mechanism="NaTs2t")
+
+    When the target is stored sparsely (e.g. keyed mechanisms), the slice will
+    internally materialise a dense tensor, index it, and return the selected
+    subset.
+
+    Attribute-style access
+    ----------------------
+    For common cases, you can also rely on attribute access instead of calling
+    :meth:`get` explicitly. The :class:`Slice` intercepts attribute access and
+    returns a sliced view of buffers, parameters, and submodules:
+
+    .. code-block:: python
+
+        # Sliced buffer access
+        v_soma = pop[:, 0].v
+        # Equivalent to:
+        # v_soma = pop[:, 0].get("v")
+
+        # Sliced mechanism access through the mechanism submodule
+        m_gate = pop[:, 0].mech.NaTs2t.m
+        # Equivalent to:
+        # m_gate = pop[:, 0].get("m", mechanism="NaTs2t")
+
+    This attribute-style syntax is often the most concise way to work with
+    subsets of state.
+
+    Writing state: :meth:`set` and attribute assignment
+    ---------------------------------------------------
+    To modify state only on the selected compartments, use :meth:`set`:
+
+    .. code-block:: python
+
+        soma = pop[:, 0]
+        soma.set("v", torch.full(soma.shape, -65.0, device=pop.device()))
+
+    If the target is registered as a buffer on the underlying PyTorch module,
+    you can also write via attribute assignment on the :class:`Slice`:
+
+    .. code-block:: python
+
+        # Assuming ``v`` is a registered buffer on ``pop``
+        soma.v = torch.full(soma.shape, -65.0, device=pop.device())
+
+    Both pathways perform writes under ``torch.no_grad()`` and call
+    ``detach_()`` afterwards to preserve the tensor identity but drop autograd
+    history, which is typically what you want inside a simulation loop.
+
+    Current injection: :meth:`inject`
+    ---------------------------------
+    :meth:`inject` registers an intracellular current waveform that should be
+    applied only to the compartments in this slice during simulation:
+
+    .. code-block:: python
+
+        soma = pop[:, 0]
+        soma.inject(step_current)
+
+    Here ``step_current`` is any :py:class:`~axonml.models.stim.waveform.core.Waveform`
+    object understood by the population's injection machinery. The slice records
+    both the waveform and the :class:`IndexSpec` so that the solver can apply the
+    current to the correct subset at run time.
+
+    Mechanism insertion: :meth:`insert`
+    -----------------------------------
+    Mechanisms (ion channels, synapses, etc.) can be inserted only on a
+    selected subset of compartments by calling :meth:`insert` on a slice:
+
+    .. code-block:: python
+
+        soma = pop[:, 0]
+        soma.insert("NaTs2t", alias="Na_soma")
+
+    Only the compartments included in the slice will host the mechanism. All
+    other compartments in the population are unaffected. Any additional keyword
+    arguments are forwarded to the underlying ``Population.insert`` call.
+
+    Labelling slices: :meth:`label`
+    -------------------------------
+    Often it is convenient to name a particular subset once and reuse it
+    throughout a model or experiment. :meth:`label` attaches a name to a
+    slice and exposes it as an attribute on the owning population (or on the
+    parent slice, if labelling a nested view):
+
+    .. code-block:: python
+
+        # Define labels
+        pop[:, 0].label("soma")
+        pop[:, 1:].label("dendrites")
+
+        # Later, possibly in a different module:
+        pop.soma.inject(step_current)
+        pop.dendrites.set("g_pas", torch.full(pop.dendrites.shape, 1e-4))
+
+    Labels are also stored in ``population._labels`` (a simple ``dict``),
+    allowing programmatic access via ``population._labels["soma"]``.
+
+    Attributes
     ----------
-    model : torch.nn.Module
-        Underlying model providing data accessors.
+    model : Population
+        Underlying population (or submodule) providing the state and methods.
     index_spec : IndexSpec
-        Normalised indexing information.
-    base_shape : tuple of int, optional
-        Shape of the parent tensor before slicing.
-    parent_slice : Slice or None, optional
-        Parent slice if this view is derived from another slice.
+        Canonicalised description of the selection (index, shape, scalar flag).
+    base_shape : tuple of int
+        Shape of the original population before any slicing was applied.
+    parent_slice : Slice or None
+        Parent slice if this slice was created from another slice.
+
+    Notes
+    -----
+    :class:`Slice` is a pure view; creating or discarding slices does not copy
+    simulation state. The main cost is that of the underlying tensor indexing
+    when :meth:`inspect`, :meth:`set`, attribute access, or other operations
+    are performed.
     """
 
     _RESERVED = ("model", "index_spec", "base_shape", "parent_slice")
@@ -116,14 +285,17 @@ class Slice:
     # -------------------------
     @property
     def index(self) -> Tuple[IndexElement, ...]:
+        """Canonical index (tuple) describing this slice."""
         return object.__getattribute__(self, "index_spec").index
 
     @property
     def shape(self):
+        """Shape produced by applying :attr:`index` to the underlying population."""
         return object.__getattribute__(self, "index_spec").shape
 
     @property
     def is_scalar(self) -> bool:
+        """Whether the selection is scalar-valued (no remaining dimensions)."""
         return object.__getattribute__(self, "index_spec").is_scalar
 
     def numel(self) -> int:
@@ -132,29 +304,56 @@ class Slice:
 
     @property
     def name(self) -> str:
+        """Name of the underlying population (delegated from ``model.name``)."""
         return object.__getattribute__(self, "model").name
 
     @property
     def is_empty(self) -> bool:
+        """Return ``True`` if this slice selects no elements."""
         return self.numel() == 0
 
     # -------------------------
     # Public API
     # -------------------------
     def inspect(self, var: str, mechanism: Optional[str] = None) -> Any:
-        """Return a read-only view of ``var`` constrained to the slice.
+        """
+        Return a read-only view of ``var`` constrained to the slice.
+
+        This is the main low-level accessor for reading model or mechanism
+        state. It honours any sparse/keyed storage used by mechanisms and
+        returns a value whose leading dimensions correspond to this slice.
 
         Parameters
         ----------
         var : str
-            Attribute name to inspect.
+            Attribute name to inspect. This may refer to a model-level buffer
+            or parameter (e.g. ``"v"``), or to a mechanism field such as a
+            gating variable.
         mechanism : str or None, optional
-            Mechanism identifier when querying mechanism state.
+            Mechanism identifier when querying mechanism state. If ``None``,
+            ``var`` is looked up directly on the wrapped ``model``.
 
         Returns
         -------
         Any
-            Sliced value of the requested attribute.
+            Sliced value of the requested attribute. For tensors, the leading
+            dimensions match :attr:`shape` of the slice. The exact return type
+            depends on how the underlying model stores ``var``.
+
+        Examples
+        --------
+        Read membrane voltage in the soma:
+
+        .. code-block:: python
+
+            soma = pop[:, 0]
+            v_soma = soma.inspect("v")       # shape == soma.shape
+
+        Read a mechanism state variable:
+
+        .. code-block:: python
+
+            m_gate = soma.inspect("m", mechanism="NaTs2t")
         """
         model = object.__getattribute__(self, "model")
         idx = object.__getattribute__(self, "index_spec").index
@@ -170,7 +369,12 @@ class Slice:
         return getattr(model, var)[idx]
 
     def _inspect(self, var: str):
-        """Inspect ``var`` on the wrapped model without mechanism handling."""
+        """Inspect ``var`` on the wrapped model without mechanism handling.
+
+        This is an internal helper used to implement attribute access for
+        buffers, parameters and submodules. It respects sparse/keyed storage
+        when the underlying model exposes a ``key`` attribute.
+        """
         model = object.__getattribute__(self, "model")
         base_shape = object.__getattribute__(self, "base_shape")
         idx = object.__getattribute__(self, "index_spec").index
@@ -185,20 +389,72 @@ class Slice:
         return getattr(model, var)[idx]
 
     def get(self, var: str, mechanism: Optional[str] = None) -> torch.Tensor:
-        """Alias for :meth:`inspect` returning a tensor."""
-        return self.inspect(var, mechanism)
+        """
+        Convenience alias for :meth:`inspect` returning a tensor.
 
-    def set(self, var: str, value: torch.Tensor, mechanism: Optional[str] = None):
-        """Write ``value`` into ``var`` constrained to the slice.
+        This method simply forwards to :meth:`inspect` and is provided for
+        readability in user code that predominantly deals with tensor-valued
+        variables.
 
         Parameters
         ----------
         var : str
-            Attribute name to mutate.
-        value : torch.Tensor
-            Tensor data to assign.
+            Attribute name to read.
         mechanism : str or None, optional
-            Mechanism identifier when writing mechanism state.
+            Mechanism identifier when querying mechanism state.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor view of the requested variable restricted to the slice.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            v_soma = pop[:, 0].get("v")
+            m_gate = pop[:, 0].get("m", mechanism="NaTs2t")
+        """
+        return self.inspect(var, mechanism)
+
+    def set(self, var: str, value: torch.Tensor, mechanism: Optional[str] = None):
+        """
+        Write ``value`` into ``var`` constrained to the slice.
+
+        This is the main low-level mutator for updating state on a subset of
+        compartments. The write is performed in-place under ``torch.no_grad()``
+        and followed by ``detach_()`` on the underlying tensor to drop autograd
+        history while preserving identity (important when the tensor is a
+        registered buffer).
+
+        Parameters
+        ----------
+        var : str
+            Attribute name to mutate. May refer to a model-level buffer or
+            parameter, or to a mechanism field.
+        value : torch.Tensor
+            Tensor data to assign. Its shape must be broadcastable to the
+            slice's :attr:`shape`.
+        mechanism : str or None, optional
+            Mechanism identifier when writing mechanism state. If provided,
+            the appropriate mechanism's storage is updated; otherwise the
+            attribute is looked up on the wrapped ``model``.
+
+        Examples
+        --------
+        Set the soma voltage to a constant:
+
+        .. code-block:: python
+
+            soma = pop[:, 0]
+            target = torch.full(soma.shape, -65.0, device=pop.device())
+            soma.set("v", target)
+
+        Modify a mechanism gating variable:
+
+        .. code-block:: python
+
+            soma.set("m", new_m_values, mechanism="NaTs2t")
         """
         model = object.__getattribute__(self, "model")
         idx = object.__getattribute__(self, "index_spec").index
@@ -224,7 +480,32 @@ class Slice:
             getattr(model, var).detach_()  # keep identity, drop history
 
     def inject(self, waveform):
-        """Register an injected waveform targeting this slice."""
+        """
+        Register an intracellular current waveform targeting this slice.
+
+        The waveform is not applied immediately. Instead, this method records
+        the tuple ``(waveform, index_spec.shape, index_spec.index)`` on the
+        underlying population's ``injections`` list. The simulator or solver
+        later interprets this record and applies the current only to the
+        compartments selected by this slice.
+
+        Parameters
+        ----------
+        waveform : Any
+            :py:class:`~axonml.models.stim.waveform.core.Waveform` object
+            understood by the population's injection infrastructure.
+
+        Notes
+        -----
+        Calling :meth:`inject` on an empty slice is a no-op.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            soma = pop[:, 0]
+            soma.inject(step_current)        # step_current defined elsewhere
+        """
         if self.is_empty:
             return  # no-op for empty slices
         model = object.__getattribute__(self, "model")
@@ -232,7 +513,43 @@ class Slice:
         model.injections.append((waveform, index_spec.shape, index_spec.index))
 
     def insert(self, mechanism, alias=None, ic=None, **kwargs):
-        """Insert a mechanism restricted to this slice."""
+        """
+        Insert a mechanism restricted to this slice.
+
+        Only the selected compartments will host the inserted mechanism. This
+        method forwards to ``model.insert`` while passing along the slice's
+        :class:`IndexSpec`, so the underlying population can allocate and wire
+        the mechanism appropriately.
+
+        Parameters
+        ----------
+        mechanism : Any
+            Mechanism class.
+        alias : str or None, optional
+            Optional alias with which the mechanism should be registered on
+            the model. If ``None``, the default aliasing behaviour of
+            ``model.insert`` is used.
+        ic : Any, optional
+            Optional initial-conditions object or configuration passed through
+            to the underlying ``insert`` call. (Exact semantics depend on the
+            population implementation.)
+        **kwargs
+            Additional keyword arguments forwarded to ``model.insert``.
+
+        Notes
+        -----
+        Calling :meth:`insert` on an empty slice is a no-op.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            soma = pop[:, 0]
+            soma.insert(NaTs2t, alias="Na_soma")
+
+            # Insert a passive mechanism only in dendrites
+            pop[:, 1:].insert(pas, alias="pas_dend", g=1e-4)
+        """
         if self.is_empty:
             return  # no-op for empty slices
         object.__getattribute__(self, "model").insert(
@@ -243,7 +560,41 @@ class Slice:
         )
 
     def label(self, name: str):
-        """Attach a label to the slice for convenient access."""
+        """
+        Attach a label to the slice for convenient, reusable access.
+
+        This method exposes the slice under the given ``name`` as an attribute
+        on the owning population (for top-level slices) or on the parent slice
+        (for nested slices). For populations, it also adds an entry to the
+        ``_labels`` dictionary.
+
+        Parameters
+        ----------
+        name : str
+            Attribute name to use as the label.
+
+        Examples
+        --------
+        Label soma and dendrites on a population:
+
+        .. code-block:: python
+
+            pop[:, 0].label("soma")
+            pop[:, 1:].label("dendrites")
+
+            # Later, reuse the labels
+            pop.soma.inject(step_current)
+            pop.dendrites.set("g_pas", torch.full(pop.dendrites.shape, 1e-4))
+
+        Labels on nested slices attach to the outer slice:
+
+        .. code-block:: python
+
+            distal = pop[:, 5:]
+            distal[:, :2].label("distal_proximal")   # stored on ``distal``
+
+            distal.distal_proximal.set("gNa", 0.0)
+        """
         parent_slice = object.__getattribute__(self, "parent_slice")
         if parent_slice is not None:
             # Attach label to the *wrapper* safely (avoid buffer interception)
@@ -254,7 +605,37 @@ class Slice:
         model._labels[name] = self
 
     def __getitem__(self, key):
-        """Return a nested slice produced by applying ``key``."""
+        """
+        Return a nested slice produced by applying ``key``.
+
+        This enables composition of selections: ``pop[idx1][idx2]`` is
+        equivalent to ``pop[idx3]`` where ``idx3`` is a single index into the
+        original population computed by :func:`compose_indices`.
+
+        Parameters
+        ----------
+        key : Any
+            Index compatible with PyTorch/NumPy semantics, applied to the
+            current slice.
+
+        Returns
+        -------
+        Slice
+            New :class:`Slice` that selects a subset of the original population
+            corresponding to the composition of the two indices.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            # Two-stage selection
+            distal = pop[:, 5:]
+            mid_distal = distal[:, 2:4]
+
+            # Direct equivalent
+            direct = pop[:, 7:9]
+            assert torch.allclose(mid_distal.v, direct.v)
+        """
         model = object.__getattribute__(self, "model")
         idx = compose_indices(
             model.shape,
@@ -274,7 +655,23 @@ class Slice:
     # Interceptors
     # -------------------------
     def __setattr__(self, name, value):
-        """Intercept assignments to pass through to the underlying model."""
+        """
+        Intercept assignments and route writes into model buffers when possible.
+
+        Behaviour is as follows:
+
+        * Writing an attribute whose name matches a registered buffer on the
+          underlying PyTorch module writes only to the slice portion of that
+          buffer (and then detaches it).
+        * Assignments to reserved/internal attributes (``model``,
+          ``index_spec``, ``base_shape``, ``parent_slice``) bypass interception.
+        * All other assignments set attributes directly on the :class:`Slice`
+          instance itself.
+
+        This allows natural syntax such as ``pop[:, 0].v = value`` for buffer
+        updates, while still permitting arbitrary user-defined attributes on a
+        slice object.
+        """
         # Always allow internal fields
         if name in Slice._RESERVED:
             object.__setattr__(self, name, value)
@@ -297,7 +694,42 @@ class Slice:
         object.__setattr__(self, name, value)
 
     def __getattr__(self, name: str) -> Any:
-        """Delegate attribute access to the underlying model when necessary."""
+        """
+        Delegate attribute access to the underlying model when appropriate.
+
+        Resolution order:
+
+        1. If ``name`` matches a buffer on the underlying PyTorch module,
+           return a sliced view via :meth:`_inspect`.
+        2. If ``name`` matches a submodule, return a new :class:`Slice` that
+           wraps the submodule but shares this slice's :class:`IndexSpec`.
+        3. If ``name`` matches a parameter, return a sliced view of that
+           parameter via :meth:`_inspect`.
+        4. Otherwise, delegate attribute access directly to the wrapped model.
+
+        This allows convenient access patterns such as:
+
+        .. code-block:: python
+
+            # Sliced buffer
+            v_soma = pop[:, 0].v
+            # same as: v_soma = pop[:, 0].get("v")
+
+            # Sliced submodule (e.g. mechanism collection) and mechanism field
+            m_gate = pop[:, 0].mech.NaTs2t.m
+            # same as: m_gate = pop[:, 0].get("m", mechanism="NaTs2t")
+
+        Parameters
+        ----------
+        name : str
+            Attribute name.
+
+        Returns
+        -------
+        Any
+            Either a sliced tensor, a new :class:`Slice` on a submodule, or
+            the underlying model's attribute.
+        """
         # Only runs if normal lookup failed
         try:
             model = object.__getattribute__(self, "model")
@@ -328,14 +760,22 @@ class Slice:
     # Misc
     # -------------------------
     def __repr__(self):
-        """Return a developer-friendly representation."""
+        """Return a developer-friendly representation summarising the selection."""
         spec = object.__getattribute__(self, "index_spec")
         return (
             f"Slice(index={spec.index}, shape={spec.shape}, is_scalar={spec.is_scalar})"
         )
 
     def _batch(self):
-        """Promote the slice to include a leading batch dimension."""
+        """
+        Promote the slice to include a leading batch dimension.
+
+        This internal helper prepends a leading ``slice(None)`` to the current
+        index (unless the first element is already an ellipsis), recomputes the
+        resulting shape, and updates the :class:`IndexSpec` in-place. It is
+        typically used when switching from unbatched to batched simulation
+        layouts.
+        """
         model = object.__getattribute__(self, "model")
         index_spec = object.__getattribute__(self, "index_spec")
 
@@ -354,8 +794,112 @@ class Slice:
         index_spec.shape = test.shape
 
 
+class Sliceable:
+    """Mixin enabling convenient slicing of population-like objects.
+
+    Classes that mix in :class:`Sliceable` gain NumPy-style indexing semantics
+    that return :class:`Slice` instances instead of raw tensors. The primary
+    intended user is :class:`axonml.models.core.Population`, but any object
+    that:
+
+    * Exposes a ``shape`` attribute describing its logical layout, and
+    * Exposes the state and methods expected by :class:`Slice`
+
+    can be made sliceable by inheriting from this mixin.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        class Population(Sliceable, nn.Module):
+            def __init__(self, shape, ...):
+                super().__init__()
+                self.shape = shape
+                ...
+
+        pop = Population((10, 3), ...)
+        soma = pop[:, 0]          # returns a Slice
+        soma.set("v", torch.zeros_like(soma.get("v")))
+    """
+
+    def __init__(self):
+        # Mapping from string labels to Slice objects (populated by Slice.label)
+        self._labels = {}
+
+    def __getitem__(self, key):
+        """
+        Return a :class:`Slice` corresponding to ``key``.
+
+        Parameters
+        ----------
+        key : Any
+            Index compatible with PyTorch/NumPy semantics.
+
+        Returns
+        -------
+        Slice
+            A new :class:`Slice` that wraps ``self`` and stores the canonical
+            index and resulting shape.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            pop = Population(...)
+            soma = pop[:, 0]          # Slice selecting soma compartment
+            dend = pop[:, 1:]         # Slice selecting dendrites
+
+            # Label and reuse
+            soma.label("soma")
+            pop.soma.inject(step_current)
+        """
+        index = parse_key(key, self.shape)
+        return Slice(self, index)
+
+
+def expand_into_shape(src, index, shape, fill_value=torch.nan):
+    """Scatter a source tensor into a larger target shape.
+
+    Parameters
+    ----------
+    src : torch.Tensor
+        Source tensor to insert into ``out``.
+    index : tuple
+        Index tuple compatible with ``shape``.
+    shape : Sequence[int]
+        Target tensor shape.
+    fill_value : float, optional
+        Value used to initialise the output tensor. Defaults to ``torch.nan``.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor with ``src`` written at ``index``.
+
+    Examples
+    --------
+    >>> src = torch.tensor([1., 2.])
+    >>> out = expand_into_shape(src, (torch.tensor([0, 2]),), (4,))
+    >>> out
+    tensor([1., nan, 2., nan])
+    """
+    out = torch.full(shape, fill_value, dtype=src.dtype, device=src.device)
+    out[index] = src
+    return out
+
+
 def compose_indices(shape, idx1, idx2, *, device="cpu"):
     """Compose two successive indexing operations.
+
+    This helper computes an index ``idx3`` such that, for any tensor ``t`` of
+    the given ``shape``,
+
+    .. code-block:: python
+
+        torch.allclose(t[idx1][idx2], t[idx3])
+
+    holds. It is used to implement slicing of slices without materialising
+    intermediate tensors.
 
     Parameters
     ----------
@@ -372,6 +916,19 @@ def compose_indices(shape, idx1, idx2, *, device="cpu"):
     -------
     tuple of torch.Tensor
         Tuple ``idx3`` satisfying ``tensor[idx1][idx2] == tensor[idx3]``.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        shape = (4, 5)
+        base = torch.arange(20).reshape(shape)
+
+        idx1 = (slice(None), slice(2, 5))
+        idx2 = (slice(None), slice(1, 3))
+
+        idx3 = compose_indices(shape, idx1, idx2)
+        assert torch.allclose(base[idx1][idx2], base[idx3])
     """
     # 1) Build a flat index map shaped like `shape`
     numel = math.prod(shape)
@@ -386,13 +943,43 @@ def compose_indices(shape, idx1, idx2, *, device="cpu"):
     return idx3  # use as t[idx3]
 
 
-class Sliceable:
-    """Mixin enabling convenient slicing of population attributes."""
+def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
+    """Normalise an indexing key for a tensor with ``shape``.
 
-    def __init__(self):
-        self._labels = {}
+    This function applies the given ``key`` to a dummy tensor with the
+    specified ``shape`` in order to infer the resulting shape and scalar-ness
+    using PyTorch's own indexing semantics. The resulting information is
+    wrapped in an :class:`IndexSpec`.
 
-    def __getitem__(self, key):
-        """Return a :class:`Slice` corresponding to ``key``."""
-        index = parse_key(key, self.shape)
-        return Slice(self, index)
+    Parameters
+    ----------
+    key : Any
+        Index compatible with PyTorch/NumPy semantics (ints, slices, ellipses,
+        boolean masks, integer arrays, tuples thereof, ...).
+    shape : Sequence[int]
+        Shape of the array to index.
+    device : torch.device or None, optional
+        Device used for temporary tensor allocation.
+
+    Returns
+    -------
+    IndexSpec
+        Structured description of the indexing request.
+
+    Examples
+    --------
+    >>> spec = parse_key((slice(None), 0), (10, 3))
+    >>> spec.index
+    (slice(None, None, None), 0)
+    >>> spec.shape
+    (10,)
+    >>> spec.is_scalar
+    False
+    """
+    out = torch.empty(shape, device=device)[key]  # type: ignore
+
+    return IndexSpec(
+        index=key,
+        is_scalar=out.ndim == 0,
+        shape=out.shape,
+    )

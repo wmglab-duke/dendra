@@ -46,9 +46,8 @@ def test_classproperty():
 
 def test_contextvar_and_ctx():
     orig_debug = H.DEBUG.value
-    with H.ctx(DEBUG=1, DTWARN=0):
+    with H.ctx(DEBUG=1):
         assert H.DEBUG.value == 1 and bool(H.DEBUG) is True
-        assert H.DTWARN.value == 0 and bool(H.DTWARN) is False
         assert H.DEBUG >= 1 and H.DEBUG > 0 and H.DEBUG.value == 1
     # restored
     assert H.DEBUG.value == orig_debug

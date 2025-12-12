@@ -5,6 +5,8 @@ Core
 ----
 .. autoclass:: axonml.models.core.Population
    :members:
+   :inherited-members: Module, object
+   :member-order: groupwise
 
 `Population` subclasses
 -----------------------
