@@ -95,11 +95,13 @@ class _bwd_euler_sc(Integrator):
 
 class _bwd_euler_sc_skip(Integrator):
     r"""
-    Single-compartment implicit Euler that skips storing conductances.
+    Single-compartment implicit Euler that skips solving the voltage.
+    Updates to voltage by VoltageProcesses are still applied.
 
     Applies the same implicit Euler step as :class:`_bwd_euler_sc` but only
-    evaluates ionic currents (discarding conductances) when stepping. Useful
-    when conductance outputs are unnecessary, reducing overhead.
+    evaluates ionic currents when stepping. Useful when the voltage is updated
+    externally (e.g., via a closed-form solution within a Mechanism) but ionic
+    currents still need to be advanced and evaluated.
 
     Parameters
     ----------
