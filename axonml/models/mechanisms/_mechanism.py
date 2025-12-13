@@ -5,7 +5,7 @@ from typing import Dict
 
 import torch
 
-from axonml.helpers import classproperty
+from axonml.helpers import USETABLES, classproperty
 from axonml.models.parametric import Parameterized
 
 from ._ions import VALENCES
@@ -346,6 +346,11 @@ class Mechanism(Parameterized):
             setattr(self, "factorable", factorable)
 
         self.populate()
+        if bool(USETABLES):
+            print("Using tables for mechanism:", self.name)
+            self.instantiate_tables()
+            for state in self.DE.values():
+                state.instantiate_tables()
 
     def set_dt(self, dt):
         """

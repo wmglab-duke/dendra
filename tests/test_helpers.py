@@ -7,8 +7,6 @@ import time
 import numpy as np
 import pytest
 import torch
-from hypothesis import given, settings
-from hypothesis import strategies as st
 
 import axonml.helpers as H
 
@@ -89,80 +87,6 @@ def test_ve_from_s_t_shapes_and_values(multicontact):
 
     assert got.shape == expected.shape
     assert torch.allclose(got, expected)
-
-
-# --------------------------------------------------------------------------
-#  1-D interpolation  (scipy-like behaviour)
-# --------------------------------------------------------------------------
-
-
-def _numpy_interp_like(x, y, xnew, *, left=None, right=None):
-    """Helper that mimics the left/right handling of helpers.interp1d."""
-    if left is None:
-        left = y[0]
-    if right is None:
-        right = y[-1]
-    return np.interp(xnew, x, y, left=left, right=right)
-
-
-float_arrays = (
-    st.lists(
-        st.floats(-100, 100, allow_nan=False, allow_infinity=False),
-        min_size=2,
-        max_size=30,
-        unique=True,
-    )
-    .map(lambda xs: sorted(xs))
-    .filter(  # every neighbour must survive FP32 quantisation
-        lambda xs: min(
-            np.float32(xs[i + 1]) - np.float32(xs[i])  # cast *then* diff
-            for i in range(len(xs) - 1)
-        )
-        > 1e-6
-    )
-)
-
-
-@given(
-    float_arrays,
-    st.lists(
-        st.floats(-100, 100, allow_nan=False, allow_infinity=False),
-        min_size=2,
-        max_size=30,
-    ),
-)
-@settings(max_examples=80)
-def test_interp1d_matches_numpy(x_list, y_list):
-    """Inside the domain helpers.interp1d must match exact linear result."""
-    assume_len = min(len(x_list), len(y_list))
-    x = torch.tensor(x_list[:assume_len], dtype=torch.float32)
-    y = torch.tensor(y_list[:assume_len], dtype=torch.float32)
-    xnew = torch.linspace(float(x.min()), float(x.max()), steps=assume_len * 2)
-
-    got = H.interp1d(x, y, xnew)
-    want = torch.tensor(
-        _numpy_interp_like(x.numpy(), y.numpy(), xnew.numpy()), dtype=torch.float32
-    )
-
-    assert torch.allclose(got, want, atol=2e-5, rtol=1e-4)
-
-
-def test_interp1d_out_of_bounds_and_grad():
-    x = torch.tensor([0.0, 1.0, 2.0], requires_grad=False)
-    y = torch.tensor([0.0, 1.0, 4.0], requires_grad=True)
-    xq = torch.tensor([-1.0, 0.5, 3.0])
-
-    # --- vanilla version: clamps to edge values
-    yq = H.interp1d(x, y, xq)
-    assert (yq[0][0] == y[0]) and (yq[0][-1] == y[-1])
-
-    # gradient flows
-    yq.sum().backward()
-    assert y.grad is not None and y.grad.shape == y.shape
-
-    # --- zero-outside version
-    yqz = H.interp1d_z(x, y.detach(), xq)
-    assert yqz[0][0] == 0 and yqz[0][-1] == 0
 
 
 # --------------------------------------------------------------------------

@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from axonml.helpers import REQUIRE_GRAD
+from axonml.utils import PreparedInterp1d
 
 from .rng import RNGModule
 
@@ -793,7 +794,11 @@ class SimpleParameterized(Referency):
 
 
 def check_conflicts(
-    global_params, range_params, params_defined_here, rng_defined_here=None
+    global_params,
+    range_params,
+    params_defined_here,
+    rng_defined_here=None,
+    table_defined_here=None,
 ):
     """
     Check for conflicts between global parameters, range parameters, and
@@ -803,11 +808,14 @@ def check_conflicts(
     """
     if rng_defined_here is None:
         rng_defined_here = set()
+    if table_defined_here is None:
+        table_defined_here = dict()
     all_params = (
         set(global_params.keys())
         .union(range_params.keys())
         .union(params_defined_here.keys())
         .union(rng_defined_here)
+        .union(table_defined_here.keys())
     )
     duplicates = set()
 
@@ -817,6 +825,7 @@ def check_conflicts(
             + (param in range_params)
             + (param in params_defined_here)
             + (param in rng_defined_here)
+            + (param in table_defined_here)
         )
         if count > 1:
             duplicates.add(param)
@@ -974,6 +983,10 @@ class Parameterized(SimpleParameterized):
     _rng_defined_here = {}
     _rng_declarations = []
 
+    _table = {}
+    _table_defined_here = {}
+    _table_declarations = []
+
     def __init_subclass__(cls, **kwargs):
         """
         This special method is called automatically whenever a class
@@ -987,6 +1000,7 @@ class Parameterized(SimpleParameterized):
         new_global = {}
         new_range = {}
         new_rng = {}
+        new_table = {}
 
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
@@ -997,10 +1011,13 @@ class Parameterized(SimpleParameterized):
                 new_range.update(base._range)
             if "_rng" in base.__dict__:
                 new_rng.update(base._rng)
+            if "_table" in base.__dict__:
+                new_table.update(base._table)
 
         cls._global_defined_here = {}
         cls._range_defined_here = {}
         cls._rng_defined_here = {}
+        cls._table_defined_here = {}
 
         # Add parameters declared via the GLOBAL() method
         if Parameterized._global_declarations:
@@ -1017,17 +1034,24 @@ class Parameterized(SimpleParameterized):
             for rng_dict in Parameterized._rng_declarations:
                 cls._rng_defined_here.update(rng_dict)
             Parameterized._rng_declarations = []
+        # Add table declarations
+        if Parameterized._table_declarations:
+            for t_dict in Parameterized._table_declarations:
+                cls._table_defined_here.update(t_dict)
+            Parameterized._table_declarations = []
 
         # Update the new global and range dictionaries with the class-specific declarations
         new_global.update(cls._global_defined_here)
         new_range.update(cls._range_defined_here)
         new_rng.update(cls._rng_defined_here)
+        new_table.update(cls._table_defined_here)
 
         check_conflicts(
             cls._global_defined_here,
             cls._range_defined_here,
             cls._params_defined_here,
             cls._rng_defined_here,
+            cls._table_defined_here,
         )
 
         # Add parameters from class definition keywords (e.g., a=10)
@@ -1038,6 +1062,7 @@ class Parameterized(SimpleParameterized):
         cls._global = new_global
         cls._range = new_range
         cls._rng = new_rng
+        cls._table = new_table
 
         assign_precendence(cls)
 
@@ -1079,6 +1104,37 @@ class Parameterized(SimpleParameterized):
             accessible via these names.
         """
         Parameterized._rng_declarations.append(set(args))
+
+    @staticmethod
+    def TABLE(func: str, low: float, high: float, n: int, learnable: bool = False):
+        """
+        Declare a lookup table to be created for the instance.
+        The table maps inputs in [low, high] to outputs of the named function.
+        The lookup table may then be used instead of direct function evaluation,
+        via self.{func}_table.
+        In practice, this can speed up repeated evaluations of (very) expensive
+        functions, but for simple functions the overhead of the table lookup
+        may outweigh the benefits.
+
+        Parameters
+        ----------
+        func : str
+            Name of the function to tabulate (e.g., 'exp', 'sigmoid').
+            This must correspond to a method that belongs to the Parameterized
+            class and can be called with a single argument (i.e., can be called
+            as ``self.func(x)``).
+        low : float
+            Lower bound of the tabulation range.
+        high : float
+            Upper bound of the tabulation range.
+        n : int
+            Number of points in the table.
+        learnable : bool, optional
+            If True, the table values are trainable parameters. Defaults to False.
+        """
+        Parameterized._table_declarations.append(
+            {func: {"low": low, "high": high, "n": n, "learnable": learnable}}
+        )
 
     def __init__(self, shape, shape_f, additional_parameters=None, **kwargs):
         super().__init__(**kwargs)
@@ -1291,6 +1347,33 @@ class Parameterized(SimpleParameterized):
             for param, args in param_list:
                 b = param(b, *[getattr(self, arg) for arg in args])
             setattr(self, name, b)
+
+    def instantiate_tables(self):
+        """
+        Instantiate lookup tables declared for this class.
+        """
+        for name, table_info in self.__class__._table.items():
+            func_name = name
+            low, high, n, learnable = (
+                table_info["low"],
+                table_info["high"],
+                table_info["n"],
+                table_info.get("learnable", False),
+            )
+            if not hasattr(self, func_name):
+                raise ValueError(
+                    f"Function '{func_name}' not found in class '{self.__class__.__name__}' for table instantiation."
+                )
+            func = getattr(self, func_name)
+            x = torch.linspace(low, high, n)
+            y = func(x).flatten()
+            setattr(
+                self,
+                f"{func_name}_table",
+                PreparedInterp1d(
+                    x, y, sort_xy=False, exact_clamp=False, learnable_y=learnable
+                ),
+            )
 
     def detach(self):
         """
