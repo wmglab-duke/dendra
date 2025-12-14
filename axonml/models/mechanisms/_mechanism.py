@@ -9,6 +9,7 @@ from axonml.helpers import USETABLES, classproperty
 from axonml.models.parametric import Parameterized
 
 from ._ions import VALENCES
+from ._state import State
 from ._symbolic import build_current_eq
 
 
@@ -313,7 +314,9 @@ class Mechanism(Parameterized):
             for state in self._state
         ]
 
-        self.DE = torch.nn.ModuleDict({state._name: state for state in states})
+        self.DE: dict[str, State] = torch.nn.ModuleDict(
+            {state._name: state for state in states}
+        )
 
         self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
         if ic is not None:
@@ -556,16 +559,11 @@ class Mechanism(Parameterized):
                         .expand_as(v_init)
                         .clone()
                     )
-                    setattr(self, state_name, buffer_tensor)
-                    buffer_tensor.detach_()
-                    # buffer_tensor.requires_grad_(True)
+                    setattr(self, state_name, buffer_tensor.detach())
                 else:
-                    if hasattr(state_module, "inf"):
-                        inf = state_module.inf(v_init)
+                    if inf := state_module.inf(v_init):
                         buffer_tensor = inf[state_name]
-                        setattr(self, state_name, buffer_tensor)
-                        buffer_tensor.detach_()
-                        # buffer_tensor.requires_grad_(True)
+                        setattr(self, state_name, buffer_tensor.detach())
 
         self.initial(v_init)
 
