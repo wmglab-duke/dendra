@@ -1083,23 +1083,23 @@ class Population(P, Sliceable):
 
                 # Construct a matching time grid for 'extra'-style helpers if needed
                 t_global = torch.arange(
-                    self.t,
-                    self.t + n * dt_tensor,
-                    dt_tensor,
+                    self.t.double(),
+                    self.t.double() + n * dt_f,
+                    dt_f,
                     device=device,
-                    dtype=dtype,
-                )
+                    dtype=torch.double,
+                ).to(dtype)
             else:
                 if tstop is None:
                     raise ValueError("tstop must be provided when 've' is not given.")
 
                 t_global = torch.arange(
-                    self.t,
-                    self.t + tstop,
-                    dt_tensor,
+                    self.t.double(),
+                    self.t.double() + tstop,
+                    dt_f,
                     device=device,
-                    dtype=dtype,
-                )
+                    dtype=torch.double,
+                ).to(dtype)
                 n = t_global.size(0)
 
             # --------------------------------------------------------------
@@ -1274,12 +1274,12 @@ class Population(P, Sliceable):
                 # Global time grid and chunking
                 # --------------------------------------------------------------
                 t = torch.arange(
-                    self.t,
-                    self.t + tstop,
-                    dt_tensor,
-                    dtype=self.dtype(),
+                    self.t.double(),
+                    self.t.double() + tstop,
+                    dt_f,
+                    dtype=torch.double,
                     device=self.device(),
-                )
+                ).to(self.dtype())
 
                 if t.numel() == 0:
                     return

@@ -1,6 +1,6 @@
 import torch
 
-from axonml.helpers import interp1d_z
+from axonml.utils import interp1d
 
 from .core import Waveform
 
@@ -372,4 +372,4 @@ class arbitrary(Waveform):
         t = t.unsqueeze(0)
         if self.values.ndim > 1:
             t = t.expand(self.values.shape[0], -1)
-        return interp1d_z(self.tpoints, self.values, t)
+        return interp1d(self.tpoints, self.values, t)

@@ -5,7 +5,7 @@ from typing import Dict
 
 import torch
 
-from axonml.helpers import classproperty
+from axonml.helpers import USETABLES, classproperty
 from axonml.models.parametric import Parameterized
 
 from ._ions import VALENCES
@@ -346,6 +346,9 @@ class Mechanism(Parameterized):
             setattr(self, "factorable", factorable)
 
         self.populate()
+        self.instantiate_tables(usetables=bool(USETABLES))
+        for state in self.DE.values():
+            state.instantiate_tables(usetables=bool(USETABLES))
 
     def set_dt(self, dt):
         """
@@ -920,7 +923,8 @@ class VoltageProcess(Mechanism):
 
     def update_v(self, v: torch.Tensor) -> torch.Tensor:
         """
-        Compute the updated membrane potential.
+        Compute the updated membrane potential. Avoid in-place modification
+        to preserve autograd compatibility.
 
         Parameters
         ----------
@@ -968,7 +972,17 @@ class Synapse(Mechanism):
 
     def net_receive(self, weights, netcon):
         """
-        Handle weighted spike arrivals.
+        Handle weighted spike arrivals. Avoid in-place modifications of
+        state buffers to preserve autograd compatibility.
+
+        Example: increment an internal synaptic conductance ``g_syn`` by the
+        incoming weight without in-place ops:
+
+        .. code-block:: python
+
+            def net_receive(self, weights, netcon):
+                g_syn = self._buffers[\"g_syn\"] + weights
+                self._buffers[\"g_syn\"] = g_syn
 
         Parameters
         ----------

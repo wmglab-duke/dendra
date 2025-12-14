@@ -8,9 +8,274 @@ from .utils import make_getattr
 
 class NetCon(Referency):
     """
-    `NetCon`s are responsible for managing all synaptic connections.
-    They are generated automatically by instances of axonml.Network
-    when `net.build()` is called.
+    Event-based connectivity wrapper between a pre-synaptic source and a
+    post-synaptic synapse mechanism.
+
+    Overview
+    --------
+    A ``NetCon`` instance mediates communication between:
+
+    * a **pre-synaptic source** (population module or :class:`NetStim`),
+    * a **post-synaptic synapse mechanism** (module exposing ``net_receive``), and
+    * an implicit **post population** that owns the synapse state.
+
+    Conceptually, each time step performs three operations:
+
+    1. **Event detection**:
+
+       - Observe a pre-synaptic variable (by default ``pre.v`` or an explicit
+         gate on a :class:`NetStim`).
+       - Detect intrinsic events (hard or surrogate spiking) via threshold
+         crossings, or directly consume externally scheduled events.
+
+    2. **Weighting and delay**:
+
+       - Combine intrinsic and scheduled events into a scalar gate per
+         connection.
+       - Multiply by a per-connection weight (optionally differentiable).
+       - Write the resulting payload into a per-synapse delay line
+         (delivery buffer) according to per-connection delays
+         (integer or differentiable).
+
+    3. **Delivery**:
+
+       - At each step, read the current row of the delay buffer.
+       - Call ``syn.net_receive(payload, netcon=self)`` on the synapse
+         mechanism, with payload reshaped to ``syn.shape_f``.
+
+    The class is designed to:
+
+    * Support heterogeneous device placement for pre, post, and synapse modules.
+    * Provide differentiable pathways for:
+
+      - weights,
+      - delays,
+      - spiking / event detection,
+      - and optionally scheduled event times.
+
+    * Provide explicit *scheduled* events that can be trained by reference.
+
+    Construction and lifecycle
+    --------------------------
+    ``NetCon`` objects are normally constructed by
+    :class:`axonml.models.networks.Network` during ``Network.build()``.
+    Initialization and stepping are managed by the network's simulation loop.
+
+    1. **Construction** (usually internal):
+
+       .. code-block:: python
+
+           nc = NetCon(
+               pre=pre_pop,
+               pre_idx=pre_indices,
+               thresholds=thresholds,
+               post=post_pop,
+               post_idx=post_indices,
+               post_syn=synapse_module,
+               weight=weight_param,
+               delay=delay_param,
+               dt=dt,
+               pre_var="v",         # optional
+               max_delay=None,      # optional
+           )
+
+    2. **Differentiable configuration (optional but required for training)**:
+
+       Call :meth:`set_diff_config` once before the first differentiable
+       simulation step to configure which components are treated as
+       differentiable:
+
+       .. code-block:: python
+
+           nc.set_diff_config(
+               diff_weights=True,
+               diff_delays=True,
+               diff_spiking=True,
+               diff_scheduled_times=True,
+               # taps, sigma, tau, sched_width as appropriate
+           )
+
+    3. **Initialization**:
+
+       Call :meth:`initialize` before stepping:
+
+       .. code-block:: python
+
+           nc.train()         # if using standard PyTorch training mode
+           nc.set_diff_config(...)  # must be called before first advance_diff
+           nc.initialize(
+               reinit_weights=True,
+               reinit_delays=True,
+               clear_deliveries=True,
+           )
+
+       ``initialize`` will:
+
+       * select ``nc.advance`` to point to either :meth:`advance_diff` or
+         :meth:`advance_non_diff` depending on ``nc.training``,
+       * (re)initialize weight and delay parameter modules,
+       * rebuild internal delay buffers if delays changed,
+       * reset the internal timing state, and
+       * detach buffers from any pre-existing computation graph
+         (fresh forward pass).
+
+    4. **Simulation loop**:
+
+       .. code-block:: python
+
+           for step in range(T):
+               nc.advance()  # calls advance_diff or advance_non_diff
+
+       At each call, ``NetCon`` delivers events to ``post_syn`` via
+       ``post_syn.net_receive(...)``.
+
+    Scheduling: value- vs reference-mode
+    ------------------------------------
+    In addition to intrinsic spiking, ``NetCon`` supports *scheduled* events.
+    These are particularly useful for:
+
+    * injecting known spike trains or stimulus patterns,
+    * training event **weights** and/or **times** as separate learnable tensors,
+    * conditioning the synaptic drive on external controllers or task structure.
+
+    There are two orthogonal axes:
+
+    1. **Value mode** (direct tensors):
+
+       - You provide explicit event weights and/or times (as numbers or Tensors).
+       - Gradients flow into those tensors if they require gradients and are
+         wired into your optimization loop.
+
+       Value-mode APIs:
+
+       * :meth:`schedule`
+       * :meth:`schedule_time_ref` with ``weight`` specified as a Tensor.
+
+    2. **Reference mode** (indices into bound sources):
+
+       - You bind a *source* tensor once via :meth:`bind_weight_source` or
+         :meth:`bind_time_source`.
+       - You then schedule events by storing integer indices into the source;
+         the values are looked up on-the-fly during the simulation.
+       - Gradients flow into the bound source tensors, not the indices.
+
+       Reference-mode APIs:
+
+       * :meth:`schedule_ref` for reference-mode weights,
+       * :meth:`schedule_time_ref` for reference-mode times.
+
+    Mixed use is allowed: you can combine intrinsic spiking, value-mode
+    scheduled events, and reference-mode scheduled events in the same ``NetCon``.
+
+    Order-of-operations for training scheduled **weights**
+    ------------------------------------------------------
+    To make scheduled event weights trainable by reference:
+
+    1. **Create a trainable weight source**:
+
+       .. code-block:: python
+
+           # Example: one scalar weight per planned event
+           sched_w = torch.nn.Parameter(
+               torch.zeros(num_events, device=device, dtype=dtype)
+           )
+
+    2. **Bind the weight source once**:
+
+       .. code-block:: python
+
+           nc.bind_weight_source(sched_w)
+
+       This does not copy data; it stores a reference to ``sched_w``. The
+       tensor must live on the same device as the synapse.
+
+    3. **Schedule events by index** using :meth:`schedule_ref`:
+
+       .. code-block:: python
+
+           # con_indices or pre_indices must map to concrete connections
+           nc.schedule_ref(
+               con_indices=con_idx,   # or pre_indices=...
+               times_ms=t_ms,         # float times in ms
+               weight_idx=w_idx,      # Long tensor of indices into sched_w
+               allow_past=False,
+           )
+
+       On each time step:
+
+       * ``NetCon`` will look up per-event weights as
+         ``sched_w[weight_idx]``.
+       * These contribute to the per-connection gates, and hence to the
+         synaptic deliveries.
+       * Gradients from the loss will flow back into ``sched_w``.
+
+    Order-of-operations for training scheduled **times**
+    ----------------------------------------------------
+    To make scheduled event **times** trainable by reference:
+
+    1. **Create a trainable time source**:
+
+       .. code-block:: python
+
+           # Example: one scalar time per event, in ms
+           sched_t = torch.nn.Parameter(
+               torch.zeros(num_events, device=device, dtype=dtype)
+           )
+
+    2. **Bind the time source once**:
+
+       .. code-block:: python
+
+           nc.bind_time_source(sched_t)
+
+    3. **Schedule events by time index** using :meth:`schedule_time_ref`:
+
+       .. code-block:: python
+
+           nc.schedule_time_ref(
+               con_indices=con_idx,   # or pre_indices=...
+               time_idx=t_idx,        # Long tensor of indices into sched_t
+               weight=1.0,            # scalar or tensor (value mode)
+               allow_past=False,
+           )
+
+       On each time step:
+
+       * ``NetCon`` will read the *current* values from ``sched_t[time_idx]``.
+       * The resulting times are interpreted in one of two ways:
+
+         - If ``diff_scheduled_times=True`` in :meth:`set_diff_config`,
+           events are smeared with a differentiable triangular kernel over
+           time steps, so gradients can move event times.
+         - If ``diff_scheduled_times=False``, times are rounded to the
+           nearest integer step and treated as exact.
+
+       In both cases, gradients flow into ``sched_t`` when using the
+       differentiable configuration.
+
+    Interactions with global time
+    -----------------------------
+    Many scheduling methods accept an ``allow_past`` flag:
+
+    * When ``allow_past=False`` (default), events whose scheduled steps are
+      **earlier** than the current internal ``global_step`` are silently
+      dropped.
+    * When ``allow_past=True``, events are kept regardless of their scheduled
+      step index.
+
+    In practice, this means that you usually want to:
+
+    * Call :meth:`initialize` (which also sets ``global_step``) before
+      scheduling events, or
+    * Explicitly pass ``allow_past=True`` when scheduling relative to a
+      fixed origin (e.g., step 0) while reusing a ``NetCon``.
+
+    Notes
+    -----
+    * ``NetCon`` automatically tracks and realigns its internal buffers when
+      moved across devices via ``.to(...)`` or when the peer modules move.
+    * The class is intentionally conservative about in-loop memory allocation:
+      buffers are pre-allocated where possible and reused across steps.
     """
 
     def __init__(
@@ -27,6 +292,73 @@ class NetCon(Referency):
         pre_var=None,
         max_delay=None,
     ):
+        """
+        Parameters
+        ----------
+        pre : :class:`~axonml.models.core.Population` or :class:`~axonml.models.networks.NetStim`
+            Pre-synaptic population module or :class:`NetStim`. The module must
+            implement ``device()`` and ``dtype()``; when ``pre`` is not a
+            :class:`NetStim`, it is also expected to expose the attribute named
+            by ``pre_var`` (e.g., ``v``) which holds the pre-synaptic state
+            used for spiking.
+        pre_idx : torch.Tensor
+            1-D Long tensor of indices into the flattened pre-synaptic variable
+            (e.g., ``pre.v.view(-1)[pre_idx]``). Length defines the number of
+            managed connections.
+        thresholds : torch.Tensor
+            Per-connection spiking thresholds in the same shape as ``pre_idx``.
+            Entries may be NaN to indicate:
+
+            * all-NaN: skip thresholding and treat the selected pre variable as
+              a continuous gate;
+            * mixed: apply thresholding for finite entries, and use the raw
+              pre variable wherever the threshold is NaN.
+
+        post : :class:`~axonml.models.core.Population`
+            Post-synaptic population module that owns the synapse mechanism.
+            Must implement ``device()`` and ``dtype()`` interfaces and is used
+            mainly for device alignment.
+        post_idx : torch.Tensor
+            1-D Long tensor of indices into the flattened synapse output space;
+            used to scatter connection events into the synapse's delivery buffer.
+        post_syn : :class:`axonml.models.mechanisms.Synapse`
+            Synapse mechanism module. Must expose:
+
+            * ``shape_f``: final tensor shape of per-synapse payloads, and
+            * ``net_receive(payload, netcon)``: function invoked each step with
+              delivery buffer slice reshaped to ``shape_f``.
+
+        weight : torch.nn.Module
+            Parameter-like module representing per-connection weights. Must support:
+
+            * ``weight.init(reinit: bool)``,
+            * ``weight()`` returning the current weight tensor, and
+            * ``weight.w`` exposing the underlying tensor.
+
+        delay : torch.nn.Module
+            Parameter-like module representing per-connection delays in ms. Must
+            support:
+
+            * ``delay.init(reinit: bool)`` and
+            * ``delay()`` returning the current delays tensor.
+
+        dt : float
+            Simulation time step in milliseconds.
+        pre_var : str, optional
+            Name of the attribute on ``pre`` to use as the spiking variable when
+            ``pre`` is not a :class:`NetStim`. Defaults to ``"v"``.
+        max_delay : float, optional
+            Optional maximum delay (ms). If provided, the internal delay buffer
+            depth is set to ``int(max_delay / dt) + 1``; otherwise it is inferred
+            from the maximum delay in ``delay``.
+
+        Notes
+        -----
+        This constructor is typically invoked by
+        :class:`axonml.models.networks.Network` during ``Network.build()``; user
+        code usually interacts with :class:`NetCon` via high-level network
+        building APIs rather than constructing it directly.
+        """
         super().__init__()
 
         self.weight = weight
@@ -236,6 +568,26 @@ class NetCon(Referency):
             )
 
     def _refresh_peer_devices(self):
+        """
+        Inspect the pre/post/synapse modules and record their devices and dtypes.
+
+        This method is called at construction and by :meth:`to` to ensure that
+        ``NetCon`` keeps an up-to-date view of:
+
+        * the device/dtype of the pre-synaptic population,
+        * the device/dtype of the post-synaptic population, and
+        * the device/dtype of the synapse mechanism (which defines the main
+          computation device for delivery buffers).
+
+        Returns
+        -------
+        pre_changed : bool
+            True if the pre-synaptic device or dtype has changed since the last
+            call.
+        post_changed : bool
+            True if the synapse/post device or dtype has changed since the last
+            call.
+        """
         pre_device = self.pre.device()
         pre_dtype = self.pre.dtype()
         post_device = self.post.device()
@@ -260,6 +612,20 @@ class NetCon(Referency):
         return pre_changed, post_changed
 
     def _align_buffer_devices(self):
+        """
+        Move internal buffers to the appropriate devices/dtypes.
+
+        This is called at construction time, at the end of ``__init__``, and
+        after any external ``.to(...)`` call via :meth:`to`. The method keeps:
+
+        * all buffers that interact with pre-synaptic state on ``pre_device``,
+        * all delivery-path buffers (delay lines, queues, scheduling metadata)
+          on ``self.device`` (the synapse/post device),
+        * parameter modules (weights and delays) and ``dt`` on ``self.device``.
+
+        It also ensures that auxiliary CSR structures used to expand pre indices
+        to connection indices are kept on the pre-synaptic device.
+        """
         # Keep buffers that interact with pre-synaptic state on the pre device/dtype.
         self._move_buffer("pre_idx", self.pre_device)
         self._move_buffer("threshold", self.pre_device, self.pre_dtype)
@@ -307,12 +673,41 @@ class NetCon(Referency):
         self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
 
     def to(self, *args, **kwargs):  # type: ignore[override]
+        """
+        Move this ``NetCon`` and its internal state to a new device/dtype.
+
+        This is a thin wrapper around ``super().to(...)`` which also:
+
+        * refreshes peer devices/dtypes via :meth:`_refresh_peer_devices`, and
+        * realigns internal buffers via :meth:`_align_buffer_devices`.
+
+        All scheduling metadata and delay buffers are preserved, but they are
+        moved to the target device/dtype as appropriate.
+
+        Returns
+        -------
+        NetCon
+            The same instance, for chaining.
+        """
         super().to(*args, **kwargs)
         self._refresh_peer_devices()
         self._align_buffer_devices()
         return self
 
     def _compute_max_delay_steps(self):
+        """
+        Compute the depth (in steps) of the internal delay line.
+
+        If ``max_delay`` is provided at construction, this method simply
+        computes ``int(max_delay / dt) + 1``. Otherwise it uses the maximum
+        integer delay in ``self.delay_steps`` if present, defaulting to 1
+        when no delays exist.
+
+        Returns
+        -------
+        int
+            Maximum number of steps in the delay buffer.
+        """
         if self.max_delay is not None:
             return int(self.max_delay / self.dt.item()) + 1
         else:
@@ -323,6 +718,19 @@ class NetCon(Referency):
             )
 
     def _rebuild_delay_buffers(self):
+        """
+        Rebuild delay-related buffers from the current delay parameters.
+
+        This is called by :meth:`initialize` when ``reinit_delays=True``.
+        It:
+
+        * recomputes integer delay steps from ``delay_ms()`` and ``dt``,
+        * recomputes ``max_delay_steps``,
+        * reallocates the delivery buffer and event queue to match the new
+          depth, and
+        * re-aligns all relevant buffers to the correct devices via
+          :meth:`_align_buffer_devices`.
+        """
         with torch.no_grad():
             delay_steps = (self.delay_ms() / self.dt.to(self.dtype)).round().long()
             self.delay_steps.copy_(delay_steps.flatten().to(self.device))
@@ -354,6 +762,63 @@ class NetCon(Referency):
         diff_scheduled_times: bool = True,
         sched_width: float = 1.0,  # kernel half-width in *steps*
     ):
+        """
+        Configure differentiable behavior for training.
+
+        This method must be called before the first call to :meth:`advance_diff`
+        (via ``NetCon.advance`` in training mode). It controls which aspects of
+        the connection are treated as differentiable and how.
+
+        Parameters
+        ----------
+        diff_weights : bool, optional
+            If True (default), synaptic weights are treated as differentiable
+            parameters. If False, the weight tensor returned by ``self.weight()``
+            is detached before being used to compute deliveries, freezing its
+            contribution during training.
+        diff_delays : bool, optional
+            If True (default), delays are interpreted as continuous values in
+            milliseconds and used with a soft, differentiable interpolation
+            scheme over time steps (2-tap linear or 3-tap Gaussian, see
+            ``taps`` and ``sigma``). If False, delays are rounded to integer
+            steps and used as hard delay lines.
+        diff_spiking : bool, optional
+            If True (default), pre-synaptic spiking is computed via a surrogate
+            gradient function (see :func:`update_active_diff`), allowing
+            gradients to flow through threshold crossings. If False, hard
+            thresholding via :func:`update_active` is used, yielding non-
+            differentiable (boolean) spikes.
+        taps : int, optional
+            Number of interpolation taps to use when ``diff_delays=True``.
+
+                * ``2`` (default): 2-tap linear interpolation between adjacent steps.
+                * ``3``: 3-tap Gaussian-like interpolation weighted by ``sigma``.
+        sigma : float, optional
+            Standard deviation (in steps) for the 3-tap Gaussian interpolation
+            when ``taps=3``. Ignored for ``taps=2``.
+        tau : float, optional
+            Temperature parameter for surrogate spiking, passed through to
+            :func:`update_active_diff` as ``tau``. Lower values yield a steeper
+            surrogate; higher values produce smoother gates.
+        diff_scheduled_times : bool, optional
+            If True (default), scheduled event times (including those provided
+            via :meth:`schedule_time_ref`) are handled via a differentiable
+            triangular kernel over time steps. This allows gradients to move
+            event times when they come from value- or reference-mode tensors.
+            If False, scheduled times are rounded to integer steps, and the
+            timing behavior is non-differentiable.
+        sched_width : float, optional
+            Half-width of the triangular kernel (in steps) when
+            ``diff_scheduled_times=True``. A value of 1.0 yields contributions
+            spread over approximately 2 steps around the nominal event time.
+
+        Notes
+        -----
+        * ``set_diff_config`` does not itself change ``training`` mode; it only
+          records configuration flags. ``NetCon.advance`` will dispatch to
+          :meth:`advance_diff` when ``self.training = True`` and to
+          :meth:`advance_non_diff` otherwise.
+        """
         self.train_flags = (
             diff_weights,
             diff_delays,
@@ -368,13 +833,50 @@ class NetCon(Referency):
     @property
     def w(self):
         """
-        Returns the weight tensor, which is a parameter of the synapse.
-        This is useful for accessing the synaptic weights directly.
+        Raw synaptic weight tensor for this ``NetCon``.
+
+        Returns
+        -------
+        torch.Tensor
+            The underlying weight tensor managed by the ``weight`` parameter
+            module (i.e., ``self.weight.w``). This tensor has one entry per
+            connection and is typically used for:
+
+            * inspection and diagnostics,
+            * direct regularization or constraints,
+            * manual initialization or export.
+
+        Notes
+        -----
+        To obtain the *current* weight values used during simulation steps
+        (which may include functional transformations), use ``self.weight()``
+        instead of accessing ``w`` directly.
         """
         return self.weight.w
 
     def _expand_pre_to_con(self, pre_indices: torch.Tensor | list[int]) -> torch.Tensor:
-        # NOTE: schedule-time helper; not called inside compiled step.
+        """
+        Expand pre-synaptic indices to connection indices using the CSR map.
+
+        This helper is used by the scheduling APIs (e.g. :meth:`schedule`,
+        :meth:`schedule_ref`, :meth:`schedule_time_ref`) when the caller
+        specifies pre-synaptic indices instead of explicit connection
+        indices.
+
+        Parameters
+        ----------
+        pre_indices : array-like of int
+            Pre-synaptic indices into the original population. These must be
+            compatible with the pre index space used to construct ``pre_idx``.
+
+        Returns
+        -------
+        torch.Tensor
+            1-D Long tensor of connection indices containing all connections
+            whose ``pre_idx`` entry matches one of the requested ``pre_indices``.
+            The tensor may be empty if no connections originate from the
+            specified pre indices.
+        """
         pres = torch.as_tensor(
             pre_indices, device=self.pre_device, dtype=torch.long
         ).view(-1)
@@ -412,9 +914,59 @@ class NetCon(Referency):
         allow_past: bool = False,
     ):
         """
-        Schedule VALUE-MODE events. Provide exactly one of (con_indices, pre_indices).
-        'weight' scales the NetCon's existing per-connection weight for that event.
-        Times are stored as floats (ms) to enable optional differentiability.
+        Schedule value-mode events on specific connections or pre indices.
+
+        This API attaches *value-mode* scheduled events, where weights and
+        times are stored directly as tensors owned by the ``NetCon``. It is
+        suitable when you want event-specific weights/times that are not
+        shared by reference with other structures, or when you are fine
+        managing these tensors directly.
+
+        Exactly one of ``con_indices`` or ``pre_indices`` must be provided.
+
+        Parameters
+        ----------
+        con_indices : Sequence[int] or torch.Tensor, optional
+            Explicit connection indices at which to schedule events.
+            Must be in ``[0, num_connections)``. Mutually exclusive with
+            ``pre_indices``.
+        pre_indices : Sequence[int] or torch.Tensor, optional
+            Pre-synaptic indices. These are expanded internally to a set of
+            connection indices using the pre→connection CSR map (see
+            :meth:`_expand_pre_to_con`). Mutually exclusive with
+            ``con_indices``.
+        times_ms : Sequence[float] or torch.Tensor
+            Event times in milliseconds. Must be broadcast-compatible with
+            the selected connections *after* filtering out past events (see
+            ``allow_past``). Times are converted to steps via
+            ``round(times_ms / dt)`` for non-differentiable scheduling, and
+            interpreted as continuous values when ``diff_scheduled_times=True``.
+        weight : float or torch.Tensor, optional
+            Scalar or per-event weight *multiplier* applied on top of the base
+            connection weights returned by ``self.weight()``. Accepted shapes:
+
+            * scalar (single value): broadcast to all scheduled events;
+            * tensor of length ``E_before`` (events before past-event filtering):
+              will be sliced by the filter; or
+            * tensor of length ``E_after`` (events after filtering): used as is.
+
+            When provided as a tensor requiring gradients, and when
+            differentiable scheduling is enabled, gradients will flow into
+            this tensor.
+        allow_past : bool, optional
+            If False (default), events whose scheduled integer step is smaller
+            than the current ``global_step`` are dropped. If True, no such
+            filtering is applied.
+
+        Notes
+        -----
+        * This is a *value-mode* scheduling API: weights and times are stored
+          directly in ``self.sched_weight`` and ``self.sched_time_ms``.
+        * For *reference-mode* weights or times (where event metadata lives in
+          a separate trainable tensor), use :meth:`schedule_ref` and
+          :meth:`schedule_time_ref` after binding sources with
+          :meth:`bind_weight_source` and :meth:`bind_time_source`.
+        * This method can be called multiple times; new events are appended.
         """
         if (con_indices is None) == (pre_indices is None):
             raise ValueError("Provide exactly one of con_indices or pre_indices")
@@ -488,11 +1040,82 @@ class NetCon(Referency):
         self.sched_time_idx = torch.cat([self.sched_time_idx, filler], dim=0)
 
     def bind_weight_source(self, source: torch.Tensor):
+        """
+        Bind a tensor providing per-event weights for reference-mode scheduling.
+
+        This method enables *reference-mode* scheduled weights used by
+        :meth:`schedule_ref`. Instead of storing per-event weights directly
+        inside ``NetCon``, you bind a tensor (usually a parameter) and then
+        refer to entries in that tensor by integer indices.
+
+        Parameters
+        ----------
+        source : torch.Tensor
+            Tensor containing candidate weights for scheduled events. It must:
+
+            * reside on the same device as the synapse (``self.device``), and
+            * have a size at least as large as any ``weight_idx`` used in
+              :meth:`schedule_ref`.
+
+            Typically this is a ``torch.nn.Parameter`` or another tensor that
+            participates in the training loop.
+
+        Notes
+        -----
+        Order of operations:
+
+            1. Construct the weight source tensor (e.g. ``nn.Parameter``).
+            2. Call ``netcon.bind_weight_source(weight_source)`` exactly once (or
+               whenever you want to replace the source).
+            3. Use :meth:`schedule_ref` with ``weight_idx`` values indexing into
+               the bound tensor.
+
+        * Calling this replaces any previously bound weight source.
+        * The tensor is not copied; ``NetCon`` keeps a reference and reads from
+          it during simulation.
+        * Gradients flow into the bound tensor whenever
+          ``diff_weights=True`` and the scheduling path is differentiable.
+        """
         if source.device != self.device:
             raise ValueError("weight source must be on same device")
         self._sched_w_source = source
 
     def bind_time_source(self, source: torch.Tensor):
+        """
+        Bind a tensor providing per-event times (ms) for reference-mode scheduling.
+
+        This method enables *reference-mode* scheduled times used by
+        :meth:`schedule_time_ref`. Instead of storing times directly in
+        ``NetCon``, you bind a tensor (usually a parameter) and then reference
+        entries in that tensor by integer indices.
+
+        Parameters
+        ----------
+        source : torch.Tensor
+            Tensor containing candidate event times in milliseconds. It must:
+
+            * reside on the same device as the synapse (``self.device``), and
+            * have a size at least as large as any ``time_idx`` used in
+              :meth:`schedule_time_ref`.
+
+            Typically this is a ``torch.nn.Parameter`` or another tensor that
+            participates in the training loop.
+
+        Notes
+        -----
+        Order of operations:
+
+            1. Construct the time source tensor (e.g. ``nn.Parameter`` in ms).
+            2. Call ``netcon.bind_time_source(time_source)``.
+            3. Use :meth:`schedule_time_ref` with ``time_idx`` values indexing into
+               the bound tensor.
+
+        * Calling this replaces any previously bound time source.
+        * The tensor is not copied; ``NetCon`` reads from it at runtime.
+        * When used with :meth:`set_diff_config(diff_scheduled_times=True)`,
+          and when the bound tensor requires gradients, event times become
+          differentiable via the triangular timing kernel.
+        """
         if source.device != self.device:
             raise ValueError("time source must be on same device")
         self._sched_t_source = source
@@ -507,7 +1130,73 @@ class NetCon(Referency):
         allow_past: bool = False,
     ):
         """
-        Schedule REFERENCE-MODE events. Provide weight indices into a bound source.
+        Schedule reference-mode events with weights drawn from a bound source.
+
+        This API is the reference-mode counterpart to :meth:`schedule`. Instead
+        of passing explicit weights, you pass integer indices into a tensor
+        that has previously been bound via :meth:`bind_weight_source`.
+
+        Exactly one of ``con_indices`` or ``pre_indices`` must be provided,
+        and :meth:`bind_weight_source` must have been called beforehand.
+
+        Parameters
+        ----------
+        con_indices : Sequence[int] or torch.Tensor, optional
+            Explicit connection indices at which to schedule events.
+            Mutually exclusive with ``pre_indices``.
+        pre_indices : Sequence[int] or torch.Tensor, optional
+            Pre-synaptic indices to expand to connection indices via the CSR
+            map (see :meth:`_expand_pre_to_con`). Mutually exclusive with
+            ``con_indices``.
+        times_ms : Sequence[float] or torch.Tensor
+            Event times in milliseconds, one per event. Converted to integer
+            steps via rounding for non-differentiable behavior; used as
+            continuous times when ``diff_scheduled_times=True``.
+        weight_idx : Sequence[int] or torch.Tensor
+            Integer indices into the tensor bound by :meth:`bind_weight_source`.
+            Must have the same length as ``times_ms`` and ``con_indices`` /
+            expanded connections.
+        allow_past : bool, optional
+            If False (default), events scheduled before the current
+            ``global_step`` are discarded. If True, no filtering is applied.
+
+        Notes
+        -----
+        *Reference-mode* scheduling is designed for scenarios where you want
+        scheduled weights to be:
+
+        * shared across multiple events or :class:`NetCon` instances,
+        * trained by a separate module or optimizer, or
+        * constrained/regularized jointly (e.g., via an external loss).
+
+        Because the weight values are read from a shared tensor at runtime,
+        gradients from all events that reference a given index accumulate into
+        that entry.
+
+        **Order of operations**:
+
+            1. Bind a weight source tensor:
+
+               .. code-block:: python
+
+                   nc.bind_weight_source(weight_source)
+
+            2. Schedule reference-mode events:
+
+               .. code-block:: python
+
+                    nc.schedule_ref(
+                        con_indices=...,
+                        times_ms=...,
+                        weight_idx=...,
+                    )
+
+            3. Run simulation (``nc.advance()`` in a loop).
+
+        * If :meth:`bind_weight_source` has not been called, this method raises
+          a ``RuntimeError``.
+        * The value-mode slots for weights are still allocated but set to zero;
+          only reference-mode contributions are active for these events.
         """
         if self._sched_w_source is None:
             raise RuntimeError("call bind_weight_source(...) before schedule_ref(...)")
@@ -563,8 +1252,72 @@ class NetCon(Referency):
         allow_past: bool = False,
     ):
         """
-        Schedule events whose times come by REFERENCE from a bound tensor.
-        You may still pass a value-mode 'weight' (scalar or per-event).
+        Schedule events whose times come by reference from a bound tensor.
+
+        This API is the time-reference analogue of :meth:`schedule`. Instead
+        of providing explicit event times, you provide integer indices into a
+        tensor bound via :meth:`bind_time_source`. Weights are still supplied
+        in value mode.
+
+        Exactly one of ``con_indices`` or ``pre_indices`` must be provided, and
+        :meth:`bind_time_source` must have been called beforehand.
+
+        Parameters
+        ----------
+        con_indices : Sequence[int] or torch.Tensor, optional
+            Explicit connection indices for the events.
+        pre_indices : Sequence[int] or torch.Tensor, optional
+            Pre-synaptic indices, expanded to connection indices via the CSR map.
+        time_idx : Sequence[int] or torch.Tensor
+            Integer indices into the tensor bound via :meth:`bind_time_source`.
+            Must match the number of events after expanding ``pre_indices`` if
+            used.
+        weight : float or torch.Tensor, optional
+            Value-mode weight multiplier, as in :meth:`schedule`. May be a
+            scalar or a per-event tensor of length equal to the number of
+            scheduled events. Gradients can flow into this tensor when
+            differentiable scheduling is enabled.
+        allow_past : bool, optional
+            If False (default), events whose current time (from the bound
+            source) would be in the past relative to ``global_step`` are
+            dropped. If True, keep all events.
+
+        Notes
+        -----
+        Time-reference scheduling is designed for scenarios where you want to:
+
+        * train event times explicitly as parameters,
+        * share timing parameters across multiple events,
+        * or couple event times to other model components (e.g., another network).
+
+        When used with ``diff_scheduled_times=True`` in :meth:`set_diff_config`,
+        gradients flow into the bound time tensor and can move events in time.
+
+        **Order of operations**:
+
+            1. Bind a time source tensor:
+
+                .. code-block:: python
+
+                    nc.bind_time_source(time_source)
+
+            2. Schedule events by time index:
+
+                .. code-block:: python
+
+                    nc.schedule_time_ref(
+                        con_indices=...,
+                        time_idx=...,
+                        weight=...,
+                    )
+
+            3. Run simulation (``nc.advance()`` in a loop).
+
+        * If :meth:`bind_time_source` has not been called, this method raises a
+          ``RuntimeError``.
+        * The value-mode time slot in ``sched_time_ms`` is populated with zeros;
+          the actual times are obtained at runtime from the bound tensor via
+          ``sched_time_idx``.
         """
         if self._sched_t_source is None:
             raise RuntimeError(
@@ -640,6 +1393,26 @@ class NetCon(Referency):
         )
 
     def clear_schedule(self):
+        """
+        Remove all scheduled events and reset scheduling-related buffers.
+
+        This clears both value-mode and reference-mode scheduled events:
+
+        * connection indices (``sched_con_idx``),
+        * absolute step indices (``sched_abs_step``),
+        * value-mode weights and times (``sched_weight``, ``sched_time_ms``),
+        * reference-mode indices (``sched_weight_idx``, ``sched_time_idx``),
+        * per-connection introspection statistics (``sched_wsum``,
+          ``sched_counts``).
+
+        The bound sources set via :meth:`bind_weight_source` and
+        :meth:`bind_time_source` are **not** modified.
+
+        Notes
+        -----
+        * This is typically called between episodes or trials when you want
+          to reuse the same ``NetCon`` instance but with a fresh schedule.
+        """
         device, dtype = self.device, self.dtype
         self.sched_con_idx = torch.empty(0, device=device, dtype=torch.long)
         self.sched_abs_step = torch.empty(0, device=device, dtype=torch.long)
@@ -652,11 +1425,34 @@ class NetCon(Referency):
 
     def _scheduled_gate_this_step(self, gs_long: torch.Tensor, *, use_tri_kernel: bool):
         """
-        Build per-connection scheduled amplitude for the current absolute step.
-        Shapes are fixed; no boolean indexing that changes sizes.
-        Returns:
-            sched_wsum_conn:   [n_conn] float
-            sched_counts_conn: [n_conn] int32
+        Aggregate scheduled contributions for the current absolute step.
+
+        This internal helper constructs:
+
+        * a per-connection scheduled gate amplitude (sum of per-event weights),
+        * a per-connection count of active scheduled events (for bookkeeping),
+
+        given the current global step and the configuration flags in
+        ``self.train_flags``.
+
+        Parameters
+        ----------
+        gs_long : torch.Tensor
+            Scalar Long tensor with the current global step index.
+        use_tri_kernel : bool
+            If True, use a differentiable triangular kernel in step space for
+            scheduled times (used when ``diff_scheduled_times=True``). If False,
+            scheduled events are active only when the rounded step equals
+            ``gs_long``.
+
+        Returns
+        -------
+        sched_wsum_conn : torch.Tensor
+            1-D tensor of shape ``[n_conn]`` containing the scheduled gate
+            amplitudes per connection for this step.
+        sched_counts_conn : torch.Tensor
+            1-D int32 tensor of shape ``[n_conn]`` containing the number of
+            scheduled events contributing to each connection at this step.
         """
         n_conn = self._n_conn
         device, dtype = self.device, self.dtype
@@ -712,6 +1508,31 @@ class NetCon(Referency):
         return sched_wsum_conn, sched_counts_conn
 
     def advance_diff(self):
+        """
+        Advance the connection state by one time step (differentiable path).
+
+        This method implements the differentiable update kernel used when
+        ``self.training`` is True and :meth:`set_diff_config` has been
+        called. It performs:
+
+        1. Delivery of the current delay-buffer row to ``syn.net_receive``.
+        2. Determination of intrinsic spiking via ``determine_spiking`` with
+           surrogate gradients if configured.
+        3. Construction of the per-connection gate combining intrinsic and
+           scheduled contributions (with optional differentiable timing).
+        4. Application of weights (optionally differentiable) and delays
+           (optionally differentiable via interpolation) to write into future
+           delay-buffer rows.
+        5. Update of ``current_time_step`` and ``global_step``.
+
+        Notes
+        -----
+        * Users typically do not call this directly; instead, call
+          ``netcon.initialize(...)`` and then invoke ``netcon.advance()``
+          inside a simulation loop.
+        * A ``RuntimeError`` is raised if :meth:`set_diff_config` has not been
+          called (``train_flags is None``).
+        """
         if self.train_flags is None:
             raise RuntimeError(
                 "NetCon.train(...) must be called before advance_diff()."
@@ -860,6 +1681,22 @@ class NetCon(Referency):
             self.global_step = new_gs.detach()
 
     def advance_non_diff(self):
+        """
+        Advance the connection state by one time step (non-differentiable path).
+
+        This kernel is used when ``self.training`` is False. It implements the
+        same logical operations as :meth:`advance_diff`, but:
+
+        * uses hard threshold spiking (no surrogate gradients),
+        * uses integer delay steps only,
+        * uses exact step times for scheduled events (no triangular kernel),
+        * performs in-place updates where convenient.
+
+        Notes
+        -----
+        * Users typically call ``netcon.advance()`` after a call to
+          :meth:`initialize` rather than invoking this method directly.
+        """
         cur_idx = self.current_time_step
         todays_delivery = self.delivery_buffer.index_select(0, cur_idx)
         self.events = self.event_queue.index_select(0, cur_idx).squeeze(0)
@@ -902,6 +1739,29 @@ class NetCon(Referency):
         self.global_step.add_(1)
 
     def determine_spiking_ns(self, pre: NetStim, diff_spiking: bool = True, tau=None):
+        """
+        Determine spiking when the pre-synaptic source is a :class:`NetStim`.
+
+        For :class:`NetStim` sources, the pre-synaptic event signal is already
+        represented as ``spikes`` (hard) or ``spike_gate`` (soft/surrogate).
+        This method:
+
+        * extracts the relevant entries using ``pre_idx``,
+        * selects hard or soft gates depending on ``diff_spiking``, and
+        * stores the result in ``self.is_spiking`` as a float tensor.
+
+        Parameters
+        ----------
+        pre : NetStim
+            Pre-synaptic :class:`NetStim` providing ``spikes`` and
+            ``spike_gate`` attributes.
+        diff_spiking : bool, optional
+            If True, use ``pre.spike_gate`` directly (assumed differentiable).
+            If False, use ``pre.spikes`` and cast to float gates {0, 1}.
+        tau : float, optional
+            Unused for :class:`NetStim` sources; present for API symmetry with
+            :meth:`determine_spiking_var`.
+        """
         # If the pre-synaptic source is a NetStim, we can directly use its spikes
         # (or spikes_gate for differentiable spiking)
         if diff_spiking:
@@ -924,6 +1784,40 @@ class NetCon(Referency):
         self.is_spiking = gate.to(device=self.pre_device, dtype=self.pre_dtype)
 
     def determine_spiking_var(self, pre, diff_spiking: bool = True, tau=0.1):
+        """
+        Determine spiking from a generic pre-synaptic variable (non-NetStim).
+
+        This method is used when the pre-synaptic source is not a
+        :class:`NetStim`. It:
+
+        1. Extracts the relevant entries from the configured pre variable
+           (e.g., ``pre.v``) using ``pre_idx``.
+        2. Applies either surrogate-gradient or hard thresholding depending on
+           ``diff_spiking`` and the presence of finite thresholds.
+        3. Handles NaN thresholds by optionally using the raw variable as a
+           continuous gate for those connections.
+
+        Parameters
+        ----------
+        pre :
+            Pre-synaptic module exposing the attribute named by
+            ``self.get_pre_var`` (usually ``"v"``).
+        diff_spiking : bool, optional
+            If True, use :func:`update_active_diff` with a surrogate gradient
+            defined by ``tau``. If False, use :func:`update_active` with hard
+            thresholding.
+        tau : float, optional
+            Temperature parameter passed through to :func:`update_active_diff`.
+            Smaller values yield steeper surrogate activation functions.
+
+        Notes
+        -----
+        * If all thresholds are NaN (``skip_thresholding=True``), the method
+          simply mirrors the pre variable as a continuous gate.
+        * If some thresholds are NaN and others are finite, the method applies
+          thresholding where finite and uses raw pre values where thresholds
+          are NaN.
+        """
         # Always work in the module's float dtype
         v_selected = (
             self.get_pre_var(pre)
@@ -967,8 +1861,28 @@ class NetCon(Referency):
 
     def zero(self, clear_delivery_buffers=True):
         """
-        Reset the delivery buffer and current time step.
-        This is useful for re-initializing the module.
+        Reset the per-step state of the connection.
+
+        This method:
+
+        * sets ``current_time_step`` to 0,
+        * optionally clears the delivery buffer and event queue state via
+          ``delivery_buffer.zero_()``,
+        * resets spike-history buffers (``has_spiked``, ``is_spiking``).
+
+        Parameters
+        ----------
+        clear_delivery_buffers : bool, optional
+            If True (default), zero the delivery buffer and reset spike
+            histories. If False, keep existing contents of the delay line and
+            event queue, but always reset ``current_time_step`` to 0.
+
+        Notes
+        -----
+        * This does **not** clear schedules; use :meth:`clear_schedule` for
+          that.
+        * ``initialize`` calls this internally, so explicit calls are only
+          needed when manually resetting state mid-simulation.
         """
         self.current_time_step.fill_(0)
         if clear_delivery_buffers:
@@ -978,8 +1892,19 @@ class NetCon(Referency):
 
     def detach(self):
         """
-        Detach the module from the current computation graph.
-        This is useful for inference or when you want to stop tracking gradients.
+        Detach internal buffers from the current computation graph.
+
+        This simply calls ``.detach()`` on all registered buffers and rebinds
+        them. It is useful when:
+
+        * starting a fresh forward pass between episodes,
+        * freezing the internal state for inference,
+        * or avoiding backpropagation through previous simulation windows.
+
+        Notes
+        -----
+        * This does not change the values of buffers; it only affects their
+          ``grad_fn`` and autograd history.
         """
         for n, b in self.named_buffers():
             setattr(self, n, b.detach())
@@ -987,6 +1912,60 @@ class NetCon(Referency):
     def initialize(
         self, reinit_weights=True, reinit_delays=True, clear_deliveries=True
     ):
+        """
+        Prepare ``NetCon`` for simulation by initializing buffers and parameters.
+
+        This method must be called before the first call to ``advance`` in a
+        new simulation episode. It performs the following steps:
+
+        1. **Select advance kernel**:
+
+           - If ``self.training`` is True, set ``self.advance = self.advance_diff``.
+           - Otherwise, set ``self.advance = self.advance_non_diff``.
+
+        2. **Reset per-step state** by calling :meth:`zero` with
+           ``clear_deliveries``.
+
+        3. **(Re)initialize parameters**:
+
+           - Call ``self.weight.init(reinit=reinit_weights)``.
+           - Call ``self.delay_ms.init(reinit=reinit_delays)``.
+
+        4. **Rebuild delay buffers** if delays were reinitialized via
+           :meth:`_rebuild_delay_buffers`.
+
+        5. **Align internal time**:
+
+           - Set ``global_step`` from the external time attribute ``self.t``
+             and ``self.dt`` (assumes ``self.t`` is managed by the broader
+             simulation).
+
+        6. **Detach state** by calling :meth:`detach`.
+
+        Parameters
+        ----------
+        reinit_weights : bool, optional
+            If True (default), reinitialize weights via the underlying
+            parameter module. If False, leave existing weights unchanged.
+        reinit_delays : bool, optional
+            If True (default), reinitialize delays via the underlying
+            parameter module and rebuild delay buffers. If False, keep
+            existing delays and the current delay buffers.
+        clear_deliveries : bool, optional
+            If True (default), zero delivery buffers and spike histories via
+            :meth:`zero`. If False, keep existing delivery-buffer contents
+            while still resetting ``current_time_step`` to 0.
+
+        Notes
+        -----
+        * For differentiable training, call :meth:`set_diff_config` before
+          calling ``initialize`` so that :meth:`advance_diff` can use the
+          correct configuration.
+        * ``initialize`` does not clear scheduled events; call
+          :meth:`clear_schedule` if you need a fresh schedule.
+        * This method is invoked automatically by higher-level simulation
+          loops in AxonML (e.g., :class:`axonml.models.networks.Network.initialize`).
+        """
         if self.training:
             self.advance = self.advance_diff
         else:
@@ -1002,7 +1981,16 @@ class NetCon(Referency):
 
     def numel(self):
         """
-        Returns the number of synaptic connections managed by this NetCon.
-        This is useful for understanding the scale of the network.
+        Return the number of synaptic connections managed by this ``NetCon``.
+
+        Returns
+        -------
+        int
+            Number of connections, equal to ``len(pre_idx)``. This is useful
+            for:
+
+            * sanity-checking connectivity sizes,
+            * allocating auxiliary tensors,
+            * reporting statistics about network scale.
         """
         return int(self.n.item())

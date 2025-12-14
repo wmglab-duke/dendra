@@ -143,3 +143,5 @@ examples/*/*.pkl
 
 # macOS
 *.DS_Store
+
+*.mp4
