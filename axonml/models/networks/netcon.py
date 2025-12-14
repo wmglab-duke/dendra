@@ -310,9 +310,9 @@ class NetCon(Referency):
             Entries may be NaN to indicate:
 
             * all-NaN: skip thresholding and treat the selected pre variable as
-            a continuous gate;
+              a continuous gate;
             * mixed: apply thresholding for finite entries, and use the raw
-            pre variable wherever the threshold is NaN.
+              pre variable wherever the threshold is NaN.
 
         post : :class:`~axonml.models.core.Population`
             Post-synaptic population module that owns the synapse mechanism.
@@ -326,7 +326,7 @@ class NetCon(Referency):
 
             * ``shape_f``: final tensor shape of per-synapse payloads, and
             * ``net_receive(payload, netcon)``: function invoked each step with
-            delivery buffer slice reshaped to ``shape_f``.
+              delivery buffer slice reshaped to ``shape_f``.
 
         weight : torch.nn.Module
             Parameter-like module representing per-connection weights. Must support:

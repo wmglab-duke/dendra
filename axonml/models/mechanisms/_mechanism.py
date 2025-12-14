@@ -346,11 +346,9 @@ class Mechanism(Parameterized):
             setattr(self, "factorable", factorable)
 
         self.populate()
-        if bool(USETABLES):
-            print("Using tables for mechanism:", self.name)
-            self.instantiate_tables()
-            for state in self.DE.values():
-                state.instantiate_tables()
+        self.instantiate_tables(usetables=bool(USETABLES))
+        for state in self.DE.values():
+            state.instantiate_tables(usetables=bool(USETABLES))
 
     def set_dt(self, dt):
         """

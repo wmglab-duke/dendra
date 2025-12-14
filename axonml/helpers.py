@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import contextlib
 import functools
 import importlib
@@ -5,7 +7,7 @@ import logging
 import os
 import re
 import time
-from typing import ClassVar
+from typing import Any, Callable, ClassVar, Optional, TypeVar
 
 import numpy as np
 import torch
@@ -25,6 +27,35 @@ class classproperty(object):
 
 
 class ctx(contextlib.ContextDecorator):
+    """
+    Context manager for temporarily setting AxonML ContextVar values.
+
+    These flags control compilation and runtime behaviors across AxonML:
+
+    - ``BACKEND`` (str): torch.compile backend (e.g., ``\"inductor\"``).
+    - ``FULLGRAPH`` (int/bool): request full-graph compilation.
+    - ``DYNAMIC`` (int/bool): enable dynamic shape compilation.
+    - ``JIT`` (int/bool): enable/disable torch.compile wrapping.
+    - ``COMPILE_MODE`` (str): torch.compile mode (e.g., ``\"default\"``).
+    - ``DEBUG`` (int/bool): increase logging verbosity for mechanism/state
+      compilation (symbolic transforms, conductance differentiation).
+    - ``IMEM`` (int/bool): whether integrators compute/store ``i_membrane``
+      in populations (required for LFP calculations).
+    - ``USETABLES`` (int/bool): toggle lookup tables declared via ``TABLE`` on
+      State/Mechanism.
+    - ``TF32`` is available but typically not toggled here.
+
+    Example
+    -------
+    >>> with ctx(DEBUG=1, JIT=0):
+    ...     net.build(...)
+
+    Parameters
+    ----------
+    **kwargs
+        Mapping from ContextVar key to temporary value. Restored on exit.
+    """
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
 
@@ -83,6 +114,14 @@ COMPILE_MODE = ContextVar("COMPILE_MODE", "default")
 
 
 def set_jit_enabled(enable=True):
+    """
+    Enable or disable JIT compilation globally for AxonML models.
+
+    Parameters
+    ----------
+    enable : bool
+        If True, enable JIT compilation. If False, disable it. Default is True.
+    """
     global JIT
     JIT.value = int(enable)
     return
@@ -179,7 +218,16 @@ def op_sc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return torch.einsum("an,at->tan", s, t).contiguous()
 
 
-nojit = torch._dynamo.disable
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+@functools.wraps(torch._dynamo.disable)
+def nojit(fn: Optional[F] = None, recursive: bool = True) -> F:  # type: ignore[misc]
+    """Disable TorchDynamo compilation for a function.
+
+    This is a convenience wrapper around :func:`torch._dynamo.disable`.
+    """
+    return torch._dynamo.disable(fn=fn, recursive=recursive)  # type: ignore[return-value]
 
 
 # -- timing utilities --
@@ -198,12 +246,41 @@ logger.setLevel(logging.INFO)
 
 
 def tic(message=None, log=True):
+    """
+    Start a wall-clock timer.
+
+    Parameters
+    ----------
+    message : str, optional
+        Optional message to log when starting the timer.
+    log : bool, optional
+        If True (default), log the message via the module logger.
+    """
     TIME_STACK.append(time.time())
     if message and log:
         logger.info(str(message))
 
 
 def toc(message=None, log=True):
+    """
+    Stop the most recent timer and return elapsed seconds.
+
+    Parameters
+    ----------
+    message : str, optional
+        Optional message to prefix the elapsed time.
+    log : bool, optional
+        If True (default), log the elapsed time via the module logger.
+
+    Returns
+    -------
+    float
+        Elapsed time in seconds.
+
+    Notes
+    -----
+    Raises a log error if called without a matching :func:`tic`.
+    """
     try:
         t = time.time() - TIME_STACK.pop()
         output = f"Elapsed: {t:.3f}s"

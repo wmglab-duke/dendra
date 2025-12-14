@@ -361,6 +361,7 @@ class PreparedInterp1d(nn.Module):
             Query points at which to evaluate the interpolant(s).
 
             Accepted shapes:
+
             - ``(P,)``: a single query vector
             - ``(Q, P)``: a batch of query vectors
 
@@ -375,6 +376,7 @@ class PreparedInterp1d(nn.Module):
             - If x,y are 1D: `indices` is optional; if provided, it must be all zeros.
 
             - If x,y are 2D (D,N):
+
               * If ``x_new`` is ``(D, P)`` and `indices` is None:
                 row-wise alignment is used (row d uses LUT row d).
               * If ``x_new`` is ``(Q, P)`` and `Q != D`:
@@ -418,37 +420,34 @@ class PreparedInterp1d(nn.Module):
 
             **1) Unbatched LUT mode** (``x, y`` are 1D with shape ``(N,)``)
 
-            - If ``x_new`` has shape ``(P,)``:
-              - output has shape ``(P,)``
+            - If ``x_new`` has shape ``(P,)``, output has shape ``(P,)``
 
-            - If ``x_new`` has shape ``(Q, P)``:
-              - output has shape ``(Q, P)``
+            - If ``x_new`` has shape ``(Q, P)``, output has shape ``(Q, P)``
 
             (In unbatched mode, `indices` is never required; if provided it must be all zeros.)
 
             **2) Batched LUT mode** (``x, y`` are 2D with shape ``(D, N)``)
 
             - If ``x_new`` has shape ``(D, P)`` and ``indices is None``:
-              - output has shape ``(D, P)``
-              - (Row-wise alignment: query row ``d`` uses LUT row ``d``.)
+
+              - output has shape ``(D, P)`` (Row-wise alignment: query row ``d`` uses LUT row ``d``.)
 
             - If ``x_new`` has shape ``(Q, P)`` and ``indices`` is provided with length ``Q``:
-              - output has shape ``(Q, P)``
-              - (Query row ``q`` uses LUT row ``indices[q]``.)
 
-            - If ``x_new`` has shape ``(Q, P)`` with ``Q != D`` and ``indices is None``:
-              - **error** (ambiguous mapping)
+              - output has shape ``(Q, P)`` (Query row ``q`` uses LUT row ``indices[q]``.)
+
+            - If ``x_new`` has shape ``(Q, P)`` with ``Q != D`` and ``indices is None``: **error** (ambiguous mapping)
 
             - If ``x_new`` has shape ``(P,)``:
+
               - ``indices`` is **required** (otherwise ambiguous)
               - The same query vector is evaluated against each selected LUT row.
 
               Let ``L = len(indices)``:
-              - If ``L == 1``:
-                - output has shape ``(P,)`` (the module returns 1D when the input was 1D
-                  and only one effective query row is evaluated)
-              - If ``L > 1``:
-                - output has shape ``(L, P)``
+
+              - If ``L == 1``, output has shape ``(P,)`` (the module returns 1D when the input was 1D
+                and only one effective query row is evaluated)
+              - If ``L > 1``, output has shape ``(L, P)``
 
             **Forcing a 2D output for a single selected LUT row**
 
@@ -720,6 +719,7 @@ def interp1d(x, y, xnew, out=None, *, outside: str = "zero"):
     -------
     ynew : torch.Tensor
         Interpolated values. Shape matches `xnew` in the common cases:
+
         - if x,y,xnew are 1D -> (P,)
         - if batched -> typically (D_eff, P)
         - special case: if x,y are single-row and xnew has multiple rows, the

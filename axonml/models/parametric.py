@@ -1348,12 +1348,15 @@ class Parameterized(SimpleParameterized):
                 b = param(b, *[getattr(self, arg) for arg in args])
             setattr(self, name, b)
 
-    def instantiate_tables(self):
+    def instantiate_tables(self, usetables=True):
         """
         Instantiate lookup tables declared for this class.
         """
         for name, table_info in self.__class__._table.items():
             func_name = name
+            if not usetables:
+                setattr(self, f"{func_name}_table", getattr(self, func_name))
+                continue
             low, high, n, learnable = (
                 table_info["low"],
                 table_info["high"],
@@ -1374,6 +1377,13 @@ class Parameterized(SimpleParameterized):
                     x, y, sort_xy=False, exact_clamp=False, learnable_y=learnable
                 ),
             )
+
+    def usetables(self, usetables=True):
+        """
+        Switch all function implementations to use lookup tables.
+        """
+        self.instantiate_tables(usetables=usetables)
+        torch._dynamo.reset()
 
     def detach(self):
         """
