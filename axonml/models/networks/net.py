@@ -1565,6 +1565,14 @@ class Network(RNGMixin):
         """
         return {name: syn.weight for name, syn in self.synapses.items()}
 
+    # population utilities
+    def delete_injections(self):
+        """
+        Deletes all current injections from all populations in the network.
+        """
+        for pop in self.populations.values():
+            pop.delete_injections()
+
 
 def prepare_intra(intra_c, intra, local_ind):
     """
