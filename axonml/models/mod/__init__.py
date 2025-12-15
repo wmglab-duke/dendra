@@ -11,6 +11,7 @@ from .fire import fire
 from .fire_r import fire_r
 from .hh import hh
 from .pas import pas
+from .spikedetect import spikedetect
 
 
 class MechanismContainer:

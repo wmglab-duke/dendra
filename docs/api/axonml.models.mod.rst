@@ -13,3 +13,4 @@ In-built mechanisms.
 .. autoclass:: axonml.models.mod.fire
 .. autoclass:: axonml.models.mod.hh
 .. autoclass:: axonml.models.mod.pas
+.. autoclass:: axonml.models.mod.spikedetect

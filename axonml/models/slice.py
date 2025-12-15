@@ -749,6 +749,21 @@ class Slice:
                 base_shape=object.__getattribute__(self, "base_shape"),
             )
 
+        if name in model._labels:
+            model = object.__getattribute__(self, "model")
+            idx = compose_indices(
+                model.shape,
+                model._labels[name].index,
+                object.__getattribute__(self, "index"),
+                device=model.device(),
+            )
+            idx = parse_key(idx, model.shape, device=model.device())
+            return type(self)(
+                model,
+                idx,
+                base_shape=object.__getattribute__(self, "base_shape"),
+            )
+
         # Parameters (optional): often handy to read through
         if name in model._parameters:
             return self._inspect(name)
