@@ -29,3 +29,15 @@ repos:
     hooks:
       - id: isort
         args: [--profile=black]  # keeps style aligned with Ruff/Black
+
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.8.2
+    hooks:
+      - id: nbstripout
+        files: \.ipynb$
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=5000"]
