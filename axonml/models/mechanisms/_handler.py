@@ -1,5 +1,6 @@
 import torch
 import torch._dynamo as dynamo
+import torch._inductor.config as inductor_config
 
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
 
@@ -103,6 +104,16 @@ class MechanismHandler(torch.nn.Module):
 
         self.shape = None
 
+        if self.write_ion_c:
+            self.write_to_ions = dynamo.disable(self.write_to_ions)
+        if self.read_ion:
+            self.read_from_ions = dynamo.disable(self.read_from_ions)
+
+        if self.write_ion_c or self.read_ion:
+            inductor_config.cpp_wrapper = False
+        else:
+            inductor_config.cpp_wrapper = True
+
     def make_maps(self):
         """
         Create the mapping of current indices to mechanisms and their functions.
@@ -133,6 +144,7 @@ class MechanismHandler(torch.nn.Module):
         for ion in self.ions.values():
             ion.advance(celsius)
         self.read_from_ions()
+        self.write_to_ions(v)
 
     def update_v(self, v):
         for vp in self.voltage_processes.values():
@@ -167,7 +179,6 @@ class MechanismHandler(torch.nn.Module):
         for ion in self.ions.values():
             ion.initialize(temp)
 
-    @dynamo.disable
     def write_to_ions(self, v):
         for ion, ion_c_write in self.write_ion_c.items():
             for k, conc_list in ion_c_write.items():
@@ -204,10 +215,10 @@ class MechanismHandler(torch.nn.Module):
     def detach_i_g_bufs(self):
         if not self.i_g_buffers_initialized:
             return
-        for buf in self._buf_i:
-            buf.detach_()
-        for buf in self._buf_g:
-            buf.detach_()
+        for i, buf in enumerate(self._buf_i):
+            self._buf_i[i] = buf.detach()
+        for i, buf in enumerate(self._buf_g):
+            self._buf_g[i] = buf.detach()
 
     def detach(self):
         for mech in self.mechanisms.values():

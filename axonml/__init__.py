@@ -1,4 +1,10 @@
 import os
+
+os.environ.setdefault("OMP_DYNAMIC", "FALSE")
+os.environ.setdefault("MKL_DYNAMIC", "FALSE")
+os.environ["OMP_PROC_BIND"] = "true"
+os.environ["OMP_PLACES"] = "cores"
+
 import pickle
 import time
 import warnings
@@ -70,6 +76,7 @@ __all__ = [
     "mod",
     "load_mechanisms",
     "Population",
+    "SingleCompartment",
     "Axon",
     "Unmyelinated",
     "Myelinated",
@@ -142,3 +149,7 @@ _cache_cpu_isa_list()
 
 # setup environment
 allow_tf32(bool(TF32))
+
+import torch._inductor.config as inductor_config
+
+inductor_config.cpp_wrapper = True

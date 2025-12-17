@@ -119,6 +119,13 @@ If you use `AxonML`, consider citing the `corresponding paper <https://www.natur
 
 .. toctree::
    :hidden:
+   :maxdepth: 1
+   :caption: Miscellaneous
+
+   misc
+
+.. toctree::
+   :hidden:
    :maxdepth: 2
    :caption: Resources
 

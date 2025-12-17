@@ -59,9 +59,11 @@ class ExtCellAxon(Axon):
 
     def _x(self):
         """Compute compartment midpoints centered along the axon."""
-        node_l = torch.atleast_2d(self.dx.squeeze())
+        dtype = self.dx.dtype
+        node_l = torch.atleast_2d(self.dx.squeeze().to(torch.double))
         x = node_l.cumsum(dim=1) - node_l / 2
-        return x - torch.sum(node_l, dim=1, keepdim=True) / 2
+        x = x - torch.sum(node_l, dim=1, keepdim=True) / 2
+        return x.to(dtype)
 
 
 def gather_extcell(graph, n_layers=2):

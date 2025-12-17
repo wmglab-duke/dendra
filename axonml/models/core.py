@@ -1166,7 +1166,7 @@ class Population(P, Sliceable):
 
                 # Integrator step
                 self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
-                self.t = self.t + dt_tensor
+                self.t += dt_tensor
 
                 post_step_hook(callbacks, self)
                 local_ind += 1
@@ -2959,8 +2959,10 @@ class Myelinated(Axon):
         start = -length / 2
         end = length / 2
         steps = self.n_comp
-        t = torch.linspace(0, 1, steps, device=length.device).unsqueeze(0)
-        return (1 - t) * start + t * end
+        t = torch.linspace(
+            0, 1, steps, device=length.device, dtype=torch.double
+        ).unsqueeze(0)
+        return ((1 - t) * start + t * end).to(self.dtype())
 
 
 # callback helpers
