@@ -957,6 +957,39 @@ class PreparedInterp1dUniform(nn.Module):
         fill_value: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Interpolate at query points `x_new`.
+
+        Parameters
+        ----------
+        x_new : torch.Tensor
+            Query points at which to evaluate the interpolant(s).
+            Accepted shapes:
+                - (P,) for unbatched interpolation
+                - (Q, P) for batched interpolation with Q batches
+        indices : int or sequence of int or torch.Tensor, optional
+            Mapping from query rows in `x_new` to LUT rows in `x`/`y` (batched mode).
+        outside : {"clamp", "zero", "fill"}, optional
+            Override the module's default out-of-bounds policy for this call.
+        fill_value : float, optional
+            Override the module's default fill value for this call when ``outside="fill"``.
+        out : torch.Tensor, optional
+            Optional output tensor to write results into. Must have exactly the same
+            shape as the computed output.
+
+        Returns
+        -------
+        y_new : torch.Tensor
+            Interpolated values.
+
+        Raises
+        ------
+        ValueError
+            If `x_new` is not 1D/2D, has incompatible batch dimension in batched mode
+            without `indices`, or if `indices` is missing or malformed in ambiguous cases.
+        TypeError
+            If `x_new` is not floating-point.
+        """
         outside = self.outside if outside is None else outside
         if outside not in ("clamp", "zero", "fill"):
             raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
@@ -1757,6 +1790,35 @@ class PreparedInterp3dRect(nn.Module):
         fill_value: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Interpolate at new query points.
+
+        Parameters
+        ----------
+        xyz_new : torch.Tensor
+            Shape (P,3) or (Q,P,3) (or generally (1,P,3) broadcastable).
+            If 2D, single grid is used (unbatched). If 3D, Q is the batch size.
+        indices : int or Sequence[int], optional
+            If the interpolator is batched (D > 1), specifies which grid(s) to use.
+            Can be a single int (applied to all points) or a sequence of length Q.
+            If None and batched, then Q must equal D and all grids are used.
+        outside : {"clamp", "zero", "fill"}, optional
+            Out-of-bounds handling override. If None, uses the setting from constructor.
+            - "clamp": values outside are clamped to endpoint values
+            - "zero":  values outside are set to 0
+            - "fill":  values outside are set to `fill_value`
+        fill_value : float, optional
+            Fill value to use if `outside="fill"`. If None, uses the setting from
+            constructor.
+        out : torch.Tensor, optional
+            Optional output buffer. If provided, must have the correct shape.
+
+        Returns
+        -------
+        values_new : torch.Tensor
+            Interpolated values at `xyz_new`. Shape is (P,C) if unbatched,
+            or (Q,P,C) if batched (or generally broadcastable to that).
+        """
         outside = self.outside if outside is None else outside
         if outside not in ("clamp", "zero", "fill"):
             raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
@@ -2286,6 +2348,27 @@ class PreparedInterp3dRectUniform(nn.Module):
         fill_value: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Interpolate values at query points xyz_new.
+
+        Parameters
+        ----------
+        xyz_new : (Q,P,3) or (P,3) float tensor
+            Query points.
+        indices : Optional[IndexLike], optional
+            Indices for batched interpolation, by default None
+        outside : Optional[OutsideMode], optional
+            How to handle points outside the interpolation domain, by default None
+        fill_value : Optional[float], optional
+            Value to use for points outside the domain if outside='fill', by default None
+        out : Optional[torch.Tensor], optional
+            Optional output tensor to write results into, by default None
+
+        Returns
+        -------
+        torch.Tensor
+            Interpolated values at query points.
+        """
         outside = self.outside if outside is None else outside
         if outside not in ("clamp", "zero", "fill"):
             raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
@@ -2866,6 +2949,22 @@ class PreparedInterp3dScattered(nn.Module):
     def forward(
         self, xq: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        """
+        Interpolate values at query points xq.
+
+        Parameters
+        ----------
+        xq : (...,3) float tensor
+            Query points.
+        out : (...,P) or (...) float tensor, optional
+            Optional output tensor to write results into.
+
+        Returns
+        -------
+        y : (...,P) or (...) float tensor
+            Interpolated values at query points.
+            If input values were scalar, shape is (...); otherwise (...,P).
+        """
         if xq.ndim < 2 or xq.shape[-1] != 3:
             raise ValueError("xq must have shape (...,3).")
         if xq.device != self._points.device:
