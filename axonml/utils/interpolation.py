@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Literal, Optional, Sequence, Union
+from typing import Literal, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
 
 OutsideMode = Literal["clamp", "zero", "fill"]
+OutsideMode3D = Literal["none", "zero", "fill"]
+KNNBackend = Literal["auto", "torch", "pytorch3d", "torch_cluster", "faiss"]
 IndexLike = Union[int, Sequence[int], torch.Tensor]
 
 
@@ -127,6 +129,10 @@ class PreparedInterp1d(nn.Module):
         sort_xy: bool = True,
         eps: Optional[float] = None,
         exact_clamp: bool = True,
+        # --- uniform fast paths ---
+        uniform: Literal["auto", "never", "always"] = "auto",
+        uniform_rtol: float = 1e-5,
+        uniform_atol: float = 1e-7,
     ):
         """
         Initialize and prepare the interpolator.
@@ -184,6 +190,18 @@ class PreparedInterp1d(nn.Module):
             prior to interval selection; this is typically sufficient and can save two
             ``torch.where`` operations.
 
+        uniform : {"auto", "never", "always"}, default="auto"
+            Whether to check for uniform spacing in `x` and use a fast path if so.
+            - "auto": check for uniform spacing and use fast path if detected.
+            - "never": always use the general (non-uniform) path.
+            - "always": assume `x` is uniformly spaced; raise an error if not.
+
+        uniform_rtol : float, default=1e-5
+            Relative tolerance used when checking for uniform spacing in `x` rows.
+
+        uniform_atol : float, default=1e-7
+            Absolute tolerance used when checking for uniform spacing in `x` rows.
+
         Raises
         ------
         ValueError
@@ -201,7 +219,6 @@ class PreparedInterp1d(nn.Module):
             raise ValueError(
                 "x and y must have the same ndim, and be either both 1D or both 2D."
             )
-
         if x.device != y.device:
             raise ValueError("x and y must be on the same device.")
         if x.dtype != y.dtype:
@@ -233,6 +250,9 @@ class PreparedInterp1d(nn.Module):
         self.learnable_y = bool(learnable_y)
         self.exact_clamp = bool(exact_clamp)
 
+        if uniform not in ("auto", "never", "always"):
+            raise ValueError("uniform must be 'auto', 'never', or 'always'")
+
         # ---- sort x and permute y (optional) ----
         if sort_xy:
             if x.ndim == 1:
@@ -261,9 +281,44 @@ class PreparedInterp1d(nn.Module):
 
         if eps is None:
             eps = float(torch.finfo(dx.dtype).eps)
+
+        # ---- uniform fast-path detection (per row) ----
+        self._use_uniform = False
+        if uniform != "never":
+            if not self.batched:
+                dx0 = dx[:1]  # (1,)
+                uniform_ok = bool(torch.all(dx0 > 0).item()) and torch.allclose(
+                    dx, dx0.expand_as(dx), rtol=uniform_rtol, atol=uniform_atol
+                )
+                if uniform == "always" and not uniform_ok:
+                    raise ValueError("uniform='always' but x is not uniformly spaced.")
+                if uniform_ok:
+                    self._use_uniform = True
+                    safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
+                    inv_dx_u = (1.0 / safe_dx0)[0]  # scalar
+                    dx_u = safe_dx0[0]  # scalar
+                    self.register_buffer("_inv_dx_uniform", inv_dx_u.detach())
+                    self.register_buffer("_dx_uniform", dx_u.detach())
+            else:
+                dx0 = dx[:, :1]  # (D,1)
+                uniform_ok = bool(torch.all(dx0 > 0).item()) and torch.allclose(
+                    dx, dx0.expand_as(dx), rtol=uniform_rtol, atol=uniform_atol
+                )
+                if uniform == "always" and not uniform_ok:
+                    raise ValueError(
+                        "uniform='always' but x is not uniformly spaced per row."
+                    )
+                if uniform_ok:
+                    self._use_uniform = True
+                    safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
+                    inv_dx_u = (1.0 / safe_dx0).contiguous()
+                    dx_u = safe_dx0.contiguous()
+                    self.register_buffer("_inv_dx_uniform", inv_dx_u.detach())
+                    self.register_buffer("_dx_uniform", dx_u.detach())
+
+        # ---- per-segment inv_dx (used for non-uniform path) ----
         safe_dx = torch.where(dx == 0, torch.full_like(dx, eps), dx)
         inv_dx = (1.0 / safe_dx).contiguous()
-
         self.register_buffer("_inv_dx", inv_dx.detach())
         self._ind_hi = self.N - 2
 
@@ -286,7 +341,6 @@ class PreparedInterp1d(nn.Module):
                 self.register_buffer("_y_first", y_sorted[:, :1].detach())  # (D,1)
                 self.register_buffer("_y_last", y_sorted[:, -1:].detach())  # (D,1)
 
-        # Cached index tensor to reduce allocations in repeated calls with same x_new shape
         self._ind_cache: Optional[torch.Tensor] = None
 
     def _as_index_tensor(
@@ -469,14 +523,10 @@ class PreparedInterp1d(nn.Module):
         if outside not in ("clamp", "zero", "fill"):
             raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
 
-        if fill_value is None:
-            fill_value = self.fill_value
-        else:
-            fill_value = float(fill_value)
+        fill_value = self.fill_value if fill_value is None else float(fill_value)
 
         if x_new.ndim not in (1, 2):
             raise ValueError("x_new must be 1D (P,) or 2D (Q,P).")
-
         if x_new.device != self._x_search.device:
             raise ValueError("x_new must be on the same device as the interpolator.")
         if x_new.dtype != self._x_search.dtype:
@@ -487,8 +537,6 @@ class PreparedInterp1d(nn.Module):
             raise TypeError("x_new must be floating-point.")
 
         xnew_was_1d = x_new.ndim == 1
-
-        # Normalize to 2D
         xq = x_new[None, :] if xnew_was_1d else x_new
         Q = int(xq.shape[0])
 
@@ -502,10 +550,11 @@ class PreparedInterp1d(nn.Module):
             x_min = self._x_min
             x_max = self._x_max
 
-            if outside == "clamp":
-                xq_used = torch.maximum(torch.minimum(xq, x_max), x_min)
-            else:
-                xq_used = xq
+            xq_used = (
+                torch.maximum(torch.minimum(xq, x_max), x_min)
+                if outside == "clamp"
+                else xq
+            )
 
             if (
                 self._ind_cache is None
@@ -517,25 +566,44 @@ class PreparedInterp1d(nn.Module):
                 )
             ind = self._ind_cache
 
-            torch.searchsorted(self._x_search, xq_used, out=ind)
-            ind -= 1
-            ind.clamp_(0, self._ind_hi)
+            if self._use_uniform:
+                # ---- uniform fast-path: no searchsorted ----
+                u = (xq_used - x_min) * self._inv_dx_uniform
+                ind.copy_(u.to(torch.long))
+                ind.clamp_(0, self._ind_hi)
 
-            x0i = self._x0[ind]
-            inv_dxi = self._inv_dx[ind]
-
-            if self.learnable_y:
-                y = self.y  # (N,)
-                y0 = y[ind]
-                y1 = y[ind + 1]
-                t = (xq_used - x0i) * inv_dxi
-                ynew = y0 + (y1 - y0) * t
+                if self.learnable_y:
+                    y = self.y  # (N,)
+                    y0 = y[ind]
+                    y1 = y[ind + 1]
+                    t = u - ind.to(u.dtype)
+                    ynew = y0 + (y1 - y0) * t
+                else:
+                    x0i = x_min + ind.to(xq_used.dtype) * self._dx_uniform
+                    y0 = self._y0[ind]
+                    m = self._slopes[ind]
+                    ynew = y0 + m * (xq_used - x0i)
             else:
-                y0 = self._y0[ind]
-                m = self._slopes[ind]
-                ynew = y0 + m * (xq_used - x0i)
+                # ---- original path ----
+                torch.searchsorted(self._x_search, xq_used, out=ind)
+                ind -= 1
+                ind.clamp_(0, self._ind_hi)
 
-            # Outside policy
+                x0i = self._x0[ind]
+                inv_dxi = self._inv_dx[ind]
+
+                if self.learnable_y:
+                    y = self.y  # (N,)
+                    y0 = y[ind]
+                    y1 = y[ind + 1]
+                    t = (xq_used - x0i) * inv_dxi
+                    ynew = y0 + (y1 - y0) * t
+                else:
+                    y0 = self._y0[ind]
+                    m = self._slopes[ind]
+                    ynew = y0 + m * (xq_used - x0i)
+
+            # Outside policy (same as your original)
             if outside == "clamp":
                 if self.exact_clamp:
                     if self.learnable_y:
@@ -544,7 +612,6 @@ class PreparedInterp1d(nn.Module):
                     else:
                         y_first = self._y_first
                         y_last = self._y_last
-
                     ynew = torch.where(xq <= x_min, y_first, ynew)
                     ynew = torch.where(xq >= x_max, y_last, ynew)
             else:
@@ -561,23 +628,19 @@ class PreparedInterp1d(nn.Module):
             if xnew_was_1d:
                 if indices is None:
                     raise ValueError(
-                        "Ambiguous: x,y are (D,N) but x_new is (P,). "
-                        "Provide `indices` to specify which LUT rows to use."
+                        "Ambiguous: x,y are (D,N) but x_new is (P,). Provide indices."
                     )
                 idx = self._as_index_tensor(
                     indices, device=xq.device, expected_len=None
                 )
                 Q_eff = int(idx.numel())
-                xq = xq.expand(
-                    Q_eff, -1
-                )  # evaluate same x_new against selected LUT rows
+                xq = xq.expand(Q_eff, -1)
                 Q = Q_eff
             else:
                 if indices is None:
                     if Q != self.D:
                         raise ValueError(
-                            f"Ambiguous: x,y are (D,N) with D={self.D} but x_new is (Q,P) with Q={Q}. "
-                            "Provide `indices` of length Q to map each x_new row to an (x,y) row."
+                            f"Ambiguous: D={self.D} but Q={Q}. Provide indices of length Q."
                         )
                     idx = None
                 else:
@@ -592,7 +655,9 @@ class PreparedInterp1d(nn.Module):
                 inv_dx = self._inv_dx
                 x_min = self._x_min
                 x_max = self._x_max
-
+                if self._use_uniform:
+                    inv_dx_u = self._inv_dx_uniform
+                    dx_u = self._dx_uniform
                 if self.learnable_y:
                     y_sel = self.y
                 else:
@@ -606,7 +671,9 @@ class PreparedInterp1d(nn.Module):
                 inv_dx = self._inv_dx.index_select(0, idx)
                 x_min = self._x_min.index_select(0, idx)
                 x_max = self._x_max.index_select(0, idx)
-
+                if self._use_uniform:
+                    inv_dx_u = self._inv_dx_uniform.index_select(0, idx)
+                    dx_u = self._dx_uniform.index_select(0, idx)
                 if self.learnable_y:
                     y_sel = self.y.index_select(0, idx)
                 else:
@@ -615,10 +682,11 @@ class PreparedInterp1d(nn.Module):
                     y_first = self._y_first.index_select(0, idx)
                     y_last = self._y_last.index_select(0, idx)
 
-            if outside == "clamp":
-                xq_used = torch.maximum(torch.minimum(xq, x_max), x_min)
-            else:
-                xq_used = xq
+            xq_used = (
+                torch.maximum(torch.minimum(xq, x_max), x_min)
+                if outside == "clamp"
+                else xq
+            )
 
             if (
                 self._ind_cache is None
@@ -630,32 +698,60 @@ class PreparedInterp1d(nn.Module):
                 )
             ind = self._ind_cache
 
-            torch.searchsorted(x_search, xq_used, out=ind)
-            ind -= 1
-            ind.clamp_(0, self._ind_hi)
+            if self._use_uniform:
+                u = (xq_used - x_min) * inv_dx_u
+                ind.copy_(u.to(torch.long))
+                ind.clamp_(0, self._ind_hi)
 
-            x0i = torch.gather(x0, 1, ind)
-            inv_dxi = torch.gather(inv_dx, 1, ind)
-
-            if self.learnable_y:
-                y0 = torch.gather(y_sel, 1, ind)
-                y1 = torch.gather(y_sel, 1, ind + 1)
-                t = (xq_used - x0i) * inv_dxi
-                ynew = y0 + (y1 - y0) * t
-
-                if outside == "clamp" and self.exact_clamp:
-                    y_first_dyn = y_sel[:, :1]
-                    y_last_dyn = y_sel[:, -1:]
-                    ynew = torch.where(xq <= x_min, y_first_dyn.expand_as(ynew), ynew)
-                    ynew = torch.where(xq >= x_max, y_last_dyn.expand_as(ynew), ynew)
+                if self.learnable_y:
+                    y0 = torch.gather(y_sel, 1, ind)
+                    y1 = torch.gather(y_sel, 1, ind + 1)
+                    t = u - ind.to(u.dtype)
+                    ynew = y0 + (y1 - y0) * t
+                    if outside == "clamp" and self.exact_clamp:
+                        ynew = torch.where(
+                            xq <= x_min, y_sel[:, :1].expand_as(ynew), ynew
+                        )
+                        ynew = torch.where(
+                            xq >= x_max, y_sel[:, -1:].expand_as(ynew), ynew
+                        )
+                else:
+                    x0i = x_min + ind.to(xq_used.dtype) * dx_u
+                    y0i = torch.gather(y0_tab, 1, ind)
+                    mi = torch.gather(m_tab, 1, ind)
+                    ynew = y0i + mi * (xq_used - x0i)
+                    if outside == "clamp" and self.exact_clamp:
+                        ynew = torch.where(xq <= x_min, y_first.expand_as(ynew), ynew)
+                        ynew = torch.where(xq >= x_max, y_last.expand_as(ynew), ynew)
             else:
-                y0i = torch.gather(y0_tab, 1, ind)
-                mi = torch.gather(m_tab, 1, ind)
-                ynew = y0i + mi * (xq_used - x0i)
+                torch.searchsorted(x_search, xq_used, out=ind)
+                ind -= 1
+                ind.clamp_(0, self._ind_hi)
 
-                if outside == "clamp" and self.exact_clamp:
-                    ynew = torch.where(xq <= x_min, y_first.expand_as(ynew), ynew)
-                    ynew = torch.where(xq >= x_max, y_last.expand_as(ynew), ynew)
+                x0i = torch.gather(x0, 1, ind)
+                inv_dxi = torch.gather(inv_dx, 1, ind)
+
+                if self.learnable_y:
+                    y0 = torch.gather(y_sel, 1, ind)
+                    y1 = torch.gather(y_sel, 1, ind + 1)
+                    t = (xq_used - x0i) * inv_dxi
+                    ynew = y0 + (y1 - y0) * t
+
+                    if outside == "clamp" and self.exact_clamp:
+                        ynew = torch.where(
+                            xq <= x_min, y_sel[:, :1].expand_as(ynew), ynew
+                        )
+                        ynew = torch.where(
+                            xq >= x_max, y_sel[:, -1:].expand_as(ynew), ynew
+                        )
+                else:
+                    y0i = torch.gather(y0_tab, 1, ind)
+                    mi = torch.gather(m_tab, 1, ind)
+                    ynew = y0i + mi * (xq_used - x0i)
+
+                    if outside == "clamp" and self.exact_clamp:
+                        ynew = torch.where(xq <= x_min, y_first.expand_as(ynew), ynew)
+                        ynew = torch.where(xq >= x_max, y_last.expand_as(ynew), ynew)
 
             if outside in ("zero", "fill"):
                 outside_mask = (xq < x_min) | (xq > x_max)
@@ -664,7 +760,6 @@ class PreparedInterp1d(nn.Module):
                 else:
                     ynew = ynew.masked_fill(outside_mask, fill_value)
 
-        # Restore 1D output only when there is exactly one query row
         if xnew_was_1d and ynew.shape[0] == 1:
             ynew = ynew[0]
 
@@ -679,7 +774,354 @@ class PreparedInterp1d(nn.Module):
         return ynew
 
 
-def interp1d(x, y, xnew, out=None, *, outside: str = "zero"):
+class PreparedInterp1dUniform(nn.Module):
+    """
+    Prepared 1D uniform-grid linear interpolator.
+
+    Same input/output regimes as PreparedInterp1d, but assumes x is uniformly spaced
+    (per row, if batched), enabling O(1) interval selection without searchsorted.
+    """
+
+    def __init__(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        outside: OutsideMode = "clamp",
+        fill_value: float = 0.0,
+        learnable_y: bool = False,
+        y_requires_grad: bool = True,
+        sort_xy: bool = True,
+        check_uniform: bool = False,
+        rtol: float = 1e-5,
+        atol: float = 1e-7,
+        eps: Optional[float] = None,
+        exact_clamp: bool = True,
+    ):
+        super().__init__()
+
+        if outside not in ("clamp", "zero", "fill"):
+            raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
+
+        if x.ndim != y.ndim or x.ndim not in (1, 2):
+            raise ValueError("x and y must both be 1D or both be 2D.")
+
+        if x.device != y.device or x.dtype != y.dtype:
+            raise ValueError(
+                "x and y must be on the same device and have the same dtype."
+            )
+        if not torch.is_floating_point(x):
+            raise TypeError("x and y must be floating-point.")
+
+        # Enforce shapes
+        if x.ndim == 1:
+            if x.shape != y.shape:
+                raise ValueError("Unbatched: x and y must both be (N,).")
+            self.batched = False
+            self.D = 1
+            self.N = int(x.shape[0])
+        else:
+            if x.shape != y.shape:
+                raise ValueError("Batched: x and y must both be (D,N).")
+            self.batched = True
+            self.D = int(x.shape[0])
+            self.N = int(x.shape[1])
+
+        if self.N < 2:
+            raise ValueError("Need N >= 2 points for interpolation.")
+
+        self.outside = outside
+        self.fill_value = float(fill_value)
+        self.learnable_y = bool(learnable_y)
+        self.exact_clamp = bool(exact_clamp)
+
+        # Optional sort + permute
+        if sort_xy:
+            if not self.batched:
+                x_sorted, perm = torch.sort(x, dim=0)
+                y_sorted = y.index_select(0, perm)
+            else:
+                x_sorted, perm = torch.sort(x, dim=1)
+                y_sorted = torch.gather(y, dim=1, index=perm)
+        else:
+            x_sorted = x.contiguous()
+            y_sorted = y.contiguous()
+
+        # Uniform-grid parameters per row:
+        # dx0 = first spacing; inv_dx = 1/dx0
+        if eps is None:
+            eps = float(torch.finfo(x_sorted.dtype).eps)
+
+        if not self.batched:
+            dx = x_sorted[1:] - x_sorted[:-1]  # (N-1,)
+            dx0 = dx[:1]  # (1,)
+            if check_uniform:
+                ref = dx0.expand_as(dx)
+                if not torch.allclose(dx, ref, rtol=rtol, atol=atol):
+                    raise ValueError("x is not uniformly spaced (check_uniform=True).")
+            if torch.any(dx0 <= 0):
+                raise ValueError(
+                    "x must be strictly increasing (after sorting, if enabled)."
+                )
+
+            x_min = x_sorted[0]
+            x_max = x_sorted[-1]
+            safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
+            inv_dx = (1.0 / safe_dx0)[0]  # scalar
+            self.register_buffer("_x_min", x_min.detach())
+            self.register_buffer("_x_max", x_max.detach())
+            self.register_buffer("_inv_dx", inv_dx.detach())
+        else:
+            dx = x_sorted[:, 1:] - x_sorted[:, :-1]  # (D,N-1)
+            dx0 = dx[:, :1]  # (D,1)
+            if check_uniform:
+                ref = dx0.expand_as(dx)
+                if not torch.allclose(dx, ref, rtol=rtol, atol=atol):
+                    raise ValueError(
+                        "x is not uniformly spaced per row (check_uniform=True)."
+                    )
+            if torch.any(dx0 <= 0):
+                raise ValueError(
+                    "Each x row must be strictly increasing (after sorting, if enabled)."
+                )
+
+            x_min = x_sorted[:, :1]  # (D,1)
+            x_max = x_sorted[:, -1:]  # (D,1)
+            safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
+            inv_dx = (1.0 / safe_dx0).contiguous()  # (D,1)
+            self.register_buffer("_x_min", x_min.detach())
+            self.register_buffer("_x_max", x_max.detach())
+            self.register_buffer("_inv_dx", inv_dx.detach())
+
+        self._ind_hi = self.N - 2
+
+        # Store y tables
+        if self.learnable_y:
+            self.y = nn.Parameter(y_sorted.contiguous(), requires_grad=y_requires_grad)
+        else:
+            if not self.batched:
+                self.register_buffer(
+                    "_y0", y_sorted[:-1].detach().contiguous()
+                )  # (N-1,)
+                self.register_buffer(
+                    "_dy", (y_sorted[1:] - y_sorted[:-1]).detach().contiguous()
+                )  # (N-1,)
+                self.register_buffer("_y_first", y_sorted[0].detach())
+                self.register_buffer("_y_last", y_sorted[-1].detach())
+            else:
+                self.register_buffer(
+                    "_y0", y_sorted[:, :-1].detach().contiguous()
+                )  # (D,N-1)
+                self.register_buffer(
+                    "_dy", (y_sorted[:, 1:] - y_sorted[:, :-1]).detach().contiguous()
+                )  # (D,N-1)
+                self.register_buffer("_y_first", y_sorted[:, :1].detach())
+                self.register_buffer("_y_last", y_sorted[:, -1:].detach())
+
+    def _as_index_tensor(
+        self,
+        indices: IndexLike,
+        *,
+        device: torch.device,
+        expected_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        if isinstance(indices, int):
+            idx = torch.tensor([indices], device=device, dtype=torch.long)
+        else:
+            idx = torch.as_tensor(indices, device=device, dtype=torch.long)
+
+        if idx.ndim != 1:
+            raise ValueError("indices must be a 1D sequence/tensor (or a single int).")
+        if idx.numel() == 0:
+            raise ValueError("indices must be non-empty.")
+        if expected_len is not None and idx.numel() != expected_len:
+            raise ValueError(
+                f"indices must have length {expected_len}, got {idx.numel()}."
+            )
+
+        if self.batched:
+            if torch.any((idx < 0) | (idx >= self.D)):
+                raise ValueError(f"indices values must be in [0, {self.D - 1}].")
+        else:
+            if torch.any(idx != 0):
+                raise ValueError("In unbatched mode, indices can only contain 0.")
+
+        return idx
+
+    def forward(
+        self,
+        x_new: torch.Tensor,
+        *,
+        indices: Optional[IndexLike] = None,
+        outside: Optional[OutsideMode] = None,
+        fill_value: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        outside = self.outside if outside is None else outside
+        if outside not in ("clamp", "zero", "fill"):
+            raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
+
+        fill_value = self.fill_value if fill_value is None else float(fill_value)
+
+        if x_new.ndim not in (1, 2):
+            raise ValueError("x_new must be 1D (P,) or 2D (Q,P).")
+        if x_new.device != self._x_min.device or x_new.dtype != self._x_min.dtype:
+            raise ValueError("x_new must match device and dtype of the interpolator.")
+        if not torch.is_floating_point(x_new):
+            raise TypeError("x_new must be floating-point.")
+
+        xnew_was_1d = x_new.ndim == 1
+        xq = x_new[None, :] if xnew_was_1d else x_new
+        Q = int(xq.shape[0])
+
+        # -------- unbatched --------
+        if not self.batched:
+            if indices is not None:
+                _ = self._as_index_tensor(indices, device=xq.device, expected_len=Q)
+
+            x_min = self._x_min
+            x_max = self._x_max
+            inv_dx = self._inv_dx
+
+            xq_used = torch.clamp(xq, x_min, x_max) if outside == "clamp" else xq
+
+            u = (xq_used - x_min) * inv_dx  # (Q,P)
+            ind = u.to(torch.long)
+            ind.clamp_(0, self._ind_hi)  # (Q,P)
+            t = u - ind.to(u.dtype)  # (Q,P)
+
+            if outside == "clamp":
+                # numeric safety: ensure t in [0,1] on the boundary
+                t = torch.clamp(t, 0.0, 1.0)
+
+            if self.learnable_y:
+                y = self.y
+                y0 = y[ind]
+                y1 = y[ind + 1]
+                ynew = y0 + (y1 - y0) * t
+                if outside == "clamp" and self.exact_clamp:
+                    ynew = torch.where(xq <= x_min, y[0], ynew)
+                    ynew = torch.where(xq >= x_max, y[-1], ynew)
+            else:
+                y0 = self._y0[ind]
+                dy = self._dy[ind]
+                ynew = y0 + dy * t
+                if outside == "clamp" and self.exact_clamp:
+                    ynew = torch.where(xq <= x_min, self._y_first, ynew)
+                    ynew = torch.where(xq >= x_max, self._y_last, ynew)
+
+            if outside in ("zero", "fill"):
+                outside_mask = (xq < x_min) | (xq > x_max)
+                ynew = ynew.masked_fill(
+                    outside_mask, 0.0 if outside == "zero" else fill_value
+                )
+
+        # -------- batched --------
+        else:
+            if xnew_was_1d:
+                if indices is None:
+                    raise ValueError(
+                        "Ambiguous: x,y are (D,N) but x_new is (P,). Provide indices."
+                    )
+                idx = self._as_index_tensor(
+                    indices, device=xq.device, expected_len=None
+                )
+                Q_eff = int(idx.numel())
+                xq = xq.expand(Q_eff, -1)
+                Q = Q_eff
+            else:
+                if indices is None:
+                    if Q != self.D:
+                        raise ValueError(
+                            f"Ambiguous: x,y have D={self.D} but x_new has Q={Q}. Provide indices of length Q."
+                        )
+                    idx = None
+                else:
+                    idx = self._as_index_tensor(
+                        indices, device=xq.device, expected_len=Q
+                    )
+
+            if idx is None:
+                x_min = self._x_min
+                x_max = self._x_max
+                inv_dx = self._inv_dx
+                if self.learnable_y:
+                    y_sel = self.y
+                else:
+                    y0_tab = self._y0
+                    dy_tab = self._dy
+                    y_first = self._y_first
+                    y_last = self._y_last
+            else:
+                x_min = self._x_min.index_select(0, idx)
+                x_max = self._x_max.index_select(0, idx)
+                inv_dx = self._inv_dx.index_select(0, idx)
+                if self.learnable_y:
+                    y_sel = self.y.index_select(0, idx)
+                else:
+                    y0_tab = self._y0.index_select(0, idx)
+                    dy_tab = self._dy.index_select(0, idx)
+                    y_first = self._y_first.index_select(0, idx)
+                    y_last = self._y_last.index_select(0, idx)
+
+            xq_used = torch.clamp(xq, x_min, x_max) if outside == "clamp" else xq
+
+            u = (xq_used - x_min) * inv_dx  # (Q,P)
+            ind = u.to(torch.long)
+            ind.clamp_(0, self._ind_hi)
+            t = u - ind.to(u.dtype)
+
+            if outside == "clamp":
+                t = torch.clamp(t, 0.0, 1.0)
+
+            if self.learnable_y:
+                y0 = torch.gather(y_sel, 1, ind)
+                y1 = torch.gather(y_sel, 1, ind + 1)
+                ynew = y0 + (y1 - y0) * t
+                if outside == "clamp" and self.exact_clamp:
+                    ynew = torch.where(xq <= x_min, y_sel[:, :1].expand_as(ynew), ynew)
+                    ynew = torch.where(xq >= x_max, y_sel[:, -1:].expand_as(ynew), ynew)
+            else:
+                y0 = torch.gather(y0_tab, 1, ind)
+                dy = torch.gather(dy_tab, 1, ind)
+                ynew = y0 + dy * t
+                if outside == "clamp" and self.exact_clamp:
+                    ynew = torch.where(xq <= x_min, y_first.expand_as(ynew), ynew)
+                    ynew = torch.where(xq >= x_max, y_last.expand_as(ynew), ynew)
+
+            if outside in ("zero", "fill"):
+                outside_mask = (xq < x_min) | (xq > x_max)
+                ynew = ynew.masked_fill(
+                    outside_mask, 0.0 if outside == "zero" else fill_value
+                )
+
+        # Restore 1D output iff a single query row was evaluated
+        if xnew_was_1d and ynew.shape[0] == 1:
+            ynew = ynew[0]
+
+        if out is not None:
+            if out.shape != ynew.shape:
+                raise ValueError(
+                    f"out has shape {tuple(out.shape)} but expected {tuple(ynew.shape)}."
+                )
+            out.copy_(ynew)
+            return out
+
+        return ynew
+
+
+def interp1d(
+    x,
+    y,
+    xnew,
+    out=None,
+    *,
+    outside: str = "zero",
+    # --- uniform fast paths ---
+    uniform: str = "auto",  # "never" | "auto" | "always"
+    uniform_rtol: float = 1e-5,
+    uniform_atol: float = 1e-7,
+):
     """
     Linear 1D interpolation for PyTorch (CPU/GPU) with batched support.
 
@@ -714,6 +1156,15 @@ def interp1d(x, y, xnew, out=None, *, outside: str = "zero"):
         Out-of-bounds handling:
         - "zero":  values with xnew < x_min or xnew > x_max are set to 0
         - "clamp": values outside are clamped to endpoint values y_min / y_max
+    uniform : {"never", "auto", "always"}, default="auto"
+        Whether to use the uniform-grid fast path (O(1) interval selection).
+        - "never": always use searchsorted (O(log N) interval selection)
+        - "auto":  use uniform fast path if `x` is uniformly spaced (per row)
+        - "always": assume `x` is uniformly spaced; raise ValueError if not
+    uniform_rtol : float, default=1e-5
+        Relative tolerance for uniformity check (when `uniform="auto"`).
+    uniform_atol : float, default=1e-7
+        Absolute tolerance for uniformity check (when `uniform="auto"`).
 
     Returns
     -------
@@ -727,6 +1178,8 @@ def interp1d(x, y, xnew, out=None, *, outside: str = "zero"):
     """
     if outside not in {"zero", "clamp"}:
         raise ValueError("outside must be one of {'zero', 'clamp'}")
+    if uniform not in {"never", "auto", "always"}:
+        raise ValueError("uniform must be one of {'never','auto','always'}")
 
     # --- make inputs at least 2D ---
     is_flat = {}
@@ -739,13 +1192,11 @@ def interp1d(x, y, xnew, out=None, *, outside: str = "zero"):
         is_flat[name] = v[name].shape[0] == 1
         require_grad[name] = vec.requires_grad
 
-    # --- device consistency ---
     device = x.device
     assert y.device == device and xnew.device == device, (
         "All parameters must be on the same device."
     )
 
-    # --- shape checks ---
     assert v["x"].shape[1] == v["y"].shape[1] and (
         v["x"].shape[0] == v["y"].shape[0]
         or v["x"].shape[0] == 1
@@ -756,7 +1207,6 @@ def interp1d(x, y, xnew, out=None, *, outside: str = "zero"):
     )
 
     # Optimization: if x and y are single-row but xnew has multiple rows, flatten xnew
-    # into a single long row, interpolate once, then reshape back.
     reshaped_xnew = False
     if (v["x"].shape[0] == 1) and (v["y"].shape[0] == 1) and (v["xnew"].shape[0] > 1):
         original_xnew_shape = v["xnew"].shape
@@ -781,66 +1231,1726 @@ def interp1d(x, y, xnew, out=None, *, outside: str = "zero"):
     if v["xnew"].shape[0] == 1 and D_eff > 1:
         v["xnew"] = v["xnew"].expand(D_eff, -1)
 
-    # Allocate indices
-    ind = torch.empty(shape_ynew, device=device, dtype=torch.long)
-
-    # searchsorted:
-    # - if x is (1,N), squeeze -> (N,) and searchsorted works for (D_eff,P)
-    # - if x is (D_eff,N), squeeze keeps 2D and requires xnew to be (D_eff,P)
-    torch.searchsorted(v["x"].contiguous().squeeze(), v["xnew"].contiguous(), out=ind)
-
-    # Convert insertion index to left-interval index
-    ind -= 1
-    ind.clamp_(0, v["x"].shape[1] - 2)  # [0, N-2]
-
-    def sel(t: torch.Tensor, flat: bool) -> torch.Tensor:
-        # Select along last dimension using `ind`.
-        # If flat (1, M): advanced indexing broadcasts across (D_eff,P).
+    def sel(t: torch.Tensor, flat: bool, ind: torch.Tensor) -> torch.Tensor:
         if flat:
             return t.contiguous().view(-1)[ind]
         return torch.gather(t, 1, ind)
 
-    # Enable grad only if any input needs it; otherwise disable for speed.
     enable_grad = require_grad["x"] or require_grad["y"] or require_grad["xnew"]
     grad_ctx = torch.enable_grad() if enable_grad else torch.no_grad()
 
     with grad_ctx:
-        # Compute slopes
-        dx = v["x"][:, 1:] - v["x"][:, :-1]
-        safe_dx = torch.where(
-            dx == 0, torch.full_like(dx, torch.finfo(dx.dtype).eps), dx
-        )
-        slopes = (v["y"][:, 1:] - v["y"][:, :-1]) / safe_dx
+        # Decide whether to use uniform fast-path
+        use_uniform = False
+        if uniform != "never":
+            dx = v["x"][:, 1:] - v["x"][:, :-1]  # (Rx,N-1)
+            dx0 = dx[:, :1]
+            uniform_ok = bool(torch.all(dx0 > 0).item()) and torch.allclose(
+                dx, dx0.expand_as(dx), rtol=uniform_rtol, atol=uniform_atol
+            )
+            if uniform == "always" and not uniform_ok:
+                raise ValueError(
+                    "uniform='always' but x is not uniformly spaced (per row)."
+                )
+            use_uniform = uniform_ok
 
-        # IMPORTANT: slopes "flatness" depends on slopes itself, not on x
-        slopes_is_flat = slopes.shape[0] == 1
+        if use_uniform:
+            x_min = v["x"][:, :1]
+            x_max = v["x"][:, -1:]
+            dx0 = v["x"][:, 1:2] - v["x"][:, 0:1]
 
-        # Linear interpolation
-        ynew = sel(v["y"], is_flat["y"]) + sel(slopes, slopes_is_flat) * (
-            v["xnew"] - sel(v["x"], is_flat["x"])
-        )
+            if x_min.shape[0] == 1 and D_eff > 1:
+                x_min = x_min.expand(D_eff, 1)
+                x_max = x_max.expand(D_eff, 1)
+                dx0 = dx0.expand(D_eff, 1)
 
-        # Bounds (assumes x sorted along last dim per row)
-        x_min = v["x"][:, :1]
-        x_max = v["x"][:, -1:]
+            eps = torch.finfo(v["x"].dtype).eps
+            safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
+            inv_dx0 = 1.0 / safe_dx0
 
-        if outside == "clamp":
-            y_min = v["y"][:, :1]
-            y_max = v["y"][:, -1:]
-            ynew = torch.where(v["xnew"] <= x_min, y_min.expand_as(ynew), ynew)
-            ynew = torch.where(v["xnew"] >= x_max, y_max.expand_as(ynew), ynew)
-        else:  # outside == "zero"
-            outside_mask = (v["xnew"] < x_min) | (v["xnew"] > x_max)
-            ynew = ynew.masked_fill(outside_mask, 0.0)
+            x_used = (
+                torch.clamp(v["xnew"], x_min, x_max)
+                if outside == "clamp"
+                else v["xnew"]
+            )
+            u = (x_used - x_min) * inv_dx0
+            ind = u.to(torch.long)
+            ind.clamp_(0, v["x"].shape[1] - 2)
+            t = u - ind.to(u.dtype)
+            if outside == "clamp":
+                t = torch.clamp(t, 0.0, 1.0)
 
-    # Write into output buffer (keeps semantics simple and makes `out` actually work)
+            dy = v["y"][:, 1:] - v["y"][:, :-1]
+            dy_is_flat = dy.shape[0] == 1
+
+            ynew = sel(v["y"], is_flat["y"], ind) + sel(dy, dy_is_flat, ind) * t
+
+            if outside == "clamp":
+                y_min = v["y"][:, :1]
+                y_max = v["y"][:, -1:]
+                if y_min.shape[0] == 1 and D_eff > 1:
+                    y_min = y_min.expand(D_eff, 1)
+                    y_max = y_max.expand(D_eff, 1)
+                ynew = torch.where(v["xnew"] <= x_min, y_min.expand_as(ynew), ynew)
+                ynew = torch.where(v["xnew"] >= x_max, y_max.expand_as(ynew), ynew)
+            else:
+                outside_mask = (v["xnew"] < x_min) | (v["xnew"] > x_max)
+                ynew = ynew.masked_fill(outside_mask, 0.0)
+
+        else:
+            # Original searchsorted path
+            ind = torch.empty(shape_ynew, device=device, dtype=torch.long)
+            torch.searchsorted(
+                v["x"].contiguous().squeeze(), v["xnew"].contiguous(), out=ind
+            )
+            ind -= 1
+            ind.clamp_(0, v["x"].shape[1] - 2)
+
+            dx = v["x"][:, 1:] - v["x"][:, :-1]
+            safe_dx = torch.where(
+                dx == 0, torch.full_like(dx, torch.finfo(dx.dtype).eps), dx
+            )
+            slopes = (v["y"][:, 1:] - v["y"][:, :-1]) / safe_dx
+            slopes_is_flat = slopes.shape[0] == 1
+
+            ynew = sel(v["y"], is_flat["y"], ind) + sel(slopes, slopes_is_flat, ind) * (
+                v["xnew"] - sel(v["x"], is_flat["x"], ind)
+            )
+
+            x_min = v["x"][:, :1]
+            x_max = v["x"][:, -1:]
+
+            if outside == "clamp":
+                y_min = v["y"][:, :1]
+                y_max = v["y"][:, -1:]
+                ynew = torch.where(v["xnew"] <= x_min, y_min.expand_as(ynew), ynew)
+                ynew = torch.where(v["xnew"] >= x_max, y_max.expand_as(ynew), ynew)
+            else:
+                outside_mask = (v["xnew"] < x_min) | (v["xnew"] > x_max)
+                ynew = ynew.masked_fill(outside_mask, 0.0)
+
     ybuf.copy_(ynew)
 
     if reshaped_xnew:
         ybuf = ybuf.view(original_xnew_shape)
 
-    # If all inputs were 1D, return 1D
     if x.ndim == 1 and y.ndim == 1 and xnew.ndim == 1:
         return ybuf.view(-1)
 
     return ybuf
+
+
+def interp1d_uniform(x, y, xnew, out=None, *, outside: str = "zero"):
+    """
+    Uniform-grid 1D linear interpolation for PyTorch with batched support.
+
+    Same calling convention as interp1d(x,y,xnew,...) but assumes x is uniformly spaced
+    per row (if batched). Uses arithmetic indexing, not searchsorted.
+    """
+    if outside not in {"zero", "clamp"}:
+        raise ValueError("outside must be one of {'zero', 'clamp'}")
+
+    is_flat = {}
+    require_grad = {}
+    v = {}
+
+    for name, vec in {"x": x, "y": y, "xnew": xnew}.items():
+        assert vec.ndim <= 2, "interp1d_uniform: all inputs must be at most 2-D."
+        v[name] = vec[None, :] if vec.ndim == 1 else vec
+        is_flat[name] = v[name].shape[0] == 1
+        require_grad[name] = vec.requires_grad
+
+    device = x.device
+    assert y.device == device and xnew.device == device, (
+        "All parameters must be on the same device."
+    )
+
+    assert v["x"].shape[1] == v["y"].shape[1] and (
+        v["x"].shape[0] == v["y"].shape[0]
+        or v["x"].shape[0] == 1
+        or v["y"].shape[0] == 1
+    ), (
+        "x and y must have the same number of columns, and either the same number "
+        "of rows or one of them having only one row."
+    )
+
+    # Optimization: if x and y are single-row but xnew has multiple rows, flatten xnew
+    reshaped_xnew = False
+    if (v["x"].shape[0] == 1) and (v["y"].shape[0] == 1) and (v["xnew"].shape[0] > 1):
+        original_xnew_shape = v["xnew"].shape
+        v["xnew"] = v["xnew"].contiguous().view(1, -1)
+        reshaped_xnew = True
+
+    D_eff = max(v["x"].shape[0], v["y"].shape[0], v["xnew"].shape[0])
+    P = v["xnew"].shape[1]
+    shape_ynew = (D_eff, P)
+
+    # Prepare output buffer
+    if out is not None:
+        if out.numel() != D_eff * P:
+            out = None
+        else:
+            ybuf = out.reshape(shape_ynew)
+    if out is None:
+        ybuf = torch.empty(*shape_ynew, device=device, dtype=v["x"].dtype)
+
+    # Broadcast xnew rows if needed
+    if v["xnew"].shape[0] == 1 and D_eff > 1:
+        v["xnew"] = v["xnew"].expand(D_eff, -1)
+
+    # Helper to broadcast row-wise scalar params
+    def row_param(t: torch.Tensor) -> torch.Tensor:
+        # t is (R,N) -> return (D_eff,1) by selecting from first/each row then expanding if needed
+        if t.shape[0] == 1 and D_eff > 1:
+            return t[:, :1].expand(D_eff, 1)
+        return t[:, :1]
+
+    enable_grad = require_grad["x"] or require_grad["y"] or require_grad["xnew"]
+    grad_ctx = torch.enable_grad() if enable_grad else torch.no_grad()
+
+    with grad_ctx:
+        # Uniform axis params
+        x_min = row_param(v["x"])
+        x_max = (
+            v["x"][:, -1:] if v["x"].shape[0] != 1 else v["x"][:, -1:].expand(D_eff, 1)
+        )
+        dx0 = v["x"][:, 1:2] - v["x"][:, 0:1]
+        if dx0.shape[0] == 1 and D_eff > 1:
+            dx0 = dx0.expand(D_eff, 1)
+
+        eps = torch.finfo(v["x"].dtype).eps
+        safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
+        inv_dx = 1.0 / safe_dx0  # (D_eff,1)
+
+        x_used = (
+            torch.clamp(v["xnew"], x_min, x_max) if outside == "clamp" else v["xnew"]
+        )
+
+        u = (x_used - x_min) * inv_dx  # (D_eff,P)
+        ind = u.to(torch.long)
+        ind.clamp_(0, v["x"].shape[1] - 2)
+
+        t = u - ind.to(u.dtype)
+        if outside == "clamp":
+            t = torch.clamp(t, 0.0, 1.0)
+
+        def sel(tensor: torch.Tensor, flat: bool) -> torch.Tensor:
+            if flat:
+                return tensor.contiguous().view(-1)[ind]
+            return torch.gather(tensor, 1, ind)
+
+        dy = v["y"][:, 1:] - v["y"][:, :-1]
+        dy_is_flat = dy.shape[0] == 1
+
+        ynew = sel(v["y"], is_flat["y"]) + sel(dy, dy_is_flat) * t
+
+        if outside == "clamp":
+            y_min = row_param(v["y"])
+            y_max = (
+                v["y"][:, -1:]
+                if v["y"].shape[0] != 1
+                else v["y"][:, -1:].expand(D_eff, 1)
+            )
+            ynew = torch.where(v["xnew"] <= x_min, y_min.expand_as(ynew), ynew)
+            ynew = torch.where(v["xnew"] >= x_max, y_max.expand_as(ynew), ynew)
+        else:
+            outside_mask = (v["xnew"] < x_min) | (v["xnew"] > x_max)
+            ynew = ynew.masked_fill(outside_mask, 0.0)
+
+    ybuf.copy_(ynew)
+
+    if reshaped_xnew:
+        ybuf = ybuf.view(original_xnew_shape)
+
+    if x.ndim == 1 and y.ndim == 1 and xnew.ndim == 1:
+        return ybuf.view(-1)
+
+    return ybuf
+
+
+class PreparedInterp3dRect(nn.Module):
+    """
+    Prepared trilinear interpolator on a rectilinear (tensor-product) grid.
+
+    Non-uniform axes use searchsorted. Uniform axes (detected per row) use arithmetic
+    indexing as a fast-path.
+    """
+
+    def __init__(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        z: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        outside: OutsideMode = "clamp",
+        fill_value: float = 0.0,
+        learnable_values: bool = False,
+        values_requires_grad: bool = True,
+        sort_xyz: bool = True,
+        eps: Optional[float] = None,
+        # NEW:
+        uniform: Literal["auto", "never", "always"] = "auto",
+        uniform_rtol: float = 1e-5,
+        uniform_atol: float = 1e-7,
+    ):
+        super().__init__()
+
+        if outside not in ("clamp", "zero", "fill"):
+            raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
+        if uniform not in ("auto", "never", "always"):
+            raise ValueError("uniform must be 'auto', 'never', or 'always'")
+
+        if not (x.ndim == y.ndim == z.ndim) or x.ndim not in (1, 2):
+            raise ValueError("x, y, z must have the same ndim (all 1D or all 2D).")
+
+        if x.device != y.device or x.device != z.device or x.device != values.device:
+            raise ValueError("x, y, z, values must be on the same device.")
+        if x.dtype != y.dtype or x.dtype != z.dtype or x.dtype != values.dtype:
+            raise ValueError("x, y, z, values must have the same dtype.")
+        if not torch.is_floating_point(x):
+            raise TypeError("x, y, z, values must be floating-point tensors.")
+
+        self.outside = outside
+        self.fill_value = float(fill_value)
+        self.learnable_values = bool(learnable_values)
+
+        self.batched = x.ndim == 2
+
+        # Validate shapes vs values
+        if not self.batched:
+            Nx, Ny, Nz = int(x.shape[0]), int(y.shape[0]), int(z.shape[0])
+            if values.ndim not in (3, 4):
+                raise ValueError(
+                    "Unbatched: values must be (Nx,Ny,Nz) or (Nx,Ny,Nz,C)."
+                )
+            if values.shape[0] != Nx or values.shape[1] != Ny or values.shape[2] != Nz:
+                raise ValueError(
+                    "Unbatched: values first 3 dims must match (Nx,Ny,Nz)."
+                )
+            self.D = 1
+        else:
+            D = int(x.shape[0])
+            if y.shape[0] != D or z.shape[0] != D:
+                raise ValueError("Batched: x,y,z must have same leading dim D.")
+            Nx, Ny, Nz = int(x.shape[1]), int(y.shape[1]), int(z.shape[1])
+            if values.ndim not in (4, 5):
+                raise ValueError(
+                    "Batched: values must be (D,Nx,Ny,Nz) or (D,Nx,Ny,Nz,C)."
+                )
+            if (
+                values.shape[0] != D
+                or values.shape[1] != Nx
+                or values.shape[2] != Ny
+                or values.shape[3] != Nz
+            ):
+                raise ValueError(
+                    "Batched: values must match (D,Nx,Ny,Nz,...) in its first 4 dims."
+                )
+            self.D = D
+
+        if Nx < 2 or Ny < 2 or Nz < 2:
+            raise ValueError("Need at least 2 samples along each axis.")
+
+        self.Nx, self.Ny, self.Nz = Nx, Ny, Nz
+
+        # Normalize values to have explicit channels-last
+        self._had_channels = values.ndim == (4 if not self.batched else 5)
+        if not self._had_channels:
+            values = values.unsqueeze(-1)
+        self.C = int(values.shape[-1])
+
+        # Sorting + permute values
+        if sort_xyz:
+            if not self.batched:
+                x_sorted, px = torch.sort(x, dim=0)
+                y_sorted, py = torch.sort(y, dim=0)
+                z_sorted, pz = torch.sort(z, dim=0)
+                vals = (
+                    values.index_select(0, px).index_select(1, py).index_select(2, pz)
+                )
+            else:
+                x_sorted, px = torch.sort(x, dim=1)
+                y_sorted, py = torch.sort(y, dim=1)
+                z_sorted, pz = torch.sort(z, dim=1)
+
+                vals = values
+                ix = px[:, :, None, None, None].expand(-1, -1, Ny, Nz, self.C)
+                vals = torch.gather(vals, dim=1, index=ix)
+                iy = py[:, None, :, None, None].expand(-1, Nx, -1, Nz, self.C)
+                vals = torch.gather(vals, dim=2, index=iy)
+                iz = pz[:, None, None, :, None].expand(-1, Nx, Ny, -1, self.C)
+                vals = torch.gather(vals, dim=3, index=iz)
+        else:
+            x_sorted, y_sorted, z_sorted = (
+                x.contiguous(),
+                y.contiguous(),
+                z.contiguous(),
+            )
+            vals = values.contiguous()
+
+        # Store axis searchsorted buffers (always; used for non-uniform fallback)
+        if not self.batched:
+            self.register_buffer("_x_search", x_sorted.detach())
+            self.register_buffer("_x0", x_sorted[:-1].detach())
+            self.register_buffer("_x_min", x_sorted[0].detach())
+            self.register_buffer("_x_max", x_sorted[-1].detach())
+            dx = x_sorted[1:] - x_sorted[:-1]
+
+            self.register_buffer("_y_search", y_sorted.detach())
+            self.register_buffer("_y0", y_sorted[:-1].detach())
+            self.register_buffer("_y_min", y_sorted[0].detach())
+            self.register_buffer("_y_max", y_sorted[-1].detach())
+            dy = y_sorted[1:] - y_sorted[:-1]
+
+            self.register_buffer("_z_search", z_sorted.detach())
+            self.register_buffer("_z0", z_sorted[:-1].detach())
+            self.register_buffer("_z_min", z_sorted[0].detach())
+            self.register_buffer("_z_max", z_sorted[-1].detach())
+            dz = z_sorted[1:] - z_sorted[:-1]
+        else:
+            self.register_buffer("_x_search", x_sorted.detach())
+            self.register_buffer("_x0", x_sorted[:, :-1].detach())
+            self.register_buffer("_x_min", x_sorted[:, :1].detach())
+            self.register_buffer("_x_max", x_sorted[:, -1:].detach())
+            dx = x_sorted[:, 1:] - x_sorted[:, :-1]
+
+            self.register_buffer("_y_search", y_sorted.detach())
+            self.register_buffer("_y0", y_sorted[:, :-1].detach())
+            self.register_buffer("_y_min", y_sorted[:, :1].detach())
+            self.register_buffer("_y_max", y_sorted[:, -1:].detach())
+            dy = y_sorted[:, 1:] - y_sorted[:, :-1]
+
+            self.register_buffer("_z_search", z_sorted.detach())
+            self.register_buffer("_z0", z_sorted[:, :-1].detach())
+            self.register_buffer("_z_min", z_sorted[:, :1].detach())
+            self.register_buffer("_z_max", z_sorted[:, -1:].detach())
+            dz = z_sorted[:, 1:] - z_sorted[:, :-1]
+
+        if eps is None:
+            eps = float(torch.finfo(x_sorted.dtype).eps)
+
+        def safe_inv(d: torch.Tensor) -> torch.Tensor:
+            sd = torch.where(d == 0, torch.full_like(d, eps), d)
+            return (1.0 / sd).contiguous()
+
+        self.register_buffer("_inv_dx", safe_inv(dx).detach())
+        self.register_buffer("_inv_dy", safe_inv(dy).detach())
+        self.register_buffer("_inv_dz", safe_inv(dz).detach())
+
+        self._ix_hi = Nx - 2
+        self._iy_hi = Ny - 2
+        self._iz_hi = Nz - 2
+
+        # Per-axis uniform detection + params
+        self._uniform_x = False
+        self._uniform_y = False
+        self._uniform_z = False
+
+        def detect_uniform(d: torch.Tensor) -> Tuple[bool, torch.Tensor]:
+            # returns (ok, inv_dx0) where inv_dx0 is scalar or (D,1)
+            if d.ndim == 1:
+                dx0 = d[:1]
+                ok = bool(torch.all(dx0 > 0).item()) and torch.allclose(
+                    d, dx0.expand_as(d), rtol=uniform_rtol, atol=uniform_atol
+                )
+                safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
+                inv = (1.0 / safe_dx0)[0]
+                return ok, inv
+            else:
+                dx0 = d[:, :1]
+                ok = bool(torch.all(dx0 > 0).item()) and torch.allclose(
+                    d, dx0.expand_as(d), rtol=uniform_rtol, atol=uniform_atol
+                )
+                safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
+                inv = (1.0 / safe_dx0).contiguous()
+                return ok, inv
+
+        if uniform != "never":
+            okx, invx = detect_uniform(dx)
+            oky, invy = detect_uniform(dy)
+            okz, invz = detect_uniform(dz)
+
+            if uniform == "always" and not (okx and oky and okz):
+                raise ValueError(
+                    "uniform='always' but not all axes are uniformly spaced."
+                )
+
+            if uniform == "auto":
+                self._uniform_x, self._uniform_y, self._uniform_z = okx, oky, okz
+            else:  # always
+                self._uniform_x = self._uniform_y = self._uniform_z = True
+
+            if self._uniform_x:
+                self.register_buffer("_inv_dx0_x", invx.detach())
+            if self._uniform_y:
+                self.register_buffer("_inv_dy0_y", invy.detach())
+            if self._uniform_z:
+                self.register_buffer("_inv_dz0_z", invz.detach())
+
+        # Store values
+        if self.learnable_values:
+            self.values = nn.Parameter(
+                vals.contiguous(), requires_grad=values_requires_grad
+            )
+        else:
+            self.register_buffer("_values", vals.detach().contiguous())
+
+        # constant corner offsets for flattened indexing
+        stride_x = Ny * Nz
+        stride_y = Nz
+        offsets = torch.tensor(
+            [
+                0,
+                stride_x,
+                stride_y,
+                stride_x + stride_y,
+                1,
+                stride_x + 1,
+                stride_y + 1,
+                stride_x + stride_y + 1,
+            ],
+            device=values.device,
+            dtype=torch.long,
+        )
+        self.register_buffer("_corner_offsets", offsets)
+
+        self._ix_cache: Optional[torch.Tensor] = None
+        self._iy_cache: Optional[torch.Tensor] = None
+        self._iz_cache: Optional[torch.Tensor] = None
+
+    def _as_index_tensor(
+        self,
+        indices: IndexLike,
+        *,
+        device: torch.device,
+        expected_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        if isinstance(indices, int):
+            idx = torch.tensor([indices], device=device, dtype=torch.long)
+        else:
+            idx = torch.as_tensor(indices, device=device, dtype=torch.long)
+
+        if idx.ndim != 1:
+            raise ValueError("indices must be a 1D sequence/tensor (or a single int).")
+        if idx.numel() == 0:
+            raise ValueError("indices must be non-empty.")
+        if expected_len is not None and idx.numel() != expected_len:
+            raise ValueError(
+                f"indices must have length {expected_len}, got {idx.numel()}."
+            )
+
+        if self.batched:
+            if torch.any((idx < 0) | (idx >= self.D)):
+                raise ValueError(f"indices values must be in [0, {self.D - 1}].")
+        else:
+            if torch.any(idx != 0):
+                raise ValueError("Unbatched: indices can only contain 0.")
+        return idx
+
+    def forward(
+        self,
+        xyz_new: torch.Tensor,
+        *,
+        indices: Optional[IndexLike] = None,
+        outside: Optional[OutsideMode] = None,
+        fill_value: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        outside = self.outside if outside is None else outside
+        if outside not in ("clamp", "zero", "fill"):
+            raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
+        fill_value = self.fill_value if fill_value is None else float(fill_value)
+
+        if xyz_new.ndim not in (2, 3) or xyz_new.shape[-1] != 3:
+            raise ValueError("xyz_new must have shape (P,3) or (Q,P,3).")
+        if xyz_new.device != self._x_min.device or xyz_new.dtype != self._x_min.dtype:
+            raise ValueError("xyz_new must match device and dtype of the interpolator.")
+        if not torch.is_floating_point(xyz_new):
+            raise TypeError("xyz_new must be floating-point.")
+
+        pts_was_2d = xyz_new.ndim == 2
+        xyzq = xyz_new[None, :, :] if pts_was_2d else xyz_new  # (Q,P,3)
+        Q = int(xyzq.shape[0])
+        P = int(xyzq.shape[1])
+
+        xq = xyzq[..., 0]
+        yq = xyzq[..., 1]
+        zq = xyzq[..., 2]
+
+        # Resolve batched mapping
+        if not self.batched:
+            if indices is not None:
+                _ = self._as_index_tensor(indices, device=xyzq.device, expected_len=Q)
+            idx = None
+        else:
+            if pts_was_2d:
+                if indices is None:
+                    raise ValueError(
+                        "Ambiguous: batched grid but xyz_new is (P,3). Provide indices."
+                    )
+                idx = self._as_index_tensor(
+                    indices, device=xyzq.device, expected_len=None
+                )
+                Q_eff = int(idx.numel())
+                xyzq = xyzq.expand(Q_eff, -1, -1)
+                xq = xyzq[..., 0]
+                yq = xyzq[..., 1]
+                zq = xyzq[..., 2]
+                Q = Q_eff
+            else:
+                if indices is None:
+                    if Q != self.D:
+                        raise ValueError(
+                            f"Ambiguous: D={self.D} but Q={Q}. Provide indices of length Q."
+                        )
+                    idx = None
+                else:
+                    idx = self._as_index_tensor(
+                        indices, device=xyzq.device, expected_len=Q
+                    )
+
+        # Select rows / params
+        if not self.batched:
+            x_min, x_max = self._x_min, self._x_max
+            y_min, y_max = self._y_min, self._y_max
+            z_min, z_max = self._z_min, self._z_max
+            x_search, y_search, z_search = (
+                self._x_search,
+                self._y_search,
+                self._z_search,
+            )
+            x0, y0, z0 = self._x0, self._y0, self._z0
+            inv_dx_tab, inv_dy_tab, inv_dz_tab = (
+                self._inv_dx,
+                self._inv_dy,
+                self._inv_dz,
+            )
+            vals = self.values if self.learnable_values else self._values
+            if self._uniform_x:
+                inv_dx0 = self._inv_dx0_x
+            if self._uniform_y:
+                inv_dy0 = self._inv_dy0_y
+            if self._uniform_z:
+                inv_dz0 = self._inv_dz0_z
+        else:
+            if idx is None:
+                x_min, x_max = self._x_min, self._x_max
+                y_min, y_max = self._y_min, self._y_max
+                z_min, z_max = self._z_min, self._z_max
+                x_search, y_search, z_search = (
+                    self._x_search,
+                    self._y_search,
+                    self._z_search,
+                )
+                x0, y0, z0 = self._x0, self._y0, self._z0
+                inv_dx_tab, inv_dy_tab, inv_dz_tab = (
+                    self._inv_dx,
+                    self._inv_dy,
+                    self._inv_dz,
+                )
+                vals = self.values if self.learnable_values else self._values
+                if self._uniform_x:
+                    inv_dx0 = self._inv_dx0_x
+                if self._uniform_y:
+                    inv_dy0 = self._inv_dy0_y
+                if self._uniform_z:
+                    inv_dz0 = self._inv_dz0_z
+            else:
+                x_min = self._x_min.index_select(0, idx)
+                x_max = self._x_max.index_select(0, idx)
+                y_min = self._y_min.index_select(0, idx)
+                y_max = self._y_max.index_select(0, idx)
+                z_min = self._z_min.index_select(0, idx)
+                z_max = self._z_max.index_select(0, idx)
+
+                x_search = self._x_search.index_select(0, idx)
+                y_search = self._y_search.index_select(0, idx)
+                z_search = self._z_search.index_select(0, idx)
+
+                x0 = self._x0.index_select(0, idx)
+                y0 = self._y0.index_select(0, idx)
+                z0 = self._z0.index_select(0, idx)
+
+                inv_dx_tab = self._inv_dx.index_select(0, idx)
+                inv_dy_tab = self._inv_dy.index_select(0, idx)
+                inv_dz_tab = self._inv_dz.index_select(0, idx)
+
+                vals = (
+                    self.values if self.learnable_values else self._values
+                ).index_select(0, idx)
+
+                if self._uniform_x:
+                    inv_dx0 = self._inv_dx0_x.index_select(0, idx)
+                if self._uniform_y:
+                    inv_dy0 = self._inv_dy0_y.index_select(0, idx)
+                if self._uniform_z:
+                    inv_dz0 = self._inv_dz0_z.index_select(0, idx)
+
+        # Clamp coords if requested (border semantics)
+        if outside == "clamp":
+            x_used = torch.clamp(xq, x_min, x_max)
+            y_used = torch.clamp(yq, y_min, y_max)
+            z_used = torch.clamp(zq, z_min, z_max)
+        else:
+            x_used, y_used, z_used = xq, yq, zq
+
+        # Ensure caches
+        def ensure(cache: Optional[torch.Tensor], shape, device):
+            if cache is None or cache.shape != shape or cache.device != device:
+                return torch.empty(shape, device=device, dtype=torch.long)
+            return cache
+
+        self._ix_cache = ensure(self._ix_cache, x_used.shape, x_used.device)
+        self._iy_cache = ensure(self._iy_cache, y_used.shape, y_used.device)
+        self._iz_cache = ensure(self._iz_cache, z_used.shape, z_used.device)
+        ix, iy, iz = self._ix_cache, self._iy_cache, self._iz_cache
+
+        # Axis helper: compute (ind,t) either uniform or searchsorted
+        def axis_ind_t_uniform(ucoord, amin, inv_d0, hi, ind_out):
+            u = (ucoord - amin) * inv_d0
+            ind_out.copy_(u.to(torch.long))
+            ind_out.clamp_(0, hi)
+            t = u - ind_out.to(u.dtype)
+            if outside == "clamp":
+                t = torch.clamp(t, 0.0, 1.0)
+            return ind_out, t
+
+        def axis_ind_t_nu(search, ucoord, a0, inv_tab, hi, ind_out, batched_axis: bool):
+            torch.searchsorted(search, ucoord, out=ind_out)
+            ind_out -= 1
+            ind_out.clamp_(0, hi)
+            if not batched_axis:
+                a0i = a0[ind_out]
+                inv_i = inv_tab[ind_out]
+            else:
+                a0i = torch.gather(a0, 1, ind_out)
+                inv_i = torch.gather(inv_tab, 1, ind_out)
+            t = (ucoord - a0i) * inv_i
+            return ind_out, t
+
+        if not self.batched:
+            ix, tx = (
+                axis_ind_t_uniform(x_used, x_min, inv_dx0, self._ix_hi, ix)
+                if self._uniform_x
+                else axis_ind_t_nu(
+                    x_search, x_used, x0, inv_dx_tab, self._ix_hi, ix, False
+                )
+            )
+            iy, ty = (
+                axis_ind_t_uniform(y_used, y_min, inv_dy0, self._iy_hi, iy)
+                if self._uniform_y
+                else axis_ind_t_nu(
+                    y_search, y_used, y0, inv_dy_tab, self._iy_hi, iy, False
+                )
+            )
+            iz, tz = (
+                axis_ind_t_uniform(z_used, z_min, inv_dz0, self._iz_hi, iz)
+                if self._uniform_z
+                else axis_ind_t_nu(
+                    z_search, z_used, z0, inv_dz_tab, self._iz_hi, iz, False
+                )
+            )
+        else:
+            ix, tx = (
+                axis_ind_t_uniform(x_used, x_min, inv_dx0, self._ix_hi, ix)
+                if self._uniform_x
+                else axis_ind_t_nu(
+                    x_search, x_used, x0, inv_dx_tab, self._ix_hi, ix, True
+                )
+            )
+            iy, ty = (
+                axis_ind_t_uniform(y_used, y_min, inv_dy0, self._iy_hi, iy)
+                if self._uniform_y
+                else axis_ind_t_nu(
+                    y_search, y_used, y0, inv_dy_tab, self._iy_hi, iy, True
+                )
+            )
+            iz, tz = (
+                axis_ind_t_uniform(z_used, z_min, inv_dz0, self._iz_hi, iz)
+                if self._uniform_z
+                else axis_ind_t_nu(
+                    z_search, z_used, z0, inv_dz_tab, self._iz_hi, iz, True
+                )
+            )
+
+        # Gather 8 corners via flattened indexing
+        base = (ix * self.Ny + iy) * self.Nz + iz  # (Q,P)
+        idxs = base.unsqueeze(-1) + self._corner_offsets  # (Q,P,8)
+
+        if not self.batched:
+            v_flat = vals.reshape(-1, self.C)  # (M,C)
+            idxs_flat = idxs.reshape(Q, -1)  # (Q,8P)
+            corners = v_flat[idxs_flat].view(Q, P, 8, self.C)
+        else:
+            v_flat = vals.reshape(Q, -1, self.C)  # (Q,M,C)
+            idxs_flat = idxs.reshape(Q, -1)  # (Q,8P)
+            idxs_exp = idxs_flat.unsqueeze(-1).expand(-1, -1, self.C)
+            corners = torch.gather(v_flat, 1, idxs_exp).view(Q, P, 8, self.C)
+
+        # Trilinear blending
+        txe = tx.unsqueeze(-1)
+        tye = ty.unsqueeze(-1)
+        tze = tz.unsqueeze(-1)
+
+        v000 = corners[:, :, 0, :]
+        v100 = corners[:, :, 1, :]
+        v010 = corners[:, :, 2, :]
+        v110 = corners[:, :, 3, :]
+        v001 = corners[:, :, 4, :]
+        v101 = corners[:, :, 5, :]
+        v011 = corners[:, :, 6, :]
+        v111 = corners[:, :, 7, :]
+
+        v00 = v000 + (v100 - v000) * txe
+        v10 = v010 + (v110 - v010) * txe
+        v01 = v001 + (v101 - v001) * txe
+        v11 = v011 + (v111 - v011) * txe
+
+        v0 = v00 + (v10 - v00) * tye
+        v1 = v01 + (v11 - v01) * tye
+
+        ynew = v0 + (v1 - v0) * tze  # (Q,P,C)
+
+        # Outside mask for zero/fill
+        if outside in ("zero", "fill"):
+            outside_mask = (
+                (xq < x_min)
+                | (xq > x_max)
+                | (yq < y_min)
+                | (yq > y_max)
+                | (zq < z_min)
+                | (zq > z_max)
+            )
+            ynew = ynew.masked_fill(
+                outside_mask.unsqueeze(-1), 0.0 if outside == "zero" else fill_value
+            )
+
+        if not self._had_channels:
+            ynew = ynew.squeeze(-1)  # (Q,P)
+
+        if pts_was_2d and ynew.shape[0] == 1:
+            ynew = ynew[0]
+
+        if out is not None:
+            if out.shape != ynew.shape:
+                raise ValueError(
+                    f"out has shape {tuple(out.shape)} but expected {tuple(ynew.shape)}."
+                )
+            out.copy_(ynew)
+            return out
+
+        return ynew
+
+
+class PreparedInterp3dRectUniform(nn.Module):
+    """
+    Prepared trilinear interpolator on a uniform rectilinear (tensor-product) grid.
+
+    Same regimes as the non-uniform 3D rectilinear interpolator, but assumes each
+    axis is uniformly spaced (per row, if batched).
+    """
+
+    def __init__(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        z: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        outside: OutsideMode = "clamp",
+        fill_value: float = 0.0,
+        learnable_values: bool = False,
+        values_requires_grad: bool = True,
+        sort_xyz: bool = True,
+        check_uniform: bool = False,
+        rtol: float = 1e-5,
+        atol: float = 1e-7,
+        eps: Optional[float] = None,
+    ):
+        super().__init__()
+
+        if outside not in ("clamp", "zero", "fill"):
+            raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
+
+        if not (x.ndim == y.ndim == z.ndim) or x.ndim not in (1, 2):
+            raise ValueError(
+                "x, y, z must have the same ndim, either all 1D or all 2D."
+            )
+
+        if x.device != y.device or x.device != z.device or x.device != values.device:
+            raise ValueError("x, y, z, values must be on the same device.")
+        if x.dtype != y.dtype or x.dtype != z.dtype or x.dtype != values.dtype:
+            raise ValueError("x, y, z, values must have the same dtype.")
+        if not torch.is_floating_point(x):
+            raise TypeError("x, y, z, values must be floating-point.")
+
+        self.outside = outside
+        self.fill_value = float(fill_value)
+        self.learnable_values = bool(learnable_values)
+
+        self.batched = x.ndim == 2
+
+        # Validate shapes vs values
+        if not self.batched:
+            Nx, Ny, Nz = int(x.shape[0]), int(y.shape[0]), int(z.shape[0])
+            if values.ndim not in (3, 4):
+                raise ValueError("Unbatched values must be (Nx,Ny,Nz) or (Nx,Ny,Nz,C).")
+            if values.shape[0] != Nx or values.shape[1] != Ny or values.shape[2] != Nz:
+                raise ValueError(
+                    "Unbatched values must match (Nx,Ny,Nz) in its first 3 dims."
+                )
+            self.D = 1
+        else:
+            D = int(x.shape[0])
+            if y.shape[0] != D or z.shape[0] != D:
+                raise ValueError("Batched: x,y,z must share leading dim D.")
+            Nx, Ny, Nz = int(x.shape[1]), int(y.shape[1]), int(z.shape[1])
+            if values.ndim not in (4, 5):
+                raise ValueError(
+                    "Batched values must be (D,Nx,Ny,Nz) or (D,Nx,Ny,Nz,C)."
+                )
+            if (
+                values.shape[0] != D
+                or values.shape[1] != Nx
+                or values.shape[2] != Ny
+                or values.shape[3] != Nz
+            ):
+                raise ValueError(
+                    "Batched values must match (D,Nx,Ny,Nz,...) in its first 4 dims."
+                )
+            self.D = D
+
+        if Nx < 2 or Ny < 2 or Nz < 2:
+            raise ValueError("Need at least 2 samples along each axis.")
+
+        self.Nx, self.Ny, self.Nz = Nx, Ny, Nz
+
+        # Normalize values to have explicit channels-last
+        self._had_channels = values.ndim == (4 if not self.batched else 5)
+        if not self._had_channels:
+            values = values.unsqueeze(-1)
+        self.C = int(values.shape[-1])
+
+        # Optional sort + permute values accordingly
+        if sort_xyz:
+            if not self.batched:
+                x_sorted, px = torch.sort(x, dim=0)
+                y_sorted, py = torch.sort(y, dim=0)
+                z_sorted, pz = torch.sort(z, dim=0)
+
+                vals = values.index_select(0, px)
+                vals = vals.index_select(1, py)
+                vals = vals.index_select(2, pz)
+            else:
+                x_sorted, px = torch.sort(x, dim=1)
+                y_sorted, py = torch.sort(y, dim=1)
+                z_sorted, pz = torch.sort(z, dim=1)
+
+                vals = values
+                ix = px[:, :, None, None, None].expand(-1, -1, Ny, Nz, self.C)
+                vals = torch.gather(vals, dim=1, index=ix)
+                iy = py[:, None, :, None, None].expand(-1, Nx, -1, Nz, self.C)
+                vals = torch.gather(vals, dim=2, index=iy)
+                iz = pz[:, None, None, :, None].expand(-1, Nx, Ny, -1, self.C)
+                vals = torch.gather(vals, dim=3, index=iz)
+        else:
+            x_sorted, y_sorted, z_sorted = (
+                x.contiguous(),
+                y.contiguous(),
+                z.contiguous(),
+            )
+            vals = values.contiguous()
+
+        # Uniform-axis params per row
+        if eps is None:
+            eps = float(torch.finfo(x_sorted.dtype).eps)
+
+        def axis_params(axis: torch.Tensor, name: str):
+            if axis.ndim == 1:
+                d = axis[1:] - axis[:-1]
+                d0 = d[:1]
+                if check_uniform:
+                    if not torch.allclose(d, d0.expand_as(d), rtol=rtol, atol=atol):
+                        raise ValueError(
+                            f"{name} is not uniformly spaced (check_uniform=True)."
+                        )
+                if torch.any(d0 <= 0):
+                    raise ValueError(
+                        f"{name} must be strictly increasing (after sorting, if enabled)."
+                    )
+                a_min = axis[0]
+                a_max = axis[-1]
+                safe = torch.where(d0 == 0, torch.full_like(d0, eps), d0)
+                inv = (1.0 / safe)[0]
+                return a_min.detach(), a_max.detach(), inv.detach()
+            else:
+                d = axis[:, 1:] - axis[:, :-1]  # (D,N-1)
+                d0 = d[:, :1]  # (D,1)
+                if check_uniform:
+                    if not torch.allclose(d, d0.expand_as(d), rtol=rtol, atol=atol):
+                        raise ValueError(
+                            f"{name} is not uniformly spaced per row (check_uniform=True)."
+                        )
+                if torch.any(d0 <= 0):
+                    raise ValueError(
+                        f"{name} rows must be strictly increasing (after sorting, if enabled)."
+                    )
+                a_min = axis[:, :1]
+                a_max = axis[:, -1:]
+                safe = torch.where(d0 == 0, torch.full_like(d0, eps), d0)
+                inv = (1.0 / safe).contiguous()
+                return a_min.detach(), a_max.detach(), inv.detach()
+
+        x_min, x_max, inv_dx = axis_params(x_sorted, "x")
+        y_min, y_max, inv_dy = axis_params(y_sorted, "y")
+        z_min, z_max, inv_dz = axis_params(z_sorted, "z")
+
+        self.register_buffer("_x_min", x_min)
+        self.register_buffer("_x_max", x_max)
+        self.register_buffer("_inv_dx", inv_dx)
+        self.register_buffer("_y_min", y_min)
+        self.register_buffer("_y_max", y_max)
+        self.register_buffer("_inv_dy", inv_dy)
+        self.register_buffer("_z_min", z_min)
+        self.register_buffer("_z_max", z_max)
+        self.register_buffer("_inv_dz", inv_dz)
+
+        self._ix_hi = Nx - 2
+        self._iy_hi = Ny - 2
+        self._iz_hi = Nz - 2
+
+        # Store values
+        if self.learnable_values:
+            self.values = nn.Parameter(
+                vals.contiguous(), requires_grad=values_requires_grad
+            )
+        else:
+            self.register_buffer("_values", vals.detach().contiguous())
+
+        # Corner offsets for linear indexing into flattened (Nx*Ny*Nz) volume
+        stride_x = Ny * Nz
+        stride_y = Nz
+        offsets = torch.tensor(
+            [
+                0,
+                stride_x,
+                stride_y,
+                stride_x + stride_y,
+                1,
+                stride_x + 1,
+                stride_y + 1,
+                stride_x + stride_y + 1,
+            ],
+            device=values.device,
+            dtype=torch.long,
+        )
+        self.register_buffer("_corner_offsets", offsets)
+
+    def _as_index_tensor(
+        self,
+        indices: IndexLike,
+        *,
+        device: torch.device,
+        expected_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        if isinstance(indices, int):
+            idx = torch.tensor([indices], device=device, dtype=torch.long)
+        else:
+            idx = torch.as_tensor(indices, device=device, dtype=torch.long)
+
+        if idx.ndim != 1:
+            raise ValueError("indices must be a 1D sequence/tensor (or a single int).")
+        if idx.numel() == 0:
+            raise ValueError("indices must be non-empty.")
+        if expected_len is not None and idx.numel() != expected_len:
+            raise ValueError(
+                f"indices must have length {expected_len}, got {idx.numel()}."
+            )
+
+        if self.batched:
+            if torch.any((idx < 0) | (idx >= self.D)):
+                raise ValueError(f"indices values must be in [0, {self.D - 1}].")
+        else:
+            if torch.any(idx != 0):
+                raise ValueError("In unbatched mode, indices can only contain 0.")
+
+        return idx
+
+    def forward(
+        self,
+        xyz_new: torch.Tensor,
+        *,
+        indices: Optional[IndexLike] = None,
+        outside: Optional[OutsideMode] = None,
+        fill_value: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        outside = self.outside if outside is None else outside
+        if outside not in ("clamp", "zero", "fill"):
+            raise ValueError("outside must be one of: 'clamp', 'zero', 'fill'")
+        fill_value = self.fill_value if fill_value is None else float(fill_value)
+
+        if xyz_new.ndim not in (2, 3) or xyz_new.shape[-1] != 3:
+            raise ValueError("xyz_new must be (P,3) or (Q,P,3).")
+        if xyz_new.device != self._x_min.device or xyz_new.dtype != self._x_min.dtype:
+            raise ValueError("xyz_new must match device and dtype of the interpolator.")
+        if not torch.is_floating_point(xyz_new):
+            raise TypeError("xyz_new must be floating-point.")
+
+        pts_was_2d = xyz_new.ndim == 2
+        xyzq = xyz_new[None, :, :] if pts_was_2d else xyz_new  # (Q,P,3)
+        Q = int(xyzq.shape[0])
+        P = int(xyzq.shape[1])
+
+        xq = xyzq[..., 0]
+        yq = xyzq[..., 1]
+        zq = xyzq[..., 2]
+
+        # Resolve mapping in batched mode
+        if not self.batched:
+            if indices is not None:
+                _ = self._as_index_tensor(indices, device=xyzq.device, expected_len=Q)
+            idx = None
+        else:
+            if pts_was_2d:
+                if indices is None:
+                    raise ValueError(
+                        "Ambiguous: batched grid (D,...) but xyz_new is (P,3). Provide indices."
+                    )
+                idx = self._as_index_tensor(
+                    indices, device=xyzq.device, expected_len=None
+                )
+                Q_eff = int(idx.numel())
+                xyzq = xyzq.expand(Q_eff, -1, -1)
+                xq = xyzq[..., 0]
+                yq = xyzq[..., 1]
+                zq = xyzq[..., 2]
+                Q = Q_eff
+            else:
+                if indices is None:
+                    if Q != self.D:
+                        raise ValueError(
+                            f"Ambiguous: batched grid has D={self.D} but xyz_new has Q={Q}. Provide indices of length Q."
+                        )
+                    idx = None
+                else:
+                    idx = self._as_index_tensor(
+                        indices, device=xyzq.device, expected_len=Q
+                    )
+
+        # Select per-query-row params/values
+        if not self.batched:
+            x_min, x_max, inv_dx = self._x_min, self._x_max, self._inv_dx
+            y_min, y_max, inv_dy = self._y_min, self._y_max, self._inv_dy
+            z_min, z_max, inv_dz = self._z_min, self._z_max, self._inv_dz
+            vals = (
+                self.values if self.learnable_values else self._values
+            )  # (Nx,Ny,Nz,C)
+        else:
+            if idx is None:
+                x_min, x_max, inv_dx = self._x_min, self._x_max, self._inv_dx
+                y_min, y_max, inv_dy = self._y_min, self._y_max, self._inv_dy
+                z_min, z_max, inv_dz = self._z_min, self._z_max, self._inv_dz
+                vals = (
+                    self.values if self.learnable_values else self._values
+                )  # (D,Nx,Ny,Nz,C)
+            else:
+                x_min = self._x_min.index_select(0, idx)
+                x_max = self._x_max.index_select(0, idx)
+                inv_dx = self._inv_dx.index_select(0, idx)
+                y_min = self._y_min.index_select(0, idx)
+                y_max = self._y_max.index_select(0, idx)
+                inv_dy = self._inv_dy.index_select(0, idx)
+                z_min = self._z_min.index_select(0, idx)
+                z_max = self._z_max.index_select(0, idx)
+                inv_dz = self._inv_dz.index_select(0, idx)
+                vals = (
+                    self.values if self.learnable_values else self._values
+                ).index_select(0, idx)
+
+        # Coordinate clamp if requested
+        if outside == "clamp":
+            x_used = torch.clamp(xq, x_min, x_max)
+            y_used = torch.clamp(yq, y_min, y_max)
+            z_used = torch.clamp(zq, z_min, z_max)
+        else:
+            x_used, y_used, z_used = xq, yq, zq
+
+        # Uniform indexing (no searchsorted)
+        ux = (x_used - x_min) * inv_dx
+        ix = ux.to(torch.long)
+        ix.clamp_(0, self._ix_hi)
+        tx = ux - ix.to(ux.dtype)
+
+        uy = (y_used - y_min) * inv_dy
+        iy = uy.to(torch.long)
+        iy.clamp_(0, self._iy_hi)
+        ty = uy - iy.to(uy.dtype)
+
+        uz = (z_used - z_min) * inv_dz
+        iz = uz.to(torch.long)
+        iz.clamp_(0, self._iz_hi)
+        tz = uz - iz.to(uz.dtype)
+
+        if outside == "clamp":
+            # numeric safety at upper boundary
+            tx = torch.clamp(tx, 0.0, 1.0)
+            ty = torch.clamp(ty, 0.0, 1.0)
+            tz = torch.clamp(tz, 0.0, 1.0)
+
+        # Flattened corner gather
+        base = (ix * self.Ny + iy) * self.Nz + iz  # (Q,P)
+        idxs = base.unsqueeze(-1) + self._corner_offsets  # (Q,P,8)
+
+        if not self.batched:
+            v_flat = vals.reshape(-1, self.C)  # (M,C)
+            idxs_flat = idxs.reshape(Q, -1)  # (Q,8P)
+            corners = v_flat[idxs_flat].view(Q, P, 8, self.C)  # (Q,P,8,C)
+        else:
+            v_flat = vals.reshape(Q, -1, self.C)  # (Q,M,C)
+            idxs_flat = idxs.reshape(Q, -1)  # (Q,8P)
+            idxs_exp = idxs_flat.unsqueeze(-1).expand(-1, -1, self.C)
+            corners = torch.gather(v_flat, 1, idxs_exp).view(Q, P, 8, self.C)
+
+        # Trilinear blending
+        txe = tx.unsqueeze(-1)
+        tye = ty.unsqueeze(-1)
+        tze = tz.unsqueeze(-1)
+
+        v000 = corners[:, :, 0, :]
+        v100 = corners[:, :, 1, :]
+        v010 = corners[:, :, 2, :]
+        v110 = corners[:, :, 3, :]
+        v001 = corners[:, :, 4, :]
+        v101 = corners[:, :, 5, :]
+        v011 = corners[:, :, 6, :]
+        v111 = corners[:, :, 7, :]
+
+        v00 = v000 + (v100 - v000) * txe
+        v10 = v010 + (v110 - v010) * txe
+        v01 = v001 + (v101 - v001) * txe
+        v11 = v011 + (v111 - v011) * txe
+
+        v0 = v00 + (v10 - v00) * tye
+        v1 = v01 + (v11 - v01) * tye
+
+        ynew = v0 + (v1 - v0) * tze  # (Q,P,C)
+
+        # Outside masking for zero/fill
+        if outside in ("zero", "fill"):
+            outside_mask = (
+                (xq < x_min)
+                | (xq > x_max)
+                | (yq < y_min)
+                | (yq > y_max)
+                | (zq < z_min)
+                | (zq > z_max)
+            )  # (Q,P)
+            ynew = ynew.masked_fill(
+                outside_mask.unsqueeze(-1), 0.0 if outside == "zero" else fill_value
+            )
+
+        # Drop channel dim if input had no channels
+        if not self._had_channels:
+            ynew = ynew.squeeze(-1)  # (Q,P)
+
+        if pts_was_2d and ynew.shape[0] == 1:
+            ynew = ynew[0]
+
+        if out is not None:
+            if out.shape != ynew.shape:
+                raise ValueError(
+                    f"out has shape {tuple(out.shape)} but expected {tuple(ynew.shape)}."
+                )
+            out.copy_(ynew)
+            return out
+
+        return ynew
+
+
+class PreparedInterp3dScattered(nn.Module):
+    """
+    Scattered-data interpolator in 3D using kNN-based local methods.
+
+    Required inputs
+    ---------------
+    points : (N,3) float tensor
+    values : (N,P) or (N,) float tensor
+
+    Query
+    -----
+    xq : (...,3) -> (...,P) (or (...) if values were scalar)
+
+    Interpolation methods
+    ---------------------
+    - nearest : nearest neighbor (k ignored; uses k=1)
+    - idw     : inverse-distance weighted average over k neighbors
+    - mls     : moving least squares local affine fit (reproduces linear fields)
+
+    Optional accelerated kNN backends
+    ---------------------------------
+    knn_backend="auto" chooses based on device & availability:
+
+      CUDA:
+        1) pytorch3d (knn_points) if installed
+        2) torch_cluster if installed
+        3) torch fallback
+
+      CPU:
+        1) faiss (IndexFlatL2) if installed
+        2) torch fallback
+
+    Notes
+    -----
+    - Neighbor selection is discrete, so gradients do not flow through changes in the
+      neighbor set. Gradients do flow to `values` and (optionally) to `xq` inside a
+      fixed neighbor set when `recompute_d2=True`.
+    """
+
+    def __init__(
+        self,
+        points: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        method: Literal["nearest", "idw", "mls"] = "idw",
+        k: int = 8,
+        # kNN backend
+        knn_backend: KNNBackend = "auto",
+        recompute_d2: bool = True,
+        # IDW params
+        power: float = 2.0,
+        # MLS params
+        mls_reg: float = 1e-6,
+        # Optional distance cutoff
+        radius: Optional[float] = None,
+        outside: OutsideMode3D = "none",
+        fill_value: float = 0.0,
+        # Performance
+        chunk_size: int = 4096,
+        # Numerical stability
+        eps: Optional[float] = None,
+        # Learnability
+        learnable_values: bool = False,
+        values_requires_grad: bool = True,
+        # FAISS options (CPU-only in this implementation)
+        faiss_factory: Optional[
+            str
+        ] = None,  # None -> IndexFlatL2; or e.g. "IVF1024,PQ16"
+        faiss_nprobe: int = 16,
+    ):
+        super().__init__()
+
+        if method not in ("nearest", "idw", "mls"):
+            raise ValueError("method must be one of {'nearest','idw','mls'}")
+        if outside not in ("none", "zero", "fill"):
+            raise ValueError("outside must be one of {'none','zero','fill'}")
+        if knn_backend not in ("auto", "torch", "pytorch3d", "torch_cluster", "faiss"):
+            raise ValueError(
+                "knn_backend must be one of {'auto','torch','pytorch3d','torch_cluster','faiss'}"
+            )
+
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("points must have shape (N,3).")
+        if values.ndim == 1:
+            values = values[:, None]
+            self._scalar_values = True
+        elif values.ndim == 2:
+            self._scalar_values = False
+        else:
+            raise ValueError("values must have shape (N,) or (N,P).")
+
+        if points.shape[0] != values.shape[0]:
+            raise ValueError(
+                f"points has N={points.shape[0]} but values has N={values.shape[0]}."
+            )
+
+        if points.device != values.device:
+            raise ValueError("points and values must be on the same device.")
+        if points.dtype != values.dtype:
+            raise ValueError("points and values must have the same dtype.")
+        if not torch.is_floating_point(points):
+            raise TypeError("points and values must be floating-point tensors.")
+
+        N = int(points.shape[0])
+        if k < 1 or k > N:
+            raise ValueError(f"k must be in [1, N]; got k={k}, N={N}.")
+        if method == "mls" and k < 4:
+            raise ValueError("MLS in 3D requires k >= 4 (prefer k>=8).")
+
+        self.method = method
+        self.k = int(k)
+        self.knn_backend = knn_backend
+        self.recompute_d2 = bool(recompute_d2)
+
+        self.power = float(power)
+        self.mls_reg = float(mls_reg)
+
+        self.radius = None if radius is None else float(radius)
+        self.outside = outside
+        self.fill_value = float(fill_value)
+
+        self.chunk_size = int(chunk_size)
+        if eps is None:
+            eps = float(torch.finfo(points.dtype).eps)
+        self.eps = float(eps)
+
+        self.faiss_factory = faiss_factory
+        self.faiss_nprobe = int(faiss_nprobe)
+
+        # Store points + norms (used by torch fallback and distance recomputation)
+        self.register_buffer("_points", points.contiguous())  # (N,3)
+        self.register_buffer(
+            "_points_norm", (points * points).sum(dim=1).contiguous()
+        )  # (N,)
+
+        # Values
+        if learnable_values:
+            self.values = nn.Parameter(
+                values.contiguous(), requires_grad=values_requires_grad
+            )
+        else:
+            self.register_buffer("_values", values.contiguous())
+
+        # Lazy FAISS state (CPU only here)
+        self._faiss_index = None
+        self._faiss_index_dim = 3
+
+    def _get_values(self) -> torch.Tensor:
+        return self.values if hasattr(self, "values") else self._values
+
+    # -----------------------------
+    # Backend availability helpers
+    # -----------------------------
+    @staticmethod
+    def _has_pytorch3d() -> bool:
+        try:
+            import pytorch3d  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _has_torch_cluster() -> bool:
+        try:
+            import torch_cluster  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _has_faiss() -> bool:
+        try:
+            import faiss  # noqa: F401
+
+            return True
+        except Exception:
+            return False
+
+    def _select_backend(self, device: torch.device) -> KNNBackend:
+        if self.knn_backend != "auto":
+            return self.knn_backend
+
+        if device.type == "cuda":
+            if self._has_pytorch3d():
+                return "pytorch3d"
+            if self._has_torch_cluster():
+                return "torch_cluster"
+            return "torch"
+
+        # CPU
+        if self._has_faiss():
+            return "faiss"
+        return "torch"
+
+    # -----------------------------
+    # kNN implementations
+    # -----------------------------
+    def _knn_torch(self, xq: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Exact kNN via dense distances in chunks.
+        Returns idx (Q,k) and d2 (Q,k).
+        """
+        Q = int(xq.shape[0])
+
+        idx_out = torch.empty((Q, k), device=xq.device, dtype=torch.long)
+        d2_out = torch.empty((Q, k), device=xq.device, dtype=xq.dtype)
+
+        pts = self._points
+        pts_norm = self._points_norm  # (N,)
+
+        cs = self.chunk_size if self.chunk_size > 0 else Q
+        for s in range(0, Q, cs):
+            e = min(Q, s + cs)
+            q = xq[s:e]  # (Qc,3)
+
+            q_norm = (q * q).sum(dim=1, keepdim=True)  # (Qc,1)
+            prod = q @ pts.t()  # (Qc,N)
+            d2 = q_norm + pts_norm.unsqueeze(0) - 2.0 * prod
+            d2 = torch.clamp(d2, min=0.0)
+
+            d2k, idxk = torch.topk(d2, k=k, dim=1, largest=False, sorted=True)
+            idx_out[s:e] = idxk
+            d2_out[s:e] = d2k
+
+        return idx_out, d2_out
+
+    def _knn_pytorch3d(
+        self, xq: torch.Tensor, k: int
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Exact kNN via pytorch3d.ops.knn_points.
+        Returns idx (Q,k) and d2 (Q,k) (squared distances).
+        """
+        from pytorch3d.ops import knn_points  # type: ignore
+
+        Q = int(xq.shape[0])
+
+        idx_out = torch.empty((Q, k), device=xq.device, dtype=torch.long)
+        d2_out = torch.empty((Q, k), device=xq.device, dtype=xq.dtype)
+
+        p2 = self._points.unsqueeze(0)  # (1,N,3)
+
+        cs = self.chunk_size if self.chunk_size > 0 else Q
+        for s in range(0, Q, cs):
+            e = min(Q, s + cs)
+            p1 = xq[s:e].unsqueeze(0)  # (1,Qc,3)
+
+            knn = knn_points(p1, p2, K=k, return_sorted=True)
+            # knn is a NamedTuple-like with fields .idx and .dists in most versions
+            idx = knn.idx if hasattr(knn, "idx") else knn[1]
+            d2 = knn.dists if hasattr(knn, "dists") else knn[0]
+
+            # (1,Qc,k) -> (Qc,k)
+            idx_out[s:e] = idx[0]
+            d2_out[s:e] = d2[0]
+
+        return idx_out, d2_out
+
+    def _knn_torch_cluster(
+        self, xq: torch.Tensor, k: int
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Exact kNN via torch_cluster.knn (CUDA extension when tensors are CUDA).
+        Returns idx (Q,k). Distances are computed later in Torch.
+        """
+        try:
+            from torch_cluster import knn as tc_knn  # type: ignore
+        except Exception as e:
+            raise RuntimeError("torch_cluster not available") from e
+
+        Q = int(xq.shape[0])
+        x = self._points.contiguous()
+        y = xq.contiguous()
+
+        # batch vectors (single batch)
+        batch_x = torch.zeros(x.shape[0], device=x.device, dtype=torch.long)
+        batch_y = torch.zeros(y.shape[0], device=y.device, dtype=torch.long)
+
+        edge_index = tc_knn(x, y, k, batch_x, batch_y)  # (2, Q*k) typically
+        row, col = edge_index[0], edge_index[1]  # row in [0,Q), col in [0,N)
+
+        # Group edges by query row
+        order = torch.argsort(row)
+        row_s = row[order]
+        col_s = col[order]
+
+        # Fast path: expect exactly k per query in row-major groups
+        if col_s.numel() != Q * k:
+            raise RuntimeError(
+                f"torch_cluster.knn returned {col_s.numel()} edges, expected {Q * k}."
+            )
+        row_view = row_s.view(Q, k)
+        if not torch.equal(
+            row_view[:, 0], torch.arange(Q, device=row_s.device, dtype=row_s.dtype)
+        ):
+            raise RuntimeError(
+                "torch_cluster.knn output not groupable into (Q,k) in a simple reshape."
+            )
+
+        idx = col_s.view(Q, k).contiguous()
+        return idx, None
+
+    def _ensure_faiss_index(self) -> None:
+        """
+        Build a FAISS index on CPU for the current points (CPU only in this implementation).
+        """
+        if self._faiss_index is not None:
+            return
+
+        if self._points.device.type != "cpu":
+            raise RuntimeError(
+                "FAISS backend in this implementation is CPU-only. Move module/points to CPU or use knn_backend='pytorch3d'/'torch_cluster' on CUDA."
+            )
+
+        import faiss  # type: ignore
+
+        pts = self._points.detach().contiguous().to(dtype=torch.float32).cpu().numpy()
+
+        d = 3
+        if self.faiss_factory is None:
+            index = faiss.IndexFlatL2(d)
+        else:
+            # Index factory string, e.g. "IVF1024,PQ16"
+            index = faiss.index_factory(d, self.faiss_factory)
+
+        if not index.is_trained:
+            index.train(pts)
+        index.add(pts)
+
+        # Optional: IVF indexes use nprobe
+        try:
+            index.nprobe = self.faiss_nprobe
+        except Exception:
+            pass
+
+        self._faiss_index = index
+
+    def _knn_faiss(
+        self, xq: torch.Tensor, k: int
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        kNN via FAISS (CPU-only here). Returns idx (Q,k).
+        Distances are recomputed in Torch unless recompute_d2=False.
+        """
+        self._ensure_faiss_index()
+        index = self._faiss_index
+
+        q = xq.detach().contiguous().to(dtype=torch.float32).cpu().numpy()
+        d2, idx = index.search(q, k)  # d2: (Q,k) squared L2, idx: (Q,k)
+        idx_t = torch.from_numpy(idx).to(device=xq.device, dtype=torch.long)
+
+        if self.recompute_d2:
+            return idx_t, None
+        d2_t = torch.from_numpy(d2).to(device=xq.device, dtype=xq.dtype)
+        return idx_t, d2_t
+
+    def _knn(
+        self, xq: torch.Tensor, k: int, *, need_d2: bool
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Unified kNN: returns (idx, d2) with d2 squared distances.
+        """
+        backend = self._select_backend(xq.device)
+
+        if backend == "torch":
+            idx, d2 = self._knn_torch(xq, k)
+            return idx, d2
+
+        if backend == "pytorch3d":
+            idx, d2b = self._knn_pytorch3d(xq, k)
+        elif backend == "torch_cluster":
+            idx, d2b = self._knn_torch_cluster(xq, k)
+        elif backend == "faiss":
+            idx, d2b = self._knn_faiss(xq, k)
+        else:
+            raise RuntimeError(f"Unknown backend: {backend}")
+
+        # If we don't need distances and don't plan to use radius/weights, we can skip d2.
+        # But for simplicity/robustness, we always return d2 (computed cheaply from idx).
+        if (d2b is None) or self.recompute_d2 or need_d2:
+            # Recompute d2 in Torch from gathered neighbors; cheap O(Q*k*3)
+            pts = self._points
+            pnn = pts.index_select(0, idx.reshape(-1)).view(xq.shape[0], k, 3)
+            d2 = ((pnn - xq[:, None, :]) ** 2).sum(dim=-1)
+        else:
+            d2 = d2b
+
+        return idx, d2
+
+    # -----------------------------
+    # Forward interpolation
+    # -----------------------------
+    def forward(
+        self, xq: torch.Tensor, *, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if xq.ndim < 2 or xq.shape[-1] != 3:
+            raise ValueError("xq must have shape (...,3).")
+        if xq.device != self._points.device:
+            raise ValueError("xq must be on the same device as points/values.")
+        if xq.dtype != self._points.dtype:
+            raise ValueError("xq must have the same dtype as points/values.")
+
+        orig_shape = xq.shape[:-1]
+        xq_flat = xq.reshape(-1, 3)
+        Q = int(xq_flat.shape[0])
+
+        vals = self._get_values()  # (N,P)
+        Pdim = int(vals.shape[1])
+
+        k_eff = 1 if self.method == "nearest" else self.k
+        need_d2 = (self.method in ("idw", "mls")) or (self.radius is not None)
+
+        idx, d2 = self._knn(xq_flat, k_eff, need_d2=need_d2)  # (Q,k), (Q,k)
+
+        # Gather neighbor values -> (Q,k,P)
+        v = vals.index_select(0, idx.reshape(-1)).view(Q, k_eff, Pdim)
+
+        if self.method == "nearest" or k_eff == 1:
+            y = v[:, 0, :]  # (Q,P)
+
+        elif self.method == "idw":
+            p = self.power
+            w = 1.0 / (d2.clamp_min(0.0).pow(0.5 * p) + self.eps)  # (Q,k)
+
+            # exact hit => take nearest exactly
+            hit = d2[:, 0] <= (self.eps * self.eps)
+            if hit.any():
+                w = torch.where(hit[:, None], torch.zeros_like(w), w)
+                w[:, 0] = torch.where(hit, torch.ones_like(w[:, 0]), w[:, 0])
+
+            w = w / w.sum(dim=1, keepdim=True).clamp_min(self.eps)
+            y = (w.unsqueeze(-1) * v).sum(dim=1)
+            if hit.any():
+                y = torch.where(hit[:, None], v[:, 0, :], y)
+
+        else:  # MLS
+            # neighbor coords (Q,k,3)
+            pnn = self._points.index_select(0, idx.reshape(-1)).view(Q, k_eff, 3)
+            dx = pnn - xq_flat[:, None, :]  # (Q,k,3)
+            ones = torch.ones((Q, k_eff, 1), device=xq.device, dtype=xq.dtype)
+            A = torch.cat([ones, dx], dim=2)  # (Q,k,4)
+
+            # weight kernel using farthest neighbor as scale
+            sigma2 = d2[:, -1].clamp_min(self.eps)  # (Q,)
+            w = torch.exp(-0.5 * d2 / sigma2[:, None])  # (Q,k)
+
+            AtWA = torch.einsum("qki,qkj,qk->qij", A, A, w)  # (Q,4,4)
+            if self.mls_reg > 0:
+                I_ = torch.eye(4, device=xq.device, dtype=xq.dtype).unsqueeze(0)
+                AtWA = AtWA + self.mls_reg * I_
+            AtWy = torch.einsum("qki,qk,qkp->qip", A, w, v)  # (Q,4,P)
+
+            theta = torch.linalg.solve(AtWA, AtWy)  # (Q,4,P)
+            y = theta[:, 0, :]  # value at query (since features are [1,0,0,0])
+
+            hit = d2[:, 0] <= (self.eps * self.eps)
+            if hit.any():
+                y = torch.where(hit[:, None], v[:, 0, :], y)
+
+        # Radius-based outside handling (optional)
+        if self.radius is not None and self.outside != "none":
+            outside_mask = d2[:, 0] > (self.radius * self.radius)
+            if outside_mask.any():
+                if self.outside == "zero":
+                    y = torch.where(outside_mask[:, None], torch.zeros_like(y), y)
+                else:
+                    y = torch.where(
+                        outside_mask[:, None], torch.full_like(y, self.fill_value), y
+                    )
+
+        y = y.view(*orig_shape, Pdim)
+        if self._scalar_values:
+            y = y.squeeze(-1)
+
+        if out is not None:
+            if out.shape != y.shape:
+                raise ValueError(
+                    f"out has shape {tuple(out.shape)} but expected {tuple(y.shape)}."
+                )
+            out.copy_(y)
+            return out
+
+        return y
