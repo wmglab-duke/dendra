@@ -5,7 +5,7 @@ from typing import Dict
 
 import torch
 
-from axonml.helpers import USETABLES, classproperty
+from axonml.helpers import classproperty
 from axonml.models.parametric import Parameterized
 
 from ._ions import VALENCES
@@ -359,9 +359,9 @@ class Mechanism(Parameterized):
             setattr(self, "factorable", factorable)
 
         self.populate()
-        self.instantiate_tables(usetables=bool(USETABLES))
+        self.instantiate_tables()
         for state in self.DE.values():
-            state.instantiate_tables(usetables=bool(USETABLES))
+            state.instantiate_tables()
 
     def set_dt(self, dt):
         """
@@ -931,6 +931,20 @@ class Mechanism(Parameterized):
         for state_module in self.DE.values():
             state_module.reset_rng()
         super().reset_rng()
+
+    # -- tables --
+    def usetables(self, value: bool):
+        """
+        Enable or disable table usage for the mechanism and nested states.
+
+        Parameters
+        ----------
+        value : bool
+            Whether to use tables for function approximations.
+        """
+        for state_module in self.DE.values():
+            state_module.usetables(value)
+        super().usetables(value)
 
 
 class VoltageProcess(Mechanism):

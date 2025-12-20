@@ -1,12 +1,13 @@
 """Parameter handling utilities and mixins for AxonML models."""
 
 import itertools
+from types import MethodType
 from typing import Callable
 
 import torch
 import torch.nn.functional as F
 
-from axonml.helpers import REQUIRE_GRAD
+from axonml.helpers import DEBUG, REQUIRE_GRAD, logger
 from axonml.utils import PreparedInterp1d
 
 from .rng import RNGModule
@@ -684,25 +685,38 @@ class SimpleParameterized(Referency):
     _params_defined_here = {}
     _params_declarations = []
 
+    _flags = {}
+    _flags_defined_here = {}
+    _flags_declarations = []
+
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__()
 
         new_params = {}
+        new_flags = {}
 
         for base in reversed(cls.__mro__):
             if "_params" in base.__dict__:
                 new_params.update(base._params)
-
+            if "_flags" in base.__dict__:
+                new_flags.update(base._flags)
         cls._params_defined_here = {}
+        cls._flags_defined_here = {}
 
         if SimpleParameterized._params_declarations:
             for p_dict in SimpleParameterized._params_declarations:
                 cls._params_defined_here.update(p_dict)
             SimpleParameterized._params_declarations = []
+        if SimpleParameterized._flags_declarations:
+            for f_dict in SimpleParameterized._flags_declarations:
+                cls._flags_defined_here.update(f_dict)
+            SimpleParameterized._flags_declarations = []
 
         new_params.update(cls._params_defined_here)
+        new_flags.update(cls._flags_defined_here)
 
         cls._params = new_params
+        cls._flags = new_flags
 
     def __init__(self, **kwargs):
         super(SimpleParameterized, self).__init__()
@@ -712,6 +726,13 @@ class SimpleParameterized(Referency):
                 key: kwargs.get(key, value) for key, value in self.params.items()
             }
         self.instantiate_parameters(**self.params)
+        self.flags = self.__class__._flags.copy()
+        if kwargs:
+            self.flags = {
+                key: kwargs.get(key, value) for key, value in self.flags.items()
+            }
+        for key, value in self.flags.items():
+            setattr(self, key, value)
 
     def check_kwargs(self, kwargs):
         """
@@ -766,6 +787,18 @@ class SimpleParameterized(Referency):
             GLOBAL/RANGE/RNG categories when population-aware shapes are needed.
         """
         SimpleParameterized._params_declarations.append(kwargs)
+
+    @staticmethod
+    def FLAG(**kwargs):
+        """
+        Declare flags for the next subclass initialization.
+
+        Parameters
+        ----------
+        **kwargs
+            Flag names with default boolean values.
+        """
+        SimpleParameterized._flags_declarations.append(kwargs)
 
     def device(self):
         """
@@ -1134,6 +1167,7 @@ class Parameterized(SimpleParameterized):
         learnable : bool, optional
             If True, the table values are trainable parameters. Defaults to False.
         """
+        Parameterized.FLAG(**{f"usetable_{func}": False})
         Parameterized._table_declarations.append(
             {func: {"low": low, "high": high, "n": n, "learnable": learnable}}
         )
@@ -1350,15 +1384,13 @@ class Parameterized(SimpleParameterized):
                 b = param(b, *[getattr(self, arg) for arg in args])
             setattr(self, name, b)
 
-    def instantiate_tables(self, usetables=True):
+    def instantiate_tables(self):
         """
         Instantiate lookup tables declared for this class.
         """
         for name, table_info in self.__class__._table.items():
             func_name = name
-            if not usetables:
-                setattr(self, f"{func_name}_table", getattr(self, func_name))
-                continue
+            rebind_func_with_table(self, func_name)
             low, high, n, learnable = (
                 table_info["low"],
                 table_info["high"],
@@ -1384,13 +1416,14 @@ class Parameterized(SimpleParameterized):
                     uniform="always",
                 ),
             )
+            setattr(self, f"usetable_{func_name}", True)
 
     def usetables(self, usetables=True):
         """
         Switch all function implementations to use lookup tables.
         """
-        self.instantiate_tables(usetables=usetables)
-        torch._dynamo.reset()
+        for name in self.__class__._table.keys():
+            setattr(self, f"usetable_{name}", usetables)
 
     def detach(self):
         """
@@ -1435,3 +1468,33 @@ class Parameterized(SimpleParameterized):
         Returns a dictionary of all parameters in the model.
         """
         return {name: param for name, param in self.named_parameters()}
+
+
+table_function_template = """
+def {func_name}_with_table(self, x):
+    if self.usetable_{func_name}:
+        return self.{func_name}_table(x)
+    return self.{func_name}_original(x)
+"""
+
+
+def rebind_func_with_table(obj, func_name):
+    """
+    Rebind a function of an object to use its lookup table if available.
+
+    Parameters
+    ----------
+    obj : object
+        The object containing the function and potential lookup table.
+    func_name : str
+        The name of the function to rebind.
+    """
+    func_code = table_function_template.format(func_name=func_name)
+    if DEBUG > 0:
+        logger.info(f"Generated code for {func_name}:\n{func_code}")
+    filename = "<table_function>"
+    code = compile(func_code, filename, "exec")
+    exec(code)
+    meth = locals()[f"{func_name}_with_table"]
+    setattr(obj, f"{func_name}_original", getattr(obj, func_name))
+    setattr(obj, func_name, MethodType(meth, obj))
