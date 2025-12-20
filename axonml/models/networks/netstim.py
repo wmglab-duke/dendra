@@ -369,7 +369,7 @@ class NetStim(torch.nn.Module, Sliceable):
         # COMMIT state safely (no version-bump hazards)
         if bptt:
             # keep graph across steps: replace the buffer with the new tensor
-            self._buffers["next_stoch_time"] = new_stoch
+            self.next_stoch_time = new_stoch
         else:
             # no BPTT: commit numerically but don't grow graph
             with torch.no_grad():
@@ -458,3 +458,118 @@ class NetStim(torch.nn.Module, Sliceable):
     def detach_(self):
         """In-place variant of :meth:`detach` that returns ``None``."""
         self.detach()
+
+    # ───────────────────────── checkpointing ─────────────────────────
+    def state_dict_for_checkpoint(self):
+        """Return a replay-safe snapshot of NetStim *dynamic* state.
+
+        This is intended for activation checkpointing in long unrolled runs.
+        Key points:
+          • We MUST include the per-instance torch.Generator RNG state, because
+            torch.utils.checkpoint can preserve global RNG state, but not custom
+            Generator objects passed via `generator=...`.
+          • Scheduled spikes live in Python-side heaps. We store them as an
+            immutable tuple-of-tuples so the returned state object is not
+            accidentally mutated by subsequent simulation steps.
+
+        Returns
+        -------
+        dict
+            A lightweight state snapshot that can be passed through
+            torch.utils.checkpoint and used to deterministically restore the
+            NetStim internal state.
+        """
+        # Store scheduled heaps as immutable data (avoid aliasing/mutation).
+        sched_heaps = tuple(tuple(h) for h in self._sched_heaps)
+
+        return {
+            # Differentiable state (needed for BPTT across chunks)
+            "next_stoch_time": self.next_stoch_time,
+            # Non-differentiable state (counters/logical guards)
+            "spike_counts": self.spike_counts,
+            "t_last": self.t_last,
+            # Scheduled-spike state
+            "sched_heaps": sched_heaps,
+            # RNG state (critical for deterministic checkpoint replay)
+            "rng_state": self._rng.get_state(),
+            "seeder_state": self._seeder.get_state(),
+        }
+
+    def restore_dict_from_checkpoint(self, state_dict):
+        """Restore NetStim dynamic state from :meth:`state_dict_for_checkpoint`.
+
+        Important details for activation checkpointing:
+          • We rebind/clone any buffers that are mutated in-place during forward
+            (e.g., spike_counts, t_last) to avoid mutating checkpoint inputs.
+          • We rebind next_stoch_time directly in training mode to preserve its
+            autograd history (BPTT across chunks).
+          • We restore the torch.Generator state so stochastic renewal sampling
+            is replay-identical during backward recomputation.
+
+        Parameters
+        ----------
+        state_dict:
+            A dict produced by :meth:`state_dict_for_checkpoint`.
+        """
+        device, dtype = self.device(), self.dtype()
+        # 1) Restore RNGs.
+        #    torch.utils.checkpoint can preserve *global* RNG state, but it does
+        #    not handle custom per-module Generators. We must restore it here.
+        if "seeder_state" in state_dict:
+            self._seeder.set_state(state_dict["seeder_state"])
+        # Ensure the sampling generator exists on the correct device.
+        # (Module `.to(...)` does not automatically move torch.Generator.)
+        if getattr(self._rng, "device", torch.device("cpu")) != device:
+            self._rng = torch.Generator(device=device)
+        if "rng_state" in state_dict:
+            self._rng.set_state(state_dict["rng_state"])
+        else:
+            # Best-effort fallback.
+            self.init_rng()
+
+        # 2) Restore scheduled spikes (Python-side heaps) and rebuild
+        #    the derived device tensor ``next_sched_time``.
+        heaps_in = state_dict.get("sched_heaps", None)
+        if heaps_in is not None:
+            self._sched_heaps = [list(h) for h in heaps_in]
+            for h in self._sched_heaps:
+                heapq.heapify(h)
+            self._refresh_next_sched_time_tensor()
+        elif "next_sched_time" in state_dict:
+            # Backward-compatible path if an older checkpoint stored the tensor.
+            self.next_sched_time = (
+                state_dict["next_sched_time"]
+                .detach()
+                .to(device=device, dtype=dtype)
+                .clone()
+            )
+
+        # 3) Restore differentiable stochastic state.
+        #    Preserve gradient connectivity across chunks in training mode.
+        ns = state_dict["next_stoch_time"]
+        if ns.device != device or ns.dtype != dtype:
+            ns = ns.to(device=device, dtype=dtype)
+
+        if self.training:
+            # Rebind so downstream steps see the exact tensor with its
+            # autograd history.
+            self.next_stoch_time = ns
+        else:
+            # Eval path: keep the existing buffer object and copy values in.
+            with torch.no_grad():
+                self.next_stoch_time.copy_(ns)
+
+        # 4) Restore non-differentiable counters/buffers.
+        #    These are mutated in-place during forward, so we rebind to clones
+        #    to avoid aliasing checkpoint inputs.
+        sc = state_dict.get("spike_counts", None)
+        if sc is not None:
+            self.spike_counts = sc.detach().to(device=device, dtype=torch.long).clone()
+
+        tl = state_dict.get("t_last", None)
+        if tl is not None:
+            self.t_last = tl.detach().to(device=device, dtype=dtype).clone()
+
+        # 5) Reset per-step outputs (they will be recomputed on the next call).
+        self.spikes = torch.zeros(self.N, device=device, dtype=torch.bool)
+        self.spike_gate = torch.zeros(self.N, device=device, dtype=dtype)

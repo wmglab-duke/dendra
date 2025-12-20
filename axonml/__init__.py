@@ -22,7 +22,7 @@ from .const import (
     E,
     R,
 )
-from .helpers import TF32, allow_tf32, ctx, set_jit_enabled
+from .helpers import TF32, allow_tf32, ctx, set_jit_enabled, set_jit_in_network_enabled
 from .models import (
     Axon,
     ExtCellAxon,
@@ -72,6 +72,7 @@ __all__ = [
     "FARADAY",
     "ctx",
     "set_jit_enabled",
+    "set_jit_in_network_enabled",
     "callbacks",
     "mod",
     "load_mechanisms",

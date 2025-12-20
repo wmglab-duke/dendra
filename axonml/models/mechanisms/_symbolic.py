@@ -73,6 +73,15 @@ def build_unfactorable_equation(current, assign):
 def build_current_eq(mechanism, k, assign=False):
     if hasattr(mechanism, f"{k}_with_conductance"):
         return getattr(mechanism, f"{k}_with_conductance"), True
+    if k in mechanism._numerical:
+        code = build_numerical_equation(k, assign)
+        factorable = True
+        if DEBUG > 0:
+            logger.info(f"Generated code for {k}:\n{code}")
+        filename = "<solve_function>"
+        code = compile(code, filename, "exec")
+        exec(code)
+        return locals()[k], factorable
     try:
         gtot, irev = factorize_linear_in_v(mechanism.__class__, method=k)
         code = build_implicit_equation(k, gtot, irev, assign)

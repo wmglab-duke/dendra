@@ -31,6 +31,7 @@ from axonml.helpers import (
     FULLGRAPH,
     IMEM,
     JIT,
+    JIT_IN_NETWORK,
     op_mc,
     op_sc,
 )
@@ -286,6 +287,7 @@ class Population(P, Sliceable):
         self.fullgraph = bool(FULLGRAPH)
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
+        self.jit_in_network = bool(JIT_IN_NETWORK)
         self.imem = bool(IMEM)
         self.compile_mode = COMPILE_MODE.value
 
@@ -1166,7 +1168,7 @@ class Population(P, Sliceable):
 
                 # Integrator step
                 self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
-                self.t += dt_tensor
+                self.t = self.t + dt_tensor
 
                 post_step_hook(callbacks, self)
                 local_ind += 1
@@ -1394,7 +1396,7 @@ class Population(P, Sliceable):
                 self._step(self.integrator, self, dt, ve, intra)
 
         self.cache("_steady_state")
-        self.t.detach().zero_()
+        self.t = self.t.zero_().detach()
         return self
 
     def clear_steady_state(self):
@@ -1446,7 +1448,7 @@ class Population(P, Sliceable):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
             self.post_initialize()
-            self.t.detach().zero_()
+            self.t = self.t.zero_().detach()
             self.initialized = True
             return True
         return False
@@ -2389,6 +2391,400 @@ class Population(P, Sliceable):
             delattr(self, name)
         self._labels.clear()
 
+    # -- gradient checkpointing --
+    def state_dict_for_checkpoint(self):
+        """
+        Get state dictionary for gradient checkpointing.
+
+        Returns
+        -------
+        dict
+            State dictionary containing model parameters and buffers.
+        """
+        mech_dct = self.mech.mutable_state_dict()
+        integrator_dct = self.integrator.mutable_state_dict(self)
+        full_dct = {
+            "mech": mech_dct,
+            "integrator": integrator_dct,
+            "t": self.t,
+        }
+        return full_dct
+
+    def restore_dict_from_checkpoint(self, state_dict):
+        """
+        Restore model state from a checkpoint state dictionary.
+
+        Parameters
+        ----------
+        state_dict : dict
+            State dictionary containing model parameters and buffers.
+        """
+        self.mech.restore_mutable_state_dict(state_dict["mech"])
+        self.integrator.restore_mutable_state_dict(self, state_dict["integrator"])
+        self.t = state_dict["t"]
+
+    def longrun_checkpointed(
+        self,
+        tstop: float,
+        chunklength: int,
+        dt: float = None,
+        extra: Optional[ExtraSpec] = None,
+        callbacks: Optional[Sequence[Callback]] = None,
+        progressbar=False,
+        *,
+        safe_checkpoint: bool = False,
+        restore_state_after_backward: bool = True,
+        return_final_state: bool = False,
+    ):
+        r"""
+        Run a long simulation in chunks using activation checkpointing.
+
+        This is a checkpointed analogue of :meth:`longrun`. Each chunk is wrapped
+        in :func:`torch.utils.checkpoint.checkpoint` (with ``use_reentrant=False``),
+        so intermediate activations inside the chunk are discarded and
+        recomputed during the backward pass. This enables full BPTT across the
+        entire ``tstop`` horizon while bounding activation memory by the chunk size.
+
+        Parameters
+        ----------
+        tstop : float
+            Total simulation time in milliseconds.
+        chunklength : int
+            Number of time steps per checkpointed chunk.
+        dt : float, optional
+            Time step size in milliseconds. If None, uses the global default
+            ``A.dt``.
+        extra : ExtraSpec, optional
+            Extracellular configuration for the run. See :class:`ExtraSpec` for details.
+        callbacks : Sequence[Callback] or CallbackList, optional
+            Sequence of callback hooks to run at various points during the simulation.
+            See :class:`Callback` for details.
+        progressbar : bool, optional
+            If True, display a progress bar during the run. Default is False.
+        safe_checkpoint : bool, optional
+            If True, clone checkpoint boundary state to avoid in-place mutation
+            of checkpoint inputs. This is safer but may incur a memory overhead.
+            Default is False.
+        restore_state_after_backward : bool, optional
+            If True, restore model state to the end of the forward pass after
+            backward. This is useful when further simulation or evaluation is
+            needed after backpropagation. Default is True.
+        return_final_state : bool, optional
+            If True, return a tuple (loss, final_state) where final_state is a
+            checkpoint state dictionary suitable for restore_dict_from_checkpoint.
+            Default is False.
+
+        Returns
+        -------
+        torch.Tensor or None, or (torch.Tensor or None, dict)
+            If return_final_state is False (default): returns the total loss contribution
+            from callbacks, or None if no hook returned a non-None value.
+            If return_final_state is True: returns (loss_or_none, final_state_dict).
+
+
+        Notes
+        -----
+        **In-place update contract**
+
+        ``torch.utils.checkpoint`` forbids in-place mutation of checkpoint *inputs*.
+        If your stepping code (integrator/mechanisms) is strictly out-of-place with
+        respect to the boundary state tensors, you may keep ``safe_checkpoint=False``
+        (default) for best performance. If you are unsure, set
+        ``safe_checkpoint=True`` to clone the boundary state at chunk entry.
+
+        **Callback contract (restricted)**
+
+        For correctness under checkpointing, callbacks used here must be replay-safe:
+
+        * Hooks must be free of persistent side effects (e.g., do not append to
+          Python lists intended to be consumed after the run).
+        * Hooks must not mutate model state in a way that changes simulation dynamics.
+        * If a hook uses internal temporary state, it must fully clear that state
+          within the hook call itself.
+
+        **Loss aggregation**
+
+        Hooks may optionally return a scalar tensor loss contribution. Any non-None
+        returns from the following hooks are summed:
+
+        * ``post_step_hook(model)``
+        * ``post_chunk_hook(model, t_chunk)``
+        * ``post_loop_hook(model)``
+        """
+        if not self.initialized:
+            raise ValueError("Model must be initialized before running.")
+
+        intra = self.intra
+        with_intra = intra is not None
+
+        # dt scalars
+        dt = dt if dt is not None else A.dt
+        dt_f = float(dt)
+        dt_tensor = torch.tensor(dt, device=self.device(), dtype=self.dtype())
+
+        # Normalize callback container
+        if not isinstance(callbacks, CallbackList):
+            callbacks = CallbackList(callbacks)
+
+        if callbacks:
+            for c in callbacks:
+                c.dt = dt_f
+
+        def _as_loss_tensor(x):
+            if x is None:
+                return None
+            if isinstance(x, torch.Tensor):
+                return x
+            return torch.as_tensor(x, device=self.device(), dtype=self.dtype())
+
+        def _add_loss(acc, x):
+            x_t = _as_loss_tensor(x)
+            if x_t is None:
+                return acc, False
+            if acc is None:
+                return x_t, True
+            return acc + x_t, True
+
+        def _clone_checkpoint_state_dict(sd: Dict[str, Any]) -> Dict[str, Any]:
+            """
+            Clone all tensors in a checkpoint state dict to avoid in-place mutation
+            of checkpoint inputs (a hard requirement of torch.utils.checkpoint).
+
+            We preserve object-identity aliasing within the dict (if the same tensor
+            object is referenced multiple times) by memoizing clones.
+            """
+            memo: Dict[int, torch.Tensor] = {}
+
+            def _clone_any(v):
+                if not torch.is_tensor(v):
+                    return v
+                key = id(v)
+                if key in memo:
+                    return memo[key]
+                out = v.clone()
+                memo[key] = out
+                return out
+
+            mech_in = sd.get("mech", {})
+            integ_in = sd.get("integrator", {})
+
+            mech_out = {k: _clone_any(v) for k, v in mech_in.items()}
+            integ_out = {k: _clone_any(v) for k, v in integ_in.items()}
+
+            return {
+                "mech": mech_out,
+                "integrator": integ_out,
+                "t": _clone_any(sd["t"]),
+            }
+
+        def _copy_state_containers(sd: Dict[str, Any]) -> Dict[str, Any]:
+            """
+            Copy only the dict containers (not tensors). Useful to protect the
+            backward-restore hook from accidental user mutation of the returned dict.
+            """
+            return {
+                "mech": dict(sd.get("mech", {})),
+                "integrator": dict(sd.get("integrator", {})),
+                "t": sd["t"],
+            }
+
+        with torch.nn.utils.parametrize.cached():
+            with torch.set_grad_enabled(self.training):
+                # --------------------------------------------------------------
+                # Global time grid and chunking
+                # --------------------------------------------------------------
+                t = torch.arange(
+                    self.t.double(),
+                    self.t.double() + tstop,
+                    dt_f,
+                    dtype=torch.double,
+                    device=self.device(),
+                ).to(self.dtype())
+
+                if t.numel() == 0:
+                    return None
+
+                n_chunks = math.ceil(len(t) / chunklength)
+                t_chunks = torch.tensor_split(t, n_chunks)
+
+                # --------------------------------------------------------------
+                # Extracellular configuration (single vs multi-contact, functional)
+                # --------------------------------------------------------------
+                extra_cfg = self._prepare_extra(extra, t, n_chunks)
+                with_extra = extra_cfg.enabled
+
+                # --------------------------------------------------------------
+                # Integrator initialization + pre-loop hooks
+                # --------------------------------------------------------------
+                pre_loop_hook(callbacks, self)
+                self.integrator._initialize(self, dt_tensor, force=self.training)
+
+                if progressbar:
+                    progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
+
+                # Capture boundary state after initialization
+                state = self.state_dict_for_checkpoint()
+
+                total_loss = None
+                saw_any_loss = False
+
+                # Local alias for speed
+                _checkpoint = torch.utils.checkpoint.checkpoint
+
+                # --------------------------------------------------------------
+                # Main chunk loop (checkpointed)
+                # --------------------------------------------------------------
+                for i, t_chunk in enumerate(t_chunks):
+                    chunk_idx = int(i)
+                    t_chunk_local = t_chunk
+
+                    def _run_chunk(
+                        state_in, t_chunk_local=t_chunk_local, chunk_idx=chunk_idx
+                    ):
+                        # IMPORTANT: torch.utils.checkpoint forbids in-place mutation of
+                        # checkpoint *inputs*. If out-of-place stepping is guaranteed,
+                        # we can safely reuse the boundary tensors. Otherwise, clone.
+                        state_local = (
+                            state_in
+                            if not safe_checkpoint
+                            else _clone_checkpoint_state_dict(state_in)
+                        )
+
+                        # Restore model state at chunk boundary
+                        self.restore_dict_from_checkpoint(state_local)
+
+                        if with_intra:
+                            stims, indices = intra.init(t_chunk_local)
+                            stims = [s.unbind(0) for s in stims]
+                        else:
+                            stims, indices = None, None
+
+                        if with_extra:
+                            ve_list = self._compute_extra_chunk(
+                                extra_cfg, chunk_idx, t_chunk_local
+                            )
+                        else:
+                            ve_list = None
+
+                        pre_chunk_hook(callbacks, self, t_chunk_local)
+
+                        chunk_loss = None
+                        saw_loss_local = False
+
+                        for j in range(len(t_chunk_local)):
+                            ve_c = ve_list[j] if ve_list is not None else None
+
+                            if with_intra:
+                                s = [st[j] for st in stims]
+                                intra_c = self.make_intra(intra, s, indices)
+                            else:
+                                intra_c = None
+
+                            self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+
+                            # Replay-safe post-step callbacks (may contribute loss)
+                            if callbacks:
+                                for c in callbacks:
+                                    hook = getattr(c, "post_step_hook", None)
+                                    if hook is None:
+                                        continue
+                                    chunk_loss, saw = _add_loss(chunk_loss, hook(self))
+                                    saw_loss_local = saw_loss_local or saw
+
+                            self.t = self.t + dt_tensor
+
+                        # Replay-safe post-chunk callbacks (may contribute loss)
+                        if callbacks:
+                            for c in callbacks:
+                                hook = getattr(c, "post_chunk_hook", None)
+                                if hook is None:
+                                    continue
+                                chunk_loss, saw = _add_loss(
+                                    chunk_loss, hook(self, t_chunk_local)
+                                )
+                                saw_loss_local = saw_loss_local or saw
+
+                        state_out = self.state_dict_for_checkpoint()
+
+                        if chunk_loss is None:
+                            chunk_loss = torch.zeros(
+                                (),
+                                device=self.device(),
+                                dtype=self.dtype(),
+                            )
+
+                        saw_loss_flag = torch.tensor(
+                            1 if saw_loss_local else 0,
+                            device=self.device(),
+                            dtype=torch.int32,
+                        )
+
+                        return state_out, chunk_loss, saw_loss_flag
+
+                    state, chunk_loss, saw_loss_flag = _checkpoint(
+                        _run_chunk, state, use_reentrant=False, determinism_check="none"
+                    )
+
+                    total_loss, _ = _add_loss(total_loss, chunk_loss)
+                    saw_any_loss = saw_any_loss or bool(int(saw_loss_flag.item()))
+
+                    if progressbar:
+                        progressbar.update(1)
+                        progressbar.set_description(f"{self.t.item():.1f} ms")
+
+                # Replay-safe post-loop callbacks (may contribute loss)
+                if callbacks:
+                    for c in callbacks:
+                        hook = getattr(c, "post_loop_hook", None)
+                        if hook is None:
+                            continue
+                        total_loss, saw = _add_loss(total_loss, hook(self))
+                        saw_any_loss = saw_any_loss or saw
+
+                if progressbar:
+                    progressbar.close()
+
+        if not saw_any_loss:
+            if return_final_state:
+                return None, self.state_dict_for_checkpoint()
+            return None
+
+        # ------------------------------------------------------------------
+        # IMPORTANT: preserve forward-final model state across backward.
+        #
+        # With checkpointing, backward re-runs chunk forwards and therefore
+        # re-mutates self.t / buffers. Without intervention, the module state
+        # after loss.backward() will typically reflect the last recomputed
+        # chunk, not the true forward-final state.
+        #
+        # We snapshot the final state and schedule a restoration callback at
+        # the *end* of backward.
+        # ------------------------------------------------------------------
+        final_state = None
+        if restore_state_after_backward or return_final_state:
+            final_state = self.state_dict_for_checkpoint()
+
+        if restore_state_after_backward:
+            # Protect hook state from accidental external mutation of the dict structure.
+            final_state_for_hook = _copy_state_containers(final_state)
+
+            def _queue_restore(grad, fs=final_state_for_hook):
+                # Must be called during backward; this schedules restore after
+                # the autograd engine finishes the backward pass.
+                torch.autograd.Variable._execution_engine.queue_callback(
+                    lambda: self.restore_dict_from_checkpoint(fs)
+                )
+                return grad
+
+            # Only meaningful if backward will actually run through this tensor.
+            # (register_hook requires requires_grad=True)
+            if isinstance(total_loss, torch.Tensor) and total_loss.requires_grad:
+                total_loss.register_hook(_queue_restore)
+
+        if return_final_state:
+            return total_loss, final_state
+        return total_loss
+
 
 class SingleCompartment(Population):
     """
@@ -2606,8 +3002,7 @@ class Axon(Population):
         self.temp = float(celsius)
 
         self.v_init = v_init
-        self.v[:] = v_init
-        self.v.detach_()
+        self.v = torch.full_like(self.v, fill_value=v_init)
 
         self.x[:] = self._x()  # Initialize x positions
 

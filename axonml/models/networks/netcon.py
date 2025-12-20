@@ -1,3 +1,5 @@
+from typing import Any, Dict
+
 import torch
 
 from ..parametric import Referency
@@ -1549,14 +1551,16 @@ class NetCon(Referency):
         ) = self.train_flags
         device, dtype = self.device, self.dtype
 
-        # snapshot indices for this step (avoid version bumps)
-        cur_idx = self.current_time_step.detach().clone()  # [1], long
-        gs = self.global_step.detach().clone()  # [1], long
+        # Snapshot indices for this step (avoid version bumps).
+        # clone() is not necessary here; detach is enough because we never mutate
+        # these tensors in-place and we treat them as non-differentiable counters.
+        cur_idx = self.current_time_step.detach()  # [1], long
+        gs = self.global_step.detach()  # [1], long
 
         # 1) deliver today's payload
-        todays = self.delivery_buffer.index_select(0, cur_idx)  # [1, n_syn]
-        self.events = self.event_queue.index_select(0, cur_idx).squeeze(0)  # [n_conn]
-        self.syn.net_receive(todays.squeeze(0).view(*self.syn.shape_f), self)
+        # NOTE: event_queue/events are assumed debug-only (not used for dynamics).
+        todays = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)  # [n_syn]
+        self.syn.net_receive(todays.view(*self.syn.shape_f), self)
 
         # 2) intrinsic spiking
         self.determine_spiking(
@@ -1583,8 +1587,19 @@ class NetCon(Referency):
             wvals = wvals.detach()
         weighted_spikes = wvals * gate  # [n_conn]
 
-        functional_update = diff_weights or diff_delays
-        buf_flat = self.delivery_buffer.view(-1)
+        # ------------------------------------------------------------------
+        # Build next delivery buffer WITHOUT allocating a full-size "contrib"
+        # buffer and WITHOUT constructing a full-size dense mask.
+        #
+        # We clone once (this is the output buffer), clear the delivered row,
+        # then scatter-add into it.
+        #
+        # This reduces per-step peak memory substantially compared to:
+        #   contrib=zeros_like(buf_flat) + mask2d + (buf_flat*mask2d + contrib)
+        # ------------------------------------------------------------------
+        buf_next = self.delivery_buffer.clone()
+        buf_next.index_fill_(0, cur_idx, 0.0)  # clear the row we just delivered
+        buf_flat = buf_next.view(-1)
 
         if diff_delays:
             d_ms = self.delay_ms().to(dtype)  # [n_conn]
@@ -1598,20 +1613,9 @@ class NetCon(Referency):
                 idx1 = (idx0 + 1).remainder(self.max_delay_steps)
                 flat0 = idx0 * self.syn_numel + self.post_idx
                 flat1 = idx1 * self.syn_numel + self.post_idx
-
-                contrib = torch.zeros_like(buf_flat)
-                contrib.index_add_(0, flat0, weighted_spikes * (1.0 - alpha))
-                contrib.index_add_(0, flat1, weighted_spikes * alpha)
-
-                flat_e = (cur_idx + kL).remainder(
-                    self.max_delay_steps
-                ) * self.n + self.con_range
-                self.event_queue.view(-1).index_add_(
-                    0,
-                    flat_e,
-                    (intrinsic_gate > 0).to(self.sched_counts.dtype)
-                    + sched_counts_conn,
-                )
+                # Vectorized 2-tap write
+                buf_flat.index_add_(0, flat0, weighted_spikes * (1.0 - alpha))
+                buf_flat.index_add_(0, flat1, weighted_spikes * alpha)
             else:
                 offs = torch.stack([kL - 1, kL, kL + 1], dim=-1)
                 centers = offs.to(dtype)
@@ -1621,64 +1625,28 @@ class NetCon(Referency):
                 )
 
                 idxs = (cur_idx + offs).remainder(self.max_delay_steps)
-                contrib = torch.zeros_like(buf_flat)
-                for j in range(3):
-                    flatj = idxs[:, j] * self.syn_numel + self.post_idx
-                    contrib.index_add_(0, flatj, weighted_spikes * w[:, j])
-
-                flat_e = (cur_idx + kL).remainder(
-                    self.max_delay_steps
-                ) * self.n + self.con_range
-                self.event_queue.view(-1).index_add_(
-                    0,
-                    flat_e,
-                    (intrinsic_gate > 0).to(self.sched_counts.dtype)
-                    + sched_counts_conn,
-                )
+                # Vectorized 3-tap write
+                flat_idx = idxs * self.syn_numel + self.post_idx.unsqueeze(
+                    -1
+                )  # [n_conn,3]
+                vals = weighted_spikes.unsqueeze(-1) * w  # [n_conn,3]
+                buf_flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
         else:
             future_steps = (cur_idx + self.delay_steps).remainder(self.max_delay_steps)
             flat = future_steps * self.syn_numel + self.post_idx
+            # Integer delay: single destination per connection
+            buf_flat.index_add_(0, flat, weighted_spikes)
 
-            if functional_update:
-                contrib = torch.zeros_like(buf_flat)
-                contrib.index_add_(0, flat, weighted_spikes)
-                flat_e = future_steps * self.n + self.con_range
-                self.event_queue.view(-1).index_add_(
-                    0,
-                    flat_e,
-                    (intrinsic_gate > 0).to(self.sched_counts.dtype)
-                    + sched_counts_conn,
-                )
-            else:
-                # (kept for completeness; normally you won't hit this in training)
-                self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
-                self.event_queue.index_fill_(0, cur_idx, 0)
-                self.delivery_buffer.view(-1).index_add_(0, flat, weighted_spikes)
-                flat_e = future_steps * self.n + self.con_range
-                self.event_queue.view(-1).index_add_(
-                    0,
-                    flat_e,
-                    (intrinsic_gate > 0).to(self.sched_counts.dtype)
-                    + sched_counts_conn,
-                )
-                self.current_time_step.add_(1).remainder_(self.max_delay_steps)
-                return
-
-        # commit masked update
-        mask1d = torch.ones(self.max_delay_steps, device=device, dtype=dtype)
-        mask1d.index_fill_(0, cur_idx, 0.0)
-        mask2d = mask1d.view(-1, 1).expand(-1, int(self._syn_numel)).reshape(-1)
-        self.delivery_buffer = (buf_flat * mask2d + contrib).view_as(
-            self.delivery_buffer
-        )
+        # Commit next buffer (already cleared + updated)
+        self.delivery_buffer = buf_next
 
         # advance counters (no grad)
         with torch.no_grad():
-            new_cur = (self.current_time_step + 1).remainder(self.max_delay_steps)
-            new_gs = self.global_step + 1
             # Rebind buffers (out-of-place) to avoid version bumps on saved tensors
-            self.current_time_step = new_cur.detach()
-            self.global_step = new_gs.detach()
+            self.current_time_step = (
+                (self.current_time_step + 1).remainder(self.max_delay_steps).detach()
+            )
+            self.global_step = (self.global_step + 1).detach()
 
     def advance_non_diff(self):
         """
@@ -1994,3 +1962,59 @@ class NetCon(Referency):
             * reporting statistics about network scale.
         """
         return int(self.n.item())
+
+    def state_dict_for_checkpoint(self):
+        """
+        Return a state dictionary suitable for gradient checkpointing / long-run chunking.
+
+        This should include ONLY mutable tensors that affect future dynamics and are
+        mutated by advance_*(). The returned structure must be stable across chunks
+        (same keys; same shapes).
+
+        Notes
+        -----
+        - This is *not* a full PyTorch state_dict. It is the *minimal mutable*
+          runtime state needed to resume stepping identically mid-simulation.
+        - Do NOT include weights/delays/modules here; those are model params
+          and remain constant across a forward.
+        - Under the assumption that event_queue/events are only for logging,
+          we intentionally omit them. TODO: if they become essential to dynamics,
+          they should be handled here, in a way that the user can flag.
+        """
+
+        sd: Dict[str, Any] = {
+            "delivery_buffer": self.delivery_buffer,
+            "current_time_step": self.current_time_step,
+            "global_step": self.global_step,
+        }
+
+        # Threshold-crossing history matters for spike detection when thresholds are used.
+        if not self.skip_thresholding:
+            sd["has_spiked"] = self.has_spiked
+
+        return sd
+
+    def restore_dict_from_checkpoint(self, state_dict):
+        """
+        Restore the state of this NetCon from a checkpoint dictionary created by
+        state_dict_for_checkpoint().
+
+        Important checkpointing detail:
+        - delivery_buffer must be rebound directly (to preserve gradient flow).
+        - non-differentiable tensors that NetCon mutates in-place should be cloned
+        here to avoid in-place mutation of checkpoint *inputs* inside a chunk.
+
+        This matches the expectation in longrun_checkpointed that restore rebinds
+        mutable tensors.
+        """
+        # IMPORTANT:
+        # Restore by *rebinding* tensors, not copy_(), so that:
+        # - we preserve autograd history through the state tensors, and
+        # - we don't inadvertently sever BPTT across chunk boundaries.
+        self.delivery_buffer = state_dict["delivery_buffer"]
+        self.current_time_step = state_dict["current_time_step"]
+        self.global_step = state_dict["global_step"]
+
+        if not self.skip_thresholding and "has_spiked" in state_dict:
+            self.has_spiked = state_dict["has_spiked"]
+        return self

@@ -1114,7 +1114,9 @@ class Parameterized(SimpleParameterized):
         via self.{func}_table.
         In practice, this can speed up repeated evaluations of (very) expensive
         functions, but for simple functions the overhead of the table lookup
-        may outweigh the benefits.
+        may outweigh the benefits. May also be useful to optimize functions
+        without assuming a specific functional form (besides that used for table
+        initialization).
 
         Parameters
         ----------
@@ -1374,7 +1376,12 @@ class Parameterized(SimpleParameterized):
                 self,
                 f"{func_name}_table",
                 PreparedInterp1d(
-                    x, y, sort_xy=False, exact_clamp=False, learnable_y=learnable
+                    x,
+                    y,
+                    sort_xy=False,
+                    exact_clamp=False,
+                    learnable_y=learnable,
+                    uniform="always",
                 ),
             )
 

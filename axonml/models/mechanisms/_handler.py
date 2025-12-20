@@ -359,3 +359,50 @@ class MechanismHandler(torch.nn.Module):
         for mech in self.mechanisms.values():
             states.extend(mech.states())
         return states
+
+    def mutable_state_dict(self):
+        """
+        Return a dictionary of all mutable / rebound states in the MechanismHandler.
+        """
+        states = {}
+        for mech_name, mech in self.mechanisms.items():
+            for _, state in mech.DE.items():
+                for state_name in state._state:
+                    states[f"{mech_name}.{state_name}"] = getattr(mech, state_name)
+            for buffer_name in mech._assigned:
+                states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
+        for ion, ion_read in self.read_ion.items():
+            for k, conc_list in ion_read.items():
+                mech = self.mechanisms[k]
+                for conc in conc_list:
+                    states[f"{k}.{conc}"] = mech._buffers[conc]
+        for ion_name, ion in self.ions.items():
+            for buffer_name, buffer in ion.named_buffers():
+                states[f"{ion_name}_ion.{buffer_name}"] = buffer
+        return states
+
+    def restore_mutable_state_dict(self, state_dict):
+        """
+        Restore mutable states from a given state dictionary.
+        Assumes that the state_dict was created by mutable_state_dict().
+        """
+        for mech_name, mech in self.mechanisms.items():
+            for _, state in mech.DE.items():
+                for state_name in state._state:
+                    key = f"{mech_name}.{state_name}"
+                    setattr(mech, state_name, state_dict[key])
+            for buffer_name in mech._assigned:
+                key = f"{mech_name}.{buffer_name}"
+                setattr(mech, buffer_name, state_dict[key])
+        for ion, ion_read in self.read_ion.items():
+            for k, conc_list in ion_read.items():
+                mech = self.mechanisms[k]
+                for conc in conc_list:
+                    key = f"{k}.{conc}"
+                    setattr(mech, conc, state_dict[key])
+                    for s in mech.DE.values():
+                        setattr(s, conc, state_dict[key])
+        for ion_name, ion in self.ions.items():
+            for buffer_name, _ in ion.named_buffers():
+                key = f"{ion_name}_ion.{buffer_name}"
+                setattr(ion, buffer_name, state_dict[key])
