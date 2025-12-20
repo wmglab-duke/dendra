@@ -1075,6 +1075,11 @@ class Population(P, Sliceable):
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
+        if self.jit:
+            psh = torch.compile(post_step_hook)
+        else:
+            psh = post_step_hook
+
         with ctx:
             # --------------------------------------------------------------
             # Determine number of steps and global time grid
@@ -1170,7 +1175,7 @@ class Population(P, Sliceable):
                 self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
                 self.t = self.t + dt_tensor
 
-                post_step_hook(callbacks, self)
+                psh(callbacks, self)
                 local_ind += 1
 
                 # Progress bar update
@@ -1270,6 +1275,11 @@ class Population(P, Sliceable):
         dt_f = float(dt)
         dt_tensor = torch.tensor(dt, device=self.device(), dtype=self.dtype())
 
+        if self.jit:
+            psh = torch.compile(post_step_hook)
+        else:
+            psh = post_step_hook
+
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
                 # --------------------------------------------------------------
@@ -1340,7 +1350,7 @@ class Population(P, Sliceable):
                             intra_c = None
 
                         self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
-                        post_step_hook(callbacks, self)
+                        psh(callbacks, self)
                         self.t = self.t + dt_tensor
 
                     post_chunk_hook(callbacks, self, t_chunk)
@@ -2987,11 +2997,19 @@ class Axon(Population):
     ]
 
     def __init__(
-        self, diameters, n_comp: int, celsius=37.0, v_init=-80.0, integrator=None
+        self,
+        diameters,
+        n_comp: int,
+        celsius=37.0,
+        v_init=-80.0,
+        integrator=None,
+        **kwargs,
     ):
         if integrator is None:
             integrator = bwd_euler_ub()
-        super().__init__(len(diameters), n_comp, integrator=integrator, celsius=celsius)
+        super().__init__(
+            len(diameters), n_comp, integrator=integrator, celsius=celsius, **kwargs
+        )
 
         self.register_buffer(
             "diameters", torch.as_tensor(diameters, dtype=self.dtype())
@@ -3163,13 +3181,14 @@ class Unmyelinated(Axon):
         celsius=37.0,
         v_init=-80.0,
         integrator=None,
+        **kwargs,
     ):
         # L = L * 1000  # mm -> um
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
         self.dx_: float = dx
         self.L: float = n_comp * dx
-        super().__init__(diameters, n_comp, celsius, v_init, integrator)
+        super().__init__(diameters, n_comp, celsius, v_init, integrator, **kwargs)
         self.dx[:] = self.dx_
 
     def _x(self) -> torch.Tensor:  # x in um
@@ -3310,9 +3329,10 @@ class Myelinated(Axon):
         celsius=37.0,
         v_init=-80.0,
         integrator=None,
+        **kwargs,
     ):
         self.node_length = node_length  # length of the nodes of Ranvier in um
-        super().__init__(diameters, n_node, celsius, v_init, integrator)
+        super().__init__(diameters, n_node, celsius, v_init, integrator, **kwargs)
         self.dx[:] = self.node_length
 
         self.register_parametrization(
@@ -3403,7 +3423,6 @@ def pre_step_hook(c, m):
     c.pre_step_hook(m)
 
 
-@torch.compile
 def post_step_hook(c, m):
     """
     Invoke the registered post-step hook on a callback list.
