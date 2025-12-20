@@ -1143,9 +1143,19 @@ class Parameterized(SimpleParameterized):
         """
         Declare a lookup table to be created for the instance.
         The table maps inputs in [low, high] to outputs of the named function.
-        The lookup table may then be used instead of direct function evaluation,
-        via self.{func}_table.
-        In practice, this can speed up repeated evaluations of (very) expensive
+
+        This automatically creates a flag ``usetable_<func>`` that can be used to
+        enable or disable table usage at runtime. By default, table usage is enabled,
+        and can be disabled by setting the flag to False. Interpolation tables
+        can be disabled for an entire State / Mechanism by using
+        `.usetables(False)`.
+
+        This does not require any modification of the State / Mechanism
+        implementation (beyond the TABLE declaration); internally, AxonML will
+        check the flag and use the table when enabled  whenever the State /
+        Mechanism calls `func` (within, e.g., `breakpoint`).
+
+        In practice, this can speed up repeated evaluations of expensive
         functions, but for simple functions the overhead of the table lookup
         may outweigh the benefits. May also be useful to optimize functions
         without assuming a specific functional form (besides that used for table
