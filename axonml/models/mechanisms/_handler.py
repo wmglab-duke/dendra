@@ -366,9 +366,15 @@ class MechanismHandler(torch.nn.Module):
         """
         states = {}
         for mech_name, mech in self.mechanisms.items():
+            for rng_name in mech._rng:
+                states[f"{mech_name}.{rng_name}"] = getattr(mech, rng_name).rng_state()
             for _, state in mech.DE.items():
                 for state_name in state._state:
                     states[f"{mech_name}.{state_name}"] = getattr(mech, state_name)
+                for rng_name in state._rng:
+                    states[f"{mech_name}.{state_name}.{rng_name}"] = getattr(
+                        state, rng_name
+                    ).rng_state()
             for buffer_name in mech._assigned:
                 states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
         for ion, ion_read in self.read_ion.items():
@@ -387,10 +393,16 @@ class MechanismHandler(torch.nn.Module):
         Assumes that the state_dict was created by mutable_state_dict().
         """
         for mech_name, mech in self.mechanisms.items():
+            for rng_name in mech._rng:
+                key = f"{mech_name}.{rng_name}"
+                getattr(mech, rng_name).set_rng_state(state_dict[key])
             for _, state in mech.DE.items():
                 for state_name in state._state:
                     key = f"{mech_name}.{state_name}"
                     setattr(mech, state_name, state_dict[key])
+                for rng_name in state._rng:
+                    key = f"{mech_name}.{state_name}.{rng_name}"
+                    getattr(state, rng_name).set_rng_state(state_dict[key])
             for buffer_name in mech._assigned:
                 key = f"{mech_name}.{buffer_name}"
                 setattr(mech, buffer_name, state_dict[key])

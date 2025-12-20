@@ -847,7 +847,7 @@ def check_conflicts(
         set(global_params.keys())
         .union(range_params.keys())
         .union(params_defined_here.keys())
-        .union(rng_defined_here)
+        .union(rng_defined_here.keys())
         .union(table_defined_here.keys())
     )
     duplicates = set()
@@ -1126,17 +1126,23 @@ class Parameterized(SimpleParameterized):
         Parameterized._range_declarations.append(kwargs)
 
     @staticmethod
-    def RNG(*args):
+    def RNG(*args, **kwargs):
         """
         Declare RNG identifiers to instantiate device-local generators.
+        May supply initial seed values via keyword arguments.
 
         Parameters
         ----------
         *args : str
             Names of RNG streams to create. Instances receive generator buffers
-            accessible via these names.
+            accessible via these names. No initial seed is set.
+        **kwargs : str -> int
+            Mapping of RNG stream names to initial seed values. Instances receive generator
+            buffers initialized with the specified seeds.
         """
-        Parameterized._rng_declarations.append(set(args))
+        Parameterized._rng_declarations.append(
+            {**{name: None for name in args}, **kwargs}
+        )
 
     @staticmethod
     def TABLE(func: str, low: float, high: float, n: int, learnable: bool = False):
