@@ -279,7 +279,8 @@ class NetStim(torch.nn.Module, Sliceable):
 
     @torch.no_grad()
     @torch._dynamo.disable()  # keep everything here out of Dynamo/Inductor
-    def _consume_scheduled_tensor(self, fired_idx: torch.Tensor):
+    def _consume_scheduled_tensor(self, s_sched: torch.Tensor):
+        fired_idx = torch.nonzero(s_sched, as_tuple=True)[0]
         # fired_idx is a 1D Long tensor of generator indices (may be empty)
         if fired_idx is None or fired_idx.numel() == 0:
             return
@@ -344,7 +345,10 @@ class NetStim(torch.nn.Module, Sliceable):
         self.spike_gate = gate * can_spike.to(gate.dtype)  # keep grad if used in loss
 
         # 2) stochastic interval draw (grad will flow to interval via this)
-        U = torch.rand((self.N,), generator=self._rng, device=device, dtype=dtype)
+        eps = torch.finfo(dtype).tiny
+        U = torch.rand(
+            (self.N,), generator=self._rng, device=device, dtype=dtype
+        ).clamp_min(eps)
         exp_rand = -torch.log(U)
         interval = self.interval(cache=(not self.training))
         next_interval = interval * (1 - self.noise) + interval * self.noise * exp_rand
@@ -375,10 +379,9 @@ class NetStim(torch.nn.Module, Sliceable):
             with torch.no_grad():
                 self.next_stoch_time.copy_(new_stoch)  # copy into original storage
 
-        #    b) scheduled: heap pops are side-effects; keep them out of the graph
-        fired_idx = torch.nonzero(s_sched, as_tuple=True)[0]
+        # b) scheduled: heap pops are side-effects; keep them out of the graph
         torch._dynamo.graph_break()
-        self._consume_scheduled_tensor(fired_idx)
+        self._consume_scheduled_tensor(s_sched)
 
         # 4) counters (not part of the computational graph)
         with torch.no_grad():
