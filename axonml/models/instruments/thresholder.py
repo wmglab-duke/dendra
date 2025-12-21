@@ -500,7 +500,8 @@ class Thresholder:
             by default ``False``.
         reset_bounds : bool, optional
             Whether to reset upper and lower bounds to initial values before
-            calculation, by default ``True``.
+            calculation, by default ``True``. Set to ``False`` to continue
+            a previous calculation, e.g., with tighter tolerances.
         atol : optional
             Absolute tolerance for the threshold interval ``ub - lb``. If
             ``None``, the value provided at construction is used.
