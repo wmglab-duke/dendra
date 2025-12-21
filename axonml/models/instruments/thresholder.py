@@ -291,6 +291,7 @@ class Thresholder:
         self.rtol = rtol
 
         self.active = active
+        self.threshold = active.threshold
         self.rec = Recorder(["v"], max_only=True)
 
     def check_tolerance(self, awindow: Tensor, rwindow: Tensor) -> Tensor:
@@ -452,10 +453,10 @@ class Thresholder:
                     mask = self.check_active(tstop, dt, self.ub)
                 inactive = ~mask
                 if block_possible:
-                    self.ub[(rec[:, -1] < self.threshold) & inactive] *= (
+                    self.ub[(rec.squeeze() < self.threshold) & inactive] *= (
                         self.fix_bound_up
                     )
-                    self.ub[(rec[:, -1] >= self.threshold) & inactive] *= (
+                    self.ub[(rec.squeeze() >= self.threshold) & inactive] *= (
                         self.fix_bound_down
                     )
                 else:
