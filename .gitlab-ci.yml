@@ -37,8 +37,15 @@ before_script:
   # Use build-constraint ONLY here (no --no-build-isolation on this command)
   - python -m pip install --build-constraint "$CI_PROJECT_DIR/constraints.txt" ".[doc]"
 
+  # 4) Clone and install axonml-models AFTER axonml and torch
+  - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/axonml-models.git"
+  - cd axonml-models && python -m pip install --build-constraint "$CI_PROJECT_DIR/constraints.txt" . && cd "$CI_PROJECT_DIR"
+
   # Optional: verify in logs
   - python -c "import numpy as np; print('NumPy:', np.__version__)"
+  - python -c "import torch; print('PyTorch:', torch.__version__)"
+  - python -c "import axonml; print('AxonML:', axonml.__version__)"
+  - python -c "import axonml_models; print('AxonML-Models:', axonml_models.__version__)"
 
 build_docs:
   stage: build
