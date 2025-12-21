@@ -19,28 +19,30 @@ before_script:
 
   # Optional: useful debug if you want to confirm missing ISA flags
   - uname -m
-  - grep -m1 -E "model name|flags" /proc/cpuinfo || true
+  - grep -m1 '^flags' /proc/cpuinfo || true
 
   - python -m pip install --upgrade pip
 
-  # Force NumPy < 2 everywhere (including build isolation subprocesses)
+  # Constrain runtime environment to NumPy < 2 (works on older/limited virtual CPUs)
   - printf "numpy<2\n" > "$CI_PROJECT_DIR/constraints.txt"
   - export PIP_CONSTRAINT="$CI_PROJECT_DIR/constraints.txt"
-  - export PIP_BUILD_CONSTRAINT="$CI_PROJECT_DIR/constraints.txt"
 
-  # Install NumPy early so downstream installs don't pull NumPy 2.x
+  # Install NumPy early so anything built w/ --no-build-isolation can see it
   - python -m pip install numpy
 
   # 1) Install PyTorch first
   - python -m pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cpu
 
-  # 2) Clone and install axonml-solvers AFTER torch
+  # 2) Clone and install axonml-solvers AFTER torch (still no-build-isolation)
   - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/axonml-solvers.git"
   - cd axonml-solvers && python -m pip install --no-build-isolation . && cd "$CI_PROJECT_DIR"
 
   # 3) Install your main package with [doc] extra
-  - python -m pip install ".[doc]"
+  # Use build-constraint ONLY here (no --no-build-isolation on this command)
+  - python -m pip install --build-constraint "$CI_PROJECT_DIR/constraints.txt" ".[doc]"
 
+  # Optional: verify in logs
+  - python -c "import numpy as np; print('NumPy:', np.__version__)"
 
 build_docs:
   stage: build
