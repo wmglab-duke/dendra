@@ -14,21 +14,38 @@ cache:
     - .cache/pip
 
 before_script:
-  # Install git (and optionally compilers)
   - apt-get update && apt-get install -y --no-install-recommends git build-essential ffmpeg
   - rm -rf /var/lib/apt/lists/*
 
   - python -m pip install --upgrade pip
 
-  # 1) Install PyTorch first
-  - python -m pip install "torch==2.9.0" --index-url https://download.pytorch.org/whl/cpu
+  # Constrain runtime environment to NumPy < 2 (works on older/limited virtual CPUs)
+  - printf "numpy<2\n" > "$CI_PROJECT_DIR/constraints.txt"
+  - export PIP_CONSTRAINT="$CI_PROJECT_DIR/constraints.txt"
 
-  # 2) Clone and install axonml-solvers AFTER torch
+  # Install NumPy early so anything built w/ --no-build-isolation can see it
+  - python -m pip install numpy
+
+  # 1) Install PyTorch first
+  - python -m pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cpu
+
+  # 2) Clone and install axonml-solvers AFTER torch (still no-build-isolation)
   - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/axonml-solvers.git"
   - cd axonml-solvers && python -m pip install --no-build-isolation . && cd "$CI_PROJECT_DIR"
 
   # 3) Install your main package with [doc] extra
-  - python -m pip install ".[doc]"
+  # Use build-constraint ONLY here (no --no-build-isolation on this command)
+  - python -m pip install --build-constraint "$CI_PROJECT_DIR/constraints.txt" ".[doc]"
+
+  # 4) Clone and install axonml-models AFTER axonml and torch
+  - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/axonml-models.git"
+  - cd axonml-models && python -m pip install --build-constraint "$CI_PROJECT_DIR/constraints.txt" . && cd "$CI_PROJECT_DIR"
+
+  # Optional: verify in logs
+  - python -c "import numpy as np; print('NumPy:', np.__version__)"
+  - python -c "import torch; print('PyTorch:', torch.__version__)"
+  - python -c "import axonml; print('AxonML:', axonml.__version__)"
+  - python -c "import axonml_models; print('AxonML-Models:', axonml_models.__version__)"
 
 build_docs:
   stage: build

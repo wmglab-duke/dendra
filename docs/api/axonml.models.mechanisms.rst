@@ -49,3 +49,8 @@ axonml.models.mechanisms
 .. autoclass:: axonml.models.mechanisms.Synapse
    :members: net_receive
    :show-inheritance:
+
+
+Ion Management
+--------------
+.. autofunction:: axonml.models.mechanisms.register_ion

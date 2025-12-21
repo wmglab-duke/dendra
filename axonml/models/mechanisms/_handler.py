@@ -1,5 +1,6 @@
 import torch
 import torch._dynamo as dynamo
+import torch._inductor.config as inductor_config
 
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
 
@@ -103,6 +104,16 @@ class MechanismHandler(torch.nn.Module):
 
         self.shape = None
 
+        if self.write_ion_c:
+            self.write_to_ions = dynamo.disable(self.write_to_ions)
+        if self.read_ion:
+            self.read_from_ions = dynamo.disable(self.read_from_ions)
+
+        if self.write_ion_c or self.read_ion:
+            inductor_config.cpp_wrapper = False
+        else:
+            inductor_config.cpp_wrapper = True
+
     def make_maps(self):
         """
         Create the mapping of current indices to mechanisms and their functions.
@@ -133,6 +144,7 @@ class MechanismHandler(torch.nn.Module):
         for ion in self.ions.values():
             ion.advance(celsius)
         self.read_from_ions()
+        self.write_to_ions(v)
 
     def update_v(self, v):
         for vp in self.voltage_processes.values():
@@ -167,7 +179,6 @@ class MechanismHandler(torch.nn.Module):
         for ion in self.ions.values():
             ion.initialize(temp)
 
-    @dynamo.disable
     def write_to_ions(self, v):
         for ion, ion_c_write in self.write_ion_c.items():
             for k, conc_list in ion_c_write.items():
@@ -204,10 +215,10 @@ class MechanismHandler(torch.nn.Module):
     def detach_i_g_bufs(self):
         if not self.i_g_buffers_initialized:
             return
-        for buf in self._buf_i:
-            buf.detach_()
-        for buf in self._buf_g:
-            buf.detach_()
+        for i, buf in enumerate(self._buf_i):
+            self._buf_i[i] = buf.detach()
+        for i, buf in enumerate(self._buf_g):
+            self._buf_g[i] = buf.detach()
 
     def detach(self):
         for mech in self.mechanisms.values():
@@ -348,3 +359,62 @@ class MechanismHandler(torch.nn.Module):
         for mech in self.mechanisms.values():
             states.extend(mech.states())
         return states
+
+    def mutable_state_dict(self):
+        """
+        Return a dictionary of all mutable / rebound states in the MechanismHandler.
+        """
+        states = {}
+        for mech_name, mech in self.mechanisms.items():
+            for rng_name in mech._rng:
+                states[f"{mech_name}.{rng_name}"] = getattr(mech, rng_name).rng_state()
+            for _, state in mech.DE.items():
+                for state_name in state._state:
+                    states[f"{mech_name}.{state_name}"] = getattr(mech, state_name)
+                for rng_name in state._rng:
+                    states[f"{mech_name}.{state_name}.{rng_name}"] = getattr(
+                        state, rng_name
+                    ).rng_state()
+            for buffer_name in mech._assigned:
+                states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
+        for ion, ion_read in self.read_ion.items():
+            for k, conc_list in ion_read.items():
+                mech = self.mechanisms[k]
+                for conc in conc_list:
+                    states[f"{k}.{conc}"] = mech._buffers[conc]
+        for ion_name, ion in self.ions.items():
+            for buffer_name, buffer in ion.named_buffers():
+                states[f"{ion_name}_ion.{buffer_name}"] = buffer
+        return states
+
+    def restore_mutable_state_dict(self, state_dict):
+        """
+        Restore mutable states from a given state dictionary.
+        Assumes that the state_dict was created by mutable_state_dict().
+        """
+        for mech_name, mech in self.mechanisms.items():
+            for rng_name in mech._rng:
+                key = f"{mech_name}.{rng_name}"
+                getattr(mech, rng_name).set_rng_state(state_dict[key])
+            for _, state in mech.DE.items():
+                for state_name in state._state:
+                    key = f"{mech_name}.{state_name}"
+                    setattr(mech, state_name, state_dict[key])
+                for rng_name in state._rng:
+                    key = f"{mech_name}.{state_name}.{rng_name}"
+                    getattr(state, rng_name).set_rng_state(state_dict[key])
+            for buffer_name in mech._assigned:
+                key = f"{mech_name}.{buffer_name}"
+                setattr(mech, buffer_name, state_dict[key])
+        for ion, ion_read in self.read_ion.items():
+            for k, conc_list in ion_read.items():
+                mech = self.mechanisms[k]
+                for conc in conc_list:
+                    key = f"{k}.{conc}"
+                    setattr(mech, conc, state_dict[key])
+                    for s in mech.DE.values():
+                        setattr(s, conc, state_dict[key])
+        for ion_name, ion in self.ions.items():
+            for buffer_name, _ in ion.named_buffers():
+                key = f"{ion_name}_ion.{buffer_name}"
+                setattr(ion, buffer_name, state_dict[key])

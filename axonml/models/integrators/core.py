@@ -111,6 +111,20 @@ class Integrator(torch.nn.Module):
             model.i_membrane = model.i_membrane.detach()
         self.mech.detach()
 
+    def mutable_state_dict(self, model):
+        dct = {}
+        for var in self.v_vars:
+            dct[var] = getattr(model, var)
+        if self.imem:
+            dct["i_membrane"] = model.i_membrane
+        return dct
+
+    def restore_mutable_state_dict(self, model, state_dict):
+        for var in self.v_vars:
+            setattr(model, var, state_dict[var])
+        if self.imem:
+            model.i_membrane = state_dict["i_membrane"]
+
 
 @torch.compile
 def _write_back(model, split_at):

@@ -5,7 +5,7 @@ from typing import Dict
 
 import torch
 
-from axonml.helpers import USETABLES, classproperty
+from axonml.helpers import classproperty
 from axonml.models.parametric import Parameterized
 
 from ._ions import VALENCES
@@ -52,12 +52,14 @@ class Mechanism(Parameterized):
     _save = set()
     _assigned = set()
     _explicit = set()
+    _numerical = set()
 
     _state_declarations = []
     _ion_declarations = []
     _save_declarations = []
     _assigned_declarations = []
     _explicit_declarations = []
+    _numerical_declarations = []
 
     _conductances = {}
     _currents = {}
@@ -92,6 +94,7 @@ class Mechanism(Parameterized):
         new_save = set()
         new_assigned = set()
         new_explicit = set()
+        new_numerical = set()
 
         new_read_ion = {}
         new_write_ion = {}
@@ -123,6 +126,8 @@ class Mechanism(Parameterized):
                 new_init.update(base._init)
             if "_explicit" in base.__dict__:
                 new_explicit.update(base._explicit)
+            if "_numerical" in base.__dict__:
+                new_numerical.update(base._numerical)
 
         if Mechanism._state_declarations:
             for s_list in Mechanism._state_declarations:
@@ -164,6 +169,10 @@ class Mechanism(Parameterized):
             for v_list in Mechanism._explicit_declarations:
                 new_explicit.update(v_list)
             Mechanism._explicit_declarations = []
+        if Mechanism._numerical_declarations:
+            for v_list in Mechanism._numerical_declarations:
+                new_numerical.update(v_list)
+            Mechanism._numerical_declarations = []
 
         cls.state_classes = {s.__name__: s for s in new_state}
 
@@ -177,6 +186,7 @@ class Mechanism(Parameterized):
         cls._write_ion_c = new_write_ion_c
         cls._init = new_init
         cls._explicit = new_explicit
+        cls._numerical = new_numerical
         cls._name = None
 
     def __init__(
@@ -349,9 +359,9 @@ class Mechanism(Parameterized):
             setattr(self, "factorable", factorable)
 
         self.populate()
-        self.instantiate_tables(usetables=bool(USETABLES))
+        self.instantiate_tables()
         for state in self.DE.values():
-            state.instantiate_tables(usetables=bool(USETABLES))
+            state.instantiate_tables()
 
     def set_dt(self, dt):
         """
@@ -709,6 +719,18 @@ class Mechanism(Parameterized):
         """
         Mechanism._explicit_declarations.append(args)
 
+    @staticmethod
+    def NUMERICAL(*args):
+        """
+        Mark currents as requiring numerical differentiation.
+
+        Parameters
+        ----------
+        *args : str
+            Current names that should be numerically differentiated.
+        """
+        Mechanism._numerical_declarations.append(args)
+
     def breakpoint(self, v):
         """
         Evaluate mechanism currents at the breakpoint stage.
@@ -909,6 +931,20 @@ class Mechanism(Parameterized):
         for state_module in self.DE.values():
             state_module.reset_rng()
         super().reset_rng()
+
+    # -- tables --
+    def usetables(self, value: bool):
+        """
+        Enable or disable table usage for the mechanism and nested states.
+
+        Parameters
+        ----------
+        value : bool
+            Whether to use tables for function approximations.
+        """
+        for state_module in self.DE.values():
+            state_module.usetables(value)
+        super().usetables(value)
 
 
 class VoltageProcess(Mechanism):

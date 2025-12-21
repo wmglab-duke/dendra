@@ -13,32 +13,32 @@ def calculate_quasipotentials_batched_coords(
     e_fields_batch: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Calculates extracellular quasipotentials (ψ) for a BATCH of E-fields and
-    a BATCH of corresponding coordinates using PyTorch.
+    Calculate extracellular quasipotentials (ψ) for batches of E-fields and
+    corresponding coordinates using PyTorch.
 
-    This version is optimized for scenarios where both the E-field and the
-    neuron's spatial coordinates vary per batch instance, while the underlying
-    graph topology remains constant. The calculations are performed on the
-    device of the input tensors (e.g., 'cpu' or 'cuda').
+    Optimized for cases where both the E-field and neuron coordinates vary per
+    batch while the graph topology stays constant. Computations run on the
+    device of the input tensors.
 
-    Args:
-        G (nx.DiGraph): A single directed graph representing the constant neuron
-                        morphology. Edges must point from parent to child. The
-                        node IDs in the graph must correspond to the indices
-                        in the last dimension of the input tensors.
-        x_batch (torch.Tensor): Tensor of shape (B, N) for x-coordinates.
-                                Assumed to be in **microns (µm)**.
-        y_batch (torch.Tensor): Tensor of shape (B, N) for y-coordinates.
-                                Assumed to be in **microns (µm)**.
-        z_batch (torch.Tensor): Tensor of shape (B, N) for z-coordinates.
-                                Assumed to be in **microns (µm)**.
-        e_fields_batch (torch.Tensor): Tensor of shape (B, N, 3) for E-fields.
-                                       Assumed to be in **Volts/meter (V/m)**.
+    Parameters
+    ----------
+    G : nx.DiGraph
+        Directed graph for the constant neuron morphology with edges from
+        parent to child; node IDs must match tensor indices.
+    x_batch : torch.Tensor
+        X-coordinates of shape (B, N) in microns (µm).
+    y_batch : torch.Tensor
+        Y-coordinates of shape (B, N) in microns (µm).
+    z_batch : torch.Tensor
+        Z-coordinates of shape (B, N) in microns (µm).
+    e_fields_batch : torch.Tensor
+        E-fields of shape (B, N, 3) in Volts/meter (V/m).
 
-    Returns:
-        torch.Tensor: A 2D Tensor of shape (B, N) containing the calculated
-                      quasipotential `ψ` for each batch instance and node, in
-                      **millivolts (mV)**.
+    Returns
+    -------
+    torch.Tensor
+        Tensor of shape (B, N) containing the quasipotential ψ for each batch
+        instance and node in millivolts (mV).
     """
     # --- Step 1: Input Validation and Data Preparation ---
     num_nodes = G.number_of_nodes()

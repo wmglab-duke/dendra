@@ -393,8 +393,7 @@ class Thresholder:
                 )
             else:
                 self.model.run(
-                    space=ve,
-                    time=self.time,
+                    extra=(ve, self.time),
                     tstop=tstop,
                     dt=dt,
                     callbacks=[self.active],
@@ -426,8 +425,7 @@ class Thresholder:
                 else:
                     ve = self.space * bound[:, None]
                     self.model.run(
-                        space=ve,
-                        time=self.time,
+                        extra=(ve, self.time),
                         tstop=tstop,
                         dt=dt,
                         callbacks=[self.active, self.rec],

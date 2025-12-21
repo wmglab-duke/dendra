@@ -40,7 +40,23 @@ def cinits():
     return CINIT
 
 
-def ion_register(ion, valence, e, i0, o0):
+def register_ion(ion, valence, e, i0, o0):
+    """
+    Register a new ion species with its properties.
+
+    Parameters
+    ----------
+    ion : str
+        The name of the ion (e.g., 'na', 'k', 'ca').
+    valence : float
+        The valence of the ion (e.g., 1.0 for Na+, 2.0 for Ca2+).
+    e : float
+        The reversal potential (in mV) for the ion.
+    i0 : float
+        The initial intracellular concentration of the ion (in mM).
+    o0 : float
+        The initial extracellular concentration of the ion (in mM).
+    """
     global VALENCES
     global REVERSAL
     global CINIT

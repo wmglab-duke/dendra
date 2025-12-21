@@ -1,4 +1,12 @@
 import os
+
+__version__ = "0.7.0"
+
+os.environ.setdefault("OMP_DYNAMIC", "FALSE")
+os.environ.setdefault("MKL_DYNAMIC", "FALSE")
+os.environ["OMP_PROC_BIND"] = "true"
+os.environ["OMP_PLACES"] = "cores"
+
 import pickle
 import time
 import warnings
@@ -16,7 +24,7 @@ from .const import (
     E,
     R,
 )
-from .helpers import TF32, allow_tf32, ctx, set_jit_enabled
+from .helpers import TF32, allow_tf32, ctx, set_jit_enabled, set_jit_in_network_enabled
 from .models import (
     Axon,
     ExtCellAxon,
@@ -66,10 +74,12 @@ __all__ = [
     "FARADAY",
     "ctx",
     "set_jit_enabled",
+    "set_jit_in_network_enabled",
     "callbacks",
     "mod",
     "load_mechanisms",
     "Population",
+    "SingleCompartment",
     "Axon",
     "Unmyelinated",
     "Myelinated",
@@ -142,3 +152,7 @@ _cache_cpu_isa_list()
 
 # setup environment
 allow_tf32(bool(TF32))
+
+import torch._inductor.config as inductor_config
+
+inductor_config.cpp_wrapper = True

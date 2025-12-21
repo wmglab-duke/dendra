@@ -110,12 +110,13 @@ BACKEND = ContextVar("BACKEND", "inductor")
 FULLGRAPH = ContextVar("FULLGRAPH", 0)
 DYNAMIC = ContextVar("DYNAMIC", 0)
 JIT = ContextVar("JIT", 1)
+JIT_IN_NETWORK = ContextVar("JIT_IN_NETWORK", 1)
 COMPILE_MODE = ContextVar("COMPILE_MODE", "default")
 
 
 def set_jit_enabled(enable=True):
     """
-    Enable or disable JIT compilation globally for AxonML models.
+    Enable or disable JIT compilation globally for AxonML models (Populations and Networks).
 
     Parameters
     ----------
@@ -124,6 +125,20 @@ def set_jit_enabled(enable=True):
     """
     global JIT
     JIT.value = int(enable)
+    return
+
+
+def set_jit_in_network_enabled(enable=True):
+    """
+    Enable or disable JIT compilation within networks globally for AxonML Populations.
+
+    Parameters
+    ----------
+    enable : bool
+        If True, enable JIT compilation within networks. If False, disable it. Default is True.
+    """
+    global JIT_IN_NETWORK
+    JIT_IN_NETWORK.value = int(enable)
     return
 
 

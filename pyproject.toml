@@ -4,11 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axonml"
-version = "0.2"
 requires-python = ">=3.11"
 readme = "README.md"
 
-dynamic = ["dependencies"]
+dynamic = ["version", "dependencies"]
 
 [project.optional-dependencies]
 doc = [
@@ -37,6 +36,9 @@ dev = [
     "hypothesis",
     "pytest-xdist",
 ]
+
+[tool.setuptools.dynamic]
+version = {attr = "axonml.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)

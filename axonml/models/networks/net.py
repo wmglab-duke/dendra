@@ -50,13 +50,16 @@ def step_pop(integrator, model, dt, ve=None, intra=None):
     model.t = model.t + dt
 
 
+compiled_step_pop = torch.compile(step_pop)
+
+
 def step(
     populations,
     synapses,
     netstim,
     t,
     dt,
-    ve: Dict[str, torch.Tensor | None] = {},
+    extra: Dict[str, torch.Tensor | None] = {},
     intra: Dict[str, torch.Tensor | None] = {},
 ):
     if netstim is not None:
@@ -64,7 +67,12 @@ def step(
     for s in synapses.values():
         s.advance()
     for n, pop in populations.items():
-        step_pop(pop.integrator, pop, dt, ve.get(n, None), intra.get(n, None))
+        if pop.jit_in_network:
+            compiled_step_pop(
+                pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
+            )
+        else:
+            step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
 
 
 def get_local_index(population, mech, index):
@@ -1224,7 +1232,7 @@ class Network(RNGMixin):
                 clear_deliveries=clear_deliveries,
             )
 
-    def run(self, tstop, ve=None, callbacks=None, progressbar=False):
+    def run(self, tstop, extra=None, callbacks=None, progressbar=False):
         """
         Advance the network for a fixed duration.
 
@@ -1232,7 +1240,7 @@ class Network(RNGMixin):
         ----------
         tstop : float
             Total simulation time (ms) to advance from current ``self.t``.
-        ve : dict[str, tuple[torch.Tensor, object]], optional
+        extra : dict[str, tuple[torch.Tensor, object]], optional
             Optional mapping of population name to extracellular stimulus tuple
             ``(v, t)`` where ``t`` is assembled against the current time; values
             are moved to the network device/dtype.
@@ -1255,9 +1263,9 @@ class Network(RNGMixin):
             if p.intra is not None:
                 intra[n] = p.intra
 
-        ve = ve if ve is not None else {}
-        ve_prepped = {}
-        for n, (v, t) in ve.items():
+        extra = extra if extra is not None else {}
+        extra_prepped = {}
+        for n, (v, t) in extra.items():
             pop = self.populations[n]
             dev, dtp = pop.device(), pop.dtype()
             v_dev = v.to(device=dev, dtype=dtp)
@@ -1265,12 +1273,11 @@ class Network(RNGMixin):
             t0 = self.t.to(device=dev, dtype=dtp)
             dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
             t1 = t0 + torch.tensor(tstop, device=dev, dtype=dtp)
-            ve_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
-        ve = ve_prepped
+            extra_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
+        extra = extra_prepped
 
         with_intra = bool(intra)
-        with_ve = bool(ve)
-
+        with_extra = bool(extra)
         tstart = self.t.item()
 
         with ctx:
@@ -1297,13 +1304,13 @@ class Network(RNGMixin):
 
             for _ in range(n_steps):
                 intra_c = {}
-                ve_c = {}
+                extra_c = {}
 
                 if with_intra:
                     intra_c = prepare_intra(intra_c, intra, local_ind)
 
-                if with_ve:
-                    ve_c = prepare_ve(ve, local_ind)
+                if with_extra:
+                    extra_c = prepare_extra(extra, local_ind)
 
                 self._step(
                     self.populations,
@@ -1311,7 +1318,7 @@ class Network(RNGMixin):
                     self.netstim,
                     self.t,
                     dt_f,
-                    ve=ve_c,
+                    extra=extra_c,
                     intra=intra_c,
                 )
                 self.t = self.t + dt_t
@@ -1573,6 +1580,402 @@ class Network(RNGMixin):
         for pop in self.populations.values():
             pop.delete_injections()
 
+    # checkpoint utilities
+
+    def populations_state_dict_for_checkpoint(self):
+        """
+        Returns a state dict of all populations suitable for checkpointing.
+        """
+        return {
+            name: pop.state_dict_for_checkpoint()
+            for name, pop in self.populations.items()
+        }
+
+    def netcons_state_dict_for_checkpoint(self):
+        """
+        Returns a state dict of all NetCons suitable for checkpointing.
+        """
+        return {
+            name: syn.state_dict_for_checkpoint() for name, syn in self.synapses.items()
+        }
+
+    def netstim_state_dict_for_checkpoint(self):
+        """
+        Returns a state dict of the NetStim suitable for checkpointing.
+        """
+        if self.netstim is None:
+            return None
+        return self.netstim.state_dict_for_checkpoint()
+
+    def state_dict_for_checkpoint(self):
+        """
+        Returns a state dict of the entire network suitable for checkpointing.
+        """
+        return {
+            "populations": self.populations_state_dict_for_checkpoint(),
+            "netcons": self.netcons_state_dict_for_checkpoint(),
+            "netstim": self.netstim_state_dict_for_checkpoint(),
+            "t": self.t,
+        }
+
+    def restore_dict_from_checkpoint(self, state_dict):
+        """
+        Restores the network state from a checkpoint state dict.
+        """
+        for name, pop_state in state_dict["populations"].items():
+            self.populations[name].restore_dict_from_checkpoint(pop_state)
+        for name, syn_state in state_dict["netcons"].items():
+            self.synapses[name].restore_dict_from_checkpoint(syn_state)
+        if state_dict["netstim"] is not None and self.netstim is not None:
+            self.netstim.restore_dict_from_checkpoint(state_dict["netstim"])
+        self.t = state_dict["t"]
+
+    # -- checkpointed run --
+
+    def longrun_checkpointed(
+        self,
+        tstop: float,
+        chunklength: int,
+        extra=None,
+        callbacks=None,
+        progressbar=False,
+        *,
+        safe_checkpoint: bool = False,
+        restore_state_after_backward: bool = True,
+        return_final_state: bool = False,
+    ):
+        """Run the network for a long horizon using activation checkpointing.
+
+        This method mirrors :meth:`Population.longrun_checkpointed` but is
+        specialized for :class:`Network`:
+
+        * ``dt`` is **not** an argument here. The network time step is fixed by
+          :meth:`initialize` / :meth:`build` (required for constructing
+          :class:`NetCon` delay buffers).
+        * Simulation state is checkpointed at chunk boundaries via
+          :meth:`state_dict_for_checkpoint` / :meth:`restore_dict_from_checkpoint`.
+
+        Parameters
+        ----------
+        tstop:
+            Total simulated time (ms).
+        chunklength:
+            Number of time steps per checkpoint chunk.
+        extra:
+            Optional extracellular specification (same as :meth:`run`).
+        callbacks:
+            Optional list of callbacks.
+        progressbar:
+            If ``True``, displays a tqdm progress bar over chunks.
+        safe_checkpoint:
+            If ``True``, clone checkpoint input tensors at each chunk boundary
+            to guard against inadvertent in-place mutation.
+        restore_state_after_backward:
+            If ``True``, restores the forward final state after backward
+            completes (useful because checkpointing replays forward during
+            backward and mutates module state).
+        return_final_state:
+            If ``True``, return ``(loss, final_state_dict)``.
+
+        Notes
+        -----
+        **Callback contract (restricted)**
+
+        To remain replay-safe under activation checkpointing, callbacks should
+        be pure functions of the model state. Hooks may optionally return a
+        scalar tensor loss contribution. Any non-``None`` returns from:
+
+        * ``post_step_hook(model)``
+        * ``post_chunk_hook(model, t_chunk)``
+        * ``post_loop_hook(model)``
+
+        are summed and returned as the total loss.
+        """
+
+        if self.dt is None:
+            raise RuntimeError(
+                "Network.dt is None. Call net.initialize(dt=...) before longrun_checkpointed()."
+            )
+        if chunklength <= 0:
+            raise ValueError("chunklength must be a positive integer")
+
+        # Normalize callbacks.
+        if callbacks is None:
+            callbacks = []
+        if not isinstance(callbacks, CallbackList):
+            callbacks = CallbackList(callbacks)
+        for c in callbacks:
+            c.dt = self.dt
+
+        dt_f = float(self.dt)
+        dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
+
+        # Build a global time grid (used only for chunking + callback timing).
+        t_grid = torch.arange(
+            self.t.double(),
+            (self.t.double() + float(tstop)),
+            dt_f,
+            dtype=torch.double,
+            device=self.t.device,
+        ).to(dtype=self.t.dtype)
+
+        if t_grid.numel() == 0:
+            # Nothing to do.
+            if return_final_state:
+                return None, self.state_dict_for_checkpoint()
+            return None
+
+        n_chunks = int(math.ceil(len(t_grid) / chunklength))
+        t_chunks = torch.tensor_split(t_grid, n_chunks)
+
+        # Preprocess extra: move spatial fields to the target population devices.
+        extra = extra if extra is not None else {}
+        extra_prepped = {}
+        if len(extra) > 0:
+            for name, (v, tt) in extra.items():
+                if name not in self.populations:
+                    raise KeyError(f"extra specified for unknown population '{name}'")
+                pop = self.populations[name]
+                dev, dtp = pop.device(), pop.dtype()
+                v_dev = v.to(device=dev, dtype=dtp)
+                tt_dev = tt.to(device=dev, dtype=dtp)
+                dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
+                extra_prepped[name] = (v_dev, tt_dev, dt_pop, dev, dtp)
+
+        # Identify intra sources (prepared per chunk to bound memory).
+        intra_sources = {
+            name: pop.intra
+            for name, pop in self.populations.items()
+            if pop.intra is not None
+        }
+
+        def _as_loss_tensor(x):
+            if x is None:
+                return None
+            if isinstance(x, torch.Tensor):
+                return x
+            # Default device/dtype: first population.
+            return torch.as_tensor(x, device=self.device(), dtype=self.dtype())
+
+        def _add_loss(acc, x):
+            x_t = _as_loss_tensor(x)
+            if x_t is None:
+                return acc, False
+            if acc is None:
+                return x_t, True
+            return acc + x_t, True
+
+        def _clone_checkpoint_state_dict(sd):
+            """Clone all tensors in a nested checkpoint state dict.
+
+            This is used when ``safe_checkpoint=True`` to ensure that tensors
+            passed as checkpoint inputs are not mutated in-place during the
+            chunk forward.
+            """
+
+            memo = {}
+
+            def _clone_any(v):
+                if isinstance(v, torch.Tensor):
+                    k = id(v)
+                    if k in memo:
+                        return memo[k]
+                    out = v.clone()
+                    memo[k] = out
+                    return out
+                if isinstance(v, dict):
+                    return {kk: _clone_any(vv) for kk, vv in v.items()}
+                if isinstance(v, list):
+                    return [_clone_any(vv) for vv in v]
+                if isinstance(v, tuple):
+                    return tuple(_clone_any(vv) for vv in v)
+                return v
+
+            return _clone_any(sd)
+
+        def _copy_state_containers(sd):
+            """Deep-copy container structure while preserving tensor identity."""
+
+            def _copy_any(v):
+                if isinstance(v, dict):
+                    return {kk: _copy_any(vv) for kk, vv in v.items()}
+                if isinstance(v, list):
+                    return [_copy_any(vv) for vv in v]
+                if isinstance(v, tuple):
+                    return tuple(_copy_any(vv) for vv in v)
+                return v
+
+            return _copy_any(sd)
+
+        total_loss = None
+        saw_any_loss = False
+
+        with torch.nn.utils.parametrize.cached():
+            with torch.set_grad_enabled(self.training):
+                pre_loop_hook(callbacks, self)
+
+                # Snapshot boundary state after pre-loop hooks.
+                state = self.state_dict_for_checkpoint()
+
+                pbar = (
+                    tqdm(total=n_chunks, desc=f"{t_grid[0].item():.1f} ms")
+                    if progressbar
+                    else None
+                )
+
+                # Local alias for speed
+                _checkpoint = torch.utils.checkpoint.checkpoint
+
+                for chunk_idx, t_chunk in enumerate(t_chunks):
+                    if pbar is not None:
+                        pbar.set_description(f"{t_chunk[0].item():.1f} ms")
+
+                    def _run_chunk(state_in, t_chunk_local=t_chunk):
+                        # Optional safety: clone checkpoint inputs to avoid
+                        # in-place mutation of checkpoint input tensors.
+                        state_local = state_in
+                        if safe_checkpoint:
+                            state_local = _clone_checkpoint_state_dict(state_in)
+
+                        self.restore_dict_from_checkpoint(state_local)
+                        pre_chunk_hook(callbacks, self, t_chunk_local)
+
+                        # Prepare per-chunk intra specs (bounded to chunklength).
+                        intra_chunk = {}
+                        if len(intra_sources) > 0:
+                            for name, intra_obj in intra_sources.items():
+                                stims, indices = self.populations[name].prep_intra(
+                                    intra_obj, len(t_chunk_local), dt_f
+                                )
+                                intra_chunk[name] = (intra_obj, stims, indices)
+
+                        # Prepare per-chunk extracellular time series (bounded).
+                        extra_ts = {}
+                        if len(extra_prepped) > 0:
+                            for name, (
+                                v_dev,
+                                tt_dev,
+                                dt_pop,
+                                dev,
+                                dtp,
+                            ) in extra_prepped.items():
+                                t0 = self.t.to(device=dev, dtype=dtp)
+                                t1 = t0 + (dt_pop * int(len(t_chunk_local)))
+                                extra_ts[name] = (
+                                    v_dev,
+                                    tt_dev.assemble(t0, t1, dt_pop),
+                                )
+
+                        chunk_loss = None
+                        saw_loss_local = False
+
+                        for i_t in range(len(t_chunk_local)):
+                            # Intra for this step.
+                            intra_c = {}
+                            if len(intra_chunk) > 0:
+                                for name, (
+                                    intra_obj,
+                                    stims,
+                                    indices,
+                                ) in intra_chunk.items():
+                                    s = [st[i_t] for st in stims]
+                                    intra_c[name] = make_intra(intra_obj, s, indices)
+                            # Extra for this step.
+                            extra_c = {}
+                            if len(extra_ts) > 0:
+                                for name, (v_dev, ts) in extra_ts.items():
+                                    extra_c[name] = v_dev * ts[i_t]
+
+                            # Advance network dynamics.
+                            self._step(
+                                self.populations,
+                                self.synapses,
+                                self.netstim,
+                                self.t,
+                                dt_f,
+                                extra=extra_c,
+                                intra=intra_c,
+                            )
+                            self.t = self.t + dt_t
+
+                            # Replay-safe loss aggregation via callback returns.
+                            for cb in callbacks:
+                                hook = getattr(cb, "post_step_hook", None)
+                                if hook is not None:
+                                    chunk_loss, saw = _add_loss(chunk_loss, hook(self))
+                                    saw_loss_local = saw_loss_local or saw
+
+                        for cb in callbacks:
+                            hook = getattr(cb, "post_chunk_hook", None)
+                            if hook is not None:
+                                chunk_loss, saw = _add_loss(
+                                    chunk_loss, hook(self, t_chunk_local)
+                                )
+                                saw_loss_local = saw_loss_local or saw
+
+                        state_out = self.state_dict_for_checkpoint()
+
+                        if chunk_loss is None:
+                            chunk_loss = torch.zeros(
+                                (), device=self.device(), dtype=self.dtype()
+                            )
+                        saw_loss_flag = torch.tensor(
+                            1 if saw_loss_local else 0,
+                            device=chunk_loss.device,
+                            dtype=torch.int32,
+                        )
+                        return state_out, chunk_loss, saw_loss_flag
+
+                    state, chunk_loss, saw_loss_flag = _checkpoint(
+                        _run_chunk,
+                        state,
+                        use_reentrant=False,
+                        determinism_check="none",
+                    )
+
+                    total_loss, _ = _add_loss(total_loss, chunk_loss)
+                    saw_any_loss = saw_any_loss or bool(int(saw_loss_flag.item()))
+
+                    if pbar is not None:
+                        pbar.update(1)
+
+                for cb in callbacks:
+                    hook = getattr(cb, "post_loop_hook", None)
+                    if hook is not None:
+                        total_loss, saw = _add_loss(total_loss, hook(self))
+                        saw_any_loss = saw_any_loss or saw
+
+                if pbar is not None:
+                    pbar.close()
+
+        if not saw_any_loss:
+            if return_final_state:
+                return None, self.state_dict_for_checkpoint()
+            return None
+
+        final_state = None
+        if restore_state_after_backward or return_final_state:
+            final_state = self.state_dict_for_checkpoint()
+
+        if (
+            restore_state_after_backward
+            and isinstance(total_loss, torch.Tensor)
+            and total_loss.requires_grad
+        ):
+            final_state_for_hook = _copy_state_containers(final_state)
+
+            def _queue_restore(grad, fs=final_state_for_hook):
+                torch.autograd.Variable._execution_engine.queue_callback(
+                    lambda: self.restore_dict_from_checkpoint(fs)
+                )
+                return grad
+
+            total_loss.register_hook(_queue_restore)
+
+        if return_final_state:
+            return total_loss, final_state
+        return total_loss
+
 
 def prepare_intra(intra_c, intra, local_ind):
     """
@@ -1585,11 +1988,11 @@ def prepare_intra(intra_c, intra, local_ind):
 
 
 @torch.compile
-def prepare_ve(ve, local_ind: int):
+def prepare_extra(extra, local_ind: int):
     """
     Prepares the voltage and time data for the current step.
     """
-    return {n: v * t[local_ind] for n, (v, t) in ve.items()}
+    return {n: v * t[local_ind] for n, (v, t) in extra.items()}
 
 
 # callback helpers

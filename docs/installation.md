@@ -21,12 +21,15 @@
 
 2. Install PyTorch (pick the command that matches your hardware):
 
+   ```{important}
+   PyTorch 2.9+ is supported but exhibits some stochastic performance regressions on small-batch CPU simulation. If this is your use case (relatively small numbers of individual fiber simulations), we recommend PyTorch 2.8.0 for best performance.
+
    ```sh
    # GPU build (CUDA 12.9)
-   python -m pip install torch --index-url https://download.pytorch.org/whl/cu129
+   python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129
 
    # CPU-only build
-   # python -m pip install torch
+   # python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
    ```
 
 3. Clone the repository and install AxonML:
