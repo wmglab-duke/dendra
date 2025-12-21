@@ -1,5 +1,7 @@
 import os
 
+__version__ = "0.7.0"
+
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 os.environ.setdefault("MKL_DYNAMIC", "FALSE")
 os.environ["OMP_PROC_BIND"] = "true"
