@@ -214,9 +214,8 @@ class Thresholder:
         self.chunklength = chunklength
         self.bases = None
         self.functional = False
-
-        if atol is None and rtol is None:
-            raise ValueError("Either atol or rtol must be provided.")
+        self.atol = atol
+        self.rtol = rtol
 
         if bases is None and (space is None and time is None):
             raise ValueError(
@@ -287,20 +286,31 @@ class Thresholder:
         self.max_tries_bound_fix = max_tries_bound_fix
         self.max_tries_thresh = max_tries_thresh
 
-        self.atol = atol
-        self.rtol = rtol
-
         self.active = active
         self.threshold = active.threshold
         self.rec = Recorder(["v"], max_only=True)
 
-    def check_tolerance(self, awindow: Tensor, rwindow: Tensor) -> Tensor:
-        if self.atol is not None and self.rtol is not None:
-            return (awindow >= self.atol) & (rwindow >= self.rtol)
-        elif self.atol is not None:
-            return awindow >= self.atol
-        elif self.rtol is not None:
-            return rwindow >= self.rtol
+    def reset_bounds(self):
+        """Reset upper and lower bounds to initial values."""
+        with torch.no_grad():
+            self.ub = self.ub_initial.clone()
+            self.lb = torch.zeros_like(self.ub)
+            self.ignore = None
+
+    def check_tolerance(
+        self, awindow: Tensor, rwindow: Tensor, atol=None, rtol=None
+    ) -> Tensor:
+        if atol is None:
+            atol = self.atol
+        if rtol is None:
+            rtol = self.rtol
+
+        if atol is not None and rtol is not None:
+            return (awindow >= atol) & (rwindow >= rtol)
+        elif atol is not None:
+            return awindow >= atol
+        elif rtol is not None:
+            return rwindow >= rtol
         else:
             raise ValueError("Either atol or rtol must be provided.")
 
@@ -474,17 +484,39 @@ class Thresholder:
             self.lb[self.ignore] = 1
 
     def calculate_thresholds(
-        self, tstop, dt, block_possible=False
+        self, tstop, dt, block_possible=False, reset_bounds=True, atol=None, rtol=None
     ) -> Tuple[Tensor, Tensor]:
         """Calculate thresholds. If bases were provided on Thresholder
         construction, they are used and tstop is ignored.
+
+        Parameters
+        ----------
+        tstop : float
+            Simulation stop time in milliseconds.
+        dt : float
+            Simulation time step in milliseconds.
+        block_possible : bool, optional
+            Whether to consider conduction block when fixing upper bounds,
+            by default ``False``.
+        reset_bounds : bool, optional
+            Whether to reset upper and lower bounds to initial values before
+            calculation, by default ``True``. Set to ``False`` to continue
+            a previous calculation, e.g., with tighter tolerances.
+        atol : optional
+            Absolute tolerance for the threshold interval ``ub - lb``. If
+            ``None``, the value provided at construction is used.
+        rtol : optional
+            Relative tolerance for the threshold interval. If ``None``, the
+            value provided at construction is used.
 
         Returns
         -------
         Tuple[Tensor, Tensor]
             Upper and lower bound on thresholds.
         """
-        self._fix_bounds(tstop, dt, block_possible)
+        if reset_bounds:
+            self.reset_bounds()
+        self._fix_bounds(tstop, dt, block_possible=block_possible)
         self.rec.reset()
         self.active.reset()
 
@@ -494,7 +526,7 @@ class Thresholder:
 
             awindow = ub - lb
             rwindow = awindow / ub
-            msk = self.check_tolerance(awindow, rwindow)
+            msk = self.check_tolerance(awindow, rwindow, atol=atol, rtol=rtol)
             tries = 0
 
             while torch.any(msk) & (tries < self.max_tries_thresh):
@@ -506,20 +538,20 @@ class Thresholder:
                 lb[b_thr] = stimamp[b_thr]
                 awindow = ub - lb
                 rwindow = awindow / ub
-                msk = self.check_tolerance(awindow, rwindow)
+                msk = self.check_tolerance(awindow, rwindow, atol=atol, rtol=rtol)
                 tries += 1
             if tries >= self.max_tries_thresh:
                 print("hmm")
                 if self.ignore is not None:
                     ub[self.ignore] = torch.nan
                     lb[self.ignore] = torch.nan
-                return ub.cpu().numpy(), lb.cpu().numpy()
+                return ub.cpu(), lb.cpu()
 
             if self.ignore is not None:
                 ub[self.ignore] = torch.nan
                 lb[self.ignore] = torch.nan
 
-            return ub.cpu().numpy(), lb.cpu().numpy()
+            return ub.cpu(), lb.cpu()
 
 
 @torch.jit.script
