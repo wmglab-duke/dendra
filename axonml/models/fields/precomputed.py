@@ -16,7 +16,37 @@ from .quasipotentials import calculate_quasipotentials_batched_coords
 
 
 class PreComputedInterpolate1D(torch.nn.Module):
-    """Use PreComputed data sampled along x at different (y, z) locations."""
+    """
+    Use PreComputed data sampled along x at different (y, z) locations.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        2D tensor of shape (D, N) containing the precomputed data values.
+    x : torch.Tensor
+        2D tensor of shape (D, N) containing the x-coordinates corresponding to the data values.
+    outside : str, optional
+        Behavior for points outside the interpolation range. Options are "zero" or "point_source".
+        If "point_source", the interpolation uses a point-source model outside the (optionally
+        truncated) support. Default is "zero".
+    truncate : float or None, optional
+        Amount to truncate the data symmetrically. Default is None (no truncation).
+    truncate_mode : str, optional
+        Mode for truncation, either "best_fit" or "safe". Default is "best_fit".
+    **kwargs
+        Additional keyword arguments passed to :class:`PreparedInterp1d`.
+
+    Notes
+    -----
+    - The input `data` and `x` tensors must have the same shape (D, N), where D is the
+      number of data rows and N is the number of samples per row.
+    - The `x` values for each row must be sorted in ascending order, either by setting
+      `sort_xy=True` (default) or ensuring they are pre-sorted when `sort_xy=False`.
+    - Truncation removes a fraction of the data symmetrically from both ends of the x-domain.
+    - The `outside` parameter determines how values outside the interpolation range are handled.
+      If set to "point_source", a point-source extrapolation is applied based on the peak
+      and boundary values of each row.
+    """
 
     def __init__(
         self,
@@ -360,7 +390,7 @@ class PreComputedInterpolate1D(torch.nn.Module):
 
         return d, valid
 
-    def point_source_fill(
+    def _point_source_fill(
         self,
         x_vec: torch.Tensor,  # (Q,P)
         interp: torch.Tensor,  # (Q,P) from PreparedInterp1d with outside="zero"
@@ -469,7 +499,7 @@ class PreComputedInterpolate1D(torch.nn.Module):
 
         # Point-source extrapolation is applied only outside the bounds.
         if self.outside == "point_source":
-            interpolated = self.point_source_fill(x_2d, interpolated, indices=idx)
+            interpolated = self._point_source_fill(x_2d, interpolated, indices=idx)
 
         return interpolated.reshape(shape)
 

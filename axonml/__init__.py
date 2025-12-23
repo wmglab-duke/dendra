@@ -1,6 +1,6 @@
 import os
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 os.environ.setdefault("MKL_DYNAMIC", "FALSE")
@@ -38,15 +38,7 @@ from .models import (
     Unmyelinated,
     concat,
 )
-from .models.fields import (
-    EfieldInterpolate3D,
-    PreComputedInterpolate1D,
-    anisotropic_point,
-    efield_interpolate_3d,
-    isotropic_point,
-    parametric_efield,
-    precomputed_interpolate_1d,
-)
+from .models.fields import *
 from .models.integrators import (
     bwd_euler_bt,
     bwd_euler_sc,
@@ -65,6 +57,7 @@ from .models.integrators import (
 )
 from .models.mod import load_mechanisms
 from .models.stim.waveform import *
+from .utils.inductor import refresh_torchinductor_precompiled_headers
 
 __all__ = [
     "PI",
@@ -94,8 +87,14 @@ __all__ = [
     "parametric_efield",
     "PreComputedInterpolate1D",
     "precomputed_interpolate_1d",
-    "EfieldInterpolate3D",
-    "efield_interpolate_3d",
+    "EfieldInterpolate3DRect",
+    "efield_interpolate_3d_rect",
+    "PreComputedInterpolate3DRect",
+    "precomputed_interpolate_3d_rect",
+    "PreComputedInterpolate3DScattered",
+    "precomputed_interpolate_3d_scattered",
+    "EfieldInterpolate3DScattered",
+    "efield_interpolate_3d_scattered",
     "euler",
     "eulerv1",
     "rk1",
@@ -149,6 +148,7 @@ def _cache_cpu_isa_list():
 
 
 _cache_cpu_isa_list()
+refresh_torchinductor_precompiled_headers()
 
 # setup environment
 allow_tf32(bool(TF32))
