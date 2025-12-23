@@ -1130,13 +1130,22 @@ class ActiveAL(APCount):
     """
 
     def __init__(
-        self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None, at_least=1
+        self,
+        threshold=0.0,
+        t_start_check=0.0,
+        node_check=[5, -5],
+        dt=None,
+        at_least=1,
+        inv=False,
     ):
         super().__init__(threshold, t_start_check, node_check, dt)
         self.at_least = at_least
+        self.inv = inv
 
     def is_active(self):
         if self.record is not None:
+            if self.inv:
+                return ~_is_active(self.record, self.at_least)
             return _is_active(self.record, self.at_least)
         return self.record
 
@@ -1188,6 +1197,12 @@ class Active(ThresholdCallback):
         Boolean tensor tracking membrane potential state relative to threshold.
     """
 
+    def __init__(
+        self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None, inv=False
+    ):
+        super().__init__(threshold, t_start_check, node_check, dt)
+        self.inv = inv
+
     def pre_loop_hook(self, model):
         """
         Initialize boolean fire mask and cache for threshold detection.
@@ -1226,6 +1241,8 @@ class Active(ThresholdCallback):
         self.i += 1
 
     def is_active(self):
+        if self.inv:
+            return ~self.record
         return self.record
 
     def numpy(self):

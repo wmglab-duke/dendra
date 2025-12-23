@@ -7,7 +7,7 @@
 ## Prerequisites
 
 - Python 3.11 or newer
-- PyTorch 2.7+ (install the CUDA 12.9 wheels if you want GPU support)
+- PyTorch 2.7+ (install the CUDA 12.9+ wheels if you want GPU support)
 - Git
 
 ## Quick start
@@ -64,6 +64,5 @@ python - <<'PY'
 import axonml as ax
 
 print("AxonML import succeeded")
-print("Available base types:", ax.Axon, ax.Unmyelinated, ax.Myelinated)
 PY
 ```

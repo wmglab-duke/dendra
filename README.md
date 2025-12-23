@@ -26,7 +26,7 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/axonml](ht
 > [!TIP]
 > We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.12`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
 
-1. Install PyTorch (+ CUDA 12.9 if you're running on GPU).
+1. Install PyTorch (+ CUDA 12.9+ if you're running on GPU).
 ```bash
 > pip install torch --index-url https://download.pytorch.org/whl/cu129
 ```

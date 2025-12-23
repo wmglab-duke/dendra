@@ -16,7 +16,8 @@ class Thresholder:
     This helper class wraps a :class:`~axonml.models.Population` together with
     a :class:`~axonml.models.callbacks.ThresholdCallback` and computes, for
     each element in the population, the stimulus amplitude at which an action
-    potential is first detected.
+    potential (or some other binary state, as reported by the callback) is first
+    detected.
 
     The stimulus is assumed to have a fixed spatiotemporal *shape* and an
     unknown scalar *amplitude* per population element. The shape can be
@@ -81,7 +82,8 @@ class Thresholder:
         The population model to compute thresholds for.
     active : ThresholdCallback
         Callback used to decide whether an action potential was generated for
-        each population element.
+        each population element. Must implement :meth:`is_active`, which returns
+        a boolean tensor indicating activity for each element.
     space : Optional[Union[npt.NDArray, Tensor]], optional
         Spatial extracellular potential distribution of the stimulus. An array of
         shape ``(model.np, model.nc)`` that encodes the coupling between each population
@@ -217,6 +219,9 @@ class Thresholder:
         self.atol = atol
         self.rtol = rtol
 
+        self.space = None
+        self.time = None
+
         if bases is None and (space is None and time is None):
             raise ValueError(
                 "At least one of bases or space and time must be provided."
@@ -336,8 +341,12 @@ class Thresholder:
             self.bases = self.bases.float()
         if self.diams is not None:
             self.diams = self.diams.float()
+        if self.space is not None:
+            self.space = self.space.float()
+        if self.time is not None:
+            self.time = self.time.float()
         self.ub = self.ub.float()
-        self.ub_initial = self.ub.clone()
+        self.ub_initial = self.ub_initial.float()
         self.lb = self.lb.float()
         return self
 
@@ -348,8 +357,12 @@ class Thresholder:
             self.bases = self.bases.double()
         if self.diams is not None:
             self.diams = self.diams.double()
+        if self.space is not None:
+            self.space = self.space.double()
+        if self.time is not None:
+            self.time = self.time.double()
         self.ub = self.ub.double()
-        self.ub_initial = self.ub.clone()
+        self.ub_initial = self.ub_initial.double()
         self.lb = self.lb.double()
         return self
 
@@ -519,6 +532,13 @@ class Thresholder:
         self._fix_bounds(tstop, dt, block_possible=block_possible)
         self.rec.reset()
         self.active.reset()
+
+        # check no active in lb
+        act = self.check_active(tstop, dt, self.lb)
+        if torch.any(act):
+            raise RuntimeError(
+                "Some lower bounds are active. Cannot proceed with bisection."
+            )
 
         with torch.no_grad():
             ub = self.ub
