@@ -482,6 +482,17 @@ class PreComputedInterpolate1D(torch.nn.Module):
         return out
 
     def forward(self, model, indices=None):
+        """
+        Interpolate field at model.x using precomputed 1D LUT.
+
+        Parameters
+        ----------
+        model : axonml.models.Population
+            Model with .x coordinates where field is evaluated.
+        indices : array-like of int, optional
+            Indices selecting which LUT row to use for each query point. If None, uses row 0 for all points
+            (or the only row if LUT is unbatched). If provided, must have length 1 or Q (number of query points).
+        """
         x = model.x
         self.to(device=x.device, dtype=x.dtype)
 
@@ -544,6 +555,19 @@ class PreComputedInterpolate3DRect(torch.nn.Module):
         return field
 
     def forward(self, model):
+        """
+        Interpolate field at model.x, model.y, model.z using precomputed 3D rectilinear grid.
+
+        Parameters
+        ----------
+        model : axonml.models.Population
+            Model with .x, .y, .z coordinates where field is evaluated.
+
+        Returns
+        -------
+        field : torch.Tensor
+            Tensor of shape (B, K, ...) containing the interpolated field values at the model
+        """
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
         field = self._interp(x, y, z)
@@ -600,6 +624,19 @@ class PreComputedInterpolate3DScattered(torch.nn.Module):
         return field
 
     def forward(self, model):
+        """
+        Interpolate field at model.x, model.y, model.z using precomputed 3D scattered points.
+
+        Parameters
+        ----------
+        model : axonml.models.Population
+            Model with .x, .y, .z coordinates where field is evaluated.
+
+        Returns
+        -------
+        field : torch.Tensor
+            Tensor of shape (B, K, ...) containing the interpolated field values at the model
+        """
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
         field = self._interp(x, y, z)

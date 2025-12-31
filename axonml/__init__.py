@@ -36,7 +36,8 @@ from .models import (
     SingleCompartment,
     Tree,
     Unmyelinated,
-    concat,
+    concat_models,
+    concat_slices,
 )
 from .models.fields import *
 from .models.integrators import (
@@ -81,7 +82,8 @@ __all__ = [
     "ExtCellTree",
     "NetStim",
     "Network",
-    "concat",
+    "concat_models",
+    "concat_slices",
     "anisotropic_point",
     "isotropic_point",
     "parametric_efield",

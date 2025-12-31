@@ -10,7 +10,7 @@ from axonml.helpers import BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT
 
 from ..callbacks import CallbackList
 from ..core import Population, make_intra
-from ..multi import concat, indices
+from ..multi import concat_models, indices
 from ..parametric import is_parametric, to_param
 from ..rng import RNGMixin
 from .netcon import NetCon
@@ -53,6 +53,12 @@ def step_pop(integrator, model, dt, ve=None, intra=None):
 compiled_step_pop = torch.compile(step_pop)
 
 
+@torch.compile
+def advance_populations(populations, dt, extra, intra):
+    for n, pop in populations.items():
+        step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
+
+
 def step(
     populations,
     synapses,
@@ -61,18 +67,25 @@ def step(
     dt,
     extra: Dict[str, torch.Tensor | None] = {},
     intra: Dict[str, torch.Tensor | None] = {},
+    compiled_advance_population=True,
 ):
     if netstim is not None:
         netstim(t, bptt=netstim.training)
     for s in synapses.values():
         s.advance()
-    for n, pop in populations.items():
-        if pop.jit_in_network:
-            compiled_step_pop(
-                pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
-            )
-        else:
-            step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
+
+    if compiled_advance_population:
+        advance_populations(populations, dt, extra, intra)
+    else:
+        for n, pop in populations.items():
+            if pop.jit_in_network:
+                compiled_step_pop(
+                    pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
+                )
+            else:
+                step_pop(
+                    pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
+                )
 
 
 def get_local_index(population, mech, index):
@@ -434,6 +447,11 @@ class Network(RNGMixin):
         self.register_buffer(
             "t", torch.tensor(0.0, device=torch.device("cpu"), dtype=torch.float32)
         )
+
+        if all(p.jit_in_network for p in populations.values()):
+            self.use_compiled_advance_populations = True
+        else:
+            self.use_compiled_advance_populations = False
 
         # Track device signature to trigger rebuilds if placements change.
         self._device_sig = self._device_signature()
@@ -1320,6 +1338,7 @@ class Network(RNGMixin):
                     dt_f,
                     extra=extra_c,
                     intra=intra_c,
+                    compiled_advance_population=self.use_compiled_advance_populations,
                 )
                 self.t = self.t + dt_t
                 post_step_hook(callbacks, self)
@@ -1458,7 +1477,7 @@ class Network(RNGMixin):
             "All populations must be of the same type."
         )
         celsius = _last_celsius(concat_pops).item()
-        concatenated = concat(concat_pops, threads=threads, celsius=celsius)
+        concatenated = concat_models(concat_pops, threads=threads, celsius=celsius)
         new_populations = {
             n: p for n, p in self.populations.items() if n not in pops_to_concatenate
         }
@@ -1895,6 +1914,7 @@ class Network(RNGMixin):
                                 dt_f,
                                 extra=extra_c,
                                 intra=intra_c,
+                                compiled_advance_population=self.use_compiled_advance_populations,
                             )
                             self.t = self.t + dt_t
 

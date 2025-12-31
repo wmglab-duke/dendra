@@ -873,6 +873,21 @@ class Mechanism(Parameterized):
             states.extend(state_module._state)
         return [f"{self.name}.{state}" for state in states]
 
+    @classmethod
+    def state_names(cls):
+        """
+        Collect state variable names declared by the mechanism class.
+
+        Returns
+        -------
+        list of str
+            Names of state variables registered in ``cls._state``.
+        """
+        states = []
+        for state_module in cls._state:
+            states.extend(state_module._state)
+        return states
+
     @classproperty
     def code(cls):
         """

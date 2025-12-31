@@ -1418,7 +1418,7 @@ class Parameterized(SimpleParameterized):
                     f"Function '{func_name}' not found in class '{self.__class__.__name__}' for table instantiation."
                 )
             func = getattr(self, func_name)
-            x = torch.linspace(low, high, n)
+            x = torch.linspace(low, high, n, dtype=torch.float64)
             y = func(x).flatten()
             setattr(
                 self,
@@ -1430,7 +1430,7 @@ class Parameterized(SimpleParameterized):
                     exact_clamp=False,
                     learnable_y=learnable,
                     uniform="always",
-                ),
+                ).to(dtype=self.dtype(), device=self.device()),
             )
             setattr(self, f"usetable_{func_name}", True)
 
@@ -1484,6 +1484,38 @@ class Parameterized(SimpleParameterized):
         Returns a dictionary of all parameters in the model.
         """
         return {name: param for name, param in self.named_parameters()}
+
+    def all_parameters(self):
+        """
+        Returns a list of all parameter names in the model.
+        """
+        return (
+            list(self._params.keys())
+            + list(self._global.keys())
+            + list(self._range.keys())
+        )
+
+    def dtype(self):
+        """
+        Data type of the module's parameters.
+
+        Returns
+        -------
+        torch.dtype
+            Data type of the first registered parameter.
+        """
+        return next(iter(self.parameters())).dtype
+
+    def device(self):
+        """
+        Device hosting the module's parameters.
+
+        Returns
+        -------
+        torch.device
+            Device of the first registered parameter.
+        """
+        return next(iter(self.parameters())).device
 
 
 table_function_template = """

@@ -49,7 +49,7 @@ def _check_celsius(celsius, populations):
         )
 
 
-def concat(
+def concat_models(
     populations: dict[str, Population], threads=16, write_back=True, celsius=37.0
 ):
     """Concatenate multiple populations into a :class:`MultiPopulation`.
