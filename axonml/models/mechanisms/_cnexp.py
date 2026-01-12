@@ -1,3 +1,7 @@
+# ruff: noqa: F401
+
+import torch
+
 from axonml.helpers import DEBUG, PADE, logger
 
 from ._solve_utils import (
