@@ -8,6 +8,7 @@ from torch import nn
 OutsideMode = Literal["clamp", "zero", "fill"]
 OutsideMode3D = Literal["none", "zero", "fill"]
 KNNBackend = Literal["auto", "torch", "pytorch3d", "torch_cluster", "faiss"]
+BoundaryMode = Literal["replicate", "zero", "one-sided", "valid"]
 IndexLike = Union[int, Sequence[int], torch.Tensor]
 
 
@@ -2103,6 +2104,601 @@ class PreparedInterp3dRect(nn.Module):
             return out
 
         return ynew
+
+    def laplacian_values(
+        self,
+        *,
+        boundary: BoundaryMode = "valid",
+    ) -> torch.Tensor:
+        """
+        Compute the discrete (finite-difference) Laplacian of the *grid values*.
+
+        This is NOT the analytic Laplacian of the trilinear interpolant (which is 0
+        within each cell). Instead, it computes a second-derivative stencil along each
+        axis on the rectilinear grid and returns:
+
+            lap = d2/dx2(values) + d2/dy2(values) + d2/dz2(values)
+
+        Parameters
+        ----------
+        boundary : {"replicate", "zero", "one-sided", "valid"}, optional
+            How to fill the Laplacian at the boundary indices along each axis:
+            - "valid" (default): only compute Laplacian at fully interior nodes (requires Nx, Ny, Nz >= 3)
+            - "replicate": copy nearest interior value (e.g. lap[0]=lap[1])
+            - "zero": leave boundary Laplacian as 0
+            - "one-sided": use a 3-point one-sided second-derivative formula at the edges
+
+        Returns
+        -------
+        lap : torch.Tensor
+            Same shape as the original `values` passed to __init__:
+            - unbatched: (Nx,Ny,Nz) or (Nx,Ny,Nz,C)
+            - batched:   (D,Nx,Ny,Nz) or (D,Nx,Ny,Nz,C)
+        """
+        if boundary not in ("replicate", "zero", "one-sided", "valid"):
+            raise ValueError(
+                "boundary must be 'replicate', 'zero', 'one-sided', or 'valid'"
+            )
+
+        vals = self.values if self.learnable_values else self._values  # channels-last
+        dtype = vals.dtype
+        eps = float(torch.finfo(dtype).eps)
+
+        def _safe_div(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
+            den = torch.where(den == 0, torch.full_like(den, eps), den)
+            return num / den
+
+        if boundary == "valid":
+            # Need at least 3 nodes along each axis to have any valid interior
+            if self.Nx < 3 or self.Ny < 3 or self.Nz < 3:
+                raise ValueError("boundary='valid' requires Nx, Ny, Nz >= 3.")
+
+            if not self.batched:
+                f = vals  # (Nx,Ny,Nz,C)
+                f0 = f[1:-1, 1:-1, 1:-1, :]  # common center (Nx-2,Ny-2,Nz-2,C)
+
+                # x second derivative at fully interior nodes
+                x = self._x_search  # (Nx,)
+                h0x = x[1:-1] - x[:-2]  # (Nx-2,)
+                h1x = x[2:] - x[1:-1]  # (Nx-2,)
+                denx = h0x * h1x * (h0x + h1x)  # (Nx-2,)
+                h0x = h0x[:, None, None, None]
+                h1x = h1x[:, None, None, None]
+                denx = denx[:, None, None, None]
+
+                fxm = f[:-2, 1:-1, 1:-1, :]
+                fxp = f[2:, 1:-1, 1:-1, :]
+                d2x = _safe_div(2.0 * (h0x * fxp - (h0x + h1x) * f0 + h1x * fxm), denx)
+
+                # y second derivative at fully interior nodes
+                y = self._y_search  # (Ny,)
+                h0y = y[1:-1] - y[:-2]  # (Ny-2,)
+                h1y = y[2:] - y[1:-1]  # (Ny-2,)
+                deny = h0y * h1y * (h0y + h1y)  # (Ny-2,)
+                h0y = h0y[None, :, None, None]
+                h1y = h1y[None, :, None, None]
+                deny = deny[None, :, None, None]
+
+                fym = f[1:-1, :-2, 1:-1, :]
+                fyp = f[1:-1, 2:, 1:-1, :]
+                d2y = _safe_div(2.0 * (h0y * fyp - (h0y + h1y) * f0 + h1y * fym), deny)
+
+                # z second derivative at fully interior nodes
+                z = self._z_search  # (Nz,)
+                h0z = z[1:-1] - z[:-2]  # (Nz-2,)
+                h1z = z[2:] - z[1:-1]  # (Nz-2,)
+                denz = h0z * h1z * (h0z + h1z)  # (Nz-2,)
+                h0z = h0z[None, None, :, None]
+                h1z = h1z[None, None, :, None]
+                denz = denz[None, None, :, None]
+
+                fzm = f[1:-1, 1:-1, :-2, :]
+                fzp = f[1:-1, 1:-1, 2:, :]
+                d2z = _safe_div(2.0 * (h0z * fzp - (h0z + h1z) * f0 + h1z * fzm), denz)
+
+                lap = d2x + d2y + d2z  # (Nx-2,Ny-2,Nz-2,C)
+
+            else:
+                f = vals  # (D,Nx,Ny,Nz,C)
+                f0 = f[:, 1:-1, 1:-1, 1:-1, :]  # (D,Nx-2,Ny-2,Nz-2,C)
+
+                # x
+                x = self._x_search  # (D,Nx)
+                h0x = x[:, 1:-1] - x[:, :-2]  # (D,Nx-2)
+                h1x = x[:, 2:] - x[:, 1:-1]  # (D,Nx-2)
+                denx = h0x * h1x * (h0x + h1x)  # (D,Nx-2)
+                h0x = h0x[:, :, None, None, None]
+                h1x = h1x[:, :, None, None, None]
+                denx = denx[:, :, None, None, None]
+
+                fxm = f[:, :-2, 1:-1, 1:-1, :]
+                fxp = f[:, 2:, 1:-1, 1:-1, :]
+                d2x = _safe_div(2.0 * (h0x * fxp - (h0x + h1x) * f0 + h1x * fxm), denx)
+
+                # y
+                y = self._y_search  # (D,Ny)
+                h0y = y[:, 1:-1] - y[:, :-2]  # (D,Ny-2)
+                h1y = y[:, 2:] - y[:, 1:-1]  # (D,Ny-2)
+                deny = h0y * h1y * (h0y + h1y)  # (D,Ny-2)
+                h0y = h0y[:, None, :, None, None]
+                h1y = h1y[:, None, :, None, None]
+                deny = deny[:, None, :, None, None]
+
+                fym = f[:, 1:-1, :-2, 1:-1, :]
+                fyp = f[:, 1:-1, 2:, 1:-1, :]
+                d2y = _safe_div(2.0 * (h0y * fyp - (h0y + h1y) * f0 + h1y * fym), deny)
+
+                # z
+                z = self._z_search  # (D,Nz)
+                h0z = z[:, 1:-1] - z[:, :-2]  # (D,Nz-2)
+                h1z = z[:, 2:] - z[:, 1:-1]  # (D,Nz-2)
+                denz = h0z * h1z * (h0z + h1z)  # (D,Nz-2)
+                h0z = h0z[:, None, None, :, None]
+                h1z = h1z[:, None, None, :, None]
+                denz = denz[:, None, None, :, None]
+
+                fzm = f[:, 1:-1, 1:-1, :-2, :]
+                fzp = f[:, 1:-1, 1:-1, 2:, :]
+                d2z = _safe_div(2.0 * (h0z * fzp - (h0z + h1z) * f0 + h1z * fzm), denz)
+
+                lap = d2x + d2y + d2z  # (D,Nx-2,Ny-2,Nz-2,C)
+
+            if not self._had_channels:
+                lap = lap.squeeze(-1)
+
+            return lap
+
+        # -----------------------------
+        # Unbatched helpers
+        # -----------------------------
+        def _d2_unbatched_x(f: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            # f: (Nx,Ny,Nz,C), x: (Nx,)
+            Nx = f.shape[0]
+            if Nx < 3:
+                return torch.zeros_like(f)
+
+            d2 = torch.zeros_like(f)
+
+            h0 = x[1:-1] - x[:-2]  # (Nx-2,)
+            h1 = x[2:] - x[1:-1]  # (Nx-2,)
+            den = h0 * h1 * (h0 + h1)  # (Nx-2,)
+
+            h0b = h0[:, None, None, None]
+            h1b = h1[:, None, None, None]
+            denb = den[:, None, None, None]
+
+            fm = f[:-2, :, :, :]
+            f0 = f[1:-1, :, :, :]
+            fp = f[2:, :, :, :]
+
+            d2_inner = _safe_div(
+                2.0 * (h0b * fp - (h0b + h1b) * f0 + h1b * fm),
+                denb,
+            )
+            d2[1:-1, :, :, :] = d2_inner
+
+            if boundary == "replicate":
+                d2[0, :, :, :] = d2[1, :, :, :]
+                d2[-1, :, :, :] = d2[-2, :, :, :]
+            elif boundary == "one-sided":
+                # left edge i=0 using points 0,1,2
+                h0l = x[1] - x[0]
+                h1l = x[2] - x[1]
+                den01 = torch.where(
+                    h0l * h1l == 0, torch.full_like(h0l, eps), h0l * h1l
+                )
+                den0 = torch.where(
+                    h0l * (h0l + h1l) == 0, torch.full_like(h0l, eps), h0l * (h0l + h1l)
+                )
+                den2 = torch.where(
+                    h1l * (h0l + h1l) == 0, torch.full_like(h1l, eps), h1l * (h0l + h1l)
+                )
+                c0 = 2.0 / den0
+                c1 = -2.0 / den01
+                c2 = 2.0 / den2
+                d2[0, :, :, :] = (
+                    c0 * f[0, :, :, :] + c1 * f[1, :, :, :] + c2 * f[2, :, :, :]
+                )
+
+                # right edge i=Nx-1 using points Nx-3, Nx-2, Nx-1
+                h0r = x[-2] - x[-3]
+                h1r = x[-1] - x[-2]
+                den01 = torch.where(
+                    h0r * h1r == 0, torch.full_like(h0r, eps), h0r * h1r
+                )
+                den0 = torch.where(
+                    h0r * (h0r + h1r) == 0, torch.full_like(h0r, eps), h0r * (h0r + h1r)
+                )
+                den2 = torch.where(
+                    h1r * (h0r + h1r) == 0, torch.full_like(h1r, eps), h1r * (h0r + h1r)
+                )
+                c0 = 2.0 / den0
+                c1 = -2.0 / den01
+                c2 = 2.0 / den2
+                d2[-1, :, :, :] = (
+                    c0 * f[-3, :, :, :] + c1 * f[-2, :, :, :] + c2 * f[-1, :, :, :]
+                )
+
+            # boundary == "zero": leave as zeros
+            return d2
+
+        def _d2_unbatched_y(f: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # f: (Nx,Ny,Nz,C), y: (Ny,)
+            Ny = f.shape[1]
+            if Ny < 3:
+                return torch.zeros_like(f)
+
+            d2 = torch.zeros_like(f)
+
+            h0 = y[1:-1] - y[:-2]  # (Ny-2,)
+            h1 = y[2:] - y[1:-1]  # (Ny-2,)
+            den = h0 * h1 * (h0 + h1)  # (Ny-2,)
+
+            h0b = h0[None, :, None, None]
+            h1b = h1[None, :, None, None]
+            denb = den[None, :, None, None]
+
+            fm = f[:, :-2, :, :]
+            f0 = f[:, 1:-1, :, :]
+            fp = f[:, 2:, :, :]
+
+            d2_inner = _safe_div(
+                2.0 * (h0b * fp - (h0b + h1b) * f0 + h1b * fm),
+                denb,
+            )
+            d2[:, 1:-1, :, :] = d2_inner
+
+            if boundary == "replicate":
+                d2[:, 0, :, :] = d2[:, 1, :, :]
+                d2[:, -1, :, :] = d2[:, -2, :, :]
+            elif boundary == "one-sided":
+                h0l = y[1] - y[0]
+                h1l = y[2] - y[1]
+                den01 = torch.where(
+                    h0l * h1l == 0, torch.full_like(h0l, eps), h0l * h1l
+                )
+                den0 = torch.where(
+                    h0l * (h0l + h1l) == 0, torch.full_like(h0l, eps), h0l * (h0l + h1l)
+                )
+                den2 = torch.where(
+                    h1l * (h0l + h1l) == 0, torch.full_like(h1l, eps), h1l * (h0l + h1l)
+                )
+                c0 = 2.0 / den0
+                c1 = -2.0 / den01
+                c2 = 2.0 / den2
+                d2[:, 0, :, :] = (
+                    c0 * f[:, 0, :, :] + c1 * f[:, 1, :, :] + c2 * f[:, 2, :, :]
+                )
+
+                h0r = y[-2] - y[-3]
+                h1r = y[-1] - y[-2]
+                den01 = torch.where(
+                    h0r * h1r == 0, torch.full_like(h0r, eps), h0r * h1r
+                )
+                den0 = torch.where(
+                    h0r * (h0r + h1r) == 0, torch.full_like(h0r, eps), h0r * (h0r + h1r)
+                )
+                den2 = torch.where(
+                    h1r * (h0r + h1r) == 0, torch.full_like(h1r, eps), h1r * (h0r + h1r)
+                )
+                c0 = 2.0 / den0
+                c1 = -2.0 / den01
+                c2 = 2.0 / den2
+                d2[:, -1, :, :] = (
+                    c0 * f[:, -3, :, :] + c1 * f[:, -2, :, :] + c2 * f[:, -1, :, :]
+                )
+
+            return d2
+
+        def _d2_unbatched_z(f: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+            # f: (Nx,Ny,Nz,C), z: (Nz,)
+            Nz = f.shape[2]
+            if Nz < 3:
+                return torch.zeros_like(f)
+
+            d2 = torch.zeros_like(f)
+
+            h0 = z[1:-1] - z[:-2]  # (Nz-2,)
+            h1 = z[2:] - z[1:-1]  # (Nz-2,)
+            den = h0 * h1 * (h0 + h1)  # (Nz-2,)
+
+            h0b = h0[None, None, :, None]
+            h1b = h1[None, None, :, None]
+            denb = den[None, None, :, None]
+
+            fm = f[:, :, :-2, :]
+            f0 = f[:, :, 1:-1, :]
+            fp = f[:, :, 2:, :]
+
+            d2_inner = _safe_div(
+                2.0 * (h0b * fp - (h0b + h1b) * f0 + h1b * fm),
+                denb,
+            )
+            d2[:, :, 1:-1, :] = d2_inner
+
+            if boundary == "replicate":
+                d2[:, :, 0, :] = d2[:, :, 1, :]
+                d2[:, :, -1, :] = d2[:, :, -2, :]
+            elif boundary == "one-sided":
+                h0l = z[1] - z[0]
+                h1l = z[2] - z[1]
+                den01 = torch.where(
+                    h0l * h1l == 0, torch.full_like(h0l, eps), h0l * h1l
+                )
+                den0 = torch.where(
+                    h0l * (h0l + h1l) == 0, torch.full_like(h0l, eps), h0l * (h0l + h1l)
+                )
+                den2 = torch.where(
+                    h1l * (h0l + h1l) == 0, torch.full_like(h1l, eps), h1l * (h0l + h1l)
+                )
+                c0 = 2.0 / den0
+                c1 = -2.0 / den01
+                c2 = 2.0 / den2
+                d2[:, :, 0, :] = (
+                    c0 * f[:, :, 0, :] + c1 * f[:, :, 1, :] + c2 * f[:, :, 2, :]
+                )
+
+                h0r = z[-2] - z[-3]
+                h1r = z[-1] - z[-2]
+                den01 = torch.where(
+                    h0r * h1r == 0, torch.full_like(h0r, eps), h0r * h1r
+                )
+                den0 = torch.where(
+                    h0r * (h0r + h1r) == 0, torch.full_like(h0r, eps), h0r * (h0r + h1r)
+                )
+                den2 = torch.where(
+                    h1r * (h0r + h1r) == 0, torch.full_like(h1r, eps), h1r * (h0r + h1r)
+                )
+                c0 = 2.0 / den0
+                c1 = -2.0 / den01
+                c2 = 2.0 / den2
+                d2[:, :, -1, :] = (
+                    c0 * f[:, :, -3, :] + c1 * f[:, :, -2, :] + c2 * f[:, :, -1, :]
+                )
+
+            return d2
+
+        # -----------------------------
+        # Batched helpers
+        # -----------------------------
+        def _d2_batched_x(f: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            # f: (D,Nx,Ny,Nz,C), x: (D,Nx)
+            Nx = f.shape[1]
+            if Nx < 3:
+                return torch.zeros_like(f)
+
+            d2 = torch.zeros_like(f)
+
+            h0 = x[:, 1:-1] - x[:, :-2]  # (D,Nx-2)
+            h1 = x[:, 2:] - x[:, 1:-1]  # (D,Nx-2)
+            den = h0 * h1 * (h0 + h1)  # (D,Nx-2)
+
+            h0b = h0[:, :, None, None, None]
+            h1b = h1[:, :, None, None, None]
+            denb = den[:, :, None, None, None]
+
+            fm = f[:, :-2, :, :, :]
+            f0 = f[:, 1:-1, :, :, :]
+            fp = f[:, 2:, :, :, :]
+
+            d2_inner = _safe_div(
+                2.0 * (h0b * fp - (h0b + h1b) * f0 + h1b * fm),
+                denb,
+            )
+            d2[:, 1:-1, :, :, :] = d2_inner
+
+            if boundary == "replicate":
+                d2[:, 0, :, :, :] = d2[:, 1, :, :, :]
+                d2[:, -1, :, :, :] = d2[:, -2, :, :, :]
+            elif boundary == "one-sided":
+                # left boundary (i=0): use points 0,1,2
+                h0l = x[:, 1] - x[:, 0]  # (D,)
+                h1l = x[:, 2] - x[:, 1]  # (D,)
+                den01 = torch.where(
+                    h0l * h1l == 0, torch.full_like(h0l, eps), h0l * h1l
+                )
+                den0 = torch.where(
+                    h0l * (h0l + h1l) == 0, torch.full_like(h0l, eps), h0l * (h0l + h1l)
+                )
+                den2 = torch.where(
+                    h1l * (h0l + h1l) == 0, torch.full_like(h1l, eps), h1l * (h0l + h1l)
+                )
+                c0 = (2.0 / den0)[:, None, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None, None]
+                d2[:, 0, :, :, :] = (
+                    c0 * f[:, 0, :, :, :]
+                    + c1 * f[:, 1, :, :, :]
+                    + c2 * f[:, 2, :, :, :]
+                )
+
+                # right boundary (i=Nx-1): use points Nx-3, Nx-2, Nx-1
+                h0r = x[:, -2] - x[:, -3]
+                h1r = x[:, -1] - x[:, -2]
+                den01 = torch.where(
+                    h0r * h1r == 0, torch.full_like(h0r, eps), h0r * h1r
+                )
+                den0 = torch.where(
+                    h0r * (h0r + h1r) == 0, torch.full_like(h0r, eps), h0r * (h0r + h1r)
+                )
+                den2 = torch.where(
+                    h1r * (h0r + h1r) == 0, torch.full_like(h1r, eps), h1r * (h0r + h1r)
+                )
+                c0 = (2.0 / den0)[:, None, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None, None]
+                d2[:, -1, :, :, :] = (
+                    c0 * f[:, -3, :, :, :]
+                    + c1 * f[:, -2, :, :, :]
+                    + c2 * f[:, -1, :, :, :]
+                )
+
+            return d2
+
+        def _d2_batched_y(f: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # f: (D,Nx,Ny,Nz,C), y: (D,Ny)
+            Ny = f.shape[2]
+            if Ny < 3:
+                return torch.zeros_like(f)
+
+            d2 = torch.zeros_like(f)
+
+            h0 = y[:, 1:-1] - y[:, :-2]  # (D,Ny-2)
+            h1 = y[:, 2:] - y[:, 1:-1]  # (D,Ny-2)
+            den = h0 * h1 * (h0 + h1)  # (D,Ny-2)
+
+            h0b = h0[:, None, :, None, None]
+            h1b = h1[:, None, :, None, None]
+            denb = den[:, None, :, None, None]
+
+            fm = f[:, :, :-2, :, :]
+            f0 = f[:, :, 1:-1, :, :]
+            fp = f[:, :, 2:, :, :]
+
+            d2_inner = _safe_div(
+                2.0 * (h0b * fp - (h0b + h1b) * f0 + h1b * fm),
+                denb,
+            )
+            d2[:, :, 1:-1, :, :] = d2_inner
+
+            if boundary == "replicate":
+                d2[:, :, 0, :, :] = d2[:, :, 1, :, :]
+                d2[:, :, -1, :, :] = d2[:, :, -2, :, :]
+            elif boundary == "one-sided":
+                h0l = y[:, 1] - y[:, 0]
+                h1l = y[:, 2] - y[:, 1]
+                den01 = torch.where(
+                    h0l * h1l == 0, torch.full_like(h0l, eps), h0l * h1l
+                )
+                den0 = torch.where(
+                    h0l * (h0l + h1l) == 0, torch.full_like(h0l, eps), h0l * (h0l + h1l)
+                )
+                den2 = torch.where(
+                    h1l * (h0l + h1l) == 0, torch.full_like(h1l, eps), h1l * (h0l + h1l)
+                )
+                c0 = (2.0 / den0)[:, None, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None, None]
+                d2[:, :, 0, :, :] = (
+                    c0 * f[:, :, 0, :, :]
+                    + c1 * f[:, :, 1, :, :]
+                    + c2 * f[:, :, 2, :, :]
+                )
+
+                h0r = y[:, -2] - y[:, -3]
+                h1r = y[:, -1] - y[:, -2]
+                den01 = torch.where(
+                    h0r * h1r == 0, torch.full_like(h0r, eps), h0r * h1r
+                )
+                den0 = torch.where(
+                    h0r * (h0r + h1r) == 0, torch.full_like(h0r, eps), h0r * (h0r + h1r)
+                )
+                den2 = torch.where(
+                    h1r * (h0r + h1r) == 0, torch.full_like(h1r, eps), h1r * (h0r + h1r)
+                )
+                c0 = (2.0 / den0)[:, None, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None, None]
+                d2[:, :, -1, :, :] = (
+                    c0 * f[:, :, -3, :, :]
+                    + c1 * f[:, :, -2, :, :]
+                    + c2 * f[:, :, -1, :, :]
+                )
+
+            return d2
+
+        def _d2_batched_z(f: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+            # f: (D,Nx,Ny,Nz,C), z: (D,Nz)
+            Nz = f.shape[3]
+            if Nz < 3:
+                return torch.zeros_like(f)
+
+            d2 = torch.zeros_like(f)
+
+            h0 = z[:, 1:-1] - z[:, :-2]  # (D,Nz-2)
+            h1 = z[:, 2:] - z[:, 1:-1]  # (D,Nz-2)
+            den = h0 * h1 * (h0 + h1)  # (D,Nz-2)
+
+            h0b = h0[:, None, None, :, None]
+            h1b = h1[:, None, None, :, None]
+            denb = den[:, None, None, :, None]
+
+            fm = f[:, :, :, :-2, :]
+            f0 = f[:, :, :, 1:-1, :]
+            fp = f[:, :, :, 2:, :]
+
+            d2_inner = _safe_div(
+                2.0 * (h0b * fp - (h0b + h1b) * f0 + h1b * fm),
+                denb,
+            )
+            d2[:, :, :, 1:-1, :] = d2_inner
+
+            if boundary == "replicate":
+                d2[:, :, :, 0, :] = d2[:, :, :, 1, :]
+                d2[:, :, :, -1, :] = d2[:, :, :, -2, :]
+            elif boundary == "one-sided":
+                h0l = z[:, 1] - z[:, 0]
+                h1l = z[:, 2] - z[:, 1]
+                den01 = torch.where(
+                    h0l * h1l == 0, torch.full_like(h0l, eps), h0l * h1l
+                )
+                den0 = torch.where(
+                    h0l * (h0l + h1l) == 0, torch.full_like(h0l, eps), h0l * (h0l + h1l)
+                )
+                den2 = torch.where(
+                    h1l * (h0l + h1l) == 0, torch.full_like(h1l, eps), h1l * (h0l + h1l)
+                )
+                c0 = (2.0 / den0)[:, None, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None, None]
+                d2[:, :, :, 0, :] = (
+                    c0 * f[:, :, :, 0, :]
+                    + c1 * f[:, :, :, 1, :]
+                    + c2 * f[:, :, :, 2, :]
+                )
+
+                h0r = z[:, -2] - z[:, -3]
+                h1r = z[:, -1] - z[:, -2]
+                den01 = torch.where(
+                    h0r * h1r == 0, torch.full_like(h0r, eps), h0r * h1r
+                )
+                den0 = torch.where(
+                    h0r * (h0r + h1r) == 0, torch.full_like(h0r, eps), h0r * (h0r + h1r)
+                )
+                den2 = torch.where(
+                    h1r * (h0r + h1r) == 0, torch.full_like(h1r, eps), h1r * (h0r + h1r)
+                )
+                c0 = (2.0 / den0)[:, None, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None, None]
+                d2[:, :, :, -1, :] = (
+                    c0 * f[:, :, :, -3, :]
+                    + c1 * f[:, :, :, -2, :]
+                    + c2 * f[:, :, :, -1, :]
+                )
+
+            return d2
+
+        # -----------------------------
+        # Compute Laplacian
+        # -----------------------------
+        if not self.batched:
+            # sorted axes are stored in _x_search/_y_search/_z_search
+            d2x = _d2_unbatched_x(vals, self._x_search)
+            d2y = _d2_unbatched_y(vals, self._y_search)
+            d2z = _d2_unbatched_z(vals, self._z_search)
+            lap = d2x + d2y + d2z
+        else:
+            d2x = _d2_batched_x(vals, self._x_search)
+            d2y = _d2_batched_y(vals, self._y_search)
+            d2z = _d2_batched_z(vals, self._z_search)
+            lap = d2x + d2y + d2z
+
+        # match original "had channels" convention
+        if not self._had_channels:
+            lap = lap.squeeze(-1)
+
+        return lap
 
 
 class PreparedInterp3dRectUniform(nn.Module):

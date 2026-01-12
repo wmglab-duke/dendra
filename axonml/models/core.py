@@ -380,7 +380,6 @@ class Population(P, Sliceable):
     def area(self):
         """
         Returns the area of the population.
-        This is a placeholder for future area-related functionality.
         """
         if self.graph is not None:
             area = get_area_from_graph(self.graph)
@@ -1450,7 +1449,8 @@ class Population(P, Sliceable):
 
     def populate_(self):
         """
-        In-place alias of :meth:`populate`.
+        "In-place" alias of :meth:`populate`. Same as :meth:`populate`, but
+        does not return self.
         """
         self.populate()
 
@@ -1495,11 +1495,14 @@ class Population(P, Sliceable):
         )
         self.t = self.t.zero_().detach()
         self.initialized = True
+        if force_rebuild:
+            self.integrator.initialized = False
         return self
 
     def initialize_(self):
         """
-        In-place alias of :meth:`initialize`.
+        "In-place" alias of :meth:`initialize`. Same as :meth:`initialize`, but
+        does not return self.
         """
         self.initialize()
 
@@ -2053,7 +2056,8 @@ class Population(P, Sliceable):
 
     def build_(self, force_rebuild=False):
         """
-        In-place alias of :meth:`build`.
+        "In-place" alias of :meth:`build`. Same as :meth:`build`,
+        but does not return self.
 
         Parameters
         ----------
@@ -2076,7 +2080,8 @@ class Population(P, Sliceable):
 
     def detach_(self):
         """
-        In-place alias of :meth:`detach`.
+        "In-place" alias of :meth:`detach`. Same as :meth:`detach`,
+        but does not return self.
         """
         self.detach()
 
@@ -2987,6 +2992,15 @@ class Axon(Population):
 
     This is the base class for axon models, implementing common functionality
     for simulating action potential propagation along 1D fibers.
+
+    Notes
+    -----
+    - {py:class}`~axonml.models.core.Unmyelinated` and {py:class}`~axonml.models.core.Myelinated` extend this class.
+    - The axon is represented as a series of compartments arranged in a line,
+      with each compartment having its own diameter and biophysical properties.
+      All axon classes by defalt are instantiate such that all compartments
+      lie along the x-axis (y=z=0), with the central compartment at x=0 (thereby
+      spanning from -axon_length/2 to axon_length/2).
     """
 
     __constants__ = [
@@ -3048,12 +3062,14 @@ class Axon(Population):
         """
         graphs = []
         for i in range(self.n_ax):
-            G = nx.path_graph(self.n_comp).to_directed()
+            G = nx.path_graph(self.n_comp, create_using=nx.DiGraph)
             for node in G.nodes:
-                G.nodes[node]["name"] = f"axon[{i}]({node / (self.n_comp - 1):.2f})"
+                G.nodes[node]["name"] = (
+                    f"{self.__class__.__name__}[{i}]({node / (self.n_comp - 1):.2f})"
+                )
                 G.nodes[node]["x"] = self.x[i, node].item()
-                G.nodes[node]["y"] = 0.0
-                G.nodes[node]["z"] = 0.0
+                G.nodes[node]["y"] = self.y[i, node].item()
+                G.nodes[node]["z"] = self.z[i, node].item()
                 G.nodes[node]["diam"] = self.diam[i, node].item()
                 G.nodes[node]["L"] = self.dx[i, node].item()
                 G.nodes[node]["Ra"] = self.rhoa[i, node].item()
@@ -3196,40 +3212,67 @@ class Unmyelinated(Axon):
         x = torch.linspace(-length / 2, length / 2, self.n_comp, device=self.device())
         return torch.atleast_2d(x)
 
+    def length(self) -> float:
+        """
+        Get the total length of the axon in micrometers.
+
+        Returns
+        -------
+        float
+            Total length of the axon in μm.
+        """
+        return self.dx.sum(axis=1)
+
 
 class Myelinated(Axon):
     """
-    Base myelinated axon model class.
+    Myelinated axon model with quadratic geometry scaling.
 
-    This class implements a model of myelinated axons (nerve fibers with myelin sheaths)
-    by extending the base Axon class. It models nodes of Ranvier separated by
-    myelinated internodal regions, with parameters that scale with axon diameter.
+    Nodes of Ranvier are separated by myelinated internodes. Geometric quantities
+    (axon diameter, node diameter, and internodal spacing) are derived from the
+    fiber diameter via simple quadratic fits defined by the class-level
+    ``GLOBAL(axon_d, node_d, delta_x)`` coefficients.
 
     Parameters
     ----------
     diameters : array_like
-        Diameters of the axons in μm. Can be a single value, list, or tensor.
+        Fiber diameters in µm; scalar or sequence broadcast to the population.
     n_node : int
-        Number of compartments (nodes of Ranvier) in the model.
+        Number of nodes of Ranvier (compartments) in the model.
     node_length : float, optional
-        Length of the nodes of Ranvier in μm. Default is 2.0 μm.
+        Physical length of each node in µm used to set ``dx``. Default is 2.0.
     celsius : float, optional
-        Temperature in degrees Celsius. Default is 37°C.
+        Temperature in degrees Celsius. Default is 37.
     v_init : float, optional
-        Initial membrane potential in mV. Default is -80 mV.
+        Initial membrane potential in mV. Default is -80.
     integrator : Integrator, optional
-        The integrator to use for the simulation. If None, a default backward Euler integrator
-        will be used.
+        Integrator instance. If ``None``, a backward Euler integrator is used.
+    **kwargs : Any
+        Additional arguments forwarded to :class:`Axon`.
 
     Notes
     -----
-    The model uses quadratic equations to calculate various geometric parameters
-    based on the fiber diameter, following anatomical scaling relationships.
 
-    See Also
-    --------
-    Axon : Base class providing common functionality for axon models.
-    Unmyelinated : Companion class implementing unmyelinated axon models.
+    **Geometry**
+
+    For a fiber diameter :math:`D` (µm), the derived quantities are
+
+    .. math::
+
+       d_\\text{axon}(D) &= a_1 D^2 + a_2 D + a_3 \\\\
+       d_\\text{node}(D) &= n_1 D^2 + n_2 D + n_3 \\\\
+       \\Delta x(D) &= \\delta_1 D^2 + \\delta_2 D + \\delta_3
+
+    Coefficients are taken from ``GLOBAL(axon_d=..., node_d=..., delta_x=...)``.
+    Defaults are:
+
+    - ``axon_d``: :math:`a_1=0.0`, :math:`a_2=0.7`, :math:`a_3=0.0`
+    - ``node_d``: :math:`n_1=0.0`, :math:`n_2=0.7`, :math:`n_3=0.0`
+    - ``delta_x``: :math:`\\delta_1=0.0`, :math:`\\delta_2=100.0`,
+      :math:`\\delta_3=0.0` (center-to-center internodal spacing)
+
+    ``node_length`` controls the physical node extent used for per-node ``dx``,
+    while :meth:`deltax` evaluates the center-to-center spacing polynomial above.
     """
 
     Axon.RANGE(
@@ -3378,6 +3421,18 @@ class Myelinated(Axon):
             0, 1, steps, device=length.device, dtype=torch.double
         ).unsqueeze(0)
         return ((1 - t) * start + t * end).to(self.dtype())
+
+    def length(self) -> torch.Tensor:
+        """
+        Get the total length of each axon in micrometers.
+
+        Returns
+        -------
+        Tensor
+            Total lengths of the axons in μm.
+        """
+        deltax = self.deltax(self.diameters)
+        return (self.nc - 1) * deltax
 
 
 # callback helpers

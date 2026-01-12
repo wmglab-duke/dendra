@@ -1,7 +1,10 @@
 # -- adapted from now defunct bluebrain/nmodl repository --
+import re
 from importlib import import_module
+from typing import Optional
 
 import sympy as sp
+from sympy.printing.pycode import PythonCodePrinter
 
 # import known_functions through low-level mechanism because the ccode
 # module is overwritten in sympy and contents of that submodule cannot be
@@ -185,3 +188,311 @@ def integrate2c(diff_string, dt_var, vars, use_pade_approx=False):
     #   - in the lhs x_0 refers to the state var at time (t+dt)
     #   - in the rhs x_0 refers to the state var at time t
     return f"{sp.ccode(x)} = {sp.ccode(solution.evalf(), user_functions=custom_fcts)}"
+
+
+# -- differentiate --
+
+_where = sp.Function("where")
+
+
+def _nmodl_preprocess(s: str) -> str:
+    # NMODL uses ^ for power; convert for SymPy/Python.
+    return s.replace("^", "**")
+
+
+def _build_locals(vars_):
+    locals_map = {}
+    for v in vars_:
+        name, obj = _var_to_sympy(v)
+        locals_map[name] = obj
+    return locals_map
+
+
+def _piecewise_to_where(expr: sp.Expr) -> sp.Expr:
+    """Convert SymPy Piecewise to nested where(cond, a, b) to support torch.where."""
+    if isinstance(expr, sp.Piecewise):
+        pairs = expr.args
+        e_last, c_last = pairs[-1]
+        else_expr = (
+            _piecewise_to_where(e_last)
+            if (c_last is True or c_last == sp.true)
+            else _where(c_last, _piecewise_to_where(e_last), sp.nan)
+        )
+        for e, c in reversed(pairs[:-1]):
+            else_expr = _where(c, _piecewise_to_where(e), else_expr)
+        return else_expr
+
+    if expr.args:
+        return expr.func(*(_piecewise_to_where(a) for a in expr.args))
+    return expr
+
+
+class TorchCodePrinter(PythonCodePrinter):
+    """Printer that emits torch.* calls and tensor-safe boolean logic."""
+
+    def __init__(self, settings=None, extra_user_functions=None):
+        settings = dict(settings or {})
+        settings.setdefault("fully_qualified_modules", True)
+
+        uf = dict(settings.get("user_functions", {}))
+        uf.update(
+            {
+                # elementary
+                "exp": "torch.exp",
+                "log": "torch.log",
+                "sqrt": "torch.sqrt",
+                "sin": "torch.sin",
+                "cos": "torch.cos",
+                "tan": "torch.tan",
+                "asin": "torch.asin",
+                "acos": "torch.acos",
+                "atan": "torch.atan",
+                "atan2": "torch.atan2",
+                "sinh": "torch.sinh",
+                "cosh": "torch.cosh",
+                "tanh": "torch.tanh",
+                "asinh": "torch.asinh",
+                "acosh": "torch.acosh",
+                "atanh": "torch.atanh",
+                "Abs": "torch.abs",
+                "floor": "torch.floor",
+                "ceiling": "torch.ceil",
+                "erf": "torch.erf",
+                # Piecewise rewrite target:
+                "where": "torch.where",
+            }
+        )
+        # Optional: allow mapping custom NMODL helper fns to your own torch implementations.
+        # Example: {"vtrap": "vtrap"} where vtrap is a Python function in your runtime.
+        if extra_user_functions:
+            uf.update(extra_user_functions)
+
+        settings["user_functions"] = uf
+        super().__init__(settings)
+
+    # tensor-safe boolean ops
+    def _print_And(self, expr):
+        return " & ".join(f"({self._print(a)})" for a in expr.args)
+
+    def _print_Or(self, expr):
+        return " | ".join(f"({self._print(a)})" for a in expr.args)
+
+    def _print_Not(self, expr):
+        return f"~({self._print(expr.args[0])})"
+
+    def _print_sign(self, expr):
+        return f"torch.sign({self._print(expr.args[0])})"
+
+    # tensor-safe constants
+    def _print_NaN(self, expr):
+        return "torch.nan"
+
+    def _print_Infinity(self, expr):
+        return "torch.inf"
+
+    def _print_NegativeInfinity(self, expr):
+        return "-torch.inf"
+
+    def _print_Pi(self, expr):
+        return "torch.pi"
+
+    def _print_Exp1(self, expr):
+        return "2.718281828459045"
+
+
+_UNEVALUATED_TOKENS = ("Derivative(", "Integral(", "Subs(", "Lambda(")
+_DISALLOWED_PREFIXES = ("math.", "numpy.", "sympy.")
+
+
+def _validate_torch_expression(expr_str: str, allowed_callables=None) -> bool:
+    """
+    Heuristic validation:
+      - rejects unevaluated SymPy constructs
+      - rejects math/numpy/sympy prefixes
+      - ensures any function calls are torch.* or explicitly allowed
+    """
+    if not expr_str or not isinstance(expr_str, str):
+        return False
+
+    for tok in _UNEVALUATED_TOKENS:
+        if tok in expr_str:
+            return False
+    for pref in _DISALLOWED_PREFIXES:
+        if pref in expr_str:
+            return False
+
+    # Find all call sites like name(...) or dotted.name(...)
+    # We allow torch.xxx(...), and optionally allowlisted names (e.g., vtrap(...)).
+    allowed = set(allowed_callables or [])
+    call_pat = re.compile(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*\(")
+    for m in call_pat.finditer(expr_str):
+        fname = m.group(1)
+        if fname.startswith("torch."):
+            continue
+        if fname in allowed:
+            continue
+        # Disallow any other callable like exp(...), v(...), etc.
+        return False
+
+    return True
+
+
+def _expr_depends_on_state(expr: sp.Expr, state_obj) -> bool:
+    """
+    Robust dependency check that handles Symbol, IndexedBase, and Indexed.
+    """
+    if isinstance(state_obj, sp.Symbol):
+        return expr.has(state_obj)
+
+    if isinstance(state_obj, sp.Indexed):
+        return expr.has(state_obj)
+
+    if isinstance(state_obj, sp.IndexedBase):
+        # Expressions involving x[i] typically contain Indexed(x, i), not the base itself.
+        if expr.has(state_obj):
+            return True
+        for idx in expr.atoms(sp.Indexed):
+            # idx.base is the IndexedBase
+            if getattr(idx, "base", None) == state_obj:
+                return True
+        # Sometimes IndexedBase may appear directly
+        if state_obj in expr.atoms(sp.IndexedBase):
+            return True
+        return False
+
+    # Fallback
+    return expr.has(state_obj)
+
+
+def differentiate_rhs_2torch_checked(
+    diff_string: str,
+    vars,
+    wrt: str,
+    *,
+    state_vars: Optional[list[str]] = None,
+    simplify: bool = True,
+    extra_user_functions: dict | None = None,
+    # Finite-difference fallback controls
+    fd_scheme: str = "central",  # "central" | "forward" | "backward"
+    fd_eps: float = 1e-6,  # constant epsilon (keeps dependency detection meaningful)
+) -> tuple[str, bool, bool]:
+    """
+    Input:
+      diff_string: "x' = f(...)"
+      vars: iterable of variable declarations used in RHS (prefer list/tuple, not set)
+      wrt: variable name/index to differentiate against, e.g. "x", "m", "x[0]"
+      state_vars: list of state variable names (subset of vars) to test dependency against
+
+    Output:
+      (df_dy_str, ok, depends_on_any_state)
+        df_dy_str: PyTorch-valid expression string for ∂f/∂wrt if ok=True else ""
+        ok: True if expression is torch-safe per _validate_torch_expression
+        depends_on_any_state: True if the returned derivative expr depends on any of state_vars
+    """
+    # ---- parse RHS (required for both symbolic and FD routes) ----
+    try:
+        diff_string = _nmodl_preprocess(diff_string)
+        wrt = _nmodl_preprocess(wrt)
+
+        vars_list = list(vars)
+        locals_map = _build_locals(vars_list)
+
+        _lhs, rhs = diff_string.split("=", 1)
+        f_expr = sp.sympify(rhs.strip(), locals=locals_map)
+
+        wrt_sym = sp.sympify(wrt, locals=locals_map)
+
+    except Exception:
+        return "", False, False
+
+    # If RHS does not depend on wrt, derivative is exactly zero (fast path).
+    try:
+        if not f_expr.has(wrt_sym):
+            df_str = "0"
+            depends = False
+            if state_vars:
+                # "0" depends on nothing
+                depends = False
+            return df_str, True, depends
+    except Exception:
+        # If .has() is unhappy for some exotic sympy object, just continue.
+        pass
+
+    # Helper: compute depends flag + torch-string + validate
+    def _emit(df_expr: sp.Expr) -> tuple[str, bool, bool]:
+        # Determine whether df depends on any state var (on the symbolic df expression)
+        depends_local = False
+        if state_vars:
+            for s in state_vars:
+                s_sym = sp.sympify(_nmodl_preprocess(s), locals=locals_map)
+                if _expr_depends_on_state(df_expr, s_sym):
+                    depends_local = True
+                    break
+
+        # Rewrite Piecewise -> where(...) and print to torch code
+        df_expr_pw = _piecewise_to_where(df_expr)
+
+        printer = TorchCodePrinter(extra_user_functions=extra_user_functions)
+        df_str_local = printer.doprint(df_expr_pw)
+
+        allowed_calls = set()
+        if extra_user_functions:
+            allowed_calls.update(extra_user_functions.values())
+
+        ok_local = _validate_torch_expression(
+            df_str_local, allowed_callables=allowed_calls
+        )
+        return (df_str_local if ok_local else ""), ok_local, depends_local
+
+    # ---- 1) Try symbolic differentiation ----
+    try:
+        df = sp.diff(f_expr, wrt_sym)
+        if simplify:
+            # Can be expensive, but gives cleaner/faster printed code.
+            df = sp.simplify(df)
+
+        df_str, ok, depends = _emit(df)
+        if ok:
+            return df_str, True, depends
+
+    except Exception:
+        # fall through to finite-difference
+        pass
+
+    # ---- 2) Finite-difference fallback (still returns a torch-valid string) ----
+    try:
+        eps = sp.Float(fd_eps)
+        scheme = fd_scheme.lower().strip()
+
+        if scheme == "central":
+            f_plus = f_expr.subs({wrt_sym: wrt_sym + eps})
+            f_minus = f_expr.subs({wrt_sym: wrt_sym - eps})
+            df_fd = (f_plus - f_minus) / (2 * eps)
+
+        elif scheme == "forward":
+            f_plus = f_expr.subs({wrt_sym: wrt_sym + eps})
+            df_fd = (f_plus - f_expr) / eps
+
+        elif scheme == "backward":
+            f_minus = f_expr.subs({wrt_sym: wrt_sym - eps})
+            df_fd = (f_expr - f_minus) / eps
+
+        else:
+            raise ValueError(
+                f"Unsupported fd_scheme={fd_scheme!r}. Use 'central', 'forward', or 'backward'."
+            )
+
+        if simplify:
+            # Often cancels out the variable and reduces the FD expression dramatically
+            # (e.g., for affine-in-wrt RHS, FD reduces to an exact constant derivative).
+            df_fd = sp.simplify(df_fd)
+
+        df_str, ok, depends = _emit(df_fd)
+        if ok:
+            return df_str, True, depends
+
+    except Exception:
+        pass
+
+    # ---- 3) Both symbolic and FD failed ----
+    return "", False, False

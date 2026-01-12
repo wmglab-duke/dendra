@@ -6,13 +6,47 @@ import numpy as np
 import torch
 from natsort import natsorted
 
-from axonml.utils import PreparedInterp1d, PreparedInterp3dScattered
+from axonml.utils import (
+    PreparedInterp1d,
+    PreparedInterp3dRect,
+    PreparedInterp3dScattered,
+)
 
 from .quasipotentials import calculate_quasipotentials_batched_coords
 
 
 class PreComputedInterpolate1D(torch.nn.Module):
-    """Use PreComputed data sampled along x at different (y, z) locations."""
+    """
+    Use PreComputed data sampled along x at different (y, z) locations.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        2D tensor of shape (D, N) containing the precomputed data values.
+    x : torch.Tensor
+        2D tensor of shape (D, N) containing the x-coordinates corresponding to the data values.
+    outside : str, optional
+        Behavior for points outside the interpolation range. Options are "zero" or "point_source".
+        If "point_source", the interpolation uses a point-source model outside the (optionally
+        truncated) support. Default is "zero".
+    truncate : float or None, optional
+        Amount to truncate the data symmetrically. Default is None (no truncation).
+    truncate_mode : str, optional
+        Mode for truncation, either "best_fit" or "safe". Default is "best_fit".
+    **kwargs
+        Additional keyword arguments passed to :class:`PreparedInterp1d`.
+
+    Notes
+    -----
+    - The input `data` and `x` tensors must have the same shape (D, N), where D is the
+      number of data rows and N is the number of samples per row.
+    - The `x` values for each row must be sorted in ascending order, either by setting
+      `sort_xy=True` (default) or ensuring they are pre-sorted when `sort_xy=False`.
+    - Truncation removes a fraction of the data symmetrically from both ends of the x-domain.
+    - The `outside` parameter determines how values outside the interpolation range are handled.
+      If set to "point_source", a point-source extrapolation is applied based on the peak
+      and boundary values of each row.
+    """
 
     def __init__(
         self,
@@ -356,7 +390,7 @@ class PreComputedInterpolate1D(torch.nn.Module):
 
         return d, valid
 
-    def point_source_fill(
+    def _point_source_fill(
         self,
         x_vec: torch.Tensor,  # (Q,P)
         interp: torch.Tensor,  # (Q,P) from PreparedInterp1d with outside="zero"
@@ -448,6 +482,17 @@ class PreComputedInterpolate1D(torch.nn.Module):
         return out
 
     def forward(self, model, indices=None):
+        """
+        Interpolate field at model.x using precomputed 1D LUT.
+
+        Parameters
+        ----------
+        model : axonml.models.Population
+            Model with .x coordinates where field is evaluated.
+        indices : array-like of int, optional
+            Indices selecting which LUT row to use for each query point. If None, uses row 0 for all points
+            (or the only row if LUT is unbatched). If provided, must have length 1 or Q (number of query points).
+        """
         x = model.x
         self.to(device=x.device, dtype=x.dtype)
 
@@ -465,46 +510,223 @@ class PreComputedInterpolate1D(torch.nn.Module):
 
         # Point-source extrapolation is applied only outside the bounds.
         if self.outside == "point_source":
-            interpolated = self.point_source_fill(x_2d, interpolated, indices=idx)
+            interpolated = self._point_source_fill(x_2d, interpolated, indices=idx)
 
         return interpolated.reshape(shape)
 
 
+class PreComputedInterpolate3DRect(torch.nn.Module):
+    """Interpolate 3D field from rectilinear grid.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        1D tensor of x-coordinates of the grid points (in μm).
+    y : torch.Tensor
+        1D tensor of y-coordinates of the grid points (in μm).
+    z : torch.Tensor
+        1D tensor of z-coordinates of the grid points (in μm).
+    field : torch.Tensor
+        4D tensor of shape (Nx, Ny, Nz, ...) containing the field values at the grid points.
+    **kwargs : additional keyword arguments for PreparedInterp3dRect.
+
+    Forward
+    -------
+    forward(model) → (B, K, ...) tensor
+        Computes the field at the model's coordinates using trilinear interpolation.
+
+    Notes
+    -----
+    *  All operations remain on the same device/dtype as the model.
+    *  The module is differentiable w.r.t. the model's coordinates; the
+       field grid points/values are treated as constants (buffers).
+    *  The module is differentiable w.r.t. the field values, but must be
+       specified explicitly with learnable=True as a kwarg.
+    """
+
+    def __init__(self, x, y, z, field, **kwargs):
+        super().__init__()
+        self.interpolator = PreparedInterp3dRect(x=x, y=y, z=z, values=field, **kwargs)
+
+    def _interp(self, x, y, z):
+        shape = x.shape
+        xyz_q = torch.stack((x, y, z), dim=-1).reshape(-1, 3)  # (Q, 3)
+        field = self.interpolator(xyz_q).view(*shape)
+        return field
+
+    def forward(self, model):
+        """
+        Interpolate field at model.x, model.y, model.z using precomputed 3D rectilinear grid.
+
+        Parameters
+        ----------
+        model : axonml.models.Population
+            Model with .x, .y, .z coordinates where field is evaluated.
+
+        Returns
+        -------
+        field : torch.Tensor
+            Tensor of shape (B, K, ...) containing the interpolated field values at the model
+        """
+        self.to(device=model.device(), dtype=model.dtype())
+        x, y, z = model.x, model.y, model.z
+        field = self._interp(x, y, z)
+        return field
+
+
+class PreComputedInterpolate3DScattered(torch.nn.Module):
+    """Interpolate 3D field from scattered points.
+
+    Parameters
+    ----------
+    xyz : torch.Tensor
+        A tensor of shape (N, 3) containing the coordinates (x, y, z) in μm.
+    field : torch.Tensor
+        A tensor of shape (N, 1) containing the field values at the coordinates.
+    **kwargs : additional keyword arguments for PreparedInterp3dScattered.
+
+    Forward
+    -------
+    forward(model) → (B, K) tensor
+        Computes the field at the model's coordinates using inverse-distance weighting.
+
+    Notes
+    -----
+    *  All operations remain on the same device/dtype as the model.
+    *  The module is differentiable w.r.t. the model's coordinates; the
+       sample points/values are treated as constants (buffers).
+    *  The module is differentiable w.r.t. the field values, but must be
+       specified explicitly with learnable=True as a kwarg.
+    """
+
+    def __init__(
+        self,
+        xyz,
+        field,
+        **kwargs,
+    ):
+        super().__init__()
+        assert xyz.shape[0] == field.shape[0] and field.shape[1] == 1
+
+        xyz = torch.as_tensor(xyz)
+        field = torch.as_tensor(field)
+
+        self.interpolator = PreparedInterp3dScattered(
+            points=xyz,
+            values=field,
+            **kwargs,
+        )
+
+    def _interp(self, x, y, z):
+        shape = x.shape
+        xyz_q = torch.stack((x, y, z), dim=-1).reshape(-1, 3)  # (Q, 3)
+        field = self.interpolator(xyz_q).view(*shape)
+        return field
+
+    def forward(self, model):
+        """
+        Interpolate field at model.x, model.y, model.z using precomputed 3D scattered points.
+
+        Parameters
+        ----------
+        model : axonml.models.Population
+            Model with .x, .y, .z coordinates where field is evaluated.
+
+        Returns
+        -------
+        field : torch.Tensor
+            Tensor of shape (B, K, ...) containing the interpolated field values at the model
+        """
+        self.to(device=model.device(), dtype=model.dtype())
+        x, y, z = model.x, model.y, model.z
+        field = self._interp(x, y, z)
+        return field
+
+
 # -- aliases --
 FEMInterpolate1D = PreComputedInterpolate1D
+FEMInterpolate3DRect = PreComputedInterpolate3DRect
+FEMInterpolate3DScattered = PreComputedInterpolate3DScattered
 
 
-class EfieldInterpolate3D(torch.nn.Module):
+class EfieldInterpolate3DRect(torch.nn.Module):
+    """Interpolate 3D E-field from rectilinear grid and compute quasipotentials.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        1D tensor of x-coordinates of the grid points (in μm).
+    y : torch.Tensor
+        1D tensor of y-coordinates of the grid points (in μm).
+    z : torch.Tensor
+        1D tensor of z-coordinates of the grid points (in μm).
+    efield : torch.Tensor
+        4D tensor of shape (Nx, Ny, Nz, 3) containing the electric field vectors at the grid points.
+    **kwargs : additional keyword arguments for PreparedInterp3dRect.
+
+    Forward
+    -------
+    forward(model) → (B, K) tensor
+        Computes the quasipotentials at the model's coordinates using the interpolated E-field.
+
+    Notes
+    -----
+    *  All operations remain on the same device/dtype as the model.
+    *  The module is differentiable w.r.t. the model's coordinates; the
+       E-field grid points/values are treated as constants (buffers).
+    *  The module is differentiable w.r.t. the efield values, but must be
+       specified explicitly with learnable=True as a kwarg.
+    """
+
+    def __init__(self, x, y, z, efield, **kwargs):
+        super().__init__()
+        self.interpolator = PreparedInterp3dRect(x=x, y=y, z=z, values=efield, **kwargs)
+
+    def _interp(self, x, y, z):
+        shape = x.shape
+        xyz_q = torch.stack((x, y, z), dim=-1).reshape(-1, 3)  # (Q, 3)
+        efield = self.interpolator(xyz_q).view(*shape, 3)
+        return efield
+
+    def forward(self, model):
+        self.to(device=model.device(), dtype=model.dtype())
+        x, y, z = model.x, model.y, model.z
+        G = model.graph
+        efield = self._interp(x, y, z)
+        return calculate_quasipotentials_batched_coords(G, x, y, z, efield)
+
+
+class EfieldInterpolate3DScattered(torch.nn.Module):
+    """Interpolate 3D E-field from scattered points and compute quasipotentials.
+
+    Parameters
+    ----------
+    xyz : torch.Tensor
+        A tensor of shape (N, 3) containing the coordinates (x, y, z) in μm.
+    efield : torch.Tensor
+        A tensor of shape (N, 3) containing the electric field vectors at the coordinates.
+    **kwargs : additional keyword arguments for PreparedInterp3dScattered.
+
+    Forward
+    -------
+    forward(model) → (B, K) tensor
+        Computes the quasipotentials at the model's coordinates using the interpolated E-field.
+
+    Notes
+    -----
+    *  All operations remain on the same device/dtype as the model.
+    *  The module is differentiable w.r.t. the model's coordinates; the
+       sample points/values are treated as constants (buffers).
+    *  The module is differentiable w.r.t. the efield values, but must be
+       specified explicitly with learnable=True as a kwarg.
+    """
+
     def __init__(
         self,
         xyz,
         efield,
         **kwargs,
     ):
-        """
-        Initialize the EfieldInterpolate3D module.
-
-        Parameters
-        ----------
-        xyz : torch.Tensor
-            A tensor of shape (N, 3) containing the coordinates (x, y, z) in μm.
-        efield : torch.Tensor
-            A tensor of shape (N, 3) containing the electric field vectors at the coordinates.
-        **kwargs : additional keyword arguments for PreparedInterp3dScattered.
-
-        Forward
-        -------
-        forward(x, y, z) → (B, K, 3) tensor
-            `x`, `y`, `z` are each (B, K) tensors of coordinates.  The output
-            is the interpolated E-field at every query point using
-            inverse-distance weighting.
-
-        Notes
-        -----
-        *  All operations remain on the same device/dtype as the inputs.
-        *  The module is differentiable w.r.t. *query* coordinates; the
-           sample points/values are treated as constants (buffers).
-        """
         super().__init__()
         assert xyz.shape == efield.shape and xyz.shape[1] == 3
 
@@ -518,9 +740,9 @@ class EfieldInterpolate3D(torch.nn.Module):
         )
 
     def _interp(self, x, y, z):
-        B, K = x.shape
+        shape = x.shape
         xyz_q = torch.stack((x, y, z), dim=-1).reshape(-1, 3)  # (Q, 3)
-        efield = self.interpolator(xyz_q).view(B, K, 3)
+        efield = self.interpolator(xyz_q).view(*shape, 3)
         return efield
 
     def forward(self, model):

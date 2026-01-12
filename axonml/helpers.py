@@ -257,7 +257,7 @@ logFormatter = logging.Formatter(
 consoleHandler = logging.StreamHandler()
 consoleHandler.setFormatter(logFormatter)
 logger.addHandler(consoleHandler)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 def tic(message=None, log=True):

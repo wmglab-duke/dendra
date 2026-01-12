@@ -63,6 +63,14 @@ class IndexSpec:
     is_scalar: bool
     shape: Tuple[int, ...]
 
+    def to_key(self, model) -> torch.LongTensor:
+        """Given a model with shape `shape_p`, return a flat key tensor."""
+        # Build a flat index map once and apply the slice directly.
+        base = torch.arange(
+            math.prod(model.shape_p), device=model.device(), dtype=torch.long
+        ).view(model.shape_p)
+        return base[self.index].reshape(-1)
+
 
 class Slice:
     """
@@ -559,6 +567,45 @@ class Slice:
             **kwargs,
         )
 
+    def parametrize(self, name, value, alias=None):
+        """
+        Add or update an alias-specific parameter override on this slice.
+
+        This method forwards to ``model.parametrize`` while passing along the
+        slice's :class:`IndexSpec`, so that only the selected compartments
+        receive the parameter override.
+
+        Parameters
+        ----------
+        name : str
+            Parameter name to override.
+        value : float, torch.Tensor, torch.nn.Parameter, or torch.nn.Module
+            New parameter value.
+        alias : str or None, optional
+            Optional mechanism alias to which the parameter applies. If
+            ``None``, the parameter is assumed to be a model-level parameter.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            # Override a model-level parameter in the soma
+            pop[:, 0].parametrize("rhoa", 150.0)
+
+            # Override a mechanism parameter in dendrites
+            pop[:, 1:].mech.pas.parametrize("g", 1e-4, alias="dend")
+        """
+        if self.is_empty:
+            return  # no-op for empty slices
+        model = object.__getattribute__(self, "model")
+        index_spec = object.__getattribute__(self, "index_spec")
+        model.parametrize(
+            name,
+            value,
+            key=index_spec.to_key(model),
+            alias=alias,
+        )
+
     def label(self, name: str):
         """
         Attach a label to the slice for convenient, reusable access.
@@ -998,3 +1045,153 @@ def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
         is_scalar=out.ndim == 0,
         shape=out.shape,
     )
+
+
+def concat_slices(slices: Sequence[Slice], dim: int = -1) -> Slice:
+    """Concatenate multiple :class:`Slice` objects into a single slice.
+
+    Parameters
+    ----------
+    slices : Sequence[Slice]
+        Slices to concatenate. All slices must wrap the same underlying model
+        and be compatible for concatenation along ``dim``.
+    dim : int, optional
+        Dimension along which to concatenate. If None, concatenates
+        flattened slices. Defaults to ``-1``.
+
+    Returns
+    -------
+    Slice
+        New :class:`Slice` representing the concatenation of the inputs.
+
+    Raises
+    ------
+    ValueError
+        If the input slices wrap different models or are incompatible for
+        concatenation.
+    """
+
+    if not slices:
+        raise ValueError("At least one slice must be provided for concatenation.")
+
+    base_model = slices[0].model
+    base_shape = list(slices[0].base_shape)
+
+    indices = []
+    shapes = []
+    for slc in slices:
+        if slc.model is not base_model:
+            raise ValueError("All slices must wrap the same underlying model.")
+        indices.append(slc.index)
+        shapes.append(slc.shape)
+
+    final_shape = _assess_shape_compatibility(shapes, dim)
+
+    if dim is None:
+        # Flatten all slices before concatenation
+        flat_indices = []
+        for idx, shape in zip(indices, shapes):
+            flat_idx = torch.arange(np.prod(shape), device=base_model.device()).reshape(
+                shape
+            )[idx]
+            flat_indices.append(flat_idx.flatten())
+        concatenated_idx = torch.cat(flat_indices)
+        new_index = (concatenated_idx,)
+    else:
+        # Concatenate along the specified dimension
+        dim_indices = []
+        for idx in indices:
+            dim_indices.append(
+                torch.arange(base_shape[dim], device=base_model.device())[idx[dim]]
+            )
+        concatenated_idx = _merge_indices(dim_indices)
+        new_index = list(indices[0])
+        new_index[dim] = concatenated_idx
+        new_index = tuple(new_index)
+
+    return Slice(
+        base_model,
+        IndexSpec(index=new_index, shape=final_shape, is_scalar=False),
+        base_shape=tuple(base_shape),
+    )
+
+
+def _assess_shape_compatibility(shapes: Sequence[Sequence[int]], dim: Optional[int]):
+    """Check that shapes are compatible for concatenation along ``dim``.
+
+    Parameters
+    ----------
+    shapes : Sequence[Sequence[int]]
+        Shapes to assess.
+    dim : int or None
+        Dimension along which concatenation is intended. If None, all shapes
+        must be identical when flattened.
+
+    Raises
+    ------
+    ValueError
+        If the shapes are incompatible for concatenation.
+    """
+
+    # first convert negative dim to positive
+    if dim is not None and dim < 0:
+        dim += len(shapes[0])
+
+    if dim is None:
+        # All shapes must have the same number of elements when flattened
+        numel_set = {int(np.prod(shape)) for shape in shapes}
+        if len(numel_set) > 1:
+            raise ValueError(
+                "All slices must have the same number of elements when flattened for concatenation."
+            )
+    else:
+        # All shapes must match in all dimensions except ``dim``
+        ref_shape = list(shapes[0])
+        for shape in shapes[1:]:
+            if len(shape) != len(ref_shape):
+                raise ValueError(
+                    "All slices must have the same number of dimensions for concatenation."
+                )
+            for d in range(len(shape)):
+                if d != dim and shape[d] != ref_shape[d]:
+                    raise ValueError(
+                        f"Shapes differ at dimension {d}, cannot concatenate."
+                    )
+
+    # If we reach here, shapes are compatible
+    # Compute final shape after concatenation
+    final_shape = list(shapes[0])
+    if dim is None:
+        final_shape = (sum(int(np.prod(shape)) for shape in shapes),)
+    else:
+        final_shape[dim] = sum(shape[dim] for shape in shapes)
+    return tuple(final_shape)
+
+
+def _merge_indices(indices: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Merge multiple index tensors into a single concatenated index.
+    If can be a slice, return a slice.
+
+    Parameters
+    ----------
+    indices : Sequence[torch.Tensor]
+        Index tensors to merge. Each tensor should be 1D.
+
+    Returns
+    -------
+    torch.Tensor or slice
+        Concatenated index tensor.
+    """
+    concatenated = torch.cat(indices)
+
+    # Check if the concatenated indices form a contiguous range
+    # with a uniform step (may not be 1)
+
+    diffs = concatenated[1:] - concatenated[:-1]
+    if torch.all(diffs == diffs[0]):
+        start = concatenated[0].item()
+        stop = concatenated[-1].item() + diffs[0].item()
+        step = diffs[0].item()
+        return slice(start, stop, step)
+
+    return concatenated

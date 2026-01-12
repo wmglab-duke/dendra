@@ -468,12 +468,13 @@ class NetStim(torch.nn.Module, Sliceable):
 
         This is intended for activation checkpointing in long unrolled runs.
         Key points:
-          • We MUST include the per-instance torch.Generator RNG state, because
-            torch.utils.checkpoint can preserve global RNG state, but not custom
-            Generator objects passed via `generator=...`.
-          • Scheduled spikes live in Python-side heaps. We store them as an
-            immutable tuple-of-tuples so the returned state object is not
-            accidentally mutated by subsequent simulation steps.
+
+        - We MUST include the per-instance torch.Generator RNG state, because
+          torch.utils.checkpoint can preserve global RNG state, but not custom
+          Generator objects passed via `generator=...`.
+        - Scheduled spikes live in Python-side heaps. We store them as an
+          immutable tuple-of-tuples so the returned state object is not
+          accidentally mutated by subsequent simulation steps.
 
         Returns
         -------
@@ -502,12 +503,13 @@ class NetStim(torch.nn.Module, Sliceable):
         """Restore NetStim dynamic state from :meth:`state_dict_for_checkpoint`.
 
         Important details for activation checkpointing:
-          • We rebind/clone any buffers that are mutated in-place during forward
-            (e.g., spike_counts, t_last) to avoid mutating checkpoint inputs.
-          • We rebind next_stoch_time directly in training mode to preserve its
-            autograd history (BPTT across chunks).
-          • We restore the torch.Generator state so stochastic renewal sampling
-            is replay-identical during backward recomputation.
+
+        - We rebind/clone any buffers that are mutated in-place during forward
+          (e.g., spike_counts, t_last) to avoid mutating checkpoint inputs.
+        - We rebind next_stoch_time directly in training mode to preserve its
+          autograd history (BPTT across chunks).
+        - We restore the torch.Generator state so stochastic renewal sampling
+          is replay-identical during backward recomputation.
 
         Parameters
         ----------

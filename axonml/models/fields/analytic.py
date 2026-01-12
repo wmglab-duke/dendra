@@ -35,7 +35,7 @@ class isotropic_point(Point):
     z : float, optional
         Z-coordinate of the point source in μm. Default is 0.0.
     rhoe : float, optional
-        Extracellular resistivity in Ω·cm. Default is 500.0.
+        Extracellular resistivity in Ω·cm. Default is 300.0.
 
     Notes
     -----
@@ -50,7 +50,7 @@ class isotropic_point(Point):
     is converted from μm to cm for calculation.
     """
 
-    Point.PARAMETER(x=0.0, y=0.0, z=0.0, rhoe=500.0)
+    Point.PARAMETER(x=0.0, y=0.0, z=0.0, rhoe=300.0)
 
     def fn(self, x, y, z):
         r = torch.sqrt((x - self.x) ** 2 + (y - self.y) ** 2 + (z - self.z) ** 2) * 1e-4
@@ -73,12 +73,11 @@ class anisotropic_point(Point):
     z : float, optional
         Z-coordinate of the point source in μm. Default is 0.0.
     rhox : float, optional
-        Resistivity in the x-direction in Ω·cm. Default is 500.0.
+        Resistivity in the x-direction in Ω·cm. Default is 300.0.
     rhoy : float, optional
-        Resistivity in the y-direction in Ω·cm. Default is 500.0.
+        Resistivity in the y-direction in Ω·cm. Default is 300.0.
     rhoz : float, optional
-        Resistivity in the z-direction in Ω·cm. Default is 500.0.
-
+        Resistivity in the z-direction in Ω·cm. Default is 300.0.
     Notes
     -----
     The potential is calculated using the anisotropic medium equation:
@@ -91,7 +90,7 @@ class anisotropic_point(Point):
     The result is in mV with an assumed unit current source.
     """
 
-    Point.PARAMETER(x=0.0, y=0.0, z=0.0, rhox=500.0, rhoy=500.0, rhoz=500.0)
+    Point.PARAMETER(x=0.0, y=0.0, z=0.0, rhox=300.0, rhoy=300.0, rhoz=300.0)
 
     def fn(self, x, y, z):
         # Convert distances from μm to cm (1e-4)

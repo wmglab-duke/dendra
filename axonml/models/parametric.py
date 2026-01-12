@@ -1,8 +1,9 @@
 """Parameter handling utilities and mixins for AxonML models."""
 
 import itertools
+import math
 from types import MethodType
-from typing import Callable
+from typing import Callable, Union
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +12,8 @@ from axonml.helpers import DEBUG, REQUIRE_GRAD, logger
 from axonml.utils import PreparedInterp1d
 
 from .rng import RNGModule
+
+_valid_param_type = Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
 
 
 def to_param(val, positive=False, requires_grad=None):
@@ -734,33 +737,46 @@ class SimpleParameterized(Referency):
         for key, value in self.flags.items():
             setattr(self, key, value)
 
-    def check_kwargs(self, kwargs):
+    @classmethod
+    def check_kwargs(cls, kwargs):
         """
-        Validate keyword arguments against declared parameters.
+        Validate keyword arguments against declared mechanism parameters.
 
         Parameters
         ----------
         kwargs : dict
-            Keyword arguments passed to the constructor.
+            Keyword arguments supplied to the initializer.
 
         Returns
         -------
         bool
-            True when all keys are known.
+            True when all names are valid.
 
         Raises
         ------
         ValueError
-            If an unexpected parameter name is encountered.
+            If an unexpected parameter name is provided.
         """
-        if not self._params:
-            return True
-        for key in kwargs:
-            if key not in self._params:
-                raise ValueError(
-                    f"Unknown parameter: {key} for {self.__class__.__name__}. Valid parameters are: {list(self._params.keys())}"
-                )
+        all_params = set(cls.all_parameter_names())
+        if all_params is not None:
+            for name in kwargs.keys():
+                if name not in all_params:
+                    raise ValueError(
+                        f"Unknown parameter {name}. Valid parameters are {all_params}."
+                    )
         return True
+
+    @classmethod
+    def all_parameter_names(cls):
+        """
+        Get all declared parameter names for the class.
+
+        Returns
+        -------
+        dict
+            Mapping from parameter names to default values.
+        """
+        return list(cls._params.keys())
 
     def instantiate_parameters(self, **kwargs):
         """
@@ -1370,6 +1386,74 @@ class Parameterized(SimpleParameterized):
             key = self.keys[name].to(buffer.device)
             buffer.view(-1).index_copy_(0, key, additional_params)
 
+    def parametrize(
+        self,
+        name: str,
+        value: _valid_param_type,
+        key: torch.LongTensor = None,
+        alias: str = None,
+    ):
+        """
+        Add or update an alias-specific parameter override.
+
+        Parameters
+        ----------
+        name : str
+            Name of the base parameter to override.
+        value : Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
+            New parameter value or module.
+        key : torch.LongTensor, optional
+            Flat indices where the override should be applied. If None, applies to all indices.
+        alias : str, optional
+            Alias name for the override. If None, a numeric suffix is used.
+
+        Examples
+        --------
+        >>> print(model.rhoa)  # Original parameter
+        tensor([[100., 100., 100.],
+                [100., 100., 100.]])
+        >>> model.parametrize('rhoa', 150.0)
+        >>> model.initialize() # Re-initialize to apply the override
+        >>> print(model.rhoa)  # Updated parameter
+        tensor([[150., 150., 150.],
+                [150., 150., 150.]])
+        >>> print(model.rhoa_0)  # Access the override parameter
+        tensor(150.)
+        """
+        if key is None:
+            return self.parametrize(
+                name, value, key=torch.arange(math.prod(self.shape_p)), alias=alias
+            )
+        if name in self.range:
+            if alias is None:
+                count = 0
+                while hasattr(self, f"{name}_{count}"):
+                    count += 1
+                alias = str(count)
+            p_name = f"{name}_{alias}"
+            if hasattr(self, p_name):
+                raise ValueError(
+                    f"Parameter override '{p_name}' already exists. Choose a different alias."
+                )
+            parameter = to_param(value)
+            if isinstance(parameter, torch.nn.Module):
+                p = parameter(torch.empty(self.shape_p))
+                parametrization = build_parametrization(
+                    parameter, p, key, self.shape_p[-2:]
+                )
+                self.register_parametrization_in_graph(name, parametrization)
+                setattr(self, p_name, parameter)
+            else:
+                setattr(self, p_name, parameter)
+                fill = create_param_expander(parameter, key, self.shape_p[-2:])
+                if name not in self.additional_parameters:
+                    self.additional_parameters[name] = []
+                self.additional_parameters[name].append((fill, getattr(self, p_name)))
+                if name not in self.keys:
+                    self.keys[name] = key.to(torch.long)
+                else:
+                    self.keys[name] = torch.cat([self.keys[name], key.to(torch.long)])
+
     def populate_parameter_buffers(self):
         """
         Reset parameter buffers to defaults, then apply overrides and parametrizations.
@@ -1418,7 +1502,7 @@ class Parameterized(SimpleParameterized):
                     f"Function '{func_name}' not found in class '{self.__class__.__name__}' for table instantiation."
                 )
             func = getattr(self, func_name)
-            x = torch.linspace(low, high, n)
+            x = torch.linspace(low, high, n, dtype=torch.float64)
             y = func(x).flatten()
             setattr(
                 self,
@@ -1430,7 +1514,7 @@ class Parameterized(SimpleParameterized):
                     exact_clamp=False,
                     learnable_y=learnable,
                     uniform="always",
-                ),
+                ).to(dtype=self.dtype(), device=self.device()),
             )
             setattr(self, f"usetable_{func_name}", True)
 
@@ -1451,39 +1535,44 @@ class Parameterized(SimpleParameterized):
             except Exception:
                 setattr(self, n, b.detach())
 
-    def check_kwargs(self, kwargs):
-        """
-        Validate keyword arguments against declared mechanism parameters.
-
-        Parameters
-        ----------
-        kwargs : dict
-            Keyword arguments supplied to the initializer.
-
-        Returns
-        -------
-        bool
-            True when all names are valid.
-
-        Raises
-        ------
-        ValueError
-            If an unexpected parameter name is provided.
-        """
-        _params = self.__class__._params
-        if _params is not None:
-            for name in kwargs.keys():
-                if name not in _params:
-                    raise ValueError(
-                        f"Unknown parameter {name}. Valid parameters are {list(_params.keys())}."
-                    )
-        return True
-
     def parameters_dict(self):
         """
         Returns a dictionary of all parameters in the model.
         """
         return {name: param for name, param in self.named_parameters()}
+
+    @classmethod
+    def all_parameter_names(cls):
+        """
+        Returns a list of all parameter names in the model.
+        """
+        return (
+            list(cls._params.keys())
+            + list(cls._global.keys())
+            + list(cls._range.keys())
+        )
+
+    def dtype(self):
+        """
+        Data type of the module's parameters.
+
+        Returns
+        -------
+        torch.dtype
+            Data type of the first registered parameter.
+        """
+        return next(iter(self.parameters())).dtype
+
+    def device(self):
+        """
+        Device hosting the module's parameters.
+
+        Returns
+        -------
+        torch.device
+            Device of the first registered parameter.
+        """
+        return next(iter(self.parameters())).device
 
 
 table_function_template = """

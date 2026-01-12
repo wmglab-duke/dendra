@@ -65,6 +65,22 @@ class ExtCellAxon(Axon):
         x = x - torch.sum(node_l, dim=1, keepdim=True) / 2
         return x.to(dtype)
 
+    def assemble_graphs(self):
+        """Export the axon morphology and parameters as a graph.
+
+        Returns
+        -------
+        networkx.Graph
+            Morphology graph with extracellular attributes.
+        """
+        graphs = super().assemble_graphs()
+        for i in range(self.n_ax):
+            for node in graphs[i].nodes:
+                graphs[i].nodes[node]["xraxial"] = self.xraxial[i, node].tolist()
+                graphs[i].nodes[node]["xc"] = self.xc[i, node].tolist()
+                graphs[i].nodes[node]["xg"] = self.xg[i, node].tolist()
+        return graphs
+
 
 def gather_extcell(graph, n_layers=2):
     """Collect extracellular parameters from a morphology graph.
@@ -218,3 +234,6 @@ class ExtCellTree(Tree):
         return cls.from_graph(
             graph, N=N, n_layers=n_layers, integrator=integrator, **kwargs
         )
+
+    def assemble_graphs(self):
+        return [self.graph]
