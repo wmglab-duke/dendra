@@ -63,6 +63,14 @@ class IndexSpec:
     is_scalar: bool
     shape: Tuple[int, ...]
 
+    def to_key(self, model) -> torch.LongTensor:
+        """Given a model with shape `shape_p`, return a flat key tensor."""
+        # Build a flat index map once and apply the slice directly.
+        base = torch.arange(
+            math.prod(model.shape_p), device=model.device(), dtype=torch.long
+        ).view(model.shape_p)
+        return base[self.index].reshape(-1)
+
 
 class Slice:
     """
@@ -557,6 +565,45 @@ class Slice:
             alias=alias,
             index_spec=object.__getattribute__(self, "index_spec"),
             **kwargs,
+        )
+
+    def parametrize(self, name, value, alias=None):
+        """
+        Add or update an alias-specific parameter override on this slice.
+
+        This method forwards to ``model.parametrize`` while passing along the
+        slice's :class:`IndexSpec`, so that only the selected compartments
+        receive the parameter override.
+
+        Parameters
+        ----------
+        name : str
+            Parameter name to override.
+        value : float, torch.Tensor, torch.nn.Parameter, or torch.nn.Module
+            New parameter value.
+        alias : str or None, optional
+            Optional mechanism alias to which the parameter applies. If
+            ``None``, the parameter is assumed to be a model-level parameter.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            # Override a model-level parameter in the soma
+            pop[:, 0].parametrize("rhoa", 150.0)
+
+            # Override a mechanism parameter in dendrites
+            pop[:, 1:].mech.pas.parametrize("g", 1e-4, alias="dend")
+        """
+        if self.is_empty:
+            return  # no-op for empty slices
+        model = object.__getattribute__(self, "model")
+        index_spec = object.__getattribute__(self, "index_spec")
+        model.parametrize(
+            name,
+            value,
+            key=index_spec.to_key(model),
+            alias=alias,
         )
 
     def label(self, name: str):

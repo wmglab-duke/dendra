@@ -380,7 +380,6 @@ class Population(P, Sliceable):
     def area(self):
         """
         Returns the area of the population.
-        This is a placeholder for future area-related functionality.
         """
         if self.graph is not None:
             area = get_area_from_graph(self.graph)
@@ -1450,7 +1449,8 @@ class Population(P, Sliceable):
 
     def populate_(self):
         """
-        In-place alias of :meth:`populate`.
+        "In-place" alias of :meth:`populate`. Same as :meth:`populate`, but
+        does not return self.
         """
         self.populate()
 
@@ -1495,11 +1495,14 @@ class Population(P, Sliceable):
         )
         self.t = self.t.zero_().detach()
         self.initialized = True
+        if force_rebuild:
+            self.integrator.initialized = False
         return self
 
     def initialize_(self):
         """
-        In-place alias of :meth:`initialize`.
+        "In-place" alias of :meth:`initialize`. Same as :meth:`initialize`, but
+        does not return self.
         """
         self.initialize()
 
@@ -2053,7 +2056,8 @@ class Population(P, Sliceable):
 
     def build_(self, force_rebuild=False):
         """
-        In-place alias of :meth:`build`.
+        "In-place" alias of :meth:`build`. Same as :meth:`build`,
+        but does not return self.
 
         Parameters
         ----------
@@ -2076,7 +2080,8 @@ class Population(P, Sliceable):
 
     def detach_(self):
         """
-        In-place alias of :meth:`detach`.
+        "In-place" alias of :meth:`detach`. Same as :meth:`detach`,
+        but does not return self.
         """
         self.detach()
 
@@ -3057,12 +3062,14 @@ class Axon(Population):
         """
         graphs = []
         for i in range(self.n_ax):
-            G = nx.path_graph(self.n_comp).to_directed()
+            G = nx.path_graph(self.n_comp, create_using=nx.DiGraph)
             for node in G.nodes:
-                G.nodes[node]["name"] = f"axon[{i}]({node / (self.n_comp - 1):.2f})"
+                G.nodes[node]["name"] = (
+                    f"{self.__class__.__name__}[{i}]({node / (self.n_comp - 1):.2f})"
+                )
                 G.nodes[node]["x"] = self.x[i, node].item()
-                G.nodes[node]["y"] = 0.0
-                G.nodes[node]["z"] = 0.0
+                G.nodes[node]["y"] = self.y[i, node].item()
+                G.nodes[node]["z"] = self.z[i, node].item()
                 G.nodes[node]["diam"] = self.diam[i, node].item()
                 G.nodes[node]["L"] = self.dx[i, node].item()
                 G.nodes[node]["Ra"] = self.rhoa[i, node].item()

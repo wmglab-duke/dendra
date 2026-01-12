@@ -624,7 +624,19 @@ def vis_voltage_3d(x, y, z, voltage, height=800, width=None):
     fig.show()
 
 
-def vis_voltage_2d(x, y, z, voltage, view="y", node_scale=8, dpi=200):
+def vis_voltage_2d(
+    x,
+    y,
+    z,
+    voltage,
+    view="y",
+    node_scale=8,
+    dpi=200,
+    fig=None,
+    cbar=True,
+    cmap=None,
+    norm=None,
+):
     """
     Visualizes 3D voltage data in a 2D projection using matplotlib.
 
@@ -640,29 +652,50 @@ def vis_voltage_2d(x, y, z, voltage, view="y", node_scale=8, dpi=200):
         Factor that converts diam (µm) to matplotlib marker area points².
     dpi : int, optional
         The resolution of the figure in dots per inch.
+    fig : matplotlib.figure.Figure, optional
+        If provided, plot into this figure; otherwise create a new one.
+    cbar : bool, optional
+        Whether to display a colorbar. Default is True.
+    cmap : matplotlib.colors.Colormap, optional
+        Colormap to use for voltage values. Default is 'viridis'.
+    norm : matplotlib.colors.Normalize, optional
+        Normalization for the colormap. Default is None.
     """
-    fig, ax = plt.subplots(dpi=dpi, figsize=(8, 8))
+    if fig is None:
+        fig, ax = plt.subplots(dpi=dpi, figsize=(8, 8))
+    else:
+        ax = fig.gca()
+
+    if cmap is None:
+        cmap = plt.get_cmap("viridis")
 
     # We will capture the output of ax.scatter into a variable, let's call it `sc`.
     if view == "z":
-        sc = ax.scatter(x, y, c=voltage, s=node_scale * 10, cmap="viridis", alpha=0.7)
+        sc = ax.scatter(
+            x, y, c=voltage, s=node_scale * 10, cmap=cmap, norm=norm, alpha=0.7
+        )
         ax.set_xlabel("x (µm)")
         ax.set_ylabel("y (µm)")
     elif view == "y":
-        sc = ax.scatter(x, z, c=voltage, s=node_scale * 10, cmap="viridis", alpha=0.7)
+        sc = ax.scatter(
+            x, z, c=voltage, s=node_scale * 10, cmap=cmap, norm=norm, alpha=0.7
+        )
         ax.set_xlabel("x (µm)")
         ax.set_ylabel("z (µm)")
     elif view == "x":
-        sc = ax.scatter(y, z, c=voltage, s=node_scale * 10, cmap="viridis", alpha=0.7)
+        sc = ax.scatter(
+            y, z, c=voltage, s=node_scale * 10, cmap=cmap, norm=norm, alpha=0.7
+        )
         ax.set_xlabel("y (µm)")
         ax.set_ylabel("z (µm)")
     else:
         raise ValueError("view must be 'x', 'y', or 'z'")
 
-    fig.colorbar(sc, label="Voltage (mV)", ax=ax)
+    if cbar:
+        fig.colorbar(sc, label="Voltage (mV)", ax=ax)
 
     fig.tight_layout()
-    plt.show()
+    return fig, ax
 
 
 def _relabel_longitude_ticks(

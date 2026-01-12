@@ -961,6 +961,46 @@ class Mechanism(Parameterized):
             state_module.usetables(value)
         super().usetables(value)
 
+    @classmethod
+    def all_mech_parameter_names(cls):
+        """
+        Collect all parameter names declared by the mechanism class.
+
+        Returns
+        -------
+        list of str
+            Names of parameters registered in ``cls._parameters``.
+        """
+        param_names = {}
+        param_names["mechanism"] = cls.all_parameter_names()
+        for state_module in cls._state:
+            param_names[state_module.__name__] = state_module.all_parameter_names()
+        return param_names
+
+    @classmethod
+    def check_kwargs(cls, kwargs):
+        """
+        Check for unexpected keyword arguments.
+
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments to validate.
+
+        Raises
+        ------
+        ValueError
+            If any unexpected keyword arguments are found.
+        """
+        valid_keys = set()
+        for state_module in cls._state:
+            valid_keys.update(state_module.all_parameter_names())
+        valid_keys.update(cls.all_parameter_names())
+
+        for key in kwargs.keys():
+            if key not in valid_keys:
+                raise ValueError(f"Unexpected keyword argument: {key}")
+
 
 class VoltageProcess(Mechanism):
     """
@@ -1030,8 +1070,7 @@ class Synapse(Mechanism):
         .. code-block:: python
 
             def net_receive(self, weights, netcon):
-                g_syn = self._buffers[\"g_syn\"] + weights
-                self._buffers[\"g_syn\"] = g_syn
+                self.g_syn = self.g_syn + weights
 
         Parameters
         ----------

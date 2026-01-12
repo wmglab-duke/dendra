@@ -52,14 +52,16 @@ def gather_membrane(graph):
     dict
         Mapping from attribute names to tensors shaped ``(1, n_comp)``.
     """
-    rhoa, cm = [], []
+    rhoa, cm, area = [], [], []
     for i in range(len(graph.nodes)):
         attrs = graph.nodes[i]
         rhoa.append(attrs.get("Ra"))
         cm.append(attrs.get("cm"))
+        area.append(attrs.get("area"))
     return {
         "rhoa": torch.tensor(rhoa).unsqueeze(0),
         "cm": torch.tensor(cm).unsqueeze(0),
+        "area": torch.tensor(area).unsqueeze(0),
     }
 
 
