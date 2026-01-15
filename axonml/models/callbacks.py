@@ -1105,6 +1105,9 @@ class ActiveAL(APCount):
     at_least : int, optional
         Minimum number of threshold crossings required to mark an axon as active.
         Default is 1.
+    inv : bool, optional
+        If True, inverts the active detection (marks axons as inactive if they
+        meet the threshold). Default is False.
 
     See Also
     --------
@@ -1176,6 +1179,9 @@ class Active(ThresholdCallback):
         (check at node 5 from beginning and node 5 from end).
     dt : float, optional
         Time step in ms. If None, uses the default from backend. Default is None.
+    inv : bool, optional
+        If True, inverts the active detection (marks axons as inactive if they
+        fired). Default is False.
 
     See Also
     --------
