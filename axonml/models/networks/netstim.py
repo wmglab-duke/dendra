@@ -3,6 +3,7 @@ from typing import Iterable, Optional
 
 import torch
 
+from ..modular import AxModule
 from ..parametric import PositiveParam
 from ..slice import Sliceable
 
@@ -14,7 +15,7 @@ def _ste_gate(x, tau):
     return gate, hard
 
 
-class NetStim(torch.nn.Module, Sliceable):
+class NetStim(AxModule, Sliceable):
     """
     Differentiable spike generator modeled after NEURON's NetStim.
 

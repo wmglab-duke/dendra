@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from axonml.helpers import DEBUG, REQUIRE_GRAD, logger
 from axonml.utils import PreparedInterp1d
 
+from .modular import AxModule
 from .rng import RNGModule
 
 _valid_param_type = Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
@@ -659,7 +660,7 @@ def add_instance_property(obj, name, func):
     obj.__class__ = sub  # replace the instance’s class in‑place
 
 
-class Referency(torch.nn.Module):
+class Referency(AxModule):
     """Mixin that allows modules to expose dynamic property references."""
 
     def setreference(self, name, func):
