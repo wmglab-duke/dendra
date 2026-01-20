@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from axonml.helpers import DEBUG, REQUIRE_GRAD, logger
 from axonml.utils import PreparedInterp1d
 
-from .modular import AxModule
+from .modular import AxModule, matches_any_pattern
 from .rng import RNGModule
 
 _valid_param_type = Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
@@ -857,13 +857,17 @@ class SimpleParameterized(Referency):
             If an unknown parameter name is provided.
         """
         for key, value in kwargs.items():
-            if not hasattr(self, key):
-                raise ValueError(f"Unknown parameter {key}.")
-            param = getattr(self, key)
-            if not isinstance(param, torch.nn.Parameter):
-                raise ValueError(f"Attribute {key} is not a parameter.")
-            with torch.no_grad():
-                param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
+            if key in self._params:
+                param = getattr(self, key)
+                if isinstance(param, torch.nn.Parameter):
+                    with torch.no_grad():
+                        param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
+                    continue
+            else:
+                for param_name, param in self.named_parameters():
+                    if matches_any_pattern([key], param_name):
+                        with torch.no_grad():
+                            param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
 
 
 def check_conflicts(
