@@ -4,6 +4,10 @@
 > 💡 We recommend using a dedicated environment (e.g., `conda`) for AxonML.
 > AxonML targets Python 3.11+; the examples below use Python 3.12.
 
+```{note}
+On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best compatibility.
+```
+
 ## Prerequisites
 
 - Python 3.11 or newer
@@ -32,7 +36,9 @@
    # python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
    ```
 
-3. Clone the repository and install AxonML:
+3. (Windows without WSL2) If you are using Windows without WSL2, install NEURON using the precompiled installer from https://neuron.yale.edu/neuron/download.
+
+4. Clone the repository and install AxonML:
 
    ```sh
    git clone https://gitlab.oit.duke.edu/mah148/axonml.git
