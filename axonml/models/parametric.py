@@ -842,6 +842,29 @@ class SimpleParameterized(Referency):
         """
         return ", ".join(f"{k}={v}" for k, v in self.named_parameters())
 
+    def parameter_set_(self, **kwargs):
+        """
+        Update parameter values in place.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping from parameter names to new values.
+
+        Raises
+        ------
+        ValueError
+            If an unknown parameter name is provided.
+        """
+        for key, value in kwargs.items():
+            if not hasattr(self, key):
+                raise ValueError(f"Unknown parameter {key}.")
+            param = getattr(self, key)
+            if not isinstance(param, torch.nn.Parameter):
+                raise ValueError(f"Attribute {key} is not a parameter.")
+            with torch.no_grad():
+                param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
+
 
 def check_conflicts(
     global_params,
