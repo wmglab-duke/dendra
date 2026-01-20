@@ -15,6 +15,17 @@ __all__ = [
 ]
 
 
+def _rect_gate(t, start, stop, tau, inclusive_stop=False):
+    tau = torch.clamp(tau, min=1e-6)
+    soft = torch.sigmoid((t - start) / tau) * torch.sigmoid((stop - t) / tau)
+    if inclusive_stop:
+        hard = ((t >= start) & (t <= stop)).to(soft.dtype)
+    else:
+        hard = ((t >= start) & (t < stop)).to(soft.dtype)
+    # Straight-through gate: hard in forward, soft for gradients.
+    return hard + (soft - soft.detach())
+
+
 class sin(Waveform):
     """
     Sinusoidal waveform generator.
@@ -134,6 +145,8 @@ class mono_rect(Waveform):
         Time delay before the pulse starts in ms. Default is 0.0.
     pw : float, optional
         Width of the pulse in ms. Default is 1.0.
+    tau : float, optional
+        Sigmoid temperature for differentiable edges in ms. Default is 0.1.
 
     Notes
     -----
@@ -155,12 +168,11 @@ class mono_rect(Waveform):
     >>> values = waveform(t)
     """
 
-    Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0)
+    Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0, tau=0.1)
 
     def fn(self, t):
-        return self.amp * torch.where(
-            (t >= self.delay) & (t < self.delay + self.pw), 1.0, 0.0
-        )
+        gate = _rect_gate(t, self.delay, self.delay + self.pw, self.tau)
+        return self.amp * gate
 
 
 class bi_rect(Waveform):
@@ -185,6 +197,8 @@ class bi_rect(Waveform):
         Pulse width of the second phase in ms. Default is 1.0.
     interval : float, optional
         Time interval between the two phases in ms. Default is 0.0.
+    tau : float, optional
+        Sigmoid temperature for differentiable edges in ms. Default is 0.1.
 
     Notes
     -----
@@ -207,17 +221,24 @@ class bi_rect(Waveform):
     >>> values = waveform(t)
     """
 
-    Waveform.PARAMETER(amp1=-1.0, amp2=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0)
+    Waveform.PARAMETER(
+        amp1=-1.0,
+        amp2=1.0,
+        delay=0.0,
+        pw1=1.0,
+        pw2=1.0,
+        interval=0.0,
+        tau=0.1,
+    )
 
     def fn(self, t):
-        return self.amp1 * torch.where(
-            (t >= self.delay) & (t <= self.delay + self.pw1), 1.0, 0.0
-        ) + self.amp2 * torch.where(
-            (t >= self.delay + self.pw1 + self.interval)
-            & (t <= self.delay + self.pw1 + self.interval + self.pw2),
-            1.0,
-            0.0,
-        )
+        t1_start = self.delay
+        t1_stop = self.delay + self.pw1
+        t2_start = self.delay + self.pw1 + self.interval
+        t2_stop = t2_start + self.pw2
+        gate1 = _rect_gate(t, t1_start, t1_stop, self.tau, inclusive_stop=True)
+        gate2 = _rect_gate(t, t2_start, t2_stop, self.tau, inclusive_stop=True)
+        return self.amp1 * gate1 + self.amp2 * gate2
 
 
 class bi_rect_balanced(Waveform):
@@ -240,6 +261,8 @@ class bi_rect_balanced(Waveform):
         Pulse width of the second phase in ms. Default is 1.0.
     interval : float, optional
         Time interval between the two phases in ms. Default is 0.0.
+    tau : float, optional
+        Sigmoid temperature for differentiable edges in ms. Default is 0.1.
 
     Notes
     -----
@@ -267,17 +290,17 @@ class bi_rect_balanced(Waveform):
     >>> values = waveform(t)
     """
 
-    Waveform.PARAMETER(amp=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0)
+    Waveform.PARAMETER(amp=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0, tau=0.1)
 
     def fn(self, t):
-        return self.amp * torch.where(
-            (t >= self.delay) & (t <= self.delay + self.pw1), 1.0, 0.0
-        ) - self.amp / (self.pw1 / self.pw2) * torch.where(
-            (t >= self.delay + self.pw1 + self.interval)
-            & (t <= self.delay + self.pw1 + self.interval + self.pw2),
-            1.0,
-            0.0,
-        )
+        t1_start = self.delay
+        t1_stop = self.delay + self.pw1
+        t2_start = self.delay + self.pw1 + self.interval
+        t2_stop = t2_start + self.pw2
+        gate1 = _rect_gate(t, t1_start, t1_stop, self.tau, inclusive_stop=True)
+        gate2 = _rect_gate(t, t2_start, t2_stop, self.tau, inclusive_stop=True)
+        amp2 = -self.amp / (self.pw1 / self.pw2)
+        return self.amp * gate1 + amp2 * gate2
 
 
 class bi_rect_symm(Waveform):
@@ -297,6 +320,8 @@ class bi_rect_symm(Waveform):
         Pulse width for each phase in ms. Default is 1.0.
     interval : float, optional
         Time interval between the two phases in ms. Default is 0.0.
+    tau : float, optional
+        Sigmoid temperature for differentiable edges in ms. Default is 0.1.
 
     Notes
     -----
@@ -322,17 +347,16 @@ class bi_rect_symm(Waveform):
     >>> values = waveform(t)
     """
 
-    Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0, interval=0.0)
+    Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0, interval=0.0, tau=0.1)
 
     def fn(self, t):
-        return self.amp * torch.where(
-            (t >= self.delay) & (t <= self.delay + self.pw), 1.0, 0.0
-        ) - self.amp * torch.where(
-            (t >= self.delay + self.pw + self.interval)
-            & (t <= self.delay + 2 * self.pw + self.interval),
-            1.0,
-            0.0,
-        )
+        t1_start = self.delay
+        t1_stop = self.delay + self.pw
+        t2_start = self.delay + self.pw + self.interval
+        t2_stop = self.delay + 2 * self.pw + self.interval
+        gate1 = _rect_gate(t, t1_start, t1_stop, self.tau, inclusive_stop=True)
+        gate2 = _rect_gate(t, t2_start, t2_stop, self.tau, inclusive_stop=True)
+        return self.amp * gate1 - self.amp * gate2
 
 
 class arbitrary(Waveform):
