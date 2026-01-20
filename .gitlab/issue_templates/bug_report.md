@@ -21,6 +21,17 @@ in a more recent version)
 
 (What you should see instead)
 
+## Environment
+
+- OS:
+- Python version:
+- PyTorch version:
+- AxonML version:
+- AxonML commit (if from source):
+- CPU:
+- GPU:
+- Installation method (pip/conda/source):
+
 ## Relevant logs and/or screenshots
 
 (Paste any relevant logs - use code blocks (```) to format console output, logs, and code, as
