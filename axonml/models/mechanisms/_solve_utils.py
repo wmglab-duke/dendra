@@ -223,6 +223,8 @@ def modify_operations(
         tokenize.STRING,
         tokenize.ERRORTOKEN,
     }
+    fstring_start = getattr(tokenize, "FSTRING_START", None)
+    fstring_end = getattr(tokenize, "FSTRING_END", None)
 
     def next_sig(idx):
         j = idx + 1
@@ -242,9 +244,9 @@ def modify_operations(
         ttype, tstr, (sl, sc), (el, ec), _ = tok
 
         # Track f-string expression nesting
-        if ttype == tokenize.FSTRING_START:
+        if fstring_start is not None and ttype == fstring_start:
             fdepth += 1
-        elif ttype == tokenize.FSTRING_END:
+        elif fstring_end is not None and ttype == fstring_end:
             fdepth -= 1
 
         # Absolute positions in the *original* source
