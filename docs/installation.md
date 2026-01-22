@@ -31,6 +31,7 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 
    ```{important}
    If installing on Windows without WSL2, please follow PyTorch installation instructions [here](https://docs.pytorch.org/tutorials/unstable/inductor_windows.html) to ensure proper setup of the PyTorch Inductor backend (used by AxonML for JIT-compilation of models).
+   ```
 
    ```sh
    # e.g., GPU build (Pytorch 2.8.0, CUDA 12.9)
