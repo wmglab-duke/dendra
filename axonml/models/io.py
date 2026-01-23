@@ -216,6 +216,7 @@ def neuron_to_axonml_graph(
     attach_objects: bool = True,
     data_func=None,
     extcell=None,
+    exclude=None,
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """
     Build a directed acyclic graph whose nodes are NEURON compartments.
@@ -277,9 +278,13 @@ def neuron_to_axonml_graph(
     # 1. depth‑first traversal --------------------------------------------------
     stack, visited = list(roots), set()
 
+    if exclude is not None:
+        exclude_set = set(exclude)
+        stack = [sec for sec in stack if sec not in exclude_set]
+
     while stack:
         sec = stack.pop()
-        if sec in visited:
+        if sec in visited or (exclude is not None and sec in exclude_set):
             continue
         visited.add(sec)
 
