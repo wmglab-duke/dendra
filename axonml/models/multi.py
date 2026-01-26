@@ -75,9 +75,9 @@ def concat_models(
         populations, threads=threads, write_back=write_back
     )
     # concatenate x, y, z
-    x = torch.cat([pop.x.flatten() for pop in populations.values()], dim=1)
-    y = torch.cat([pop.y.flatten() for pop in populations.values()], dim=1)
-    z = torch.cat([pop.z.flatten() for pop in populations.values()], dim=1)
+    x = torch.cat([pop.x.flatten() for pop in populations.values()])
+    y = torch.cat([pop.y.flatten() for pop in populations.values()])
+    z = torch.cat([pop.z.flatten() for pop in populations.values()])
     mp = MultiPopulation(
         integrator=integrator,
         celsius=celsius,
@@ -139,7 +139,7 @@ class MultiPopulation(Population):
         C = sum(math.prod(pop.shape) for pop in populations.values())
         super().__init__(1, C, integrator=integrator, celsius=celsius)
 
-        self.populations = populations
+        self.populations = torch.nn.ModuleDict(populations)
 
         for pop in self.populations.values():
             self._equilibria.update(pop._equilibria)
@@ -156,6 +156,7 @@ class MultiPopulation(Population):
         self.register_buffer("v_init", v_init)
 
         self.reinsert_all()
+        self.reinject_all()
         self.register_labels()
 
     def __iter__(self):
@@ -181,6 +182,13 @@ class MultiPopulation(Population):
                 getattr(self, label_name)[
                     :, flatten_key(pop.numel(), pop.shape, slice.index)
                 ].label(label)
+
+    def reinject_all(self):
+        """Reinject intracellular currents for all component populations."""
+        all_indices = indices(self.populations)
+        for index, (name, pop) in zip(all_indices, self.populations.items()):
+            for stim, _, idx in pop.injections:
+                self[:, key_to_flat_index(index, idx)].inject(stim)
 
     def reinsert_all(self):
         """Recreate mechanisms for all component populations."""

@@ -14,6 +14,7 @@ API Reference
    api/axonml.models.mechanisms
    api/axonml.models.mod
    api/axonml.models.networks
+   api/axonml.models.parametric
    api/axonml.models.slice
    api/axonml.models.stim
    api/axonml.const
