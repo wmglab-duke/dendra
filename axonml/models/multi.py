@@ -10,7 +10,7 @@ from .integrators import bwd_euler_sc_multi, dhs_multi
 from .tree import Tree
 
 
-def assess_type_and_make_integrator(populations, threads=16, write_back=True):
+def _assess_type_and_make_integrator(populations, threads=16, write_back=True):
     """Select an integrator compatible with the provided populations.
 
     Parameters
@@ -71,7 +71,7 @@ def concat_models(
         Combined population.
     """
     _check_celsius(celsius, populations)
-    integrator = assess_type_and_make_integrator(
+    integrator = _assess_type_and_make_integrator(
         populations, threads=threads, write_back=write_back
     )
     # concatenate x, y, z
@@ -135,9 +135,17 @@ class MultiPopulation(Population):
         if any(b.is_batched() for b in populations.values()):
             raise ValueError("All populations must be unbatched.")
         if integrator is None:
-            integrator = assess_type_and_make_integrator(populations)
+            integrator = _assess_type_and_make_integrator(populations)
         C = sum(math.prod(pop.shape) for pop in populations.values())
         super().__init__(1, C, integrator=integrator, celsius=celsius)
+
+        # check all populations are on the same device/dtype
+        devices = {pop.device() for pop in populations.values()}
+        dtypes = {pop.dtype() for pop in populations.values()}
+        if len(devices) > 1:
+            raise ValueError("All populations must be on the same device.")
+        if len(dtypes) > 1:
+            raise ValueError("All populations must be of the same dtype.")
 
         self.populations = torch.nn.ModuleDict(populations)
 
@@ -154,6 +162,11 @@ class MultiPopulation(Population):
             dim=0,
         ).unsqueeze(0)
         self.register_buffer("v_init", v_init)
+
+        if all(hasattr(pop, "names") for pop in self.populations.values()):
+            self.names = []
+            for name, pop in self.populations.items():
+                self.names.extend([f"{name}.{n}" for n in pop.names])
 
         self.reinsert_all()
         self.reinject_all()

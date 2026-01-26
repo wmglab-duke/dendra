@@ -98,8 +98,6 @@ class Tree(Population):
             for i in range(len(graph.nodes)):
                 attrs = graph.nodes[i]
                 name = attrs.get("name")
-                if "branchpoint" in name:
-                    name = name.replace("_", ".")
                 names.append(name)
         self.names = names
 
