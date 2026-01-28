@@ -295,7 +295,7 @@ def test_assign_precedence_no_defined_anywhere_fallback_order():
 
 
 # ---- Parameterized: GLOBAL/RANGE, buffers, additional params, parametrizations ----
-def test_parameterized_global_and_range_instantiation_and_defaults():
+def test_parameterized_global_and_range_instantiation_and_params():
     M.Parameterized.GLOBAL(alpha=1.5, config={"w": 3.0, "b": 5.0})
     M.Parameterized.RANGE(beta=2.0)
 
@@ -304,7 +304,7 @@ def test_parameterized_global_and_range_instantiation_and_defaults():
 
     w = W(shape=(2, 3), shape_f=(2, 3))
     # global scalar
-    assert isinstance(getattr(w, "alpha_default"), torch.nn.Parameter)
+    assert isinstance(getattr(w, "alpha_param"), torch.nn.Parameter)
     assert torch.allclose(getattr(w, "alpha"), torch.tensor(1.5))
     # global dict -> ParameterDict + individual parameters
     assert isinstance(getattr(w, "config"), torch.nn.ParameterDict)
@@ -313,7 +313,7 @@ def test_parameterized_global_and_range_instantiation_and_defaults():
     # range buffer and default
     assert getattr(w, "beta").shape == (2, 3)
     assert torch.allclose(getattr(w, "beta"), torch.full((2, 3), 2.0))
-    assert isinstance(getattr(w, "beta_default"), torch.nn.Parameter)
+    assert isinstance(getattr(w, "beta_param"), torch.nn.Parameter)
 
 
 def test_parameterized_additional_parameters_tensor_and_module_and_apply():
@@ -352,7 +352,7 @@ def test_parameterized_additional_parameters_tensor_and_module_and_apply():
     )
 
 
-def test_populate_resets_to_defaults_then_applies_again():
+def test_populate_resets_to_params_then_applies_again():
     H, W = 2, 3
     M.Parameterized.RANGE(r=5.0)
 
@@ -398,9 +398,9 @@ def test_parameters_dict_contains_named_parameters():
 
     w = W(shape=(1, 1), shape_f=(1, 1))
     d = w.parameters_dict()
-    # contains a_default and b_default (the actual nn.Parameters)
-    assert "a_default" in d and "b_default" in d
-    assert isinstance(d["a_default"], torch.nn.Parameter)
+    # contains a_param and b_param (the actual nn.Parameters)
+    assert "a_param" in d and "b_param" in d
+    assert isinstance(d["a_param"], torch.nn.Parameter)
 
 
 # ---- build_parametrization --------------------------------------------------------
