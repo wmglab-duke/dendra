@@ -1052,9 +1052,17 @@ class Parameterized(SimpleParameterized):
     _global_defined_here = {}
     _global_declarations = []
 
+    _global_p = {}
+    _global_p_defined_here = {}
+    _global_p_declarations = []
+
     _range = {}
     _range_defined_here = {}
     _range_declarations = []
+
+    _range_p = {}
+    _range_p_defined_here = {}
+    _range_p_declarations = []
 
     _rng = {}
     _rng_defined_here = {}
@@ -1075,7 +1083,9 @@ class Parameterized(SimpleParameterized):
 
         # Start with a fresh dictionary for the new class's parameters.
         new_global = {}
+        new_global_p = {}
         new_range = {}
+        new_range_p = {}
         new_rng = {}
         new_table = {}
 
@@ -1084,15 +1094,21 @@ class Parameterized(SimpleParameterized):
             # We look for _global, _range, _rng attributes defined directly on the base
             if "_global" in base.__dict__:
                 new_global.update(base._global)
+            if "_global_p" in base.__dict__:
+                new_global_p.update(base._global_p)
             if "_range" in base.__dict__:
                 new_range.update(base._range)
+            if "_range_p" in base.__dict__:
+                new_range_p.update(base._range_p)
             if "_rng" in base.__dict__:
                 new_rng.update(base._rng)
             if "_table" in base.__dict__:
                 new_table.update(base._table)
 
         cls._global_defined_here = {}
+        cls._global_p_defined_here = {}
         cls._range_defined_here = {}
+        cls._range_p_defined_here = {}
         cls._rng_defined_here = {}
         cls._table_defined_here = {}
 
@@ -1101,11 +1117,21 @@ class Parameterized(SimpleParameterized):
             for p_dict in Parameterized._global_declarations:
                 cls._global_defined_here.update(p_dict)
             Parameterized._global_declarations = []  # Clear for next class
+        # Add parameters declared via the GLOBALP() method
+        if Parameterized._global_p_declarations:
+            for p_dict in Parameterized._global_p_declarations:
+                cls._global_p_defined_here.update(p_dict)
+            Parameterized._global_p_declarations = []
         # Add range declarations
         if Parameterized._range_declarations:
             for r_dict in Parameterized._range_declarations:
                 cls._range_defined_here.update(r_dict)
             Parameterized._range_declarations = []
+        # Add parameters declared via the RANGEP() method
+        if Parameterized._range_p_declarations:
+            for r_dict in Parameterized._range_p_declarations:
+                cls._range_p_defined_here.update(r_dict)
+            Parameterized._range_p_declarations = []
         # Add rng declarations
         if Parameterized._rng_declarations:
             for rng_dict in Parameterized._rng_declarations:
@@ -1119,13 +1145,17 @@ class Parameterized(SimpleParameterized):
 
         # Update the new global and range dictionaries with the class-specific declarations
         new_global.update(cls._global_defined_here)
+        new_global_p.update(cls._global_p_defined_here)
         new_range.update(cls._range_defined_here)
+        new_range_p.update(cls._range_p_defined_here)
         new_rng.update(cls._rng_defined_here)
         new_table.update(cls._table_defined_here)
 
         check_conflicts(
             cls._global_defined_here,
             cls._range_defined_here,
+            cls._global_p_defined_here,
+            cls._range_p_defined_here,
             cls._params_defined_here,
             cls._rng_defined_here,
             cls._table_defined_here,
@@ -1134,10 +1164,14 @@ class Parameterized(SimpleParameterized):
         # Add parameters from class definition keywords (e.g., a=10)
         # These will override anything set by parents.
         new_global.update({k: v for k, v in kwargs.items() if k in new_global})
+        new_global_p.update({k: v for k, v in kwargs.items() if k in new_global_p})
         new_range.update({k: v for k, v in kwargs.items() if k in new_range})
+        new_range_p.update({k: v for k, v in kwargs.items() if k in new_range_p})
 
         cls._global = new_global
+        cls._global_p = new_global_p
         cls._range = new_range
+        cls._range_p = new_range_p
         cls._rng = new_rng
         cls._table = new_table
 
@@ -1157,6 +1191,19 @@ class Parameterized(SimpleParameterized):
         Parameterized._global_declarations.append(kwargs)
 
     @staticmethod
+    def GLOBALP(**kwargs):
+        """
+        Declare scalar (compartment-independent) strictly positive parameters.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            once per instance and broadcast across compartments.
+        """
+        Parameterized._global_p_declarations.append(kwargs)
+
+    @staticmethod
     def RANGE(**kwargs):
         """
         Declare per-compartment parameters (range variables).
@@ -1168,6 +1215,19 @@ class Parameterized(SimpleParameterized):
             with shape matching the population ``shape_p``.
         """
         Parameterized._range_declarations.append(kwargs)
+
+    @staticmethod
+    def RANGEP(**kwargs):
+        """
+        Declare per-compartment strictly positive parameters (range variables).
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            with shape matching the population ``shape_p``.
+        """
+        Parameterized._range_p_declarations.append(kwargs)
 
     @staticmethod
     def RNG(*args, **kwargs):
@@ -1243,7 +1303,9 @@ class Parameterized(SimpleParameterized):
             raise TypeError(f"error assigning shape {shape!r}") from e
 
         self.globals = self.__class__._global.copy()
+        self.globals_p = self.__class__._global_p.copy()
         self.range = self.__class__._range.copy()
+        self.range_p = self.__class__._range_p.copy()
         self.rng = self.__class__._rng.copy()
 
         self.in_graph_parametrizations = {}
@@ -1255,11 +1317,19 @@ class Parameterized(SimpleParameterized):
             self.range = {
                 key: kwargs.get(key, value) for key, value in self.range.items()
             }
+            self.globals_p = {
+                key: kwargs.get(key, value) for key, value in self.globals_p.items()
+            }
+            self.range_p = {
+                key: kwargs.get(key, value) for key, value in self.range_p.items()
+            }
 
         self.keys = {}
         self.additional_parameters = {}
         self.instantiate_global(**self.globals)
+        self.instantiate_global(positive=True, **self.globals_p)
         self.instantiate_range(**self.range)
+        self.instantiate_range(positive=True, **self.range_p)
         self.instantiate_rng(**self.rng)
         self.instantiate_additional_parameters(additional_parameters)
 
@@ -1278,7 +1348,7 @@ class Parameterized(SimpleParameterized):
         self.shape_f = shape_f
         self.instantiate_range(**self.range)
 
-    def instantiate_global(self, **kwargs):
+    def instantiate_global(self, positive=False, **kwargs):
         """
         Instantiate global (scalar) parameters and default buffers.
 
@@ -1292,15 +1362,15 @@ class Parameterized(SimpleParameterized):
                 if isinstance(value, dict):
                     setattr(self, name, torch.nn.ParameterDict())
                     for pname, pval in value.items():
-                        setattr(self, pname, to_param(pval))
+                        setattr(self, pname, to_param(pval, positive=positive))
                         getattr(self, name)[pname] = getattr(self, pname)
                 else:
                     p_name = f"{name}_default"
-                    setattr(self, p_name, to_param(value))
+                    setattr(self, p_name, to_param(value, positive=positive))
                     self.register_buffer(name, torch.empty(()))
                     getattr(self, name).copy_(getattr(self, p_name))
 
-    def instantiate_range(self, **kwargs):
+    def instantiate_range(self, positive=False, **kwargs):
         """
         Instantiate range parameters over the population shape.
 
@@ -1312,7 +1382,7 @@ class Parameterized(SimpleParameterized):
         if kwargs is not None:
             for name, value in kwargs.items():
                 p_name = f"{name}_default"
-                setattr(self, p_name, to_param(value))
+                setattr(self, p_name, to_param(value, positive=positive))
                 self.register_buffer(name, torch.empty(self.shape_p))
                 getattr(self, name).copy_(getattr(self, p_name))
 
