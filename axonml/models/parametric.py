@@ -861,6 +861,28 @@ class SimpleParameterized(Referency):
         """
         return next(iter(self.parameters())).device
 
+    def evaluate(self, parameter_name: str):
+        """
+        Evaluate and return the value of a parameter by name.
+
+        Parameters
+        ----------
+        parameter_name : str
+            Name of the parameter to retrieve.
+
+        Returns
+        -------
+        torch.Tensor
+            The value of the requested parameter.
+        """
+        p = getattr(self, parameter_name)
+        if isinstance(p, torch.nn.Parameter):
+            return p
+        elif isinstance(p, torch.nn.Module):
+            return p()
+        else:
+            return p
+
     def __repr__(self):
         return f"{self.__class__.__name__}({self.parameters_repr()})"
 
@@ -1386,28 +1408,6 @@ class Parameterized(SimpleParameterized):
         self.shape_p = shape_p
         self.shape_f = shape_f
         self.instantiate_range(**self.range)
-
-    def evaluate(self, parameter_name: str):
-        """
-        Evaluate and return the value of a parameter by name.
-
-        Parameters
-        ----------
-        parameter_name : str
-            Name of the parameter to retrieve.
-
-        Returns
-        -------
-        torch.Tensor
-            The value of the requested parameter.
-        """
-        p = getattr(self, parameter_name)
-        if isinstance(p, torch.nn.Parameter):
-            return p
-        elif isinstance(p, torch.nn.Module):
-            return p()
-        else:
-            return p
 
     def _refresh_and_set(self, name, value):
         """
