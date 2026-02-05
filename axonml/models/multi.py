@@ -210,19 +210,24 @@ class MultiPopulation(Population):
             # first do _mech_everywhere
             for m_class, (_, _, kwargs) in pop._mech_everywhere.items():
                 alias = name
-                index = index.flatten()
-                self[:, index].insert(m_class, alias=alias, **kwargs)
+                index_f = index.flatten()
+                self[:, index_f].insert(m_class, alias=alias, **kwargs)
             # now do _mech_data
             for m_class, list_of_aliases_kwargs_keys in pop._mech_data.items():
+                idx = 0
                 for alias, kwargs, key in list_of_aliases_kwargs_keys:
                     index_f = key_to_flat_index(index, key)
-                    alias = f"{name}_{alias}"
-                    self[:, index_f].insert(m_class, alias=alias, **kwargs)
+                    if alias is not None:
+                        alias_n = f"{name}_{alias}"
+                    else:
+                        alias_n = f"{name}_{idx}"
+                        idx += 1
+                    self[:, index_f].insert(m_class, alias=alias_n, **kwargs)
 
     def batch(self, batch_size: int):
         """Create a batched view of the multi-population."""
         super().batch(batch_size)
-        self.v_init.unsqueeze(0)
+        self.v_init = self.v_init.unsqueeze(0)
         for pop in self.populations.values():
             pop.batch(batch_size)
         return self
