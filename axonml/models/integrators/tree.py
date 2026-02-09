@@ -636,6 +636,9 @@ class _dhs_multi(MultiIntegrator):
                         "`assemble_graphs()` method returning a list of graphs."
                     ) from err
 
+            if not isinstance(graph, list):
+                graph = [graph]
+
             parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(
                 graph, dtype_axial=mdl.dtype()
             )
@@ -1067,8 +1070,8 @@ class _dhs_multi(MultiIntegrator):
             I_edge = dV_edge * self.EDGE_GAX_FLAT  # (sum_g B_g*E_g,)
 
             S_flat = torch.zeros_like(f_n_flat)
-            S_flat.scatter_add_(1, self.EDGE_CHILD_IDX_FLAT, -I_edge)
-            S_flat.scatter_add_(1, self.EDGE_PARENT_IDX_FLAT, I_edge)
+            S_flat.scatter_add_(1, self.EDGE_CHILD_IDX_FLAT.unsqueeze(0), -I_edge)
+            S_flat.scatter_add_(1, self.EDGE_PARENT_IDX_FLAT.unsqueeze(0), I_edge)
             f_n_flat = f_n_flat + S_flat
 
         CMDT_MECH = self.CMDT_MECH.reshape(1, -1)

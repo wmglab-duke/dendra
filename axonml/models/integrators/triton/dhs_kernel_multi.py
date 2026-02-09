@@ -9,7 +9,7 @@ import triton.language as tl
 
 @triton.jit
 def _multi_dhs_kernel_warp_hom(
-    D_ptr,  # (B_total, K_STRIDE)   main diag  (SOLVER order; row-padded)
+    D_ptr,  # (B_total, K_STRIDE)   main diag   (SOLVER order; row-padded)
     A_ptr,  # (B_total, K_STRIDE)   axial g     (SOLVER order; row-padded)
     B_ptr,  # (B_total, K_STRIDE)   RHS         (SOLVER order; row-padded)
     V_ptr,  # (B_total, K_STRIDE)   output V    (SOLVER order; row-padded)

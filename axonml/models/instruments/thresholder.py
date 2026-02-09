@@ -222,6 +222,9 @@ class Thresholder:
         self.space = None
         self.time = None
 
+        self.model_partition = None
+        self.active_partition = None
+
         if bases is None and (space is None and time is None):
             raise ValueError(
                 "At least one of bases or space and time must be provided."
@@ -294,6 +297,36 @@ class Thresholder:
         self.active = active
         self.threshold = active.threshold
         self.rec = Recorder(["v"], max_only=True)
+
+    def set_partition(self, model_partition, active_partition=None):
+        assert sum(model_partition) == self.model.nc, (
+            "Sum of partition lengths must equal number of population compartment."
+        )
+        if active_partition is not None:
+            assert len(model_partition) == len(active_partition), (
+                "Model and active partitions must have the same length."
+            )
+            assert all(m >= a for m, a in zip(model_partition, active_partition)), (
+                "Each model partition length must be at least as large as the corresponding active partition length."
+            )
+        else:
+            active_partition = model_partition
+        with torch.no_grad():
+            self.model_partition = model_partition
+            self.active_partition = active_partition
+            self.ub = (
+                self.ub[:, None].expand(-1, len(model_partition)).contiguous().clone()
+            )
+            self.lb = (
+                self.lb[:, None].expand(-1, len(model_partition)).contiguous().clone()
+            )
+            self.ub_initial = (
+                self.ub_initial[:, None]
+                .expand(-1, len(model_partition))
+                .contiguous()
+                .clone()
+            )
+            self.rec.set_partition(active_partition)
 
     def reset_bounds(self):
         """Reset upper and lower bounds to initial values."""
@@ -388,7 +421,7 @@ class Thresholder:
                 dt=dt,
                 callbacks=[self.active],
             )
-        return self.active.is_active()
+        return self.active.is_active(partition=self.active_partition)
 
     def _check_active_space_time(self, tstop, dt, bound: Tensor):
         """Check whether stimulus amplitudes generates APs.
@@ -405,7 +438,7 @@ class Thresholder:
         """
         self.active.reset()
         with torch.no_grad():
-            ve = self.space * bound[:, None]
+            ve = self.space * bound
             self.model.initialize()
             if self.chunklength is not None:
                 self.model.longrun(
@@ -422,7 +455,7 @@ class Thresholder:
                     dt=dt,
                     callbacks=[self.active],
                 )
-        return self.active.is_active()
+        return self.active.is_active(partition=self.active_partition)
 
     def check_active_with_rec(self, tstop, dt, bound: Tensor):
         self.active.reset()
@@ -438,7 +471,7 @@ class Thresholder:
                 )
             else:
                 if self.chunklength is not None:
-                    ve = self.space * bound[:, None]
+                    ve = self.space * bound
                     self.model.longrun(
                         extra=(ve, self.time),
                         tstop=tstop,
@@ -447,33 +480,35 @@ class Thresholder:
                         chunklength=self.chunklength,
                     )
                 else:
-                    ve = self.space * bound[:, None]
+                    ve = self.space * bound
                     self.model.run(
                         extra=(ve, self.time),
                         tstop=tstop,
                         dt=dt,
                         callbacks=[self.active, self.rec],
                     )
-        return self.active.is_active(), self.rec.stack()
+        return self.active.is_active(partition=self.active_partition), self.rec.stack()
 
     def _fix_bounds(self, tstop, dt, block_possible=True):
         """Make sure upper bound generates AP."""
 
         with torch.no_grad():
             tries = 0
+            ub = _scale_by_partition(self.ub, self.model_partition)
             if block_possible:
-                mask, rec = self.check_active_with_rec(tstop, dt, self.ub)
+                mask, rec = self.check_active_with_rec(tstop, dt, ub)
             else:
-                mask = self.check_active(tstop, dt, self.ub)
+                mask = self.check_active(tstop, dt, ub)
             print("Fixing bounds.", end="")
             while torch.any(~mask):
                 print(".", end="")
+                ub = _scale_by_partition(self.ub, self.model_partition)
                 if tries >= self.max_tries_bound_fix:
                     break
                 if block_possible:
-                    mask, rec = self.check_active_with_rec(tstop, dt, self.ub)
+                    mask, rec = self.check_active_with_rec(tstop, dt, ub)
                 else:
-                    mask = self.check_active(tstop, dt, self.ub)
+                    mask = self.check_active(tstop, dt, ub)
                 inactive = ~mask
                 if block_possible:
                     self.ub[(rec.squeeze() < self.threshold) & inactive] *= (
@@ -534,15 +569,17 @@ class Thresholder:
         self.active.reset()
 
         # check no active in lb
-        act = self.check_active(tstop, dt, self.lb)
+        act = self.check_active(
+            tstop, dt, _scale_by_partition(self.lb, self.model_partition)
+        )
         if torch.any(act):
             raise RuntimeError(
                 "Some lower bounds are active. Cannot proceed with bisection."
             )
 
         with torch.no_grad():
-            ub = self.ub
-            lb = self.lb
+            ub = _scale_by_partition(self.ub, self.model_partition)
+            lb = _scale_by_partition(self.lb, self.model_partition)
 
             awindow = ub - lb
             rwindow = awindow / ub
@@ -550,12 +587,15 @@ class Thresholder:
             tries = 0
 
             while torch.any(msk) & (tries < self.max_tries_thresh):
+                ub = _scale_by_partition(self.ub, self.model_partition)
+                lb = _scale_by_partition(self.lb, self.model_partition)
                 stimamp = (ub + lb) / 2
                 mask = self.check_active(tstop, dt, stimamp)
+                mask = _agree_dims(mask, msk)
                 a_thr = msk & mask
                 b_thr = msk & ~mask
-                ub[a_thr] = stimamp[a_thr]
-                lb[b_thr] = stimamp[b_thr]
+                self.ub[_agree_dims(a_thr, self.ub)] = stimamp[a_thr]
+                self.lb[_agree_dims(b_thr, self.lb)] = stimamp[b_thr]
                 awindow = ub - lb
                 rwindow = awindow / ub
                 msk = self.check_tolerance(awindow, rwindow, atol=atol, rtol=rtol)
@@ -563,15 +603,15 @@ class Thresholder:
             if tries >= self.max_tries_thresh:
                 print("hmm")
                 if self.ignore is not None:
-                    ub[self.ignore] = torch.nan
-                    lb[self.ignore] = torch.nan
-                return ub.cpu(), lb.cpu()
+                    self.ub[self.ignore] = torch.nan
+                    self.lb[self.ignore] = torch.nan
+                return self.ub.cpu(), self.lb.cpu()
 
             if self.ignore is not None:
-                ub[self.ignore] = torch.nan
-                lb[self.ignore] = torch.nan
+                self.ub[self.ignore] = torch.nan
+                self.lb[self.ignore] = torch.nan
 
-            return ub.cpu(), lb.cpu()
+            return self.ub.cpu(), self.lb.cpu()
 
 
 @torch.jit.script
@@ -582,3 +622,71 @@ def op_mc(s: Tensor, t: Tensor) -> Tensor:
 @torch.jit.script
 def op_sc(s: Tensor, t: Tensor) -> Tensor:
     return torch.einsum("an,at->tan", s, t).contiguous()
+
+
+def _scale_by_partition(B: torch.Tensor, partition=None) -> torch.Tensor:
+    """
+    Reshape B by repeating each column according to the corresponding
+    segment length in partition.
+
+    Parameters
+    ----------
+    B : torch.Tensor
+        Scaling tensor of shape (m, p). Each column provides the scaling
+        factor for the corresponding segment in ``partition``.
+    partition : sequence of int
+        Segment lengths whose sum equals ``n``.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of shape (m, n) where each segment ``j`` is scaled by
+        ``B[:, j]``.
+
+    Raises
+    ------
+    ValueError
+        If tensor shapes are incompatible or ``partition`` is invalid.
+    """
+
+    if partition is None:
+        return B[:, None]
+
+    lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
+    if lengths.dim() != 1:
+        raise ValueError("partition must be a 1D sequence of integers.")
+    if lengths.numel() != B.shape[1]:
+        raise ValueError(
+            "partition length must match the number of columns in B; "
+            f"got {lengths.numel()} and {B.shape[1]}."
+        )
+    if lengths.numel() == 0:
+        raise ValueError("partition must be non-empty.")
+    if torch.any(lengths < 0):
+        raise ValueError("partition values must be non-negative.")
+
+    weights = torch.repeat_interleave(B, lengths.tolist(), dim=1)
+    return weights
+
+
+def _agree_dims(mask: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """
+    Expand mask to agree with the dimensions of B.
+
+    Parameters
+    ----------
+    mask : torch.Tensor
+        Boolean mask tensor of shape (m,).
+    B : torch.Tensor
+        Target tensor of shape (m, n).
+
+    Returns
+    -------
+    torch.Tensor
+        Expanded boolean mask of shape (m, n).
+    """
+    if mask.dim() == 1 and B.dim() == 2:
+        return mask[:, None].expand_as(B)
+    if B.dim() == 1 and mask.dim() == 2:
+        return mask.squeeze(-1)
+    return mask

@@ -205,8 +205,7 @@ class Intra(torch.nn.Module):
             if len(idx) > 0:
                 bshape = torch.broadcast_shapes(*[t.shape for t in idx])
                 stim = stim.expand(bshape)
-
-        intra.index_put_(idx, stim, accumulate=True)
+            intra.index_put_(idx, stim, accumulate=True)
         return intra
 
 

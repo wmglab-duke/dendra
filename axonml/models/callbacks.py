@@ -172,7 +172,7 @@ m_template = """
     {implementation}
 """
 
-max_only_t = "_append_tensor_max(states, self.rec['{full_state}'])"
+max_only_t = "_append_tensor_max(states, self.rec['{full_state}'], self.partition)"
 indexed_t = (
     "_append_tensor_indexed(states, self.rec['{full_state}'], self.node_indices)"
 )
@@ -193,9 +193,11 @@ def _append_tensor(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
     record.append(tensor)
 
 
-def _append_tensor_max(tensor: torch.Tensor, record: List[torch.Tensor]) -> None:
+def _append_tensor_max(
+    tensor: torch.Tensor, record: List[torch.Tensor], partition=None
+) -> None:
     """
-    Append the maximum value of a tensor to a list of tensors.
+    Append max-reduced tensor values to a list of tensors.
 
     Parameters
     ----------
@@ -203,8 +205,28 @@ def _append_tensor_max(tensor: torch.Tensor, record: List[torch.Tensor]) -> None
         The tensor from which the maximum will be taken.
     record : List[torch.Tensor]
         The list to which the maximum value will be appended.
+    partition : sequence of int, optional
+        Segment lengths that partition ``tensor`` along dimension 1. The sum of
+        the sequence must equal ``tensor.shape[1]`` and all values must be
+        positive. If provided, the maximum is computed within each segment
+        along dimension 1 and stacked into a new dimension.
     """
-    record.append(torch.amax(tensor, -1, keepdim=True))
+    if partition is None:
+        record.append(torch.amax(tensor, -1, keepdim=True))
+        return
+
+    if tensor.dim() < 2:
+        raise ValueError("partitioned max requires tensor with at least 2 dims.")
+
+    total = int(partition.sum().item())
+    if total != tensor.shape[1]:
+        raise ValueError(
+            "sum(partition) must equal tensor.shape[1]; "
+            f"got {total} and {tensor.shape[1]}."
+        )
+
+    segments = torch.split(tensor, partition.tolist(), dim=1)
+    record.append(torch.stack([torch.amax(seg, dim=1) for seg in segments], dim=1))
 
 
 def _append_tensor_indexed(
@@ -398,11 +420,14 @@ class Recorder(Callback):
         node_indices=None,
         dt=None,
         sliding_window=None,
+        partition=None,
     ):
         super().__init__()
         self.states = states
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
+        self.partition = None
+        self.set_partition(partition)
 
         self.indexed = node_indices is not None
         self.node_indices = None
@@ -433,6 +458,17 @@ class Recorder(Callback):
         self.writer_thread = None
         self.data_pinned = {}
         self.stream = None
+
+    def set_partition(self, partition=None):
+        if partition is not None:
+            lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
+            if lengths.dim() != 1:
+                raise ValueError("partition must be a 1D sequence of integers.")
+            if lengths.numel() == 0:
+                raise ValueError("partition must be non-empty.")
+            if torch.any(lengths <= 0):
+                raise ValueError("partition values must be positive.")
+            self.partition = lengths
 
     @property
     def dt(self):
@@ -1145,20 +1181,101 @@ class ActiveAL(APCount):
         self.at_least = at_least
         self.inv = inv
 
-    def is_active(self):
+    def is_active(self, partition=None):
+        """
+        Determine which axons are active based on spike counts.
+
+        By default, an axon is active if the number of nonzero entries in each
+        row of ``record`` is at least ``at_least``. When ``partition`` is
+        provided, the check is performed independently over contiguous segments
+        of each row, and a boolean mask is returned for each segment.
+
+        Parameters
+        ----------
+        partition : sequence of int, optional
+            Segment lengths that partition ``record`` along dimension 1. The
+            sum of the sequence must equal ``record.shape[1]`` and every value
+            must be at least ``at_least``. If None, the full row is used.
+
+        Returns
+        -------
+        torch.Tensor
+            Boolean tensor of shape ``(n_axons,)`` when ``partition`` is None,
+            otherwise ``(n_axons, len(partition))``. If ``inv`` is True, the
+            result is inverted.
+
+        Raises
+        ------
+        ValueError
+            If ``partition`` is empty, not 1D, does not sum to
+            ``record.shape[1]``, or any segment length is less than
+            ``at_least``.
+        """
+        if self.record is None:
+            return self.record
+        active = _is_active(self.record, self.at_least, partition)
+        if self.inv:
+            return ~active
+        return active
+
+    def numpy(self, partition=None):
         if self.record is not None:
-            if self.inv:
-                return ~_is_active(self.record, self.at_least)
-            return _is_active(self.record, self.at_least)
+            return self.is_active(partition).detach().cpu().numpy()
         return self.record
 
-    def numpy(self):
-        if self.record is not None:
-            return self.is_active().detach().cpu().numpy()
-        return self.record
+
+class Active(ActiveAL):
+    """
+    Callback for detecting if axons fire at any point during simulation.
+
+    This class detects if the membrane potential crosses above a specified
+    voltage threshold at selected nodes at any point during the simulation.
+    It subclasses ActiveAL with ``at_least=1`` to mark an axon as "active"
+    (fired) as soon as the first threshold crossing is detected.
+
+    Parameters
+    ----------
+    threshold : float, optional
+        Voltage threshold in mV for spike detection. Default is 0.0.
+    t_start_check : float, optional
+        Time in ms after which to start checking for threshold crossings.
+        Default is 0.0 (check from beginning).
+    node_check : list of int, optional
+        Indices of nodes to monitor for spike detection. Default is [5, -5]
+        (check at node 5 from beginning and node 5 from end).
+    dt : float, optional
+        Time step in ms. If None, uses the default from backend. Default is None.
+    inv : bool, optional
+        If True, inverts the active detection (marks axons as inactive if they
+        fired). Default is False.
+
+    See Also
+    --------
+    APCount : Callback for counting total spikes during simulation
+    Raster : Callback for recording spike times for raster plots
+
+    Examples
+    --------
+    >>> active_detector = Active(threshold=20.0)  # Detect when v crosses +20 mV
+    >>> model.run(ve, callbacks=[active_detector])
+    >>> active_axons = active_detector.numpy()  # Get boolean array of active axons
+    >>> active_count = active_axons.sum()  # Count how many axons fired
+
+    Attributes
+    ----------
+    record : torch.Tensor
+        Boolean tensor of shape [n_axons] indicating which axons fired at least once.
+    state_cache : torch.Tensor
+        Boolean tensor tracking membrane potential state relative to threshold.
+    """
+
+    def __init__(
+        self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None, inv=False
+    ):
+        super().__init__(threshold, t_start_check, node_check, dt, inv=inv)
 
 
-class Active(ThresholdCallback):
+class _Active(ThresholdCallback):
     """
     Callback for detecting if axons fire at any point during simulation.
 
@@ -1457,8 +1574,32 @@ def _update_active(
     return ~ge, record
 
 
-def _is_active(record, at_least: int) -> torch.Tensor:
-    return torch.count_nonzero(record, dim=1) >= at_least
+def _is_active(record, at_least: int, partition=None) -> torch.Tensor:
+    if partition is None:
+        return torch.count_nonzero(record, dim=1) >= at_least
+
+    lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
+    if lengths.dim() != 1:
+        raise ValueError("partition must be a 1D sequence of integers.")
+
+    lengths_list = lengths.tolist()
+    if not lengths_list:
+        raise ValueError("partition must be non-empty.")
+    if sum(lengths_list) != record.shape[1]:
+        raise ValueError(
+            "sum(partition) must equal record.shape[1]; "
+            f"got {sum(lengths_list)} and {record.shape[1]}."
+        )
+    if min(lengths_list) < at_least:
+        raise ValueError(
+            "all partition values must be at least `at_least`; "
+            f"minimum was {min(lengths_list)}."
+        )
+
+    segments = torch.split(record, lengths_list, dim=1)
+    return torch.stack(
+        [torch.count_nonzero(seg, dim=1) >= at_least for seg in segments], dim=1
+    )
 
 
 def _sliding_window_average(x, window_size: int):

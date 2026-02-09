@@ -2706,7 +2706,7 @@ def _indices_to_slice_or_tensor(
         return slice(start, stop, step if step != 1 else None)
     else:
         # Indices are not contiguous, fall back to returning a tensor
-        torch_indices = torch.from_numpy(numpy_indices)
+        torch_indices = torch.tensor(numpy_indices, dtype=torch.long)
         return torch_indices.to(device) if device else torch_indices
 
 

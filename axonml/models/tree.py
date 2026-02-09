@@ -98,8 +98,6 @@ class Tree(Population):
             for i in range(len(graph.nodes)):
                 attrs = graph.nodes[i]
                 name = attrs.get("name")
-                if "branchpoint" in name:
-                    name = name.replace("_", ".")
                 names.append(name)
         self.names = names
 
@@ -170,7 +168,13 @@ class Tree(Population):
 
     @classmethod
     def from_NEURON(
-        cls, root_sec=None, N=1, integrator=None, principal_axis=None, **kwargs
+        cls,
+        root_sec=None,
+        N=1,
+        integrator=None,
+        principal_axis=None,
+        exclude=None,
+        **kwargs,
     ):
         """Construct a tree population from a NEURON root section.
 
@@ -192,7 +196,7 @@ class Tree(Population):
         """
         from axonml.models.io import neuron_to_axonml_graph
 
-        graph, _ = neuron_to_axonml_graph(root_sec)
+        graph, _ = neuron_to_axonml_graph(root_sec, exclude=exclude)
         cell = cls.from_graph(
             graph, N, integrator, principal_axis=principal_axis, **kwargs
         )

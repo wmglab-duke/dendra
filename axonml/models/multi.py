@@ -10,7 +10,7 @@ from .integrators import bwd_euler_sc_multi, dhs_multi
 from .tree import Tree
 
 
-def assess_type_and_make_integrator(populations, threads=16, write_back=True):
+def _assess_type_and_make_integrator(populations, threads=16, write_back=True):
     """Select an integrator compatible with the provided populations.
 
     Parameters
@@ -71,13 +71,13 @@ def concat_models(
         Combined population.
     """
     _check_celsius(celsius, populations)
-    integrator = assess_type_and_make_integrator(
+    integrator = _assess_type_and_make_integrator(
         populations, threads=threads, write_back=write_back
     )
     # concatenate x, y, z
-    x = torch.cat([pop.x.flatten() for pop in populations.values()], dim=1)
-    y = torch.cat([pop.y.flatten() for pop in populations.values()], dim=1)
-    z = torch.cat([pop.z.flatten() for pop in populations.values()], dim=1)
+    x = torch.cat([pop.x.flatten() for pop in populations.values()])
+    y = torch.cat([pop.y.flatten() for pop in populations.values()])
+    z = torch.cat([pop.z.flatten() for pop in populations.values()])
     mp = MultiPopulation(
         integrator=integrator,
         celsius=celsius,
@@ -135,11 +135,19 @@ class MultiPopulation(Population):
         if any(b.is_batched() for b in populations.values()):
             raise ValueError("All populations must be unbatched.")
         if integrator is None:
-            integrator = assess_type_and_make_integrator(populations)
+            integrator = _assess_type_and_make_integrator(populations)
         C = sum(math.prod(pop.shape) for pop in populations.values())
         super().__init__(1, C, integrator=integrator, celsius=celsius)
 
-        self.populations = populations
+        # check all populations are on the same device/dtype
+        devices = {pop.device() for pop in populations.values()}
+        dtypes = {pop.dtype() for pop in populations.values()}
+        if len(devices) > 1:
+            raise ValueError("All populations must be on the same device.")
+        if len(dtypes) > 1:
+            raise ValueError("All populations must be of the same dtype.")
+
+        self.populations = torch.nn.ModuleDict(populations)
 
         for pop in self.populations.values():
             self._equilibria.update(pop._equilibria)
@@ -155,7 +163,13 @@ class MultiPopulation(Population):
         ).unsqueeze(0)
         self.register_buffer("v_init", v_init)
 
+        if all(hasattr(pop, "names") for pop in self.populations.values()):
+            self.names = []
+            for name, pop in self.populations.items():
+                self.names.extend([f"{name}.{n}" for n in pop.names])
+
         self.reinsert_all()
+        self.reinject_all()
         self.register_labels()
 
     def __iter__(self):
@@ -182,6 +196,13 @@ class MultiPopulation(Population):
                     :, flatten_key(pop.numel(), pop.shape, slice.index)
                 ].label(label)
 
+    def reinject_all(self):
+        """Reinject intracellular currents for all component populations."""
+        all_indices = indices(self.populations)
+        for index, (name, pop) in zip(all_indices, self.populations.items()):
+            for stim, _, idx in pop.injections:
+                self[:, key_to_flat_index(index, idx)].inject(stim)
+
     def reinsert_all(self):
         """Recreate mechanisms for all component populations."""
         all_indices = indices(self.populations)
@@ -189,19 +210,24 @@ class MultiPopulation(Population):
             # first do _mech_everywhere
             for m_class, (_, _, kwargs) in pop._mech_everywhere.items():
                 alias = name
-                index = index.flatten()
-                self[:, index].insert(m_class, alias=alias, **kwargs)
+                index_f = index.flatten()
+                self[:, index_f].insert(m_class, alias=alias, **kwargs)
             # now do _mech_data
             for m_class, list_of_aliases_kwargs_keys in pop._mech_data.items():
+                idx = 0
                 for alias, kwargs, key in list_of_aliases_kwargs_keys:
                     index_f = key_to_flat_index(index, key)
-                    alias = f"{name}_{alias}"
-                    self[:, index_f].insert(m_class, alias=alias, **kwargs)
+                    if alias is not None:
+                        alias_n = f"{name}_{alias}"
+                    else:
+                        alias_n = f"{name}_{idx}"
+                        idx += 1
+                    self[:, index_f].insert(m_class, alias=alias_n, **kwargs)
 
     def batch(self, batch_size: int):
         """Create a batched view of the multi-population."""
         super().batch(batch_size)
-        self.v_init.unsqueeze(0)
+        self.v_init = self.v_init.unsqueeze(0)
         for pop in self.populations.values():
             pop.batch(batch_size)
         return self
