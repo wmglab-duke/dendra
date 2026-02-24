@@ -12,24 +12,25 @@ class mhn(S):
         "m' = (minf - m) / mtau", "h' = (hinf - h) / htau", "n' = (ninf - n) / ntau"
     )
     S.ASSIGNED("minf", "mtau", "hinf", "htau", "ninf", "ntau")
+    S.GLOBAL(am1=0.1, am2=4.0, ah1=0.07, ah2=1.0, an1=0.01, an2=0.125)
 
     def calc_q10(self):
         return 3.0 ** ((self.celsius - 6.3) / 10.0)
 
     def breakpoint(self, v, states):
         q10 = self.q10()
-        alpha_m = 0.1 * vtrap(-(v + 40), 10)
-        beta_m = 4 * exp(-(v + 65) / 18)
+        alpha_m = self.am1 * vtrap(-(v + 40), 10)
+        beta_m = self.am2 * exp(-(v + 65) / 18)
         tot = alpha_m + beta_m
         mtau = 1 / (q10 * tot)
         minf = alpha_m / tot
-        alpha_h = 0.07 * exp(-(v + 65) / 20)
-        beta_h = 1 / (exp(-(v + 35) / 10) + 1)
+        alpha_h = self.ah1 * exp(-(v + 65) / 20)
+        beta_h = self.ah2 / (exp(-(v + 35) / 10) + 1)
         tot = alpha_h + beta_h
         htau = 1 / (q10 * tot)
         hinf = alpha_h / tot
-        alpha_n = 0.01 * vtrap(-(v + 55), 10)
-        beta_n = 0.125 * exp(-(v + 65) / 80)
+        alpha_n = self.an1 * vtrap(-(v + 55), 10)
+        beta_n = self.an2 * exp(-(v + 65) / 80)
         tot = alpha_n + beta_n
         ntau = 1 / (q10 * tot)
         ninf = alpha_n / tot

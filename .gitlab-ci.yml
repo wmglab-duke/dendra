@@ -2,6 +2,7 @@ image: python:3.12-slim
 
 stages:
   - build
+  - release
   - deploy
 
 variables:
@@ -58,9 +59,41 @@ build_docs:
       - public
     expire_in: 1 week
 
+release_bump:
+  stage: release
+  image: python:3.12-slim
+  needs: ["build_docs"]
+  variables:
+    GIT_DEPTH: "0"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
+    - rm -rf /var/lib/apt/lists/*
+    - python -m pip install --upgrade pip
+    - python -m pip install commitizen
+
+    - git config user.name  "gitlab-ci"
+    - git config user.email "gitlab-ci@duke.edu"
+
+    # Ensure tags + full history are present
+    - git fetch --tags --force
+
+    # Authenticate pushes using CI_JOB_TOKEN
+    - git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+  script:
+    - cz bump --dry-run || true
+    - cz bump --yes || (echo "No version bump needed." && exit 0)
+
+    # Push bump commit and tags back to main
+    - git push origin HEAD:main
+    - git push origin --tags
+  rules:
+    # Run only on main branch "push" pipelines, and don't run on bump commits that contain [skip ci]
+    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE !~ /\[skip ci\]/i'
+      when: on_success
+    - when: never
+
 pages:
   stage: deploy
-  # override the global before_script
   before_script: []
   dependencies:
     - build_docs
