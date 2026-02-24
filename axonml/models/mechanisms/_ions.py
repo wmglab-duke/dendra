@@ -19,6 +19,12 @@ CINIT = {
     "cai0": 5e-5,
 }
 
+MIN_CONCENTRATION = {
+    "na": 1e-12,
+    "k": 1e-12,
+    "ca": 1e-12,
+}
+
 
 def valid_ions():
     global VALENCES
@@ -40,7 +46,27 @@ def cinits():
     return CINIT
 
 
-def register_ion(ion, valence, e, i0, o0):
+def min_concentrations():
+    global MIN_CONCENTRATION
+    return MIN_CONCENTRATION
+
+
+def set_min_concentration(ion, min_concentration):
+    """
+    Set the minimum concentration for a specific ion.
+
+    Parameters
+    ----------
+    ion : str
+        The name of the ion (e.g., 'na', 'k', 'ca').
+    min_concentration : float
+        The minimum concentration of the ion (in mM).
+    """
+    global MIN_CONCENTRATION
+    MIN_CONCENTRATION[ion] = min_concentration
+
+
+def register_ion(ion, valence, e, i0, o0, min_concentration=None):
     """
     Register a new ion species with its properties.
 
@@ -56,14 +82,19 @@ def register_ion(ion, valence, e, i0, o0):
         The initial intracellular concentration of the ion (in mM).
     o0 : float
         The initial extracellular concentration of the ion (in mM).
+    min_concentration : float, optional
+        The minimum concentration of the ion (in mM). If None, a default value is used.
     """
     global VALENCES
     global REVERSAL
     global CINIT
+    global MIN_CONCENTRATION
     VALENCES[ion] = valence
     REVERSAL[f"e{ion}"] = e
     CINIT[f"{ion}o0"] = o0
     CINIT[f"{ion}i0"] = i0
+    min_concentration = min_concentration if min_concentration is not None else 1e-12
+    MIN_CONCENTRATION[ion] = min_concentration
 
 
 class equilibria(ContextDecorator):
@@ -150,6 +181,8 @@ class Ion(torch.nn.Module):
         self.i_init = cinits()[f"{name}i0"]
         self.o_init = cinits()[f"{name}o0"]
 
+        self.min_concentration = min_concentrations()[name]
+
         self.register_buffer(f"i{name}", torch.zeros(shape))
         self.register_buffer(f"e{name}", torch.full(shape, self.e_init))
         self.register_buffer(f"{name}i", torch.full(shape, self.i_init))
@@ -211,7 +244,9 @@ class Ion(torch.nn.Module):
         ioni_t = getattr(self, ioni_name)
 
         # Safeguard against <= 0
-        min_val = torch.tensor(1e-9, device=iono_t.device, dtype=iono_t.dtype)
+        min_val = torch.tensor(
+            self.min_concentration, device=iono_t.device, dtype=iono_t.dtype
+        )
         iono_t = torch.where(iono_t <= 0, min_val, iono_t)
         ioni_t = torch.where(ioni_t <= 0, min_val, ioni_t)
 
