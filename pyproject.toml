@@ -35,6 +35,7 @@ dev = [
     "pytest-cov",
     "hypothesis",
     "pytest-xdist",
+    "commitizen"
 ]
 
 [tool.setuptools.dynamic]
