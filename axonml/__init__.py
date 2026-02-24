@@ -1,6 +1,6 @@
 import os
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 os.environ.setdefault("MKL_DYNAMIC", "FALSE")
