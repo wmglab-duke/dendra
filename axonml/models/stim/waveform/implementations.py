@@ -135,7 +135,8 @@ class mono_rect(Waveform):
     Monophasic rectangular pulse waveform generator.
 
     Generates a single rectangular pulse with configurable amplitude,
-    delay, and duration. The waveform is zero outside the pulse duration.
+    delay, and pulse width (duration). The waveform is zero outside the pulse
+    duration.
 
     Parameters
     ----------
@@ -163,7 +164,7 @@ class mono_rect(Waveform):
     --------
     >>> import torch
     >>> impotr axonml as ax
-    >>> waveform = ax.mono_rect(amp=-2.0, duration=0.5)
+    >>> waveform = ax.mono_rect(amp=-2.0, pw=0.5)
     >>> t = torch.linspace(0, 2, 100)
     >>> values = waveform(t)
     """
