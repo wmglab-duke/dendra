@@ -122,6 +122,7 @@ If you use `AxonML`, consider citing the `corresponding paper <https://www.natur
    :maxdepth: 1
    :caption: Miscellaneous
 
+   units
    misc
 
 .. toctree::
