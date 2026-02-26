@@ -7,6 +7,7 @@ API Reference
    :maxdepth: 1
 
    api/axonml.models
+   api/axonml.models.analysis
    api/axonml.models.callbacks
    api/axonml.models.fields
    api/axonml.models.instruments

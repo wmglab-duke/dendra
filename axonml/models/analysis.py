@@ -61,11 +61,13 @@ def conduction_velocity(
         - ``F`` : number of fibers
         - ``C`` : number of compartments per fiber
 
-        Units are typically mV (but any consistent voltage units are acceptable; see Notes).
+        Units in Axon are typically mV (but any consistent voltage units are acceptable; see Notes).
 
     lengths_um : torch.Tensor
         Compartment physical lengths (in micrometers) with shape ``(F, C)``.
         These are used to compute compartment midpoint positions along each fiber.
+        For `ax.Myelinated`, this should be internodal length
+        (`model.deltax(model.diameters)[:, None].expand_as(model.dx)`).
 
     dt_ms : float or torch.Tensor
         Time step between samples in milliseconds. If provided as a tensor, it will be
@@ -77,8 +79,8 @@ def conduction_velocity(
         - boolean mask: ``True`` entries are included, ``False`` excluded
         - float mask: values act as multiplicative weights (e.g., soft node-ness)
 
-        This is useful for myelinated models where APs are generated only at nodes of Ranvier.
-        If ``None``, all compartments are eligible.
+        This is useful for complex myelinated models (e.g., MRG) where APs are
+        generated only at nodes of Ranvier. If ``None``, all compartments are eligible.
 
     Other Parameters
     ----------------
@@ -213,7 +215,9 @@ def conduction_velocity(
 
     **Units.**
     The code assumes lengths are in :math:`\mu m` and time is in ms, producing :math:`\mu m/ms`.
-    The conversion to m/s is a fixed factor of :math:`10^{-3}`.
+    This is consistent with AxonML's internal practice of representing lengths in :math:`\mu m`,
+    therefore `model.dx` etc. can often be used directly. For `ax.Myelinated`, internodal length
+    should be used instead of compartment length. The conversion to m/s is a fixed factor of :math:`10^{-3}`.
 
     **Directionality.**
     The returned ``v_m_per_s`` is signed: positive means increasing x with increasing arrival time.
@@ -223,7 +227,7 @@ def conduction_velocity(
     This estimator is best behaved when:
 
     - a single traveling AP (or a dominant one) is present within the time window,
-    - recordings exclude the initiation region (as you indicated),
+    - recordings exclude the initiation region,
     - compartments used for fitting span a meaningful propagation distance.
 
     Examples
