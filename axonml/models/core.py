@@ -3,6 +3,7 @@
 import itertools
 import math
 import re
+import textwrap
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (
@@ -194,6 +195,17 @@ class Population(P, Sliceable):
     """
     Base class for a population of multicompartment neurons.
     """
+
+    # ---------- repr knobs (safe defaults) ----------
+    _REPR_MAX_MECHS: int = 18
+    _REPR_MAX_IONS: int = 12
+    _REPR_TENSOR_SAMPLES: int = 7  # sample points for big tensors
+    _REPR_SHOW_KWARGS: bool = False  # kwargs can be huge; default off
+    _REPR_TENSOR_STATS: str = "sample"  # "none" | "sample" | "full"
+
+    _REPR_FULL_TENSOR_MAX_ELEMS: int = 16  # print full values if numel <= this
+    _REPR_FLOAT_SIGFIGS: int = 6  # scalar + small tensor formatting
+    _REPR_MAX_MECH_PARAM_ENTRIES: int = 200  # safety bound per mechanism
 
     P.RANGE(cm=1.0, rhoa=35.4)
     P.GLOBAL(celsius=37.0)
@@ -2658,6 +2670,679 @@ class Population(P, Sliceable):
         if return_final_state:
             return total_loss, final_state
         return total_loss
+
+    # ---------- small formatting helpers ----------
+    @staticmethod
+    def _fmt_scalar(x: Any) -> str:
+        """Best-effort scalar formatting; avoids dumping tensors."""
+        if x is None:
+            return "<?>"
+        if isinstance(x, (bool, int)):
+            return str(x)
+        if isinstance(x, float):
+            # compact but readable
+            return f"{x:g}"
+        if isinstance(x, str):
+            return x
+        if torch.is_tensor(x):
+            t = x.detach()
+            if t.numel() == 1:
+                # NOTE: .item() can sync on CUDA; still usually acceptable for a scalar.
+                try:
+                    return f"{t.item():g}"
+                except Exception:
+                    return str(t)
+            return f"Tensor(shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device})"
+        return str(x)
+
+    @staticmethod
+    def _linspace_indices(n_total: int, n_samples: int) -> List[int]:
+        """Deterministic sample indices without allocating big tensors."""
+        if n_total <= 0:
+            return []
+        if n_total <= n_samples:
+            return list(range(n_total))
+        if n_samples <= 1:
+            return [0]
+        step = (n_total - 1) / (n_samples - 1)
+        idx = [int(round(i * step)) for i in range(n_samples)]
+        # ensure monotonic + in-bounds
+        idx = [min(max(i, 0), n_total - 1) for i in idx]
+        # de-dup while preserving order
+        out = []
+        seen = set()
+        for i in idx:
+            if i not in seen:
+                seen.add(i)
+                out.append(i)
+        return out
+
+    def _fmt_tensor_param(
+        self,
+        t: Any,
+        *,
+        units: str = "",
+        stats: Optional[str] = None,  # overrides _REPR_TENSOR_STATS
+    ) -> str:
+        """
+        Summarize a parameter tensor:
+        - scalar -> value
+        - big tensor -> shape (+ optional sample/full stats)
+        """
+        if t is None:
+            return "<?>"
+
+        stats = stats or self._REPR_TENSOR_STATS
+
+        if isinstance(t, (float, int)):
+            return f"{t:g}{units}"
+
+        if not torch.is_tensor(t):
+            return f"{t}{units}"
+
+        x = t.detach()
+        shape = tuple(x.shape)
+
+        if x.numel() == 1:
+            try:
+                return f"{x.item():g}{units}"
+            except Exception:
+                return (
+                    f"Tensor(shape={shape}, dtype={x.dtype}, device={x.device}){units}"
+                )
+
+        # stats="none" is the safest/cheapest: no reductions, no sampling.
+        if stats == "none":
+            return f"Tensor(shape={shape}, dtype={x.dtype}, device={x.device}){units}"
+
+        # "sample" stats: only look at a few points (cheap, bounded)
+        flat = x.reshape(-1)
+        idx = self._linspace_indices(flat.numel(), self._REPR_TENSOR_SAMPLES)
+
+        # gather a few scalar values (bounded work)
+        vals: List[float] = []
+        for i in idx:
+            try:
+                vals.append(float(flat[i].item()))
+            except Exception:
+                # if we can't safely scalarize, fall back
+                return (
+                    f"Tensor(shape={shape}, dtype={x.dtype}, device={x.device}){units}"
+                )
+
+        vmin = min(vals)
+        vmax = max(vals)
+        if vmin == vmax:
+            # "probably constant" (sample-based)
+            return f"≈{vmin:g}{units} (const?; shape={shape})"
+        return f"shape={shape}, sample≈[{vmin:g}, {vmax:g}]{units}"
+
+    @staticmethod
+    def _fmt_index(idx: Any) -> str:
+        """Compact placement/index description."""
+        if idx is None:
+            return "everywhere"
+        if isinstance(idx, slice):
+            return f"slice({idx.start},{idx.stop},{idx.step})"
+        if isinstance(idx, tuple) and all(isinstance(x, slice) for x in idx):
+            inner = ", ".join(f"{s.start}:{s.stop}:{s.step}" for s in idx)
+            return f"slices({inner})"
+        # list/ndarray/tensor indices can be huge: summarize length/type
+        if isinstance(idx, (list, tuple)):
+            return f"{type(idx).__name__}(len={len(idx)})"
+        if isinstance(idx, np.ndarray):
+            return f"ndarray(shape={idx.shape}, dtype={idx.dtype})"
+        if torch.is_tensor(idx):
+            return f"Tensor(shape={tuple(idx.shape)}, dtype={idx.dtype}, device={idx.device})"
+        return type(idx).__name__
+
+    def _fmt_kwargs(self, kwargs: Dict[str, Any], max_items: int = 4) -> str:
+        """Short kwargs summary that won’t explode logs."""
+        if not kwargs:
+            return ""
+        items = []
+        for k in sorted(kwargs.keys()):
+            v = kwargs[k]
+            if isinstance(v, (bool, int, float, str)):
+                items.append(f"{k}={v}")
+            elif torch.is_tensor(v):
+                if v.numel() == 1:
+                    try:
+                        items.append(f"{k}={v.detach().item():g}")
+                    except Exception:
+                        items.append(f"{k}=Tensor{tuple(v.shape)}")
+                else:
+                    items.append(f"{k}=Tensor{tuple(v.shape)}")
+            elif isinstance(v, (list, tuple, dict)):
+                items.append(f"{k}={type(v).__name__}(len={len(v)})")
+            else:
+                items.append(f"{k}={type(v).__name__}")
+            if len(items) >= max_items:
+                break
+        extra = len(kwargs) - len(items)
+        suffix = f", …+{extra}" if extra > 0 else ""
+        return "{" + ", ".join(items) + suffix + "}"
+
+    @staticmethod
+    def _fmt_number(v, sigfigs: int = 6) -> str:
+        if isinstance(v, bool):
+            return "True" if v else "False"
+        if isinstance(v, (int, np.integer)):
+            return str(int(v))
+        if isinstance(v, (float, np.floating)):
+            return f"{float(v):.{sigfigs}g}"
+        if isinstance(v, complex):
+            return f"{v.real:.{sigfigs}g}{v.imag:+.{sigfigs}g}j"
+        return str(v)
+
+    def _fmt_tensor_value(
+        self,
+        t: object,
+        *,
+        tensor_stats: str = "sample",  # "none" | "sample" | "full"
+        full_max_elems: int = None,
+        sigfigs: int = None,
+    ) -> str:
+        """
+        Scalar -> value
+        Small tensor -> full values
+        Large tensor -> stats summary (none/sample/full)
+        """
+        if t is None:
+            return "<?>"
+
+        full_max_elems = (
+            self._REPR_FULL_TENSOR_MAX_ELEMS
+            if full_max_elems is None
+            else full_max_elems
+        )
+        sigfigs = self._REPR_FLOAT_SIGFIGS if sigfigs is None else sigfigs
+
+        if isinstance(t, (float, int, bool, np.number)):
+            return self._fmt_number(t, sigfigs=sigfigs)
+
+        if not torch.is_tensor(t):
+            return str(t)
+
+        x = t.detach()
+        shape = tuple(x.shape)
+        dtype = x.dtype
+        device = x.device
+
+        # Scalar tensor
+        if x.numel() == 1:
+            try:
+                return self._fmt_number(x.item(), sigfigs=sigfigs)
+            except Exception:
+                return f"Tensor(shape={shape}, dtype={dtype}, device={device})"
+
+        # If "small enough", print full contents
+        if x.numel() <= full_max_elems:
+            try:
+                y = x
+                # numpy doesn't like bfloat16; cast for display only
+                if y.dtype == torch.bfloat16:
+                    y = y.to(torch.float32)
+                if y.device.type != "cpu":
+                    y = y.cpu()
+                arr = y.numpy()
+
+                s = np.array2string(
+                    arr,
+                    separator=", ",
+                    formatter={"float_kind": lambda v: f"{float(v):.{sigfigs}g}"},
+                )
+                return f"{s} (shape={shape})"
+            except Exception:
+                # fallback
+                return f"Tensor(shape={shape}, dtype={dtype}, device={device})"
+
+        # Large tensor: stats
+        if tensor_stats == "none":
+            return f"Tensor(shape={shape}, dtype={dtype}, device={device})"
+
+        if tensor_stats == "full":
+            # true min/max (can be expensive; user opted in)
+            try:
+                y = x
+                if y.dtype == torch.bfloat16:
+                    y = y.to(torch.float32)
+                vmin = y.amin().item()
+                vmax = y.amax().item()
+                if vmin == vmax:
+                    return f"≈{self._fmt_number(vmin, sigfigs=sigfigs)} (const; shape={shape}, dtype={dtype}, device={device})"
+                return (
+                    f"shape={shape}, min={self._fmt_number(vmin, sigfigs=sigfigs)}, "
+                    f"max={self._fmt_number(vmax, sigfigs=sigfigs)} (dtype={dtype}, device={device})"
+                )
+            except Exception:
+                # fall through to sample if full fails
+                pass
+
+        # tensor_stats == "sample" (default)
+        try:
+            if not x.is_contiguous():
+                # avoid accidental huge copies when flattening
+                return f"Tensor(shape={shape}, dtype={dtype}, device={device}, noncontiguous=True)"
+
+            flat = x.reshape(-1)
+            idx = self._linspace_indices(flat.numel(), self._REPR_TENSOR_SAMPLES)
+
+            # gather samples with one device->host transfer
+            idx_t = torch.tensor(idx, device=flat.device, dtype=torch.long)
+            samples = flat.index_select(0, idx_t).detach()
+            if samples.dtype == torch.bfloat16:
+                samples = samples.to(torch.float32)
+            samples_cpu = samples.cpu()
+            vals = samples_cpu.flatten().tolist()
+
+            vmin = min(vals)
+            vmax = max(vals)
+            if vmin == vmax:
+                return f"≈{self._fmt_number(vmin, sigfigs=sigfigs)} (const?; shape={shape})"
+            return f"shape={shape}, sample≈[{self._fmt_number(vmin, sigfigs=sigfigs)}, {self._fmt_number(vmax, sigfigs=sigfigs)}]"
+        except Exception:
+            return f"Tensor(shape={shape}, dtype={dtype}, device={device})"
+
+    # ---------- mechanisms / ions reporting ----------
+    def _pending_mech_lines(self, *, verbose: bool, show_kwargs: bool) -> List[str]:
+        lines: List[str] = []
+
+        # Everywhere mechanisms
+        ev = sorted(self._mech_everywhere.items(), key=lambda kv: kv[0].__name__)
+        idx = sorted(self._mech_data.items(), key=lambda kv: kv[0].__name__)
+
+        n_ev = len(ev)
+        n_regions = sum(len(v) for _, v in idx)
+        n_types = len(set([k.__name__ for k, _ in ev] + [k.__name__ for k, _ in idx]))
+
+        if n_ev == 0 and n_regions == 0:
+            lines.append("mechanisms: (none inserted)")
+            return lines
+
+        lines.append(
+            f"mechanisms: {n_types} types "
+            f"(everywhere={n_ev}, indexed_regions={n_regions})"
+        )
+
+        if not verbose:
+            # one-line-ish names
+            names = []
+            for mech_cls, (name, ic, kwargs) in ev:
+                names.append(name)
+            for mech_cls, regions in idx:
+                names.append(f"{mech_cls.__name__}×{len(regions)}")
+            names = sorted(names)
+            preview = names[: self._REPR_MAX_MECHS]
+            more = len(names) - len(preview)
+            s = ", ".join(preview) + (f", …+{more}" if more > 0 else "")
+            lines.append(f"  {s}")
+            return lines
+
+        # Verbose: list each insertion
+        for mech_cls, (name, ic, kwargs) in ev:
+            kw = f" {self._fmt_kwargs(kwargs)}" if (show_kwargs and kwargs) else ""
+            ic_s = "" if ic is None else f" ic={type(ic).__name__}"
+            lines.append(f"  - {name} @ everywhere{ic_s}{kw}")
+
+        for mech_cls, regions in idx:
+            # regions: List[(alias, kwargs, key)]
+            lines.append(f"  - {mech_cls.__name__} @ {len(regions)} region(s):")
+            for alias, kwargs, key in regions[: self._REPR_MAX_MECHS]:
+                nm = alias if alias is not None else mech_cls.__name__
+                kw = f" {self._fmt_kwargs(kwargs)}" if (show_kwargs and kwargs) else ""
+                lines.append(f"      • {nm} @ {self._fmt_index(key)}{kw}")
+            if len(regions) > self._REPR_MAX_MECHS:
+                lines.append(f"      • …+{len(regions) - self._REPR_MAX_MECHS} more")
+
+        return lines
+
+    def _built_mech_lines(
+        self,
+        *,
+        verbose: bool,
+        show_mechanism_parameters: bool = False,
+        tensor_stats: str = "sample",
+    ) -> List[str]:
+        lines: List[str] = []
+        mech_obj = getattr(self, "mech", None)
+        if mech_obj is None:
+            lines.append("mechanisms: built=True (handler missing?)")
+            return lines
+
+        try:
+            mech_dict = mech_obj.mechanisms  # dict-like of name -> nn.Module
+            names = sorted(list(mech_dict.keys()))
+        except Exception:
+            names = sorted(list(set(self._m_name)))
+
+        key_map = {}
+        if hasattr(self, "_m_name") and hasattr(self, "_m_keys"):
+            for n, k in zip(self._m_name, self._m_keys):
+                key_map[n] = k
+
+        lines.append(f"mechanisms: {len(names)} built")
+
+        if not verbose:
+            preview = names[: self._REPR_MAX_MECHS]
+            more = len(names) - len(preview)
+            s = ", ".join(preview) + (f", …+{more}" if more > 0 else "")
+            lines.append(f"  {s}")
+            return lines
+
+        for n in names:
+            k = key_map.get(n, None)
+            pshape = self._m_shape.get(n, None)
+            pshape_s = f", pshape={pshape}" if pshape is not None else ""
+
+            mod = None
+            try:
+                mod = mech_obj.mechanisms[n]
+            except Exception:
+                mod = None
+
+            cls_s = mod._get_name() if isinstance(mod, torch.nn.Module) else "<?>"
+
+            header = f"  - {n} ({cls_s}) @ {self._fmt_index(k)}{pshape_s}"
+
+            if show_mechanism_parameters and isinstance(mod, torch.nn.Module):
+                lines.append(header + " {")
+                lines.extend(
+                    self._mechanism_parameter_block_lines(
+                        mod,
+                        tensor_stats=tensor_stats,
+                        indent0="    ",
+                        indent1="      ",
+                    )
+                )
+                lines.append("  }")
+            else:
+                lines.append(header)
+
+        return lines
+
+    def _infer_ion_usage_from_inserted(self) -> Dict[str, Dict[str, bool]]:
+        """
+        Infer ion usage without build() by reading mechanism class metadata:
+        _read_ion/_write_ion/_write_ion_c.
+        """
+        mech_classes = set(
+            list(self._mech_everywhere.keys()) + list(self._mech_data.keys())
+        )
+        usage: Dict[str, Dict[str, bool]] = {}
+
+        for mech_cls in mech_classes:
+            read_ion = getattr(mech_cls, "_read_ion", {}) or {}
+            write_ion = getattr(mech_cls, "_write_ion", {}) or {}
+            write_ion_c = getattr(mech_cls, "_write_ion_c", {}) or {}
+
+            for ion, vars_ in read_ion.items():
+                u = usage.setdefault(
+                    ion,
+                    {
+                        "read_c": False,
+                        "read_e": False,
+                        "write_i": False,
+                        "write_c": False,
+                    },
+                )
+                if isinstance(vars_, (list, tuple)):
+                    # match your runtime logic in _c_is_read / _e_is_read
+                    if (f"{ion}i" in vars_) or (f"{ion}o" in vars_):
+                        u["read_c"] = True
+                    if f"e{ion}" in vars_:
+                        u["read_e"] = True
+                else:
+                    # if unknown structure, mark as "reads something"
+                    u["read_c"] = True
+
+            for ion in write_ion.keys():
+                u = usage.setdefault(
+                    ion,
+                    {
+                        "read_c": False,
+                        "read_e": False,
+                        "write_i": False,
+                        "write_c": False,
+                    },
+                )
+                u["write_i"] = True
+
+            for ion in write_ion_c.keys():
+                u = usage.setdefault(
+                    ion,
+                    {
+                        "read_c": False,
+                        "read_e": False,
+                        "write_i": False,
+                        "write_c": False,
+                    },
+                )
+                u["write_c"] = True
+
+        # include any explicitly styled ions even if no mech references them
+        for ion in getattr(self, "_ion_style", {}).keys():
+            usage.setdefault(
+                ion,
+                {"read_c": False, "read_e": False, "write_i": False, "write_c": False},
+            )
+
+        return usage
+
+    def _built_ion_usage(self) -> Dict[str, Dict[str, bool]]:
+        """Ion usage from built bookkeeping dictionaries."""
+        ions = (
+            set(self._ion_read.keys())
+            | set(self._ion_write.keys())
+            | set(self._ion_write_c.keys())
+            | set(self._ion_style.keys())
+        )
+        usage: Dict[str, Dict[str, bool]] = {}
+        for ion in ions:
+            usage[ion] = {
+                "read_c": bool(self._c_is_read(ion)),
+                "read_e": bool(self._e_is_read(ion)),
+                "write_i": bool(self._ion_write.get(ion, {})),
+                "write_c": bool(self._ion_write_c.get(ion, {})),
+            }
+        return usage
+
+    def _ion_lines(self, *, verbose: bool) -> List[str]:
+        built = bool(getattr(self, "is_built", False))
+        usage = (
+            self._built_ion_usage() if built else self._infer_ion_usage_from_inserted()
+        )
+        ions = sorted(list(usage.keys()))
+
+        if not ions:
+            return ["ions: (none)"]
+
+        def flags(u: Dict[str, bool]) -> str:
+            bits = []
+            if u.get("write_i"):
+                bits.append("write_i")
+            if u.get("write_c"):
+                bits.append("write_c")
+            if u.get("read_e"):
+                bits.append("read_e")
+            if u.get("read_c"):
+                bits.append("read_c")
+            return ",".join(bits) if bits else "no-io"
+
+        lines: List[str] = [f"ions: {len(ions)} ({'built' if built else 'inferred'})"]
+
+        if not verbose:
+            preview = ions[: self._REPR_MAX_IONS]
+            more = len(ions) - len(preview)
+            s = ", ".join(preview) + (f", …+{more}" if more > 0 else "")
+            lines.append(f"  {s}")
+            return lines
+
+        for ion in ions:
+            u = usage[ion]
+            # show explicit style if present, else (if built) show computed style
+            style_s = ""
+            if ion in getattr(self, "_ion_style", {}):
+                style_s = f", style={self._ion_style[ion]}(explicit)"
+            elif built:
+                try:
+                    style_s = f", style={self.get_ion_style(ion)}"
+                except Exception:
+                    style_s = ""
+            lines.append(f"  - {ion}: {flags(u)}{style_s}")
+
+        # also show whether equilibria/concentrations configs exist
+        if verbose:
+            if getattr(self, "_equilibria", {}):
+                lines.append(
+                    f"  equilibria: keys={sorted(list(self._equilibria.keys()))}"
+                )
+            if getattr(self, "_concentrations", {}):
+                lines.append(
+                    f"  concentrations: keys={sorted(list(self._concentrations.keys()))}"
+                )
+
+        return lines
+
+    def _mechanism_parameter_block_lines(
+        self,
+        mech_module: torch.nn.Module,
+        *,
+        tensor_stats: str,
+        indent0: str = "    ",
+        indent1: str = "      ",
+        max_entries: int = None,
+    ) -> List[str]:
+        """
+        Returns lines like:
+            parameters {
+              a: 1
+              w: [ ... ] (shape=(...))
+            }
+        """
+        max_entries = (
+            self._REPR_MAX_MECH_PARAM_ENTRIES if max_entries is None else max_entries
+        )
+
+        params = list(mech_module.named_parameters(recurse=True))
+        # deterministic order
+        params.sort(key=lambda kv: kv[0])
+
+        if not params:
+            return [f"{indent0}parameters {{", f"{indent1}(none)", f"{indent0}}}"]
+
+        lines: List[str] = [f"{indent0}parameters {{"]
+
+        shown = 0
+        for name, p in params:
+            if shown >= max_entries:
+                break
+            grad_tag = " (grad)" if getattr(p, "requires_grad", False) else ""
+            val_s = self._fmt_tensor_value(p, tensor_stats=tensor_stats)
+            lines.append(f"{indent1}{name}{grad_tag}: {val_s}")
+            shown += 1
+
+        remaining = len(params) - shown
+        if remaining > 0:
+            lines.append(f"{indent1}…+{remaining} more")
+
+        lines.append(f"{indent0}}}")
+        return lines
+
+    # ---------- single source of truth for repr lines ----------
+    def _repr_lines(
+        self,
+        *,
+        verbose: bool = False,
+        show_kwargs: Optional[bool] = None,
+        tensor_stats: Optional[str] = None,
+        show_mechanism_parameters: bool = False,
+    ) -> List[str]:
+        show_kwargs = self._REPR_SHOW_KWARGS if show_kwargs is None else show_kwargs
+        if tensor_stats is not None:
+            self._REPR_TENSOR_STATS = tensor_stats  # allow per-call override
+
+        lines: List[str] = []
+
+        # Shape / batching
+        if self.is_batched():
+            lines.append(
+                f"batch_shape={self.shape[:-2]}, core_shape={self.core_shape()}, shape={self.shape}"
+            )
+        else:
+            lines.append(f"core_shape={self.core_shape()} (np={self.np}, nc={self.nc})")
+
+        lines.append(
+            f"device={self.device()}, dtype={self.dtype()}, built={self.is_built}, rebuild_pending={self._flag_rebuild}"
+        )
+
+        # Parameters: show celsius scalar; cm/rhoa summarized (sample by default)
+        lines.append(
+            "params: "
+            f"celsius={self._fmt_scalar(getattr(self, 'celsius', None))} °C, "
+            f"cm={self._fmt_tensor_param(getattr(self, 'cm', None), units='')}, "
+            f"rhoa={self._fmt_tensor_param(getattr(self, 'rhoa', None), units='')}"
+        )
+
+        # Mechanisms
+        if self.is_built:
+            lines.extend(
+                self._built_mech_lines(
+                    verbose=verbose,
+                    show_mechanism_parameters=(show_mechanism_parameters and verbose),
+                    tensor_stats=tensor_stats or "sample",
+                )
+            )
+        else:
+            lines.extend(
+                self._pending_mech_lines(verbose=verbose, show_kwargs=show_kwargs)
+            )
+
+        # Ions
+        lines.extend(self._ion_lines(verbose=verbose))
+
+        return lines
+
+    # ---------- the PyTorch hook ----------
+    def extra_repr(self) -> str:
+        # concise by default; keep it bounded
+        return "\n".join(self._repr_lines(verbose=False))
+
+    # optional: explicit verbose summary for debugging/logging
+    def pretty(
+        self,
+        *,
+        show_kwargs: bool = False,
+        tensor_stats: str = "sample",
+        show_mechanism_parameters: bool = False,
+        indent: int = 2,
+    ) -> str:
+        """
+        Human-friendly, block-formatted summary:
+
+        Population {
+          ...
+        }
+        """
+        name = self._get_name()  # nn.Module hook (defaults to class name)
+
+        # your existing verbose lines
+        lines = self._repr_lines(
+            verbose=True,
+            show_kwargs=show_kwargs,
+            tensor_stats=tensor_stats,
+            show_mechanism_parameters=show_mechanism_parameters,
+        )
+
+        body = "\n".join(lines).rstrip()
+        if body:
+            body = textwrap.indent(body, " " * indent)
+
+        # handle empty body gracefully
+        if not body:
+            return f"{name} {{\n}}"
+
+        return f"{name} {{\n{body}\n}}"
 
 
 class SingleCompartment(Population):

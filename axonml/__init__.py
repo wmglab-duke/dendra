@@ -1,3 +1,5 @@
+"""AxonML: A PyTorch-based framework for simulating and modeling neural dynamics."""
+
 import os
 
 __version__ = "0.9.0"

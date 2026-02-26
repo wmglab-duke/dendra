@@ -80,8 +80,11 @@ release_bump:
     # Authenticate pushes using CI_JOB_TOKEN
     - git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
   script:
-    - cz bump --dry-run || true
-    - cz bump --yes || (echo "No version bump needed." && exit 0)
+    # Preview (won't fail job if there's nothing to bump)
+    - cz -nr NO_INCREMENT bump --dry-run --major-version-zero
+
+    # Perform bump (breaking changes won't jump to 1.0.0)
+    - cz -nr NO_INCREMENT bump --yes --major-version-zero
 
     # Push bump commit and tags back to main
     - git push origin HEAD:main
