@@ -109,9 +109,19 @@ class sin(Waveform):
     )
 
     def fn(self, t):
-        off = torch.minimum(self.off, self.off_after + self.delay)
-        w = torch.sin(2 * torch.pi * self.freq * (t - self.delay) + self.phase)
-        return self.amp * torch.where((t >= self.delay) & (t < off), w, 0.0)
+        amp = _time_broadcast_param(self.amp, t)
+        freq = _time_broadcast_param(self.freq, t)
+        phase = _time_broadcast_param(self.phase, t)
+        delay = _time_broadcast_param(self.delay, t)
+        off = _time_broadcast_param(self.off, t)
+        off_after = _time_broadcast_param(self.off_after, t)
+
+        off_eff = torch.minimum(off, off_after + delay)
+
+        w = torch.sin(2 * torch.pi * freq * (t - delay) + phase)
+        on = (t >= delay) & (t < off_eff)
+
+        return amp * torch.where(on, w, torch.zeros_like(w))
 
 
 class cos(Waveform):
@@ -161,9 +171,19 @@ class cos(Waveform):
     )
 
     def fn(self, t):
-        off = torch.minimum(self.off, self.off_after + self.delay)
-        w = torch.cos(2 * torch.pi * self.freq * (t - self.delay) + self.phase)
-        return self.amp * torch.where((t >= self.delay) & (t < off), w, 0.0)
+        amp = _time_broadcast_param(self.amp, t)
+        freq = _time_broadcast_param(self.freq, t)
+        phase = _time_broadcast_param(self.phase, t)
+        delay = _time_broadcast_param(self.delay, t)
+        off = _time_broadcast_param(self.off, t)
+        off_after = _time_broadcast_param(self.off_after, t)
+
+        off_eff = torch.minimum(off, off_after + delay)
+
+        w = torch.cos(2 * torch.pi * freq * (t - delay) + phase)
+        on = (t >= delay) & (t < off_eff)
+
+        return amp * torch.where(on, w, torch.zeros_like(w))
 
 
 class mono_rect(Waveform):
@@ -208,8 +228,13 @@ class mono_rect(Waveform):
     Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0, tau=0.1)
 
     def fn(self, t):
-        gate = _rect_gate(t, self.delay, self.delay + self.pw, self.tau)
-        return self.amp * gate
+        amp = _time_broadcast_param(self.amp, t)
+        delay = _time_broadcast_param(self.delay, t)
+        pw = _time_broadcast_param(self.pw, t)
+        tau = _time_broadcast_param(self.tau, t)
+
+        gate = _rect_gate(t, delay, delay + pw, tau)
+        return amp * gate
 
 
 class bi_rect(Waveform):
@@ -269,13 +294,23 @@ class bi_rect(Waveform):
     )
 
     def fn(self, t):
-        t1_start = self.delay
-        t1_stop = self.delay + self.pw1
-        t2_start = self.delay + self.pw1 + self.interval
-        t2_stop = t2_start + self.pw2
-        gate1 = _rect_gate(t, t1_start, t1_stop, self.tau, inclusive_stop=True)
-        gate2 = _rect_gate(t, t2_start, t2_stop, self.tau, inclusive_stop=True)
-        return self.amp1 * gate1 + self.amp2 * gate2
+        amp1 = _time_broadcast_param(self.amp1, t)
+        amp2 = _time_broadcast_param(self.amp2, t)
+        delay = _time_broadcast_param(self.delay, t)
+        pw1 = _time_broadcast_param(self.pw1, t)
+        pw2 = _time_broadcast_param(self.pw2, t)
+        interval = _time_broadcast_param(self.interval, t)
+        tau = _time_broadcast_param(self.tau, t)
+
+        t1_start = delay
+        t1_stop = delay + pw1
+        t2_start = t1_stop + interval
+        t2_stop = t2_start + pw2
+
+        gate1 = _rect_gate(t, t1_start, t1_stop, tau, inclusive_stop=True)
+        gate2 = _rect_gate(t, t2_start, t2_stop, tau, inclusive_stop=True)
+
+        return amp1 * gate1 + amp2 * gate2
 
 
 class bi_rect_balanced(Waveform):
@@ -330,14 +365,25 @@ class bi_rect_balanced(Waveform):
     Waveform.PARAMETER(amp=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0, tau=0.1)
 
     def fn(self, t):
-        t1_start = self.delay
-        t1_stop = self.delay + self.pw1
-        t2_start = self.delay + self.pw1 + self.interval
-        t2_stop = t2_start + self.pw2
-        gate1 = _rect_gate(t, t1_start, t1_stop, self.tau, inclusive_stop=True)
-        gate2 = _rect_gate(t, t2_start, t2_stop, self.tau, inclusive_stop=True)
-        amp2 = -self.amp / (self.pw1 / self.pw2)
-        return self.amp * gate1 + amp2 * gate2
+        amp = _time_broadcast_param(self.amp, t)
+        delay = _time_broadcast_param(self.delay, t)
+        pw1 = _time_broadcast_param(self.pw1, t)
+        pw2 = _time_broadcast_param(self.pw2, t)
+        interval = _time_broadcast_param(self.interval, t)
+        tau = _time_broadcast_param(self.tau, t)
+
+        t1_start = delay
+        t1_stop = delay + pw1
+        t2_start = t1_stop + interval
+        t2_stop = t2_start + pw2
+
+        gate1 = _rect_gate(t, t1_start, t1_stop, tau, inclusive_stop=True)
+        gate2 = _rect_gate(t, t2_start, t2_stop, tau, inclusive_stop=True)
+
+        pw2_safe = torch.clamp(pw2, min=1e-12)
+        amp2 = -amp * (pw1 / pw2_safe)
+
+        return amp * gate1 + amp2 * gate2
 
 
 class bi_rect_symm(Waveform):
@@ -387,13 +433,21 @@ class bi_rect_symm(Waveform):
     Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0, interval=0.0, tau=0.1)
 
     def fn(self, t):
-        t1_start = self.delay
-        t1_stop = self.delay + self.pw
-        t2_start = self.delay + self.pw + self.interval
-        t2_stop = self.delay + 2 * self.pw + self.interval
-        gate1 = _rect_gate(t, t1_start, t1_stop, self.tau, inclusive_stop=True)
-        gate2 = _rect_gate(t, t2_start, t2_stop, self.tau, inclusive_stop=True)
-        return self.amp * gate1 - self.amp * gate2
+        amp = _time_broadcast_param(self.amp, t)
+        delay = _time_broadcast_param(self.delay, t)
+        pw = _time_broadcast_param(self.pw, t)
+        interval = _time_broadcast_param(self.interval, t)
+        tau = _time_broadcast_param(self.tau, t)
+
+        t1_start = delay
+        t1_stop = delay + pw
+        t2_start = t1_stop + interval
+        t2_stop = t2_start + pw
+
+        gate1 = _rect_gate(t, t1_start, t1_stop, tau, inclusive_stop=True)
+        gate2 = _rect_gate(t, t2_start, t2_stop, tau, inclusive_stop=True)
+
+        return amp * gate1 - amp * gate2
 
 
 class arbitrary(Waveform):

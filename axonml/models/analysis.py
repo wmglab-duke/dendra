@@ -241,7 +241,7 @@ def conduction_velocity(
     --------
     Basic usage (single AP, known nodes):
 
-    >>> out = differentiable_conduction_velocity(
+    >>> out = conduction_velocity(
     ...     V, lengths_um, dt_ms,
     ...     node_mask=node_mask,
     ...     V_spk=-10.0,
@@ -253,7 +253,7 @@ def conduction_velocity(
 
     Add robustness penalties when training:
 
-    >>> out = differentiable_conduction_velocity(
+    >>> out = conduction_velocity(
     ...     V, lengths_um, dt_ms,
     ...     node_mask=node_mask,
     ...     reg_ess_weight=1e-2, min_ess=4.0,
@@ -421,9 +421,356 @@ def chronaxie_from_trials(
     reg_weiss_fit_weight: float = 0.0,
     eps: float = 1e-8,
 ) -> Dict[str, Any]:
-    """
-    Chronaxie estimator robust to high-amplitude block by extracting the *lower* activation
-    threshold (first activation) per pulse width, rather than a global bracket midpoint.
+    r"""
+    Differentiably estimate chronaxie and rheobase from trial-wise voltage recordings,
+    with explicit support for **non-monotone activation vs amplitude** (e.g., high-amplitude
+    conduction block).
+
+    This function is designed for the common simulation/recording format where each trial
+    corresponds to a single `(pulse width, amplitude)` pair:
+
+    - ``V[t, p, c]``: membrane potential time series for trial ``p`` across compartments
+    - ``amplitudes[p]``: stimulus amplitude for trial ``p``
+    - ``pws_ms[p]``: pulse width (ms) for trial ``p``
+
+    The key difference vs. many threshold extractors is that it can separate:
+
+    - the **onset threshold** ("first activation": lowest amplitude that yields an AP),
+      which is what chronaxie typically refers to, and
+    - an optional **block boundary** at high amplitude (if activation becomes non-monotone).
+
+    The output includes both the estimated chronaxie/rheobase and intermediate per-pulse-width
+    threshold/boundary estimates.
+
+    The computation has three stages:
+
+    1) **Smooth activation surrogate per trial**
+       A scalar "activation confidence" ``p_spike_trial[p] ∈ (0, 1)`` is computed from each
+       voltage recording using a differentiable approximation to a max-over-time-and-space
+       spike detector:
+
+       - compute ``Z = V - V_spk``
+       - approximate ``max_{t,c} Z[t,p,c]`` with a log-sum-exp (softmax) using ``kappa_V``
+       - map to (0,1) with a sigmoid with scale ``gate_V_scale``
+
+       This avoids non-differentiable threshold crossing and keeps gradients defined everywhere.
+
+    2) **Group trials by pulse width**
+       Trials are grouped by unique values in ``pws_ms`` (optionally rounded).
+
+    3) **Extract a differentiable threshold strength per pulse width**
+       For each pulse width group, a differentiable onset threshold is computed. The default
+       (``threshold_method="onset_midpoint"``) is robust to high-amplitude block:
+
+       - ``I_on(d)``: a soft estimate of the **lowest activating strength** (soft-min over
+         strength weighted by activation membership)
+       - ``I_pre(d)``: a soft estimate of the **highest inactive strength below onset**
+         (selected by smallest positive gap to ``I_on``, weighted by inactivity membership)
+
+       Then the onset threshold is defined as:
+           ``I_th(d) = 0.5 * (I_pre(d) + I_on(d))``
+
+       This definition matches the common empirical rule "midpoint between highest inactive
+       and lowest active", while remaining differentiable and avoiding contamination from
+       blocked high-amplitude non-activation.
+
+       Optionally, the function also estimates high-amplitude block boundaries:
+       - ``I_last(d)``: soft estimate of the **highest activating strength**
+       - ``I_post(d)``: soft estimate of the **lowest inactive strength above I_last**
+       - ``I_block_mid(d) = 0.5*(I_last + I_post)`` (diagnostic)
+
+
+    Given per-pulse-width thresholds ``I_th(d)``, the function uses the Weiss charge form:
+
+        ``Q_th(d) = d * I_th(d) ≈ I_r * d + I_r * c``
+
+    where:
+    - ``I_r`` is rheobase (slope),
+    - ``c`` is chronaxie (intercept/slope).
+
+    A **weighted least-squares** fit is used. Pulse widths where the threshold extraction
+    is ambiguous (e.g., no strong evidence of a subthreshold point and an activating point)
+    are automatically downweighted via ``pw_weight`` (see Returns).
+
+    Parameters
+    ----------
+    V : torch.Tensor
+        Voltage recordings with shape ``(T, P, C)``:
+
+        - ``T``: number of time samples
+        - ``P``: number of trials
+        - ``C``: number of compartments
+
+        Units are typically mV. Gradients propagate through ``V`` (and therefore through any
+        upstream differentiable simulator).
+
+        Important: the activation surrogate detects *any* spike-like event within the scored
+        compartments. If you care about **propagating** activation (not just local initiation),
+        ensure that `node_mask` selects compartments in the region where propagation is assessed
+        (often distal compartments).
+
+    amplitudes : torch.Tensor
+        Stimulus amplitudes, shape ``(P,)``. These are typically design constants and do not
+        need gradients. Units are arbitrary (uA, mA, etc.) but must be consistent across trials.
+
+    pws_ms : torch.Tensor
+        Pulse widths in milliseconds, shape ``(P,)``. Must contain at least 2 distinct pulse
+        widths to estimate chronaxie.
+
+    V_spk : float, default=0.0
+        Voltage reference for spike scoring (same units as ``V``). The spike score is based on
+        ``V - V_spk``. Example choices: 0 mV, -20 mV.
+
+    kappa_V : float, default=20.0
+        Sharpness of the log-sum-exp used to approximate a max. Larger values make spike scoring
+        closer to a hard max but can produce peakier gradients.
+
+    gate_V_scale : float, default=5.0
+        Softness of the sigmoid mapping the spike score to confidence in (0,1). Smaller values
+        act more threshold-like.
+
+    node_mask : torch.Tensor, optional
+        Compartment weights/mask, shape ``(C,)`` (bool or float).
+
+        - bool: True compartments included, False excluded
+        - float: nonnegative weights (0 excludes)
+
+        Used inside the smooth max over compartments. This is the primary mechanism to focus
+        activation scoring on nodes of Ranvier or distal compartments.
+
+    time_window : tuple[int, int], optional
+        Time index window ``(t_start, t_end)`` applied as ``V[t_start:t_end]`` before scoring.
+        Useful to exclude baseline and/or late artifacts.
+
+    strength : torch.Tensor, optional
+        A per-trial monotone “strength” variable, shape ``(P,)``, used as the 1D axis along which
+        thresholds are extracted. If None, defaults to ``amplitudes``.
+
+        Use this when “stronger stimulus” is not numerically larger amplitude. Examples:
+        - cathodic negative currents: use ``strength = -amplitudes`` so stronger means larger
+        - magnitude-only experiments: use ``use_abs_strength=True``
+
+        All threshold outputs (I_th, rheobase, boundaries) are in the units of `strength`.
+
+    use_abs_strength : bool, default=False
+        If True, thresholds are extracted on ``abs(strength)`` (or ``abs(amplitudes)``).
+
+    pw_round_decimals : int, optional
+        If provided, pulse widths are rounded to this number of decimals before grouping.
+        Useful if `pws_ms` contains float representation noise.
+
+        Note: grouping is discrete (not differentiable w.r.t. pws), which is typically fine
+        since pws are design constants.
+
+    enforce_min_trials_per_pw : bool, default=True
+        If True, raises ValueError if any pulse width group has fewer than `min_trials_per_pw` trials.
+
+    min_trials_per_pw : int, default=2
+        Minimum trial count per pulse width group when enforcement is enabled.
+
+    threshold_method : {"onset", "onset_midpoint", "ptarget", "bracket_midpoint"}, default="onset_midpoint"
+        How to compute the per-pulse-width threshold:
+
+        - ``"onset"``:
+          ``I_th(d) = I_on(d)``, i.e. soft estimate of the **lowest active** strength.
+          Closest to the empirical "lowest activating amplitude".
+
+        - ``"onset_midpoint"`` (recommended for chronaxie):
+          ``I_th(d) = 0.5*(I_pre(d) + I_on(d))`` where I_pre is the **highest inactive below onset**
+          (soft, block-robust). Closest to empirical "midpoint between highest inactive and lowest active".
+
+        - ``"ptarget"``:
+          Selects the strength whose activation confidence is closest to ``p_target`` using a soft-argmin.
+          This requires trials near the boundary; it is often poorly conditioned for all-or-none activation.
+
+        - ``"bracket_midpoint"``:
+          Legacy "global bracket" midpoint between soft max inactive and soft min active. This can fail under
+          block because high-amplitude blocked trials appear inactive and dominate the max-inactive selection.
+
+    p_target : float, default=0.5
+        Used only for ``threshold_method="ptarget"``.
+
+    alpha_thresh : float, default=200.0
+        Used only for ``threshold_method="ptarget"``; soft-argmin sharpness.
+
+    alpha_extreme : float, default=50.0
+        Sharpness for soft extreme selection (soft-min / soft-max) used in onset/block boundaries.
+        Internally strengths are normalized within each PW group, so this is dimensionless.
+
+    membership_power : float, default=10.0
+        Sharpens activation/inactivation membership by exponentiating probabilities in log-space.
+        Larger values make "active" behave more like a hard set (p≈1) and "inactive" more like p≈0.
+        This improves extreme selection when p_spike is nearly binary.
+
+    gap_alpha : float, default=200.0
+        Sharpness for selecting the **nearest** inactive point below onset (and optionally above last active).
+        Larger values behave more like selecting the single closest gap.
+
+    below_gate_frac : float, default=0.02
+        Scale (fraction of within-group strength range) controlling a smooth gate that suppresses points on
+        the wrong side of the boundary when selecting "inactive below onset" (or "inactive above last active").
+
+    compute_block : bool, default=True
+        If True, compute high-amplitude block boundary diagnostics (I_last, I_post, I_block_mid).
+        These diagnostics do not affect the onset threshold unless you explicitly use them.
+
+    p_low, p_high : float, default=0.05, 0.95
+        Targets for optional bracketing regularization. See `reg_bracket_weight`.
+
+    reg_bracket_weight : float, default=0.0
+        Optional regularizer that encourages each PW group to contain evidence of both:
+        - a low-strength non-activating trial (p at minimum strength <= p_low),
+        - at least one strongly activating trial (max p >= p_high).
+
+        This is *block compatible* because it uses `max p` rather than p at max strength.
+
+    reg_monotone_weight : float, default=0.0
+        Optional regularizer that encourages p_spike to be nondecreasing with strength within each PW group.
+        This **conflicts with block** (0→1→0 behavior), so leave it at 0 if block is expected.
+
+    reg_unimodal_weight : float, default=0.0
+        Optional regularizer that encourages **unimodality** of p_spike vs strength within each PW group:
+        allows 0→1→0 (single peak) but discourages oscillations (e.g., 0→1→0→1).
+        This is the recommended shape prior if block is expected.
+
+    unimodal_beta_peak : float, default=50.0
+        Sharpness of the soft peak-location estimate used by the unimodality regularizer.
+
+    unimodal_tau_idx : float, default=1.0
+        Softness of the “before/after peak” partition used by the unimodality regularizer
+        (in index units along the sorted strength axis).
+
+    reg_weiss_fit_weight : float, default=0.0
+        Optional regularizer penalizing Weiss-fit residual MSE across pulse widths, weighted by pw_weight.
+        Useful if you want extracted thresholds to adhere closely to Weiss/Lapicque behavior.
+
+    eps : float, default=1e-8
+        Numerical stability constant used in logs/divisions.
+
+    Returns
+    -------
+    out : dict[str, Any]
+        Dictionary of differentiable outputs (gradients w.r.t. V):
+
+        chronaxie_ms : torch.Tensor, shape ``()``
+            Estimated chronaxie in milliseconds.
+
+        rheobase : torch.Tensor, shape ``()``
+            Estimated rheobase in the units of `strength` (or amplitudes if strength is None).
+
+        pw_unique_ms : torch.Tensor, shape ``(D,)``
+            Unique pulse widths used for estimation, sorted ascending.
+
+        I_th : torch.Tensor, shape ``(D,)``
+            Differentiable onset threshold per pulse width (definition depends on `threshold_method`).
+
+        Q_th : torch.Tensor, shape ``(D,)``
+            Charge thresholds: ``Q_th[d] = pw_unique_ms[d] * I_th[d]``.
+
+        p_spike_trial : torch.Tensor, shape ``(P,)``
+            Smooth activation confidence per trial in (0,1).
+
+        pw_group_id : torch.Tensor, shape ``(P,)``
+            Integer PW group index per trial (maps trials to entries of pw_unique_ms).
+            This is discrete and mainly for inspection/debugging.
+
+        pw_weight : torch.Tensor, shape ``(D,)``
+            Reliability weights per pulse width used in the weighted Weiss fit. These downweight
+            pulse widths where evidence of bracketing (inactive at low strength and some activation)
+            is weak.
+
+        boundaries : dict[str, torch.Tensor]
+            Boundary diagnostics (each shape ``(D,)``):
+
+            - ``I_on``:
+                soft estimate of lowest activating strength (“lowest active”).
+
+            - ``I_pre_inactive``:
+                soft estimate of highest inactive strength below onset (block-robust).
+
+            - ``I_last_active``:
+                soft estimate of highest activating strength (“last active”).
+
+            - ``I_post_inactive``:
+                soft estimate of lowest inactive strength above last active (for block diagnostics).
+
+            - ``I_block_mid``:
+                midpoint between I_last_active and I_post_inactive (diagnostic block threshold).
+
+        fit : dict
+            Weiss fit diagnostics:
+              - ``slope``     (rheobase)
+              - ``intercept`` (rheobase * chronaxie)
+              - ``weiss_mse`` (weighted MSE)
+
+        reg : torch.Tensor, shape ``()``
+            Optional regularization term (0 if all reg_*_weight are 0). Add to your training loss
+            if you are optimizing model parameters through this chronaxie estimator.
+
+    Notes
+    -----
+
+    - You must have at least 2 distinct pulse widths to estimate chronaxie.
+    - For each pulse width, threshold extraction is meaningful only if you have trials that
+      bracket the onset transition (some inactive below onset and some active at/above onset).
+    - Under block, you can still estimate onset threshold if low-end bracketing exists.
+
+    - The outputs are differentiable w.r.t. V (and thus w.r.t. upstream simulator parameters).
+    - Grouping by pulse width is discrete; do not expect gradients w.r.t. pws_ms grouping.
+    - The `amplitudes`/`strength` are typically constants; threshold extraction does not require
+      gradients w.r.t. these design variables.
+
+    Spike scoring is a soft max over time and the selected compartments. If your goal is
+    *propagating* activation, choose a `node_mask` that reflects the observation site(s)
+    where propagation is assessed (often distal nodes/compartments). Otherwise, the surrogate
+    may report activation even if propagation fails downstream.
+
+    - If block can occur, prefer:
+      - ``threshold_method="onset"`` or ``"onset_midpoint"`` (default)
+      - avoid ``"bracket_midpoint"``
+      - avoid monotonicity regularization; use unimodality regularization if desired.
+
+    Examples
+    --------
+    Basic usage (robust onset midpoint thresholds):
+
+    >>> out = chronaxie_from_trials(
+    ...     V, amps, pws_ms,
+    ...     node_mask=distal_mask,
+    ...     threshold_method="onset_midpoint",
+    ... )
+    >>> c_ms = out["chronaxie_ms"]
+    >>> Ir = out["rheobase"]
+
+    Cathodic-negative amplitudes (stronger means more negative):
+    pass strength=-amps so strength increases with stimulus intensity:
+
+    >>> out = chronaxie_from_trials(
+    ...     V, amps, pws_ms,
+    ...     strength=-amps,
+    ...     threshold_method="onset_midpoint",
+    ... )
+
+    Non-monotone activation due to high-amplitude block:
+    extract onset threshold but also inspect block boundary diagnostics:
+
+    >>> out = chronaxie_from_trials(
+    ...     V, amps, pws_ms,
+    ...     threshold_method="onset_midpoint",
+    ...     compute_block=True,
+    ... )
+    >>> onset = out["boundaries"]["I_on"]
+    >>> block = out["boundaries"]["I_block_mid"]
+
+    Add shape prior that allows 0→1→0 but discourages oscillations:
+
+    >>> out = chronaxie_from_trials(
+    ...     V, amps, pws_ms,
+    ...     threshold_method="onset_midpoint",
+    ...     reg_unimodal_weight=1e-2,
+    ... )
+    >>> loss = task_loss(out["chronaxie_ms"]) + out["reg"]
+
     """
     if V.ndim != 3:
         raise ValueError("V must have shape (T, P, C).")
@@ -736,11 +1083,11 @@ def plot_activation_heatmap_from_chronaxie_output(
 ):
     """
     Plot an activation heatmap (activated vs non-activated) vs amplitude and pulse width,
-    with optional overlays for (i) estimated strength–duration threshold curves and (ii)
+    with optional overlays for (i) estimated strength-duration threshold curves and (ii)
     empirical threshold points derived directly from the binned heatmap.
 
     This helper is intended to work with the dictionary output from
-    ``differentiable_chronaxie_from_trials(...)`` (or a compatible estimator that returns
+    ``chronaxie_from_trials(...)`` (or a compatible estimator that returns
     per-trial activation confidences and pulse-width grouping information).
 
     The plot is constructed by binning trials onto a 2D grid:
@@ -774,7 +1121,6 @@ def plot_activation_heatmap_from_chronaxie_output(
        These are useful to visually compare the estimator output (I_th / fit) against the
        “data-derived” boundary.
 
-       Notes:
        - This assumes that “activation likelihood increases monotonically with amplitude/strength”
          within each pulse-width column. If your design violates this, empirical thresholds may be
          ambiguous (you can use the monotonicity regularizer during fitting, or inspect manually).
@@ -784,7 +1130,7 @@ def plot_activation_heatmap_from_chronaxie_output(
     Parameters
     ----------
     chron_out : dict
-        Output dictionary from ``differentiable_chronaxie_from_trials`` (or equivalent).
+        Output dictionary from ``chronaxie_from_trials`` (or equivalent).
         Required keys:
 
         - ``"p_spike_trial"`` : torch.Tensor, shape (P,)
