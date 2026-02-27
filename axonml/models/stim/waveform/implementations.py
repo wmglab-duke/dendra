@@ -15,13 +15,49 @@ __all__ = [
 ]
 
 
+def _as_tensor_like(x, ref: torch.Tensor) -> torch.Tensor:
+    """
+    Convert python/numpy scalars to a tensor on ref.device/ref.dtype.
+    Leave torch.Tensors (incl. nn.Parameter) untouched to preserve grads.
+    """
+    if torch.is_tensor(x):
+        return x
+    return ref.new_tensor(x)
+
+
+def _time_broadcast_param(x, t: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure x broadcasts against t (shape [T]) with time as the LAST dim.
+
+    Rules:
+      - scalars (0-dim) are fine as-is
+      - if last dim is already 1, fine (explicit time axis)
+      - if last dim equals T, treat as time-varying and keep
+      - otherwise append a trailing singleton dim, e.g. [B] -> [B,1], [B,C] -> [B,C,1]
+    """
+    x = _as_tensor_like(x, t)
+    if x.ndim == 0:
+        return x
+    T = t.shape[-1]
+    if x.shape[-1] in (1, T):
+        return x
+    return x.unsqueeze(-1)
+
+
 def _rect_gate(t, start, stop, tau, inclusive_stop=False):
+    # Canonicalize to broadcast across time
+    start = _time_broadcast_param(start, t)
+    stop = _time_broadcast_param(stop, t)
+    tau = _time_broadcast_param(tau, t)
+
     tau = torch.clamp(tau, min=1e-6)
     soft = torch.sigmoid((t - start) / tau) * torch.sigmoid((stop - t) / tau)
+
     if inclusive_stop:
         hard = ((t >= start) & (t <= stop)).to(soft.dtype)
     else:
         hard = ((t >= start) & (t < stop)).to(soft.dtype)
+
     # Straight-through gate: hard in forward, soft for gradients.
     return hard + (soft - soft.detach())
 
@@ -163,7 +199,7 @@ class mono_rect(Waveform):
     Examples
     --------
     >>> import torch
-    >>> impotr axonml as ax
+    >>> import axonml as ax
     >>> waveform = ax.mono_rect(amp=-2.0, pw=0.5)
     >>> t = torch.linspace(0, 2, 100)
     >>> values = waveform(t)
