@@ -12,6 +12,10 @@ ms : float
     Millisecond time unit (base unit for time in AxonML).
 s : float
     Second (``1000 * ms``).
+minutes : float
+    Minute (``60 * s``).
+hours : float
+    Hour (``60 * minutes``).
 
 mV : float
     Millivolt voltage unit (base unit for voltage in AxonML).
@@ -90,6 +94,8 @@ Use these units when specifying model parameters:
 # time
 ms = 1.0
 s = 1000.0 * ms
+minutes = 60.0 * s
+hours = 60.0 * minutes
 
 # voltage
 mV = 1.0
