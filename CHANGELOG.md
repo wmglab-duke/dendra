@@ -1,3 +1,13 @@
+## v0.11.0 (2026-03-04)
+
+### Feat
+
+- differentiable chronaxie estimation
+
+### Fix
+
+- **stim/waveform.py**: fixes bi_rect_balanced
+
 ## v0.10.0 (2026-02-26)
 
 ### Feat
