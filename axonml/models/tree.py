@@ -117,13 +117,14 @@ class Tree(Population):
         self.register_buffer("directions", directions)
         self.register_buffer(
             "azimuthal_rotations",
-            torch.tensor(0.0, dtype=self.dtype(), device=self.device()).expand(N),
+            torch.tensor(0.0, dtype=self.dtype(), device=self.device())
+            .expand(N)
+            .clone(),
         )
 
         self.register_buffer("base_direction", self.directions.clone())
         self.register_buffer(
-            "base_azimuthal_rotation",
-            torch.tensor(0.0, dtype=self.dtype(), device=self.device()),
+            "base_azimuthal_rotation", self.azimuthal_rotations.clone()
         )
 
         self[:, self.find_not("branchpoint")].label("internal_nodes")
@@ -159,7 +160,7 @@ class Tree(Population):
         membrane.update(kwargs)
         tree = cls(N, C, graph, integrator, **membrane)
         for key, value in data.items():
-            tree.register_buffer(key, value.expand(N, -1).to(tree.dtype()))
+            tree.register_buffer(key, value.expand(N, -1).clone().to(tree.dtype()))
         tree.slice("soma").label("soma")
         tree.slice("axon").label("axon")
         tree.slice("dend").label("dend")
