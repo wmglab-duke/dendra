@@ -1,3 +1,10 @@
+## v0.11.1 (2026-03-06)
+
+### Fix
+
+- fix from_ascent classmethod for precomputed_interpolate_1d field
+- fix rotate_azimuthal in Tree class
+
 ## v0.11.0 (2026-03-04)
 
 ### Feat
