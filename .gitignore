@@ -146,3 +146,6 @@ examples/*/*.pkl
 *.DS_Store
 
 *.mp4
+*.zip
+
+frontend/node_modules/

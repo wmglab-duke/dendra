@@ -9,6 +9,68 @@ import torch.nn.functional as F
 ArrayLike1D = Union[torch.Tensor, np.ndarray, Sequence[float], Sequence[int]]
 
 
+def _soft_arrival_and_spike_gate(
+    V: torch.Tensor,  # (T, F, C)
+    dt_ms: float | torch.Tensor,
+    *,
+    # Soft arrival time settings (upstroke-based)
+    beta: float = 50.0,
+    dv0: float = 0.0,
+    dv_scale: float = 1.0,
+    lambda_early: float = 0.0,
+    # Spike-present confidence gate (voltage-based)
+    V_spk: float = 0.0,
+    kappa_V: float = 20.0,
+    gate_V_scale: float = 5.0,
+    # Optional dV/dt gate
+    use_dv_gate: bool = False,
+    dv_spk: float = 10.0,
+    kappa_dv: float = 10.0,
+    gate_dv_scale: float = 5.0,
+):
+    """
+    Shared helper for soft spike localization.
+
+    Returns
+    -------
+    t_hat_ms : torch.Tensor
+        Soft upstroke arrival times, shape (F, C).
+    p_spike : torch.Tensor
+        Spike-present confidence, shape (F, C).
+    """
+    assert V.ndim == 3, "V must be (T, F, C)"
+    T, Fibs, C = V.shape
+    device, dtype = V.device, V.dtype
+
+    if not torch.is_tensor(dt_ms):
+        dt_ms = torch.tensor(dt_ms, device=device, dtype=dtype)
+    else:
+        dt_ms = dt_ms.to(device=device, dtype=dtype)
+
+    # Time grid
+    t_ms = torch.arange(T, device=device, dtype=dtype) * dt_ms  # (T,)
+
+    # Upstroke-based soft arrival time
+    dV = (V[1:] - V[:-1]) / dt_ms  # (T-1, F, C), mV/ms
+    t_mid = 0.5 * (t_ms[1:] + t_ms[:-1])  # (T-1,)
+
+    U = F.softplus((dV - dv0) / dv_scale)  # (T-1, F, C)
+    logits = beta * U - lambda_early * t_mid[:, None, None]
+    w_time = torch.softmax(logits, dim=0)
+    t_hat_ms = (w_time * t_mid[:, None, None]).sum(dim=0)  # (F, C)
+
+    # Spike-present confidence
+    a = torch.logsumexp(kappa_V * (V - V_spk), dim=0) / kappa_V  # (F, C)
+    p_spike = torch.sigmoid(a / gate_V_scale)
+
+    if use_dv_gate:
+        u = torch.logsumexp(kappa_dv * (dV - dv_spk), dim=0) / kappa_dv  # (F, C)
+        p_dv = torch.sigmoid(u / gate_dv_scale)
+        p_spike = p_spike * p_dv
+
+    return t_hat_ms, p_spike
+
+
 def conduction_velocity(
     V: torch.Tensor,  # (T, F, C) membrane potentials
     lengths_um: torch.Tensor,  # (F, C) compartment lengths in um
@@ -268,54 +330,37 @@ def conduction_velocity(
 
     """
     assert V.ndim == 3, "V must be (T, F, C)"
-    T, Fibs, C = V.shape
+    _, Fibs, C = V.shape
     assert lengths_um.shape == (Fibs, C), "lengths_um must be (F, C)"
 
-    device = V.device
-    dtype = V.dtype
-
-    if not torch.is_tensor(dt_ms):
-        dt_ms = torch.tensor(dt_ms, device=device, dtype=dtype)
-    else:
-        dt_ms = dt_ms.to(device=device, dtype=dtype)
+    device, dtype = V.device, V.dtype
 
     # ---- 1) Positions x (um): midpoint of each compartment along the fiber
-    x_um = torch.cumsum(
-        lengths_um.to(device=device, dtype=dtype), dim=-1
-    ) - 0.5 * lengths_um.to(device=device, dtype=dtype)  # (F, C)
+    lengths_um = lengths_um.to(device=device, dtype=dtype)
+    x_um = torch.cumsum(lengths_um, dim=-1) - 0.5 * lengths_um  # (F, C)
 
-    # ---- 2) Time grid (ms)
-    t_ms = torch.arange(T, device=device, dtype=dtype) * dt_ms  # (T,)
-
-    # ---- 3) Upstroke-based soft arrival time per compartment
-    dV = (V[1:] - V[:-1]) / dt_ms  # (T-1, F, C) in mV/ms
-    t_mid = 0.5 * (t_ms[1:] + t_ms[:-1])  # (T-1,)
-
-    U = F.softplus((dV - dv0) / dv_scale)  # (T-1, F, C), >=0
-    logits = beta * U - lambda_early * t_mid[:, None, None]  # (T-1, F, C)
-    w_time = torch.softmax(logits, dim=0)  # (T-1, F, C)
-
-    t_hat_ms = (w_time * t_mid[:, None, None]).sum(dim=0)  # (F, C)
-
-    # ---- 4) Spike-present confidence p_spike (voltage-based smooth max)
-    a = torch.logsumexp(kappa_V * (V - V_spk), dim=0) / kappa_V  # (F, C) in mV
-    pV = torch.sigmoid(a / gate_V_scale)  # (F, C) in (0,1)
-    p_spike = pV
-
-    if use_dv_gate:
-        u = torch.logsumexp(kappa_dv * (dV - dv_spk), dim=0) / kappa_dv  # (F, C) mV/ms
-        pDV = torch.sigmoid(u / gate_dv_scale)
-        p_spike = p_spike * pDV
+    # ---- 2-4) Shared temporal localization + spike-present confidence
+    t_hat_ms, p_spike = _soft_arrival_and_spike_gate(
+        V,
+        dt_ms,
+        beta=beta,
+        dv0=dv0,
+        dv_scale=dv_scale,
+        lambda_early=lambda_early,
+        V_spk=V_spk,
+        kappa_V=kappa_V,
+        gate_V_scale=gate_V_scale,
+        use_dv_gate=use_dv_gate,
+        dv_spk=dv_spk,
+        kappa_dv=kappa_dv,
+        gate_dv_scale=gate_dv_scale,
+    )
 
     # ---- 5) Optional node_mask restriction
     if node_mask is None:
         nm = torch.ones((Fibs, C), device=device, dtype=dtype)
     else:
-        nm = node_mask.to(device=device)
-        if nm.dtype == torch.bool:
-            nm = nm.to(dtype=dtype)
-        else:
-            nm = nm.to(dtype=dtype)
+        nm = node_mask.to(device=device, dtype=dtype)
         assert nm.shape == (Fibs, C), "node_mask must be (F, C)"
 
     weights = p_spike * nm  # (F, C)
@@ -330,11 +375,10 @@ def conduction_velocity(
     dxc = x_um - x_bar  # (F, C)
 
     cov = (weights * dtc * dxc).sum(dim=-1) / W.squeeze(-1)  # (F,)
-    var_t = (weights * dtc * dtc).sum(dim=-1) / W.squeeze(-1)  # (F,) in ms^2
+    var_t = (weights * dtc * dtc).sum(dim=-1) / W.squeeze(-1)  # (F,) ms^2
 
     v_um_per_ms = cov / (var_t + eps)  # (F,) um/ms
     v_m_per_s = v_um_per_ms * 1e-3  # (F,) m/s
-
     speed_m_per_s = torch.sqrt(v_m_per_s * v_m_per_s + eps_speed)  # smooth |v|
 
     # ---- 7) ESS and optional penalties
@@ -367,6 +411,217 @@ def conduction_velocity(
         "ess": ess,
         "var_t_ms2": var_t,
         "reg": reg,
+    }
+
+
+def action_potential_width(
+    V: torch.Tensor,  # (T, F, C)
+    lengths_um: torch.Tensor | None,  # accepted for API symmetry; unused
+    dt_ms: float | torch.Tensor,
+    node_mask: torch.Tensor | None = None,
+    *,
+    # Optionally reuse from conduction_velocity(...)
+    t_hat_ms: torch.Tensor | None = None,  # (F, C)
+    p_spike: torch.Tensor | None = None,  # (F, C)
+    # Width definition
+    mode: str = "half_height",  # {"half_height", "half_peak_to_peak"}
+    # Same localization / gating knobs as conduction_velocity
+    beta: float = 50.0,
+    dv0: float = 0.0,
+    dv_scale: float = 1.0,
+    lambda_early: float = 0.0,
+    V_spk: float = 0.0,
+    kappa_V: float = 20.0,
+    gate_V_scale: float = 5.0,
+    use_dv_gate: bool = False,
+    dv_spk: float = 10.0,
+    kappa_dv: float = 10.0,
+    gate_dv_scale: float = 5.0,
+    # Local windows around the spike (ms)
+    baseline_pre_ms: float = 1.0,
+    baseline_guard_ms: float = 0.15,
+    peak_pre_ms: float = 0.2,
+    peak_post_ms: float = 1.5,
+    trough_pre_ms: float = 0.3,  # used only in mode="half_peak_to_peak"
+    trough_post_ms: float = 3.0,
+    width_pre_ms: float = 1.0,
+    width_post_ms: float = 3.0,
+    gate_t_scale_ms: float = 0.05,
+    # Smooth extrema / thresholding
+    kappa_peak: float = 10.0,
+    kappa_trough: float = 10.0,
+    half_level: float = 0.5,
+    V_width_scale: float = 1.0,
+    # Weighting / regularization
+    amp_min_mV: float = 20.0,
+    amp_scale_mV: float = 5.0,
+    min_ess: float = 3.0,
+    min_amp_mV: float = 5.0,
+    reg_ess_weight: float = 0.0,
+    reg_amp_weight: float = 0.0,
+    eps: float = 1e-6,
+):
+    """
+    Differentiable AP width surrogate.
+
+    Returns a per-fiber width estimate by:
+      1) localizing the main spike per compartment,
+      2) constructing a differentiable half-amplitude level,
+      3) integrating a soft indicator of V > V_half over time.
+
+    In the hard limit, width_ms_comp approaches the usual duration-above-half-height
+    (or half peak-to-peak) for each compartment.
+    """
+    del lengths_um  # AP width is local in time; lengths are not used.
+
+    assert V.ndim == 3, "V must be (T, F, C)"
+    T, Fibs, C = V.shape
+    device, dtype = V.device, V.dtype
+
+    assert baseline_pre_ms > baseline_guard_ms, (
+        "baseline_pre_ms must be > baseline_guard_ms"
+    )
+
+    if not torch.is_tensor(dt_ms):
+        dt_ms = torch.tensor(dt_ms, device=device, dtype=dtype)
+    else:
+        dt_ms = dt_ms.to(device=device, dtype=dtype)
+
+    if t_hat_ms is None or p_spike is None:
+        _t_hat_ms, _p_spike = _soft_arrival_and_spike_gate(
+            V,
+            dt_ms,
+            beta=beta,
+            dv0=dv0,
+            dv_scale=dv_scale,
+            lambda_early=lambda_early,
+            V_spk=V_spk,
+            kappa_V=kappa_V,
+            gate_V_scale=gate_V_scale,
+            use_dv_gate=use_dv_gate,
+            dv_spk=dv_spk,
+            kappa_dv=kappa_dv,
+            gate_dv_scale=gate_dv_scale,
+        )
+        if t_hat_ms is None:
+            t_hat_ms = _t_hat_ms
+        if p_spike is None:
+            p_spike = _p_spike
+
+    t_hat_ms = t_hat_ms.to(device=device, dtype=dtype)
+    p_spike = p_spike.to(device=device, dtype=dtype)
+    assert t_hat_ms.shape == (Fibs, C)
+    assert p_spike.shape == (Fibs, C)
+
+    if node_mask is None:
+        nm = torch.ones((Fibs, C), device=device, dtype=dtype)
+    else:
+        nm = node_mask.to(device=device)
+        nm = nm.to(dtype=dtype)
+        assert nm.shape == (Fibs, C), "node_mask must be (F, C)"
+
+    t_ms = torch.arange(T, device=device, dtype=dtype) * dt_ms
+    t = t_ms[:, None, None]  # (T, 1, 1)
+
+    def interval_gate(
+        t: torch.Tensor, a: torch.Tensor, b: torch.Tensor, tau_ms: float
+    ) -> torch.Tensor:
+        tau = torch.as_tensor(tau_ms, device=device, dtype=dtype)
+        return torch.sigmoid((t - a[None, :, :]) / tau) * torch.sigmoid(
+            (b[None, :, :] - t) / tau
+        )
+
+    # Pre-spike baseline window
+    g_base = interval_gate(
+        t,
+        t_hat_ms - baseline_pre_ms,
+        t_hat_ms - baseline_guard_ms,
+        gate_t_scale_ms,
+    )
+    V_base = (g_base * V).sum(dim=0) / (g_base.sum(dim=0) + eps)  # (F, C)
+
+    # Local soft peak
+    g_peak = interval_gate(
+        t,
+        t_hat_ms - peak_pre_ms,
+        t_hat_ms + peak_post_ms,
+        gate_t_scale_ms,
+    )
+    alpha_peak = torch.softmax(kappa_peak * V + torch.log(g_peak + eps), dim=0)
+    V_peak = (alpha_peak * V).sum(dim=0)  # (F, C)
+    t_peak_ms = (alpha_peak * t).sum(dim=0)  # (F, C)
+
+    # Low reference level
+    if mode == "half_height":
+        V_low = V_base
+    elif mode == "half_peak_to_peak":
+        g_trough = interval_gate(
+            t,
+            t_peak_ms - trough_pre_ms,
+            t_peak_ms + trough_post_ms,
+            gate_t_scale_ms,
+        )
+        alpha_trough = torch.softmax(
+            -kappa_trough * V + torch.log(g_trough + eps), dim=0
+        )
+        V_low = (alpha_trough * V).sum(dim=0)  # (F, C)
+    else:
+        raise ValueError("mode must be 'half_height' or 'half_peak_to_peak'")
+
+    amp_mV = V_peak - V_low
+    V_half = V_low + half_level * amp_mV
+
+    # Width = soft time spent above half-level
+    g_width = interval_gate(
+        t,
+        t_peak_ms - width_pre_ms,
+        t_peak_ms + width_post_ms,
+        gate_t_scale_ms,
+    )
+    q = torch.sigmoid((V - V_half[None, :, :]) / V_width_scale)
+    width_ms_comp = (g_width * q).sum(dim=0) * dt_ms  # (F, C)
+
+    # Aggregate across compartments/nodes
+    p_amp = torch.sigmoid((amp_mV - amp_min_mV) / amp_scale_mV)
+    weights = nm * p_spike * p_amp
+
+    W = weights.sum(dim=-1) + eps
+    width_ms = (weights * width_ms_comp).sum(dim=-1) / W  # (F,)
+
+    # Diagnostics / regularization
+    ess = (weights.sum(dim=-1) ** 2) / ((weights * weights).sum(dim=-1) + eps)
+
+    reg = V.new_zeros(())
+    if reg_ess_weight > 0.0:
+        reg = (
+            reg
+            + reg_ess_weight
+            * F.softplus(torch.tensor(min_ess, device=device, dtype=dtype) - ess).mean()
+        )
+    if reg_amp_weight > 0.0:
+        reg = (
+            reg
+            + reg_amp_weight
+            * F.softplus(
+                torch.tensor(min_amp_mV, device=device, dtype=dtype) - amp_mV
+            ).mean()
+        )
+
+    return {
+        "width_ms": width_ms,  # (F,)
+        "width_ms_comp": width_ms_comp,  # (F, C)
+        "t_hat_ms": t_hat_ms,  # (F, C)
+        "t_peak_ms": t_peak_ms,  # (F, C)
+        "V_base_mV": V_base,  # (F, C)
+        "V_low_mV": V_low,  # (F, C)
+        "V_peak_mV": V_peak,  # (F, C)
+        "V_half_mV": V_half,  # (F, C)
+        "amp_mV": amp_mV,  # (F, C)
+        "p_spike": p_spike,  # (F, C)
+        "p_amp": p_amp,  # (F, C)
+        "weights": weights,  # (F, C)
+        "ess": ess,  # (F,)
+        "reg": reg,  # scalar
     }
 
 
