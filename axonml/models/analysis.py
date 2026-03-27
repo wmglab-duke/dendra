@@ -416,7 +416,6 @@ def conduction_velocity(
 
 def action_potential_width(
     V: torch.Tensor,  # (T, F, C)
-    lengths_um: torch.Tensor | None,  # accepted for API symmetry; unused
     dt_ms: float | torch.Tensor,
     node_mask: torch.Tensor | None = None,
     *,
@@ -472,7 +471,6 @@ def action_potential_width(
     In the hard limit, width_ms_comp approaches the usual duration-above-half-height
     (or half peak-to-peak) for each compartment.
     """
-    del lengths_um  # AP width is local in time; lengths are not used.
 
     assert V.ndim == 3, "V must be (T, F, C)"
     T, Fibs, C = V.shape
@@ -1856,3 +1854,307 @@ def plot_activation_heatmap_from_chronaxie_output(
 
     fig.tight_layout()
     return fig, ax, mesh, plot_grid, amp_unique, pw_unique_ms
+
+
+def firing_rate(
+    V: torch.Tensor,  # (T, F, C)
+    dt_ms: float | torch.Tensor,
+    node_mask: torch.Tensor | None = None,
+    *,
+    # Optionally reuse a precomputed per-compartment spike-present confidence
+    p_spike: torch.Tensor | None = None,  # (F, C)
+    # Spike-state thresholding
+    V_spk: float = 0.0,
+    gate_V_scale: float = 5.0,
+    # Optional dV/dt gate to suppress slow depolarizations
+    use_dv_gate: bool = True,
+    dv_spk: float = 10.0,
+    kappa_V: float = 20.0,
+    kappa_dv: float = 10.0,
+    gate_dv_scale: float = 5.0,
+    # Optional time restriction, applied before counting
+    time_window: tuple[int, int] | None = None,
+    # Robustness / regularization
+    min_ess: float = 1.0,
+    reg_ess_weight: float = 0.0,
+    eps: float = 1e-6,
+    confidence_weighted: bool = False,
+):
+    r"""
+    Differentiable firing-rate surrogate in Hz.
+
+    For each compartment:
+        s[t] = sigmoid((V[t] - V_spk) / gate_V_scale)
+
+    Then count soft upward crossings:
+        up[t] = relu(s[t+1] - s[t])
+
+    For a full 0->1->0 excursion, sum_t up[t] is approximately 1, so each AP
+    contributes about one count. Optionally, `up` is multiplied by a smooth dV/dt
+    gate to reject slow threshold crossings.
+
+    Returns
+    -------
+    out : dict[str, torch.Tensor]
+        "rate_hz"      : (F,)   weighted per-fiber firing-rate surrogate
+        "rate_hz_comp" : (F, C) per-compartment firing-rate surrogate
+        "count"        : (F,)   weighted soft spike count over the window
+        "count_comp"   : (F, C) per-compartment soft spike count
+        "p_spike"      : (F, C) spike-present confidence used for weighting
+        "weights"      : (F, C) final aggregation weights
+        "ess"          : (F,)   effective sample size of weights
+        "window_ms"    : scalar analyzed duration in ms
+        "reg"          : scalar optional regularizer
+    """
+
+    assert V.ndim == 3, "V must be (T, F, C)"
+    T, Fibs, C = V.shape
+    device, dtype = V.device, V.dtype
+
+    if T < 2:
+        raise ValueError("Need at least 2 time samples to estimate firing rate.")
+
+    if not torch.is_tensor(dt_ms):
+        dt_ms = torch.tensor(dt_ms, device=device, dtype=dtype)
+    else:
+        dt_ms = dt_ms.to(device=device, dtype=dtype)
+
+    Vw = V[slice(*time_window)] if time_window is not None else V
+    Tw = Vw.shape[0]
+    if Tw < 2:
+        raise ValueError("Selected time window must contain at least 2 samples.")
+
+    if node_mask is None:
+        nm = torch.ones((Fibs, C), device=device, dtype=dtype)
+    else:
+        nm = node_mask.to(device=device, dtype=dtype)
+        assert nm.shape == (Fibs, C), "node_mask must be (F, C)"
+
+    dV = (Vw[1:] - Vw[:-1]) / dt_ms  # (Tw-1, F, C), mV/ms
+
+    # Smooth compartment-level spike-present confidence, same style as the other surrogates
+    if p_spike is None:
+        a = torch.logsumexp(kappa_V * (Vw - V_spk), dim=0) / kappa_V  # (F, C)
+        p_spike = torch.sigmoid(a / gate_V_scale)
+
+        if use_dv_gate:
+            u = torch.logsumexp(kappa_dv * (dV - dv_spk), dim=0) / kappa_dv  # (F, C)
+            p_dv = torch.sigmoid(u / gate_dv_scale)
+            p_spike = p_spike * p_dv
+    else:
+        p_spike = p_spike.to(device=device, dtype=dtype)
+        assert p_spike.shape == (Fibs, C), "p_spike must be (F, C)"
+
+    # Smooth spike-state occupancy in (0, 1)
+    s = torch.sigmoid((Vw - V_spk) / gate_V_scale)  # (Tw, F, C)
+
+    # Positive changes in occupancy. A full 0->1 excursion contributes ~1.
+    ds = s[1:] - s[:-1]  # (Tw-1, F, C)
+    up = torch.relu(ds)
+
+    # Optional upstroke gate to reject slow threshold crossings / depolarizations.
+    if use_dv_gate:
+        g_up = torch.sigmoid((dV - dv_spk) / gate_dv_scale)
+        up = up * g_up
+
+    count_comp = up.sum(dim=0)  # (F, C), soft spike count per compartment
+
+    window_ms = (Tw - 1) * dt_ms
+    rate_hz_comp = 1000.0 * count_comp / window_ms  # (F, C)
+
+    # Aggregate across compartments in the same style as the other functions
+    if confidence_weighted:
+        # Weight by p_spike to get a confidence-weighted rate estimate
+        weights = nm * p_spike
+    else:
+        # Just use the node mask for weighting, without p_spike confidence
+        weights = nm
+
+    W = weights.sum(dim=-1) + eps
+    count = (weights * count_comp).sum(dim=-1) / W  # (F,)
+    rate_hz = (weights * rate_hz_comp).sum(dim=-1) / W  # (F,)
+
+    ess = (weights.sum(dim=-1) ** 2) / ((weights * weights).sum(dim=-1) + eps)
+
+    reg = V.new_zeros(())
+    if reg_ess_weight > 0.0:
+        reg = (
+            reg
+            + reg_ess_weight
+            * F.softplus(torch.tensor(min_ess, device=device, dtype=dtype) - ess).mean()
+        )
+
+    return {
+        "rate_hz": rate_hz,  # (F,)
+        "rate_hz_comp": rate_hz_comp,  # (F, C)
+        "count": count,  # (F,)
+        "count_comp": count_comp,  # (F, C)
+        "p_spike": p_spike,  # (F, C)
+        "weights": weights,  # (F, C)
+        "ess": ess,  # (F,)
+        "window_ms": window_ms,  # scalar
+        "reg": reg,  # scalar
+    }
+
+
+def active(
+    V: torch.Tensor,  # (T, F, C)
+    dt_ms: float | torch.Tensor,
+    node_mask: torch.Tensor | None = None,
+    *,
+    # Spike-present confidence from voltages
+    V_spk: float = 0.0,
+    kappa_V: float = 20.0,
+    gate_V_scale: float = 5.0,
+    # Optional dV/dt gate to suppress slow depolarizations
+    use_dv_gate: bool = True,
+    dv_spk: float = 10.0,
+    kappa_dv: float = 10.0,
+    gate_dv_scale: float = 5.0,
+    # Optional time restriction, applied before scoring
+    time_window: tuple[int, int] | None = None,
+    # Compartment aggregation
+    aggregate: Literal["softmax", "soft_or", "mean"] = "softmax",
+    # Robustness / regularization
+    min_ess: float = 1.0,
+    reg_ess_weight: float = 0.0,
+    eps: float = 1e-6,
+):
+    r"""
+    Differentiable spike-present / "active" surrogate.
+
+    `active[f]` is a smooth confidence that at least one AP occurred in the
+    user-selected readout region of fiber `f` within the analysis window.
+
+    Aggregation options
+    -------------------
+    softmax:
+        Region-level smooth max over time and selected compartments.
+        Best default for "did any selected trace spike?"
+    soft_or:
+        Probabilistic soft-OR over per-compartment activity confidences.
+    mean:
+        Literal mean local activity confidence over selected compartments.
+
+    Returns
+    -------
+    out : dict[str, torch.Tensor]
+        "active"      : (F,)   aggregated readout-region activity confidence
+        "active_comp" : (F, C) per-compartment activity confidence
+        "p_spike"     : (F, C) alias for active_comp
+        "score_comp"  : (F, C) pre-sigmoid voltage score per compartment
+        "weights"     : (F, C) selected compartment weights / mask
+        "ess"         : (F,)   effective sample size of the readout weights
+        "window_ms"   : scalar analyzed duration in ms
+        "reg"         : scalar optional regularizer
+    """
+    assert V.ndim == 3, "V must be (T, F, C)"
+    _, Fibs, C = V.shape
+    device, dtype = V.device, V.dtype
+
+    if not torch.is_tensor(dt_ms):
+        dt_ms = torch.tensor(dt_ms, device=device, dtype=dtype)
+    else:
+        dt_ms = dt_ms.to(device=device, dtype=dtype)
+
+    Vw = V[slice(*time_window)] if time_window is not None else V
+    Tw = Vw.shape[0]
+    if Tw < 1:
+        raise ValueError("Selected time window must contain at least 1 sample.")
+    if use_dv_gate and Tw < 2:
+        raise ValueError("Need at least 2 time samples when use_dv_gate=True.")
+
+    if node_mask is None:
+        nm = torch.ones((Fibs, C), device=device, dtype=dtype)
+    else:
+        nm = node_mask.to(device=device, dtype=dtype)
+        assert nm.shape == (Fibs, C), "node_mask must be (F, C)"
+    nm = torch.clamp(nm, min=0.0)
+
+    # Local per-compartment spike-present confidence
+    score_comp = torch.logsumexp(kappa_V * (Vw - V_spk), dim=0) / kappa_V  # (F, C)
+    active_comp = torch.sigmoid(score_comp / gate_V_scale)
+
+    dV = None
+    p_dv_comp = None
+    if use_dv_gate:
+        dV = (Vw[1:] - Vw[:-1]) / dt_ms
+        score_dv_comp = torch.logsumexp(kappa_dv * (dV - dv_spk), dim=0) / kappa_dv
+        p_dv_comp = torch.sigmoid(score_dv_comp / gate_dv_scale)
+        active_comp = active_comp * p_dv_comp
+
+    # Aggregate over the user-selected readout set
+    if aggregate == "mean":
+        weights = nm
+        W = weights.sum(dim=-1) + eps
+        active_region = (weights * active_comp).sum(dim=-1) / W
+
+    elif aggregate == "soft_or":
+        weights = nm
+        log_not = weights * torch.log(torch.clamp(1.0 - active_comp, min=eps))
+        active_region = 1.0 - torch.exp(log_not.sum(dim=-1))
+
+    elif aggregate == "softmax":
+        weights = nm
+        neg_inf = torch.full_like(weights, -torch.inf)
+        logw = torch.where(
+            weights > 0,
+            torch.log(torch.clamp(weights, min=eps)),
+            neg_inf,
+        )
+
+        score_region = (
+            torch.logsumexp(
+                kappa_V * (Vw - V_spk) + logw[None, :, :],
+                dim=(0, 2),
+            )
+            / kappa_V
+        )
+        active_region = torch.sigmoid(score_region / gate_V_scale)
+
+        if use_dv_gate:
+            score_dv_region = (
+                torch.logsumexp(
+                    kappa_dv * (dV - dv_spk) + logw[None, :, :],
+                    dim=(0, 2),
+                )
+                / kappa_dv
+            )
+            active_region = active_region * torch.sigmoid(
+                score_dv_region / gate_dv_scale
+            )
+
+        active_region = torch.where(
+            weights.sum(dim=-1) > 0,
+            active_region,
+            torch.zeros_like(active_region),
+        )
+
+    else:
+        raise ValueError("aggregate must be one of {'softmax', 'soft_or', 'mean'}.")
+
+    ess = (nm.sum(dim=-1) ** 2) / ((nm * nm).sum(dim=-1) + eps)
+
+    reg = V.new_zeros(())
+    if reg_ess_weight > 0.0:
+        reg = (
+            reg
+            + reg_ess_weight
+            * F.softplus(torch.tensor(min_ess, device=device, dtype=dtype) - ess).mean()
+        )
+
+    window_ms = (
+        (Tw - 1) * dt_ms if Tw >= 2 else torch.zeros((), device=device, dtype=dtype)
+    )
+
+    return {
+        "active": active_region,  # (F,)
+        "active_comp": active_comp,  # (F, C)
+        "p_spike": active_comp,  # alias for suite consistency
+        "p_dv_comp": p_dv_comp,  # (F, C) or None
+        "score_comp": score_comp,  # (F, C)
+        "weights": weights,  # (F, C)
+        "ess": ess,  # (F,)
+        "window_ms": window_ms,  # scalar
+        "reg": reg,  # scalar
+    }
