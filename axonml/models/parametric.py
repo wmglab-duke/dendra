@@ -1408,6 +1408,7 @@ class Parameterized(SimpleParameterized):
         self.shape_p = shape_p
         self.shape_f = shape_f
         self.instantiate_range(**self.range)
+        self.instantiate_range(positive=True, **self.range_p)
 
     def _refresh_and_set(self, name, value):
         """
