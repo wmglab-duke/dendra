@@ -222,3 +222,27 @@ def cartesian_product(
     if return_stacked:
         return torch.stack(outs, dim=-1)
     return tuple(outs)
+
+
+def add_dims_as_necessary(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Add singleton dimensions to `a` as necessary to make it broadcastable with `b`.
+
+    `a` may be 0D (scalar) or 1D. `b` may be any shape. The output will have the same shape as `b`.
+    If 1D, `a` must have length equal to one of the dimensions of `b` to be broadcastable. If 0D, it can be broadcast to any shape.
+    """
+
+    if a.ndim == 0:
+        # Scalar can be broadcast to any shape
+        return a
+    elif a.ndim == 1:
+        # Find a dimension in b that matches the length of a
+        for i, dim in enumerate(b.shape):
+            if dim == a.shape[0]:
+                # Insert singleton dimensions before and after to align with this dimension
+                return a.reshape((1,) * i + (-1,) + (1,) * (b.ndim - i - 1))
+        raise ValueError(
+            f"Cannot broadcast 1D tensor of length {a.shape[0]} to shape {b.shape}."
+        )
+    else:
+        raise ValueError(f"Input tensor must be 0D or 1D, but got shape {a.shape}.")

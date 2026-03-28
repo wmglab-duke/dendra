@@ -1,4 +1,5 @@
 from .analytic import anisotropic_point, isotropic_point, parametric_efield
+from .line import arbitrary_line, arc_line, helix_line, line3d
 from .precomputed import (
     EfieldInterpolate3DRect,
     EfieldInterpolate3DScattered,
@@ -28,4 +29,8 @@ __all__ = [
     "precomputed_interpolate_3d_scattered",
     "EfieldInterpolate3DRect",
     "efield_interpolate_3d_rect",
+    "line3d",
+    "arbitrary_line",
+    "arc_line",
+    "helix_line",
 ]

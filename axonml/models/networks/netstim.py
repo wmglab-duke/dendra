@@ -197,7 +197,7 @@ class NetStim(AxModule, Sliceable):
                     (self.N,), generator=self._rng, device=device, dtype=dtype
                 )
                 # Use a detached interval here; we don't want grads through this random kick
-                interval0 = self.interval(cache=(not self.training)).detach()
+                interval0 = self.interval().detach()
                 init_offsets = -(self.noise * interval0) * torch.log(U)
                 self.next_stoch_time.add_(init_offsets)
 
@@ -351,7 +351,7 @@ class NetStim(AxModule, Sliceable):
             (self.N,), generator=self._rng, device=device, dtype=dtype
         ).clamp_min(eps)
         exp_rand = -torch.log(U)
-        interval = self.interval(cache=(not self.training))
+        interval = self.interval()
         next_interval = interval * (1 - self.noise) + interval * self.noise * exp_rand
 
         # Split origin of spikes (scheduled vs stochastic)

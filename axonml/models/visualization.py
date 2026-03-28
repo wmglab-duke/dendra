@@ -9,6 +9,7 @@ import networkx as nx
 import numpy as np
 import torch
 from matplotlib import cm
+from matplotlib.collections import LineCollection
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 from scipy.interpolate import griddata
 
@@ -370,7 +371,7 @@ def vis_2d(cell, idx=0, view="y", node_scale=8, dpi=200):
     # e.g., {'soma': {'xs': [...], 'ys': [...], 'sizes': [...]}, ...}
     data_by_label = {label: {"xs": [], "ys": [], "sizes": []} for label in labels}
 
-    indices = torch.arange(len(G.nodes()), device=cell.device())
+    indices = torch.arange(len(G.nodes()), device=cell.device(), dtype=torch.long)
 
     # Create a reverse map from node_id to its label for quick lookup
     node_to_label = {}
@@ -443,6 +444,207 @@ def vis_2d(cell, idx=0, view="y", node_scale=8, dpi=200):
     ax.set_ylabel(f"{y_l} (µm)")
     fig.tight_layout()
     plt.show()
+
+
+def vis_2d_line(
+    cell,
+    idx=0,
+    view="y",
+    node_scale=8,
+    dpi=200,
+    *,
+    fig=None,
+    ax=None,
+    show_nodes=False,
+    show_edges=True,
+    show_legend=True,
+    edge_alpha=0.85,
+    node_alpha=0.7,
+    edge_scale=0.12,
+    min_edge_width=0.35,
+    max_edge_width=None,
+    edge_color="k",
+):
+    """
+    Project a 3-D morphology graph to 2-D and plot it with matplotlib.
+
+    Parameters
+    ----------
+    cell : AxonML Population
+        The cell object containing the graph, labels, and ``find`` method.
+    idx : int, optional
+        Population instance index to visualize.
+    view : {'x', 'y', 'z'}, optional
+        Axis to project along. Default ``'y'`` (drop y -> plot x-z).
+    node_scale : float, optional
+        Factor converting compartment diameter (µm) to marker area.
+    dpi : int, optional
+        Figure resolution in dots per inch.
+    fig, ax : matplotlib objects, optional
+        Existing figure/axes to draw into. If omitted, a new figure is created.
+    show_nodes, show_edges, show_legend : bool, optional
+        Toggle display of node markers, graph edges, and legend.
+    edge_alpha, node_alpha : float, optional
+        Transparency for edges and node markers.
+    edge_scale : float, optional
+        Scale factor converting local diameter (µm) to line width.
+    min_edge_width : float, optional
+        Minimum visible line width for edges.
+    max_edge_width : float or None, optional
+        Optional cap on edge line width.
+    edge_color : matplotlib color, optional
+        Fallback color for edges.
+
+    Returns
+    -------
+    (fig, ax)
+        The matplotlib figure and axes.
+    """
+    G = cell.graph
+    if G is None:
+        raise ValueError("Graph is None. Please create a graph first.")
+
+    x = cell.x[idx]
+    y = cell.y[idx]
+    z = cell.z[idx]
+
+    coords = {n: (float(x[n]), float(y[n]), float(z[n])) for n in G.nodes}
+
+    # Orthographic projection
+    if view == "z":
+        x_l, y_l = "x", "y"
+        proj = {n: (c[0], c[1]) for n, c in coords.items()}
+    elif view == "y":
+        x_l, y_l = "x", "z"
+        proj = {n: (c[0], c[2]) for n, c in coords.items()}
+    elif view == "x":
+        x_l, y_l = "y", "z"
+        proj = {n: (c[1], c[2]) for n, c in coords.items()}
+    else:
+        raise ValueError("view must be 'x', 'y', or 'z'")
+
+    labels = list(cell._labels)
+    color_choices = palette_hsv(max(len(labels), 1))
+    label_to_color = {label: color for label, color in zip(labels, color_choices)}
+
+    created_fig = ax is None and fig is None
+    if ax is None:
+        if fig is None:
+            fig, ax = plt.subplots(dpi=dpi, figsize=(8, 8))
+        else:
+            ax = fig.gca()
+    else:
+        fig = ax.figure if fig is None else fig
+
+    # Build a reverse node -> label map
+    indices = torch.arange(len(G.nodes()), device=cell.device(), dtype=torch.long)
+    node_to_label = {}
+    for label in labels:
+        nodes_for_label = indices[cell.find(label)].detach().cpu().tolist()
+        for node_id in nodes_for_label:
+            node_to_label[node_id] = label
+
+    # Draw edges first with widths tied to local diameter.
+    if show_edges and G.number_of_edges() > 0:
+        segments = []
+        widths = []
+        for u, v in G.edges():
+            x0, y0 = proj[u]
+            x1, y1 = proj[v]
+            segments.append([(x0, y0), (x1, y1)])
+
+            diam_u = float(G.nodes[u].get("diam", 1.0) or 1.0)
+            diam_v = float(G.nodes[v].get("diam", 1.0) or 1.0)
+            width = 0.5 * (diam_u + diam_v) * edge_scale
+            width = max(float(min_edge_width), float(width))
+            if max_edge_width is not None:
+                width = min(float(max_edge_width), width)
+            widths.append(width)
+
+        lc = LineCollection(
+            segments,
+            colors=edge_color,
+            linewidths=widths,
+            alpha=edge_alpha,
+            zorder=1,
+            capstyle="round",
+            joinstyle="round",
+        )
+        ax.add_collection(lc)
+
+    # Group nodes by label for plotting/legend entries
+    data_by_label = {label: {"xs": [], "ys": [], "sizes": []} for label in labels}
+    unclassified_nodes = {"xs": [], "ys": [], "sizes": []}
+
+    for n in G.nodes():
+        label = node_to_label.get(n)
+        px, py = proj[n]
+        diam = float(G.nodes[n].get("diam", 1.0) or 1.0)
+        size = max(diam, 0.05) * node_scale
+
+        if label is not None:
+            data_by_label[label]["xs"].append(px)
+            data_by_label[label]["ys"].append(py)
+            data_by_label[label]["sizes"].append(size)
+        else:
+            unclassified_nodes["xs"].append(px)
+            unclassified_nodes["ys"].append(py)
+            unclassified_nodes["sizes"].append(size)
+
+    if show_nodes:
+        for label, data in data_by_label.items():
+            if not data["xs"]:
+                continue
+            ax.scatter(
+                data["xs"],
+                data["ys"],
+                s=data["sizes"],
+                c=[label_to_color[label]],
+                label=label,
+                alpha=node_alpha,
+                edgecolors="k",
+                linewidths=0.25,
+                zorder=3,
+            )
+
+        if unclassified_nodes["xs"]:
+            ax.scatter(
+                unclassified_nodes["xs"],
+                unclassified_nodes["ys"],
+                s=unclassified_nodes["sizes"],
+                c="grey",
+                label="unclassified",
+                alpha=max(0.5, node_alpha - 0.15),
+                edgecolors="k",
+                linewidths=0.25,
+                zorder=3,
+            )
+
+    if show_legend and show_nodes:
+        ax.legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            borderaxespad=0.0,
+            frameon=False,
+        )
+
+    # Set limits from projected coordinates, with a small padding
+    proj_arr = np.asarray(list(proj.values()), dtype=float)
+    if proj_arr.size:
+        mins = proj_arr.min(axis=0)
+        maxs = proj_arr.max(axis=0)
+        spans = np.maximum(maxs - mins, 1.0)
+        pad = 0.03 * spans
+        ax.set_xlim(mins[0] - pad[0], maxs[0] + pad[0])
+        ax.set_ylim(mins[1] - pad[1], maxs[1] + pad[1])
+
+    ax.set_aspect("equal")
+    ax.set_xlabel(f"{x_l} (µm)")
+    ax.set_ylabel(f"{y_l} (µm)")
+    fig.tight_layout()
+    if created_fig:
+        plt.show()
+    return fig, ax
 
 
 @requires_packages("plotly")

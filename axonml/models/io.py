@@ -14,32 +14,56 @@ from ..helpers import requires_packages
 
 
 def xyz(seg, extcell=None):
+    """
+    Return interpolated 3-D coordinates for a NEURON segment.
+
+    Notes
+    -----
+    NEURON segment positions ``seg.x`` are normalized to the interval [0, 1],
+    while ``sec.arc3d(i)`` is reported in physical distance units (typically µm)
+    along the pt3d centerline.  We therefore convert the normalized position to
+    physical arclength before interpolation.
+
+    If ``extcell`` is provided, extracellular mechanism data are also copied from
+    the segment in the same way as the original implementation.
+    """
     sec = seg.sec
-    seg_x = seg.x
-    x_arr = []
-    y_arr = []
-    z_arr = []
-    arc_l = []
-    if sec.n3d() < 1:
-        return {"x": 0.0, "y": 0.0, "z": 0.0}
-    for i in range(sec.n3d()):
-        x_arr.append(sec.x3d(i))
-        y_arr.append(sec.y3d(i))
-        z_arr.append(sec.z3d(i))
-        arc_l.append(sec.arc3d(i))
-    x = np.interp(seg_x, arc_l, x_arr)
-    y = np.interp(seg_x, arc_l, y_arr)
-    z = np.interp(seg_x, arc_l, z_arr)
-    dat = {"x": x, "y": y, "z": z}
+    n3d = int(sec.n3d())
+
+    if n3d < 1:
+        dat = {"x": 0.0, "y": 0.0, "z": 0.0}
+    else:
+        arc_l = np.array([sec.arc3d(i) for i in range(n3d)], dtype=float)
+        x_arr = np.array([sec.x3d(i) for i in range(n3d)], dtype=float)
+        y_arr = np.array([sec.y3d(i) for i in range(n3d)], dtype=float)
+        z_arr = np.array([sec.z3d(i) for i in range(n3d)], dtype=float)
+
+        seg_x = float(seg.x)
+        seg_x = min(max(seg_x, 0.0), 1.0)
+
+        total_arc = float(arc_l[-1]) if len(arc_l) else 0.0
+        if total_arc <= 0.0:
+            x = float(x_arr[0])
+            y = float(y_arr[0])
+            z = float(z_arr[0])
+        else:
+            s_um = seg_x * total_arc
+            x = float(np.interp(s_um, arc_l, x_arr))
+            y = float(np.interp(s_um, arc_l, y_arr))
+            z = float(np.interp(s_um, arc_l, z_arr))
+
+        dat = {"x": x, "y": y, "z": z}
+
     if extcell is not None:
         xraxial, xc, xg = [], [], []
-        for i in range(extcell):
+        for i in range(int(extcell)):
             xraxial.append(seg.xraxial[i])
             xc.append(seg.xc[i])
             xg.append(seg.xg[i])
         dat["xraxial"] = xraxial
         dat["xc"] = xc
         dat["xg"] = xg
+
     return dat
 
 
