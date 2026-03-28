@@ -1,3 +1,18 @@
+## v0.12.0 (2026-03-28)
+
+### Feat
+
+- add differentiable active and firing_rate analysis
+- experimental: line sources (for extracellular stim)
+
+### Fix
+
+- correctly capture x,y,z segment coordinates for branched morphs
+
+### Refactor
+
+- refactor conduction_velocity and action_potential_width to use the same spike-time helper
+
 ## v0.11.1 (2026-03-06)
 
 ### Fix
