@@ -943,17 +943,26 @@ class ThresholdCallback(Callback):
 
     """
 
-    def __init__(self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None):
+    def __init__(
+        self,
+        threshold=0.0,
+        t_start_check=0.0,
+        t_end_check=None,
+        node_check=[5, -5],
+        dt=None,
+    ):
         super().__init__()
         self.record: torch.Tensor = None
         self.state_cache: torch.Tensor = None
         self.threshold: float = threshold
         self.t_start_check: float = t_start_check
+        self.t_end_check: float = t_end_check if t_end_check is not None else float(1e9)
         self.node_check: List[int] = node_check
 
         self.i: int = 0
         self._dt: float = dt if dt is not None else A.dt
         self.ind_start = int(self.t_start_check / self._dt)
+        self.ind_end = int(self.t_end_check / self._dt)
 
     def pre_loop_hook(self, model):
         """
@@ -978,6 +987,7 @@ class ThresholdCallback(Callback):
     def dt(self, value):
         self._dt = value
         self.ind_start = int(self.t_start_check / self._dt)
+        self.ind_end = int(self.t_end_check / self._dt)
 
     def reset_timer(self):
         """
@@ -1098,7 +1108,7 @@ class APCount(ThresholdCallback):
         currently below threshold, and add one to ``record`` wherever a rising
         edge was observed this step.
         """
-        if self.i >= self.ind_start:
+        if self.i >= self.ind_start and self.i < self.ind_end:
             vm_new = model.v.index_select(-1, self.node_check)
             self.state_cache, self.record = _increment_count(
                 self.state_cache, vm_new, self.record, self.threshold
