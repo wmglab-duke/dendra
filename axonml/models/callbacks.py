@@ -1224,6 +1224,77 @@ class ActiveAL(APCount):
         return self.record
 
 
+class ActiveALCount(APCount):
+    """
+    Callback for determining whether an axon fired based on the total spike count.
+
+    This class extends APCount to determine if an axon is "active" based on whether
+    the total number of threshold crossings across all monitored nodes meets or
+    exceeds a specified count. It marks an axon as active if the total spike count
+    is at least the specified threshold.
+
+    Parameters
+    ----------
+    threshold : float, optional
+        Voltage threshold in mV for spike detection. Default is 0.0.
+    t_start_check : float, optional
+        Time in ms after which to start checking for threshold crossings.
+        Default is 0.0 (check from beginning).
+    node_check : list of int, optional
+        Indices of nodes to monitor for spike detection. Default is [5, -5]
+        (check at node 5 from beginning and node 5 from end).
+    dt : float, optional
+        Time step in ms. If None, uses the default from backend. Default is None.
+    at_least : int, optional
+        Minimum total spike count across all monitored nodes required to mark an axon as active.
+        Default is 1.
+    inv : bool, optional
+        If True, inverts the active detection (marks axons as inactive if they
+        meet the count threshold). Default is False.
+    """
+
+    def __init__(
+        self,
+        threshold=0.0,
+        t_start_check=0.0,
+        node_check=[5, -5],
+        dt=None,
+        at_least=1,
+        inv=False,
+    ):
+        super().__init__(threshold, t_start_check, node_check, dt)
+        self.at_least = at_least
+        self.inv = inv
+
+    def is_active(self, partition=None):
+        """
+        Determine which axons are active based on total spike count.
+
+        An axon is active if the sum of counts across all monitored nodes in
+        ``record`` is at least ``at_least``. When ``partition`` is provided,
+        the check is performed independently over contiguous segments of each row,
+        and a boolean mask is returned for each segment.
+
+        Returns
+        -------
+        torch.Tensor
+            Boolean tensor of shape ``(n_axons,)`` when ``partition`` is None,
+            otherwise ``(n_axons, len(partition))``. If ``inv`` is True, the
+            result is inverted.
+        """
+        if self.record is None:
+            return self.record
+        active = _is_active_count(self.record, self.at_least, partition)
+        if self.inv:
+            return ~active
+        return active
+
+    def numpy(self, partition=None):
+        if self.record is not None:
+            return self.is_active(partition).detach().cpu().numpy()
+        return self.record
+
+
 class Active(ActiveAL):
     """
     Callback for detecting if axons fire at any point during simulation.
@@ -1600,6 +1671,32 @@ def _is_active(record, at_least: int, partition=None) -> torch.Tensor:
     return torch.stack(
         [torch.count_nonzero(seg, dim=1) >= at_least for seg in segments], dim=1
     )
+
+
+def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
+    if partition is None:
+        return record.sum(dim=1) >= at_least
+
+    lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
+    if lengths.dim() != 1:
+        raise ValueError("partition must be a 1D sequence of integers.")
+
+    lengths_list = lengths.tolist()
+    if not lengths_list:
+        raise ValueError("partition must be non-empty.")
+    if sum(lengths_list) != record.shape[1]:
+        raise ValueError(
+            "sum(partition) must equal record.shape[1]; "
+            f"got {sum(lengths_list)} and {record.shape[1]}."
+        )
+    if min(lengths_list) < at_least:
+        raise ValueError(
+            "all partition values must be at least `at_least`; "
+            f"minimum was {min(lengths_list)}."
+        )
+
+    segments = torch.split(record, lengths_list, dim=1)
+    return torch.stack([seg.sum(dim=1) >= at_least for seg in segments], dim=1)
 
 
 def _sliding_window_average(x, window_size: int):
