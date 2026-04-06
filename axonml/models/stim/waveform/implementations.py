@@ -484,7 +484,7 @@ class arbitrary(Waveform):
     Waveform.PARAMETER(values=[0.0, 0.0], tpoints=[0.0, 1.0])
 
     def fn(self, t):
-        t = t.unsqueeze(0)
         if self.values.ndim > 1:
+            t = t.unsqueeze(0)
             t = t.expand(self.values.shape[0], -1)
         return interp1d(self.tpoints, self.values, t)

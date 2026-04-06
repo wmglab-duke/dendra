@@ -127,10 +127,7 @@ def apply_d_lambda(all_sections: List, d_lambda: float = 0.1, freq: float = 100.
 
 @requires_packages("neuron")
 def read_swc(
-    file_path: str,
-    d_lambda=0.1,
-    freq=100.0,
-    data_func=None,
+    file_path: str, d_lambda=0.1, freq=100.0, data_func=None, **kwargs
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read an SWC file and return the contents."""
 
@@ -138,6 +135,9 @@ def read_swc(
         data_func = xyz
 
     h.load_file("import3d.hoc")
+
+    rhoa = kwargs.get("rhoa", None)  # intracellular resistivity (Ω·cm)
+    cm = kwargs.get("cm", None)  # specific membrane capacitance (µF/cm²)
 
     class Cell:
         def __init__(self, importer):
@@ -151,6 +151,14 @@ def read_swc(
     importer = h.Import3d_GUI(reader, 0)
 
     cell = Cell(importer)
+
+    if rhoa is not None:
+        for sec in cell.all:
+            sec.Ra = rhoa
+    if cm is not None:
+        for sec in cell.all:
+            sec.cm = cm
+
     apply_d_lambda(cell.all, d_lambda, freq)
 
     return neuron_to_axonml_graph(root_sec=cell.all[0], data_func=data_func)
@@ -158,12 +166,15 @@ def read_swc(
 
 @requires_packages("neuron")
 def read_neurolucida(
-    file_path: str, d_lambda=0.1, freq=100.0, data_func=None
+    file_path: str, d_lambda=0.1, freq=100.0, data_func=None, **kwargs
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read a Neurolucida file and return the contents."""
 
     if data_func is None:
         data_func = xyz
+
+    rhoa = kwargs.get("rhoa", None)  # intracellular resistivity (Ω·cm)
+    cm = kwargs.get("cm", None)  # specific membrane capacitance (µF/cm²)
 
     h.load_file("import3d.hoc")
 
@@ -180,6 +191,13 @@ def read_neurolucida(
     importer = h.Import3d_GUI(reader, 0)
 
     cell = Cell(importer)
+    if rhoa is not None:
+        for sec in cell.all:
+            sec.Ra = rhoa
+    if cm is not None:
+        for sec in cell.all:
+            sec.cm = cm
+
     apply_d_lambda(cell.all, d_lambda, freq)
 
     return neuron_to_axonml_graph(root_sec=cell.all[0], data_func=data_func)

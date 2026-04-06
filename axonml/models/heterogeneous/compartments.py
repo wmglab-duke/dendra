@@ -6,10 +6,13 @@ import torch
 
 
 class CompartmentID:
-    def __init__(self, names: List[str], n_repeats: int):
+    def __init__(self, names: List[str], n_repeats: int, wrap=True):
         self._names = names
         self.n_repeats = n_repeats
-        self.names = np.array(expand_string_list(names) * n_repeats + names[:1])
+        if wrap:
+            self.names = np.array(expand_string_list(names) * n_repeats + names[:1])
+        else:
+            self.names = np.array(expand_string_list(names) * n_repeats)
 
     def nc(self):
         return len(self.names)
@@ -46,10 +49,13 @@ class CompartmentID:
 
 
 class CompartmentIDTorch:
-    def __init__(self, names: List[str], n_repeats: int):
+    def __init__(self, names: List[str], n_repeats: int, wrap=True):
         self._names = names
         self.n_repeats = n_repeats
-        self.names = torch.tensor(expand_string_list(names) * n_repeats + names[:1])
+        if wrap:
+            self.names = torch.tensor(expand_string_list(names) * n_repeats + names[:1])
+        else:
+            self.names = torch.tensor(expand_string_list(names) * n_repeats)
 
     def nc(self):
         return len(self.names)

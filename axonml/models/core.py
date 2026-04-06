@@ -207,8 +207,9 @@ class Population(P, Sliceable):
     _REPR_FLOAT_SIGFIGS: int = 6  # scalar + small tensor formatting
     _REPR_MAX_MECH_PARAM_ENTRIES: int = 200  # safety bound per mechanism
 
-    P.RANGE(cm=1.0, rhoa=35.4)
+    P.RANGEP(cm=1.0, rhoa=35.4)
     P.GLOBAL(celsius=37.0)
+    P.GLOBALP(rhoa_scale=1.0, cm_scale=1.0, area_scale=1.0)
 
     def __init__(self, N: int = 1, C: int = 1, integrator=None, v_init=-65.0, **kwargs):
         super().__init__((N, C), (N, C), **kwargs)
@@ -391,52 +392,6 @@ class Population(P, Sliceable):
             Keyword arguments forwarded to ``axonml.models.mechanisms._ions.concentrations``.
         """
         self._concentrations.update(kwargs)
-
-    def collect_parameters(self, *names):
-        """
-        Collects parameters from the model based on the provided names.
-
-        Parameters
-        ----------
-        *names : str
-            Variable length argument list of parameter name patterns.
-            If empty, all parameters will be collected.
-            Otherwise, only parameters matching any of these patterns will be collected.
-
-        Returns
-        -------
-        list
-            List of parameters matching the provided names.
-        """
-        if not names:
-            return self.parameters()
-        else:
-            for n, p in self.named_parameters():
-                if matches_any_pattern(names, n):
-                    yield p
-
-    def collect_named_parameters(self, *names):
-        """
-        Collects parameters from the model based on the provided names.
-
-        Parameters
-        ----------
-        *names : str
-            Variable length argument list of parameter name patterns.
-            If empty, all parameters will be collected.
-            Otherwise, only parameters matching any of these patterns will be collected.
-
-        Returns
-        -------
-        list
-            List of tuples (name, parameter) matching the provided names.
-        """
-        if not names:
-            return self.named_parameters()
-        else:
-            for n, p in self.named_parameters():
-                if matches_any_pattern(names, n):
-                    yield (n, p)
 
     def unfreeze_group(self, *groups):
         """

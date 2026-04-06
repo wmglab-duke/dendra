@@ -238,7 +238,7 @@ class Tree(Population):
         """
         from axonml.models.io import read_swc
 
-        graph, _ = read_swc(file_path, d_lambda=d_lambda, freq=freq)
+        graph, _ = read_swc(file_path, d_lambda=d_lambda, freq=freq, **kwargs)
         cell = cls.from_graph(
             graph, N, integrator, principal_axis=principal_axis, **kwargs
         )
@@ -279,7 +279,7 @@ class Tree(Population):
         """
         from axonml.models.io import read_neurolucida
 
-        graph, _ = read_neurolucida(file_path, d_lambda=d_lambda, freq=freq)
+        graph, _ = read_neurolucida(file_path, d_lambda=d_lambda, freq=freq, **kwargs)
         cell = cls.from_graph(
             graph, N, integrator, principal_axis=principal_axis, **kwargs
         )
