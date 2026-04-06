@@ -1182,12 +1182,13 @@ class ActiveAL(APCount):
         self,
         threshold=0.0,
         t_start_check=0.0,
+        t_end_check=None,
         node_check=[5, -5],
         dt=None,
         at_least=1,
         inv=False,
     ):
-        super().__init__(threshold, t_start_check, node_check, dt)
+        super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
         self.at_least = at_least
         self.inv = inv
 
@@ -1267,6 +1268,7 @@ class ActiveALCount(APCount):
         self,
         threshold=0.0,
         t_start_check=0.0,
+        t_end_check=None,
         node_check=[5, -5],
         dt=None,
         at_least=1,
@@ -1351,9 +1353,15 @@ class Active(ActiveAL):
     """
 
     def __init__(
-        self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None, inv=False
+        self,
+        threshold=0.0,
+        t_start_check=0.0,
+        t_end_check=None,
+        node_check=[5, -5],
+        dt=None,
+        inv=False,
     ):
-        super().__init__(threshold, t_start_check, node_check, dt, inv=inv)
+        super().__init__(threshold, t_start_check, t_end_check, node_check, dt, inv=inv)
 
 
 class _Active(ThresholdCallback):
