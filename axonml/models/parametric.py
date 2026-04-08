@@ -138,6 +138,15 @@ def softplus_inv(y, beta: float = 1.0, threshold: float = 20.0, eps: float = 1e-
     return torch.where(small, x_small, x_large)
 
 
+def resolve(parameter):
+    """Resolve a parameter-like object to a tensor value."""
+    if isinstance(parameter, torch.nn.Parameter):
+        return parameter
+    if isinstance(parameter, torch.nn.Module):
+        return parameter()
+    return parameter
+
+
 class Parametric(torch.nn.Module):
     """
     Base class for modules that implement parameterized behavior.
@@ -962,11 +971,7 @@ class SimpleParameterized(Referency):
     def resolve(self, parameter):
         if isinstance(parameter, str):
             return self.evaluate(parameter)
-        if isinstance(parameter, torch.nn.Parameter):
-            return parameter
-        if isinstance(parameter, torch.nn.Module):
-            return parameter()
-        return parameter
+        return resolve(parameter)
 
     def __repr__(self):
         return f"{self.__class__.__name__}({self.parameters_repr()})"
