@@ -17,7 +17,7 @@ from .rng import RNGModule
 _valid_param_type = Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
 
 
-def to_param(val, positive=False, requires_grad=None):
+def to_param(val, positive=False, negative=False, requires_grad=None):
     """
     Convert a value into a parameter-like object.
 
@@ -36,6 +36,8 @@ def to_param(val, positive=False, requires_grad=None):
     torch.nn.Parameter or PositiveParam or torch.nn.Module
         Parameterized representation of ``val`` suitable for registration.
     """
+    if negative and positive:
+        raise ValueError("Cannot set both positive and negative to True.")
     if requires_grad is None:
         requires_grad = bool(REQUIRE_GRAD)
     if isinstance(val, torch.nn.Parameter):
@@ -46,6 +48,9 @@ def to_param(val, positive=False, requires_grad=None):
     if positive:
         val = torch.clamp(val, min=0.0)
         return PositiveParam(val)
+    if negative:
+        val = torch.clamp(val, max=0.0)
+        return NegativeParam(val)
     param = torch.nn.Parameter(val, requires_grad=requires_grad)
     return param
 
@@ -131,6 +136,15 @@ def softplus_inv(y, beta: float = 1.0, threshold: float = 20.0, eps: float = 1e-
     x_large = (by + torch.log1p(-torch.exp(-by))) / beta  # stable for large by
 
     return torch.where(small, x_small, x_large)
+
+
+def resolve(parameter):
+    """Resolve a parameter-like object to a tensor value."""
+    if isinstance(parameter, torch.nn.Parameter):
+        return parameter
+    if isinstance(parameter, torch.nn.Module):
+        return parameter()
+    return parameter
 
 
 class Parametric(torch.nn.Module):
@@ -387,7 +401,7 @@ class Bounded(cacheable):
         # sigmoid mode handled in both-bounds path
         return y
 
-    def _compute(self):
+    def _compute(self, *args, **kwargs):
         # No bounds
         if self.min_val is None and self.max_val is None:
             return self.rho
@@ -468,6 +482,58 @@ class PositiveParam(Bounded):
             cap_mode=cap_mode,
             cap_beta=cap_beta,
         )
+
+
+class NegativeParam(Bounded):
+    """
+    Bounded parameter constrained to non-positive values.
+
+    Parameters
+    ----------
+    init : array_like
+        Initial value for the parameter.
+    include_zero : bool, optional
+        If True, make the zero bound inclusive using a leaky STE transform.
+    min_val : float, optional
+        Optional lower bound (must be negative when provided).
+    beta : float, optional
+        Softplus/sigmoid sharpness parameter.
+    threshold : float, optional
+        Softplus threshold for numerical stability.
+    upper_alpha : float, optional
+        Surrogate slope above zero when ``include_zero`` is True.
+    cap_mode : {'auto', 'softcap', 'sigmoid', 'hard-ste'}, optional
+        Strategy for the optional lower bound.
+    cap_beta : float, optional
+        Softcap temperature. Defaults to ``beta`` when ``None``.
+    """
+
+    def __init__(
+        self,
+        init,
+        *,
+        include_zero: bool = False,
+        min_val: float | None = None,
+        beta: float = 1.0,
+        threshold: float = 20.0,
+        upper_alpha: float = 0.1,  # used only if include_zero=True (leaky-ste)
+        cap_mode: str = "auto",
+        cap_beta: float | None = None,
+    ):
+        super().__init__(
+            torch.neg(init),
+            min_val=0.0,
+            max_val=-min_val if min_val is not None else None,
+            beta=beta,
+            threshold=threshold,
+            lower_mode=("leaky-ste" if include_zero else "softplus"),
+            lower_alpha=upper_alpha,  # note the flipped role of alpha here
+            cap_mode=cap_mode,
+            cap_beta=cap_beta,
+        )
+
+    def _compute(self, *args, **kwargs):
+        return torch.neg(super()._compute(*args, **kwargs))
 
 
 class Functional(torch.nn.Module):
@@ -693,6 +759,10 @@ class SimpleParameterized(Referency):
     _params_p_defined_here = {}
     _params_p_declarations = []
 
+    _params_n = {}
+    _params_n_defined_here = {}
+    _params_n_declarations = []
+
     _flags = {}
     _flags_defined_here = {}
     _flags_declarations = []
@@ -702,6 +772,7 @@ class SimpleParameterized(Referency):
 
         new_params = {}
         new_params_p = {}
+        new_params_n = {}
         new_flags = {}
 
         for base in reversed(cls.__mro__):
@@ -709,10 +780,13 @@ class SimpleParameterized(Referency):
                 new_params.update(base._params)
             if "_params_p" in base.__dict__:
                 new_params_p.update(base._params_p)
+            if "_params_n" in base.__dict__:
+                new_params_n.update(base._params_n)
             if "_flags" in base.__dict__:
                 new_flags.update(base._flags)
         cls._params_defined_here = {}
         cls._params_p_defined_here = {}
+        cls._params_n_defined_here = {}
         cls._flags_defined_here = {}
 
         if SimpleParameterized._params_declarations:
@@ -723,6 +797,10 @@ class SimpleParameterized(Referency):
             for pp_dict in SimpleParameterized._params_p_declarations:
                 cls._params_p_defined_here.update(pp_dict)
             SimpleParameterized._params_p_declarations = []
+        if SimpleParameterized._params_n_declarations:
+            for pn_dict in SimpleParameterized._params_n_declarations:
+                cls._params_n_defined_here.update(pn_dict)
+            SimpleParameterized._params_n_declarations = []
         if SimpleParameterized._flags_declarations:
             for f_dict in SimpleParameterized._flags_declarations:
                 cls._flags_defined_here.update(f_dict)
@@ -730,16 +808,19 @@ class SimpleParameterized(Referency):
 
         new_params.update(cls._params_defined_here)
         new_params_p.update(cls._params_p_defined_here)
+        new_params_n.update(cls._params_n_defined_here)
         new_flags.update(cls._flags_defined_here)
 
         cls._params = new_params
         cls._params_p = new_params_p
+        cls._params_n = new_params_n
         cls._flags = new_flags
 
     def __init__(self, **kwargs):
         super(SimpleParameterized, self).__init__()
         self.params = self.__class__._params.copy()
         self.params_p = self.__class__._params_p.copy()
+        self.params_n = self.__class__._params_n.copy()
         if kwargs:
             self.params = {
                 key: kwargs.get(key, value) for key, value in self.params.items()
@@ -747,8 +828,12 @@ class SimpleParameterized(Referency):
             self.params_p = {
                 key: kwargs.get(key, value) for key, value in self.params_p.items()
             }
+            self.params_n = {
+                key: kwargs.get(key, value) for key, value in self.params_n.items()
+            }
         self.instantiate_parameters(**self.params)
         self.instantiate_parameters(positive=True, **self.params_p)
+        self.instantiate_parameters(negative=True, **self.params_n)
         self.flags = self.__class__._flags.copy()
         if kwargs:
             self.flags = {
@@ -798,7 +883,7 @@ class SimpleParameterized(Referency):
         """
         return list(cls._params.keys())
 
-    def instantiate_parameters(self, positive=False, **kwargs):
+    def instantiate_parameters(self, positive=False, negative=False, **kwargs):
         """
         Materialize parameters declared for the subclass.
 
@@ -808,7 +893,7 @@ class SimpleParameterized(Referency):
             Mapping from parameter names to initial values.
         """
         for key, value in kwargs.items():
-            setattr(self, key, to_param(value, positive=positive))
+            setattr(self, key, to_param(value, positive=positive, negative=negative))
 
     @staticmethod
     def PARAMETER(**kwargs):
@@ -883,6 +968,11 @@ class SimpleParameterized(Referency):
         else:
             return p
 
+    def resolve(self, parameter):
+        if isinstance(parameter, str):
+            return self.evaluate(parameter)
+        return resolve(parameter)
+
     def __repr__(self):
         return f"{self.__class__.__name__}({self.parameters_repr()})"
 
@@ -930,6 +1020,8 @@ def check_conflicts(
     range_params,
     global_p_params,
     range_p_params,
+    global_n_params,
+    range_n_params,
     params_defined_here,
     rng_defined_here=None,
     table_defined_here=None,
@@ -949,6 +1041,8 @@ def check_conflicts(
         .union(range_params.keys())
         .union(global_p_params.keys())
         .union(range_p_params.keys())
+        .union(global_n_params.keys())
+        .union(range_n_params.keys())
         .union(params_defined_here.keys())
         .union(rng_defined_here.keys())
         .union(table_defined_here.keys())
@@ -961,6 +1055,8 @@ def check_conflicts(
             + (param in range_params)
             + (param in global_p_params)
             + (param in range_p_params)
+            + (param in global_n_params)
+            + (param in range_n_params)
             + (param in params_defined_here)
             + (param in rng_defined_here)
             + (param in table_defined_here)
@@ -1012,11 +1108,27 @@ def assign_precendence(cls):
         "_global": getattr(cls, "_global", {}) or {},
         "_range": getattr(cls, "_range", {}) or {},
         "_params": getattr(cls, "_params", {}) or {},
+        "_global_p": getattr(cls, "_global_p", {}) or {},
+        "_range_p": getattr(cls, "_range_p", {}) or {},
+        "_global_n": getattr(cls, "_global_n", {}) or {},
+        "_range_n": getattr(cls, "_range_n", {}) or {},
+        "_params_p": getattr(cls, "_params_p", {}) or {},
+        "_params_n": getattr(cls, "_params_n", {}) or {},
     }
 
     # Which params are present where?
     present = {k: set(v.keys()) for k, v in containers.items()}
-    all_params = present["_global"] | present["_range"] | present["_params"]
+    all_params = (
+        present["_global"]
+        | present["_range"]
+        | present["_params"]
+        | present["_global_p"]
+        | present["_range_p"]
+        | present["_global_n"]
+        | present["_range_n"]
+        | present["_params_p"]
+        | present["_params_n"]
+    )
     dupes = {p for p in all_params if sum(p in present[k] for k in present) > 1}
     if not dupes:
         return {}
@@ -1031,6 +1143,12 @@ def assign_precendence(cls):
         "_global": _as_names(getattr(cls, "_global_defined_here", None)),
         "_range": _as_names(getattr(cls, "_range_defined_here", None)),
         "_params": _as_names(getattr(cls, "_params_defined_here", None)),
+        "_global_p": _as_names(getattr(cls, "_global_p_defined_here", None)),
+        "_range_p": _as_names(getattr(cls, "_range_p_defined_here", None)),
+        "_global_n": _as_names(getattr(cls, "_global_n_defined_here", None)),
+        "_range_n": _as_names(getattr(cls, "_range_n_defined_here", None)),
+        "_params_p": _as_names(getattr(cls, "_params_p_defined_here", None)),
+        "_params_n": _as_names(getattr(cls, "_params_n_defined_here", None)),
     }
 
     for p in dupes:
@@ -1058,6 +1176,20 @@ def assign_precendence(cls):
                     "_global": _as_names(getattr(base, "_global_defined_here", None)),
                     "_range": _as_names(getattr(base, "_range_defined_here", None)),
                     "_params": _as_names(getattr(base, "_params_defined_here", None)),
+                    "_global_p": _as_names(
+                        getattr(base, "_global_p_defined_here", None)
+                    ),
+                    "_range_p": _as_names(getattr(base, "_range_p_defined_here", None)),
+                    "_global_n": _as_names(
+                        getattr(base, "_global_n_defined_here", None)
+                    ),
+                    "_range_n": _as_names(getattr(base, "_range_n_defined_here", None)),
+                    "_params_p": _as_names(
+                        getattr(base, "_params_p_defined_here", None)
+                    ),
+                    "_params_n": _as_names(
+                        getattr(base, "_params_n_defined_here", None)
+                    ),
                 }
                 hits = [cat for cat, s in dh.items() if p in s]
                 if hits:
@@ -1117,6 +1249,10 @@ class Parameterized(SimpleParameterized):
     _global_p_defined_here = {}
     _global_p_declarations = []
 
+    _global_n = {}
+    _global_n_defined_here = {}
+    _global_n_declarations = []
+
     _range = {}
     _range_defined_here = {}
     _range_declarations = []
@@ -1124,6 +1260,10 @@ class Parameterized(SimpleParameterized):
     _range_p = {}
     _range_p_defined_here = {}
     _range_p_declarations = []
+
+    _range_n = {}
+    _range_n_defined_here = {}
+    _range_n_declarations = []
 
     _rng = {}
     _rng_defined_here = {}
@@ -1149,6 +1289,8 @@ class Parameterized(SimpleParameterized):
         new_range_p = {}
         new_rng = {}
         new_table = {}
+        new_global_n = {}
+        new_range_n = {}
 
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
@@ -1165,6 +1307,10 @@ class Parameterized(SimpleParameterized):
                 new_rng.update(base._rng)
             if "_table" in base.__dict__:
                 new_table.update(base._table)
+            if "_global_n" in base.__dict__:
+                new_global_n.update(base._global_n)
+            if "_range_n" in base.__dict__:
+                new_range_n.update(base._range_n)
 
         cls._global_defined_here = {}
         cls._global_p_defined_here = {}
@@ -1172,6 +1318,8 @@ class Parameterized(SimpleParameterized):
         cls._range_p_defined_here = {}
         cls._rng_defined_here = {}
         cls._table_defined_here = {}
+        cls._global_n_defined_here = {}
+        cls._range_n_defined_here = {}
 
         # Add parameters declared via the GLOBAL() method
         if Parameterized._global_declarations:
@@ -1183,6 +1331,11 @@ class Parameterized(SimpleParameterized):
             for p_dict in Parameterized._global_p_declarations:
                 cls._global_p_defined_here.update(p_dict)
             Parameterized._global_p_declarations = []
+        # Add negative global declarations
+        if Parameterized._global_n_declarations:
+            for n_dict in Parameterized._global_n_declarations:
+                cls._global_n_defined_here.update(n_dict)
+            Parameterized._global_n_declarations = []
         # Add range declarations
         if Parameterized._range_declarations:
             for r_dict in Parameterized._range_declarations:
@@ -1193,6 +1346,11 @@ class Parameterized(SimpleParameterized):
             for r_dict in Parameterized._range_p_declarations:
                 cls._range_p_defined_here.update(r_dict)
             Parameterized._range_p_declarations = []
+        # Add negative range declarations
+        if Parameterized._range_n_declarations:
+            for n_dict in Parameterized._range_n_declarations:
+                cls._range_n_defined_here.update(n_dict)
+            Parameterized._range_n_declarations = []
         # Add rng declarations
         if Parameterized._rng_declarations:
             for rng_dict in Parameterized._rng_declarations:
@@ -1211,12 +1369,16 @@ class Parameterized(SimpleParameterized):
         new_range_p.update(cls._range_p_defined_here)
         new_rng.update(cls._rng_defined_here)
         new_table.update(cls._table_defined_here)
+        new_global_n.update(cls._global_n_defined_here)
+        new_range_n.update(cls._range_n_defined_here)
 
         check_conflicts(
             cls._global_defined_here,
             cls._range_defined_here,
             cls._global_p_defined_here,
             cls._range_p_defined_here,
+            cls._global_n_defined_here,
+            cls._range_n_defined_here,
             cls._params_defined_here,
             cls._rng_defined_here,
             cls._table_defined_here,
@@ -1228,11 +1390,15 @@ class Parameterized(SimpleParameterized):
         new_global_p.update({k: v for k, v in kwargs.items() if k in new_global_p})
         new_range.update({k: v for k, v in kwargs.items() if k in new_range})
         new_range_p.update({k: v for k, v in kwargs.items() if k in new_range_p})
+        new_global_n.update({k: v for k, v in kwargs.items() if k in new_global_n})
+        new_range_n.update({k: v for k, v in kwargs.items() if k in new_range_n})
 
         cls._global = new_global
         cls._global_p = new_global_p
         cls._range = new_range
         cls._range_p = new_range_p
+        cls._global_n = new_global_n
+        cls._range_n = new_range_n
         cls._rng = new_rng
         cls._table = new_table
 
@@ -1265,6 +1431,19 @@ class Parameterized(SimpleParameterized):
         Parameterized._global_p_declarations.append(kwargs)
 
     @staticmethod
+    def GLOBALN(**kwargs):
+        """
+        Declare scalar (compartment-independent) strictly negative parameters.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            once per instance and broadcast across compartments.
+        """
+        Parameterized._global_n_declarations.append(kwargs)
+
+    @staticmethod
     def RANGE(**kwargs):
         """
         Declare per-compartment parameters (range variables).
@@ -1289,6 +1468,19 @@ class Parameterized(SimpleParameterized):
             with shape matching the population ``shape_p``.
         """
         Parameterized._range_p_declarations.append(kwargs)
+
+    @staticmethod
+    def RANGEN(**kwargs):
+        """
+        Declare per-compartment strictly negative parameters (range variables).
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            with shape matching the population ``shape_p``.
+        """
+        Parameterized._range_n_declarations.append(kwargs)
 
     @staticmethod
     def RNG(*args, **kwargs):
@@ -1367,6 +1559,9 @@ class Parameterized(SimpleParameterized):
         self.globals_p = self.__class__._global_p.copy()
         self.range = self.__class__._range.copy()
         self.range_p = self.__class__._range_p.copy()
+        self.range_n = self.__class__._range_n.copy()
+        self.global_n = self.__class__._global_n.copy()
+
         self.rng = self.__class__._rng.copy()
 
         self.in_graph_parametrizations = {}
@@ -1384,13 +1579,21 @@ class Parameterized(SimpleParameterized):
             self.range_p = {
                 key: kwargs.get(key, value) for key, value in self.range_p.items()
             }
+            self.global_n = {
+                key: kwargs.get(key, value) for key, value in self.global_n.items()
+            }
+            self.range_n = {
+                key: kwargs.get(key, value) for key, value in self.range_n.items()
+            }
 
         self.keys = {}
         self.additional_parameters = {}
         self.instantiate_global(**self.globals)
         self.instantiate_global(positive=True, **self.globals_p)
+        self.instantiate_global(negative=True, **self.global_n)
         self.instantiate_range(**self.range)
         self.instantiate_range(positive=True, **self.range_p)
+        self.instantiate_range(negative=True, **self.range_n)
         self.instantiate_rng(**self.rng)
         self.instantiate_additional_parameters(additional_parameters)
 
@@ -1409,6 +1612,7 @@ class Parameterized(SimpleParameterized):
         self.shape_f = shape_f
         self.instantiate_range(**self.range)
         self.instantiate_range(positive=True, **self.range_p)
+        self.instantiate_range(negative=True, **self.range_n)
 
     def _refresh_and_set(self, name, value):
         """
@@ -1432,7 +1636,7 @@ class Parameterized(SimpleParameterized):
                 pass
         setattr(self, name, value)
 
-    def instantiate_global(self, positive=False, **kwargs):
+    def instantiate_global(self, positive=False, negative=False, **kwargs):
         """
         Instantiate global (scalar) parameters and default buffers.
 
@@ -1446,15 +1650,21 @@ class Parameterized(SimpleParameterized):
                 if isinstance(value, dict):
                     setattr(self, name, torch.nn.ParameterDict())
                     for pname, pval in value.items():
-                        setattr(self, pname, to_param(pval, positive=positive))
+                        setattr(
+                            self,
+                            pname,
+                            to_param(pval, positive=positive, negative=negative),
+                        )
                         getattr(self, name)[pname] = getattr(self, pname)
                 else:
                     p_name = f"{name}_param"
-                    self._refresh_and_set(p_name, to_param(value, positive=positive))
+                    self._refresh_and_set(
+                        p_name, to_param(value, positive=positive, negative=negative)
+                    )
                     self.register_buffer(name, torch.empty(()))
                     getattr(self, name).copy_(self.evaluate(p_name))
 
-    def instantiate_range(self, positive=False, **kwargs):
+    def instantiate_range(self, positive=False, negative=False, **kwargs):
         """
         Instantiate range parameters over the population shape.
 
@@ -1466,7 +1676,9 @@ class Parameterized(SimpleParameterized):
         if kwargs is not None:
             for name, value in kwargs.items():
                 p_name = f"{name}_param"
-                self._refresh_and_set(p_name, to_param(value, positive=positive))
+                self._refresh_and_set(
+                    p_name, to_param(value, positive=positive, negative=negative)
+                )
                 self.register_buffer(name, torch.empty(self.shape_p))
                 getattr(self, name).copy_(self.evaluate(p_name))
 
@@ -1527,8 +1739,10 @@ class Parameterized(SimpleParameterized):
         """
         if additional_parameters is not None:
             for name, list_of_aliases_values_and_keys in additional_parameters.items():
-                positive = False
-                if (name in self.range) or (positive := (name in self.range_p)):
+                positive = name in self.range_p
+                negative = name in self.range_n
+                bounded = positive or negative
+                if (name in self.range) or bounded:
                     count = 0
                     keys = []
                     for alias, value, key in list_of_aliases_values_and_keys:
@@ -1538,8 +1752,10 @@ class Parameterized(SimpleParameterized):
                             p_name = f"{name}_param_{count}"
                             count += 1
                         key = torch.as_tensor(key, dtype=torch.long)
-                        parameter = to_param(value, positive=positive)
-                        if isinstance(parameter, torch.nn.Module):
+                        parameter = to_param(
+                            value, positive=positive, negative=negative
+                        )
+                        if isinstance(parameter, torch.nn.Module) and not bounded:
                             p = parameter(torch.empty(self.shape_p))
                             parametrization = build_parametrization(
                                 parameter, p, key, self.shape_p[-2:]
@@ -1550,9 +1766,11 @@ class Parameterized(SimpleParameterized):
                             setattr(self, p_name, parameter)
                         else:
                             setattr(self, p_name, parameter)
-                            fill = create_param_expander(
-                                parameter, key, self.shape_p[-2:]
-                            )
+                            if bounded:
+                                p = parameter()
+                            else:
+                                p = parameter
+                            fill = create_param_expander(p, key, self.shape_p[-2:])
                             self.additional_parameters.setdefault(name, []).append(
                                 (fill, getattr(self, p_name))
                             )
@@ -1565,7 +1783,9 @@ class Parameterized(SimpleParameterized):
         """
         for name, list_of_parameters in self.additional_parameters.items():
             buffer = getattr(self, name)
-            additional_params = torch.cat([fill(p) for fill, p in list_of_parameters])
+            additional_params = torch.cat(
+                [fill(self.resolve(p)) for fill, p in list_of_parameters]
+            )
             key = self.keys[name].to(buffer.device)
             buffer.view(-1).index_copy_(0, key, additional_params)
 
@@ -1646,6 +1866,8 @@ class Parameterized(SimpleParameterized):
             self.__class__._range.keys(),
             self.__class__._global_p.keys(),
             self.__class__._range_p.keys(),
+            self.__class__._global_n.keys(),
+            self.__class__._range_n.keys(),
         )
         for name in keys_to_process:
             if not torch.is_tensor(getattr(self, name)):
@@ -1659,6 +1881,36 @@ class Parameterized(SimpleParameterized):
             getattr(self, name).copy_(self.evaluate(p_name))
         self.load_additional_parameters()
         self.apply_parametrizations()
+        self.make_contiguous()
+
+    def make_contiguous(self):
+        """
+        Ensure all parameter buffers are contiguous in memory.
+        """
+        for name in self.__class__._global.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
+        for name in self.__class__._range.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
+        for name in self.__class__._global_p.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
+        for name in self.__class__._range_p.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
+        for name in self.__class__._global_n.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
+        for name in self.__class__._range_n.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
 
     def apply_parametrizations(self):
         """
@@ -1725,7 +1977,7 @@ class Parameterized(SimpleParameterized):
         """
         Returns a dictionary of all parameters in the model.
         """
-        return {name: param for name, param in self.named_parameters()}
+        return {name: param.clone() for name, param in self.named_parameters()}
 
     @classmethod
     def all_parameter_names(cls):

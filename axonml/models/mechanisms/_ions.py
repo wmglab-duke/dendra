@@ -4,6 +4,8 @@ import torch
 
 from axonml.helpers import DEBUG
 
+from ..parametric import to_param
+
 # default reversal potentials from NEURON
 REVERSAL = {"ena": 50.0, "ek": -77.0, "eca": 132.0}
 
@@ -177,9 +179,9 @@ class Ion(torch.nn.Module):
         self.name = name
         self.rzf = R / (VALENCES[name] * FARADAY)
 
-        self.e_init = reversals()[f"e{name}"]
-        self.i_init = cinits()[f"{name}i0"]
-        self.o_init = cinits()[f"{name}o0"]
+        self.e_init = to_param(reversals()[f"e{name}"])
+        self.i_init = to_param(cinits()[f"{name}i0"])
+        self.o_init = to_param(cinits()[f"{name}o0"])
 
         self.min_concentration = min_concentrations()[name]
 
@@ -203,20 +205,24 @@ class Ion(torch.nn.Module):
         setattr(
             self,
             f"e{name}",
-            torch.full(e.shape, self.e_init, dtype=e.dtype, device=e.device),
+            torch.full(e.shape, 0.0, dtype=e.dtype, device=e.device),
         )
+        getattr(self, f"e{name}").copy_(self.e_init)
         setattr(
             self,
             f"{name}i",
-            torch.full(ioni.shape, self.i_init, dtype=ioni.dtype, device=ioni.device),
+            torch.full(ioni.shape, 0.0, dtype=ioni.dtype, device=ioni.device),
         )
+        getattr(self, f"{name}i").copy_(self.i_init)
         setattr(
             self,
             f"{name}o",
-            torch.full(iono.shape, self.o_init, dtype=iono.dtype, device=iono.device),
+            torch.full(iono.shape, 0.0, dtype=iono.dtype, device=iono.device),
         )
+        getattr(self, f"{name}o").copy_(self.o_init)
         self.einit(celsius)
-        self.detach()
+        if not self.training:
+            self.detach()
 
     def detach(self):
         name = self.name

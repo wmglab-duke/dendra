@@ -70,7 +70,7 @@ def matches_any_pattern(base_patterns: Iterable[str], target_string: str) -> boo
 class AxModule(torch.nn.Module):
     """Base class for modular neuron model components."""
 
-    def unfreeze(self, *names):
+    def unfreeze(self, *names, exclude=None):
         """
         Unfreezes model parameters, making them trainable.
 
@@ -84,6 +84,9 @@ class AxModule(torch.nn.Module):
             Variable length argument list of parameter name patterns.
             If empty, all parameters will be unfrozen.
             Otherwise, only parameters matching any of these patterns will be unfrozen.
+        exclude : Iterable[str], optional
+            Optional collection of name patterns to exclude from unfreezing.
+            If provided, any parameter whose name matches any of these patterns will not be unfrozen,
 
         Notes
         -----
@@ -91,11 +94,21 @@ class AxModule(torch.nn.Module):
         When a parameter is unfrozen, a message is printed to the console.
         """
         if not names:
-            for p in self.parameters():
-                p.requires_grad = True
+            if exclude is not None:
+                for n, p in self.named_parameters():
+                    if matches_any_pattern(exclude, n):
+                        continue
+                    else:
+                        print(f"Unfreezing {n}")
+                        p.requires_grad = True
+            else:
+                for p in self.parameters():
+                    p.requires_grad = True
         else:
             for n, p in self.named_parameters():
-                if matches_any_pattern(names, n):
+                if matches_any_pattern(names, n) and (
+                    exclude is None or not matches_any_pattern(exclude, n)
+                ):
                     print(f"Unfreezing {n}")
                     p.requires_grad = True
         return self
@@ -111,7 +124,7 @@ class AxModule(torch.nn.Module):
         """
         self.unfreeze(*names)
 
-    def freeze(self, *names):
+    def freeze(self, *names, exclude=None):
         """
         Freeze parameters to disable gradient computation.
 
@@ -120,6 +133,9 @@ class AxModule(torch.nn.Module):
         *names : str
             Optional name patterns selecting parameters to freeze. When omitted,
             all parameters are frozen.
+        exclude : Iterable[str], optional
+            Optional collection of name patterns to exclude from freezing. If
+            provided, any parameter whose name matches any of these patterns will not be frozen, even if
 
         Returns
         -------
@@ -127,11 +143,21 @@ class AxModule(torch.nn.Module):
             The population instance for chaining.
         """
         if not names:
-            for p in self.parameters():
-                p.requires_grad = False
+            if exclude is not None:
+                for n, p in self.named_parameters():
+                    if matches_any_pattern(exclude, n):
+                        continue
+                    else:
+                        print(f"Freezing {n}")
+                        p.requires_grad = False
+            else:
+                for p in self.parameters():
+                    p.requires_grad = False
         else:
             for n, p in self.named_parameters():
-                if matches_any_pattern(names, n):
+                if matches_any_pattern(names, n) and (
+                    exclude is None or not matches_any_pattern(exclude, n)
+                ):
                     print(f"Freezing {n}")
                     p.requires_grad = False
         return self
@@ -146,3 +172,49 @@ class AxModule(torch.nn.Module):
             Optional name patterns forwarded to :meth:`freeze`.
         """
         self.freeze(*names)
+
+    def collect_parameters(self, *names):
+        """
+        Collects parameters from the model based on the provided names.
+
+        Parameters
+        ----------
+        *names : str
+            Variable length argument list of parameter name patterns.
+            If empty, all parameters will be collected.
+            Otherwise, only parameters matching any of these patterns will be collected.
+
+        Returns
+        -------
+        list
+            List of parameters matching the provided names.
+        """
+        if not names:
+            return self.parameters()
+        else:
+            for n, p in self.named_parameters():
+                if matches_any_pattern(names, n):
+                    yield p
+
+    def collect_named_parameters(self, *names):
+        """
+        Collects parameters from the model based on the provided names.
+
+        Parameters
+        ----------
+        *names : str
+            Variable length argument list of parameter name patterns.
+            If empty, all parameters will be collected.
+            Otherwise, only parameters matching any of these patterns will be collected.
+
+        Returns
+        -------
+        list
+            List of tuples (name, parameter) matching the provided names.
+        """
+        if not names:
+            return self.named_parameters()
+        else:
+            for n, p in self.named_parameters():
+                if matches_any_pattern(names, n):
+                    yield (n, p)

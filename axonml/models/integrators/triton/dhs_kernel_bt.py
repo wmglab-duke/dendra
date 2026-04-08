@@ -236,17 +236,20 @@ class DHSBTSolve3(torch.autograd.Function):
     @staticmethod
     def forward(ctx, D_blocks, G_vec, b, parent_idx, order, layer_ptr, threads: int):
         B, K, m, n = D_blocks.shape
-        assert m == 3 and n == 3, "DHSBTSolve3 expects (B,K,3,3) blocks."
+        assert m == 3 and n == 3
         X = torch.empty_like(b)
         MINV = torch.empty(B, K, 9, device=b.device, dtype=b.dtype)
+
+        D_work = D_blocks.clone()
+        b_work = b.clone()
 
         NEURONS_PER_WARP = 32 // threads
         grid_x = math.ceil(B / NEURONS_PER_WARP)
 
         _dhs_bt3_kernel[(grid_x,)](
-            D_blocks.reshape(B, -1),
+            D_work.reshape(B, -1),
             G_vec.reshape(B, -1),
-            b.reshape(B, -1),
+            b_work.reshape(B, -1),
             X.reshape(B, -1),
             MINV.reshape(B, -1),
             parent_idx,
@@ -298,13 +301,18 @@ class DHSBTSolve3(torch.autograd.Function):
 
         grad_b = g
         grad_D = -(g.unsqueeze(-1) * X.unsqueeze(-2))  # per-node 3×3
+
         # Edge grads
-        is_root = parent_idx < 0
-        parent = parent_idx.clamp_min(0).view(1, -1, 1).expand(B, -1, 3)
-        Xp = X.gather(1, parent)
-        gp = g.gather(1, parent)
-        grad_G = -(g - gp) * (X - Xp)
-        grad_G[:, is_root, :] = -(g[:, is_root, :] * X[:, is_root, :])
+        parent = parent_idx.clamp_min(0).to(torch.int64)
+
+        Xp = X.index_select(1, parent)
+        gp = g.index_select(1, parent)
+
+        root_mask = (parent_idx < 0).view(1, -1, 1)
+        root_grad = -(g * X)
+        nonroot_grad = -((g - gp) * (X - Xp))
+
+        grad_G = torch.where(root_mask, root_grad, nonroot_grad)
         return grad_D, grad_G, grad_b, None, None, None, None
 
 

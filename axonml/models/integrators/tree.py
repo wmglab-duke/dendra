@@ -340,7 +340,7 @@ class _dhs(Integrator):
         )  # (N,)
         self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))  # (N,)
 
-        area_cm2 = model.area.to(device=device)  # cm²
+        area_cm2 = model.area.to(device=device) * model.area_scale  # cm²
 
         self.register_buffer(
             "layer_ptr", layer_ptr.to(dtype=torch.int64, device=device)
@@ -352,11 +352,13 @@ class _dhs(Integrator):
             .to(device=device, dtype=model.dtype())
             .clone()
             .contiguous()
-        )  # (B,N)
+        ) / model.rhoa_scale  # (B,N)
 
         self.scale = area_cm2
 
-        cm = 1e-6 * model.cm.to(device=device) * area_cm2  # convert from µF / cm2 to F
+        cm = (
+            1e-6 * model.cm.to(device=device) * area_cm2 * model.cm_scale
+        )  # convert from µF / cm2 to F
         self.cmdt = (
             (cm / dt_s).expand(model.shape).reshape(B, self.K)
         )  # (B,N) (F/s = S)
@@ -423,6 +425,7 @@ class _dhs(Integrator):
             torch.tensor(edge_parent_orig_list, dtype=torch.int64, device=device),
         )
         self.register_buffer("edge_gax_orig", edge_gax_orig)
+        self.edge_gax_orig = self.edge_gax_orig / model.rhoa_scale  # (B, E)
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._step(model.v, dt, model.celsius, ve, intra)

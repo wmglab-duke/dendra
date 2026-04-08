@@ -286,23 +286,18 @@ class DHSSolveStable(torch.autograd.Function):
         # --- 2. Compute Gradients for Original Inputs ---
         grad_b = g
         grad_d_mem = -(g * x)
-        is_root = parent_idx < 0
 
-        # --- Gradient of `a_geom` ---
-        # First, compute the general gradient formula, which is correct for all non-root nodes.
-        parent_idx_clamped = parent_idx.clamp_min(0).to(torch.int64)
-        x_parent = x.gather(1, parent_idx_clamped.expand_as(x))
-        g_parent = g.gather(1, parent_idx_clamped.expand_as(g))
+        parent = parent_idx.clamp_min(0).to(torch.int64)
 
-        delta_x = x - x_parent
-        delta_g = g - g_parent
+        # In DHSSolveStable.backward use x, not V
+        x_parent = x.index_select(1, parent)
+        g_parent = g.index_select(1, parent)
 
-        grad_a_geom = -(delta_g * delta_x)
+        root_mask = (parent_idx < 0).view(1, -1)
+        root_grad = -(g * x)
+        nonroot_grad = -((g - g_parent) * (x - x_parent))
 
-        # Second, explicitly compute the correct gradient for the root node(s) and
-        # overwrite the value calculated by the general formula. The parameter a_geom[root]
-        # only affects the diagonal A[root, root], so its gradient is -g[root]*x[root].
-        grad_a_geom[:, is_root] = -(g[:, is_root] * x[:, is_root])
+        grad_a_geom = torch.where(root_mask, root_grad, nonroot_grad)
 
         # The return signature must match the forward inputs in order.
         return grad_d_mem, grad_a_geom, grad_b, None, None, None, None
@@ -383,14 +378,16 @@ class DHSSolvePacked(torch.autograd.Function):
         grad_b = g
         grad_d_mem = -(g * V)
 
-        is_root = parent_idx < 0
-        parent_clamped = parent_idx.clamp_min(0)
+        parent = parent_idx.clamp_min(0).to(torch.int64)
 
-        V_parent = V.gather(1, parent_clamped.expand_as(V))
-        g_parent = g.gather(1, parent_clamped.expand_as(g))
+        V_parent = V.index_select(1, parent)
+        g_parent = g.index_select(1, parent)
 
-        grad_a_geom = -(g - g_parent) * (V - V_parent)
-        grad_a_geom[:, is_root] = -(g[:, is_root] * V[:, is_root])
+        root_mask = (parent_idx < 0).view(1, -1)
+        root_grad = -(g * V)
+        nonroot_grad = -((g - g_parent) * (V - V_parent))
+
+        grad_a_geom = torch.where(root_mask, root_grad, nonroot_grad)
 
         return grad_d_mem, grad_a_geom, grad_b, None, None, None, None
 

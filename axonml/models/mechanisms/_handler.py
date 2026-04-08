@@ -102,6 +102,8 @@ class MechanismHandler(torch.nn.Module):
         self.ion_to_buff_idx = {}
         self.i_g_buffers_initialized = False
 
+        self.update_ion_buf = {}
+
         self.shape = None
 
         if self.write_ion_c:
@@ -156,8 +158,13 @@ class MechanismHandler(torch.nn.Module):
         self._buf_i = [torch.zeros_like(v) for _ in current_names]
         self._buf_g = [torch.zeros_like(v) for _ in current_names]
         for ion in self.ions.keys():
-            idx = current_names.index(f"i{ion}")
-            self.ion_to_buff_idx[ion] = idx
+            try:
+                idx = current_names.index(f"i{ion}")
+                self.ion_to_buff_idx[ion] = idx
+                self.update_ion_buf[ion] = True
+            except ValueError:
+                self.update_ion_buf[ion] = False
+
         self.i_g_buffers_initialized = True
 
     def init_rng(self):
@@ -254,7 +261,8 @@ class MechanismHandler(torch.nn.Module):
 
         # expose per-ion currents
         for ion, ion_h in self.ions.items():
-            ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
+            if self.update_ion_buf.get(ion, False):
+                ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
         return tot_i, tot_g
 

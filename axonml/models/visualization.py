@@ -321,132 +321,162 @@ def palette_hsv(n, *, s=0.65, v=0.9, seed=0):
     return [mpl.colors.to_hex(colorsys.hsv_to_rgb(h, s, v)) for h in hues]
 
 
-def vis_2d(cell, idx=0, view="y", node_scale=8, dpi=200):
-    """
-    Project a 3-D NetworkX graph to 2-D and plot with a legend.
+def _nice_scalebar_length(span):
+    """Choose a visually sensible scalebar length in data units."""
+    span = float(span)
+    if not np.isfinite(span) or span <= 0:
+        return 1.0
+    target = 0.2 * span
+    exp = 10 ** np.floor(np.log10(target))
+    candidates = exp * np.array([1.0, 2.0, 5.0, 10.0])
+    valid = candidates[candidates <= target * (1.0 + 1e-12)]
+    return float(valid[-1] if valid.size else candidates[0])
 
-    Parameters
-    ----------
-    cell : AxonML Population
-        The cell object containing the graph, labels, and find method.
-    view : {'x', 'y', 'z'}, optional
-        Axis to project along. Default 'z' (drop z -> use x-y).
-    node_scale : float, optional
-        Factor that converts diam (µm) to matplotlib marker area points².
-    dpi : int, optional
-        The resolution of the figure in dots per inch.
-    """
-    # ---- 1. Collect coordinates and graph ----
-    G = cell.graph
-    if G is None:
-        raise ValueError("Graph is None. Please create a graph first.")
 
-    x = cell.x[idx]
-    y = cell.y[idx]
-    z = cell.z[idx]
-
-    coords = {n: (float(x[n]), float(y[n]), float(z[n])) for n in G.nodes}
-
-    # Orthographic projection
-    if view == "z":
-        x_l, y_l = "x", "y"
-        proj = {n: (c[0], c[1]) for n, c in coords.items()}
-    elif view == "y":
-        x_l, y_l = "x", "z"
-        proj = {n: (c[0], c[2]) for n, c in coords.items()}
-    elif view == "x":
-        x_l, y_l = "y", "z"
-        proj = {n: (c[1], c[2]) for n, c in coords.items()}
+def _format_scalebar_label(length_um):
+    length_um = float(length_um)
+    if abs(length_um) >= 1000:
+        val = length_um / 1000.0
+        text = f"{val:g} mm"
     else:
-        raise ValueError("view must be 'x', 'y', or 'z'")
+        text = f"{length_um:g} µm"
+    return text
 
-    # ---- 2. Prepare data grouped by label for plotting ----
-    labels = cell._labels
-    color_choices = palette_hsv(len(labels))
 
-    # Create a mapping from a label string to its color
-    label_to_color = {label: color for label, color in zip(labels, color_choices)}
+def _hide_2d_axes(ax):
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
 
-    # This dictionary will hold the plot data for each group
-    # e.g., {'soma': {'xs': [...], 'ys': [...], 'sizes': [...]}, ...}
-    data_by_label = {label: {"xs": [], "ys": [], "sizes": []} for label in labels}
 
-    indices = torch.arange(len(G.nodes()), device=cell.device(), dtype=torch.long)
+def _add_2d_scalebar(
+    ax,
+    xlim,
+    ylim,
+    *,
+    length=None,
+    loc="lower right",
+    pad_frac=0.05,
+    text_pad_frac=0.01,
+    linewidth=2.5,
+    color="black",
+    fontsize=10,
+):
+    """Draw a simple horizontal scalebar in data coordinates."""
+    x0, x1 = map(float, xlim)
+    y0, y1 = map(float, ylim)
+    xspan = max(x1 - x0, 1.0)
+    yspan = max(y1 - y0, 1.0)
 
-    # Create a reverse map from node_id to its label for quick lookup
-    node_to_label = {}
-    for label in labels:
-        nodes_for_label = indices[cell.find(label)].cpu().tolist()
-        for node_id in nodes_for_label:
-            node_to_label[node_id] = label
+    if length is None:
+        length = _nice_scalebar_length(xspan)
+    length = float(length)
 
-    # Populate the data dictionary
-    unclassified_nodes = {"xs": [], "ys": [], "sizes": []}
-    for n in G.nodes():
-        label = node_to_label.get(n)
-        px, py = proj[n]
-        size = G.nodes[n]["diam"] * node_scale
+    pad_x = pad_frac * xspan
+    pad_y = pad_frac * yspan
+    text_pad = text_pad_frac * yspan
 
-        if label:
-            data_by_label[label]["xs"].append(px)
-            data_by_label[label]["ys"].append(py)
-            data_by_label[label]["sizes"].append(size)
-        else:
-            # Handle nodes that might not have a label
-            unclassified_nodes["xs"].append(px)
-            unclassified_nodes["ys"].append(py)
-            unclassified_nodes["sizes"].append(size)
+    loc = str(loc).lower().replace("_", " ")
+    if loc in {"lower right", "right", "lr"}:
+        xs = x1 - pad_x - length
+        xe = x1 - pad_x
+    elif loc in {"lower left", "left", "ll"}:
+        xs = x0 + pad_x
+        xe = x0 + pad_x + length
+    else:
+        raise ValueError("scalebar_loc must be 'lower right' or 'lower left'")
 
-    # ---- 3. Plotting ----
-    fig, ax = plt.subplots(dpi=dpi, figsize=(8, 8))
-
-    # Plot edges first so they are in the background
-    for u, v in G.edges():
-        x0, y0 = proj[u]
-        x1, y1 = proj[v]
-        ax.plot([x0, x1], [y0, y1], "k-", linewidth=0.5, alpha=0.7)
-
-    # Plot each group of nodes with a separate scatter call to create legend handles
-    for label, data in data_by_label.items():
-        if not data["xs"]:
-            continue  # Skip empty labels
-        ax.scatter(
-            data["xs"],
-            data["ys"],
-            s=data["sizes"],
-            c=[label_to_color[label]],  # Use a list with one color
-            label=label,
-            alpha=0.85,
-            edgecolors="k",
-            linewidths=0.3,
-        )
-
-    # Plot any unclassified nodes
-    if unclassified_nodes["xs"]:
-        ax.scatter(
-            unclassified_nodes["xs"],
-            unclassified_nodes["ys"],
-            s=unclassified_nodes["sizes"],
-            c="grey",
-            label="unclassified",
-            alpha=0.6,
-            edgecolors="k",
-            linewidths=0.3,
-        )
-
-    # ---- 4. Create and display the legend ----
-    ax.legend(
-        loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0.0, frameon=False
+    y = y0 + pad_y
+    ax.plot(
+        [xs, xe], [y, y], color=color, lw=linewidth, solid_capstyle="butt", zorder=20
+    )
+    # ax.plot([xs, xs], [y - tick, y + tick], color=color, lw=linewidth, zorder=20)
+    # ax.plot([xe, xe], [y - tick, y + tick], color=color, lw=linewidth, zorder=20)
+    ax.text(
+        0.5 * (xs + xe),
+        y + text_pad,
+        _format_scalebar_label(length),
+        ha="center",
+        va="bottom",
+        color=color,
+        fontsize=fontsize,
+        zorder=21,
     )
 
-    ax.set_aspect("equal")
-    ax.set_xlabel(f"{x_l} (µm)")
-    ax.set_ylabel(f"{y_l} (µm)")
-    fig.tight_layout()
-    plt.show()
+
+def _build_3d_scalebar(
+    coords,
+    *,
+    length=None,
+    pad_frac=0.06,
+    axis=None,
+    color="black",
+    line_width=6,
+    font_size=14,
+):
+    """Create a world-space 3D scalebar trace and matching annotation."""
+    pts = np.asarray(list(coords.values()), dtype=float)
+    mins = pts.min(axis=0)
+    maxs = pts.max(axis=0)
+    spans = np.maximum(maxs - mins, 1.0)
+
+    if axis is None:
+        axis_idx = int(np.argmax(spans))
+    else:
+        axis_lookup = {"x": 0, "y": 1, "z": 2}
+        axis_idx = axis_lookup[str(axis).lower()]
+
+    if length is None:
+        length = _nice_scalebar_length(spans[axis_idx])
+    length = float(length)
+
+    start = mins + pad_frac * spans
+    end = start.copy()
+    end[axis_idx] = start[axis_idx] + length
+
+    tick_axis = 2 if axis_idx != 2 else 1
+    tick_half = 0.02 * spans[tick_axis]
+
+    tick1a = start.copy()
+    tick1b = start.copy()
+    tick1a[tick_axis] -= tick_half
+    tick1b[tick_axis] += tick_half
+    tick2a = end.copy()
+    tick2b = end.copy()
+    tick2a[tick_axis] -= tick_half
+    tick2b[tick_axis] += tick_half
+
+    trace = go.Scatter3d(
+        x=[start[0], end[0], None, tick1a[0], tick1b[0], None, tick2a[0], tick2b[0]],
+        y=[start[1], end[1], None, tick1a[1], tick1b[1], None, tick2a[1], tick2b[1]],
+        z=[start[2], end[2], None, tick1a[2], tick1b[2], None, tick2a[2], tick2b[2]],
+        mode="lines",
+        line=dict(width=float(line_width), color=color),
+        hoverinfo="skip",
+        showlegend=False,
+        name="scalebar",
+    )
+
+    label_pos = 0.5 * (start + end)
+    label_pos[tick_axis] += 2.5 * tick_half
+    annotation = dict(
+        x=float(label_pos[0]),
+        y=float(label_pos[1]),
+        z=float(label_pos[2]),
+        text=_format_scalebar_label(length),
+        showarrow=False,
+        font=dict(size=int(font_size), color=color),
+        xanchor="center",
+        yanchor="bottom",
+        bgcolor="rgba(255,255,255,0.0)",
+    )
+    return trace, annotation
 
 
-def vis_2d_line(
+def vis_2d(
     cell,
     idx=0,
     view="y",
@@ -455,7 +485,7 @@ def vis_2d_line(
     *,
     fig=None,
     ax=None,
-    show_nodes=False,
+    show_nodes=True,
     show_edges=True,
     show_legend=True,
     edge_alpha=0.85,
@@ -464,6 +494,12 @@ def vis_2d_line(
     min_edge_width=0.35,
     max_edge_width=None,
     edge_color="k",
+    scalebar: bool = False,
+    scalebar_length=None,
+    scalebar_loc: str = "lower right",
+    scalebar_color: str = "black",
+    scalebar_linewidth: float = 2.5,
+    scalebar_fontsize: float = 10,
 ):
     """
     Project a 3-D morphology graph to 2-D and plot it with matplotlib.
@@ -494,6 +530,12 @@ def vis_2d_line(
         Optional cap on edge line width.
     edge_color : matplotlib color, optional
         Fallback color for edges.
+    scalebar : bool, optional
+        If True, hide axes and draw a 2D scalebar instead.
+    scalebar_length : float or None, optional
+        Scalebar length in µm. If omitted, a visually sensible value is chosen.
+    scalebar_loc : {'lower right', 'lower left'}, optional
+        Placement of the scalebar.
 
     Returns
     -------
@@ -555,11 +597,11 @@ def vis_2d_line(
 
             diam_u = float(G.nodes[u].get("diam", 1.0) or 1.0)
             diam_v = float(G.nodes[v].get("diam", 1.0) or 1.0)
-            width = 0.5 * (diam_u + diam_v) * edge_scale
-            width = max(float(min_edge_width), float(width))
+            edge_width = 0.5 * (diam_u + diam_v) * edge_scale
+            edge_width = max(float(min_edge_width), float(edge_width))
             if max_edge_width is not None:
-                width = min(float(max_edge_width), width)
-            widths.append(width)
+                edge_width = min(float(max_edge_width), edge_width)
+            widths.append(edge_width)
 
         lc = LineCollection(
             segments,
@@ -635,12 +677,31 @@ def vis_2d_line(
         maxs = proj_arr.max(axis=0)
         spans = np.maximum(maxs - mins, 1.0)
         pad = 0.03 * spans
-        ax.set_xlim(mins[0] - pad[0], maxs[0] + pad[0])
-        ax.set_ylim(mins[1] - pad[1], maxs[1] + pad[1])
+        xlim = (mins[0] - pad[0], maxs[0] + pad[0])
+        ylim = (mins[1] - pad[1], maxs[1] + pad[1])
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+    else:
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
 
     ax.set_aspect("equal")
-    ax.set_xlabel(f"{x_l} (µm)")
-    ax.set_ylabel(f"{y_l} (µm)")
+    if scalebar:
+        _hide_2d_axes(ax)
+        _add_2d_scalebar(
+            ax,
+            xlim,
+            ylim,
+            length=scalebar_length,
+            loc=scalebar_loc,
+            linewidth=scalebar_linewidth,
+            color=scalebar_color,
+            fontsize=scalebar_fontsize,
+        )
+    else:
+        ax.set_xlabel(f"{x_l} (µm)")
+        ax.set_ylabel(f"{y_l} (µm)")
+
     fig.tight_layout()
     if created_fig:
         plt.show()
@@ -648,141 +709,267 @@ def vis_2d_line(
 
 
 @requires_packages("plotly")
-def vis_3d(cell, idx=0, node_scale: float = 10.0, height=800.0, width=None) -> None:
+def vis_3d(
+    cell,
+    idx=0,
+    node_scale: float = 4.0,
+    height=800.0,
+    width=None,
+    show_nodes: bool = True,
+    show_edges: bool = True,
+    show_legend: bool = True,
+    node_alpha: float = 0.75,
+    edge_alpha: float = 0.7,
+    edge_color: str = "black",
+    edge_scale: float = 0.5,
+    min_edge_width: float = 1.0,
+    max_edge_width: float = 6.0,
+    min_node_size: float = 2.0,
+    max_node_size: float = 18.0,
+    size_mode: str = "sqrt",
+    background: str = "white",
+    show_axes: bool = True,
+    scalebar: bool = False,
+    scalebar_length=None,
+    scalebar_axis: str = None,
+    scalebar_color: str = "black",
+    scalebar_linewidth: float = 6.0,
+    scalebar_fontsize: float = 14.0,
+    show: bool = True,
+):
     """
-    Plots a 3D NetworkX graph interactively using Plotly.
-    Correctly aligns hover text with plotted nodes.
+    Plot a 3D compartment graph interactively using Plotly.
 
     Parameters
     ----------
-    cell : AxonML Population-like object
-        Must have .graph, .device, ._labels, and .find() attributes.
-    node_scale : float, optional
-        Factor that converts compartment diameter (µm) to Plotly's marker size.
+    scalebar : bool, optional
+        If True, hide axes and add a small world-space scalebar instead.
+    scalebar_length : float or None, optional
+        Scalebar length in µm. If omitted, a visually sensible value is chosen.
+    scalebar_axis : {'x', 'y', 'z'} or None, optional
+        Axis along which to draw the 3D scalebar. Default picks the widest span.
     """
     G = cell.graph
     if not isinstance(G, nx.Graph) or G.number_of_nodes() == 0:
-        print("Graph is not a valid or non-empty NetworkX graph. Nothing to plot.")
-        return
+        raise ValueError("Graph is not a valid or non-empty NetworkX graph.")
 
     x = cell.x[idx]
     y = cell.y[idx]
     z = cell.z[idx]
 
-    # ---- 1. Collect 3D coordinates for each node ----
     coords = {n: (float(x[n]), float(y[n]), float(z[n])) for n in G.nodes}
-
-    # ---- 2. Assign colors based on labels ----
-    indices = torch.arange(len(G.nodes()), device=cell.device())
-    labels = cell._labels
-    color_choices = palette_hsv(len(labels))
-    colors: Dict[int, str] = {}
-
-    for i, label in enumerate(labels):
-        # This part assumes cell.find() returns a slice or an integer tensor
-        label_indices_obj = cell.find(label)
-        if isinstance(label_indices_obj, slice):
-            label_indices_tensor = indices[label_indices_obj]
-        else:
-            label_indices_tensor = label_indices_obj
-
-        for idx in label_indices_tensor.cpu().tolist():
-            colors[idx] = color_choices[i]
-
-    # ---- 3. Prepare data for Plotly traces (the corrected part) ----
-
-    # Create a fixed list of nodes to ensure all subsequent lists are in the same order.
     node_list = list(G.nodes())
 
-    # --- For the Edges ---
-    # This method is efficient for drawing all lines in one go.
-    edge_x, edge_y, edge_z = [], [], []
-    edge_text = []
-    for u, v, data in G.edges(data=True):
-        edge_x.extend([coords[u][0], coords[v][0], None])
-        edge_y.extend([coords[u][1], coords[v][1], None])
-        edge_z.extend([coords[u][2], coords[v][2], None])
-        # Prepare hover text for edges
-        r_ohm = data.get("R_ohm", None)
-        if r_ohm is not None:
-            r_ohm = float(r_ohm) * 1e-6  # Convert to MOhm
+    labels = list(cell._labels)
+    color_choices = palette_hsv(len(labels)) if labels else []
+    label_to_color = {label: color for label, color in zip(labels, color_choices)}
+
+    # Build a reverse node -> label map robustly.
+    indices = torch.arange(len(G.nodes()), device=cell.device(), dtype=torch.long)
+    node_to_label: Dict[int, str] = {}
+    for label in labels:
+        label_idx_obj = cell.find(label)
+        if isinstance(label_idx_obj, slice):
+            label_indices = indices[label_idx_obj]
+        elif torch.is_tensor(label_idx_obj) and label_idx_obj.dtype == torch.bool:
+            label_indices = indices[label_idx_obj]
         else:
-            r_ohm = "N/A"
-        edge_info = f"R (MOhm): {r_ohm:.3f}<br>"
-        edge_text.append(edge_info)
+            label_indices = label_idx_obj
 
-    edge_trace = go.Scatter3d(
-        x=edge_x,
-        y=edge_y,
-        z=edge_z,
-        line=dict(width=1.5, color="black"),
-        hoverinfo="text",
-        text=edge_text,
-        mode="lines",
-    )
+        for node_id in label_indices.detach().cpu().tolist():
+            node_to_label[int(node_id)] = label
 
-    # --- For the Nodes and their Hover Text (Aligned) ---
-    node_x = [coords[n][0] for n in node_list]
-    node_y = [coords[n][1] for n in node_list]
-    node_z = [coords[n][2] for n in node_list]
+    def _scale_node_sizes(diams):
+        diams = np.clip(np.asarray(diams, dtype=float), 0.05, None)
+        if size_mode == "sqrt":
+            sizes = np.sqrt(diams) * float(node_scale)
+        elif size_mode == "linear":
+            sizes = diams * float(node_scale)
+        elif size_mode == "log":
+            sizes = np.log10(diams + 1.0) * float(node_scale)
+        else:
+            raise ValueError("size_mode must be 'sqrt', 'linear', or 'log'")
+        return np.clip(sizes, float(min_node_size), float(max_node_size))
 
-    node_colors = [colors.get(n, "grey") for n in node_list]
-    node_sizes = [G.nodes[n].get("diam", 1.0) * node_scale for n in node_list]
-    node_sizes = np.log10(node_sizes)
-    node_sizes = np.clip(node_sizes, 0.1, None)  # Ensure minimum size for visibility
-
-    hover_texts = []
-    for node_id in node_list:
+    def _node_hover_text(node_id):
         attrs = G.nodes[node_id]
         name = attrs.get("name", "N/A")
-        diam = attrs.get("diam", 0.0)
-        length = attrs.get("L", 0.0)
-        area = attrs.get("area", 0.0)
-
-        node_info = (
+        diam = float(attrs.get("diam", 0.0) or 0.0)
+        length = float(attrs.get("L", 0.0) or 0.0)
+        area = float(attrs.get("area", 0.0) or 0.0)
+        label = node_to_label.get(node_id, "unclassified")
+        cx, cy, cz = coords[node_id]
+        return (
             f"<b>Node ID: {node_id}</b><br>"
+            f"Label: {label}<br>"
             f"Name: {name}<br>"
             f"Diameter: {diam:.2f} µm<br>"
             f"Length: {length:.2f} µm<br>"
             f"Area: {area:.2f} µm²<br>"
+            f"x, y, z: ({cx:.2f}, {cy:.2f}, {cz:.2f}) µm"
         )
-        hover_texts.append(node_info)
 
-    node_trace = go.Scatter3d(
-        x=node_x,
-        y=node_y,
-        z=node_z,
-        mode="markers",
-        hoverinfo="text",
-        text=hover_texts,  # Assign the correctly ordered hover texts
-        marker=dict(
-            showscale=False,
-            color=node_colors,
-            size=node_sizes,
-            sizemin=4,
-            line=dict(width=0.5, color="black"),
-        ),
+    traces = []
+
+    if show_edges and G.number_of_edges() > 0:
+        edge_records = []
+        edge_widths = []
+        for u, v in G.edges():
+            diam_u = float(G.nodes[u].get("diam", 1.0) or 1.0)
+            diam_v = float(G.nodes[v].get("diam", 1.0) or 1.0)
+            edge_width = 0.5 * (diam_u + diam_v) * float(edge_scale)
+            edge_width = max(float(min_edge_width), edge_width)
+            if max_edge_width is not None:
+                edge_width = min(float(max_edge_width), edge_width)
+            edge_records.append((u, v, edge_width))
+            edge_widths.append(edge_width)
+
+        edge_widths = np.asarray(edge_widths, dtype=float)
+        if len(edge_records) <= 6 or np.allclose(edge_widths.min(), edge_widths.max()):
+            bin_ids = np.zeros(len(edge_records), dtype=int)
+        else:
+            nbins = min(6, len(edge_records))
+            bins = np.linspace(edge_widths.min(), edge_widths.max(), nbins + 1)
+            bin_ids = np.digitize(edge_widths, bins[1:-1], right=True)
+
+        for bin_id in sorted(set(bin_ids.tolist())):
+            edge_x, edge_y, edge_z = [], [], []
+            bin_widths = []
+            for (u, v, edge_width), cur_bin in zip(edge_records, bin_ids):
+                if int(cur_bin) != int(bin_id):
+                    continue
+                edge_x.extend([coords[u][0], coords[v][0], None])
+                edge_y.extend([coords[u][1], coords[v][1], None])
+                edge_z.extend([coords[u][2], coords[v][2], None])
+                bin_widths.append(edge_width)
+
+            if not edge_x:
+                continue
+
+            traces.append(
+                go.Scatter3d(
+                    x=edge_x,
+                    y=edge_y,
+                    z=edge_z,
+                    mode="lines",
+                    hoverinfo="skip",
+                    showlegend=False,
+                    opacity=edge_alpha,
+                    line=dict(
+                        width=float(np.median(bin_widths)),
+                        color=edge_color,
+                    ),
+                )
+            )
+
+    if show_nodes:
+        grouped_nodes = {label: [] for label in labels}
+        unclassified = []
+        for n in node_list:
+            label = node_to_label.get(n)
+            if label is None:
+                unclassified.append(n)
+            else:
+                grouped_nodes[label].append(n)
+
+        for label, nodes in grouped_nodes.items():
+            if not nodes:
+                continue
+            traces.append(
+                go.Scatter3d(
+                    x=[coords[n][0] for n in nodes],
+                    y=[coords[n][1] for n in nodes],
+                    z=[coords[n][2] for n in nodes],
+                    mode="markers",
+                    name=label,
+                    legendgroup=label,
+                    showlegend=show_legend,
+                    hoverinfo="text",
+                    text=[_node_hover_text(n) for n in nodes],
+                    opacity=node_alpha,
+                    marker=dict(
+                        showscale=False,
+                        color=label_to_color[label],
+                        size=_scale_node_sizes(
+                            [G.nodes[n].get("diam", 1.0) for n in nodes]
+                        ),
+                        line=dict(width=0.3, color="black"),
+                    ),
+                )
+            )
+
+        if unclassified:
+            traces.append(
+                go.Scatter3d(
+                    x=[coords[n][0] for n in unclassified],
+                    y=[coords[n][1] for n in unclassified],
+                    z=[coords[n][2] for n in unclassified],
+                    mode="markers",
+                    name="unclassified",
+                    legendgroup="unclassified",
+                    showlegend=show_legend,
+                    hoverinfo="text",
+                    text=[_node_hover_text(n) for n in unclassified],
+                    opacity=max(0.5, node_alpha - 0.15),
+                    marker=dict(
+                        showscale=False,
+                        color="grey",
+                        size=_scale_node_sizes(
+                            [G.nodes[n].get("diam", 1.0) for n in unclassified]
+                        ),
+                        line=dict(width=0.3, color="black"),
+                    ),
+                )
+            )
+
+    scene_show_axes = bool(show_axes and not scalebar)
+    axis_template = dict(
+        visible=scene_show_axes,
+        showbackground=False,
+        showgrid=scene_show_axes,
+        zeroline=False,
     )
 
-    # ---- 4. Create the Figure and define Layout ----
+    fig_height = None if height is None else int(round(float(height)))
+    fig_width = None if width is None else int(round(float(width)))
+
+    scene_dict = dict(
+        xaxis=dict(title="X (µm)", **axis_template),
+        yaxis=dict(title="Y (µm)", **axis_template),
+        zaxis=dict(title="Z (µm)", **axis_template),
+        aspectmode="data",
+        bgcolor=background,
+    )
+
+    if scalebar:
+        scalebar_trace, scalebar_annotation = _build_3d_scalebar(
+            coords,
+            length=scalebar_length,
+            axis=scalebar_axis,
+            color=scalebar_color,
+            line_width=scalebar_linewidth,
+            font_size=scalebar_fontsize,
+        )
+        traces.append(scalebar_trace)
+        scene_dict["annotations"] = [scalebar_annotation]
+
     fig = go.Figure(
-        data=[edge_trace, node_trace],
+        data=traces,
         layout=go.Layout(
-            height=height,
-            width=width,
-            showlegend=False,
+            height=fig_height,
+            width=fig_width,
+            showlegend=show_legend and show_nodes,
             hovermode="closest",
+            paper_bgcolor=background,
+            plot_bgcolor=background,
             margin=dict(b=20, l=5, r=5, t=40),
-            scene=dict(
-                xaxis_title="X (µm)",
-                yaxis_title="Y (µm)",
-                zaxis_title="Z (µm)",
-                aspectmode="data",  # This ensures a 1:1:1 aspect ratio
-            ),
+            scene=scene_dict,
         ),
     )
 
-    fig.show()
+    if show:
+        fig.show()
+    return fig
 
 
 @requires_packages("plotly")
