@@ -1,3 +1,19 @@
+## v0.13.0 (2026-04-08)
+
+### Feat
+
+- **axonml.models.callbacks**: adding t_end_check to ThresholdCallbacks to limit threshold detection to specified time window
+- **axonml.models.callbacks**: added ActiveALCount to determine activity based on total # registered APs
+
+### Fix
+
+- **axonml.models.callbacks**: add t_end_check as param to Active* threshold callback family
+- resolve positive and negative parameter overrides in mro for Parameterized
+
+### Refactor
+
+- **models.parametric**: refactor resolve method to call general resolve function
+
 ## v0.12.0 (2026-03-28)
 
 ### Feat
