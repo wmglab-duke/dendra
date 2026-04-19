@@ -377,7 +377,7 @@ class Bounded(cacheable):
                 t = torch.clamp((init - self.min_val) / rng, 1e-6, 1 - 1e-6)
                 rho0 = torch.special.logit(t) / self.beta
 
-        self.rho = torch.nn.Parameter(rho0)
+        self.rho = torch.nn.Parameter(rho0, requires_grad=True)
 
     def _upper_mode(self, *, upper_only: bool) -> str:
         if self.max_val is None:
@@ -1018,10 +1018,13 @@ class SimpleParameterized(Referency):
 def check_conflicts(
     global_params,
     range_params,
+    batch_params,
     global_p_params,
     range_p_params,
+    batch_p_params,
     global_n_params,
     range_n_params,
+    batch_n_params,
     params_defined_here,
     rng_defined_here=None,
     table_defined_here=None,
@@ -1039,10 +1042,13 @@ def check_conflicts(
     all_params = (
         set(global_params.keys())
         .union(range_params.keys())
+        .union(batch_params.keys())
         .union(global_p_params.keys())
         .union(range_p_params.keys())
+        .union(batch_p_params.keys())
         .union(global_n_params.keys())
         .union(range_n_params.keys())
+        .union(batch_n_params.keys())
         .union(params_defined_here.keys())
         .union(rng_defined_here.keys())
         .union(table_defined_here.keys())
@@ -1053,10 +1059,13 @@ def check_conflicts(
         count = (
             (param in global_params)
             + (param in range_params)
+            + (param in batch_params)
             + (param in global_p_params)
             + (param in range_p_params)
+            + (param in batch_p_params)
             + (param in global_n_params)
             + (param in range_n_params)
+            + (param in batch_n_params)
             + (param in params_defined_here)
             + (param in rng_defined_here)
             + (param in table_defined_here)
@@ -1107,11 +1116,14 @@ def assign_precendence(cls):
     containers = {
         "_global": getattr(cls, "_global", {}) or {},
         "_range": getattr(cls, "_range", {}) or {},
+        "_batch": getattr(cls, "_batch", {}) or {},
         "_params": getattr(cls, "_params", {}) or {},
         "_global_p": getattr(cls, "_global_p", {}) or {},
         "_range_p": getattr(cls, "_range_p", {}) or {},
+        "_batch_p": getattr(cls, "_batch_p", {}) or {},
         "_global_n": getattr(cls, "_global_n", {}) or {},
         "_range_n": getattr(cls, "_range_n", {}) or {},
+        "_batch_n": getattr(cls, "_batch_n", {}) or {},
         "_params_p": getattr(cls, "_params_p", {}) or {},
         "_params_n": getattr(cls, "_params_n", {}) or {},
     }
@@ -1121,11 +1133,14 @@ def assign_precendence(cls):
     all_params = (
         present["_global"]
         | present["_range"]
+        | present["_batch"]
         | present["_params"]
         | present["_global_p"]
         | present["_range_p"]
+        | present["_batch_p"]
         | present["_global_n"]
         | present["_range_n"]
+        | present["_batch_n"]
         | present["_params_p"]
         | present["_params_n"]
     )
@@ -1134,7 +1149,20 @@ def assign_precendence(cls):
         return {}
 
     # Category preference only for tie-breaking when nobody "defined_here" it.
-    FALLBACK_ORDER = ("_params", "_range", "_global")
+    FALLBACK_ORDER = (
+        "_params",
+        "_params_p",
+        "_params_n",
+        "_range",
+        "_range_p",
+        "_range_n",
+        "_batch",
+        "_batch_p",
+        "_batch_n",
+        "_global",
+        "_global_p",
+        "_global_n",
+    )
 
     kept = {}
 
@@ -1142,11 +1170,14 @@ def assign_precendence(cls):
     defined_here_cls = {
         "_global": _as_names(getattr(cls, "_global_defined_here", None)),
         "_range": _as_names(getattr(cls, "_range_defined_here", None)),
+        "_batch": _as_names(getattr(cls, "_batch_defined_here", None)),
         "_params": _as_names(getattr(cls, "_params_defined_here", None)),
         "_global_p": _as_names(getattr(cls, "_global_p_defined_here", None)),
         "_range_p": _as_names(getattr(cls, "_range_p_defined_here", None)),
+        "_batch_p": _as_names(getattr(cls, "_batch_p_defined_here", None)),
         "_global_n": _as_names(getattr(cls, "_global_n_defined_here", None)),
         "_range_n": _as_names(getattr(cls, "_range_n_defined_here", None)),
+        "_batch_n": _as_names(getattr(cls, "_batch_n_defined_here", None)),
         "_params_p": _as_names(getattr(cls, "_params_p_defined_here", None)),
         "_params_n": _as_names(getattr(cls, "_params_n_defined_here", None)),
     }
@@ -1175,15 +1206,18 @@ def assign_precendence(cls):
                 dh = {
                     "_global": _as_names(getattr(base, "_global_defined_here", None)),
                     "_range": _as_names(getattr(base, "_range_defined_here", None)),
+                    "_batch": _as_names(getattr(base, "_batch_defined_here", None)),
                     "_params": _as_names(getattr(base, "_params_defined_here", None)),
                     "_global_p": _as_names(
                         getattr(base, "_global_p_defined_here", None)
                     ),
                     "_range_p": _as_names(getattr(base, "_range_p_defined_here", None)),
+                    "_batch_p": _as_names(getattr(base, "_batch_p_defined_here", None)),
                     "_global_n": _as_names(
                         getattr(base, "_global_n_defined_here", None)
                     ),
                     "_range_n": _as_names(getattr(base, "_range_n_defined_here", None)),
+                    "_batch_n": _as_names(getattr(base, "_batch_n_defined_here", None)),
                     "_params_p": _as_names(
                         getattr(base, "_params_p_defined_here", None)
                     ),
@@ -1233,6 +1267,8 @@ class Parameterized(SimpleParameterized):
     Use uppercase classmethods at definition time:
 
     - ``GLOBAL``: shared scalar parameters (broadcast across compartments).
+    - ``BATCH``: parameters with shape ``shape_p[:-1] + (1,)`` so they
+      broadcast across the final compartment dimension.
     - ``RANGE``: per-compartment parameters (shaped like ``shape_p``).
     - ``PARAMETER``: flat per-instance parameters from :class:`SimpleParameterized`.
     - ``RNG``: declare RNG seeds/generators to be instantiated.
@@ -1265,6 +1301,18 @@ class Parameterized(SimpleParameterized):
     _range_n_defined_here = {}
     _range_n_declarations = []
 
+    _batch = {}
+    _batch_defined_here = {}
+    _batch_declarations = []
+
+    _batch_p = {}
+    _batch_p_defined_here = {}
+    _batch_p_declarations = []
+
+    _batch_n = {}
+    _batch_n_defined_here = {}
+    _batch_n_declarations = []
+
     _rng = {}
     _rng_defined_here = {}
     _rng_declarations = []
@@ -1287,10 +1335,13 @@ class Parameterized(SimpleParameterized):
         new_global_p = {}
         new_range = {}
         new_range_p = {}
+        new_batch = {}
+        new_batch_p = {}
         new_rng = {}
         new_table = {}
         new_global_n = {}
         new_range_n = {}
+        new_batch_n = {}
 
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
@@ -1303,6 +1354,10 @@ class Parameterized(SimpleParameterized):
                 new_range.update(base._range)
             if "_range_p" in base.__dict__:
                 new_range_p.update(base._range_p)
+            if "_batch" in base.__dict__:
+                new_batch.update(base._batch)
+            if "_batch_p" in base.__dict__:
+                new_batch_p.update(base._batch_p)
             if "_rng" in base.__dict__:
                 new_rng.update(base._rng)
             if "_table" in base.__dict__:
@@ -1311,15 +1366,20 @@ class Parameterized(SimpleParameterized):
                 new_global_n.update(base._global_n)
             if "_range_n" in base.__dict__:
                 new_range_n.update(base._range_n)
+            if "_batch_n" in base.__dict__:
+                new_batch_n.update(base._batch_n)
 
         cls._global_defined_here = {}
         cls._global_p_defined_here = {}
         cls._range_defined_here = {}
         cls._range_p_defined_here = {}
+        cls._batch_defined_here = {}
+        cls._batch_p_defined_here = {}
         cls._rng_defined_here = {}
         cls._table_defined_here = {}
         cls._global_n_defined_here = {}
         cls._range_n_defined_here = {}
+        cls._batch_n_defined_here = {}
 
         # Add parameters declared via the GLOBAL() method
         if Parameterized._global_declarations:
@@ -1346,11 +1406,26 @@ class Parameterized(SimpleParameterized):
             for r_dict in Parameterized._range_p_declarations:
                 cls._range_p_defined_here.update(r_dict)
             Parameterized._range_p_declarations = []
+        # Add batch declarations
+        if Parameterized._batch_declarations:
+            for b_dict in Parameterized._batch_declarations:
+                cls._batch_defined_here.update(b_dict)
+            Parameterized._batch_declarations = []
+        # Add parameters declared via the BATCHP() method
+        if Parameterized._batch_p_declarations:
+            for b_dict in Parameterized._batch_p_declarations:
+                cls._batch_p_defined_here.update(b_dict)
+            Parameterized._batch_p_declarations = []
         # Add negative range declarations
         if Parameterized._range_n_declarations:
             for n_dict in Parameterized._range_n_declarations:
                 cls._range_n_defined_here.update(n_dict)
             Parameterized._range_n_declarations = []
+        # Add negative batch declarations
+        if Parameterized._batch_n_declarations:
+            for n_dict in Parameterized._batch_n_declarations:
+                cls._batch_n_defined_here.update(n_dict)
+            Parameterized._batch_n_declarations = []
         # Add rng declarations
         if Parameterized._rng_declarations:
             for rng_dict in Parameterized._rng_declarations:
@@ -1367,18 +1442,24 @@ class Parameterized(SimpleParameterized):
         new_global_p.update(cls._global_p_defined_here)
         new_range.update(cls._range_defined_here)
         new_range_p.update(cls._range_p_defined_here)
+        new_batch.update(cls._batch_defined_here)
+        new_batch_p.update(cls._batch_p_defined_here)
         new_rng.update(cls._rng_defined_here)
         new_table.update(cls._table_defined_here)
         new_global_n.update(cls._global_n_defined_here)
         new_range_n.update(cls._range_n_defined_here)
+        new_batch_n.update(cls._batch_n_defined_here)
 
         check_conflicts(
             cls._global_defined_here,
             cls._range_defined_here,
+            cls._batch_defined_here,
             cls._global_p_defined_here,
             cls._range_p_defined_here,
+            cls._batch_p_defined_here,
             cls._global_n_defined_here,
             cls._range_n_defined_here,
+            cls._batch_n_defined_here,
             cls._params_defined_here,
             cls._rng_defined_here,
             cls._table_defined_here,
@@ -1390,15 +1471,21 @@ class Parameterized(SimpleParameterized):
         new_global_p.update({k: v for k, v in kwargs.items() if k in new_global_p})
         new_range.update({k: v for k, v in kwargs.items() if k in new_range})
         new_range_p.update({k: v for k, v in kwargs.items() if k in new_range_p})
+        new_batch.update({k: v for k, v in kwargs.items() if k in new_batch})
+        new_batch_p.update({k: v for k, v in kwargs.items() if k in new_batch_p})
         new_global_n.update({k: v for k, v in kwargs.items() if k in new_global_n})
         new_range_n.update({k: v for k, v in kwargs.items() if k in new_range_n})
+        new_batch_n.update({k: v for k, v in kwargs.items() if k in new_batch_n})
 
         cls._global = new_global
         cls._global_p = new_global_p
         cls._range = new_range
         cls._range_p = new_range_p
+        cls._batch = new_batch
+        cls._batch_p = new_batch_p
         cls._global_n = new_global_n
         cls._range_n = new_range_n
+        cls._batch_n = new_batch_n
         cls._rng = new_rng
         cls._table = new_table
 
@@ -1483,6 +1570,45 @@ class Parameterized(SimpleParameterized):
         Parameterized._range_n_declarations.append(kwargs)
 
     @staticmethod
+    def BATCH(**kwargs):
+        """
+        Declare parameters that broadcast over the final compartment dimension.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            with shape ``shape_p[:-1] + (1,)``.
+        """
+        Parameterized._batch_declarations.append(kwargs)
+
+    @staticmethod
+    def BATCHP(**kwargs):
+        """
+        Declare strictly positive parameters that broadcast over compartments.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            with shape ``shape_p[:-1] + (1,)``.
+        """
+        Parameterized._batch_p_declarations.append(kwargs)
+
+    @staticmethod
+    def BATCHN(**kwargs):
+        """
+        Declare strictly negative parameters that broadcast over compartments.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            with shape ``shape_p[:-1] + (1,)``.
+        """
+        Parameterized._batch_n_declarations.append(kwargs)
+
+    @staticmethod
     def RNG(*args, **kwargs):
         """
         Declare RNG identifiers to instantiate device-local generators.
@@ -1560,6 +1686,9 @@ class Parameterized(SimpleParameterized):
         self.range = self.__class__._range.copy()
         self.range_p = self.__class__._range_p.copy()
         self.range_n = self.__class__._range_n.copy()
+        self.batch = self.__class__._batch.copy()
+        self.batch_p = self.__class__._batch_p.copy()
+        self.batch_n = self.__class__._batch_n.copy()
         self.global_n = self.__class__._global_n.copy()
 
         self.rng = self.__class__._rng.copy()
@@ -1573,17 +1702,26 @@ class Parameterized(SimpleParameterized):
             self.range = {
                 key: kwargs.get(key, value) for key, value in self.range.items()
             }
+            self.batch = {
+                key: kwargs.get(key, value) for key, value in self.batch.items()
+            }
             self.globals_p = {
                 key: kwargs.get(key, value) for key, value in self.globals_p.items()
             }
             self.range_p = {
                 key: kwargs.get(key, value) for key, value in self.range_p.items()
             }
+            self.batch_p = {
+                key: kwargs.get(key, value) for key, value in self.batch_p.items()
+            }
             self.global_n = {
                 key: kwargs.get(key, value) for key, value in self.global_n.items()
             }
             self.range_n = {
                 key: kwargs.get(key, value) for key, value in self.range_n.items()
+            }
+            self.batch_n = {
+                key: kwargs.get(key, value) for key, value in self.batch_n.items()
             }
 
         self.keys = {}
@@ -1594,6 +1732,9 @@ class Parameterized(SimpleParameterized):
         self.instantiate_range(**self.range)
         self.instantiate_range(positive=True, **self.range_p)
         self.instantiate_range(negative=True, **self.range_n)
+        self.instantiate_batch(**self.batch)
+        self.instantiate_batch(positive=True, **self.batch_p)
+        self.instantiate_batch(negative=True, **self.batch_n)
         self.instantiate_rng(**self.rng)
         self.instantiate_additional_parameters(additional_parameters)
 
@@ -1613,6 +1754,9 @@ class Parameterized(SimpleParameterized):
         self.instantiate_range(**self.range)
         self.instantiate_range(positive=True, **self.range_p)
         self.instantiate_range(negative=True, **self.range_n)
+        self.instantiate_batch(**self.batch)
+        self.instantiate_batch(positive=True, **self.batch_p)
+        self.instantiate_batch(negative=True, **self.batch_n)
 
     def _refresh_and_set(self, name, value):
         """
@@ -1664,6 +1808,30 @@ class Parameterized(SimpleParameterized):
                     self.register_buffer(name, torch.empty(()))
                     getattr(self, name).copy_(self.evaluate(p_name))
 
+    def _batch_shape(self):
+        if len(self.shape_p) == 0:
+            raise ValueError(
+                "BATCH parameters require shape_p to have at least one dimension."
+            )
+        return self.shape_p[:-1] + (1,)
+
+    def _batch_main_shape(self) -> tuple[int, int]:
+        return (math.prod(self._batch_shape()[:-1]) or 1, 1)
+
+    def _collapse_batch_key(self, key: torch.LongTensor) -> torch.LongTensor:
+        key = torch.as_tensor(key, dtype=torch.long)
+        if key.numel() == 0:
+            return key
+        collapsed = torch.div(key, self.shape_p[-1], rounding_mode="floor")
+        # Preserve first-seen ordering so pre-sized tensors map predictably.
+        seen = set()
+        ordered = []
+        for idx in collapsed.detach().cpu().tolist():
+            if idx not in seen:
+                seen.add(idx)
+                ordered.append(idx)
+        return torch.as_tensor(ordered, dtype=torch.long, device=collapsed.device)
+
     def instantiate_range(self, positive=False, negative=False, **kwargs):
         """
         Instantiate range parameters over the population shape.
@@ -1680,6 +1848,26 @@ class Parameterized(SimpleParameterized):
                     p_name, to_param(value, positive=positive, negative=negative)
                 )
                 self.register_buffer(name, torch.empty(self.shape_p))
+                getattr(self, name).copy_(self.evaluate(p_name))
+
+    def instantiate_batch(self, positive=False, negative=False, **kwargs):
+        """
+        Instantiate parameters that broadcast over the final compartment axis.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter names to initial values broadcast over
+            ``shape_p[:-1] + (1,)``.
+        """
+        if kwargs is not None:
+            batch_shape = self._batch_shape()
+            for name, value in kwargs.items():
+                p_name = f"{name}_param"
+                self._refresh_and_set(
+                    p_name, to_param(value, positive=positive, negative=negative)
+                )
+                self.register_buffer(name, torch.empty(batch_shape))
                 getattr(self, name).copy_(self.evaluate(p_name))
 
     def instantiate_rng(self, **kwargs):
@@ -1739,12 +1927,22 @@ class Parameterized(SimpleParameterized):
         """
         if additional_parameters is not None:
             for name, list_of_aliases_values_and_keys in additional_parameters.items():
-                positive = name in self.range_p
-                negative = name in self.range_n
+                positive = (name in self.range_p) or (name in self.batch_p)
+                negative = (name in self.range_n) or (name in self.batch_n)
                 bounded = positive or negative
-                if (name in self.range) or bounded:
+                is_range = (
+                    name in self.range or name in self.range_p or name in self.range_n
+                )
+                is_batch = (
+                    name in self.batch or name in self.batch_p or name in self.batch_n
+                )
+                if is_range or is_batch:
                     count = 0
                     keys = []
+                    param_shape = (
+                        self._batch_main_shape() if is_batch else self.shape_p[-2:]
+                    )
+                    empty_shape = self._batch_shape() if is_batch else self.shape_p
                     for alias, value, key in list_of_aliases_values_and_keys:
                         if alias is not None:
                             p_name = f"{name}_{alias}"
@@ -1752,13 +1950,15 @@ class Parameterized(SimpleParameterized):
                             p_name = f"{name}_param_{count}"
                             count += 1
                         key = torch.as_tensor(key, dtype=torch.long)
+                        if is_batch:
+                            key = self._collapse_batch_key(key)
                         parameter = to_param(
                             value, positive=positive, negative=negative
                         )
                         if isinstance(parameter, torch.nn.Module) and not bounded:
-                            p = parameter(torch.empty(self.shape_p))
+                            p = parameter(torch.empty(empty_shape))
                             parametrization = build_parametrization(
-                                parameter, p, key, self.shape_p[-2:]
+                                parameter, p, key, param_shape
                             )
                             self.register_parametrization_in_graph(
                                 name, parametrization
@@ -1770,7 +1970,7 @@ class Parameterized(SimpleParameterized):
                                 p = parameter()
                             else:
                                 p = parameter
-                            fill = create_param_expander(p, key, self.shape_p[-2:])
+                            fill = create_param_expander(p, key, param_shape)
                             self.additional_parameters.setdefault(name, []).append(
                                 (fill, getattr(self, p_name))
                             )
@@ -1827,7 +2027,11 @@ class Parameterized(SimpleParameterized):
             return self.parametrize(
                 name, value, key=torch.arange(math.prod(self.shape_p)), alias=alias
             )
-        if name in self.range:
+        is_range = name in self.range or name in self.range_p or name in self.range_n
+        is_batch = name in self.batch or name in self.batch_p or name in self.batch_n
+        if is_range or is_batch:
+            positive = (name in self.range_p) or (name in self.batch_p)
+            negative = (name in self.range_n) or (name in self.batch_n)
             if alias is None:
                 count = 0
                 while hasattr(self, f"{name}_param_{count}"):
@@ -1838,17 +2042,21 @@ class Parameterized(SimpleParameterized):
                 raise ValueError(
                     f"Parameter override '{p_name}' already exists. Choose a different alias."
                 )
-            parameter = to_param(value)
-            if isinstance(parameter, torch.nn.Module):
-                p = parameter(torch.empty(self.shape_p))
-                parametrization = build_parametrization(
-                    parameter, p, key, self.shape_p[-2:]
-                )
+            key = torch.as_tensor(key, dtype=torch.long)
+            main_shape = self._batch_main_shape() if is_batch else self.shape_p[-2:]
+            empty_shape = self._batch_shape() if is_batch else self.shape_p
+            if is_batch:
+                key = self._collapse_batch_key(key)
+            parameter = to_param(value, positive=positive, negative=negative)
+            if isinstance(parameter, torch.nn.Module) and not (positive or negative):
+                p = parameter(torch.empty(empty_shape))
+                parametrization = build_parametrization(parameter, p, key, main_shape)
                 self.register_parametrization_in_graph(name, parametrization)
                 setattr(self, p_name, parameter)
             else:
                 setattr(self, p_name, parameter)
-                fill = create_param_expander(parameter, key, self.shape_p[-2:])
+                p = parameter() if (positive or negative) else parameter
+                fill = create_param_expander(p, key, main_shape)
                 if name not in self.additional_parameters:
                     self.additional_parameters[name] = []
                 self.additional_parameters[name].append((fill, getattr(self, p_name)))
@@ -1864,10 +2072,13 @@ class Parameterized(SimpleParameterized):
         keys_to_process = itertools.chain(
             self.__class__._global.keys(),
             self.__class__._range.keys(),
+            self.__class__._batch.keys(),
             self.__class__._global_p.keys(),
             self.__class__._range_p.keys(),
+            self.__class__._batch_p.keys(),
             self.__class__._global_n.keys(),
             self.__class__._range_n.keys(),
+            self.__class__._batch_n.keys(),
         )
         for name in keys_to_process:
             if not torch.is_tensor(getattr(self, name)):
@@ -1895,6 +2106,10 @@ class Parameterized(SimpleParameterized):
             b = getattr(self, name)
             if torch.is_tensor(b) and not b.is_contiguous():
                 setattr(self, name, b.contiguous())
+        for name in self.__class__._batch.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
         for name in self.__class__._global_p.keys():
             b = getattr(self, name)
             if torch.is_tensor(b) and not b.is_contiguous():
@@ -1903,11 +2118,19 @@ class Parameterized(SimpleParameterized):
             b = getattr(self, name)
             if torch.is_tensor(b) and not b.is_contiguous():
                 setattr(self, name, b.contiguous())
+        for name in self.__class__._batch_p.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
         for name in self.__class__._global_n.keys():
             b = getattr(self, name)
             if torch.is_tensor(b) and not b.is_contiguous():
                 setattr(self, name, b.contiguous())
         for name in self.__class__._range_n.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
+        for name in self.__class__._batch_n.keys():
             b = getattr(self, name)
             if torch.is_tensor(b) and not b.is_contiguous():
                 setattr(self, name, b.contiguous())
@@ -1984,11 +2207,21 @@ class Parameterized(SimpleParameterized):
         """
         Returns a list of all parameter names in the model.
         """
-        return (
-            list(cls._params.keys())
-            + list(cls._global.keys())
-            + list(cls._range.keys())
+        ordered_names = itertools.chain(
+            cls._params.keys(),
+            cls._params_p.keys(),
+            cls._params_n.keys(),
+            cls._global.keys(),
+            cls._global_p.keys(),
+            cls._global_n.keys(),
+            cls._batch.keys(),
+            cls._batch_p.keys(),
+            cls._batch_n.keys(),
+            cls._range.keys(),
+            cls._range_p.keys(),
+            cls._range_n.keys(),
         )
+        return list(dict.fromkeys(ordered_names))
 
     def dtype(self):
         """

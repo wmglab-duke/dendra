@@ -526,7 +526,10 @@ def fix_graph_branchpoints(G, id2seg, data_func=None):
     for pre, post_list in children_map.items():
         for idx in post_list:
             post_seg = id2seg[idx]
-            parent_x = post_seg.sec.parentseg().x
+            parent_seg = post_seg.sec.parentseg()
+            if parent_seg is None:
+                continue
+            parent_x = parent_seg.x
             if parent_x == 0 or parent_x == 1:
                 to_fix.setdefault(pre, {}).setdefault(parent_x, []).append(idx)
     c = 0

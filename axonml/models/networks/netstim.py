@@ -105,6 +105,16 @@ class NetStim(AxModule, Sliceable):
         # Per-generator min-heaps of future scheduled times (CPU-side metadata)
         self._sched_heaps: list[list[float]] = [[] for _ in range(self.N)]
 
+    def freeze(self):
+        for p in self.parameters():
+            p.requires_grad_(False)
+        return self
+
+    def unfreeze(self):
+        for p in self.parameters():
+            p.requires_grad_(True)
+        return self
+
     # ───────────────────────── misc API ─────────────────────────
     def device(self):
         """
