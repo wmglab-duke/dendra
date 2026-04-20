@@ -1,3 +1,9 @@
+## v0.14.0 (2026-04-20)
+
+### Feat
+
+- align network connection semantics with NEST
+
 ## v0.13.0 (2026-04-08)
 
 ### Feat
