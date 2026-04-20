@@ -9,12 +9,22 @@ from tqdm.auto import tqdm
 from axonml.helpers import BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT
 
 from ..callbacks import CallbackList
-from ..core import Population, make_intra
+from ..core import Population, _match_state_dict, make_intra
 from ..multi import concat_models, indices
 from ..parametric import is_parametric, to_param
 from ..rng import RNGMixin
 from .netcon import NetCon
 from .netstim import NetStim
+
+ConnRule = Literal[
+    "one_to_one",
+    "all_to_all",
+    "pairwise_bernoulli",
+    "pairwise_poisson",
+    "fixed_total_number",
+    "fixed_indegree",
+    "fixed_outdegree",
+]
 
 
 def to_flat_idx_torch(shape, idx, device):
@@ -195,6 +205,15 @@ def expand(value, n):
     if isinstance(value, torch.nn.Module):
         return value.sample(n)
     return torch.tensor(value).repeat(n)
+
+
+def _require(spec: dict, *names):
+    for name in names:
+        if name in spec:
+            return spec[name]
+    raise ValueError(
+        f"Missing required connection parameter: one of {', '.join(names)}."
+    )
 
 
 def batchify_index(old_shape, n: int, i: torch.Tensor) -> torch.Tensor:
@@ -553,6 +572,370 @@ class Network(RNGMixin):
         self.synapses.clear()
         self.built = False
 
+    def _normalize_endpoint(self, source, target):
+        """Normalize full populations/devices to slice-like endpoints."""
+        if isinstance(source, Population) or isinstance(source, NetStim):
+            source = source[:]
+        if isinstance(target, Population):
+            target = target[:]
+        return source, target, source.model, target.model
+
+    def _flat_selection(self, selection):
+        """Return selected population-flat indices for a Population/NetStim slice."""
+        model = selection.model
+        return to_flat_idx_torch(
+            model.shape,
+            selection.index,
+            model.device(),
+        ).to(torch.long)
+
+    def _to_synapse_local_post_idx(self, target_model, post_flat, synapse):
+        """
+        Convert target population-flat indices to target synapse-local indices.
+
+        Connectivity rules operate in population-flat coordinates so that
+        autapse/multapse checks are well-defined. NetCon construction expects
+        target indices local to the target-side synapse mechanism, so conversion
+        happens only after the final edge set has been generated.
+        """
+        post_flat = post_flat.to(device=target_model.device(), dtype=torch.long)
+        local = get_local_index(target_model, synapse, post_flat)
+
+        if torch.any(local < 0):
+            bad = post_flat[local < 0][:10].detach().cpu().tolist()
+            raise ValueError(
+                f"Target population '{target_model.name}' does not have "
+                f"the synapse '{synapse}' at target locations including {bad}."
+            )
+
+        return local
+
+    def _all_to_all_edges(self, pre_pool, post_pool):
+        """Return all directed edges from pre_pool to post_pool."""
+        if pre_pool.numel() == 0 or post_pool.numel() == 0:
+            return pre_pool[:0], post_pool[:0]
+
+        n_pre = pre_pool.numel()
+        n_post = post_pool.numel()
+        pre = pre_pool.repeat_interleave(n_post)
+        post = post_pool.repeat(n_pre)
+        return pre, post
+
+    def _drop_autapses(self, pre_idx, post_idx, *, same_population: bool):
+        """Remove self-connections in population-flat coordinates."""
+        if not same_population or pre_idx.numel() == 0:
+            return pre_idx, post_idx
+        mask = pre_idx != post_idx
+        return pre_idx[mask], post_idx[mask]
+
+    def _drop_multapses(self, pre_idx, post_idx, *, num_targets_total: int):
+        """
+        Remove duplicate directed source-target pairs within one connection call.
+
+        This deliberately mirrors NEST's per-call interpretation: it does not
+        scan previously queued calls for duplicates.
+        """
+        if pre_idx.numel() <= 1:
+            return pre_idx, post_idx
+
+        device = pre_idx.device
+        post_on_pre_device = post_idx.to(device=device, dtype=torch.long)
+        key = pre_idx.to(torch.long) * int(num_targets_total) + post_on_pre_device
+
+        unique_key, inverse = torch.unique(key, sorted=True, return_inverse=True)
+        positions = torch.arange(key.numel(), device=device, dtype=torch.long)
+        first = torch.full(
+            (unique_key.numel(),),
+            key.numel(),
+            device=device,
+            dtype=torch.long,
+        )
+        first.scatter_reduce_(0, inverse, positions, reduce="amin", include_self=True)
+
+        keep = first.sort().values
+        return pre_idx[keep], post_on_pre_device[keep]
+
+    def _draw_from_pool(self, pool, k: int, *, replace: bool, device):
+        """Sample k entries from pool, with or without replacement."""
+        if k < 0:
+            raise ValueError("Degree/count must be non-negative.")
+        if k == 0:
+            return pool[:0]
+        if pool.numel() == 0:
+            raise ValueError("Cannot draw from an empty candidate pool.")
+
+        if replace:
+            idx = torch.randint(
+                pool.numel(),
+                (k,),
+                device=device,
+                generator=self._rng(device),
+            )
+            return pool[idx]
+
+        if k > pool.numel():
+            raise ValueError(
+                f"Requested {k} unique connections, but only "
+                f"{pool.numel()} candidates are available. "
+                "Use allow_multapses=True or reduce the requested degree/count."
+            )
+
+        idx = torch.randperm(
+            pool.numel(),
+            device=device,
+            generator=self._rng(device),
+        )[:k]
+        return pool[idx]
+
+    def _edges_for_rule(
+        self,
+        *,
+        rule: ConnRule,
+        spec: dict,
+        source_model,
+        target_model,
+        pre_pool,
+        post_pool,
+        allow_autapses: bool,
+        allow_multapses: bool,
+    ):
+        """
+        Generate edges in population-flat coordinates for one connection call.
+        """
+        device = source_model.device()
+        pre_pool = pre_pool.to(device=device, dtype=torch.long)
+        post_pool = post_pool.to(device=device, dtype=torch.long)
+        same_population = source_model is target_model
+        rule = str(rule).replace("-", "_")
+
+        if rule == "one_to_one":
+            if pre_pool.numel() != post_pool.numel():
+                raise ValueError(
+                    "one_to_one requires source and target selections to have "
+                    "the same number of elements."
+                )
+            pre_idx, post_idx = pre_pool, post_pool
+
+            if not allow_autapses:
+                pre_idx, post_idx = self._drop_autapses(
+                    pre_idx,
+                    post_idx,
+                    same_population=same_population,
+                )
+            if not allow_multapses:
+                pre_idx, post_idx = self._drop_multapses(
+                    pre_idx,
+                    post_idx,
+                    num_targets_total=target_model.v.numel(),
+                )
+            return pre_idx, post_idx
+
+        if rule in ("all_to_all", "dense"):
+            pre_idx, post_idx = self._all_to_all_edges(pre_pool, post_pool)
+
+            if not allow_autapses:
+                pre_idx, post_idx = self._drop_autapses(
+                    pre_idx,
+                    post_idx,
+                    same_population=same_population,
+                )
+            if not allow_multapses:
+                pre_idx, post_idx = self._drop_multapses(
+                    pre_idx,
+                    post_idx,
+                    num_targets_total=target_model.v.numel(),
+                )
+            return pre_idx, post_idx
+
+        if rule in ("pairwise_bernoulli", "bernoulli"):
+            p = float(_require(spec, "p", "prob", "probability"))
+            if not 0.0 <= p <= 1.0:
+                raise ValueError("pairwise_bernoulli requires 0 <= p <= 1.")
+
+            pre_idx, post_idx = self._all_to_all_edges(pre_pool, post_pool)
+            if not allow_autapses:
+                pre_idx, post_idx = self._drop_autapses(
+                    pre_idx,
+                    post_idx,
+                    same_population=same_population,
+                )
+            if pre_idx.numel() == 0 or p == 0.0:
+                return pre_idx[:0], post_idx[:0]
+            if p < 1.0:
+                mask = (
+                    torch.rand(
+                        pre_idx.numel(),
+                        device=device,
+                        generator=self._rng(device),
+                    )
+                    < p
+                )
+                pre_idx, post_idx = pre_idx[mask], post_idx[mask]
+
+            # Pairwise Bernoulli visits every pair at most once. This branch is
+            # only needed when user-supplied index selections contain repeats.
+            if not allow_multapses:
+                pre_idx, post_idx = self._drop_multapses(
+                    pre_idx,
+                    post_idx,
+                    num_targets_total=target_model.v.numel(),
+                )
+            return pre_idx, post_idx
+
+        if rule == "pairwise_poisson":
+            lam = float(
+                _require(
+                    spec,
+                    "pairwise_avg_num_conns",
+                    "lambda",
+                    "lam",
+                    "mean",
+                )
+            )
+            if lam < 0.0:
+                raise ValueError("pairwise_poisson requires a non-negative mean.")
+            if not allow_multapses:
+                raise ValueError(
+                    "pairwise_poisson can create multiple connections per "
+                    "source-target pair, so allow_multapses=False is invalid."
+                )
+
+            pre_idx, post_idx = self._all_to_all_edges(pre_pool, post_pool)
+            if not allow_autapses:
+                pre_idx, post_idx = self._drop_autapses(
+                    pre_idx,
+                    post_idx,
+                    same_population=same_population,
+                )
+            if pre_idx.numel() == 0 or lam == 0.0:
+                return pre_idx[:0], post_idx[:0]
+
+            rate = torch.full(
+                (pre_idx.numel(),),
+                lam,
+                device=device,
+                dtype=torch.float32,
+            )
+            counts = torch.poisson(rate, generator=self._rng(device)).to(torch.long)
+            if counts.sum() == 0:
+                return pre_idx[:0], post_idx[:0]
+
+            edge_idx = torch.repeat_interleave(
+                torch.arange(pre_idx.numel(), device=device),
+                counts,
+            )
+            return pre_idx[edge_idx], post_idx[edge_idx]
+
+        if rule in ("fixed_total_number", "fixed_total"):
+            n = int(_require(spec, "N", "n"))
+            if n <= 0:
+                return pre_pool[:0], post_pool[:0]
+
+            candidates_pre, candidates_post = self._all_to_all_edges(
+                pre_pool, post_pool
+            )
+            if not allow_autapses:
+                candidates_pre, candidates_post = self._drop_autapses(
+                    candidates_pre,
+                    candidates_post,
+                    same_population=same_population,
+                )
+
+            m = candidates_pre.numel()
+            if m == 0:
+                raise ValueError("No candidate edges are available.")
+
+            if allow_multapses:
+                chosen = torch.randint(
+                    m,
+                    (n,),
+                    device=device,
+                    generator=self._rng(device),
+                )
+            else:
+                if n > m:
+                    raise ValueError(
+                        f"Requested {n} unique connections, but only {m} "
+                        "candidate edges are available after autapse filtering."
+                    )
+                chosen = torch.randperm(
+                    m,
+                    device=device,
+                    generator=self._rng(device),
+                )[:n]
+
+            return candidates_pre[chosen], candidates_post[chosen]
+
+        if rule == "fixed_indegree":
+            indegree = int(_require(spec, "indegree", "in_degree", "K", "N"))
+            if indegree < 0:
+                raise ValueError("indegree must be non-negative.")
+            if indegree == 0 or post_pool.numel() == 0:
+                return pre_pool[:0], post_pool[:0]
+
+            pre_chunks = []
+            post_chunks = []
+            for target in post_pool:
+                pool = pre_pool
+                if not allow_autapses and same_population:
+                    pool = pool[pool != target]
+
+                chosen_pre = self._draw_from_pool(
+                    pool,
+                    indegree,
+                    replace=allow_multapses,
+                    device=device,
+                )
+                pre_chunks.append(chosen_pre)
+                post_chunks.append(target.expand(chosen_pre.numel()))
+
+            pre_idx = torch.cat(pre_chunks) if pre_chunks else pre_pool[:0]
+            post_idx = torch.cat(post_chunks) if post_chunks else post_pool[:0]
+
+            if not allow_multapses:
+                pre_idx, post_idx = self._drop_multapses(
+                    pre_idx,
+                    post_idx,
+                    num_targets_total=target_model.v.numel(),
+                )
+            return pre_idx, post_idx
+
+        if rule == "fixed_outdegree":
+            outdegree = int(_require(spec, "outdegree", "out_degree", "K", "N"))
+            if outdegree < 0:
+                raise ValueError("outdegree must be non-negative.")
+            if outdegree == 0 or pre_pool.numel() == 0:
+                return pre_pool[:0], post_pool[:0]
+
+            pre_chunks = []
+            post_chunks = []
+            for source in pre_pool:
+                pool = post_pool
+                if not allow_autapses and same_population:
+                    pool = pool[pool != source]
+
+                chosen_post = self._draw_from_pool(
+                    pool,
+                    outdegree,
+                    replace=allow_multapses,
+                    device=device,
+                )
+                pre_chunks.append(source.expand(chosen_post.numel()))
+                post_chunks.append(chosen_post)
+
+            pre_idx = torch.cat(pre_chunks) if pre_chunks else pre_pool[:0]
+            post_idx = torch.cat(post_chunks) if post_chunks else post_pool[:0]
+
+            if not allow_multapses:
+                pre_idx, post_idx = self._drop_multapses(
+                    pre_idx,
+                    post_idx,
+                    num_targets_total=target_model.v.numel(),
+                )
+            return pre_idx, post_idx
+
+        raise ValueError(f"Unsupported connection rule: {rule!r}")
+
     def _connect(
         self,
         source_pop,
@@ -566,13 +949,21 @@ class Network(RNGMixin):
         pre_var=None,
     ):
         """
-        Internal method to connect two populations with a synapse.
+        Append a finalized connection spec.
+
+        `source_idx` is source population-flat. `target_idx` is target
+        synapse-local. Higher-level connection methods are responsible for
+        generating edges and applying autapse/multapse policy before calling
+        this method. The `allow_autapses` parameter remains accepted for older
+        internal callers but is intentionally not used here.
         """
+        if source_idx.numel() == 0:
+            return
+
         n_threshold = check_weight_shape(threshold, source_idx)
         n_weight = check_weight_shape(weight, source_idx)
         n_delay = check_weight_shape(delay, source_idx)
 
-        # Add the connection to the synapse specification
         self.synapse_spec.setdefault(
             (source_pop.name, target_pop.name, synapse, pre_var), []
         ).append(
@@ -588,6 +979,113 @@ class Network(RNGMixin):
             )
         )
 
+    def connect(
+        self,
+        source,
+        target,
+        synapse,
+        conn_spec=None,
+        *,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+        auto_expand=False,
+        allow_autapses: Optional[bool] = None,
+        allow_multapses: Optional[bool] = None,
+    ):
+        """
+        Connect source to target using a NEST-style connectivity specification.
+
+        Examples
+        --------
+        >>> net.connect(pre, post, post.mech.syn, "all_to_all")
+        >>> net.connect(pre, post, post.mech.syn,
+        ...             {"rule": "pairwise_bernoulli", "p": 0.1,
+        ...              "allow_autapses": False, "allow_multapses": False})
+        >>> net.connect(pre, post, post.mech.syn,
+        ...             {"rule": "fixed_indegree", "indegree": 20})
+
+        Supported rules are ``one_to_one``, ``all_to_all``,
+        ``pairwise_bernoulli``, ``pairwise_poisson``,
+        ``fixed_total_number``, ``fixed_indegree``, and ``fixed_outdegree``.
+        For this NEST-style entry point, ``allow_autapses`` and
+        ``allow_multapses`` default to ``True`` unless specified in
+        ``conn_spec`` or as keyword arguments.
+        """
+        source, target, source_model, target_model = self._normalize_endpoint(
+            source,
+            target,
+        )
+
+        if conn_spec is None:
+            spec = {"rule": "all_to_all"}
+        elif isinstance(conn_spec, str):
+            spec = {"rule": conn_spec}
+        else:
+            spec = dict(conn_spec)
+
+        rule = spec.pop("rule", "all_to_all")
+
+        if allow_autapses is None:
+            allow_autapses = bool(spec.pop("allow_autapses", True))
+        else:
+            spec.pop("allow_autapses", None)
+
+        if allow_multapses is None:
+            allow_multapses = bool(spec.pop("allow_multapses", True))
+        else:
+            spec.pop("allow_multapses", None)
+
+        if threshold is None:
+            threshold = torch.nan
+
+        pre_pool = self._flat_selection(source)
+        post_pool = self._flat_selection(target)
+
+        # Preserve the previous contract: all explicitly selected target
+        # locations must host the requested synapse, even if a stochastic rule
+        # would later sample only a subset of them.
+        self._to_synapse_local_post_idx(target_model, post_pool, synapse)
+
+        pre_idx, post_flat = self._edges_for_rule(
+            rule=rule,
+            spec=spec,
+            source_model=source_model,
+            target_model=target_model,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+        )
+
+        if pre_idx.numel() == 0:
+            return
+
+        post_idx = self._to_synapse_local_post_idx(
+            target_model,
+            post_flat.to(target_model.device()),
+            synapse,
+        )
+
+        if auto_expand:
+            n_connections = pre_idx.numel()
+            threshold = expand(threshold, n_connections)
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
+        self._connect(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            threshold=threshold,
+            weight=weight,
+            delay=delay,
+            pre_var=pre_var,
+        )
+
     def connect_one_to_one(
         self,
         source,
@@ -597,85 +1095,28 @@ class Network(RNGMixin):
         weight=1.0,
         delay=0.0,
         pre_var=None,
+        allow_autapses=False,
+        allow_multapses=False,
     ):
         """
         Connect source to target one-to-one.
 
-        Each selected source element connects to exactly one selected target
-        element (pairwise). The target locations must already host the given
-        synapse mechanism.
-
-        Parameters
-        ----------
-        source : Population | NetStim | PopulationSlice | NetStimSlice
-            Source population (or a slice produced via source[...]).
-            If a Population/NetStim is passed, it is converted to source[:].
-        target : Population | PopulationSlice
-            Target population (or a slice via target[...]). Converted to target[:]
-            if a Population is passed.
-        synapse : object
-            Target-side synapse mechanism attached to the target population. It
-            must be present at all target locations selected by `target`.
-        threshold : float | torch.Tensor | torch.nn.Module, optional
-            Spike threshold(s) for the pre-synaptic units. A scalar applies to
-            all connections. A length-N tensor/module output provides one value
-            per pre-synaptic unit. Default is 0.0. If None, no thresholding is applied
-            (raw presynaptic variable is used as event variable).
-        weight : float | torch.Tensor | torch.nn.Module, optional
-            Synaptic weight(s). A scalar applies to all connections. A tensor of
-            length N (number of pre-synaptic indices) supplies per-connection
-            weights. A torch.nn.Module is expected to implement .sample(N).
-            Default is 1.0.
-        delay : float | torch.Tensor | torch.nn.Module, optional
-            Synaptic delay(s) in ms. Same broadcasting rules as `weight`.
-            Default is 0.0.
-        pre_var : str, optional
-            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
-            for triggering synaptic events. Default is None (use voltage / spikes).
-
-        Returns
-        -------
-        None
-
-        Raises
-        ------
-        ValueError
-            If the synapse is not present at all specified target locations, or
-            if provided tensors have incompatible shapes with the selected
-            indices.
-
-        Notes
-        -----
-        - The number of selected source elements must match the number of
-          selected target elements for a one-to-one mapping.
-        - The connection specifications are queued and materialized during
-          build()/initialize().
-
-        Examples
-        --------
-        >>> net.connect_one_to_one(pop_pre, pop_post, pop_post.mech.syn)
+        This is a backward-compatible wrapper around ``connect(...,
+        conn_spec={"rule": "one_to_one"})``. Unlike the general NEST-style
+        ``connect`` entry point, the legacy wrapper keeps autapses disabled by
+        default.
         """
-        if isinstance(source, Population) or isinstance(source, NetStim):
-            source = source[:]  # Ensure source is a slice if it's a Population
-        if isinstance(target, Population):
-            target = target[:]  # Ensure target is a slice if it's a Population
-        # every target compartment receives input from exactly one source compartment
-        # 1. validate that the synapse exists at all the target locations
-        pre_idx, post_idx = prepare_indices_one_one(source, target, synapse)
-
-        if threshold is None:
-            threshold = torch.nan
-
-        self._connect(
-            source.model,
-            pre_idx,
-            target.model,
-            post_idx,
+        return self.connect(
+            source,
+            target,
             synapse,
-            threshold,
-            weight,
-            delay,
-            pre_var,
+            conn_spec={"rule": "one_to_one"},
+            threshold=threshold,
+            weight=weight,
+            delay=delay,
+            pre_var=pre_var,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
         )
 
     def connect_dense(
@@ -688,112 +1129,27 @@ class Network(RNGMixin):
         delay=0.0,
         pre_var=None,
         auto_expand=False,
+        allow_autapses=False,
+        allow_multapses=False,
     ):
         """
-        Connect source to target densely (all-to-all between selections).
+        Connect source to target densely, i.e. all-to-all between selections.
 
-        Every selected target element receives input from every selected source
-        element. Target locations must already host the given synapse mechanism.
-
-        Parameters
-        ----------
-        source : Population | NetStim | PopulationSlice | NetStimSlice
-            Source population (or a slice produced via source[...]). If a
-            Population/NetStim is passed, it is converted to source[:].
-        target : Population | PopulationSlice
-            Target population (or a slice via target[...]). Converted to target[:]
-            if a Population is passed.
-        synapse : object
-            Target-side synapse mechanism attached to the target population.
-        threshold : float | torch.Tensor | torch.nn.Module, optional
-            Spike threshold(s) for the pre-synaptic units. See connect_one_to_one
-            for broadcasting rules. Default is 0.0. If None, no thresholding is applied
-            (raw presynaptic variable is used as event variable).
-        weight : float | torch.Tensor | torch.nn.Module, optional
-            Synaptic weight(s). See connect_one_to_one for broadcasting rules.
-            Default is 1.0.
-        delay : float | torch.Tensor | torch.nn.Module, optional
-            Synaptic delay(s) in ms. See connect_one_to_one for broadcasting
-            rules. Default is 0.0.
-        pre_var : str, optional
-            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
-            for triggering synaptic events. Default is None (use voltage / spikes).
-        auto_expand : bool, optional
-            If True, automatically expand scalar/tensor weights & delays to the full
-            number of connections. If False, the weight & delays tensors must match the
-            number of pre-synaptic indices or be a scalar. Default is False.
-
-        Returns
-        -------
-        None
-
-        Raises
-        ------
-        ValueError
-            If the synapse is not present at some target locations, or if
-            provided tensors have incompatible shapes.
-
-        Notes
-        -----
-        - Forms a complete bipartite connectivity between the selected pre and
-          post indices (all pairs).
-        - Connection specs are queued and built during build()/initialize().
-
-        Examples
-        --------
-        >>> net.connect_dense(pop_pre[:], pop_post[:], pop_post.mech.syn)
+        Backward-compatible wrapper around ``connect(...,
+        conn_spec={"rule": "all_to_all"})``.
         """
-        if isinstance(source, Population) or isinstance(source, NetStim):
-            source = source[:]  # Ensure source is a slice if it's a Population
-        if isinstance(target, Population):
-            target = target[:]  # Ensure target is a slice if it's a Population
-
-        if threshold is None:
-            threshold = torch.nan
-
-        # every target compartment receives input from every source compartment
-        source_model = source.model
-        target_model = target.model
-        pre_idx = to_flat_idx_torch(
-            source_model.shape, source.index, source_model.device()
-        )
-        post_idx = to_flat_idx_torch(
-            target_model.shape, target.index, target_model.device()
-        )
-
-        # 1. Get the original number of elements
-        num_pre = pre_idx.numel()
-        num_post = post_idx.numel()
-
-        # 2. Expand the first tensor to repeat its elements
-        # Shape becomes [3, 1] -> [3, 4] -> [12]
-        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
-
-        # 3. Expand the second tensor to repeat the whole sequence
-        # Shape becomes [1, 4] -> [3, 4] -> [12]
-        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
-
-        pre_idx, post_idx = prepare_indices_one_one_flat(
-            source_model, pre_idx, target_model, post_idx, synapse
-        )
-
-        if auto_expand:
-            n_connections = len(pre_idx)
-            threshold = expand(threshold, n_connections)
-            weight = expand(weight, n_connections)
-            delay = expand(delay, n_connections)
-
-        # now connect
-        self._connect(
-            source_model,
-            pre_idx,
-            target_model,
-            post_idx,
+        return self.connect(
+            source,
+            target,
             synapse,
-            threshold,
-            weight,
-            delay,
-            pre_var,
+            conn_spec={"rule": "all_to_all"},
+            threshold=threshold,
+            weight=weight,
+            delay=delay,
+            pre_var=pre_var,
+            auto_expand=auto_expand,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
         )
 
     def connect_prob(
@@ -807,126 +1163,45 @@ class Network(RNGMixin):
         delay=0.0,
         pre_var=None,
         auto_expand=False,
+        allow_autapses=False,
+        allow_multapses=False,
+        strategy="bernoulli",
     ):
         """
-        Connect source to target sparsely via Bernoulli sampling over all pairs.
+        Connect source to target probabilistically.
 
-        Starting from the dense all-to-all candidate set between `source` and
-        `target`, keep each candidate connection independently with probability
-        `prob`. Target locations must already host the given synapse mechanism.
-
-        Parameters
-        ----------
-        source : Population | NetStim | PopulationSlice | NetStimSlice
-            Source selection; converted to source[:] if a full Population/NetStim
-            is provided.
-        target : Population | PopulationSlice
-            Target selection; converted to target[:] if a full Population.
-        synapse : object
-            Target-side synapse mechanism attached to the target population.
-        prob : float
-            Independent probability (0 ≤ prob ≤ 1) of keeping each candidate
-            pre-post pair.
-        threshold : float | torch.Tensor | torch.nn.Module, optional
-            Spike threshold(s); broadcasting as in connect_one_to_one.
-            Default is 0.0. If None, no thresholding is applied
-            (raw presynaptic variable is used as event variable).
-        weight : float | torch.Tensor | torch.nn.Module, optional
-            Synaptic weight(s); broadcasting as in connect_one_to_one.
-        delay : float | torch.Tensor | torch.nn.Module, optional
-            Synaptic delay(s); broadcasting as in connect_one_to_one.
-        pre_var : str, optional
-            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
-            for triggering synaptic events. Default is None (use voltage / spikes).
-        auto_expand : bool, optional
-            If True, automatically expand scalar/tensor weights & delays to the full
-            number of connections. If False, the weight & delays tensors must match the
-            number of pre-synaptic indices or be a scalar. Default is False.
-
-        Returns
-        -------
-        None
-
-        Raises
-        ------
-        ValueError
-            If the synapse is not present at some target locations, or if
-            provided tensors have incompatible shapes.
-
-        Notes
-        -----
-        - If no connections are sampled, no specs are added (early return).
-        - Randomness comes from torch.rand on the source device.
-
-        Examples
-        --------
-        >>> net.connect_prob(pop_pre[:], pop_post[:], pop_post.mech.syn, prob=0.2)
+        ``strategy='bernoulli'`` maps to NEST ``pairwise_bernoulli`` and uses
+        ``prob`` as the pairwise connection probability. ``strategy='poisson'``
+        or ``'pairwise_poisson'`` maps to NEST ``pairwise_poisson`` and uses
+        ``prob`` as ``pairwise_avg_num_conns``; for that rule,
+        ``allow_multapses`` must be ``True``.
         """
-        if isinstance(source, Population) or isinstance(source, NetStim):
-            source = source[:]  # Ensure source is a slice if it's a Population
-        if isinstance(target, Population):
-            target = target[:]  # Ensure target is a slice if it's a Population
+        strategy = str(strategy).replace("-", "_")
+        if strategy in ("bernoulli", "pairwise_bernoulli"):
+            conn_spec = {"rule": "pairwise_bernoulli", "p": prob}
+        elif strategy in ("poisson", "pairwise_poisson"):
+            conn_spec = {
+                "rule": "pairwise_poisson",
+                "pairwise_avg_num_conns": prob,
+            }
+        else:
+            raise ValueError(
+                "strategy must be 'bernoulli', 'pairwise_bernoulli', "
+                "'poisson', or 'pairwise_poisson'."
+            )
 
-        if threshold is None:
-            threshold = torch.nan
-
-        # every target compartment receives input from every source compartment
-        source_model = source.model
-        target_model = target.model
-        pre_idx = to_flat_idx_torch(
-            source_model.shape, source.index, source_model.device()
-        )
-        post_idx = to_flat_idx_torch(
-            target_model.shape, target.index, target_model.device()
-        )
-
-        # 1. Get the original number of elements
-        num_pre = pre_idx.numel()
-        num_post = post_idx.numel()
-
-        # 2. Expand the first tensor to repeat its elements
-        # Shape becomes [3, 1] -> [3, 4] -> [12]
-        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
-
-        # 3. Expand the second tensor to repeat the whole sequence
-        # Shape becomes [1, 4] -> [3, 4] -> [12]
-        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
-
-        # randomly select connections based on the probability
-        device = source_model.device()
-        mask = (
-            torch.rand(pre_idx.numel(), device=device, generator=self._rng(device))
-            < prob
-        )
-
-        if mask.sum() == 0:
-            # If no connections are selected, return early
-            return
-
-        pre_idx = pre_idx[mask]
-        post_idx = post_idx.to(device)[mask].to(target_model.device())
-
-        pre_idx, post_idx = prepare_indices_one_one_flat(
-            source_model, pre_idx, target_model, post_idx, synapse
-        )
-
-        if auto_expand:
-            n_connections = len(pre_idx)
-            threshold = expand(threshold, n_connections)
-            weight = expand(weight, n_connections)
-            delay = expand(delay, n_connections)
-
-        # now connect
-        self._connect(
-            source_model,
-            pre_idx,
-            target_model,
-            post_idx,
+        return self.connect(
+            source,
+            target,
             synapse,
-            threshold,
-            weight,
-            delay,
-            pre_var,
+            conn_spec=conn_spec,
+            threshold=threshold,
+            weight=weight,
+            delay=delay,
+            pre_var=pre_var,
+            auto_expand=auto_expand,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
         )
 
     def connect_prob_n(
@@ -940,125 +1215,28 @@ class Network(RNGMixin):
         delay=0.0,
         pre_var=None,
         auto_expand=False,
+        allow_autapses=False,
+        allow_multapses=False,
     ):
         """
-        Connect exactly n random pre-post pairs (without replacement).
+        Connect exactly ``n`` random pre-post pairs.
 
-        From the dense all-to-all candidate set between `source` and `target`,
-        sample n unique pairs uniformly without replacement. Target locations
-        must already host the given synapse mechanism.
-
-        Parameters
-        ----------
-        source : Population | NetStim | PopulationSlice | NetStimSlice
-            Source selection; converted to source[:] if a full Population/NetStim
-            is provided.
-        target : Population | PopulationSlice
-            Target selection; converted to target[:] if a full Population.
-        synapse : object
-            Target-side synapse mechanism attached to the target population.
-        n : int
-            Number of connections to sample. If n <= 0, no connections are added.
-            If n exceeds the number of possible pairs, all pairs are selected.
-        threshold : float | torch.Tensor | torch.nn.Module, optional
-            Spike threshold(s); broadcasting as in connect_one_to_one.
-            Default is 0.0. If None, no thresholding is applied
-            (raw presynaptic variable is used as event variable).
-        weight : float | torch.Tensor | torch.nn.Module, optional
-            Synaptic weight(s); broadcasting as in connect_one_to_one.
-        delay : float | torch.Tensor | torch.nn.Module, optional
-            Synaptic delay(s); broadcasting as in connect_one_to_one.
-        pre_var : str, optional
-            Name of a pre-synaptic variable (e.g., "g") to use instead of voltage
-            for triggering synaptic events. Default is None (use voltage / spikes).
-        auto_expand : bool, optional
-            If True, automatically expand scalar/tensor weights & delays to the full
-            number of connections. If False, the weight & delays tensors must match the
-            number of pre-synaptic indices or be a scalar. Default is False.
-
-        Returns
-        -------
-        None
-
-        Raises
-        ------
-        ValueError
-            If the synapse is not present at some target locations, or if
-            provided tensors have incompatible shapes.
-
-        Notes
-        -----
-        - Sampling uses torch.randperm on the source device.
-        - n is effectively clipped by the number of candidate pairs.
-
-        Examples
-        --------
-        >>> net.connect_prob_n(pop_pre[:], pop_post[:], pop_post.mech.syn, n=1000)
+        This maps to NEST ``fixed_total_number``. With
+        ``allow_multapses=True``, pairs are drawn with replacement. With
+        ``allow_multapses=False`` the sampled source-target pairs are unique.
         """
-
-        if n <= 0:
-            return
-        if isinstance(source, Population) or isinstance(source, NetStim):
-            source = source[:]
-        if isinstance(target, Population):
-            target = target[:]
-
-        if threshold is None:
-            threshold = torch.nan
-
-        # every target compartment receives input from every source compartment
-        source_model = source.model
-        target_model = target.model
-        pre_idx = to_flat_idx_torch(
-            source_model.shape, source.index, source_model.device()
-        )
-        post_idx = to_flat_idx_torch(
-            target_model.shape, target.index, target_model.device()
-        )
-
-        # 1. Get the original number of elements
-        num_pre = pre_idx.numel()
-        num_post = post_idx.numel()
-
-        # 2. Expand the first tensor to repeat its elements
-        # Shape becomes [3, 1] -> [3, 4] -> [12]
-        pre_idx = pre_idx.unsqueeze(1).expand(num_pre, num_post).flatten()
-
-        # 3. Expand the second tensor to repeat the whole sequence
-        # Shape becomes [1, 4] -> [3, 4] -> [12]
-        post_idx = post_idx.unsqueeze(0).expand(num_pre, num_post).flatten()
-
-        # randomly select connections based on the probability
-        device = source_model.device()
-        total_connections = pre_idx.numel()
-        mask = torch.randperm(
-            total_connections, device=device, generator=self._rng(device)
-        )[:n]
-
-        pre_idx = pre_idx[mask]
-        post_idx = post_idx.to(device)[mask].to(target_model.device())
-
-        pre_idx, post_idx = prepare_indices_one_one_flat(
-            source_model, pre_idx, target_model, post_idx, synapse
-        )
-
-        if auto_expand:
-            n_connections = len(pre_idx)
-            threshold = expand(threshold, n_connections)
-            weight = expand(weight, n_connections)
-            delay = expand(delay, n_connections)
-
-        # now connect
-        self._connect(
-            source_model,
-            pre_idx,
-            target_model,
-            post_idx,
+        return self.connect(
+            source,
+            target,
             synapse,
-            threshold,
-            weight,
-            delay,
-            pre_var,
+            conn_spec={"rule": "fixed_total_number", "N": n},
+            threshold=threshold,
+            weight=weight,
+            delay=delay,
+            pre_var=pre_var,
+            auto_expand=auto_expand,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
         )
 
     def build_synapses(self, dt, max_delay_ms=None):
@@ -1385,7 +1563,7 @@ class Network(RNGMixin):
             _old_shapes["netstim"] = self.netstim.shape
             self.netstim.batch(n)
         for k, v in _synapse_spec.items():
-            source_name, target_name, synapse = k
+            source_name, target_name, synapse, pre_var = k
             source_pop = getattr(self, source_name)
             target_pop = getattr(self, target_name)
             synapse = getattr(target_pop.mech, synapse.name)
@@ -1408,6 +1586,7 @@ class Network(RNGMixin):
                     threshold,
                     weight,
                     delay,
+                    pre_var=pre_var,
                 )
         self.built = False
         self.is_batched = True
@@ -1489,7 +1668,7 @@ class Network(RNGMixin):
 
         # now reapply connections
         for k, v in self.synapse_spec.items():
-            source_name, target_name, synapse = k
+            source_name, target_name, synapse, pre_var = k
             if (source_pop := new_net.populations.get(name)) is None:
                 source_pop = getattr(new_net, source_name)
             if (target_pop := new_net.populations.get(name)) is None:
@@ -1514,6 +1693,7 @@ class Network(RNGMixin):
                     threshold,
                     weight,
                     delay,
+                    pre_var=pre_var,
                 )
 
         return new_net
@@ -1568,9 +1748,47 @@ class Network(RNGMixin):
         self._state_cache.clear()
         self._syn_cache.clear()
 
+    def load_state_cache(self, state_cache=None, syn_cache=None):
+        if state_cache is not None:
+            self._state_cache = state_cache
+        if syn_cache is not None:
+            self._syn_cache = syn_cache
+
     def set_synaptic_diff_config(self, **kwargs):
         for syn in self.synapses.values():
             syn.set_diff_config(**kwargs)
+
+    # load utilities
+    def load(self, state_dict):
+        """
+        Load model weights from a state dictionary.
+
+        This method supports loading weights from:
+        1. A file path as a string
+        2. An actual state dictionary object
+
+        The loaded weights are matched to the model's current state dict structure
+        and only compatible weights are loaded.
+
+        Parameters
+        ----------
+        state_dict : str or dict
+            Can be one of:
+            - A file path to a saved model state
+            - A state dictionary object
+
+        Returns
+        -------
+        self
+            The model instance with loaded weights
+        """
+        if isinstance(state_dict, str):
+            state_dict = torch.load(
+                state_dict, map_location=self.device(), weights_only=True
+            )
+        matched, _ = _match_state_dict(self.state_dict(), state_dict)
+        self.load_state_dict(matched, strict=False)
+        return self
 
     # utilities
     def concatenated_weights(self):
