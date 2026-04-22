@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from typing import Literal, Optional, Sequence, Tuple, Union
+import copy
+from typing import Any, Literal, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -3649,3 +3651,751 @@ class PreparedInterp3dScattered(nn.Module):
             return out
 
         return y
+
+
+FEMDataKind = Literal["node", "element"]
+FEMElementMethod = Literal["assign", "linear"]
+FEMPreparedKind = Literal[
+    "node",
+    "element_assign",
+    "element_linear_discontinuous",
+]
+
+
+class PreparedInterp3dFEM(nn.Module):
+    """
+    Mesh-guided tetrahedral FEM interpolator compatible with SimNIBS-style
+    ``NodeData.interpolate_scattered`` and ``ElementData.interpolate_scattered``.
+
+    This module deliberately uses the mesh's own tetrahedron point-location routine
+    during ``forward`` and then performs the value gathering/blending in PyTorch.
+    That preserves the high-quality mesh-guided behavior of the original methods:
+
+    - node data: barycentric interpolation inside the containing tetrahedron;
+    - element data, ``method="assign"``: assign the containing tetrahedron's value;
+    - element data, ``method="linear", continuous=True``: recover element data to
+      nodes once with ``ElementData.elm_data2node_data`` and then use node-data
+      barycentric interpolation;
+    - element data, ``method="linear", continuous=False``: perform the same
+      tag-wise superconvergent patch recovery as ``ElementData.interpolate_scattered``
+      and interpolate with the recovered nodal field of the containing tag.
+
+    Parameters
+    ----------
+    mesh : object
+        A mesh object implementing the relevant ``mesh_io.Msh`` API:
+        ``find_tetrahedron_with_points``, ``nodes.find_closest_node``,
+        ``find_closest_element``, ``elm.node_number_list``, ``elm.tag1``, and
+        ``elm.tetrahedra``.
+    values : array-like or torch.Tensor
+        Nodal values for ``kind="node"`` or element values for
+        ``kind="element_assign"``. For ``kind="element_linear_discontinuous"`` this
+        is used only for the outside ``out_fill="nearest"`` behavior; tag-wise
+        recovered nodal values must be provided via ``tag_states``.
+    kind : {"node", "element_assign", "element_linear_discontinuous"}
+        Prepared interpolation regime.
+    out_fill : float or "nearest", default=np.nan
+        Outside-volume policy, matching the ``mesh_io.py`` methods.
+    th_indices : array-like, optional
+        One-based tetrahedron/element numbers to consider as the valid volume.
+        Tetrahedra outside this set are treated as outside.
+    squeeze : bool, default=True
+        Match the ``squeeze`` behavior of the original methods.
+    learnable_values : bool, default=False
+        Store ``values`` as a parameter. Supported for ``kind="node"`` and
+        ``kind="element_assign"``. For tag-wise element-linear interpolation, use
+        the classmethod defaults unless you intentionally want only outside-nearest
+        element values to be learnable.
+
+    Notes
+    -----
+    Gradients flow to stored values through the PyTorch gather/blend operations.
+    Gradients do not flow through the discrete tetrahedron search, and barycentric
+    coordinates are computed by the mesh's NumPy/Cython locator, matching the source
+    implementation rather than providing differentiability with respect to query
+    coordinates.
+    """
+
+    def __init__(
+        self,
+        mesh: Any,
+        values: Union[np.ndarray, torch.Tensor],
+        *,
+        kind: FEMPreparedKind = "node",
+        out_fill: Union[float, str] = np.nan,
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]] = None,
+        squeeze: bool = True,
+        field_name: str = "",
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        learnable_values: bool = False,
+        values_requires_grad: bool = True,
+        tag_states: Optional[Sequence[dict[str, Any]]] = None,
+    ):
+        super().__init__()
+
+        if kind not in ("node", "element_assign", "element_linear_discontinuous"):
+            raise ValueError(
+                "kind must be one of {'node', 'element_assign', "
+                "'element_linear_discontinuous'}."
+            )
+
+        self.mesh = mesh
+        self.kind = kind
+        self.out_fill = out_fill
+        self.squeeze = bool(squeeze)
+        self.field_name = field_name
+        self.learnable_values = bool(learnable_values)
+
+        th_np = self._normalize_th_indices(th_indices)
+        self._default_th_indices_np = th_np
+
+        values_t, input_was_1d = self._coerce_values(values, dtype=dtype, device=device)
+        self._input_was_1d = bool(input_was_1d)
+        self._n_components = int(values_t.shape[1])
+
+        if self.learnable_values:
+            self.values = nn.Parameter(values_t, requires_grad=values_requires_grad)
+        else:
+            self.register_buffer("_values", values_t)
+
+        # Original element tags are needed to select the tag-local recovered nodal
+        # field in the discontinuous ElementData linear branch.
+        self._element_tags_np = np.asarray(mesh.elm.tag1).copy()
+
+        self._n_tag_states = 0
+        self._tag_state_meta: list[dict[str, Any]] = []
+        if kind == "element_linear_discontinuous":
+            if tag_states is None:
+                raise ValueError(
+                    "tag_states are required for kind='element_linear_discontinuous'. "
+                    "Use PreparedInterpolate3dFEM.from_ElementData(..., "
+                    "method='linear', continuous=False)."
+                )
+            self._register_tag_states(
+                tag_states, dtype=values_t.dtype, device=values_t.device
+            )
+
+    # ------------------------------------------------------------------
+    # Construction helpers
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_NodeData(
+        cls,
+        node_data: Any,
+        *,
+        out_fill: Union[float, str] = np.nan,
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]] = None,
+        squeeze: bool = True,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        learnable_values: bool = False,
+        values_requires_grad: bool = True,
+    ) -> "PreparedInterp3dFEM":
+        """
+        Build an interpolator from a ``mesh_io.NodeData``-like object.
+
+        The returned module reproduces ``node_data.interpolate_scattered(points,
+        out_fill=out_fill, squeeze=squeeze, th_indices=th_indices)`` for the same
+        mesh and points, up to normal floating-point roundoff.
+        """
+        cls._test_data_mesh(node_data)
+        return cls(
+            node_data.mesh,
+            node_data.value,
+            kind="node",
+            out_fill=out_fill,
+            th_indices=th_indices,
+            squeeze=squeeze,
+            field_name=getattr(node_data, "field_name", ""),
+            dtype=dtype,
+            device=device,
+            learnable_values=learnable_values,
+            values_requires_grad=values_requires_grad,
+        )
+
+    @classmethod
+    def from_ElementData(
+        cls,
+        element_data: Any,
+        *,
+        out_fill: Union[float, str] = np.nan,
+        method: FEMElementMethod = "linear",
+        continuous: bool = False,
+        squeeze: bool = True,
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]] = None,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        learnable_values: bool = False,
+        values_requires_grad: bool = True,
+    ) -> "PreparedInterp3dFEM":
+        """
+        Build an interpolator from a ``mesh_io.ElementData``-like object.
+
+        This mirrors ``ElementData.interpolate_scattered``:
+
+        - ``method='assign'`` stores element values and assigns containing-tet
+          values in ``forward``.
+        - ``method='linear', continuous=True`` performs the same global
+          ``elm_data2node_data`` recovery once and then returns a node-data FEM
+          interpolator using the recovered nodal field.
+        - ``method='linear', continuous=False`` performs tag-wise recovery once
+          and selects the containing tetrahedron's tag-specific nodal field in
+          ``forward``.
+        """
+        cls._test_data_mesh(element_data)
+
+        if method not in ("assign", "linear"):
+            raise ValueError("method must be 'assign' or 'linear'.")
+
+        mesh = element_data.mesh
+        if len(mesh.elm.tetrahedra) == 0:
+            raise ValueError("Mesh has no volume elements.")
+
+        if method == "assign":
+            return cls(
+                mesh,
+                element_data.value,
+                kind="element_assign",
+                out_fill=out_fill,
+                th_indices=th_indices,
+                squeeze=squeeze,
+                field_name=getattr(element_data, "field_name", ""),
+                dtype=dtype,
+                device=device,
+                learnable_values=learnable_values,
+                values_requires_grad=values_requires_grad,
+            )
+
+        if continuous:
+            if learnable_values:
+                raise ValueError(
+                    "learnable_values=True is not supported for ElementData "
+                    "method='linear', continuous=True because values are first "
+                    "converted to recovered nodal values by the mesh_io routine. "
+                    "Use method='assign', or build from the recovered NodeData."
+                )
+            recovered = element_data.elm_data2node_data()
+            return cls(
+                mesh,
+                recovered.value,
+                kind="node",
+                out_fill=out_fill,
+                th_indices=th_indices,
+                squeeze=squeeze,
+                field_name=getattr(element_data, "field_name", ""),
+                dtype=dtype,
+                device=device,
+                learnable_values=False,
+                values_requires_grad=False,
+            )
+
+        if learnable_values:
+            raise ValueError(
+                "learnable_values=True is not supported for ElementData "
+                "method='linear', continuous=False in this faithful wrapper, "
+                "because tag-wise superconvergent patch recovery is performed "
+                "with the mesh_io implementation at preparation time."
+            )
+
+        tag_states = cls._build_discontinuous_tag_states(element_data)
+        return cls(
+            mesh,
+            element_data.value,
+            kind="element_linear_discontinuous",
+            out_fill=out_fill,
+            th_indices=th_indices,
+            squeeze=squeeze,
+            field_name=getattr(element_data, "field_name", ""),
+            dtype=dtype,
+            device=device,
+            learnable_values=False,
+            values_requires_grad=False,
+            tag_states=tag_states,
+        )
+
+    @staticmethod
+    def _test_data_mesh(data: Any) -> None:
+        if getattr(data, "mesh", None) is None:
+            raise ValueError("Cannot prepare FEM interpolation if data.mesh is None.")
+
+    @staticmethod
+    def _normalize_th_indices(
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]],
+    ) -> Optional[np.ndarray]:
+        if th_indices is None:
+            return None
+        if isinstance(th_indices, torch.Tensor):
+            th = th_indices.detach().cpu().numpy()
+        else:
+            th = np.asarray(th_indices)
+        th = th.astype(np.int64, copy=False).reshape(-1)
+        if np.any(th <= 0):
+            raise ValueError(
+                "th_indices must contain one-based positive element numbers."
+            )
+        return th
+
+    @staticmethod
+    def _coerce_values(
+        values: Union[np.ndarray, torch.Tensor],
+        *,
+        dtype: Optional[torch.dtype],
+        device: Optional[Union[str, torch.device]],
+    ) -> tuple[torch.Tensor, bool]:
+        if isinstance(values, torch.Tensor):
+            t = values.detach().clone() if not values.is_leaf else values
+            if dtype is not None or device is not None:
+                t = t.to(dtype=dtype or t.dtype, device=device or t.device)
+        else:
+            t = torch.as_tensor(values, dtype=dtype, device=device)
+
+        if not torch.is_floating_point(t):
+            raise TypeError(
+                "FEM interpolation values must be floating-point tensors/arrays."
+            )
+        if t.ndim == 1:
+            return t.contiguous().unsqueeze(-1), True
+        if t.ndim == 2:
+            return t.contiguous(), False
+        raise ValueError("values must have shape (N,) or (N,C).")
+
+    @classmethod
+    def _build_discontinuous_tag_states(cls, element_data: Any) -> list[dict[str, Any]]:
+        """Precompute the tag-wise ElementData->NodeData recovery used by mesh_io."""
+        mesh = element_data.mesh
+        field_name = getattr(element_data, "field_name", "")
+        ed_cls = element_data.__class__
+
+        # Work on a copy exactly as ElementData.interpolate_scattered does. This
+        # lets crop_mesh carry the element values onto each tag-local mesh without
+        # mutating the caller's mesh.
+        msh_work = copy.deepcopy(mesh)
+        msh_work.elmdata = [ed_cls(element_data.value, field_name, mesh=msh_work)]
+
+        tet_numbers = np.asarray(msh_work.elm.tetrahedra, dtype=np.int64)
+        tet_tags = np.asarray(msh_work.elm.tag1[tet_numbers - 1])
+        tag_states: list[dict[str, Any]] = []
+
+        for tag in np.unique(tet_tags):
+            # This mirrors the source branch:
+            #   msh_tag = msh.crop_mesh(tags=t)
+            #   nd = msh_tag.elmdata[0].elm_data2node_data()
+            #   msh_with_t = msh.elm.elm_number[msh.elm.get_tags(t)]
+            msh_tag = msh_work.crop_mesh(tags=int(tag))
+            nd = msh_tag.elmdata[0].elm_data2node_data()
+
+            orig_elms = np.asarray(
+                msh_work.elm.elm_number[msh_work.elm.get_tags(int(tag))], dtype=np.int64
+            )
+            local_nodes = np.asarray(msh_tag.elm.node_number_list, dtype=np.int64) - 1
+
+            tag_states.append(
+                {
+                    "tag": int(tag),
+                    "orig_elms": orig_elms,
+                    "local_nodes": local_nodes,
+                    "node_values": nd.value,
+                }
+            )
+        return tag_states
+
+    def _register_tag_states(
+        self,
+        tag_states: Sequence[dict[str, Any]],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self._n_tag_states = len(tag_states)
+        self._tag_state_meta = []
+
+        for i, state in enumerate(tag_states):
+            tag = int(state["tag"])
+            orig_elms_np = np.asarray(state["orig_elms"], dtype=np.int64)
+            self._tag_state_meta.append({"tag": tag, "orig_elms_np": orig_elms_np})
+
+            node_values, input_was_1d = self._coerce_values(
+                state["node_values"], dtype=dtype, device=device
+            )
+            if int(node_values.shape[1]) != self._n_components:
+                # Scalar ElementData recovery can squeeze (N,1) to (N,), so the
+                # number of components should still be one. Anything else is a
+                # genuine shape mismatch.
+                if not (input_was_1d and self._n_components == 1):
+                    raise ValueError(
+                        "Recovered tag-local node values have incompatible component count."
+                    )
+
+            local_nodes = torch.as_tensor(
+                np.asarray(state["local_nodes"], dtype=np.int64),
+                device=device,
+                dtype=torch.long,
+            ).contiguous()
+
+            self.register_buffer(f"_tag_{i}_node_values", node_values.contiguous())
+            self.register_buffer(f"_tag_{i}_local_nodes", local_nodes)
+
+    # ------------------------------------------------------------------
+    # Forward helpers
+    # ------------------------------------------------------------------
+    def _get_values(self) -> torch.Tensor:
+        return self.values if hasattr(self, "values") else self._values
+
+    def _points_to_numpy(self, points: torch.Tensor) -> tuple[np.ndarray, torch.Size]:
+        if points.ndim < 2 or points.shape[-1] != 3:
+            raise ValueError("points must have shape (..., 3).")
+        if not torch.is_floating_point(points):
+            raise TypeError("points must be floating-point.")
+        orig_shape = points.shape[:-1]
+        pts_np = (
+            points.detach().reshape(-1, 3).cpu().numpy().astype(np.float64, copy=False)
+        )
+        return pts_np, orig_shape
+
+    def _locate_points(
+        self,
+        points_np: np.ndarray,
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        th_np = (
+            self._default_th_indices_np
+            if th_indices is None
+            else self._normalize_th_indices(th_indices)
+        )
+        if points_np.shape[0] == 0:
+            empty_th = np.empty((0,), dtype=np.int64)
+            empty_bar = np.empty((0, 4), dtype=np.float64)
+            empty_inside = np.empty((0,), dtype=bool)
+            return empty_th, empty_bar, empty_inside
+
+        th_with_points, bary = self.mesh.find_tetrahedron_with_points(
+            points_np, compute_baricentric=True
+        )
+        th_with_points = np.asarray(th_with_points, dtype=np.int64)
+        bary = np.asarray(bary)
+
+        if th_np is not None:
+            th_with_points[~np.isin(th_with_points, th_np)] = -1
+
+        inside = th_with_points != -1
+        return th_with_points, bary, inside
+
+    def _empty_output(self, Q: int, values: torch.Tensor) -> torch.Tensor:
+        return torch.empty(
+            (Q, self._n_components), device=values.device, dtype=values.dtype
+        )
+
+    def _fill_outside(
+        self,
+        y: torch.Tensor,
+        points_np: np.ndarray,
+        outside: np.ndarray,
+        values: torch.Tensor,
+        *,
+        out_fill: Union[float, str],
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]],
+        nearest_kind: Literal["node", "element"],
+    ) -> None:
+        if not np.any(outside):
+            return
+
+        outside_idx = torch.as_tensor(
+            np.where(outside)[0], device=y.device, dtype=torch.long
+        )
+
+        if out_fill == "nearest":
+            pts_out = points_np[outside]
+            th_np = (
+                self._default_th_indices_np
+                if th_indices is None
+                else self._normalize_th_indices(th_indices)
+            )
+
+            if nearest_kind == "node":
+                if th_np is None:
+                    _, nearest = self.mesh.nodes.find_closest_node(
+                        pts_out, return_index=True
+                    )
+                    nearest0 = np.asarray(nearest, dtype=np.int64) - 1
+                else:
+                    # Equivalent to adding the NodeData to the mesh, cropping to
+                    # th_indices, finding the closest cropped node, and reading the
+                    # cropped NodeData value.
+                    elm_nodes = np.asarray(
+                        self.mesh.elm.node_number_list[th_np - 1], dtype=np.int64
+                    )
+                    valid_nodes = np.unique(elm_nodes[elm_nodes > 0])
+                    if valid_nodes.size == 0:
+                        raise ValueError(
+                            "th_indices selects no valid nodes for nearest fill."
+                        )
+                    coords = self.mesh.nodes.node_coord[valid_nodes - 1]
+                    import scipy.spatial
+
+                    _, nearest_local = scipy.spatial.cKDTree(coords).query(pts_out)
+                    nearest0 = (
+                        valid_nodes[np.asarray(nearest_local, dtype=np.int64)] - 1
+                    )
+
+                idx_t = torch.as_tensor(nearest0, device=y.device, dtype=torch.long)
+                fill = values.index_select(0, idx_t)
+
+            else:  # nearest element
+                if th_np is None:
+                    _, nearest = self.mesh.find_closest_element(
+                        pts_out, return_index=True
+                    )
+                else:
+                    _, nearest = self.mesh.find_closest_element(
+                        pts_out, return_index=True, elements_of_interest=th_np
+                    )
+                nearest0 = np.asarray(nearest, dtype=np.int64) - 1
+                idx_t = torch.as_tensor(nearest0, device=y.device, dtype=torch.long)
+                fill = values.index_select(0, idx_t)
+
+            y.index_copy_(0, outside_idx, fill)
+        else:
+            fill_value = float(out_fill)
+            fill = torch.full(
+                (outside_idx.numel(), self._n_components),
+                fill_value,
+                device=y.device,
+                dtype=y.dtype,
+            )
+            y.index_copy_(0, outside_idx, fill)
+
+    def _forward_node_like(
+        self,
+        points_np: np.ndarray,
+        th_with_points: np.ndarray,
+        bary: np.ndarray,
+        inside: np.ndarray,
+        values: torch.Tensor,
+        *,
+        out_fill: Union[float, str],
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]],
+        nearest_kind: Literal["node", "element"] = "node",
+    ) -> torch.Tensor:
+        Q = int(points_np.shape[0])
+        y = self._empty_output(Q, values)
+
+        if np.any(inside):
+            node_ids = (
+                np.asarray(
+                    self.mesh.elm.node_number_list[th_with_points[inside] - 1],
+                    dtype=np.int64,
+                )
+                - 1
+            )
+            node_ids_t = torch.as_tensor(
+                node_ids, device=values.device, dtype=torch.long
+            )
+            weights = torch.as_tensor(
+                bary[inside], device=values.device, dtype=values.dtype
+            )
+            gathered = values.index_select(0, node_ids_t.reshape(-1)).view(
+                -1, 4, self._n_components
+            )
+            yi = torch.einsum("ik,ikj->ij", weights, gathered)
+            inside_idx = torch.as_tensor(
+                np.where(inside)[0], device=values.device, dtype=torch.long
+            )
+            y.index_copy_(0, inside_idx, yi)
+
+        self._fill_outside(
+            y,
+            points_np,
+            ~inside,
+            values,
+            out_fill=out_fill,
+            th_indices=th_indices,
+            nearest_kind=nearest_kind,
+        )
+        return y
+
+    def _forward_element_assign(
+        self,
+        points_np: np.ndarray,
+        th_with_points: np.ndarray,
+        inside: np.ndarray,
+        values: torch.Tensor,
+        *,
+        out_fill: Union[float, str],
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]],
+    ) -> torch.Tensor:
+        Q = int(points_np.shape[0])
+        y = self._empty_output(Q, values)
+
+        if np.any(inside):
+            elem0 = torch.as_tensor(
+                th_with_points[inside] - 1, device=values.device, dtype=torch.long
+            )
+            yi = values.index_select(0, elem0)
+            inside_idx = torch.as_tensor(
+                np.where(inside)[0], device=values.device, dtype=torch.long
+            )
+            y.index_copy_(0, inside_idx, yi)
+
+        self._fill_outside(
+            y,
+            points_np,
+            ~inside,
+            values,
+            out_fill=out_fill,
+            th_indices=th_indices,
+            nearest_kind="element",
+        )
+        return y
+
+    def _forward_element_linear_discontinuous(
+        self,
+        points_np: np.ndarray,
+        th_with_points: np.ndarray,
+        bary: np.ndarray,
+        inside: np.ndarray,
+        values: torch.Tensor,
+        *,
+        out_fill: Union[float, str],
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]],
+    ) -> torch.Tensor:
+        Q = int(points_np.shape[0])
+        y = self._empty_output(Q, values)
+
+        if np.any(inside):
+            inside_positions = np.where(inside)[0]
+            inside_th = th_with_points[inside]
+            inside_tags = self._element_tags_np[inside_th - 1]
+
+            for i, meta in enumerate(self._tag_state_meta):
+                tag = meta["tag"]
+                is_tag = inside_tags == tag
+                if not np.any(is_tag):
+                    continue
+
+                pos_np = inside_positions[is_tag]
+                th_tag = inside_th[is_tag]
+                orig_elms = meta["orig_elms_np"]
+                local_idx_np = np.searchsorted(orig_elms, th_tag).astype(
+                    np.int64, copy=False
+                )
+
+                local_nodes_all = getattr(self, f"_tag_{i}_local_nodes")
+                node_values = getattr(self, f"_tag_{i}_node_values")
+
+                local_idx = torch.as_tensor(
+                    local_idx_np, device=values.device, dtype=torch.long
+                )
+                local_nodes = local_nodes_all.index_select(0, local_idx)[:, :4]
+                weights = torch.as_tensor(
+                    bary[pos_np], device=values.device, dtype=node_values.dtype
+                )
+                gathered = node_values.index_select(0, local_nodes.reshape(-1)).view(
+                    -1, 4, self._n_components
+                )
+                yi = torch.einsum("ik,ikj->ij", weights, gathered)
+                pos_t = torch.as_tensor(pos_np, device=values.device, dtype=torch.long)
+                y.index_copy_(0, pos_t, yi)
+
+        self._fill_outside(
+            y,
+            points_np,
+            ~inside,
+            values,
+            out_fill=out_fill,
+            th_indices=th_indices,
+            nearest_kind="element",
+        )
+        return y
+
+    def _finish_output(
+        self,
+        y: torch.Tensor,
+        orig_shape: torch.Size,
+        *,
+        squeeze: bool,
+        out: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        y = y.view(*tuple(orig_shape), self._n_components)
+        if self._input_was_1d:
+            y = y.squeeze(-1)
+        if squeeze:
+            y = y.squeeze()
+
+        if out is not None:
+            if out.shape != y.shape:
+                raise ValueError(
+                    f"out has shape {tuple(out.shape)} but expected {tuple(y.shape)}."
+                )
+            out.copy_(y)
+            return out
+        return y
+
+    def forward(
+        self,
+        points: torch.Tensor,
+        *,
+        out_fill: Optional[Union[float, str]] = None,
+        squeeze: Optional[bool] = None,
+        th_indices: Optional[Union[np.ndarray, Sequence[int], torch.Tensor]] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Interpolate at query points.
+
+        Parameters
+        ----------
+        points : torch.Tensor
+            Query coordinates with shape ``(..., 3)``. They may live on CPU or GPU;
+            point-location is performed by the mesh implementation on a detached CPU
+            copy, and the output is returned on the module value buffers' device.
+        out_fill : float or "nearest", optional
+            Per-call outside policy override. Defaults to the constructor setting.
+        squeeze : bool, optional
+            Per-call squeeze override. Defaults to the constructor setting.
+        th_indices : array-like, optional
+            Per-call valid tetrahedron/element subset override. Defaults to the
+            constructor setting. Passing this argument does not mutate the prepared
+            object.
+        out : torch.Tensor, optional
+            Optional output tensor.
+        """
+        values = self._get_values()
+        points_np, orig_shape = self._points_to_numpy(points)
+        th_with_points, bary, inside = self._locate_points(points_np, th_indices)
+
+        out_fill_eff = self.out_fill if out_fill is None else out_fill
+        squeeze_eff = self.squeeze if squeeze is None else bool(squeeze)
+
+        if self.kind == "node":
+            y = self._forward_node_like(
+                points_np,
+                th_with_points,
+                bary,
+                inside,
+                values,
+                out_fill=out_fill_eff,
+                th_indices=th_indices,
+                nearest_kind="node",
+            )
+        elif self.kind == "element_assign":
+            y = self._forward_element_assign(
+                points_np,
+                th_with_points,
+                inside,
+                values,
+                out_fill=out_fill_eff,
+                th_indices=th_indices,
+            )
+        else:
+            y = self._forward_element_linear_discontinuous(
+                points_np,
+                th_with_points,
+                bary,
+                inside,
+                values,
+                out_fill=out_fill_eff,
+                th_indices=th_indices,
+            )
+
+        return self._finish_output(y, orig_shape, squeeze=squeeze_eff, out=out)

@@ -9,6 +9,7 @@ from natsort import natsorted
 from axonml.helpers import logger
 from axonml.utils import (
     PreparedInterp1d,
+    PreparedInterp3dFEM,
     PreparedInterp3dRect,
     PreparedInterp3dScattered,
 )
@@ -682,10 +683,152 @@ class PreComputedInterpolate3DScattered(torch.nn.Module):
         return field
 
 
+class _MeshCoordinateTransformMixin:
+    """Shared coordinate handling for mesh-backed interpolators."""
+
+    def _init_mesh_coordinate_transform(
+        self,
+        *,
+        coordinate_scale=1.0,
+        coordinate_offset=None,
+    ):
+        self.register_buffer(
+            "_coordinate_scale",
+            torch.as_tensor(float(coordinate_scale), dtype=torch.float32),
+        )
+        if coordinate_offset is None:
+            self.register_buffer("_coordinate_offset", None)
+        else:
+            offset = torch.as_tensor(coordinate_offset, dtype=torch.float32)
+            if offset.shape != (3,):
+                raise ValueError("coordinate_offset must be None or a length-3 vector.")
+            self.register_buffer("_coordinate_offset", offset)
+
+    def _query_xyz_from_model_coords(self, x, y, z):
+        xyz_q = torch.stack((x, y, z), dim=-1).reshape(-1, 3)
+        scale = self._coordinate_scale.to(device=xyz_q.device, dtype=xyz_q.dtype)
+        xyz_q = xyz_q * scale
+        if self._coordinate_offset is not None:
+            offset = self._coordinate_offset.to(device=xyz_q.device, dtype=xyz_q.dtype)
+            xyz_q = xyz_q + offset
+        return xyz_q
+
+
+class PreComputedInterpolate3DMesh(_MeshCoordinateTransformMixin, torch.nn.Module):
+    """Interpolate a scalar mesh-defined field at model coordinates.
+
+    This wrapper is the tetrahedral-mesh analogue of
+    :class:`PreComputedInterpolate3DRect` and
+    :class:`PreComputedInterpolate3DScattered`.  It delegates the actual
+    mesh-guided FEM interpolation to :class:`PreparedInterpolate3dFEM`, which
+    reproduces SimNIBS ``NodeData.interpolate_scattered`` behavior.
+
+    Parameters
+    ----------
+    interpolator : PreparedInterpolate3dFEM
+        Prepared FEM interpolator, normally created with :meth:`from_NodeData`.
+    coordinate_scale : float, optional
+        Multiplicative conversion from model coordinates to mesh coordinates before
+        interpolation.  Use ``1e-3`` when model coordinates are in micrometers and
+        the SimNIBS mesh is in millimeters.  Default is ``1.0``.
+    coordinate_offset : array-like of shape (3,), optional
+        Additive offset applied after scaling, in mesh-coordinate units.
+
+    Notes
+    -----
+    * The SimNIBS mesh point-location step remains CPU/NumPy/Cython based inside
+      ``PreparedInterpolate3dFEM``; value gathering/blending runs in torch on the
+      interpolator device.
+    * Gradients may flow to learnable field values when the prepared interpolator
+      was constructed with ``learnable_values=True``.  Gradients do not flow
+      through the discrete tetrahedron lookup or back to query coordinates.
+    """
+
+    def __init__(
+        self,
+        interpolator,
+        *,
+        coordinate_scale=1.0,
+        coordinate_offset=None,
+    ):
+        super().__init__()
+        self.interpolator = interpolator
+        self._init_mesh_coordinate_transform(
+            coordinate_scale=coordinate_scale,
+            coordinate_offset=coordinate_offset,
+        )
+
+    @classmethod
+    def from_NodeData(
+        cls,
+        node_data,
+        *,
+        out_fill=np.nan,
+        th_indices=None,
+        coordinate_scale=1.0,
+        coordinate_offset=None,
+        dtype=None,
+        device=None,
+        learnable_values=False,
+        values_requires_grad=True,
+    ):
+        """Create a scalar mesh interpolator from a SimNIBS-like ``NodeData``.
+
+        ``NodeData`` is the natural format for scalar nodal fields such as voltage.
+        The wrapped prepared interpolator uses tetrahedron containment plus
+        barycentric interpolation, matching ``node_data.interpolate_scattered``.
+        """
+        nr_comp = getattr(node_data, "nr_comp", None)
+        if nr_comp is not None and int(nr_comp) != 1:
+            raise ValueError(
+                "PreComputedInterpolate3DMesh expects scalar NodeData. "
+                "For vector E-fields, use EFieldInterpolate3DMesh.from_ElementData."
+            )
+
+        interpolator = PreparedInterp3dFEM.from_NodeData(
+            node_data,
+            out_fill=out_fill,
+            th_indices=th_indices,
+            squeeze=False,
+            dtype=dtype,
+            device=device,
+            learnable_values=learnable_values,
+            values_requires_grad=values_requires_grad,
+        )
+        return cls(
+            interpolator,
+            coordinate_scale=coordinate_scale,
+            coordinate_offset=coordinate_offset,
+        )
+
+    # PEP-8 alias; keep from_NodeData for SimNIBS class-name symmetry.
+    from_node_data = from_NodeData
+
+    def _interp(self, x, y, z):
+        shape = x.shape
+        xyz_q = self._query_xyz_from_model_coords(x, y, z)
+        field = self.interpolator(xyz_q, squeeze=False)
+        if field.ndim == 2:
+            if field.shape[-1] != 1:
+                raise RuntimeError(
+                    "Expected scalar mesh interpolator output with one component, "
+                    f"got shape {tuple(field.shape)}."
+                )
+            field = field.squeeze(-1)
+        return field.reshape(*shape)
+
+    def forward(self, model):
+        """Interpolate the scalar field at ``model.x``, ``model.y``, ``model.z``."""
+        self.to(device=model.device(), dtype=model.dtype())
+        x, y, z = model.x, model.y, model.z
+        return self._interp(x, y, z)
+
+
 # -- aliases --
 FEMInterpolate1D = PreComputedInterpolate1D
 FEMInterpolate3DRect = PreComputedInterpolate3DRect
 FEMInterpolate3DScattered = PreComputedInterpolate3DScattered
+FEMInterpolate3DMesh = PreComputedInterpolate3DMesh
 
 
 class EfieldInterpolate3DRect(torch.nn.Module):
@@ -775,6 +918,124 @@ class EfieldInterpolate3DScattered(torch.nn.Module):
         return efield
 
     def forward(self, model):
+        self.to(device=model.device(), dtype=model.dtype())
+        x, y, z = model.x, model.y, model.z
+        G = model.graph
+        efield = self._interp(x, y, z)
+        return calculate_quasipotentials_batched_coords(G, x, y, z, efield)
+
+
+class EfieldInterpolate3DMesh(_MeshCoordinateTransformMixin, torch.nn.Module):
+    """Interpolate a mesh-defined 3-D E-field and compute quasipotentials.
+
+    This is the tetrahedral-mesh analogue of :class:`EfieldInterpolate3DRect`
+    and :class:`EfieldInterpolate3DScattered`.  E-field solutions from SimNIBS are
+    stored as ``ElementData`` with three components per element, so construction is
+    normally via :meth:`from_ElementData`.
+
+    Parameters
+    ----------
+    interpolator : PreparedInterpolate3dFEM
+        Prepared FEM interpolator created from vector ``ElementData``.
+    coordinate_scale : float, optional
+        Multiplicative conversion from model coordinates to mesh coordinates before
+        interpolation.  Use ``1e-3`` when model coordinates are in micrometers and
+        the SimNIBS mesh is in millimeters.  Default is ``1.0``.
+    coordinate_offset : array-like of shape (3,), optional
+        Additive offset applied after scaling, in mesh-coordinate units.
+
+    Notes
+    -----
+    The default ``from_ElementData(..., method='linear', continuous=False)`` path
+    reproduces SimNIBS' tag-wise element-to-node recovery followed by barycentric
+    interpolation, which is the appropriate high-quality interpolation path for
+    discontinuous E-fields across tissue boundaries.
+    """
+
+    def __init__(
+        self,
+        interpolator,
+        *,
+        coordinate_scale=1.0,
+        coordinate_offset=None,
+    ):
+        super().__init__()
+        self.interpolator = interpolator
+        self._init_mesh_coordinate_transform(
+            coordinate_scale=coordinate_scale,
+            coordinate_offset=coordinate_offset,
+        )
+
+    @classmethod
+    def from_ElementData(
+        cls,
+        element_data,
+        *,
+        out_fill=np.nan,
+        method="linear",
+        continuous=False,
+        th_indices=None,
+        coordinate_scale=1.0,
+        coordinate_offset=None,
+        dtype=None,
+        device=None,
+        learnable_values=False,
+        values_requires_grad=True,
+    ):
+        """Create an E-field interpolator from SimNIBS-like ``ElementData``.
+
+        Parameters mirror ``ElementData.interpolate_scattered`` where relevant.
+        The default ``method='linear', continuous=False`` is selected for E-fields
+        because it preserves tag-wise discontinuities by preparing separate
+        recovered nodal fields per tissue tag.
+        """
+        nr_comp = getattr(element_data, "nr_comp", None)
+        if nr_comp is not None and int(nr_comp) != 3:
+            raise ValueError(
+                "EFieldInterp3DMesh expects vector ElementData with exactly "
+                f"3 components; got nr_comp={nr_comp}."
+            )
+
+        interpolator = PreparedInterp3dFEM.from_ElementData(
+            element_data,
+            out_fill=out_fill,
+            method=method,
+            continuous=continuous,
+            squeeze=False,
+            th_indices=th_indices,
+            dtype=dtype,
+            device=device,
+            learnable_values=learnable_values,
+            values_requires_grad=values_requires_grad,
+        )
+        return cls(
+            interpolator,
+            coordinate_scale=coordinate_scale,
+            coordinate_offset=coordinate_offset,
+        )
+
+    # PEP-8 alias; keep from_ElementData for SimNIBS class-name symmetry.
+    from_element_data = from_ElementData
+
+    def _interp(self, x, y, z):
+        shape = x.shape
+        xyz_q = self._query_xyz_from_model_coords(x, y, z)
+        efield = self.interpolator(xyz_q, squeeze=False)
+        if efield.ndim != 2 or efield.shape[-1] != 3:
+            raise RuntimeError(
+                "Expected E-field mesh interpolator output with shape (Q, 3), "
+                f"got {tuple(efield.shape)}."
+            )
+        return efield.reshape(*shape, 3)
+
+    def interpolate_efield(self, model):
+        """Return interpolated E-field vectors at model coordinates."""
+        self.to(device=model.device(), dtype=model.dtype())
+        x, y, z = model.x, model.y, model.z
+        return self._interp(x, y, z)
+
+    def forward(self, model):
+        """Interpolate E-field vectors and convert them to quasipotentials."""
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
         G = model.graph
