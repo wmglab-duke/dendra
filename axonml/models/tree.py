@@ -108,11 +108,15 @@ class Tree(Population):
                 )
                 .reshape(1, 3)
                 .expand(N, -1)
-            )
+            ).clone()
         else:
-            directions = torch.tensor(
-                [[0.0, 0.0, 1.0]], dtype=self.dtype(), device=self.device()
-            ).expand(N, -1)
+            directions = (
+                torch.tensor(
+                    [[0.0, 0.0, 1.0]], dtype=self.dtype(), device=self.device()
+                )
+                .expand(N, -1)
+                .clone()
+            )
 
         self.register_buffer("directions", directions)
         self.register_buffer(
