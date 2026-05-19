@@ -12,9 +12,9 @@ from .triton import dhs_bt_solve_cuda
 try:
     import dendra_solvers  # noqa:F401
 
-    AXONML_SOLVERS_AVAILABLE = True
+    DENDRA_SOLVERS_AVAILABLE = True
 except ImportError:
-    AXONML_SOLVERS_AVAILABLE = False
+    DENDRA_SOLVERS_AVAILABLE = False
 
 
 # ---------------- Topology helpers (local, to avoid extra deps) ----------------
@@ -130,7 +130,7 @@ class _dhs_bt(Integrator):
         dev, dtyp = model.device(), model.dtype()
         self.to(dev)
 
-        if dev.type == "cpu" and not AXONML_SOLVERS_AVAILABLE:
+        if dev.type == "cpu" and not DENDRA_SOLVERS_AVAILABLE:
             raise ImportError(
                 "DHS_BT integrator requires dendra_solvers package for CPU execution. "
                 "Please install it with `pip install dendra_solvers`."

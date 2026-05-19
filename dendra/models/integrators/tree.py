@@ -13,7 +13,7 @@ from .triton import dhs_solve_cuda, dhs_solve_multi_cuda
 try:
     import dendra_solvers  # noqa: F401
 
-    AXONML_SOLVERS_AVAILABLE = True
+    DENDRA_SOLVERS_AVAILABLE = True
 
     def _dhs_multi_solve_cpu(
         d_mem,
@@ -47,7 +47,7 @@ try:
             WARP_ROW_COUNT,
         )
 except ImportError:
-    AXONML_SOLVERS_AVAILABLE = False
+    DENDRA_SOLVERS_AVAILABLE = False
 
 
 THREADS_PER_WARP = 32
@@ -306,7 +306,7 @@ class _dhs(Integrator):
         device = model.device()
         self.to(device)
 
-        if device.type == "cpu" and not AXONML_SOLVERS_AVAILABLE:
+        if device.type == "cpu" and not DENDRA_SOLVERS_AVAILABLE:
             raise ImportError(
                 "DHS integrator requires dendra_solvers package for CPU execution. "
                 "Please install it with `pip install dendra_solvers`."
@@ -597,7 +597,7 @@ class _dhs_multi(MultiIntegrator):
         if dev0.type == "cuda":
             self.solve = partial(dhs_solve_multi_cuda, threads=self.threads)
         else:
-            if not AXONML_SOLVERS_AVAILABLE:
+            if not DENDRA_SOLVERS_AVAILABLE:
                 raise ImportError(
                     "DHS integrator requires dendra_solvers package for CPU execution. "
                     "Please install it with `pip install dendra_solvers`."

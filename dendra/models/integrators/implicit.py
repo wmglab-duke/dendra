@@ -11,9 +11,9 @@ from torch import Tensor
 try:
     import dendra_solvers  # noqa: F401
 
-    AXONML_SOLVERS_AVAILABLE = True
+    DENDRA_SOLVERS_AVAILABLE = True
 except ImportError:
-    AXONML_SOLVERS_AVAILABLE = False
+    DENDRA_SOLVERS_AVAILABLE = False
 
 from ..batching import expand_and_reshape
 from .core import Integrator, MultiIntegrator
@@ -219,7 +219,7 @@ class _bwd_euler_ub(Integrator):
                         "method='spd' requested on CPU but solve_tri_spd / dendra_solvers "
                         "is not available; falling back to method='thomas' (CPU) or PCR."
                     )
-                    if AXONML_SOLVERS_AVAILABLE:
+                    if DENDRA_SOLVERS_AVAILABLE:
                         self._solve = torch.ops.dendra_solvers.thomas_solve_t
                     else:
                         self._solve = pcr_solve_t
@@ -241,7 +241,7 @@ class _bwd_euler_ub(Integrator):
             # CUDA: always use CUDA Thomas implementation
             self._solve = thomas_solve_cuda_t
         elif dev == "cpu":
-            if AXONML_SOLVERS_AVAILABLE:
+            if DENDRA_SOLVERS_AVAILABLE:
                 if self.use_gc_variant:
                     self._solve = torch.ops.dendra_solvers.thomas_solve_t_gc
                 else:
@@ -388,7 +388,7 @@ class _bwd_euler_bt(Integrator):
     v_vars = ["v", "vc"]
 
     def __init__(self, model, mech, imem=None, method="inv", **kwargs):
-        if not AXONML_SOLVERS_AVAILABLE:
+        if not DENDRA_SOLVERS_AVAILABLE:
             logging.warning(
                 "Only CUDA-based solvers available, using triton Thomas solver. "
                 "CPU models will not work. Install dendra_solvers for CPU support."
@@ -458,7 +458,7 @@ class _bwd_euler_bt(Integrator):
         The outermost (Dirichlet) bath is *not* part of the unknowns.
         """
         if model.device().type == "cpu":
-            if not AXONML_SOLVERS_AVAILABLE:
+            if not DENDRA_SOLVERS_AVAILABLE:
                 raise RuntimeError(
                     "CPU models require dendra_solvers to be installed for implicit integration."
                 )
