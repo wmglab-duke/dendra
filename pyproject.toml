@@ -46,9 +46,6 @@ where = ["."]  # list of folders that contain the packages (["."] by default)
 include = ["axonml*",]  # package names should match these glob patterns (["*"] by default)
 namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 
-[tool.setuptools.package-data]
-"axonml" = ["trained/*"]
-
 [tool.commitizen]
 name = "cz_conventional_commits"
 version = "0.14.0"
