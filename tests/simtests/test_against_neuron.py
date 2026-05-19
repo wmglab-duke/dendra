@@ -5,10 +5,10 @@ import pytest
 import torch
 from neuron import h
 
-import axonml as ax
-from axonml.models.io import apply_d_lambda
-from axonml.models.mod import hh
-from axonml.units import nA
+import dendra as ax
+from dendra.models.io import apply_d_lambda
+from dendra.models.mod import hh
+from dendra.units import nA
 
 
 def sim_and_rec_neuron(d_lambda):

@@ -6,7 +6,7 @@ import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-import axonml.models.networks.netstim as M
+import dendra.models.networks.netstim as M
 
 # -------------------------- utilities & fixtures ----------------------------------
 

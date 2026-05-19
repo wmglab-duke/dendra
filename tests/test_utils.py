@@ -8,7 +8,7 @@ import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-import axonml.utils as U
+import dendra.utils as U
 
 # --------------------------------------------------------------------------
 # Helpers

@@ -8,7 +8,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # ---- Import the module under test -------------------------------------------------
-import axonml.models.parametric as M
+import dendra.models.parametric as M
 
 # If the source file had a weird `import itertools` line, patch it here.
 if not hasattr(M, "itertools"):

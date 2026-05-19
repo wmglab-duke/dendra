@@ -4,7 +4,7 @@ import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from axonml.models.fields.precomputed import (
+from dendra.models.fields.precomputed import (
     EfieldInterpolate3D,
     PreComputedExact,
     PreComputedInterpolate1D,

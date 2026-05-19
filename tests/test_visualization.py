@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-VIS = importlib.import_module("axonml.models.visualization")
+VIS = importlib.import_module("dendra.models.visualization")
 
 
 # -----------------------------------------------------------------------------

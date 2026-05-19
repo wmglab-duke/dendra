@@ -3,7 +3,7 @@ requires = ["setuptools", "cython", "numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "axonml"
+name = "dendra"
 requires-python = ">=3.11"
 readme = "README.md"
 
@@ -39,11 +39,11 @@ dev = [
 ]
 
 [tool.setuptools.dynamic]
-version = {attr = "axonml.__version__"}
+version = {attr = "dendra.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
-include = ["axonml*",]  # package names should match these glob patterns (["*"] by default)
+include = ["dendra*",]  # package names should match these glob patterns (["*"] by default)
 namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 
 [tool.commitizen]
@@ -51,7 +51,7 @@ name = "cz_conventional_commits"
 version = "0.14.0"
 version_provider = "commitizen"
 version_scheme = "pep440"
-version_files = ["axonml/__init__.py:__version__"]
+version_files = ["dendra/__init__.py:__version__"]
 tag_format = "v$version"
 update_changelog_on_bump = true
 changelog_file = "CHANGELOG.md"

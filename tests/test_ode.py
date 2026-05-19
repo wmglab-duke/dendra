@@ -3,7 +3,7 @@ from importlib import import_module
 import pytest
 import sympy as sp
 
-INTEGRATE = import_module("axonml.models.mechanisms.ode")
+INTEGRATE = import_module("dendra.models.mechanisms.ode")
 integrate2c = INTEGRATE.integrate2c
 
 

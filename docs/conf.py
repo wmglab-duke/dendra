@@ -19,7 +19,7 @@ from pathlib import Path
 
 # -- Project information -----------------------------------------------------
 
-project = "AxonML"
+project = "Dendra"
 copyright = "2025, WMG Lab (Duke University)"
 author = "Minhaj Hussain"
 
@@ -88,7 +88,7 @@ html_theme_options = {
     "light_logo": "logo-light.png",  # file is _static/logo-light.png
     "dark_logo": "logo-dark.png",  # file is _static/logo-dark.png
     "accent_color": "cyan",
-    "gitlab_url": "https://gitlab.oit.duke.edu/mah148/axonml",
+    "gitlab_url": "https://gitlab.oit.duke.edu/mah148/dendra",
 }
 
 html_css_files = ["custom.css"]

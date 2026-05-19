@@ -8,7 +8,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # ---------------------------------------------------------------------------
-MODULE_NAME = "axonml.models.fields.analytic"
+MODULE_NAME = "dendra.models.fields.analytic"
 
 point_src = importlib.import_module(MODULE_NAME)
 

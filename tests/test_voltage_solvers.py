@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from axonml.models.integrators.tridiag import pcr_solve_t
-from axonml.models.integrators.triton import (
+from dendra.models.integrators.tridiag import pcr_solve_t
+from dendra.models.integrators.triton import (
     dhs_solve_cuda,
     thomas_solve_cuda_bt,
     thomas_solve_cuda_t,

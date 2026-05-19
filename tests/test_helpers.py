@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-import axonml.helpers as H
+import dendra.helpers as H
 
 # --------------------------------------------------------------------------
 #  basic utilities
@@ -117,7 +117,7 @@ def test_allow_tf32(state):
 
 
 def test_tic_toc_and_stack_error(caplog):
-    caplog.set_level("INFO", logger="axonml")
+    caplog.set_level("INFO", logger="dendra")
 
     H.tic("start")
     time.sleep(0.001)

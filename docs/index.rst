@@ -1,7 +1,7 @@
-Welcome to AxonML!
+Welcome to Dendra!
 ===================
 
-``AxonML`` is a differentiable simulator for biophysical neuron fiber models in `PyTorch <https://github.com/pytorch/pytorch>`_, with an emphasis on effects of extracellular stimulation and event-based networks with synaptic delays. Its key features are:
+``Dendra`` is a differentiable simulator for biophysical neuron fiber models in `PyTorch <https://github.com/pytorch/pytorch>`_, with an emphasis on effects of extracellular stimulation and event-based networks with synaptic delays. Its key features are:
 
 - support for CPU and GPU
 - automatic differentiation, allowing gradient-based optimization of thousands of parameters
@@ -10,23 +10,23 @@ Welcome to AxonML!
 - flexible extracellular stimulation with support for complex 3D fields
 - event-based network simulation with synaptic delays
 - a simple API, making it easy to use for beginners and experts alike
-- implementations of a range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more (via `AxonML Models <https://gitlab.oit.duke.edu/mah148/axonml-models>`_)
+- implementations of a range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more (via `Dendra Models <https://gitlab.oit.duke.edu/mah148/dendra-models>`_)
 
 
-``AxonML`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please let us know by opening an issue on our `GitLab repository <https://gitlab.oit.duke.edu/mah148/axonml>`_.
+``Dendra`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please let us know by opening an issue on our `GitLab repository <https://gitlab.oit.duke.edu/mah148/dendra>`_.
 
 Getting started
 ---------------
 
-``AxonML`` allows you to simulate the effects of stimulation on large numbers of biophysical neuron models on CPU or GPU:
+``Dendra`` allows you to simulate the effects of stimulation on large numbers of biophysical neuron models on CPU or GPU:
 
 .. code-block:: python
 
     import torch
     import matplotlib.pyplot as plt
 
-    import axonml as ax
-    from axonml_models.models import smolMRG
+    import dendra as ax
+    from dendra_models.models import smolMRG
 
     # single 2.0 µm MRG model with extracellular stimulation
     model = smolMRG([2.0], n_node=201)
@@ -52,15 +52,15 @@ Getting started
 Installation
 ------------
 
-AxonML targets Python 3.11+ and PyTorch 2.7+ (CUDA 12.9 wheels recommended for GPU use). A typical setup is:
+Dendra targets Python 3.11+ and PyTorch 2.7+ (CUDA 12.9 wheels recommended for GPU use). A typical setup is:
 
-1. Create and activate an isolated environment (optional): ``conda create -n axonml python=3.12 && conda activate axonml``.
+1. Create and activate an isolated environment (optional): ``conda create -n dendra python=3.12 && conda activate dendra``.
 2. Install PyTorch (choose GPU or CPU wheels): ``python -m pip install torch --index-url https://download.pytorch.org/whl/cu129``.
-3. Clone the repo and install: ``git clone https://gitlab.oit.duke.edu/mah148/axonml.git && cd axonml && python -m pip install .``.
+3. Clone the repo and install: ``git clone https://gitlab.oit.duke.edu/mah148/dendra.git && cd dendra && python -m pip install .``.
 
 To build these docs locally, install the extras (``python -m pip install '.[doc]'``) and run ``make html`` inside ``docs``.
 
-See :ref:`installation` for detailed guidance and optional extras (Jupyter, development tooling, and CPU implicit solver support via ``axonml-solvers``).
+See :ref:`installation` for detailed guidance and optional extras (Jupyter, development tooling, and CPU implicit solver support via ``dendra-solvers``).
 
 
 Feedback and Contributions
@@ -79,7 +79,7 @@ Contribution tips:
 Citation
 --------
 
-If you use `AxonML`, consider citing the `corresponding paper <https://www.nature.com/articles/s41467-024-51709-8>`_:
+If you use `Dendra`, consider citing the `corresponding paper <https://www.nature.com/articles/s41467-024-51709-8>`_:
 
 .. code-block:: console
 
@@ -130,5 +130,5 @@ If you use `AxonML`, consider citing the `corresponding paper <https://www.natur
    :maxdepth: 2
    :caption: Resources
 
-   axonml
+   dendra
    license
