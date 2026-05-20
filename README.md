@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/_static/logo-light.png">
+  <img src="docs/_static/logo-v2.png">
 </div>
 
 ***
@@ -11,20 +11,20 @@
 Fast, scalable, and differentiable neural simulator with support for extracellular fields. Useful to implement and train high-throughput GPU-compatible models.
 
 ## Documentation
-Full documentation is available at [https://mah148.pages.oit.duke.edu/axonml](https://mah148.pages.oit.duke.edu/axonml).
+Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](https://mah148.pages.oit.duke.edu/dendra).
 
 ## Requirements
 
 ### OS requirements
-`axonml` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).
+`dendra` has been tested on Windows 11 under WSL2 (Ubuntu 22.04), Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux), and macOS (Tahoe 26.3).
 
 ### Python dependencies
-`axonml` requires Python 3.10+ and PyTorch 2.7+. For GPU support, CUDA 12.9+ is required for best performance.
+`dendra` requires Python 3.10+ and PyTorch 2.7+. For GPU support, CUDA 12.9+ is required for best performance.
 
 ## 🖥️ Installation
 
 > [!TIP]
-> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n axonml python=3.12`. Be sure to activate your new environment (`conda activate axonml`) before following the installation instructions or running code.
+> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n dendra python=3.12`. Be sure to activate your new environment (`conda activate dendra`) before following the installation instructions or running code.
 
 1. Install PyTorch (+ CUDA 12.9+ if you're running on GPU).
 ```bash
@@ -34,13 +34,13 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/axonml](ht
 2. Clone this repository.
 
 ```bash
-> git clone https://gitlab.oit.duke.edu/mah148/axonml.git
+> git clone https://gitlab.oit.duke.edu/mah148/dendra.git
 ```
 
 3. Install.
 
 ```bash
-> cd axonml
+> cd dendra
 > python -m pip install .
 ```
 
@@ -59,16 +59,18 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/axonml](ht
 > Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive space.
 
 > [!IMPORTANT]
-> To enable implicit methods for solving $V_m$ **on CPU**, install [axonml-solvers](https://gitlab.oit.duke.edu/mah148/axonml-solvers). GPU implementations of all solvers are available by default.
+> To enable implicit methods for solving $V_m$ **on CPU**, install [dendra-solvers](https://gitlab.oit.duke.edu/mah148/dendra-solvers). GPU implementations of all solvers are available by default.
 
 ## 🗄️ Pre-implemented models
 
-Cell models are available at https://gitlab.oit.duke.edu/mah148/axonml-models.
+Cell & network models are available at https://gitlab.oit.duke.edu/mah148/dendra-models.
 
 
 ## 🔍 Citation
 
-Geometric / topological surrogates and gradient-based design of neurostimulation are discussed in, and `AxonML` is introduced in
+If you use Dendra, please cite...(paper forthcoming).
+
+Please also consider citing the work where geometric / topological surrogates and gradient-based design of selective neurostimulation are discussed in detail:
 
 Minhaj A. Hussain, Warren M. Grill, Nicole A. Pelot. "Highly efficient modeling and optimization of neural fiber responses to electrical stimulation." *Nature Communications.* 2024. [(nature.com)](https://www.nature.com/articles/s41467-024-51709-8)
 
@@ -81,8 +83,6 @@ Minhaj A. Hussain, Warren M. Grill, Nicole A. Pelot. "Highly efficient modeling 
     year = {2024}
 }
 ```
-
-AxonML v2, adding support for branched morphologies, multiple layers of extracellular field, and network simulations, is described in...(paper forthcoming).
 
 
 ## 📜 License

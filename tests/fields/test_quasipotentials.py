@@ -14,7 +14,7 @@ from hypothesis.extra import numpy as hnp
 # -----------------------------------------------------------------------------#
 # 1.  SUT import (adjust the import path if you keep the function elsewhere)
 # -----------------------------------------------------------------------------#
-from axonml.models.fields.quasipotentials import (
+from dendra.models.fields.quasipotentials import (
     calculate_quasipotentials_batched_coords,
 )
 

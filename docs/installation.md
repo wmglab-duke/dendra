@@ -1,8 +1,8 @@
 (installation)=
 # Installation
 
-> 💡 We recommend using a dedicated environment (e.g., `conda`) for AxonML.
-> AxonML targets Python 3.11+; the examples below use Python 3.12.
+> 💡 We recommend using a dedicated environment (e.g., `conda`) for Dendra.
+> Dendra targets Python 3.11+; the examples below use Python 3.12.
 
 ```{important}
 On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best compatibility and performance. 'Native' Windows is currently not supported for GPU simulations.
@@ -19,8 +19,8 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 1. Create and activate an environment (optional but recommended):
 
    ```sh
-   conda create -n axonml python=3.12
-   conda activate axonml
+   conda create -n dendra python=3.12
+   conda activate dendra
    ```
 
 2. Install PyTorch (pick the command that matches your hardware):
@@ -30,7 +30,7 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
    ```
 
    ```{important}
-   If installing on Windows without WSL2, please follow PyTorch installation instructions [here](https://docs.pytorch.org/tutorials/unstable/inductor_windows.html) to ensure proper setup of the PyTorch Inductor backend (used by AxonML for JIT-compilation of models).
+   If installing on Windows without WSL2, please follow PyTorch installation instructions [here](https://docs.pytorch.org/tutorials/unstable/inductor_windows.html) to ensure proper setup of the PyTorch Inductor backend (used by Dendra for JIT-compilation of models).
    ```
 
    ```sh
@@ -43,11 +43,11 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 
 3. (Windows without WSL2) Install NEURON using the precompiled installer from https://neuron.yale.edu/neuron/download.
 
-4. Clone the repository and install AxonML:
+4. Clone the repository and install Dendra:
 
    ```sh
-   git clone https://gitlab.oit.duke.edu/mah148/axonml.git
-   cd axonml
+   git clone https://gitlab.oit.duke.edu/mah148/dendra.git
+   cd dendra
    python -m pip install .
    ```
 
@@ -55,7 +55,7 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 
 - Jupyter support: `python -m pip install '.[jupyter]'`
 
-- CPU implicit solvers: install the companion package [`axonml-solvers`](https://gitlab.oit.duke.edu/mah148/axonml-solvers) (required only for CPU implicit methods; GPU solvers are included by default). Also required to build the documentation.
+- CPU implicit solvers: install the companion package [`dendra-solvers`](https://gitlab.oit.duke.edu/mah148/dendra-solvers) (required only for CPU implicit methods; GPU solvers are included by default). Also required to build the documentation.
 
 - Documentation build dependencies: `python -m pip install '.[doc]'` then `cd docs && make html`
 
@@ -66,14 +66,14 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
   python -m pre-commit install
   ```
 
-- Library of models: install the companion package [`axonml-models`](https://gitlab.oit.duke.edu/mah148/axonml-models) for additional pre-defined neuron & network models.
+- Library of models: install the companion package [`dendra-models`](https://gitlab.oit.duke.edu/mah148/dendra-models) for additional pre-defined neuron & network models.
 
 ## Verify the install
 
 ```sh
 python - <<'PY'
-import axonml as ax
+import dendra as ax
 
-print("AxonML import succeeded")
+print("Dendra import succeeded")
 PY
 ```

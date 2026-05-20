@@ -1,7 +1,7 @@
 import networkx as nx
 
 # Import the code you want to test
-import axonml.models.io as io
+import dendra.models.io as io
 
 
 def test_find_branch_points():

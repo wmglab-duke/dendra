@@ -6,7 +6,7 @@ import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from axonml.models.callbacks import (
+from dendra.models.callbacks import (
     Active,
     AnomalyDetector,
     APCount,
@@ -16,7 +16,7 @@ from axonml.models.callbacks import (
 
 
 # ----------------------------------------------------------------------
-# Minimal stand-ins that look like a real AxonML model/integrator
+# Minimal stand-ins that look like a real Dendra model/integrator
 # ----------------------------------------------------------------------
 class _DummyIntegrator:
     def __init__(self, n_ax, nc, device):

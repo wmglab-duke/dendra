@@ -2,10 +2,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-import axonml as ax
-from axonml.models.callbacks import RecorderLambda
-from axonml.models.mod import exp2syn, hh
-from axonml.units import ms
+import dendra as ax
+from dendra.models.callbacks import RecorderLambda
+from dendra.models.mod import exp2syn, hh
+from dendra.units import ms
 
 ax.set_jit_enabled(False)  # True to enable jit compilation globally
 

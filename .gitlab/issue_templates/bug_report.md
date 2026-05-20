@@ -10,7 +10,7 @@
 ## Example Project
 
 (If possible, create a minimal example project or script that exhibits the problematic behavior, and link to it here.
-If you are using an older version of AxonML, this will also determine whether the bug has been fixed
+If you are using an older version of Dendra, this will also determine whether the bug has been fixed
 in a more recent version)
 
 ## What is the current bug behavior?
@@ -26,8 +26,8 @@ in a more recent version)
 - OS:
 - Python version:
 - PyTorch version:
-- AxonML version:
-- AxonML commit (if from source):
+- Dendra version:
+- Dendra commit (if from source):
 - CPU:
 - GPU:
 - Installation method (pip/conda/source):

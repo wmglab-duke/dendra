@@ -1,4 +1,4 @@
-Units used in AxonML
+Units used in Dendra
 ====================
 
 ===========     =======================
@@ -13,12 +13,12 @@ Time            ms
 Frequency       kHz
 ===========     =======================
 
-Internally, AxonML assumes the above units for all physical quantities.
-However, it may be natural to use different units under certain circumstances. For example, you may want to specify a length in millimeters (mm) instead of micrometers (µm) (e.g., when speciying the length of an axon), or a time in seconds (s) instead of milliseconds (ms). For intracellular current injection in particular, it is more natural to express the amplitude in units of nA. To facilitate this, AxonML provides a set of unit conversion factors that you can use to convert between different units in :mod:`axonml.units`:
+Internally, Dendra assumes the above units for all physical quantities.
+However, it may be natural to use different units under certain circumstances. For example, you may want to specify a length in millimeters (mm) instead of micrometers (µm) (e.g., when speciying the length of an axon), or a time in seconds (s) instead of milliseconds (ms). For intracellular current injection in particular, it is more natural to express the amplitude in units of nA. To facilitate this, Dendra provides a set of unit conversion factors that you can use to convert between different units in :mod:`dendra.units`:
 
 .. code-block:: python
 
-    from axonml.units import mm, s, nA
+    from dendra.units import mm, s, nA
 
     length_mm = 1.0 * mm   # 1 mm in micrometers
     time_s = 0.5 * s       # 0.5 seconds in milliseconds

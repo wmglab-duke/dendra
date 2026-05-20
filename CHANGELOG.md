@@ -8,12 +8,12 @@
 
 ### Feat
 
-- **axonml.models.callbacks**: adding t_end_check to ThresholdCallbacks to limit threshold detection to specified time window
-- **axonml.models.callbacks**: added ActiveALCount to determine activity based on total # registered APs
+- **dendra.models.callbacks**: adding t_end_check to ThresholdCallbacks to limit threshold detection to specified time window
+- **dendra.models.callbacks**: added ActiveALCount to determine activity based on total # registered APs
 
 ### Fix
 
-- **axonml.models.callbacks**: add t_end_check as param to Active* threshold callback family
+- **dendra.models.callbacks**: add t_end_check as param to Active* threshold callback family
 - resolve positive and negative parameter overrides in mro for Parameterized
 
 ### Refactor
@@ -56,7 +56,7 @@
 
 ### Feat
 
-- **axonml/core.py**: str representation of Population and subclasses through extra_repr() (brief) and pretty() (verbose / complete)
+- **dendra/core.py**: str representation of Population and subclasses through extra_repr() (brief) and pretty() (verbose / complete)
 
 ## v0.9.0 (2026-02-24)
 

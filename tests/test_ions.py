@@ -1,4 +1,4 @@
-"""Tests for ``axonml.models.mechanisms._ions``.
+"""Tests for ``dendra.models.mechanisms._ions``.
 
 These tests aim for high branch & line coverage of the public helpers,
 context-managers, and the ``Ion`` module class.  A single automatic fixture
@@ -15,7 +15,7 @@ import torch
 from hypothesis import given
 from hypothesis import strategies as st
 
-from axonml.models.mechanisms import _ions as ions  # noqa: E402  (after torch)
+from dendra.models.mechanisms import _ions as ions  # noqa: E402  (after torch)
 
 # -----------------------------------------------------------------------------
 # System‑under‑test

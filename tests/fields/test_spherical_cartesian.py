@@ -4,7 +4,7 @@ import torch
 from hypothesis import given
 from hypothesis import strategies as st
 
-from axonml.models.fields.spherical_cartesian import spherical_to_cartesian
+from dendra.models.fields.spherical_cartesian import spherical_to_cartesian
 
 
 def test_spherical_known_axes():
