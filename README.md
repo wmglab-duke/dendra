@@ -16,7 +16,7 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](ht
 ## Requirements
 
 ### OS requirements
-`dendra` has been tested on Windows 11 under WSL2 (Ubuntu 22.04) and Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux).
+`dendra` has been tested on Windows 11 under WSL2 (Ubuntu 22.04), Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux), and macOS (Tahoe 26.3).
 
 ### Python dependencies
 `dendra` requires Python 3.10+ and PyTorch 2.7+. For GPU support, CUDA 12.9+ is required for best performance.
@@ -63,12 +63,14 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](ht
 
 ## 🗄️ Pre-implemented models
 
-Cell models are available at https://gitlab.oit.duke.edu/mah148/dendra-models.
+Cell & network models are available at https://gitlab.oit.duke.edu/mah148/dendra-models.
 
 
 ## 🔍 Citation
 
-Geometric / topological surrogates and gradient-based design of neurostimulation are discussed in, and `Dendra` is introduced in
+If you use Dendra, please cite...(paper forthcoming).
+
+Please also consider citing the work where geometric / topological surrogates and gradient-based design of selective neurostimulation are discussed in detail:
 
 Minhaj A. Hussain, Warren M. Grill, Nicole A. Pelot. "Highly efficient modeling and optimization of neural fiber responses to electrical stimulation." *Nature Communications.* 2024. [(nature.com)](https://www.nature.com/articles/s41467-024-51709-8)
 
@@ -81,8 +83,6 @@ Minhaj A. Hussain, Warren M. Grill, Nicole A. Pelot. "Highly efficient modeling 
     year = {2024}
 }
 ```
-
-Dendra v2, adding support for branched morphologies, multiple layers of extracellular field, and network simulations, is described in...(paper forthcoming).
 
 
 ## 📜 License
