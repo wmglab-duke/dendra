@@ -48,7 +48,7 @@ namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.14.0"
+version = "0.15.0"
 version_provider = "commitizen"
 version_scheme = "pep440"
 version_files = ["dendra/__init__.py:__version__"]
