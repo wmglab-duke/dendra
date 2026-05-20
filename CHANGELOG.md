@@ -1,3 +1,19 @@
+## v0.15.0 (2026-05-20)
+
+### Feat
+
+- **models.fields.precomputed**: added mesh-aware field interpolators to interface with SimNIBS
+
+### Fix
+
+- **instrument.thresholder**: fix to handle nans in field for Thresholder
+- **models.tree**: fixes rotate_into_direction
+
+### Refactor
+
+- rename package dendra
+- rename package from axonml to dendra
+
 ## v0.14.0 (2026-04-20)
 
 ### Feat
