@@ -610,6 +610,58 @@ class Network(RNGMixin):
 
         return local
 
+    def _mechanism_from_pre_var(self, pre, pre_var):
+        """Return the mechanism addressed by a ``mech.<alias>.<var>`` pre_var.
+
+        ``Network`` stores source indices in population-flat coordinates.
+        Mechanism variables, however, can be local to the mechanism insertion
+        region.  When ``pre_var`` names such a mechanism-local variable, the
+        indices passed to ``NetCon`` need to be converted into that local frame.
+
+        Returns ``None`` for ordinary population variables, NetStim variables,
+        malformed strings, or pre variables whose mechanism cannot be resolved.
+        """
+        if not isinstance(pre_var, str):
+            return None
+        parts = pre_var.split(".")
+        if len(parts) < 3 or parts[0] != "mech":
+            return None
+        handler = getattr(pre, "mech", None)
+        if handler is None:
+            return None
+        alias = parts[1]
+        try:
+            return getattr(handler, alias)
+        except AttributeError:
+            mechanisms = getattr(handler, "mechanisms", None)
+            if mechanisms is None:
+                return None
+            return mechanisms.get(alias, None)
+
+    def _pre_idx_for_pre_var(self, pre, pre_idx, pre_var):
+        """Convert population-flat pre indices to the frame used by ``pre_var``.
+
+        For population-wide variables such as ``v`` or mechanisms inserted
+        everywhere, ``pre_idx`` is already correct.  For variables owned by a
+        mechanism inserted on a slice, e.g. ``mech.ctx_fs.syn_spikes``,
+        ``get_pre_var(pre).view(-1)`` is mechanism-local, so the population-flat
+        indices must be mapped to local indices using the mechanism key.
+        """
+        mech = self._mechanism_from_pre_var(pre, pre_var)
+        if mech is None or getattr(mech, "key", None) is None:
+            return pre_idx
+
+        pre_flat = pre_idx.to(device=pre.device(), dtype=torch.long)
+        local = get_local_index(pre, mech, pre_flat)
+        if torch.any(local < 0):
+            bad = pre_flat[local < 0][:10].detach().cpu().tolist()
+            raise ValueError(
+                f"Pre-synaptic variable '{pre_var}' is local to mechanism "
+                f"'{getattr(mech, 'name', '<unknown>')}', but source locations "
+                f"including {bad} are outside that mechanism's insertion region."
+            )
+        return local
+
     def _all_to_all_edges(self, pre_pool, post_pool):
         """Return all directed edges from pre_pool to post_pool."""
         if pre_pool.numel() == 0 or post_pool.numel() == 0:
@@ -1265,10 +1317,11 @@ class Network(RNGMixin):
             thresholds = torch.cat([expand(s[2], s[3]) for s in specs])
             weights = make_weight([s[4] for s in specs], [s[5] for s in specs])
             delay = make_weight([s[6] for s in specs], [s[7] for s in specs])
+            pre_idx_for_var = self._pre_idx_for_pre_var(pre, pre_idx, pre_var)
 
             syn = NetCon(
                 pre=pre,
-                pre_idx=pre_idx,
+                pre_idx=pre_idx_for_var,
                 thresholds=thresholds,
                 post=post,
                 post_idx=post_idx,

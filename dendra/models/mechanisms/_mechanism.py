@@ -242,6 +242,14 @@ class Mechanism(Parameterized):
 
         self.register_buffer("dt", torch.tensor(0.0))
 
+        # Mechanism-level waveform injection support.  The base "inject"
+        # method is intentionally a no-op; mechanisms that want to consume
+        # waveform stimuli can override it and call register_waveform_injection().
+        # Waveforms are stored as submodules so their parameters move with the
+        # mechanism and remain differentiable.
+        self.injected_waveforms = torch.nn.ModuleList()
+        self._injection_specs = []
+
         if key is not None:
             if is_composable:
                 self.key = key
@@ -1000,6 +1008,215 @@ class Mechanism(Parameterized):
         for key in kwargs.keys():
             if key not in valid_keys:
                 raise ValueError(f"Unexpected keyword argument: {key}")
+
+    # -- mechanism-level waveform injections ---------------------------------
+    def inject(
+        self,
+        waveform,
+        *,
+        index=None,
+        shape=None,
+        model_shape=None,
+        model=None,
+        **kwargs,
+    ):
+        """Optionally attach a waveform stimulus to this mechanism.
+
+        The default implementation is deliberately a no-op and returns ``False``.
+        Mechanisms that own their own voltage/current dynamics can override this
+        method and either consume the arguments directly or call
+        :meth:`register_waveform_injection` to get padded ``I(t)`` tensors.
+
+        Parameters
+        ----------
+        waveform : Waveform
+            Waveform object supplied through ``model[idx].inject(waveform)``.
+        index : tuple, optional
+            Population-level index tuple identifying the targeted compartments.
+        shape : tuple, optional
+            Shape produced by applying ``index`` to the population.
+        model_shape : tuple, optional
+            Full population voltage shape at registration time.
+        model : Population, optional
+            Owning population. Used for device/dtype/shape information.
+        **kwargs
+            Reserved for future extension.
+
+        Returns
+        -------
+        bool
+            ``True`` if the mechanism accepted the injection, otherwise ``False``.
+        """
+        return False
+
+    def clear_injections(self):
+        """Remove all waveform injections registered on this mechanism."""
+        self.injected_waveforms = torch.nn.ModuleList()
+        self._injection_specs = []
+        for name in list(self._buffers.keys()):
+            if name.startswith("_injection_mask_") or name.startswith(
+                "_injection_scale_"
+            ):
+                delattr(self, name)
+        return self
+
+    def register_waveform_injection(
+        self,
+        waveform,
+        *,
+        index=None,
+        model_shape=None,
+        current_name="i_inj",
+        scale=1.0,
+        model=None,
+    ):
+        """Register a waveform and build a local padding mask for this mechanism.
+
+        This helper is intended for mechanism subclasses that override
+        :meth:`inject`.  It computes the overlap between a population-level
+        injection index and the compartments occupied by this mechanism, stores
+        the waveform as a submodule, and records a boolean local mask.  Later,
+        :meth:`evaluate_injections` evaluates all registered waveforms at the
+        current mechanism time and returns a tensor shaped like the local voltage
+        argument, with zeros outside the targeted compartments.
+        """
+        device = self.diam.device
+        dtype = self.diam.dtype
+        if model is not None:
+            device = model.device()
+            dtype = model.dtype()
+
+        if hasattr(waveform, "to"):
+            waveform = waveform.to(device=device, dtype=dtype)
+
+        if model_shape is None:
+            # No population frame was supplied: treat this as targeting every
+            # compartment where the mechanism resides.
+            local_mask = torch.ones_like(self.diam, dtype=torch.bool, device=device)
+        else:
+            full_mask = torch.zeros(tuple(model_shape), dtype=torch.bool, device=device)
+            if index is None:
+                full_mask.fill_(True)
+            else:
+                full_mask[index] = True
+            local_mask = self.get(full_mask)
+
+        if local_mask.numel() == 0 or not bool(torch.any(local_mask).item()):
+            return False
+
+        k = len(self.injected_waveforms)
+        mask_name = f"_injection_mask_{k}"
+        scale_name = f"_injection_scale_{k}"
+        self.register_buffer(mask_name, local_mask.detach().clone())
+        self.register_buffer(
+            scale_name,
+            torch.as_tensor(scale, device=device, dtype=dtype).detach().clone(),
+        )
+        self.injected_waveforms.append(waveform)
+        self._injection_specs.append(
+            {"mask": mask_name, "scale": scale_name, "current_name": current_name}
+        )
+
+        # Expose the current variable immediately for introspection, even before
+        # the first timestep.  Subclasses may also declare it with ASSIGNED.
+        if not hasattr(self, current_name):
+            self.register_buffer(
+                current_name, torch.zeros_like(local_mask, dtype=dtype)
+            )
+        return True
+
+    def _expand_injection_value(self, value, mask, out):
+        """Return ``value`` padded/broadcast into ``out`` at ``mask`` locations."""
+        value = torch.as_tensor(value, device=out.device, dtype=out.dtype)
+
+        # Bring an unbatched mask up to the current local state shape.
+        mask = mask.to(device=out.device, dtype=torch.bool)
+        while mask.ndim < out.ndim:
+            mask = mask.unsqueeze(0)
+        mask = mask.expand_as(out)
+
+        if value.ndim == 0 or value.numel() == 1:
+            return value.reshape(()) * mask.to(out.dtype)
+
+        if tuple(value.shape) == tuple(out.shape):
+            return value * mask.to(out.dtype)
+
+        # Common case: waveform returns the unbatched local mechanism shape.
+        if value.ndim <= out.ndim:
+            v = value
+            while v.ndim < out.ndim:
+                v = v.unsqueeze(0)
+            if tuple(v.shape) == tuple(out.shape) or all(
+                a == b or a == 1 for a, b in zip(v.shape, out.shape)
+            ):
+                return v.expand_as(out) * mask.to(out.dtype)
+
+        # Vector over selected compartments.  This supports either a single
+        # unbatched vector of length n_selected or a batched tensor whose last
+        # dimension is n_selected.
+        n_selected = int(mask.reshape(-1).sum().item()) if out.ndim == mask.ndim else 0
+        if value.numel() == n_selected:
+            padded = torch.zeros_like(out)
+            padded.reshape(-1)[mask.reshape(-1)] = value.reshape(-1)
+            return padded
+
+        # Last-resort attempt: rely on PyTorch broadcasting, then mask.
+        try:
+            return value.expand_as(out) * mask.to(out.dtype)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Waveform output shape {tuple(value.shape)} cannot be broadcast "
+                f"or padded into mechanism-local shape {tuple(out.shape)}."
+            ) from exc
+
+    def evaluate_injections(self, v=None, *, t=None, current_name="i_inj"):
+        """Evaluate registered waveform injections and expose the result.
+
+        Parameters
+        ----------
+        v : torch.Tensor, optional
+            Local voltage/state tensor that defines the desired output shape.  If
+            omitted, the first injection mask shape is used.
+        t : torch.Tensor or float, optional
+            Evaluation time in ms.  Defaults to the mechanism's ``t`` reference,
+            which :class:`Population` sets during build.
+        current_name : str, optional
+            Name of the exposed current variable.  Defaults to ``i_inj``.
+
+        Returns
+        -------
+        torch.Tensor
+            Sum of all registered waveform currents, padded to ``v``'s shape.
+        """
+        if v is None:
+            if self._injection_specs:
+                v = getattr(self, self._injection_specs[0]["mask"]).to(self.diam.dtype)
+            elif hasattr(self, current_name):
+                v = getattr(self, current_name)
+            else:
+                v = self.diam
+
+        out = torch.zeros_like(v, dtype=v.dtype, device=v.device)
+        if not self._injection_specs:
+            setattr(self, current_name, out)
+            return out
+
+        if t is None:
+            t = (
+                self.t
+                if hasattr(self, "t")
+                else torch.zeros((), device=v.device, dtype=v.dtype)
+            )
+        t = torch.as_tensor(t, device=v.device, dtype=v.dtype)
+
+        for k, spec in enumerate(self._injection_specs):
+            mask = getattr(self, spec["mask"])
+            scale = getattr(self, spec["scale"])
+            value = self.injected_waveforms[k](t) * scale
+            out = out + self._expand_injection_value(value, mask, out)
+
+        setattr(self, current_name, out)
+        return out
 
 
 class VoltageProcess(Mechanism):

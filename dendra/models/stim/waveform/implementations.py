@@ -12,6 +12,7 @@ __all__ = [
     "bi_rect_balanced",
     "bi_rect_symm",
     "arbitrary",
+    "constant",
 ]
 
 
@@ -488,3 +489,36 @@ class arbitrary(Waveform):
             t = t.unsqueeze(0)
             t = t.expand(self.values.shape[0], -1)
         return interp1d(self.tpoints, self.values, t)
+
+
+class constant(Waveform):
+    """
+    Constant waveform generator.
+
+    Generates a constant value over time.
+
+    Parameters
+    ----------
+    value : float, optional
+        The constant value to generate. Default is 0.0.
+
+    Notes
+    -----
+    The waveform is defined as:
+
+    .. math::
+        f(t) = \\text{value}
+
+    Examples
+    --------
+    >>> import torch
+    >>> import dendra as ax
+    >>> waveform = ax.constant(value=5.0)
+    >>> t = torch.linspace(0, 1, 100)
+    >>> values = waveform(t)
+    """
+
+    Waveform.PARAMETER(value=0.0)
+
+    def fn(self, t):
+        return _time_broadcast_param(self.value, t)

@@ -227,7 +227,10 @@ class Population(P, Sliceable):
 
         self.register_buffer("_dummy", torch.zeros(1))
 
-        self.register_buffer("v", torch.full((N, C), self.v_init))
+        # Initialize voltage from scalar v_init or from a vector of length nc.
+        # The latter is useful for point-neuron populations represented as a
+        # single Dendra population with one compartment per modeled neuron.
+        self.register_buffer("v", self.expanded_v_init((N, C)).clone().contiguous())
         self.register_buffer("diam", torch.full(self.shape, 500.0))
         self.register_buffer("dx", torch.full(self.shape, 100.0))
         self.register_buffer("t", torch.zeros(()))
@@ -250,6 +253,11 @@ class Population(P, Sliceable):
         self.integrator = None  # type: ignore
 
         self.injections = []
+        # Parallel mechanism-level injection registry.  Standard injections are
+        # still consumed by Intra/integrators; these specs are additionally
+        # offered to mechanisms via Mechanism.inject(...).
+        self.mechanism_injections = []
+        self.mechanism_injection_accepted = []
         self.intra = None
 
         self._mech_data = {}
@@ -518,6 +526,102 @@ class Population(P, Sliceable):
             Data type inferred from the registered dummy buffer.
         """
         return self._dummy.dtype
+
+    def expanded_v_init(self, target_shape=None):
+        """
+        Return ``v_init`` as a tensor expanded to the model voltage shape.
+
+        Supported ``v_init`` forms are:
+
+        - scalar: broadcast to every element of ``model.v``;
+        - one-dimensional tensor/array/list of length ``model.nc``: broadcast
+          across the population axis and any batch axes;
+        - tensor/array with shape ``(model.np, model.nc)`` or the current full
+          voltage shape: used as explicit per-element initial voltages.
+
+        Parameters
+        ----------
+        target_shape : tuple of int, optional
+            Shape to expand into. Defaults to ``self.v.shape`` after ``v`` has
+            been registered.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor view with shape ``target_shape`` on this model's device and
+            dtype. The returned tensor may be expanded; callers that will mutate
+            it should clone first.
+        """
+        if target_shape is None:
+            if not hasattr(self, "v"):
+                target_shape = (self.np, self.nc)
+            else:
+                target_shape = tuple(self.v.shape)
+        else:
+            target_shape = tuple(int(x) for x in target_shape)
+
+        if len(target_shape) < 2:
+            raise ValueError(
+                f"target_shape must have at least population and compartment axes; "
+                f"got {target_shape}."
+            )
+
+        n_pop = int(target_shape[-2])
+        n_comp = int(target_shape[-1])
+        v0 = torch.as_tensor(self.v_init, device=self.device(), dtype=self.dtype())
+
+        # Scalar or scalar-like tensor/list: broadcast everywhere.
+        if v0.ndim == 0 or v0.numel() == 1:
+            return v0.reshape(()).expand(target_shape)
+
+        # Length-nc vector: one initial value per compartment, broadcast across
+        # cells/fibers and batch dimensions.
+        if v0.ndim == 1:
+            if v0.numel() != n_comp:
+                raise ValueError(
+                    f"v_init has length {v0.numel()}, but model.nc is {n_comp}. "
+                    "Use a scalar or a vector of length model.nc."
+                )
+            view_shape = (1,) * (len(target_shape) - 1) + (n_comp,)
+            return v0.reshape(view_shape).expand(target_shape)
+
+        # Explicit initial voltage for the unbatched core shape.
+        core_shape = (n_pop, n_comp)
+        if tuple(v0.shape) == core_shape:
+            view_shape = (1,) * (len(target_shape) - 2) + core_shape
+            return v0.reshape(view_shape).expand(target_shape)
+
+        # Explicit initial voltage for the full current shape.
+        if tuple(v0.shape) == target_shape:
+            return v0
+
+        # Common explicit-broadcast form: [1, nc].
+        if tuple(v0.shape) == (1, n_comp):
+            view_shape = (1,) * (len(target_shape) - 2) + (1, n_comp)
+            return v0.reshape(view_shape).expand(target_shape)
+
+        raise ValueError(
+            "Unsupported v_init shape. Expected a scalar, a 1D vector of length "
+            f"model.nc ({n_comp}), shape (model.np, model.nc) = {core_shape}, "
+            f"or full voltage shape {target_shape}; got shape {tuple(v0.shape)}."
+        )
+
+    def set_v_init(self, v_init):
+        """
+        Set and validate the model's voltage initial condition.
+
+        ``v_init`` follows the same shape rules as :meth:`expanded_v_init`.
+        This method does not immediately overwrite ``model.v``; call
+        :meth:`init_v` or :meth:`initialize` to apply it.
+        """
+        old_v_init = self.v_init
+        self.v_init = v_init
+        try:
+            self.expanded_v_init()
+        except Exception:
+            self.v_init = old_v_init
+            raise
+        return self
 
     def prep_intra(self, intra, n, dt):
         """
@@ -1476,16 +1580,75 @@ class Population(P, Sliceable):
         """
         self.restore(name)
 
+    def register_injection(self, waveform, index_spec):
+        """Register a waveform injection on both solver and mechanism paths.
+
+        The solver path preserves the existing ``Intra`` behavior used by
+        standard voltage integrators.  The mechanism path offers the same
+        waveform/index information to every built mechanism through
+        ``Mechanism.inject(...)``; mechanisms that do not override that method
+        simply ignore it.
+        """
+        self.injections.append((waveform, index_spec.shape, index_spec.index))
+        self.mechanism_injections.append((waveform, index_spec.shape, index_spec.index))
+        self.mechanism_injection_accepted.append(False)
+        # Force lazy reconstruction of the solver-level Intra object on the next
+        # run/initialize after a new injection is added.
+        self.intra = None
+
+        # If mechanisms have already been built, deliver this injection
+        # immediately.  If not, build() will dispatch all stored specs later.
+        if getattr(self, "is_built", False) and getattr(self, "mech", None) is not None:
+            self._dispatch_mechanism_injections(
+                start=len(self.mechanism_injections) - 1
+            )
+        return self
+
+    def _dispatch_mechanism_injections(self, mech_handler=None, *, start=0):
+        """Offer stored waveform injections to built mechanisms."""
+        mech_handler = self.mech if mech_handler is None else mech_handler
+        if mech_handler is None:
+            return
+        if not self.mechanism_injections:
+            return
+
+        model_shape = tuple(self.shape)
+        for inj_i, (waveform, shape, index) in enumerate(
+            self.mechanism_injections[start:], start
+        ):
+            accepted = bool(self.mechanism_injection_accepted[inj_i])
+            for mech in mech_handler.mechanisms.values():
+                accepted = (
+                    bool(
+                        mech.inject(
+                            waveform,
+                            index=index,
+                            shape=shape,
+                            model_shape=model_shape,
+                            model=self,
+                        )
+                    )
+                    or accepted
+                )
+            self.mechanism_injection_accepted[inj_i] = accepted
+
     def delete_injections(self):
         """
-        Remove all registered intra-cellular injections.
+        Remove all registered intra-cellular and mechanism-level injections.
 
         Returns
         -------
         None
         """
         self.injections = []
+        self.mechanism_injections = []
+        self.mechanism_injection_accepted = []
         self.intra = None
+        if getattr(self, "mech", None) is not None:
+            for mech in self.mech.mechanisms.values():
+                clear = getattr(mech, "clear_injections", None)
+                if clear is not None:
+                    clear()
 
     def build_intra(self):
         """
@@ -1497,7 +1660,19 @@ class Population(P, Sliceable):
             Intra stimulus object when injections are configured, otherwise None.
         """
         if self.injections:
-            return Intra(self, self.injections)
+            # If a mechanism accepted a waveform injection, it is responsible for
+            # evaluating/padding that stimulus and exposing it internally.  Do
+            # not also route the same waveform through the solver-level Intra
+            # path, which would duplicate the current for standard solvers and
+            # add unnecessary overhead for scnv/fused mechanisms.
+            accepted = list(self.mechanism_injection_accepted)
+            if len(accepted) < len(self.injections):
+                accepted.extend([False] * (len(self.injections) - len(accepted)))
+            solver_injections = [
+                inj for inj, ok in zip(self.injections, accepted) if not ok
+            ]
+            if solver_injections:
+                return Intra(self, solver_injections)
         return None
 
     def insert(self, mechanism, alias=None, index_spec=None, ic=None, **kwargs):
@@ -1871,6 +2046,10 @@ class Population(P, Sliceable):
 
             for m in mech.mechanisms.values():
                 m.setreference("t", lambda: self.t)
+
+            # Give mechanisms a chance to consume waveform injections directly.
+            # Mechanisms that do not implement injection support ignore these.
+            self._dispatch_mechanism_injections(mech)
 
             self.integrator = self._integrator_class(self, mech, imem=self.imem)
             self.mech = self.integrator.mech
@@ -3506,7 +3685,6 @@ class Axon(Population):
         "n_ax",
         "n_comp",
         "temp",
-        "v_init",
     ]
 
     def __init__(
@@ -3521,7 +3699,12 @@ class Axon(Population):
         if integrator is None:
             integrator = bwd_euler_ub()
         super().__init__(
-            len(diameters), n_comp, integrator=integrator, celsius=celsius, **kwargs
+            len(diameters),
+            n_comp,
+            integrator=integrator,
+            celsius=celsius,
+            v_init=v_init,
+            **kwargs,
         )
 
         self.register_buffer(
@@ -3532,8 +3715,8 @@ class Axon(Population):
         self.n_comp = self.nc
         self.temp = float(celsius)
 
-        self.v_init = v_init
-        self.v = torch.full_like(self.v, fill_value=v_init)
+        # ``v_init`` is normalized by Population; it may be scalar or a
+        # length-n_comp vector. ``self.v`` was already created from it.
 
         self.x[:] = self._x()  # Initialize x positions
 

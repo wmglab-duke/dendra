@@ -47,3 +47,31 @@ def sigmoid_ste(x: torch.Tensor, tau: torch.Tensor):
     s = torch.sigmoid(x / tau)  # surrogate
     h = (x >= 0).to(x.dtype)  # hard forward
     return (h - s).detach() + s  # forward==h, grad==∂s/∂x and ∂s/∂tau
+
+
+def crossing_spike(v_old, v_new, threshold, tau=0.1, ste_scale=1.0):
+    """
+    Detects if the voltage crosses the threshold from below to above, using a surrogate gradient.
+
+    Returns:
+      spiked_hard: bool  (rising edge: v_new >= threshold and v_old < threshold)
+      spk_gate:    float in [0,1] with STE for *rising edge*
+    """
+    hard = ((v_old < threshold) & (v_new > threshold)).to(v_new.dtype)
+    g0 = torch.sigmoid((v_old - threshold) / tau)
+    g1 = torch.sigmoid((v_new - threshold) / tau)
+    soft = torch.relu(g1 - g0)
+    return hard + ste_scale * (soft - soft.detach())
+
+
+def level_spike(v_new, threshold, tau=0.1, ste_scale=1.0):
+    """
+    Detects if the voltage is above the threshold, using a surrogate gradient.
+
+    Returns:
+      spiked_hard: bool  (v_new >= threshold)
+      spk_gate:    float in [0,1] with STE for v_new >= threshold
+    """
+    hard = (v_new >= threshold).to(v_new.dtype)
+    soft = torch.sigmoid((v_new - threshold) / tau)
+    return hard + ste_scale * (soft - soft.detach())

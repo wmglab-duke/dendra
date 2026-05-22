@@ -493,9 +493,11 @@ class Slice:
 
         The waveform is not applied immediately. Instead, this method records
         the tuple ``(waveform, index_spec.shape, index_spec.index)`` on the
-        underlying population's ``injections`` list. The simulator or solver
-        later interprets this record and applies the current only to the
-        compartments selected by this slice.
+        underlying population's ``injections`` list and, when available, on the
+        population's mechanism-level injection registry. The solver path applies
+        the current to the selected compartments in the usual way, while
+        mechanisms that implement ``inject(...)`` can consume the waveform
+        directly.
 
         Parameters
         ----------
@@ -518,7 +520,10 @@ class Slice:
             return  # no-op for empty slices
         model = object.__getattribute__(self, "model")
         index_spec = object.__getattribute__(self, "index_spec")
-        model.injections.append((waveform, index_spec.shape, index_spec.index))
+        if hasattr(model, "register_injection"):
+            model.register_injection(waveform, index_spec)
+        else:
+            model.injections.append((waveform, index_spec.shape, index_spec.index))
 
     def insert(self, mechanism, alias=None, ic=None, **kwargs):
         """

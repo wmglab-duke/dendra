@@ -14,6 +14,63 @@ def get_init_defaults(cls):
     }
 
 
+def _expanded_v_init(model):
+    """
+    Return ``model.v_init`` expanded to ``model.v.shape``.
+
+    Population implements ``expanded_v_init`` directly. The fallback here keeps
+    integrators robust for Network/MultiIntegrator-like containers that expose
+    only ``v`` and ``v_init``.
+    """
+    if hasattr(model, "expanded_v_init"):
+        return model.expanded_v_init()
+
+    target = model.v
+    target_shape = tuple(target.shape)
+    if len(target_shape) < 1:
+        raise ValueError(
+            f"model.v must have at least one dimension; got {target_shape}."
+        )
+
+    v0 = torch.as_tensor(model.v_init, device=target.device, dtype=target.dtype)
+
+    if v0.ndim == 0 or v0.numel() == 1:
+        return v0.reshape(()).expand_as(target)
+
+    # For flattened Network state, model.nc may not exist; use the last voltage
+    # dimension as the compartment/state dimension.
+    n_comp = int(getattr(model, "nc", target_shape[-1]))
+    if target_shape[-1] != n_comp:
+        n_comp = int(target_shape[-1])
+
+    if v0.ndim == 1:
+        if v0.numel() != n_comp:
+            raise ValueError(
+                f"v_init has length {v0.numel()}, but the voltage state expects "
+                f"length {n_comp}. Use a scalar or a vector matching model.nc/the "
+                "last voltage dimension."
+            )
+        view_shape = (1,) * (target.ndim - 1) + (n_comp,)
+        return v0.reshape(view_shape).expand_as(target)
+
+    if tuple(v0.shape) == target_shape:
+        return v0
+
+    if target.ndim >= 2 and tuple(v0.shape) == tuple(target_shape[-2:]):
+        view_shape = (1,) * (target.ndim - 2) + tuple(target_shape[-2:])
+        return v0.reshape(view_shape).expand_as(target)
+
+    if target.ndim >= 2 and tuple(v0.shape) == (1, target_shape[-1]):
+        view_shape = (1,) * (target.ndim - 2) + (1, target_shape[-1])
+        return v0.reshape(view_shape).expand_as(target)
+
+    raise ValueError(
+        "Unsupported v_init shape. Expected a scalar, a 1D vector matching "
+        f"model.nc/the last voltage dimension ({n_comp}), the model core shape, "
+        f"or full voltage shape {target_shape}; got shape {tuple(v0.shape)}."
+    )
+
+
 class Integrator(torch.nn.Module):
     r"""
     Base class for all integrators.
@@ -91,7 +148,7 @@ class Integrator(torch.nn.Module):
             self.initialized = True
 
     def init_v(self, model):
-        model.v = model.v.detach().clone().contiguous().copy_(model.v_init)
+        model.v = _expanded_v_init(model).clone().detach().contiguous()
         if self.imem:
             model.i_membrane = torch.zeros_like(model.v).detach()
 
@@ -150,7 +207,7 @@ class MultiIntegrator(Integrator):
         self.split_at = torch.cumsum(torch.tensor(split_lengths), dim=0)[:-1].tolist()
 
     def init_v(self, model):
-        model.v = model.v_init.expand_as(model.v).clone().detach().contiguous()
+        model.v = _expanded_v_init(model).clone().detach().contiguous()
         if self.write_back:
             self._calc_splits(model)
             _write_back(model, self.split_at)
