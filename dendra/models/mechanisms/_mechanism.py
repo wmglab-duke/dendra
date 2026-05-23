@@ -250,6 +250,12 @@ class Mechanism(Parameterized):
         self.injected_waveforms = torch.nn.ModuleList()
         self._injection_specs = []
 
+        # Mechanism-level delayed-state support.  This is intended for fused
+        # mechanisms that bypass Network/NetCon but still need fixed axonal or
+        # state delays.  Each entry in _delayed_state_specs maps a user-facing
+        # delay name to registered buffer/pointer names and update policy.
+        self._delayed_state_specs = {}
+
         if key is not None:
             if is_composable:
                 self.key = key
@@ -1008,6 +1014,545 @@ class Mechanism(Parameterized):
         for key in kwargs.keys():
             if key not in valid_keys:
                 raise ValueError(f"Unexpected keyword argument: {key}")
+
+    # -- mechanism-level delayed states ---------------------------------------
+    def register_delayed_state(
+        self,
+        name,
+        like,
+        delay_steps: int,
+        *,
+        mode="auto",
+        buffer_name=None,
+        pointer_name=None,
+        insert_axis: int = -1,
+        clear: bool = True,
+    ):
+        """Register a fixed-step delayed state buffer on this mechanism.
+
+        This helper is for fused mechanisms that need NetCon-like fixed delays
+        while bypassing :class:`~dendra.models.networks.NetCon`.  The delayed
+        state has two update backends:
+
+        ``mode="shift"``
+            Graph-safe functional update. Each call constructs a new queue with
+            ``torch.cat``. This is appropriate for training / BPTT because the
+            delayed value remains connected to the computation graph.
+
+        ``mode="circular"``
+            Fast in-place circular buffer. This avoids shifting/copying the
+            whole queue each step, but it intentionally writes under
+            ``torch.no_grad()`` and is therefore intended for evaluation only.
+
+        ``mode="auto"``
+            Use ``circular`` when the mechanism is in eval mode and gradients are
+            disabled; otherwise use ``shift``.
+
+        Parameters
+        ----------
+        name : str
+            User-facing delay name used with :meth:`delayed_state`.
+        like : torch.Tensor
+            Tensor whose shape/device/dtype define the payload shape.
+        delay_steps : int
+            Integer delay in simulation steps. A value emitted at call ``k``
+            appears after ``delay_steps`` subsequent calls, matching the queue
+            convention used by Dendra's event delay buffers. The current delayed-state
+            helper assumes one uniform delay per registered delayed state. For heterogeneous
+            per-connection delays, use ``NetCon`` / ``ContinuousCon`` or register
+            separate delayed states for each distinct delay.
+        mode : {"auto", "shift", "circular"}, default "auto"
+            Backend selection policy.
+        buffer_name : str, optional
+            Name of the registered buffer. Defaults to
+            ``f"{name}_delay_buffer"``. Existing ``ASSIGNED`` buffers can be
+            reused by passing their name here.
+        pointer_name : str, optional
+            Name of the circular-buffer write pointer.
+        insert_axis : int, default -1
+            Axis before which the delay dimension is inserted. The default
+            inserts the delay axis before the final payload dimension, so a
+            payload of shape ``(..., n)`` becomes ``(..., depth, n)``.
+        clear : bool, default True
+            If true, reset the delay buffer and pointer.
+
+        Returns
+        -------
+        torch.Tensor
+            The registered delay buffer.
+        """
+        if mode is None:
+            mode = "auto"
+        mode = str(mode).lower()
+        aliases = {
+            "functional": "shift",
+            "queue": "shift",
+            "shift_queue": "shift",
+            "eval_circular": "auto",
+            "fast_eval": "auto",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"auto", "shift", "circular"}:
+            raise ValueError(
+                "delayed-state mode must be 'auto', 'shift', or 'circular'; "
+                f"got {mode!r}."
+            )
+
+        delay_steps = int(delay_steps)
+        depth = max(1, delay_steps + 1)
+        like = torch.as_tensor(like)
+
+        if insert_axis < 0:
+            insert_axis = like.ndim + 1 + insert_axis
+        if insert_axis < 0 or insert_axis > like.ndim:
+            raise ValueError(
+                f"insert_axis={insert_axis} is invalid for payload ndim={like.ndim}."
+            )
+
+        buffer_name = buffer_name or f"{name}_delay_buffer"
+        pointer_name = pointer_name or f"{name}_delay_ptr"
+
+        buffer_shape = (
+            tuple(like.shape[:insert_axis]) + (depth,) + tuple(like.shape[insert_axis:])
+        )
+        buffer = torch.zeros(buffer_shape, device=like.device, dtype=like.dtype)
+        pointer = torch.zeros((), device=like.device, dtype=torch.long)
+
+        if buffer_name in self._buffers:
+            if clear or tuple(getattr(self, buffer_name).shape) != buffer_shape:
+                setattr(self, buffer_name, buffer)
+        else:
+            self.register_buffer(buffer_name, buffer)
+
+        if pointer_name in self._buffers:
+            if clear:
+                setattr(self, pointer_name, pointer)
+        else:
+            self.register_buffer(pointer_name, pointer)
+
+        self._delayed_state_specs[name] = {
+            "buffer": buffer_name,
+            "pointer": pointer_name,
+            "steps": delay_steps,
+            "depth": depth,
+            "axis": int(insert_axis),
+            "mode": mode,
+        }
+        return getattr(self, buffer_name)
+
+    def register_delayed_states(
+        self,
+        name,
+        like,
+        delay_steps,
+        *,
+        mode="auto",
+        buffer_name=None,
+        pointer_name=None,
+        steps_name=None,
+        stream_axis: int = -2,
+        clear: bool = True,
+    ):
+        """Register a batched fixed-step delay line for several streams.
+
+        This is the multi-stream counterpart of :meth:`register_delayed_state`.
+        It is intended for fused mechanisms that need many pathway-level delays
+        over tensors with the same payload shape.  For example, a value tensor
+        with shape ``(batch, n_streams, n)`` and ``stream_axis=-2`` is stored in
+        one delay buffer with shape ``(batch, depth, n_streams, n)``.
+
+        Parameters
+        ----------
+        name : str
+            User-facing delay group name used with :meth:`delayed_states`.
+        like : torch.Tensor
+            Example value tensor. One dimension is interpreted as the stream /
+            pathway axis; all other dimensions are payload dimensions.
+        delay_steps : int or sequence[int] or torch.Tensor
+            Integer delays in simulation steps. A scalar applies the same delay
+            to every stream. A vector must have length ``like.shape[stream_axis]``.
+        mode : {"auto", "shift", "circular"}, default "auto"
+            Backend selection policy. ``auto`` uses circular buffers in eval /
+            no-grad mode and graph-safe shifted queues during training/grad mode.
+        buffer_name : str, optional
+            Name of the registered delay buffer. Defaults to
+            ``f"{name}_delay_buffer"``.
+        pointer_name : str, optional
+            Name of the circular-buffer write pointer. Defaults to
+            ``f"{name}_delay_ptr"``.
+        steps_name : str, optional
+            Name of the registered integer delay vector. Defaults to
+            ``f"{name}_delay_steps"``.
+        stream_axis : int, default -2
+            Axis of ``like`` containing independent delay streams. The delay
+            dimension is inserted immediately before this axis.
+        clear : bool, default True
+            If true, reset the delay buffer and circular pointer.
+
+        Returns
+        -------
+        torch.Tensor
+            The registered delay buffer.
+
+        Notes
+        -----
+        ``delayed_states`` supports heterogeneous per-stream integer delays,
+        but all streams in a group share one circular pointer and one buffer
+        depth equal to ``max(delay_steps) + 1``. This is useful for fused
+        models with several fixed pathway delays and avoids one delayed-state
+        helper call per pathway.
+        """
+        if mode is None:
+            mode = "auto"
+        mode = str(mode).lower()
+        aliases = {
+            "functional": "shift",
+            "queue": "shift",
+            "shift_queue": "shift",
+            "eval_circular": "auto",
+            "fast_eval": "auto",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"auto", "shift", "circular"}:
+            raise ValueError(
+                "batched delayed-state mode must be 'auto', 'shift', or 'circular'; "
+                f"got {mode!r}."
+            )
+
+        like = torch.as_tensor(like)
+        if like.ndim == 0:
+            raise ValueError("register_delayed_states requires a non-scalar payload.")
+
+        if stream_axis < 0:
+            stream_axis = like.ndim + stream_axis
+        if stream_axis < 0 or stream_axis >= like.ndim:
+            raise ValueError(
+                f"stream_axis={stream_axis} is invalid for payload ndim={like.ndim}."
+            )
+        n_streams = int(like.shape[stream_axis])
+        if n_streams <= 0:
+            raise ValueError("delayed-state stream axis must be non-empty.")
+
+        steps = torch.as_tensor(delay_steps, device=like.device, dtype=torch.long)
+        if steps.ndim == 0 or steps.numel() == 1:
+            steps = steps.reshape(1).expand(n_streams).clone()
+        else:
+            steps = steps.reshape(-1).clone()
+            if steps.numel() != n_streams:
+                raise ValueError(
+                    f"delay_steps has length {steps.numel()}, but the stream axis "
+                    f"has length {n_streams}."
+                )
+        if torch.any(steps < 0):
+            raise ValueError("delay_steps must be non-negative integers.")
+
+        max_steps = int(steps.max().item()) if steps.numel() else 0
+        depth = max(1, max_steps + 1)
+
+        # Insert delay axis immediately before the stream axis.  If like has
+        # shape (..., streams, n), the buffer has shape (..., depth, streams, n).
+        delay_axis = int(stream_axis)
+        buffer_stream_axis = delay_axis + 1
+        buffer_shape = (
+            tuple(like.shape[:delay_axis]) + (depth,) + tuple(like.shape[delay_axis:])
+        )
+
+        buffer_name = buffer_name or f"{name}_delay_buffer"
+        pointer_name = pointer_name or f"{name}_delay_ptr"
+        steps_name = steps_name or f"{name}_delay_steps"
+
+        buffer = torch.zeros(buffer_shape, device=like.device, dtype=like.dtype)
+        pointer = torch.zeros((), device=like.device, dtype=torch.long)
+
+        if buffer_name in self._buffers:
+            if clear or tuple(getattr(self, buffer_name).shape) != buffer_shape:
+                setattr(self, buffer_name, buffer)
+        else:
+            self.register_buffer(buffer_name, buffer)
+
+        if pointer_name in self._buffers:
+            if clear:
+                setattr(self, pointer_name, pointer)
+        else:
+            self.register_buffer(pointer_name, pointer)
+
+        if steps_name in self._buffers:
+            if clear or tuple(getattr(self, steps_name).shape) != tuple(steps.shape):
+                setattr(self, steps_name, steps)
+        else:
+            self.register_buffer(steps_name, steps)
+
+        # Static delay metadata used to avoid scalar tensor reductions in the
+        # compiled per-step path.  In particular, do not call Tensor.item() from
+        # delayed_states(...): TorchDynamo treats that as a graph break unless
+        # capture_scalar_outputs is enabled.  These booleans are valid for the
+        # registered delay vector; if callers override delay_steps dynamically,
+        # delayed_states falls back to the generic update path without relying on
+        # these flags.
+        has_zero_delay = bool(torch.any(steps == 0).item())
+        all_zero_delay = bool(torch.all(steps <= 0).item())
+
+        self._delayed_state_specs[name] = {
+            "buffer": buffer_name,
+            "pointer": pointer_name,
+            "steps_buffer": steps_name,
+            "steps": max_steps,
+            "depth": depth,
+            "axis": delay_axis,
+            "stream_axis": buffer_stream_axis,
+            "value_stream_axis": int(stream_axis),
+            "n_streams": n_streams,
+            "mode": mode,
+            "batched": True,
+            "has_zero_delay": has_zero_delay,
+            "all_zero_delay": all_zero_delay,
+        }
+        return getattr(self, buffer_name)
+
+    def reset_delayed_states(self, *names):
+        """Zero registered delayed-state buffers and reset circular pointers."""
+        if not names:
+            names = tuple(self._delayed_state_specs.keys())
+        with torch.no_grad():
+            for name in names:
+                spec = self._delayed_state_specs[name]
+                getattr(self, spec["buffer"]).zero_()
+                getattr(self, spec["pointer"]).zero_()
+        return self
+
+    def delayed_state(self, name, value, *, delay_steps=None, mode=None):
+        """Return a delayed copy of ``value`` and update the named delay line.
+
+        The delay line must first be created with
+        :meth:`register_delayed_state`. ``mode="auto"`` uses the in-place
+        circular buffer only in eval/no-grad mode; otherwise it uses a graph-safe
+        functional shift update.
+        """
+        if name not in self._delayed_state_specs:
+            raise KeyError(
+                f"No delayed state named {name!r} has been registered. "
+                "Call register_delayed_state(...) during initial(...)."
+            )
+        spec = self._delayed_state_specs[name]
+        steps = int(spec["steps"] if delay_steps is None else delay_steps)
+        if steps <= 0:
+            return value
+
+        selected_mode = str(spec["mode"] if mode is None else mode).lower()
+        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
+        selected_mode = aliases.get(selected_mode, selected_mode)
+        if selected_mode == "auto":
+            selected_mode = (
+                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
+            )
+
+        if selected_mode == "circular":
+            return self._delayed_state_circular(spec, value, steps)
+        if selected_mode == "shift":
+            return self._delayed_state_shift(spec, value, steps)
+        raise ValueError(
+            "delayed-state mode must be 'auto', 'shift', or 'circular'; "
+            f"got {selected_mode!r}."
+        )
+
+    def _delayed_state_shift(self, spec, value, steps: int):
+        """Graph-safe delayed-state update using an out-of-place shifted queue."""
+        buf_name = spec["buffer"]
+        axis = int(spec["axis"])
+        buf = getattr(self, buf_name)
+        depth = int(buf.shape[axis])
+        if steps + 1 != depth:
+            # Re-register if a caller overrides delay_steps with a different
+            # length. This is uncommon but keeps the helper predictable.
+            state_name = next(
+                k for k, v in self._delayed_state_specs.items() if v is spec
+            )
+            self.register_delayed_state(
+                state_name,
+                value,
+                steps,
+                mode=spec["mode"],
+                buffer_name=buf_name,
+                pointer_name=spec["pointer"],
+                insert_axis=axis,
+                clear=True,
+            )
+            buf = getattr(self, buf_name)
+            depth = int(buf.shape[axis])
+
+        sl = [slice(None)] * buf.ndim
+        sl[axis] = slice(0, depth - 1)
+        buf_new = torch.cat((value.unsqueeze(axis), buf[tuple(sl)]), dim=axis)
+        setattr(self, buf_name, buf_new)
+        return buf_new.select(axis, depth - 1)
+
+    def _delayed_state_circular(self, spec, value, steps: int):
+        """Fast eval delayed-state update using an in-place circular buffer."""
+        buf = getattr(self, spec["buffer"])
+        ptr = getattr(self, spec["pointer"])
+        axis = int(spec["axis"])
+        depth = int(buf.shape[axis])
+        if steps + 1 != depth:
+            raise ValueError(
+                "Circular delayed_state cannot change delay_steps without "
+                "re-registering the delayed state."
+            )
+
+        read_idx = torch.remainder(ptr - int(steps), depth).reshape(1)
+        delayed = buf.index_select(axis, read_idx).squeeze(axis)
+
+        # Evaluation-only fast path: mutate the circular buffer without building
+        # autograd history. In training/grad mode, delayed_state(..., mode='auto')
+        # selects the graph-safe shift backend instead.
+        with torch.no_grad():
+            write_idx = ptr.reshape(1)
+            buf.index_copy_(axis, write_idx, value.detach().unsqueeze(axis))
+            ptr.add_(1).remainder_(depth)
+        return delayed
+
+    def delayed_states(self, name, values, *, delay_steps=None, mode=None):
+        """Return delayed copies of a multi-stream value tensor.
+
+        The delay group must first be created with
+        :meth:`register_delayed_states`.  ``values`` must have the same shape as
+        the ``like`` tensor used at registration time.  The stream axis can have
+        distinct integer delays supplied during registration.
+        """
+        if name not in self._delayed_state_specs:
+            raise KeyError(
+                f"No delayed state group named {name!r} has been registered. "
+                "Call register_delayed_states(...) during initial(...)."
+            )
+        spec = self._delayed_state_specs[name]
+        if not spec.get("batched", False):
+            raise ValueError(
+                f"Delayed state {name!r} was registered with register_delayed_state; "
+                "use delayed_state(...) instead."
+            )
+
+        # Fast all-zero shortcut for the registered delay vector.  This is a
+        # Python bool stored at registration time, so it is safe under
+        # torch.compile.  Avoid Tensor.item() here: the per-step path may be
+        # captured by TorchDynamo, and scalar extraction causes a graph break.
+        if delay_steps is None and bool(spec.get("all_zero_delay", False)):
+            return values
+
+        steps = self._delayed_states_steps(spec, values, delay_steps)
+
+        selected_mode = str(spec["mode"] if mode is None else mode).lower()
+        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
+        selected_mode = aliases.get(selected_mode, selected_mode)
+        if selected_mode == "auto":
+            selected_mode = (
+                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
+            )
+
+        if selected_mode == "circular":
+            return self._delayed_states_circular(spec, values, steps)
+        if selected_mode == "shift":
+            return self._delayed_states_shift(spec, values, steps)
+        raise ValueError(
+            "batched delayed-state mode must be 'auto', 'shift', or 'circular'; "
+            f"got {selected_mode!r}."
+        )
+
+    def _delayed_states_steps(self, spec, values, delay_steps=None):
+        if delay_steps is None:
+            steps = getattr(self, spec["steps_buffer"])
+        else:
+            steps = torch.as_tensor(delay_steps, device=values.device, dtype=torch.long)
+        steps = steps.to(device=values.device, dtype=torch.long)
+        if steps.ndim == 0 or steps.numel() == 1:
+            steps = steps.reshape(1).expand(int(spec["n_streams"]))
+        else:
+            steps = steps.reshape(-1)
+        if steps.numel() != int(spec["n_streams"]):
+            raise ValueError(
+                f"delay_steps has length {steps.numel()}, expected {spec['n_streams']}."
+            )
+        return steps
+
+    def _delayed_states_gather(self, buf, spec, read_idx):
+        axis = int(spec["axis"])
+        stream_axis = int(spec["stream_axis"])
+        n_streams = int(spec["n_streams"])
+
+        index_shape = [1] * buf.ndim
+        index_shape[axis] = 1
+        index_shape[stream_axis] = n_streams
+
+        expand_shape = list(buf.shape)
+        expand_shape[axis] = 1
+
+        idx = read_idx.reshape(index_shape).expand(expand_shape)
+        return torch.gather(buf, dim=axis, index=idx).squeeze(axis)
+
+    def _delayed_states_zero_mask(self, spec, values, steps):
+        value_stream_axis = int(spec["value_stream_axis"])
+        mask_shape = [1] * values.ndim
+        mask_shape[value_stream_axis] = int(spec["n_streams"])
+        return (steps == 0).reshape(mask_shape)
+
+    def _delayed_states_shift(self, spec, values, steps):
+        """Graph-safe multi-stream delay update using a shifted queue."""
+        buf_name = spec["buffer"]
+        axis = int(spec["axis"])
+        buf = getattr(self, buf_name)
+        depth = int(buf.shape[axis])
+        required_depth = int(spec.get("steps", 0)) + 1
+        if required_depth != depth:
+            state_name = next(
+                k for k, v in self._delayed_state_specs.items() if v is spec
+            )
+            self.register_delayed_states(
+                state_name,
+                values,
+                steps,
+                mode=spec["mode"],
+                buffer_name=buf_name,
+                pointer_name=spec["pointer"],
+                steps_name=spec["steps_buffer"],
+                stream_axis=int(spec["value_stream_axis"]),
+                clear=True,
+            )
+            spec = self._delayed_state_specs[state_name]
+            buf = getattr(self, buf_name)
+            depth = int(buf.shape[axis])
+
+        sl = [slice(None)] * buf.ndim
+        sl[axis] = slice(0, depth - 1)
+        buf_new = torch.cat((values.unsqueeze(axis), buf[tuple(sl)]), dim=axis)
+        setattr(self, buf_name, buf_new)
+        return self._delayed_states_gather(buf_new, spec, steps)
+
+    def _delayed_states_circular(self, spec, values, steps):
+        """Fast eval multi-stream delay update using one in-place ring buffer."""
+        buf = getattr(self, spec["buffer"])
+        ptr = getattr(self, spec["pointer"])
+        axis = int(spec["axis"])
+        depth = int(buf.shape[axis])
+        required_depth = int(spec.get("steps", 0)) + 1
+        if required_depth > depth:
+            raise ValueError(
+                "Circular delayed_states cannot increase max delay_steps without "
+                "re-registering the delayed state group."
+            )
+
+        read_idx = torch.remainder(ptr - steps.to(device=buf.device), depth)
+        delayed = self._delayed_states_gather(buf, spec, read_idx)
+
+        # A stream with zero delay should deliver the current value, not the
+        # previous content of the circular slot that will be overwritten below.
+        if bool(spec.get("has_zero_delay", False)):
+            delayed = torch.where(
+                self._delayed_states_zero_mask(spec, values, steps), values, delayed
+            )
+
+        with torch.no_grad():
+            write_idx = ptr.reshape(1)
+            buf.index_copy_(axis, write_idx, values.detach().unsqueeze(axis))
+            ptr.add_(1).remainder_(depth)
+        return delayed
 
     # -- mechanism-level waveform injections ---------------------------------
     def inject(
