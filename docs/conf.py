@@ -95,8 +95,12 @@ html_css_files = ["custom.css"]
 
 autosummary_generate = True
 autodoc_typehints = "description"
+autodoc_typehints_description_target = "documented"
 add_module_names = False
 autodoc_member_order = "bysource"
+
+autoclass_content = "class"
+autodoc_inherit_docstrings = False
 
 
 def skip_inplace_methods(app, what, name, obj, skip, options):

@@ -14,3 +14,12 @@ In-built mechanisms.
 .. autoclass:: dendra.models.mod.hh
 .. autoclass:: dendra.models.mod.pas
 .. autoclass:: dendra.models.mod.spikedetect
+
+Graded / continuous synapses
+----------------------------
+
+.. automodule:: dendra.models.mod.graded_synapse
+   :members: sigmoid_release, graded_release_gate, graded_syn
+   :exclude-members: __init__, initial, breakpoint, inf, forward
+   :show-inheritance:
+   :no-inherited-members:

@@ -8,6 +8,484 @@ from .spiking import update_active, update_active_diff
 from .utils import make_getattr
 
 
+class ContinuousCon(Referency):
+    """Continuous analog projection between a presynaptic variable and a postsynaptic mechanism.
+
+    ``ContinuousCon`` is the analog counterpart of :class:`NetCon`: it gathers a
+    presynaptic variable, applies optional weighting and integer delay, scatters
+    the resulting values into the target synapse's local shape, and calls
+    ``syn.continuous_receive(...)``.  It performs no thresholding and no event
+    detection.
+
+    The hot path is specialized at construction / delay-rebuild time.  Static
+    delay masks, selected post indices, flat delay-buffer offsets, and dispatch
+    mode are precomputed once so ``advance()`` does not repeatedly build masks or
+    check for empty delayed subsets.
+    """
+
+    def __init__(
+        self,
+        pre,
+        pre_idx,
+        post,
+        post_idx,
+        post_syn,
+        weight,
+        delay,
+        dt,
+        pre_var=None,
+        input=None,
+        reduce="sum",
+        max_delay=None,
+        transform=None,
+        reset_inputs=False,
+    ):
+        super().__init__()
+        self.weight = weight
+        self.delay_ms = delay
+        self.syn = post_syn
+        self.pre = pre
+        self.post = post
+        self.input = input
+        self.reduce = reduce
+        self.transform = transform
+        self.max_delay = max_delay
+
+        # reset_inputs is accepted for compatibility with older internal
+        # builders, but input reset is now owned by Network.step so every
+        # ContinuousSynapse target is reset exactly once before all analog
+        # deliveries.  ContinuousCon therefore has no per-step reset branch.
+        self._reset_inputs = False
+
+        self._refresh_peer_devices()
+        self.weight = self.weight.to(device=self.device)
+        self.delay_ms = self.delay_ms.to(device=self.device)
+        if isinstance(self.transform, torch.nn.Module):
+            self.transform = self.transform.to(device=self.device, dtype=self.dtype)
+
+        self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
+        if pre_var is None:
+            pre_var = "v"
+        self.get_pre_var = make_getattr(pre_var)
+        self.pre_var = pre_var
+        self._has_transform = transform is not None
+
+        self.register_buffer(
+            "pre_idx", pre_idx.flatten().to(self.pre_device, dtype=torch.long)
+        )
+        self.register_buffer(
+            "post_idx", post_idx.flatten().to(self.device, dtype=torch.long)
+        )
+        self.register_buffer(
+            "syn_numel",
+            torch.prod(torch.tensor(self.syn.shape_f, device=self.device)).to(
+                self.device, dtype=torch.long
+            ),
+        )
+        self._syn_numel = int(self.syn_numel.item())
+        self.register_buffer(
+            "n",
+            torch.tensor(self.pre_idx.numel(), device=self.device, dtype=torch.long),
+        )
+        self._n_conn = int(self.pre_idx.numel())
+        self.register_buffer(
+            "current_time_step", torch.tensor([0], device=self.device, dtype=torch.long)
+        )
+        self.register_buffer(
+            "global_step", torch.tensor([0], device=self.device, dtype=torch.long)
+        )
+
+        delay_values = self.delay_ms.init().w
+        delay_steps = (delay_values / dt).round().long()
+        self.register_buffer("delay_steps", delay_steps.flatten().to(self.device))
+        self.max_delay_steps = self._compute_max_delay_steps()
+        self._delivery_numel = int(self.max_delay_steps * self._syn_numel)
+        self.register_buffer(
+            "delivery_buffer",
+            torch.zeros(
+                (self.max_delay_steps, self._syn_numel),
+                device=self.device,
+                dtype=self.dtype,
+            ),
+        )
+        self.register_buffer(
+            "con_range",
+            torch.arange(self._n_conn, device=self.device, dtype=torch.long),
+        )
+
+        # Delay/layout metadata buffers are registered in _rebuild_delay_metadata().
+        self._rebuild_delay_metadata()
+        self._align_buffer_devices()
+        self._configure_advance_impl()
+
+    # ------------------------------------------------------------------
+    # Device / dtype bookkeeping
+    # ------------------------------------------------------------------
+
+    def _refresh_peer_devices(self):
+        pre_device = self.pre.device()
+        pre_dtype = self.pre.dtype()
+        post_device = self.post.device()
+        post_dtype = self.post.dtype()
+        syn_device = self.syn.device() if hasattr(self.syn, "device") else post_device
+
+        self.pre_device = pre_device
+        self.pre_dtype = pre_dtype
+        self.post_device = post_device
+        self.device = syn_device
+        self.dtype = post_dtype
+
+    def _move_buffer(self, name, device, dtype=None):
+        if not hasattr(self, name):
+            return
+        buf = getattr(self, name)
+        target_dtype = dtype if dtype is not None else buf.dtype
+        if buf.device != device or buf.dtype != target_dtype:
+            setattr(self, name, buf.to(device=device, dtype=target_dtype))
+
+    def _set_buffer(self, name, value):
+        if name in self._buffers:
+            setattr(self, name, value)
+        else:
+            self.register_buffer(name, value)
+
+    def _align_buffer_devices(self):
+        self._move_buffer("pre_idx", self.pre_device)
+        for name in (
+            "post_idx",
+            "syn_numel",
+            "n",
+            "delay_steps",
+            "current_time_step",
+            "global_step",
+            "con_range",
+            # Precomputed continuous-delay metadata.
+            "zero_con_idx",
+            "nonzero_con_idx",
+            "post_idx_zero",
+            "post_idx_nz",
+            "delay_steps_nz",
+            "flat_delay_offsets_nz",
+        ):
+            self._move_buffer(name, self.device)
+        self._move_buffer("delivery_buffer", self.device, self.dtype)
+        self.dt = self.dt.to(device=self.device, dtype=torch.float32)
+        self.weight = self.weight.to(device=self.device, dtype=self.dtype)
+        self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
+
+    def to(self, *args, **kwargs):  # type: ignore[override]
+        super().to(*args, **kwargs)
+        self._refresh_peer_devices()
+        self._align_buffer_devices()
+        if isinstance(self.transform, torch.nn.Module):
+            self.transform = self.transform.to(device=self.device, dtype=self.dtype)
+        self._configure_advance_impl()
+        return self
+
+    # ------------------------------------------------------------------
+    # Delay metadata / specialization
+    # ------------------------------------------------------------------
+
+    def _compute_max_delay_steps(self):
+        if self.max_delay is not None:
+            return max(1, int(self.max_delay / self.dt.item()) + 1)
+        if self.delay_steps.numel() == 0:
+            return 1
+        return max(1, int(self.delay_steps.max().item()) + 1)
+
+    def _rebuild_delay_metadata(self):
+        """Precompute masks/indices/offsets used by the continuous hot path."""
+        delay_steps = self.delay_steps.flatten().to(self.device, dtype=torch.long)
+        n_conn = int(delay_steps.numel())
+        self._n_conn = n_conn
+        self._has_connections = n_conn > 0
+
+        if n_conn == 0:
+            empty = torch.empty(0, device=self.device, dtype=torch.long)
+            self._set_buffer("zero_con_idx", empty)
+            self._set_buffer("nonzero_con_idx", empty)
+            self._set_buffer("post_idx_zero", empty)
+            self._set_buffer("post_idx_nz", empty)
+            self._set_buffer("delay_steps_nz", empty)
+            self._set_buffer("flat_delay_offsets_nz", empty)
+            self._has_zero_delay = False
+            self._has_nonzero_delay = False
+            self._all_zero_delay = False
+            self._all_nonzero_delay = False
+            self._nonzero_delay_uniform = False
+            self._direct_all = False
+            return
+
+        zero_mask = delay_steps == 0
+        nonzero_mask = ~zero_mask
+        zero_idx = torch.nonzero(zero_mask, as_tuple=False).flatten().to(self.device)
+        nonzero_idx = (
+            torch.nonzero(nonzero_mask, as_tuple=False).flatten().to(self.device)
+        )
+
+        self._has_zero_delay = bool(zero_idx.numel() > 0)
+        self._has_nonzero_delay = bool(nonzero_idx.numel() > 0)
+        self._all_zero_delay = bool(
+            self._has_zero_delay and not self._has_nonzero_delay
+        )
+        self._all_nonzero_delay = bool(
+            self._has_nonzero_delay and not self._has_zero_delay
+        )
+
+        post_idx_zero = (
+            self.post_idx.index_select(0, zero_idx) if zero_idx.numel() else zero_idx
+        )
+        post_idx_nz = (
+            self.post_idx.index_select(0, nonzero_idx)
+            if nonzero_idx.numel()
+            else nonzero_idx
+        )
+        delay_steps_nz = (
+            delay_steps.index_select(0, nonzero_idx)
+            if nonzero_idx.numel()
+            else nonzero_idx
+        )
+        flat_offsets = delay_steps_nz * int(self._syn_numel) + post_idx_nz
+
+        self._set_buffer("zero_con_idx", zero_idx)
+        self._set_buffer("nonzero_con_idx", nonzero_idx)
+        self._set_buffer("post_idx_zero", post_idx_zero)
+        self._set_buffer("post_idx_nz", post_idx_nz)
+        self._set_buffer("delay_steps_nz", delay_steps_nz)
+        self._set_buffer("flat_delay_offsets_nz", flat_offsets)
+
+        if delay_steps_nz.numel() > 0:
+            first = delay_steps_nz[0]
+            self._nonzero_delay_uniform = bool(
+                torch.all(delay_steps_nz == first).item()
+            )
+            self._uniform_delay_step = (
+                int(first.item()) if self._nonzero_delay_uniform else None
+            )
+        else:
+            self._nonzero_delay_uniform = False
+            self._uniform_delay_step = None
+
+        # Fast path for dense one-to-one all-immediate projections: avoid scatter.
+        if n_conn == self._syn_numel:
+            expected = torch.arange(
+                self._syn_numel, device=self.device, dtype=torch.long
+            )
+            self._direct_all = bool(
+                torch.equal(self.post_idx.to(self.device), expected)
+            )
+        else:
+            self._direct_all = False
+
+    def _configure_advance_impl(self):
+        if not getattr(self, "_has_connections", False):
+            self.advance = self._advance_empty
+        elif self._all_zero_delay:
+            self.advance = self._advance_all_immediate
+        elif self._all_nonzero_delay:
+            if self._nonzero_delay_uniform:
+                self.advance = self._advance_all_delayed_uniform
+            else:
+                self.advance = self._advance_all_delayed_mixed
+        else:
+            if self._nonzero_delay_uniform:
+                self.advance = self._advance_mixed_uniform
+            else:
+                self.advance = self._advance_mixed
+
+    def _rebuild_delay_buffers(self):
+        with torch.no_grad():
+            delay_values = self.delay_ms()
+            delay_steps = (delay_values / self.dt.to(self.dtype)).round().long()
+            self.delay_steps = delay_steps.flatten().to(self.device)
+            self.max_delay_steps = self._compute_max_delay_steps()
+            self._delivery_numel = int(self.max_delay_steps * self._syn_numel)
+            self.delivery_buffer = torch.zeros(
+                (self.max_delay_steps, self._syn_numel),
+                device=self.device,
+                dtype=self.dtype,
+            )
+            self._rebuild_delay_metadata()
+            self._align_buffer_devices()
+            self._configure_advance_impl()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def zero(self, clear_deliveries=True):
+        self.current_time_step.fill_(0)
+        self.global_step.fill_(0)
+        if clear_deliveries:
+            self.delivery_buffer.zero_()
+
+    def detach(self):
+        for n, b in self.named_buffers():
+            setattr(self, n, b.detach())
+
+    def initialize(
+        self, reinit_weights=True, reinit_delays=True, clear_deliveries=True
+    ):
+        self.zero(clear_deliveries=clear_deliveries)
+        self.weight.init(reinit=reinit_weights)
+        self.delay_ms.init(reinit=reinit_delays)
+        if reinit_delays:
+            self._rebuild_delay_buffers()
+        if hasattr(self, "t"):
+            step = torch.round(
+                self.t.to(self.device, dtype=self.dtype) / self.dt.to(self.dtype)
+            ).long()
+            self.global_step.copy_(step.reshape_as(self.global_step))
+        self.detach()
+        self._configure_advance_impl()
+        return self
+
+    def n_connections(self):
+        return int(self.n.item())
+
+    def state_dict_for_checkpoint(self):
+        return {
+            "delivery_buffer": self.delivery_buffer,
+            "current_time_step": self.current_time_step,
+            "global_step": self.global_step,
+        }
+
+    def restore_dict_from_checkpoint(self, state_dict):
+        self.delivery_buffer = state_dict["delivery_buffer"]
+        self.current_time_step = state_dict["current_time_step"]
+        self.global_step = state_dict["global_step"]
+        return self
+
+    # ------------------------------------------------------------------
+    # Hot-path helpers
+    # ------------------------------------------------------------------
+
+    def _maybe_reset_inputs(self):
+        # Deprecated compatibility hook.  Continuous input resets are performed
+        # by Network before advancing continuous projections.
+        return None
+
+    def _advance_counters(self):
+        self.current_time_step.add_(1).remainder_(self.max_delay_steps)
+        self.global_step.add_(1)
+
+    def _pre_value(self):
+        # The presynaptic variable should already live on the source device; only
+        # move if necessary.  This avoids redundant no-op .to(...) dispatches in
+        # the common single-device path.
+        x_full = self.get_pre_var(self.pre)
+        if x_full.device != self.pre_device or x_full.dtype != self.pre_dtype:
+            x_full = x_full.to(device=self.pre_device, dtype=self.pre_dtype)
+        x = x_full.reshape(-1).index_select(0, self.pre_idx)
+        if x.device != self.device or x.dtype != self.dtype:
+            x = x.to(device=self.device, dtype=self.dtype)
+        if self._has_transform:
+            x = self.transform(x)
+        return x
+
+    def _weighted_pre_value(self):
+        return self.weight() * self._pre_value()
+
+    def _zeros_delivery(self):
+        return torch.zeros(self._syn_numel, device=self.device, dtype=self.dtype)
+
+    def _scatter_all(self, values):
+        if self._direct_all:
+            return values
+        out = self._zeros_delivery()
+        out.index_add_(0, self.post_idx, values)
+        return out
+
+    def _scatter_zero_subset(self, values):
+        out = self._zeros_delivery()
+        vals = values.index_select(0, self.zero_con_idx)
+        out.index_add_(0, self.post_idx_zero, vals)
+        return out
+
+    def _read_and_clear_current_row(self):
+        cur_idx = self.current_time_step
+        delayed_delivery = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)
+        self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
+        return cur_idx, delayed_delivery
+
+    def _deliver(self, flat_delivery):
+        self.syn.continuous_receive(
+            flat_delivery.view(*self.syn.shape_f),
+            self,
+            input=self.input,
+            reduce=self.reduce,
+        )
+
+    def _schedule_all_delayed_uniform(self, cur_idx, weighted):
+        future = (cur_idx + int(self._uniform_delay_step)).remainder(
+            self.max_delay_steps
+        )
+        flat = future * self._syn_numel + self.post_idx
+        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
+
+    def _schedule_selected_delayed_uniform(self, cur_idx, weighted):
+        vals = weighted.index_select(0, self.nonzero_con_idx)
+        future = (cur_idx + int(self._uniform_delay_step)).remainder(
+            self.max_delay_steps
+        )
+        flat = future * self._syn_numel + self.post_idx_nz
+        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
+
+    def _schedule_all_delayed_mixed(self, cur_idx, weighted):
+        base = cur_idx * self._syn_numel
+        flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
+        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
+
+    def _schedule_selected_delayed_mixed(self, cur_idx, weighted):
+        vals = weighted.index_select(0, self.nonzero_con_idx)
+        base = cur_idx * self._syn_numel
+        flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
+        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
+
+    # ------------------------------------------------------------------
+    # Specialized advance paths
+    # ------------------------------------------------------------------
+
+    def _advance_empty(self):
+        self._advance_counters()
+
+    def _advance_all_immediate(self):
+        weighted = self._weighted_pre_value()
+        self._deliver(self._scatter_all(weighted))
+        # All delays are zero, so current_time_step remains zero modulo one.
+        self.global_step.add_(1)
+
+    def _advance_all_delayed_uniform(self):
+        cur_idx, delayed_delivery = self._read_and_clear_current_row()
+        self._deliver(delayed_delivery)
+        weighted = self._weighted_pre_value()
+        self._schedule_all_delayed_uniform(cur_idx, weighted)
+        self._advance_counters()
+
+    def _advance_all_delayed_mixed(self):
+        cur_idx, delayed_delivery = self._read_and_clear_current_row()
+        self._deliver(delayed_delivery)
+        weighted = self._weighted_pre_value()
+        self._schedule_all_delayed_mixed(cur_idx, weighted)
+        self._advance_counters()
+
+    def _advance_mixed_uniform(self):
+        cur_idx, delayed_delivery = self._read_and_clear_current_row()
+        weighted = self._weighted_pre_value()
+        immediate = self._scatter_zero_subset(weighted)
+        self._deliver(delayed_delivery + immediate)
+        self._schedule_selected_delayed_uniform(cur_idx, weighted)
+        self._advance_counters()
+
+    def _advance_mixed(self):
+        cur_idx, delayed_delivery = self._read_and_clear_current_row()
+        weighted = self._weighted_pre_value()
+        immediate = self._scatter_zero_subset(weighted)
+        self._deliver(delayed_delivery + immediate)
+        self._schedule_selected_delayed_mixed(cur_idx, weighted)
+        self._advance_counters()
+
+
 class NetCon(Referency):
     """
     Event-based connectivity wrapper between a pre-synaptic source and a

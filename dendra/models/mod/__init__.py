@@ -9,6 +9,7 @@ from .exp2syn import exp2syn
 from .expsyn import expsyn
 from .fire import fire
 from .fire_r import fire_r
+from .graded_synapse import graded_release_gate, graded_syn, sigmoid_release
 from .hh import hh
 from .pas import pas
 from .spikedetect import spikedetect

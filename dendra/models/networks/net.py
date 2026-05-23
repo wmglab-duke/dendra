@@ -13,7 +13,7 @@ from ..core import Population, _match_state_dict, make_intra
 from ..multi import concat_models, indices
 from ..parametric import is_parametric, to_param
 from ..rng import RNGMixin
-from .netcon import NetCon
+from .netcon import ContinuousCon, NetCon
 from .netstim import NetStim
 
 ConnRule = Literal[
@@ -72,6 +72,8 @@ def advance_populations(populations, dt, extra, intra):
 def step(
     populations,
     synapses,
+    continuous_synapses,
+    continuous_targets,
     netstim,
     t,
     dt,
@@ -81,6 +83,10 @@ def step(
 ):
     if netstim is not None:
         netstim(t, bptt=netstim.training)
+    for target in continuous_targets.values():
+        target.reset_continuous_inputs()
+    for c in continuous_synapses.values():
+        c.advance()
     for s in synapses.values():
         s.advance()
 
@@ -425,6 +431,13 @@ class Network(RNGMixin):
 
         self.synapse_spec = {}
         self.synapses = torch.nn.ModuleDict()
+        self.continuous_synapse_spec = {}
+        self.continuous_synapses = torch.nn.ModuleDict()
+        # Plain dict of unique target ContinuousSynapse mechanisms that need
+        # their per-step analog input buffers reset.  These mechanisms are
+        # already registered on their owning populations, so this dict does not
+        # duplicate module ownership/state_dict entries.
+        self.continuous_targets = {}
         self.dt = None
         self.built = False
 
@@ -499,6 +512,8 @@ class Network(RNGMixin):
             pop.train(mode)
         for syn in self.synapses.values():
             syn.train(mode)
+        for syn in self.continuous_synapses.values():
+            syn.train(mode)
         self.training = mode
         self._step = self._step_train
         return self
@@ -523,6 +538,8 @@ class Network(RNGMixin):
         for pop in self.populations.values():
             pop.eval()
         for syn in self.synapses.values():
+            syn.eval()
+        for syn in self.continuous_synapses.values():
             syn.eval()
         self.training = False
         self._step = self._step_eval
@@ -570,6 +587,9 @@ class Network(RNGMixin):
         """
         self.synapse_spec = {}
         self.synapses.clear()
+        self.continuous_synapse_spec = {}
+        self.continuous_synapses.clear()
+        self.continuous_targets = {}
         self.built = False
 
     def _normalize_endpoint(self, source, target):
@@ -1031,6 +1051,183 @@ class Network(RNGMixin):
             )
         )
 
+    def _connect_continuous(
+        self,
+        source_pop,
+        source_idx,
+        target_pop,
+        target_idx,
+        synapse,
+        *,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+        input=None,
+        reduce="sum",
+        transform=None,
+    ):
+        """Append a finalized continuous-connection spec.
+
+        ``source_idx`` is in source population-flat or pre-var-local coordinates
+        after build-time conversion. ``target_idx`` is target synapse-local.
+        """
+        if source_idx.numel() == 0:
+            return
+
+        n_weight = check_weight_shape(weight, source_idx)
+        n_delay = check_weight_shape(delay, source_idx)
+
+        self.continuous_synapse_spec.setdefault(
+            (
+                source_pop.name,
+                target_pop.name,
+                synapse,
+                pre_var,
+                input,
+                reduce,
+                transform,
+            ),
+            [],
+        ).append(
+            (
+                source_idx,
+                target_idx,
+                to_param(weight, positive=True),
+                n_weight,
+                to_param(delay, positive=True),
+                n_delay,
+            )
+        )
+
+    def connect_continuous(
+        self,
+        source,
+        target,
+        synapse,
+        conn_spec=None,
+        *,
+        pre_var="v",
+        input=None,
+        weight=1.0,
+        delay=0.0,
+        reduce="sum",
+        transform=None,
+        auto_expand=False,
+        allow_autapses: Optional[bool] = None,
+        allow_multapses: Optional[bool] = None,
+    ):
+        """Connect a continuous presynaptic variable to a ContinuousSynapse.
+
+        Unlike :meth:`connect`, this method performs no thresholding.  The
+        selected ``pre_var`` is sampled each timestep, multiplied by ``weight``,
+        optionally delayed, scatter-summed into the target synapse's local shape,
+        and delivered via ``synapse.continuous_receive(..., input=input)``.
+        """
+        if not hasattr(synapse, "continuous_receive"):
+            raise TypeError(
+                "connect_continuous requires a target mechanism that implements "
+                "continuous_receive; did you subclass ContinuousSynapse?"
+            )
+
+        source, target, source_model, target_model = self._normalize_endpoint(
+            source,
+            target,
+        )
+
+        if conn_spec is None:
+            spec = {"rule": "all_to_all"}
+        elif isinstance(conn_spec, str):
+            spec = {"rule": conn_spec}
+        else:
+            spec = dict(conn_spec)
+
+        rule = spec.pop("rule", "all_to_all")
+
+        if allow_autapses is None:
+            allow_autapses = bool(spec.pop("allow_autapses", True))
+        else:
+            spec.pop("allow_autapses", None)
+
+        if allow_multapses is None:
+            allow_multapses = bool(spec.pop("allow_multapses", True))
+        else:
+            spec.pop("allow_multapses", None)
+
+        pre_pool = self._flat_selection(source)
+        post_pool = self._flat_selection(target)
+
+        self._to_synapse_local_post_idx(target_model, post_pool, synapse)
+
+        pre_idx, post_flat = self._edges_for_rule(
+            rule=rule,
+            spec=spec,
+            source_model=source_model,
+            target_model=target_model,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+        )
+
+        if pre_idx.numel() == 0:
+            return
+
+        post_idx = self._to_synapse_local_post_idx(
+            target_model,
+            post_flat.to(target_model.device()),
+            synapse,
+        )
+
+        if auto_expand:
+            n_connections = pre_idx.numel()
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
+        self._connect_continuous(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            weight=weight,
+            delay=delay,
+            pre_var=pre_var,
+            input=input,
+            reduce=reduce,
+            transform=transform,
+        )
+
+    def connect_continuous_one_to_one(
+        self,
+        source,
+        target,
+        synapse,
+        *,
+        pre_var="v",
+        input=None,
+        weight=1.0,
+        delay=0.0,
+        reduce="sum",
+        transform=None,
+        allow_autapses=False,
+        allow_multapses=False,
+    ):
+        """One-to-one wrapper around :meth:`connect_continuous`."""
+        return self.connect_continuous(
+            source,
+            target,
+            synapse,
+            conn_spec={"rule": "one_to_one"},
+            pre_var=pre_var,
+            input=input,
+            weight=weight,
+            delay=delay,
+            reduce=reduce,
+            transform=transform,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+        )
+
     def connect(
         self,
         source,
@@ -1344,6 +1541,83 @@ class Network(RNGMixin):
                 f"{pre_name}:{pre_var.replace('.', '_')}->{post_name}:{synapse.name}"
             ] = syn
 
+    def build_continuous_synapses(self, dt, max_delay_ms=None):
+        """Materialize queued continuous connection specs into ContinuousCon modules.
+
+        Connection specs are coalesced before construction, mirroring the
+        event-based NetCon builder: all user connect_continuous calls with the
+        same ``(pre_name, post_name, synapse, pre_var, input, reduce,
+        transform)`` key are concatenated into one ContinuousCon.  Separately,
+        Network owns a unique target-synapse reset list so each ContinuousSynapse
+        input buffer is reset exactly once per timestep before all analog
+        deliveries.
+        """
+        self.continuous_targets = {}
+        for group_i, (
+            (
+                pre_name,
+                post_name,
+                synapse,
+                pre_var,
+                input_name,
+                reduce,
+                transform,
+            ),
+            specs,
+        ) in enumerate(self.continuous_synapse_spec.items()):
+            pre_var = pre_var if pre_var is not None else "v"
+            pre = getattr(self, pre_name)
+            post = self.populations[post_name]
+            post_device = post.device()
+            post_dtype = post.dtype()
+            pre_idx = torch.cat([s[0] for s in specs])
+            post_idx = torch.cat([s[1] for s in specs])
+            weights = make_weight([s[2] for s in specs], [s[3] for s in specs])
+            delay = make_weight([s[4] for s in specs], [s[5] for s in specs])
+            pre_idx_for_var = self._pre_idx_for_pre_var(pre, pre_idx, pre_var)
+
+            target_name = f"{post_name}:{synapse.name}"
+            if target_name not in self.continuous_targets:
+                if not hasattr(synapse, "reset_continuous_inputs"):
+                    raise TypeError(
+                        "connect_continuous target must implement "
+                        "reset_continuous_inputs()."
+                    )
+                self.continuous_targets[target_name] = synapse
+
+            con = ContinuousCon(
+                pre=pre,
+                pre_idx=pre_idx_for_var,
+                post=post,
+                post_idx=post_idx,
+                post_syn=synapse,
+                weight=weights,
+                delay=delay,
+                dt=dt,
+                pre_var=pre_var,
+                input=input_name,
+                reduce=reduce,
+                max_delay=max_delay_ms,
+                transform=transform,
+                reset_inputs=False,
+            ).to(device=post_device, dtype=post_dtype)
+
+            con.setreference("t", lambda: self.t)
+
+            if self.training:
+                con.train()
+            else:
+                con.eval()
+
+            iname = input_name if input_name is not None else "input"
+            # group_i makes the ModuleDict key collision-proof when distinct
+            # transforms or other non-rendered key fields are used.
+            cname = (
+                f"{group_i}:{pre_name}:{pre_var.replace('.', '_')}~>{post_name}:"
+                f"{synapse.name}:{iname}:{reduce}"
+            )
+            self.continuous_synapses[cname] = con
+
     def build(self, dt, max_delay_ms=None, force_rebuild=False):
         """
         Build synaptic modules for the current wiring spec.
@@ -1368,7 +1642,11 @@ class Network(RNGMixin):
         if not self.built or self.dt != dt or force_rebuild or devices_changed:
             torch._dynamo.reset()
             self.dt = dt
+            self.synapses.clear()
+            self.continuous_synapses.clear()
+            self.continuous_targets = {}
             self.build_synapses(dt, max_delay_ms=max_delay_ms)
+            self.build_continuous_synapses(dt, max_delay_ms=max_delay_ms)
             self.built = True
             self._device_sig = self._device_signature()
         return self
@@ -1480,6 +1758,12 @@ class Network(RNGMixin):
                 reinit_delays=reinit_delays,
                 clear_deliveries=clear_deliveries,
             )
+        for syn in self.continuous_synapses.values():
+            syn.initialize(
+                reinit_weights=reinit_weights,
+                reinit_delays=reinit_delays,
+                clear_deliveries=clear_deliveries,
+            )
 
     def run(self, tstop, extra=None, callbacks=None, progressbar=False):
         """
@@ -1564,6 +1848,8 @@ class Network(RNGMixin):
                 self._step(
                     self.populations,
                     self.synapses,
+                    self.continuous_synapses,
+                    self.continuous_targets,
                     self.netstim,
                     self.t,
                     dt_f,
@@ -1604,6 +1890,7 @@ class Network(RNGMixin):
             Self, with populations and NetCons batched.
         """
         _synapse_spec = self.synapse_spec.copy()
+        _continuous_synapse_spec = self.continuous_synapse_spec.copy()
         self.clear_synapses()
         _old_shapes = {}
         for name, p in self.populations.items():
@@ -1640,6 +1927,42 @@ class Network(RNGMixin):
                     weight,
                     delay,
                     pre_var=pre_var,
+                )
+        for k, v in _continuous_synapse_spec.items():
+            (
+                source_name,
+                target_name,
+                synapse,
+                pre_var,
+                input_name,
+                reduce,
+                transform,
+            ) = k
+            source_pop = getattr(self, source_name)
+            target_pop = getattr(self, target_name)
+            synapse = getattr(target_pop.mech, synapse.name)
+            for data in v:
+                source_idx, target_idx = data[0], data[1]
+                weight, delay = data[2], data[4]
+                if source_name == "netstim" and not include_netstim:
+                    new_source_idx = source_idx.repeat(n)
+                else:
+                    new_source_idx = batchify_index(
+                        _old_shapes[source_name], n, source_idx
+                    )
+                new_target_idx = batchify_index(_old_shapes[target_name], n, target_idx)
+                self._connect_continuous(
+                    source_pop,
+                    new_source_idx,
+                    target_pop,
+                    new_target_idx,
+                    synapse,
+                    weight=weight,
+                    delay=delay,
+                    pre_var=pre_var,
+                    input=input_name,
+                    reduce=reduce,
+                    transform=transform,
                 )
         self.built = False
         self.is_batched = True
@@ -1886,7 +2209,14 @@ class Network(RNGMixin):
         Returns a state dict of all NetCons suitable for checkpointing.
         """
         return {
-            name: syn.state_dict_for_checkpoint() for name, syn in self.synapses.items()
+            "event": {
+                name: syn.state_dict_for_checkpoint()
+                for name, syn in self.synapses.items()
+            },
+            "continuous": {
+                name: syn.state_dict_for_checkpoint()
+                for name, syn in self.continuous_synapses.items()
+            },
         }
 
     def netstim_state_dict_for_checkpoint(self):
@@ -1914,8 +2244,18 @@ class Network(RNGMixin):
         """
         for name, pop_state in state_dict["populations"].items():
             self.populations[name].restore_dict_from_checkpoint(pop_state)
-        for name, syn_state in state_dict["netcons"].items():
-            self.synapses[name].restore_dict_from_checkpoint(syn_state)
+        netcons = state_dict["netcons"]
+        # Backward compatibility: older checkpoints stored only event NetCons as
+        # a flat mapping.  New checkpoints separate event and continuous
+        # connection states.
+        if "event" in netcons or "continuous" in netcons:
+            for name, syn_state in netcons.get("event", {}).items():
+                self.synapses[name].restore_dict_from_checkpoint(syn_state)
+            for name, syn_state in netcons.get("continuous", {}).items():
+                self.continuous_synapses[name].restore_dict_from_checkpoint(syn_state)
+        else:
+            for name, syn_state in netcons.items():
+                self.synapses[name].restore_dict_from_checkpoint(syn_state)
         if state_dict["netstim"] is not None and self.netstim is not None:
             self.netstim.restore_dict_from_checkpoint(state_dict["netstim"])
         self.t = state_dict["t"]
@@ -2180,6 +2520,8 @@ class Network(RNGMixin):
                             self._step(
                                 self.populations,
                                 self.synapses,
+                                self.continuous_synapses,
+                                self.continuous_targets,
                                 self.netstim,
                                 self.t,
                                 dt_f,

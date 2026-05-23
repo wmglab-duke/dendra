@@ -1301,6 +1301,158 @@ class Synapse(Mechanism):
         )
 
 
+class ContinuousSynapse(Mechanism):
+    """
+    A mechanism that receives continuously valued presynaptic variables.
+
+    ``ContinuousSynapse`` is the analog counterpart to :class:`Synapse`.  It is
+    intended for graded transmitter gates, rate-coded projections, neuromodulatory
+    drives, and other connections where the presynaptic mechanism emits a
+    continuous variable rather than discrete events.
+
+    Subclasses declare continuous input buffers with ``ContinuousSynapse.INPUT``.
+    The network's continuous-connection machinery resets those buffers once per
+    timestep, then delivers weighted presynaptic values by calling
+    :meth:`continuous_receive`.  By default, deliveries are **summed** into the
+    named input, which is the natural behavior for convergent synaptic currents.
+    The previous timestep's input is also available as ``<input>_old`` when the
+    input was declared with the default ``keep_old=True``.
+
+    Example
+    -------
+
+    .. code-block:: python
+
+        class graded_gaba(ContinuousSynapse):
+            ContinuousSynapse.INPUT("g_pre")
+            ContinuousSynapse.RANGE(e=-80.0)
+            ContinuousSynapse.NONSPECIFIC_CURRENT("i")
+
+            def i(self, v):
+                return self.g_pre * (v - self.e)
+    """
+
+    _continuous_inputs = tuple()
+    _continuous_input_old = {}
+    _continuous_input_declarations = []
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        inputs = []
+        old_map = {}
+        for base in reversed(cls.__mro__):
+            if "_continuous_inputs" in base.__dict__:
+                inputs.extend(list(base._continuous_inputs))
+            if "_continuous_input_old" in base.__dict__:
+                old_map.update(dict(base._continuous_input_old))
+
+        for names, keep_old in ContinuousSynapse._continuous_input_declarations:
+            for name in names:
+                if name not in inputs:
+                    inputs.append(name)
+                if keep_old:
+                    old_map[name] = f"{name}_old"
+
+        ContinuousSynapse._continuous_input_declarations = []
+        cls._continuous_inputs = tuple(inputs)
+        cls._continuous_input_old = old_map
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Used by ContinuousCon for optional introspection/debugging.  The
+        # current implementation normally resets through a designated first
+        # ContinuousCon per target synapse, but this buffer also makes explicit
+        # step-aware reset policies possible later.
+        self.register_buffer(
+            "_continuous_reset_count", torch.zeros((), dtype=torch.long)
+        )
+
+    @staticmethod
+    def INPUT(*names, keep_old=True):
+        """Declare one or more per-step continuous input buffers.
+
+        Parameters
+        ----------
+        *names : str
+            Input buffer names to declare.
+        keep_old : bool, optional
+            If True (default), also declare ``<name>_old`` buffers and populate
+            them with the previous timestep's input during reset.
+        """
+        if not names:
+            raise ValueError("ContinuousSynapse.INPUT requires at least one name.")
+        names = tuple(str(n) for n in names)
+        assigned = list(names)
+        if keep_old:
+            assigned.extend(f"{name}_old" for name in names)
+        Mechanism.ASSIGNED(*assigned)
+        ContinuousSynapse._continuous_input_declarations.append((names, bool(keep_old)))
+
+    def reset_continuous_inputs(self):
+        """Reset continuous input buffers before new analog deliveries.
+
+        For each declared input ``x``, ``x_old`` is first updated to the current
+        value when available, and ``x`` is then reset to zeros.  Rebinding rather
+        than in-place mutation keeps the operation compatible with autograd.
+        """
+        for name in self._continuous_inputs:
+            current = getattr(self, name)
+            old_name = self._continuous_input_old.get(name, None)
+            if old_name is not None and hasattr(self, old_name):
+                setattr(self, old_name, current)
+            setattr(self, name, torch.zeros_like(current))
+        self._continuous_reset_count = self._continuous_reset_count + 1
+
+    def continuous_receive(self, value, con=None, input=None, reduce=None):
+        """Receive a continuously valued presynaptic projection.
+
+        Parameters
+        ----------
+        value : torch.Tensor
+            Delivered value in the synapse-local shape.
+        con : ContinuousCon, optional
+            Connectivity object delivering the value.
+        input : str, optional
+            Name of the input buffer to update.  If omitted, the first declared
+            input is used.
+        reduce : {"sum", "set", "max", "min"}, optional
+            Reduction used when multiple continuous projections target the same
+            input.  Defaults to the connection's ``reduce`` attribute if present,
+            otherwise ``"sum"``.
+        """
+        if input is None:
+            if len(self._continuous_inputs) != 1:
+                raise ValueError(
+                    "continuous_receive requires `input=` when the synapse has "
+                    f"{len(self._continuous_inputs)} declared inputs."
+                )
+            input = self._continuous_inputs[0]
+
+        if input not in self._continuous_inputs:
+            raise ValueError(
+                f"{self.name!r} has no continuous input {input!r}. "
+                f"Declared inputs are {self._continuous_inputs!r}."
+            )
+
+        if reduce is None:
+            reduce = getattr(con, "reduce", "sum")
+
+        current = getattr(self, input)
+        value = value.to(device=current.device, dtype=current.dtype)
+
+        if reduce in ("sum", "add"):
+            setattr(self, input, current + value)
+        elif reduce in ("set", "replace", "last"):
+            setattr(self, input, value)
+        elif reduce == "max":
+            setattr(self, input, torch.maximum(current, value))
+        elif reduce == "min":
+            setattr(self, input, torch.minimum(current, value))
+        else:
+            raise ValueError(f"Unsupported continuous reduction mode: {reduce!r}.")
+
+
 def rename(mechanism, new_name=None):
     """
     Clone a mechanism class under a new name.
