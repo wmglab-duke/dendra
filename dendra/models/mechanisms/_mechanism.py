@@ -1151,6 +1151,7 @@ class Mechanism(Parameterized):
         pointer_name=None,
         steps_name=None,
         stream_axis: int = -2,
+        delay_axis: int | None = None,
         clear: bool = True,
     ):
         """Register a batched fixed-step delay line for several streams.
@@ -1184,8 +1185,13 @@ class Mechanism(Parameterized):
             Name of the registered integer delay vector. Defaults to
             ``f"{name}_delay_steps"``.
         stream_axis : int, default -2
-            Axis of ``like`` containing independent delay streams. The delay
-            dimension is inserted immediately before this axis.
+            Axis of ``like`` containing independent delay streams.
+        delay_axis : int or None, default None
+            Axis of the delay buffer where the delay dimension is inserted. If
+            ``None``, the delay dimension is inserted immediately before
+            ``stream_axis`` for backwards compatibility. Use ``delay_axis=0``
+            for a time-major buffer layout ``(depth, *like.shape)``, which is
+            often preferable for GPU execution.
         clear : bool, default True
             If true, reset the delay buffer and circular pointer.
 
@@ -1249,10 +1255,22 @@ class Mechanism(Parameterized):
         max_steps = int(steps.max().item()) if steps.numel() else 0
         depth = max(1, max_steps + 1)
 
-        # Insert delay axis immediately before the stream axis.  If like has
-        # shape (..., streams, n), the buffer has shape (..., depth, streams, n).
-        delay_axis = int(stream_axis)
-        buffer_stream_axis = delay_axis + 1
+        # Insert the delay axis.  By default this preserves the original layout
+        # (..., depth, streams, n).  Passing delay_axis=0 gives a time-major
+        # layout (depth, ...), which tends to be more compiler/GPU friendly.
+        if delay_axis is None:
+            delay_axis = int(stream_axis)
+        else:
+            if delay_axis < 0:
+                delay_axis = like.ndim + 1 + delay_axis
+            if delay_axis < 0 or delay_axis > like.ndim:
+                raise ValueError(
+                    f"delay_axis={delay_axis} is invalid for payload ndim={like.ndim}."
+                )
+
+        buffer_stream_axis = (
+            int(stream_axis) + 1 if delay_axis <= int(stream_axis) else int(stream_axis)
+        )
         buffer_shape = (
             tuple(like.shape[:delay_axis]) + (depth,) + tuple(like.shape[delay_axis:])
         )
@@ -1457,20 +1475,16 @@ class Mechanism(Parameterized):
         )
 
     def _delayed_states_steps(self, spec, values, delay_steps=None):
+        # Registered delay vectors are normalized at initialization and kept as
+        # long buffers on the mechanism device.  Avoid per-step .to(...),
+        # torch.as_tensor(...), and shape checks in the common path.
         if delay_steps is None:
-            steps = getattr(self, spec["steps_buffer"])
-        else:
-            steps = torch.as_tensor(delay_steps, device=values.device, dtype=torch.long)
-        steps = steps.to(device=values.device, dtype=torch.long)
+            return getattr(self, spec["steps_buffer"])
+
+        steps = torch.as_tensor(delay_steps, device=values.device, dtype=torch.long)
         if steps.ndim == 0 or steps.numel() == 1:
-            steps = steps.reshape(1).expand(int(spec["n_streams"]))
-        else:
-            steps = steps.reshape(-1)
-        if steps.numel() != int(spec["n_streams"]):
-            raise ValueError(
-                f"delay_steps has length {steps.numel()}, expected {spec['n_streams']}."
-            )
-        return steps
+            return steps.reshape(1).expand(int(spec["n_streams"]))
+        return steps.reshape(-1)
 
     def _delayed_states_gather(self, buf, spec, read_idx):
         axis = int(spec["axis"])
@@ -1513,6 +1527,7 @@ class Mechanism(Parameterized):
                 pointer_name=spec["pointer"],
                 steps_name=spec["steps_buffer"],
                 stream_axis=int(spec["value_stream_axis"]),
+                delay_axis=int(spec["axis"]),
                 clear=True,
             )
             spec = self._delayed_state_specs[state_name]
@@ -1531,14 +1546,8 @@ class Mechanism(Parameterized):
         ptr = getattr(self, spec["pointer"])
         axis = int(spec["axis"])
         depth = int(buf.shape[axis])
-        required_depth = int(spec.get("steps", 0)) + 1
-        if required_depth > depth:
-            raise ValueError(
-                "Circular delayed_states cannot increase max delay_steps without "
-                "re-registering the delayed state group."
-            )
 
-        read_idx = torch.remainder(ptr - steps.to(device=buf.device), depth)
+        read_idx = torch.remainder(ptr - steps, depth)
         delayed = self._delayed_states_gather(buf, spec, read_idx)
 
         # A stream with zero delay should deliver the current value, not the

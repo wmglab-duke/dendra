@@ -75,3 +75,22 @@ def level_spike(v_new, threshold, tau=0.1, ste_scale=1.0):
     hard = (v_new >= threshold).to(v_new.dtype)
     soft = torch.sigmoid((v_new - threshold) / tau)
     return hard + ste_scale * (soft - soft.detach())
+
+
+def crossing_spikes(v_old, v_new, threshold, tau=0.1, ste_scale=1.0):
+    """Broadcasted upward-threshold crossing surrogate.
+
+    This is an explicit batched alias for :func:`crossing_spike`.  All arguments
+    follow PyTorch broadcasting semantics, so ``threshold`` may be a scalar, a
+    per-population vector reshaped with singleton axes, or a full tensor.
+    """
+    return crossing_spike(v_old, v_new, threshold, tau=tau, ste_scale=ste_scale)
+
+
+def level_spikes(v_new, threshold, tau=0.1, ste_scale=1.0):
+    """Broadcasted above-threshold surrogate.
+
+    This is an explicit batched alias for :func:`level_spike`.  All arguments
+    follow PyTorch broadcasting semantics.
+    """
+    return level_spike(v_new, threshold, tau=tau, ste_scale=ste_scale)
