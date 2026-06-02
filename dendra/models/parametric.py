@@ -434,6 +434,48 @@ class Bounded(cacheable):
     def __len__(self):
         return self.rho.numel()
 
+    def set(self, value):
+        """
+        Set the parameter value directly, bypassing the unconstrained ``rho``.
+
+        Parameters
+        ----------
+        value : array_like
+            New value for the parameter, which will be clamped to the valid range.
+        """
+        with torch.no_grad():
+            resolved = torch.as_tensor(
+                value, dtype=self.rho.dtype, device=self.rho.device
+            )
+            self.rho.copy_(self._inverse_transform(resolved))
+
+    def _inverse_transform(self, value):
+        # This method computes the inverse of the forward mapping, used for direct setting.
+        if self.min_val is None and self.max_val is None:
+            return value
+
+        elif self.min_val is not None and self.max_val is None:
+            if self.lower_mode == "softplus":
+                y = torch.clamp(value - self.min_val, min=1e-12)
+                return softplus_inv(y, beta=self.beta, threshold=self.threshold)
+            else:
+                return value
+
+        elif self.min_val is None and self.max_val is not None:
+            if self._upper_mode(upper_only=True) == "hard-ste":
+                return value
+            else:
+                y = torch.clamp(self.max_val - value, min=1e-12)
+                return softplus_inv(y, beta=self.cap_beta, threshold=self.threshold)
+
+        else:
+            if self._upper_mode(upper_only=False) == "hard-ste":
+                return value
+            else:
+                rng = max(self.max_val - self.min_val, 1e-12)
+                t = torch.clamp((value - self.min_val) / rng, 1e-6, 1 - 1e-6)
+                return torch.special.logit(t) / self.beta
+
 
 class PositiveParam(Bounded):
     """
@@ -1008,6 +1050,11 @@ class SimpleParameterized(Referency):
                     with torch.no_grad():
                         param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
                     continue
+            elif key in self._modules:
+                module = getattr(self, key)
+                if isinstance(module, Bounded):
+                    module.set(value)
+                    continue
             else:
                 for param_name, param in self.named_parameters():
                     if matches_any_pattern([key], param_name):
@@ -1529,6 +1576,25 @@ class Parameterized(SimpleParameterized):
             once per instance and broadcast across compartments.
         """
         Parameterized._global_n_declarations.append(kwargs)
+
+    @staticmethod
+    def GLOBAL_SIGNED(**kwargs):
+        """
+        Declare scalar (compartment-independent) signed parameters.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            once per instance and broadcast across compartments.
+        """
+        for k, v in kwargs.items():
+            if v > 0:
+                Parameterized._global_p_declarations.append({k: v})
+            elif v < 0:
+                Parameterized._global_n_declarations.append({k: v})
+            else:
+                Parameterized._global_declarations.append({k: v})
 
     @staticmethod
     def RANGE(**kwargs):
@@ -2200,7 +2266,29 @@ class Parameterized(SimpleParameterized):
         """
         Returns a dictionary of all parameters in the model.
         """
-        return {name: param.clone() for name, param in self.named_parameters()}
+        with torch.no_grad():
+            dct = {name: param.clone() for name, param in self.named_parameters()}
+        return dct
+
+    def load_parameters_dict(self, parameters, strict=True):
+        """
+        Load parameters from a dictionary.
+
+        Parameters
+        ----------
+        parameters : dict
+            Mapping of parameter names to tensors. The tensors are copied into the model's parameters.
+        strict : bool, optional
+            If True, raises an error if a parameter in the model is not found in the dictionary.
+        """
+        with torch.no_grad():
+            for name, param in self.named_parameters():
+                if name in parameters:
+                    param.data.copy_(parameters[name])
+                elif strict:
+                    raise KeyError(
+                        f"Parameter '{name}' not found in the provided dictionary."
+                    )
 
     @classmethod
     def all_parameter_names(cls):

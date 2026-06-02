@@ -1336,7 +1336,7 @@ class Population(P, Sliceable):
                 self._step(self.integrator, self, dt, ve, intra)
 
         self.cache("_steady_state")
-        self.t = self.t.zero_().detach()
+        self.t = torch.zeros_like(self.t).detach()
         return self
 
     def clear_steady_state(self):
@@ -1389,7 +1389,7 @@ class Population(P, Sliceable):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
             self.post_initialize()
-            self.t = self.t.zero_().detach()
+            self.t = torch.zeros_like(self.t).detach()
             self.initialized = True
             return True
         return False
@@ -1424,7 +1424,7 @@ class Population(P, Sliceable):
         self.integrator.mech.initialize(
             self.v, self.celsius, self.diam, populate=populate_parameter_buffers
         )
-        self.t = self.t.zero_().detach()
+        self.t = torch.zeros_like(self.t).detach()
         self.initialized = True
         if force_rebuild:
             self.integrator.initialized = False
@@ -1998,6 +1998,7 @@ class Population(P, Sliceable):
                 key = None
                 shape = self._calc_shape_p()
                 shape_f = self.shape
+                mech.check_kwargs(kwargs)
                 m = mech(
                     name, self.celsius, self.diam, shape, shape_f, key, ic=ic, **kwargs
                 )
@@ -4436,6 +4437,8 @@ def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
     for alias, kwargs, idx in zip(aliases, kwargs_list, local_indices):
         for k, v in kwargs.items():
             additional_parameters.setdefault(k, []).append((alias, v, idx))
+
+    mechanism.check_kwargs(additional_parameters)
 
     m = mechanism(
         None,
