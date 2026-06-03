@@ -3801,7 +3801,7 @@ def hard_spike_arrival_times(
     """
     Non-differentiable first upward-threshold-crossing arrival times.
 
-    This hard reference descriptor is intended for Experiment 1 comparisons against smooth
+    This hard reference descriptor is intended for comparisons against smooth
     surrogates. It uses boolean threshold crossings and therefore does not provide useful
     gradients. Crossings are detected independently for every fiber and compartment.
 
@@ -4729,7 +4729,7 @@ def hard_activity_dependent_slowing(
     computes latency relative to pulse onset, and optionally estimates conduction velocity from
     hard per-compartment crossing times.
 
-    It is intended for Experiment 1 hard-vs-surrogate comparisons, not gradient-based fitting.
+    It is intended for hard-vs-surrogate comparisons, not gradient-based fitting.
     """
     if V.ndim != 3:
         raise ValueError("V must have shape (T, F, C).")
