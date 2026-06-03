@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from dendra.helpers import DEBUG, REQUIRE_GRAD, logger
 from dendra.utils import PreparedInterp1d
 
-from .modular import AxModule, matches_any_pattern
+from .modular import DNModule, matches_any_pattern
 from .rng import RNGModule
 
 _valid_param_type = Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
@@ -768,7 +768,7 @@ def add_instance_property(obj, name, func):
     obj.__class__ = sub  # replace the instance’s class in‑place
 
 
-class Referency(AxModule):
+class Referency(DNModule):
     """Mixin that allows modules to expose dynamic property references."""
 
     def setreference(self, name, func):
@@ -2262,12 +2262,15 @@ class Parameterized(SimpleParameterized):
             except Exception:
                 setattr(self, n, b.detach())
 
-    def parameters_dict(self):
+    def parameters_dict(self, clone=True):
         """
         Returns a dictionary of all parameters in the model.
         """
         with torch.no_grad():
-            dct = {name: param.clone() for name, param in self.named_parameters()}
+            if clone:
+                dct = {name: param.clone() for name, param in self.named_parameters()}
+            else:
+                dct = {name: param for name, param in self.named_parameters()}
         return dct
 
     def load_parameters_dict(self, parameters, strict=True):
