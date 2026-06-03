@@ -19,16 +19,16 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](ht
 `dendra` has been tested on Windows 11 under WSL2 (Ubuntu 22.04), Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux), and macOS (Tahoe 26.3).
 
 ### Python dependencies
-`dendra` requires Python 3.10+ and PyTorch 2.7+. For GPU support, CUDA 12.9+ is required for best performance.
+`dendra` requires Python 3.11+ and PyTorch 2.7+. For GPU support, CUDA 12.9+ is required for best performance. We recommend installing the most recent stable version of PyTorch that supports your CUDA version. If you have an older GPU that is not compatible with the latest CUDA, you may need to install an older version of PyTorch that supports your CUDA version. See the [PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/) for more details.
 
 ## 🖥️ Installation
 
 > [!TIP]
 > We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n dendra python=3.12`. Be sure to activate your new environment (`conda activate dendra`) before following the installation instructions or running code.
 
-1. Install PyTorch (+ CUDA 12.9+ if you're running on GPU).
+1. (Optional) Install your preferred version of PyTorch.
 ```bash
-> pip install torch --index-url https://download.pytorch.org/whl/cu129
+> pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129
 ```
 
 2. Clone this repository.
@@ -41,16 +41,16 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](ht
 
 ```bash
 > cd dendra
-> python -m pip install .
+> pip install .
 ```
 
 - If you want to build and run the documentation locally:
-    - `python -m pip install '.[doc]'`
+    - `pip install ".[doc]"`
 
 ### ⚙️ Installing for development
 - Install `--editable` with dev dependencies & install `pre-commit`:
-    - `python -m pip install --editable '.[dev]'`
-    - `python -m pre-commit install`
+    - `pip install --editable ".[dev]"`
+    - `pre-commit install`
 
 
 🥳 You're all set!

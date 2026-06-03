@@ -23,7 +23,7 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
    conda activate dendra
    ```
 
-2. Install PyTorch (pick the command that matches your hardware):
+2. (Optional) Install your preferred version of PyTorch:
 
    ```{important}
    If installing on Windows without WSL2, please follow PyTorch installation instructions [here](https://docs.pytorch.org/tutorials/unstable/inductor_windows.html) to ensure proper setup of the PyTorch Inductor backend (used by Dendra for JIT-compilation of models).
@@ -35,10 +35,10 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 
    ```sh
    # e.g., GPU build (Pytorch 2.8.0, CUDA 12.9) - adjust the version and CUDA version as needed
-   python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129
+   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129
 
    # CPU-only build
-   # python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+   # pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
    ```
 
 3. (Windows without WSL2) Install NEURON using the precompiled installer from https://neuron.yale.edu/neuron/download.
