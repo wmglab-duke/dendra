@@ -37,7 +37,7 @@ def _normalize_eliminate(eliminate):
 
 
 cnexp_template = """
-def solve(self, dt, {states_and_assigned}):
+def solve(self, dt, {states_and_assigned}, **kwargs):
     {solves}
     return {returns}
 """

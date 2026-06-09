@@ -472,7 +472,7 @@ def derivimplicit_step(
 
 
 derivimplicit_template = """
-def solve(self, dt, {states_and_assigned}):
+def solve(self, dt, {states_and_assigned}, **kwargs):
     {locals}
     {concatenate}
     {f_str}

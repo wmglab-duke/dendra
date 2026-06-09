@@ -3,7 +3,6 @@ import math
 import warnings
 from typing import Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -15,12 +14,20 @@ try:
 except ImportError:
     DENDRA_SOLVERS_AVAILABLE = False
 
-from ..batching import expand_and_reshape
-from .core import Integrator, MultiIntegrator
+from .core import (
+    Integrator,
+    MultiIntegrator,
+    _as_solve_block,
+    _as_solve_matrix,
+    _expanded_v_init,
+    _flatten_to_solve,
+    _model_solve_shape,
+    ensure_model_buffer,
+)
 from .tridiag import pcr_solve_t
 from .triton import (
     pcr_solve_cuda_t,
-    solve_bt_spd_cuda,
+    solve_bt_spd_cuda_consume_unchecked,
     thomas_solve_cuda_bt,
     thomas_solve_cuda_t,
 )
@@ -57,7 +64,9 @@ class _bwd_euler_sc(Integrator):
         self.area = 2 * math.pi * (1e-4 * model.diam / 2.0) * (1e-4 * model.dx)  # cm²
 
     def step(self, model, dt, ve=None, intra=None):
-        v_new, i_membrane = self._solve(model.v, dt, model.celsius, intra)
+        v_new, i_membrane = self._call_kernel(
+            "_solve", model.v, dt, model.celsius, intra
+        )
         model.v = v_new
         if self.imem:
             model.i_membrane = i_membrane
@@ -118,7 +127,7 @@ class _bwd_euler_sc_skip(Integrator):
         pass
 
     def step(self, model, dt, ve=None, intra=None):
-        model.v = self._solve(model.v, dt, model.celsius, intra)
+        model.v = self._call_kernel("_solve", model.v, dt, model.celsius, intra)
 
     def _solve(self, v, dt, temp, intra=None):
         # apply voltage processes
@@ -133,7 +142,9 @@ class _bwd_euler_sc_multi(MultiIntegrator, _bwd_euler_sc):
         super().__init__(model, mech, imem, write_back)
 
     def step(self, model, dt, ve=None, intra=None):
-        v_new, i_membrane = self._solve(model.v, dt, model.celsius, intra)
+        v_new, i_membrane = self._call_kernel(
+            "_solve", model.v, dt, model.celsius, intra
+        )
         model.v = v_new
         if self.imem:
             model.i_membrane = i_membrane
@@ -181,7 +192,10 @@ class _bwd_euler_ub(Integrator):
                 self.use_gc_variant = True
 
         self._last_bands: Tuple[Tensor, Tensor, Tensor] = None
-        B, K = model.np, model.nc
+        B, K = _model_solve_shape(model)
+        self.B = B
+        self.K = K
+        self.base_shape = tuple(model.shape)
 
         # Buffers for diffusive diag, axonal conductance, membrane scale
         self.register_buffer("diag_base", torch.zeros(B, K))
@@ -261,19 +275,25 @@ class _bwd_euler_ub(Integrator):
         # Select solver first (depends on device and method)
         self._select_solver(model)
 
-        B, K = model.np, model.nc
+        B, K = _model_solve_shape(model)
+        self.B, self.K = B, K
         dt_s = dt * 1e-3  # s
 
+        diam = _as_solve_matrix(model.diam, model)
+        dx = _as_solve_matrix(model.dx, model)
+        cm = _as_solve_matrix(model.cm, model)
+        rhoa = _as_solve_matrix(model.rhoa, model)
+
         # ── geometry (all element-wise) ──────────────────────────────
-        radius_cm = 1e-4 * model.diam / 2.0  # µm → cm   (B,K)
-        dx_cm = 1e-4 * model.dx  # µm → cm   (B,K)
+        radius_cm = 1e-4 * diam / 2.0  # µm → cm   (B,K)
+        dx_cm = 1e-4 * dx  # µm → cm   (B,K)
         area_cm2 = 2 * torch.pi * radius_cm * dx_cm  # cm²
 
-        Cm = 1e-6 * model.cm * area_cm2  # F   (B,K)
+        Cm = 1e-6 * cm * area_cm2  # F   (B,K)
         Cm_inv = 1.0 / Cm  # 1/F
 
         # segment axial resistance  (Ω cm)
-        Ra_seg = model.rhoa * dx_cm / (torch.pi * radius_cm**2)  # (B,K)
+        Ra_seg = rhoa * dx_cm / (torch.pi * radius_cm**2)  # (B,K)
 
         # ── edge axial conductance between centres i ↔ i+1 ──────────
         # harmonic mean:   g_edge = 2 / (Ra_i + Ra_{i+1})
@@ -288,7 +308,7 @@ class _bwd_euler_ub(Integrator):
 
         # ── fill solver buffers ─────────────────────────────────────
         # diagonal of the diffusive operator (base part, no ion channels yet)
-        diag = torch.zeros(B, K, device=model.device())
+        diag = torch.zeros(B, K, device=model.device(), dtype=model.dtype())
         diag[:, :-1] -= g_left
         diag[:, 1:] -= g_right
         self.diag_base = diag
@@ -301,10 +321,15 @@ class _bwd_euler_ub(Integrator):
         self.cm_inv = Cm_inv  # (B,K)
         self.scale = area_cm2 * Cm_inv  # 1 / c_m (inverse specific capacitance, cm^2/F)
 
-        self.base_shape = model.shape
+        self.base_shape = tuple(model.shape)
 
     def step(self, model, dt, ve=None, intra=None):
-        model.v, model.i_membrane = self._step(model.v, dt, model.celsius, ve, intra)
+        v_new, i_membrane = self._call_kernel(
+            "_step", model.v, dt, model.celsius, ve, intra
+        )
+        model.v = v_new
+        if self.imem:
+            model.i_membrane = i_membrane
 
     def _step(self, v, dt, temp, ve=None, intra=None) -> Tensor:
         dt_s = dt * 1e-3
@@ -312,24 +337,29 @@ class _bwd_euler_ub(Integrator):
         v = self.mech.update_v(v)  # apply voltage processes
         self.mech.advance(v, dt, temp)
 
-        itot, gtot = self.mech.i(v)  # (B,K)
+        itot, gtot = self.mech.i(v)  # public voltage shape
+
+        v_flat = _flatten_to_solve(v, self.K)
+        itot = _flatten_to_solve(itot, self.K)
+        gtot = _flatten_to_solve(gtot, self.K)
 
         # f_n = (irev - i_res) * self.scale
-        f_n = (gtot * v - itot) * self.scale  # (B,K)
+        f_n = (gtot * v_flat - itot) * self.scale  # (B,K)
 
         if ve is not None:
             # diffusive extracellular coupling
-            flux = self.g_edge_Cinv * (ve[..., 1:] - ve[..., :-1])  # (B, K-1)
-            S = torch.zeros_like(ve)  # (B, K)
+            ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
+            flux = self.g_edge_Cinv * (ve_flat[..., 1:] - ve_flat[..., :-1])  # (B, K-1)
+            S = torch.zeros_like(ve_flat)  # (B, K)
             S[..., 1:-1] = -flux[..., :-1] + flux[..., 1:]
             S[..., 0] = -flux[..., 0]
             S[..., -1] = flux[..., -1]
             f_n = f_n + S
 
         if intra is not None:
-            f_n = f_n + intra * self.cm_inv
+            f_n = f_n + _flatten_to_solve(intra, self.K, self.base_shape) * self.cm_inv
 
-        RHS = v + dt_s * f_n
+        RHS = v_flat + dt_s * f_n
 
         # build tridiagonal system M v_{n+1} = RHS
         A_diag = self.diag_base - gtot * self.scale
@@ -340,7 +370,8 @@ class _bwd_euler_ub(Integrator):
         c_s = self.upper  # (B,K-1)
         b_s = main  # (B,K)
 
-        self._last_bands = (a_s, b_s, c_s)
+        if not self.jit:
+            self._last_bands = (a_s, b_s, c_s)
 
         d_s = RHS
 
@@ -360,9 +391,9 @@ class _bwd_euler_ub(Integrator):
             g_abs = gtot * area  # S (ionic conductance per segment)
             i_abs = itot * area  # mA (ionic current per segment)
             dmem = Cdt + g_abs  # A/V
-            i_membrane = dmem * (v_np1 - v) + i_abs
+            i_membrane = (dmem * (v_np1 - v_flat) + i_abs).reshape(self.base_shape)
 
-        return v_np1, i_membrane
+        return v_np1.reshape(self.base_shape), i_membrane
 
 
 class _bwd_euler_bt(Integrator):
@@ -370,9 +401,10 @@ class _bwd_euler_bt(Integrator):
     Implicit Euler for block tridiagonal systems (multi-layer extracellular).
 
     Solves a block-tridiagonal linear system per step that couples the
-    intracellular voltage and multiple concentric extracellular shells (e.g.,
-    ExtCellAxon). Supports SPD or Thomas-like solvers on CPU (via
-    ``dendra_solvers``) and custom CUDA kernels.
+    intracellular voltage and extracellular shell variables. The current block
+    solver path is specialized to 3 unknowns per compartment. The SPD backend
+    uses consuming workspace solvers: the per-step block matrix and RHS buffers
+    constructed in ``_step`` are disposable and may be overwritten by the solver.
 
     Parameters
     ----------
@@ -395,16 +427,24 @@ class _bwd_euler_bt(Integrator):
             )
         super().__init__(model, mech, imem)
 
-        valid_methods = ["spd", "inv"]
+        valid_methods = ["spd", "inv", "thomas"]
         if method not in valid_methods:
             raise ValueError(
                 f"Unknown method: {method}, must be one of {valid_methods}"
             )
+        if method == "inv":
+            method = "thomas"
         self.method = method
 
         self.mech = mech
 
-        B, K, M = np.prod(model.shape[:-1]), model.n_comp, model.n_layers + 1
+        B, K = _model_solve_shape(model)
+        M = model.n_layers + 1
+        if M != 3:
+            raise ValueError(
+                "_bwd_euler_bt currently requires exactly 3 unknowns per "
+                f"compartment (model.n_layers + 1 == 3); got {M}."
+            )
         self.B = B
         self.K = K
         self.M = M
@@ -419,10 +459,11 @@ class _bwd_euler_bt(Integrator):
         self.register_buffer("c_rad", torch.zeros(B, K, M))
         self.register_buffer("xg", torch.zeros(B, K, M))
 
-        model.register_buffer("vc", torch.zeros(B, K, M))
+        ensure_model_buffer(model, "vc", tuple(model.shape) + (M,))
 
-        model.vc[..., 0] = model.v_init
-        model.v[:] = model.v_init
+        v0 = _expanded_v_init(model)
+        model.vc[..., 0] = v0
+        model.v[:] = v0
 
         self.initialized = False
         self.dt = None
@@ -432,9 +473,11 @@ class _bwd_euler_bt(Integrator):
         return (np, nc)
 
     def init_v(self, model):
+        v0 = _expanded_v_init(model).clone().detach().contiguous()
+        ensure_model_buffer(model, "vc", tuple(model.shape) + (self.M,))
         model.vc.zero_()
-        model.vc[..., 0] = model.v_init
-        model.v[:] = model.v_init
+        model.vc[..., 0] = v0
+        model.v = v0.clone()
         model.vc = model.vc.detach()
         model.v = model.v.detach()
         if self.imem:
@@ -445,36 +488,60 @@ class _bwd_euler_bt(Integrator):
         model.v = model.v.detach()
         self.mech.detach()
 
+    def _select_solver(self, model):
+        dev = model.device().type  # "cpu" or "cuda"
+
+        if self.method == "spd":
+            if dev == "cuda":
+                # _step constructs fresh B_work/D_work buffers, so use the
+                # unchecked consuming path to avoid duplicate per-step validation.
+                self._solve = solve_bt_spd_cuda_consume_unchecked
+            elif dev == "cpu":
+                try:
+                    from dendra_solvers import solve_bt_spd_consume_unchecked
+                except ImportError as err:
+                    raise ImportError(
+                        "_bwd_euler_bt(method='spd') requires dendra_solvers for CPU execution. "
+                        "Use CUDA or install dendra_solvers."
+                    ) from err
+                else:
+                    # _step constructs fresh B_work/D_work buffers, so use the
+                    # unchecked consuming path to avoid duplicate per-step validation.
+                    self._solve = solve_bt_spd_consume_unchecked
+        else:  # method == "thomas"
+            if dev == "cuda":
+                self._solve = thomas_solve_cuda_bt
+            elif dev == "cpu":
+                if DENDRA_SOLVERS_AVAILABLE:
+                    self._solve = torch.ops.dendra_solvers.solve_bt
+                else:
+                    raise ImportError(
+                        "_bwd_euler_bt(method='thomas') requires dendra_solvers for CPU execution. "
+                        "Use CUDA or install dendra_solvers."
+                    )
+
     def initialize(self, model, dt):
         """
-        Generic MxM block initialisation (M >= 3).
+        3x3 block initialisation.
 
         Unknown ordering per compartment
-            0  : intracellular v
-            1  : ve[0]            (innermost shell)
-            ...
-            M-1: ve[M-2]          (outermost shell)
+            0: intracellular v
+            1: ve[0]            (innermost shell)
+            2: ve[1]            (outermost unknown shell)
 
         The outermost (Dirichlet) bath is *not* part of the unknowns.
         """
-        if model.device().type == "cpu":
-            if not DENDRA_SOLVERS_AVAILABLE:
-                raise RuntimeError(
-                    "CPU models require dendra_solvers to be installed for implicit integration."
-                )
-            from dendra_solvers import solve_bt_spd
-
-            if self.M != 3:
-                raise ValueError(f"CPU block-Thomas (3x3) requires M=3, got M={self.M}")
-            if self.method == "spd":
-                self._solve = solve_bt_spd
-            elif self.method == "inv":
-                self._solve = torch.ops.dendra_solvers.solve_bt
-        elif model.device().type == "cuda":
-            if self.method == "spd":
-                self._solve = solve_bt_spd_cuda
-            else:
-                self._solve = thomas_solve_cuda_bt
+        self._select_solver(model)
+        self._refresh_solver_shape(model, block_dim=self.M)
+        if tuple(model.vc.shape) != tuple(model.shape) + (self.M,):
+            vc_new = torch.zeros(
+                *model.shape, self.M, device=model.device(), dtype=model.dtype()
+            )
+            old = model.vc.reshape(-1, self.M)
+            new = vc_new.reshape(-1, self.M)
+            n = min(old.shape[0], new.shape[0])
+            new[:n].copy_(old[:n].to(device=model.device(), dtype=model.dtype()))
+            model.vc = vc_new
 
         # ------------------------------------------------------------------
         # Geometry-dependent scalars
@@ -483,36 +550,21 @@ class _bwd_euler_bt(Integrator):
         B, K, M = self.B, self.K, self.M
         dev, dtyp = model.device(), model.dtype()
 
-        n_batch_dims = len(model.shape) - 2
-        L = (
-            expand_and_reshape(model.dx, model.shape, n_batch_dims, (B, K)) * 1e-4
-        )  # μm → cm
-        diam = (
-            expand_and_reshape(model.diam, model.shape, n_batch_dims, (B, K)) * 1e-4
-        )  # μm → cm
+        L = _as_solve_matrix(model.dx, model) * 1e-4  # μm → cm
+        diam = _as_solve_matrix(model.diam, model) * 1e-4  # μm → cm
         radius = 0.5 * diam  # cm
         area = torch.pi * diam * L  # cm² for each segment
 
         # ------------------------------------------------------------------
         # Axial conductances (left/right padding → K+1)
         # ------------------------------------------------------------------
-        ri = (
-            expand_and_reshape(model.rhoa, model.shape, n_batch_dims, (B, K))
-            * L
-            / (torch.pi * radius**2)
-        )  # Ω
+        ri = _as_solve_matrix(model.rhoa, model) * L / (torch.pi * radius**2)  # Ω
         ri = 0.5 * (ri[:, :-1] + ri[:, 1:])  # (B,K-1)
         gi = 1.0 / ri  # S
         gi = F.pad(gi, (1, 1))  # (B,K+1)
 
-        batched_shape_for_vectors = tuple(list(model.shape) + [M - 1])
-
         raxial = (
-            expand_and_reshape(
-                model.xraxial, batched_shape_for_vectors, n_batch_dims, (B, K, M - 1)
-            )
-            * L.unsqueeze(-1)
-            * 1e6
+            _as_solve_block(model.xraxial, model, (M - 1,)) * L.unsqueeze(-1) * 1e6
         )  # Ω
         raxial = 0.5 * (raxial[:, :-1, :] + raxial[:, 1:, :])
         self.register_buffer("raxial", raxial[..., 0])
@@ -530,24 +582,15 @@ class _bwd_euler_bt(Integrator):
         # Radial (membrane + shell) elements
         # ------------------------------------------------------------------
         area_cm2 = area  # cm²
-        cm_dt = (
-            expand_and_reshape(model.cm, model.shape, n_batch_dims, (B, K))
-            * 1e-6
-            * area_cm2
-            / dt
-        )  # F/s, (B,K)
+        cm_dt = _as_solve_matrix(model.cm, model) * 1e-6 * area_cm2 / dt
 
         xc_dt = (
-            expand_and_reshape(
-                model.xc, batched_shape_for_vectors, n_batch_dims, (B, K, M - 1)
-            )
+            _as_solve_block(model.xc, model, (M - 1,))
             * 1e-6
             * area_cm2.unsqueeze(-1)
             / dt
         )  # F/s, (B,K,M-1)
-        xg = expand_and_reshape(
-            model.xg, batched_shape_for_vectors, n_batch_dims, (B, K, M - 1)
-        ) * area_cm2.unsqueeze(-1)  # S  , (B,K,M-1)
+        xg = _as_solve_block(model.xg, model, (M - 1,)) * area_cm2.unsqueeze(-1)
 
         # ------------------------------------------------------------------
         # Allocate blocks
@@ -627,9 +670,19 @@ class _bwd_euler_bt(Integrator):
         self.base_shape = tuple(list(model.shape) + [self.M])
 
     def step(self, model, dt, ve=None, intra=None):
-        model.vc, model.v, model.i_membrane = self._step(
-            model.vc.view(-1, self.K, 3), model.v, dt, model.celsius, ve, intra
+        vc_new, v_new, i_membrane = self._call_kernel(
+            "_step",
+            model.vc.reshape(-1, self.K, self.M),
+            model.v,
+            dt,
+            model.celsius,
+            ve,
+            intra,
         )
+        model.vc = vc_new
+        model.v = v_new
+        if self.imem:
+            model.i_membrane = i_membrane
 
     def _step(self, vc, v, dt, temp, ve=None, intra=None) -> Tuple[Tensor, Tensor]:
         xg = self.xg[..., -1]
@@ -643,25 +696,34 @@ class _bwd_euler_bt(Integrator):
         itot, gtot = self.mech.i(v)
 
         # linearized ionic conductances & reversal
-        gtot = gtot.view(-1, self.K) * self.area
+        v_flat = _flatten_to_solve(v, self.K)
+        gtot = _flatten_to_solve(gtot, self.K) * self.area
 
-        itot = itot.view(-1, self.K) * self.area  # (B, K)
+        itot = _flatten_to_solve(itot, self.K) * self.area  # (B, K)
 
-        d = gtot * v.view(-1, self.K) - itot
+        d = gtot * v_flat - itot
 
         if intra is not None:
-            d = d + intra.view(-1, self.K)
+            d = d + _flatten_to_solve(intra, self.K, self.base_shape[:-1])
 
-        B = self.maind.clone()  # (B, K, M, M)
-        B[..., 0, 0] += gtot
-        B[..., 1, 1] += gtot
-        B[..., 0, 1] -= gtot
-        B[..., 1, 0] -= gtot
+        # Disposable solver workspaces. The SPD consuming solvers may overwrite
+        # both buffers during factorization/elimination; neither is read after
+        # the solve.
+        B_work = self.maind.clone()  # (B, K, M, M)
+        B_work[..., 0, 0] += gtot
+        B_work[..., 1, 1] += gtot
+        B_work[..., 0, 1] -= gtot
+        B_work[..., 1, 0] -= gtot
 
-        D = assemble_rhs(vc, self.c_rad, d, xg, ve)
+        ve_flat = (
+            _flatten_to_solve(ve, self.K, self.base_shape[:-1])
+            if ve is not None
+            else None
+        )
+        D_work = assemble_rhs(vc, self.c_rad, d, xg, ve_flat)
 
-        # solve tridiagonal system
-        vc_new = self._solve(self.lower, B, self.upper, D).reshape(
+        # solve block-tridiagonal system
+        vc_new = self._solve(self.lower, B_work, self.upper, D_work).reshape(
             self.base_shape
         )  # (model.shape)
         v = vc_new[..., 0] - vc_new[..., 1]  # v = vi - ve0
@@ -671,13 +733,13 @@ class _bwd_euler_bt(Integrator):
         if self.imem:
             vprev_mem = vc[..., 0] - vc[..., 1]
             d_mem = self.cm_dt + gtot  # (B, K)  A/V
-            rhs_mem = self.cm_dt * vprev_mem.view(-1, self.K) + d
-            i_membrane = d_mem * v.view(-1, self.K) - rhs_mem
+            rhs_mem = self.cm_dt * vprev_mem.reshape(-1, self.K) + d
+            i_membrane = d_mem * _flatten_to_solve(v, self.K) - rhs_mem
             periaxonal = torch.zeros_like(i_membrane)
-            periaxonal[:, :-1] += (vc[:, 1:, 1] - vc[:, :-1, 1]).view(
+            periaxonal[:, :-1] += (vc[:, 1:, 1] - vc[:, :-1, 1]).reshape(
                 -1, self.K - 1
             ) / self.raxial
-            periaxonal[:, 1:] += (vc[:, :-1, 1] - vc[:, 1:, 1]).view(
+            periaxonal[:, 1:] += (vc[:, :-1, 1] - vc[:, 1:, 1]).reshape(
                 -1, self.K - 1
             ) / self.raxial
             i_membrane = (i_membrane + periaxonal).reshape_as(v)

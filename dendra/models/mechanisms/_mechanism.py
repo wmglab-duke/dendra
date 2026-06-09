@@ -358,6 +358,13 @@ class Mechanism(Parameterized):
         for a in self._assigned:
             self.register_buffer(a, torch.zeros(shape))
 
+        self._all_states = []
+        for state_module in self.DE.values():
+            for state_name in state_module._state:
+                self._all_states.append(state_name)
+
+        self._all_states += [a for a in self._assigned]
+
         # factorize current equations
         current_eqs = []
         for _, v in self._currents.items():
@@ -782,12 +789,15 @@ class Mechanism(Parameterized):
             Time-step tensor propagated from the integrator.
         """
         for state_module in self.DE.values():
-            states = {
-                state_name: self._buffers[state_name]
-                for state_name in state_module._state
-            }
+            states = self._gather_states()
             local = state_module.advance(v, dt, states)
             self._buffers.update(local)
+
+    def _gather_states(self):
+        states = {
+            state_name: self._buffers[state_name] for state_name in self._all_states
+        }
+        return states
 
     def populate(self):
         """
@@ -1762,6 +1772,7 @@ class Mechanism(Parameterized):
                 else torch.zeros((), device=v.device, dtype=v.dtype)
             )
         t = torch.as_tensor(t, device=v.device, dtype=v.dtype)
+        t = torch.atleast_1d(t)
 
         for k, spec in enumerate(self._injection_specs):
             mask = getattr(self, spec["mask"])

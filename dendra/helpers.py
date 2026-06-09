@@ -35,7 +35,13 @@ class ctx(contextlib.ContextDecorator):
     - ``BACKEND`` (str): torch.compile backend (e.g., ``\"inductor\"``).
     - ``FULLGRAPH`` (int/bool): request full-graph compilation.
     - ``DYNAMIC`` (int/bool): enable dynamic shape compilation.
-    - ``JIT`` (int/bool): enable/disable torch.compile wrapping.
+    - ``JIT`` (int/bool): enable standalone population/integrator JIT and
+      opt into aggressive network-side compilation where supported.
+    - ``JIT_NETWORK_SOLVES`` (int/bool): enable population/integrator JIT only
+      for populations stepped by a Network. This replaces the legacy
+      ``JIT_IN_NETWORK`` name.
+    - ``JIT_NETWORK_OPS`` (int/bool): enable network-side/event/synapse JIT
+      where a component exposes a compile-safe kernel.
     - ``COMPILE_MODE`` (str): torch.compile mode (e.g., ``\"default\"``).
     - ``DEBUG`` (int/bool): increase logging verbosity for mechanism/state
       compilation (symbolic transforms, conductance differentiation).
@@ -60,11 +66,19 @@ class ctx(contextlib.ContextDecorator):
         self.kwargs = kwargs
 
     def __enter__(self):
-        self.old_context: dict[str, int] = {
+        self.old_context: dict[str, Any] = {
             k: v.value for k, v in ContextVar._cache.items()
         }
         for k, v in self.kwargs.items():
-            ContextVar._cache[k].value = v
+            key = CONTEXT_ALIASES.get(k, k)
+            if key not in ContextVar._cache:
+                valid = ", ".join(sorted(ContextVar._cache))
+                aliases = ", ".join(sorted(CONTEXT_ALIASES))
+                raise KeyError(
+                    f"Unknown Dendra context variable {k!r}. "
+                    f"Valid keys: {valid}. Legacy aliases: {aliases}."
+                )
+            ContextVar._cache[key].value = v
 
     def __exit__(self, *args):
         for k, v in self.old_context.items():
@@ -98,6 +112,15 @@ class ContextVar:
         return self.value <= x
 
 
+# Backward-compatible context-key aliases. The exported variable
+# ``JIT_IN_NETWORK`` below points at ``JIT_NETWORK_SOLVES`` as well, but ctx()
+# needs a key-level alias so ``with dendra.ctx(JIT_IN_NETWORK=0): ...`` keeps
+# working.
+CONTEXT_ALIASES = {
+    "JIT_IN_NETWORK": "JIT_NETWORK_SOLVES",
+}
+
+
 DEBUG = ContextVar("DEBUG", 0)
 TF32 = ContextVar("TF32", 0)
 IMEM = ContextVar("IMEM", 0)
@@ -109,8 +132,21 @@ USETABLES = ContextVar("USETABLES", 1)
 BACKEND = ContextVar("BACKEND", "inductor")
 FULLGRAPH = ContextVar("FULLGRAPH", 0)
 DYNAMIC = ContextVar("DYNAMIC", 0)
-JIT = ContextVar("JIT", 1)
-JIT_IN_NETWORK = ContextVar("JIT_IN_NETWORK", 1)
+
+# Compilation policy:
+#   JIT                 -> standalone population/integrator kernels and aggressive
+#                          network-side opt-in where supported.
+#   JIT_NETWORK_SOLVES  -> population/integrator kernels only when the population
+#                          is stepped by a Network.
+#   JIT_NETWORK_OPS     -> network event/synapse plumbing where compile-safe
+#                          kernels are explicitly exposed.
+#
+# For compatibility, the old environment variable JIT_IN_NETWORK can still seed
+# JIT_NETWORK_SOLVES, and the exported JIT_IN_NETWORK object is an alias.
+JIT = ContextVar("JIT", 0)
+JIT_NETWORK_SOLVES = ContextVar("JIT_NETWORK_SOLVES", getenv("JIT_IN_NETWORK", 0))
+JIT_NETWORK_OPS = ContextVar("JIT_NETWORK_OPS", 0)
+JIT_IN_NETWORK = JIT_NETWORK_SOLVES
 COMPILE_MODE = ContextVar("COMPILE_MODE", "default")
 
 
@@ -128,18 +164,74 @@ def set_jit_enabled(enable=True):
     return
 
 
-def set_jit_in_network_enabled(enable=True):
+def set_jit_network_solves_enabled(enable=True):
     """
-    Enable or disable JIT compilation within networks globally for Dendra Populations.
+    Enable or disable population/integrator kernel compilation for populations
+    stepped by a Network.
 
-    Parameters
-    ----------
-    enable : bool
-        If True, enable JIT compilation within networks. If False, disable it. Default is True.
+    This is the preferred spelling for the legacy
+    :func:`set_jit_in_network_enabled` helper.
     """
-    global JIT_IN_NETWORK
-    JIT_IN_NETWORK.value = int(enable)
+    JIT_NETWORK_SOLVES.value = int(enable)
     return
+
+
+def set_jit_network_ops_enabled(enable=True):
+    """
+    Enable or disable network-side/event/synapse compilation where supported.
+
+    This flag is intentionally separate from population solve compilation,
+    because NetCon/NetStim/event delivery has much more Python-side state.
+    """
+    JIT_NETWORK_OPS.value = int(enable)
+    return
+
+
+def set_jit_in_network_enabled(enable=True):
+    """Deprecated alias for :func:`set_jit_network_solves_enabled`."""
+    return set_jit_network_solves_enabled(enable)
+
+
+def jit_enabled_for_scope(scope: str, owner=None) -> bool:
+    """Return the effective JIT decision for a Dendra execution scope.
+
+    Scopes
+    ------
+    ``"population"``
+        Standalone Population.run/longrun/steady_state. Only ``JIT`` enables
+        compilation.
+    ``"network_population"``
+        Population/integrator kernels while stepped by a Network. Enabled by
+        ``JIT`` or ``JIT_NETWORK_SOLVES``.
+    ``"network_ops"``
+        Network-side event/synapse/NetStim plumbing. Enabled by ``JIT`` or
+        ``JIT_NETWORK_OPS``.
+    """
+    if owner is None:
+        jit = bool(JIT)
+        jit_network_solves = bool(JIT_NETWORK_SOLVES)
+        jit_network_ops = bool(JIT_NETWORK_OPS)
+    else:
+        jit = bool(getattr(owner, "jit", bool(JIT)))
+        jit_network_solves = bool(
+            getattr(
+                owner,
+                "jit_network_solves",
+                getattr(owner, "jit_in_network", bool(JIT_NETWORK_SOLVES)),
+            )
+        )
+        jit_network_ops = bool(getattr(owner, "jit_network_ops", bool(JIT_NETWORK_OPS)))
+
+    if scope == "population":
+        return jit
+    if scope == "network_population":
+        return jit or jit_network_solves
+    if scope == "network_ops":
+        return jit or jit_network_ops
+    raise ValueError(
+        "Unknown Dendra JIT scope "
+        f"{scope!r}; expected 'population', 'network_population', or 'network_ops'."
+    )
 
 
 def numpify(x):

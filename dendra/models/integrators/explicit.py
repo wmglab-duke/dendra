@@ -3,7 +3,29 @@ from typing import Optional, Tuple
 import torch
 from torch.nn import functional as F
 
-from .core import Integrator
+from .core import (
+    Integrator,
+    _broadcast_to_shape,
+    _expanded_v_init,
+    _flatten_to_solve,
+)
+
+
+def _conv_last(conv: torch.nn.Conv1d, *xs: torch.Tensor) -> torch.Tensor:
+    """Apply a Conv1d stencil along the final dimension of arbitrary-shaped tensors."""
+    ref = xs[0]
+    K = ref.shape[-1]
+    x = torch.stack(
+        [_flatten_to_solve(t, K, tuple(ref.shape)) for t in xs],
+        dim=1,
+    )
+    return conv(x).squeeze(1).reshape_as(ref)
+
+
+def _filter_last(filter_: torch.nn.Conv1d, x: torch.Tensor) -> torch.Tensor:
+    """Apply a single-channel Conv1d filter along the final axis."""
+    xf = _flatten_to_solve(x).unsqueeze(1)
+    return filter_(xf).squeeze(1).reshape_as(x)
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
@@ -56,12 +78,13 @@ class _euler(Integrator):
             p.requires_grad = False
 
     def initialize(self, model, dt) -> None:
-        dx = model.dx / 10000.0  # Convert to cm
-        area = torch.pi * (model.diam / 10000.0) * dx  # Convert to cm^2
-        cm = model.cm / 1000.0 * area  # Convert to F/cm^2
-        ra = (model.rhoa * dx) / (
-            torch.pi * (model.diameters[:, None] / 20000.0) ** 2
-        )  # Convert to Ohm
+        dx = _broadcast_to_shape(model.dx, model.shape) / 10000.0  # cm
+        diam = _broadcast_to_shape(model.diam, model.shape)
+        area = torch.pi * (diam / 10000.0) * dx  # cm^2
+        cm = _broadcast_to_shape(model.cm, model.shape) / 1000.0 * area
+        ra = (_broadcast_to_shape(model.rhoa, model.shape) * dx) / (
+            torch.pi * (diam / 20000.0) ** 2
+        )
         self.cm_inv = 1.0 / cm
         self.ra_inv = 1.0 / ra
         self.cm_c = cm
@@ -69,25 +92,28 @@ class _euler(Integrator):
         self.ve_zero = torch.zeros_like(model.v)
 
     def FRK(self, v, ve, area, cm, ra, intra=None):
-        x = torch.stack([v, ve], dim=1)
-        d2v = self.ssd(x).squeeze(1)
+        d2v = _conv_last(self.ssd, v, ve)
         if intra is None:
             i_ion = self.mech.iexp(v) * area
             return cm * ((ra * d2v) - i_ion), i_ion
         else:
+            intra = _broadcast_to_shape(intra, tuple(v.shape))
             i_ion = self.mech.iexp(v) * area - intra
             return cm * ((ra * d2v) - i_ion), i_ion
 
     def step(self, model, dt, ve=None, intra=None):
         if ve is None:
             ve = self.ve_zero
-        model.v, model.i_membrane = self._step(
-            model.v, ve, self.area_c, dt, model.celsius, self.cm_c, intra
+        v_new, i_membrane = self._call_kernel(
+            "_step", model.v, ve, self.area_c, dt, model.celsius, self.cm_c, intra
         )
+        model.v = v_new
+        if self.imem:
+            model.i_membrane = i_membrane
 
     def _step(self, v, ve, area, dt, temp, cm, intra):
         self.mech.advance(v, dt, temp)
-        K1, i_ion = self.FRK_intra(v, ve, area, self.cm_inv, self.ra_inv, intra)
+        K1, i_ion = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
         v_n = v + K1 * dt
         i_membrane = None
         if self.imem:
@@ -187,41 +213,50 @@ class _rk4(_euler):
 
 
 def ssd_df(v_c, v_p, v_e):
-    v_c_p = F.pad(v_c, (1, 1), "reflect")
-    v_e_p = F.pad(v_e, (1, 1), "reflect")
-
-    ret = v_c_p[:, :-2] + v_c_p[:, 2:] - v_p + v_e_p[:, 2:] + v_e_p[:, :-2] - 2 * v_e
-
-    return ret
+    K = v_c.shape[-1]
+    vc = _flatten_to_solve(v_c, K)
+    vp = _flatten_to_solve(v_p, K)
+    ve = _flatten_to_solve(v_e, K, tuple(v_c.shape))
+    vc_p = F.pad(vc, (1, 1), "reflect")
+    ve_p = F.pad(ve, (1, 1), "reflect")
+    ret = vc_p[:, :-2] + vc_p[:, 2:] - vp + ve_p[:, 2:] + ve_p[:, :-2] - 2 * ve
+    return ret.reshape_as(v_c)
 
 
 def ssd_df_no_ve(v_c, v_p):
-    v_c_p = F.pad(v_c, (1, 1), "reflect")
-
-    ret = v_c_p[:, :-2] + v_c_p[:, 2:] - v_p
-
-    return ret
+    K = v_c.shape[-1]
+    vc = _flatten_to_solve(v_c, K)
+    vp = _flatten_to_solve(v_p, K)
+    vc_p = F.pad(vc, (1, 1), "reflect")
+    return (vc_p[:, :-2] + vc_p[:, 2:] - vp).reshape_as(v_c)
 
 
 def ssd_df_heterogeneous(v_c, v_p, v_e, g_left, g_right):
-    """Calculates the spatial second derivative for heterogeneous morphologies."""
-    v_c_p = F.pad(v_c, (1, 1), "reflect")
-    v_e_p = F.pad(v_e, (1, 1), "reflect")
-    g_sum = g_left + g_right
-
-    # Dufort-Frankel for the membrane potential term
-    d2v_c = g_left * v_c_p[:, :-2] + g_right * v_c_p[:, 2:] - g_sum * v_p
-    # Standard central difference for the external potential term
-    d2v_e = g_left * v_e_p[:, :-2] + g_right * v_e_p[:, 2:] - g_sum * v_e
-    return d2v_c + d2v_e
+    """Calculates the spatial second derivative along the final axis."""
+    K = v_c.shape[-1]
+    vc = _flatten_to_solve(v_c, K)
+    vp = _flatten_to_solve(v_p, K)
+    ve = _flatten_to_solve(v_e, K, tuple(v_c.shape))
+    gl = _flatten_to_solve(g_left, K)
+    gr = _flatten_to_solve(g_right, K)
+    vc_p = F.pad(vc, (1, 1), "reflect")
+    ve_p = F.pad(ve, (1, 1), "reflect")
+    g_sum = gl + gr
+    d2v_c = gl * vc_p[:, :-2] + gr * vc_p[:, 2:] - g_sum * vp
+    d2v_e = gl * ve_p[:, :-2] + gr * ve_p[:, 2:] - g_sum * ve
+    return (d2v_c + d2v_e).reshape_as(v_c)
 
 
 def ssd_df_heterogeneous_no_ve(v_c, v_p, g_left, g_right):
-    """Calculates the spatial second derivative for heterogeneous morphologies without ve."""
-    v_c_p = F.pad(v_c, (1, 1), "reflect")
-    g_sum = g_left + g_right
-    d2v_c = g_left * v_c_p[:, :-2] + g_right * v_c_p[:, 2:] - g_sum * v_p
-    return d2v_c
+    """Calculates the spatial second derivative along the final axis without ve."""
+    K = v_c.shape[-1]
+    vc = _flatten_to_solve(v_c, K)
+    vp = _flatten_to_solve(v_p, K)
+    gl = _flatten_to_solve(g_left, K)
+    gr = _flatten_to_solve(g_right, K)
+    vc_p = F.pad(vc, (1, 1), "reflect")
+    g_sum = gl + gr
+    return (gl * vc_p[:, :-2] + gr * vc_p[:, 2:] - g_sum * vp).reshape_as(v_c)
 
 
 class _dufort_frankel_homogeneous(Integrator):
@@ -253,7 +288,7 @@ class _dufort_frankel_homogeneous(Integrator):
     def __init__(self, model, mech, beta=1.0, smooth_every=100, conv=False, imem=None):
         super().__init__(model, mech, imem)
 
-        model.register_buffer("v_prev", torch.full((model.np, model.nc), model.v_init))
+        model.register_buffer("v_prev", _expanded_v_init(model).clone().detach())
 
         self.register_buffer("area", torch.tensor(0.0))
         self.register_buffer("s1", torch.tensor(0.0))
@@ -292,11 +327,15 @@ class _dufort_frankel_homogeneous(Integrator):
             p.requires_grad = False
 
     def initialize(self, model, dt) -> None:
-        self.area = torch.pi * (model.diam / 10000) * (model.dx / 10000)
-        cm = (model.cm / 1e3) * self.area
-        dx = model.dx / 10000
-        radii = model.diam / 20000
-        ra = (model.rhoa * dx) / (torch.pi * radii**2)
+        diam = _broadcast_to_shape(model.diam, model.shape)
+        dx_raw = _broadcast_to_shape(model.dx, model.shape)
+        rhoa = _broadcast_to_shape(model.rhoa, model.shape)
+        cm_param = _broadcast_to_shape(model.cm, model.shape)
+        self.area = torch.pi * (diam / 10000) * (dx_raw / 10000)
+        cm = (cm_param / 1e3) * self.area
+        dx = dx_raw / 10000
+        radii = diam / 20000
+        ra = (rhoa * dx) / (torch.pi * radii**2)
         self.s1 = 2 * dt / cm
         self.s2 = self.s1 / ra
         self.s3 = self.area * self.s1
@@ -312,7 +351,8 @@ class _dufort_frankel_homogeneous(Integrator):
         if ve is None:
             if self.conv:
                 ve = self.ve_zero
-        model.v, model.v_prev, model.i_membrane = self.method(
+        v_new, v_prev_new, i_membrane = self._call_kernel(
+            "_step_conv" if self.conv else "_step",
             model.v,
             model.v_prev,
             ve,
@@ -325,6 +365,10 @@ class _dufort_frankel_homogeneous(Integrator):
             model.celsius,
             intra,
         )
+        model.v = v_new
+        model.v_prev = v_prev_new
+        if self.imem:
+            model.i_membrane = i_membrane
 
     def _step(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra=None
@@ -338,7 +382,7 @@ class _dufort_frankel_homogeneous(Integrator):
         i_ion, gtot = self.mech.idf(v, v_prev)
 
         if intra is not None:
-            i_ion = i_ion * area - intra
+            i_ion = i_ion * area - _broadcast_to_shape(intra, tuple(v.shape))
         else:
             i_ion = i_ion * area
 
@@ -347,13 +391,17 @@ class _dufort_frankel_homogeneous(Integrator):
         i_mem = self.mech.itot(v)
 
         if self.smoothing:
-            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+            v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
+                self.filter, v_new
+            )
 
         i_membrane = None
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
             if intra is not None:
-                i_membrane = i_cap + i_mem * area - intra
+                i_membrane = (
+                    i_cap + i_mem * area - _broadcast_to_shape(intra, tuple(v.shape))
+                )
             else:
                 i_membrane = i_cap + i_mem * area
 
@@ -373,14 +421,13 @@ class _dufort_frankel_homogeneous(Integrator):
         temp,
         intra=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.stack([v, v_prev, ve], dim=1)
-        d2v = s2 * self.ssd(x).squeeze(1)
+        d2v = s2 * _conv_last(self.ssd, v, v_prev, ve)
 
         self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
 
         if intra is not None:
-            i_ion = i_ion * area - intra
+            i_ion = i_ion * area - _broadcast_to_shape(intra, tuple(v.shape))
         else:
             i_ion = i_ion * area
 
@@ -389,28 +436,26 @@ class _dufort_frankel_homogeneous(Integrator):
         i_mem = self.mech.itot(v)
 
         if self.smoothing:
-            v_new = self.beta * v_new + (1 - self.beta) * self.filter(v_new)
+            v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
+                self.filter, v_new
+            )
 
         i_membrane = None
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
             if intra is not None:
-                i_membrane = i_cap + i_mem * area - intra
+                i_membrane = (
+                    i_cap + i_mem * area - _broadcast_to_shape(intra, tuple(v.shape))
+                )
             else:
                 i_membrane = i_cap + i_mem * area
 
         return v_new, v, i_membrane
 
     def init_v(self, model):
-        model.v = torch.full(
-            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
-        ).detach()
-        model.v_prev = torch.full(
-            model.v_prev.shape,
-            model.v_init,
-            dtype=model.v_prev.dtype,
-            device=model.v_prev.device,
-        ).detach()
+        v0 = _expanded_v_init(model).clone().detach().contiguous()
+        model.v = v0.clone()
+        model.v_prev = v0.clone()
         if self.imem:
             model.i_membrane = torch.zeros_like(model.v).detach()
 
@@ -441,7 +486,7 @@ class _dufort_frankel(Integrator):
     def __init__(self, model, mech, beta=1.0, smooth_every=100, imem=None):
         super().__init__(model, mech, imem)
 
-        model.register_buffer("v_prev", torch.full((model.np, model.nc), model.v_init))
+        model.register_buffer("v_prev", _expanded_v_init(model).clone().detach())
 
         self.register_buffer("area", torch.tensor(0.0))
         self.register_buffer("s1", torch.tensor(0.0))
@@ -469,37 +514,29 @@ class _dufort_frankel(Integrator):
 
     def initialize(self, model, dt) -> None:
         # Units are critical here. We'll work in [V, A, s, F, Ohm, cm].
+        diam = _broadcast_to_shape(model.diam, model.shape)
+        dx = _broadcast_to_shape(model.dx, model.shape)
+        cm_param = _broadcast_to_shape(model.cm, model.shape)
+        rhoa = _broadcast_to_shape(model.rhoa, model.shape)
 
-        # Total area of each compartment [cm^2]
-        self.area = torch.pi * (model.diam / 10000.0) * (model.dx / 10000.0)
-        # Total capacitance of each compartment [F]
-        cm_total = (model.cm / 1000.0) * self.area  # cm is in uF/cm^2 -> F/cm^2 -> F
+        self.area = torch.pi * (diam / 10000.0) * (dx / 10000.0)
+        cm_total = (cm_param / 1000.0) * self.area
 
-        # Axial resistance of a FULL compartment [Ohm]
-        dx_cm = model.dx / 10000.0
-        radii_cm = model.diam / 20000.0
-        # rhoa [Ohm-cm], dx [cm], radii [cm] -> ra [Ohm]
-        ra_comp = (model.rhoa * dx_cm) / (torch.pi * radii_cm**2)
-
-        # Resistance between compartment centers [Ohm]
-        # This is the average of two half-compartment resistances.
-        ra_padded = F.pad(ra_comp, (1, 1), "reflect")
+        dx_cm = dx / 10000.0
+        radii_cm = diam / 20000.0
+        ra_comp = (rhoa * dx_cm) / (torch.pi * radii_cm**2)
+        ra_flat = _flatten_to_solve(ra_comp)
+        ra_padded = F.pad(ra_flat, (1, 1), "reflect")
         r_left = 0.5 * (ra_padded[:, :-2] + ra_padded[:, 1:-1])
         r_right = 0.5 * (ra_padded[:, 1:-1] + ra_padded[:, 2:])
 
-        # Conductance between compartment centers [S, or 1/Ohm]
-        g_left = 1.0 / r_left
-        g_right = 1.0 / r_right
+        g_left = (1.0 / r_left).reshape(model.shape)
+        g_right = (1.0 / r_right).reshape(model.shape)
 
-        # --- Define the core Dufort-Frankel coefficients ---
-        # s1 is a coefficient used for scaling currents.
         self.s1 = (2 * dt) / cm_total
-        self.s3 = self.area * self.s1  # Scales current density [uA/cm^2]
-
-        # C_left/C_right are the coupling terms for neighboring voltages.
+        self.s3 = self.area * self.s1
         self.c_left = self.s1 * g_left
         self.c_right = self.s1 * g_right
-        # c_axial is the total axial coupling for the implicit terms.
         self.c_axial = 0.5 * (self.c_left + self.c_right)
 
         self.f64 = model.dtype() == torch.float64
@@ -509,7 +546,8 @@ class _dufort_frankel(Integrator):
 
     def step(self, model, dt, ve=None, intra=None):
         # The step logic is simplified as we no longer branch on `conv`
-        model.v, model.v_prev, model.i_membrane = self._step(
+        v_new, v_prev_new, i_membrane = self._call_kernel(
+            "_step",
             model.v,
             model.v_prev,
             ve,
@@ -517,6 +555,10 @@ class _dufort_frankel(Integrator):
             model.celsius,
             intra,
         )
+        model.v = v_new
+        model.v_prev = v_prev_new
+        if self.imem:
+            model.i_membrane = i_membrane
 
     def _step(
         self,
@@ -528,15 +570,22 @@ class _dufort_frankel(Integrator):
         intra=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         # The stimulus current `intra` is added to the numerator.
-        v_padded = F.pad(v, (1, 1), "reflect")
+        K = v.shape[-1]
+        v_flat = _flatten_to_solve(v, K)
+        v_prev_flat = _flatten_to_solve(v_prev, K)
+        c_left = _flatten_to_solve(self.c_left, K)
+        c_right = _flatten_to_solve(self.c_right, K)
+        c_axial = _flatten_to_solve(self.c_axial, K)
 
-        num_v_prev = v_prev * (1 - self.c_axial)
-        num_axial_v = self.c_left * v_padded[:, :-2] + self.c_right * v_padded[:, 2:]
+        v_padded = F.pad(v_flat, (1, 1), "reflect")
+        num_v_prev = v_prev_flat * (1 - c_axial)
+        num_axial_v = c_left * v_padded[:, :-2] + c_right * v_padded[:, 2:]
 
         if ve is not None:
-            ve_padded = F.pad(ve, (1, 1), "reflect")
-            num_axial_ve = self.c_left * (ve_padded[:, :-2] - ve) + self.c_right * (
-                ve_padded[:, 2:] - ve
+            ve_flat = _flatten_to_solve(ve, K, tuple(v.shape))
+            ve_padded = F.pad(ve_flat, (1, 1), "reflect")
+            num_axial_ve = c_left * (ve_padded[:, :-2] - ve_flat) + c_right * (
+                ve_padded[:, 2:] - ve_flat
             )
             num = num_v_prev + num_axial_v + num_axial_ve
         else:
@@ -544,47 +593,39 @@ class _dufort_frankel(Integrator):
 
         self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
-        i_ion_stim = (
-            i_ion * self.area - intra if intra is not None else i_ion * self.area
-        )
-        num_ion = -self.s1 * i_ion_stim
+        area = _flatten_to_solve(self.area, K)
+        s1 = _flatten_to_solve(self.s1, K)
+        s3 = _flatten_to_solve(self.s3, K)
+        i_ion_stim = _flatten_to_solve(i_ion, K) * area
+        if intra is not None:
+            i_ion_stim = i_ion_stim - _flatten_to_solve(intra, K, tuple(v.shape))
+        num_ion = -s1 * i_ion_stim
 
         numerator = num + num_ion
-
-        denominator = 1 + self.c_axial + (0.5 * self.s3 * gtot)
-
-        v_new = numerator / denominator
+        denominator = 1 + c_axial + (0.5 * s3 * _flatten_to_solve(gtot, K))
+        v_new = (numerator / denominator).reshape_as(v)
 
         i_mem = self.mech.itot(v)
 
         if self.smoothing:
-            v_new = self.beta * v_new + (1 - self.beta) * self.filter(
-                v_new.unsqueeze(1)
-            ).squeeze(1)
+            v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
+                self.filter, v_new
+            )
 
         i_membrane = None
         if self.imem:
-            i_cap = (v_new - v_prev) / self.s1
-            i_membrane = (
-                i_cap + i_mem * self.area - intra
-                if intra is not None
-                else i_cap + i_mem * self.area
-            )
+            i_cap = (_flatten_to_solve(v_new, K) - v_prev_flat) / s1
+            i_membrane = i_cap + _flatten_to_solve(i_mem, K) * area
+            if intra is not None:
+                i_membrane = i_membrane - _flatten_to_solve(intra, K, tuple(v.shape))
+            i_membrane = i_membrane.reshape_as(v)
 
         return v_new, v, i_membrane
 
     # The rest of the class methods (init_v, detach) do not need changes.
     def init_v(self, model):
-        model.v = torch.full(
-            model.v.shape, model.v_init, dtype=model.v.dtype, device=model.v.device
-        )
-        model.v.detach_()
-        model.v_prev = torch.full(
-            model.v_prev.shape,
-            model.v_init,
-            dtype=model.v_prev.dtype,
-            device=model.v_prev.device,
-        )
-        model.v_prev.detach_()
+        v0 = _expanded_v_init(model).clone().detach().contiguous()
+        model.v = v0.clone()
+        model.v_prev = v0.clone()
         if self.imem:
             model.i_membrane = torch.zeros_like(model.v).detach()

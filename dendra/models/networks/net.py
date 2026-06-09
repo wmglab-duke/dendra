@@ -6,7 +6,16 @@ from typing import Dict, Literal, Optional
 import torch
 from tqdm.auto import tqdm
 
-from dendra.helpers import BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT
+from dendra.helpers import (
+    BACKEND,
+    COMPILE_MODE,
+    DYNAMIC,
+    FULLGRAPH,
+    JIT,
+    JIT_NETWORK_OPS,
+    JIT_NETWORK_SOLVES,
+    jit_enabled_for_scope,
+)
 
 from ..callbacks import CallbackList
 from ..core import Population, _match_state_dict, make_intra
@@ -55,18 +64,45 @@ def to_flat_idx_torch(shape, idx, device):
     return selected_indices.flatten()
 
 
+def to_flat_idx_mech(shape, mech, device):
+    # 1. Create a grid of flat indices with the same shape as the input array.
+    #    e.g., for a (2, 3) tensor, this becomes [[0, 1, 2], [3, 4, 5]]
+    indices_grid = torch.arange(torch.prod(torch.tensor(shape)), device=device).view(
+        shape
+    )
+
+    # 2. Apply the user's index to this grid. PyTorch's indexing logic
+    #    will select the corresponding flat indices for us.
+    selected_indices = mech.get(indices_grid)
+
+    # 3. Flatten the result to get a 1D tensor of flat indices.
+    return selected_indices.flatten()
+
+
 def step_pop(integrator, model, dt, ve=None, intra=None):
     integrator.step(model, dt, ve, intra)
     model.t = model.t + dt
 
 
-compiled_step_pop = torch.compile(step_pop)
+compiled_step_pop = step_pop
 
 
-@torch.compile
 def advance_populations(populations, dt, extra, intra):
     for n, pop in populations.items():
         step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
+
+
+def _advance_network_component(component, *, compile_network_ops: bool = False):
+    """Advance a network-side component.
+
+    Components may expose an explicitly compile-safe ``advance_compiled`` method.
+    We do not torch.compile arbitrary ``advance`` methods here because NetCon,
+    ContinuousCon, and NetStim contain Python/module state mutations that should
+    remain outside the default population-solve JIT path.
+    """
+    if compile_network_ops and hasattr(component, "advance_compiled"):
+        return component.advance_compiled()
+    return component.advance()
 
 
 def step(
@@ -79,36 +115,29 @@ def step(
     dt,
     extra: Dict[str, torch.Tensor | None] = {},
     intra: Dict[str, torch.Tensor | None] = {},
-    compiled_advance_population=True,
+    compile_network_ops=False,
 ):
     if netstim is not None:
+        # NetStim has explicit heap/schedule side effects; keep it eager unless
+        # NetStim grows a compile-safe method of its own.
         netstim(t, bptt=netstim.training)
     for target in continuous_targets.values():
         target.reset_continuous_inputs()
     for c in continuous_synapses.values():
-        c.advance()
+        _advance_network_component(c, compile_network_ops=compile_network_ops)
     for s in synapses.values():
-        s.advance()
+        _advance_network_component(s, compile_network_ops=compile_network_ops)
 
-    if compiled_advance_population:
-        advance_populations(populations, dt, extra, intra)
-    else:
-        for n, pop in populations.items():
-            if pop.jit_in_network:
-                compiled_step_pop(
-                    pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
-                )
-            else:
-                step_pop(
-                    pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
-                )
+    # Population/integrator compilation is handled inside each integrator with
+    # scope="network_population". The stateful Python wrapper remains eager.
+    advance_populations(populations, dt, extra, intra)
 
 
 def get_local_index(population, mech, index):
     indices = torch.full_like(
         population.v, -1, dtype=torch.long, device=population.device()
     ).flatten()
-    mech_key_flat = to_flat_idx_torch(population.shape, mech.key, population.device())
+    mech_key_flat = to_flat_idx_mech(population.shape, mech, population.device())
     indices.index_copy_(
         0,
         mech_key_flat,
@@ -182,6 +211,8 @@ def check_weight_shape(weight, pre_idx):
     Checks the shape of the weight tensor against the pre-synaptic indices.
     If the weight is a scalar, it returns the number of pre-synaptic indices.
     If the weight is a tensor, it checks if its shape matches the number of pre-synaptic indices.
+    Otherwise, if if the weight is a tensor, len(pre_idx) must be a multiple of len(weight)
+    and the weight will be repeated accordingly (suitable for batching).
     """
     if isinstance(weight, float):
         return len(pre_idx)
@@ -193,18 +224,26 @@ def check_weight_shape(weight, pre_idx):
                 return len(pre_idx)
             if weight.shape[0] == len(pre_idx):
                 return 1
+            if len(pre_idx) % len(weight) == 0:
+                return len(pre_idx) // len(weight)
             raise ValueError(
                 f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
             )
     if hasattr(weight, "__len__"):
         if len(weight) != len(pre_idx):
             raise ValueError(
-                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
+                f"Weight tensor shape {len(weight)} does not match pre-synaptic indices shape {pre_idx.shape}."
             )
         return 1
     if isinstance(weight, torch.nn.Module):
         return len(pre_idx)
     raise TypeError(f"Unsupported type for weight: {type(weight)}.")
+
+
+def _evaluate(value):
+    if isinstance(value, torch.nn.Module):
+        return value()
+    return value
 
 
 def expand(value, n):
@@ -445,45 +484,28 @@ class Network(RNGMixin):
         self.fullgraph = bool(FULLGRAPH)
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
+        self.jit_network_solves = bool(JIT_NETWORK_SOLVES)
+        self.jit_network_ops = bool(JIT_NETWORK_OPS)
+        # Legacy spelling retained as an attribute alias.
+        self.jit_in_network = self.jit_network_solves
         self.compile_mode = COMPILE_MODE.value
 
         self.is_batched = False
 
         torch._dynamo.reset()
 
-        with torch.set_grad_enabled(True):
-            if self.jit:
-                self._step_train = torch.compile(
-                    step,
-                    backend=self.backend,
-                    fullgraph=self.fullgraph,
-                    dynamic=self.dynamic,
-                    mode=self.compile_mode,
-                )
-            else:
-                self._step_train = step
-
-        with torch.set_grad_enabled(False):
-            if self.jit:
-                self._step_eval = torch.compile(
-                    step,
-                    backend=self.backend,
-                    fullgraph=self.fullgraph,
-                    dynamic=self.dynamic,
-                    mode=self.compile_mode,
-                )
-            else:
-                self._step_eval = step
+        # Keep the stateful network/population wrapper eager. Population JIT is
+        # now handled by each integrator, which compiles only its tensor kernel
+        # and leaves model state commits outside Dynamo.
+        self._step_train = step
+        self._step_eval = step
 
         # Network clock lives on CPU by default; move when needed.
         self.register_buffer(
             "t", torch.tensor(0.0, device=torch.device("cpu"), dtype=torch.float32)
         )
 
-        if all(p.jit_in_network for p in populations.values()):
-            self.use_compiled_advance_populations = True
-        else:
-            self.use_compiled_advance_populations = False
+        self.compile_network_ops = jit_enabled_for_scope("network_ops", self)
 
         # Track device signature to trigger rebuilds if placements change.
         self._device_sig = self._device_signature()
@@ -492,6 +514,26 @@ class Network(RNGMixin):
         self._syn_cache = {}
 
         self.eval()
+
+    def _refresh_compile_config_from_ctx(self):
+        """Refresh network compile policy from the active dendra.ctx."""
+        self.backend = BACKEND.value
+        self.fullgraph = bool(FULLGRAPH)
+        self.dynamic = bool(DYNAMIC)
+        self.jit = bool(JIT)
+        self.jit_network_solves = bool(JIT_NETWORK_SOLVES)
+        self.jit_network_ops = bool(JIT_NETWORK_OPS)
+        self.jit_in_network = self.jit_network_solves
+        self.compile_mode = COMPILE_MODE.value
+        self.compile_network_ops = jit_enabled_for_scope("network_ops", self)
+
+        for pop in self.populations.values():
+            refresh = getattr(pop, "_refresh_compile_config_from_ctx", None)
+            if refresh is not None:
+                refresh()
+            if getattr(pop, "integrator", None) is not None:
+                pop.integrator.configure_jit(pop, scope="network_population")
+        return self
 
     def train(self, mode=True):
         """
@@ -1636,6 +1678,7 @@ class Network(RNGMixin):
         Network
             Self, for chaining.
         """
+        self._refresh_compile_config_from_ctx()
         current_sig = self._device_signature()
         devices_changed = current_sig != getattr(self, "_device_sig", None)
 
@@ -1683,7 +1726,7 @@ class Network(RNGMixin):
         Network
             Self, for chaining.
         """
-        self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
+        self._refresh_compile_config_from_ctx()
         self.t = self.t.detach()
         self.t.fill_(t)
         for pop in self.populations.values():
@@ -1701,8 +1744,9 @@ class Network(RNGMixin):
             if not self._state_cache:
                 pop.initialize()
             dt_pop = torch.tensor(dt_f, device=pop.device(), dtype=pop.dtype())
-            pop.integrator._initialize(pop, dt_pop)
+            pop.integrator._initialize(pop, dt_pop, compile_scope="network_population")
             pop.intra = pop.build_intra()
+        self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
         self.init_synapses(
             reinit_weights=reinit_weights,
             reinit_delays=reinit_delays,
@@ -1786,6 +1830,7 @@ class Network(RNGMixin):
         -------
         None
         """
+        self._refresh_compile_config_from_ctx()
         dt_f = float(self.dt)
         dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
 
@@ -1855,7 +1900,7 @@ class Network(RNGMixin):
                     dt_f,
                     extra=extra_c,
                     intra=intra_c,
-                    compiled_advance_population=self.use_compiled_advance_populations,
+                    compile_network_ops=self.compile_network_ops,
                 )
                 self.t = self.t + dt_t
                 post_step_hook(callbacks, self)
@@ -1924,8 +1969,8 @@ class Network(RNGMixin):
                     new_target_idx,
                     synapse,
                     threshold,
-                    weight,
-                    delay,
+                    _evaluate(weight),
+                    _evaluate(delay),
                     pre_var=pre_var,
                 )
         for k, v in _continuous_synapse_spec.items():
@@ -1957,8 +2002,8 @@ class Network(RNGMixin):
                     target_pop,
                     new_target_idx,
                     synapse,
-                    weight=weight,
-                    delay=delay,
+                    weight=_evaluate(weight),
+                    delay=_evaluate(delay),
                     pre_var=pre_var,
                     input=input_name,
                     reduce=reduce,
@@ -2326,6 +2371,7 @@ class Network(RNGMixin):
             raise RuntimeError(
                 "Network.dt is None. Call net.initialize(dt=...) before longrun_checkpointed()."
             )
+        self._refresh_compile_config_from_ctx()
         if chunklength <= 0:
             raise ValueError("chunklength must be a positive integer")
 
@@ -2527,7 +2573,7 @@ class Network(RNGMixin):
                                 dt_f,
                                 extra=extra_c,
                                 intra=intra_c,
-                                compiled_advance_population=self.use_compiled_advance_populations,
+                                compile_network_ops=self.compile_network_ops,
                             )
                             self.t = self.t + dt_t
 
@@ -2620,7 +2666,6 @@ def prepare_intra(intra_c, intra, local_ind):
     return intra_c
 
 
-@torch.compile
 def prepare_extra(extra, local_ind: int):
     """
     Prepares the voltage and time data for the current step.
@@ -2641,7 +2686,6 @@ def pre_step_hook(c, m):
     c.pre_step_hook(m)
 
 
-@torch.compile
 def post_step_hook(c, m):
     c.post_step_hook(m)
 

@@ -9,6 +9,10 @@ os.environ.setdefault("MKL_DYNAMIC", "FALSE")
 os.environ["OMP_PROC_BIND"] = "true"
 os.environ["OMP_PLACES"] = "cores"
 
+from ._bootstrap import configure_torchinductor_cache_for_dendra
+
+configure_torchinductor_cache_for_dendra()
+
 import pickle
 import time
 import warnings
@@ -26,7 +30,15 @@ from .const import (
     E,
     R,
 )
-from .helpers import TF32, allow_tf32, ctx, set_jit_enabled, set_jit_in_network_enabled
+from .helpers import (
+    TF32,
+    allow_tf32,
+    ctx,
+    set_jit_enabled,
+    set_jit_in_network_enabled,
+    set_jit_network_ops_enabled,
+    set_jit_network_solves_enabled,
+)
 from .models import (
     Axon,
     ExtCellAxon,
@@ -70,6 +82,8 @@ __all__ = [
     "FARADAY",
     "ctx",
     "set_jit_enabled",
+    "set_jit_network_solves_enabled",
+    "set_jit_network_ops_enabled",
     "set_jit_in_network_enabled",
     "callbacks",
     "mod",
@@ -152,7 +166,6 @@ def _cache_cpu_isa_list():
 
 
 _cache_cpu_isa_list()
-refresh_torchinductor_precompiled_headers()
 
 # setup environment
 allow_tf32(bool(TF32))

@@ -171,6 +171,21 @@ R = 1e3 * 8.31446261815324
 FARADAY = 96485.33212331001
 
 
+def _is_scalar(x):
+    if isinstance(x, float):
+        return True
+    if isinstance(x, int):
+        return True
+    return torch.is_tensor(x) and x.ndim == 0
+
+
+def _make_into_shape(shape, value):
+    if _is_scalar(value):
+        return torch.full(shape, value)
+    else:
+        return value.expand(shape).clone()
+
+
 class Ion(torch.nn.Module):
     __constants__ = "init_e_reversal", "advance_e"
 
@@ -186,9 +201,9 @@ class Ion(torch.nn.Module):
         self.min_concentration = min_concentrations()[name]
 
         self.register_buffer(f"i{name}", torch.zeros(shape))
-        self.register_buffer(f"e{name}", torch.full(shape, self.e_init))
-        self.register_buffer(f"{name}i", torch.full(shape, self.i_init))
-        self.register_buffer(f"{name}o", torch.full(shape, self.o_init))
+        self.register_buffer(f"e{name}", _make_into_shape(shape, self.e_init))
+        self.register_buffer(f"{name}i", _make_into_shape(shape, self.i_init))
+        self.register_buffer(f"{name}o", _make_into_shape(shape, self.o_init))
 
         self.init_e_reversal = einit != 0
         self.advance_e = eadvance != 0

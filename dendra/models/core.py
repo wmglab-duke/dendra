@@ -31,7 +31,8 @@ from dendra.helpers import (
     FULLGRAPH,
     IMEM,
     JIT,
-    JIT_IN_NETWORK,
+    JIT_NETWORK_OPS,
+    JIT_NETWORK_SOLVES,
     op_mc,
     op_sc,
 )
@@ -240,7 +241,11 @@ class Population(P, Sliceable):
         self.fullgraph = bool(FULLGRAPH)
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
-        self.jit_in_network = bool(JIT_IN_NETWORK)
+        self.jit_network_solves = bool(JIT_NETWORK_SOLVES)
+        self.jit_network_ops = bool(JIT_NETWORK_OPS)
+        # Legacy attribute retained for external code. Internally this now means
+        # "compile population solves when this population is stepped by Network".
+        self.jit_in_network = self.jit_network_solves
         self.imem = bool(IMEM)
         self.compile_mode = COMPILE_MODE.value
 
@@ -287,21 +292,14 @@ class Population(P, Sliceable):
 
         torch._dynamo.reset()
 
-        if self.jit:
-            self._step = torch.compile(
-                step,
-                backend=self.backend,
-                fullgraph=self.fullgraph,
-                dynamic=self.dynamic,
-                mode=self.compile_mode,
-            )
-        else:
-            self._step = step
+        # Keep the state-mutating Population/Integrator wrapper eager.  JIT
+        # settings are propagated to the integrator, which compiles only its
+        # tensor-valued numerical kernels.  This avoids Dynamo tracing
+        # nn.Module.__setattr__ for model.v/model.vc/model.i_membrane commits.
+        self._step = step
 
-        if self.jit:
-            self.make_intra = torch.compile(make_intra)
-        else:
-            self.make_intra = make_intra
+        self._make_intra_config = None
+        self._refresh_compile_config_from_ctx()
 
         self._caches = {}
 
@@ -313,6 +311,45 @@ class Population(P, Sliceable):
 
         self.initialized: bool = False
         self.eval()
+
+    def _refresh_compile_config_from_ctx(self):
+        """Refresh compile flags from dendra.ctx / ContextVar state.
+
+        Population-owned stepping stays eager; these flags are forwarded to the
+        integrator with an explicit execution scope at run/initialize time.
+        ``JIT_NETWORK_SOLVES`` is intentionally stored but ignored for standalone
+        Population.run(), where only ``JIT`` enables integrator compilation.
+        """
+        self.backend = BACKEND.value
+        self.fullgraph = bool(FULLGRAPH)
+        self.dynamic = bool(DYNAMIC)
+        self.jit = bool(JIT)
+        self.jit_network_solves = bool(JIT_NETWORK_SOLVES)
+        self.jit_network_ops = bool(JIT_NETWORK_OPS)
+        self.jit_in_network = self.jit_network_solves
+        self.compile_mode = COMPILE_MODE.value
+
+        make_intra_config = (
+            self.jit,
+            self.backend,
+            self.fullgraph,
+            self.dynamic,
+            self.compile_mode,
+        )
+        if getattr(self, "_make_intra_config", None) != make_intra_config:
+            if self.jit:
+                kwargs = dict(
+                    backend=self.backend,
+                    fullgraph=self.fullgraph,
+                    dynamic=self.dynamic,
+                )
+                if self.compile_mode is not None:
+                    kwargs["mode"] = self.compile_mode
+                self.make_intra = torch.compile(make_intra, **kwargs)
+            else:
+                self.make_intra = make_intra
+            self._make_intra_config = make_intra_config
+        return self
 
     @property
     def shape(self):
@@ -976,6 +1013,7 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        self._refresh_compile_config_from_ctx()
 
         # auto-build intra if missing
         if self.intra is None:
@@ -1005,10 +1043,7 @@ class Population(P, Sliceable):
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
-        if self.jit:
-            psh = torch.compile(post_step_hook)
-        else:
-            psh = post_step_hook
+        psh = post_step_hook
 
         with ctx:
             # --------------------------------------------------------------
@@ -1057,7 +1092,12 @@ class Population(P, Sliceable):
                     c.dt = dt_f
 
             pre_loop_hook(callbacks, self)
-            self.integrator._initialize(self, dt_tensor, force=self.training)
+            self.integrator._initialize(
+                self,
+                dt_tensor,
+                force=self.training,
+                compile_scope="population",
+            )
 
             # Progress bar setup
             if progressbar:
@@ -1196,6 +1236,7 @@ class Population(P, Sliceable):
 
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        self._refresh_compile_config_from_ctx()
 
         intra = self.intra
         with_intra = intra is not None
@@ -1205,10 +1246,7 @@ class Population(P, Sliceable):
         dt_f = float(dt)
         dt_tensor = torch.tensor(dt, device=self.device(), dtype=self.dtype())
 
-        if self.jit:
-            psh = torch.compile(post_step_hook)
-        else:
-            psh = post_step_hook
+        psh = post_step_hook
 
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
@@ -1251,7 +1289,12 @@ class Population(P, Sliceable):
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
-                self.integrator._initialize(self, dt_tensor, force=self.training)
+                self.integrator._initialize(
+                    self,
+                    dt_tensor,
+                    force=self.training,
+                    compile_scope="population",
+                )
 
                 pre_loop_hook(callbacks, self)
 
@@ -1311,10 +1354,11 @@ class Population(P, Sliceable):
         The steady state can be restored later by calling model.initialize().
         """
 
+        self._refresh_compile_config_from_ctx()
         self.clear_steady_state()
 
         self.initialize()
-        self.integrator._initialize(self, dt)
+        self.integrator._initialize(self, dt, compile_scope="population")
 
         maxiter = int(tstop / dt)
 
@@ -1979,6 +2023,8 @@ class Population(P, Sliceable):
         Population
             The population instance, ready for simulation.
         """
+        self._refresh_compile_config_from_ctx()
+
         if self.is_built and not (force_rebuild or self._flag_rebuild):
             return self
 
@@ -2053,6 +2099,7 @@ class Population(P, Sliceable):
             self._dispatch_mechanism_injections(mech)
 
             self.integrator = self._integrator_class(self, mech, imem=self.imem)
+            self.integrator.configure_jit(self, scope="population")
             self.mech = self.integrator.mech
 
         self.is_built = True
@@ -2376,13 +2423,30 @@ class Population(P, Sliceable):
         Population
             The population instance with replicated buffers.
         """
-        self.v = self.v.unsqueeze(0).expand(n, *self.v.shape).clone()
-        if hasattr(self, "v_prev"):
-            self.v_prev = self.v_prev.unsqueeze(0).expand(n, *self.v_prev.shape).clone()
-        if hasattr(self, "i_membrane"):
-            self.i_membrane = (
-                self.i_membrane.unsqueeze(0).expand(n, *self.i_membrane.shape).clone()
-            )
+        if n <= 0:
+            raise ValueError("Batch size n must be positive.")
+
+        def _batch_tensor_attr(name: str):
+            if not hasattr(self, name):
+                return
+            value = getattr(self, name)
+            if value is None or not torch.is_tensor(value):
+                return
+            setattr(self, name, value.unsqueeze(0).expand(n, *value.shape).clone())
+
+        _batch_tensor_attr("v")
+
+        state_vars = {"v_prev", "vc"}
+        integrator = getattr(self, "integrator", None)
+        if integrator is not None:
+            state_vars.update(getattr(integrator, "v_vars", ()))
+        state_vars.discard("v")
+        for name in sorted(state_vars):
+            _batch_tensor_attr(name)
+
+        if hasattr(self, "i_membrane") and self.i_membrane is not None:
+            _batch_tensor_attr("i_membrane")
+
         self.reshape(self._calc_shape_p(), self.shape)
         for slice in self._labels.values():
             slice._batch()
@@ -2534,6 +2598,7 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        self._refresh_compile_config_from_ctx()
 
         intra = self.intra
         with_intra = intra is not None
@@ -2638,7 +2703,12 @@ class Population(P, Sliceable):
                 # Integrator initialization + pre-loop hooks
                 # --------------------------------------------------------------
                 pre_loop_hook(callbacks, self)
-                self.integrator._initialize(self, dt_tensor, force=self.training)
+                self.integrator._initialize(
+                    self,
+                    dt_tensor,
+                    force=self.training,
+                    compile_scope="population",
+                )
 
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
@@ -3714,7 +3784,6 @@ class Axon(Population):
 
         self.n_ax = self.np
         self.n_comp = self.nc
-        self.temp = float(celsius)
 
         # ``v_init`` is normalized by Population; it may be scalar or a
         # length-n_comp vector. ``self.v`` was already created from it.
@@ -3795,6 +3864,22 @@ class Axon(Population):
         [25, 50, 75]  # For a model with n_comp=101
         """
         return [round((self.n_comp - 1) * i) for i in args]
+
+    def csl(self, *args):
+        """
+        Slice the axon at specified relative positions.
+        Parameters
+        ----------
+        *args : float
+            Variable number of float values between 0 and 1, representing
+            relative positions along the axon.
+
+        Returns
+        -------
+        Axon
+            A sliced view of the axon at the specified relative positions.
+        """
+        return self[:, self.c(*args)]
 
 
 def _match_state_dict(
@@ -3993,7 +4078,7 @@ class Myelinated(Axon):
             self.axond2 = axond2
             self.axond3 = axond3
 
-        def forward(self, rhoa, dx, diameters):
+        def forward(self, rhoa, dx, diameters, diam):
             """
             Compute scaled axial resistivity parameters.
 
@@ -4017,7 +4102,7 @@ class Myelinated(Axon):
                 self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
             )
             deltax = deltax / dx
-            scale = 1 / ((axon_d / diameters) ** 2)
+            scale = 1 / ((axon_d / diam) ** 2)
             rhoa = rhoa * scale * deltax
             return rhoa
 
@@ -4075,7 +4160,7 @@ class Myelinated(Axon):
                 self.axond2,
                 self.axond3,
             ),
-            args=("dx", "diameters"),
+            args=("dx", "diameters", "diam"),
         )
 
     def deltax(self, diameters):

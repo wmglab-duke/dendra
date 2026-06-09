@@ -476,6 +476,22 @@ class Bounded(cacheable):
                 t = torch.clamp((value - self.min_val) / rng, 1e-6, 1 - 1e-6)
                 return torch.special.logit(t) / self.beta
 
+    def repeat_and_reinit(self, n: int):
+        new = self.repeat(n)
+        new_p = self._inverse_transform(new)
+        self.rho = to_param(
+            torch.as_tensor(new_p, device=self.rho.device, dtype=self.rho.dtype)
+        )
+        self.clear_cache()
+        return self
+
+    def batch(self, n: int):
+        old = torch.atleast_1d(self())
+        new = old[None, :].expand(n, *old.shape).clone()
+        self.rho = to_param(self._inverse_transform(new))
+        self.clear_cache()
+        return self
+
 
 class PositiveParam(Bounded):
     """
@@ -1752,7 +1768,7 @@ class Parameterized(SimpleParameterized):
         self.range = self.__class__._range.copy()
         self.range_p = self.__class__._range_p.copy()
         self.range_n = self.__class__._range_n.copy()
-        self.batch = self.__class__._batch.copy()
+        self.batch_t = self.__class__._batch.copy()
         self.batch_p = self.__class__._batch_p.copy()
         self.batch_n = self.__class__._batch_n.copy()
         self.global_n = self.__class__._global_n.copy()
@@ -1768,8 +1784,8 @@ class Parameterized(SimpleParameterized):
             self.range = {
                 key: kwargs.get(key, value) for key, value in self.range.items()
             }
-            self.batch = {
-                key: kwargs.get(key, value) for key, value in self.batch.items()
+            self.batch_t = {
+                key: kwargs.get(key, value) for key, value in self.batch_t.items()
             }
             self.globals_p = {
                 key: kwargs.get(key, value) for key, value in self.globals_p.items()
@@ -1798,7 +1814,7 @@ class Parameterized(SimpleParameterized):
         self.instantiate_range(**self.range)
         self.instantiate_range(positive=True, **self.range_p)
         self.instantiate_range(negative=True, **self.range_n)
-        self.instantiate_batch(**self.batch)
+        self.instantiate_batch(**self.batch_t)
         self.instantiate_batch(positive=True, **self.batch_p)
         self.instantiate_batch(negative=True, **self.batch_n)
         self.instantiate_rng(**self.rng)
@@ -1820,7 +1836,7 @@ class Parameterized(SimpleParameterized):
         self.instantiate_range(**self.range)
         self.instantiate_range(positive=True, **self.range_p)
         self.instantiate_range(negative=True, **self.range_n)
-        self.instantiate_batch(**self.batch)
+        self.instantiate_batch(**self.batch_t)
         self.instantiate_batch(positive=True, **self.batch_p)
         self.instantiate_batch(negative=True, **self.batch_n)
 
@@ -2000,7 +2016,7 @@ class Parameterized(SimpleParameterized):
                     name in self.range or name in self.range_p or name in self.range_n
                 )
                 is_batch = (
-                    name in self.batch or name in self.batch_p or name in self.batch_n
+                    name in self.batch_t or name in self.batch_p or name in self.batch_n
                 )
                 if is_range or is_batch:
                     count = 0
@@ -2094,7 +2110,7 @@ class Parameterized(SimpleParameterized):
                 name, value, key=torch.arange(math.prod(self.shape_p)), alias=alias
             )
         is_range = name in self.range or name in self.range_p or name in self.range_n
-        is_batch = name in self.batch or name in self.batch_p or name in self.batch_n
+        is_batch = name in self.batch_t or name in self.batch_p or name in self.batch_n
         if is_range or is_batch:
             positive = (name in self.range_p) or (name in self.batch_p)
             negative = (name in self.range_n) or (name in self.batch_n)
@@ -2262,15 +2278,31 @@ class Parameterized(SimpleParameterized):
             except Exception:
                 setattr(self, n, b.detach())
 
-    def parameters_dict(self, clone=True):
+    def parameters_dict(self, clone=True, trainable_only=False):
         """
         Returns a dictionary of all parameters in the model.
         """
         with torch.no_grad():
             if clone:
-                dct = {name: param.clone() for name, param in self.named_parameters()}
+                if trainable_only:
+                    dct = {
+                        name: param.clone()
+                        for name, param in self.named_parameters()
+                        if param.requires_grad
+                    }
+                else:
+                    dct = {
+                        name: param.clone() for name, param in self.named_parameters()
+                    }
             else:
-                dct = {name: param for name, param in self.named_parameters()}
+                if trainable_only:
+                    dct = {
+                        name: param
+                        for name, param in self.named_parameters()
+                        if param.requires_grad
+                    }
+                else:
+                    dct = {name: param for name, param in self.named_parameters()}
         return dct
 
     def load_parameters_dict(self, parameters, strict=True):

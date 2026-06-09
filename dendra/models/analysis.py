@@ -804,6 +804,327 @@ def action_potential_width(
     return out
 
 
+def _weighted_weiss_fit(
+    d: torch.Tensor,
+    I_th: torch.Tensor,
+    w: torch.Tensor,
+    *,
+    weiss_fit_domain: Literal["charge", "current", "log_current"] = "charge",
+    log_current_iterations: int = 25,
+    log_current_min_chronaxie_ms: float = 1e-4,
+    log_current_max_chronaxie_ms: float = 1e3,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    """
+    Fit the Weiss/Lapicque strength-duration relation from threshold currents.
+
+    Model:
+        I(d) = I_r * (1 + T_ch / d)
+
+    Fit domains:
+        charge:
+            Ordinary weighted least squares of Q=d*I against d:
+                Q(d) ~= I_r*d + I_r*T_ch.
+            This preserves the legacy behavior of chronaxie_from_trials.
+
+        current:
+            Ordinary weighted least squares of I against 1/d:
+                I(d) ~= I_r + I_r*T_ch*(1/d).
+            This is equivalent to charge-domain fitting with weights divided by d^2.
+
+        log_current:
+            Weighted nonlinear least squares in log-current space:
+                log(I(d)) ~= log(I_r * (1 + T_ch/d)).
+            This matches the form used by Thio et al. 2024, up to using natural
+            log rather than log10. The minimizer is unchanged by log base.
+
+    Returns a dict containing rheobase, chronaxie_ms, fitted I/Q predictions,
+    and fit diagnostics. All operations are differentiable w.r.t. I_th.
+    """
+    if weiss_fit_domain not in ("charge", "current", "log_current"):
+        raise ValueError(
+            "weiss_fit_domain must be one of {'charge', 'current', 'log_current'}."
+        )
+
+    d = d.clamp_min(eps)
+    I_pos = I_th.clamp_min(eps)
+    w = w.clamp_min(0.0)
+    W = w.sum() + eps
+    Q_th = d * I_th
+
+    if weiss_fit_domain == "charge":
+        # Q = rheobase*d + rheobase*chronaxie
+        Q_bar = (w * Q_th).sum() / W
+        d_bar = (w * d).sum() / W
+        cov = (w * (d - d_bar) * (Q_th - Q_bar)).sum() / W
+        var = (w * (d - d_bar).pow(2)).sum() / W
+        rheobase = cov / (var + eps)
+        intercept = Q_bar - rheobase * d_bar
+        chronaxie_ms = intercept / (rheobase + eps)
+        I_pred = rheobase * (1.0 + chronaxie_ms / d)
+        Q_pred = d * I_pred
+        weiss_mse = (w * (Q_th - Q_pred).pow(2)).sum() / W
+        log_weiss_mse = (
+            w * (torch.log(I_pos) - torch.log(I_pred.clamp_min(eps))).pow(2)
+        ).sum() / W
+
+    elif weiss_fit_domain == "current":
+        # I = rheobase + rheobase*chronaxie*(1/d)
+        x = 1.0 / d
+        y = I_th
+        x_bar = (w * x).sum() / W
+        y_bar = (w * y).sum() / W
+        cov = (w * (x - x_bar) * (y - y_bar)).sum() / W
+        var = (w * (x - x_bar).pow(2)).sum() / W
+        intercept_current = y_bar - (cov / (var + eps)) * x_bar
+        slope_current = cov / (var + eps)
+        rheobase = intercept_current
+        chronaxie_ms = slope_current / (rheobase + eps)
+        intercept = rheobase * chronaxie_ms
+        I_pred = rheobase * (1.0 + chronaxie_ms / d)
+        Q_pred = d * I_pred
+        weiss_mse = (w * (I_th - I_pred).pow(2)).sum() / W
+        log_weiss_mse = (
+            w * (torch.log(I_pos) - torch.log(I_pred.clamp_min(eps))).pow(2)
+        ).sum() / W
+
+    else:  # weiss_fit_domain == "log_current"
+        # log(I) = log(Ir) + log(1 + Tch/d).
+        # For fixed Tch, the optimal log(Ir) is analytic, so we only optimize
+        # log(Tch) with a small differentiable 1D Gauss-Newton loop.
+        y = torch.log(I_pos)
+
+        # Use the current-domain closed-form solution as a differentiable initial guess.
+        x = 1.0 / d
+        x_bar = (w * x).sum() / W
+        y_lin_bar = (w * I_th).sum() / W
+        cov = (w * (x - x_bar) * (I_th - y_lin_bar)).sum() / W
+        var = (w * (x - x_bar).pow(2)).sum() / W
+        slope_current = cov / (var + eps)
+        intercept_current = y_lin_bar - slope_current * x_bar
+        c_init = slope_current / (intercept_current + eps)
+
+        c_min = torch.as_tensor(
+            log_current_min_chronaxie_ms, device=d.device, dtype=d.dtype
+        )
+        c_max = torch.as_tensor(
+            log_current_max_chronaxie_ms, device=d.device, dtype=d.dtype
+        )
+        c_init = c_init.clamp(min=c_min, max=c_max)
+        u = torch.log(c_init)
+        u_min = torch.log(c_min)
+        u_max = torch.log(c_max)
+
+        n_iter = int(log_current_iterations)
+        if n_iter < 0:
+            raise ValueError("log_current_iterations must be >= 0.")
+
+        for _ in range(n_iter):
+            c = torch.exp(u)
+            m = torch.log1p(c / d)
+            a = (w * (y - m)).sum() / W
+            r = y - a - m
+
+            # derivative of log(1+c/d) wrt u=log(c)
+            mp = c / (d + c)
+            mp_bar = (w * mp).sum() / W
+            J = -(mp - mp_bar)  # dr/du
+
+            grad = 2.0 * (w * r * J).sum() / W
+            hess_gn = 2.0 * (w * J.pow(2)).sum() / W
+            step = grad / (hess_gn + eps)
+            u = (u - step).clamp(min=u_min, max=u_max)
+
+        chronaxie_ms = torch.exp(u)
+        m = torch.log1p(chronaxie_ms / d)
+        log_rheobase = (w * (y - m)).sum() / W
+        rheobase = torch.exp(log_rheobase)
+        intercept = rheobase * chronaxie_ms
+        I_pred = rheobase * (1.0 + chronaxie_ms / d)
+        Q_pred = d * I_pred
+
+        # The primary residual is in log10-current units to match the paper's equation.
+        log10 = torch.log(torch.as_tensor(10.0, device=d.device, dtype=d.dtype))
+        log_resid = (torch.log(I_pos) - torch.log(I_pred.clamp_min(eps))) / log10
+        weiss_mse = (w * log_resid.pow(2)).sum() / W
+        log_weiss_mse = weiss_mse
+
+    return {
+        "rheobase": rheobase,
+        "chronaxie_ms": chronaxie_ms,
+        "slope": rheobase,
+        "intercept": intercept,
+        "I_pred": I_pred,
+        "Q_pred": Q_pred,
+        "weiss_mse": weiss_mse,
+        "log_weiss_mse": log_weiss_mse,
+        "weiss_fit_domain": weiss_fit_domain,
+    }
+
+
+def compute_rheobase_chronaxie(
+    pws,
+    thresholds,
+    *,
+    weights=None,
+    fit_domain: Literal["current", "charge", "log_current"] = "current",
+    log_current_iterations: int = 50,
+    log_current_min_chronaxie_ms: float = 1e-4,
+    log_current_max_chronaxie_ms: float = 1e3,
+    return_dict: bool = False,
+    eps: float = 1e-12,
+):
+    """
+    Estimate rheobase and chronaxie from strength-duration thresholds.
+
+    This is a standalone analogue of the common NumPy/polyfit helper:
+
+        x = 1 / pws
+        y = thresholds
+        b, a = np.polyfit(x, y, deg=1)
+        rheobase = a
+        chronaxie = b / a
+
+    but with an explicit fit-domain choice matching ``chronaxie_from_trials``.
+
+    Parameters
+    ----------
+    pws : array-like or torch.Tensor, shape (D,)
+        Pulse widths. Units are arbitrary but determine the returned chronaxie
+        units. For Dendra chronaxie analyses this is usually milliseconds.
+
+    thresholds : array-like or torch.Tensor, shape (D,)
+        Activation thresholds in current units.
+
+    weights : array-like or torch.Tensor, optional, shape (D,)
+        Optional nonnegative weights for each pulse-width/threshold pair.
+
+    fit_domain : {"current", "charge", "log_current"}, default="current"
+        How to fit the Weiss/Lapicque relation
+
+            I(PW) = Irh * (1 + Tch / PW).
+
+        ``"current"``
+            Ordinary least-squares fit of ``I`` against ``1/PW``. This exactly
+            matches the supplied NumPy ``polyfit`` method when ``weights=None``.
+
+        ``"charge"``
+            Ordinary least-squares fit of charge ``Q = PW * I`` against ``PW``.
+            This is the historical/default behavior used by earlier versions of
+            ``chronaxie_from_trials``.
+
+        ``"log_current"``
+            Thio-style log-current fit:
+
+                log10(Ith) = log10(Irh * (1 + Tch / PW)).
+
+            The implementation minimizes squared residuals in log current. The
+            log base does not affect the optimum; diagnostics are reported in
+            log10 units for interpretability.
+
+    log_current_iterations : int, default=50
+        Number of differentiable Gauss-Newton iterations used for the nonlinear
+        one-dimensional ``log_current`` fit.
+
+    log_current_min_chronaxie_ms, log_current_max_chronaxie_ms : float
+        Bounds for chronaxie during the log-current fit. Despite the ``_ms``
+        suffix, these are in the same units as ``pws``.
+
+    return_dict : bool, default=False
+        If False, return ``(rheobase, chronaxie)``. If True, return the full fit
+        dictionary including predictions and residual diagnostics.
+
+    eps : float, default=1e-12
+        Numerical stability constant.
+
+    Returns
+    -------
+    rheobase, chronaxie : float or torch.Tensor
+        If the inputs are NumPy/list-like, returns Python floats by default. If
+        any input is a torch.Tensor, returns differentiable torch tensors.
+
+    Notes
+    -----
+    The ``log_current`` fit is the closest analogue to the Thio et al. equation.
+    It is useful when thresholds span a large dynamic range because it fits
+    relative/multiplicative threshold errors rather than absolute current errors.
+    """
+    input_is_tensor = (
+        torch.is_tensor(pws) or torch.is_tensor(thresholds) or torch.is_tensor(weights)
+    )
+
+    if input_is_tensor:
+        # Preserve device/dtype from the first tensor input.
+        ref = (
+            pws
+            if torch.is_tensor(pws)
+            else thresholds
+            if torch.is_tensor(thresholds)
+            else weights
+        )
+        device = ref.device
+        dtype = ref.dtype if torch.is_floating_point(ref) else torch.float64
+        d = torch.as_tensor(pws, device=device, dtype=dtype).reshape(-1)
+        I = torch.as_tensor(thresholds, device=device, dtype=dtype).reshape(-1)
+        if weights is None:
+            w = torch.ones_like(d)
+        else:
+            w = torch.as_tensor(weights, device=device, dtype=dtype).reshape(-1)
+    else:
+        d = torch.as_tensor(pws, dtype=torch.float64).reshape(-1)
+        I = torch.as_tensor(thresholds, dtype=torch.float64).reshape(-1)
+        if weights is None:
+            w = torch.ones_like(d)
+        else:
+            w = torch.as_tensor(weights, dtype=torch.float64).reshape(-1)
+
+    if d.shape != I.shape or d.shape != w.shape:
+        raise ValueError("pws, thresholds, and weights must have the same 1D shape.")
+
+    mask = torch.isfinite(d) & torch.isfinite(I) & torch.isfinite(w) & (d > 0) & (w > 0)
+    if fit_domain == "log_current":
+        mask = mask & (I > 0)
+
+    d = d[mask]
+    I = I[mask]
+    w = w[mask]
+
+    if d.numel() < 2:
+        raise ValueError("Need at least two valid pulse-width/threshold points.")
+
+    fit = _weighted_weiss_fit(
+        d,
+        I,
+        w,
+        weiss_fit_domain=fit_domain,
+        log_current_iterations=log_current_iterations,
+        log_current_min_chronaxie_ms=log_current_min_chronaxie_ms,
+        log_current_max_chronaxie_ms=log_current_max_chronaxie_ms,
+        eps=eps,
+    )
+
+    if return_dict:
+        if input_is_tensor:
+            return fit
+        out = {}
+        for k, v in fit.items():
+            if torch.is_tensor(v):
+                if v.ndim == 0:
+                    out[k] = float(v.detach().cpu())
+                else:
+                    out[k] = v.detach().cpu().numpy()
+            else:
+                out[k] = v
+        return out
+
+    rheobase = fit["rheobase"]
+    chronaxie = fit["chronaxie_ms"]
+
+    if input_is_tensor:
+        return rheobase, chronaxie
+    return float(rheobase.detach().cpu()), float(chronaxie.detach().cpu())
+
+
 def chronaxie_from_trials(
     V: torch.Tensor,  # (T, P, C)
     amplitudes: torch.Tensor,  # (P,)
@@ -815,6 +1136,44 @@ def chronaxie_from_trials(
     gate_V_scale: float = 5.0,
     node_mask: Optional[torch.Tensor] = None,  # (C,) bool/float weights
     time_window: Optional[Tuple[int, int]] = None,
+    # ActiveAL-like activation aggregation
+    activation_mode: Literal[
+        "soft_max",
+        "soft_count",
+        "soft_fraction",
+        "soft_all",
+        "partition_soft_count",
+    ] = "soft_max",
+    at_least: int = 1,
+    count_scale: float = 0.25,
+    # How per-compartment events are converted into a soft count.
+    # "crossing" is the ActiveAL-like option: compartments contribute when
+    # they exhibit an upward threshold crossing.  "peak" preserves the older
+    # behavior where compartments contribute according to a smooth max voltage.
+    count_event: Literal["crossing", "peak"] = "crossing",
+    count_V_scale: Optional[float] = None,
+    crossing_count_threshold: float = 0.5,
+    crossing_count_scale: float = 0.10,
+    # Optional gradient-only smoother for count-based activation.
+    # When enabled, the forward value remains the usual soft_count activation,
+    # but the backward pass uses a wider/smoother surrogate. This is useful
+    # when `at_least` is large and the forward count sigmoid saturates.
+    use_activation_straight_through: bool = False,
+    count_grad_scale: Optional[float] = None,
+    count_V_grad_scale: Optional[float] = None,
+    crossing_count_grad_scale: Optional[float] = None,
+    fraction_threshold: float = 0.9,
+    fraction_scale: float = 0.05,
+    partition_masks: Optional[
+        torch.Tensor
+    ] = None,  # (K, C), optional partitioned readouts
+    partition_combine: Literal["any", "all"] = "any",
+    # Optional upstroke gate for activation scoring
+    dt_ms: Optional[float | torch.Tensor] = None,
+    use_dv_gate: bool = False,
+    dv_spk: float = 10.0,
+    kappa_dv: float = 10.0,
+    gate_dv_scale: float = 5.0,
     # --- Strength axis convention ---
     strength: Optional[
         torch.Tensor
@@ -853,358 +1212,73 @@ def chronaxie_from_trials(
     unimodal_beta_peak: float = 50.0,
     unimodal_tau_idx: float = 1.0,
     reg_weiss_fit_weight: float = 0.0,
+    # --- Weiss/Lapicque fit convention ---
+    # charge      -> legacy linear charge-duration fit: Q=d*I ≈ Ir*d + Ir*Tch
+    # current     -> linear current-duration fit: I ≈ Ir + Ir*Tch/d
+    # log_current -> Thio-style nonlinear fit: log10(I) ≈ log10(Ir*(1+Tch/d))
+    weiss_fit_domain: Literal["charge", "current", "log_current"] = "charge",
+    log_current_iterations: int = 25,
+    log_current_min_chronaxie_ms: float = 1e-4,
+    log_current_max_chronaxie_ms: float = 1e3,
     eps: float = 1e-8,
 ) -> Dict[str, Any]:
     r"""
-    Differentiably estimate chronaxie and rheobase from trial-wise voltage recordings,
-    with explicit support for **non-monotone activation vs amplitude** (e.g., high-amplitude
-    conduction block).
-
-    This function is designed for the common simulation/recording format where each trial
-    corresponds to a single `(pulse width, amplitude)` pair:
-
-    - ``V[t, p, c]``: membrane potential time series for trial ``p`` across compartments
-    - ``amplitudes[p]``: stimulus amplitude for trial ``p``
-    - ``pws_ms[p]``: pulse width (ms) for trial ``p``
-
-    The key difference vs. many threshold extractors is that it can separate:
-
-    - the **onset threshold** ("first activation": lowest amplitude that yields an AP),
-      which is what chronaxie typically refers to, and
-    - an optional **block boundary** at high amplitude (if activation becomes non-monotone).
-
-    The output includes both the estimated chronaxie/rheobase and intermediate per-pulse-width
-    threshold/boundary estimates.
-
-    The computation has three stages:
-
-    1) **Smooth activation surrogate per trial**
-       A scalar "activation confidence" ``p_spike_trial[p] ∈ (0, 1)`` is computed from each
-       voltage recording using a differentiable approximation to a max-over-time-and-space
-       spike detector:
-
-       - compute ``Z = V - V_spk``
-       - approximate ``max_{t,c} Z[t,p,c]`` with a log-sum-exp (softmax) using ``kappa_V``
-       - map to (0,1) with a sigmoid with scale ``gate_V_scale``
-
-       This avoids non-differentiable threshold crossing and keeps gradients defined everywhere.
-
-    2) **Group trials by pulse width**
-       Trials are grouped by unique values in ``pws_ms`` (optionally rounded).
-
-    3) **Extract a differentiable threshold strength per pulse width**
-       For each pulse width group, a differentiable onset threshold is computed. The default
-       (``threshold_method="onset_midpoint"``) is robust to high-amplitude block:
-
-       - ``I_on(d)``: a soft estimate of the **lowest activating strength** (soft-min over
-         strength weighted by activation membership)
-       - ``I_pre(d)``: a soft estimate of the **highest inactive strength below onset**
-         (selected by smallest positive gap to ``I_on``, weighted by inactivity membership)
-
-       Then the onset threshold is defined as:
-           ``I_th(d) = 0.5 * (I_pre(d) + I_on(d))``
-
-       This definition matches the common empirical rule "midpoint between highest inactive
-       and lowest active", while remaining differentiable and avoiding contamination from
-       blocked high-amplitude non-activation.
-
-       Optionally, the function also estimates high-amplitude block boundaries:
-       - ``I_last(d)``: soft estimate of the **highest activating strength**
-       - ``I_post(d)``: soft estimate of the **lowest inactive strength above I_last**
-       - ``I_block_mid(d) = 0.5*(I_last + I_post)`` (diagnostic)
-
-
-    Given per-pulse-width thresholds ``I_th(d)``, the function uses the Weiss charge form:
-
-        ``Q_th(d) = d * I_th(d) ≈ I_r * d + I_r * c``
-
-    where:
-    - ``I_r`` is rheobase (slope),
-    - ``c`` is chronaxie (intercept/slope).
-
-    A **weighted least-squares** fit is used. Pulse widths where the threshold extraction
-    is ambiguous (e.g., no strong evidence of a subthreshold point and an activating point)
-    are automatically downweighted via ``pw_weight`` (see Returns).
-
-    Parameters
-    ----------
-    V : torch.Tensor
-        Voltage recordings with shape ``(T, P, C)``:
-
-        - ``T``: number of time samples
-        - ``P``: number of trials
-        - ``C``: number of compartments
-
-        Units are typically mV. Gradients propagate through ``V`` (and therefore through any
-        upstream differentiable simulator).
-
-        Important: the activation surrogate detects *any* spike-like event within the scored
-        compartments. If you care about **propagating** activation (not just local initiation),
-        ensure that `node_mask` selects compartments in the region where propagation is assessed
-        (often distal compartments).
-
-    amplitudes : torch.Tensor
-        Stimulus amplitudes, shape ``(P,)``. These are typically design constants and do not
-        need gradients. Units are arbitrary (uA, mA, etc.) but must be consistent across trials.
-
-    pws_ms : torch.Tensor
-        Pulse widths in milliseconds, shape ``(P,)``. Must contain at least 2 distinct pulse
-        widths to estimate chronaxie.
-
-    V_spk : float, default=0.0
-        Voltage reference for spike scoring (same units as ``V``). The spike score is based on
-        ``V - V_spk``. Example choices: 0 mV, -20 mV.
-
-    kappa_V : float, default=20.0
-        Sharpness of the log-sum-exp used to approximate a max. Larger values make spike scoring
-        closer to a hard max but can produce peakier gradients.
-
-    gate_V_scale : float, default=5.0
-        Softness of the sigmoid mapping the spike score to confidence in (0,1). Smaller values
-        act more threshold-like.
-
-    node_mask : torch.Tensor, optional
-        Compartment weights/mask, shape ``(C,)`` (bool or float).
-
-        - bool: True compartments included, False excluded
-        - float: nonnegative weights (0 excludes)
-
-        Used inside the smooth max over compartments. This is the primary mechanism to focus
-        activation scoring on nodes of Ranvier or distal compartments.
-
-    time_window : tuple[int, int], optional
-        Time index window ``(t_start, t_end)`` applied as ``V[t_start:t_end]`` before scoring.
-        Useful to exclude baseline and/or late artifacts.
-
-    strength : torch.Tensor, optional
-        A per-trial monotone “strength” variable, shape ``(P,)``, used as the 1D axis along which
-        thresholds are extracted. If None, defaults to ``amplitudes``.
-
-        Use this when “stronger stimulus” is not numerically larger amplitude. Examples:
-        - cathodic negative currents: use ``strength = -amplitudes`` so stronger means larger
-        - magnitude-only experiments: use ``use_abs_strength=True``
-
-        All threshold outputs (I_th, rheobase, boundaries) are in the units of `strength`.
-
-    use_abs_strength : bool, default=False
-        If True, thresholds are extracted on ``abs(strength)`` (or ``abs(amplitudes)``).
-
-    pw_round_decimals : int, optional
-        If provided, pulse widths are rounded to this number of decimals before grouping.
-        Useful if `pws_ms` contains float representation noise.
-
-        Note: grouping is discrete (not differentiable w.r.t. pws), which is typically fine
-        since pws are design constants.
-
-    enforce_min_trials_per_pw : bool, default=True
-        If True, raises ValueError if any pulse width group has fewer than `min_trials_per_pw` trials.
-
-    min_trials_per_pw : int, default=2
-        Minimum trial count per pulse width group when enforcement is enabled.
-
-    threshold_method : {"onset", "onset_midpoint", "ptarget", "bracket_midpoint"}, default="onset_midpoint"
-        How to compute the per-pulse-width threshold:
-
-        - ``"onset"``:
-          ``I_th(d) = I_on(d)``, i.e. soft estimate of the **lowest active** strength.
-          Closest to the empirical "lowest activating amplitude".
-
-        - ``"onset_midpoint"`` (recommended for chronaxie):
-          ``I_th(d) = 0.5*(I_pre(d) + I_on(d))`` where I_pre is the **highest inactive below onset**
-          (soft, block-robust). Closest to empirical "midpoint between highest inactive and lowest active".
-
-        - ``"ptarget"``:
-          Selects the strength whose activation confidence is closest to ``p_target`` using a soft-argmin.
-          This requires trials near the boundary; it is often poorly conditioned for all-or-none activation.
-
-        - ``"bracket_midpoint"``:
-          Legacy "global bracket" midpoint between soft max inactive and soft min active. This can fail under
-          block because high-amplitude blocked trials appear inactive and dominate the max-inactive selection.
-
-    p_target : float, default=0.5
-        Used only for ``threshold_method="ptarget"``.
-
-    alpha_thresh : float, default=200.0
-        Used only for ``threshold_method="ptarget"``; soft-argmin sharpness.
-
-    alpha_extreme : float, default=50.0
-        Sharpness for soft extreme selection (soft-min / soft-max) used in onset/block boundaries.
-        Internally strengths are normalized within each PW group, so this is dimensionless.
-
-    membership_power : float, default=10.0
-        Sharpens activation/inactivation membership by exponentiating probabilities in log-space.
-        Larger values make "active" behave more like a hard set (p≈1) and "inactive" more like p≈0.
-        This improves extreme selection when p_spike is nearly binary.
-
-    gap_alpha : float, default=200.0
-        Sharpness for selecting the **nearest** inactive point below onset (and optionally above last active).
-        Larger values behave more like selecting the single closest gap.
-
-    below_gate_frac : float, default=0.02
-        Scale (fraction of within-group strength range) controlling a smooth gate that suppresses points on
-        the wrong side of the boundary when selecting "inactive below onset" (or "inactive above last active").
-
-    compute_block : bool, default=True
-        If True, compute high-amplitude block boundary diagnostics (I_last, I_post, I_block_mid).
-        These diagnostics do not affect the onset threshold unless you explicitly use them.
-
-    p_low, p_high : float, default=0.05, 0.95
-        Targets for optional bracketing regularization. See `reg_bracket_weight`.
-
-    reg_bracket_weight : float, default=0.0
-        Optional regularizer that encourages each PW group to contain evidence of both:
-        - a low-strength non-activating trial (p at minimum strength <= p_low),
-        - at least one strongly activating trial (max p >= p_high).
-
-        This is *block compatible* because it uses `max p` rather than p at max strength.
-
-    reg_monotone_weight : float, default=0.0
-        Optional regularizer that encourages p_spike to be nondecreasing with strength within each PW group.
-        This **conflicts with block** (0→1→0 behavior), so leave it at 0 if block is expected.
-
-    reg_unimodal_weight : float, default=0.0
-        Optional regularizer that encourages **unimodality** of p_spike vs strength within each PW group:
-        allows 0→1→0 (single peak) but discourages oscillations (e.g., 0→1→0→1).
-        This is the recommended shape prior if block is expected.
-
-    unimodal_beta_peak : float, default=50.0
-        Sharpness of the soft peak-location estimate used by the unimodality regularizer.
-
-    unimodal_tau_idx : float, default=1.0
-        Softness of the “before/after peak” partition used by the unimodality regularizer
-        (in index units along the sorted strength axis).
-
-    reg_weiss_fit_weight : float, default=0.0
-        Optional regularizer penalizing Weiss-fit residual MSE across pulse widths, weighted by pw_weight.
-        Useful if you want extracted thresholds to adhere closely to Weiss/Lapicque behavior.
-
-    eps : float, default=1e-8
-        Numerical stability constant used in logs/divisions.
-
-    Returns
-    -------
-    out : dict[str, Any]
-        Dictionary of differentiable outputs (gradients w.r.t. V):
-
-        chronaxie_ms : torch.Tensor, shape ``()``
-            Estimated chronaxie in milliseconds.
-
-        rheobase : torch.Tensor, shape ``()``
-            Estimated rheobase in the units of `strength` (or amplitudes if strength is None).
-
-        pw_unique_ms : torch.Tensor, shape ``(D,)``
-            Unique pulse widths used for estimation, sorted ascending.
-
-        I_th : torch.Tensor, shape ``(D,)``
-            Differentiable onset threshold per pulse width (definition depends on `threshold_method`).
-
-        Q_th : torch.Tensor, shape ``(D,)``
-            Charge thresholds: ``Q_th[d] = pw_unique_ms[d] * I_th[d]``.
-
-        p_spike_trial : torch.Tensor, shape ``(P,)``
-            Smooth activation confidence per trial in (0,1).
-
-        pw_group_id : torch.Tensor, shape ``(P,)``
-            Integer PW group index per trial (maps trials to entries of pw_unique_ms).
-            This is discrete and mainly for inspection/debugging.
-
-        pw_weight : torch.Tensor, shape ``(D,)``
-            Reliability weights per pulse width used in the weighted Weiss fit. These downweight
-            pulse widths where evidence of bracketing (inactive at low strength and some activation)
-            is weak.
-
-        boundaries : dict[str, torch.Tensor]
-            Boundary diagnostics (each shape ``(D,)``):
-
-            - ``I_on``:
-                soft estimate of lowest activating strength (“lowest active”).
-
-            - ``I_pre_inactive``:
-                soft estimate of highest inactive strength below onset (block-robust).
-
-            - ``I_last_active``:
-                soft estimate of highest activating strength (“last active”).
-
-            - ``I_post_inactive``:
-                soft estimate of lowest inactive strength above last active (for block diagnostics).
-
-            - ``I_block_mid``:
-                midpoint between I_last_active and I_post_inactive (diagnostic block threshold).
-
-        fit : dict
-            Weiss fit diagnostics:
-              - ``slope``     (rheobase)
-              - ``intercept`` (rheobase * chronaxie)
-              - ``weiss_mse`` (weighted MSE)
-
-        reg : torch.Tensor, shape ``()``
-            Optional regularization term (0 if all reg_*_weight are 0). Add to your training loss
-            if you are optimizing model parameters through this chronaxie estimator.
-
-    Notes
-    -----
-
-    - You must have at least 2 distinct pulse widths to estimate chronaxie.
-    - For each pulse width, threshold extraction is meaningful only if you have trials that
-      bracket the onset transition (some inactive below onset and some active at/above onset).
-    - Under block, you can still estimate onset threshold if low-end bracketing exists.
-
-    - The outputs are differentiable w.r.t. V (and thus w.r.t. upstream simulator parameters).
-    - Grouping by pulse width is discrete; do not expect gradients w.r.t. pws_ms grouping.
-    - The `amplitudes`/`strength` are typically constants; threshold extraction does not require
-      gradients w.r.t. these design variables.
-
-    Spike scoring is a soft max over time and the selected compartments. If your goal is
-    *propagating* activation, choose a `node_mask` that reflects the observation site(s)
-    where propagation is assessed (often distal nodes/compartments). Otherwise, the surrogate
-    may report activation even if propagation fails downstream.
-
-    - If block can occur, prefer:
-      - ``threshold_method="onset"`` or ``"onset_midpoint"`` (default)
-      - avoid ``"bracket_midpoint"``
-      - avoid monotonicity regularization; use unimodality regularization if desired.
-
-    Examples
-    --------
-    Basic usage (robust onset midpoint thresholds):
-
-    >>> out = chronaxie_from_trials(
-    ...     V, amps, pws_ms,
-    ...     node_mask=distal_mask,
-    ...     threshold_method="onset_midpoint",
-    ... )
-    >>> c_ms = out["chronaxie_ms"]
-    >>> Ir = out["rheobase"]
-
-    Cathodic-negative amplitudes (stronger means more negative):
-    pass strength=-amps so strength increases with stimulus intensity:
-
-    >>> out = chronaxie_from_trials(
-    ...     V, amps, pws_ms,
-    ...     strength=-amps,
-    ...     threshold_method="onset_midpoint",
-    ... )
-
-    Non-monotone activation due to high-amplitude block:
-    extract onset threshold but also inspect block boundary diagnostics:
-
-    >>> out = chronaxie_from_trials(
-    ...     V, amps, pws_ms,
-    ...     threshold_method="onset_midpoint",
-    ...     compute_block=True,
-    ... )
-    >>> onset = out["boundaries"]["I_on"]
-    >>> block = out["boundaries"]["I_block_mid"]
-
-    Add shape prior that allows 0→1→0 but discourages oscillations:
-
-    >>> out = chronaxie_from_trials(
-    ...     V, amps, pws_ms,
-    ...     threshold_method="onset_midpoint",
-    ...     reg_unimodal_weight=1e-2,
-    ... )
-    >>> loss = task_loss(out["chronaxie_ms"]) + out["reg"]
-
+    Differentiably estimate chronaxie and rheobase from trial-wise voltage recordings.
+
+    Each trial ``p`` corresponds to one stimulus amplitude / pulse-width pair:
+
+        ``V[t, p, c]``, ``amplitudes[p]``, ``pws_ms[p]``.
+
+    The function first computes a differentiable activation confidence per trial,
+    then extracts a differentiable onset threshold for each pulse width, and finally
+    fits the Weiss charge-duration relation
+
+        ``Q_th(d) = d * I_th(d) ~= I_r * d + I_r * c``.
+
+    This version supports multiple activation aggregators. The default
+    ``activation_mode='soft_max'`` preserves the previous behavior: a smooth max over
+    time and selected compartments. For extracellular stimulation, where the field can
+    strongly depolarize compartments under the electrode without producing a robust
+    propagating AP, use ``activation_mode='soft_count'``. In that mode the function
+    first computes a per-compartment event probability and then activates the trial
+    only when approximately ``at_least`` selected compartments spike, providing a
+    differentiable analogue of Dendra's ``ActiveAL`` callback. By default, count-based
+    modes use ``count_event='crossing'`` so that a compartment contributes when it has
+    an upward threshold crossing, rather than merely a large smooth maximum voltage.
+    ``use_dv_gate=True`` can additionally suppress passive depolarizations by requiring
+    a strong upstroke.
+
+    Recommended extracellular usage::
+
+        chron = chronaxie_from_trials(
+            V_distal, amps, pws_ms,
+            V_spk=-20.0,
+            dt_ms=0.005,
+            activation_mode="soft_count",
+            at_least=3,
+            count_event="crossing",
+            count_V_scale=1.0,
+            count_scale=0.25,
+            use_dv_gate=True,
+            dv_spk=10.0,
+            threshold_method="onset_midpoint",
+        )
+
+    Threshold extraction
+    --------------------
+    For each pulse-width group, the function estimates:
+
+    - ``I_on``: soft lowest activating strength;
+    - ``I_pre_inactive``: soft nearest inactive strength below onset;
+    - ``I_th``: by default ``0.5 * (I_pre_inactive + I_on)``.
+
+    This matches the empirical midpoint between the highest inactive and lowest active
+    amplitudes, while remaining differentiable and robust to high-amplitude block.
+
+    Returns include ``p_spike_trial`` (P,), ``p_spike_comp`` (P, C), optional
+    ``soft_active_count`` (P,), threshold boundaries, fitted rheobase/chronaxie, and
+    regularization terms. Gradients propagate through ``V``; amplitudes and pulse
+    widths are treated as experiment-design constants.
     """
     if V.ndim != 3:
         raise ValueError("V must have shape (T, P, C).")
@@ -1216,7 +1290,22 @@ def chronaxie_from_trials(
     if amplitudes.shape != (P,) or pws_ms.shape != (P,):
         raise ValueError("amplitudes and pws_ms must have shape (P,).")
 
-    # Strength variable used for thresholding / x-axis; must be monotone with "strongness"
+    if at_least < 1:
+        raise ValueError("at_least must be >= 1.")
+    if count_scale <= 0:
+        raise ValueError("count_scale must be positive.")
+    if count_grad_scale is not None and count_grad_scale <= 0:
+        raise ValueError("count_grad_scale must be positive when provided.")
+    if count_V_grad_scale is not None and count_V_grad_scale <= 0:
+        raise ValueError("count_V_grad_scale must be positive when provided.")
+    if crossing_count_grad_scale is not None and crossing_count_grad_scale <= 0:
+        raise ValueError("crossing_count_grad_scale must be positive when provided.")
+    if fraction_scale <= 0:
+        raise ValueError("fraction_scale must be positive.")
+    if partition_combine not in ("any", "all"):
+        raise ValueError("partition_combine must be 'any' or 'all'.")
+
+    # Strength variable used for thresholding / x-axis; must be monotone with "strongness".
     if strength is None:
         S = amplitudes
     else:
@@ -1226,10 +1315,13 @@ def chronaxie_from_trials(
     if use_abs_strength:
         S = S.abs()
 
-    # Time window
+    # Time window.
     Vw = V[slice(*time_window)] if time_window is not None else V
+    Tw = Vw.shape[0]
+    if Tw < 1:
+        raise ValueError("time_window produced an empty voltage tensor.")
 
-    # Compartment mask/weights
+    # Compartment mask/weights.
     if node_mask is None:
         comp_w = torch.ones((C,), device=device, dtype=dtype)
     else:
@@ -1240,13 +1332,207 @@ def chronaxie_from_trials(
     comp_w = torch.clamp(comp_w, min=0.0)
     logw = torch.log(torch.clamp(comp_w, min=eps))
 
-    # Smooth activation confidence per trial
+    # ------------------------------------------------------------------
+    # Trial activation surrogate
+    # ------------------------------------------------------------------
+    # Per-compartment event probabilities.
+    #
+    # p_peak_comp is the older voltage-maximum event probability.  It is useful for
+    # local initiation and soft_max scoring, but for ActiveAL-like count criteria it
+    # can substantially over-count subthreshold/passive depolarizations because many
+    # compartments can contribute fractional probabilities.
+    #
+    # p_cross_comp is a differentiable approximation to APCount/ActiveAL's upward
+    # threshold-crossing criterion.  It computes the positive variation of a smooth
+    # threshold occupancy q(t)=sigmoid((V(t)-V_spk)/count_V_scale).  A clean upward
+    # crossing contributes approximately one; a subthreshold excursion contributes
+    # less than crossing_count_threshold.
     Z = Vw - V_spk
-    logits = kappa_V * Z + logw[None, None, :]
-    score = torch.logsumexp(logits, dim=(0, 2)) / kappa_V
-    p_spike_trial = torch.sigmoid(score / gate_V_scale)  # (P,)
+    score_comp = torch.logsumexp(kappa_V * Z, dim=0) / kappa_V  # (P, C)
+    p_peak_comp = torch.sigmoid(score_comp / gate_V_scale)  # (P, C)
 
-    # Group pulse widths
+    if count_V_scale is None:
+        count_V_scale_t = torch.as_tensor(gate_V_scale, device=device, dtype=dtype)
+    else:
+        count_V_scale_t = torch.as_tensor(count_V_scale, device=device, dtype=dtype)
+
+    if Tw >= 2:
+        q_state = torch.sigmoid((Vw - V_spk) / count_V_scale_t)  # (T, P, C)
+        # Sum of positive occupancy increments.  ReLU is intentional here: it
+        # closely matches an upward crossing count while remaining differentiable
+        # almost everywhere.  Avoid softplus here, because its positive bias grows
+        # with the number of time samples.
+        soft_upcross_count = torch.relu(q_state[1:] - q_state[:-1]).sum(dim=0)
+        p_cross_comp = torch.sigmoid(
+            (soft_upcross_count - crossing_count_threshold) / crossing_count_scale
+        )
+    else:
+        soft_upcross_count = torch.zeros((P, C), device=device, dtype=dtype)
+        p_cross_comp = p_peak_comp.new_zeros((P, C))
+
+    # Optional smoother gradient path for count-based activation.
+    # This does NOT change the forward value unless used below through the
+    # straight-through combination. It is deliberately broader than the
+    # measurement-like count path so gradients do not vanish when the forward
+    # soft_count criterion is nearly hard.
+    p_peak_comp_grad = p_peak_comp
+    p_cross_comp_grad = p_cross_comp
+    soft_upcross_count_grad = soft_upcross_count
+    if use_activation_straight_through:
+        if count_V_grad_scale is None:
+            cvg = torch.maximum(
+                count_V_scale_t,
+                torch.as_tensor(3.0, device=device, dtype=dtype),
+            )
+        else:
+            cvg = torch.as_tensor(count_V_grad_scale, device=device, dtype=dtype)
+
+        if crossing_count_grad_scale is None:
+            ccg = torch.as_tensor(
+                max(float(crossing_count_scale), 0.50),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            ccg = torch.as_tensor(crossing_count_grad_scale, device=device, dtype=dtype)
+
+        score_comp_grad = torch.logsumexp(kappa_V * Z, dim=0) / kappa_V
+        p_peak_comp_grad = torch.sigmoid(
+            score_comp_grad
+            / torch.maximum(cvg, torch.as_tensor(eps, device=device, dtype=dtype))
+        )
+
+        if Tw >= 2:
+            q_state_grad = torch.sigmoid((Vw - V_spk) / cvg)
+            soft_upcross_count_grad = torch.relu(
+                q_state_grad[1:] - q_state_grad[:-1]
+            ).sum(dim=0)
+            p_cross_comp_grad = torch.sigmoid(
+                (soft_upcross_count_grad - crossing_count_threshold) / ccg
+            )
+        else:
+            soft_upcross_count_grad = torch.zeros((P, C), device=device, dtype=dtype)
+            p_cross_comp_grad = p_peak_comp_grad.new_zeros((P, C))
+
+    p_dv = None
+    if use_dv_gate:
+        if dt_ms is None:
+            raise ValueError("dt_ms is required when use_dv_gate=True.")
+        dt = torch.as_tensor(dt_ms, device=device, dtype=dtype)
+        if Tw < 2:
+            raise ValueError("use_dv_gate=True requires at least two time samples.")
+        dV = (Vw[1:] - Vw[:-1]) / dt
+        score_dv = torch.logsumexp(kappa_dv * (dV - dv_spk), dim=0) / kappa_dv
+        p_dv = torch.sigmoid(score_dv / gate_dv_scale)
+        p_peak_comp = p_peak_comp * p_dv
+        p_cross_comp = p_cross_comp * p_dv
+        if use_activation_straight_through:
+            # Preserve the dv gate in the backward surrogate as well.
+            p_peak_comp_grad = p_peak_comp_grad * p_dv
+            p_cross_comp_grad = p_cross_comp_grad * p_dv
+
+    if count_event == "peak":
+        p_spike_comp = p_peak_comp
+        p_spike_comp_grad = p_peak_comp_grad
+    elif count_event == "crossing":
+        p_spike_comp = p_cross_comp
+        p_spike_comp_grad = p_cross_comp_grad
+    else:
+        raise ValueError("count_event must be 'crossing' or 'peak'.")
+
+    soft_active_count = (p_spike_comp * comp_w[None, :]).sum(dim=-1)  # (P,)
+    soft_active_count_grad = (p_spike_comp_grad * comp_w[None, :]).sum(dim=-1)
+
+    if count_grad_scale is None:
+        # A useful default gradient scale is a few percent of the required
+        # compartment count, with a small lower bound.
+        count_grad_scale_t = torch.as_tensor(
+            max(float(count_scale), max(1.0, 0.05 * float(at_least))),
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        count_grad_scale_t = torch.as_tensor(
+            count_grad_scale, device=device, dtype=dtype
+        )
+
+    if activation_mode == "soft_max":
+        # Backward-compatible behavior: any sufficiently strong event in the selected
+        # compartments can activate the trial.
+        logits = kappa_V * Z + logw[None, None, :]
+        score = torch.logsumexp(logits, dim=(0, 2)) / kappa_V
+        p_spike_trial = torch.sigmoid(score / gate_V_scale)  # (P,)
+
+        # If requested, still let dv gate suppress passive soft-max activations.
+        if use_dv_gate:
+            denom = comp_w.sum().clamp_min(eps)
+            p_dv_trial = (p_dv * comp_w[None, :]).sum(dim=-1) / denom
+            p_spike_trial = p_spike_trial * p_dv_trial
+
+    elif activation_mode == "soft_count":
+        # Differentiable ActiveAL-like criterion: at least N selected compartments spike.
+        p_spike_trial_forward = torch.sigmoid(
+            (soft_active_count - float(at_least) + 0.5) / count_scale
+        )
+        if use_activation_straight_through:
+            p_spike_trial_grad = torch.sigmoid(
+                (soft_active_count_grad - float(at_least) + 0.5) / count_grad_scale_t
+            )
+            p_spike_trial = (
+                p_spike_trial_forward.detach()
+                + p_spike_trial_grad
+                - p_spike_trial_grad.detach()
+            )
+        else:
+            p_spike_trial = p_spike_trial_forward
+
+    elif activation_mode in ("soft_fraction", "soft_all"):
+        denom = comp_w.sum().clamp_min(eps)
+        frac = soft_active_count / denom
+        thresh = 0.9 if activation_mode == "soft_all" else fraction_threshold
+        p_spike_trial = torch.sigmoid((frac - thresh) / fraction_scale)
+
+    elif activation_mode == "partition_soft_count":
+        if partition_masks is None:
+            raise ValueError(
+                "partition_masks must be provided when activation_mode='partition_soft_count'."
+            )
+        pm = partition_masks.to(device=device, dtype=dtype)
+        if pm.ndim != 2 or pm.shape[1] != C:
+            raise ValueError("partition_masks must have shape (K, C).")
+        pm = torch.clamp(pm, min=0.0) * comp_w[None, :]
+        part_counts = torch.einsum("pc,kc->pk", p_spike_comp, pm)  # (P, K)
+        part_counts_grad = torch.einsum("pc,kc->pk", p_spike_comp_grad, pm)
+        p_part_forward = torch.sigmoid(
+            (part_counts - float(at_least) + 0.5) / count_scale
+        )  # (P, K)
+        if use_activation_straight_through:
+            p_part_grad = torch.sigmoid(
+                (part_counts_grad - float(at_least) + 0.5) / count_grad_scale_t
+            )
+            p_part = p_part_forward.detach() + p_part_grad - p_part_grad.detach()
+        else:
+            p_part = p_part_forward
+        if partition_combine == "any":
+            p_spike_trial = 1.0 - torch.prod(1.0 - p_part, dim=-1)
+        else:
+            p_spike_trial = torch.prod(p_part, dim=-1)
+        soft_active_count = part_counts.max(dim=-1).values
+        soft_active_count_grad = part_counts_grad.max(dim=-1).values
+
+    else:
+        raise ValueError(
+            "activation_mode must be one of "
+            "{'soft_max', 'soft_count', 'soft_fraction', 'soft_all', 'partition_soft_count'}."
+        )
+
+    # Avoid torch.clamp here: once the count sigmoid saturates outside [eps, 1-eps],
+    # clamp has exactly zero gradient.  This affine squashing keeps probabilities
+    # numerically safe for logs/BCE while preserving the upstream gradient.
+    p_spike_trial_raw = p_spike_trial
+    p_spike_trial = eps + (1.0 - 2.0 * eps) * p_spike_trial
+
+    # Group pulse widths.
     if pw_round_decimals is not None:
         factor = float(10**pw_round_decimals)
         pws_group = torch.round(pws_ms * factor) / factor
@@ -1272,7 +1558,7 @@ def chronaxie_from_trials(
         Soft estimate of 'highest inactive below I_on' robust to block.
 
         Uses gap g = I_on - Sg and selects the smallest positive gap among inactive points
-        (instead of selecting max inactive strength globally).
+        instead of selecting max inactive strength globally.
         """
         Smin, Smax = Sg.min(), Sg.max()
         Srange = (Smax - Smin).clamp_min(eps)
@@ -1281,12 +1567,15 @@ def chronaxie_from_trials(
         inact = torch.clamp(1.0 - pg, min=eps, max=1.0 - eps)
         log_inact = membership_power * torch.log(inact)
 
-        gate_below = torch.sigmoid(
-            g / (below_gate_frac * Srange + eps)
-        )  # suppress S > I_on
+        # Strongly suppress points that are not strictly below onset.  This is
+        # important because the active point at I_on has zero gap and can otherwise
+        # dominate the nearest-inactive selection when activation probabilities are
+        # soft rather than exactly binary.
+        scale = below_gate_frac * Srange + eps
+        wrong_side = F.softplus(-g / scale)
         err = (g / (Srange + eps)) ** 2
         w = torch.softmax(
-            -gap_alpha * err + log_inact + torch.log(torch.clamp(gate_below, min=eps)),
+            -gap_alpha * err + log_inact - gap_alpha * wrong_side.pow(2),
             dim=0,
         )
         g_hat = (w * g).sum()
@@ -1295,7 +1584,7 @@ def chronaxie_from_trials(
     def _soft_post_inactive(
         Sg: torch.Tensor, pg: torch.Tensor, I_last: torch.Tensor
     ) -> torch.Tensor:
-        """Soft estimate of 'lowest inactive above I_last' (for block boundary diagnostics)."""
+        """Soft estimate of 'lowest inactive above I_last' for block diagnostics."""
         Smin, Smax = Sg.min(), Sg.max()
         Srange = (Smax - Smin).clamp_min(eps)
 
@@ -1303,10 +1592,13 @@ def chronaxie_from_trials(
         inact = torch.clamp(1.0 - pg, min=eps, max=1.0 - eps)
         log_inact = membership_power * torch.log(inact)
 
-        gate_above = torch.sigmoid(g / (below_gate_frac * Srange + eps))
+        # Strongly suppress points that are not strictly above the last-active
+        # boundary for block diagnostics.
+        scale = below_gate_frac * Srange + eps
+        wrong_side = F.softplus(-g / scale)
         err = (g / (Srange + eps)) ** 2
         w = torch.softmax(
-            -gap_alpha * err + log_inact + torch.log(torch.clamp(gate_above, min=eps)),
+            -gap_alpha * err + log_inact - gap_alpha * wrong_side.pow(2),
             dim=0,
         )
         g_hat = (w * g).sum()
@@ -1315,6 +1607,7 @@ def chronaxie_from_trials(
     I_th_list, I_on_list, I_pre_list = [], [], []
     I_last_list, I_post_list, I_block_mid_list = [], [], []
     pw_weight_list = []
+    strength_min_list, strength_max_list, threshold_resolution_list = [], [], []
 
     reg = V.new_zeros(())
     bracket_terms, mono_terms, unimodal_terms = [], [], []
@@ -1324,31 +1617,30 @@ def chronaxie_from_trials(
         Sg = S[idx]
         pg = p_spike_trial[idx]
 
-        # Sort by strength for diagnostics/regularizers
         if idx.numel() > 1:
             perm = torch.argsort(Sg)
             pg_sort = pg[perm]
         else:
             pg_sort = pg
 
-        # Sharpen membership so "inactive" really excludes p≈1 points (and vice versa)
+        # Sharpen membership so "inactive" excludes p≈1 points and vice versa.
         act = torch.clamp(pg, min=eps, max=1.0 - eps)
         log_act = membership_power * torch.log(act)
 
-        # Normalize strength within group for stable extreme selection
+        # Normalize strength within group for stable soft extreme selection.
         Smin, Smax = Sg.min(), Sg.max()
         Srange = (Smax - Smin).clamp_min(eps)
         Sunit = (Sg - Smin) / Srange
 
-        # Lower boundary (onset): soft-min of strength among active membership
+        # Lower boundary (onset): soft-min of strength among active membership.
         w_on = torch.softmax(alpha_extreme * (-Sunit) + log_act, dim=0)
         I_on = (w_on * Sg).sum()
 
-        # Optional upper boundary (block diagnostics): soft-max of strength among active membership
+        # Upper boundary (block diagnostics): soft-max of strength among active membership.
         w_last = torch.softmax(alpha_extreme * (Sunit) + log_act, dim=0)
         I_last = (w_last * Sg).sum()
 
-        # Nearest inactive below onset (robust to blocked high-amplitude inactives)
+        # Nearest inactive below onset, robust to high-amplitude blocked inactives.
         I_pre = _soft_pre_inactive(Sg, pg, I_on)
 
         if compute_block:
@@ -1358,7 +1650,6 @@ def chronaxie_from_trials(
             I_post = torch.tensor(float("nan"), device=device, dtype=dtype)
             I_block_mid = torch.tensor(float("nan"), device=device, dtype=dtype)
 
-        # Choose I_th(d)
         if threshold_method == "onset":
             I_th = I_on
         elif threshold_method == "onset_midpoint":
@@ -1368,12 +1659,9 @@ def chronaxie_from_trials(
             wA = torch.softmax(-alpha_thresh * err, dim=0)
             I_th = (wA * Sg).sum()
         elif threshold_method == "bracket_midpoint":
-            # Historical behavior: can be wrong under block
             inact = torch.clamp(1.0 - pg, min=eps, max=1.0 - eps)
             log_inact = membership_power * torch.log(inact)
-            w_low = torch.softmax(
-                alpha_extreme * (Sunit) + log_inact, dim=0
-            )  # global max inactive (bad under block)
+            w_low = torch.softmax(alpha_extreme * (Sunit) + log_inact, dim=0)
             I_low = (w_low * Sg).sum()
             I_th = 0.5 * (I_low + I_on)
         else:
@@ -1385,8 +1673,11 @@ def chronaxie_from_trials(
         I_last_list.append(I_last)
         I_post_list.append(I_post)
         I_block_mid_list.append(I_block_mid)
+        strength_min_list.append(Smin)
+        strength_max_list.append(Smax)
+        threshold_resolution_list.append((I_on - I_pre).abs())
 
-        # Reliability weight: want low-end inactive AND at least one active anywhere (block-safe)
+        # Reliability weight: want low-end inactive AND at least one active anywhere.
         p_at_min = pg_sort[0]
         p_any_active = pg_sort.max()
         tau = 0.05
@@ -1395,18 +1686,15 @@ def chronaxie_from_trials(
         )
         pw_weight_list.append(w_pw)
 
-        # Optional bracketing reg (block-safe definition)
         if reg_bracket_weight > 0.0:
             bracket_terms.append(
                 F.softplus(p_at_min - p_low) + F.softplus(p_high - p_any_active)
             )
 
-        # Optional monotonic reg (NOT appropriate if you expect block)
         if reg_monotone_weight > 0.0 and pg_sort.numel() >= 2:
             dp = pg_sort[1:] - pg_sort[:-1]
             mono_terms.append(F.softplus(-dp).mean())
 
-        # Optional unimodal reg (allows 0->1->0; discourages oscillations)
         if reg_unimodal_weight > 0.0 and pg_sort.numel() >= 3:
             idxs = torch.arange(pg_sort.numel(), device=device, dtype=dtype)
             w_peak = torch.softmax(unimodal_beta_peak * pg_sort, dim=0)
@@ -1427,22 +1715,37 @@ def chronaxie_from_trials(
     I_last = torch.stack(I_last_list)
     I_post = torch.stack(I_post_list)
     I_block_mid = torch.stack(I_block_mid_list)
-
     w_pw = torch.stack(pw_weight_list)  # (D,)
+    strength_min_by_pw = torch.stack(strength_min_list)
+    strength_max_by_pw = torch.stack(strength_max_list)
+    threshold_resolution = torch.stack(threshold_resolution_list)
 
-    # Weighted Weiss fit: Q_th(d) ≈ I_r*d + I_r*c
-    W = w_pw.sum() + eps
+    # Weighted Weiss/Lapicque fit.
+    #
+    # Legacy/default behavior uses a linear charge-duration fit:
+    #     Q_th(d) = d*I_th(d) ≈ I_r*d + I_r*T_ch.
+    #
+    # For Thio et al.-style fitting, use weiss_fit_domain="log_current":
+    #     log10(I_th) ≈ log10(I_r * (1 + T_ch / d)).
     d = pw_unique_ms
-    d_bar = (w_pw * d).sum() / W
-    Q_bar = (w_pw * Q_th).sum() / W
-    cov = (w_pw * (d - d_bar) * (Q_th - Q_bar)).sum() / W
-    var = (w_pw * (d - d_bar) ** 2).sum() / W
-    slope = cov / (var + eps)  # rheobase
-    intercept = Q_bar - slope * d_bar  # rheobase * chronaxie
-    chronaxie_ms = intercept / (slope + eps)
+    fit_out = _weighted_weiss_fit(
+        d,
+        I_th,
+        w_pw,
+        weiss_fit_domain=weiss_fit_domain,
+        log_current_iterations=log_current_iterations,
+        log_current_min_chronaxie_ms=log_current_min_chronaxie_ms,
+        log_current_max_chronaxie_ms=log_current_max_chronaxie_ms,
+        eps=eps,
+    )
 
-    Q_pred = slope * d + intercept
-    weiss_mse = (w_pw * (Q_th - Q_pred) ** 2).sum() / W
+    slope = fit_out["slope"]  # rheobase
+    intercept = fit_out["intercept"]  # rheobase * chronaxie
+    chronaxie_ms = fit_out["chronaxie_ms"]
+    Q_pred = fit_out["Q_pred"]
+    I_pred = fit_out["I_pred"]
+    weiss_mse = fit_out["weiss_mse"]
+    log_weiss_mse = fit_out["log_weiss_mse"]
 
     if reg_weiss_fit_weight > 0.0:
         reg = reg + reg_weiss_fit_weight * weiss_mse
@@ -1460,16 +1763,45 @@ def chronaxie_from_trials(
         "I_th": I_th,
         "Q_th": Q_th,
         "p_spike_trial": p_spike_trial,
+        "p_spike_trial_raw": p_spike_trial_raw,
+        "p_spike_comp": p_spike_comp,
+        "p_spike_comp_grad": p_spike_comp_grad,
+        "p_peak_comp": p_peak_comp,
+        "p_cross_comp": p_cross_comp,
+        "p_cross_comp_grad": p_cross_comp_grad,
+        "soft_upcross_count_comp": soft_upcross_count,
+        "soft_upcross_count_comp_grad": soft_upcross_count_grad,
+        "soft_cross_count_comp": soft_upcross_count,
+        "soft_active_count": soft_active_count,
+        "soft_active_count_grad": soft_active_count_grad,
+        "count_grad_scale": count_grad_scale_t,
+        "use_activation_straight_through": use_activation_straight_through,
+        "activation_mode": activation_mode,
+        "count_event": count_event,
+        "at_least": at_least,
         "pw_group_id": pw_group_id,
+        "pw_counts": pw_counts,
         "pw_weight": w_pw,
+        "strength_min_by_pw": strength_min_by_pw,
+        "strength_max_by_pw": strength_max_by_pw,
+        "threshold_resolution": threshold_resolution,
         "boundaries": {
-            "I_on": I_on,  # lowest-active (soft)
-            "I_pre_inactive": I_pre,  # highest-inactive below onset (soft, block-safe)
-            "I_last_active": I_last,  # highest-active (soft)
-            "I_post_inactive": I_post,  # lowest-inactive above last active (soft)
-            "I_block_mid": I_block_mid,  # midpoint block boundary (diagnostic)
+            "I_on": I_on,
+            "I_pre_inactive": I_pre,
+            "I_last_active": I_last,
+            "I_post_inactive": I_post,
+            "I_block_mid": I_block_mid,
         },
-        "fit": {"slope": slope, "intercept": intercept, "weiss_mse": weiss_mse},
+        "fit": {
+            "slope": slope,
+            "intercept": intercept,
+            "I_pred": I_pred,
+            "Q_pred": Q_pred,
+            "weiss_mse": weiss_mse,
+            "log_weiss_mse": log_weiss_mse,
+            "weiss_fit_domain": weiss_fit_domain,
+        },
+        "weiss_fit_domain": weiss_fit_domain,
         "reg": reg,
     }
 
@@ -3787,6 +4119,780 @@ def activity_dependent_slowing(
     return out
 
 
+def _coerce_train_frequency_hz(
+    frequency_hz: float | torch.Tensor | Sequence[float] | None,
+    pulse_times_ms: torch.Tensor,  # (F, N)
+    *,
+    eps: float,
+    name: str = "frequency_hz",
+) -> torch.Tensor:
+    """Internal helper: return one nominal train frequency per fiber, shape (F,)."""
+    if pulse_times_ms.ndim != 2:
+        raise ValueError("pulse_times_ms must have shape (F, N).")
+    Fibs, N = pulse_times_ms.shape
+    device, dtype = pulse_times_ms.device, pulse_times_ms.dtype
+
+    if frequency_hz is None:
+        if N < 2:
+            raise ValueError(
+                "Cannot infer frequency_hz from fewer than two pulse times. "
+                "Pass frequency_hz explicitly for single-pulse inputs."
+            )
+        isi = pulse_times_ms[:, 1:] - pulse_times_ms[:, :-1]
+        mean_isi = isi.mean(dim=-1)
+        return 1000.0 / (mean_isi + eps)
+
+    f = torch.as_tensor(frequency_hz, device=device, dtype=dtype)
+    if f.ndim == 0:
+        return f.expand(Fibs)
+    if f.ndim == 1:
+        if f.numel() == 1:
+            return f.reshape(1).expand(Fibs)
+        if f.shape == (Fibs,):
+            return f
+    if f.ndim == 2:
+        if f.shape == (Fibs, 1):
+            return f[:, 0]
+        if f.shape == (1, Fibs):
+            return f[0]
+    raise ValueError(
+        f"{name} must be scalar or shape (F,), where F={Fibs}; got {tuple(f.shape)}."
+    )
+
+
+def _frequency_group_ids(
+    frequency_hz: torch.Tensor,  # (F,)
+    *,
+    round_decimals: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Internal helper: optionally round frequencies, then return unique/group ids/counts."""
+    if frequency_hz.ndim != 1:
+        raise ValueError("frequency_hz must have shape (F,).")
+    if round_decimals is not None:
+        factor = float(10**round_decimals)
+        freq_group = torch.round(frequency_hz * factor) / factor
+    else:
+        freq_group = frequency_hz
+    return torch.unique(
+        freq_group, sorted=True, return_inverse=True, return_counts=True
+    )
+
+
+def _grouped_mean_by_frequency(
+    values: torch.Tensor | None,
+    frequency_group_id: torch.Tensor,
+    n_frequency: int,
+    *,
+    eps: float,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Internal differentiable grouped mean over the fiber/trial dimension."""
+    if values is None:
+        return None
+    if values.ndim != 1:
+        raise ValueError("values must have shape (F,) for grouped frequency summaries.")
+    if weights is not None and weights.shape != values.shape:
+        raise ValueError("weights must have the same shape as values.")
+
+    out = []
+    for g in range(n_frequency):
+        idx = torch.where(frequency_group_id == g)[0]
+        vg = values[idx]
+        finite = torch.isfinite(vg)
+        if weights is None:
+            wg = finite.to(dtype=vg.dtype)
+        else:
+            wg = torch.clamp(weights[idx], min=0.0) * finite.to(dtype=vg.dtype)
+        vals = torch.where(finite, vg, torch.zeros_like(vg))
+        out.append((wg * vals).sum() / (wg.sum() + eps))
+    return torch.stack(out)
+
+
+def _weighted_mean_over_time_indices(
+    x: torch.Tensor,  # (F, M)
+    idx: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+    eps: float,
+) -> torch.Tensor:
+    """Internal helper: weighted finite mean over selected pulse/pair indices."""
+    if idx.numel() == 0:
+        return torch.full((x.shape[0],), float("nan"), device=x.device, dtype=x.dtype)
+    xs = x[:, idx]
+    finite = torch.isfinite(xs)
+    vals = torch.where(finite, xs, torch.zeros_like(xs))
+    if weights is None:
+        w = finite.to(dtype=x.dtype)
+    else:
+        ws = weights[:, idx]
+        w = torch.clamp(ws, min=0.0) * finite.to(dtype=x.dtype)
+    return (w * vals).sum(dim=-1) / (w.sum(dim=-1) + eps)
+
+
+def _frequency_following_summary_from_ads(
+    ads_out: Dict[str, Any],
+    *,
+    frequency_hz: torch.Tensor,  # (F,)
+    frequency_round_decimals: int | None,
+    p_initiated: torch.Tensor | None,
+    success_threshold: float,
+    success_scale: float,
+    accommodation_skip_pulses: int,
+    tail_n_pulses: int,
+    max_isi_error_ms: float | torch.Tensor | None,
+    max_isi_error_frac: float,
+    entrainment_isi_scale_ms: float,
+    target_follow_fraction: float,
+    target_follow_scale: float,
+    max_frequency_beta: float,
+    eps: float,
+) -> Dict[str, Any]:
+    """Internal differentiable summaries shared by soft and hard frequency-following metrics."""
+    p_success = ads_out["p_success"]
+    input_isi_ms = ads_out.get("input_isi_ms")
+    output_isi_ms = ads_out.get("output_isi_ms")
+    isi_error_ms = ads_out.get("isi_error_ms")
+
+    if p_success.ndim != 2:
+        raise ValueError("ads_out['p_success'] must have shape (F, N).")
+    Fibs, N = p_success.shape
+    device, dtype = p_success.device, p_success.dtype
+
+    if accommodation_skip_pulses < 0:
+        raise ValueError("accommodation_skip_pulses must be nonnegative.")
+    if accommodation_skip_pulses >= N:
+        raise ValueError(
+            "accommodation_skip_pulses must be smaller than the number of pulses."
+        )
+    if tail_n_pulses < 1:
+        raise ValueError("tail_n_pulses must be >= 1.")
+
+    eval_idx = torch.arange(
+        accommodation_skip_pulses, N, device=device, dtype=torch.long
+    )
+    tail_k = min(int(tail_n_pulses), N - accommodation_skip_pulses)
+    tail_idx = torch.arange(N - tail_k, N, device=device, dtype=torch.long)
+
+    # Differentiable soft count using confidence values, plus an optional sharpened count.
+    follow_fraction = p_success[:, eval_idx].mean(dim=-1)
+    failure_fraction = 1.0 - follow_fraction
+    tail_follow_fraction = p_success[:, tail_idx].mean(dim=-1)
+    final_success = p_success[:, -1]
+    soft_follow_count = p_success[:, eval_idx].sum(dim=-1)
+    p_success_state = torch.sigmoid(
+        (p_success - torch.as_tensor(success_threshold, device=device, dtype=dtype))
+        / torch.as_tensor(success_scale, device=device, dtype=dtype)
+    )
+    thresholded_follow_fraction = p_success_state[:, eval_idx].mean(dim=-1)
+    thresholded_follow_count = p_success_state[:, eval_idx].sum(dim=-1)
+
+    # Consecutive-pulse / entrainment summaries.
+    if (
+        N >= 2
+        and input_isi_ms is not None
+        and output_isi_ms is not None
+        and isi_error_ms is not None
+    ):
+        pair_success = p_success[:, :-1] * p_success[:, 1:]
+        pair_eval_start = min(accommodation_skip_pulses, N - 1)
+        pair_eval_idx = torch.arange(
+            pair_eval_start, N - 1, device=device, dtype=torch.long
+        )
+        pair_tail_start = max(pair_eval_start, N - tail_k)
+        pair_tail_idx = torch.arange(
+            pair_tail_start, N - 1, device=device, dtype=torch.long
+        )
+
+        abs_isi_error_ms = torch.sqrt(isi_error_ms * isi_error_ms + eps)
+        if max_isi_error_ms is None:
+            isi_tol = (
+                torch.as_tensor(max_isi_error_frac, device=device, dtype=dtype)
+                * input_isi_ms
+            )
+        else:
+            tol = torch.as_tensor(max_isi_error_ms, device=device, dtype=dtype)
+            if tol.ndim == 0:
+                isi_tol = tol.expand_as(input_isi_ms)
+            elif tol.shape == input_isi_ms.shape:
+                isi_tol = tol
+            elif tol.shape == (Fibs,):
+                isi_tol = tol[:, None].expand_as(input_isi_ms)
+            else:
+                raise ValueError(
+                    "max_isi_error_ms must be scalar, shape (F,), or shape (F, N-1)."
+                )
+
+        p_isi_close = torch.sigmoid(
+            (isi_tol - abs_isi_error_ms)
+            / torch.as_tensor(entrainment_isi_scale_ms, device=device, dtype=dtype)
+        )
+        p_entrained_pair = pair_success * p_isi_close
+        entrained_fraction = _weighted_mean_over_time_indices(
+            p_entrained_pair, pair_eval_idx, eps=eps
+        )
+        tail_entrained_fraction = _weighted_mean_over_time_indices(
+            p_entrained_pair, pair_tail_idx, eps=eps
+        )
+        entrainment_interval_ms = _weighted_mean_over_time_indices(
+            output_isi_ms, pair_tail_idx, weights=pair_success, eps=eps
+        )
+        tail_input_isi_ms = _weighted_mean_over_time_indices(
+            input_isi_ms, pair_tail_idx, weights=pair_success, eps=eps
+        )
+        tail_isi_error_ms = _weighted_mean_over_time_indices(
+            isi_error_ms, pair_tail_idx, weights=pair_success, eps=eps
+        )
+        tail_abs_isi_error_ms = _weighted_mean_over_time_indices(
+            abs_isi_error_ms, pair_tail_idx, weights=pair_success, eps=eps
+        )
+        entrainment_ratio = entrainment_interval_ms / (tail_input_isi_ms + eps)
+    else:
+        pair_success = None
+        abs_isi_error_ms = None
+        p_isi_close = None
+        p_entrained_pair = None
+        entrained_fraction = torch.full(
+            (Fibs,), float("nan"), device=device, dtype=dtype
+        )
+        tail_entrained_fraction = torch.full_like(entrained_fraction, float("nan"))
+        entrainment_interval_ms = torch.full_like(entrained_fraction, float("nan"))
+        tail_input_isi_ms = torch.full_like(entrained_fraction, float("nan"))
+        tail_isi_error_ms = torch.full_like(entrained_fraction, float("nan"))
+        tail_abs_isi_error_ms = torch.full_like(entrained_fraction, float("nan"))
+        entrainment_ratio = torch.full_like(entrained_fraction, float("nan"))
+        pair_eval_idx = torch.empty((0,), device=device, dtype=torch.long)
+        pair_tail_idx = torch.empty((0,), device=device, dtype=torch.long)
+
+    # Optional initiation-vs-distal propagation/block diagnostics.
+    if p_initiated is not None:
+        if p_initiated.shape != p_success.shape:
+            raise ValueError(
+                "p_initiated must have the same shape as p_success, (F, N)."
+            )
+        p_propagated = p_initiated * p_success
+        p_conduction_failure = p_initiated * (1.0 - p_success)
+        initiation_fraction = p_initiated[:, eval_idx].mean(dim=-1)
+        propagated_fraction = p_propagated[:, eval_idx].mean(dim=-1)
+        block_fraction = p_conduction_failure[:, eval_idx].mean(dim=-1)
+        tail_block_fraction = p_conduction_failure[:, tail_idx].mean(dim=-1)
+        final_conduction_failure = p_conduction_failure[:, -1]
+        propagation_fraction_given_init = p_propagated[:, eval_idx].sum(dim=-1) / (
+            p_initiated[:, eval_idx].sum(dim=-1) + eps
+        )
+    else:
+        p_propagated = None
+        p_conduction_failure = None
+        initiation_fraction = None
+        propagated_fraction = None
+        block_fraction = None
+        tail_block_fraction = None
+        final_conduction_failure = None
+        propagation_fraction_given_init = None
+
+    # Frequency-level summaries over the fiber/trial dimension.
+    freq_unique, freq_group_id, freq_counts = _frequency_group_ids(
+        frequency_hz, round_decimals=frequency_round_decimals
+    )
+    n_freq = int(freq_unique.numel())
+    follow_by_freq = _grouped_mean_by_frequency(
+        follow_fraction, freq_group_id, n_freq, eps=eps
+    )
+    tail_follow_by_freq = _grouped_mean_by_frequency(
+        tail_follow_fraction, freq_group_id, n_freq, eps=eps
+    )
+    failure_by_freq = _grouped_mean_by_frequency(
+        failure_fraction, freq_group_id, n_freq, eps=eps
+    )
+    entrained_by_freq = _grouped_mean_by_frequency(
+        entrained_fraction, freq_group_id, n_freq, eps=eps
+    )
+    tail_entrained_by_freq = _grouped_mean_by_frequency(
+        tail_entrained_fraction, freq_group_id, n_freq, eps=eps
+    )
+    entrainment_interval_by_freq = _grouped_mean_by_frequency(
+        entrainment_interval_ms, freq_group_id, n_freq, eps=eps
+    )
+    tail_abs_isi_error_by_freq = _grouped_mean_by_frequency(
+        tail_abs_isi_error_ms, freq_group_id, n_freq, eps=eps
+    )
+    block_by_freq = _grouped_mean_by_frequency(
+        block_fraction, freq_group_id, n_freq, eps=eps
+    )
+
+    velocity_slowing = ads_out.get("tail_velocity_slowing_percent")
+    velocity_slowing_by_freq = _grouped_mean_by_frequency(
+        velocity_slowing, freq_group_id, n_freq, eps=eps
+    )
+
+    p_follow_target_by_frequency = torch.sigmoid(
+        (
+            tail_follow_by_freq
+            - torch.as_tensor(target_follow_fraction, device=device, dtype=dtype)
+        )
+        / torch.as_tensor(target_follow_scale, device=device, dtype=dtype)
+    )
+    log_freq = torch.log(torch.clamp(freq_unique, min=eps))
+    if n_freq > 1:
+        freq_score = (log_freq - log_freq.min()) / (
+            log_freq.max() - log_freq.min() + eps
+        )
+    else:
+        freq_score = torch.zeros_like(log_freq)
+    max_freq_logits = torch.as_tensor(
+        max_frequency_beta, device=device, dtype=dtype
+    ) * freq_score + torch.log(torch.clamp(p_follow_target_by_frequency, min=eps))
+    max_freq_w = torch.softmax(max_freq_logits, dim=0)
+    soft_max_following_frequency_hz = (max_freq_w * freq_unique).sum()
+
+    return {
+        "frequency_hz": frequency_hz,
+        "frequency_unique_hz": freq_unique,
+        "frequency_group_id": freq_group_id,
+        "frequency_counts": freq_counts,
+        "eval_pulse_indices": eval_idx,
+        "eval_pair_indices": pair_eval_idx,
+        "tail_pulse_indices": tail_idx,
+        "tail_pair_indices": pair_tail_idx,
+        "p_success": p_success,
+        "p_fail": 1.0 - p_success,
+        "follow_fraction": follow_fraction,
+        "tail_follow_fraction": tail_follow_fraction,
+        "final_success": final_success,
+        "failure_fraction": failure_fraction,
+        "soft_follow_count": soft_follow_count,
+        "thresholded_follow_fraction": thresholded_follow_fraction,
+        "thresholded_follow_count": thresholded_follow_count,
+        "pair_success": pair_success,
+        "abs_isi_error_ms": abs_isi_error_ms,
+        "p_isi_close": p_isi_close,
+        "p_entrained_pair": p_entrained_pair,
+        "entrained_fraction": entrained_fraction,
+        "tail_entrained_fraction": tail_entrained_fraction,
+        "entrainment_interval_ms": entrainment_interval_ms,
+        "tail_input_isi_ms": tail_input_isi_ms,
+        "tail_isi_error_ms": tail_isi_error_ms,
+        "tail_abs_isi_error_ms": tail_abs_isi_error_ms,
+        "entrainment_ratio": entrainment_ratio,
+        "p_initiated": p_initiated,
+        "p_propagated": p_propagated,
+        "p_conduction_failure": p_conduction_failure,
+        "initiation_fraction": initiation_fraction,
+        "propagated_fraction": propagated_fraction,
+        "block_fraction": block_fraction,
+        "tail_block_fraction": tail_block_fraction,
+        "final_conduction_failure": final_conduction_failure,
+        "propagation_fraction_given_init": propagation_fraction_given_init,
+        "follow_fraction_by_frequency": follow_by_freq,
+        "tail_follow_fraction_by_frequency": tail_follow_by_freq,
+        "failure_fraction_by_frequency": failure_by_freq,
+        "entrained_fraction_by_frequency": entrained_by_freq,
+        "tail_entrained_fraction_by_frequency": tail_entrained_by_freq,
+        "entrainment_interval_ms_by_frequency": entrainment_interval_by_freq,
+        "tail_abs_isi_error_ms_by_frequency": tail_abs_isi_error_by_freq,
+        "block_fraction_by_frequency": block_by_freq,
+        "tail_velocity_slowing_percent_by_frequency": velocity_slowing_by_freq,
+        "p_follow_target_by_frequency": p_follow_target_by_frequency,
+        "soft_max_following_frequency_hz": soft_max_following_frequency_hz,
+    }
+
+
+def frequency_following(
+    V: torch.Tensor,  # (T, F, C)
+    pulse_times_ms: torch.Tensor | Sequence[float],  # (N,), (1, N), or (F, N)
+    dt_ms: float | torch.Tensor,
+    *,
+    frequency_hz: float | torch.Tensor | Sequence[float] | None = None,
+    lengths_um: Optional[LengthLike] = None,  # scalar, (C,), or (F, C)
+    node_mask: torch.Tensor | None = None,  # distal/readout mask, (C,) or (F, C)
+    initiation_node_mask: torch.Tensor | None = None,  # optional initiation-region mask
+    response_window_ms: tuple[float, float] = (0.1, 10.0),
+    initiation_response_window_ms: tuple[float, float] | None = None,
+    gate_t_scale_ms: float = 0.05,
+    window_margin_ms: float | None = None,
+    chunk_pulses: int | None = None,
+    return_compartment_metrics: bool = False,
+    # Spike-present scoring
+    V_spk: float = 0.0,
+    kappa_V: float = 20.0,
+    gate_V_scale: float = 5.0,
+    use_dv_gate: bool = True,
+    dv_spk: float = 10.0,
+    kappa_dv: float = 10.0,
+    gate_dv_scale: float = 5.0,
+    # Soft arrival-time settings
+    beta: float = 50.0,
+    dv0: float = 0.0,
+    dv_scale: float = 1.0,
+    lambda_early: float = 0.0,
+    # Summary / entrainment controls
+    frequency_round_decimals: int | None = 6,
+    accommodation_skip_pulses: int = 0,
+    tail_n_pulses: int = 10,
+    success_threshold: float = 0.5,
+    success_scale: float = 0.05,
+    max_isi_error_ms: float | torch.Tensor | None = None,
+    max_isi_error_frac: float = 0.10,
+    entrainment_isi_scale_ms: float = 0.1,
+    target_follow_fraction: float = 0.90,
+    target_follow_scale: float = 0.05,
+    max_frequency_beta: float = 5.0,
+    # Baseline / velocity reference passthroughs
+    baseline_pulse_indices: torch.Tensor | Sequence[int] | None = None,
+    baseline_n_pulses: int = 1,
+    reference_latency_ms: float | torch.Tensor | None = None,
+    reference_velocity_m_per_s: float | torch.Tensor | None = None,
+    # Robustness regularizers passthroughs
+    min_ess: float = 1.0,
+    min_var_ms2: float = 1e-3,
+    min_success_prob: float = 0.5,
+    reg_ess_weight: float = 0.0,
+    reg_var_weight: float = 0.0,
+    reg_success_weight: float = 0.0,
+    eps: float = 1e-8,
+) -> Dict[str, Any]:
+    r"""
+    Differentiably estimate frequency following, entrainment, and conduction failure.
+
+    This metric is intended for pulse-train simulations in which the same axon/fiber is driven
+    at one or more stimulation frequencies and the model should be scored by how reliably
+    pulse-evoked spikes propagate to a readout region. It reuses the optimized local-window
+    activity-dependent-slowing estimator internally, so it avoids materializing dense
+    ``T x N x F x C`` gates for long trains.
+
+    Required input data
+    -------------------
+    V : torch.Tensor
+        Voltage traces with shape ``(T, F, C)``. ``F`` can represent fibers, parameter sets,
+        or trial instances. To compare multiple frequencies in one call, batch them along ``F``
+        and pass either fiber-specific ``pulse_times_ms`` or ``frequency_hz``.
+
+    pulse_times_ms : array-like or torch.Tensor
+        Pulse onset times in milliseconds. Accepts shape ``(N,)`` for a common train,
+        ``(1, N)`` for broadcastable pulse times, or ``(F, N)`` for fiber/trial-specific trains.
+
+    dt_ms : float or torch.Tensor
+        Simulation time step in milliseconds.
+
+    Simulations required to produce the input data
+    ----------------------------------------------
+    Run one train-stimulation simulation per tested frequency, amplitude, and model condition.
+    For example, to estimate a maximum following frequency, simulate trains at 5, 10, 20, 50,
+    and 100 Hz, recording voltage at a distal readout region. If different frequencies are
+    batched together in ``F``, pass ``frequency_hz`` with shape ``(F,)``. If ``frequency_hz`` is
+    omitted, a nominal frequency is inferred from the mean pulse interval of each row of
+    ``pulse_times_ms``.
+
+    Readout and conduction failure
+    ------------------------------
+    ``node_mask`` selects the distal/readout compartments used to decide whether a pulse was
+    followed. If ``initiation_node_mask`` is also provided, the function separately scores local
+    initiation and distal propagation. It then returns a differentiable conduction-failure score
+
+    ``p_conduction_failure = p_initiated * (1 - p_success)``
+
+    for each pulse. This distinguishes failure to initiate from failure to propagate.
+
+    What it returns
+    ---------------
+    The output dictionary includes the full ADS-style pulse-locked outputs from the distal
+    readout, plus these frequency-following summaries:
+
+    ``p_success`` : ``(F, N)``
+        Smooth probability-like confidence that each pulse produced a distal/readout spike.
+
+    ``follow_fraction`` : ``(F,)``
+        Mean ``p_success`` across evaluated pulses after ``accommodation_skip_pulses``.
+
+    ``tail_follow_fraction`` : ``(F,)``
+        Mean ``p_success`` over the last ``tail_n_pulses``.
+
+    ``p_entrained_pair`` : ``(F, N-1)`` or ``None``
+        Smooth confidence that adjacent output spikes both occurred and preserved the input ISI
+        within ``max_isi_error_ms`` or ``max_isi_error_frac * input_isi``.
+
+    ``entrainment_interval_ms`` : ``(F,)``
+        Success-weighted output ISI over the tail of the train.
+
+    ``block_fraction`` / ``p_conduction_failure`` : optional
+        Returned when ``initiation_node_mask`` is supplied. These score pulse-evoked initiation
+        without distal propagation.
+
+    ``*_by_frequency`` : ``(D,)``
+        Grouped summaries across all fibers/trials with the same nominal frequency.
+
+    ``soft_max_following_frequency_hz`` : scalar
+        A differentiable soft estimate of the highest tested frequency whose tail following
+        fraction exceeds ``target_follow_fraction``.
+
+    Notes
+    -----
+    - Main outputs are differentiable with respect to ``V``. Frequency grouping and pulse times
+      are experiment-design constants.
+    - ``p_success`` is a smooth confidence, not a calibrated probability unless externally
+      calibrated.
+    - For high-frequency trains, choose ``response_window_ms`` so one pulse's readout window does
+      not include the next pulse's response.
+    - Use ``initiation_node_mask`` plus distal ``node_mask`` when you specifically need conduction
+      block/failure rather than simple readout failure.
+
+    Example
+    -------
+    >>> out = frequency_following(
+    ...     V_train,
+    ...     pulse_times_ms,
+    ...     dt_ms,
+    ...     frequency_hz=freqs_hz,
+    ...     lengths_um=recording_spacing_um,
+    ...     node_mask=distal_mask,
+    ...     initiation_node_mask=stim_region_mask,
+    ...     response_window_ms=(0.5, 20.0),
+    ... )
+    >>> loss = (1.0 - out["tail_follow_fraction"]).mean() + out["reg"]
+    """
+    if V.ndim != 3:
+        raise ValueError("V must have shape (T, F, C).")
+    T, Fibs, C = V.shape
+    if T < 2:
+        raise ValueError("Need at least 2 time samples.")
+
+    device, dtype = V.device, V.dtype
+    dt = torch.as_tensor(dt_ms, device=device, dtype=dtype)
+    pulse_times = _coerce_pulse_times_ms(
+        pulse_times_ms, Fibs=Fibs, device=device, dtype=dtype
+    )
+    nominal_frequency_hz = _coerce_train_frequency_hz(
+        frequency_hz, pulse_times, eps=eps
+    )
+
+    distal = activity_dependent_slowing(
+        V,
+        pulse_times,
+        dt,
+        lengths_um=lengths_um,
+        node_mask=node_mask,
+        response_window_ms=response_window_ms,
+        gate_t_scale_ms=gate_t_scale_ms,
+        window_margin_ms=window_margin_ms,
+        chunk_pulses=chunk_pulses,
+        return_compartment_metrics=return_compartment_metrics,
+        V_spk=V_spk,
+        kappa_V=kappa_V,
+        gate_V_scale=gate_V_scale,
+        use_dv_gate=use_dv_gate,
+        dv_spk=dv_spk,
+        kappa_dv=kappa_dv,
+        gate_dv_scale=gate_dv_scale,
+        beta=beta,
+        dv0=dv0,
+        dv_scale=dv_scale,
+        lambda_early=lambda_early,
+        baseline_pulse_indices=baseline_pulse_indices,
+        baseline_n_pulses=baseline_n_pulses,
+        reference_latency_ms=reference_latency_ms,
+        reference_velocity_m_per_s=reference_velocity_m_per_s,
+        tail_n_pulses=tail_n_pulses,
+        success_threshold=success_threshold,
+        min_ess=min_ess,
+        min_var_ms2=min_var_ms2,
+        min_success_prob=min_success_prob,
+        reg_ess_weight=reg_ess_weight,
+        reg_var_weight=reg_var_weight,
+        reg_success_weight=reg_success_weight,
+        eps=eps,
+        return_time_traces=False,
+    )
+
+    init_out = None
+    p_initiated = None
+    if initiation_node_mask is not None:
+        init_win = (
+            initiation_response_window_ms
+            if initiation_response_window_ms is not None
+            else response_window_ms
+        )
+        init_out = activity_dependent_slowing(
+            V,
+            pulse_times,
+            dt,
+            lengths_um=None,
+            node_mask=initiation_node_mask,
+            response_window_ms=init_win,
+            gate_t_scale_ms=gate_t_scale_ms,
+            window_margin_ms=window_margin_ms,
+            chunk_pulses=chunk_pulses,
+            return_compartment_metrics=False,
+            V_spk=V_spk,
+            kappa_V=kappa_V,
+            gate_V_scale=gate_V_scale,
+            use_dv_gate=use_dv_gate,
+            dv_spk=dv_spk,
+            kappa_dv=kappa_dv,
+            gate_dv_scale=gate_dv_scale,
+            beta=beta,
+            dv0=dv0,
+            dv_scale=dv_scale,
+            lambda_early=lambda_early,
+            baseline_n_pulses=baseline_n_pulses,
+            tail_n_pulses=tail_n_pulses,
+            success_threshold=success_threshold,
+            min_ess=min_ess,
+            min_var_ms2=min_var_ms2,
+            min_success_prob=min_success_prob,
+            reg_ess_weight=0.0,
+            reg_var_weight=0.0,
+            reg_success_weight=0.0,
+            eps=eps,
+            return_time_traces=False,
+        )
+        p_initiated = init_out["p_success"]
+
+    summary = _frequency_following_summary_from_ads(
+        distal,
+        frequency_hz=nominal_frequency_hz,
+        frequency_round_decimals=frequency_round_decimals,
+        p_initiated=p_initiated,
+        success_threshold=success_threshold,
+        success_scale=success_scale,
+        accommodation_skip_pulses=accommodation_skip_pulses,
+        tail_n_pulses=tail_n_pulses,
+        max_isi_error_ms=max_isi_error_ms,
+        max_isi_error_frac=max_isi_error_frac,
+        entrainment_isi_scale_ms=entrainment_isi_scale_ms,
+        target_follow_fraction=target_follow_fraction,
+        target_follow_scale=target_follow_scale,
+        max_frequency_beta=max_frequency_beta,
+        eps=eps,
+    )
+
+    out = dict(distal)
+    out.update(summary)
+    out["distal_ads"] = distal
+    out["initiation_ads"] = init_out
+    out["reg"] = distal["reg"]
+    return out
+
+
+@torch.no_grad()
+def hard_frequency_following(
+    V: torch.Tensor,  # (T, F, C)
+    pulse_times_ms: torch.Tensor | Sequence[float],
+    dt_ms: float | torch.Tensor,
+    *,
+    frequency_hz: float | torch.Tensor | Sequence[float] | None = None,
+    lengths_um: Optional[LengthLike] = None,
+    node_mask: torch.Tensor | None = None,
+    initiation_node_mask: torch.Tensor | None = None,
+    response_window_ms: tuple[float, float] = (0.1, 10.0),
+    initiation_response_window_ms: tuple[float, float] | None = None,
+    V_th: float = 0.0,
+    dv_th: float | None = 10.0,
+    interpolate: bool = True,
+    frequency_round_decimals: int | None = 6,
+    accommodation_skip_pulses: int = 0,
+    tail_n_pulses: int = 10,
+    success_threshold: float = 0.5,
+    success_scale: float = 0.05,
+    max_isi_error_ms: float | torch.Tensor | None = None,
+    max_isi_error_frac: float = 0.10,
+    entrainment_isi_scale_ms: float = 0.1,
+    target_follow_fraction: float = 0.90,
+    target_follow_scale: float = 0.05,
+    max_frequency_beta: float = 5.0,
+    baseline_pulse_indices: torch.Tensor | Sequence[int] | None = None,
+    baseline_n_pulses: int = 1,
+    reference_latency_ms: float | torch.Tensor | None = None,
+    reference_velocity_m_per_s: float | torch.Tensor | None = None,
+    eps: float = 1e-12,
+    window_margin_ms: float | None = None,
+) -> Dict[str, Any]:
+    r"""
+    Hard non-differentiable reference descriptor for frequency following and conduction failure.
+
+    This is the threshold-crossing analogue of ``frequency_following``. It uses
+    ``hard_activity_dependent_slowing`` to detect pulse-locked distal responses and, optionally,
+    initiation-region responses. It is intended for hard-vs-surrogate validation, not training.
+    """
+    if V.ndim != 3:
+        raise ValueError("V must have shape (T, F, C).")
+    Fibs = V.shape[1]
+    device, dtype = V.device, V.dtype
+    dt = torch.as_tensor(dt_ms, device=device, dtype=dtype)
+    pulse_times = _coerce_pulse_times_ms(
+        pulse_times_ms, Fibs=Fibs, device=device, dtype=dtype
+    )
+    nominal_frequency_hz = _coerce_train_frequency_hz(
+        frequency_hz, pulse_times, eps=eps
+    )
+
+    distal = hard_activity_dependent_slowing(
+        V,
+        pulse_times,
+        dt,
+        lengths_um=lengths_um,
+        node_mask=node_mask,
+        response_window_ms=response_window_ms,
+        V_th=V_th,
+        dv_th=dv_th,
+        baseline_pulse_indices=baseline_pulse_indices,
+        baseline_n_pulses=baseline_n_pulses,
+        reference_latency_ms=reference_latency_ms,
+        reference_velocity_m_per_s=reference_velocity_m_per_s,
+        tail_n_pulses=tail_n_pulses,
+        interpolate=interpolate,
+        eps=eps,
+        window_margin_ms=window_margin_ms,
+    )
+
+    init_out = None
+    p_initiated = None
+    if initiation_node_mask is not None:
+        init_win = (
+            initiation_response_window_ms
+            if initiation_response_window_ms is not None
+            else response_window_ms
+        )
+        init_out = hard_activity_dependent_slowing(
+            V,
+            pulse_times,
+            dt,
+            lengths_um=None,
+            node_mask=initiation_node_mask,
+            response_window_ms=init_win,
+            V_th=V_th,
+            dv_th=dv_th,
+            baseline_n_pulses=baseline_n_pulses,
+            tail_n_pulses=tail_n_pulses,
+            interpolate=interpolate,
+            eps=eps,
+            window_margin_ms=window_margin_ms,
+        )
+        p_initiated = init_out["p_success"]
+
+    summary = _frequency_following_summary_from_ads(
+        distal,
+        frequency_hz=nominal_frequency_hz,
+        frequency_round_decimals=frequency_round_decimals,
+        p_initiated=p_initiated,
+        success_threshold=success_threshold,
+        success_scale=success_scale,
+        accommodation_skip_pulses=accommodation_skip_pulses,
+        tail_n_pulses=tail_n_pulses,
+        max_isi_error_ms=max_isi_error_ms,
+        max_isi_error_frac=max_isi_error_frac,
+        entrainment_isi_scale_ms=entrainment_isi_scale_ms,
+        target_follow_fraction=target_follow_fraction,
+        target_follow_scale=target_follow_scale,
+        max_frequency_beta=max_frequency_beta,
+        eps=eps,
+    )
+
+    out = dict(distal)
+    out.update(summary)
+    out["distal_ads"] = distal
+    out["initiation_ads"] = init_out
+    return out
+
+
 @torch.no_grad()
 def hard_spike_arrival_times(
     V: torch.Tensor,  # (T, F, C)
@@ -4322,6 +5428,12 @@ def hard_chronaxie_from_trials(
     use_abs_strength: bool = False,
     pw_round_decimals: int | None = None,
     threshold_method: Literal["onset", "onset_midpoint"] = "onset_midpoint",
+    activation_mode: Literal["any", "count"] = "any",
+    at_least: int = 1,
+    weiss_fit_domain: Literal["charge", "current", "log_current"] = "charge",
+    log_current_iterations: int = 25,
+    log_current_min_chronaxie_ms: float = 1e-4,
+    log_current_max_chronaxie_ms: float = 1e3,
     eps: float = 1e-12,
 ) -> Dict[str, Any]:
     """
@@ -4365,7 +5477,15 @@ def hard_chronaxie_from_trials(
         if m.shape != (C,):
             raise ValueError("node_mask must have shape (C,) for trial data.")
         mask = (m != 0)[None, :].expand(P, C)
-    p_active = (active_comp & mask).any(dim=-1).to(dtype=dtype)  # (P,)
+    active_count = (active_comp & mask).sum(dim=-1)  # (P,)
+    if activation_mode == "any":
+        p_active = (active_count >= 1).to(dtype=dtype)
+    elif activation_mode == "count":
+        if at_least < 1:
+            raise ValueError("at_least must be >= 1.")
+        p_active = (active_count >= at_least).to(dtype=dtype)
+    else:
+        raise ValueError("activation_mode must be 'any' or 'count'.")
 
     if pw_round_decimals is not None:
         factor = float(10**pw_round_decimals)
@@ -4416,20 +5536,28 @@ def hard_chronaxie_from_trials(
         rheobase = torch.tensor(float("nan"), device=device, dtype=dtype)
         chron = torch.tensor(float("nan"), device=device, dtype=dtype)
         weiss_mse = torch.tensor(float("nan"), device=device, dtype=dtype)
+        log_weiss_mse = torch.tensor(float("nan"), device=device, dtype=dtype)
+        slope = rheobase
+        intercept = torch.tensor(float("nan"), device=device, dtype=dtype)
     else:
         d = pw_unique_ms[finite]
-        Q = d * I_th[finite]
         wf = w[finite]
-        W = wf.sum() + eps
-        db = (wf * d).sum() / W
-        Qb = (wf * Q).sum() / W
-        var = (wf * (d - db) ** 2).sum() / W
-        cov = (wf * (d - db) * (Q - Qb)).sum() / W
-        slope = cov / (var + eps)
-        intercept = Qb - slope * db
-        rheobase = slope
-        chron = intercept / (slope + eps)
-        weiss_mse = (wf * (Q - (slope * d + intercept)) ** 2).sum() / W
+        fit_out = _weighted_weiss_fit(
+            d,
+            I_th[finite],
+            wf,
+            weiss_fit_domain=weiss_fit_domain,
+            log_current_iterations=log_current_iterations,
+            log_current_min_chronaxie_ms=log_current_min_chronaxie_ms,
+            log_current_max_chronaxie_ms=log_current_max_chronaxie_ms,
+            eps=eps,
+        )
+        rheobase = fit_out["rheobase"]
+        chron = fit_out["chronaxie_ms"]
+        weiss_mse = fit_out["weiss_mse"]
+        log_weiss_mse = fit_out["log_weiss_mse"]
+        slope = fit_out["slope"]
+        intercept = fit_out["intercept"]
 
     return {
         "chronaxie_ms": chron,
@@ -4438,6 +5566,10 @@ def hard_chronaxie_from_trials(
         "I_th": I_th,
         "Q_th": pw_unique_ms * I_th,
         "p_spike_trial": p_active,
+        "p_spike_comp": (active_comp & mask).to(dtype=dtype),
+        "active_count": active_count,
+        "activation_mode": activation_mode,
+        "at_least": at_least,
         "pw_group_id": group_id,
         "pw_weight": w,
         "boundaries": {
@@ -4447,7 +5579,14 @@ def hard_chronaxie_from_trials(
             "I_post_inactive": I_post,
             "I_block_mid": I_block,
         },
-        "fit": {"weiss_mse": weiss_mse},
+        "fit": {
+            "slope": slope,
+            "intercept": intercept,
+            "weiss_mse": weiss_mse,
+            "log_weiss_mse": log_weiss_mse,
+            "weiss_fit_domain": weiss_fit_domain,
+        },
+        "weiss_fit_domain": weiss_fit_domain,
     }
 
 
