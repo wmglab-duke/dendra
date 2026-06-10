@@ -212,7 +212,7 @@ class Thresholder:
         time: Optional[Waveform] = None,
         bases: Optional[Union[npt.NDArray, Tensor]] = None,
         ub=None,
-        fix_bound_up=5.0,
+        fix_bound_up=2.0,
         fix_bound_down=0.1,
         max_tries_bound_fix=10,
         max_tries_thresh=25,
