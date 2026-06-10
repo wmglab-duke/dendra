@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-import dendra as ax
+import dendra as dn
 from dendra.models.io import apply_d_lambda
 from dendra.models.mod import hh
 from dendra.units import nA
@@ -75,13 +75,13 @@ def test_against_neuron(d_lambda):
     rec1, rec2 = sim_and_rec_neuron(d_lambda)
     asc_file = str(Path(__file__).parent / "111200A.asc")
 
-    cell = ax.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
+    cell = dn.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
     cell.insert(hh)
-    cell.soma.inject(ax.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
+    cell.soma.inject(dn.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
     r_ind = cell.find("soma", loc=0.5, as_list=True)
     r_ind += cell.find("dend[86]", loc=0.5, as_list=True)
 
-    rec = ax.callbacks.Recorder(states=["v"], node_indices=r_ind)
+    rec = dn.callbacks.Recorder(states=["v"], node_indices=r_ind)
 
     cell.double().initialize()
     cell.run(tstop=10.0, dt=0.025, callbacks=[rec])
@@ -99,13 +99,13 @@ def test_against_neuron_longrun(d_lambda):
     rec1, rec2 = sim_and_rec_neuron(d_lambda)
     asc_file = str(Path(__file__).parent / "111200A.asc")
 
-    cell = ax.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
+    cell = dn.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
     cell.insert(hh)
-    cell.soma.inject(ax.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
+    cell.soma.inject(dn.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
     r_ind = cell.find("soma", loc=0.5, as_list=True)
     r_ind += cell.find("dend[86]", loc=0.5, as_list=True)
 
-    rec = ax.callbacks.Recorder(states=["v"], node_indices=r_ind)
+    rec = dn.callbacks.Recorder(states=["v"], node_indices=r_ind)
 
     cell.double().initialize()
     cell.longrun(tstop=10.0, dt=0.025, chunklength=100, callbacks=[rec])
@@ -126,17 +126,17 @@ def test_against_neuron_cuda(d_lambda, threads, N):
     rec1, rec2 = sim_and_rec_neuron(d_lambda)
     asc_file = str(Path(__file__).parent / "111200A.asc")
 
-    integrator = ax.dhs(threads=threads)
+    integrator = dn.dhs(threads=threads)
 
-    cell = ax.Tree.from_asc(
+    cell = dn.Tree.from_asc(
         asc_file, N=N, d_lambda=d_lambda, celsius=6.3, integrator=integrator
     )
     cell.insert(hh)
-    cell.soma.inject(ax.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
+    cell.soma.inject(dn.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
     r_ind = cell.find("soma", loc=0.5, as_list=True)
     r_ind += cell.find("dend[86]", loc=0.5, as_list=True)
 
-    rec = ax.callbacks.Recorder(states=["v"], node_indices=r_ind)
+    rec = dn.callbacks.Recorder(states=["v"], node_indices=r_ind)
 
     cell.cuda().double().initialize()
     cell.run(tstop=10.0, dt=0.025, callbacks=[rec])

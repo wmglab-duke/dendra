@@ -875,7 +875,7 @@ class LFP(Callback):
         """
         if not model.integrator.imem:
             raise RuntimeError(
-                "Model must be compiled with IMEM=1. Use with ax.ctx(IMEM=1): model = ..."
+                "Model must be compiled with IMEM=1. Use with dn.ctx(IMEM=1): model = ..."
             )
         self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
         self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))

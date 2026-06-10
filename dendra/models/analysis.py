@@ -291,7 +291,7 @@ def conduction_velocity(
     **Units.**
     The code assumes lengths are in :math:`\mu m` and time is in ms, producing :math:`\mu m/ms`.
     This is consistent with Dendra's internal practice of representing lengths in :math:`\mu m`,
-    therefore `model.dx` etc. can often be used directly. For `ax.Myelinated`, internodal length
+    therefore `model.dx` etc. can often be used directly. For `dn.Myelinated`, internodal length
     should be used instead of compartment length. The conversion to m/s is a fixed factor of :math:`10^{-3}`.
 
     **Directionality.**

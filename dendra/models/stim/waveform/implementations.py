@@ -370,18 +370,18 @@ class sin(Waveform):
     Examples
     --------
     >>> import torch
-    >>> import dendra as ax
+    >>> import dendra as dn
     >>> t = torch.linspace(0, 1, 100)
-    >>> waveform = ax.sin(amp=2.0, freq=10.0)
+    >>> waveform = dn.sin(amp=2.0, freq=10.0)
     >>> values = waveform(t)  # [T]
 
-    >>> waveform = ax.sin(
+    >>> waveform = dn.sin(
     ...     amp=torch.tensor([1.0, 0.5, 0.25]),
     ...     freq=torch.tensor([5.0, 7.0, 11.0]),
     ... )
     >>> values = waveform(t)  # [T], sum of 3 components
 
-    >>> waveform = ax.sin(
+    >>> waveform = dn.sin(
     ...     amp=torch.ones(4, 3),
     ...     freq=torch.tensor([[5.0, 7.0, 11.0]]).expand(4, 3),
     ... )
@@ -467,18 +467,18 @@ class cos(Waveform):
     Examples
     --------
     >>> import torch
-    >>> import dendra as ax
+    >>> import dendra as dn
     >>> t = torch.linspace(0, 1, 100)
-    >>> waveform = ax.cos(amp=2.0, freq=10.0)
+    >>> waveform = dn.cos(amp=2.0, freq=10.0)
     >>> values = waveform(t)  # [T]
 
-    >>> waveform = ax.cos(
+    >>> waveform = dn.cos(
     ...     amp=torch.tensor([1.0, 0.5, 0.25]),
     ...     freq=torch.tensor([5.0, 7.0, 11.0]),
     ... )
     >>> values = waveform(t)  # [T], sum of 3 components
 
-    >>> waveform = ax.cos(
+    >>> waveform = dn.cos(
     ...     amp=torch.ones(4, 3),
     ...     freq=torch.tensor([[5.0, 7.0, 11.0]]).expand(4, 3),
     ... )
@@ -542,8 +542,8 @@ class mono_rect(Waveform):
     Examples
     --------
     >>> import torch
-    >>> import dendra as ax
-    >>> waveform = ax.mono_rect(amp=-2.0, pw=0.5)
+    >>> import dendra as dn
+    >>> waveform = dn.mono_rect(amp=-2.0, pw=0.5)
     >>> t = torch.linspace(0, 2, 100)
     >>> values = waveform(t)
     """
@@ -600,8 +600,8 @@ class bi_rect(Waveform):
     Examples
     --------
     >>> import torch
-    >>> import dendra as ax
-    >>> waveform = ax.bi_rect(amp1=-2.0, amp2=1.0, pw1=0.5, pw2=1.0)
+    >>> import dendra as dn
+    >>> waveform = dn.bi_rect(amp1=-2.0, amp2=1.0, pw1=0.5, pw2=1.0)
     >>> t = torch.linspace(0, 3, 100)
     >>> values = waveform(t)
     """
@@ -679,8 +679,8 @@ class bi_rect_balanced(Waveform):
     Examples
     --------
     >>> import torch
-    >>> import dendra as ax
-    >>> waveform = ax.bi_rect_balanced(amp=2.0, pw1=0.5, pw2=1.0)
+    >>> import dendra as dn
+    >>> waveform = dn.bi_rect_balanced(amp=2.0, pw1=0.5, pw2=1.0)
     >>> t = torch.linspace(0, 3, 100)
     >>> values = waveform(t)
     """
@@ -747,8 +747,8 @@ class bi_rect_symm(Waveform):
     Examples
     --------
     >>> import torch
-    >>> import dendra as ax
-    >>> waveform = ax.bi_rect_symm(amp=2.0, pw=0.5, interval=0.1)
+    >>> import dendra as dn
+    >>> waveform = dn.bi_rect_symm(amp=2.0, pw=0.5, interval=0.1)
     >>> t = torch.linspace(0, 3, 100)
     >>> values = waveform(t)
     """
@@ -797,9 +797,9 @@ class arbitrary(Waveform):
     Examples
     --------
     >>> import torch
-    >>> import dendra as ax
+    >>> import dendra as dn
     >>> # Create a triangular pulse
-    >>> waveform = ax.arbitrary(tpoints=[0.0, 0.5, 1.0], values=[0.0, 1.0, 0.0])
+    >>> waveform = dn.arbitrary(tpoints=[0.0, 0.5, 1.0], values=[0.0, 1.0, 0.0])
     >>> t = torch.linspace(0, 1.5, 100)
     >>> values = waveform(t)
     """
@@ -834,8 +834,8 @@ class constant(Waveform):
     Examples
     --------
     >>> import torch
-    >>> import dendra as ax
-    >>> waveform = ax.constant(value=5.0)
+    >>> import dendra as dn
+    >>> waveform = dn.constant(value=5.0)
     >>> t = torch.linspace(0, 1, 100)
     >>> values = waveform(t)
     """
