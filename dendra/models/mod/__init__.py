@@ -4,11 +4,15 @@ import sys
 from pathlib import Path
 
 from .alphasynapse import alphasynapse
+from .alphasynapse_d import alpha_d, alphasynapse_d
 from .apcount import apcount
+from .apcount_d import apcount_d
 from .exp2syn import exp2syn
 from .expsyn import expsyn
 from .fire import fire
+from .fire_d import fire_d
 from .fire_r import fire_r
+from .fire_r_d import fire_r_d
 from .graded_synapse import graded_release_gate, graded_syn, sigmoid_release
 from .hh import hh
 from .pas import pas
@@ -88,3 +92,26 @@ def load_mechanisms(*paths):
                 ) from e
 
     return MechanismContainer(**mechanisms)
+
+
+__all__ = [
+    "MechanismContainer",
+    "load_mechanisms",
+    "alphasynapse",
+    "alphasynapse_d",
+    "alpha_d",
+    "apcount",
+    "apcount_d",
+    "exp2syn",
+    "expsyn",
+    "fire",
+    "fire_d",
+    "fire_r",
+    "fire_r_d",
+    "graded_release_gate",
+    "graded_syn",
+    "sigmoid_release",
+    "hh",
+    "pas",
+    "spikedetect",
+]

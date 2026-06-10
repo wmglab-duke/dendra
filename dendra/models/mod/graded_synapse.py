@@ -60,12 +60,12 @@ References
 ----------
 .. [1] Destexhe, A., Mainen, Z. F., & Sejnowski, T. J. (1994).
    An efficient method for computing synaptic conductances based on a kinetic
-   model of receptor binding. *Neural Computation*, 6(1), 14–18.
+   model of receptor binding. *Neural Computation*, 6(1), 14-18.
 
 .. [2] Destexhe, A., Mainen, Z. F., & Sejnowski, T. J. (1994).
    Synthesis of models for excitable membranes, synaptic transmission and
    neuromodulation using a common kinetic formalism.
-   *Journal of Computational Neuroscience*, 1, 195–230.
+   *Journal of Computational Neuroscience*, 1, 195-230.
 
 
 Examples
