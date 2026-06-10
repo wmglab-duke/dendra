@@ -1806,3 +1806,7 @@ def _sliding_window_average(x, window_size: int):
     # Remove the extra batch dimension (squeeze dimension 0)
     out = out_perm.squeeze(0)
     return out
+
+
+# Public alias retained for tests and user code; Recorder uses the private name internally.
+sliding_window_average = _sliding_window_average

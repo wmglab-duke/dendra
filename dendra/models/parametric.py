@@ -1078,63 +1078,57 @@ class SimpleParameterized(Referency):
                             param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
 
 
+def _param_key_set(mapping):
+    """Return keys from a declaration mapping/set/list, treating None as empty."""
+    if mapping is None:
+        return set()
+    if hasattr(mapping, "keys"):
+        return set(mapping.keys())
+    return set(mapping)
+
+
 def check_conflicts(
-    global_params,
-    range_params,
-    batch_params,
-    global_p_params,
-    range_p_params,
-    batch_p_params,
-    global_n_params,
-    range_n_params,
-    batch_n_params,
-    params_defined_here,
+    global_params=None,
+    range_params=None,
+    batch_params=None,
+    global_p_params=None,
+    range_p_params=None,
+    batch_p_params=None,
+    global_n_params=None,
+    range_n_params=None,
+    batch_n_params=None,
+    params_defined_here=None,
     rng_defined_here=None,
     table_defined_here=None,
 ):
     """
-    Check for conflicts between global parameters, range parameters, and
-    parameters defined in the current class.
+    Check for parameter declaration conflicts across all declaration categories.
 
-    Raises ValueError if any parameter is defined in more than one category.
+    The first three arguments are kept backward-compatible with the historical
+    ``check_conflicts(global, range, batch)`` helper form used by older tests and
+    downstream code.  Newer declaration categories default to empty.
     """
-    if rng_defined_here is None:
-        rng_defined_here = set()
-    if table_defined_here is None:
-        table_defined_here = dict()
-    all_params = (
-        set(global_params.keys())
-        .union(range_params.keys())
-        .union(batch_params.keys())
-        .union(global_p_params.keys())
-        .union(range_p_params.keys())
-        .union(batch_p_params.keys())
-        .union(global_n_params.keys())
-        .union(range_n_params.keys())
-        .union(batch_n_params.keys())
-        .union(params_defined_here.keys())
-        .union(rng_defined_here.keys())
-        .union(table_defined_here.keys())
-    )
-    duplicates = set()
-
-    for param in all_params:
-        count = (
-            (param in global_params)
-            + (param in range_params)
-            + (param in batch_params)
-            + (param in global_p_params)
-            + (param in range_p_params)
-            + (param in batch_p_params)
-            + (param in global_n_params)
-            + (param in range_n_params)
-            + (param in batch_n_params)
-            + (param in params_defined_here)
-            + (param in rng_defined_here)
-            + (param in table_defined_here)
-        )
-        if count > 1:
-            duplicates.add(param)
+    groups = [
+        global_params,
+        range_params,
+        batch_params,
+        global_p_params,
+        range_p_params,
+        batch_p_params,
+        global_n_params,
+        range_n_params,
+        batch_n_params,
+        params_defined_here,
+        rng_defined_here,
+        table_defined_here,
+    ]
+    key_sets = [_param_key_set(group) for group in groups]
+    all_params = set().union(*key_sets) if key_sets else set()
+    duplicates = {
+        param
+        for param in all_params
+        if sum(param in key_set for key_set in key_sets) > 1
+    }
 
     if duplicates:
         raise ValueError(

@@ -134,15 +134,15 @@ def test_active_sets_flag_once():
 
     # initially below threshold
     cb.post_step_hook(model)
-    assert cb.record.eq(False).all()
+    assert cb.is_active().eq(False).all()
 
-    # cross once → becomes True and stays True
+    # cross once → becomes active and stays active
     model.v[0, 0] = 5.0
     cb.post_step_hook(model)
-    assert cb.record[0].item() is True
+    assert cb.is_active()[0].item() is True
     model.v.fill_(-5.0)
     cb.post_step_hook(model)
-    assert cb.record[0].item() is True  # should remain latched
+    assert cb.is_active()[0].item() is True  # should remain latched
 
 
 # ----------------------------------------------------------------------

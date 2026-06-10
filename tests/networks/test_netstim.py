@@ -77,7 +77,7 @@ def test_noise_is_clamped_scalar_and_vector():
     b = M.NetStim(N=1, noise=7.5)
     assert float(b.noise) == pytest.approx(1.0)
 
-    # Vector clamp (don’t call initialize(), because initialize uses a scalar-style condition)
+    # Vector clamp should work before and after initialize().
     vec = [-1.0, 0.25, 1.3]
     c = M.NetStim(N=3, noise=vec)
     assert torch.allclose(c.noise, torch.tensor([0.0, 0.25, 1.0], dtype=torch.float32))
@@ -98,8 +98,8 @@ def test_device_and_dtype_report_buffers(device):
         )
         assert ns.device().index == expected_idx
 
-    assert ns.dtype() == ns.next_spike_time.dtype == torch.float32
-    assert ns.next_spike_time.device.type == device.type
+    assert ns.dtype() == ns.next_stoch_time.dtype == torch.float32
+    assert ns.next_stoch_time.device.type == device.type
 
 
 # ------------------------------ initialize() --------------------------------------
@@ -110,24 +110,24 @@ def test_initialize_noise_zero_sets_next_equal_start():
     starts = [0.0, 5.0, 2.0]
     ns = M.NetStim(N=N, interval=10.0, start=starts, noise=0.0, max_spikes=5)
     ns.initialize()
-    assert torch.allclose(ns.next_spike_time, torch.tensor(starts, dtype=torch.float32))
+    assert torch.allclose(ns.next_stoch_time, torch.tensor(starts, dtype=torch.float32))
     assert torch.equal(ns.spike_counts, torch.zeros(N, dtype=torch.long))
 
 
 def test_initialize_with_seed_makes_offsets_reproducible_when_noise_positive():
-    # Two identical instances with the same seed → identical next_spike_time after initialize
+    # Two identical instances with the same seed → identical next_stoch_time after initialize
     N = 5
     cfg = dict(N=N, interval=7.0, start=3.0, noise=1.0, max_spikes=10, seed=12345)
     a = M.NetStim(**cfg).initialize()
     b = M.NetStim(**cfg).initialize()
-    assert torch.allclose(a.next_spike_time, b.next_spike_time)
+    assert torch.allclose(a.next_stoch_time, b.next_stoch_time)
 
     # Different seed → very likely different offsets
     c = M.NetStim(**{**cfg, "seed": 54321}).initialize()
-    if torch.allclose(a.next_spike_time, c.next_spike_time):
-        a.forward(float(torch.max(a.next_spike_time).item()))
-        c.forward(float(torch.max(c.next_spike_time).item()))
-        assert not torch.allclose(a.next_spike_time, c.next_spike_time)
+    if torch.allclose(a.next_stoch_time, c.next_stoch_time):
+        a.forward(float(torch.max(a.next_stoch_time).item()))
+        c.forward(float(torch.max(c.next_stoch_time).item()))
+        assert not torch.allclose(a.next_stoch_time, c.next_stoch_time)
 
 
 # ------------------------------ forward() deterministic (noise=0) -----------------
@@ -180,7 +180,7 @@ def test_forward_same_seed_same_spike_sequence_when_noise_positive():
     for sa, sb in zip(a_outs, b_outs):
         assert torch.equal(sa, sb)
     assert torch.equal(a.spike_counts, b.spike_counts)
-    assert torch.allclose(a.next_spike_time, b.next_spike_time)
+    assert torch.allclose(a.next_stoch_time, b.next_stoch_time)
 
 
 def test_forward_different_seed_probably_different_sequence_when_noise_positive():
@@ -195,7 +195,7 @@ def test_forward_different_seed_probably_different_sequence_when_noise_positive(
     if not any_diff:
         a.forward(9999.0)
         b.forward(9999.0)
-        assert not torch.allclose(a.next_spike_time, b.next_spike_time)
+        assert not torch.allclose(a.next_stoch_time, b.next_stoch_time)
 
 
 # ------------------------------ per-unit broadcasting (noise=0) -------------------
@@ -229,7 +229,7 @@ def test_cuda_behavior_generators_on_device_and_spiking(device=torch.device("cud
     ns = M.NetStim(N=3, interval=5.0, start=0.0, noise=0.0, seed=42).to(device)
     ns.initialize()
     ns.forward(0.0)
-    assert ns.next_spike_time.device.type == "cuda"
+    assert ns.next_stoch_time.device.type == "cuda"
     assert ns.spikes.device.type == "cuda"
     assert ns.spike_counts.device.type == "cuda"
 
@@ -277,6 +277,46 @@ def test_noise_zero_schedule_matches_exact(N, starts, intervals, maxsp):
     assert torch.equal(ns.spike_counts, torch.tensor(maxsp, dtype=torch.long))
 
 
+def test_noise_zero_tiny_positive_start_does_not_fire_at_zero():
+    tiny = torch.tensor(torch.finfo(torch.float32).tiny, dtype=torch.float32).item()
+    ns = M.NetStim(
+        N=2,
+        interval=[1.0, 1.0],
+        start=[0.0, tiny],
+        noise=0.0,
+        max_spikes=[1, 1],
+        seed=777,
+    ).initialize()
+
+    ns.forward(0.0)
+    assert torch.equal(ns.spikes, torch.tensor([True, False]))
+
+    ns.forward(tiny)
+    assert torch.equal(ns.spikes, torch.tensor([False, True]))
+
+
+def test_noise_zero_positive_param_one_ulp_interval_drift_still_fires():
+    # PositiveParam(1.5845052003860474) reconstructs the interval one float32
+    # ulp larger on current PyTorch, so the exact float32 schedule time can be
+    # just below the internal next_stoch_time. The event comparison should be
+    # tolerant to that local ulp drift without using a coarse absolute tolerance.
+    interval = torch.tensor(1.5845052203122405, dtype=torch.float32).item()
+    ns = M.NetStim(
+        N=1,
+        interval=[interval],
+        start=[0.0],
+        noise=0.0,
+        max_spikes=[2],
+        seed=777,
+    ).initialize()
+
+    ns.forward(0.0)
+    assert bool(ns.spikes[0])
+
+    ns.forward(interval)
+    assert bool(ns.spikes[0])
+
+
 # ------------------------------ misc ---------------------------------------------
 
 
@@ -311,9 +351,9 @@ def test_initialize_vector_noise_randomizes_only_positive_entries():
     nz = torch.tensor(noise, dtype=torch.float32)
     for i in range(N):
         if nz[i] == 0:
-            assert ns1.next_spike_time[i].item() == pytest.approx(starts[i].item())
+            assert ns1.next_stoch_time[i].item() == pytest.approx(starts[i].item())
         else:
-            assert ns1.next_spike_time[i].item() > starts[i].item()
+            assert ns1.next_stoch_time[i].item() > starts[i].item()
 
     # Same seed + same config → identical initialization
     ns2 = M.NetStim(
@@ -324,7 +364,7 @@ def test_initialize_vector_noise_randomizes_only_positive_entries():
         max_spikes=10,
         seed=123,
     ).initialize()
-    assert torch.allclose(ns1.next_spike_time, ns2.next_spike_time)
+    assert torch.allclose(ns1.next_stoch_time, ns2.next_stoch_time)
 
     # Different seed → at least one randomized entry should differ
     ns3 = M.NetStim(
@@ -339,5 +379,53 @@ def test_initialize_vector_noise_randomizes_only_positive_entries():
     pos_idx = (nz > 0).nonzero(as_tuple=True)[0]
     if len(pos_idx) > 0:
         assert not torch.allclose(
-            ns1.next_spike_time[pos_idx], ns3.next_spike_time[pos_idx]
+            ns1.next_stoch_time[pos_idx], ns3.next_stoch_time[pos_idx]
         )
+
+
+def test_batch_prepends_dimensions_and_preserves_generator_axis():
+    ns = M.NetStim(N=3, interval=[1.0, 2.0, 3.0], start=0.0, noise=0.0)
+    ns.initialize()
+    ns.batch(4)
+
+    assert ns.N == 3
+    assert ns.shape == (4, 3)
+    assert ns.numel() == 12
+    for name in (
+        "noise",
+        "start",
+        "start_cache",
+        "max_spikes",
+        "next_stoch_time",
+        "next_sched_time",
+        "spike_counts",
+        "spikes",
+    ):
+        assert tuple(getattr(ns, name).shape) == (4, 3)
+
+    ns.batch(2)
+    assert ns.shape == (2, 4, 3)
+    assert ns.numel() == 24
+
+
+def test_batched_forward_accepts_per_batch_time_and_preserves_shape():
+    ns = M.NetStim(N=2, interval=100.0, start=100.0, noise=0.0).batch(3).initialize()
+    ns.schedule(1, 2.0)  # bare generator index applies to all batch elements
+
+    spikes = ns(torch.tensor([2.0, 1.0, 2.0]))
+    expected = torch.tensor(
+        [[False, True], [False, False], [False, True]], dtype=torch.bool
+    )
+    assert spikes.shape == ns.shape == (3, 2)
+    assert torch.equal(spikes.cpu(), expected)
+
+
+def test_batched_schedule_full_coordinate_targets_single_state_element():
+    ns = M.NetStim(N=2, interval=100.0, start=100.0, noise=0.0).batch(3).initialize()
+    ns.schedule((1, 0), 2.0)
+
+    spikes = ns(2.0)
+    expected = torch.tensor(
+        [[False, False], [True, False], [False, False]], dtype=torch.bool
+    )
+    assert torch.equal(spikes.cpu(), expected)

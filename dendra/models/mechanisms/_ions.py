@@ -99,6 +99,11 @@ def register_ion(ion, valence, e, i0, o0, min_concentration=None):
     MIN_CONCENTRATION[ion] = min_concentration
 
 
+def ion_register(ion, valence, e, i0, o0, min_concentration=None):
+    """Backward-compatible alias for :func:`register_ion`."""
+    return register_ion(ion, valence, e, i0, o0, min_concentration)
+
+
 class equilibria(ContextDecorator):
     _last = {}
 

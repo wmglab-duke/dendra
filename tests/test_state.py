@@ -2,7 +2,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from dendra.models.mechanisms._state import modify_operations
+from dendra.models.mechanisms._solve_utils import modify_operations
 
 TORCH_OPS = {"sin", "cos", "exp"}
 
