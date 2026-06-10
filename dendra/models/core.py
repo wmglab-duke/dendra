@@ -3801,7 +3801,7 @@ class Axon(Population):
             diameters = diameters.unsqueeze(1)
 
         self.diam[:] = diameters
-        self.diam.detach_()
+        self.diam = self.diam.detach()
 
     def assemble_graphs(self):
         """

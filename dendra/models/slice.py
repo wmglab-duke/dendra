@@ -472,7 +472,7 @@ class Slice:
             if mech.key is None:
                 with torch.no_grad():
                     getattr(mech, var)[idx] = value
-                    getattr(mech, var).detach_()
+                    setattr(mech, var, getattr(mech, var).detach())
                 return
 
             dummy = torch.tensor(torch.nan, device=model.device(), dtype=model.dtype())
@@ -480,12 +480,12 @@ class Slice:
             with torch.no_grad():
                 dummy[idx] = value
                 getattr(mech, var).copy_(mech.get(dummy))
-                getattr(mech, var).detach_()
+                setattr(mech, var, getattr(mech, var).detach())
             return
 
         with torch.no_grad():
             getattr(model, var)[idx] = value
-            getattr(model, var).detach_()  # keep identity, drop history
+            setattr(mech, var, getattr(mech, var).detach())
 
     def inject(self, waveform):
         """
@@ -731,15 +731,27 @@ class Slice:
 
         # Safely fetch model without triggering our __getattr__
         model = object.__getattribute__(self, "model")
+        base_shape = object.__getattribute__(self, "base_shape")
+        idx = object.__getattribute__(self, "index_spec").index
 
         # Intercept writes to model buffers
         buffers = model._buffers  # nn.Module guarantee
         if name in buffers:
             buf = buffers[name]
-            idx = object.__getattribute__(self, "index_spec").index
+            if getattr(model, "key", None) is not None:
+                with torch.no_grad():
+                    dummy = torch.tensor(torch.nan, device=buf.device, dtype=buf.dtype)
+                    dummy = model.put(
+                        buf,
+                        dummy,
+                        torch.empty(base_shape, device=buf.device, dtype=buf.dtype),
+                    )
+                    dummy[idx] = value
+                    buffers[name] = model.get(dummy).detach()
+                    return
             with torch.no_grad():
                 buf[idx] = value
-                buf.detach_()  # drop history but keep identity
+                buffers[name] = buf.detach()  # drop history but keep identity
             return
 
         # Otherwise set on this wrapper
@@ -801,20 +813,21 @@ class Slice:
                 base_shape=object.__getattribute__(self, "base_shape"),
             )
 
-        if name in model._labels:
-            model = object.__getattribute__(self, "model")
-            idx = compose_indices(
-                model.shape,
-                model._labels[name].index,
-                object.__getattribute__(self, "index"),
-                device=model.device(),
-            )
-            idx = parse_key(idx, model.shape, device=model.device())
-            return type(self)(
-                model,
-                idx,
-                base_shape=object.__getattribute__(self, "base_shape"),
-            )
+        if hasattr(model, "_labels"):
+            if name in model._labels:
+                model = object.__getattribute__(self, "model")
+                idx = compose_indices(
+                    model.shape,
+                    model._labels[name].index,
+                    object.__getattribute__(self, "index"),
+                    device=model.device(),
+                )
+                idx = parse_key(idx, model.shape, device=model.device())
+                return type(self)(
+                    model,
+                    idx,
+                    base_shape=object.__getattribute__(self, "base_shape"),
+                )
 
         # Parameters (optional): often handy to read through
         if name in model._parameters:
