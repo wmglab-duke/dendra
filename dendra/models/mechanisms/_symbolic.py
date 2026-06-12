@@ -1,4 +1,5 @@
 from dendra.helpers import DEBUG, logger
+from dendra.utils.dynamic_compilation import compile_generated_function
 
 from .compilers.ast import factorize_linear_in_v
 
@@ -78,10 +79,12 @@ def build_current_eq(mechanism, k, assign=False):
         factorable = True
         if DEBUG > 0:
             logger.info(f"Generated code for {k}:\n{code}")
-        filename = "<solve_function>"
-        code = compile(code, filename, "exec")
-        exec(code)
-        return locals()[k], factorable
+        return compile_generated_function(
+            code,
+            func_name=k,
+            filename_prefix="dendra.mechanisms.numerical",
+            global_ns=globals(),
+        ), factorable
     try:
         gtot, irev = factorize_linear_in_v(mechanism.__class__, method=k)
         code = build_implicit_equation(k, gtot, irev, assign)
@@ -95,7 +98,9 @@ def build_current_eq(mechanism, k, assign=False):
             factorable = False
     if DEBUG > 0:
         logger.info(f"Generated code for {k}:\n{code}")
-    filename = "<solve_function>"
-    code = compile(code, filename, "exec")
-    exec(code)
-    return locals()[k], factorable
+    return compile_generated_function(
+        code,
+        func_name=k,
+        filename_prefix="dendra.mechanisms.implicit",
+        global_ns=globals(),
+    ), factorable

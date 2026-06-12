@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 from h5py import File
 
+from dendra.utils.dynamic_compilation import compile_generated_function
+
 from ..helpers import nojit
 from .backend import Backend as A
 
@@ -283,10 +285,12 @@ def _build_recorder_func(states, max_only, indexed):
             res.append(_parse_template(s, max_only, indexed))
     impl = "".join(res)
     forward_str = template.format(implementation=impl)
-    filename = "<rec_template>"
-    code = compile(forward_str, filename, "exec")
-    exec(code)
-    return locals()["recorder"]
+    return compile_generated_function(
+        forward_str,
+        func_name="recorder",
+        filename_prefix="dendra.callbacks.recorder_func",
+        global_ns=globals(),
+    )
 
 
 def _avoid_smart_indexing(node_indices):

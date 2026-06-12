@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from dendra.helpers import DEBUG, REQUIRE_GRAD, logger
 from dendra.utils import PreparedInterp1d
+from dendra.utils.dynamic_compilation import compile_generated_function
 
 from .modular import DNModule, matches_any_pattern
 from .rng import RNGModule
@@ -2385,9 +2386,11 @@ def rebind_func_with_table(obj, func_name):
     func_code = table_function_template.format(func_name=func_name)
     if DEBUG > 0:
         logger.info(f"Generated code for {func_name}:\n{func_code}")
-    filename = "<table_function>"
-    code = compile(func_code, filename, "exec")
-    exec(code)
-    meth = locals()[f"{func_name}_with_table"]
+    meth = compile_generated_function(
+        func_code,
+        func_name=f"{func_name}_with_table",
+        filename_prefix=f"dendra.parametric.{func_name}_with_table",
+        global_ns=globals(),
+    )
     setattr(obj, f"{func_name}_original", getattr(obj, func_name))
     setattr(obj, func_name, MethodType(meth, obj))

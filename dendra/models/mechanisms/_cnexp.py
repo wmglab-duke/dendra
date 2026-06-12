@@ -3,6 +3,7 @@
 import torch
 
 from dendra.helpers import DEBUG, PADE, logger
+from dendra.utils.dynamic_compilation import compile_generated_function
 
 from ._solve_utils import (
     add_underscore_to_lhs,
@@ -86,7 +87,7 @@ def build_cnexp(states, assigned, derivative, eliminate=None, pade=False):
     eliminate = _normalize_eliminate(eliminate)
 
     # Solve only non-eliminated states, preserving input order
-    states_to_solve = [s for s in states if s not in eliminate]
+    # states_to_solve = [s for s in states if s not in eliminate]
 
     # Deterministic signature: states first (in given order), then assigned (sorted)
     assigned_list = list(assigned)
@@ -125,7 +126,9 @@ def build_cnexp(states, assigned, derivative, eliminate=None, pade=False):
     )
     if DEBUG:
         logger.debug(f"Function:\n{f}")
-    filename = "<solve_function>"
-    code = compile(f, filename, "exec")
-    exec(code)
-    return locals()["solve"]
+    return compile_generated_function(
+        f,
+        func_name="solve",
+        filename_prefix="dendra.cnexp.solve",
+        global_ns=globals(),
+    )

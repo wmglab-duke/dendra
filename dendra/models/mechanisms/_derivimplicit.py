@@ -3,6 +3,7 @@ from typing import Callable, Optional
 import torch
 
 from dendra.helpers import DEBUG, logger
+from dendra.utils.dynamic_compilation import compile_generated_function
 
 from ._solve_utils import (
     add_underscore_to_states,
@@ -680,6 +681,9 @@ def build_derivimplicit(states, assigned, derivative, eliminate=None, pade=False
     if DEBUG:
         logger.debug(f"Function:\n{solve_src}")
 
-    code = compile(solve_src, "<solve_function>", "exec")
-    exec(code)
-    return locals()["solve"]
+    return compile_generated_function(
+        solve_src,
+        func_name="solve",
+        filename_prefix="dendra.derivimplicit.solve",
+        global_ns=globals(),
+    )
