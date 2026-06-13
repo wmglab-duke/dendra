@@ -3879,6 +3879,7 @@ class Axon(Population):
     def csl(self, *args):
         """
         Slice the axon at specified relative positions.
+
         Parameters
         ----------
         *args : float
@@ -3887,7 +3888,7 @@ class Axon(Population):
 
         Returns
         -------
-        Axon
+        Slice
             A sliced view of the axon at the specified relative positions.
         """
         return self[:, self.c(*args)]

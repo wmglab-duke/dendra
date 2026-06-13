@@ -77,7 +77,16 @@ def convert(deriv, state, states, assigned, use_pade_approx=False):
     return add_underscore_to_lhs(modify_operations(replace(f, v)))
 
 
-def build_cnexp(states, assigned, derivative, eliminate=None, pade=False):
+def build_cnexp(
+    states, assigned, derivative, eliminate=None, pade=False, **method_kwargs
+):
+    if method_kwargs:
+        valid = "pade"
+        unknown = ", ".join(sorted(method_kwargs))
+        raise ValueError(
+            f"Unknown cnexp option(s): {unknown}. Valid cnexp options are: {valid}."
+        )
+
     for state in states:
         if state in assigned:
             raise ValueError(

@@ -1,4 +1,5 @@
 from contextlib import ContextDecorator
+from types import MethodType
 
 import torch
 
@@ -191,97 +192,243 @@ def _make_into_shape(shape, value):
         return value.expand(shape).clone()
 
 
+def _make_like(reference, value):
+    """Materialize ``value`` with the same shape/device/dtype as ``reference``."""
+    if torch.is_tensor(value):
+        return (
+            value.to(device=reference.device, dtype=reference.dtype)
+            .expand_as(reference)
+            .clone()
+        )
+    return torch.full_like(reference, float(value))
+
+
+def _clamp_ion_concentrations(iono_t, ioni_t, min_concentration_t):
+    """Replace non-positive concentrations without rebinding modules."""
+    min_val = min_concentration_t.to(device=iono_t.device, dtype=iono_t.dtype)
+    return (
+        torch.where(iono_t <= 0, min_val, iono_t),
+        torch.where(ioni_t <= 0, min_val, ioni_t),
+    )
+
+
+def _nernst_potential(iono_t, ioni_t, celsius, rzf_t):
+    """Compute the Nernst reversal potential using tensor-valued scalar constants."""
+    rzf = rzf_t.to(device=iono_t.device, dtype=iono_t.dtype)
+    celsius = torch.as_tensor(celsius, device=iono_t.device, dtype=iono_t.dtype)
+    return torch.log(iono_t / ioni_t) * rzf * (273.15 + celsius)
+
+
+def _safe_impl_suffix(name):
+    return "".join(ch if ch.isalnum() else "_" for ch in str(name)) or "ion"
+
+
+_ION_ADVANCE_IMPL_CACHE = {}
+_ION_EINIT_IMPL_CACHE = {}
+
+
+def _make_ion_advance_impl(name, advance_e):
+    """Create a per-ion advance method with literal buffer names.
+
+    TorchDynamo caches by Python code object. The previous Ion.advance used one
+    shared code object for Na/K/Ca and reached different ``nn.Module.__setattr__``
+    branches for names such as ``nao`` and ``ko``. This factory gives each ion
+    layout a distinct, monomorphic code object and updates ``_buffers`` directly.
+    """
+    name = str(name)
+    advance_e = bool(advance_e)
+    key = (name, advance_e)
+    if key in _ION_ADVANCE_IMPL_CACHE:
+        return _ION_ADVANCE_IMPL_CACHE[key]
+
+    suffix = _safe_impl_suffix(name)
+    fn_name = f"_advance_ion_{suffix}_{int(advance_e)}"
+    iono_name = f"{name}o"
+    ioni_name = f"{name}i"
+    e_name = f"e{name}"
+
+    src = f"""
+def {fn_name}(self, celsius):
+    iono_t = self._buffers[{iono_name!r}]
+    ioni_t = self._buffers[{ioni_name!r}]
+    iono_t, ioni_t = _clamp_ion_concentrations(
+        iono_t,
+        ioni_t,
+        self._buffers[\"_min_concentration_t\"],
+    )
+    self._buffers[{iono_name!r}] = iono_t
+    self._buffers[{ioni_name!r}] = ioni_t
+"""
+    if advance_e:
+        src += f"""    self._buffers[{e_name!r}] = _nernst_potential(
+        iono_t,
+        ioni_t,
+        celsius,
+        self._buffers[\"_rzf_t\"],
+    )
+"""
+    src += """    return None
+"""
+
+    namespace = {
+        "_clamp_ion_concentrations": _clamp_ion_concentrations,
+        "_nernst_potential": _nernst_potential,
+    }
+    exec(src, namespace)
+    impl = namespace[fn_name]
+    impl.__module__ = __name__
+    globals()[fn_name] = impl
+    _ION_ADVANCE_IMPL_CACHE[key] = impl
+    return impl
+
+
+def _make_ion_einit_impl(name, init_e_reversal):
+    """Create a per-ion initial reversal-potential method with literal names."""
+    name = str(name)
+    init_e_reversal = bool(init_e_reversal)
+    key = (name, init_e_reversal)
+    if key in _ION_EINIT_IMPL_CACHE:
+        return _ION_EINIT_IMPL_CACHE[key]
+
+    suffix = _safe_impl_suffix(name)
+    fn_name = f"_einit_ion_{suffix}_{int(init_e_reversal)}"
+    iono_name = f"{name}o"
+    ioni_name = f"{name}i"
+    e_name = f"e{name}"
+
+    if init_e_reversal:
+        src = f"""
+def {fn_name}(self, celsius):
+    self._buffers[{e_name!r}] = _nernst_potential(
+        self._buffers[{iono_name!r}],
+        self._buffers[{ioni_name!r}],
+        celsius,
+        self._buffers[\"_rzf_t\"],
+    )
+    return None
+"""
+    else:
+        src = f"""
+def {fn_name}(self, celsius):
+    return None
+"""
+
+    namespace = {"_nernst_potential": _nernst_potential}
+    exec(src, namespace)
+    impl = namespace[fn_name]
+    impl.__module__ = __name__
+    globals()[fn_name] = impl
+    _ION_EINIT_IMPL_CACHE[key] = impl
+    return impl
+
+
 class Ion(torch.nn.Module):
-    __constants__ = "init_e_reversal", "advance_e"
+    __constants__ = (
+        "name",
+        "init_e_reversal",
+        "advance_e",
+        "_current_name",
+        "_e_name",
+        "_ioni_name",
+        "_iono_name",
+    )
 
     def __init__(self, name, shape, einit, eadvance):
         super().__init__()
-        self.name = name
-        self.rzf = R / (VALENCES[name] * FARADAY)
+        self.name = str(name)
 
-        self.e_init = to_param(reversals()[f"e{name}"])
-        self.i_init = to_param(cinits()[f"{name}i0"])
-        self.o_init = to_param(cinits()[f"{name}o0"])
+        self._current_name = f"i{self.name}"
+        self._e_name = f"e{self.name}"
+        self._ioni_name = f"{self.name}i"
+        self._iono_name = f"{self.name}o"
 
-        self.min_concentration = min_concentrations()[name]
+        self.rzf = R / (VALENCES[self.name] * FARADAY)
 
-        self.register_buffer(f"i{name}", torch.zeros(shape))
-        self.register_buffer(f"e{name}", _make_into_shape(shape, self.e_init))
-        self.register_buffer(f"{name}i", _make_into_shape(shape, self.i_init))
-        self.register_buffer(f"{name}o", _make_into_shape(shape, self.o_init))
+        self.e_init = to_param(reversals()[self._e_name])
+        self.i_init = to_param(cinits()[f"{self.name}i0"])
+        self.o_init = to_param(cinits()[f"{self.name}o0"])
+
+        self.min_concentration = min_concentrations()[self.name]
+
+        scalar_ref = torch.zeros((), dtype=torch.get_default_dtype())
+        self.register_buffer(
+            "_rzf_t",
+            scalar_ref.new_tensor(self.rzf),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_min_concentration_t",
+            scalar_ref.new_tensor(self.min_concentration),
+            persistent=False,
+        )
+
+        self.register_buffer(self._current_name, torch.zeros(shape))
+        self.register_buffer(self._e_name, _make_into_shape(shape, self.e_init))
+        self.register_buffer(self._ioni_name, _make_into_shape(shape, self.i_init))
+        self.register_buffer(self._iono_name, _make_into_shape(shape, self.o_init))
 
         self.init_e_reversal = einit != 0
         self.advance_e = eadvance != 0
 
+        # Shadow the generic class methods with per-ion generated methods. This
+        # avoids one shared Ion.advance code object specializing alternately on
+        # ``nao``, ``ko``, ``cao``, etc. during torch.compile.
+        self.einit = MethodType(
+            _make_ion_einit_impl(self.name, self.init_e_reversal), self
+        )
+        self.advance = MethodType(
+            _make_ion_advance_impl(self.name, self.advance_e), self
+        )
+
     def initialize(self, celsius) -> None:
-        name = self.name
-        i = getattr(self, f"i{name}")
-        e = getattr(self, f"e{name}")
-        ioni = getattr(self, f"{name}i")
-        iono = getattr(self, f"{name}o")
-        setattr(
-            self, f"i{name}", torch.full(i.shape, 0.0, dtype=i.dtype, device=i.device)
-        )
-        setattr(
-            self,
-            f"e{name}",
-            torch.full(e.shape, 0.0, dtype=e.dtype, device=e.device),
-        )
-        getattr(self, f"e{name}").copy_(self.e_init)
-        setattr(
-            self,
-            f"{name}i",
-            torch.full(ioni.shape, 0.0, dtype=ioni.dtype, device=ioni.device),
-        )
-        getattr(self, f"{name}i").copy_(self.i_init)
-        setattr(
-            self,
-            f"{name}o",
-            torch.full(iono.shape, 0.0, dtype=iono.dtype, device=iono.device),
-        )
-        getattr(self, f"{name}o").copy_(self.o_init)
+        current = self._buffers[self._current_name]
+        e = self._buffers[self._e_name]
+        ioni = self._buffers[self._ioni_name]
+        iono = self._buffers[self._iono_name]
+
+        # Rebind rather than copy_ so training-mode concentration trajectories
+        # remain compatible with autograd, matching the previous behavior.
+        self._buffers[self._current_name] = torch.zeros_like(current)
+        self._buffers[self._e_name] = _make_like(e, self.e_init)
+        self._buffers[self._ioni_name] = _make_like(ioni, self.i_init)
+        self._buffers[self._iono_name] = _make_like(iono, self.o_init)
+
         self.einit(celsius)
         if not self.training:
             self.detach()
 
     def detach(self):
-        name = self.name
-        setattr(self, f"i{name}", getattr(self, f"i{name}").detach())
-        setattr(self, f"{name}i", getattr(self, f"{name}i").detach())
-        setattr(self, f"{name}o", getattr(self, f"{name}o").detach())
-        setattr(self, f"e{name}", getattr(self, f"e{name}").detach())
+        self._buffers[self._current_name] = self._buffers[self._current_name].detach()
+        self._buffers[self._ioni_name] = self._buffers[self._ioni_name].detach()
+        self._buffers[self._iono_name] = self._buffers[self._iono_name].detach()
+        self._buffers[self._e_name] = self._buffers[self._e_name].detach()
 
     def einit(self, celsius) -> None:
+        """Fallback; instances replace this with a per-ion generated method."""
         if self.init_e_reversal:
-            name = self.name
-            iono = getattr(self, f"{name}o")
-            ioni = getattr(self, f"{name}i")
-            new_val = torch.log(iono / ioni) * self.rzf * (273.15 + celsius)
-            setattr(self, f"e{name}", new_val)
+            self._buffers[self._e_name] = _nernst_potential(
+                self._buffers[self._iono_name],
+                self._buffers[self._ioni_name],
+                celsius,
+                self._buffers["_rzf_t"],
+            )
 
     def advance(self, celsius) -> None:
-        name = self.name
-        iono_name = f"{name}o"
-        ioni_name = f"{name}i"
-        e_name = f"e{name}"
-
-        # Read current buffers via attributes
-        iono_t = getattr(self, iono_name)
-        ioni_t = getattr(self, ioni_name)
-
-        # Safeguard against <= 0
-        min_val = torch.tensor(
-            self.min_concentration, device=iono_t.device, dtype=iono_t.dtype
+        """Fallback; instances replace this with a per-ion generated method."""
+        iono_t = self._buffers[self._iono_name]
+        ioni_t = self._buffers[self._ioni_name]
+        iono_t, ioni_t = _clamp_ion_concentrations(
+            iono_t,
+            ioni_t,
+            self._buffers["_min_concentration_t"],
         )
-        iono_t = torch.where(iono_t <= 0, min_val, iono_t)
-        ioni_t = torch.where(ioni_t <= 0, min_val, ioni_t)
+        self._buffers[self._iono_name] = iono_t
+        self._buffers[self._ioni_name] = ioni_t
 
-        # Rebind attributes with the new tensors (no in-place)
-        setattr(self, iono_name, iono_t)
-        setattr(self, ioni_name, ioni_t)
-
-        if not self.advance_e:
-            return
-
-        new_e = torch.log(iono_t / ioni_t) * self.rzf * (273.15 + celsius)
-        setattr(self, e_name, new_e)
+        if self.advance_e:
+            self._buffers[self._e_name] = _nernst_potential(
+                iono_t,
+                ioni_t,
+                celsius,
+                self._buffers["_rzf_t"],
+            )

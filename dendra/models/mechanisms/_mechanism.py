@@ -5,12 +5,152 @@ from typing import Dict
 
 import torch
 
-from dendra.helpers import classproperty
+from dendra.helpers import DEBUG, classproperty
 from dendra.models.parametric import Parameterized
 
 from ._ions import VALENCES
 from ._state import State
 from ._symbolic import build_current_eq
+
+# -- TorchDynamo-friendly mechanism advance generation -----------------------
+
+
+def _safe_generated_identifier(value: object) -> str:
+    """Return a Python-identifier fragment suitable for generated helper names."""
+    text = str(value)
+    chars = [ch if (ch.isalnum() or ch == "_") else "_" for ch in text]
+    out = "".join(chars).strip("_") or "mechanism"
+    if out[0].isdigit():
+        out = f"_{out}"
+    return out
+
+
+def _mechanism_advance_signature(mech) -> tuple:
+    """Static layout signature for a generated mechanism advance fast path."""
+    state_layout = []
+    for state_name, state_module in mech.DE.items():
+        state_layout.append(
+            (
+                state_name,
+                tuple(state_module._state),
+                getattr(type(state_module), "advance", None) is State.advance,
+                getattr(type(state_module), "breakpoint", None) is State.breakpoint,
+            )
+        )
+    return (tuple(state_layout), tuple(mech._all_states))
+
+
+def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
+    """Compile a per-mechanism/per-proxy `_advance` implementation.
+
+    The generated function deliberately avoids the shared base-class loop over
+    ``self.DE.values()`` and uses literal state-module names / buffer keys.  This
+    gives TorchDynamo a distinct code object for each generated mechanism proxy,
+    avoiding cache churn from one polymorphic ``Mechanism._advance`` frame being
+    called with many unrelated ``self`` types.
+
+    State-module updates are evaluated from a single snapshot of mechanism
+    buffers taken at the start of the timestep.  The returned locals are committed
+    only after every state module has evaluated its breakpoint/solve call.  This
+    avoids order-dependent Gauss-Seidel semantics across ``mech.DE`` entries and
+    matches the usual ODE interpretation that all state bundles advance from
+    time-n values to time-(n+1) values together.
+    """
+    cls = mech.__class__
+    cls_name = _safe_generated_identifier(cls.__name__)
+    mech_name = _safe_generated_identifier(getattr(mech, "name", cls.__name__))
+    func_name = f"_advance_{cls_name}_{mech_name}_{id(cls):x}"
+
+    lines = [
+        f"def {func_name}(self, v, dt):",
+        "    __buffers = self._buffers",
+    ]
+
+    if not mech.DE:
+        lines.append("    return None")
+    else:
+        lines.append("    __DE = self.DE")
+        all_state_names = tuple(mech._all_states)
+
+        if all_state_names:
+            lines.append(
+                "    # Snapshot all mechanism states/assigned buffers before solving any bundle."
+            )
+            lines.append("    __states = {")
+            for state_name in all_state_names:
+                lines.append(f"        {state_name!r}: __buffers[{state_name!r}],")
+            lines.append("    }")
+        else:
+            lines.append("    __states = {}")
+
+        commit_lines = []
+        for idx, (state_key, state_module) in enumerate(mech.DE.items()):
+            state_var_names = tuple(state_module._state)
+            uses_default_advance = (
+                getattr(type(state_module), "advance", None) is State.advance
+            )
+            uses_default_breakpoint = (
+                getattr(type(state_module), "breakpoint", None) is State.breakpoint
+            )
+
+            lines.extend(
+                [
+                    f"    # State bundle {idx}: {state_key}",
+                    f"    __state_module_{idx} = __DE[{state_key!r}]",
+                ]
+            )
+
+            if uses_default_advance:
+                if uses_default_breakpoint:
+                    lines.append(f"    __breakpoint_{idx} = {{}}")
+                else:
+                    lines.append(
+                        f"    __breakpoint_{idx} = __state_module_{idx}.breakpoint(v, __states)"
+                    )
+                lines.append(
+                    f"    __local_{idx} = __state_module_{idx}.solve(dt, **__breakpoint_{idx}, **__states)"
+                )
+                for state_var_name in state_var_names:
+                    commit_lines.append(
+                        f"    __buffers[{state_var_name!r}] = __local_{idx}[{state_var_name!r}]"
+                    )
+            else:
+                # Preserve custom State.advance call semantics, but delay
+                # committing its returned updates until all bundles have read the
+                # start-of-step snapshot.  Any internal side effects performed by
+                # a custom advance method remain that method's responsibility.
+                lines.append(
+                    f"    __local_{idx} = __state_module_{idx}.advance(v, dt, __states)"
+                )
+                commit_lines.append(f"    __buffers.update(__local_{idx})")
+
+        if commit_lines:
+            lines.append(
+                "    # Commit all returned updates after every bundle has evaluated."
+            )
+            lines.extend(commit_lines)
+        lines.append("    return None")
+
+    source = "\n".join(lines) + "\n"
+    if DEBUG:
+        print(f"Generated advance for {cls.__name__} (id={id(cls):x}):\n{source}")
+    filename = (
+        f"<dendra.mechanism.advance.{cls.__module__}.{cls.__qualname__}.{id(cls):x}>"
+    )
+    namespace = {}
+    exec(compile(source, filename, "exec"), {}, namespace)
+    fn = namespace[func_name]
+    fn.__name__ = "_advance"
+    fn.__qualname__ = f"{cls.__qualname__}._advance"
+    fn.__module__ = cls.__module__
+    fn.__doc__ = (
+        "Generated monomorphic mechanism state-advance fast path.  The source "
+        "is stored on the owning class as `_dendra_monomorphic_advance_source`."
+    )
+    fn._dendra_monomorphic_advance = True
+    fn._dendra_monomorphic_advance_signature = signature
+    fn._dendra_monomorphic_advance_source = source
+    return fn, source
 
 
 class Mechanism(Parameterized):
@@ -383,6 +523,7 @@ class Mechanism(Parameterized):
         self.instantiate_tables()
         for state in self.DE.values():
             state.instantiate_tables()
+        self._install_monomorphic_advance()
 
     def set_dt(self, dt):
         """
@@ -777,6 +918,45 @@ class Mechanism(Parameterized):
         for state_module in self.DE.values():
             state_module.detach()
 
+    def _install_monomorphic_advance(self):
+        """Install a generated per-proxy `_advance` fast path when safe.
+
+        The base `_advance` method is intentionally generic and polymorphic.  It
+        is convenient for eager execution, but TorchDynamo specializes it on
+        ``type(self)``.  In models with many generated mechanism proxy classes,
+        that shared code object can recompile once per mechanism.  This installer
+        replaces the inherited generic method on the concrete mechanism/proxy
+        class with a generated method whose code object is unique to that class
+        and whose state-module names / buffer keys are static literals.
+
+        Subclasses that define their own `_advance` are left untouched.
+        """
+        cls = self.__class__
+        if cls is Mechanism:
+            return
+
+        existing = cls.__dict__.get("_advance", None)
+        base_advance = Mechanism.__dict__.get("_advance")
+
+        if (
+            existing is not None
+            and existing is not base_advance
+            and not getattr(existing, "_dendra_monomorphic_advance", False)
+        ):
+            return
+
+        signature = _mechanism_advance_signature(self)
+        if (
+            getattr(existing, "_dendra_monomorphic_advance_signature", None)
+            == signature
+        ):
+            return
+
+        advance_fn, source = _compile_monomorphic_mechanism_advance(self, signature)
+        setattr(cls, "_advance", advance_fn)
+        cls._dendra_monomorphic_advance_signature = signature
+        cls._dendra_monomorphic_advance_source = source
+
     def _advance(self, v, dt):
         """
         Advance nested state modules by one time step.
@@ -787,11 +967,19 @@ class Mechanism(Parameterized):
             Membrane potentials for the local compartments.
         dt : Tensor
             Time-step tensor propagated from the integrator.
+
+        Notes
+        -----
+        This generic fallback is normally replaced at instance construction by
+        :meth:`_install_monomorphic_advance`, which installs a generated method
+        on the concrete mechanism/proxy class.
         """
+        states = self._gather_states()
+        updates = {}
         for state_module in self.DE.values():
-            states = self._gather_states()
             local = state_module.advance(v, dt, states)
-            self._buffers.update(local)
+            updates.update(local)
+        self._buffers.update(updates)
 
     def _gather_states(self):
         states = {
@@ -2042,6 +2230,15 @@ def rename(mechanism, new_name=None):
 
     # Copy the original class's namespace dictionary.
     class_dict = dict(mechanism.__dict__)
+
+    # Do not clone generated monomorphic advance functions.  A renamed class may
+    # be used alongside the source class; sharing the same generated `_advance`
+    # code object would reintroduce cross-class Dynamo guard churn.  The first
+    # instance of the renamed class will generate its own fast path.
+    if getattr(class_dict.get("_advance"), "_dendra_monomorphic_advance", False):
+        class_dict.pop("_advance", None)
+    class_dict.pop("_dendra_monomorphic_advance_signature", None)
+    class_dict.pop("_dendra_monomorphic_advance_source", None)
 
     # The __dict__ of a class doesn't always include '__module__',
     # so we copy it over explicitly to make the new class look authentic.

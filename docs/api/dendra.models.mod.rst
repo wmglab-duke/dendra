@@ -24,7 +24,7 @@ In-built mechanisms.
 Graded / continuous synapses
 ----------------------------
 
-.. automodule:: dendra.models.mod.graded_synapse
+.. automodule:: dendra.models.mod.GRADED_SYNAPSE
    :members: sigmoid_release, graded_release_gate, graded_syn
    :exclude-members: __init__, initial, breakpoint, inf, forward
    :show-inheritance:

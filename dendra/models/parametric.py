@@ -331,8 +331,11 @@ class Bounded(cacheable):
         lower_alpha: float = 0.1,
         cap_mode: str = "auto",
         cap_beta: float | None = None,
+        requires_grad: bool = None,
     ):
         super().__init__()
+        if requires_grad is None:
+            requires_grad = bool(REQUIRE_GRAD)
         self.min_val = None if min_val is None else float(min_val)
         self.max_val = None if max_val is None else float(max_val)
         if (
@@ -378,7 +381,7 @@ class Bounded(cacheable):
                 t = torch.clamp((init - self.min_val) / rng, 1e-6, 1 - 1e-6)
                 rho0 = torch.special.logit(t) / self.beta
 
-        self.rho = torch.nn.Parameter(rho0, requires_grad=True)
+        self.rho = torch.nn.Parameter(rho0, requires_grad=requires_grad)
 
     def _upper_mode(self, *, upper_only: bool) -> str:
         if self.max_val is None:
@@ -529,6 +532,7 @@ class PositiveParam(Bounded):
         lower_alpha: float = 0.1,  # used only if include_zero=True (leaky-ste)
         cap_mode: str = "auto",
         cap_beta: float | None = None,
+        requires_grad: bool = None,
     ):
         super().__init__(
             init,
@@ -540,6 +544,7 @@ class PositiveParam(Bounded):
             lower_alpha=lower_alpha,
             cap_mode=cap_mode,
             cap_beta=cap_beta,
+            requires_grad=requires_grad,
         )
 
 
@@ -578,6 +583,7 @@ class NegativeParam(Bounded):
         upper_alpha: float = 0.1,  # used only if include_zero=True (leaky-ste)
         cap_mode: str = "auto",
         cap_beta: float | None = None,
+        requires_grad: bool = None,
     ):
         super().__init__(
             torch.neg(init),
@@ -589,6 +595,7 @@ class NegativeParam(Bounded):
             lower_alpha=upper_alpha,  # note the flipped role of alpha here
             cap_mode=cap_mode,
             cap_beta=cap_beta,
+            requires_grad=requires_grad,
         )
 
     def _compute(self, *args, **kwargs):
