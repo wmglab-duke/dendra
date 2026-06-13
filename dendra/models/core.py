@@ -1753,7 +1753,7 @@ class Population(P, Sliceable):
             raise ValueError(f"Mechanism {mechanism} is already inserted everywhere.")
         self._mech_data.setdefault(mechanism, []).append((alias, kwargs, key))
 
-    def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
+    def ion_style(self, ion, einit, eadvance):
         """
         Register explicit ion handling style parameters.
 
@@ -1761,19 +1761,13 @@ class Population(P, Sliceable):
         ----------
         ion : str
             Ion species identifier (e.g., ``'na'``).
-        c_style : int
-            Style flag for concentration handling.
-        e_style : int
-            Style flag for reversal potential handling.
         einit : int
             Initialization flag for equilibration.
         eadvance : int
             Advance-time flag for equilibration updates.
-        cinit : int
-            Initialization flag for concentration updates.
         """
         assert ion in valid_ions(), f"Invalid ion: {ion}"
-        self._ion_style[ion] = (c_style, e_style, einit, eadvance, cinit)
+        self._ion_style[ion] = (einit, eadvance)
 
     def get_ion_style(self, ion):
         """
@@ -1861,7 +1855,7 @@ class Population(P, Sliceable):
         Returns
         -------
         tuple
-            Tuple of style flags ``(c_style, e_style, einit, eadvance, cinit)``.
+            Tuple of style flags ``(einit, eadvance)``.
         """
         _c_is_written = self._c_is_written(ion)
         _c_is_read = self._c_is_read(ion)
@@ -1869,15 +1863,15 @@ class Population(P, Sliceable):
 
         if _c_is_written:
             if _e_is_read:
-                return (3, 2, 1, 1, 1)
-            return (3, 0, 0, 0, 1)
+                return (1, 1)
+            return (0, 0)
         if _c_is_read:
             if _e_is_read:
-                return (1, 2, 1, 0, 0)
-            return (1, 0, 0, 0, 0)
+                return (1, 0)
+            return (0, 0)
         if _e_is_read:
-            return (0, 1, 0, 0, 0)
-        return (0, 0, 0, 0, 0)
+            return (0, 0)
+        return (0, 0)
 
     def _register_mech(self, m, shape, key):
         """

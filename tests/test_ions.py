@@ -132,11 +132,8 @@ def test_ion_initialize_sets_buffers(einit, eadvance):
     ion = ions.Ion(
         name="na",
         shape=(2, 3),
-        cstyle=None,
-        estyle=None,
         einit=einit,
         eadvance=eadvance,
-        cinit=None,
     )
 
     # after *ctor* – every buffer must be present with the right shape

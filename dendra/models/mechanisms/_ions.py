@@ -194,7 +194,7 @@ def _make_into_shape(shape, value):
 class Ion(torch.nn.Module):
     __constants__ = "init_e_reversal", "advance_e"
 
-    def __init__(self, name, shape, cstyle, estyle, einit, eadvance, cinit):
+    def __init__(self, name, shape, einit, eadvance):
         super().__init__()
         self.name = name
         self.rzf = R / (VALENCES[name] * FARADAY)
