@@ -1744,7 +1744,12 @@ class Network(RNGMixin):
             if not self._state_cache:
                 pop.initialize()
             dt_pop = torch.tensor(dt_f, device=pop.device(), dtype=pop.dtype())
-            pop.integrator._initialize(pop, dt_pop, compile_scope="network_population")
+            pop.integrator._initialize(
+                pop,
+                dt_pop,
+                force=pop.force_integrator_reinit(),
+                compile_scope="network_population",
+            )
             pop.intra = pop.build_intra()
         self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
         self.init_synapses(
@@ -1761,6 +1766,7 @@ class Network(RNGMixin):
         for name, pop in self.populations.items():
             pop.load_state_dict(self._state_cache[name])
             pop.detach()
+            pop.initializing_from_state_cache = True
 
     def initialize_synapses_from_state_cache(self):
         for name, syn in self.synapses.items():

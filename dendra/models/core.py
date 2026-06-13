@@ -248,6 +248,7 @@ class Population(P, Sliceable):
         self.jit_in_network = self.jit_network_solves
         self.imem = bool(IMEM)
         self.compile_mode = COMPILE_MODE.value
+        self.initializing_from_state_cache = False
 
         if self.imem:
             self.register_buffer("i_membrane", torch.zeros(self.shape))
@@ -311,6 +312,21 @@ class Population(P, Sliceable):
 
         self.initialized: bool = False
         self.eval()
+
+    def force_integrator_reinit(self):
+        """
+        Determine whether the integrator should be re-initialized.
+
+        Returns
+        -------
+        bool
+            True if the integrator should be re-initialized, False otherwise.
+            By default, this returns True during training to ensure that any
+            changes to model parameters are reflected in the integrator state.
+            During evaluation, it returns False to allow the integrator to reuse
+            its existing state for efficiency.
+        """
+        return self.training or self.initializing_from_state_cache
 
     def _refresh_compile_config_from_ctx(self):
         """Refresh compile flags from dendra.ctx / ContextVar state.
@@ -1095,7 +1111,7 @@ class Population(P, Sliceable):
             self.integrator._initialize(
                 self,
                 dt_tensor,
-                force=self.training,
+                force=self.force_integrator_reinit(),
                 compile_scope="population",
             )
 
@@ -1292,7 +1308,7 @@ class Population(P, Sliceable):
                 self.integrator._initialize(
                     self,
                     dt_tensor,
-                    force=self.training,
+                    force=self.force_integrator_reinit(),
                     compile_scope="population",
                 )
 
@@ -1358,7 +1374,7 @@ class Population(P, Sliceable):
         self.clear_steady_state()
 
         self.initialize()
-        self.integrator._initialize(self, dt, compile_scope="population")
+        self.integrator._initialize(self, dt, force=True, compile_scope="population")
 
         maxiter = int(tstop / dt)
 
@@ -1435,6 +1451,7 @@ class Population(P, Sliceable):
             self.post_initialize()
             self.t = torch.zeros_like(self.t).detach()
             self.initialized = True
+            self.initializing_from_state_cache = True
             return True
         return False
 
@@ -2700,7 +2717,7 @@ class Population(P, Sliceable):
                 self.integrator._initialize(
                     self,
                     dt_tensor,
-                    force=self.training,
+                    force=self.force_integrator_reinit(),
                     compile_scope="population",
                 )
 
