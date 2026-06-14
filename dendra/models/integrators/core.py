@@ -367,8 +367,11 @@ class Integrator(torch.nn.Module):
             self.dt = float(dt)
             self.shape = model.shape
             self._compiled_kernels.clear()
-            for mech in self.mech.mechanisms.values():
-                mech.set_dt(dt)
+            if hasattr(self.mech, "set_dt"):
+                self.mech.set_dt(dt)
+            else:
+                for mech in self.mech.mechanisms.values():
+                    mech.set_dt(dt)
             self.initialize(model, dt)
             self.initialized = True
 

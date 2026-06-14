@@ -1,3 +1,5 @@
+# ruff: noqa: F401
+
 """Generated linearly implicit Rosenbrock-Euler solvers.
 
 This builder implements the one-stage Rosenbrock / linearly implicit Euler update
@@ -14,6 +16,8 @@ equation.
 from __future__ import annotations
 
 from typing import Iterable
+
+import torch
 
 from dendra.helpers import DEBUG, logger
 from dendra.utils.dynamic_compilation import compile_generated_function

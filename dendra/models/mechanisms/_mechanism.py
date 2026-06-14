@@ -5,12 +5,45 @@ from typing import Dict
 
 import torch
 
-from dendra.helpers import DEBUG, classproperty
+from dendra.helpers import classproperty
 from dendra.models.parametric import Parameterized
 
 from ._ions import VALENCES
 from ._state import State
 from ._symbolic import build_current_eq
+
+
+def _merge_list_dict(dst, src):
+    for key, values in src.items():
+        dst.setdefault(key, [])
+        for value in values:
+            if value not in dst[key]:
+                dst[key].append(value)
+
+
+def _merge_nested_dict(dst, src):
+    for key, values in src.items():
+        dst.setdefault(key, {})
+        dst[key].update(values)
+
+
+def _as_name_list(values):
+    if values is None:
+        return []
+    if isinstance(values, str):
+        return [values]
+    return [str(v) for v in values]
+
+
+def _normalize_material_source(source):
+    if not source:
+        return {}
+    if isinstance(source, dict):
+        return {str(field): str(local_name) for field, local_name in source.items()}
+    if isinstance(source, str):
+        return {source: f"{source}_source"}
+    return {str(field): f"{field}_source" for field in source}
+
 
 # -- TorchDynamo-friendly mechanism advance generation -----------------------
 
@@ -132,8 +165,6 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
         lines.append("    return None")
 
     source = "\n".join(lines) + "\n"
-    if DEBUG:
-        print(f"Generated advance for {cls.__name__} (id={id(cls):x}):\n{source}")
     filename = (
         f"<dendra.mechanism.advance.{cls.__module__}.{cls.__qualname__}.{id(cls):x}>"
     )
@@ -189,6 +220,7 @@ class Mechanism(Parameterized):
 
     _state = set()
     _ion = set()
+    _material = set()
     _save = set()
     _assigned = set()
     _explicit = set()
@@ -196,6 +228,7 @@ class Mechanism(Parameterized):
 
     _state_declarations = []
     _ion_declarations = []
+    _material_declarations = []
     _save_declarations = []
     _assigned_declarations = []
     _explicit_declarations = []
@@ -209,6 +242,10 @@ class Mechanism(Parameterized):
     _write_ion = {}
     _write_ion_c = {}
 
+    _read_material = {}
+    _write_material = {}
+    _source_material = {}
+
     _conductances_declarations = []
     _currents_declarations = []
     _init_declarations = []
@@ -216,6 +253,10 @@ class Mechanism(Parameterized):
     _read_ion_declarations = []
     _write_ion_declarations = []
     _write_ion_c_declarations = []
+
+    _read_material_declarations = []
+    _write_material_declarations = []
+    _source_material_declarations = []
 
     _renamed_aliases = {}
 
@@ -231,6 +272,7 @@ class Mechanism(Parameterized):
         # Start with a fresh dictionary for the new class's parameters.
         new_state = set()
         new_ion = set()
+        new_material = set()
         new_save = set()
         new_assigned = set()
         new_explicit = set()
@@ -239,6 +281,10 @@ class Mechanism(Parameterized):
         new_read_ion = {}
         new_write_ion = {}
         new_write_ion_c = {}
+
+        new_read_material = {}
+        new_write_material = {}
+        new_source_material = {}
 
         new_currents = {}
         new_init = {}
@@ -250,6 +296,8 @@ class Mechanism(Parameterized):
                 new_state.update(base._state)
             if "_ion" in base.__dict__:
                 new_ion.update(base._ion)
+            if "_material" in base.__dict__:
+                new_material.update(base._material)
             if "_save" in base.__dict__:
                 new_save.update(base._save)
             if "_assigned" in base.__dict__:
@@ -260,6 +308,12 @@ class Mechanism(Parameterized):
                 new_write_ion.update(base._write_ion)
             if "_write_ion_c" in base.__dict__:
                 new_write_ion_c.update(base._write_ion_c)
+            if "_read_material" in base.__dict__:
+                _merge_list_dict(new_read_material, base._read_material)
+            if "_write_material" in base.__dict__:
+                _merge_list_dict(new_write_material, base._write_material)
+            if "_source_material" in base.__dict__:
+                _merge_nested_dict(new_source_material, base._source_material)
             if "_currents" in base.__dict__:
                 new_currents.update(base._currents)
             if "_init" in base.__dict__:
@@ -277,6 +331,10 @@ class Mechanism(Parameterized):
             for i_list in Mechanism._ion_declarations:
                 new_ion.update(i_list)
             Mechanism._ion_declarations = []
+        if Mechanism._material_declarations:
+            for m_list in Mechanism._material_declarations:
+                new_material.update(m_list)
+            Mechanism._material_declarations = []
         if Mechanism._save_declarations:
             for s_list in Mechanism._save_declarations:
                 new_save.update(s_list)
@@ -297,6 +355,18 @@ class Mechanism(Parameterized):
             for w_dict in Mechanism._write_ion_c_declarations:
                 new_write_ion_c.update(w_dict)
             Mechanism._write_ion_c_declarations = []
+        if Mechanism._read_material_declarations:
+            for r_dict in Mechanism._read_material_declarations:
+                _merge_list_dict(new_read_material, r_dict)
+            Mechanism._read_material_declarations = []
+        if Mechanism._write_material_declarations:
+            for w_dict in Mechanism._write_material_declarations:
+                _merge_list_dict(new_write_material, w_dict)
+            Mechanism._write_material_declarations = []
+        if Mechanism._source_material_declarations:
+            for s_dict in Mechanism._source_material_declarations:
+                _merge_nested_dict(new_source_material, s_dict)
+            Mechanism._source_material_declarations = []
         if Mechanism._currents_declarations:
             for c_list in Mechanism._currents_declarations:
                 new_currents.setdefault("nonspecific", []).extend(c_list)
@@ -318,12 +388,16 @@ class Mechanism(Parameterized):
 
         cls._state = new_state
         cls._ion = new_ion
+        cls._material = new_material
         cls._save = new_save
         cls._currents = new_currents
         cls._assigned = new_assigned
         cls._read_ion = new_read_ion
         cls._write_ion = new_write_ion
         cls._write_ion_c = new_write_ion_c
+        cls._read_material = new_read_material
+        cls._write_material = new_write_material
+        cls._source_material = new_source_material
         cls._init = new_init
         cls._explicit = new_explicit
         cls._numerical = new_numerical
@@ -464,6 +538,9 @@ class Mechanism(Parameterized):
 
         self.read_ion = self._read_ion
         self.write_ion_c = self._write_ion_c
+        self.read_material = self._read_material
+        self.write_material = self._write_material
+        self.source_material = self._source_material
 
         states = [
             state(
@@ -717,6 +794,68 @@ class Mechanism(Parameterized):
                 else:
                     self.register_buffer(v, q)
 
+    def _set_local_material_buffer(self, name, value, *, expose_to_states=True):
+        """Register or rebind a local material buffer on mechanism and states."""
+        if name in self._buffers:
+            self._buffers[name] = value
+        else:
+            self.register_buffer(name, value)
+        if expose_to_states:
+            for _, state_module in self.DE.items():
+                if name in state_module._buffers:
+                    state_module._buffers[name] = value
+                else:
+                    state_module.register_buffer(name, value)
+
+    def _material_local_view(self, material, field):
+        if not hasattr(material, "has_field"):
+            raise TypeError(
+                "register_material expects a Material-like object with has_field(field)."
+            )
+        if not material.has_field(field):
+            raise ValueError(
+                f"Material {material.name!r} has no field {field!r}. "
+                f"Available fields: {getattr(material, 'fields', tuple(material._buffers.keys()))!r}."
+            )
+        q = material._buffers[field]
+        if self.key is not None and q.ndim > 0:
+            return self.get(q)
+        return q
+
+    def register_material(self, material):
+        """Attach shared material buffers used by the mechanism.
+
+        Material fields are population-wide.  Read bindings expose local views of
+        the full material field to the mechanism and nested State modules.  Write
+        bindings allocate local buffers initialized from the material field; the
+        owning handler commits those buffers back to the full Material after the
+        local mechanism phase.  Source bindings allocate additive increment
+        buffers named ``<field>_source`` by default, or by the explicit local name
+        supplied to ``USEMATERIAL(..., source={field: local_name})``.
+        """
+        name = material.name
+
+        if name in self.read_material:
+            for field in self.read_material[name]:
+                self._set_local_material_buffer(
+                    field, self._material_local_view(material, field)
+                )
+
+        if name in self.write_material:
+            for field in self.write_material[name]:
+                local = self._material_local_view(material, field)
+                # Writable material fields should be local tensors, not aliases,
+                # so mechanism state updates do not mutate the population field
+                # before the handler's commit phase.
+                if self.key is not None and local.ndim > 0:
+                    local = local.clone()
+                self._set_local_material_buffer(field, local)
+
+        if name in self.source_material:
+            for field, local_name in self.source_material[name].items():
+                local = self._material_local_view(material, field)
+                self._set_local_material_buffer(local_name, torch.zeros_like(local))
+
     def _init_buffers_s(self, v_init):
         for state_module in self.DE.values():
             state_names = state_module._state
@@ -844,6 +983,49 @@ class Mechanism(Parameterized):
                 Mechanism._write_ion_c_declarations.append({ion: c_write})
             if other:
                 Mechanism._write_ion_declarations.append({ion: other})
+
+    @staticmethod
+    def USEMATERIAL(material, read=None, write=None, source=None):
+        """Declare generic material read/write dependencies.
+
+        Parameters
+        ----------
+        material : str
+            Material name, e.g. ``"ip3"`` or ``"ca"``.
+        read : Sequence[str], optional
+            Material fields to expose as local read buffers on this mechanism and
+            its nested State modules.
+        write : Sequence[str], optional
+            Material fields that this mechanism locally replaces.  The handler
+            commits these local buffers back to the full population Material
+            after the local mechanism phase.
+        source : Sequence[str] or Mapping[str, str], optional
+            Additive material increments.  A sequence such as ``["ip3i"]``
+            creates local source buffers named ``"ip3i_source"``.  A mapping
+            such as ``{"ip3i": "j_ip3"}`` uses explicit local buffer names.
+
+        Notes
+        -----
+        Unlike USEION, USEMATERIAL allows a field to appear in both ``read`` and
+        ``write`` because local reaction mechanisms commonly need to read a
+        material and then write its updated value.
+        """
+        read = _as_name_list(read)
+        write = _as_name_list(write)
+        source_map = _normalize_material_source(source)
+
+        if not read and not write and not source_map:
+            return
+
+        material = str(material)
+        Mechanism._material_declarations.append((material,))
+
+        if read:
+            Mechanism._read_material_declarations.append({material: read})
+        if write:
+            Mechanism._write_material_declarations.append({material: write})
+        if source_map:
+            Mechanism._source_material_declarations.append({material: source_map})
 
     @staticmethod
     def NONSPECIFIC_CURRENT(*args):

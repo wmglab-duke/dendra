@@ -42,6 +42,13 @@ from dendra.models.graph import get_area_from_graph
 from dendra.models.integrators import bwd_euler_sc, bwd_euler_ub
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
+from dendra.models.mechanisms._material_process import MaterialProcess
+from dendra.models.mechanisms._materials import (
+    Material,
+    MaterialFieldSpec,
+    material_specs,
+    valid_materials,
+)
 from dendra.models.mechanisms.validate import validate
 from dendra.models.modular import matches_any_pattern
 from dendra.models.parametric import Parameterized as P
@@ -200,6 +207,7 @@ class Population(P, Sliceable):
     # ---------- repr knobs (safe defaults) ----------
     _REPR_MAX_MECHS: int = 18
     _REPR_MAX_IONS: int = 12
+    _REPR_MAX_MATERIALS: int = 12
     _REPR_TENSOR_SAMPLES: int = 7  # sample points for big tensors
     _REPR_SHOW_KWARGS: bool = False  # kwargs can be huge; default off
     _REPR_TENSOR_STATS: str = "sample"  # "none" | "sample" | "full"
@@ -278,6 +286,17 @@ class Population(P, Sliceable):
         self._ion_read = {}
         self._ion_write = {}
         self._ion_write_c = {}
+
+        # Generic Material bookkeeping mirrors the ion maps above.  These maps
+        # are populated from Mechanism.USEMATERIAL(...) declarations during
+        # build() and are passed to MechanismHandler for sync/commit.
+        self._material_read = {}
+        self._material_write = {}
+        self._material_source = {}
+        self._material_process_read = {}
+        self._material_process_write = {}
+        self._material_process_source = {}
+        self._material_configs = {}
 
         self._all_read = {}
         self._all_write = {}
@@ -453,6 +472,204 @@ class Population(P, Sliceable):
             Keyword arguments forwarded to ``dendra.models.mechanisms._ions.concentrations``.
         """
         self._concentrations.update(kwargs)
+
+    def material(
+        self,
+        name: str,
+        fields=None,
+        *,
+        initial_values: Optional[Dict[str, object]] = None,
+        min_values: Optional[Dict[str, Optional[float]]] = None,
+        specs: Optional[Dict[str, MaterialFieldSpec]] = None,
+        domain=None,
+        units=None,
+        conserved=None,
+        **field_initials,
+    ):
+        """Register or override a generic population-wide Material.
+
+        Parameters
+        ----------
+        name : str
+            Material name, e.g. ``"ip3"``.  For registered ions such as
+            ``"ca"``, continue to use :meth:`concentrations` /
+            :meth:`equilibria`; ions are already Material-like and may be read
+            through ``USEION`` or ``USEMATERIAL``.
+        fields : Mapping or Sequence, optional
+            Field declarations passed to :class:`Material`.  A mapping specifies
+            initial values, e.g. ``fields={"ip3i": 0.1}``; a sequence declares
+            fields initialized to zero unless ``initial_values`` supplies values.
+        initial_values : Mapping, optional
+            Per-field initial value overrides.  When the material has been
+            registered globally, these override the registered initial values
+            while preserving other field metadata such as min values and units.
+        min_values : Mapping, optional
+            Per-field minimum-value guards.
+        specs : Mapping[str, MaterialFieldSpec], optional
+            Fully specified field specs.  This is the most explicit form and is
+            forwarded directly to :class:`Material`.
+        **field_initials
+            Convenience initial values, e.g. ``model.material("ip3", ip3i=0.1)``.
+
+        Returns
+        -------
+        Population
+            The population instance for chaining.
+        """
+        name = str(name)
+        if name in valid_ions():
+            raise ValueError(
+                f"{name!r} is a registered ion. Use concentrations(...) and "
+                "equilibria(...) for ion defaults; mechanisms may still read ion "
+                "fields through USEION or USEMATERIAL."
+            )
+        if self.is_built:
+            self._flag_rebuild = True
+
+        if field_initials:
+            initial_values = dict(initial_values or {})
+            for field, value in field_initials.items():
+                initial_values[str(field)] = value
+
+        cfg = self._material_configs.setdefault(
+            name,
+            {
+                "fields": None,
+                "initial_values": {},
+                "min_values": {},
+                "specs": None,
+                "domain": None,
+                "units": None,
+                "conserved": None,
+            },
+        )
+
+        if specs is not None:
+            cfg["specs"] = dict(specs)
+        if fields is not None:
+            cfg["fields"] = fields
+        if initial_values:
+            cfg.setdefault("initial_values", {}).update(dict(initial_values))
+        if min_values:
+            cfg.setdefault("min_values", {}).update(dict(min_values))
+        if domain is not None:
+            cfg["domain"] = domain
+        if units is not None:
+            cfg["units"] = units
+        if conserved is not None:
+            cfg["conserved"] = conserved
+        return self
+
+    def material_(self, name: str, *args, **kwargs):
+        """In-place alias of :meth:`material`."""
+        self.material(name, *args, **kwargs)
+
+    def _material_constructor_kwargs(self, name: str) -> Dict[str, object]:
+        """Build Material constructor kwargs from population-local overrides."""
+        cfg = self._material_configs.get(str(name), None)
+        if not cfg:
+            return {}
+
+        if cfg.get("specs") is not None:
+            return {"specs": cfg["specs"]}
+
+        fields = cfg.get("fields", None)
+        initial_values = dict(cfg.get("initial_values") or {})
+        min_values = dict(cfg.get("min_values") or {})
+        domain = cfg.get("domain", None)
+        units = cfg.get("units", None)
+        conserved = cfg.get("conserved", None)
+
+        def pick(obj, key, default):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return default if obj is None else obj
+
+        def field_initial_mapping(fields_obj):
+            if fields_obj is None:
+                return None
+            if isinstance(fields_obj, dict):
+                out = dict(fields_obj)
+                out.update(initial_values)
+                return out
+            if isinstance(fields_obj, str):
+                return {fields_obj: initial_values.get(fields_obj, 0.0)}
+            return {
+                str(field): initial_values.get(str(field), 0.0) for field in fields_obj
+            }
+
+        # If a registered material already has specs and the user only supplies
+        # overrides, preserve registered metadata while changing requested values.
+        registered = material_specs().get(str(name), None)
+        if (
+            fields is None
+            and registered is not None
+            and (
+                initial_values
+                or min_values
+                or domain is not None
+                or units is not None
+                or conserved is not None
+            )
+        ):
+            specs_out = {}
+            all_fields = (
+                set(registered.keys())
+                | set(initial_values.keys())
+                | set(min_values.keys())
+            )
+            for field in all_fields:
+                if field in registered:
+                    spec = registered[field]
+                    specs_out[field] = MaterialFieldSpec(
+                        name=spec.name,
+                        initial=initial_values.get(field, spec.initial),
+                        min_value=min_values.get(field, spec.min_value),
+                        conserved=bool(pick(conserved, field, spec.conserved)),
+                        domain=str(pick(domain, field, spec.domain)),
+                        units=pick(units, field, spec.units),
+                    )
+                else:
+                    specs_out[field] = MaterialFieldSpec(
+                        name=field,
+                        initial=initial_values.get(field, 0.0),
+                        min_value=min_values.get(field, None),
+                        conserved=bool(pick(conserved, field, True)),
+                        domain=str(pick(domain, field, "i")),
+                        units=pick(units, field, None),
+                    )
+            return {"specs": specs_out}
+
+        # If the user supplied domain/units/conserved for an unregistered or
+        # explicitly field-declared material, build full specs here so metadata is
+        # preserved by the Material constructor.
+        field_initials = field_initial_mapping(fields)
+        if field_initials is not None and (
+            domain is not None
+            or units is not None
+            or conserved is not None
+            or min_values
+        ):
+            specs_out = {}
+            for field, initial in field_initials.items():
+                specs_out[field] = MaterialFieldSpec(
+                    name=field,
+                    initial=initial,
+                    min_value=min_values.get(field, None),
+                    conserved=bool(pick(conserved, field, True)),
+                    domain=str(pick(domain, field, "i")),
+                    units=pick(units, field, None),
+                )
+            return {"specs": specs_out}
+
+        out: Dict[str, object] = {}
+        if fields is not None:
+            out["fields"] = fields
+        if initial_values:
+            out["initial_values"] = initial_values
+        if min_values:
+            out["min_values"] = min_values
+        return out
 
     def unfreeze_group(self, *groups):
         """
@@ -1819,7 +2036,17 @@ class Population(P, Sliceable):
             True if any mechanism writes concentrations for the ion.
         """
         d = self._ion_write_c.get(ion, {})
-        return bool(d)
+        if d:
+            return True
+        # Ion-like materials can also write concentration fields through
+        # USEMATERIAL(ion, write=[...]) or source=[...].  Include them in style
+        # inference so USEMATERIAL("ca", read=["eca"], write=["cai"])
+        # advances eca just like USEION would.
+        material_w = self._material_write.get(ion, {})
+        material_s = self._material_source.get(ion, {})
+        material_pw = self._material_process_write.get(ion, {})
+        material_ps = self._material_process_source.get(ion, {})
+        return bool(material_w or material_s or material_pw or material_ps)
 
     def _c_is_read(self, ion):
         """
@@ -1836,9 +2063,13 @@ class Population(P, Sliceable):
             True if any mechanism reads intra- or extracellular concentration.
         """
         d = self._ion_read.get(ion, {})
-        if not d:
+        material_d = self._material_read.get(ion, {})
+        material_pd = self._material_process_read.get(ion, {})
+        if not d and not material_d and not material_pd:
             return False
-        check = list(itertools.chain(*d.values()))
+        check = list(itertools.chain(*d.values())) if d else []
+        check += list(itertools.chain(*material_d.values())) if material_d else []
+        check += list(itertools.chain(*material_pd.values())) if material_pd else []
         return f"{ion}i" in check or f"{ion}o" in check
 
     def _e_is_read(self, ion):
@@ -1856,9 +2087,14 @@ class Population(P, Sliceable):
             True if any mechanism reads the ion's equilibrium potential.
         """
         d = self._ion_read.get(ion, {})
-        if not d:
+        material_d = self._material_read.get(ion, {})
+        material_pd = self._material_process_read.get(ion, {})
+        if not d and not material_d and not material_pd:
             return False
-        return f"e{ion}" in list(itertools.chain(*d.values()))
+        check = list(itertools.chain(*d.values())) if d else []
+        check += list(itertools.chain(*material_d.values())) if material_d else []
+        check += list(itertools.chain(*material_pd.values())) if material_pd else []
+        return f"e{ion}" in check
 
     def _calc_ion_style(self, ion):
         """
@@ -1910,17 +2146,36 @@ class Population(P, Sliceable):
         self._m_keys.append(key)
         self._m_shape[name] = shape
 
-        for k, v in mech._currents.items():
-            self._m_curr.setdefault(k, {}).update({name: v})
+        is_material_process = isinstance(m, MaterialProcess)
 
-        for k, v in mech._read_ion.items():
-            self._ion_read.setdefault(k, {}).update({name: v})
+        if not is_material_process:
+            for k, v in mech._currents.items():
+                self._m_curr.setdefault(k, {}).update({name: v})
 
-        for k, v in mech._write_ion.items():
-            self._ion_write.setdefault(k, {}).update({name: v})
+            for k, v in mech._read_ion.items():
+                self._ion_read.setdefault(k, {}).update({name: v})
 
-        for k, v in mech._write_ion_c.items():
-            self._ion_write_c.setdefault(k, {}).update({name: v})
+            for k, v in mech._write_ion.items():
+                self._ion_write.setdefault(k, {}).update({name: v})
+
+            for k, v in mech._write_ion_c.items():
+                self._ion_write_c.setdefault(k, {}).update({name: v})
+
+            for k, v in getattr(mech, "_read_material", {}).items():
+                self._material_read.setdefault(k, {}).update({name: v})
+
+            for k, v in getattr(mech, "_write_material", {}).items():
+                self._material_write.setdefault(k, {}).update({name: v})
+
+            for k, v in getattr(mech, "_source_material", {}).items():
+                self._material_source.setdefault(k, {}).update({name: v})
+        else:
+            for k, v in getattr(mech, "_read_material", {}).items():
+                self._material_process_read.setdefault(k, {}).update({name: v})
+            for k, v in getattr(mech, "_write_material", {}).items():
+                self._material_process_write.setdefault(k, {}).update({name: v})
+            for k, v in getattr(mech, "_source_material", {}).items():
+                self._material_process_source.setdefault(k, {}).update({name: v})
 
     # -- Device and dtype methods --
 
@@ -2072,9 +2327,28 @@ class Population(P, Sliceable):
                 )
                 self._register_mech(m, shape, key)
 
+            all_materials = get_unique_keys(
+                [
+                    self._material_read,
+                    self._material_write,
+                    self._material_source,
+                    self._material_process_read,
+                    self._material_process_write,
+                    self._material_process_source,
+                ]
+            )
+            all_materials.update(self._material_configs.keys())
+
+            # If an ion species is used through the generic Material interface,
+            # instantiate the Ion and expose the same object through both the
+            # ion and material registries.  This lets USEMATERIAL("ca",
+            # read=["cai", "eca"]) and USEION("ca", ...) share state.
+            ion_like_materials = {m for m in all_materials if m in valid_ions()}
             all_ions = get_unique_keys(
                 [self._ion_read, self._ion_write, self._ion_write_c]
             )
+            all_ions.update(ion_like_materials)
+            all_ions.update(self._ion_style.keys())
 
             _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
             self._m_curr.update(_ion_write)
@@ -2088,7 +2362,37 @@ class Population(P, Sliceable):
                     *ion_style,
                 )
                 for m in self._m_list:
-                    m.register_ion(ions[ion])
+                    if not isinstance(m, MaterialProcess):
+                        m.register_ion(ions[ion])
+
+            materials = {}
+            for material in sorted(all_materials):
+                if material in ions:
+                    continue
+                try:
+                    materials[material] = Material(
+                        material,
+                        self.shape,
+                        **self._material_constructor_kwargs(material),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Material {material!r} is used by a mechanism but has no registered fields. "
+                        f"Call model.material({material!r}, fields=...) or register_material(...) before build()."
+                    ) from exc
+
+                for m in self._m_list:
+                    if not isinstance(m, MaterialProcess):
+                        m.register_material(materials[material])
+
+            # Registered ions are Material subclasses.  Bind them for mechanisms
+            # that requested USEMATERIAL("ca", ...), without inserting duplicate
+            # references into the generic material ModuleDict.
+            for ion_material in sorted(ion_like_materials):
+                ion_h = ions[ion_material]
+                for m in self._m_list:
+                    if not isinstance(m, MaterialProcess):
+                        m.register_material(ion_h)
 
             mechs = {n: m for n, m in zip(self._m_name, self._m_list)}
             keys = {n: k for n, k in zip(self._m_name, self._m_keys)}
@@ -2096,13 +2400,20 @@ class Population(P, Sliceable):
                 self.celsius,
                 self.area,
                 mechs,
-                ions,
-                self._ion_write_c,
-                self._ion_read,
-                self._m_curr,
+                ions=ions,
+                materials=materials,
+                write_ion_c=self._ion_write_c,
+                read_ion=self._ion_read,
+                read_material=self._material_read,
+                write_material=self._material_write,
+                source_material=self._material_source,
+                currents=self._m_curr,
+                population=self,
             )
 
             for m in mech.mechanisms.values():
+                m.setreference("t", lambda: self.t)
+            for m in getattr(mech, "material_processes", {}).values():
                 m.setreference("t", lambda: self.t)
 
             # Give mechanisms a chance to consume waveform injections directly.
@@ -3291,6 +3602,9 @@ class Population(P, Sliceable):
             read_ion = getattr(mech_cls, "_read_ion", {}) or {}
             write_ion = getattr(mech_cls, "_write_ion", {}) or {}
             write_ion_c = getattr(mech_cls, "_write_ion_c", {}) or {}
+            read_material = getattr(mech_cls, "_read_material", {}) or {}
+            write_material = getattr(mech_cls, "_write_material", {}) or {}
+            source_material = getattr(mech_cls, "_source_material", {}) or {}
 
             for ion, vars_ in read_ion.items():
                 u = usage.setdefault(
@@ -3336,6 +3650,41 @@ class Population(P, Sliceable):
                 )
                 u["write_c"] = True
 
+            # Ion-like materials are represented by Ion at build time.  Include
+            # them in the pre-build ion summary/style inference so a mechanism
+            # using USEMATERIAL("ca", read=["cai", "eca"], write=["cai"])
+            # is reported consistently.
+            for ion, vars_ in read_material.items():
+                if ion not in valid_ions():
+                    continue
+                u = usage.setdefault(
+                    ion,
+                    {
+                        "read_c": False,
+                        "read_e": False,
+                        "write_i": False,
+                        "write_c": False,
+                    },
+                )
+                if (f"{ion}i" in vars_) or (f"{ion}o" in vars_):
+                    u["read_c"] = True
+                if f"e{ion}" in vars_:
+                    u["read_e"] = True
+
+            for ion in set(write_material.keys()) | set(source_material.keys()):
+                if ion not in valid_ions():
+                    continue
+                u = usage.setdefault(
+                    ion,
+                    {
+                        "read_c": False,
+                        "read_e": False,
+                        "write_i": False,
+                        "write_c": False,
+                    },
+                )
+                u["write_c"] = True
+
         # include any explicitly styled ions even if no mech references them
         for ion in getattr(self, "_ion_style", {}).keys():
             usage.setdefault(
@@ -3347,11 +3696,21 @@ class Population(P, Sliceable):
 
     def _built_ion_usage(self) -> Dict[str, Dict[str, bool]]:
         """Ion usage from built bookkeeping dictionaries."""
+        ion_like_materials = (
+            set(self._material_read.keys())
+            | set(self._material_write.keys())
+            | set(self._material_source.keys())
+            | set(self._material_process_read.keys())
+            | set(self._material_process_write.keys())
+            | set(self._material_process_source.keys())
+            | set(getattr(self, "_material_configs", {}).keys())
+        ) & set(valid_ions())
         ions = (
             set(self._ion_read.keys())
             | set(self._ion_write.keys())
             | set(self._ion_write_c.keys())
             | set(self._ion_style.keys())
+            | ion_like_materials
         )
         usage: Dict[str, Dict[str, bool]] = {}
         for ion in ions:
@@ -3359,7 +3718,11 @@ class Population(P, Sliceable):
                 "read_c": bool(self._c_is_read(ion)),
                 "read_e": bool(self._e_is_read(ion)),
                 "write_i": bool(self._ion_write.get(ion, {})),
-                "write_c": bool(self._ion_write_c.get(ion, {})),
+                "write_c": bool(
+                    self._ion_write_c.get(ion, {})
+                    or self._material_write.get(ion, {})
+                    or self._material_source.get(ion, {})
+                ),
             }
         return usage
 
@@ -3418,6 +3781,112 @@ class Population(P, Sliceable):
                     f"  concentrations: keys={sorted(list(self._concentrations.keys()))}"
                 )
 
+        return lines
+
+    def _infer_material_usage_from_inserted(self) -> Dict[str, Dict[str, int]]:
+        """Infer generic Material usage from pending mechanism class metadata."""
+        mech_classes = set(
+            list(self._mech_everywhere.keys()) + list(self._mech_data.keys())
+        )
+        usage: Dict[str, Dict[str, int]] = {}
+
+        for mech_cls in mech_classes:
+            read_material = getattr(mech_cls, "_read_material", {}) or {}
+            write_material = getattr(mech_cls, "_write_material", {}) or {}
+            source_material = getattr(mech_cls, "_source_material", {}) or {}
+
+            for material, fields in read_material.items():
+                u = usage.setdefault(material, {"read": 0, "write": 0, "source": 0})
+                u["read"] += len(fields)
+            for material, fields in write_material.items():
+                u = usage.setdefault(material, {"read": 0, "write": 0, "source": 0})
+                u["write"] += len(fields)
+            for material, fields in source_material.items():
+                u = usage.setdefault(material, {"read": 0, "write": 0, "source": 0})
+                u["source"] += len(fields)
+
+        for material in getattr(self, "_material_configs", {}).keys():
+            usage.setdefault(material, {"read": 0, "write": 0, "source": 0})
+        return usage
+
+    def _built_material_usage(self) -> Dict[str, Dict[str, int]]:
+        materials = (
+            set(self._material_read.keys())
+            | set(self._material_write.keys())
+            | set(self._material_source.keys())
+            | set(self._material_process_read.keys())
+            | set(self._material_process_write.keys())
+            | set(self._material_process_source.keys())
+            | set(getattr(self, "_material_configs", {}).keys())
+        )
+        mech_handler = getattr(self, "mech", None)
+        if mech_handler is not None and hasattr(mech_handler, "materials"):
+            materials |= set(mech_handler.materials.keys())
+
+        usage: Dict[str, Dict[str, int]] = {}
+        for material in materials:
+            usage[material] = {
+                "read": sum(
+                    len(v) for v in self._material_read.get(material, {}).values()
+                ),
+                "write": sum(
+                    len(v) for v in self._material_write.get(material, {}).values()
+                ),
+                "source": sum(
+                    len(v) for v in self._material_source.get(material, {}).values()
+                ),
+            }
+        return usage
+
+    def _material_lines(self, *, verbose: bool) -> List[str]:
+        built = bool(getattr(self, "is_built", False))
+        usage = (
+            self._built_material_usage()
+            if built
+            else self._infer_material_usage_from_inserted()
+        )
+        materials = sorted(list(usage.keys()))
+
+        if not materials:
+            return ["materials: (none)"]
+
+        lines: List[str] = [
+            f"materials: {len(materials)} ({'built' if built else 'inferred'})"
+        ]
+        if not verbose:
+            preview = materials[: self._REPR_MAX_MATERIALS]
+            more = len(materials) - len(preview)
+            s = ", ".join(preview) + (f", …+{more}" if more > 0 else "")
+            lines.append(f"  {s}")
+            return lines
+
+        for material in materials:
+            u = usage[material]
+            bits = []
+            if u.get("read", 0):
+                bits.append(f"read={u['read']}")
+            if u.get("write", 0):
+                bits.append(f"write={u['write']}")
+            if u.get("source", 0):
+                bits.append(f"source={u['source']}")
+            if not bits:
+                bits.append("registered")
+
+            fields = ""
+            if (
+                built
+                and getattr(self, "mech", None) is not None
+                and hasattr(self.mech, "materials")
+            ):
+                if material in self.mech.materials:
+                    material_h = self.mech.materials[material]
+                    fields = f", fields={tuple(getattr(material_h, 'fields', ()))!r}"
+            elif material in valid_materials():
+                fields = (
+                    f", registered_fields={tuple(material_specs()[material].keys())!r}"
+                )
+
+            lines.append(f"  - {material}: {', '.join(bits)}{fields}")
         return lines
 
     def _mechanism_parameter_block_lines(
@@ -3514,8 +3983,9 @@ class Population(P, Sliceable):
                 self._pending_mech_lines(verbose=verbose, show_kwargs=show_kwargs)
             )
 
-        # Ions
+        # Ions and generic materials
         lines.extend(self._ion_lines(verbose=verbose))
+        lines.extend(self._material_lines(verbose=verbose))
 
         return lines
 
