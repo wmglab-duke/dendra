@@ -842,10 +842,12 @@ class NetCon(Referency):
         delay_backend : {"dense", "sparse_calendar"}, optional
             Delay-line implementation for non-differentiable inference. The
             default ``"dense"`` keeps the existing ``[max_delay_steps,
-            syn_numel]`` ring buffer. ``"sparse_calendar"`` stores pending
-            nonzero inference deliveries in Python-side calendar buckets and
-            uses only a reusable one-row dense scratch buffer before calling
-            ``syn.net_receive(...)``. Training always uses the dense backend.
+            syn_numel]`` ring buffer, but uses precomputed integer-delay routing
+            metadata and specialized uniform-/mixed-delay hot paths. The
+            ``"sparse_calendar"`` backend stores pending nonzero inference
+            deliveries in Python-side calendar buckets and uses only a reusable
+            one-row dense scratch buffer before calling ``syn.net_receive(...)``.
+            Training always uses the dense backend.
 
         Notes
         -----
@@ -1014,6 +1016,10 @@ class NetCon(Referency):
             torch.arange(self.pre_idx.numel(), device=self.device, dtype=torch.long),
         )
 
+        # Dense inference routing metadata is static between delay rebuilds and
+        # avoids recomputing future slots/flat indices every step.
+        self._rebuild_dense_delay_metadata()
+
         # connection-schedule storage (fixed-length vectors; all per-connection)
         self.register_buffer(
             "sched_con_idx", torch.empty(0, device=self.device, dtype=torch.long)
@@ -1086,6 +1092,13 @@ class NetCon(Referency):
                 name,
                 buf.to(device=device, dtype=target_dtype),
             )
+
+    def _set_buffer(self, name: str, value: torch.Tensor):
+        """Register or replace a non-parameter tensor buffer."""
+        if name in self._buffers:
+            setattr(self, name, value)
+        else:
+            self.register_buffer(name, value)
 
     def _refresh_peer_devices(self):
         """
@@ -1160,6 +1173,9 @@ class NetCon(Referency):
             "syn_numel",
             "n",
             "delay_steps",
+            "inference_delay_steps",
+            "flat_delay_offsets",
+            "flat_event_offsets",
             "event_queue",
             "events",
             "current_time_step",
@@ -1238,6 +1254,61 @@ class NetCon(Referency):
                 else 1
             )
 
+    def _rebuild_dense_delay_metadata(self):
+        """Precompute integer-delay routing metadata for dense inference.
+
+        NetCon delays are positive-valued by construction, but very small
+        positive delays can round to zero integer steps.  In non-differentiable
+        inference, the earliest valid delivery is the next simulation step, so
+        ``inference_delay_steps`` is clamped to at least one step.  The dense hot
+        path then uses precomputed flat offsets:
+
+            flat = (current_slot * syn_numel + flat_delay_offsets) % delivery_numel
+
+        instead of rebuilding ``future_steps`` and multiplying by ``syn_numel``
+        for every connection on every timestep.
+        """
+        delay_steps = self.delay_steps.flatten().to(self.device, dtype=torch.long)
+        if delay_steps.numel() == 0:
+            inference_delay_steps = delay_steps
+        else:
+            inference_delay_steps = delay_steps.clamp_min(1)
+
+        post_idx = self.post_idx.to(self.device, dtype=torch.long)
+        con_range = self.con_range.to(self.device, dtype=torch.long)
+        syn_numel = int(self._syn_numel)
+        n_conn = int(self._n_conn)
+
+        flat_delay_offsets = inference_delay_steps * syn_numel + post_idx
+        flat_event_offsets = inference_delay_steps * max(n_conn, 1) + con_range
+
+        self._set_buffer("inference_delay_steps", inference_delay_steps)
+        self._set_buffer("flat_delay_offsets", flat_delay_offsets)
+        self._set_buffer("flat_event_offsets", flat_event_offsets)
+
+        self._delivery_numel = int(max(1, self.max_delay_steps) * syn_numel)
+        self._event_queue_numel = int(max(1, self.max_delay_steps) * max(n_conn, 1))
+
+        if inference_delay_steps.numel() > 0:
+            first = inference_delay_steps[0]
+            self._dense_delay_uniform = bool(
+                torch.all(inference_delay_steps == first).item()
+            )
+            self._dense_uniform_delay_step = int(first.item())
+        else:
+            self._dense_delay_uniform = True
+            self._dense_uniform_delay_step = 1
+
+    def _has_scheduled_events(self) -> bool:
+        """Cheap shape-only check used to skip scheduled-event aggregation."""
+        return self.sched_con_idx.numel() > 0
+
+    def _dense_advance_target(self):
+        """Return the specialized dense inference advance method for current delays."""
+        if getattr(self, "_dense_delay_uniform", False):
+            return self.advance_non_diff_dense_uniform
+        return self.advance_non_diff_dense_mixed
+
     def _use_sparse_calendar_runtime(self) -> bool:
         """Return True when the current initialized mode should use sparse inference."""
         return (not self.training) and self.delay_backend == "sparse_calendar"
@@ -1278,6 +1349,8 @@ class NetCon(Referency):
                     dtype=torch.int32,
                 ),
             )
+        elif not self.track_events and "event_queue" in self._buffers:
+            del self._buffers["event_queue"]
 
     def _clear_sparse_calendar(self):
         """Drop all pending sparse-calendar deliveries and event counts."""
@@ -1428,6 +1501,7 @@ class NetCon(Referency):
             self.delay_steps.copy_(delay_steps.flatten().to(self.device))
 
             self.max_delay_steps = self._compute_max_delay_steps()
+            self._rebuild_dense_delay_metadata()
 
             buffer_depth = self._desired_delivery_buffer_depth()
             buffer_shape = (buffer_depth, self.syn_numel.item())
@@ -2348,68 +2422,114 @@ class NetCon(Referency):
             )
             self.global_step = (self.global_step + 1).detach()
 
-    def advance_non_diff(self):
-        """
-        Advance the connection state by one time step (non-differentiable path).
-
-        This kernel is used when ``self.training`` is False. It implements the
-        same logical operations as :meth:`advance_diff`, but:
-
-        * uses hard threshold spiking (no surrogate gradients),
-        * uses integer delay steps only,
-        * uses exact step times for scheduled events (no triangular kernel),
-        * performs in-place updates where convenient.
-
-        Notes
-        -----
-        * Users typically call ``netcon.advance()`` after a call to
-          :meth:`initialize` rather than invoking this method directly.
-        """
+    def _dense_current_delivery(self):
+        """Return the dense delivery row due at the current slot."""
         cur_idx = self.current_time_step
-        todays_delivery = self.delivery_buffer.index_select(0, cur_idx)
+        todays_delivery = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)
+        return cur_idx, todays_delivery
+
+    def _dense_current_events(self, cur_idx):
+        """Expose per-connection event counts for the current slot if enabled."""
         if self.track_events:
             self.events.copy_(self.event_queue.index_select(0, cur_idx).squeeze(0))
         else:
             self.events.zero_()
-        self.syn.net_receive(todays_delivery.squeeze(0).view(*self.syn.shape_f), self)
 
-        # clear current row
+    def _dense_clear_current_slot(self, cur_idx):
+        """Clear the dense delivery/event row after it has been delivered."""
         self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
         if self.track_events:
             self.event_queue.index_fill_(0, cur_idx, 0)
 
-        # intrinsic spikes (hard)
+    def _dense_gate_and_event_counts(self):
+        """Compute this step's connection gate and optional event counts."""
         self.determine_spiking(self.pre, diff_spiking=False)
-        intrinsic_gate = self.is_spiking.to(
-            device=self.device, dtype=self.dtype
-        )  # [n_conn]
+        intrinsic_gate = self.is_spiking.to(device=self.device, dtype=self.dtype)
 
-        # scheduled contributions (constant shape)
-        gs = self.global_step
-        sched_wsum_conn, sched_counts_conn = self._scheduled_gate_this_step(
-            gs, use_tri_kernel=False
-        )
-        with torch.no_grad():
-            self.sched_wsum.copy_(sched_wsum_conn)
-            self.sched_counts.copy_(sched_counts_conn)
-
-        gate = intrinsic_gate + sched_wsum_conn
-        weighted_spikes = self.weight() * gate  # [n_conn]
-
-        future_steps = (cur_idx + self.delay_steps).remainder(self.max_delay_steps)
-        flat = future_steps * self.syn_numel + self.post_idx
-
-        self.delivery_buffer.view(-1).index_add_(0, flat, weighted_spikes)
-        if self.track_events:
-            flat_e = future_steps * self.n + self.con_range
-            self.event_queue.view(-1).index_add_(
-                0,
-                flat_e,
-                (intrinsic_gate > 0).to(self.sched_counts.dtype) + sched_counts_conn,
+        if self._has_scheduled_events():
+            sched_wsum_conn, sched_counts_conn = self._scheduled_gate_this_step(
+                self.global_step, use_tri_kernel=False
             )
+            with torch.no_grad():
+                self.sched_wsum.copy_(sched_wsum_conn)
+                self.sched_counts.copy_(sched_counts_conn)
+            gate = intrinsic_gate + sched_wsum_conn
+            if self.track_events:
+                event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
+            else:
+                event_counts = None
+        else:
+            gate = intrinsic_gate
+            if self.track_events:
+                event_counts = (intrinsic_gate > 0).to(torch.int32)
+            else:
+                event_counts = None
 
+        return gate, event_counts
+
+    def _dense_schedule_uniform(self, cur_idx, weighted_spikes, event_counts=None):
+        """Schedule all connections into one future dense delay row."""
+        future = (cur_idx + int(self._dense_uniform_delay_step)).remainder(
+            self.max_delay_steps
+        )
+        flat = future * self._syn_numel + self.post_idx
+        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted_spikes)
+
+        if self.track_events and event_counts is not None:
+            flat_e = future * self._n_conn + self.con_range
+            self.event_queue.view(-1).index_add_(0, flat_e.reshape(-1), event_counts)
+
+    def _dense_schedule_mixed(self, cur_idx, weighted_spikes, event_counts=None):
+        """Schedule all connections using precomputed per-connection offsets."""
+        base = cur_idx * self._syn_numel
+        flat = (base + self.flat_delay_offsets).remainder(self._delivery_numel)
+        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted_spikes)
+
+        if self.track_events and event_counts is not None:
+            base_e = cur_idx * self._n_conn
+            flat_e = (base_e + self.flat_event_offsets).remainder(
+                self._event_queue_numel
+            )
+            self.event_queue.view(-1).index_add_(0, flat_e.reshape(-1), event_counts)
+
+    def _advance_dense_counters(self):
         self.current_time_step.add_(1).remainder_(self.max_delay_steps)
         self.global_step.add_(1)
+
+    def advance_non_diff_dense_uniform(self):
+        """Dense inference hot path for NetCons whose integer delays are uniform."""
+        cur_idx, todays_delivery = self._dense_current_delivery()
+        self._dense_current_events(cur_idx)
+        self.syn.net_receive(todays_delivery.view(*self.syn.shape_f), self)
+        self._dense_clear_current_slot(cur_idx)
+
+        gate, event_counts = self._dense_gate_and_event_counts()
+        weighted_spikes = self.weight() * gate
+        self._dense_schedule_uniform(cur_idx, weighted_spikes, event_counts)
+        self._advance_dense_counters()
+
+    def advance_non_diff_dense_mixed(self):
+        """Dense inference hot path for NetCons with mixed integer delays."""
+        cur_idx, todays_delivery = self._dense_current_delivery()
+        self._dense_current_events(cur_idx)
+        self.syn.net_receive(todays_delivery.view(*self.syn.shape_f), self)
+        self._dense_clear_current_slot(cur_idx)
+
+        gate, event_counts = self._dense_gate_and_event_counts()
+        weighted_spikes = self.weight() * gate
+        self._dense_schedule_mixed(cur_idx, weighted_spikes, event_counts)
+        self._advance_dense_counters()
+
+    def advance_non_diff(self):
+        """
+        Advance the connection state by one non-differentiable timestep.
+
+        This compatibility entry point dispatches to the dense inference hot path
+        selected from precomputed delay metadata.  ``initialize()`` normally
+        binds ``self.advance`` directly to the selected method, so this wrapper
+        is only used by direct callers.
+        """
+        return self._dense_advance_target()()
 
     @torch.no_grad()
     def advance_non_diff_sparse_calendar(self):
@@ -2462,7 +2582,7 @@ class NetCon(Referency):
                 # Since delays are positive-valued by construction, the soonest
                 # discrete delivery is the next timestep.  Clamp protects the
                 # sparse backend from round-to-zero delays.
-                delay_steps = self.delay_steps.index_select(0, con_payload).clamp_min(1)
+                delay_steps = self.inference_delay_steps.index_select(0, con_payload)
                 future_slots = (cur_idx + delay_steps).remainder(self.max_delay_steps)
                 post_payload = self.post_idx.index_select(0, con_payload)
                 self._append_sparse_payloads(future_slots, post_payload, values)
@@ -2473,9 +2593,7 @@ class NetCon(Referency):
             event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
             active_events = torch.nonzero(event_counts != 0, as_tuple=False).flatten()
             if active_events.numel() > 0:
-                delay_steps = self.delay_steps.index_select(0, active_events).clamp_min(
-                    1
-                )
+                delay_steps = self.inference_delay_steps.index_select(0, active_events)
                 future_slots = (cur_idx + delay_steps).remainder(self.max_delay_steps)
                 counts = event_counts.index_select(0, active_events)
                 self._append_sparse_events(future_slots, active_events, counts)
@@ -2720,13 +2838,19 @@ class NetCon(Referency):
         elif self.delay_backend == "sparse_calendar":
             self.advance = self.advance_non_diff_sparse_calendar
         else:
-            self.advance = self.advance_non_diff
+            self.advance = self._dense_advance_target()
         self._ensure_delivery_storage_for_current_mode(clear=False)
         self.zero(clear_delivery_buffers=clear_deliveries)
         self.weight.init(reinit=reinit_weights)
         self.delay_ms.init(reinit=reinit_delays)
         if reinit_delays:
             self._rebuild_delay_buffers()
+            if self.training:
+                self.advance = self.advance_diff
+            elif self.delay_backend == "sparse_calendar":
+                self.advance = self.advance_non_diff_sparse_calendar
+            else:
+                self.advance = self._dense_advance_target()
         with torch.no_grad():
             self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
         self.detach()
