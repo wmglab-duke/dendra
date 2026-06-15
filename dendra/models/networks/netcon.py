@@ -771,6 +771,7 @@ class NetCon(Referency):
         dt,
         pre_var=None,
         max_delay=None,
+        track_events: bool = False,
     ):
         """
         Parameters
@@ -831,6 +832,12 @@ class NetCon(Referency):
             Optional maximum delay (ms). If provided, the internal delay buffer
             depth is set to ``int(max_delay / dt) + 1``; otherwise it is inferred
             from the maximum delay in ``delay``.
+        track_events : bool, optional
+            If True, allocate and maintain the historical ``event_queue`` used
+            for per-connection delivery introspection. If False (default), skip
+            the large ``[max_delay_steps, n_connections]`` int32 queue and keep
+            only the lightweight current-step ``events`` buffer, which is zeroed
+            on each non-differentiable step.
 
         Notes
         -----
@@ -855,6 +862,7 @@ class NetCon(Referency):
 
         self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
         self.max_delay = max_delay
+        self.track_events = bool(track_events)
 
         self.delay_ms = delay
         delay = delay.init().w
@@ -932,12 +940,15 @@ class NetCon(Referency):
             "delivery_buffer",
             torch.zeros(buffer_shape, device=self.device, dtype=self.dtype),
         )
-        self.register_buffer(
-            "event_queue",
-            torch.zeros(
-                (self.max_delay_steps, n_pre), device=self.device, dtype=torch.int32
-            ),
-        )
+        if self.track_events:
+            self.register_buffer(
+                "event_queue",
+                torch.zeros(
+                    (self.max_delay_steps, n_pre),
+                    device=self.device,
+                    dtype=torch.int32,
+                ),
+            )
         self.register_buffer(
             "events", torch.zeros(n_pre, device=self.device, dtype=torch.int32)
         )
@@ -1038,7 +1049,11 @@ class NetCon(Referency):
         self._align_buffer_devices()
 
     def _move_buffer(self, name: str, device: torch.device, dtype=None):
+        if not hasattr(self, name):
+            return
         buf = getattr(self, name)
+        if buf is None:
+            return
         target_dtype = dtype if dtype is not None else buf.dtype
         if buf.device != device or buf.dtype != target_dtype:
             setattr(
@@ -1206,8 +1221,8 @@ class NetCon(Referency):
 
         * recomputes integer delay steps from ``delay_ms()`` and ``dt``,
         * recomputes ``max_delay_steps``,
-        * reallocates the delivery buffer and event queue to match the new
-          depth, and
+        * reallocates the delivery buffer and, when event tracking is enabled,
+          the event queue to match the new depth, and
         * re-aligns all relevant buffers to the correct devices via
           :meth:`_align_buffer_devices`.
         """
@@ -1221,11 +1236,18 @@ class NetCon(Referency):
             self.delivery_buffer = torch.zeros(
                 buffer_shape, device=self.device, dtype=self.dtype
             )
-            self.event_queue = torch.zeros(
-                (self.max_delay_steps, self.n.item()),
-                device=self.device,
-                dtype=torch.int32,
-            )
+            if self.track_events:
+                event_queue = torch.zeros(
+                    (self.max_delay_steps, self.n.item()),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                if "event_queue" in self._buffers:
+                    self.event_queue = event_queue
+                else:
+                    self.register_buffer("event_queue", event_queue)
+            elif "event_queue" in self._buffers:
+                del self._buffers["event_queue"]
             self.time_indices = torch.arange(
                 self.max_delay_steps, device=self.device, dtype=torch.long
             )
@@ -2145,12 +2167,16 @@ class NetCon(Referency):
         """
         cur_idx = self.current_time_step
         todays_delivery = self.delivery_buffer.index_select(0, cur_idx)
-        self.events = self.event_queue.index_select(0, cur_idx).squeeze(0)
+        if self.track_events:
+            self.events.copy_(self.event_queue.index_select(0, cur_idx).squeeze(0))
+        else:
+            self.events.zero_()
         self.syn.net_receive(todays_delivery.squeeze(0).view(*self.syn.shape_f), self)
 
         # clear current row
         self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
-        self.event_queue.index_fill_(0, cur_idx, 0)
+        if self.track_events:
+            self.event_queue.index_fill_(0, cur_idx, 0)
 
         # intrinsic spikes (hard)
         self.determine_spiking(self.pre, diff_spiking=False)
@@ -2174,12 +2200,13 @@ class NetCon(Referency):
         flat = future_steps * self.syn_numel + self.post_idx
 
         self.delivery_buffer.view(-1).index_add_(0, flat, weighted_spikes)
-        flat_e = future_steps * self.n + self.con_range
-        self.event_queue.view(-1).index_add_(
-            0,
-            flat_e,
-            (intrinsic_gate > 0).to(self.sched_counts.dtype) + sched_counts_conn,
-        )
+        if self.track_events:
+            flat_e = future_steps * self.n + self.con_range
+            self.event_queue.view(-1).index_add_(
+                0,
+                flat_e,
+                (intrinsic_gate > 0).to(self.sched_counts.dtype) + sched_counts_conn,
+            )
 
         self.current_time_step.add_(1).remainder_(self.max_delay_steps)
         self.global_step.add_(1)
@@ -2312,8 +2339,8 @@ class NetCon(Referency):
         This method:
 
         * sets ``current_time_step`` to 0,
-        * optionally clears the delivery buffer and event queue state via
-          ``delivery_buffer.zero_()``,
+        * optionally clears the delivery buffer and, when event tracking is
+          enabled, the event queue,
         * resets spike-history buffers (``has_spiked``, ``is_spiking``).
 
         Parameters
@@ -2321,7 +2348,7 @@ class NetCon(Referency):
         clear_delivery_buffers : bool, optional
             If True (default), zero the delivery buffer and reset spike
             histories. If False, keep existing contents of the delay line and
-            event queue, but always reset ``current_time_step`` to 0.
+            optional event queue, but always reset ``current_time_step`` to 0.
 
         Notes
         -----
@@ -2333,6 +2360,9 @@ class NetCon(Referency):
         self.current_time_step.fill_(0)
         if clear_delivery_buffers:
             self.delivery_buffer.zero_()
+            if self.track_events:
+                self.event_queue.zero_()
+            self.events.zero_()
             self.has_spiked.fill_(False)
             self.is_spiking.zero_()  # float buffer, reset to 0.0
 

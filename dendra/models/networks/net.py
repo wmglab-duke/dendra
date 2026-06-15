@@ -450,9 +450,21 @@ class Network(RNGMixin):
         Optional spike generator attached under the name ``netstim``.
     seed : int, optional
         Seed for network-level RNG used in stochastic wiring utilities.
+    track_netcon_events : bool, optional
+        If True, event-based NetCons allocate the historical per-connection
+        ``event_queue`` used for delivery introspection. If False (default),
+        NetCons skip that large debug queue during inference and keep only the
+        lightweight current-step ``events`` buffer.
     """
 
-    def __init__(self, populations: Dict[str, Population], netstim=None, seed=None):
+    def __init__(
+        self,
+        populations: Dict[str, Population],
+        netstim=None,
+        seed=None,
+        *,
+        track_netcon_events: bool = False,
+    ):
         if any(pop.is_batched() for pop in populations.values()):
             raise ValueError(
                 "Batched populations are not supported. Implement your networks with unbatched populations and then call .batch(batch_size)."
@@ -467,6 +479,7 @@ class Network(RNGMixin):
             setattr(self, name, pop)
 
         self.netstim = netstim
+        self.track_netcon_events = bool(track_netcon_events)
 
         self.synapse_spec = {}
         self.synapses = torch.nn.ModuleDict()
@@ -1570,6 +1583,7 @@ class Network(RNGMixin):
                 dt=dt,
                 pre_var=pre_var,
                 max_delay=max_delay_ms,
+                track_events=self.track_netcon_events,
             ).to(device=post_device, dtype=post_dtype)
 
             syn.setreference("t", lambda: self.t)
@@ -2088,7 +2102,11 @@ class Network(RNGMixin):
             n: p for n, p in self.populations.items() if n not in pops_to_concatenate
         }
         new_populations[name] = concatenated
-        new_net = Network(new_populations, netstim=self.netstim)
+        new_net = Network(
+            new_populations,
+            netstim=self.netstim,
+            track_netcon_events=self.track_netcon_events,
+        )
 
         all_indices = indices(concat_pops)
         all_indices = {n: i.flatten() for n, i in zip(pops_to_concatenate, all_indices)}

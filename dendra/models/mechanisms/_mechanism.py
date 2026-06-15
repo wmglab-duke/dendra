@@ -1282,6 +1282,183 @@ class Mechanism(Parameterized):
             states.extend(state_module._state)
         return states
 
+    @staticmethod
+    def _usage_values(values):
+        """Return a stable, duplicate-free list of usage variable names."""
+        if values is None:
+            return []
+        if isinstance(values, str):
+            values = [values]
+        out = []
+        seen = set()
+        for value in values:
+            value = str(value)
+            if value not in seen:
+                seen.add(value)
+                out.append(value)
+        return sorted(out)
+
+    @staticmethod
+    def _format_usage_values(values):
+        values = Mechanism._usage_values(values)
+        return ", ".join(values) if values else "—"
+
+    @staticmethod
+    def _format_source_map(source_map):
+        if not source_map:
+            return "—"
+        parts = []
+        for field in sorted(source_map):
+            local_name = source_map[field]
+            if str(local_name) == f"{field}_source":
+                parts.append(str(field))
+            else:
+                parts.append(f"{field}→{local_name}")
+        return ", ".join(parts) if parts else "—"
+
+    @classmethod
+    def material_usage(cls, *, include_ions=True):
+        """Return structured material/ion dependency metadata for this class.
+
+        Parameters
+        ----------
+        include_ions : bool, default True
+            If True, include ``USEION`` declarations alongside generic
+            ``USEMATERIAL`` declarations.  Ion entries use ``read`` for
+            concentration/reversal/current reads, ``write_current`` for ionic
+            current writes such as ``ica``, and ``write_concentration`` for
+            concentration writes such as ``cai``.
+
+        Returns
+        -------
+        dict
+            A dictionary with ``"materials"`` and, when requested, ``"ions"``
+            entries.  The result is intended for debugging, documentation, and
+            population-build diagnostics; it does not require mechanism
+            instantiation.
+        """
+        materials = {}
+        material_names = set(getattr(cls, "_material", set()) or set())
+        material_names.update((getattr(cls, "_read_material", {}) or {}).keys())
+        material_names.update((getattr(cls, "_write_material", {}) or {}).keys())
+        material_names.update((getattr(cls, "_source_material", {}) or {}).keys())
+
+        for material in sorted(material_names):
+            source_map = dict(
+                (getattr(cls, "_source_material", {}) or {}).get(material, {}) or {}
+            )
+            materials[material] = {
+                "read": Mechanism._usage_values(
+                    (getattr(cls, "_read_material", {}) or {}).get(material, [])
+                ),
+                "write": Mechanism._usage_values(
+                    (getattr(cls, "_write_material", {}) or {}).get(material, [])
+                ),
+                "source": {str(k): str(v) for k, v in sorted(source_map.items())},
+            }
+
+        usage = {"materials": materials}
+
+        if include_ions:
+            ions = {}
+            ion_names = set(getattr(cls, "_ion", set()) or set())
+            ion_names.update((getattr(cls, "_read_ion", {}) or {}).keys())
+            ion_names.update((getattr(cls, "_write_ion", {}) or {}).keys())
+            ion_names.update((getattr(cls, "_write_ion_c", {}) or {}).keys())
+
+            for ion in sorted(ion_names):
+                ions[ion] = {
+                    "read": Mechanism._usage_values(
+                        (getattr(cls, "_read_ion", {}) or {}).get(ion, [])
+                    ),
+                    "write_current": Mechanism._usage_values(
+                        (getattr(cls, "_write_ion", {}) or {}).get(ion, [])
+                    ),
+                    "write_concentration": Mechanism._usage_values(
+                        (getattr(cls, "_write_ion_c", {}) or {}).get(ion, [])
+                    ),
+                }
+            usage["ions"] = ions
+
+        return usage
+
+    @classmethod
+    def material_summary(cls, *, include_ions=True, include_empty=False):
+        """Return a printable summary of Material and Ion usage.
+
+        Parameters
+        ----------
+        include_ions : bool, default True
+            Include ``USEION`` declarations in the summary.  Ions are treated as
+            specialized materials for the purpose of this report.
+        include_empty : bool, default False
+            If True, include empty ``materials`` / ``ions`` blocks even when the
+            mechanism declares none.
+
+        Returns
+        -------
+        str
+            Human-readable multi-line summary.
+
+        Examples
+        --------
+        >>> print(MyMechanism.material_summary())
+        MyMechanism material usage:
+          ions:
+            ca: read=ica, write_concentration=cai
+          materials:
+            ip3: read=ip3i, source=ip3i→j_ip3
+        """
+        usage = cls.material_usage(include_ions=include_ions)
+        label = getattr(cls, "_name", None) or cls.__name__
+        lines = [f"{label} material usage:"]
+
+        ions = usage.get("ions", {}) if include_ions else {}
+        materials = usage.get("materials", {})
+
+        if ions or include_empty:
+            lines.append("  ions:" if ions else "  ions: —")
+            for ion, data in ions.items():
+                parts = []
+                if data.get("read"):
+                    parts.append(f"read={Mechanism._format_usage_values(data['read'])}")
+                if data.get("write_current"):
+                    parts.append(
+                        f"write_current={Mechanism._format_usage_values(data['write_current'])}"
+                    )
+                if data.get("write_concentration"):
+                    parts.append(
+                        "write_concentration="
+                        f"{Mechanism._format_usage_values(data['write_concentration'])}"
+                    )
+                lines.append(f"    {ion}: {', '.join(parts) if parts else '—'}")
+
+        if materials or include_empty:
+            lines.append("  materials:" if materials else "  materials: —")
+            for material, data in materials.items():
+                parts = []
+                if data.get("read"):
+                    parts.append(f"read={Mechanism._format_usage_values(data['read'])}")
+                if data.get("write"):
+                    parts.append(
+                        f"write={Mechanism._format_usage_values(data['write'])}"
+                    )
+                if data.get("source"):
+                    parts.append(
+                        f"source={Mechanism._format_source_map(data['source'])}"
+                    )
+                lines.append(f"    {material}: {', '.join(parts) if parts else '—'}")
+
+        if not ions and not materials and not include_empty:
+            lines.append("  —")
+
+        return "\n".join(lines)
+
+    @classmethod
+    def materials_summary(cls, **kwargs):
+        """Alias for :meth:`material_summary`."""
+        return cls.material_summary(**kwargs)
+
     @classproperty
     def code(cls):
         """
