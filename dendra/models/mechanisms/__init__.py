@@ -1,5 +1,11 @@
 from ._ions import concentrations, equilibria, register_ion
-from ._material_process import DiffusionProcess, MaterialProcess
+from ._material_process import (
+    ClampProcess,
+    ClearanceProcess,
+    DiffusionProcess,
+    ExchangeProcess,
+    MaterialProcess,
+)
 from ._materials import Material, material_defaults, register_material
 from ._mechanism import (
     ContinuousSynapse,
@@ -19,6 +25,9 @@ __all__ = [
     "Material",
     "MaterialProcess",
     "DiffusionProcess",
+    "ClearanceProcess",
+    "ClampProcess",
+    "ExchangeProcess",
     "SpatialOperator1D",
     "solve_tridiagonal_1d",
     "concentrations",

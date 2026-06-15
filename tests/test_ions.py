@@ -184,7 +184,7 @@ def test_ion_initialize_sets_buffers(einit, eadvance):
 def test_ion_advance_updates_nernst(extra: float, intra: float):
     """Dynamic E-reversal tracking & concentration clamping."""
 
-    ion = ions.Ion("na", (1,), None, None, einit=0, eadvance=1, cinit=None)
+    ion = ions.Ion("na", (1,), einit=0, eadvance=1)
 
     # manually plant arbitrary (positive) concentrations
     getattr(ion, "nao")[0] = torch.tensor(extra)
@@ -203,7 +203,7 @@ def test_ion_advance_updates_nernst(extra: float, intra: float):
 
 
 def test_ion_advance_clamps_non_positive():
-    ion = ions.Ion("na", (3,), None, None, einit=0, eadvance=1, cinit=None)
+    ion = ions.Ion("na", (3,), einit=0, eadvance=1)
 
     getattr(ion, "nao").fill_(0.0)  # zero – should be clamped to 1e‑9
     getattr(ion, "nai").fill_(-2.0)  # negative – should be clamped too
@@ -215,7 +215,7 @@ def test_ion_advance_clamps_non_positive():
 
 
 def test_detach_clears_grad_history():
-    ion = ions.Ion("na", (1,), None, None, einit=0, eadvance=0, cinit=None)
+    ion = ions.Ion("na", (1,), einit=0, eadvance=0)
 
     # turn on autograd, then detach
     getattr(ion, "nai").requires_grad_(True)

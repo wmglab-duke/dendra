@@ -5,6 +5,42 @@ import torch._inductor.config as inductor_config
 from ._material_process import MaterialProcess
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
 
+_MATERIAL_PHASE_ALIASES = {
+    "": "post_local",
+    "none": "post_local",
+    "default": "post_local",
+    "postlocal": "post_local",
+    "post_local": "post_local",
+    "after_local": "post_local",
+    "after_reactions": "post_local",
+    "exchange": "post_local",
+    "exchanges": "post_local",
+    "pool_exchange": "post_local",
+    "local_exchange": "post_local",
+    "reaction": "post_local",
+    "reactions": "post_local",
+    "transport": "transport",
+    "spatial": "transport",
+    "diffusion": "transport",
+    "posttransport": "post_transport",
+    "post_transport": "post_transport",
+    "after_transport": "post_transport",
+    "post_diffusion": "post_transport",
+    "after_diffusion": "post_transport",
+    "clamp": "post_transport",
+    "clamps": "post_transport",
+    "post_clamp": "post_transport",
+    "bath": "post_transport",
+    "boundary": "post_transport",
+}
+
+_MATERIAL_PHASE_ORDER = ("post_local", "transport", "post_transport")
+
+
+def _canonical_material_phase(phase) -> str:
+    p = str(phase or "post_local").lower().replace("-", "_")
+    return _MATERIAL_PHASE_ALIASES.get(p, p)
+
 
 def make_scaler(mech, area):
     """
@@ -118,6 +154,8 @@ class MechanismHandler(torch.nn.Module):
 
         for process in self.material_processes.values():
             process.bind_materials(self._get_material, population=population)
+
+        self._material_process_order = self._ordered_material_process_names()
 
         # --- flattened mapping (current-index, mechanism-obj, fn) ------------
         self._map = []
@@ -297,9 +335,28 @@ class MechanismHandler(torch.nn.Module):
                     for s in mech.DE.values():
                         s._buffers[field] = field_value
 
+    def _ordered_material_process_names(self):
+        items = tuple(self.material_processes.items())
+        ordered = []
+        seen = set()
+        for phase in _MATERIAL_PHASE_ORDER:
+            for name, process in items:
+                process_phase = _canonical_material_phase(
+                    getattr(type(process), "_material_process_phase", "post_local")
+                )
+                if process_phase == phase:
+                    ordered.append(name)
+                    seen.add(name)
+        # Preserve insertion order for custom/unrecognized phases.  This keeps
+        # PHASE extensible without silently dropping a process from the scheduler.
+        for name, _process in items:
+            if name not in seen:
+                ordered.append(name)
+        return tuple(ordered)
+
     def advance_material_processes(self, dt):
-        for process in self.material_processes.values():
-            process.advance_materials(dt)
+        for process_name in self._material_process_order:
+            self.material_processes[process_name].advance_materials(dt)
 
     def write_to_ions(self, v):
         for ion, ion_c_write in self.write_ion_c.items():

@@ -19,6 +19,39 @@ class DiffusionSpec:
     domain: str | None = None
 
 
+@dataclass(frozen=True)
+class ClearanceSpec:
+    material: str
+    field: str
+    rate: Any
+    target: Any = 0.0
+    domain: str | None = None
+
+
+@dataclass(frozen=True)
+class ClampSpec:
+    material: str
+    field: str
+    value: Any = 0.0
+    where: Any = "all"
+    mode: str | None = None
+    domain: str | None = None
+
+
+@dataclass(frozen=True)
+class ExchangeSpec:
+    material_a: str
+    field_a: str
+    material_b: str
+    field_b: str
+    rate: Any | None = None
+    conductance: Any | None = None
+    volume_a: Any | None = None
+    volume_b: Any | None = None
+    domain_a: str | None = None
+    domain_b: str | None = None
+
+
 def _canonical_domain(domain: str | None) -> str | None:
     if domain is None:
         return None
@@ -47,6 +80,42 @@ def _copy_method_kwargs(kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
 def _safe_key(index: int, material: str, field: str) -> str:
     raw = f"{index}_{material}_{field}"
     return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in raw)
+
+
+def _material_field_ref(ref, *, field=None) -> tuple[str, str]:
+    """Normalize a material/field reference.
+
+    Accepted forms are ``("ca", "cai")``, ``"ca.cai"``, or a material
+    name such as ``"ca"`` with an optional ``field=...`` override.  If the
+    field is omitted, it defaults to ``f"{material}i"``.
+    """
+    if isinstance(ref, Mapping):
+        material = ref.get("material", ref.get("name", None))
+        field_ = ref.get("field", field)
+        if material is None:
+            raise ValueError(
+                "Material reference mapping must contain 'material' or 'name'."
+            )
+        material = str(material)
+        if field_ is None:
+            field_ = f"{material}i"
+        return material, str(field_)
+
+    if isinstance(ref, (tuple, list)) and len(ref) == 2:
+        return str(ref[0]), str(ref[1])
+
+    if isinstance(ref, str):
+        if "." in ref and field is None:
+            material, field_ = ref.split(".", 1)
+            return str(material), str(field_)
+        material = str(ref)
+        field_ = field if field is not None else f"{material}i"
+        return material, str(field_)
+
+    raise ValueError(
+        "Material field reference must be ('material', 'field'), 'material.field', "
+        "or a material name with field=... ."
+    )
 
 
 class MaterialProcess(Mechanism):
@@ -126,10 +195,975 @@ class MaterialProcess(Mechanism):
     ) -> None:
         self._get_material(material)._buffers[str(field)] = value
 
+    def _resolve_quantity(self, value, like: torch.Tensor, *, what: str = "quantity"):
+        """Resolve a scalar/tensor/process parameter into a tensor like ``like``.
+
+        MaterialProcess subclasses use this for declarations such as
+        ``rate="kclear"`` or ``target="ko_bath"``.  A string first resolves
+        as an attribute, then as a registered buffer, so RANGE/GLOBAL parameters
+        and process-local buffers are both supported.
+        """
+        if isinstance(value, str):
+            if hasattr(self, value):
+                return getattr(self, value).to(device=like.device, dtype=like.dtype)
+            try:
+                return self._buffers[value].to(device=like.device, dtype=like.dtype)
+            except KeyError as exc:
+                raise AttributeError(
+                    f"{type(self).__name__} {self.name!r} expected a parameter/buffer "
+                    f"named {value!r} for {what}. Declare it with RANGE/GLOBAL "
+                    "or pass a scalar/tensor value."
+                ) from exc
+        if torch.is_tensor(value):
+            return value.to(device=like.device, dtype=like.dtype)
+        return torch.as_tensor(value, device=like.device, dtype=like.dtype)
+
     def advance_materials(self, dt):
         raise NotImplementedError(
             f"{type(self).__name__}.advance_materials(dt) must be implemented."
         )
+
+
+class ClearanceProcess(MaterialProcess):
+    """Pointwise first-order clearance/relaxation of full Material fields.
+
+    A ClearanceProcess applies
+
+        c' = -rate * (c - target)
+
+    to one or more population-wide material fields.  It is intended for generic
+    decay, degradation, uptake, bath relaxation, and recovery-to-baseline
+    dynamics that do not require spatial coupling.  The default method is the
+    exact exponential update, which is stable for non-negative rates and fixed
+    targets over the timestep.
+    """
+
+    _clearance_specs: tuple[ClearanceSpec, ...] = tuple()
+    _clearance_declarations = []
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        specs: list[ClearanceSpec] = []
+        for base in reversed(cls.__mro__):
+            if "_clearance_specs" in base.__dict__:
+                specs.extend(list(base._clearance_specs))
+        if ClearanceProcess._clearance_declarations:
+            specs.extend(ClearanceProcess._clearance_declarations)
+            ClearanceProcess._clearance_declarations = []
+        cls._clearance_specs = tuple(specs)
+
+    @staticmethod
+    def CLEAR(material, *, field=None, rate=None, target=0.0, domain=None):
+        """Declare a first-order clearance/relaxation for a material field.
+
+        Parameters
+        ----------
+        material
+            Material name, e.g. ``"ip3"`` or ``"k"``.
+        field
+            Field name, e.g. ``"ip3i"`` or ``"ko"``.  If omitted, defaults to
+            ``f"{material}i"``.
+        rate
+            First-order rate in ``1/ms``.  May be a scalar/tensor or the name of
+            a process parameter, e.g. ``rate="kclear"``.  If omitted, defaults to
+            the parameter name ``"rate"``.
+        target
+            Relaxation target.  May be a scalar/tensor or the name of a process
+            parameter, e.g. ``target="ko_bath"``.
+        domain
+            Optional domain metadata override.  Clearance is pointwise, so the
+            domain is currently validation metadata rather than geometry input.
+        """
+        material = str(material)
+        if field is None:
+            field = f"{material}i"
+        if rate is None:
+            rate = "rate"
+        spec = ClearanceSpec(
+            str(material),
+            str(field),
+            rate,
+            target,
+            None if domain is None else str(domain),
+        )
+        ClearanceProcess._clearance_declarations.append(spec)
+
+    @staticmethod
+    def DECAY(material, *, field=None, rate=None, target=0.0, domain=None):
+        """Alias for :meth:`CLEAR`."""
+        ClearanceProcess.CLEAR(
+            material,
+            field=field,
+            rate=rate,
+            target=target,
+            domain=domain,
+        )
+
+    @staticmethod
+    def RELAX(material, *, field=None, rate=None, target=0.0, domain=None):
+        """Alias for :meth:`CLEAR`."""
+        ClearanceProcess.CLEAR(
+            material,
+            field=field,
+            rate=rate,
+            target=target,
+            domain=domain,
+        )
+
+    def configure_process(self, population=None):
+        if self.key is not None:
+            raise NotImplementedError(
+                "ClearanceProcess MVP must be inserted globally. Region-restricted "
+                "clearance will require explicit masks or restricted process operators."
+            )
+
+        kwargs = _copy_method_kwargs(type(self)._material_process_method_kwargs)
+        method = str(type(self)._material_process_method or "exact").lower()
+        if method in {"none", ""}:
+            method = "exact"
+        aliases = {
+            "exp": "exact",
+            "exponential": "exact",
+            "cnexp": "exact",
+            "rush_larsen": "exact",
+            "be": "implicit",
+            "backward_euler": "implicit",
+            "bwd_euler": "implicit",
+            "forward_euler": "explicit",
+            "euler": "explicit",
+        }
+        self._clearance_method = aliases.get(method, method)
+        if self._clearance_method not in {"exact", "implicit", "explicit"}:
+            raise NotImplementedError(
+                "ClearanceProcess supports METHOD('exact'), METHOD('implicit'), "
+                "and METHOD('explicit')."
+            )
+
+        self._clearance_domain = kwargs.get("domain", None)
+        self._clearance_allow_negative_rate = bool(
+            kwargs.get("allow_negative_rate", False)
+        )
+
+        if not type(self)._clearance_specs:
+            raise ValueError(
+                f"{type(self).__name__} declares no cleared fields. Add "
+                "ClearanceProcess.CLEAR(...)."
+            )
+        self._validate_clearance_specs()
+        return None
+
+    def _effective_clearance_domain(self, material, spec: ClearanceSpec) -> str | None:
+        domain = spec.domain
+        if domain is None:
+            domain = self._clearance_domain
+        if domain is None:
+            try:
+                domain = material.field_spec(spec.field).domain
+            except Exception:
+                domain = None
+        return _canonical_domain(domain)
+
+    def _validate_clearance_specs(self):
+        for spec in type(self)._clearance_specs:
+            material = self._get_material(spec.material)
+            if not material.has_field(spec.field):
+                raise ValueError(
+                    f"Material {spec.material!r} has no field {spec.field!r}. "
+                    f"Available fields: {material.fields}."
+                )
+            # Domain is intentionally not restricted: pointwise clearance can be
+            # applied to intracellular, extracellular, membrane, or custom fields.
+            self._effective_clearance_domain(material, spec)
+
+    def advance_materials(self, dt):
+        dt_t = None
+        for spec in type(self)._clearance_specs:
+            material = self._get_material(spec.material)
+            c = material._buffers[spec.field]
+            rate = self._resolve_quantity(spec.rate, c, what="clearance rate")
+            target = self._resolve_quantity(spec.target, c, what="clearance target")
+
+            if dt_t is None:
+                dt_t = torch.as_tensor(dt, device=c.device, dtype=c.dtype)
+            else:
+                dt_t = dt_t.to(device=c.device, dtype=c.dtype)
+
+            if not self._clearance_allow_negative_rate:
+                rate = torch.clamp_min(rate, 0.0)
+
+            if self._clearance_method == "explicit":
+                c_new = c + dt_t * (-rate * (c - target))
+            elif self._clearance_method == "implicit":
+                c_new = (c + dt_t * rate * target) / (1.0 + dt_t * rate)
+            else:  # exact exponential relaxation
+                c_new = target + (c - target) * torch.exp(-rate * dt_t)
+
+            material._buffers[spec.field] = c_new
+
+
+class ClampProcess(MaterialProcess):
+    """Pointwise hard or bound clamp of full Material fields.
+
+    A ClampProcess imposes an externally prescribed value or bound on one or
+    more population-wide material fields.  It is intended for bath conditions,
+    boundary conditions after transport, fixed experimental fields, and safety
+    bounds that should be applied as a well-defined material-process phase.
+
+    The default phase is ``post_transport`` so a clamp inserted with diffusion
+    behaves like a boundary/bath condition: local reactions run first, transport
+    runs second, and the clamp is imposed last.  Override with
+    ``ClampProcess.PHASE(...)`` if a different ordering is desired.
+    """
+
+    _material_process_phase = "post_transport"
+    _clamp_specs: tuple[ClampSpec, ...] = tuple()
+    _clamp_declarations = []
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        specs: list[ClampSpec] = []
+        for base in reversed(cls.__mro__):
+            if "_clamp_specs" in base.__dict__:
+                specs.extend(list(base._clamp_specs))
+        if ClampProcess._clamp_declarations:
+            specs.extend(ClampProcess._clamp_declarations)
+            ClampProcess._clamp_declarations = []
+        cls._clamp_specs = tuple(specs)
+
+    @staticmethod
+    def PHASE(phase="post_transport"):
+        """ClampProcess defaults to the post-transport material phase."""
+        MaterialProcess.PHASE(phase)
+
+    @staticmethod
+    def CLAMP(material, *, field=None, value=0.0, where="all", mode=None, domain=None):
+        """Declare a clamp for a material field.
+
+        Parameters
+        ----------
+        material
+            Material name, e.g. ``"ip3"``, ``"k"``, or ``"ca"``.
+        field
+            Field name, e.g. ``"ip3i"``, ``"ko"``, or ``"cai"``.  If omitted,
+            defaults to ``f"{material}i"``.
+        value
+            Clamp value or bound.  May be a scalar/tensor or the name of a
+            process parameter/buffer.  For ``mode="range"``, pass a two-element
+            tuple/list ``(lower, upper)`` whose entries may also be parameter
+            names.
+        where
+            Region where the clamp applies.  Supported MVP values include
+            ``"all"``, ``"terminal"``/``"boundary"``, ``"root"``/``"proximal"``,
+            a boolean mask tensor, or an index/slice into the material field.
+        mode
+            ``"set"``/``"hard"`` sets the field to ``value``.  ``"min"`` imposes
+            a lower bound.  ``"max"`` imposes an upper bound.  ``"range"`` imposes
+            lower and upper bounds.
+        domain
+            Optional domain metadata override.  Clamp is pointwise, so this is
+            currently validation/semantic metadata rather than geometry input.
+        """
+        material = str(material)
+        if field is None:
+            field = f"{material}i"
+        spec = ClampSpec(
+            str(material),
+            str(field),
+            value,
+            where,
+            None if mode is None else str(mode),
+            None if domain is None else str(domain),
+        )
+        ClampProcess._clamp_declarations.append(spec)
+
+    @staticmethod
+    def SET(material, *, field=None, value=0.0, where="all", domain=None):
+        """Alias for a hard set clamp."""
+        ClampProcess.CLAMP(
+            material,
+            field=field,
+            value=value,
+            where=where,
+            mode="set",
+            domain=domain,
+        )
+
+    @staticmethod
+    def MIN(material, *, field=None, value=0.0, where="all", domain=None):
+        """Declare a lower-bound clamp: ``field = max(field, value)``."""
+        ClampProcess.CLAMP(
+            material,
+            field=field,
+            value=value,
+            where=where,
+            mode="min",
+            domain=domain,
+        )
+
+    @staticmethod
+    def LOWER(material, *, field=None, value=0.0, where="all", domain=None):
+        """Alias for :meth:`MIN`."""
+        ClampProcess.MIN(material, field=field, value=value, where=where, domain=domain)
+
+    @staticmethod
+    def MAX(material, *, field=None, value=0.0, where="all", domain=None):
+        """Declare an upper-bound clamp: ``field = min(field, value)``."""
+        ClampProcess.CLAMP(
+            material,
+            field=field,
+            value=value,
+            where=where,
+            mode="max",
+            domain=domain,
+        )
+
+    @staticmethod
+    def UPPER(material, *, field=None, value=0.0, where="all", domain=None):
+        """Alias for :meth:`MAX`."""
+        ClampProcess.MAX(material, field=field, value=value, where=where, domain=domain)
+
+    @staticmethod
+    def BOUNDS(
+        material, *, field=None, lower=0.0, upper=None, where="all", domain=None
+    ):
+        """Declare a lower/upper bound clamp.
+
+        ``lower`` and ``upper`` may be scalars/tensors or parameter names.  If
+        ``upper`` is omitted, only the lower bound is applied through ``MIN``.
+
+        This helper is intentionally named ``BOUNDS`` rather than ``RANGE`` so it
+        does not shadow :meth:`Mechanism.RANGE`, which is still used to declare
+        process parameters such as bath values.
+        """
+        if upper is None:
+            ClampProcess.MIN(
+                material, field=field, value=lower, where=where, domain=domain
+            )
+            return
+        ClampProcess.CLAMP(
+            material,
+            field=field,
+            value=(lower, upper),
+            where=where,
+            mode="range",
+            domain=domain,
+        )
+
+    def configure_process(self, population=None):
+        if self.key is not None:
+            raise NotImplementedError(
+                "ClampProcess MVP must be inserted globally. Region-restricted "
+                "clamps should be expressed with the `where=` mask/index argument."
+            )
+
+        kwargs = _copy_method_kwargs(type(self)._material_process_method_kwargs)
+        method = str(type(self)._material_process_method or "set").lower()
+        if method in {"none", ""}:
+            method = "set"
+        aliases = {
+            "hard": "set",
+            "value": "set",
+            "assign": "set",
+            "assignment": "set",
+            "lower": "min",
+            "lower_bound": "min",
+            "minimum": "min",
+            "upper": "max",
+            "upper_bound": "max",
+            "maximum": "max",
+            "bounds": "range",
+            "clip": "range",
+        }
+        self._clamp_method = aliases.get(method, method)
+        if self._clamp_method not in {"set", "min", "max", "range"}:
+            raise NotImplementedError(
+                "ClampProcess supports METHOD('set'), METHOD('min'), "
+                "METHOD('max'), and METHOD('range')."
+            )
+        self._clamp_domain = kwargs.get("domain", None)
+
+        if not type(self)._clamp_specs:
+            raise ValueError(
+                f"{type(self).__name__} declares no clamped fields. Add "
+                "ClampProcess.CLAMP(...)."
+            )
+
+        self._clamp_operator_keys = tuple(
+            _safe_key(i, spec.material, spec.field)
+            for i, spec in enumerate(type(self)._clamp_specs)
+        )
+        self._clamp_mask_names: dict[str, str | None] = {}
+        self._validate_and_configure_clamp_specs(population)
+        return None
+
+    def _effective_clamp_domain(self, material, spec: ClampSpec) -> str | None:
+        domain = spec.domain
+        if domain is None:
+            domain = self._clamp_domain
+        if domain is None:
+            try:
+                domain = material.field_spec(spec.field).domain
+            except Exception:
+                domain = None
+        return _canonical_domain(domain)
+
+    def _effective_clamp_mode(self, spec: ClampSpec) -> str:
+        mode = spec.mode if spec.mode is not None else self._clamp_method
+        mode = str(mode or "set").lower()
+        aliases = {
+            "hard": "set",
+            "value": "set",
+            "assign": "set",
+            "assignment": "set",
+            "lower": "min",
+            "lower_bound": "min",
+            "minimum": "min",
+            "upper": "max",
+            "upper_bound": "max",
+            "maximum": "max",
+            "bounds": "range",
+            "clip": "range",
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in {"set", "min", "max", "range"}:
+            raise NotImplementedError(
+                f"Unsupported clamp mode {mode!r}; expected 'set', 'min', 'max', or 'range'."
+            )
+        return mode
+
+    def _validate_and_configure_clamp_specs(self, population=None):
+        for key, spec in zip(self._clamp_operator_keys, type(self)._clamp_specs):
+            material = self._get_material(spec.material)
+            if not material.has_field(spec.field):
+                raise ValueError(
+                    f"Material {spec.material!r} has no field {spec.field!r}. "
+                    f"Available fields: {material.fields}."
+                )
+            self._effective_clamp_domain(material, spec)
+            self._effective_clamp_mode(spec)
+
+            c = material._buffers[spec.field]
+            mask = self._build_where_mask(spec.where, c, population=population)
+            if mask is None:
+                self._clamp_mask_names[key] = None
+            else:
+                mask_name = f"_clamp_mask_{key}"
+                mask = mask.to(device=c.device, dtype=torch.bool)
+                if mask_name in self._buffers:
+                    self._buffers[mask_name] = mask
+                else:
+                    self.register_buffer(mask_name, mask)
+                self._clamp_mask_names[key] = mask_name
+
+    def _build_where_mask(self, where, like: torch.Tensor, *, population=None):
+        if where is None:
+            return None
+        if isinstance(where, str):
+            w = where.lower().replace("-", "_")
+            if w in {"", "all", "everywhere", "global", "none"}:
+                return None
+            if w in {
+                "terminal",
+                "terminals",
+                "leaf",
+                "leaves",
+                "boundary",
+                "boundaries",
+                "end",
+                "ends",
+            }:
+                return self._terminal_mask(like, population)
+            if w in {"root", "roots", "proximal", "soma"}:
+                return self._root_mask(like, population)
+            if hasattr(self, where):
+                return torch.as_tensor(getattr(self, where), device=like.device).to(
+                    dtype=torch.bool
+                )
+            if where in self._buffers:
+                return self._buffers[where].to(device=like.device, dtype=torch.bool)
+            raise ValueError(
+                f"Unsupported clamp region {where!r}. Use 'all', 'terminal', 'root', "
+                "a boolean mask tensor, or a process buffer/parameter name."
+            )
+        if torch.is_tensor(where):
+            return where.to(device=like.device, dtype=torch.bool)
+        if isinstance(where, bool):
+            return None if where else torch.zeros_like(like, dtype=torch.bool)
+
+        mask = torch.zeros_like(like, dtype=torch.bool)
+        try:
+            if isinstance(where, slice):
+                mask[(..., where)] = True
+            elif isinstance(where, tuple):
+                mask[(...,) + where] = True
+            else:
+                mask[(..., where)] = True
+        except Exception as exc:
+            raise ValueError(
+                f"Could not interpret clamp `where={where!r}` as a mask or index."
+            ) from exc
+        return mask
+
+    def _terminal_mask(self, like: torch.Tensor, population=None):
+        mask = torch.zeros_like(like, dtype=torch.bool)
+        graph = getattr(population, "graph", None) if population is not None else None
+        if graph is not None:
+            graphs = graph if isinstance(graph, (list, tuple)) else [graph]
+            # MaterialProcess MVP is global over one population.  If several
+            # graphs are provided, use the first topology; multi-tree material
+            # processes should get their own packed operator later.
+            g = graphs[0]
+            terminals = [int(n) for n in g.nodes if len(list(g.successors(n))) == 0]
+            if terminals:
+                mask[
+                    ...,
+                    torch.as_tensor(terminals, device=like.device, dtype=torch.long),
+                ] = True
+            return mask
+        if like.shape[-1] == 0:
+            return mask
+        mask[..., 0] = True
+        if like.shape[-1] > 1:
+            mask[..., -1] = True
+        return mask
+
+    def _root_mask(self, like: torch.Tensor, population=None):
+        mask = torch.zeros_like(like, dtype=torch.bool)
+        graph = getattr(population, "graph", None) if population is not None else None
+        if graph is not None:
+            graphs = graph if isinstance(graph, (list, tuple)) else [graph]
+            g = graphs[0]
+            roots = [int(n) for n in g.nodes if len(list(g.predecessors(n))) == 0]
+            if roots:
+                mask[
+                    ..., torch.as_tensor(roots, device=like.device, dtype=torch.long)
+                ] = True
+            return mask
+        if like.shape[-1] > 0:
+            mask[..., 0] = True
+        return mask
+
+    def _broadcast_mask(self, mask, c: torch.Tensor):
+        if mask is None:
+            return None
+        mask = mask.to(device=c.device, dtype=torch.bool)
+        while mask.ndim < c.ndim:
+            mask = mask.unsqueeze(0)
+        return mask.expand_as(c)
+
+    def _apply_clamp_mode(self, c: torch.Tensor, spec: ClampSpec, mode: str):
+        if mode == "range":
+            if not isinstance(spec.value, (tuple, list)) or len(spec.value) != 2:
+                raise ValueError(
+                    "ClampProcess mode='range' requires value=(lower, upper)."
+                )
+            lower = self._resolve_quantity(spec.value[0], c, what="clamp lower bound")
+            upper = self._resolve_quantity(spec.value[1], c, what="clamp upper bound")
+            return torch.maximum(torch.minimum(c, upper), lower)
+
+        value = self._resolve_quantity(spec.value, c, what="clamp value")
+        if mode == "min":
+            return torch.maximum(c, value)
+        if mode == "max":
+            return torch.minimum(c, value)
+        return value + torch.zeros_like(c)
+
+    def advance_materials(self, dt):
+        del dt  # clamps are algebraic process updates
+        for key, spec in zip(self._clamp_operator_keys, type(self)._clamp_specs):
+            material = self._get_material(spec.material)
+            c = material._buffers[spec.field]
+            mode = self._effective_clamp_mode(spec)
+            c_clamped = self._apply_clamp_mode(c, spec, mode)
+            mask_name = self._clamp_mask_names.get(key, None)
+            if mask_name is None:
+                c_new = c_clamped
+            else:
+                mask = self._broadcast_mask(self._buffers[mask_name], c)
+                c_new = torch.where(mask, c_clamped, c)
+            material._buffers[spec.field] = c_new
+
+
+class ExchangeProcess(MaterialProcess):
+    """Conservative pointwise exchange between two full Material fields.
+
+    An ExchangeProcess applies a local two-pool exchange at every compartment::
+
+        V_a * a' = -g * (a - b)
+        V_b * b' =  g * (a - b)
+
+    where ``a`` and ``b`` are concentration-like material fields, ``V_a`` and
+    ``V_b`` are their local mass/volume weights, and ``g`` is an exchange
+    conductance.  If ``rate`` is supplied instead of ``conductance``, Dendra uses
+    ``g = rate * V_a``; thus ``rate`` has units ``1/ms`` and describes the
+    first-order relaxation rate of pool ``a`` toward pool ``b`` when volumes are
+    fixed.
+
+    The default method is the exact closed-form update for fixed ``rate``/``g``
+    and fixed volumes over the timestep.  It preserves ``V_a*a + V_b*b`` up to
+    floating-point roundoff on compartments with positive volumes.
+    """
+
+    _exchange_specs: tuple[ExchangeSpec, ...] = tuple()
+    _exchange_declarations = []
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        specs: list[ExchangeSpec] = []
+        for base in reversed(cls.__mro__):
+            if "_exchange_specs" in base.__dict__:
+                specs.extend(list(base._exchange_specs))
+        if ExchangeProcess._exchange_declarations:
+            specs.extend(ExchangeProcess._exchange_declarations)
+            ExchangeProcess._exchange_declarations = []
+        cls._exchange_specs = tuple(specs)
+
+    @staticmethod
+    def EXCHANGE(
+        a,
+        b,
+        *,
+        field_a=None,
+        field_b=None,
+        rate=None,
+        conductance=None,
+        volume_a=None,
+        volume_b=None,
+        domain_a=None,
+        domain_b=None,
+    ):
+        """Declare conservative exchange between two material fields.
+
+        Parameters
+        ----------
+        a, b
+            Material field references.  Accepted forms are ``("ca", "cai")``,
+            ``"ca.cai"``, or a material name plus ``field_a=...`` /
+            ``field_b=...``.
+        rate
+            First-order rate in ``1/ms``.  Dendra converts this to an exchange
+            conductance via ``g = rate * volume_a``.  If omitted and
+            ``conductance`` is also omitted, defaults to the process parameter
+            name ``"rate"``.
+        conductance
+            Direct exchange conductance in material-volume units per ms.  This
+            is useful when the coupling itself is a geometric/permeability term.
+            Specify either ``rate`` or ``conductance``, not both.
+        volume_a, volume_b
+            Optional mass/volume weights.  May be scalars, tensors, parameter
+            names, or domain names such as ``"intracellular"``.  If omitted,
+            Dendra tries to infer volumes from the material field domain and
+            population geometry; if no compatible geometry is available, unit
+            volumes are used unless ``METHOD(..., require_volumes=True)`` is set.
+        domain_a, domain_b
+            Optional domain metadata overrides.
+        """
+        material_a, field_a_ = _material_field_ref(a, field=field_a)
+        material_b, field_b_ = _material_field_ref(b, field=field_b)
+        if rate is not None and conductance is not None:
+            raise ValueError(
+                "ExchangeProcess.EXCHANGE accepts either rate or conductance, not both."
+            )
+        if rate is None and conductance is None:
+            rate = "rate"
+        spec = ExchangeSpec(
+            material_a,
+            field_a_,
+            material_b,
+            field_b_,
+            rate,
+            conductance,
+            volume_a,
+            volume_b,
+            None if domain_a is None else str(domain_a),
+            None if domain_b is None else str(domain_b),
+        )
+        ExchangeProcess._exchange_declarations.append(spec)
+
+    @staticmethod
+    def COUPLE(*args, **kwargs):
+        """Alias for :meth:`EXCHANGE`."""
+        ExchangeProcess.EXCHANGE(*args, **kwargs)
+
+    @staticmethod
+    def TRANSFER(*args, **kwargs):
+        """Alias for :meth:`EXCHANGE`."""
+        ExchangeProcess.EXCHANGE(*args, **kwargs)
+
+    def configure_process(self, population=None):
+        if self.key is not None:
+            raise NotImplementedError(
+                "ExchangeProcess MVP must be inserted globally. Region-restricted "
+                "exchange should be expressed with masks or region-aware process operators."
+            )
+
+        kwargs = _copy_method_kwargs(type(self)._material_process_method_kwargs)
+        method = str(type(self)._material_process_method or "exact").lower()
+        if method in {"none", ""}:
+            method = "exact"
+        aliases = {
+            "exp": "exact",
+            "exponential": "exact",
+            "closed_form": "exact",
+            "analytic": "exact",
+            "be": "implicit",
+            "backward_euler": "implicit",
+            "bwd_euler": "implicit",
+            "forward_euler": "explicit",
+            "euler": "explicit",
+        }
+        self._exchange_method = aliases.get(method, method)
+        if self._exchange_method not in {"exact", "implicit", "explicit"}:
+            raise NotImplementedError(
+                "ExchangeProcess supports METHOD('exact'), METHOD('implicit'), "
+                "and METHOD('explicit')."
+            )
+        self._exchange_domain = kwargs.get("domain", None)
+        self._exchange_eps = float(kwargs.get("eps", 1e-30))
+        self._exchange_require_volumes = bool(kwargs.get("require_volumes", False))
+        self._exchange_allow_negative_rate = bool(
+            kwargs.get("allow_negative_rate", False)
+        )
+
+        self._configure_exchange_geometry(population)
+
+        if not type(self)._exchange_specs:
+            raise ValueError(
+                f"{type(self).__name__} declares no exchanged fields. Add "
+                "ExchangeProcess.EXCHANGE(...)."
+            )
+        self._validate_exchange_specs()
+        return None
+
+    def _set_exchange_geometry_buffer(self, name: str, value: torch.Tensor) -> None:
+        if name in self._buffers:
+            self._buffers[name] = value
+        else:
+            self.register_buffer(name, value)
+
+    def _configure_exchange_geometry(self, population=None):
+        if population is None:
+            return None
+
+        for name in ("volume", "volume_um3", "volume_i", "volume_o"):
+            if hasattr(population, name):
+                value = getattr(population, name)
+                if torch.is_tensor(value):
+                    self._set_exchange_geometry_buffer(
+                        f"_mp_{name}", value.detach().clone()
+                    )
+
+        if hasattr(population, "dx"):
+            value = getattr(population, "dx")
+            if torch.is_tensor(value):
+                self._set_exchange_geometry_buffer("_mp_dx", value.detach().clone())
+
+        try:
+            area = population.area
+            if torch.is_tensor(area):
+                # Population.area is in cm^2; convert to µm^2 for surface-like
+                # material masses.  This is available for future membrane-domain
+                # processes, but ExchangeProcess does not require it.
+                self._set_exchange_geometry_buffer(
+                    "_mp_area_um2", (area.detach().clone() * 1e8)
+                )
+        except Exception:
+            pass
+        return None
+
+    def _validate_exchange_specs(self):
+        for spec in type(self)._exchange_specs:
+            ma = self._get_material(spec.material_a)
+            mb = self._get_material(spec.material_b)
+            if not ma.has_field(spec.field_a):
+                raise ValueError(
+                    f"Material {spec.material_a!r} has no field {spec.field_a!r}. "
+                    f"Available fields: {ma.fields}."
+                )
+            if not mb.has_field(spec.field_b):
+                raise ValueError(
+                    f"Material {spec.material_b!r} has no field {spec.field_b!r}. "
+                    f"Available fields: {mb.fields}."
+                )
+            if spec.material_a == spec.material_b and spec.field_a == spec.field_b:
+                raise ValueError("ExchangeProcess cannot exchange a field with itself.")
+            self._effective_exchange_domain(ma, spec.field_a, spec.domain_a)
+            self._effective_exchange_domain(mb, spec.field_b, spec.domain_b)
+
+    def _effective_exchange_domain(self, material, field: str, domain: str | None):
+        if domain is None:
+            domain = self._exchange_domain
+        if domain is None:
+            try:
+                domain = material.field_spec(field).domain
+            except Exception:
+                domain = None
+        return _canonical_domain(domain)
+
+    def _geometry_volume_for_domain(
+        self, domain: str | None, like: torch.Tensor, *, what: str
+    ):
+        domain = _canonical_domain(domain) or "unit"
+        device, dtype = like.device, like.dtype
+
+        def _buf(name):
+            return self._buffers[name].to(device=device, dtype=dtype)
+
+        if domain == "intracellular":
+            for name in ("_mp_volume_i", "_mp_volume", "_mp_volume_um3"):
+                if name in self._buffers:
+                    return _buf(name)
+            if "_mp_dx" in self._buffers:
+                dx = _buf("_mp_dx")
+                diam = self.diam.to(device=device, dtype=dtype)
+                return torch.pi * (0.5 * diam) ** 2 * dx
+
+        if domain == "extracellular":
+            if "_mp_volume_o" in self._buffers:
+                return _buf("_mp_volume_o")
+
+        if domain == "membrane":
+            if "_mp_area_um2" in self._buffers:
+                return _buf("_mp_area_um2")
+
+        if self._exchange_require_volumes:
+            raise NotImplementedError(
+                f"Could not infer a volume/mass tensor for {what} with domain {domain!r}. "
+                "Pass volume_a=/volume_b= explicitly, or set "
+                "METHOD(..., require_volumes=False) to use unit volumes."
+            )
+        return torch.ones_like(like)
+
+    def _resolve_exchange_volume(
+        self, value, like: torch.Tensor, *, domain: str | None, what: str
+    ):
+        if value is None:
+            return self._geometry_volume_for_domain(domain, like, what=what)
+
+        if isinstance(value, str):
+            lower = value.lower()
+            domain_words = {
+                "domain",
+                "field",
+                "auto",
+                "i",
+                "inside",
+                "intra",
+                "cytosol",
+                "cytosolic",
+                "intracellular",
+                "o",
+                "outside",
+                "extra",
+                "extracellular",
+                "membrane",
+                "surface",
+                "volume",
+                "volume_i",
+                "volume_um3",
+                "intracellular_volume",
+                "volume_o",
+                "extracellular_volume",
+                "area",
+                "surface_area",
+                "membrane_area",
+            }
+            if lower in {"domain", "field", "auto"}:
+                return self._geometry_volume_for_domain(domain, like, what=what)
+            if lower in {"volume", "volume_um3"}:
+                for name in ("_mp_volume", "_mp_volume_um3", "_mp_volume_i"):
+                    if name in self._buffers:
+                        return self._buffers[name].to(
+                            device=like.device, dtype=like.dtype
+                        )
+                return self._geometry_volume_for_domain(
+                    "intracellular", like, what=what
+                )
+            if lower in {"volume_i", "intracellular_volume"}:
+                return self._geometry_volume_for_domain(
+                    "intracellular", like, what=what
+                )
+            if lower in {"volume_o", "extracellular_volume"}:
+                return self._geometry_volume_for_domain(
+                    "extracellular", like, what=what
+                )
+            if lower in {"area", "surface_area", "membrane_area"}:
+                return self._geometry_volume_for_domain("membrane", like, what=what)
+            if lower in domain_words:
+                return self._geometry_volume_for_domain(value, like, what=what)
+            # Otherwise interpret the string as a RANGE/GLOBAL parameter/buffer name.
+            return self._resolve_quantity(value, like, what=what)
+
+        if torch.is_tensor(value):
+            return value.to(device=like.device, dtype=like.dtype)
+        return torch.as_tensor(value, device=like.device, dtype=like.dtype)
+
+    def _exchange_conductance(
+        self, spec: ExchangeSpec, a: torch.Tensor, Va: torch.Tensor
+    ):
+        if spec.conductance is not None:
+            g = self._resolve_quantity(spec.conductance, a, what="exchange conductance")
+        else:
+            rate = self._resolve_quantity(spec.rate, a, what="exchange rate")
+            if not self._exchange_allow_negative_rate:
+                rate = torch.clamp_min(rate, 0.0)
+            g = rate * Va
+        if not self._exchange_allow_negative_rate:
+            g = torch.clamp_min(g, 0.0)
+        return g
+
+    def advance_materials(self, dt):
+        dt_t = None
+        for spec in type(self)._exchange_specs:
+            ma = self._get_material(spec.material_a)
+            mb = self._get_material(spec.material_b)
+            a = ma._buffers[spec.field_a]
+            b = mb._buffers[spec.field_b]
+
+            if dt_t is None:
+                dt_t = torch.as_tensor(dt, device=a.device, dtype=a.dtype)
+            else:
+                dt_t = dt_t.to(device=a.device, dtype=a.dtype)
+
+            domain_a = self._effective_exchange_domain(ma, spec.field_a, spec.domain_a)
+            domain_b = self._effective_exchange_domain(mb, spec.field_b, spec.domain_b)
+
+            Va = self._resolve_exchange_volume(
+                spec.volume_a, a, domain=domain_a, what="exchange volume_a"
+            )
+            Vb = self._resolve_exchange_volume(
+                spec.volume_b, b, domain=domain_b, what="exchange volume_b"
+            ).to(device=a.device, dtype=a.dtype)
+            b = b.to(device=a.device, dtype=a.dtype)
+
+            eps_t = torch.as_tensor(self._exchange_eps, device=a.device, dtype=a.dtype)
+            Va_safe = torch.clamp_min(Va, eps_t)
+            Vb_safe = torch.clamp_min(Vb, eps_t)
+            active = (Va > eps_t) & (Vb > eps_t)
+
+            g = self._exchange_conductance(spec, a, Va_safe)
+            diff = a - b
+
+            if self._exchange_method == "explicit":
+                flux = g * diff
+                a_new = a - dt_t * flux / Va_safe
+                b_new = b + dt_t * flux / Vb_safe
+            else:
+                lam = g * (1.0 / Va_safe + 1.0 / Vb_safe)
+                if self._exchange_method == "implicit":
+                    diff_new = diff / (1.0 + dt_t * lam)
+                else:  # exact
+                    diff_new = diff * torch.exp(-dt_t * lam)
+                total = Va_safe * a + Vb_safe * b
+                denom = Va_safe + Vb_safe
+                a_new = (total + Vb_safe * diff_new) / denom
+                b_new = (total - Va_safe * diff_new) / denom
+
+            a_new = torch.where(active, a_new, a)
+            b_new = torch.where(active, b_new, b)
+
+            ma._buffers[spec.field_a] = a_new
+            mb._buffers[spec.field_b] = b_new
 
 
 class DiffusionProcess(MaterialProcess):
@@ -148,6 +1182,7 @@ class DiffusionProcess(MaterialProcess):
     spatial operator.
     """
 
+    _material_process_phase = "transport"
     _diffusion_specs: tuple[DiffusionSpec, ...] = tuple()
     _diffusion_declarations = []
 
