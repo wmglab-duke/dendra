@@ -455,6 +455,12 @@ class Network(RNGMixin):
         ``event_queue`` used for delivery introspection. If False (default),
         NetCons skip that large debug queue during inference and keep only the
         lightweight current-step ``events`` buffer.
+    netcon_delay_backend : {"dense", "sparse_calendar"}, optional
+        Delay-line backend for event-based NetCons. ``"dense"`` preserves the
+        current differentiable/dense implementation. ``"sparse_calendar"`` is
+        an inference-only backend that stores pending nonzero deliveries in
+        sparse calendar buckets while preserving the existing ``net_receive``
+        dense-payload API.
     """
 
     def __init__(
@@ -464,6 +470,7 @@ class Network(RNGMixin):
         seed=None,
         *,
         track_netcon_events: bool = False,
+        netcon_delay_backend: Literal["dense", "sparse_calendar"] = "dense",
     ):
         if any(pop.is_batched() for pop in populations.values()):
             raise ValueError(
@@ -480,6 +487,11 @@ class Network(RNGMixin):
 
         self.netstim = netstim
         self.track_netcon_events = bool(track_netcon_events)
+        if netcon_delay_backend not in ("dense", "sparse_calendar"):
+            raise ValueError(
+                "netcon_delay_backend must be either 'dense' or 'sparse_calendar'."
+            )
+        self.netcon_delay_backend = netcon_delay_backend
 
         self.synapse_spec = {}
         self.synapses = torch.nn.ModuleDict()
@@ -1584,6 +1596,7 @@ class Network(RNGMixin):
                 pre_var=pre_var,
                 max_delay=max_delay_ms,
                 track_events=self.track_netcon_events,
+                delay_backend=self.netcon_delay_backend,
             ).to(device=post_device, dtype=post_dtype)
 
             syn.setreference("t", lambda: self.t)
@@ -2106,6 +2119,7 @@ class Network(RNGMixin):
             new_populations,
             netstim=self.netstim,
             track_netcon_events=self.track_netcon_events,
+            netcon_delay_backend=self.netcon_delay_backend,
         )
 
         all_indices = indices(concat_pops)
@@ -2180,6 +2194,16 @@ class Network(RNGMixin):
         for name, pop in self.populations.items():
             self._state_cache[name] = pop.state_dict()
         for name, syn in self.synapses.items():
+            if (
+                getattr(syn, "delay_backend", None) == "sparse_calendar"
+                and not syn.training
+            ):
+                raise RuntimeError(
+                    "Network.cache_state()/steady_state() currently require "
+                    "dense NetCon delivery buffers. Re-run with "
+                    "netcon_delay_backend='dense' for cached or steady-state "
+                    "workflows."
+                )
             self._syn_cache[name] = (
                 syn.dt,
                 syn.has_spiked.clone(),

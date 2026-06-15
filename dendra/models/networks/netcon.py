@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 
 import torch
 
@@ -772,6 +772,7 @@ class NetCon(Referency):
         pre_var=None,
         max_delay=None,
         track_events: bool = False,
+        delay_backend: Literal["dense", "sparse_calendar"] = "dense",
     ):
         """
         Parameters
@@ -838,6 +839,13 @@ class NetCon(Referency):
             the large ``[max_delay_steps, n_connections]`` int32 queue and keep
             only the lightweight current-step ``events`` buffer, which is zeroed
             on each non-differentiable step.
+        delay_backend : {"dense", "sparse_calendar"}, optional
+            Delay-line implementation for non-differentiable inference. The
+            default ``"dense"`` keeps the existing ``[max_delay_steps,
+            syn_numel]`` ring buffer. ``"sparse_calendar"`` stores pending
+            nonzero inference deliveries in Python-side calendar buckets and
+            uses only a reusable one-row dense scratch buffer before calling
+            ``syn.net_receive(...)``. Training always uses the dense backend.
 
         Notes
         -----
@@ -863,6 +871,16 @@ class NetCon(Referency):
         self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
         self.max_delay = max_delay
         self.track_events = bool(track_events)
+        if delay_backend not in ("dense", "sparse_calendar"):
+            raise ValueError(
+                "delay_backend must be either 'dense' or 'sparse_calendar'."
+            )
+        self.delay_backend = delay_backend
+        self._calendar_compact_threshold = 32
+        self._sparse_calendar: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        self._sparse_event_calendar: dict[
+            int, list[tuple[torch.Tensor, torch.Tensor]]
+        ] = {}
 
         self.delay_ms = delay
         delay = delay.init().w
@@ -935,12 +953,19 @@ class NetCon(Referency):
 
         self.max_delay_steps = self._compute_max_delay_steps()
 
-        buffer_shape = (self.max_delay_steps, self.syn_numel.item())
+        # In sparse-calendar inference mode, pending deliveries live in
+        # ``self._sparse_calendar``.  ``delivery_buffer`` is intentionally kept
+        # as a one-row dense scratch buffer so existing synaptic mechanisms can
+        # continue to receive ``syn.net_receive(dense_payload, netcon)``.
+        buffer_depth = (
+            1 if self.delay_backend == "sparse_calendar" else self.max_delay_steps
+        )
+        buffer_shape = (buffer_depth, self.syn_numel.item())
         self.register_buffer(
             "delivery_buffer",
             torch.zeros(buffer_shape, device=self.device, dtype=self.dtype),
         )
-        if self.track_events:
+        if self.track_events and self.delay_backend == "dense":
             self.register_buffer(
                 "event_queue",
                 torch.zeros(
@@ -1166,6 +1191,7 @@ class NetCon(Referency):
         self.dt = self.dt.to(device=self.device, dtype=torch.float32)
         self.weight = self.weight.to(device=self.device, dtype=self.dtype)
         self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
+        self._move_sparse_calendar_to_device()
 
     def to(self, *args, **kwargs):  # type: ignore[override]
         """
@@ -1212,6 +1238,177 @@ class NetCon(Referency):
                 else 1
             )
 
+    def _use_sparse_calendar_runtime(self) -> bool:
+        """Return True when the current initialized mode should use sparse inference."""
+        return (not self.training) and self.delay_backend == "sparse_calendar"
+
+    def _desired_delivery_buffer_depth(self) -> int:
+        """Depth of ``delivery_buffer`` for the current mode.
+
+        Dense training/inference needs one row per delay slot. Sparse-calendar
+        inference keeps only one dense row, used as a scratch receive payload.
+        """
+        return 1 if self._use_sparse_calendar_runtime() else self.max_delay_steps
+
+    def _ensure_delivery_storage_for_current_mode(self, *, clear: bool = False):
+        """Allocate dense delay storage or sparse scratch storage as needed."""
+        desired_depth = self._desired_delivery_buffer_depth()
+        desired_shape = (desired_depth, self._syn_numel)
+
+        if tuple(self.delivery_buffer.shape) != desired_shape:
+            self.delivery_buffer = torch.zeros(
+                desired_shape, device=self.device, dtype=self.dtype
+            )
+        elif clear:
+            self.delivery_buffer.zero_()
+
+        if self._use_sparse_calendar_runtime():
+            if clear:
+                self._clear_sparse_calendar()
+            # The sparse event calendar replaces the dense debug queue in this
+            # mode, even when track_events=True.
+            if "event_queue" in self._buffers:
+                del self._buffers["event_queue"]
+        elif self.track_events and "event_queue" not in self._buffers:
+            self.register_buffer(
+                "event_queue",
+                torch.zeros(
+                    (self.max_delay_steps, self.n.item()),
+                    device=self.device,
+                    dtype=torch.int32,
+                ),
+            )
+
+    def _clear_sparse_calendar(self):
+        """Drop all pending sparse-calendar deliveries and event counts."""
+        self._sparse_calendar.clear()
+        self._sparse_event_calendar.clear()
+
+    def _move_sparse_calendar_to_device(self):
+        """Move Python-side calendar chunks after ``.to(...)`` or device realignment."""
+        if not hasattr(self, "_sparse_calendar"):
+            return
+
+        def move_payload(chunks):
+            return [
+                (
+                    idx.to(device=self.device, dtype=torch.long),
+                    val.to(device=self.device, dtype=self.dtype),
+                )
+                for idx, val in chunks
+            ]
+
+        def move_events(chunks):
+            return [
+                (
+                    idx.to(device=self.device, dtype=torch.long),
+                    cnt.to(device=self.device, dtype=torch.int32),
+                )
+                for idx, cnt in chunks
+            ]
+
+        self._sparse_calendar = {
+            int(slot): move_payload(chunks)
+            for slot, chunks in self._sparse_calendar.items()
+            if len(chunks) > 0
+        }
+        self._sparse_event_calendar = {
+            int(slot): move_events(chunks)
+            for slot, chunks in self._sparse_event_calendar.items()
+            if len(chunks) > 0
+        }
+
+    def _compact_sparse_payload_slot(self, slot: int):
+        chunks = self._sparse_calendar.get(slot)
+        if not chunks or len(chunks) <= 1:
+            return
+        self._sparse_calendar[slot] = [
+            (
+                torch.cat([idx for idx, _ in chunks], dim=0),
+                torch.cat([val for _, val in chunks], dim=0),
+            )
+        ]
+
+    def _compact_sparse_event_slot(self, slot: int):
+        chunks = self._sparse_event_calendar.get(slot)
+        if not chunks or len(chunks) <= 1:
+            return
+        self._sparse_event_calendar[slot] = [
+            (
+                torch.cat([idx for idx, _ in chunks], dim=0),
+                torch.cat([cnt for _, cnt in chunks], dim=0),
+            )
+        ]
+
+    def _append_sparse_payloads(
+        self,
+        future_slots: torch.Tensor,
+        post_idx: torch.Tensor,
+        values: torch.Tensor,
+    ):
+        """Append nonzero dense-payload contributions to sparse calendar buckets."""
+        if values.numel() == 0:
+            return
+
+        for slot in torch.unique(future_slots.detach()).detach().cpu().tolist():
+            slot_i = int(slot)
+            mask = future_slots == slot_i
+            self._sparse_calendar.setdefault(slot_i, []).append(
+                (
+                    post_idx[mask].detach(),
+                    values[mask].detach(),
+                )
+            )
+            if len(self._sparse_calendar[slot_i]) > self._calendar_compact_threshold:
+                self._compact_sparse_payload_slot(slot_i)
+
+    def _append_sparse_events(
+        self,
+        future_slots: torch.Tensor,
+        con_idx: torch.Tensor,
+        counts: torch.Tensor,
+    ):
+        """Append per-connection event counts for optional sparse introspection."""
+        if counts.numel() == 0:
+            return
+
+        for slot in torch.unique(future_slots.detach()).detach().cpu().tolist():
+            slot_i = int(slot)
+            mask = future_slots == slot_i
+            self._sparse_event_calendar.setdefault(slot_i, []).append(
+                (
+                    con_idx[mask].detach(),
+                    counts[mask].detach(),
+                )
+            )
+            if (
+                len(self._sparse_event_calendar[slot_i])
+                > self._calendar_compact_threshold
+            ):
+                self._compact_sparse_event_slot(slot_i)
+
+    def _pop_sparse_calendar_to_dense(self, slot: int) -> torch.Tensor:
+        """Reduce due sparse payload chunks into the reusable dense scratch row."""
+        scratch = self.delivery_buffer.squeeze(0)
+        scratch.zero_()
+        chunks = self._sparse_calendar.pop(slot, None)
+        if chunks:
+            for post_idx, values in chunks:
+                if values.numel() > 0:
+                    scratch.index_add_(0, post_idx, values)
+        return scratch
+
+    def _pop_sparse_events(self, slot: int):
+        """Populate ``self.events`` from sparse event-count chunks due now."""
+        self.events.zero_()
+        if not self.track_events:
+            return
+        chunks = self._sparse_event_calendar.pop(slot, None)
+        if chunks:
+            for con_idx, counts in chunks:
+                if counts.numel() > 0:
+                    self.events.index_add_(0, con_idx, counts)
+
     def _rebuild_delay_buffers(self):
         """
         Rebuild delay-related buffers from the current delay parameters.
@@ -1232,11 +1429,14 @@ class NetCon(Referency):
 
             self.max_delay_steps = self._compute_max_delay_steps()
 
-            buffer_shape = (self.max_delay_steps, self.syn_numel.item())
+            buffer_depth = self._desired_delivery_buffer_depth()
+            buffer_shape = (buffer_depth, self.syn_numel.item())
             self.delivery_buffer = torch.zeros(
                 buffer_shape, device=self.device, dtype=self.dtype
             )
-            if self.track_events:
+            if self._use_sparse_calendar_runtime():
+                self._clear_sparse_calendar()
+            if self.track_events and not self._use_sparse_calendar_runtime():
                 event_queue = torch.zeros(
                     (self.max_delay_steps, self.n.item()),
                     device=self.device,
@@ -2211,6 +2411,78 @@ class NetCon(Referency):
         self.current_time_step.add_(1).remainder_(self.max_delay_steps)
         self.global_step.add_(1)
 
+    @torch.no_grad()
+    def advance_non_diff_sparse_calendar(self):
+        """
+        Advance one inference step using sparse calendar buckets.
+
+        This path preserves the existing ``syn.net_receive(payload, self)``
+        contract by reducing due sparse deliveries into a reusable dense scratch
+        row before delivery.  Unlike :meth:`advance_non_diff`, it does not keep
+        a dense ``[max_delay_steps, syn_numel]`` pending-delivery ring.  Pending
+        future deliveries are stored only as nonzero ``(post_idx, value)``
+        chunks in ``self._sparse_calendar``.
+        """
+        cur_idx = self.current_time_step
+        cur_slot = int(cur_idx.item())
+
+        # 1) Deliver events whose ring slot is due now.  This produces the same
+        # dense payload shape expected by existing synaptic mechanisms.
+        todays_delivery = self._pop_sparse_calendar_to_dense(cur_slot)
+        self._pop_sparse_events(cur_slot)
+        self.syn.net_receive(todays_delivery.view(*self.syn.shape_f), self)
+
+        # 2) Intrinsic spikes / gates (hard, inference-only).
+        self.determine_spiking(self.pre, diff_spiking=False)
+        intrinsic_gate = self.is_spiking.to(
+            device=self.device, dtype=self.dtype
+        )  # [n_conn]
+
+        # 3) Scheduled events still use the existing exact-step aggregator.  A
+        # later optimization can replace this with its own source-event calendar.
+        gs = self.global_step
+        sched_wsum_conn, sched_counts_conn = self._scheduled_gate_this_step(
+            gs, use_tri_kernel=False
+        )
+        self.sched_wsum.copy_(sched_wsum_conn)
+        self.sched_counts.copy_(sched_counts_conn)
+
+        # 4) Schedule only nonzero payloads into future calendar slots.
+        gate = intrinsic_gate + sched_wsum_conn
+        active = torch.nonzero(gate != 0, as_tuple=False).flatten()
+        if active.numel() > 0:
+            gate_a = gate.index_select(0, active)
+            values = self.weight().index_select(0, active) * gate_a
+            keep_payload = values != 0
+            if bool(keep_payload.any()):
+                con_payload = active.index_select(
+                    0, torch.nonzero(keep_payload, as_tuple=False).flatten()
+                )
+                values = values[keep_payload]
+                # Since delays are positive-valued by construction, the soonest
+                # discrete delivery is the next timestep.  Clamp protects the
+                # sparse backend from round-to-zero delays.
+                delay_steps = self.delay_steps.index_select(0, con_payload).clamp_min(1)
+                future_slots = (cur_idx + delay_steps).remainder(self.max_delay_steps)
+                post_payload = self.post_idx.index_select(0, con_payload)
+                self._append_sparse_payloads(future_slots, post_payload, values)
+
+        # 5) Optional per-connection event introspection, without allocating the
+        # dense ``[max_delay_steps, n_conn]`` debug queue.
+        if self.track_events:
+            event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
+            active_events = torch.nonzero(event_counts != 0, as_tuple=False).flatten()
+            if active_events.numel() > 0:
+                delay_steps = self.delay_steps.index_select(0, active_events).clamp_min(
+                    1
+                )
+                future_slots = (cur_idx + delay_steps).remainder(self.max_delay_steps)
+                counts = event_counts.index_select(0, active_events)
+                self._append_sparse_events(future_slots, active_events, counts)
+
+        self.current_time_step.add_(1).remainder_(self.max_delay_steps)
+        self.global_step.add_(1)
+
     def determine_spiking_ns(self, pre: NetStim, diff_spiking: bool = True, tau=None):
         """
         Determine spiking when the pre-synaptic source is a :class:`NetStim`.
@@ -2360,7 +2632,8 @@ class NetCon(Referency):
         self.current_time_step.fill_(0)
         if clear_delivery_buffers:
             self.delivery_buffer.zero_()
-            if self.track_events:
+            self._clear_sparse_calendar()
+            if self.track_events and hasattr(self, "event_queue"):
                 self.event_queue.zero_()
             self.events.zero_()
             self.has_spiked.fill_(False)
@@ -2444,8 +2717,11 @@ class NetCon(Referency):
         """
         if self.training:
             self.advance = self.advance_diff
+        elif self.delay_backend == "sparse_calendar":
+            self.advance = self.advance_non_diff_sparse_calendar
         else:
             self.advance = self.advance_non_diff
+        self._ensure_delivery_storage_for_current_mode(clear=False)
         self.zero(clear_delivery_buffers=clear_deliveries)
         self.weight.init(reinit=reinit_weights)
         self.delay_ms.init(reinit=reinit_delays)
@@ -2489,6 +2765,13 @@ class NetCon(Referency):
           we intentionally omit them. TODO: if they become essential to dynamics,
           they should be handled here, in a way that the user can flag.
         """
+
+        if self._use_sparse_calendar_runtime():
+            raise RuntimeError(
+                "Sparse-calendar NetCon state is stored in Python-side buckets "
+                "and is not supported by state_dict_for_checkpoint() yet. "
+                "Use delay_backend='dense' for checkpointed runs."
+            )
 
         sd: Dict[str, Any] = {
             "delivery_buffer": self.delivery_buffer,
