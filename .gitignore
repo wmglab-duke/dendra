@@ -7,8 +7,8 @@ __pycache__/
 # C extensions
 *.pyd
 *.so
-*.cpp
-*.c
+#*.cpp
+#*.c
 
 # Distribution / packaging
 .Python
@@ -149,3 +149,4 @@ examples/*/*.pkl
 *.zip
 
 frontend/node_modules/
+dendra/models/heterogeneous/*.cpp

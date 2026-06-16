@@ -455,12 +455,14 @@ class Network(RNGMixin):
         ``event_queue`` used for delivery introspection. If False (default),
         NetCons skip that large debug queue during inference and keep only the
         lightweight current-step ``events`` buffer.
-    netcon_delay_backend : {"dense", "sparse_calendar"}, optional
+    netcon_delay_backend : {"dense", "sparse_calendar", "bitpacked_history"}, optional
         Delay-line backend for event-based NetCons. ``"dense"`` preserves the
         current differentiable/dense implementation. ``"sparse_calendar"`` is
         an inference-only backend that stores pending nonzero deliveries in
         sparse calendar buckets while preserving the existing ``net_receive``
-        dense-payload API.
+        dense-payload API. ``"bitpacked_history"`` is an inference-only backend
+        that stores packed source-spike history and reconstructs the dense
+        delivery payload from the static edge list.
     """
 
     def __init__(
@@ -470,7 +472,9 @@ class Network(RNGMixin):
         seed=None,
         *,
         track_netcon_events: bool = False,
-        netcon_delay_backend: Literal["dense", "sparse_calendar"] = "dense",
+        netcon_delay_backend: Literal[
+            "dense", "sparse_calendar", "bitpacked_history"
+        ] = "dense",
     ):
         if any(pop.is_batched() for pop in populations.values()):
             raise ValueError(
@@ -487,9 +491,13 @@ class Network(RNGMixin):
 
         self.netstim = netstim
         self.track_netcon_events = bool(track_netcon_events)
-        if netcon_delay_backend not in ("dense", "sparse_calendar"):
+        if netcon_delay_backend not in (
+            "dense",
+            "sparse_calendar",
+            "bitpacked_history",
+        ):
             raise ValueError(
-                "netcon_delay_backend must be either 'dense' or 'sparse_calendar'."
+                "netcon_delay_backend must be one of 'dense', 'sparse_calendar', or 'bitpacked_history'."
             )
         self.netcon_delay_backend = netcon_delay_backend
 
@@ -2195,7 +2203,8 @@ class Network(RNGMixin):
             self._state_cache[name] = pop.state_dict()
         for name, syn in self.synapses.items():
             if (
-                getattr(syn, "delay_backend", None) == "sparse_calendar"
+                getattr(syn, "delay_backend", None)
+                in ("sparse_calendar", "bitpacked_history")
                 and not syn.training
             ):
                 raise RuntimeError(

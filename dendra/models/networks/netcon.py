@@ -772,7 +772,9 @@ class NetCon(Referency):
         pre_var=None,
         max_delay=None,
         track_events: bool = False,
-        delay_backend: Literal["dense", "sparse_calendar"] = "dense",
+        delay_backend: Literal[
+            "dense", "sparse_calendar", "bitpacked_history"
+        ] = "dense",
     ):
         """
         Parameters
@@ -839,7 +841,7 @@ class NetCon(Referency):
             the large ``[max_delay_steps, n_connections]`` int32 queue and keep
             only the lightweight current-step ``events`` buffer, which is zeroed
             on each non-differentiable step.
-        delay_backend : {"dense", "sparse_calendar"}, optional
+        delay_backend : {"dense", "sparse_calendar", "bitpacked_history"}, optional
             Delay-line implementation for non-differentiable inference. The
             default ``"dense"`` keeps the existing ``[max_delay_steps,
             syn_numel]`` ring buffer, but uses precomputed integer-delay routing
@@ -847,7 +849,11 @@ class NetCon(Referency):
             ``"sparse_calendar"`` backend stores pending nonzero inference
             deliveries in Python-side calendar buckets and uses only a reusable
             one-row dense scratch buffer before calling ``syn.net_receive(...)``.
-            Training always uses the dense backend.
+            ``"bitpacked_history"`` is an inference-only source-spike history
+            backend for large SNNs: it stores only packed source spikes over the
+            delay horizon and reconstructs the dense postsynaptic receive payload
+            with a CUDA extension when available. Training always uses the dense
+            backend.
 
         Notes
         -----
@@ -873,9 +879,9 @@ class NetCon(Referency):
         self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
         self.max_delay = max_delay
         self.track_events = bool(track_events)
-        if delay_backend not in ("dense", "sparse_calendar"):
+        if delay_backend not in ("dense", "sparse_calendar", "bitpacked_history"):
             raise ValueError(
-                "delay_backend must be either 'dense' or 'sparse_calendar'."
+                "delay_backend must be one of 'dense', 'sparse_calendar', or 'bitpacked_history'."
             )
         self.delay_backend = delay_backend
         self._calendar_compact_threshold = 32
@@ -883,6 +889,10 @@ class NetCon(Referency):
         self._sparse_event_calendar: dict[
             int, list[tuple[torch.Tensor, torch.Tensor]]
         ] = {}
+        self._bitpack_bits_per_word = 63
+        self._bitpack_can_use = False
+        self._bitpack_mode = "disabled"
+        self._bitpack_ineligible_reason = None
 
         self.delay_ms = delay
         delay = delay.init().w
@@ -890,6 +900,7 @@ class NetCon(Referency):
         if pre_var is None:
             pre_var = "v"
 
+        self.pre_var = pre_var
         self.get_pre_var = make_getattr(pre_var)
 
         if isinstance(pre, NetStim):
@@ -940,13 +951,15 @@ class NetCon(Referency):
             "Delay tensor shape must match pre_idx."
         )
 
+        # Spike-state buffers are allocated by ``_ensure_spike_state_storage``.
+        # The bitpacked inference backend intentionally avoids persistent
+        # per-connection spike-state buffers.
         self.register_buffer(
-            "has_spiked", torch.zeros(n_pre, device=self.pre_device, dtype=torch.bool)
+            "has_spiked", torch.empty(0, device=self.pre_device, dtype=torch.bool)
         )
-        # Store a *gate* in the same dtype as the rest of the module (float)
         self.register_buffer(
             "is_spiking",
-            torch.zeros(n_pre, device=self.pre_device, dtype=self.pre_dtype),
+            torch.empty(0, device=self.pre_device, dtype=self.pre_dtype),
         )
 
         # --- Delay Handling Logic (Compiler-Friendly) ---
@@ -955,12 +968,27 @@ class NetCon(Referency):
 
         self.max_delay_steps = self._compute_max_delay_steps()
 
-        # In sparse-calendar inference mode, pending deliveries live in
-        # ``self._sparse_calendar``.  ``delivery_buffer`` is intentionally kept
-        # as a one-row dense scratch buffer so existing synaptic mechanisms can
-        # continue to receive ``syn.net_receive(dense_payload, netcon)``.
+        # Build source-level metadata before choosing the inference storage layout.
+        # The bitpacked backend is exact only when intrinsic spiking can be reduced
+        # to one binary event stream per unique presynaptic source.
+        self._rebuild_source_csr_metadata()
+        self._configure_bitpacked_history_metadata()
+        if self.delay_backend == "bitpacked_history" and not self._bitpack_can_use:
+            raise ValueError(
+                "NetCon delay_backend='bitpacked_history' is not exact for this "
+                f"connection: {self._bitpack_ineligible_reason}. "
+                "Use delay_backend='dense' or provide a pre-side binary event "
+                "pre_var / source-consistent threshold."
+            )
+
+        # In sparse-calendar or bitpacked-history inference mode, ``delivery_buffer``
+        # is intentionally kept as a one-row dense scratch buffer so existing
+        # synaptic mechanisms can continue to receive
+        # ``syn.net_receive(dense_payload, netcon)``.
         buffer_depth = (
-            1 if self.delay_backend == "sparse_calendar" else self.max_delay_steps
+            1
+            if self.delay_backend in ("sparse_calendar", "bitpacked_history")
+            else self.max_delay_steps
         )
         buffer_shape = (buffer_depth, self.syn_numel.item())
         self.register_buffer(
@@ -976,8 +1004,13 @@ class NetCon(Referency):
                     dtype=torch.int32,
                 ),
             )
+        event_len = (
+            0
+            if self.delay_backend == "bitpacked_history" and not self.track_events
+            else n_pre
+        )
         self.register_buffer(
-            "events", torch.zeros(n_pre, device=self.device, dtype=torch.int32)
+            "events", torch.zeros(event_len, device=self.device, dtype=torch.int32)
         )
 
         self.register_buffer(
@@ -1011,10 +1044,14 @@ class NetCon(Referency):
             "global_step", torch.tensor([0], device=self.device, dtype=torch.long)
         )
         self._n_conn: int = int(self.pre_idx.numel())  # Python int
-        self.register_buffer(
-            "con_range",
-            torch.arange(self.pre_idx.numel(), device=self.device, dtype=torch.long),
+        con_range = (
+            torch.empty(0, device=self.device, dtype=torch.long)
+            if self.delay_backend == "bitpacked_history" and not self.track_events
+            else torch.arange(
+                self.pre_idx.numel(), device=self.device, dtype=torch.long
+            )
         )
+        self.register_buffer("con_range", con_range)
 
         # Dense inference routing metadata is static between delay rebuilds and
         # avoids recomputing future slots/flat indices every step.
@@ -1055,27 +1092,6 @@ class NetCon(Referency):
             torch.zeros(self._n_conn, device=self.device, dtype=torch.int32),
         )
 
-        # ---- build a pre→conn CSR map once (Python side; outside compiled step) ----
-        with torch.no_grad():
-            # sort connections by pre id
-            vals, order = torch.sort(self.pre_idx)  # both [n_conn]
-            # unique pre ids and run-lengths
-            uniq, counts = torch.unique_consecutive(vals, return_counts=True)
-            starts = torch.cat(
-                [
-                    torch.zeros(1, device=self.device, dtype=torch.long),
-                    counts.cumsum(0)[:-1],
-                ],
-                dim=0,
-            )
-            # store CSR pieces (all tensors on device for convenience)
-            self._csr_pre_ids = (
-                uniq  # [n_pre_used] sorted pre ids (maybe a subset of 0..max)
-            )
-            self._csr_starts = starts  # [n_pre_used]
-            self._csr_counts = counts  # [n_pre_used]
-            self._csr_conidx_sorted = order  # [n_conn]
-
         # Final sanity alignment (important if builder later calls .to()).
         self._align_buffer_devices()
 
@@ -1099,6 +1115,231 @@ class NetCon(Referency):
             setattr(self, name, value)
         else:
             self.register_buffer(name, value)
+
+    def _empty_long(self, device=None):
+        return torch.empty(
+            0, device=device if device is not None else self.device, dtype=torch.long
+        )
+
+    def _empty_bool(self, device=None):
+        return torch.empty(
+            0, device=device if device is not None else self.device, dtype=torch.bool
+        )
+
+    def _empty_dtype(self, device=None):
+        return torch.empty(
+            0, device=device if device is not None else self.device, dtype=self.dtype
+        )
+
+    def _rebuild_source_csr_metadata(self):
+        """Build source→connection CSR metadata shared by scheduling and bitpacking."""
+        with torch.no_grad():
+            pre_idx = self.pre_idx.to(device=self.pre_device, dtype=torch.long)
+            if pre_idx.numel() == 0:
+                empty = torch.empty(0, device=self.pre_device, dtype=torch.long)
+                self._csr_pre_ids = empty
+                self._csr_starts = empty
+                self._csr_counts = empty
+                self._csr_conidx_sorted = empty
+                return
+
+            vals, order = torch.sort(pre_idx)
+            uniq, counts = torch.unique_consecutive(vals, return_counts=True)
+            starts = torch.cat(
+                [
+                    torch.zeros(1, device=self.pre_device, dtype=torch.long),
+                    counts.cumsum(0)[:-1],
+                ],
+                dim=0,
+            )
+            self._csr_pre_ids = uniq
+            self._csr_starts = starts
+            self._csr_counts = counts
+            self._csr_conidx_sorted = order.to(device=self.pre_device, dtype=torch.long)
+
+    def _set_empty_bitpack_buffers(self):
+        """Install empty bitpack buffers so device movement/state inspection is stable."""
+        empty_pre_long = torch.empty(0, device=self.pre_device, dtype=torch.long)
+        empty_dev_long = torch.empty(0, device=self.device, dtype=torch.long)
+        empty_dev_i64 = torch.empty(0, device=self.device, dtype=torch.int64)
+        empty_pre_bool = torch.empty(0, device=self.pre_device, dtype=torch.bool)
+        empty_pre_dtype = torch.empty(0, device=self.pre_device, dtype=self.pre_dtype)
+        self._set_buffer("bitpack_source_pre_idx", empty_pre_long)
+        self._set_buffer("bitpack_source_word_idx", empty_dev_long)
+        self._set_buffer("bitpack_source_bit_mask", empty_dev_i64)
+        self._set_buffer("bitpack_conn_source_pos", empty_dev_long)
+        self._set_buffer("bitpack_conn_word_idx", empty_dev_long)
+        self._set_buffer("bitpack_conn_bit_mask", empty_dev_i64)
+        self._set_buffer("bitpack_source_threshold", empty_pre_dtype)
+        self._set_buffer("bitpack_source_has_spiked", empty_pre_bool)
+        self._set_buffer(
+            "spike_history_packed",
+            torch.empty((0, 0), device=self.device, dtype=torch.int64),
+        )
+
+    def _configure_bitpacked_history_metadata(self):
+        """Validate and allocate metadata for source-level bitpacked inference.
+
+        The backend is exact only when each unique presynaptic source has one
+        binary event stream that can be reused by all outgoing connections.  This
+        is true for NetStim sources, explicit pre-side binary event variables
+        supplied via ``pre_var`` with NaN thresholds, and thresholded variables
+        whose thresholds are source-consistent across all outgoing connections.
+        """
+        self._bitpack_can_use = False
+        self._bitpack_mode = "disabled"
+        self._bitpack_ineligible_reason = None
+        self._set_empty_bitpack_buffers()
+
+        if self.delay_backend != "bitpacked_history":
+            return
+
+        if self.track_events:
+            self._bitpack_ineligible_reason = (
+                "track_events=True needs per-connection delivery history"
+            )
+            return
+        if self.pre_device != self.device:
+            self._bitpack_ineligible_reason = "pre and post/synapse devices differ"
+            return
+        if self.apply_masking:
+            self._bitpack_ineligible_reason = (
+                "mixed finite/NaN thresholds require per-connection gates"
+            )
+            return
+        mode = None
+        source_threshold = torch.empty(0, device=self.pre_device, dtype=self.pre_dtype)
+
+        if isinstance(self.pre, NetStim):
+            mode = "netstim"
+        elif self.skip_thresholding:
+            # ``threshold=None``/NaN means the selected pre variable is already a
+            # gate.  Bitpacking deliberately treats this as a binary pre-side
+            # event stream, so we only allow explicit non-voltage pre variables.
+            if self.pre_var in (None, "v"):
+                self._bitpack_ineligible_reason = "NaN thresholds on the default voltage variable are continuous gates, not binary source spikes"
+                return
+            mode = "pre_var"
+        else:
+            # Thresholded mode is source-level only if all edges from the same
+            # presynaptic source share the same threshold.  This accepts global
+            # uniform thresholds and the slightly more general per-source uniform case.
+            if bool(self.thresh_is_nan.any().item()):
+                self._bitpack_ineligible_reason = "NaN thresholds are present"
+                return
+            if self._csr_pre_ids.numel() == 0:
+                mode = "threshold"
+                source_threshold = torch.empty(
+                    0, device=self.pre_device, dtype=self.pre_dtype
+                )
+            else:
+                order = self._csr_conidx_sorted.to(
+                    device=self.pre_device, dtype=torch.long
+                )
+                thresh_sorted = self.threshold.index_select(0, order).to(self.pre_dtype)
+                starts = self._csr_starts.to(device=self.pre_device, dtype=torch.long)
+                counts = self._csr_counts.to(device=self.pre_device, dtype=torch.long)
+                source_threshold = thresh_sorted.index_select(0, starts)
+                expanded = torch.repeat_interleave(source_threshold, counts)
+                if not bool(torch.all(thresh_sorted == expanded).item()):
+                    self._bitpack_ineligible_reason = "threshold differs across outgoing edges from at least one source"
+                    return
+                mode = "threshold"
+
+        bits = int(self._bitpack_bits_per_word)
+        source_pre_idx = self._csr_pre_ids.to(device=self.pre_device, dtype=torch.long)
+        n_source = int(source_pre_idx.numel())
+        n_words = max(1, (n_source + bits - 1) // bits)
+        source_pos = torch.arange(n_source, device=self.device, dtype=torch.long)
+        source_word_idx = source_pos.div(bits, rounding_mode="floor")
+        source_bit_mask = torch.ones_like(source_pos, dtype=torch.int64) << (
+            source_pos % bits
+        ).to(torch.int64)
+
+        if n_source == 0:
+            conn_source_pos = torch.empty(0, device=self.device, dtype=torch.long)
+        else:
+            conn_source_pos = torch.searchsorted(
+                source_pre_idx.to(device=self.device),
+                self.pre_idx.to(device=self.device, dtype=torch.long),
+            ).to(device=self.device, dtype=torch.long)
+        conn_word_idx = conn_source_pos.div(bits, rounding_mode="floor")
+        conn_bit_mask = torch.ones_like(conn_source_pos, dtype=torch.int64) << (
+            conn_source_pos % bits
+        ).to(torch.int64)
+
+        self._set_buffer("bitpack_source_pre_idx", source_pre_idx)
+        self._set_buffer("bitpack_source_word_idx", source_word_idx)
+        self._set_buffer("bitpack_source_bit_mask", source_bit_mask)
+        self._set_buffer("bitpack_conn_source_pos", conn_source_pos)
+        self._set_buffer("bitpack_conn_word_idx", conn_word_idx)
+        self._set_buffer("bitpack_conn_bit_mask", conn_bit_mask)
+        self._set_buffer(
+            "bitpack_source_threshold",
+            source_threshold.to(device=self.pre_device, dtype=self.pre_dtype),
+        )
+        self._set_buffer(
+            "bitpack_source_has_spiked",
+            torch.zeros(
+                n_source if mode == "threshold" else 0,
+                device=self.pre_device,
+                dtype=torch.bool,
+            ),
+        )
+        self._set_buffer(
+            "spike_history_packed",
+            torch.zeros(
+                (self.max_delay_steps, n_words), device=self.device, dtype=torch.int64
+            ),
+        )
+        self._bitpack_can_use = True
+        self._bitpack_mode = mode
+        self._bitpack_ineligible_reason = None
+
+    def _use_bitpacked_history_runtime(self) -> bool:
+        """Return True when the initialized inference runtime should use bitpacked history."""
+        return (
+            (not self.training)
+            and self.delay_backend == "bitpacked_history"
+            and bool(getattr(self, "_bitpack_can_use", False))
+        )
+
+    def _ensure_connection_spike_buffers(self):
+        """Ensure dense/training paths have per-connection threshold state."""
+        if self.has_spiked.numel() != self._n_conn:
+            self.has_spiked = torch.zeros(
+                self._n_conn, device=self.pre_device, dtype=torch.bool
+            )
+        else:
+            self.has_spiked = self.has_spiked.to(
+                device=self.pre_device, dtype=torch.bool
+            )
+        if self.is_spiking.numel() != self._n_conn:
+            self.is_spiking = torch.zeros(
+                self._n_conn, device=self.pre_device, dtype=self.pre_dtype
+            )
+        else:
+            self.is_spiking = self.is_spiking.to(
+                device=self.pre_device, dtype=self.pre_dtype
+            )
+        if self.con_range.numel() != self._n_conn:
+            self.con_range = torch.arange(
+                self._n_conn, device=self.device, dtype=torch.long
+            )
+        if self.events.numel() != self._n_conn:
+            self.events = torch.zeros(
+                self._n_conn, device=self.device, dtype=torch.int32
+            )
+
+    def _shrink_connection_spike_buffers_for_bitpack(self):
+        """Drop per-connection debug/spike-state buffers in bitpacked inference mode."""
+        if not self._use_bitpacked_history_runtime():
+            return
+        self.has_spiked = torch.empty(0, device=self.pre_device, dtype=torch.bool)
+        self.is_spiking = torch.empty(0, device=self.pre_device, dtype=self.pre_dtype)
+        self.con_range = torch.empty(0, device=self.device, dtype=torch.long)
+        if not self.track_events:
+            self.events = torch.empty(0, device=self.device, dtype=torch.int32)
 
     def _refresh_peer_devices(self):
         """
@@ -1166,6 +1407,9 @@ class NetCon(Referency):
         self._move_buffer("has_spiked", self.pre_device)
         self._move_buffer("is_spiking", self.pre_device, self.pre_dtype)
         self._move_buffer("pre_range", self.pre_device)
+        self._move_buffer("bitpack_source_pre_idx", self.pre_device)
+        self._move_buffer("bitpack_source_threshold", self.pre_device, self.pre_dtype)
+        self._move_buffer("bitpack_source_has_spiked", self.pre_device)
 
         # Buffers that feed the post-synaptic delivery path live with the synapse.
         for name in (
@@ -1176,6 +1420,12 @@ class NetCon(Referency):
             "inference_delay_steps",
             "flat_delay_offsets",
             "flat_event_offsets",
+            "bitpack_conn_source_pos",
+            "bitpack_conn_word_idx",
+            "bitpack_conn_bit_mask",
+            "bitpack_source_word_idx",
+            "bitpack_source_bit_mask",
+            "spike_history_packed",
             "event_queue",
             "events",
             "current_time_step",
@@ -1275,12 +1525,21 @@ class NetCon(Referency):
             inference_delay_steps = delay_steps.clamp_min(1)
 
         post_idx = self.post_idx.to(self.device, dtype=torch.long)
-        con_range = self.con_range.to(self.device, dtype=torch.long)
         syn_numel = int(self._syn_numel)
         n_conn = int(self._n_conn)
 
         flat_delay_offsets = inference_delay_steps * syn_numel + post_idx
-        flat_event_offsets = inference_delay_steps * max(n_conn, 1) + con_range
+        if (
+            getattr(self, "track_events", False)
+            or self.delay_backend != "bitpacked_history"
+        ):
+            if self.con_range.numel() == n_conn:
+                con_range = self.con_range.to(self.device, dtype=torch.long)
+            else:
+                con_range = torch.arange(n_conn, device=self.device, dtype=torch.long)
+            flat_event_offsets = inference_delay_steps * max(n_conn, 1) + con_range
+        else:
+            flat_event_offsets = torch.empty(0, device=self.device, dtype=torch.long)
 
         self._set_buffer("inference_delay_steps", inference_delay_steps)
         self._set_buffer("flat_delay_offsets", flat_delay_offsets)
@@ -1317,9 +1576,17 @@ class NetCon(Referency):
         """Depth of ``delivery_buffer`` for the current mode.
 
         Dense training/inference needs one row per delay slot. Sparse-calendar
-        inference keeps only one dense row, used as a scratch receive payload.
+        and bitpacked-history inference keep only one dense row, used as a
+        scratch receive payload.
         """
-        return 1 if self._use_sparse_calendar_runtime() else self.max_delay_steps
+        return (
+            1
+            if (
+                self._use_sparse_calendar_runtime()
+                or self._use_bitpacked_history_runtime()
+            )
+            else self.max_delay_steps
+        )
 
     def _ensure_delivery_storage_for_current_mode(self, *, clear: bool = False):
         """Allocate dense delay storage or sparse scratch storage as needed."""
@@ -1333,11 +1600,15 @@ class NetCon(Referency):
         elif clear:
             self.delivery_buffer.zero_()
 
-        if self._use_sparse_calendar_runtime():
+        if self._use_sparse_calendar_runtime() or self._use_bitpacked_history_runtime():
             if clear:
                 self._clear_sparse_calendar()
-            # The sparse event calendar replaces the dense debug queue in this
-            # mode, even when track_events=True.
+                if self._use_bitpacked_history_runtime():
+                    self.spike_history_packed.zero_()
+                    if self.bitpack_source_has_spiked.numel() > 0:
+                        self.bitpack_source_has_spiked.zero_()
+            # Sparse-calendar and bitpacked-history modes do not allocate the
+            # dense historical event queue.
             if "event_queue" in self._buffers:
                 del self._buffers["event_queue"]
         elif self.track_events and "event_queue" not in self._buffers:
@@ -1482,6 +1753,156 @@ class NetCon(Referency):
                 if counts.numel() > 0:
                     self.events.index_add_(0, con_idx, counts)
 
+    def _add_sparse_calendar_to_dense(self, slot: int, scratch: torch.Tensor):
+        """Add due sparse side-calendar payloads into an existing dense scratch row."""
+        chunks = self._sparse_calendar.pop(slot, None)
+        if chunks:
+            for post_idx, values in chunks:
+                if values.numel() > 0:
+                    scratch.index_add_(0, post_idx, values)
+
+    def _bitpack_source_spikes_this_step(self) -> torch.Tensor:
+        """Return one binary spike/event value per unique presynaptic source."""
+        if self._bitpack_mode == "netstim":
+            spikes = (
+                self.pre.spikes.to(self.pre_device)
+                .reshape(-1)
+                .index_select(0, self.bitpack_source_pre_idx)
+            )
+            return spikes.to(torch.bool)
+
+        x_full = self.get_pre_var(self.pre)
+        if x_full.device != self.pre_device:
+            x_full = x_full.to(device=self.pre_device)
+        x = x_full.reshape(-1).index_select(0, self.bitpack_source_pre_idx)
+
+        if self._bitpack_mode == "pre_var":
+            # Explicit pre-side event variables are interpreted as binary gates.
+            # bool tensors are used directly; numeric tensors fire when > 0.
+            if x.dtype == torch.bool:
+                return x
+            return x.to(self.pre_dtype) > 0
+
+        if self._bitpack_mode == "threshold":
+            x = x.to(self.pre_dtype)
+            self.bitpack_source_has_spiked, spikes = update_active(
+                self.bitpack_source_has_spiked,
+                x,
+                self.bitpack_source_threshold,
+            )
+            return spikes.to(torch.bool)
+
+        raise RuntimeError("bitpacked_history backend is not configured")
+
+    def _try_bitpack_pack_kernel(
+        self, source_spikes: torch.Tensor, cur_idx: torch.Tensor
+    ) -> bool:
+        if not source_spikes.is_cuda or self.spike_history_packed.dtype != torch.int64:
+            return False
+        try:
+            from . import netcon_bitpack_ops as bitpack_ops
+
+            if not bitpack_ops.is_available():
+                return False
+            bitpack_ops.pack_source_spikes(
+                source_spikes, self.spike_history_packed, cur_idx
+            )
+            return True
+        except Exception:
+            return False
+
+    def _try_bitpack_delivery_kernel(
+        self, cur_idx: torch.Tensor, scratch: torch.Tensor
+    ) -> bool:
+        if not self.spike_history_packed.is_cuda or scratch.dtype not in (
+            torch.float32,
+            torch.float64,
+        ):
+            return False
+        try:
+            from . import netcon_bitpack_ops as bitpack_ops
+
+            if not bitpack_ops.is_available():
+                return False
+            bitpack_ops.build_delivery(
+                self.spike_history_packed,
+                cur_idx,
+                self.inference_delay_steps,
+                self.bitpack_conn_source_pos,
+                self.post_idx,
+                self.weight(),
+                scratch,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _bitpack_pack_source_spikes(
+        self, source_spikes: torch.Tensor, cur_idx: torch.Tensor
+    ):
+        """Pack current source spikes into the current circular history row."""
+        if source_spikes.numel() == 0:
+            slot = int(cur_idx.item())
+            self.spike_history_packed[slot].zero_()
+            return
+        if self._try_bitpack_pack_kernel(source_spikes, cur_idx):
+            return
+
+        # Pure-PyTorch fallback.  This is correct and memory-light in source
+        # space, but the CUDA extension is the intended hot path.
+        slot = int(cur_idx.item())
+        row = self.spike_history_packed[slot]
+        row.zero_()
+        vals = self.bitpack_source_bit_mask * source_spikes.to(torch.int64)
+        row.index_add_(0, self.bitpack_source_word_idx, vals)
+
+    def _bitpack_build_delivery_from_history(
+        self, cur_idx: torch.Tensor, scratch: torch.Tensor
+    ):
+        """Construct today's dense delivery payload from packed source history."""
+        scratch.zero_()
+        if self._n_conn == 0:
+            return scratch
+        if self._try_bitpack_delivery_kernel(cur_idx, scratch):
+            return scratch
+
+        # Pure-PyTorch fallback.  It allocates connection-sized gate/values, so it
+        # is mainly for CPU, tests, and installations where the CUDA extension has
+        # not been built.
+        rows = (cur_idx - self.inference_delay_steps).remainder(self.max_delay_steps)
+        words = self.spike_history_packed[rows.reshape(-1), self.bitpack_conn_word_idx]
+        gate = torch.bitwise_and(words, self.bitpack_conn_bit_mask) != 0
+        values = self.weight() * gate.to(dtype=self.dtype)
+        scratch.index_add_(0, self.post_idx, values)
+        return scratch
+
+    def _bitpack_schedule_due_scheduled_events(self, cur_idx: torch.Tensor):
+        """Route explicit scheduled per-connection events through sparse side buckets."""
+        if not self._has_scheduled_events():
+            return
+
+        sched_wsum_conn, sched_counts_conn = self._scheduled_gate_this_step(
+            self.global_step, use_tri_kernel=False
+        )
+        self.sched_wsum.copy_(sched_wsum_conn)
+        self.sched_counts.copy_(sched_counts_conn)
+
+        active = torch.nonzero(sched_wsum_conn != 0, as_tuple=False).flatten()
+        if active.numel() == 0:
+            return
+        values = self.weight().index_select(0, active) * sched_wsum_conn.index_select(
+            0, active
+        )
+        keep = values != 0
+        if not bool(keep.any()):
+            return
+        active = active.index_select(0, torch.nonzero(keep, as_tuple=False).flatten())
+        values = values[keep]
+        delay_steps = self.inference_delay_steps.index_select(0, active)
+        future_slots = (cur_idx + delay_steps).remainder(self.max_delay_steps)
+        post_payload = self.post_idx.index_select(0, active)
+        self._append_sparse_payloads(future_slots, post_payload, values)
+
     def _rebuild_delay_buffers(self):
         """
         Rebuild delay-related buffers from the current delay parameters.
@@ -1502,15 +1923,31 @@ class NetCon(Referency):
 
             self.max_delay_steps = self._compute_max_delay_steps()
             self._rebuild_dense_delay_metadata()
+            self._configure_bitpacked_history_metadata()
+            if self.delay_backend == "bitpacked_history" and not self._bitpack_can_use:
+                raise ValueError(
+                    "NetCon delay_backend='bitpacked_history' is not exact after delay rebuild: "
+                    f"{self._bitpack_ineligible_reason}."
+                )
 
             buffer_depth = self._desired_delivery_buffer_depth()
             buffer_shape = (buffer_depth, self.syn_numel.item())
             self.delivery_buffer = torch.zeros(
                 buffer_shape, device=self.device, dtype=self.dtype
             )
-            if self._use_sparse_calendar_runtime():
+            if (
+                self._use_sparse_calendar_runtime()
+                or self._use_bitpacked_history_runtime()
+            ):
                 self._clear_sparse_calendar()
-            if self.track_events and not self._use_sparse_calendar_runtime():
+                if self._use_bitpacked_history_runtime():
+                    self.spike_history_packed.zero_()
+                    if self.bitpack_source_has_spiked.numel() > 0:
+                        self.bitpack_source_has_spiked.zero_()
+            if self.track_events and not (
+                self._use_sparse_calendar_runtime()
+                or self._use_bitpacked_history_runtime()
+            ):
                 event_queue = torch.zeros(
                     (self.max_delay_steps, self.n.item()),
                     device=self.device,
@@ -2529,6 +2966,10 @@ class NetCon(Referency):
         binds ``self.advance`` directly to the selected method, so this wrapper
         is only used by direct callers.
         """
+        if self._use_bitpacked_history_runtime():
+            return self.advance_non_diff_bitpacked_history()
+        if self._use_sparse_calendar_runtime():
+            return self.advance_non_diff_sparse_calendar()
         return self._dense_advance_target()()
 
     @torch.no_grad()
@@ -2597,6 +3038,42 @@ class NetCon(Referency):
                 future_slots = (cur_idx + delay_steps).remainder(self.max_delay_steps)
                 counts = event_counts.index_select(0, active_events)
                 self._append_sparse_events(future_slots, active_events, counts)
+
+        self.current_time_step.add_(1).remainder_(self.max_delay_steps)
+        self.global_step.add_(1)
+
+    @torch.no_grad()
+    def advance_non_diff_bitpacked_history(self):
+        """Advance one inference step using bitpacked source-spike history.
+
+        This backend stores one binary spike history per unique presynaptic
+        source, packed into int64 words, rather than storing a dense future
+        delivery row for every delay slot.  Today's dense ``net_receive`` payload
+        is reconstructed from the packed history and the static edge list.
+        """
+        cur_idx = self.current_time_step
+        scratch = self.delivery_buffer.squeeze(0)
+
+        # 1) Reconstruct and deliver all intrinsic delayed source spikes due now.
+        self._bitpack_build_delivery_from_history(cur_idx, scratch)
+
+        # 2) Optional explicit scheduled per-connection events are handled by a
+        # sparse side calendar so they do not force a dense delay buffer.
+        if self._sparse_calendar:
+            self._add_sparse_calendar_to_dense(int(cur_idx.item()), scratch)
+        if self.events.numel() > 0:
+            self.events.zero_()
+        self.syn.net_receive(scratch.view(*self.syn.shape_f), self)
+
+        # 3) Detect current source-level spikes and pack them into the current
+        # history row.  They can be delivered no earlier than the next timestep
+        # because inference_delay_steps is clamped to >= 1.
+        source_spikes = self._bitpack_source_spikes_this_step()
+        self._bitpack_pack_source_spikes(source_spikes, cur_idx)
+
+        # 4) Scheduled events, if present, are evaluated exactly for this global
+        # step and inserted into sparse side buckets after applying NetCon delay.
+        self._bitpack_schedule_due_scheduled_events(cur_idx)
 
         self.current_time_step.add_(1).remainder_(self.max_delay_steps)
         self.global_step.add_(1)
@@ -2722,6 +3199,20 @@ class NetCon(Referency):
 
         self.is_spiking = gate.to(device=self.pre_device, dtype=self.pre_dtype)
 
+    def train(self, mode: bool = True):  # type: ignore[override]
+        super().train(mode)
+        if mode:
+            self._ensure_connection_spike_buffers()
+        else:
+            # ``eval`` is the intended mode for the bitpacked backend.  Reclaim
+            # per-connection debug/spike-state storage as soon as the module enters
+            # inference mode.
+            self._shrink_connection_spike_buffers_for_bitpack()
+        return self
+
+    def eval(self):  # type: ignore[override]
+        return self.train(False)
+
     def zero(self, clear_delivery_buffers=True):
         """
         Reset the per-step state of the connection.
@@ -2751,6 +3242,13 @@ class NetCon(Referency):
         if clear_delivery_buffers:
             self.delivery_buffer.zero_()
             self._clear_sparse_calendar()
+            if hasattr(self, "spike_history_packed"):
+                self.spike_history_packed.zero_()
+            if (
+                hasattr(self, "bitpack_source_has_spiked")
+                and self.bitpack_source_has_spiked.numel() > 0
+            ):
+                self.bitpack_source_has_spiked.zero_()
             if self.track_events and hasattr(self, "event_queue"):
                 self.event_queue.zero_()
             self.events.zero_()
@@ -2834,10 +3332,21 @@ class NetCon(Referency):
           loops in Dendra (e.g., :class:`dendra.models.networks.Network.initialize`).
         """
         if self.training:
+            self._ensure_connection_spike_buffers()
             self.advance = self.advance_diff
+        elif self.delay_backend == "bitpacked_history":
+            if not self._bitpack_can_use:
+                raise ValueError(
+                    "NetCon delay_backend='bitpacked_history' is not exact for this "
+                    f"connection: {self._bitpack_ineligible_reason}."
+                )
+            self.advance = self.advance_non_diff_bitpacked_history
+            self._shrink_connection_spike_buffers_for_bitpack()
         elif self.delay_backend == "sparse_calendar":
+            self._ensure_connection_spike_buffers()
             self.advance = self.advance_non_diff_sparse_calendar
         else:
+            self._ensure_connection_spike_buffers()
             self.advance = self._dense_advance_target()
         self._ensure_delivery_storage_for_current_mode(clear=False)
         self.zero(clear_delivery_buffers=clear_deliveries)
@@ -2846,10 +3355,16 @@ class NetCon(Referency):
         if reinit_delays:
             self._rebuild_delay_buffers()
             if self.training:
+                self._ensure_connection_spike_buffers()
                 self.advance = self.advance_diff
+            elif self.delay_backend == "bitpacked_history":
+                self.advance = self.advance_non_diff_bitpacked_history
+                self._shrink_connection_spike_buffers_for_bitpack()
             elif self.delay_backend == "sparse_calendar":
+                self._ensure_connection_spike_buffers()
                 self.advance = self.advance_non_diff_sparse_calendar
             else:
+                self._ensure_connection_spike_buffers()
                 self.advance = self._dense_advance_target()
         with torch.no_grad():
             self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
@@ -2890,11 +3405,11 @@ class NetCon(Referency):
           they should be handled here, in a way that the user can flag.
         """
 
-        if self._use_sparse_calendar_runtime():
+        if self._use_sparse_calendar_runtime() or self._use_bitpacked_history_runtime():
             raise RuntimeError(
-                "Sparse-calendar NetCon state is stored in Python-side buckets "
-                "and is not supported by state_dict_for_checkpoint() yet. "
-                "Use delay_backend='dense' for checkpointed runs."
+                "Non-dense NetCon runtime state is not supported by "
+                "state_dict_for_checkpoint() yet. Use delay_backend='dense' "
+                "for checkpointed runs."
             )
 
         sd: Dict[str, Any] = {
