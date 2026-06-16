@@ -33,6 +33,8 @@ from dendra.helpers import (
     JIT,
     JIT_NETWORK_OPS,
     JIT_NETWORK_SOLVES,
+    current_device,
+    current_dtype,
     op_mc,
     op_sc,
 )
@@ -220,8 +222,26 @@ class Population(P, Sliceable):
     P.GLOBAL(celsius=37.0)
     P.GLOBALP(rhoa_scale=1.0, cm_scale=1.0, area_scale=1.0)
 
-    def __init__(self, N: int = 1, C: int = 1, integrator=None, v_init=-65.0, **kwargs):
-        super().__init__((N, C), (N, C), **kwargs)
+    def __init__(
+        self,
+        N: int = 1,
+        C: int = 1,
+        integrator=None,
+        v_init=-65.0,
+        *,
+        device=None,
+        dtype=None,
+        **kwargs,
+    ):
+        init_device = (
+            current_device(torch.device("cpu"))
+            if device is None
+            else torch.device(device)
+        )
+        init_dtype = (
+            current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+        )
+        super().__init__((N, C), (N, C), device=init_device, dtype=init_dtype, **kwargs)
         Sliceable.__init__(self)
         self.np = N
         self.nc = C
@@ -234,15 +254,21 @@ class Population(P, Sliceable):
         if integrator is None:
             integrator = bwd_euler_sc()
 
-        self.register_buffer("_dummy", torch.zeros(1))
+        self.register_buffer(
+            "_dummy", torch.zeros(1, device=init_device, dtype=init_dtype)
+        )
 
         # Initialize voltage from scalar v_init or from a vector of length nc.
         # The latter is useful for point-neuron populations represented as a
         # single Dendra population with one compartment per modeled neuron.
         self.register_buffer("v", self.expanded_v_init((N, C)).clone().contiguous())
-        self.register_buffer("diam", torch.full(self.shape, 500.0))
-        self.register_buffer("dx", torch.full(self.shape, 100.0))
-        self.register_buffer("t", torch.zeros(()))
+        self.register_buffer(
+            "diam", torch.full(self.shape, 500.0, device=init_device, dtype=init_dtype)
+        )
+        self.register_buffer(
+            "dx", torch.full(self.shape, 100.0, device=init_device, dtype=init_dtype)
+        )
+        self.register_buffer("t", torch.zeros((), device=init_device, dtype=init_dtype))
 
         # compiler stuff
         self.backend = BACKEND.value
@@ -259,7 +285,10 @@ class Population(P, Sliceable):
         self.initializing_from_state_cache = False
 
         if self.imem:
-            self.register_buffer("i_membrane", torch.zeros(self.shape))
+            self.register_buffer(
+                "i_membrane",
+                torch.zeros(self.shape, device=init_device, dtype=init_dtype),
+            )
         else:
             self.i_membrane = None  # type: ignore
 
@@ -323,9 +352,15 @@ class Population(P, Sliceable):
 
         self._caches = {}
 
-        self.register_buffer("x", torch.zeros(self.shape))
-        self.register_buffer("y", torch.zeros(self.shape))
-        self.register_buffer("z", torch.zeros(self.shape))
+        self.register_buffer(
+            "x", torch.zeros(self.shape, device=init_device, dtype=init_dtype)
+        )
+        self.register_buffer(
+            "y", torch.zeros(self.shape, device=init_device, dtype=init_dtype)
+        )
+        self.register_buffer(
+            "z", torch.zeros(self.shape, device=init_device, dtype=init_dtype)
+        )
 
         self.mech: MechanismHandler = None  # type: ignore
 

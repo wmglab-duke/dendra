@@ -269,12 +269,16 @@ class MultiPopulation(Population):
             else v_init
         )
 
+        init_device = next(iter(devices))
+        init_dtype = next(iter(dtypes))
         super().__init__(
             1,
             C,
             integrator=integrator,
             celsius=celsius,
             v_init=composite_v_init,
+            device=init_device,
+            dtype=init_dtype,
         )
 
         self.populations = torch.nn.ModuleDict(populations)

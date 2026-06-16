@@ -8,7 +8,7 @@ from typing import Callable, Union
 import torch
 import torch.nn.functional as F
 
-from dendra.helpers import DEBUG, REQUIRE_GRAD, logger
+from dendra.helpers import DEBUG, REQUIRE_GRAD, current_device, current_dtype, logger
 from dendra.utils import PreparedInterp1d
 from dendra.utils.dynamic_compilation import compile_generated_function
 
@@ -18,7 +18,9 @@ from .rng import RNGModule
 _valid_param_type = Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
 
 
-def to_param(val, positive=False, negative=False, requires_grad=None):
+def to_param(
+    val, positive=False, negative=False, requires_grad=None, *, device=None, dtype=None
+):
     """
     Convert a value into a parameter-like object.
 
@@ -45,7 +47,15 @@ def to_param(val, positive=False, negative=False, requires_grad=None):
         return val
     if isinstance(val, torch.nn.Module):
         return val
-    val = torch.as_tensor(val, dtype=torch.float32)
+    target_device = current_device(None) if device is None else torch.device(device)
+    target_dtype = (
+        current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+    )
+    val = torch.as_tensor(
+        val,
+        device=target_device,
+        dtype=target_dtype,
+    )
     if positive:
         val = torch.clamp(val, min=0.0)
         return PositiveParam(val)
@@ -1755,8 +1765,25 @@ class Parameterized(SimpleParameterized):
             {func: {"low": low, "high": high, "n": n, "learnable": learnable}}
         )
 
-    def __init__(self, shape, shape_f, additional_parameters=None, **kwargs):
+    def __init__(
+        self,
+        shape,
+        shape_f,
+        additional_parameters=None,
+        *,
+        device=None,
+        dtype=None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
+        self._init_device = (
+            current_device(torch.device("cpu"))
+            if device is None
+            else torch.device(device)
+        )
+        self._init_dtype = (
+            current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+        )
         try:
             shape_p = [int(s) for s in shape]
             shape_f = [int(s) for s in shape_f]
@@ -1881,15 +1908,33 @@ class Parameterized(SimpleParameterized):
                         setattr(
                             self,
                             pname,
-                            to_param(pval, positive=positive, negative=negative),
+                            to_param(
+                                pval,
+                                positive=positive,
+                                negative=negative,
+                                device=self._init_device,
+                                dtype=self._init_dtype,
+                            ),
                         )
                         getattr(self, name)[pname] = getattr(self, pname)
                 else:
                     p_name = f"{name}_param"
                     self._refresh_and_set(
-                        p_name, to_param(value, positive=positive, negative=negative)
+                        p_name,
+                        to_param(
+                            value,
+                            positive=positive,
+                            negative=negative,
+                            device=self._init_device,
+                            dtype=self._init_dtype,
+                        ),
                     )
-                    self.register_buffer(name, torch.empty(()))
+                    self.register_buffer(
+                        name,
+                        torch.empty(
+                            (), device=self._init_device, dtype=self._init_dtype
+                        ),
+                    )
                     getattr(self, name).copy_(self.evaluate(p_name))
 
     def _batch_shape(self):
@@ -1929,9 +1974,21 @@ class Parameterized(SimpleParameterized):
             for name, value in kwargs.items():
                 p_name = f"{name}_param"
                 self._refresh_and_set(
-                    p_name, to_param(value, positive=positive, negative=negative)
+                    p_name,
+                    to_param(
+                        value,
+                        positive=positive,
+                        negative=negative,
+                        device=self._init_device,
+                        dtype=self._init_dtype,
+                    ),
                 )
-                self.register_buffer(name, torch.empty(self.shape_p))
+                self.register_buffer(
+                    name,
+                    torch.empty(
+                        self.shape_p, device=self._init_device, dtype=self._init_dtype
+                    ),
+                )
                 getattr(self, name).copy_(self.evaluate(p_name))
 
     def instantiate_batch(self, positive=False, negative=False, **kwargs):
@@ -1949,9 +2006,21 @@ class Parameterized(SimpleParameterized):
             for name, value in kwargs.items():
                 p_name = f"{name}_param"
                 self._refresh_and_set(
-                    p_name, to_param(value, positive=positive, negative=negative)
+                    p_name,
+                    to_param(
+                        value,
+                        positive=positive,
+                        negative=negative,
+                        device=self._init_device,
+                        dtype=self._init_dtype,
+                    ),
                 )
-                self.register_buffer(name, torch.empty(batch_shape))
+                self.register_buffer(
+                    name,
+                    torch.empty(
+                        batch_shape, device=self._init_device, dtype=self._init_dtype
+                    ),
+                )
                 getattr(self, name).copy_(self.evaluate(p_name))
 
     def instantiate_rng(self, **kwargs):

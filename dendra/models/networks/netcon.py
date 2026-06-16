@@ -39,6 +39,10 @@ class ContinuousCon(Referency):
         max_delay=None,
         transform=None,
         reset_inputs=False,
+        device=None,
+        dtype=None,
+        pre_device=None,
+        pre_dtype=None,
     ):
         super().__init__()
         self.weight = weight
@@ -57,9 +61,11 @@ class ContinuousCon(Referency):
         # deliveries.  ContinuousCon therefore has no per-step reset branch.
         self._reset_inputs = False
 
-        self._refresh_peer_devices()
-        self.weight = self.weight.to(device=self.device)
-        self.delay_ms = self.delay_ms.to(device=self.device)
+        self._refresh_peer_devices(
+            device=device, dtype=dtype, pre_device=pre_device, pre_dtype=pre_dtype
+        )
+        self.weight = self.weight.to(device=self.device, dtype=self.dtype)
+        self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
         if isinstance(self.transform, torch.nn.Module):
             self.transform = self.transform.to(device=self.device, dtype=self.dtype)
 
@@ -122,18 +128,22 @@ class ContinuousCon(Referency):
     # Device / dtype bookkeeping
     # ------------------------------------------------------------------
 
-    def _refresh_peer_devices(self):
-        pre_device = self.pre.device()
-        pre_dtype = self.pre.dtype()
+    def _refresh_peer_devices(
+        self, *, device=None, dtype=None, pre_device=None, pre_dtype=None
+    ):
+        actual_pre_device = self.pre.device()
+        actual_pre_dtype = self.pre.dtype()
         post_device = self.post.device()
         post_dtype = self.post.dtype()
         syn_device = self.syn.device() if hasattr(self.syn, "device") else post_device
 
-        self.pre_device = pre_device
-        self.pre_dtype = pre_dtype
+        self.pre_device = (
+            torch.device(pre_device) if pre_device is not None else actual_pre_device
+        )
+        self.pre_dtype = pre_dtype if pre_dtype is not None else actual_pre_dtype
         self.post_device = post_device
-        self.device = syn_device
-        self.dtype = post_dtype
+        self.device = torch.device(device) if device is not None else syn_device
+        self.dtype = dtype if dtype is not None else post_dtype
 
     def _move_buffer(self, name, device, dtype=None):
         if not hasattr(self, name):
@@ -775,6 +785,10 @@ class NetCon(Referency):
         delay_backend: Literal[
             "dense", "sparse_calendar", "bitpacked_history"
         ] = "dense",
+        device=None,
+        dtype=None,
+        pre_device=None,
+        pre_dtype=None,
     ):
         """
         Parameters
@@ -870,11 +884,13 @@ class NetCon(Referency):
         self.post = post
 
         # Track peer devices/dtypes and keep NetCon buffers aligned with them.
-        self._refresh_peer_devices()
+        self._refresh_peer_devices(
+            device=device, dtype=dtype, pre_device=pre_device, pre_dtype=pre_dtype
+        )
 
         # Ensure parameter modules live on the delivery (post/synapse) device.
-        self.weight = self.weight.to(device=self.device)
-        delay = delay.to(device=self.device)
+        self.weight = self.weight.to(device=self.device, dtype=self.dtype)
+        delay = delay.to(device=self.device, dtype=self.dtype)
 
         self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
         self.max_delay = max_delay
@@ -1404,47 +1420,43 @@ class NetCon(Referency):
         if not self.track_events:
             self.events = torch.empty(0, device=self.device, dtype=torch.int32)
 
-    def _refresh_peer_devices(self):
+    def _refresh_peer_devices(
+        self, *, device=None, dtype=None, pre_device=None, pre_dtype=None
+    ):
         """
         Inspect the pre/post/synapse modules and record their devices and dtypes.
 
-        This method is called at construction and by :meth:`to` to ensure that
-        ``NetCon`` keeps an up-to-date view of:
-
-        * the device/dtype of the pre-synaptic population,
-        * the device/dtype of the post-synaptic population, and
-        * the device/dtype of the synapse mechanism (which defines the main
-          computation device for delivery buffers).
-
-        Returns
-        -------
-        pre_changed : bool
-            True if the pre-synaptic device or dtype has changed since the last
-            call.
-        post_changed : bool
-            True if the synapse/post device or dtype has changed since the last
-            call.
+        Constructor-supplied ``device``/``dtype`` are used only to avoid
+        constructing large NetCon buffers on an intermediate device. Later
+        calls from ``to(...)`` omit these overrides and follow the peer modules.
         """
-        pre_device = self.pre.device()
-        pre_dtype = self.pre.dtype()
+        actual_pre_device = self.pre.device()
+        actual_pre_dtype = self.pre.dtype()
         post_device = self.post.device()
         post_dtype = self.post.dtype()
         syn_device = self.syn.device() if hasattr(self.syn, "device") else post_device
 
+        target_pre_device = (
+            torch.device(pre_device) if pre_device is not None else actual_pre_device
+        )
+        target_pre_dtype = pre_dtype if pre_dtype is not None else actual_pre_dtype
+        target_device = torch.device(device) if device is not None else syn_device
+        target_dtype = dtype if dtype is not None else post_dtype
+
         pre_changed = (
-            getattr(self, "pre_device", None) != pre_device
-            or getattr(self, "pre_dtype", None) != pre_dtype
+            getattr(self, "pre_device", None) != target_pre_device
+            or getattr(self, "pre_dtype", None) != target_pre_dtype
         )
         post_changed = (
-            getattr(self, "device", None) != syn_device
-            or getattr(self, "dtype", None) != post_dtype
+            getattr(self, "device", None) != target_device
+            or getattr(self, "dtype", None) != target_dtype
         )
 
-        self.pre_device = pre_device
-        self.pre_dtype = pre_dtype
+        self.pre_device = target_pre_device
+        self.pre_dtype = target_pre_dtype
         self.post_device = post_device
-        self.device = syn_device
-        self.dtype = post_dtype
+        self.device = target_device
+        self.dtype = target_dtype
 
         return pre_changed, post_changed
 

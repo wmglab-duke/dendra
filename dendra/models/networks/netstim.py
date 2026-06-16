@@ -5,6 +5,8 @@ from typing import Optional
 
 import torch
 
+from dendra.helpers import current_device, current_dtype
+
 from ..modular import DNModule
 from ..parametric import PositiveParam
 from ..slice import Sliceable
@@ -113,9 +115,19 @@ class NetStim(DNModule, Sliceable):
         max_spikes: int | Iterable[int] = 1e9,
         tau: float = 0.1,
         seed: Optional[int] = None,
+        device=None,
+        dtype=None,
     ):
         super().__init__()
         Sliceable.__init__(self)
+        init_device = (
+            current_device(torch.device("cpu"))
+            if device is None
+            else torch.device(device)
+        )
+        init_dtype = (
+            current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+        )
         interval_t, start_t, noise_t, max_spikes_t, shape = (
             self._canonicalize_parameters(
                 N=N,
@@ -123,6 +135,8 @@ class NetStim(DNModule, Sliceable):
                 start=start,
                 noise=noise,
                 max_spikes=max_spikes,
+                device=init_device,
+                dtype=init_dtype,
             )
         )
         self.name = "netstim"
@@ -144,19 +158,29 @@ class NetStim(DNModule, Sliceable):
 
         # ——— split clocks: stochastic vs scheduled ———
         self.register_buffer(
-            "next_stoch_time", torch.zeros(self.shape)
+            "next_stoch_time",
+            torch.zeros(self.shape, device=init_device, dtype=init_dtype),
         )  # stochastic process
         self.register_buffer(
-            "next_sched_time", torch.full(self.shape, float("inf"))
+            "next_sched_time",
+            torch.full(self.shape, float("inf"), device=init_device, dtype=init_dtype),
         )  # next explicit spike or +inf
 
-        self.register_buffer("spike_counts", torch.zeros(self.shape, dtype=torch.long))
-        self.register_buffer("spikes", torch.zeros(self.shape, dtype=torch.bool))
         self.register_buffer(
-            "t_last", torch.full(self.shape, -float("inf"))
+            "spike_counts",
+            torch.zeros(self.shape, device=init_device, dtype=torch.long),
+        )
+        self.register_buffer(
+            "spikes", torch.zeros(self.shape, device=init_device, dtype=torch.bool)
+        )
+        self.register_buffer(
+            "t_last",
+            torch.full(self.shape, -float("inf"), device=init_device, dtype=init_dtype),
         )  # last time seen in forward(), per state element
 
-        self.spike_gate = torch.zeros(self.shape)  # differentiable spike gate
+        self.spike_gate = torch.zeros(
+            self.shape, device=init_device, dtype=init_dtype
+        )  # differentiable spike gate
 
         # Per-state-element min-heaps of future scheduled times (CPU metadata).
         # The flat order is row-major over ``self.shape``; the last dimension is
@@ -181,16 +205,18 @@ class NetStim(DNModule, Sliceable):
         start,
         noise,
         max_spikes,
+        device=None,
+        dtype=torch.float32,
     ):
         if N <= 0:
             raise ValueError(
                 "Number of independent event generators (N) must be positive."
             )
 
-        interval_t = torch.as_tensor(interval, dtype=torch.float32)
-        start_t = torch.as_tensor(start, dtype=torch.float32)
-        noise_t = torch.as_tensor(noise, dtype=torch.float32)
-        max_spikes_t = torch.as_tensor(max_spikes, dtype=torch.long)
+        interval_t = torch.as_tensor(interval, device=device, dtype=dtype)
+        start_t = torch.as_tensor(start, device=device, dtype=dtype)
+        noise_t = torch.as_tensor(noise, device=device, dtype=dtype)
+        max_spikes_t = torch.as_tensor(max_spikes, device=device, dtype=torch.long)
 
         try:
             shape = torch.broadcast_shapes(

@@ -45,6 +45,10 @@ class ctx(contextlib.ContextDecorator):
     - ``COMPILE_MODE`` (str): torch.compile mode (e.g., ``\"default\"``).
     - ``DEBUG`` (int/bool): increase logging verbosity for mechanism/state
       compilation (symbolic transforms, conductance differentiation).
+    - ``DEVICE`` (str/torch.device/None): default device for newly constructed
+      Dendra modules that honor context placement.
+    - ``DTYPE`` (str/torch.dtype/None): optional default floating dtype for newly
+      constructed Dendra modules that honor context placement.
     - ``IMEM`` (int/bool): whether integrators compute/store ``i_membrane``
       in populations (required for LFP calculations).
     - ``USETABLES`` (int/bool): toggle lookup tables declared via ``TABLE`` on
@@ -112,6 +116,57 @@ class ContextVar:
         return self.value <= x
 
 
+_DEVICE_DEFAULT_SENTINELS = {"", "none", "null", "default"}
+_DTYPE_DEFAULT_SENTINELS = {"", "none", "null", "default"}
+
+
+def _normalize_device_value(value, default=None):
+    """Normalize a Dendra device context value to ``torch.device`` or default."""
+    if value is None:
+        return default
+    if isinstance(value, torch.device):
+        return value
+    if isinstance(value, str):
+        v = value.strip()
+        if v.lower() in _DEVICE_DEFAULT_SENTINELS:
+            return default
+        return torch.device(v)
+    return torch.device(value)
+
+
+def _normalize_dtype_value(value, default=None):
+    """Normalize a Dendra dtype context value to ``torch.dtype`` or default."""
+    if value is None:
+        return default
+    if isinstance(value, torch.dtype):
+        return value
+    if isinstance(value, str):
+        v = value.strip()
+        if v.lower() in _DTYPE_DEFAULT_SENTINELS:
+            return default
+        v = v.removeprefix("torch.")
+        if not hasattr(torch, v):
+            raise ValueError(
+                f"Unknown torch dtype {value!r}. Expected e.g. 'float32', "
+                "'float64', 'bfloat16', or a torch.dtype object."
+            )
+        dtype = getattr(torch, v)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"torch.{v} is not a dtype")
+        return dtype
+    raise TypeError(f"Unsupported dtype context value {value!r}")
+
+
+def current_device(default=None):
+    """Return the active Dendra default device, or ``default`` when unset."""
+    return _normalize_device_value(DEVICE.value, default=default)
+
+
+def current_dtype(default=None):
+    """Return the active Dendra default dtype, or ``default`` when unset."""
+    return _normalize_dtype_value(DTYPE.value, default=default)
+
+
 # Backward-compatible context-key aliases. The exported variable
 # ``JIT_IN_NETWORK`` below points at ``JIT_NETWORK_SOLVES`` as well, but ctx()
 # needs a key-level alias so ``with dendra.ctx(JIT_IN_NETWORK=0): ...`` keeps
@@ -122,6 +177,8 @@ CONTEXT_ALIASES = {
 
 
 DEBUG = ContextVar("DEBUG", 0)
+DEVICE = ContextVar("DEVICE", "")
+DTYPE = ContextVar("DTYPE", "")
 TF32 = ContextVar("TF32", 0)
 IMEM = ContextVar("IMEM", 0)
 CUDA = ContextVar("CUDA", int(torch.cuda.is_available()))

@@ -246,10 +246,18 @@ def _evaluate(value):
     return value
 
 
-def expand(value, n):
+def expand(value, n, *, device=None, dtype=None):
     if isinstance(value, torch.nn.Module):
-        return value.sample(n)
-    return torch.tensor(value).repeat(n)
+        out = value.sample(n)
+        if torch.is_tensor(out) and (device is not None or dtype is not None):
+            out = out.to(
+                device=device if device is not None else out.device,
+                dtype=dtype
+                if dtype is not None and torch.is_floating_point(out)
+                else out.dtype,
+            )
+        return out
+    return torch.as_tensor(value, device=device, dtype=dtype).repeat(n)
 
 
 def _require(spec: dict, *names):
@@ -288,19 +296,34 @@ def batchify_index(old_shape, n: int, i: torch.Tensor) -> torch.Tensor:
     return i_n.reshape(-1)
 
 
-def make_weight(weights, n):
+def make_weight(weights, n, *, device=None, dtype=None):
     class ParameterOrDistributionWrapper(torch.nn.Module):
         """A simple wrapper for parameters or distributions that can be sampled."""
 
         def __init__(self, param):
             super().__init__()
+            if isinstance(param, torch.nn.Module) and (
+                device is not None or dtype is not None
+            ):
+                try:
+                    param = param.to(device=device, dtype=dtype)
+                except TypeError:
+                    param = param.to(device=device)
             self.param = param
 
         def sample(self, n):
             if is_parametric(self.param):
-                return self.param.repeat(n)
+                out = self.param.repeat(n)
             else:
-                return self.param.sample(n)
+                out = self.param.sample(n)
+            if torch.is_tensor(out) and (device is not None or dtype is not None):
+                out = out.to(
+                    device=device if device is not None else out.device,
+                    dtype=dtype
+                    if dtype is not None and torch.is_floating_point(out)
+                    else out.dtype,
+                )
+            return out
 
     class WeightExpander(torch.nn.Module):
         def __init__(self, weights, n):
@@ -309,7 +332,14 @@ def make_weight(weights, n):
                 [ParameterOrDistributionWrapper(w) for w in weights]
             )
             self.n = n
-            self.register_buffer("w", torch.empty(0))
+            self.register_buffer(
+                "w",
+                torch.empty(
+                    0,
+                    device=device if device is not None else None,
+                    dtype=dtype if dtype is not None else torch.float32,
+                ),
+            )
 
         def forward(self):
             return self.w
@@ -1582,13 +1612,27 @@ class Network(RNGMixin):
             )
             pre = getattr(self, pre_name)
             post = self.populations[post_name]
+            pre_device = pre.device()
+            pre_dtype = pre.dtype()
             post_device = post.device()
             post_dtype = post.dtype()
             pre_idx = torch.cat([s[0] for s in specs])
             post_idx = torch.cat([s[1] for s in specs])
-            thresholds = torch.cat([expand(s[2], s[3]) for s in specs])
-            weights = make_weight([s[4] for s in specs], [s[5] for s in specs])
-            delay = make_weight([s[6] for s in specs], [s[7] for s in specs])
+            thresholds = torch.cat(
+                [expand(s[2], s[3], device=pre_device, dtype=pre_dtype) for s in specs]
+            )
+            weights = make_weight(
+                [s[4] for s in specs],
+                [s[5] for s in specs],
+                device=post_device,
+                dtype=post_dtype,
+            )
+            delay = make_weight(
+                [s[6] for s in specs],
+                [s[7] for s in specs],
+                device=post_device,
+                dtype=post_dtype,
+            )
             pre_idx_for_var = self._pre_idx_for_pre_var(pre, pre_idx, pre_var)
 
             syn = NetCon(
@@ -1605,7 +1649,11 @@ class Network(RNGMixin):
                 max_delay=max_delay_ms,
                 track_events=self.track_netcon_events,
                 delay_backend=self.netcon_delay_backend,
-            ).to(device=post_device, dtype=post_dtype)
+                device=post_device,
+                dtype=post_dtype,
+                pre_device=pre_device,
+                pre_dtype=pre_dtype,
+            )
 
             syn.setreference("t", lambda: self.t)
 
@@ -1645,12 +1693,24 @@ class Network(RNGMixin):
             pre_var = pre_var if pre_var is not None else "v"
             pre = getattr(self, pre_name)
             post = self.populations[post_name]
+            pre_device = pre.device()
+            pre_dtype = pre.dtype()
             post_device = post.device()
             post_dtype = post.dtype()
             pre_idx = torch.cat([s[0] for s in specs])
             post_idx = torch.cat([s[1] for s in specs])
-            weights = make_weight([s[2] for s in specs], [s[3] for s in specs])
-            delay = make_weight([s[4] for s in specs], [s[5] for s in specs])
+            weights = make_weight(
+                [s[2] for s in specs],
+                [s[3] for s in specs],
+                device=post_device,
+                dtype=post_dtype,
+            )
+            delay = make_weight(
+                [s[4] for s in specs],
+                [s[5] for s in specs],
+                device=post_device,
+                dtype=post_dtype,
+            )
             pre_idx_for_var = self._pre_idx_for_pre_var(pre, pre_idx, pre_var)
 
             target_name = f"{post_name}:{synapse.name}"
@@ -1677,7 +1737,11 @@ class Network(RNGMixin):
                 max_delay=max_delay_ms,
                 transform=transform,
                 reset_inputs=False,
-            ).to(device=post_device, dtype=post_dtype)
+                device=post_device,
+                dtype=post_dtype,
+                pre_device=pre_device,
+                pre_dtype=pre_dtype,
+            )
 
             con.setreference("t", lambda: self.t)
 
