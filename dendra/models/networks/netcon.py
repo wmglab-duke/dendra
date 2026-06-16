@@ -852,7 +852,7 @@ class NetCon(Referency):
             ``"bitpacked_history"`` is an inference-only source-spike history
             backend for large SNNs: it stores only packed source spikes over the
             delay horizon and reconstructs the dense postsynaptic receive payload
-            with a CUDA extension when available. Training always uses the dense
+            with Triton kernels when available. Training always uses the dense
             backend.
 
         Notes
@@ -1814,9 +1814,10 @@ class NetCon(Referency):
     def _try_bitpack_delivery_kernel(
         self, cur_idx: torch.Tensor, scratch: torch.Tensor
     ) -> bool:
-        if not self.spike_history_packed.is_cuda or scratch.dtype not in (
-            torch.float32,
-            torch.float64,
+        if (
+            (not self.spike_history_packed.is_cuda)
+            or (not scratch.is_cuda)
+            or (not torch.is_floating_point(scratch))
         ):
             return False
         try:
@@ -1828,7 +1829,8 @@ class NetCon(Referency):
                 self.spike_history_packed,
                 cur_idx,
                 self.inference_delay_steps,
-                self.bitpack_conn_source_pos,
+                self.bitpack_conn_word_idx,
+                self.bitpack_conn_bit_mask,
                 self.post_idx,
                 self.weight(),
                 scratch,
@@ -1849,7 +1851,7 @@ class NetCon(Referency):
             return
 
         # Pure-PyTorch fallback.  This is correct and memory-light in source
-        # space, but the CUDA extension is the intended hot path.
+        # space, but the Triton kernels are the intended hot path.
         slot = int(cur_idx.item())
         row = self.spike_history_packed[slot]
         row.zero_()
@@ -1867,8 +1869,8 @@ class NetCon(Referency):
             return scratch
 
         # Pure-PyTorch fallback.  It allocates connection-sized gate/values, so it
-        # is mainly for CPU, tests, and installations where the CUDA extension has
-        # not been built.
+        # is mainly for CPU, tests, and installations where Triton is not
+        # available.
         rows = (cur_idx - self.inference_delay_steps).remainder(self.max_delay_steps)
         words = self.spike_history_packed[rows.reshape(-1), self.bitpack_conn_word_idx]
         gate = torch.bitwise_and(words, self.bitpack_conn_bit_mask) != 0
