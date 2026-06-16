@@ -1116,6 +1116,21 @@ class NetCon(Referency):
         else:
             self.register_buffer(name, value)
 
+    def _empty_buffer(self, *, device=None, dtype=torch.long, shape=(0,)):
+        """Create an empty tensor on the requested device/dtype.
+
+        This small helper is used during low-memory mode switches to eagerly
+        release large stale buffers before any new connection-sized temporary is
+        materialized.  Rebinding a registered buffer to an empty tensor returns
+        the old allocation to PyTorch's caching allocator, making it immediately
+        reusable by subsequent PyTorch allocations in the same process.
+        """
+        return torch.empty(
+            shape,
+            device=device if device is not None else self.device,
+            dtype=dtype,
+        )
+
     def _empty_long(self, device=None):
         return torch.empty(
             0, device=device if device is not None else self.device, dtype=torch.long
@@ -1176,6 +1191,49 @@ class NetCon(Referency):
             "spike_history_packed",
             torch.empty((0, 0), device=self.device, dtype=torch.int64),
         )
+
+    def _resize_bitpacked_spike_history(self, *, clear: bool = True):
+        """Resize/clear bitpacked runtime history without rebuilding topology metadata.
+
+        Delay reinitialization changes ``delay_steps`` and can change
+        ``max_delay_steps``, but it does not change the source→connection layout.
+        Rebuilding the full bitpack metadata would allocate several
+        connection-sized tensors.  This helper touches only the small
+        ``[max_delay_steps, n_source_words]`` history and threshold state.
+        """
+        if self.delay_backend != "bitpacked_history" or not getattr(
+            self, "_bitpack_can_use", False
+        ):
+            return
+
+        bits = int(self._bitpack_bits_per_word)
+        n_source = int(
+            getattr(
+                self, "bitpack_source_pre_idx", self._empty_long(self.pre_device)
+            ).numel()
+        )
+        n_words = max(1, (n_source + bits - 1) // bits)
+        desired_shape = (int(self.max_delay_steps), n_words)
+
+        if (
+            "spike_history_packed" not in self._buffers
+            or tuple(self.spike_history_packed.shape) != desired_shape
+            or self.spike_history_packed.device != self.device
+            or self.spike_history_packed.dtype != torch.int64
+        ):
+            self._set_buffer(
+                "spike_history_packed",
+                torch.zeros(desired_shape, device=self.device, dtype=torch.int64),
+            )
+        elif clear:
+            self.spike_history_packed.zero_()
+
+        if (
+            clear
+            and hasattr(self, "bitpack_source_has_spiked")
+            and self.bitpack_source_has_spiked.numel() > 0
+        ):
+            self.bitpack_source_has_spiked.zero_()
 
     def _configure_bitpacked_history_metadata(self):
         """Validate and allocate metadata for source-level bitpacked inference.
@@ -1271,9 +1329,14 @@ class NetCon(Referency):
         self._set_buffer("bitpack_source_pre_idx", source_pre_idx)
         self._set_buffer("bitpack_source_word_idx", source_word_idx)
         self._set_buffer("bitpack_source_bit_mask", source_bit_mask)
-        self._set_buffer("bitpack_conn_source_pos", conn_source_pos)
+        # ``conn_source_pos`` is only an initialization intermediate.  Persisting
+        # it costs another n_conn int64 buffer and is not used by the hot path.
+        self._set_buffer(
+            "bitpack_conn_source_pos", self._empty_buffer(dtype=torch.long)
+        )
         self._set_buffer("bitpack_conn_word_idx", conn_word_idx)
         self._set_buffer("bitpack_conn_bit_mask", conn_bit_mask)
+        del conn_source_pos
         self._set_buffer(
             "bitpack_source_threshold",
             source_threshold.to(device=self.pre_device, dtype=self.pre_dtype),
@@ -1505,58 +1568,120 @@ class NetCon(Referency):
             )
 
     def _rebuild_dense_delay_metadata(self):
-        """Precompute integer-delay routing metadata for dense inference.
+        """Precompute integer-delay routing metadata for inference.
 
         NetCon delays are positive-valued by construction, but very small
         positive delays can round to zero integer steps.  In non-differentiable
         inference, the earliest valid delivery is the next simulation step, so
-        ``inference_delay_steps`` is clamped to at least one step.  The dense hot
-        path then uses precomputed flat offsets:
+        ``inference_delay_steps`` is clamped to at least one step.
 
-            flat = (current_slot * syn_numel + flat_delay_offsets) % delivery_numel
-
-        instead of rebuilding ``future_steps`` and multiplying by ``syn_numel``
-        for every connection on every timestep.
+        Dense inference additionally needs connection-sized flat routing offsets.
+        Sparse-calendar and bitpacked-history inference do not: they only need
+        ``inference_delay_steps``.  Keeping those modes free of ``flat_*`` buffers
+        is important for large SNN reinitialization, because a single unnecessary
+        ``flat_delay_offsets`` tensor can be hundreds of MiB and can trigger OOM
+        even when the steady-state model fits.
         """
-        delay_steps = self.delay_steps.flatten().to(self.device, dtype=torch.long)
-        if delay_steps.numel() == 0:
-            inference_delay_steps = delay_steps
-        else:
-            inference_delay_steps = delay_steps.clamp_min(1)
-
-        post_idx = self.post_idx.to(self.device, dtype=torch.long)
         syn_numel = int(self._syn_numel)
         n_conn = int(self._n_conn)
 
-        flat_delay_offsets = inference_delay_steps * syn_numel + post_idx
-        if (
-            getattr(self, "track_events", False)
-            or self.delay_backend != "bitpacked_history"
-        ):
-            if self.con_range.numel() == n_conn:
-                con_range = self.con_range.to(self.device, dtype=torch.long)
-            else:
-                con_range = torch.arange(n_conn, device=self.device, dtype=torch.long)
-            flat_event_offsets = inference_delay_steps * max(n_conn, 1) + con_range
-        else:
-            flat_event_offsets = torch.empty(0, device=self.device, dtype=torch.long)
+        needs_dense_flat_offsets = self.delay_backend == "dense"
+        needs_event_flat_offsets = (
+            bool(getattr(self, "track_events", False)) and needs_dense_flat_offsets
+        )
 
-        self._set_buffer("inference_delay_steps", inference_delay_steps)
-        self._set_buffer("flat_delay_offsets", flat_delay_offsets)
-        self._set_buffer("flat_event_offsets", flat_event_offsets)
+        # If we are in a non-dense backend, eagerly drop stale dense-only buffers
+        # before constructing/reusing any connection-sized metadata.  This matters
+        # when reinitializing a model that was previously built with an older
+        # implementation that retained ``flat_delay_offsets`` in bitpacked mode.
+        if not needs_dense_flat_offsets:
+            empty_long = self._empty_buffer(dtype=torch.long)
+            if (
+                "flat_delay_offsets" in self._buffers
+                and self.flat_delay_offsets.numel() != 0
+            ):
+                self._set_buffer("flat_delay_offsets", empty_long)
+            if (
+                "flat_event_offsets" in self._buffers
+                and self.flat_event_offsets.numel() != 0
+            ):
+                self._set_buffer("flat_event_offsets", empty_long)
+
+        # Reuse the persistent inference-delay buffer during delay rebuilds rather
+        # than allocating another n_conn LongTensor.
+        delay_steps = self.delay_steps
+        if delay_steps.device != self.device or delay_steps.dtype != torch.long:
+            delay_steps = delay_steps.to(device=self.device, dtype=torch.long)
+
+        if (
+            "inference_delay_steps" in self._buffers
+            and tuple(self.inference_delay_steps.shape) == tuple(delay_steps.shape)
+            and self.inference_delay_steps.device == self.device
+            and self.inference_delay_steps.dtype == torch.long
+        ):
+            inference_delay_steps = self.inference_delay_steps
+            inference_delay_steps.copy_(delay_steps)
+            if inference_delay_steps.numel() > 0:
+                inference_delay_steps.clamp_min_(1)
+        else:
+            inference_delay_steps = delay_steps.clone()
+            if inference_delay_steps.numel() > 0:
+                inference_delay_steps.clamp_min_(1)
+            self._set_buffer("inference_delay_steps", inference_delay_steps)
 
         self._delivery_numel = int(max(1, self.max_delay_steps) * syn_numel)
         self._event_queue_numel = int(max(1, self.max_delay_steps) * max(n_conn, 1))
 
         if inference_delay_steps.numel() > 0:
-            first = inference_delay_steps[0]
-            self._dense_delay_uniform = bool(
-                torch.all(inference_delay_steps == first).item()
-            )
-            self._dense_uniform_delay_step = int(first.item())
+            # Avoid ``torch.all(inference_delay_steps == first)``, which creates a
+            # connection-sized temporary bool tensor.  min/max reductions give the
+            # same uniform-delay test with much lower peak memory.
+            d_min = int(inference_delay_steps.min().item())
+            d_max = int(inference_delay_steps.max().item())
+            self._dense_delay_uniform = d_min == d_max
+            self._dense_uniform_delay_step = d_min if self._dense_delay_uniform else 1
         else:
             self._dense_delay_uniform = True
             self._dense_uniform_delay_step = 1
+
+        if needs_dense_flat_offsets:
+            post_idx = self.post_idx.to(self.device, dtype=torch.long)
+            if (
+                "flat_delay_offsets" in self._buffers
+                and tuple(self.flat_delay_offsets.shape)
+                == tuple(inference_delay_steps.shape)
+                and self.flat_delay_offsets.device == self.device
+                and self.flat_delay_offsets.dtype == torch.long
+            ):
+                flat_delay_offsets = self.flat_delay_offsets
+                flat_delay_offsets.copy_(inference_delay_steps)
+            else:
+                flat_delay_offsets = inference_delay_steps.clone()
+            flat_delay_offsets.mul_(syn_numel).add_(post_idx)
+            self._set_buffer("flat_delay_offsets", flat_delay_offsets)
+        else:
+            self._set_buffer("flat_delay_offsets", self._empty_buffer(dtype=torch.long))
+
+        if needs_event_flat_offsets:
+            if self.con_range.numel() == n_conn:
+                con_range = self.con_range.to(self.device, dtype=torch.long)
+            else:
+                con_range = torch.arange(n_conn, device=self.device, dtype=torch.long)
+            if (
+                "flat_event_offsets" in self._buffers
+                and tuple(self.flat_event_offsets.shape)
+                == tuple(inference_delay_steps.shape)
+                and self.flat_event_offsets.device == self.device
+                and self.flat_event_offsets.dtype == torch.long
+            ):
+                flat_event_offsets = self.flat_event_offsets
+                flat_event_offsets.copy_(inference_delay_steps)
+            else:
+                flat_event_offsets = inference_delay_steps.clone()
+            flat_event_offsets.mul_(max(n_conn, 1)).add_(con_range)
+            self._set_buffer("flat_event_offsets", flat_event_offsets)
+        else:
+            self._set_buffer("flat_event_offsets", self._empty_buffer(dtype=torch.long))
 
     def _has_scheduled_events(self) -> bool:
         """Cheap shape-only check used to skip scheduled-event aggregation."""
@@ -1594,8 +1719,13 @@ class NetCon(Referency):
         desired_shape = (desired_depth, self._syn_numel)
 
         if tuple(self.delivery_buffer.shape) != desired_shape:
-            self.delivery_buffer = torch.zeros(
-                desired_shape, device=self.device, dtype=self.dtype
+            self._set_buffer(
+                "delivery_buffer",
+                torch.empty((0, self._syn_numel), device=self.device, dtype=self.dtype),
+            )
+            self._set_buffer(
+                "delivery_buffer",
+                torch.zeros(desired_shape, device=self.device, dtype=self.dtype),
             )
         elif clear:
             self.delivery_buffer.zero_()
@@ -1825,16 +1955,30 @@ class NetCon(Referency):
 
             if not bitpack_ops.is_available():
                 return False
-            bitpack_ops.build_delivery(
-                self.spike_history_packed,
-                cur_idx,
-                self.inference_delay_steps,
-                self.bitpack_conn_word_idx,
-                self.bitpack_conn_bit_mask,
-                self.post_idx,
-                self.weight(),
-                scratch,
-            )
+            if getattr(self, "_dense_delay_uniform", False) and hasattr(
+                bitpack_ops, "build_delivery_uniform"
+            ):
+                bitpack_ops.build_delivery_uniform(
+                    self.spike_history_packed,
+                    cur_idx,
+                    int(getattr(self, "_dense_uniform_delay_step", 1)),
+                    self.bitpack_conn_word_idx,
+                    self.bitpack_conn_bit_mask,
+                    self.post_idx,
+                    self.weight(),
+                    scratch,
+                )
+            else:
+                bitpack_ops.build_delivery(
+                    self.spike_history_packed,
+                    cur_idx,
+                    self.inference_delay_steps,
+                    self.bitpack_conn_word_idx,
+                    self.bitpack_conn_bit_mask,
+                    self.post_idx,
+                    self.weight(),
+                    scratch,
+                )
             return True
         except Exception:
             return False
@@ -1925,27 +2069,50 @@ class NetCon(Referency):
 
             self.max_delay_steps = self._compute_max_delay_steps()
             self._rebuild_dense_delay_metadata()
-            self._configure_bitpacked_history_metadata()
-            if self.delay_backend == "bitpacked_history" and not self._bitpack_can_use:
-                raise ValueError(
-                    "NetCon delay_backend='bitpacked_history' is not exact after delay rebuild: "
-                    f"{self._bitpack_ineligible_reason}."
-                )
+
+            if self.delay_backend == "bitpacked_history":
+                # Delay changes do not alter source-level bitpack topology.  Avoid
+                # rebuilding conn_word_idx/conn_bit_mask on every reinitialization;
+                # just resize/clear the time-history rows if the delay horizon changed.
+                if not getattr(self, "_bitpack_can_use", False):
+                    self._configure_bitpacked_history_metadata()
+                else:
+                    self._resize_bitpacked_spike_history(clear=True)
+                if not self._bitpack_can_use:
+                    raise ValueError(
+                        "NetCon delay_backend='bitpacked_history' is not exact after delay rebuild: "
+                        f"{self._bitpack_ineligible_reason}."
+                    )
+            elif getattr(self, "_bitpack_can_use", False):
+                # If the backend was switched away from bitpacked at runtime, drop
+                # bitpacked-only state before allocating dense delay buffers.
+                self._set_empty_bitpack_buffers()
+                self._bitpack_can_use = False
 
             buffer_depth = self._desired_delivery_buffer_depth()
             buffer_shape = (buffer_depth, self.syn_numel.item())
-            self.delivery_buffer = torch.zeros(
-                buffer_shape, device=self.device, dtype=self.dtype
-            )
+            if tuple(self.delivery_buffer.shape) == buffer_shape:
+                self.delivery_buffer.zero_()
+            else:
+                # Release the old buffer before allocating the replacement.  This
+                # prevents reinit from briefly needing old+new delivery storage.
+                self._set_buffer(
+                    "delivery_buffer",
+                    torch.empty(
+                        (0, self._syn_numel), device=self.device, dtype=self.dtype
+                    ),
+                )
+                self._set_buffer(
+                    "delivery_buffer",
+                    torch.zeros(buffer_shape, device=self.device, dtype=self.dtype),
+                )
             if (
                 self._use_sparse_calendar_runtime()
                 or self._use_bitpacked_history_runtime()
             ):
                 self._clear_sparse_calendar()
                 if self._use_bitpacked_history_runtime():
-                    self.spike_history_packed.zero_()
-                    if self.bitpack_source_has_spiked.numel() > 0:
-                        self.bitpack_source_has_spiked.zero_()
+                    self._resize_bitpacked_spike_history(clear=True)
             if self.track_events and not (
                 self._use_sparse_calendar_runtime()
                 or self._use_bitpacked_history_runtime()
