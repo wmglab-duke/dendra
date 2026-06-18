@@ -11,7 +11,7 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 ## Prerequisites
 
 - Python 3.11 or newer
-- PyTorch 2.7+ (install the CUDA 12.9+ wheels if you want GPU support)
+- PyTorch 2.8+
 - Git
 
 ## Quick start

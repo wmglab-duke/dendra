@@ -18,7 +18,7 @@ setup(
     install_requires=[
         "numpy",
         "sympy >= 1.2",
-        "torch >= 2.7.0",
+        "torch >= 2.8.0",
         "scipy",
         "h5py",
         "tqdm",
