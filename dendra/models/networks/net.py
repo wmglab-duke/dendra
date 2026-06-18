@@ -486,13 +486,20 @@ class Network(RNGMixin):
         NetCons skip that large debug queue during inference and keep only the
         lightweight current-step ``events`` buffer.
     netcon_delay_backend : {"dense", "sparse_calendar", "bitpacked_history"}, optional
-        Delay-line backend for event-based NetCons. ``"dense"`` preserves the
-        current differentiable/dense implementation. ``"sparse_calendar"`` is
+        Delay-line backend for event-based NetCons. ``"dense"`` is the default
+        differentiable/dense implementation. ``"sparse_calendar"`` is
         an inference-only backend that stores pending nonzero deliveries in
         sparse calendar buckets while preserving the existing ``net_receive``
-        dense-payload API. ``"bitpacked_history"`` is an inference-only backend
+        dense-payload API. Can be beneficial for memory efficiency and speed on CPU
+        when networks have long delays and are not densely spiking. Should be avoided on
+        GPU. ``"bitpacked_history"`` is an inference-only backend
         that stores packed source-spike history and reconstructs the dense
-        delivery payload from the static edge list.
+        delivery payload from the static edge list. Suitable for networks where
+        threshold is uniform and / or determined solely by the pre-synaptic population,
+        so that the same source spike history can be shared across synapses. Can be very
+        beneficial for memory efficiency and speed on GPU for large networks with long
+        delays. The first run with 'bitpacked_history' will be slow due to CUDA kernel
+        compilation, but subsequent runs will be much faster.
     """
 
     def __init__(
