@@ -28,7 +28,7 @@ before_script:
   - python -m pip install numpy
 
   # 1) Install PyTorch first
-  - python -m pip install "torch==2.8.0" --index-url https://download.pytorch.org/whl/cpu
+  - python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
   # 2) Clone and install dendra-solvers AFTER torch (still no-build-isolation)
   - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/dendra-solvers.git"
