@@ -1810,9 +1810,16 @@ class Network(RNGMixin):
         dt : float
             Simulation timestep (ms).
         reinit_weights : bool, optional
-            Re-sample or reset synaptic weights. Default is True.
+            Re-sample or refresh synaptic weights. Default is True. When
+            initializing from a steady-state cache after an optimizer update,
+            leave this True so expanded ``WeightExpander.w`` buffers are
+            regenerated from the current weight parameters before cached pending
+            deliveries are rebuilt.
         reinit_delays : bool, optional
-            Re-sample or reset synaptic delays. Default is True.
+            Re-sample or refresh synaptic delays. Default is True. When
+            initializing from a steady-state cache after delay parameters have
+            changed, leave this True so expanded delay values and integer delay
+            metadata are regenerated before cache restore.
         t : float, optional
             Starting simulation time (ms). Default is 0.0.
         max_delay_ms : float, optional
@@ -1831,16 +1838,14 @@ class Network(RNGMixin):
         for pop in self.populations.values():
             pop.t = pop.t.detach()
             pop.t.fill_(t)
-        if self._state_cache:
+
+        has_state_cache = bool(self._state_cache)
+        if has_state_cache:
             self.initialize_pops_from_state_cache()
-            self.initialize_synapses_from_state_cache()
-            clear_deliveries = False
-        else:
-            clear_deliveries = True
 
         dt_f = float(dt)
         for pop in self.populations.values():
-            if not self._state_cache:
+            if not has_state_cache:
                 pop.initialize()
             dt_pop = torch.tensor(dt_f, device=pop.device(), dtype=pop.dtype())
             pop.integrator._initialize(
@@ -1851,11 +1856,20 @@ class Network(RNGMixin):
             )
             pop.intra = pop.build_intra()
         self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
+        # Always clear runtime delivery state during synapse initialization.
+        # If a state cache is present, the backend-specific restore below will
+        # rebuild the pending traffic from cached presynaptic history using the
+        # freshly expanded current weights/delays.
         self.init_synapses(
             reinit_weights=reinit_weights,
             reinit_delays=reinit_delays,
-            clear_deliveries=clear_deliveries,
+            clear_deliveries=True,
         )
+        if has_state_cache:
+            self.initialize_synapses_from_state_cache(
+                reinit_weights=reinit_weights,
+                reinit_delays=reinit_delays,
+            )
         if self.netstim is not None:
             self.netstim.initialize()
             self.netstim.detach()
@@ -1867,17 +1881,80 @@ class Network(RNGMixin):
             pop.detach()
             pop.initializing_from_state_cache = True
 
-    def initialize_synapses_from_state_cache(self):
+    def initialize_synapses_from_state_cache(
+        self,
+        *,
+        reinit_weights: bool = True,
+        reinit_delays: bool = True,
+    ):
+        """Restore event and continuous synapse runtime caches.
+
+        Connection classes own their backend-specific cache format.  Network only
+        routes the cached payloads to the matching module names.  This method is
+        intentionally called after :meth:`init_synapses`: expanded
+        ``WeightExpander.w`` buffers and delay metadata must already reflect the
+        current parameters before cached presynaptic history is converted back
+        into pending deliveries.  A legacy fallback is retained for older caches
+        whose event NetCon entries were stored as
+        ``(old_dt, has_spiked, is_spiking, delivery_buffer)`` tuples.
+
+        Keep ``reinit_weights=True`` and ``reinit_delays=True`` when restoring a
+        steady-state cache after optimizer updates.  Set either flag False only
+        when the corresponding expanded parameter values should be reused.
+        """
+        if not self._syn_cache:
+            return
+
+        if "event" in self._syn_cache or "continuous" in self._syn_cache:
+            event_cache = self._syn_cache.get("event", {})
+            continuous_cache = self._syn_cache.get("continuous", {})
+        else:
+            # Backward compatibility with the previous flat event-NetCon cache.
+            event_cache = self._syn_cache
+            continuous_cache = {}
+
         for name, syn in self.synapses.items():
-            old_dt, has_spiked, is_spiking, delivery_buffer = self._syn_cache[name]
-            n_limit = syn.delivery_buffer.shape[0]
-            delivery_buffer = dilate(
-                delivery_buffer, float(old_dt), float(self.dt), n_limit=n_limit
-            )
-            if not syn.skip_thresholding:
-                syn.has_spiked = (has_spiked).detach()
-                syn.is_spiking = (is_spiking).detach()
-            syn.delivery_buffer = delivery_buffer.clone().detach()
+            if name not in event_cache:
+                continue
+            cache = event_cache[name]
+            if hasattr(syn, "initialize_from_state_cache"):
+                try:
+                    syn.initialize_from_state_cache(
+                        cache,
+                        dt=self.dt,
+                        rebuild_delays=False,
+                    )
+                except TypeError:
+                    # Backward-compatible call for custom connection modules
+                    # that implemented the cache API before ``rebuild_delays``.
+                    syn.initialize_from_state_cache(cache, dt=self.dt)
+            else:
+                old_dt, has_spiked, is_spiking, delivery_buffer = cache
+                n_limit = syn.delivery_buffer.shape[0]
+                delivery_buffer = dilate(
+                    delivery_buffer, float(old_dt), float(self.dt), n_limit=n_limit
+                )
+                if not syn.skip_thresholding:
+                    syn.has_spiked = (has_spiked).detach()
+                    syn.is_spiking = (is_spiking).detach()
+                syn.delivery_buffer = delivery_buffer.clone().detach()
+
+        for name, syn in self.continuous_synapses.items():
+            if name not in continuous_cache:
+                continue
+            cache = continuous_cache[name]
+            if not hasattr(syn, "initialize_from_state_cache"):
+                raise RuntimeError(
+                    f"Continuous synapse {name!r} does not implement initialize_from_state_cache()."
+                )
+            try:
+                syn.initialize_from_state_cache(
+                    cache,
+                    dt=self.dt,
+                    rebuild_delays=False,
+                )
+            except TypeError:
+                syn.initialize_from_state_cache(cache, dt=self.dt)
 
     def initialize_(self, *args, **kwargs):
         """In-place variant of :meth:`initialize` that returns ``None``."""
@@ -2229,7 +2306,28 @@ class Network(RNGMixin):
 
         return new_net
 
-    def steady_state(self, tstop=1000, dt=0.025, progressbar=False):
+    def _enable_synapse_state_cache_recording(self):
+        """Ask connection modules to record parameter-invariant cache histories."""
+        for syn in self.synapses.values():
+            hook = getattr(syn, "enable_state_cache_recording", None)
+            if hook is not None:
+                hook()
+        for syn in self.continuous_synapses.values():
+            hook = getattr(syn, "enable_state_cache_recording", None)
+            if hook is not None:
+                hook()
+
+    def _disable_synapse_state_cache_recording(self, *, release: bool = False):
+        for syn in self.synapses.values():
+            hook = getattr(syn, "disable_state_cache_recording", None)
+            if hook is not None:
+                hook(release=release)
+        for syn in self.continuous_synapses.values():
+            hook = getattr(syn, "disable_state_cache_recording", None)
+            if hook is not None:
+                hook(release=release)
+
+    def steady_state(self, tstop=1000, dt=0.025, progressbar=False, max_delay_ms=None):
         """
         Run the network until it reaches a steady state.
 
@@ -2239,6 +2337,16 @@ class Network(RNGMixin):
             Total time to run the network in ms. Default is 1000 ms.
         dt : float, optional
             Time step in ms. Default is 0.025 ms.
+        progressbar : bool, optional
+            If True, show a progress bar during the steady-state run.
+        max_delay_ms : float, optional
+            Optional delay-horizon cap used when building synapse state for the
+            steady-state/cache run. Supplying the largest delay expected in
+            later simulations lets the cache retain enough history when delays
+            grow after optimization updates. Later calls to ``initialize`` may
+            keep the default ``reinit_weights=True`` and ``reinit_delays=True``;
+            the cached synapse histories are parameter-invariant and are replayed
+            through the current expanded weights and delays.
 
         Returns
         -------
@@ -2248,43 +2356,68 @@ class Network(RNGMixin):
         self.clear_state_cache()
         was_training = self.training
         with torch.no_grad():
-            if self.netstim is not None:
-                self.netstim._prep_start_for_steady_state(tstop)
-            self.eval()
-            self.initialize(dt, t=-tstop, force_rebuild=True)
-            self.run(tstop, progressbar=progressbar)
-            if self.netstim is not None:
-                self.netstim._reset_start_times()
-            self.cache_state()
+            try:
+                if self.netstim is not None:
+                    self.netstim._prep_start_for_steady_state(tstop)
+                self.eval()
+                self.initialize(
+                    dt,
+                    t=-tstop,
+                    max_delay_ms=max_delay_ms,
+                    force_rebuild=True,
+                )
+                # Record unweighted event/value histories during the steady-state
+                # run.  This lets the later cache restore rebuild pending
+                # deliveries with changed dt, weights, and delays.
+                self._enable_synapse_state_cache_recording()
+                self.run(tstop, progressbar=progressbar)
+                self.cache_state()
+            finally:
+                self._disable_synapse_state_cache_recording(release=True)
+                if self.netstim is not None:
+                    self.netstim._reset_start_times()
         if was_training:
             self.train()
         return self
 
     def cache_state(self):
+        """Cache population and connection runtime state for steady_state().
+
+        Populations still use their normal state_dict().  Event NetCons and
+        ContinuousCons package their own backend-specific delay/runtime state so
+        Network does not need to know whether a NetCon is dense, sparse-calendar,
+        or bitpacked-history backed.
+        """
         self._state_cache.clear()
         self._syn_cache.clear()
         for name, pop in self.populations.items():
             self._state_cache[name] = pop.state_dict()
+
+        event_cache = {}
         for name, syn in self.synapses.items():
-            if (
-                getattr(syn, "delay_backend", None)
-                in ("sparse_calendar", "bitpacked_history")
-                and not syn.training
-            ):
-                raise RuntimeError(
-                    "Network.cache_state()/steady_state() currently require "
-                    "dense NetCon delivery buffers. Re-run with "
-                    "netcon_delay_backend='dense' for cached or steady-state "
-                    "workflows."
+            if hasattr(syn, "state_cache"):
+                event_cache[name] = syn.state_cache()
+            else:
+                # Legacy dense fallback.
+                event_cache[name] = (
+                    syn.dt,
+                    syn.has_spiked.clone(),
+                    syn.is_spiking.clone(),
+                    torch.roll(
+                        syn.delivery_buffer, -syn.current_time_step.item(), dims=0
+                    ).clone(),
                 )
-            self._syn_cache[name] = (
-                syn.dt,
-                syn.has_spiked.clone(),
-                syn.is_spiking.clone(),
-                torch.roll(
-                    syn.delivery_buffer, -syn.current_time_step.item(), dims=0
-                ).clone(),
-            )
+
+        continuous_cache = {}
+        for name, syn in self.continuous_synapses.items():
+            if not hasattr(syn, "state_cache"):
+                raise RuntimeError(
+                    f"Continuous synapse {name!r} does not implement state_cache()."
+                )
+            continuous_cache[name] = syn.state_cache()
+
+        self._syn_cache["event"] = event_cache
+        self._syn_cache["continuous"] = continuous_cache
 
     def clear_state_cache(self):
         self._state_cache.clear()
