@@ -653,6 +653,15 @@ class Network(RNGMixin):
         beneficial for memory efficiency and speed on GPU for large networks with long
         delays. The first run with 'bitpacked_history' will be slow due to CUDA kernel
         compilation, but subsequent runs will be much faster.
+    netcon_train_backend : {"dense", "source_history", "auto"}, optional
+        Differentiable training backend for event NetCons. ``"dense"`` keeps the
+        fully general per-synapse delay buffer. ``"source_history"`` uses compact
+        source-level histories when thresholds/events are source-level; with
+        ``diff_spiking=False`` this uses packed hard source spikes and with
+        ``diff_spiking=True`` this uses floating source gates. ``"auto"`` uses
+        source history when exact and otherwise falls back to dense. Default is
+        ``"auto"`` so common source-level SNN projections get the compact
+        differentiable backend without opting in explicitly.
     """
 
     def __init__(
@@ -665,6 +674,7 @@ class Network(RNGMixin):
         netcon_delay_backend: Literal[
             "dense", "sparse_calendar", "bitpacked_history"
         ] = "dense",
+        netcon_train_backend: Literal["dense", "source_history", "auto"] = "auto",
     ):
         if any(pop.is_batched() for pop in populations.values()):
             raise ValueError(
@@ -690,6 +700,11 @@ class Network(RNGMixin):
                 "netcon_delay_backend must be one of 'dense', 'sparse_calendar', or 'bitpacked_history'."
             )
         self.netcon_delay_backend = netcon_delay_backend
+        if netcon_train_backend not in ("dense", "source_history", "auto"):
+            raise ValueError(
+                "netcon_train_backend must be one of 'dense', 'source_history', or 'auto'."
+            )
+        self.netcon_train_backend = netcon_train_backend
 
         self.synapse_spec = {}
         self.synapses = torch.nn.ModuleDict()
@@ -1953,6 +1968,7 @@ class Network(RNGMixin):
                 max_delay=max_delay_ms,
                 track_events=self.track_netcon_events,
                 delay_backend=self.netcon_delay_backend,
+                train_delay_backend=self.netcon_train_backend,
                 device=post_device,
                 dtype=post_dtype,
                 pre_device=pre_device,
@@ -2573,6 +2589,7 @@ class Network(RNGMixin):
             netstim=self.netstim,
             track_netcon_events=self.track_netcon_events,
             netcon_delay_backend=self.netcon_delay_backend,
+            netcon_train_backend=self.netcon_train_backend,
         )
 
         all_indices = indices(concat_pops)

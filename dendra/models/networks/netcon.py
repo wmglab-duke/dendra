@@ -1199,6 +1199,7 @@ class NetCon(Referency):
         delay_backend: Literal[
             "dense", "sparse_calendar", "bitpacked_history"
         ] = "dense",
+        train_delay_backend: Literal["dense", "source_history", "auto"] = "auto",
         device=None,
         dtype=None,
         pre_device=None,
@@ -1280,8 +1281,19 @@ class NetCon(Referency):
             ``"bitpacked_history"`` is an inference-only source-spike history
             backend for large SNNs: it stores only packed source spikes over the
             delay horizon and reconstructs the dense postsynaptic receive payload
-            with Triton kernels when available. Training always uses the dense
-            backend.
+            with Triton kernels when available.
+        train_delay_backend : {"dense", "source_history", "auto"}, optional
+            Differentiable training delay backend. ``"dense"`` preserves the
+            fully general dense differentiable delay buffer. ``"source_history"``
+            uses source-level spike/gate history when the NetCon has exact
+            source-level event semantics. With ``diff_spiking=False`` this uses
+            packed boolean source history and still differentiates weights and
+            delays for realized events. With ``diff_spiking=True`` this uses a
+            floating source-gate history so surrogate gradients can flow through
+            source-level thresholding. ``"auto"`` selects source history when
+            exact and otherwise falls back to dense. Default is ``"auto"`` so
+            source-level projections use the compact training backend when it is
+            safe, while per-connection/scheduled cases retain dense semantics.
 
         Notes
         -----
@@ -1314,6 +1326,11 @@ class NetCon(Referency):
                 "delay_backend must be one of 'dense', 'sparse_calendar', or 'bitpacked_history'."
             )
         self.delay_backend = delay_backend
+        if train_delay_backend not in ("dense", "source_history", "auto"):
+            raise ValueError(
+                "train_delay_backend must be one of 'dense', 'source_history', or 'auto'."
+            )
+        self.train_delay_backend = train_delay_backend
         self._calendar_compact_threshold = 32
         self._sparse_calendar: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
         self._sparse_event_calendar: dict[
@@ -1617,9 +1634,14 @@ class NetCon(Referency):
         self._set_buffer("bitpack_conn_bit_mask", empty_dev_i64)
         self._set_buffer("bitpack_source_threshold", empty_pre_dtype)
         self._set_buffer("bitpack_source_has_spiked", empty_pre_bool)
+        self._set_buffer("source_history_conn_source_pos", empty_dev_long)
         self._set_buffer(
             "spike_history_packed",
             torch.empty((0, 0), device=self.device, dtype=torch.int64),
+        )
+        self._set_buffer(
+            "source_gate_history",
+            torch.empty((0, 0), device=self.device, dtype=self.dtype),
         )
 
     def _resize_bitpacked_spike_history(self, *, clear: bool = True):
@@ -1631,9 +1653,7 @@ class NetCon(Referency):
         connection-sized tensors.  This helper touches only the small
         ``[max_delay_steps, n_source_words]`` history and threshold state.
         """
-        if self.delay_backend != "bitpacked_history" or not getattr(
-            self, "_bitpack_can_use", False
-        ):
+        if not getattr(self, "_bitpack_can_use", False):
             return
 
         bits = int(self._bitpack_bits_per_word)
@@ -1665,21 +1685,26 @@ class NetCon(Referency):
         ):
             self.bitpack_source_has_spiked.zero_()
 
-    def _configure_bitpacked_history_metadata(self):
-        """Validate and allocate metadata for source-level bitpacked inference.
+    def _configure_bitpacked_history_metadata(self, *, for_training: bool = False):
+        """Validate and allocate metadata for source-level bitpacked/source-history backends.
 
-        The backend is exact only when each unique presynaptic source has one
-        binary event stream that can be reused by all outgoing connections.  This
-        is true for NetStim sources, explicit pre-side binary event variables
-        supplied via ``pre_var`` with NaN thresholds, and thresholded variables
-        whose thresholds are source-consistent across all outgoing connections.
+        The source-level backends are exact only when each unique presynaptic
+        source has one event/gate stream that can be reused by all outgoing
+        connections.  This is true for NetStim sources, explicit pre-side
+        event/gate variables supplied via ``pre_var`` with NaN thresholds, and
+        thresholded variables whose thresholds are source-consistent across all
+        outgoing connections.  Packed inference/hard training interpret the
+        stream as binary; floating source-history training stores the gate value.
         """
         self._bitpack_can_use = False
         self._bitpack_mode = "disabled"
         self._bitpack_ineligible_reason = None
         self._set_empty_bitpack_buffers()
 
-        if self.delay_backend != "bitpacked_history":
+        needs_source_level_history = self.delay_backend == "bitpacked_history" or bool(
+            for_training
+        )
+        if not needs_source_level_history:
             return
 
         if self.track_events:
@@ -1797,6 +1822,98 @@ class NetCon(Referency):
             and bool(getattr(self, "_bitpack_can_use", False))
         )
 
+    def _source_history_train_mode_from_flags(self) -> str:
+        """Return ``"float"`` when surrogate source gates are required.
+
+        ``set_diff_config`` is the authoritative source of training semantics.
+        If it has not been called yet, we avoid pre-allocating the larger float
+        history under ``train_delay_backend="auto"`` and keep initialization on
+        the dense path until the user supplies explicit differentiability flags.
+        """
+        if self.train_flags is None:
+            return "unconfigured"
+        return "float" if bool(self.train_flags[2]) else "packed"
+
+    def _source_history_training_requested(self) -> bool:
+        return (
+            bool(self.training)
+            and self.train_flags is not None
+            and self.train_delay_backend in ("source_history", "auto")
+        )
+
+    def _ensure_source_level_training_metadata(self):
+        """Build source-level metadata lazily for source-history training.
+
+        ``netcon_train_backend="auto"`` is intended to be cheap for users who
+        never train a given network.  Therefore constructor-time metadata is
+        built eagerly only for the bitpacked inference backend; training-only
+        source-history metadata is built here, once the module is actually in
+        training mode and ``set_diff_config`` has supplied semantics.
+        """
+        if bool(getattr(self, "_bitpack_can_use", False)):
+            return
+        self._configure_bitpacked_history_metadata(for_training=True)
+
+    def _use_source_history_training_runtime(self) -> bool:
+        """Return True when training should use source-level history instead of dense buffers.
+
+        ``source_history`` is strict: if the source-level specialization cannot
+        preserve exact semantics, it raises. ``auto`` is opportunistic: it uses
+        source history only for exact intrinsic source-level traffic and falls
+        back to the fully general dense differentiable backend for scheduled
+        events, per-connection thresholds, mixed finite/NaN thresholds,
+        cross-device projections, or event-introspection configurations.
+        """
+        if not self._source_history_training_requested():
+            return False
+
+        self._ensure_source_level_training_metadata()
+
+        if self._has_scheduled_events():
+            if self.train_delay_backend == "source_history":
+                raise RuntimeError(
+                    "NetCon train_delay_backend='source_history' currently supports "
+                    "intrinsic source-level events only. Use train_delay_backend='dense' "
+                    "or 'auto' for scheduled-event training."
+                )
+            return False
+
+        if bool(getattr(self, "_bitpack_can_use", False)):
+            return True
+
+        if self.train_delay_backend == "source_history":
+            raise ValueError(
+                "NetCon train_delay_backend='source_history' is not exact for this "
+                f"connection: {self._bitpack_ineligible_reason}. Use "
+                "train_delay_backend='dense' or source-level thresholds/pre_var."
+            )
+        return False
+
+    def _source_history_diff_spiking_enabled(self) -> bool:
+        return self._source_history_train_mode_from_flags() == "float"
+
+    def _refresh_training_advance_after_diff_config(
+        self, *, clear_histories: bool = False
+    ):
+        """Re-select training storage after ``set_diff_config`` changes.
+
+        This lets users call ``set_diff_config`` before or after ``train()`` and,
+        for interactive workflows, even after a preliminary ``initialize``.  The
+        next call to ``advance`` then sees storage that matches the requested
+        ``diff_spiking`` mode: packed source spikes for hard events or floating
+        source gates for surrogate spiking.
+        """
+        if not bool(getattr(self, "training", False)):
+            return
+        if self._use_source_history_training_runtime():
+            self._ensure_source_history_training_storage(clear=clear_histories)
+            self._shrink_connection_spike_buffers_for_source_history_training()
+            self.advance = self.advance_diff_source_history
+        else:
+            self._ensure_connection_spike_buffers()
+            self._ensure_delivery_storage_for_current_mode(clear=clear_histories)
+            self.advance = self.advance_diff
+
     def _ensure_connection_spike_buffers(self):
         """Ensure dense/training paths have per-connection threshold state."""
         if self.has_spiked.numel() != self._n_conn:
@@ -1912,9 +2029,11 @@ class NetCon(Referency):
             "bitpack_conn_source_pos",
             "bitpack_conn_word_idx",
             "bitpack_conn_bit_mask",
+            "source_history_conn_source_pos",
             "bitpack_source_word_idx",
             "bitpack_source_bit_mask",
             "spike_history_packed",
+            "source_gate_history",
             "event_queue",
             "events",
             "current_time_step",
@@ -2136,6 +2255,7 @@ class NetCon(Referency):
             if (
                 self._use_sparse_calendar_runtime()
                 or self._use_bitpacked_history_runtime()
+                or self._use_source_history_training_runtime()
             )
             else self.max_delay_steps
         )
@@ -2157,15 +2277,31 @@ class NetCon(Referency):
         elif clear:
             self.delivery_buffer.zero_()
 
-        if self._use_sparse_calendar_runtime() or self._use_bitpacked_history_runtime():
+        if (
+            self._use_sparse_calendar_runtime()
+            or self._use_bitpacked_history_runtime()
+            or self._use_source_history_training_runtime()
+        ):
             if clear:
                 self._clear_sparse_calendar()
-                if self._use_bitpacked_history_runtime():
-                    self.spike_history_packed.zero_()
+                if (
+                    self._use_bitpacked_history_runtime()
+                    or self._use_source_history_training_runtime()
+                ):
+                    if (
+                        hasattr(self, "spike_history_packed")
+                        and self.spike_history_packed.numel() > 0
+                    ):
+                        self.spike_history_packed.zero_()
+                    if (
+                        hasattr(self, "source_gate_history")
+                        and self.source_gate_history.numel() > 0
+                    ):
+                        self.source_gate_history = self.source_gate_history.detach()
+                        self.source_gate_history.zero_()
                     if self.bitpack_source_has_spiked.numel() > 0:
                         self.bitpack_source_has_spiked.zero_()
-            # Sparse-calendar and bitpacked-history modes do not allocate the
-            # dense historical event queue.
+            # Sparse/source-history modes do not allocate the dense historical event queue.
             if "event_queue" in self._buffers:
                 del self._buffers["event_queue"]
         elif self.track_events and "event_queue" not in self._buffers:
@@ -2498,6 +2634,260 @@ class NetCon(Referency):
                 if values.numel() > 0:
                     scratch.index_add_(0, post_idx, values)
 
+    def _ensure_source_history_conn_source_pos(self):
+        """Ensure connection→unique-source positions exist for float source history."""
+        if self.source_history_conn_source_pos.numel() == self._n_conn:
+            return self.source_history_conn_source_pos
+        if self.bitpack_source_pre_idx.numel() == 0:
+            pos = torch.empty(0, device=self.device, dtype=torch.long)
+        else:
+            pos = torch.searchsorted(
+                self.bitpack_source_pre_idx.to(device=self.device, dtype=torch.long),
+                self.pre_idx.to(device=self.device, dtype=torch.long),
+            ).to(device=self.device, dtype=torch.long)
+        self._set_buffer("source_history_conn_source_pos", pos)
+        return pos
+
+    def _resize_source_gate_history(self, *, clear: bool = True):
+        """Resize/clear differentiable floating source-gate history."""
+        if not getattr(self, "_bitpack_can_use", False):
+            return
+        n_source = int(self.bitpack_source_pre_idx.numel())
+        desired_shape = (int(self.max_delay_steps), n_source)
+        if (
+            "source_gate_history" not in self._buffers
+            or tuple(self.source_gate_history.shape) != desired_shape
+            or self.source_gate_history.device != self.device
+            or self.source_gate_history.dtype != self.dtype
+        ):
+            self._set_buffer(
+                "source_gate_history",
+                torch.zeros(desired_shape, device=self.device, dtype=self.dtype),
+            )
+        elif clear:
+            self.source_gate_history = self.source_gate_history.detach()
+            self.source_gate_history.zero_()
+        self._ensure_source_history_conn_source_pos()
+
+    def _ensure_source_history_training_storage(self, *, clear: bool = False):
+        """Install the minimal storage for the selected source-history training mode."""
+        if not self._use_source_history_training_runtime():
+            return
+        if self._has_scheduled_events():
+            raise RuntimeError(
+                "train_delay_backend='source_history' currently supports intrinsic "
+                "source-level events only. Use train_delay_backend='dense' for "
+                "scheduled-event training."
+            )
+        self._ensure_delivery_storage_for_current_mode(clear=clear)
+        if self._source_history_diff_spiking_enabled():
+            self._resize_source_gate_history(clear=clear)
+            # In float mode the packed bool history is not part of the training hot path.
+            if (
+                "spike_history_packed" in self._buffers
+                and self.spike_history_packed.numel() > 0
+            ):
+                self._set_buffer(
+                    "spike_history_packed",
+                    torch.empty((0, 0), device=self.device, dtype=torch.int64),
+                )
+        else:
+            self._resize_bitpacked_spike_history(clear=clear)
+            if (
+                "source_gate_history" in self._buffers
+                and self.source_gate_history.numel() > 0
+            ):
+                self._set_buffer(
+                    "source_gate_history",
+                    torch.empty((0, 0), device=self.device, dtype=self.dtype),
+                )
+            if (
+                "source_history_conn_source_pos" in self._buffers
+                and self.source_history_conn_source_pos.numel() > 0
+            ):
+                self._set_buffer(
+                    "source_history_conn_source_pos",
+                    self._empty_buffer(dtype=torch.long),
+                )
+
+    def _shrink_connection_spike_buffers_for_source_history_training(self):
+        """Drop per-connection spike buffers when source-level history is exact."""
+        if not self._use_source_history_training_runtime():
+            return
+        self.has_spiked = torch.empty(0, device=self.pre_device, dtype=torch.bool)
+        self.is_spiking = torch.empty(0, device=self.pre_device, dtype=self.pre_dtype)
+        if not self.track_events:
+            self.events = torch.empty(0, device=self.device, dtype=torch.int32)
+
+    def _source_history_source_gate_this_step(
+        self, *, diff_spiking: bool, tau: float
+    ) -> torch.Tensor:
+        """Return one source-level gate value per unique presynaptic source."""
+        if isinstance(self.pre, NetStim):
+            attr = self.pre.spike_gate if diff_spiking else self.pre.spikes
+            gate = (
+                attr.to(self.pre_device)
+                .reshape(-1)
+                .index_select(0, self.bitpack_source_pre_idx)
+            )
+            return gate.to(device=self.device, dtype=self.dtype)
+
+        x_full = self.get_pre_var(self.pre)
+        if x_full.device != self.pre_device:
+            x_full = x_full.to(device=self.pre_device)
+        x = x_full.reshape(-1).index_select(0, self.bitpack_source_pre_idx)
+
+        if self._bitpack_mode == "pre_var":
+            if x.dtype == torch.bool:
+                gate = x.to(self.pre_dtype)
+            else:
+                gate = x.to(self.pre_dtype)
+                if not diff_spiking:
+                    gate = (gate > 0).to(self.pre_dtype)
+            return gate.to(device=self.device, dtype=self.dtype)
+
+        if self._bitpack_mode == "threshold":
+            x = x.to(self.pre_dtype)
+            if diff_spiking:
+                ge_hard, _ge_gate, spk_gate = update_active_diff(
+                    self.bitpack_source_has_spiked,
+                    x,
+                    self.bitpack_source_threshold,
+                    tau,
+                )
+                # ``has_spiked`` is the hard above-threshold state used for the next
+                # rising-edge decision; keep it out of the differentiable graph.
+                self.bitpack_source_has_spiked = ge_hard.detach()
+                return spk_gate.to(device=self.device, dtype=self.dtype)
+            self.bitpack_source_has_spiked, spikes = update_active(
+                self.bitpack_source_has_spiked,
+                x,
+                self.bitpack_source_threshold,
+            )
+            return spikes.to(device=self.device, dtype=self.dtype)
+
+        raise RuntimeError("source-history training backend is not configured")
+
+    def _source_history_read_packed_connection_gates(
+        self, rows: torch.Tensor
+    ) -> torch.Tensor:
+        """Read hard source-spike gates from packed history for connection rows."""
+        if rows.ndim == 1:
+            words = self.spike_history_packed[
+                rows.reshape(-1), self.bitpack_conn_word_idx
+            ]
+            gate = torch.bitwise_and(words, self.bitpack_conn_bit_mask) != 0
+            return gate.to(device=self.device, dtype=self.dtype)
+        word_idx = self.bitpack_conn_word_idx.unsqueeze(-1).expand_as(rows)
+        mask = self.bitpack_conn_bit_mask.unsqueeze(-1).expand_as(rows)
+        words = self.spike_history_packed[
+            rows.reshape(-1), word_idx.reshape(-1)
+        ].view_as(rows)
+        gate = torch.bitwise_and(words, mask) != 0
+        return gate.to(device=self.device, dtype=self.dtype)
+
+    def _source_history_read_float_connection_gates(
+        self, rows: torch.Tensor
+    ) -> torch.Tensor:
+        """Read differentiable source gates for connection rows."""
+        source_pos = self._ensure_source_history_conn_source_pos()
+        if rows.ndim == 1:
+            return self.source_gate_history[rows.reshape(-1), source_pos]
+        src = source_pos.unsqueeze(-1).expand_as(rows)
+        return self.source_gate_history[rows.reshape(-1), src.reshape(-1)].view_as(rows)
+
+    def _source_history_build_delivery_from_history(
+        self,
+        cur_idx: torch.Tensor,
+        *,
+        diff_weights: bool,
+        diff_delays: bool,
+        taps: int,
+        sigma: float,
+    ) -> torch.Tensor:
+        """Construct the current dense payload from compact source history."""
+        out = torch.zeros(self._syn_numel, device=self.device, dtype=self.dtype)
+        if self._n_conn == 0:
+            return out
+
+        wvals = self.weight()
+        if not diff_weights:
+            wvals = wvals.detach()
+
+        read_gates = (
+            self._source_history_read_float_connection_gates
+            if self._source_history_diff_spiking_enabled()
+            else self._source_history_read_packed_connection_gates
+        )
+
+        if diff_delays:
+            d_ms = self.delay_ms().to(self.dtype)
+            lam = (d_ms / self.dt.to(self.dtype)).clamp_min(1.0)
+            k = torch.floor(lam)
+            kL = k.to(torch.long)
+
+            if taps == 2:
+                alpha = (lam - k).to(self.dtype)
+                row0 = (cur_idx - kL).remainder(self.max_delay_steps)
+                row1 = (row0 - 1).remainder(self.max_delay_steps)
+                gate0 = read_gates(row0.reshape(-1))
+                gate1 = read_gates(row1.reshape(-1))
+                vals = wvals * (gate0 * (1.0 - alpha) + gate1 * alpha)
+                out.index_add_(0, self.post_idx, vals)
+            else:
+                offs = torch.stack([kL - 1, kL, kL + 1], dim=-1)
+                centers = offs.to(self.dtype)
+                lam_e = lam.unsqueeze(-1)
+                weights = torch.softmax(
+                    -0.5 * ((lam_e - centers) / (sigma + 1e-6)) ** 2,
+                    dim=-1,
+                )
+                # Future-write offset ``o`` corresponds at delivery time to source
+                # history row ``cur_idx - o``.
+                rows = (cur_idx - offs).remainder(self.max_delay_steps)
+                gates = read_gates(rows)
+                vals = wvals * (gates * weights).sum(dim=-1)
+                out.index_add_(0, self.post_idx, vals)
+        else:
+            delay_steps = self.inference_delay_steps
+            rows = (cur_idx - delay_steps).remainder(self.max_delay_steps)
+            vals = wvals * read_gates(rows.reshape(-1))
+            out.index_add_(0, self.post_idx, vals)
+        return out
+
+    def _source_history_record_current_gate(
+        self,
+        cur_idx: torch.Tensor,
+        source_gate: torch.Tensor,
+        *,
+        diff_spiking: bool,
+    ):
+        """Append the current source-level event/gate into compact history."""
+        if diff_spiking:
+            hist_next = self.source_gate_history.clone()
+            hist_next.index_copy_(
+                0,
+                cur_idx.reshape(-1),
+                source_gate.to(device=self.device, dtype=self.dtype).reshape(1, -1),
+            )
+            self.source_gate_history = hist_next
+            return
+        self._bitpack_pack_source_spikes(source_gate.to(torch.bool), cur_idx)
+
+    def _record_source_gate_for_state_cache_if_needed(self, source_gate: torch.Tensor):
+        if not getattr(self, "_state_cache_recording_enabled", False):
+            return
+        if (
+            "state_cache_gate_history" not in self._buffers
+            or self.state_cache_gate_history.numel() == 0
+        ):
+            return
+        source_pos = self._ensure_source_history_conn_source_pos()
+        gate_conn = source_gate.to(device=self.device, dtype=self.dtype).index_select(
+            0, source_pos
+        )
+        self._record_gate_for_state_cache(gate_conn)
+
     def _bitpack_source_spikes_this_step(self) -> torch.Tensor:
         """Return one binary spike/event value per unique presynaptic source."""
         if self._bitpack_mode == "netstim":
@@ -2677,22 +3067,37 @@ class NetCon(Referency):
             self.max_delay_steps = self._compute_max_delay_steps()
             self._rebuild_dense_delay_metadata()
 
-            if self.delay_backend == "bitpacked_history":
-                # Delay changes do not alter source-level bitpack topology.  Avoid
-                # rebuilding conn_word_idx/conn_bit_mask on every reinitialization;
-                # just resize/clear the time-history rows if the delay horizon changed.
+            needs_source_history = (
+                self.delay_backend == "bitpacked_history"
+                or self._source_history_training_requested()
+            )
+            if needs_source_history:
+                # Delay changes do not alter source-level topology. Avoid rebuilding
+                # conn_word_idx/conn_bit_mask on every reinitialization; resize only
+                # the time-history rows needed by the active runtime.
                 if not getattr(self, "_bitpack_can_use", False):
-                    self._configure_bitpacked_history_metadata()
-                else:
-                    self._resize_bitpacked_spike_history(clear=True)
-                if not self._bitpack_can_use:
+                    self._configure_bitpacked_history_metadata(
+                        for_training=self._source_history_training_requested()
+                    )
+                if (
+                    self.delay_backend == "bitpacked_history"
+                    and not self._bitpack_can_use
+                ):
                     raise ValueError(
                         "NetCon delay_backend='bitpacked_history' is not exact after delay rebuild: "
                         f"{self._bitpack_ineligible_reason}."
                     )
+                if self._bitpack_can_use:
+                    if (
+                        self._use_source_history_training_runtime()
+                        and self._source_history_diff_spiking_enabled()
+                    ):
+                        self._resize_source_gate_history(clear=True)
+                    else:
+                        self._resize_bitpacked_spike_history(clear=True)
             elif getattr(self, "_bitpack_can_use", False):
-                # If the backend was switched away from bitpacked at runtime, drop
-                # bitpacked-only state before allocating dense delay buffers.
+                # If source-history/bitpacked backends were switched off at runtime,
+                # drop source-history-only state before allocating dense delay buffers.
                 self._set_empty_bitpack_buffers()
                 self._bitpack_can_use = False
 
@@ -2716,13 +3121,24 @@ class NetCon(Referency):
             if (
                 self._use_sparse_calendar_runtime()
                 or self._use_bitpacked_history_runtime()
+                or self._use_source_history_training_runtime()
             ):
                 self._clear_sparse_calendar()
-                if self._use_bitpacked_history_runtime():
-                    self._resize_bitpacked_spike_history(clear=True)
+                if (
+                    self._use_bitpacked_history_runtime()
+                    or self._use_source_history_training_runtime()
+                ):
+                    if (
+                        self._use_source_history_training_runtime()
+                        and self._source_history_diff_spiking_enabled()
+                    ):
+                        self._resize_source_gate_history(clear=True)
+                    else:
+                        self._resize_bitpacked_spike_history(clear=True)
             if self.track_events and not (
                 self._use_sparse_calendar_runtime()
                 or self._use_bitpacked_history_runtime()
+                or self._use_source_history_training_runtime()
             ):
                 event_queue = torch.zeros(
                     (self.max_delay_steps, self.n.item()),
@@ -2750,6 +3166,7 @@ class NetCon(Referency):
         tau: float = 0.1,  # temperature for surrogate spiking
         diff_scheduled_times: bool = True,
         sched_width: float = 1.0,  # kernel half-width in *steps*
+        train_delay_backend: Literal["dense", "source_history", "auto"] | None = None,
     ):
         """
         Configure differentiable behavior for training.
@@ -2800,6 +3217,10 @@ class NetCon(Referency):
             Half-width of the triangular kernel (in steps) when
             ``diff_scheduled_times=True``. A value of 1.0 yields contributions
             spread over approximately 2 steps around the nominal event time.
+        train_delay_backend : {"dense", "source_history", "auto"}, optional
+            Optional per-NetCon training backend override. ``"source_history"``
+            requires source-level event semantics; ``"auto"`` uses source
+            history when exact and otherwise keeps the dense differentiable path.
 
         Notes
         -----
@@ -2808,6 +3229,12 @@ class NetCon(Referency):
           :meth:`advance_diff` when ``self.training = True`` and to
           :meth:`advance_non_diff` otherwise.
         """
+        if train_delay_backend is not None:
+            if train_delay_backend not in ("dense", "source_history", "auto"):
+                raise ValueError(
+                    "train_delay_backend must be one of 'dense', 'source_history', or 'auto'."
+                )
+            self.train_delay_backend = train_delay_backend
         self.train_flags = (
             diff_weights,
             diff_delays,
@@ -2818,6 +3245,11 @@ class NetCon(Referency):
             diff_scheduled_times,
             float(sched_width),
         )
+        # Re-select storage immediately for interactive/training-loop workflows.
+        # This is especially important for ``diff_spiking=True`` source-history
+        # training, which needs floating source-gate history rather than packed
+        # hard spikes.
+        self._refresh_training_advance_after_diff_config(clear_histories=True)
 
     @property
     def w(self):
@@ -3496,6 +3928,70 @@ class NetCon(Referency):
         sched_counts_conn.index_add_(0, self.sched_con_idx, cnt_evt)
         return sched_wsum_conn, sched_counts_conn
 
+    def advance_diff_source_history(self):
+        """Differentiable source-history training path.
+
+        This backend replaces the dense ``[max_delay_steps, syn_numel]`` training
+        delivery ring with source-level event history.  With ``diff_spiking=False``
+        the source history is bit-packed and treated as a hard event tape; weight
+        and delay gradients still flow for realized events.  With
+        ``diff_spiking=True`` the source history is floating and preserves
+        surrogate source-gate gradients.
+        """
+        if self.train_flags is None:
+            raise RuntimeError(
+                "NetCon.set_diff_config(...) must be called before "
+                "advance_diff_source_history()."
+            )
+        if self._has_scheduled_events():
+            raise RuntimeError(
+                "train_delay_backend='source_history' currently supports intrinsic "
+                "source-level events only. Use train_delay_backend='dense' for "
+                "scheduled-event training."
+            )
+        (
+            diff_weights,
+            diff_delays,
+            diff_spiking,
+            taps,
+            sigma,
+            tau,
+            diff_sched_times,
+            _,
+        ) = self.train_flags
+        if diff_sched_times and self._has_scheduled_events():
+            raise RuntimeError(
+                "Differentiable scheduled times are not supported by source-history training."
+            )
+
+        cur_idx = self.current_time_step.detach()
+
+        todays = self._source_history_build_delivery_from_history(
+            cur_idx,
+            diff_weights=bool(diff_weights),
+            diff_delays=bool(diff_delays),
+            taps=int(taps),
+            sigma=float(sigma),
+        )
+        self.syn.net_receive(todays.view(*self.syn.shape_f), self)
+
+        source_gate = self._source_history_source_gate_this_step(
+            diff_spiking=bool(diff_spiking),
+            tau=float(tau),
+        )
+        self._record_source_gate_for_state_cache_if_needed(source_gate)
+        self._source_history_record_current_gate(
+            cur_idx,
+            source_gate,
+            diff_spiking=bool(diff_spiking),
+        )
+
+        with torch.no_grad():
+            self.current_time_step = (
+                (self.current_time_step + 1).remainder(self.max_delay_steps).detach()
+            )
+            self.global_step = (self.global_step + 1).detach()
+
     def advance_diff(self):
         """
         Advance the connection state by one time step (differentiable path).
@@ -3981,7 +4477,13 @@ class NetCon(Referency):
     def train(self, mode: bool = True):  # type: ignore[override]
         super().train(mode)
         if mode:
-            self._ensure_connection_spike_buffers()
+            # Defer dense per-connection buffer allocation when the compact
+            # source-history backend may be selected.  If diff flags have not
+            # been configured yet, ``initialize``/``set_diff_config`` will choose
+            # the concrete storage later; this keeps plain ``train()`` cheap for
+            # very large SNNs.
+            if self.train_flags is not None or self.train_delay_backend == "dense":
+                self._refresh_training_advance_after_diff_config(clear_histories=False)
         else:
             # ``eval`` is the intended mode for the bitpacked backend.  Reclaim
             # per-connection debug/spike-state storage as soon as the module enters
@@ -4021,8 +4523,17 @@ class NetCon(Referency):
         if clear_delivery_buffers:
             self.delivery_buffer.zero_()
             self._clear_sparse_calendar()
-            if hasattr(self, "spike_history_packed"):
+            if (
+                hasattr(self, "spike_history_packed")
+                and self.spike_history_packed.numel() > 0
+            ):
                 self.spike_history_packed.zero_()
+            if (
+                hasattr(self, "source_gate_history")
+                and self.source_gate_history.numel() > 0
+            ):
+                self.source_gate_history = self.source_gate_history.detach()
+                self.source_gate_history.zero_()
             if (
                 hasattr(self, "bitpack_source_has_spiked")
                 and self.bitpack_source_has_spiked.numel() > 0
@@ -4111,8 +4622,13 @@ class NetCon(Referency):
           loops in Dendra (e.g., :class:`dendra.models.networks.Network.initialize`).
         """
         if self.training:
-            self._ensure_connection_spike_buffers()
-            self.advance = self.advance_diff
+            if self._use_source_history_training_runtime():
+                self._ensure_source_history_training_storage(clear=False)
+                self._shrink_connection_spike_buffers_for_source_history_training()
+                self.advance = self.advance_diff_source_history
+            else:
+                self._ensure_connection_spike_buffers()
+                self.advance = self.advance_diff
         elif self.delay_backend == "bitpacked_history":
             if not self._bitpack_can_use:
                 raise ValueError(
@@ -4134,8 +4650,13 @@ class NetCon(Referency):
         if reinit_delays:
             self._rebuild_delay_buffers()
             if self.training:
-                self._ensure_connection_spike_buffers()
-                self.advance = self.advance_diff
+                if self._use_source_history_training_runtime():
+                    self._ensure_source_history_training_storage(clear=True)
+                    self._shrink_connection_spike_buffers_for_source_history_training()
+                    self.advance = self.advance_diff_source_history
+                else:
+                    self._ensure_connection_spike_buffers()
+                    self.advance = self.advance_diff
             elif self.delay_backend == "bitpacked_history":
                 self.advance = self.advance_non_diff_bitpacked_history
                 self._shrink_connection_spike_buffers_for_bitpack()
@@ -4506,7 +5027,11 @@ class NetCon(Referency):
           they should be handled here, in a way that the user can flag.
         """
 
-        if self._use_sparse_calendar_runtime() or self._use_bitpacked_history_runtime():
+        if (
+            self._use_sparse_calendar_runtime()
+            or self._use_bitpacked_history_runtime()
+            or self._use_source_history_training_runtime()
+        ):
             raise RuntimeError(
                 "Non-dense NetCon runtime state is not supported by "
                 "state_dict_for_checkpoint() yet. Use delay_backend='dense' "
