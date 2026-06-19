@@ -206,38 +206,191 @@ def prepare_indices_one_one_flat(
     return pre_idx, post_idx
 
 
-def check_weight_shape(weight, pre_idx):
+def _value_shape_description(value):
+    """Human-readable shape/type summary for connection arguments."""
+    if isinstance(value, torch.Tensor):
+        return (
+            f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
+            f"device={value.device})"
+        )
+    if isinstance(value, torch.nn.Module):
+        return f"{type(value).__name__} module"
+    if isinstance(value, (float, int, bool)):
+        return f"scalar {value!r}"
+    if hasattr(value, "__len__"):
+        try:
+            return f"{type(value).__name__}(len={len(value)})"
+        except TypeError:
+            pass
+    return type(value).__name__
+
+
+def _connection_shape_context_lines(context, *, actual_edges=None, value_len=None):
+    """Format connection context for shape-mismatch errors."""
+    if not context:
+        return []
+
+    lines = []
+    kind = context.get("kind", "event")
+    rule = context.get("rule", "<unknown>")
+    source_name = context.get("source_name", "<unknown>")
+    target_name = context.get("target_name", "<unknown>")
+    synapse_name = context.get("synapse_name", "<unknown>")
+    pre_var = context.get("pre_var", None)
+    input_name = context.get("input", None)
+
+    endpoint = (
+        f"{kind} connection {source_name} -> {target_name}:{synapse_name} "
+        f"using rule={rule!r}"
+    )
+    if pre_var is not None:
+        endpoint += f", pre_var={pre_var!r}"
+    if input_name is not None:
+        endpoint += f", input={input_name!r}"
+    lines.append(endpoint + ".")
+
+    selected_pre = context.get("selected_pre")
+    selected_post = context.get("selected_post")
+    candidate_edges = context.get("candidate_edges")
+    final_edges = context.get("final_edges", actual_edges)
+    allow_autapses = context.get("allow_autapses")
+    allow_multapses = context.get("allow_multapses")
+
+    summary = []
+    if selected_pre is not None:
+        summary.append(f"selected source elements={selected_pre}")
+    if selected_post is not None:
+        summary.append(f"selected target elements={selected_post}")
+    if candidate_edges is not None:
+        summary.append(f"candidate edges before filtering={candidate_edges}")
+    if final_edges is not None:
+        summary.append(f"edges after rule/filtering={final_edges}")
+    if allow_autapses is not None:
+        summary.append(f"allow_autapses={allow_autapses}")
+    if allow_multapses is not None:
+        summary.append(f"allow_multapses={allow_multapses}")
+    if summary:
+        lines.append("Connection summary: " + ", ".join(str(x) for x in summary) + ".")
+
+    if (
+        candidate_edges is not None
+        and final_edges is not None
+        and candidate_edges != final_edges
+    ):
+        removed = int(candidate_edges) - int(final_edges)
+        if removed > 0:
+            reasons = []
+            if allow_autapses is False and context.get("same_population"):
+                reasons.append("autapse filtering")
+            if allow_multapses is False:
+                reasons.append("duplicate/multapse filtering")
+            reason_txt = " or ".join(reasons) if reasons else "connection filtering"
+            lines.append(
+                f"{removed} candidate edge(s) were removed by {reason_txt} "
+                "before per-connection threshold/weight/delay shapes were checked."
+            )
+
+    if (
+        value_len is not None
+        and candidate_edges is not None
+        and final_edges is not None
+        and int(value_len) == int(candidate_edges)
+        and int(value_len) != int(final_edges)
+    ):
+        lines.append(
+            "The provided value length matches the unfiltered candidate edge "
+            "count, not the final connection count. If values were built from "
+            "the original pre/post arrays, either pass allow_multapses=True / "
+            "allow_autapses=True as appropriate, or apply the same filtering to "
+            "pre_idx, post_idx, and all per-edge values before calling connect."
+        )
+    else:
+        lines.append(
+            "Per-connection values must be scalar/0-D, length 1, length equal "
+            "to the final number of connections, or a repeat-compatible length "
+            "that evenly divides the final connection count."
+        )
+
+    if context.get("auto_expand"):
+        lines.append(
+            "auto_expand=True expands values after connectivity is sampled; it "
+            "is safest for scalar values or distribution/parameter modules, not "
+            "for already-expanded per-candidate tensors."
+        )
+
+    return lines
+
+
+def _raise_connection_shape_error(
+    name, value, pre_idx, *, context=None, value_len=None
+):
+    actual_edges = int(pre_idx.numel()) if torch.is_tensor(pre_idx) else len(pre_idx)
+    base = (
+        f"Invalid {name} shape for connection: {_value_shape_description(value)} "
+        f"cannot be aligned to {actual_edges} final connection(s)."
+    )
+    lines = [base]
+    lines.extend(
+        _connection_shape_context_lines(
+            context, actual_edges=actual_edges, value_len=value_len
+        )
+    )
+    raise ValueError("\n".join(lines))
+
+
+def check_weight_shape(weight, pre_idx, *, name="weight", context=None):
     """
-    Checks the shape of the weight tensor against the pre-synaptic indices.
-    If the weight is a scalar, it returns the number of pre-synaptic indices.
-    If the weight is a tensor, it checks if its shape matches the number of pre-synaptic indices.
-    Otherwise, if if the weight is a tensor, len(pre_idx) must be a multiple of len(weight)
-    and the weight will be repeated accordingly (suitable for batching).
+    Validate a scalar or 1-D per-connection value against finalized pre indices.
+
+    Returns the repeat count used by ``make_weight``/``expand``. ``context`` is
+    optional diagnostic metadata supplied by Network.connect so shape errors can
+    explain connectivity-rule filtering, autapse/multapse removal, and the
+    source/target/synapse involved.
     """
-    if isinstance(weight, float):
-        return len(pre_idx)
+    n_edges = int(pre_idx.numel()) if torch.is_tensor(pre_idx) else len(pre_idx)
+
+    if isinstance(weight, (float, int, bool)):
+        return n_edges
+
     if isinstance(weight, torch.Tensor):
         if weight.ndim == 0:
-            return len(pre_idx)
-        if weight.ndim == 1:
-            if len(weight) == 1:
-                return len(pre_idx)
-            if weight.shape[0] == len(pre_idx):
-                return 1
-            if len(pre_idx) % len(weight) == 0:
-                return len(pre_idx) // len(weight)
+            return n_edges
+        if weight.ndim != 1:
             raise ValueError(
-                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
+                f"Invalid {name} shape for connection: expected a scalar/0-D "
+                f"or 1-D tensor, got Tensor(shape={tuple(weight.shape)}, "
+                f"dtype={weight.dtype}, device={weight.device})."
             )
-    if hasattr(weight, "__len__"):
-        if len(weight) != len(pre_idx):
-            raise ValueError(
-                f"Weight tensor shape {len(weight)} does not match pre-synaptic indices shape {pre_idx.shape}."
-            )
-        return 1
+        value_len = int(weight.shape[0])
+        if value_len == 1:
+            return n_edges
+        if value_len == n_edges:
+            return 1
+        if value_len > 0 and n_edges % value_len == 0:
+            return n_edges // value_len
+        _raise_connection_shape_error(
+            name, weight, pre_idx, context=context, value_len=value_len
+        )
+
     if isinstance(weight, torch.nn.Module):
-        return len(pre_idx)
-    raise TypeError(f"Unsupported type for weight: {type(weight)}.")
+        return n_edges
+
+    if hasattr(weight, "__len__"):
+        value_len = len(weight)
+        if value_len == 1:
+            return n_edges
+        if value_len == n_edges:
+            return 1
+        if value_len > 0 and n_edges % value_len == 0:
+            return n_edges // value_len
+        _raise_connection_shape_error(
+            name, weight, pre_idx, context=context, value_len=value_len
+        )
+
+    raise TypeError(
+        f"Unsupported type for {name}: {type(weight)}. Expected a scalar, "
+        "1-D tensor/list, torch.nn.Module, parameter, or distribution-like module."
+    )
 
 
 def _evaluate(value):
@@ -712,6 +865,103 @@ class Network(RNGMixin):
             target = target[:]
         return source, target, source.model, target.model
 
+    def _estimate_candidate_edges(
+        self,
+        *,
+        rule,
+        spec,
+        pre_pool,
+        post_pool,
+        source_model,
+        target_model,
+        allow_autapses: bool,
+    ):
+        """Best-effort count of candidate edges before filtering.
+
+        This is diagnostics-only. Some stochastic rules cannot know the exact
+        pre-filter count a user had in mind after random sampling, so this
+        method returns ``None`` when a useful exact estimate is unavailable.
+        """
+        rule = str(rule).replace("-", "_")
+        n_pre = int(pre_pool.numel())
+        n_post = int(post_pool.numel())
+        if rule == "one_to_one":
+            return n_pre if n_pre == n_post else None
+
+        if rule in ("all_to_all", "dense"):
+            # Candidate count before autapse/multapse filtering. Keep this O(1);
+            # exact self-pair counts for arbitrary selections are not worth an
+            # additional large tensor operation on every connect call.
+            return n_pre * n_post
+
+        if rule in ("fixed_total_number", "fixed_total"):
+            try:
+                return int(_require(spec, "N", "n"))
+            except Exception:
+                return None
+
+        if rule == "fixed_indegree":
+            try:
+                return int(_require(spec, "indegree", "in_degree", "K", "N")) * n_post
+            except Exception:
+                return None
+
+        if rule == "fixed_outdegree":
+            try:
+                return int(_require(spec, "outdegree", "out_degree", "K", "N")) * n_pre
+            except Exception:
+                return None
+
+        # pairwise_bernoulli and pairwise_poisson are stochastic; the final count
+        # is the most meaningful diagnostic value.
+        return None
+
+    def _connection_shape_context(
+        self,
+        *,
+        kind: str,
+        rule,
+        spec,
+        source_model,
+        target_model,
+        synapse,
+        pre_pool,
+        post_pool,
+        pre_idx,
+        allow_autapses: bool,
+        allow_multapses: bool,
+        auto_expand: bool,
+        pre_var=None,
+        input=None,
+    ):
+        """Build diagnostic context for threshold/weight/delay shape errors."""
+        candidate_edges = self._estimate_candidate_edges(
+            rule=rule,
+            spec=spec,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            source_model=source_model,
+            target_model=target_model,
+            allow_autapses=allow_autapses,
+        )
+        return {
+            "kind": kind,
+            "rule": str(rule).replace("-", "_"),
+            "source_name": getattr(source_model, "name", "<unnamed>"),
+            "target_name": getattr(target_model, "name", "<unnamed>"),
+            "synapse_name": getattr(synapse, "name", repr(synapse)),
+            "pre_var": pre_var,
+            "input": input,
+            "selected_pre": int(pre_pool.numel()),
+            "selected_post": int(post_pool.numel()),
+            "same_population": bool(source_model is target_model),
+            "candidate_edges": candidate_edges,
+            "final_edges": int(pre_idx.numel()),
+            "allow_autapses": bool(allow_autapses),
+            "allow_multapses": bool(allow_multapses),
+            "auto_expand": bool(auto_expand),
+        }
+
     def _flat_selection(self, selection):
         """Return selected population-flat indices for a Population/NetStim slice."""
         model = selection.model
@@ -1131,6 +1381,7 @@ class Network(RNGMixin):
         weight=1.0,
         delay=0.0,
         pre_var=None,
+        shape_context=None,
     ):
         """
         Append a finalized connection spec.
@@ -1144,9 +1395,15 @@ class Network(RNGMixin):
         if source_idx.numel() == 0:
             return
 
-        n_threshold = check_weight_shape(threshold, source_idx)
-        n_weight = check_weight_shape(weight, source_idx)
-        n_delay = check_weight_shape(delay, source_idx)
+        n_threshold = check_weight_shape(
+            threshold, source_idx, name="threshold", context=shape_context
+        )
+        n_weight = check_weight_shape(
+            weight, source_idx, name="weight", context=shape_context
+        )
+        n_delay = check_weight_shape(
+            delay, source_idx, name="delay", context=shape_context
+        )
 
         self.synapse_spec.setdefault(
             (source_pop.name, target_pop.name, synapse, pre_var), []
@@ -1177,6 +1434,7 @@ class Network(RNGMixin):
         input=None,
         reduce="sum",
         transform=None,
+        shape_context=None,
     ):
         """Append a finalized continuous-connection spec.
 
@@ -1186,8 +1444,12 @@ class Network(RNGMixin):
         if source_idx.numel() == 0:
             return
 
-        n_weight = check_weight_shape(weight, source_idx)
-        n_delay = check_weight_shape(delay, source_idx)
+        n_weight = check_weight_shape(
+            weight, source_idx, name="weight", context=shape_context
+        )
+        n_delay = check_weight_shape(
+            delay, source_idx, name="delay", context=shape_context
+        )
 
         self.continuous_synapse_spec.setdefault(
             (
@@ -1284,6 +1546,23 @@ class Network(RNGMixin):
         if pre_idx.numel() == 0:
             return
 
+        shape_context = self._connection_shape_context(
+            kind="continuous",
+            rule=rule,
+            spec=spec,
+            source_model=source_model,
+            target_model=target_model,
+            synapse=synapse,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            pre_idx=pre_idx,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+            auto_expand=auto_expand,
+            pre_var=pre_var,
+            input=input,
+        )
+
         post_idx = self._to_synapse_local_post_idx(
             target_model,
             post_flat.to(target_model.device()),
@@ -1307,6 +1586,7 @@ class Network(RNGMixin):
             input=input,
             reduce=reduce,
             transform=transform,
+            shape_context=shape_context,
         )
 
     def connect_continuous_one_to_one(
@@ -1423,6 +1703,22 @@ class Network(RNGMixin):
         if pre_idx.numel() == 0:
             return
 
+        shape_context = self._connection_shape_context(
+            kind="event",
+            rule=rule,
+            spec=spec,
+            source_model=source_model,
+            target_model=target_model,
+            synapse=synapse,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            pre_idx=pre_idx,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+            auto_expand=auto_expand,
+            pre_var=pre_var,
+        )
+
         post_idx = self._to_synapse_local_post_idx(
             target_model,
             post_flat.to(target_model.device()),
@@ -1445,6 +1741,7 @@ class Network(RNGMixin):
             weight=weight,
             delay=delay,
             pre_var=pre_var,
+            shape_context=shape_context,
         )
 
     def connect_one_to_one(
