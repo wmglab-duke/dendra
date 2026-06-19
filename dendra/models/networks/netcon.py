@@ -2382,6 +2382,10 @@ class NetCon(Referency):
                 "Cached NetCon gate history has incompatible shape: "
                 f"{tuple(age_history.shape)} vs (*, {self._n_conn})."
             )
+        if self._use_source_history_training_runtime():
+            self._restore_source_history_training_from_gate_history(age_history)
+            return
+
         self.delivery_buffer.zero_()
         self._clear_sparse_calendar()
         if self._n_conn == 0 or age_history.shape[0] <= 1:
@@ -2435,18 +2439,39 @@ class NetCon(Referency):
 
         This is used when a bitpacked steady-state cache is restored into a
         dense runtime, for example when the network is switched to training mode.
+        Source-history training uses one-row receive scratch storage rather than
+        a future delivery ring, so that runtime must restore the compact source
+        history itself instead of materializing future dense deliveries.
         """
         age_history = age_history.detach().to(device=self.device, dtype=torch.int64)
         expected_words = (
             int(self.spike_history_packed.shape[1])
             if hasattr(self, "spike_history_packed")
-            else int(age_history.shape[1])
+            and self.spike_history_packed.numel() > 0
+            else max(
+                1,
+                (
+                    int(
+                        getattr(
+                            self, "bitpack_source_pre_idx", self._empty_long()
+                        ).numel()
+                    )
+                    + int(self._bitpack_bits_per_word)
+                    - 1
+                )
+                // int(self._bitpack_bits_per_word),
+            )
         )
         if age_history.ndim != 2 or age_history.shape[1] != expected_words:
             raise ValueError(
                 "Cached bitpacked source history has incompatible word count: "
                 f"{tuple(age_history.shape)} vs (*, {expected_words})."
             )
+
+        if self._use_source_history_training_runtime():
+            self._restore_source_history_training_from_packed_age_history(age_history)
+            return
+
         self.delivery_buffer.zero_()
         self._clear_sparse_calendar()
         if self._n_conn == 0 or age_history.shape[0] <= 1:
@@ -2495,6 +2520,183 @@ class NetCon(Referency):
                 0, con_idx
             ) * self._syn_numel + post_idx.index_select(0, con_idx)
             flat.index_add_(0, flat_idx.reshape(-1), values.reshape(-1))
+
+    def _first_connection_per_source(self) -> torch.Tensor:
+        """Return representative connection indices for each unique source.
+
+        Source-history modes are exact only when every outgoing edge from a
+        unique presynaptic source shares the same gate.  During cache restore we
+        may receive a connection-level gate history from a dense steady-state
+        run; this helper lets us collapse it back to source-level history by
+        selecting one representative connection per source.
+        """
+        n_source = int(
+            getattr(self, "bitpack_source_pre_idx", self._empty_long()).numel()
+        )
+        if n_source == 0 or self._n_conn == 0:
+            return torch.empty(0, device=self.device, dtype=torch.long)
+        source_pos = self._ensure_source_history_conn_source_pos().to(
+            device=self.device, dtype=torch.long
+        )
+        positions = torch.arange(
+            source_pos.numel(), device=self.device, dtype=torch.long
+        )
+        first = torch.full(
+            (n_source,),
+            source_pos.numel(),
+            device=self.device,
+            dtype=torch.long,
+        )
+        first.scatter_reduce_(
+            0, source_pos, positions, reduce="amin", include_self=True
+        )
+        return first
+
+    def _source_age_history_from_connection_gate_history(
+        self, age_history: torch.Tensor
+    ) -> torch.Tensor:
+        """Collapse connection-level age history to source-level age history."""
+        age_history = age_history.detach().to(device=self.device, dtype=self.dtype)
+        n_source = int(
+            getattr(self, "bitpack_source_pre_idx", self._empty_long()).numel()
+        )
+        out = torch.zeros(
+            (int(age_history.shape[0]), n_source),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        if n_source == 0 or age_history.numel() == 0:
+            return out
+        first = self._first_connection_per_source()
+        valid = first < int(self._n_conn)
+        if bool(valid.any()):
+            src = torch.nonzero(valid, as_tuple=False).flatten()
+            con = first.index_select(0, src)
+            out.index_copy_(1, src, age_history.index_select(1, con))
+        return out
+
+    def _unpack_source_age_history(self, age_history: torch.Tensor) -> torch.Tensor:
+        """Unpack bitpacked age rows to floating source-gate age rows."""
+        age_history = age_history.detach().to(device=self.device, dtype=torch.int64)
+        n_source = int(
+            getattr(self, "bitpack_source_pre_idx", self._empty_long()).numel()
+        )
+        out = torch.zeros(
+            (int(age_history.shape[0]), n_source),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        if n_source == 0 or age_history.numel() == 0:
+            return out
+        word_idx = self.bitpack_source_word_idx.to(device=self.device, dtype=torch.long)
+        bit_mask = self.bitpack_source_bit_mask.to(
+            device=self.device, dtype=torch.int64
+        )
+        words = age_history[:, word_idx]
+        active = torch.bitwise_and(words, bit_mask.view(1, -1)) != 0
+        out.copy_(active.to(dtype=self.dtype))
+        return out
+
+    def _pack_source_age_history_to_ring(
+        self, source_age_history: torch.Tensor
+    ) -> torch.Tensor:
+        """Pack source-level age rows into a current_slot==0 history ring."""
+        self._resize_bitpacked_spike_history(clear=True)
+        depth = int(self.spike_history_packed.shape[0])
+        n_words = int(self.spike_history_packed.shape[1])
+        ring = torch.zeros((depth, n_words), device=self.device, dtype=torch.int64)
+        if depth <= 0 or source_age_history.numel() == 0:
+            return ring
+        n = min(int(source_age_history.shape[0]), depth)
+        word_idx = self.bitpack_source_word_idx.to(device=self.device, dtype=torch.long)
+        bit_mask = self.bitpack_source_bit_mask.to(
+            device=self.device, dtype=torch.int64
+        )
+        for age in range(n):
+            active = source_age_history[age].to(device=self.device) != 0
+            if not bool(active.any()):
+                continue
+            row_idx = (-int(age)) % depth
+            vals = bit_mask * active.to(torch.int64)
+            ring[row_idx].index_add_(0, word_idx, vals)
+        return ring
+
+    def _restore_source_history_training_from_source_age_history(
+        self, source_age_history: torch.Tensor
+    ):
+        """Restore compact source-history training state from age rows."""
+        self.delivery_buffer.zero_()
+        self._clear_sparse_calendar()
+        if self._source_history_diff_spiking_enabled():
+            self._resize_source_gate_history(clear=True)
+            source_age_history = source_age_history.detach().to(
+                device=self.device, dtype=self.dtype
+            )
+            if (
+                source_age_history.ndim != 2
+                or source_age_history.shape[1] != self.source_gate_history.shape[1]
+            ):
+                raise ValueError(
+                    "Cached source gate history has incompatible shape: "
+                    f"{tuple(source_age_history.shape)} vs (*, {self.source_gate_history.shape[1]})."
+                )
+            ring = _age_rows_to_ring_rows(
+                source_age_history, depth=int(self.source_gate_history.shape[0])
+            )
+            self.source_gate_history.copy_(ring)
+        else:
+            ring = self._pack_source_age_history_to_ring(source_age_history)
+            self.spike_history_packed.copy_(ring)
+
+    def _restore_source_history_training_from_gate_history(
+        self, age_history: torch.Tensor
+    ):
+        """Restore source-history training state from connection gate history."""
+        source_age = self._source_age_history_from_connection_gate_history(age_history)
+        self._restore_source_history_training_from_source_age_history(source_age)
+
+    def _restore_source_history_training_from_packed_age_history(
+        self, age_history: torch.Tensor
+    ):
+        """Restore source-history training state from packed source spike history."""
+        if self._source_history_diff_spiking_enabled():
+            source_age = self._unpack_source_age_history(age_history)
+            self._restore_source_history_training_from_source_age_history(source_age)
+        else:
+            self.delivery_buffer.zero_()
+            self._clear_sparse_calendar()
+            self._resize_bitpacked_spike_history(clear=True)
+            ring = _age_rows_to_ring_rows(
+                age_history.detach().to(device=self.device, dtype=torch.int64),
+                depth=int(self.spike_history_packed.shape[0]),
+            )
+            self.spike_history_packed.copy_(ring)
+
+    def _restore_source_has_spiked_from_connection_cache(
+        self, has_spiked: torch.Tensor
+    ):
+        """Restore source-level threshold state from a connection-level cache."""
+        if (
+            not self._use_source_history_training_runtime()
+            or not hasattr(self, "bitpack_source_has_spiked")
+            or self.bitpack_source_has_spiked.numel() == 0
+            or has_spiked.numel() != self._n_conn
+        ):
+            return
+        first = self._first_connection_per_source()
+        valid = first < int(self._n_conn)
+        src_state = torch.zeros_like(self.bitpack_source_has_spiked)
+        if bool(valid.any()):
+            src = torch.nonzero(valid, as_tuple=False).flatten()
+            con = first.index_select(0, src)
+            src_state.index_copy_(
+                0,
+                src.to(device=self.pre_device),
+                has_spiked.to(device=self.pre_device, dtype=torch.bool).index_select(
+                    0, con.to(self.pre_device)
+                ),
+            )
+        self.bitpack_source_has_spiked.copy_(src_state)
 
     def _clear_sparse_calendar(self):
         """Drop all pending sparse-calendar deliveries and event counts."""
@@ -4818,16 +5020,18 @@ class NetCon(Referency):
         new_dt = float(_cache_dt_value(self.dt) if dt is None else dt)
         backend_state = state_cache.get("backend_state", {})
 
-        if "has_spiked" in state_cache and self.has_spiked.numel() > 0:
+        if "has_spiked" in state_cache:
             hs = (
                 state_cache["has_spiked"]
                 .detach()
                 .to(device=self.pre_device, dtype=torch.bool)
             )
-            if hs.numel() == self.has_spiked.numel():
-                self.has_spiked.copy_(hs.reshape_as(self.has_spiked))
-            else:
-                self.has_spiked = hs.clone()
+            self._restore_source_has_spiked_from_connection_cache(hs)
+            if self.has_spiked.numel() > 0:
+                if hs.numel() == self.has_spiked.numel():
+                    self.has_spiked.copy_(hs.reshape_as(self.has_spiked))
+                else:
+                    self.has_spiked = hs.clone()
         if "is_spiking" in state_cache and self.is_spiking.numel() > 0:
             isp = (
                 state_cache["is_spiking"]
@@ -4924,6 +5128,11 @@ class NetCon(Referency):
                     val_dtype=self.dtype,
                 )
                 self._sparse_event_calendar.clear()
+            elif self._use_source_history_training_runtime():
+                # Source-history training has only a one-row receive scratch.
+                # Restore compact source history rather than materializing future
+                # deliveries into a dense delay ring.
+                self._restore_source_history_training_from_packed_age_history(age_hist)
             else:
                 # Training/dense runtime: materialize an ordinary future delivery
                 # buffer from the source history and current weights/delays.
@@ -4941,7 +5150,10 @@ class NetCon(Referency):
                 new_dt,
                 n_limit=int(self.max_delay_steps),
             )
-            self._materialize_delivery_from_gate_history(gate_hist)
+            if self._use_source_history_training_runtime():
+                self._restore_source_history_training_from_gate_history(gate_hist)
+            else:
+                self._materialize_delivery_from_gate_history(gate_hist)
 
         elif self._use_sparse_calendar_runtime():
             self.delivery_buffer.zero_()

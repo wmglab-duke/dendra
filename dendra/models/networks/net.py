@@ -372,9 +372,6 @@ def check_weight_shape(weight, pre_idx, *, name="weight", context=None):
             name, weight, pre_idx, context=context, value_len=value_len
         )
 
-    if isinstance(weight, torch.nn.Module):
-        return n_edges
-
     if hasattr(weight, "__len__"):
         value_len = len(weight)
         if value_len == 1:
@@ -386,6 +383,9 @@ def check_weight_shape(weight, pre_idx, *, name="weight", context=None):
         _raise_connection_shape_error(
             name, weight, pre_idx, context=context, value_len=value_len
         )
+
+    if isinstance(weight, torch.nn.Module):
+        return n_edges
 
     raise TypeError(
         f"Unsupported type for {name}: {type(weight)}. Expected a scalar, "
