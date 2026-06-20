@@ -120,7 +120,7 @@ def step(
     if netstim is not None:
         # NetStim has explicit heap/schedule side effects; keep it eager unless
         # NetStim grows a compile-safe method of its own.
-        netstim(t, bptt=netstim.training)
+        netstim(t, bptt=netstim.training, dt=dt)
     for target in continuous_targets.values():
         target.reset_continuous_inputs()
     for c in continuous_synapses.values():
@@ -898,6 +898,8 @@ class Network(RNGMixin):
             syn.train(mode)
         for syn in self.continuous_synapses.values():
             syn.train(mode)
+        if self.netstim is not None:
+            self.netstim.train(mode)
         self.training = mode
         self._step = self._step_train
         return self
@@ -925,6 +927,8 @@ class Network(RNGMixin):
             syn.eval()
         for syn in self.continuous_synapses.values():
             syn.eval()
+        if self.netstim is not None:
+            self.netstim.eval()
         self.training = False
         self._step = self._step_eval
         return self
@@ -2295,6 +2299,8 @@ class Network(RNGMixin):
                 reinit_delays=reinit_delays,
             )
         if self.netstim is not None:
+            if hasattr(self.netstim, "set_dt"):
+                self.netstim.set_dt(dt_f)
             self.netstim.initialize()
             self.netstim.detach()
         return self
@@ -2857,6 +2863,12 @@ class Network(RNGMixin):
     def set_synaptic_diff_config(self, **kwargs):
         for syn in self.synapses.values():
             syn.set_diff_config(**kwargs)
+        if self.netstim is not None and hasattr(self.netstim, "set_diff_config"):
+            # Propagate only the scheduled-time pieces NetStim understands.
+            self.netstim.set_diff_config(
+                diff_scheduled_times=kwargs.get("diff_scheduled_times", True),
+                sched_width=kwargs.get("sched_width", 1.0),
+            )
 
     # load utilities
     def load(self, state_dict):

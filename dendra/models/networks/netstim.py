@@ -189,6 +189,35 @@ class NetStim(DNModule, Sliceable):
             [] for _ in range(self._flat_numel_from_shape(self.shape))
         ]
 
+        # Differentiable / weighted scheduled events. The legacy heap above is
+        # retained for backward-compatible exact unit-amplitude schedules using
+        # Python floats. Tensor-backed schedules live here so gradients can flow
+        # through scheduled times and amplitudes when NetCon consumes
+        # ``NetStim.spike_gate`` with ``diff_spiking=True``.
+        self.diff_scheduled_times = True
+        self.sched_width = 1.0  # triangular-kernel half-width in steps
+        self.register_buffer(
+            "schedule_dt", torch.tensor(1.0, device=init_device, dtype=init_dtype)
+        )
+        self._sched_w_source = None
+        self._sched_t_source = None
+        self.register_buffer(
+            "sched_flat_idx", torch.empty(0, device=init_device, dtype=torch.long)
+        )
+        self.register_buffer(
+            "sched_abs_step", torch.empty(0, device=init_device, dtype=torch.long)
+        )
+        self.register_buffer(
+            "sched_weight_idx", torch.empty(0, device=init_device, dtype=torch.long)
+        )
+        self.register_buffer(
+            "sched_time_idx", torch.empty(0, device=init_device, dtype=torch.long)
+        )
+        # Value-mode schedule tensors are not buffers; this preserves autograd
+        # links to tensors supplied by the caller, matching NetCon scheduling.
+        self.sched_time_ms = torch.empty(0, device=init_device, dtype=init_dtype)
+        self.sched_weight = torch.empty(0, device=init_device, dtype=init_dtype)
+
     # ───────────────────────── shape helpers ─────────────────────────
     @staticmethod
     def _flat_numel_from_shape(shape: tuple[int, ...]) -> int:
@@ -385,6 +414,68 @@ class NetStim(DNModule, Sliceable):
             Dtype of internal buffers.
         """
         return self.next_stoch_time.dtype
+
+    def _align_schedule_tensors(self):
+        """Keep differentiable schedule metadata on the NetStim device."""
+        device, dtype = self.device(), self.dtype()
+        for name in (
+            "sched_flat_idx",
+            "sched_abs_step",
+            "sched_weight_idx",
+            "sched_time_idx",
+        ):
+            if hasattr(self, name):
+                buf = getattr(self, name)
+                if buf.device != device or buf.dtype != torch.long:
+                    setattr(self, name, buf.to(device=device, dtype=torch.long))
+        if hasattr(self, "sched_time_ms"):
+            self.sched_time_ms = self.sched_time_ms.to(device=device, dtype=dtype)
+        if hasattr(self, "sched_weight"):
+            self.sched_weight = self.sched_weight.to(device=device, dtype=dtype)
+        return self
+
+    def to(self, *args, **kwargs):  # type: ignore[override]
+        super().to(*args, **kwargs)
+        self._align_schedule_tensors()
+        return self
+
+    def set_dt(self, dt):
+        """Set the timestep used to interpret differentiable scheduled times."""
+        self.schedule_dt = torch.as_tensor(
+            dt, device=self.device(), dtype=self.dtype()
+        ).reshape(())
+        return self
+
+    def set_diff_config(
+        self,
+        *,
+        diff_scheduled_times: bool = True,
+        sched_width: float = 1.0,
+        **_,
+    ):
+        """Configure differentiable tensor-backed scheduled events.
+
+        This mirrors the scheduled-time portion of ``NetCon.set_diff_config``.
+        Tensor-backed schedules use ``spike_gate`` for differentiable amplitudes;
+        downstream NetCons must use ``diff_spiking=True`` to consume that gate.
+        """
+        self.diff_scheduled_times = bool(diff_scheduled_times)
+        self.sched_width = float(sched_width)
+        return self
+
+    def bind_weight_source(self, source: torch.Tensor):
+        """Bind a tensor that provides scheduled-event amplitudes by index."""
+        if source.device != self.device():
+            raise ValueError("weight source must live on the NetStim device")
+        self._sched_w_source = source
+        return self
+
+    def bind_time_source(self, source: torch.Tensor):
+        """Bind a tensor that provides scheduled-event times, in ms, by index."""
+        if source.device != self.device():
+            raise ValueError("time source must live on the NetStim device")
+        self._sched_t_source = source
+        return self
 
     def init_rng(self):
         """
@@ -603,34 +694,292 @@ class NetStim(DNModule, Sliceable):
             out = out * num_specs
         return out
 
-    @torch.no_grad()
-    def schedule(self, indices, times):
+    def _normalize_schedule_tensor(
+        self, value, num_specs: int, *, name: str, dtype=None
+    ):
+        """Return a 1-D device tensor that is scalar or aligned to specs."""
+        device = self.device()
+        dtype = self.dtype() if dtype is None else dtype
+        if torch.is_tensor(value):
+            out = value.to(device=device, dtype=dtype).reshape(-1)
+        elif isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+            out = torch.as_tensor(list(value), device=device, dtype=dtype).reshape(-1)
+        else:
+            out = torch.as_tensor([value], device=device, dtype=dtype).reshape(-1)
+        if out.numel() == 0:
+            raise ValueError(f"At least one scheduled {name} is required.")
+        if out.numel() == 1 and num_specs > 1:
+            out = out.expand(num_specs)
+        return out
+
+    def _expand_schedule_specs_to_flat_tensors(
+        self, specs, values: dict[str, torch.Tensor]
+    ):
+        """Expand generator specs to flat indices and repeat values accordingly."""
+        if len(specs) == 0:
+            raise ValueError("At least one scheduled index is required.")
+        n_specs = len(specs)
+        target_len = max([n_specs] + [int(v.numel()) for v in values.values()])
+        if n_specs == 1 and target_len > 1:
+            specs = specs * target_len
+            n_specs = target_len
+
+        aligned = {}
+        for name, value in values.items():
+            if value.numel() == 1 and n_specs > 1:
+                aligned[name] = value.expand(n_specs)
+            elif value.numel() == n_specs:
+                aligned[name] = value
+            else:
+                raise ValueError(
+                    f"{name} must be scalar or have length {n_specs}; got {value.numel()}."
+                )
+
+        flat_chunks = []
+        value_chunks = {name: [] for name in aligned}
+        for i, spec in enumerate(specs):
+            flat_i = torch.as_tensor(
+                self._flat_indices_for_spec(spec),
+                device=self.device(),
+                dtype=torch.long,
+            )
+            if flat_i.numel() == 0:
+                continue
+            flat_chunks.append(flat_i)
+            for name, value in aligned.items():
+                value_chunks[name].append(value[i].expand(flat_i.numel()))
+
+        if not flat_chunks:
+            flat = torch.empty(0, device=self.device(), dtype=torch.long)
+            return flat, {
+                name: torch.empty(0, device=self.device(), dtype=value.dtype)
+                for name, value in aligned.items()
+            }
+        return torch.cat(flat_chunks, dim=0), {
+            name: torch.cat(chunks, dim=0) for name, chunks in value_chunks.items()
+        }
+
+    def _should_use_tensor_schedule(self, times, weight, differentiable):
+        if differentiable is not None:
+            return bool(differentiable)
+        if torch.is_tensor(times) and bool(times.requires_grad):
+            return True
+        if torch.is_tensor(weight):
+            return True
+        if isinstance(weight, Iterable) and not isinstance(weight, (str, bytes)):
+            return True
+        try:
+            return float(weight) != 1.0
+        except Exception:
+            return True
+
+    def _append_tensor_schedule(
+        self,
+        flat_idx: torch.Tensor,
+        *,
+        times_ms: torch.Tensor | None = None,
+        weight: torch.Tensor | None = None,
+        time_idx: torch.Tensor | None = None,
+        weight_idx: torch.Tensor | None = None,
+        allow_past: bool = False,
+    ):
+        """Append differentiable/value-mode scheduled events."""
+        device, dtype = self.device(), self.dtype()
+        flat_idx = flat_idx.to(device=device, dtype=torch.long).reshape(-1)
+        n_evt = int(flat_idx.numel())
+        if n_evt == 0:
+            return self
+        if (flat_idx < 0).any() or (flat_idx >= self._flat_numel()).any():
+            raise IndexError("NetStim scheduled index out of range")
+
+        if times_ms is None:
+            times_ms = torch.zeros(n_evt, device=device, dtype=dtype)
+        else:
+            times_ms = times_ms.to(device=device, dtype=dtype).reshape(-1)
+        if weight is None:
+            weight = torch.ones(n_evt, device=device, dtype=dtype)
+        else:
+            weight = weight.to(device=device, dtype=dtype).reshape(-1)
+        if time_idx is None:
+            time_idx = torch.full((n_evt,), -1, device=device, dtype=torch.long)
+        else:
+            time_idx = time_idx.to(device=device, dtype=torch.long).reshape(-1)
+        if weight_idx is None:
+            weight_idx = torch.full((n_evt,), -1, device=device, dtype=torch.long)
+        else:
+            weight_idx = weight_idx.to(device=device, dtype=torch.long).reshape(-1)
+
+        for name, value in (
+            ("times_ms", times_ms),
+            ("weight", weight),
+            ("time_idx", time_idx),
+            ("weight_idx", weight_idx),
+        ):
+            if value.numel() == 1 and n_evt > 1:
+                value = value.expand(n_evt)
+            elif value.numel() != n_evt:
+                raise ValueError(f"{name} must be scalar or length {n_evt}")
+            if name == "times_ms":
+                times_ms = value
+            elif name == "weight":
+                weight = value
+            elif name == "time_idx":
+                time_idx = value
+            else:
+                weight_idx = value
+
+        if (time_idx >= 0).any():
+            if self._sched_t_source is None:
+                raise RuntimeError("time_idx provided but no time source is bound")
+            if (time_idx >= self._sched_t_source.numel()).any():
+                raise IndexError("time_idx out of range for bound time source")
+        if (weight_idx >= 0).any():
+            if self._sched_w_source is None:
+                raise RuntimeError("weight_idx provided but no weight source is bound")
+            if (weight_idx >= self._sched_w_source.numel()).any():
+                raise IndexError("weight_idx out of range for bound weight source")
+
+        # Filter currently-past events only at scheduling time, matching NetCon.
+        t_eval = times_ms
+        if self._sched_t_source is not None and bool((time_idx >= 0).any()):
+            idx = torch.clamp(time_idx, min=0)
+            src = self._sched_t_source.index_select(0, idx).to(
+                device=device, dtype=dtype
+            )
+            t_eval = t_eval + src * (time_idx >= 0).to(dtype)
+        steps = torch.round(t_eval / self._dt_scalar(dtype)).to(torch.long)
+        if not allow_past:
+            t_last = self.t_last.detach().reshape(-1).to(device=device, dtype=dtype)
+            keep = t_eval > t_last.index_select(0, flat_idx)
+            if not bool(keep.any()):
+                return self
+            flat_idx = flat_idx[keep]
+            times_ms = times_ms[keep]
+            weight = weight[keep]
+            time_idx = time_idx[keep]
+            weight_idx = weight_idx[keep]
+            steps = steps[keep]
+
+        self.sched_flat_idx = torch.cat([self.sched_flat_idx, flat_idx], dim=0)
+        self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
+        self.sched_time_ms = torch.cat([self.sched_time_ms, times_ms], dim=0)
+        self.sched_weight = torch.cat([self.sched_weight, weight], dim=0)
+        self.sched_time_idx = torch.cat([self.sched_time_idx, time_idx], dim=0)
+        self.sched_weight_idx = torch.cat([self.sched_weight_idx, weight_idx], dim=0)
+        return self
+
+    def _dt_scalar(self, dtype=None, dt=None):
+        dtype = self.dtype() if dtype is None else dtype
+        if dt is None:
+            dt = getattr(self, "schedule_dt", 1.0)
+        return torch.as_tensor(dt, device=self.device(), dtype=dtype).reshape(())
+
+    def _scheduled_tensor_values(self):
+        """Return value/ref combined scheduled times and weights."""
+        device, dtype = self.device(), self.dtype()
+        if self.sched_flat_idx.numel() == 0:
+            empty = torch.empty(0, device=device, dtype=dtype)
+            return empty, empty
+
+        times = self.sched_time_ms.to(device=device, dtype=dtype)
+        if self._sched_t_source is not None and bool((self.sched_time_idx >= 0).any()):
+            idx = torch.clamp(self.sched_time_idx, min=0)
+            src = self._sched_t_source.index_select(0, idx).to(
+                device=device, dtype=dtype
+            )
+            times = times + src * (self.sched_time_idx >= 0).to(dtype)
+
+        weights = self.sched_weight.to(device=device, dtype=dtype)
+        if self._sched_w_source is not None and bool(
+            (self.sched_weight_idx >= 0).any()
+        ):
+            idx = torch.clamp(self.sched_weight_idx, min=0)
+            src = self._sched_w_source.index_select(0, idx).to(
+                device=device, dtype=dtype
+            )
+            weights = weights + src * (self.sched_weight_idx >= 0).to(dtype)
+        return times, weights
+
+    def _scheduled_tensor_gate(self, t: torch.Tensor, *, dt=None):
+        """Aggregate tensor-backed scheduled amplitudes into state-shaped gates."""
+        device, dtype = self.device(), self.dtype()
+        flat_n = self._flat_numel()
+        gate_flat = torch.zeros(flat_n, device=device, dtype=dtype)
+        hard_counts = torch.zeros(flat_n, device=device, dtype=torch.int32)
+        if self.sched_flat_idx.numel() == 0:
+            return gate_flat.reshape(self.shape), hard_counts.reshape(self.shape) > 0
+
+        times, weights = self._scheduled_tensor_values()
+        flat_idx = self.sched_flat_idx.to(device=device, dtype=torch.long)
+        t_flat = torch.broadcast_to(
+            t.to(device=device, dtype=dtype), self.shape
+        ).reshape(-1)
+        t_evt = t_flat.index_select(0, flat_idx)
+        dt = self._dt_scalar(dtype, dt=dt)
+        x = (times - t_evt) / dt
+
+        if bool(getattr(self, "diff_scheduled_times", True)):
+            width = max(float(getattr(self, "sched_width", 1.0)), 1e-6)
+            kernel = (1.0 - (x.abs() / width)).clamp(min=0.0, max=1.0)
+        else:
+            event_step = torch.round(times / dt).to(torch.long)
+            cur_step = torch.round(t_evt / dt).to(torch.long)
+            kernel = (event_step == cur_step).to(dtype)
+
+        amp = weights * kernel
+        gate_flat.index_add_(0, flat_idx, amp)
+
+        event_step = torch.round(times / dt).to(torch.long)
+        cur_step = torch.round(t_evt / dt).to(torch.long)
+        hard_evt = event_step == cur_step
+        hard_counts.index_add_(0, flat_idx, hard_evt.to(torch.int32))
+        return gate_flat.reshape(self.shape), (hard_counts.reshape(self.shape) > 0)
+
+    def schedule(
+        self,
+        indices,
+        times=None,
+        weight=1.0,
+        *,
+        times_ms=None,
+        allow_past: bool = False,
+        differentiable=None,
+    ):
+        """Add explicit scheduled spikes, optionally with differentiable weights/times.
+
+        The backward-compatible unit-weight path stores Python floats in legacy
+        heaps.  Tensor times, tensor/list weights, non-unit scalar weights, or
+        ``differentiable=True`` use tensor-backed scheduling.  Tensor-backed
+        schedules contribute their amplitude to ``spike_gate``; downstream
+        NetCons must use ``diff_spiking=True`` to propagate gradients into the
+        scheduled times or weights.
         """
-        Add explicit spike times without overwriting existing ones.
+        if times is None:
+            times = times_ms
+        elif times_ms is not None:
+            raise ValueError("Provide only one of times or times_ms")
+        if times is None:
+            raise ValueError("scheduled times are required")
 
-        Unbatched usage is backward-compatible: integer indices refer to
-        generator indices in ``[0, N)``. In batched mode, a bare integer still
-        refers to a generator in the final dimension and is applied to every
-        leading batch element. To schedule a single batched element, pass a full
-        coordinate tuple matching ``self.shape``, e.g. ``(batch_index, gen)`` for
-        shape ``(batch, N)``.
-
-        Allows duplicates and multiple times per generator. Past times are
-        ignored per state element using that element's ``t_last``.
-
-        Parameters
-        ----------
-        indices : int, tuple[int, ...], or Iterable
-            Generator indices or full state coordinates to receive scheduled
-            spikes.
-        times : float or Iterable[float]
-            Spike times (ms) aligned with ``indices``. A scalar time broadcasts
-            across multiple indices; multiple times with one index schedule all
-            times onto that index.
-        """
         specs = self._normalize_index_specs(indices)
-        times_list = self._normalize_schedule_times(times, len(specs))
 
+        if self._should_use_tensor_schedule(times, weight, differentiable):
+            times_t = self._normalize_schedule_tensor(times, len(specs), name="time")
+            weight_t = self._normalize_schedule_tensor(
+                weight, len(specs), name="weight"
+            )
+            flat_idx, vals = self._expand_schedule_specs_to_flat_tensors(
+                specs, {"times": times_t, "weight": weight_t}
+            )
+            return self._append_tensor_schedule(
+                flat_idx,
+                times_ms=vals["times"],
+                weight=vals["weight"],
+                allow_past=allow_past,
+            )
+
+        # Legacy exact unit-amplitude schedule.
+        times_list = self._normalize_schedule_times(times, len(specs))
         if len(specs) == 1 and len(times_list) > 1:
             specs = specs * len(times_list)
         elif len(specs) != len(times_list):
@@ -639,35 +988,116 @@ class NetStim(DNModule, Sliceable):
                 "is scalar/broadcastable."
             )
 
-        t_last_flat = self.t_last.detach().reshape(-1).cpu()
-        for spec, t in zip(specs, times_list):
-            for flat_i in self._flat_indices_for_spec(spec):
-                t_cut = float(t_last_flat[flat_i].item())
-                if not (float(t) > t_cut):  # skip retroactive times
-                    continue
-                heapq.heappush(self._sched_heaps[flat_i], float(t))
+        with torch.no_grad():
+            t_last_flat = self.t_last.detach().reshape(-1).cpu()
+            for spec, t_i in zip(specs, times_list):
+                for flat_i in self._flat_indices_for_spec(spec):
+                    t_cut = float(t_last_flat[flat_i].item())
+                    if (not allow_past) and not (float(t_i) > t_cut):
+                        continue
+                    heapq.heappush(self._sched_heaps[flat_i], float(t_i))
+            self._refresh_next_sched_time_tensor()
+        return self
 
-        self._refresh_next_sched_time_tensor()
+    def schedule_ref(
+        self,
+        indices,
+        times=None,
+        weight_idx=None,
+        *,
+        times_ms=None,
+        allow_past: bool = False,
+    ):
+        """Schedule events whose amplitudes are read from a bound weight source."""
+        if self._sched_w_source is None:
+            raise RuntimeError("call bind_weight_source(...) before schedule_ref(...)")
+        if times is None:
+            times = times_ms
+        elif times_ms is not None:
+            raise ValueError("Provide only one of times or times_ms")
+        if times is None or weight_idx is None:
+            raise ValueError("times/times_ms and weight_idx are required")
+        specs = self._normalize_index_specs(indices)
+        times_t = self._normalize_schedule_tensor(times, len(specs), name="time")
+        widx_t = self._normalize_schedule_tensor(
+            weight_idx, len(specs), name="weight_idx", dtype=torch.long
+        )
+        flat_idx, vals = self._expand_schedule_specs_to_flat_tensors(
+            specs, {"times": times_t, "weight_idx": widx_t}
+        )
+        return self._append_tensor_schedule(
+            flat_idx,
+            times_ms=vals["times"],
+            weight=torch.zeros_like(vals["times"], dtype=self.dtype()),
+            weight_idx=vals["weight_idx"].to(torch.long),
+            allow_past=allow_past,
+        )
+
+    def schedule_time_ref(
+        self, indices, time_idx, weight=1.0, *, allow_past: bool = False
+    ):
+        """Schedule events whose times are read from a bound time source."""
+        if self._sched_t_source is None:
+            raise RuntimeError(
+                "call bind_time_source(...) before schedule_time_ref(...)"
+            )
+        specs = self._normalize_index_specs(indices)
+        tidx_t = self._normalize_schedule_tensor(
+            time_idx, len(specs), name="time_idx", dtype=torch.long
+        )
+        weight_t = self._normalize_schedule_tensor(weight, len(specs), name="weight")
+        flat_idx, vals = self._expand_schedule_specs_to_flat_tensors(
+            specs, {"time_idx": tidx_t, "weight": weight_t}
+        )
+        return self._append_tensor_schedule(
+            flat_idx,
+            times_ms=torch.zeros(
+                vals["weight"].numel(), device=self.device(), dtype=self.dtype()
+            ),
+            weight=vals["weight"],
+            time_idx=vals["time_idx"].to(torch.long),
+            allow_past=allow_past,
+        )
 
     @torch.no_grad()
     def clear_schedule(self, indices: Optional[Iterable[int]] = None):
-        """
-        Remove scheduled spikes for selected state elements, or all if ``None``.
-
-        In batched mode, bare integer indices clear a generator across all
-        leading batch elements. Full coordinate tuples clear one state element.
-        """
+        """Remove scheduled spikes for selected state elements, or all if ``None``."""
         if indices is None:
-            flat_indices = range(self._flat_numel())
+            flat_indices = list(range(self._flat_numel()))
+            clear_all = True
         else:
             specs = self._normalize_index_specs(indices)
             flat_indices = []
             for spec in specs:
                 flat_indices.extend(self._flat_indices_for_spec(spec))
+            flat_indices = sorted(set(int(i) for i in flat_indices))
+            clear_all = False
 
-        for flat_i in sorted(set(int(i) for i in flat_indices)):
+        for flat_i in flat_indices:
             self._sched_heaps[flat_i].clear()
         self._refresh_next_sched_time_tensor()
+
+        device, dtype = self.device(), self.dtype()
+        if clear_all:
+            self.sched_flat_idx = torch.empty(0, device=device, dtype=torch.long)
+            self.sched_abs_step = torch.empty(0, device=device, dtype=torch.long)
+            self.sched_weight_idx = torch.empty(0, device=device, dtype=torch.long)
+            self.sched_time_idx = torch.empty(0, device=device, dtype=torch.long)
+            self.sched_time_ms = torch.empty(0, device=device, dtype=dtype)
+            self.sched_weight = torch.empty(0, device=device, dtype=dtype)
+            return self
+
+        if self.sched_flat_idx.numel() > 0:
+            flat_filter = torch.as_tensor(flat_indices, device=device, dtype=torch.long)
+            remove = torch.isin(self.sched_flat_idx, flat_filter)
+            keep = ~remove
+            self.sched_flat_idx = self.sched_flat_idx[keep]
+            self.sched_abs_step = self.sched_abs_step[keep]
+            self.sched_weight_idx = self.sched_weight_idx[keep]
+            self.sched_time_idx = self.sched_time_idx[keep]
+            self.sched_time_ms = self.sched_time_ms[keep]
+            self.sched_weight = self.sched_weight[keep]
+        return self
 
     @torch.no_grad()
     @torch._dynamo.disable()  # keep everything here out of Dynamo/Inductor
@@ -688,7 +1118,7 @@ class NetStim(DNModule, Sliceable):
             )
             next_sched_flat[flat_i] = head
 
-    def forward(self, t, *, bptt: bool = False):
+    def forward(self, t, *, bptt: bool = False, dt=None):
         r"""
         Advance generator clocks to time ``t`` and emit a spike mask.
 
@@ -755,15 +1185,25 @@ class NetStim(DNModule, Sliceable):
             event_atol = torch.where(
                 tolerance_mask, event_atol, torch.zeros_like(event_atol)
             )
-        gate, s_hard = _ste_gate(x, tau=self.tau, atol=event_atol)
+        legacy_gate, legacy_hard = _ste_gate(x, tau=self.tau, atol=event_atol)
 
         max_spikes = self._broadcast_to_state(
             self.max_spikes, dtype=torch.long, device=device, name="max_spikes"
         )
         can_spike = self.spike_counts < max_spikes
-        s_hard = torch.logical_and(s_hard, can_spike)
-        self.spikes = s_hard  # bool view; fine to keep as is
-        self.spike_gate = gate * can_spike.to(gate.dtype)  # keep grad if used in loss
+
+        sched_gate, sched_hard = self._scheduled_tensor_gate(t, dt=dt)
+        can_gate = can_spike.to(dtype)
+        legacy_hard = torch.logical_and(legacy_hard, can_spike)
+        sched_hard = torch.logical_and(sched_hard, can_spike)
+
+        # ``spikes`` remains boolean for hard / inference consumers.
+        # ``spike_gate`` is the differentiable amplitude consumed by NetCon when
+        # diff_spiking=True. Tensor-backed scheduled weights live in this gate.
+        self.spikes = torch.logical_or(legacy_hard, sched_hard)
+        legacy_gate = legacy_gate * can_gate
+        sched_gate = sched_gate * can_gate
+        self.spike_gate = legacy_gate + sched_gate
 
         # 2) stochastic interval draw (grad will flow to interval via this)
         eps = torch.finfo(dtype).tiny
@@ -783,16 +1223,13 @@ class NetStim(DNModule, Sliceable):
         from_sched = torch.logical_and(
             sched_snap <= stoch_snap, torch.isfinite(sched_snap)
         )
-        s_sched = torch.logical_and(s_hard, from_sched)
-        # s_stoch = s_hard & (~from_sched)
+        s_sched = torch.logical_and(legacy_hard, from_sched)
+        # Tensor-backed scheduled events are external injections and do not
+        # advance the stochastic renewal clock.
 
         # 3) advance clocks
         #    a) stochastic: choose whether to backprop-through-time
-        delta = (
-            next_interval
-            * self.spike_gate
-            * torch.logical_not(from_sched).to(gate.dtype)
-        )
+        delta = next_interval * legacy_gate * torch.logical_not(from_sched).to(dtype)
 
         new_stoch = stoch_snap + delta  # <- no in-place on the buffer used in 'minimum'
 
@@ -811,7 +1248,7 @@ class NetStim(DNModule, Sliceable):
 
         # 4) counters (not part of the computational graph)
         with torch.no_grad():
-            self.spike_counts.add_(s_hard.to(torch.long))
+            self.spike_counts.add_(self.spikes.to(torch.long))
             t_full = torch.broadcast_to(t.detach(), self.shape)
             if tuple(self.t_last.shape) == self.shape:
                 self.t_last.copy_(t_full)
@@ -878,7 +1315,22 @@ class NetStim(DNModule, Sliceable):
 
         old_heaps = self._sched_heaps
         repeat_count = self._flat_numel_from_shape(dims)
+        old_flat_numel = self._flat_numel_from_shape(old_shape)
         self._sched_heaps = [list(h) for _ in range(repeat_count) for h in old_heaps]
+
+        # Replicate tensor-backed schedules into the new leading batch copies.
+        if getattr(self, "sched_flat_idx", torch.empty(0)).numel() > 0:
+            offsets = torch.arange(
+                repeat_count, device=self.device(), dtype=torch.long
+            ) * int(old_flat_numel)
+            self.sched_flat_idx = (
+                self.sched_flat_idx.reshape(1, -1) + offsets.reshape(-1, 1)
+            ).reshape(-1)
+            self.sched_abs_step = self.sched_abs_step.repeat(repeat_count)
+            self.sched_weight_idx = self.sched_weight_idx.repeat(repeat_count)
+            self.sched_time_idx = self.sched_time_idx.repeat(repeat_count)
+            self.sched_time_ms = self.sched_time_ms.repeat(repeat_count)
+            self.sched_weight = self.sched_weight.repeat(repeat_count)
 
         self._set_shape_metadata(new_shape)
         self.spike_gate = self._prepend_batch_dims_to_tensor(self.spike_gate, dims).to(
@@ -945,6 +1397,15 @@ class NetStim(DNModule, Sliceable):
             "t_last": self.t_last,
             # Scheduled-spike state
             "sched_heaps": sched_heaps,
+            "sched_flat_idx": self.sched_flat_idx,
+            "sched_abs_step": self.sched_abs_step,
+            "sched_time_ms": self.sched_time_ms,
+            "sched_weight": self.sched_weight,
+            "sched_weight_idx": self.sched_weight_idx,
+            "sched_time_idx": self.sched_time_idx,
+            "diff_scheduled_times": bool(self.diff_scheduled_times),
+            "sched_width": float(self.sched_width),
+            "schedule_dt": self.schedule_dt,
             # RNG state (critical for deterministic checkpoint replay)
             "rng_state": self._rng.get_state(),
             "seeder_state": self._seeder.get_state(),
@@ -1008,6 +1469,49 @@ class NetStim(DNModule, Sliceable):
                 device=device,
                 name="next_sched_time",
             ).clone()
+
+        # Restore tensor-backed scheduled events. Bound value sources are
+        # intentionally not serialized here; callers should keep them attached
+        # to the module / training object as with NetCon reference schedules.
+        self.diff_scheduled_times = bool(
+            state_dict.get(
+                "diff_scheduled_times", getattr(self, "diff_scheduled_times", True)
+            )
+        )
+        self.sched_width = float(
+            state_dict.get("sched_width", getattr(self, "sched_width", 1.0))
+        )
+        if "schedule_dt" in state_dict:
+            self.schedule_dt = torch.as_tensor(
+                state_dict["schedule_dt"], device=device, dtype=dtype
+            ).reshape(())
+        for name in (
+            "sched_flat_idx",
+            "sched_abs_step",
+            "sched_weight_idx",
+            "sched_time_idx",
+        ):
+            if name in state_dict:
+                setattr(
+                    self,
+                    name,
+                    state_dict[name]
+                    .detach()
+                    .to(device=device, dtype=torch.long)
+                    .clone(),
+                )
+            else:
+                setattr(self, name, torch.empty(0, device=device, dtype=torch.long))
+        if "sched_time_ms" in state_dict:
+            stm = state_dict["sched_time_ms"].to(device=device, dtype=dtype)
+            self.sched_time_ms = stm.clone() if not stm.requires_grad else stm
+        else:
+            self.sched_time_ms = torch.empty(0, device=device, dtype=dtype)
+        if "sched_weight" in state_dict:
+            sw = state_dict["sched_weight"].to(device=device, dtype=dtype)
+            self.sched_weight = sw.clone() if not sw.requires_grad else sw
+        else:
+            self.sched_weight = torch.empty(0, device=device, dtype=dtype)
 
         # 3) Restore differentiable stochastic state.
         #    Preserve gradient connectivity across chunks in training mode.
