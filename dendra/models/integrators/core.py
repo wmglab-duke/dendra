@@ -295,6 +295,60 @@ class Integrator(torch.nn.Module):
             kwargs["mode"] = self.compile_mode
         return kwargs
 
+    def clear_jit_cache(self):
+        """Drop lazily generated ``torch.compile`` kernels.
+
+        Compiled callables retain TorchDynamo/Inductor configuration objects that
+        are process-local implementation details and are not pickleable.  The
+        kernels are generated lazily by :meth:`_kernel`, so clearing this cache
+        is safe: the next compiled step recreates the functions if JIT is still
+        enabled.
+        """
+        if hasattr(self, "_compiled_kernels"):
+            self._compiled_kernels.clear()
+        return self
+
+    def pickleable(
+        self,
+        *,
+        inplace: bool = False,
+        clone: bool = False,
+        reset_global_compiler: bool = False,
+    ):
+        """Return a pickle-friendly integrator handle.
+
+        By default this is non-mutating and relies on :meth:`__getstate__` to
+        omit compiled kernels from the serialized state.  Use ``inplace=True``
+        only when you intentionally want to drop the live integrator's compiled
+        cache.
+        """
+        if inplace and clone:
+            raise ValueError(
+                "pickleable(...): choose at most one of inplace=True or clone=True."
+            )
+        if clone:
+            import copy as _copy
+
+            obj = _copy.deepcopy(self)
+            obj.clear_jit_cache()
+        elif inplace:
+            obj = self.clear_jit_cache()
+        else:
+            obj = self
+        if reset_global_compiler:
+            if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+                torch.compiler.reset()
+            elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
+                torch._dynamo.reset()
+        return obj
+
+    def __getstate__(self):
+        """Serialize without process-local compiled kernels."""
+        state = self.__dict__.copy()
+        if "_compiled_kernels" in state:
+            state["_compiled_kernels"] = {}
+        return state
+
     def _kernel(self, name: str, *args, **kwargs):
         """
         Call an integrator-owned numerical kernel, compiling it if requested.

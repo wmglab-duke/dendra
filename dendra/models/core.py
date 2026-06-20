@@ -421,6 +421,89 @@ class Population(P, Sliceable):
             self._make_intra_config = make_intra_config
         return self
 
+    def clear_jit_cache(self):
+        """Drop lazily compiled functions attached to this population.
+
+        ``torch.compile`` callables are process-local and may capture
+        TorchDynamo/Inductor configuration objects that cannot be pickled.  The
+        compiled helpers are regenerated lazily by ``run``/``initialize`` after
+        unpickling, so clearing them does not discard model state.
+        """
+        # ``make_intra`` may be a torch.compile wrapper.  Reset to the top-level
+        # function and invalidate the config sentinel so the next context refresh
+        # can recompile it when JIT is enabled.
+        self.make_intra = make_intra
+        self._make_intra_config = None
+
+        integrator = getattr(self, "integrator", None)
+        if integrator is not None:
+            clear = getattr(integrator, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+            elif hasattr(integrator, "_compiled_kernels"):
+                integrator._compiled_kernels.clear()
+        return self
+
+    def pickleable(
+        self,
+        *,
+        inplace: bool = False,
+        clone: bool = False,
+        reset_global_compiler: bool = False,
+    ):
+        """Return a pickle-friendly population handle.
+
+        By default this method is non-mutating and simply returns ``self``.
+        Pickling then uses :meth:`__getstate__`, which strips process-local JIT
+        callables from the serialized state without clearing the live object's
+        compiled caches.  This lets users checkpoint a running model and keep
+        using the already-compiled kernels afterward.
+
+        Parameters
+        ----------
+        inplace : bool, default False
+            If True, also clear this live population's local JIT caches.  The
+            next JIT-enabled run may need to recompile.
+        clone : bool, default False
+            If True, return a sanitized deep copy.  This avoids mutating the
+            live population but duplicates tensor storage, so it is usually not
+            appropriate for very large models.
+        reset_global_compiler : bool, default False
+            Also clear global Torch compiler caches.  This can force recompiles
+            and should usually be False when saving mid-simulation.
+        """
+        if inplace and clone:
+            raise ValueError(
+                "pickleable(...): choose at most one of inplace=True or clone=True."
+            )
+        if clone:
+            import copy as _copy
+
+            obj = _copy.deepcopy(self)
+            obj.clear_jit_cache()
+        elif inplace:
+            obj = self.clear_jit_cache()
+        else:
+            obj = self
+        if reset_global_compiler:
+            if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+                torch.compiler.reset()
+            elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
+                torch._dynamo.reset()
+        return obj
+
+    def __getstate__(self):
+        """Serialize without process-local compiled helpers.
+
+        This makes ``pickle.dump(population, f)`` work even after a JIT-enabled
+        run.  The live object is not modified; only the serialized state is
+        sanitized.
+        """
+        state = self.__dict__.copy()
+        state["make_intra"] = make_intra
+        state["_make_intra_config"] = None
+        return state
+
     @property
     def shape(self):
         """

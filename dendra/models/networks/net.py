@@ -773,6 +773,110 @@ class Network(RNGMixin):
                 pop.integrator.configure_jit(pop, scope="network_population")
         return self
 
+    def clear_jit_cache(self):
+        """Drop lazily compiled functions/caches from this network.
+
+        Network itself keeps only eager top-level stepping functions, but its
+        populations own compiled integrator kernels and compiled ``make_intra``
+        helpers after ``with dn.ctx(JIT=1): ...``.  Those compiled callables are
+        deliberately lazy and can be recreated after load, so they should not be
+        serialized with checkpoints or arbitrary pickle payloads.
+        """
+        self._step_train = step
+        self._step_eval = step
+        self._step = step
+
+        for pop in self.populations.values():
+            clear = getattr(pop, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+            elif getattr(pop, "integrator", None) is not None and hasattr(
+                pop.integrator, "_compiled_kernels"
+            ):
+                pop.integrator._compiled_kernels.clear()
+
+        if self.netstim is not None:
+            clear = getattr(self.netstim, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+
+        for syn in self.synapses.values():
+            clear = getattr(syn, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+        for syn in self.continuous_synapses.values():
+            clear = getattr(syn, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+        return self
+
+    def pickleable(
+        self,
+        *,
+        inplace: bool = False,
+        clone: bool = False,
+        reset_global_compiler: bool = False,
+    ):
+        """Return a pickle-friendly network handle.
+
+        By default this method is cheap and non-mutating:
+
+        .. code-block:: python
+
+            payload = {"model": net.pickleable(), "loss": loss}
+            pickle.dump(payload, f)
+
+        The live network keeps its compiled population/integrator kernels.
+        Pickling calls :meth:`__getstate__`, which strips process-local compiler
+        objects only from the serialized state.  Therefore saving a checkpoint
+        does not force the current model to recompile before continuing.
+
+        Parameters
+        ----------
+        inplace : bool, default False
+            If True, clear the live network's local JIT caches before returning
+            it.  The next JIT-enabled run may need to recompile.
+        clone : bool, default False
+            If True, return a sanitized deep copy.  This avoids mutating the
+            live network but duplicates tensor storage.
+        reset_global_compiler : bool, default False
+            Also clear global Torch compiler caches.  Leave this False when you
+            want to save and continue running with already-compiled kernels.
+        """
+        if inplace and clone:
+            raise ValueError(
+                "pickleable(...): choose at most one of inplace=True or clone=True."
+            )
+        if clone:
+            import copy as _copy
+
+            obj = _copy.deepcopy(self)
+            obj.clear_jit_cache()
+        elif inplace:
+            obj = self.clear_jit_cache()
+        else:
+            obj = self
+        if reset_global_compiler:
+            if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+                torch.compiler.reset()
+            elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
+                torch._dynamo.reset()
+        return obj
+
+    def __getstate__(self):
+        """Serialize without process-local network compile wrappers.
+
+        This is a defensive hook: direct ``pickle.dump(net, f)`` should work
+        after JIT-enabled runs without requiring callers to remember
+        ``net.pickleable()``.  Population/integrator compiled kernels are
+        stripped by their own ``__getstate__`` hooks.
+        """
+        state = self.__dict__.copy()
+        state["_step_train"] = step
+        state["_step_eval"] = step
+        state["_step"] = step
+        return state
+
     def train(self, mode=True):
         """
         Switch populations and synapses into training mode.
