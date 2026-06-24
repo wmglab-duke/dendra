@@ -1,3 +1,46 @@
+## v0.16.0 (2026-06-24)
+
+### Feat
+
+- differentiable NetStim event scheduler
+- models now pickleable
+- new differentiable Network backends for better memory efficiency
+- universal cache & load state in Network
+- add DTYPE and DEVICE to ctx
+- bitpacked history netcon backend
+- implement ClearanceProcess, ClampProcess, ExchangeProcess
+- add DiffusionProcess for materials
+- add bufferimplicit, linearimplicit, rosenbrock ODE solvers
+- implemented differentiable fire and apcount mechanisms
+- add paired-pulse and sds metric to analysis and non-differentiable versions
+- add ability for mech delay buffers to be time-major
+- batched delays in Mechanism
+- continuous / analog synapses added
+- add ability to stimulate mechanisms directly using Waveforms
+
+### Fix
+
+- fixes interaction between state-cache restore and the new source-history training backend; fixes check_weight_shape
+- fixes steady_state() for models
+- robust dynamic code compiler (fix for py3.13)
+- more robust Slice __setattr__
+- fix network and model batching
+
+### Refactor
+
+- cpp option for bitpacked netocon backend
+- replace cuda bitpack netcon kernels with triton
+- rename mod files
+- NetCon storing event queues now optional
+- remove redundant ion_style params
+- AxModule -> DNModule
+
+### Perf
+
+- reduce peak-memory thrashing for network re-initialization
+- netcon dense backend optimizations
+- v1 sparse netcon backend to improve memory efficiency of Networks
+
 ## v0.15.0 (2026-05-20)
 
 ### Feat
