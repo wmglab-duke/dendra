@@ -251,6 +251,273 @@ def r_ohm(parent_seg, child_seg):
         return child_seg.ri() * 1e6
 
 
+def _section_axis_arrays(sec):
+    """Return pt3d/stylized arclength and diameter arrays in µm.
+
+    NEURON sections with pt3d morphology are represented as a sequence of
+    truncated cones.  For stylized sections without pt3d points we fall back
+    to a uniform cylinder using ``sec.L`` and ``sec.diam``.
+    """
+    try:
+        n3d = int(sec.n3d())
+    except Exception:
+        n3d = int(h.n3d(sec=sec))
+
+    if n3d >= 2:
+        try:
+            arc = np.array([sec.arc3d(i) for i in range(n3d)], dtype=float)
+            diam = np.array([sec.diam3d(i) for i in range(n3d)], dtype=float)
+        except Exception:
+            arc = np.array([h.arc3d(i, sec=sec) for i in range(n3d)], dtype=float)
+            diam = np.array([h.diam3d(i, sec=sec) for i in range(n3d)], dtype=float)
+
+        # Ensure a nondecreasing arclength grid and remove duplicate points.
+        order = np.argsort(arc, kind="stable")
+        arc = arc[order]
+        diam = diam[order]
+        keep = np.concatenate(([True], np.diff(arc) > 0.0))
+        arc = arc[keep]
+        diam = diam[keep]
+
+        if arc.size >= 2 and float(arc[-1] - arc[0]) > 0.0:
+            if arc[0] != 0.0:
+                arc = arc - arc[0]
+            return arc, diam
+
+    L = float(getattr(sec, "L", 0.0))
+    d = float(getattr(sec, "diam", 0.0))
+    if L <= 0.0:
+        return np.array([0.0, 0.0], dtype=float), np.array([d, d], dtype=float)
+    return np.array([0.0, L], dtype=float), np.array([d, d], dtype=float)
+
+
+def _segment_index(seg) -> int:
+    """Return the integer NEURON nseg index for a segment centre."""
+    nseg = int(seg.sec.nseg)
+    idx = int(round(float(seg.x) * nseg - 0.5))
+    return max(0, min(nseg - 1, idx))
+
+
+def _section_s_um(sec, x: float) -> float:
+    """Map normalized section coordinate x in [0, 1] to arclength µm."""
+    arc, _ = _section_axis_arrays(sec)
+    total = float(arc[-1]) if arc.size else float(getattr(sec, "L", 0.0))
+    x = min(max(float(x), 0.0), 1.0)
+    return x * total
+
+
+def _diam_at_s_um(s_um: float, arc: np.ndarray, diam: np.ndarray) -> float:
+    if arc.size == 0:
+        return 0.0
+    if arc.size == 1 or float(arc[-1] - arc[0]) <= 0.0:
+        return float(diam[0])
+    return float(np.interp(float(s_um), arc, diam))
+
+
+def _integrate_frustum_volume_um3(
+    s0: float,
+    s1: float,
+    d0: float,
+    d1: float,
+    *,
+    diameter_eps: float = 1e-12,
+) -> float:
+    """Volume of a truncated cone segment in µm³."""
+    L = max(0.0, float(s1) - float(s0))
+    if L <= 0.0:
+        return 0.0
+    r0 = max(float(d0), diameter_eps) * 0.5
+    r1 = max(float(d1), diameter_eps) * 0.5
+    return float(np.pi * L * (r0 * r0 + r0 * r1 + r1 * r1) / 3.0)
+
+
+def _integrate_inv_area_um_inv(
+    s0: float,
+    s1: float,
+    d0: float,
+    d1: float,
+    *,
+    diameter_eps: float = 1e-12,
+) -> float:
+    """Exact ∫ ds/A(s) for a conical section in units µm⁻¹.
+
+    Diameter is assumed to vary linearly between d0 and d1 over the interval.
+    Since A(s) = π d(s)^2 / 4, the integral over a conical frustum is
+    4 L / (π d0 d1), with the constant-diameter case included.
+    """
+    L = max(0.0, float(s1) - float(s0))
+    if L <= 0.0:
+        return 0.0
+    d0 = max(float(d0), diameter_eps)
+    d1 = max(float(d1), diameter_eps)
+    return float(4.0 * L / (np.pi * d0 * d1))
+
+
+def _integrate_section_interval(
+    sec,
+    s0: float,
+    s1: float,
+    *,
+    quantity: str,
+) -> float:
+    """Integrate a pt3d/stylized section interval.
+
+    ``quantity`` is either ``"volume"`` for µm³ or ``"inv_area"`` for
+    ∫ds/A in µm⁻¹.
+    """
+    if s1 < s0:
+        s0, s1 = s1, s0
+    arc, diam = _section_axis_arrays(sec)
+    if arc.size < 2 or s1 <= s0:
+        return 0.0
+
+    total = float(arc[-1])
+    lo_all = max(0.0, min(float(s0), total))
+    hi_all = max(0.0, min(float(s1), total))
+    if hi_all <= lo_all:
+        return 0.0
+
+    out = 0.0
+    for a0, a1, d0_raw, d1_raw in zip(arc[:-1], arc[1:], diam[:-1], diam[1:]):
+        lo = max(lo_all, float(a0))
+        hi = min(hi_all, float(a1))
+        if hi <= lo:
+            continue
+        d_lo = _diam_at_s_um(lo, arc, diam)
+        d_hi = _diam_at_s_um(hi, arc, diam)
+        if quantity == "volume":
+            out += _integrate_frustum_volume_um3(lo, hi, d_lo, d_hi)
+        elif quantity == "inv_area":
+            out += _integrate_inv_area_um_inv(lo, hi, d_lo, d_hi)
+        else:
+            raise ValueError(f"Unsupported section integral quantity: {quantity!r}.")
+    return float(out)
+
+
+def segment_volume_um3(seg) -> float:
+    """Return the physical volume of a NEURON segment in µm³.
+
+    If pt3d data are available, the volume is computed by clipping the section's
+    truncated-cone sequence to the segment interval.  Otherwise this falls back
+    to the stylized cylinder ``π(seg.diam/2)^2 * L/nseg``.
+    """
+    sec = seg.sec
+    nseg = int(sec.nseg)
+    if nseg <= 0:
+        return 0.0
+
+    try:
+        n3d = int(sec.n3d())
+    except Exception:
+        n3d = int(h.n3d(sec=sec))
+
+    if n3d < 2:
+        L = float(getattr(sec, "L", 0.0)) / nseg
+        d = float(getattr(seg, "diam", getattr(sec, "diam", 0.0)))
+        if L <= 0.0 or d <= 0.0:
+            return 0.0
+        return float(np.pi * L * (0.5 * d) ** 2)
+
+    idx = _segment_index(seg)
+    total = _section_s_um(sec, 1.0)
+    if total <= 0.0:
+        return 0.0
+    s0 = total * idx / nseg
+    s1 = total * (idx + 1) / nseg
+    return _integrate_section_interval(sec, s0, s1, quantity="volume")
+
+
+def _section_inv_area_between_x(sec, x0: float, x1: float) -> float:
+    """Return ∫ds/A between two normalized coordinates on one section."""
+    s0 = _section_s_um(sec, x0)
+    s1 = _section_s_um(sec, x1)
+    return _integrate_section_interval(sec, s0, s1, quantity="inv_area")
+
+
+def edge_inv_area_integral_um_inv(parent_seg, child_seg) -> float:
+    """Return effective axial ∫ds/A for a graph edge, in µm⁻¹.
+
+    The directed graph edge is assumed to connect the centre of ``parent_seg``
+    to the centre of ``child_seg``.  For inter-section edges, the path is split
+    into parent-centre→section-connection and child-connection→child-centre.
+    """
+    if parent_seg.sec is child_seg.sec:
+        return _section_inv_area_between_x(parent_seg.sec, parent_seg.x, child_seg.x)
+
+    parent_on_parent = child_seg.sec.parentseg()
+    if parent_on_parent is not None and parent_on_parent.sec is parent_seg.sec:
+        parent_part = _section_inv_area_between_x(
+            parent_seg.sec, parent_seg.x, parent_on_parent.x
+        )
+        try:
+            d0 = h.distance(parent_on_parent, child_seg.sec(0.0))
+            d1 = h.distance(parent_on_parent, child_seg.sec(1.0))
+            child_end_x = 0.0 if d0 <= d1 else 1.0
+        except Exception:
+            child_end_x = 0.0
+        child_part = _section_inv_area_between_x(
+            child_seg.sec, child_end_x, child_seg.x
+        )
+        return float(parent_part + child_part)
+
+    raise ValueError(
+        "Cannot infer axial section path for edge; parent/child segments do not "
+        "appear to be adjacent in NEURON section topology."
+    )
+
+
+def _edge_diff_geom_from_resistance_um(parent_seg, child_seg, R_ohm: float) -> float:
+    """Fallback conversion from electrical resistance to diffusion geometry.
+
+    If R = ρ ∫ds/A and R is in Ω while ρ is in Ω·cm, then
+    (∫ds_um/A_um²)^-1 = ρ * 1e4 / R, in µm.  This is exact only when a
+    single effective axial resistivity applies across the edge.
+    """
+    if R_ohm is None or float(R_ohm) <= 0.0:
+        return 0.0
+    rho_parent = float(parent_seg.sec.Ra)
+    rho_child = float(child_seg.sec.Ra)
+    if parent_seg.sec is child_seg.sec:
+        rho_eff = rho_child
+    else:
+        rho_eff = 0.5 * (rho_parent + rho_child)
+    return float(rho_eff * 1e4 / float(R_ohm))
+
+
+def edge_diff_geom_um(parent_seg, child_seg, R_ohm: float = None) -> float:
+    """Return diffusion edge geometry factor in µm.
+
+    A diffusion coefficient ``D`` in µm²/ms gives an edge conductance
+    ``g = D * diff_geom_um`` in µm³/ms.
+    """
+    try:
+        inv_area = edge_inv_area_integral_um_inv(parent_seg, child_seg)
+        if inv_area > 0.0 and np.isfinite(inv_area):
+            return float(1.0 / inv_area)
+    except Exception:
+        pass
+    if R_ohm is not None:
+        return _edge_diff_geom_from_resistance_um(parent_seg, child_seg, R_ohm)
+    return 0.0
+
+
+def _node_geometry_attrs(seg) -> Dict[str, float]:
+    """Geometry attrs shared by NEURON-imported material/voltage paths."""
+    vol = float(segment_volume_um3(seg))
+    return {
+        "volume": vol,
+        "volume_um3": vol,
+        "volume_i": vol,
+    }
+
+
+def _edge_geometry_attrs(parent_seg, child_seg, R_ohm_value: float) -> Dict[str, float]:
+    diff_geom = float(edge_diff_geom_um(parent_seg, child_seg, R_ohm_value))
+    return {
+        "diff_geom_um": diff_geom,
+    }
+
+
 @requires_packages("neuron")
 def neuron_to_dendra_graph(
     root_sec: Optional["nrn.Section"] = None,
@@ -267,6 +534,16 @@ def neuron_to_dendra_graph(
     properties for extcell # of layers if extcell is provided). cm, Ra, L, diam are
     always extracted.
 
+    Node attributes
+    ---------------
+    volume : float
+        Compartment volume in µm³.  For pt3d morphologies this is computed by
+        clipping the section's truncated-cone sequence to the segment interval;
+        for stylized sections this falls back to a uniform cylinder.
+    volume_i : float
+        Intracellular material volume in µm³.  Currently identical to
+        ``volume`` and provided as a domain-specific alias for material processes.
+
     Edge attributes
     ---------------
     L : float
@@ -276,6 +553,10 @@ def neuron_to_dendra_graph(
     R_ohm : float
         Axial resistance (Ω) between those centres, taken from the distal
         segment's ``seg.ri()`` (which returns megohms) and scaled by 1e6.
+    diff_geom_um : float
+        Diffusion geometry factor in µm.  A diffusion coefficient ``D`` in
+        µm²/ms gives an edge diffusive conductance ``D * diff_geom_um`` in
+        µm³/ms.
     """
     if data_func is None:
         data_func = partial(xyz, extcell=extcell)
@@ -311,6 +592,7 @@ def neuron_to_dendra_graph(
                     cm=seg.cm,
                     name=str(seg),
                     area=seg.area(),
+                    **_node_geometry_attrs(seg),
                     **data,
                 )
             else:
@@ -342,7 +624,13 @@ def neuron_to_dendra_graph(
                 L_um = h.distance(prev_seg, seg)
                 # exact axial resistance from NEURON (Ω)
                 R_ohm = r_ohm(prev_seg, seg)
-                G.add_edge(prev_id, nid, L=L_um, R_ohm=R_ohm)
+                G.add_edge(
+                    prev_id,
+                    nid,
+                    L=L_um,
+                    R_ohm=R_ohm,
+                    **_edge_geometry_attrs(prev_seg, seg, R_ohm),
+                )
 
             prev_id, prev_seg = nid, seg
 
@@ -362,7 +650,13 @@ def neuron_to_dendra_graph(
             L_um = h.distance(parent_seg, child_seg)  # µm
             R_ohm = r_ohm(parent_seg, child_seg)
 
-            G.add_edge(parent_id, child_id, L=L_um, R_ohm=R_ohm)
+            G.add_edge(
+                parent_id,
+                child_id,
+                L=L_um,
+                R_ohm=R_ohm,
+                **_edge_geometry_attrs(parent_seg, child_seg, R_ohm),
+            )
 
             stack.append(child_sec)
 
@@ -546,20 +840,30 @@ def fix_graph_branchpoints(G, id2seg, data_func=None):
                 cm=parent_seg_true.cm,
                 name=f"branchpoint.{c}.{parent_seg_true}",
                 area=parent_seg_true.area(),
+                volume=0.0,
+                volume_um3=0.0,
+                volume_i=0.0,
                 **data,
             )
+            id2seg[nid] = parent_seg_true
             c += 1
+            R_pre_bp = parent_seg_true.ri() * 1e6
             G.add_edge(
                 pre_idx,
                 nid,
                 L=h.distance(id2seg[pre_idx], parent_seg_true),
-                R_ohm=parent_seg_true.ri() * 1e6,
+                R_ohm=R_pre_bp,
+                **_edge_geometry_attrs(id2seg[pre_idx], parent_seg_true, R_pre_bp),
             )
             for post_idx in post_indices:
                 G.remove_edge(pre_idx, post_idx)
+                R_bp_post = id2seg[post_idx].ri() * 1e6
                 G.add_edge(
                     nid,
                     post_idx,
                     L=h.distance(parent_seg_true, id2seg[post_idx]),
-                    R_ohm=id2seg[post_idx].ri() * 1e6,
+                    R_ohm=R_bp_post,
+                    **_edge_geometry_attrs(
+                        parent_seg_true, id2seg[post_idx], R_bp_post
+                    ),
                 )

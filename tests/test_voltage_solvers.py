@@ -12,13 +12,12 @@ CUDA_AVAILABLE = torch.cuda.is_available()
 
 
 # ==============================================================================
-# Pytest Test Functions for CUDA
+# CUDA-specific solver tests are marked individually so CPU PCR coverage still
+# runs on non-CUDA CI/developer machines.
 # ==============================================================================
 
-# Mark the entire file to be skipped if CUDA is not available or the function isn't found.
-pytestmark = pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available.")
 
-
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available.")
 def test_dhs_cuda_forward_pass():
     """
     Tests the forward pass of the CUDA DHS solver.
@@ -50,6 +49,7 @@ def test_dhs_cuda_forward_pass():
     assert torch.allclose(x_computed, x_expected, atol=1e-6)
 
 
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available.")
 def test_dhs_cuda_backward_pass_gradcheck():
     """
     Uses torch.autograd.gradcheck to verify the CUDA backward implementation.
@@ -93,6 +93,7 @@ def test_dhs_cuda_backward_pass_gradcheck():
     assert is_correct, "Gradient check failed for CUDA DHS solver!"
 
 
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available.")
 def test_thomas_cuda_t_forward_pass():
     """
     Tests the forward pass of the CUDA Thomas solver with a simple, known case.
@@ -125,6 +126,7 @@ def test_thomas_cuda_t_forward_pass():
     assert torch.allclose(x_computed, x_expected, atol=1e-6)
 
 
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available.")
 def test_thomas_cuda_t_backward_pass_gradcheck():
     """
     Uses torch.autograd.gradcheck to verify the CUDA Thomas backward implementation.
@@ -243,6 +245,7 @@ def construct_block_tridiagonal_matrix(lower, main, upper):
     return torch.stack(A_list)
 
 
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available.")
 def test_block_thomas_cuda_forward_pass():
     """
     Tests the forward pass of the CUDA block Thomas solver.
@@ -277,6 +280,7 @@ def test_block_thomas_cuda_forward_pass():
     assert torch.allclose(x_computed, x_expected, atol=1e-4, rtol=1e-3)
 
 
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available.")
 def test_block_thomas_cuda_backward_pass_gradcheck():
     B, K, D = 1, 4, 3
     device = "cuda:0"

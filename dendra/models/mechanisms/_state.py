@@ -6,28 +6,157 @@ import torch
 
 from dendra.models.parametric import Parameterized
 
+from ._bufferimplicit import build_bufferimplicit
 from ._cnexp import build_cnexp
 from ._derivimplicit import build_derivimplicit
 from ._kinetic import kinetic_to_derivatives
+from ._linearimplicit import build_linearimplicit
 from ._mechanism import classproperty
+from ._rosenbrock import build_rosenbrock1
+
+# Integration-method registry -------------------------------------------------
+#
+# State subclasses can declare their solver with State.METHOD(...).  The registry
+# keeps method dispatch out of State.__init__ and makes it straightforward to add
+# new generated solvers such as linearimplicit/sparse, rosenbrock1, or
+# bufferimplicit without editing the State class again.
+_INTEGRATION_BUILDERS = {}
+_INTEGRATION_ALIASES = {}
+
+
+def _canonical_method_name(method):
+    if method is None:
+        method = "cnexp"
+    if not isinstance(method, str):
+        raise TypeError(
+            f"State integration method must be a string; got {type(method).__name__}."
+        )
+    method = method.strip().lower().replace("-", "_")
+    return _INTEGRATION_ALIASES.get(method, method)
+
+
+def register_integration_method(name, builder, *, aliases=()):
+    """Register a generated integration-function builder.
+
+    Parameters
+    ----------
+    name : str
+        Canonical method name, e.g. ``"cnexp"`` or ``"derivimplicit"``.
+    builder : callable
+        Function with signature ``builder(states, assigned, derivative,
+        eliminate=None, **method_kwargs)`` returning a generated ``solve``
+        function.
+    aliases : iterable[str], optional
+        Additional names accepted by :meth:`State.METHOD`.
+    """
+    canonical = str(name).strip().lower().replace("-", "_")
+    if not canonical:
+        raise ValueError("Integration method name cannot be empty.")
+    _INTEGRATION_BUILDERS[canonical] = builder
+    _INTEGRATION_ALIASES[canonical] = canonical
+    for alias in aliases:
+        alias = str(alias).strip().lower().replace("-", "_")
+        if not alias:
+            raise ValueError("Integration method alias cannot be empty.")
+        _INTEGRATION_ALIASES[alias] = canonical
+    return builder
+
+
+def valid_integration_methods():
+    """Return the currently registered canonical integration method names."""
+    return tuple(sorted(_INTEGRATION_BUILDERS))
+
+
+def _merge_method_config(current_method, current_kwargs, method, kwargs):
+    """Merge inherited/class-body method declarations.
+
+    ``method=None`` means keep the current/inherited method and only update the
+    options.  If the method changes, inherited options are intentionally dropped:
+    carrying ``max_iter`` from ``derivimplicit`` into ``cnexp`` would be a subtle
+    configuration bug.
+    """
+    kwargs = dict(kwargs or {})
+    if method is None:
+        current_kwargs.update(kwargs)
+        return current_method, current_kwargs
+
+    method = _canonical_method_name(method)
+    if method != current_method:
+        current_kwargs = {}
+    current_kwargs.update(kwargs)
+    return method, current_kwargs
 
 
 def build_integration_func(
-    states, assigned, derivative, method, eliminate=None, pade=False
+    states, assigned, derivative, method, eliminate=None, **method_kwargs
 ):
-    """
-    Build the integration function for the states and assigned variables.
-    """
-    if method == "cnexp":
-        return build_cnexp(states, assigned, derivative, eliminate=eliminate, pade=pade)
-    elif method == "derivimplicit":
-        return build_derivimplicit(
-            states, assigned, derivative, eliminate=eliminate, pade=pade
-        )
-    else:
+    """Build the integration function for a State subclass."""
+    method = _canonical_method_name(method)
+    try:
+        builder = _INTEGRATION_BUILDERS[method]
+    except KeyError as exc:
+        valid = ", ".join(valid_integration_methods())
         raise ValueError(
-            f"Unknown integration method: {method}. Valid methods are: cnexp, derivimplicit."
-        )
+            f"Unknown integration method: {method!r}. Valid methods are: {valid}."
+        ) from exc
+
+    return builder(
+        states,
+        assigned,
+        derivative,
+        eliminate=eliminate,
+        **method_kwargs,
+    )
+
+
+register_integration_method("cnexp", build_cnexp, aliases=("rush_larsen", "rl"))
+register_integration_method(
+    "derivimplicit",
+    build_derivimplicit,
+    aliases=("deriv_implicit", "implicit", "backward_euler", "be"),
+)
+register_integration_method(
+    "bufferimplicit",
+    build_bufferimplicit,
+    aliases=(
+        "buffer",
+        "implicit_buffer",
+        "ca_buffer",
+        "calcium_buffer",
+        "calciumbuffer",
+    ),
+)
+register_integration_method(
+    "linearimplicit",
+    build_linearimplicit,
+    aliases=(
+        "linear_implicit",
+        "implicitlinear",
+        "implicit_linear",
+        "affineimplicit",
+        "affine_implicit",
+        "sparse",
+        "be_linear",
+        "backward_euler_linear",
+        "linear_be",
+    ),
+)
+register_integration_method(
+    "rosenbrock",
+    build_rosenbrock1,
+    aliases=(
+        "rosenbrock1",
+        "rosenbrock_euler",
+        "rosenbrock-euler",
+        "linearlyimplicit",
+        "linearly_implicit",
+        "linearized_implicit",
+        "linearly_implicit_euler",
+        "linimplicit",
+        "semiimplicit",
+        "semi_implicit",
+    ),
+)
 
 
 class State(Parameterized):
@@ -64,7 +193,16 @@ class State(Parameterized):
     _assigned_declarations = []
 
     has_q10 = False
+
+    # Backward-compatible public class attribute.  Existing definitions such as
+    # ``method = "derivimplicit"`` continue to work.  Prefer ``State.METHOD`` for
+    # new code so solver-specific options can be declared alongside the method.
     method = "cnexp"
+    method_kwargs = {}
+
+    _method = "cnexp"
+    _method_kwargs = {}
+    _method_declarations = []
 
     def __init_subclass__(cls, **kwargs):
         """
@@ -81,10 +219,11 @@ class State(Parameterized):
         new_derivative = set()
         new_assigned = set()
         new_kinetic = set()
+        new_method = "cnexp"
+        new_method_kwargs = {}
 
-        # Walk MRO in reverse to build up params from parent to child
+        # Walk MRO in reverse to build up params from parent to child.
         for base in reversed(cls.__mro__):
-            # We look for a _params attribute defined directly on the base
             if "_state" in base.__dict__:
                 new_state.update(base._state)
             if "_state_buffers" in base.__dict__:
@@ -95,6 +234,21 @@ class State(Parameterized):
                 new_kinetic.update(base._kinetic)
             if "_assigned" in base.__dict__:
                 new_assigned.update(base._assigned)
+
+            if "_method" in base.__dict__:
+                new_method, new_method_kwargs = _merge_method_config(
+                    new_method,
+                    new_method_kwargs,
+                    base.__dict__["_method"],
+                    base.__dict__.get("_method_kwargs", {}),
+                )
+            elif "method" in base.__dict__:
+                new_method, new_method_kwargs = _merge_method_config(
+                    new_method,
+                    new_method_kwargs,
+                    base.__dict__["method"],
+                    base.__dict__.get("method_kwargs", {}),
+                )
 
         if State._state_declarations:
             for s_list in State._state_declarations:
@@ -121,11 +275,32 @@ class State(Parameterized):
                 new_assigned.update(a_list)
             State._assigned_declarations = []
 
+        if State._method_declarations:
+            for method_name, method_kwargs in State._method_declarations:
+                new_method, new_method_kwargs = _merge_method_config(
+                    new_method, new_method_kwargs, method_name, method_kwargs
+                )
+            State._method_declarations = []
+
+        new_method = _canonical_method_name(new_method)
+        if new_method not in _INTEGRATION_BUILDERS:
+            valid = ", ".join(valid_integration_methods())
+            raise ValueError(
+                f"Unknown integration method for State {cls.__name__}: "
+                f"{new_method!r}. Valid methods are: {valid}."
+            )
+
         cls._state = list(new_state)
         cls._state_buffers = new_buffers
         cls._derivative = new_derivative
         cls._kinetic = new_kinetic
         cls._assigned = list(new_assigned)
+        cls._method = new_method
+        cls._method_kwargs = dict(new_method_kwargs)
+
+        # Public/introspection aliases.
+        cls.method = cls._method
+        cls.method_kwargs = dict(cls._method_kwargs)
 
     def __init__(
         self,
@@ -163,11 +338,26 @@ class State(Parameterized):
         for b in self._state_buffers:
             self.register_buffer(b, torch.tensor(0.0))
 
-        pade = kwargs.get("pade", False)
         self.include_q10_in_comp_graph = kwargs.get("include_q10_in_comp_graph", False)
 
+        # Integration-method configuration is fixed at State-subclass definition
+        # time.  Copy it onto the instance for introspection and to keep generated
+        # solver compilation monomorphic.  Instance kwargs may still override
+        # legacy global options such as ``pade``.
+        self.method = self.__class__._method
+        self.method_kwargs = dict(self.__class__._method_kwargs)
+        if "pade" in kwargs:
+            self.method_kwargs["pade"] = kwargs["pade"]
+        else:
+            self.method_kwargs.setdefault("pade", False)
+
         ifunc = build_integration_func(
-            self._state, self._assigned, _derivative, self.method, cinfo, pade
+            self._state,
+            self._assigned,
+            _derivative,
+            self.method,
+            eliminate=cinfo,
+            **self.method_kwargs,
         )
         setattr(self, "solve", MethodType(ifunc, self))
 
@@ -240,7 +430,7 @@ class State(Parameterized):
         Parameters
         ----------
         *args : str
-            Derivative expressions like ``\"m' = (minf - m) / tau\"``.
+            Derivative expressions like ``"m' = (minf - m) / tau"``.
         """
         State._derivative_declarations.append(args)
 
@@ -252,7 +442,7 @@ class State(Parameterized):
         Parameters
         ----------
         *args : str
-            Kinetic expressions like ``\"~ a <-> b (alpha, beta)\"``.
+            Kinetic expressions like ``"~ a <-> b (alpha, beta)"``.
         """
         State._kinetic_declarations.append(args)
 
@@ -267,6 +457,31 @@ class State(Parameterized):
             Names of ASSIGNED variables to be set in :meth:`breakpoint`.
         """
         State._assigned_declarations.append(args)
+
+    @staticmethod
+    def METHOD(method=None, **kwargs):
+        """Declare the integration method for this State subclass.
+
+        Parameters
+        ----------
+        method : str, optional
+            Integration method name.  Currently registered methods include
+            ``"cnexp"``, ``"derivimplicit"``, ``"bufferimplicit"``,
+            ``"linearimplicit"``/``"sparse"``, and ``"rosenbrock"``.  Passing ``None`` leaves the inherited method
+            unchanged and only updates method kwargs.
+        **kwargs
+            Method-specific options captured at class-definition time and passed
+            to the generated solver builder.  For example::
+
+                State.METHOD("derivimplicit", max_iter=4, line_search=False)
+
+            or::
+
+                State.METHOD("cnexp", pade=True)
+        """
+        if method is not None:
+            method = _canonical_method_name(method)
+        State._method_declarations.append((method, dict(kwargs)))
 
     def breakpoint(self, v, states):
         """

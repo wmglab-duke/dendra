@@ -2,20 +2,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-import dendra as ax
+import dendra as dn
 from dendra.models.callbacks import RecorderLambda
 from dendra.models.mod import exp2syn, hh
 from dendra.units import ms
 
-ax.set_jit_enabled(False)  # True to enable jit compilation globally
+dn.set_jit_enabled(False)  # True to enable jit compilation globally
 
 N = 4
-pop = ax.Population(1, N, v_init=-65.0, celsius=6.5)
+pop = dn.Population(1, N, v_init=-65.0, celsius=6.5)
 pop.insert(hh)
 pop.insert(exp2syn.rename("NMDA"), e=0.0, tau1=0.1, tau2=1.0)
 
-ns = ax.NetStim(N=1, noise=0, seed=0, max_spikes=1)
-net = ax.Network({"hh": pop}, netstim=ns)  # .cuda() to run on GPU
+ns = dn.NetStim(N=1, noise=0, seed=0, max_spikes=1)
+net = dn.Network({"hh": pop}, netstim=ns)  # .cuda() to run on GPU
 
 net.clear_synapses()
 

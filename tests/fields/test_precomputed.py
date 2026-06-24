@@ -5,10 +5,33 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from dendra.models.fields.precomputed import (
-    EfieldInterpolate3D,
-    PreComputedExact,
+    EfieldInterpolate3DScattered,
     PreComputedInterpolate1D,
+    PreComputedInterpolate3DScattered,
 )
+
+
+class DummyModel:
+    def __init__(self, x, y=None, z=None, *, dtype=torch.float32, device="cpu"):
+        self.x = torch.as_tensor(x, dtype=dtype, device=device)
+        self.y = (
+            torch.zeros_like(self.x)
+            if y is None
+            else torch.as_tensor(y, dtype=dtype, device=device)
+        )
+        self.z = (
+            torch.zeros_like(self.x)
+            if z is None
+            else torch.as_tensor(z, dtype=dtype, device=device)
+        )
+        self.graph = None
+
+    def device(self):
+        return self.x.device
+
+    def dtype(self):
+        return self.x.dtype
+
 
 # -----------------------------------------------------------------------------
 # Helper factories
@@ -19,27 +42,12 @@ def _rand_xyz(
     N: int, *, low: float = -1_000.0, high: float = 1_000.0, dtype=torch.float32
 ):
     """Random Nx3 coordinates in the given range."""
-    rng = torch.empty(N, 3, dtype=dtype).uniform_(low, high)
-    return rng
+    return torch.empty(N, 3, dtype=dtype).uniform_(low, high)
 
 
 def _rand_vec(N: int, *, dtype=torch.float32):
     """Random Nx3 vectors (standard normal)."""
-    rng = torch.empty(N, 3, dtype=dtype).normal_()
-    return rng
-
-
-# -----------------------------------------------------------------------------
-# PreComputedExact
-# -----------------------------------------------------------------------------
-
-
-def test_precomputed_exact_get_in_memory():
-    """`get_in_memory` should round-trip the data row-by-row."""
-    data = np.arange(12).reshape(4, 3)
-    pc = PreComputedExact(data, in_memory=True)
-    for gid in range(data.shape[0]):
-        np.testing.assert_array_equal(pc.get_in_memory(gid), data[gid])
+    return torch.empty(N, 3, dtype=dtype).normal_()
 
 
 # -----------------------------------------------------------------------------
@@ -47,34 +55,69 @@ def test_precomputed_exact_get_in_memory():
 # -----------------------------------------------------------------------------
 
 
-def test_interpolate1d_exact_recovery():
-    """Interpolating at sample points should reproduce the FEM vector exactly."""
-    y = np.linspace(-5.0, 5.0, 11)
-    fem = np.sin(y)
-    data = fem[None, :]  # shape (1, len(y)) so gid==0
+def test_interpolate1d_exact_recovery_at_sample_points():
+    """Interpolating at tabulated coordinates should reproduce the LUT row."""
+    x = np.linspace(-5.0, 5.0, 11)
+    fem = np.sin(x)
     pc = PreComputedInterpolate1D(
-        data=data,
-        y=y,
-        method="linear",
-        in_memory=True,
+        data=fem[None, :],
+        x=x,
+        outside="clamp",
     )
-    out = pc.interpolate(y, 0)
-    np.testing.assert_allclose(out, fem, atol=1e-12, rtol=1e-12)
+    model = DummyModel(
+        torch.as_tensor(x, dtype=torch.float64).reshape(1, -1), dtype=torch.float64
+    )
+    out = pc(model)
+    torch.testing.assert_close(
+        out, torch.as_tensor(fem, dtype=torch.float64).reshape(1, -1)
+    )
 
 
-def test_interpolate1d_truncate_limit():
-    """truncate > 0.4 should raise an error."""
+def test_interpolate1d_outside_zero_policy():
+    x = torch.tensor([0.0, 1.0, 2.0])
+    y = torch.tensor([[0.0, 1.0, 0.0]])
+    pc = PreComputedInterpolate1D(data=y, x=x, outside="zero")
+    model = DummyModel(torch.tensor([[-1.0, 0.5, 3.0]]))
+    out = pc(model)
+    torch.testing.assert_close(out, torch.tensor([[0.0, 0.5, 0.0]]))
+
+
+def test_interpolate1d_invalid_truncate_raises():
+    """truncate accepts fractions or percentages below 100, not >=100%."""
     with pytest.raises(ValueError):
         PreComputedInterpolate1D(
             data=np.zeros((1, 10)),
-            y=np.arange(10),
-            truncate=0.5,  # > 0.4 → invalid
-            in_memory=True,
+            x=np.arange(10),
+            truncate=100.0,
         )
 
 
 # -----------------------------------------------------------------------------
-# EfieldInterpolate3D — core helper for manual IDW
+# PreComputedInterpolate3DScattered scalar wrapper
+# -----------------------------------------------------------------------------
+
+
+def test_precomputed3d_scattered_scalar_shape():
+    xyz = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=torch.float64
+    )
+    field = torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float64)
+    interp = PreComputedInterpolate3DScattered(
+        xyz, field, method="nearest", k=1, knn_backend="torch"
+    )
+    model = DummyModel(
+        x=torch.tensor([[0.0, 1.0]], dtype=torch.float64),
+        y=torch.tensor([[0.0, 0.0]], dtype=torch.float64),
+        z=torch.tensor([[0.0, 0.0]], dtype=torch.float64),
+        dtype=torch.float64,
+    )
+    out = interp(model)
+    assert out.shape == (1, 2)
+    torch.testing.assert_close(out, torch.tensor([[1.0, 2.0]], dtype=torch.float64))
+
+
+# -----------------------------------------------------------------------------
+# EfieldInterpolate3DScattered — property-based test against manual IDW
 # -----------------------------------------------------------------------------
 
 
@@ -85,11 +128,6 @@ def _manual_idw(dist2: np.ndarray, vecs: np.ndarray, eps: float = 1e-9) -> np.nd
     return (w[..., None] * vecs).sum(axis=-2)
 
 
-# -----------------------------------------------------------------------------
-# EfieldInterpolate3D — property‑based test against manual IDW
-# -----------------------------------------------------------------------------
-
-
 @given(
     N=st.integers(min_value=5, max_value=25),
     B=st.integers(min_value=1, max_value=3),
@@ -98,18 +136,25 @@ def _manual_idw(dist2: np.ndarray, vecs: np.ndarray, eps: float = 1e-9) -> np.nd
 )
 @settings(deadline=None, max_examples=25)
 def test_idw_matches_manual(N, B, K, k):
-    """`_interp` should match a pure-numpy reference implementation."""
+    """The public scattered E-field wrapper should match an explicit IDW reference."""
     k = min(k, N)
     xyz = _rand_xyz(N, dtype=torch.float64)
     efield = _rand_vec(N, dtype=torch.float64)
-    interp = EfieldInterpolate3D(xyz, efield, k=k, eps=1e-9)
+    interp = EfieldInterpolate3DScattered(
+        xyz,
+        efield,
+        method="idw",
+        power=2.0,
+        k=k,
+        eps=1e-9,
+        knn_backend="torch",
+    )
 
     xq = torch.randn(B, K, dtype=torch.float64)
     yq = torch.randn(B, K, dtype=torch.float64)
     zq = torch.randn(B, K, dtype=torch.float64)
 
-    # Python name‑mangling: __interp → _Class__interp
-    torch_out = interp._EfieldInterpolate3D__interp(xq, yq, zq)
+    torch_out = interp._interp(xq, yq, zq)
 
     xyz_q = torch.stack((xq, yq, zq), dim=-1)  # (B, K, 3)
     dist2 = ((xyz_q.unsqueeze(-2) - xyz) ** 2).sum(-1)  # (B, K, N)
@@ -123,12 +168,12 @@ def test_idw_matches_manual(N, B, K, k):
 
 
 # -----------------------------------------------------------------------------
-# EfieldInterpolate3D — gradients
+# EfieldInterpolate3DScattered — gradients
 # -----------------------------------------------------------------------------
 
 
 def test_efield_gradients():
-    """Output should be differentiable w.r.t. query coords."""
+    """Output should be differentiable w.r.t. query coords inside a fixed kNN set."""
     xyz = torch.tensor(
         [
             [0.0, 0.0, 0.0],
@@ -138,7 +183,15 @@ def test_efield_gradients():
         dtype=torch.float64,
     )
     efield = torch.eye(3, dtype=torch.float64)
-    interp = EfieldInterpolate3D(xyz, efield, k=3, eps=1e-9)
+    interp = EfieldInterpolate3DScattered(
+        xyz,
+        efield,
+        method="idw",
+        power=2.0,
+        k=3,
+        eps=1e-9,
+        knn_backend="torch",
+    )
 
     xq = torch.randn(2, 2, dtype=torch.float64, requires_grad=True)
     yq = torch.randn(2, 2, dtype=torch.float64, requires_grad=True)
@@ -154,7 +207,7 @@ def test_efield_gradients():
 
 
 # -----------------------------------------------------------------------------
-# EfieldInterpolate3D — validation & error handling
+# EfieldInterpolate3DScattered — validation & error handling
 # -----------------------------------------------------------------------------
 
 
@@ -162,20 +215,20 @@ def test_invalid_k_raises():
     xyz = _rand_xyz(5)
     efield = _rand_vec(5)
     with pytest.raises(ValueError):
-        EfieldInterpolate3D(xyz, efield, k=0)  # k must be ≥1 or None
+        EfieldInterpolate3DScattered(xyz, efield, k=0)
 
 
-def test_invalid_chunksize_raises():
+def test_invalid_method_raises():
     xyz = _rand_xyz(5)
     efield = _rand_vec(5)
     with pytest.raises(ValueError):
-        EfieldInterpolate3D(xyz, efield, chunksize=0)
+        EfieldInterpolate3DScattered(xyz, efield, method="unsupported")
 
 
 def test_shape_mismatch_raises():
     xyz = _rand_xyz(3)
     efield = _rand_vec(3)
-    interp = EfieldInterpolate3D(xyz, efield, k=3)
+    interp = EfieldInterpolate3DScattered(xyz, efield, k=3, knn_backend="torch")
 
     x = torch.zeros(1, 2)
     y = torch.zeros(1, 2)

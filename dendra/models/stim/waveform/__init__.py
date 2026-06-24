@@ -4,7 +4,9 @@ from .implementations import (
     bi_rect,
     bi_rect_balanced,
     bi_rect_symm,
+    constant,
     cos,
+    energy,
     mono_rect,
     sin,
 )
@@ -18,4 +20,6 @@ __all__ = [
     "bi_rect_balanced",
     "bi_rect_symm",
     "arbitrary",
+    "constant",
+    "energy",
 ]

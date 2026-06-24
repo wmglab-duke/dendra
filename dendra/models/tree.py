@@ -1,11 +1,120 @@
 """Tree-shaped population models and supporting utilities."""
 
+import math
+
 import torch
 import torch.nn.functional as F
 
 from dendra.models.integrators import dhs
 
 from .core import Population
+
+
+def _as_float(value, *, name: str, node=None, default=None) -> float:
+    """Convert graph metadata to ``float`` with a useful error message."""
+    if value is None:
+        if default is not None:
+            return float(default)
+        where = "" if node is None else f" on graph node {node!r}"
+        raise KeyError(f"Missing required morphology attribute {name!r}{where}.")
+    return float(value)
+
+
+def _cylindrical_volume_um3(attrs, *, node=None) -> float:
+    """Fallback volume from stylized length/diameter metadata, in µm³."""
+    length_um = _as_float(attrs.get("L"), name="L", node=node, default=0.0)
+    diam_um = _as_float(attrs.get("diam"), name="diam", node=node, default=0.0)
+    if length_um <= 0.0 or diam_um <= 0.0:
+        return 0.0
+    radius_um = 0.5 * diam_um
+    return float(math.pi * radius_um * radius_um * length_um)
+
+
+def _node_volume_um3(attrs, *, node=None) -> float:
+    """Return total compartment volume in µm³.
+
+    Graphs produced by :func:`dendra.models.io.neuron_to_dendra_graph` may carry
+    pt3d-aware ``volume``/``volume_um3`` metadata. Older graphs do not, so this
+    falls back to the stylized cylinder approximation used for Dendra's native
+    one-dimensional axon geometry. Branchpoint nodes with ``L=0`` naturally get
+    zero volume.
+    """
+    if "volume" in attrs:
+        return _as_float(attrs.get("volume"), name="volume", node=node)
+    if "volume_um3" in attrs:
+        return _as_float(attrs.get("volume_um3"), name="volume_um3", node=node)
+    return _cylindrical_volume_um3(attrs, node=node)
+
+
+def _node_domain_volume_um3(
+    attrs, domain: str, total_volume: float, *, node=None
+) -> float:
+    """Return domain-specific volume in µm³.
+
+    ``volume_i`` defaults to the total compartment volume, which is the right
+    intracellular default for imported morphologies. ``volume_o`` defaults to
+    zero until an extracellular volume model is supplied.
+    """
+    key = f"volume_{domain}"
+    if key in attrs:
+        return _as_float(attrs.get(key), name=key, node=node)
+    if domain == "i":
+        return float(total_volume)
+    return 0.0
+
+
+def _edge_diff_geom_um(graph, parent, child) -> float:
+    """Return edge diffusion geometry factor in µm.
+
+    Preferred source is the explicit ``diff_geom_um`` edge attribute written by
+    the NEURON-import geometry code. As a compatibility fallback, recover the
+    same geometric factor from electrical axial resistance when available:
+
+        diff_geom_um = Ra[Ω·cm] * 1e4 / R_ohm[Ω]
+
+    This fallback is exact only when one effective intracellular resistivity
+    applies to the edge. New NEURON-imported graphs should use explicit
+    ``diff_geom_um`` instead.
+    """
+    edge = graph.edges[parent, child]
+    if "diff_geom_um" in edge:
+        return _as_float(edge.get("diff_geom_um"), name="diff_geom_um")
+
+    R_ohm = edge.get("R_ohm", None)
+    if R_ohm is not None and float(R_ohm) != 0.0:
+        parent_Ra = graph.nodes[parent].get("Ra", None)
+        child_Ra = graph.nodes[child].get("Ra", None)
+        if parent_Ra is None and child_Ra is None:
+            raise KeyError(
+                "Edge is missing diff_geom_um and cannot recover it from R_ohm "
+                "because neither endpoint has Ra."
+            )
+        if parent_Ra is None:
+            rhoa = float(child_Ra)
+        elif child_Ra is None:
+            rhoa = float(parent_Ra)
+        else:
+            rhoa = 0.5 * (float(parent_Ra) + float(child_Ra))
+        return float(rhoa * 1e4 / float(R_ohm))
+
+    # Last-resort stylized geometry fallback: approximate the edge as two
+    # half-compartments connected in series. This is mainly for hand-written
+    # test graphs and should not be relied on for pt3d morphologies.
+    L_edge = _as_float(edge.get("L"), name="L", default=0.0)
+    if L_edge <= 0.0:
+        return 0.0
+    d_parent = _as_float(
+        graph.nodes[parent].get("diam"), name="diam", node=parent, default=0.0
+    )
+    d_child = _as_float(
+        graph.nodes[child].get("diam"), name="diam", node=child, default=0.0
+    )
+    if d_parent <= 0.0 or d_child <= 0.0:
+        return 0.0
+    a_parent = math.pi * (0.5 * d_parent) ** 2
+    a_child = math.pi * (0.5 * d_child) ** 2
+    integral = 0.5 * L_edge / a_parent + 0.5 * L_edge / a_child
+    return 1.0 / integral if integral > 0.0 else 0.0
 
 
 def gather_morphology(graph):
@@ -20,8 +129,24 @@ def gather_morphology(graph):
     -------
     dict
         Mapping from attribute names to tensors shaped ``(1, n_comp)``.
+
+    Notes
+    -----
+    In addition to Dendra's historical ``dx``, ``diam``, and coordinate buffers,
+    this now registers material-geometry buffers:
+
+    ``volume`` / ``volume_um3``
+        Total compartment volume in µm³.
+
+    ``volume_i``
+        Intracellular material volume in µm³. Defaults to ``volume``.
+
+    ``volume_o``
+        Extracellular material volume in µm³. Defaults to zero until an
+        extracellular volume model is supplied.
     """
     L, diam, x, y, z = [], [], [], [], []
+    volume, volume_i, volume_o = [], [], []
 
     for i in range(len(graph.nodes)):
         attrs = graph.nodes[i]
@@ -30,12 +155,62 @@ def gather_morphology(graph):
         x.append(attrs.get("x", 0.0))
         y.append(attrs.get("y", 0.0))
         z.append(attrs.get("z", 0.0))
+
+        vol = _node_volume_um3(attrs, node=i)
+        volume.append(vol)
+        volume_i.append(_node_domain_volume_um3(attrs, "i", vol, node=i))
+        volume_o.append(_node_domain_volume_um3(attrs, "o", vol, node=i))
+
+    volume_t = torch.tensor(volume).unsqueeze(0)
     return {
         "dx": torch.tensor(L).unsqueeze(0),
         "diam": torch.tensor(diam).unsqueeze(0),
         "x": torch.tensor(x).unsqueeze(0),
         "y": torch.tensor(y).unsqueeze(0),
         "z": torch.tensor(z).unsqueeze(0),
+        "volume": volume_t,
+        "volume_um3": volume_t.clone(),
+        "volume_i": torch.tensor(volume_i).unsqueeze(0),
+        "volume_o": torch.tensor(volume_o).unsqueeze(0),
+    }
+
+
+def gather_diffusion_edges(graph):
+    """Extract child-indexed diffusion-edge metadata from a tree graph.
+
+    Returns tensors suitable for registering on :class:`Tree`. The
+    ``diff_parent_index`` and ``diff_geom_um`` buffers have length ``n_comp`` and
+    are child-indexed: root entries have parent ``-1`` and zero geometry.
+    Compact edge-list buffers are also returned for scatter/gather backends.
+    """
+    n_comp = len(graph.nodes)
+    parent_index = [-1 for _ in range(n_comp)]
+    diff_geom = [0.0 for _ in range(n_comp)]
+    edge_parent, edge_child, edge_diff_geom = [], [], []
+
+    for child in range(n_comp):
+        preds = list(graph.predecessors(child))
+        if not preds:
+            continue
+        if len(preds) > 1:
+            raise ValueError(
+                f"Node {child!r} has {len(preds)} parents; Tree diffusion requires "
+                "a rooted tree morphology."
+            )
+        parent = int(preds[0])
+        geom = _edge_diff_geom_um(graph, parent, child)
+        parent_index[child] = parent
+        diff_geom[child] = geom
+        edge_parent.append(parent)
+        edge_child.append(int(child))
+        edge_diff_geom.append(geom)
+
+    return {
+        "diff_parent_index": torch.tensor(parent_index, dtype=torch.long),
+        "diff_geom_um": torch.tensor(diff_geom).unsqueeze(0),
+        "diff_edge_parent": torch.tensor(edge_parent, dtype=torch.long),
+        "diff_edge_child": torch.tensor(edge_child, dtype=torch.long),
+        "diff_edge_geom_um": torch.tensor(edge_diff_geom).unsqueeze(0),
     }
 
 
@@ -138,6 +313,29 @@ class Tree(Population):
         """networkx.DiGraph: Underlying morphology graph."""
         return self._graph
 
+    def material_volume(self, domain="intracellular"):
+        """Return the volume/mass buffer appropriate for a material domain.
+
+        Parameters
+        ----------
+        domain : str, optional
+            Domain name or alias. ``"i"``, ``"inside"``, ``"cytosol"``, and
+            ``"intracellular"`` return ``volume_i``. ``"o"`` and
+            ``"extracellular"`` return ``volume_o``. ``"total"`` returns
+            ``volume``. ``"membrane"``/``"surface"`` return membrane area, which
+            is useful for future surface-density material processes.
+        """
+        domain = str(domain or "intracellular").lower()
+        if domain in {"i", "inside", "cytosol", "cytoplasm", "intracellular"}:
+            return self.volume_i
+        if domain in {"o", "outside", "extracellular"}:
+            return self.volume_o
+        if domain in {"total", "volume", "all"}:
+            return self.volume
+        if domain in {"membrane", "surface", "area"}:
+            return self.area
+        raise ValueError(f"Unsupported material domain {domain!r} for Tree.")
+
     @classmethod
     def from_graph(cls, graph, N=1, integrator=None, **kwargs):
         """Instantiate a tree population from a morphology graph.
@@ -160,11 +358,21 @@ class Tree(Population):
         """
         C = len(graph.nodes)
         data = gather_morphology(graph)
+        diffusion_edges = gather_diffusion_edges(graph)
         membrane = gather_membrane(graph)
         membrane.update(kwargs)
         tree = cls(N, C, graph, integrator, **membrane)
         for key, value in data.items():
             tree.register_buffer(key, value.expand(N, -1).clone().to(tree.dtype()))
+        for key, value in diffusion_edges.items():
+            if value.dtype.is_floating_point:
+                if value.ndim == 2:
+                    value = value.expand(N, -1).clone().to(tree.dtype())
+                else:
+                    value = value.clone().to(tree.dtype())
+            else:
+                value = value.clone().to(device=tree.device())
+            tree.register_buffer(key, value)
         tree.slice("soma").label("soma")
         tree.slice("axon").label("axon")
         tree.slice("dend").label("dend")

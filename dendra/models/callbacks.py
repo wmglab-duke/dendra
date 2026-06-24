@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 from h5py import File
 
+from dendra.utils.dynamic_compilation import compile_generated_function
+
 from ..helpers import nojit
 from .backend import Backend as A
 
@@ -283,10 +285,12 @@ def _build_recorder_func(states, max_only, indexed):
             res.append(_parse_template(s, max_only, indexed))
     impl = "".join(res)
     forward_str = template.format(implementation=impl)
-    filename = "<rec_template>"
-    code = compile(forward_str, filename, "exec")
-    exec(code)
-    return locals()["recorder"]
+    return compile_generated_function(
+        forward_str,
+        func_name="recorder",
+        filename_prefix="dendra.callbacks.recorder_func",
+        global_ns=globals(),
+    )
 
 
 def _avoid_smart_indexing(node_indices):
@@ -875,7 +879,7 @@ class LFP(Callback):
         """
         if not model.integrator.imem:
             raise RuntimeError(
-                "Model must be compiled with IMEM=1. Use with ax.ctx(IMEM=1): model = ..."
+                "Model must be compiled with IMEM=1. Use with dn.ctx(IMEM=1): model = ..."
             )
         self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
         self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))
@@ -1806,3 +1810,7 @@ def _sliding_window_average(x, window_size: int):
     # Remove the extra batch dimension (squeeze dimension 0)
     out = out_perm.squeeze(0)
     return out
+
+
+# Public alias retained for tests and user code; Recorder uses the private name internally.
+sliding_window_average = _sliding_window_average

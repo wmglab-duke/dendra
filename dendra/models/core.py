@@ -31,7 +31,10 @@ from dendra.helpers import (
     FULLGRAPH,
     IMEM,
     JIT,
-    JIT_IN_NETWORK,
+    JIT_NETWORK_OPS,
+    JIT_NETWORK_SOLVES,
+    current_device,
+    current_dtype,
     op_mc,
     op_sc,
 )
@@ -41,6 +44,13 @@ from dendra.models.graph import get_area_from_graph
 from dendra.models.integrators import bwd_euler_sc, bwd_euler_ub
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
+from dendra.models.mechanisms._material_process import MaterialProcess
+from dendra.models.mechanisms._materials import (
+    Material,
+    MaterialFieldSpec,
+    material_specs,
+    valid_materials,
+)
 from dendra.models.mechanisms.validate import validate
 from dendra.models.modular import matches_any_pattern
 from dendra.models.parametric import Parameterized as P
@@ -199,6 +209,7 @@ class Population(P, Sliceable):
     # ---------- repr knobs (safe defaults) ----------
     _REPR_MAX_MECHS: int = 18
     _REPR_MAX_IONS: int = 12
+    _REPR_MAX_MATERIALS: int = 12
     _REPR_TENSOR_SAMPLES: int = 7  # sample points for big tensors
     _REPR_SHOW_KWARGS: bool = False  # kwargs can be huge; default off
     _REPR_TENSOR_STATS: str = "sample"  # "none" | "sample" | "full"
@@ -211,8 +222,26 @@ class Population(P, Sliceable):
     P.GLOBAL(celsius=37.0)
     P.GLOBALP(rhoa_scale=1.0, cm_scale=1.0, area_scale=1.0)
 
-    def __init__(self, N: int = 1, C: int = 1, integrator=None, v_init=-65.0, **kwargs):
-        super().__init__((N, C), (N, C), **kwargs)
+    def __init__(
+        self,
+        N: int = 1,
+        C: int = 1,
+        integrator=None,
+        v_init=-65.0,
+        *,
+        device=None,
+        dtype=None,
+        **kwargs,
+    ):
+        init_device = (
+            current_device(torch.device("cpu"))
+            if device is None
+            else torch.device(device)
+        )
+        init_dtype = (
+            current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+        )
+        super().__init__((N, C), (N, C), device=init_device, dtype=init_dtype, **kwargs)
         Sliceable.__init__(self)
         self.np = N
         self.nc = C
@@ -225,24 +254,41 @@ class Population(P, Sliceable):
         if integrator is None:
             integrator = bwd_euler_sc()
 
-        self.register_buffer("_dummy", torch.zeros(1))
+        self.register_buffer(
+            "_dummy", torch.zeros(1, device=init_device, dtype=init_dtype)
+        )
 
-        self.register_buffer("v", torch.full((N, C), self.v_init))
-        self.register_buffer("diam", torch.full(self.shape, 500.0))
-        self.register_buffer("dx", torch.full(self.shape, 100.0))
-        self.register_buffer("t", torch.zeros(()))
+        # Initialize voltage from scalar v_init or from a vector of length nc.
+        # The latter is useful for point-neuron populations represented as a
+        # single Dendra population with one compartment per modeled neuron.
+        self.register_buffer("v", self.expanded_v_init((N, C)).clone().contiguous())
+        self.register_buffer(
+            "diam", torch.full(self.shape, 500.0, device=init_device, dtype=init_dtype)
+        )
+        self.register_buffer(
+            "dx", torch.full(self.shape, 100.0, device=init_device, dtype=init_dtype)
+        )
+        self.register_buffer("t", torch.zeros((), device=init_device, dtype=init_dtype))
 
         # compiler stuff
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
-        self.jit_in_network = bool(JIT_IN_NETWORK)
+        self.jit_network_solves = bool(JIT_NETWORK_SOLVES)
+        self.jit_network_ops = bool(JIT_NETWORK_OPS)
+        # Legacy attribute retained for external code. Internally this now means
+        # "compile population solves when this population is stepped by Network".
+        self.jit_in_network = self.jit_network_solves
         self.imem = bool(IMEM)
         self.compile_mode = COMPILE_MODE.value
+        self.initializing_from_state_cache = False
 
         if self.imem:
-            self.register_buffer("i_membrane", torch.zeros(self.shape))
+            self.register_buffer(
+                "i_membrane",
+                torch.zeros(self.shape, device=init_device, dtype=init_dtype),
+            )
         else:
             self.i_membrane = None  # type: ignore
 
@@ -250,6 +296,11 @@ class Population(P, Sliceable):
         self.integrator = None  # type: ignore
 
         self.injections = []
+        # Parallel mechanism-level injection registry.  Standard injections are
+        # still consumed by Intra/integrators; these specs are additionally
+        # offered to mechanisms via Mechanism.inject(...).
+        self.mechanism_injections = []
+        self.mechanism_injection_accepted = []
         self.intra = None
 
         self._mech_data = {}
@@ -265,6 +316,17 @@ class Population(P, Sliceable):
         self._ion_write = {}
         self._ion_write_c = {}
 
+        # Generic Material bookkeeping mirrors the ion maps above.  These maps
+        # are populated from Mechanism.USEMATERIAL(...) declarations during
+        # build() and are passed to MechanismHandler for sync/commit.
+        self._material_read = {}
+        self._material_write = {}
+        self._material_source = {}
+        self._material_process_read = {}
+        self._material_process_write = {}
+        self._material_process_source = {}
+        self._material_configs = {}
+
         self._all_read = {}
         self._all_write = {}
         self._all_write_c = {}
@@ -279,32 +341,168 @@ class Population(P, Sliceable):
 
         torch._dynamo.reset()
 
-        if self.jit:
-            self._step = torch.compile(
-                step,
-                backend=self.backend,
-                fullgraph=self.fullgraph,
-                dynamic=self.dynamic,
-                mode=self.compile_mode,
-            )
-        else:
-            self._step = step
+        # Keep the state-mutating Population/Integrator wrapper eager.  JIT
+        # settings are propagated to the integrator, which compiles only its
+        # tensor-valued numerical kernels.  This avoids Dynamo tracing
+        # nn.Module.__setattr__ for model.v/model.vc/model.i_membrane commits.
+        self._step = step
 
-        if self.jit:
-            self.make_intra = torch.compile(make_intra)
-        else:
-            self.make_intra = make_intra
+        self._make_intra_config = None
+        self._refresh_compile_config_from_ctx()
 
         self._caches = {}
 
-        self.register_buffer("x", torch.zeros(self.shape))
-        self.register_buffer("y", torch.zeros(self.shape))
-        self.register_buffer("z", torch.zeros(self.shape))
+        self.register_buffer(
+            "x", torch.zeros(self.shape, device=init_device, dtype=init_dtype)
+        )
+        self.register_buffer(
+            "y", torch.zeros(self.shape, device=init_device, dtype=init_dtype)
+        )
+        self.register_buffer(
+            "z", torch.zeros(self.shape, device=init_device, dtype=init_dtype)
+        )
 
         self.mech: MechanismHandler = None  # type: ignore
 
         self.initialized: bool = False
         self.eval()
+
+    def force_integrator_reinit(self):
+        """
+        Determine whether the integrator should be re-initialized.
+
+        Returns
+        -------
+        bool
+            True if the integrator should be re-initialized, False otherwise.
+            By default, this returns True during training to ensure that any
+            changes to model parameters are reflected in the integrator state.
+            During evaluation, it returns False to allow the integrator to reuse
+            its existing state for efficiency.
+        """
+        return self.training or self.initializing_from_state_cache
+
+    def _refresh_compile_config_from_ctx(self):
+        """Refresh compile flags from dendra.ctx / ContextVar state.
+
+        Population-owned stepping stays eager; these flags are forwarded to the
+        integrator with an explicit execution scope at run/initialize time.
+        ``JIT_NETWORK_SOLVES`` is intentionally stored but ignored for standalone
+        Population.run(), where only ``JIT`` enables integrator compilation.
+        """
+        self.backend = BACKEND.value
+        self.fullgraph = bool(FULLGRAPH)
+        self.dynamic = bool(DYNAMIC)
+        self.jit = bool(JIT)
+        self.jit_network_solves = bool(JIT_NETWORK_SOLVES)
+        self.jit_network_ops = bool(JIT_NETWORK_OPS)
+        self.jit_in_network = self.jit_network_solves
+        self.compile_mode = COMPILE_MODE.value
+
+        make_intra_config = (
+            self.jit,
+            self.backend,
+            self.fullgraph,
+            self.dynamic,
+            self.compile_mode,
+        )
+        if getattr(self, "_make_intra_config", None) != make_intra_config:
+            if self.jit:
+                kwargs = dict(
+                    backend=self.backend,
+                    fullgraph=self.fullgraph,
+                    dynamic=self.dynamic,
+                )
+                if self.compile_mode is not None:
+                    kwargs["mode"] = self.compile_mode
+                self.make_intra = torch.compile(make_intra, **kwargs)
+            else:
+                self.make_intra = make_intra
+            self._make_intra_config = make_intra_config
+        return self
+
+    def clear_jit_cache(self):
+        """Drop lazily compiled functions attached to this population.
+
+        ``torch.compile`` callables are process-local and may capture
+        TorchDynamo/Inductor configuration objects that cannot be pickled.  The
+        compiled helpers are regenerated lazily by ``run``/``initialize`` after
+        unpickling, so clearing them does not discard model state.
+        """
+        # ``make_intra`` may be a torch.compile wrapper.  Reset to the top-level
+        # function and invalidate the config sentinel so the next context refresh
+        # can recompile it when JIT is enabled.
+        self.make_intra = make_intra
+        self._make_intra_config = None
+
+        integrator = getattr(self, "integrator", None)
+        if integrator is not None:
+            clear = getattr(integrator, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+            elif hasattr(integrator, "_compiled_kernels"):
+                integrator._compiled_kernels.clear()
+        return self
+
+    def pickleable(
+        self,
+        *,
+        inplace: bool = False,
+        clone: bool = False,
+        reset_global_compiler: bool = False,
+    ):
+        """Return a pickle-friendly population handle.
+
+        By default this method is non-mutating and simply returns ``self``.
+        Pickling then uses :meth:`__getstate__`, which strips process-local JIT
+        callables from the serialized state without clearing the live object's
+        compiled caches.  This lets users checkpoint a running model and keep
+        using the already-compiled kernels afterward.
+
+        Parameters
+        ----------
+        inplace : bool, default False
+            If True, also clear this live population's local JIT caches.  The
+            next JIT-enabled run may need to recompile.
+        clone : bool, default False
+            If True, return a sanitized deep copy.  This avoids mutating the
+            live population but duplicates tensor storage, so it is usually not
+            appropriate for very large models.
+        reset_global_compiler : bool, default False
+            Also clear global Torch compiler caches.  This can force recompiles
+            and should usually be False when saving mid-simulation.
+        """
+        if inplace and clone:
+            raise ValueError(
+                "pickleable(...): choose at most one of inplace=True or clone=True."
+            )
+        if clone:
+            import copy as _copy
+
+            obj = _copy.deepcopy(self)
+            obj.clear_jit_cache()
+        elif inplace:
+            obj = self.clear_jit_cache()
+        else:
+            obj = self
+        if reset_global_compiler:
+            if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+                torch.compiler.reset()
+            elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
+                torch._dynamo.reset()
+        return obj
+
+    def __getstate__(self):
+        """Serialize without process-local compiled helpers.
+
+        This makes ``pickle.dump(population, f)`` work even after a JIT-enabled
+        run.  The live object is not modified; only the serialized state is
+        sanitized.
+        """
+        state = self.__dict__.copy()
+        state["make_intra"] = make_intra
+        state["_make_intra_config"] = None
+        return state
 
     @property
     def shape(self):
@@ -392,6 +590,204 @@ class Population(P, Sliceable):
             Keyword arguments forwarded to ``dendra.models.mechanisms._ions.concentrations``.
         """
         self._concentrations.update(kwargs)
+
+    def material(
+        self,
+        name: str,
+        fields=None,
+        *,
+        initial_values: Optional[Dict[str, object]] = None,
+        min_values: Optional[Dict[str, Optional[float]]] = None,
+        specs: Optional[Dict[str, MaterialFieldSpec]] = None,
+        domain=None,
+        units=None,
+        conserved=None,
+        **field_initials,
+    ):
+        """Register or override a generic population-wide Material.
+
+        Parameters
+        ----------
+        name : str
+            Material name, e.g. ``"ip3"``.  For registered ions such as
+            ``"ca"``, continue to use :meth:`concentrations` /
+            :meth:`equilibria`; ions are already Material-like and may be read
+            through ``USEION`` or ``USEMATERIAL``.
+        fields : Mapping or Sequence, optional
+            Field declarations passed to :class:`Material`.  A mapping specifies
+            initial values, e.g. ``fields={"ip3i": 0.1}``; a sequence declares
+            fields initialized to zero unless ``initial_values`` supplies values.
+        initial_values : Mapping, optional
+            Per-field initial value overrides.  When the material has been
+            registered globally, these override the registered initial values
+            while preserving other field metadata such as min values and units.
+        min_values : Mapping, optional
+            Per-field minimum-value guards.
+        specs : Mapping[str, MaterialFieldSpec], optional
+            Fully specified field specs.  This is the most explicit form and is
+            forwarded directly to :class:`Material`.
+        **field_initials
+            Convenience initial values, e.g. ``model.material("ip3", ip3i=0.1)``.
+
+        Returns
+        -------
+        Population
+            The population instance for chaining.
+        """
+        name = str(name)
+        if name in valid_ions():
+            raise ValueError(
+                f"{name!r} is a registered ion. Use concentrations(...) and "
+                "equilibria(...) for ion defaults; mechanisms may still read ion "
+                "fields through USEION or USEMATERIAL."
+            )
+        if self.is_built:
+            self._flag_rebuild = True
+
+        if field_initials:
+            initial_values = dict(initial_values or {})
+            for field, value in field_initials.items():
+                initial_values[str(field)] = value
+
+        cfg = self._material_configs.setdefault(
+            name,
+            {
+                "fields": None,
+                "initial_values": {},
+                "min_values": {},
+                "specs": None,
+                "domain": None,
+                "units": None,
+                "conserved": None,
+            },
+        )
+
+        if specs is not None:
+            cfg["specs"] = dict(specs)
+        if fields is not None:
+            cfg["fields"] = fields
+        if initial_values:
+            cfg.setdefault("initial_values", {}).update(dict(initial_values))
+        if min_values:
+            cfg.setdefault("min_values", {}).update(dict(min_values))
+        if domain is not None:
+            cfg["domain"] = domain
+        if units is not None:
+            cfg["units"] = units
+        if conserved is not None:
+            cfg["conserved"] = conserved
+        return self
+
+    def material_(self, name: str, *args, **kwargs):
+        """In-place alias of :meth:`material`."""
+        self.material(name, *args, **kwargs)
+
+    def _material_constructor_kwargs(self, name: str) -> Dict[str, object]:
+        """Build Material constructor kwargs from population-local overrides."""
+        cfg = self._material_configs.get(str(name), None)
+        if not cfg:
+            return {}
+
+        if cfg.get("specs") is not None:
+            return {"specs": cfg["specs"]}
+
+        fields = cfg.get("fields", None)
+        initial_values = dict(cfg.get("initial_values") or {})
+        min_values = dict(cfg.get("min_values") or {})
+        domain = cfg.get("domain", None)
+        units = cfg.get("units", None)
+        conserved = cfg.get("conserved", None)
+
+        def pick(obj, key, default):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return default if obj is None else obj
+
+        def field_initial_mapping(fields_obj):
+            if fields_obj is None:
+                return None
+            if isinstance(fields_obj, dict):
+                out = dict(fields_obj)
+                out.update(initial_values)
+                return out
+            if isinstance(fields_obj, str):
+                return {fields_obj: initial_values.get(fields_obj, 0.0)}
+            return {
+                str(field): initial_values.get(str(field), 0.0) for field in fields_obj
+            }
+
+        # If a registered material already has specs and the user only supplies
+        # overrides, preserve registered metadata while changing requested values.
+        registered = material_specs().get(str(name), None)
+        if (
+            fields is None
+            and registered is not None
+            and (
+                initial_values
+                or min_values
+                or domain is not None
+                or units is not None
+                or conserved is not None
+            )
+        ):
+            specs_out = {}
+            all_fields = (
+                set(registered.keys())
+                | set(initial_values.keys())
+                | set(min_values.keys())
+            )
+            for field in all_fields:
+                if field in registered:
+                    spec = registered[field]
+                    specs_out[field] = MaterialFieldSpec(
+                        name=spec.name,
+                        initial=initial_values.get(field, spec.initial),
+                        min_value=min_values.get(field, spec.min_value),
+                        conserved=bool(pick(conserved, field, spec.conserved)),
+                        domain=str(pick(domain, field, spec.domain)),
+                        units=pick(units, field, spec.units),
+                    )
+                else:
+                    specs_out[field] = MaterialFieldSpec(
+                        name=field,
+                        initial=initial_values.get(field, 0.0),
+                        min_value=min_values.get(field, None),
+                        conserved=bool(pick(conserved, field, True)),
+                        domain=str(pick(domain, field, "i")),
+                        units=pick(units, field, None),
+                    )
+            return {"specs": specs_out}
+
+        # If the user supplied domain/units/conserved for an unregistered or
+        # explicitly field-declared material, build full specs here so metadata is
+        # preserved by the Material constructor.
+        field_initials = field_initial_mapping(fields)
+        if field_initials is not None and (
+            domain is not None
+            or units is not None
+            or conserved is not None
+            or min_values
+        ):
+            specs_out = {}
+            for field, initial in field_initials.items():
+                specs_out[field] = MaterialFieldSpec(
+                    name=field,
+                    initial=initial,
+                    min_value=min_values.get(field, None),
+                    conserved=bool(pick(conserved, field, True)),
+                    domain=str(pick(domain, field, "i")),
+                    units=pick(units, field, None),
+                )
+            return {"specs": specs_out}
+
+        out: Dict[str, object] = {}
+        if fields is not None:
+            out["fields"] = fields
+        if initial_values:
+            out["initial_values"] = initial_values
+        if min_values:
+            out["min_values"] = min_values
+        return out
 
     def unfreeze_group(self, *groups):
         """
@@ -518,6 +914,102 @@ class Population(P, Sliceable):
             Data type inferred from the registered dummy buffer.
         """
         return self._dummy.dtype
+
+    def expanded_v_init(self, target_shape=None):
+        """
+        Return ``v_init`` as a tensor expanded to the model voltage shape.
+
+        Supported ``v_init`` forms are:
+
+        - scalar: broadcast to every element of ``model.v``;
+        - one-dimensional tensor/array/list of length ``model.nc``: broadcast
+          across the population axis and any batch axes;
+        - tensor/array with shape ``(model.np, model.nc)`` or the current full
+          voltage shape: used as explicit per-element initial voltages.
+
+        Parameters
+        ----------
+        target_shape : tuple of int, optional
+            Shape to expand into. Defaults to ``self.v.shape`` after ``v`` has
+            been registered.
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor view with shape ``target_shape`` on this model's device and
+            dtype. The returned tensor may be expanded; callers that will mutate
+            it should clone first.
+        """
+        if target_shape is None:
+            if not hasattr(self, "v"):
+                target_shape = (self.np, self.nc)
+            else:
+                target_shape = tuple(self.v.shape)
+        else:
+            target_shape = tuple(int(x) for x in target_shape)
+
+        if len(target_shape) < 2:
+            raise ValueError(
+                f"target_shape must have at least population and compartment axes; "
+                f"got {target_shape}."
+            )
+
+        n_pop = int(target_shape[-2])
+        n_comp = int(target_shape[-1])
+        v0 = torch.as_tensor(self.v_init, device=self.device(), dtype=self.dtype())
+
+        # Scalar or scalar-like tensor/list: broadcast everywhere.
+        if v0.ndim == 0 or v0.numel() == 1:
+            return v0.reshape(()).expand(target_shape)
+
+        # Length-nc vector: one initial value per compartment, broadcast across
+        # cells/fibers and batch dimensions.
+        if v0.ndim == 1:
+            if v0.numel() != n_comp:
+                raise ValueError(
+                    f"v_init has length {v0.numel()}, but model.nc is {n_comp}. "
+                    "Use a scalar or a vector of length model.nc."
+                )
+            view_shape = (1,) * (len(target_shape) - 1) + (n_comp,)
+            return v0.reshape(view_shape).expand(target_shape)
+
+        # Explicit initial voltage for the unbatched core shape.
+        core_shape = (n_pop, n_comp)
+        if tuple(v0.shape) == core_shape:
+            view_shape = (1,) * (len(target_shape) - 2) + core_shape
+            return v0.reshape(view_shape).expand(target_shape)
+
+        # Explicit initial voltage for the full current shape.
+        if tuple(v0.shape) == target_shape:
+            return v0
+
+        # Common explicit-broadcast form: [1, nc].
+        if tuple(v0.shape) == (1, n_comp):
+            view_shape = (1,) * (len(target_shape) - 2) + (1, n_comp)
+            return v0.reshape(view_shape).expand(target_shape)
+
+        raise ValueError(
+            "Unsupported v_init shape. Expected a scalar, a 1D vector of length "
+            f"model.nc ({n_comp}), shape (model.np, model.nc) = {core_shape}, "
+            f"or full voltage shape {target_shape}; got shape {tuple(v0.shape)}."
+        )
+
+    def set_v_init(self, v_init):
+        """
+        Set and validate the model's voltage initial condition.
+
+        ``v_init`` follows the same shape rules as :meth:`expanded_v_init`.
+        This method does not immediately overwrite ``model.v``; call
+        :meth:`init_v` or :meth:`initialize` to apply it.
+        """
+        old_v_init = self.v_init
+        self.v_init = v_init
+        try:
+            self.expanded_v_init()
+        except Exception:
+            self.v_init = old_v_init
+            raise
+        return self
 
     def prep_intra(self, intra, n, dt):
         """
@@ -872,6 +1364,7 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        self._refresh_compile_config_from_ctx()
 
         # auto-build intra if missing
         if self.intra is None:
@@ -901,10 +1394,7 @@ class Population(P, Sliceable):
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
-        if self.jit:
-            psh = torch.compile(post_step_hook)
-        else:
-            psh = post_step_hook
+        psh = post_step_hook
 
         with ctx:
             # --------------------------------------------------------------
@@ -953,7 +1443,12 @@ class Population(P, Sliceable):
                     c.dt = dt_f
 
             pre_loop_hook(callbacks, self)
-            self.integrator._initialize(self, dt_tensor, force=self.training)
+            self.integrator._initialize(
+                self,
+                dt_tensor,
+                force=self.force_integrator_reinit(),
+                compile_scope="population",
+            )
 
             # Progress bar setup
             if progressbar:
@@ -1092,6 +1587,7 @@ class Population(P, Sliceable):
 
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        self._refresh_compile_config_from_ctx()
 
         intra = self.intra
         with_intra = intra is not None
@@ -1101,10 +1597,7 @@ class Population(P, Sliceable):
         dt_f = float(dt)
         dt_tensor = torch.tensor(dt, device=self.device(), dtype=self.dtype())
 
-        if self.jit:
-            psh = torch.compile(post_step_hook)
-        else:
-            psh = post_step_hook
+        psh = post_step_hook
 
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
@@ -1147,7 +1640,12 @@ class Population(P, Sliceable):
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
-                self.integrator._initialize(self, dt_tensor, force=self.training)
+                self.integrator._initialize(
+                    self,
+                    dt_tensor,
+                    force=self.force_integrator_reinit(),
+                    compile_scope="population",
+                )
 
                 pre_loop_hook(callbacks, self)
 
@@ -1207,10 +1705,11 @@ class Population(P, Sliceable):
         The steady state can be restored later by calling model.initialize().
         """
 
+        self._refresh_compile_config_from_ctx()
         self.clear_steady_state()
 
         self.initialize()
-        self.integrator._initialize(self, dt)
+        self.integrator._initialize(self, dt, force=True, compile_scope="population")
 
         maxiter = int(tstop / dt)
 
@@ -1232,7 +1731,7 @@ class Population(P, Sliceable):
                 self._step(self.integrator, self, dt, ve, intra)
 
         self.cache("_steady_state")
-        self.t = self.t.zero_().detach()
+        self.t = torch.zeros_like(self.t).detach()
         return self
 
     def clear_steady_state(self):
@@ -1285,8 +1784,9 @@ class Population(P, Sliceable):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
             self.post_initialize()
-            self.t = self.t.zero_().detach()
+            self.t = torch.zeros_like(self.t).detach()
             self.initialized = True
+            self.initializing_from_state_cache = True
             return True
         return False
 
@@ -1320,7 +1820,7 @@ class Population(P, Sliceable):
         self.integrator.mech.initialize(
             self.v, self.celsius, self.diam, populate=populate_parameter_buffers
         )
-        self.t = self.t.zero_().detach()
+        self.t = torch.zeros_like(self.t).detach()
         self.initialized = True
         if force_rebuild:
             self.integrator.initialized = False
@@ -1476,16 +1976,75 @@ class Population(P, Sliceable):
         """
         self.restore(name)
 
+    def register_injection(self, waveform, index_spec):
+        """Register a waveform injection on both solver and mechanism paths.
+
+        The solver path preserves the existing ``Intra`` behavior used by
+        standard voltage integrators.  The mechanism path offers the same
+        waveform/index information to every built mechanism through
+        ``Mechanism.inject(...)``; mechanisms that do not override that method
+        simply ignore it.
+        """
+        self.injections.append((waveform, index_spec.shape, index_spec.index))
+        self.mechanism_injections.append((waveform, index_spec.shape, index_spec.index))
+        self.mechanism_injection_accepted.append(False)
+        # Force lazy reconstruction of the solver-level Intra object on the next
+        # run/initialize after a new injection is added.
+        self.intra = None
+
+        # If mechanisms have already been built, deliver this injection
+        # immediately.  If not, build() will dispatch all stored specs later.
+        if getattr(self, "is_built", False) and getattr(self, "mech", None) is not None:
+            self._dispatch_mechanism_injections(
+                start=len(self.mechanism_injections) - 1
+            )
+        return self
+
+    def _dispatch_mechanism_injections(self, mech_handler=None, *, start=0):
+        """Offer stored waveform injections to built mechanisms."""
+        mech_handler = self.mech if mech_handler is None else mech_handler
+        if mech_handler is None:
+            return
+        if not self.mechanism_injections:
+            return
+
+        model_shape = tuple(self.shape)
+        for inj_i, (waveform, shape, index) in enumerate(
+            self.mechanism_injections[start:], start
+        ):
+            accepted = bool(self.mechanism_injection_accepted[inj_i])
+            for mech in mech_handler.mechanisms.values():
+                accepted = (
+                    bool(
+                        mech.inject(
+                            waveform,
+                            index=index,
+                            shape=shape,
+                            model_shape=model_shape,
+                            model=self,
+                        )
+                    )
+                    or accepted
+                )
+            self.mechanism_injection_accepted[inj_i] = accepted
+
     def delete_injections(self):
         """
-        Remove all registered intra-cellular injections.
+        Remove all registered intra-cellular and mechanism-level injections.
 
         Returns
         -------
         None
         """
         self.injections = []
+        self.mechanism_injections = []
+        self.mechanism_injection_accepted = []
         self.intra = None
+        if getattr(self, "mech", None) is not None:
+            for mech in self.mech.mechanisms.values():
+                clear = getattr(mech, "clear_injections", None)
+                if clear is not None:
+                    clear()
 
     def build_intra(self):
         """
@@ -1497,7 +2056,19 @@ class Population(P, Sliceable):
             Intra stimulus object when injections are configured, otherwise None.
         """
         if self.injections:
-            return Intra(self, self.injections)
+            # If a mechanism accepted a waveform injection, it is responsible for
+            # evaluating/padding that stimulus and exposing it internally.  Do
+            # not also route the same waveform through the solver-level Intra
+            # path, which would duplicate the current for standard solvers and
+            # add unnecessary overhead for scnv/fused mechanisms.
+            accepted = list(self.mechanism_injection_accepted)
+            if len(accepted) < len(self.injections):
+                accepted.extend([False] * (len(self.injections) - len(accepted)))
+            solver_injections = [
+                inj for inj, ok in zip(self.injections, accepted) if not ok
+            ]
+            if solver_injections:
+                return Intra(self, solver_injections)
         return None
 
     def insert(self, mechanism, alias=None, index_spec=None, ic=None, **kwargs):
@@ -1534,7 +2105,7 @@ class Population(P, Sliceable):
             raise ValueError(f"Mechanism {mechanism} is already inserted everywhere.")
         self._mech_data.setdefault(mechanism, []).append((alias, kwargs, key))
 
-    def ion_style(self, ion, c_style, e_style, einit, eadvance, cinit):
+    def ion_style(self, ion, einit, eadvance):
         """
         Register explicit ion handling style parameters.
 
@@ -1542,19 +2113,13 @@ class Population(P, Sliceable):
         ----------
         ion : str
             Ion species identifier (e.g., ``'na'``).
-        c_style : int
-            Style flag for concentration handling.
-        e_style : int
-            Style flag for reversal potential handling.
         einit : int
             Initialization flag for equilibration.
         eadvance : int
             Advance-time flag for equilibration updates.
-        cinit : int
-            Initialization flag for concentration updates.
         """
         assert ion in valid_ions(), f"Invalid ion: {ion}"
-        self._ion_style[ion] = (c_style, e_style, einit, eadvance, cinit)
+        self._ion_style[ion] = (einit, eadvance)
 
     def get_ion_style(self, ion):
         """
@@ -1589,7 +2154,17 @@ class Population(P, Sliceable):
             True if any mechanism writes concentrations for the ion.
         """
         d = self._ion_write_c.get(ion, {})
-        return bool(d)
+        if d:
+            return True
+        # Ion-like materials can also write concentration fields through
+        # USEMATERIAL(ion, write=[...]) or source=[...].  Include them in style
+        # inference so USEMATERIAL("ca", read=["eca"], write=["cai"])
+        # advances eca just like USEION would.
+        material_w = self._material_write.get(ion, {})
+        material_s = self._material_source.get(ion, {})
+        material_pw = self._material_process_write.get(ion, {})
+        material_ps = self._material_process_source.get(ion, {})
+        return bool(material_w or material_s or material_pw or material_ps)
 
     def _c_is_read(self, ion):
         """
@@ -1606,9 +2181,13 @@ class Population(P, Sliceable):
             True if any mechanism reads intra- or extracellular concentration.
         """
         d = self._ion_read.get(ion, {})
-        if not d:
+        material_d = self._material_read.get(ion, {})
+        material_pd = self._material_process_read.get(ion, {})
+        if not d and not material_d and not material_pd:
             return False
-        check = list(itertools.chain(*d.values()))
+        check = list(itertools.chain(*d.values())) if d else []
+        check += list(itertools.chain(*material_d.values())) if material_d else []
+        check += list(itertools.chain(*material_pd.values())) if material_pd else []
         return f"{ion}i" in check or f"{ion}o" in check
 
     def _e_is_read(self, ion):
@@ -1626,9 +2205,14 @@ class Population(P, Sliceable):
             True if any mechanism reads the ion's equilibrium potential.
         """
         d = self._ion_read.get(ion, {})
-        if not d:
+        material_d = self._material_read.get(ion, {})
+        material_pd = self._material_process_read.get(ion, {})
+        if not d and not material_d and not material_pd:
             return False
-        return f"e{ion}" in list(itertools.chain(*d.values()))
+        check = list(itertools.chain(*d.values())) if d else []
+        check += list(itertools.chain(*material_d.values())) if material_d else []
+        check += list(itertools.chain(*material_pd.values())) if material_pd else []
+        return f"e{ion}" in check
 
     def _calc_ion_style(self, ion):
         """
@@ -1642,7 +2226,7 @@ class Population(P, Sliceable):
         Returns
         -------
         tuple
-            Tuple of style flags ``(c_style, e_style, einit, eadvance, cinit)``.
+            Tuple of style flags ``(einit, eadvance)``.
         """
         _c_is_written = self._c_is_written(ion)
         _c_is_read = self._c_is_read(ion)
@@ -1650,15 +2234,15 @@ class Population(P, Sliceable):
 
         if _c_is_written:
             if _e_is_read:
-                return (3, 2, 1, 1, 1)
-            return (3, 0, 0, 0, 1)
+                return (1, 1)
+            return (0, 0)
         if _c_is_read:
             if _e_is_read:
-                return (1, 2, 1, 0, 0)
-            return (1, 0, 0, 0, 0)
+                return (1, 0)
+            return (0, 0)
         if _e_is_read:
-            return (0, 1, 0, 0, 0)
-        return (0, 0, 0, 0, 0)
+            return (0, 0)
+        return (0, 0)
 
     def _register_mech(self, m, shape, key):
         """
@@ -1680,17 +2264,36 @@ class Population(P, Sliceable):
         self._m_keys.append(key)
         self._m_shape[name] = shape
 
-        for k, v in mech._currents.items():
-            self._m_curr.setdefault(k, {}).update({name: v})
+        is_material_process = isinstance(m, MaterialProcess)
 
-        for k, v in mech._read_ion.items():
-            self._ion_read.setdefault(k, {}).update({name: v})
+        if not is_material_process:
+            for k, v in mech._currents.items():
+                self._m_curr.setdefault(k, {}).update({name: v})
 
-        for k, v in mech._write_ion.items():
-            self._ion_write.setdefault(k, {}).update({name: v})
+            for k, v in mech._read_ion.items():
+                self._ion_read.setdefault(k, {}).update({name: v})
 
-        for k, v in mech._write_ion_c.items():
-            self._ion_write_c.setdefault(k, {}).update({name: v})
+            for k, v in mech._write_ion.items():
+                self._ion_write.setdefault(k, {}).update({name: v})
+
+            for k, v in mech._write_ion_c.items():
+                self._ion_write_c.setdefault(k, {}).update({name: v})
+
+            for k, v in getattr(mech, "_read_material", {}).items():
+                self._material_read.setdefault(k, {}).update({name: v})
+
+            for k, v in getattr(mech, "_write_material", {}).items():
+                self._material_write.setdefault(k, {}).update({name: v})
+
+            for k, v in getattr(mech, "_source_material", {}).items():
+                self._material_source.setdefault(k, {}).update({name: v})
+        else:
+            for k, v in getattr(mech, "_read_material", {}).items():
+                self._material_process_read.setdefault(k, {}).update({name: v})
+            for k, v in getattr(mech, "_write_material", {}).items():
+                self._material_process_write.setdefault(k, {}).update({name: v})
+            for k, v in getattr(mech, "_source_material", {}).items():
+                self._material_process_source.setdefault(k, {}).update({name: v})
 
     # -- Device and dtype methods --
 
@@ -1804,6 +2407,8 @@ class Population(P, Sliceable):
         Population
             The population instance, ready for simulation.
         """
+        self._refresh_compile_config_from_ctx()
+
         if self.is_built and not (force_rebuild or self._flag_rebuild):
             return self
 
@@ -1823,6 +2428,7 @@ class Population(P, Sliceable):
                 key = None
                 shape = self._calc_shape_p()
                 shape_f = self.shape
+                mech.check_kwargs(kwargs)
                 m = mech(
                     name, self.celsius, self.diam, shape, shape_f, key, ic=ic, **kwargs
                 )
@@ -1839,9 +2445,28 @@ class Population(P, Sliceable):
                 )
                 self._register_mech(m, shape, key)
 
+            all_materials = get_unique_keys(
+                [
+                    self._material_read,
+                    self._material_write,
+                    self._material_source,
+                    self._material_process_read,
+                    self._material_process_write,
+                    self._material_process_source,
+                ]
+            )
+            all_materials.update(self._material_configs.keys())
+
+            # If an ion species is used through the generic Material interface,
+            # instantiate the Ion and expose the same object through both the
+            # ion and material registries.  This lets USEMATERIAL("ca",
+            # read=["cai", "eca"]) and USEION("ca", ...) share state.
+            ion_like_materials = {m for m in all_materials if m in valid_ions()}
             all_ions = get_unique_keys(
                 [self._ion_read, self._ion_write, self._ion_write_c]
             )
+            all_ions.update(ion_like_materials)
+            all_ions.update(self._ion_style.keys())
 
             _ion_write = {f"i{k}": v for k, v in self._ion_write.items()}
             self._m_curr.update(_ion_write)
@@ -1855,7 +2480,37 @@ class Population(P, Sliceable):
                     *ion_style,
                 )
                 for m in self._m_list:
-                    m.register_ion(ions[ion])
+                    if not isinstance(m, MaterialProcess):
+                        m.register_ion(ions[ion])
+
+            materials = {}
+            for material in sorted(all_materials):
+                if material in ions:
+                    continue
+                try:
+                    materials[material] = Material(
+                        material,
+                        self.shape,
+                        **self._material_constructor_kwargs(material),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Material {material!r} is used by a mechanism but has no registered fields. "
+                        f"Call model.material({material!r}, fields=...) or register_material(...) before build()."
+                    ) from exc
+
+                for m in self._m_list:
+                    if not isinstance(m, MaterialProcess):
+                        m.register_material(materials[material])
+
+            # Registered ions are Material subclasses.  Bind them for mechanisms
+            # that requested USEMATERIAL("ca", ...), without inserting duplicate
+            # references into the generic material ModuleDict.
+            for ion_material in sorted(ion_like_materials):
+                ion_h = ions[ion_material]
+                for m in self._m_list:
+                    if not isinstance(m, MaterialProcess):
+                        m.register_material(ion_h)
 
             mechs = {n: m for n, m in zip(self._m_name, self._m_list)}
             keys = {n: k for n, k in zip(self._m_name, self._m_keys)}
@@ -1863,16 +2518,28 @@ class Population(P, Sliceable):
                 self.celsius,
                 self.area,
                 mechs,
-                ions,
-                self._ion_write_c,
-                self._ion_read,
-                self._m_curr,
+                ions=ions,
+                materials=materials,
+                write_ion_c=self._ion_write_c,
+                read_ion=self._ion_read,
+                read_material=self._material_read,
+                write_material=self._material_write,
+                source_material=self._material_source,
+                currents=self._m_curr,
+                population=self,
             )
 
             for m in mech.mechanisms.values():
                 m.setreference("t", lambda: self.t)
+            for m in getattr(mech, "material_processes", {}).values():
+                m.setreference("t", lambda: self.t)
+
+            # Give mechanisms a chance to consume waveform injections directly.
+            # Mechanisms that do not implement injection support ignore these.
+            self._dispatch_mechanism_injections(mech)
 
             self.integrator = self._integrator_class(self, mech, imem=self.imem)
+            self.integrator.configure_jit(self, scope="population")
             self.mech = self.integrator.mech
 
         self.is_built = True
@@ -2196,13 +2863,30 @@ class Population(P, Sliceable):
         Population
             The population instance with replicated buffers.
         """
-        self.v = self.v.unsqueeze(0).expand(n, *self.v.shape).clone()
-        if hasattr(self, "v_prev"):
-            self.v_prev = self.v_prev.unsqueeze(0).expand(n, *self.v_prev.shape).clone()
-        if hasattr(self, "i_membrane"):
-            self.i_membrane = (
-                self.i_membrane.unsqueeze(0).expand(n, *self.i_membrane.shape).clone()
-            )
+        if n <= 0:
+            raise ValueError("Batch size n must be positive.")
+
+        def _batch_tensor_attr(name: str):
+            if not hasattr(self, name):
+                return
+            value = getattr(self, name)
+            if value is None or not torch.is_tensor(value):
+                return
+            setattr(self, name, value.unsqueeze(0).expand(n, *value.shape).clone())
+
+        _batch_tensor_attr("v")
+
+        state_vars = {"v_prev", "vc"}
+        integrator = getattr(self, "integrator", None)
+        if integrator is not None:
+            state_vars.update(getattr(integrator, "v_vars", ()))
+        state_vars.discard("v")
+        for name in sorted(state_vars):
+            _batch_tensor_attr(name)
+
+        if hasattr(self, "i_membrane") and self.i_membrane is not None:
+            _batch_tensor_attr("i_membrane")
+
         self.reshape(self._calc_shape_p(), self.shape)
         for slice in self._labels.values():
             slice._batch()
@@ -2354,6 +3038,7 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        self._refresh_compile_config_from_ctx()
 
         intra = self.intra
         with_intra = intra is not None
@@ -2458,7 +3143,12 @@ class Population(P, Sliceable):
                 # Integrator initialization + pre-loop hooks
                 # --------------------------------------------------------------
                 pre_loop_hook(callbacks, self)
-                self.integrator._initialize(self, dt_tensor, force=self.training)
+                self.integrator._initialize(
+                    self,
+                    dt_tensor,
+                    force=self.force_integrator_reinit(),
+                    compile_scope="population",
+                )
 
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
@@ -3030,6 +3720,9 @@ class Population(P, Sliceable):
             read_ion = getattr(mech_cls, "_read_ion", {}) or {}
             write_ion = getattr(mech_cls, "_write_ion", {}) or {}
             write_ion_c = getattr(mech_cls, "_write_ion_c", {}) or {}
+            read_material = getattr(mech_cls, "_read_material", {}) or {}
+            write_material = getattr(mech_cls, "_write_material", {}) or {}
+            source_material = getattr(mech_cls, "_source_material", {}) or {}
 
             for ion, vars_ in read_ion.items():
                 u = usage.setdefault(
@@ -3075,6 +3768,41 @@ class Population(P, Sliceable):
                 )
                 u["write_c"] = True
 
+            # Ion-like materials are represented by Ion at build time.  Include
+            # them in the pre-build ion summary/style inference so a mechanism
+            # using USEMATERIAL("ca", read=["cai", "eca"], write=["cai"])
+            # is reported consistently.
+            for ion, vars_ in read_material.items():
+                if ion not in valid_ions():
+                    continue
+                u = usage.setdefault(
+                    ion,
+                    {
+                        "read_c": False,
+                        "read_e": False,
+                        "write_i": False,
+                        "write_c": False,
+                    },
+                )
+                if (f"{ion}i" in vars_) or (f"{ion}o" in vars_):
+                    u["read_c"] = True
+                if f"e{ion}" in vars_:
+                    u["read_e"] = True
+
+            for ion in set(write_material.keys()) | set(source_material.keys()):
+                if ion not in valid_ions():
+                    continue
+                u = usage.setdefault(
+                    ion,
+                    {
+                        "read_c": False,
+                        "read_e": False,
+                        "write_i": False,
+                        "write_c": False,
+                    },
+                )
+                u["write_c"] = True
+
         # include any explicitly styled ions even if no mech references them
         for ion in getattr(self, "_ion_style", {}).keys():
             usage.setdefault(
@@ -3086,11 +3814,21 @@ class Population(P, Sliceable):
 
     def _built_ion_usage(self) -> Dict[str, Dict[str, bool]]:
         """Ion usage from built bookkeeping dictionaries."""
+        ion_like_materials = (
+            set(self._material_read.keys())
+            | set(self._material_write.keys())
+            | set(self._material_source.keys())
+            | set(self._material_process_read.keys())
+            | set(self._material_process_write.keys())
+            | set(self._material_process_source.keys())
+            | set(getattr(self, "_material_configs", {}).keys())
+        ) & set(valid_ions())
         ions = (
             set(self._ion_read.keys())
             | set(self._ion_write.keys())
             | set(self._ion_write_c.keys())
             | set(self._ion_style.keys())
+            | ion_like_materials
         )
         usage: Dict[str, Dict[str, bool]] = {}
         for ion in ions:
@@ -3098,7 +3836,11 @@ class Population(P, Sliceable):
                 "read_c": bool(self._c_is_read(ion)),
                 "read_e": bool(self._e_is_read(ion)),
                 "write_i": bool(self._ion_write.get(ion, {})),
-                "write_c": bool(self._ion_write_c.get(ion, {})),
+                "write_c": bool(
+                    self._ion_write_c.get(ion, {})
+                    or self._material_write.get(ion, {})
+                    or self._material_source.get(ion, {})
+                ),
             }
         return usage
 
@@ -3157,6 +3899,112 @@ class Population(P, Sliceable):
                     f"  concentrations: keys={sorted(list(self._concentrations.keys()))}"
                 )
 
+        return lines
+
+    def _infer_material_usage_from_inserted(self) -> Dict[str, Dict[str, int]]:
+        """Infer generic Material usage from pending mechanism class metadata."""
+        mech_classes = set(
+            list(self._mech_everywhere.keys()) + list(self._mech_data.keys())
+        )
+        usage: Dict[str, Dict[str, int]] = {}
+
+        for mech_cls in mech_classes:
+            read_material = getattr(mech_cls, "_read_material", {}) or {}
+            write_material = getattr(mech_cls, "_write_material", {}) or {}
+            source_material = getattr(mech_cls, "_source_material", {}) or {}
+
+            for material, fields in read_material.items():
+                u = usage.setdefault(material, {"read": 0, "write": 0, "source": 0})
+                u["read"] += len(fields)
+            for material, fields in write_material.items():
+                u = usage.setdefault(material, {"read": 0, "write": 0, "source": 0})
+                u["write"] += len(fields)
+            for material, fields in source_material.items():
+                u = usage.setdefault(material, {"read": 0, "write": 0, "source": 0})
+                u["source"] += len(fields)
+
+        for material in getattr(self, "_material_configs", {}).keys():
+            usage.setdefault(material, {"read": 0, "write": 0, "source": 0})
+        return usage
+
+    def _built_material_usage(self) -> Dict[str, Dict[str, int]]:
+        materials = (
+            set(self._material_read.keys())
+            | set(self._material_write.keys())
+            | set(self._material_source.keys())
+            | set(self._material_process_read.keys())
+            | set(self._material_process_write.keys())
+            | set(self._material_process_source.keys())
+            | set(getattr(self, "_material_configs", {}).keys())
+        )
+        mech_handler = getattr(self, "mech", None)
+        if mech_handler is not None and hasattr(mech_handler, "materials"):
+            materials |= set(mech_handler.materials.keys())
+
+        usage: Dict[str, Dict[str, int]] = {}
+        for material in materials:
+            usage[material] = {
+                "read": sum(
+                    len(v) for v in self._material_read.get(material, {}).values()
+                ),
+                "write": sum(
+                    len(v) for v in self._material_write.get(material, {}).values()
+                ),
+                "source": sum(
+                    len(v) for v in self._material_source.get(material, {}).values()
+                ),
+            }
+        return usage
+
+    def _material_lines(self, *, verbose: bool) -> List[str]:
+        built = bool(getattr(self, "is_built", False))
+        usage = (
+            self._built_material_usage()
+            if built
+            else self._infer_material_usage_from_inserted()
+        )
+        materials = sorted(list(usage.keys()))
+
+        if not materials:
+            return ["materials: (none)"]
+
+        lines: List[str] = [
+            f"materials: {len(materials)} ({'built' if built else 'inferred'})"
+        ]
+        if not verbose:
+            preview = materials[: self._REPR_MAX_MATERIALS]
+            more = len(materials) - len(preview)
+            s = ", ".join(preview) + (f", …+{more}" if more > 0 else "")
+            lines.append(f"  {s}")
+            return lines
+
+        for material in materials:
+            u = usage[material]
+            bits = []
+            if u.get("read", 0):
+                bits.append(f"read={u['read']}")
+            if u.get("write", 0):
+                bits.append(f"write={u['write']}")
+            if u.get("source", 0):
+                bits.append(f"source={u['source']}")
+            if not bits:
+                bits.append("registered")
+
+            fields = ""
+            if (
+                built
+                and getattr(self, "mech", None) is not None
+                and hasattr(self.mech, "materials")
+            ):
+                if material in self.mech.materials:
+                    material_h = self.mech.materials[material]
+                    fields = f", fields={tuple(getattr(material_h, 'fields', ()))!r}"
+            elif material in valid_materials():
+                fields = (
+                    f", registered_fields={tuple(material_specs()[material].keys())!r}"
+                )
+
+            lines.append(f"  - {material}: {', '.join(bits)}{fields}")
         return lines
 
     def _mechanism_parameter_block_lines(
@@ -3253,8 +4101,9 @@ class Population(P, Sliceable):
                 self._pending_mech_lines(verbose=verbose, show_kwargs=show_kwargs)
             )
 
-        # Ions
+        # Ions and generic materials
         lines.extend(self._ion_lines(verbose=verbose))
+        lines.extend(self._material_lines(verbose=verbose))
 
         return lines
 
@@ -3506,7 +4355,6 @@ class Axon(Population):
         "n_ax",
         "n_comp",
         "temp",
-        "v_init",
     ]
 
     def __init__(
@@ -3521,7 +4369,12 @@ class Axon(Population):
         if integrator is None:
             integrator = bwd_euler_ub()
         super().__init__(
-            len(diameters), n_comp, integrator=integrator, celsius=celsius, **kwargs
+            len(diameters),
+            n_comp,
+            integrator=integrator,
+            celsius=celsius,
+            v_init=v_init,
+            **kwargs,
         )
 
         self.register_buffer(
@@ -3530,10 +4383,9 @@ class Axon(Population):
 
         self.n_ax = self.np
         self.n_comp = self.nc
-        self.temp = float(celsius)
 
-        self.v_init = v_init
-        self.v = torch.full_like(self.v, fill_value=v_init)
+        # ``v_init`` is normalized by Population; it may be scalar or a
+        # length-n_comp vector. ``self.v`` was already created from it.
 
         self.x[:] = self._x()  # Initialize x positions
 
@@ -3548,7 +4400,7 @@ class Axon(Population):
             diameters = diameters.unsqueeze(1)
 
         self.diam[:] = diameters
-        self.diam.detach_()
+        self.diam = self.diam.detach()
 
     def assemble_graphs(self):
         """
@@ -3611,6 +4463,23 @@ class Axon(Population):
         [25, 50, 75]  # For a model with n_comp=101
         """
         return [round((self.n_comp - 1) * i) for i in args]
+
+    def csl(self, *args):
+        """
+        Slice the axon at specified relative positions.
+
+        Parameters
+        ----------
+        *args : float
+            Variable number of float values between 0 and 1, representing
+            relative positions along the axon.
+
+        Returns
+        -------
+        Slice
+            A sliced view of the axon at the specified relative positions.
+        """
+        return self[:, self.c(*args)]
 
 
 def _match_state_dict(
@@ -3809,7 +4678,7 @@ class Myelinated(Axon):
             self.axond2 = axond2
             self.axond3 = axond3
 
-        def forward(self, rhoa, dx, diameters):
+        def forward(self, rhoa, dx, diameters, diam):
             """
             Compute scaled axial resistivity parameters.
 
@@ -3833,7 +4702,7 @@ class Myelinated(Axon):
                 self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
             )
             deltax = deltax / dx
-            scale = 1 / ((axon_d / diameters) ** 2)
+            scale = 1 / ((axon_d / diam) ** 2)
             rhoa = rhoa * scale * deltax
             return rhoa
 
@@ -3891,7 +4760,7 @@ class Myelinated(Axon):
                 self.axond2,
                 self.axond3,
             ),
-            args=("dx", "diameters"),
+            args=("dx", "diameters", "diam"),
         )
 
     def deltax(self, diameters):
@@ -4253,6 +5122,8 @@ def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
     for alias, kwargs, idx in zip(aliases, kwargs_list, local_indices):
         for k, v in kwargs.items():
             additional_parameters.setdefault(k, []).append((alias, v, idx))
+
+    mechanism.check_kwargs(additional_parameters)
 
     m = mechanism(
         None,

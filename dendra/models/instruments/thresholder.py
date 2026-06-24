@@ -141,7 +141,7 @@ class Thresholder:
     .. code-block:: python
 
         import numpy as np
-        import dendra as ax
+        import dendra as dn
 
         # Assume ``model`` is an existing Population with diameters defined
         model = ...  # type: dendra.models.Population
@@ -151,14 +151,14 @@ class Thresholder:
         dt = 0.005
         times = np.arange(0.0, tstop, dt)
         values = np.exp(-0.5 * ((times - 1.0) / 0.2) ** 2)
-        stim = ax.arbitrary(values=values, tpoints=times)
+        stim = dn.arbitrary(values=values, tpoints=times)
 
         # Compute the spatial extracellular potential at each compartment
-        field = ax.anisotropic_point(z=200.0, rhox=100.0, rhoz=100.0)
+        field = dn.anisotropic_point(z=200.0, rhox=100.0, rhoz=100.0)
         ve_space = field(model)  # shape (model.np, model.nc)
 
         # Define an activity callback that detects spikes in a subset of nodes
-        active = ax.callbacks.ActiveAL(
+        active = dn.callbacks.ActiveAL(
             threshold=20.0,
             node_check=list(range(model.nc))[::20],
             at_least=5,
@@ -212,7 +212,7 @@ class Thresholder:
         time: Optional[Waveform] = None,
         bases: Optional[Union[npt.NDArray, Tensor]] = None,
         ub=None,
-        fix_bound_up=5.0,
+        fix_bound_up=2.0,
         fix_bound_down=0.1,
         max_tries_bound_fix=10,
         max_tries_thresh=25,

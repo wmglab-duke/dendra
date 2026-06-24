@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 import numpy as np
@@ -17,15 +18,15 @@ import dendra.helpers as H
 
 def test_getenv_caching(monkeypatch):
     """getenv should return casted values and honour lru_cache semantics."""
-    monkeypatch.setenv("AXONML_TEST_ENV", "42")
+    monkeypatch.setenv("DENDRA_TEST_ENV", "42")
     H.getenv.cache_clear()
 
-    assert H.getenv("AXONML_TEST_ENV", 0) == 42  # first read
-    monkeypatch.setenv("AXONML_TEST_ENV", "314159")  # would change, but cached
-    assert H.getenv("AXONML_TEST_ENV", 0) == 42  # still old
+    assert H.getenv("DENDRA_TEST_ENV", 0) == 42  # first read
+    monkeypatch.setenv("DENDRA_TEST_ENV", "314159")  # would change, but cached
+    assert H.getenv("DENDRA_TEST_ENV", 0) == 42  # still old
 
     H.getenv.cache_clear()
-    assert H.getenv("AXONML_TEST_ENV", 0) == 314_159  # after clearing
+    assert H.getenv("DENDRA_TEST_ENV", 0) == 314_159  # after clearing
 
 
 def test_classproperty():
@@ -97,18 +98,36 @@ def test_ve_from_s_t_shapes_and_values(multicontact):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("state", [True, False])
 def test_allow_tf32(state):
-    """H.allow_tf32 should set *both* CUDA matmul and cuDNN flags consistently."""
-    orig_matmul = torch.backends.cuda.matmul.allow_tf32
-    orig_cudnn = torch.backends.cudnn.allow_tf32
+    """H.allow_tf32 should set CUDA matmul/cuDNN precision switches consistently."""
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", torch.__version__)
+    version = tuple(map(int, match.groups())) if match else (0, 0, 0)
 
-    try:
-        H.allow_tf32(state)
-        assert torch.backends.cuda.matmul.allow_tf32 is state
-        assert torch.backends.cudnn.allow_tf32 is state
-    finally:
-        # always restore original state, even if assertions fail
-        torch.backends.cuda.matmul.allow_tf32 = orig_matmul
-        torch.backends.cudnn.allow_tf32 = orig_cudnn
+    if version >= (2, 9, 0):
+        orig_matmul = torch.backends.cuda.matmul.fp32_precision
+        orig_conv = torch.backends.cudnn.conv.fp32_precision
+        orig_rnn = torch.backends.cudnn.rnn.fp32_precision
+        expected = "tf32" if state else "ieee"
+
+        try:
+            H.allow_tf32(state)
+            assert torch.backends.cuda.matmul.fp32_precision == expected
+            assert torch.backends.cudnn.conv.fp32_precision == expected
+            assert torch.backends.cudnn.rnn.fp32_precision == expected
+        finally:
+            torch.backends.cuda.matmul.fp32_precision = orig_matmul
+            torch.backends.cudnn.conv.fp32_precision = orig_conv
+            torch.backends.cudnn.rnn.fp32_precision = orig_rnn
+    else:
+        orig_matmul = torch.backends.cuda.matmul.allow_tf32
+        orig_cudnn = torch.backends.cudnn.allow_tf32
+
+        try:
+            H.allow_tf32(state)
+            assert torch.backends.cuda.matmul.allow_tf32 is state
+            assert torch.backends.cudnn.allow_tf32 is state
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = orig_matmul
+            torch.backends.cudnn.allow_tf32 = orig_cudnn
 
 
 # --------------------------------------------------------------------------

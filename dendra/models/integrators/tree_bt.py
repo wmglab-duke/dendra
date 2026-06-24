@@ -3,10 +3,16 @@ from functools import partial
 from typing import List, Tuple
 
 import networkx as nx
-import numpy as np
 import torch
 
-from .core import Integrator
+from .core import (
+    Integrator,
+    _as_solve_block,
+    _as_solve_matrix,
+    _expanded_v_init,
+    _flatten_to_solve,
+    _model_solve_shape,
+)
 from .triton import dhs_bt_solve_cuda
 
 try:
@@ -105,7 +111,7 @@ class _dhs_bt(Integrator):
         super().__init__(model, mech, imem)
         self.threads = threads
 
-        _, K = model.np, model.nc
+        _, K = _model_solve_shape(model)
 
         self.K = K
 
@@ -154,20 +160,23 @@ class _dhs_bt(Integrator):
         self.order.copy_(order.to(device=dev, dtype=torch.int64))
         self.layer_ptr = layer_ptr.to(device=dev, dtype=torch.int64)
 
-        B = np.prod(model.shape[:-1])
+        self._refresh_solver_shape(model, block_dim=3)
+        B = self.B
         K = self.K
         dt_s = dt * 1e-3  # convert to seconds for capacitance
 
         # Areas: recompute from geometry to guarantee cm² (matches unbranched BT)
-        area_cm2 = model.area
+        area_cm2 = _as_solve_matrix(model.area, model)
         self.area = area_cm2
 
+        xc = _as_solve_block(model.xc, model, (2,))
+        xg_param = _as_solve_block(model.xg, model, (2,))
+        cm = _as_solve_matrix(model.cm, model)
+
         # Capacitances / conductances (per node)
-        cm_dt = (
-            (1e-6 * model.cm * area_cm2 / dt_s).expand(model.shape).view(B, self.K)
-        )  # (B,K)   F/s -> S
-        xc_dt = 1e-6 * model.xc * area_cm2.unsqueeze(-1) / dt_s  # (B,K,2) F/s -> S
-        xg = model.xg * area_cm2.unsqueeze(-1)  # (B,K,2) S
+        cm_dt = 1e-6 * cm * area_cm2 / dt_s  # (B,K)   F/s -> S
+        xc_dt = 1e-6 * xc * area_cm2.unsqueeze(-1) / dt_s  # (B,K,2) F/s -> S
+        xg = xg_param * area_cm2.unsqueeze(-1)  # (B,K,2) S
 
         # Zero-area branch points: explicitly zero radial terms (prevents NaNs)
         area_zero = area_cm2 == 0
@@ -215,13 +224,13 @@ class _dhs_bt(Integrator):
         non_root = (parent_mech >= 0).view(1, -1, 1)  # (1,K,1)
 
         # Child/parent edge lengths (cm), mechanism order
-        dx_cm = 1e-4 * model.dx.expand(B, K)  # (B,K)
+        dx_cm = 1e-4 * _as_solve_matrix(model.dx, model)  # (B,K)
         dx_parent = dx_cm.gather(
             1, parent_mech.clamp_min(0).view(1, -1).expand(B, -1)
         )  # (B,K)
 
         # Per-shell resistivities per side (Ω·cm), mechanism order
-        xrax_child = model.xraxial.expand(B, K, 2)  # (B,K,2)
+        xrax_child = _as_solve_block(model.xraxial, model, (2,))  # (B,K,2)
         xrax_parent = xrax_child.gather(
             1, parent_mech.clamp_min(0).view(1, -1, 1).expand(B, -1, 2)
         )  # (B,K,2)
@@ -256,19 +265,30 @@ class _dhs_bt(Integrator):
             model.register_buffer(
                 "vc", torch.zeros(*model.shape, 3, device=dev, dtype=dtyp)
             )
-            model.vc[..., 0] = model.v_init
-            model.vc[..., 1] = 0.0
-            model.vc[..., 2] = 0.0
+        elif tuple(model.vc.shape) != tuple(model.shape) + (3,):
+            model.vc = torch.zeros(*model.shape, 3, device=dev, dtype=dtyp)
+        v0 = _expanded_v_init(model)
+        model.vc[..., 0] = v0
+        model.vc[..., 1] = 0.0
+        model.vc[..., 2] = 0.0
         if not hasattr(model, "v"):
             model.register_buffer(
                 "v", torch.zeros(*model.shape, device=dev, dtype=dtyp)
             )
-            model.v[:] = model.v_init
+        model.v[:] = v0
 
     def step(self, model, dt, ve=None, intra=None):
-        model.vc, model.v = self._step(
-            model.vc.view(-1, self.K, 3), model.v, dt, model.celsius, ve, intra
+        vc_new, v_new = self._call_kernel(
+            "_step",
+            self._flat_block_voltage(model.vc, 3),
+            model.v,
+            dt,
+            model.celsius,
+            ve,
+            intra,
         )
+        model.vc = vc_new
+        model.v = v_new
 
     def _step(self, vc, v, dt, temp, ve=None, intra=None):
         # Update mechanisms in mV / mA/cm^2
@@ -278,15 +298,21 @@ class _dhs_bt(Integrator):
 
         # RHS (mechanism order), keep everything in mV/mA/S:
         # d_lin = (g*v - itot) * area  [mA]
-        d_lin = (gtot * v - itot).view(-1, self.K) * self.area
+        v_flat = self._flat_voltage(v)
+        d_lin = (
+            self._flat_voltage(gtot) * v_flat - self._flat_voltage(itot)
+        ) * self.area
         if intra is not None:
-            d_lin = d_lin + intra  # assume intra is already in mA
+            d_lin = d_lin + _flatten_to_solve(
+                intra, self.K, self.shape
+            )  # assume intra is already in mA
 
         # Capacitive+shell terms (S) operate on mV to yield mA
         c_rad = torch.cat(
             [self.cm_dt.unsqueeze(-1), self.xc_dt], dim=-1
         )  # (B,K,3) in S
-        rhs_mech = assemble_rhs(vc, c_rad, d_lin, self.xg, ve)  # (B,K,3) in mA
+        ve_flat = _flatten_to_solve(ve, self.K, self.shape) if ve is not None else None
+        rhs_mech = assemble_rhs(vc, c_rad, d_lin, self.xg, ve_flat)  # (B,K,3) in mA
 
         # Reorder into solver order
         idx = self.solver_order
@@ -294,7 +320,7 @@ class _dhs_bt(Integrator):
         G_ = self.g_to_parent
 
         # Inject membrane gtot (scaled by area) into [vi, ve0] block (solver order)
-        g_mech = gtot.view(-1, self.K) * self.area  # (B,K) S (mechanism order)
+        g_mech = self._flat_voltage(gtot) * self.area  # (B,K) S (mechanism order)
         g_ = g_mech.index_select(1, idx)  # (B,K) S (solver order)
 
         Dm = self.main_blocks.clone()  # (B, K, 3, 3)
@@ -321,9 +347,19 @@ class _dhs_bt(Integrator):
         return vc_out, v_out
 
     def init_v(self, model):
+        v0 = _expanded_v_init(model).clone().detach().contiguous()
+        if not hasattr(model, "vc") or tuple(model.vc.shape) != tuple(model.shape) + (
+            3,
+        ):
+            model.register_buffer(
+                "vc",
+                torch.zeros(
+                    *model.shape, 3, device=model.device(), dtype=model.dtype()
+                ),
+            )
         model.vc.zero_()
-        model.vc[..., 0] = model.v_init
-        model.v[:] = model.v_init
+        model.vc[..., 0] = v0
+        model.v = v0.clone()
         model.vc = model.vc.detach()
         model.v = model.v.detach()
         if self.imem:

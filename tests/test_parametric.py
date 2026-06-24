@@ -1,5 +1,4 @@
 # tests/test_parametric.py
-import itertools as _it
 import math
 
 import pytest
@@ -9,10 +8,6 @@ from hypothesis import strategies as st
 
 # ---- Import the module under test -------------------------------------------------
 import dendra.models.parametric as M
-
-# If the source file had a weird `import itertools` line, patch it here.
-if not hasattr(M, "itertools"):
-    M.itertools = _it
 
 
 # ---- Helpers ----------------------------------------------------------------------
@@ -398,9 +393,13 @@ def test_parameters_dict_contains_named_parameters():
 
     w = W(shape=(1, 1), shape_f=(1, 1))
     d = w.parameters_dict()
-    # contains a_param and b_param (the actual nn.Parameters)
+    # Default behavior returns detached/cloned tensor snapshots.
     assert "a_param" in d and "b_param" in d
-    assert isinstance(d["a_param"], torch.nn.Parameter)
+    assert torch.is_tensor(d["a_param"])
+    assert not isinstance(d["a_param"], torch.nn.Parameter)
+
+    live = w.parameters_dict(clone=False)
+    assert isinstance(live["a_param"], torch.nn.Parameter)
 
 
 # ---- build_parametrization --------------------------------------------------------

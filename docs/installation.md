@@ -11,7 +11,7 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 ## Prerequisites
 
 - Python 3.11 or newer
-- PyTorch 2.7+ (install the CUDA 12.9+ wheels if you want GPU support)
+- PyTorch 2.8+
 - Git
 
 ## Quick start
@@ -23,22 +23,22 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
    conda activate dendra
    ```
 
-2. Install PyTorch (pick the command that matches your hardware):
-
-   ```{important}
-   PyTorch 2.9+ is supported but exhibits some stochastic performance regressions on small-batch CPU simulation. If this is your use case (relatively small numbers of individual fiber simulations), we recommend PyTorch 2.8.0 for best performance.
-   ```
+2. (Optional) Install your preferred version of PyTorch:
 
    ```{important}
    If installing on Windows without WSL2, please follow PyTorch installation instructions [here](https://docs.pytorch.org/tutorials/unstable/inductor_windows.html) to ensure proper setup of the PyTorch Inductor backend (used by Dendra for JIT-compilation of models).
    ```
 
+   ```{tip}
+   We recommend installing the most recent stable version of PyTorch that supports your CUDA version. If you have an older GPU that is not compatible with the latest CUDA, you may need to install an older version of PyTorch that supports your CUDA version. See the [PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/) for more details.
+   ```
+
    ```sh
-   # e.g., GPU build (Pytorch 2.8.0, CUDA 12.9)
-   python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129
+   # e.g., GPU build (Pytorch 2.8.0, CUDA 12.9) - adjust the version and CUDA version as needed
+   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129
 
    # CPU-only build
-   # python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+   # pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
    ```
 
 3. (Windows without WSL2) Install NEURON using the precompiled installer from https://neuron.yale.edu/neuron/download.
@@ -48,22 +48,22 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
    ```sh
    git clone https://gitlab.oit.duke.edu/mah148/dendra.git
    cd dendra
-   python -m pip install .
+   pip install .
    ```
 
 ## Optional extras
 
-- Jupyter support: `python -m pip install '.[jupyter]'`
+- Jupyter support: `pip install ".[jupyter]"`
 
 - CPU implicit solvers: install the companion package [`dendra-solvers`](https://gitlab.oit.duke.edu/mah148/dendra-solvers) (required only for CPU implicit methods; GPU solvers are included by default). Also required to build the documentation.
 
-- Documentation build dependencies: `python -m pip install '.[doc]'` then `cd docs && make html`
+- Documentation build dependencies: `pip install ".[doc]"` then `cd docs && make html`
 
 - Development setup (editable install + lint/test tooling):
 
   ```sh
-  python -m pip install --editable '.[dev]'
-  python -m pre-commit install
+  pip install --editable ".[dev]"
+  pre-commit install
   ```
 
 - Library of models: install the companion package [`dendra-models`](https://gitlab.oit.duke.edu/mah148/dendra-models) for additional pre-defined neuron & network models.
@@ -72,7 +72,7 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 
 ```sh
 python - <<'PY'
-import dendra as ax
+import dendra as dn
 
 print("Dendra import succeeded")
 PY

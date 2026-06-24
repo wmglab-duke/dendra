@@ -5,7 +5,7 @@
 ***
 
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style-plastic&logo=PyTorch&logoColor=white)](https://pytorch.com)
-[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/downloads/)
 [![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 Fast, scalable, and differentiable neural simulator with support for extracellular fields. Useful to implement and train high-throughput GPU-compatible models.
@@ -19,16 +19,17 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](ht
 `dendra` has been tested on Windows 11 under WSL2 (Ubuntu 22.04), Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux), and macOS (Tahoe 26.3).
 
 ### Python dependencies
-`dendra` requires Python 3.10+ and PyTorch 2.7+. For GPU support, CUDA 12.9+ is required for best performance.
+`dendra` requires Python 3.11+ and PyTorch 2.8+. For GPU support, CUDA 12.9+ is required for best performance. **We recommend installing the most recent stable version of PyTorch that supports your CUDA version**. If you have an older GPU that is not compatible with the latest CUDA, you may need to install an older version of PyTorch that supports your CUDA version. See the [PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/) for more details.
 
 ## 🖥️ Installation
 
 > [!TIP]
 > We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n dendra python=3.12`. Be sure to activate your new environment (`conda activate dendra`) before following the installation instructions or running code.
 
-1. Install PyTorch (+ CUDA 12.9+ if you're running on GPU).
+1. (Optional) Install your preferred version of PyTorch. If you do not have a GPU or do not need GPU support, we recommend you install the CPU-only version of PyTorch to avoid installing unnecessary CUDA dependencies. e.g., for PyTorch 2.8.0:
 ```bash
-> pip install torch --index-url https://download.pytorch.org/whl/cu129
+> pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129  # GPU version, CUDA 12.9 specified - adjust the version and CUDA version as needed
+> pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu    # CPU-only version
 ```
 
 2. Clone this repository.
@@ -41,16 +42,16 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](ht
 
 ```bash
 > cd dendra
-> python -m pip install .
+> pip install .
 ```
 
 - If you want to build and run the documentation locally:
-    - `python -m pip install '.[doc]'`
+    - `pip install ".[doc]"`
 
 ### ⚙️ Installing for development
 - Install `--editable` with dev dependencies & install `pre-commit`:
-    - `python -m pip install --editable '.[dev]'`
-    - `python -m pre-commit install`
+    - `pip install --editable ".[dev]"`
+    - `pre-commit install`
 
 
 🥳 You're all set!

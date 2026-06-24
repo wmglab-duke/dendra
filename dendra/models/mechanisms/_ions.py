@@ -5,6 +5,7 @@ import torch
 from dendra.helpers import DEBUG
 
 from ..parametric import to_param
+from ._materials import Material
 
 # default reversal potentials from NEURON
 REVERSAL = {"ena": 50.0, "ek": -77.0, "eca": 132.0}
@@ -99,6 +100,11 @@ def register_ion(ion, valence, e, i0, o0, min_concentration=None):
     MIN_CONCENTRATION[ion] = min_concentration
 
 
+def ion_register(ion, valence, e, i0, o0, min_concentration=None):
+    """Backward-compatible alias for :func:`register_ion`."""
+    return register_ion(ion, valence, e, i0, o0, min_concentration)
+
+
 class equilibria(ContextDecorator):
     _last = {}
 
@@ -171,97 +177,110 @@ R = 1e3 * 8.31446261815324
 FARADAY = 96485.33212331001
 
 
-class Ion(torch.nn.Module):
+def _is_scalar(x):
+    if isinstance(x, float):
+        return True
+    if isinstance(x, int):
+        return True
+    return torch.is_tensor(x) and x.ndim == 0
+
+
+def _make_into_shape(shape, value):
+    if _is_scalar(value):
+        return torch.full(shape, value)
+    else:
+        return value.expand(shape).clone()
+
+
+class Ion(Material):
     __constants__ = "init_e_reversal", "advance_e"
 
-    def __init__(self, name, shape, cstyle, estyle, einit, eadvance, cinit):
-        super().__init__()
-        self.name = name
+    def __init__(self, name, shape, einit, eadvance):
+        # Do not assign Parameters before torch.nn.Module.__init__ has run.
+        # Material.__init__ calls Module.__init__, so pass plain defaults into
+        # the Material field specs first, then register learnable/init values.
+        e0 = reversals()[f"e{name}"]
+        i0 = cinits()[f"{name}i0"]
+        o0 = cinits()[f"{name}o0"]
+        min_concentration = min_concentrations()[name]
+
+        super().__init__(
+            name,
+            shape,
+            fields={
+                f"i{name}": 0.0,
+                f"e{name}": e0,
+                f"{name}i": i0,
+                f"{name}o": o0,
+            },
+            min_values={
+                f"{name}i": min_concentration,
+                f"{name}o": min_concentration,
+            },
+        )
+
         self.rzf = R / (VALENCES[name] * FARADAY)
-
-        self.e_init = to_param(reversals()[f"e{name}"])
-        self.i_init = to_param(cinits()[f"{name}i0"])
-        self.o_init = to_param(cinits()[f"{name}o0"])
-
-        self.min_concentration = min_concentrations()[name]
-
-        self.register_buffer(f"i{name}", torch.zeros(shape))
-        self.register_buffer(f"e{name}", torch.full(shape, self.e_init))
-        self.register_buffer(f"{name}i", torch.full(shape, self.i_init))
-        self.register_buffer(f"{name}o", torch.full(shape, self.o_init))
+        self.e_init = to_param(e0)
+        self.i_init = to_param(i0)
+        self.o_init = to_param(o0)
+        self.min_concentration = min_concentration
 
         self.init_e_reversal = einit != 0
         self.advance_e = eadvance != 0
 
+    @staticmethod
+    def _expand_init_like(value, like):
+        if torch.is_tensor(value):
+            value_t = value.to(device=like.device, dtype=like.dtype)
+        else:
+            value_t = torch.as_tensor(value, device=like.device, dtype=like.dtype)
+        if value_t.ndim == 0 or value_t.numel() == 1:
+            return value_t.reshape(()).expand_as(like).clone()
+        return value_t.expand_as(like).clone()
+
     def initialize(self, celsius) -> None:
+        # Ion initialization should use e_init/i_init/o_init so that explicit
+        # equilibria()/concentrations() values, including trainable parameter
+        # declarations handled by to_param, remain the source of truth.
         name = self.name
-        i = getattr(self, f"i{name}")
-        e = getattr(self, f"e{name}")
-        ioni = getattr(self, f"{name}i")
-        iono = getattr(self, f"{name}o")
-        setattr(
-            self, f"i{name}", torch.full(i.shape, 0.0, dtype=i.dtype, device=i.device)
+        i_buf = self._buffers[f"i{name}"]
+        self._buffers[f"i{name}"] = torch.zeros_like(i_buf)
+        self._buffers[f"e{name}"] = self._expand_init_like(
+            self.e_init, self._buffers[f"e{name}"]
         )
-        setattr(
-            self,
-            f"e{name}",
-            torch.full(e.shape, 0.0, dtype=e.dtype, device=e.device),
+        self._buffers[f"{name}i"] = self._expand_init_like(
+            self.i_init, self._buffers[f"{name}i"]
         )
-        getattr(self, f"e{name}").copy_(self.e_init)
-        setattr(
-            self,
-            f"{name}i",
-            torch.full(ioni.shape, 0.0, dtype=ioni.dtype, device=ioni.device),
+        self._buffers[f"{name}o"] = self._expand_init_like(
+            self.o_init, self._buffers[f"{name}o"]
         )
-        getattr(self, f"{name}i").copy_(self.i_init)
-        setattr(
-            self,
-            f"{name}o",
-            torch.full(iono.shape, 0.0, dtype=iono.dtype, device=iono.device),
-        )
-        getattr(self, f"{name}o").copy_(self.o_init)
         self.einit(celsius)
         if not self.training:
             self.detach()
 
     def detach(self):
-        name = self.name
-        setattr(self, f"i{name}", getattr(self, f"i{name}").detach())
-        setattr(self, f"{name}i", getattr(self, f"{name}i").detach())
-        setattr(self, f"{name}o", getattr(self, f"{name}o").detach())
-        setattr(self, f"e{name}", getattr(self, f"e{name}").detach())
+        super().detach()
+        return self
 
     def einit(self, celsius) -> None:
         if self.init_e_reversal:
             name = self.name
-            iono = getattr(self, f"{name}o")
-            ioni = getattr(self, f"{name}i")
-            new_val = torch.log(iono / ioni) * self.rzf * (273.15 + celsius)
-            setattr(self, f"e{name}", new_val)
+            iono = self._buffers[f"{name}o"]
+            ioni = self._buffers[f"{name}i"]
+            self._buffers[f"e{name}"] = (
+                torch.log(iono / ioni) * self.rzf * (273.15 + celsius)
+            )
 
     def advance(self, celsius) -> None:
-        name = self.name
-        iono_name = f"{name}o"
-        ioni_name = f"{name}i"
-        e_name = f"e{name}"
-
-        # Read current buffers via attributes
-        iono_t = getattr(self, iono_name)
-        ioni_t = getattr(self, ioni_name)
-
-        # Safeguard against <= 0
-        min_val = torch.tensor(
-            self.min_concentration, device=iono_t.device, dtype=iono_t.dtype
-        )
-        iono_t = torch.where(iono_t <= 0, min_val, iono_t)
-        ioni_t = torch.where(ioni_t <= 0, min_val, ioni_t)
-
-        # Rebind attributes with the new tensors (no in-place)
-        setattr(self, iono_name, iono_t)
-        setattr(self, ioni_name, ioni_t)
+        # Clamp intracellular/extracellular concentrations through Material.advance.
+        super().advance(celsius)
 
         if not self.advance_e:
             return
 
-        new_e = torch.log(iono_t / ioni_t) * self.rzf * (273.15 + celsius)
-        setattr(self, e_name, new_e)
+        name = self.name
+        iono = self._buffers[f"{name}o"]
+        ioni = self._buffers[f"{name}i"]
+        self._buffers[f"e{name}"] = (
+            torch.log(iono / ioni) * self.rzf * (273.15 + celsius)
+        )

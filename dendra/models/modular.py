@@ -67,7 +67,7 @@ def matches_any_pattern(base_patterns: Iterable[str], target_string: str) -> boo
     return False
 
 
-class AxModule(torch.nn.Module):
+class DNModule(torch.nn.Module):
     """Base class for modular neuron model components."""
 
     def unfreeze(self, *names, exclude=None):
@@ -86,12 +86,18 @@ class AxModule(torch.nn.Module):
             Otherwise, only parameters matching any of these patterns will be unfrozen.
         exclude : Iterable[str], optional
             Optional collection of name patterns to exclude from unfreezing.
-            If provided, any parameter whose name matches any of these patterns will not be unfrozen,
+            If provided, any parameter whose name matches any of these patterns will
+            not be unfrozen, even if it matches a pattern in `names`.
 
         Notes
         -----
         The matching is done using the `matches_any_pattern` function.
         When a parameter is unfrozen, a message is printed to the console.
+
+        Returns
+        -------
+        DNModule
+            The module instance for chaining.
         """
         if not names:
             if exclude is not None:
@@ -135,12 +141,18 @@ class AxModule(torch.nn.Module):
             all parameters are frozen.
         exclude : Iterable[str], optional
             Optional collection of name patterns to exclude from freezing. If
-            provided, any parameter whose name matches any of these patterns will not be frozen, even if
+            provided, any parameter whose name matches any of these patterns will
+            not be frozen, even if it matches a pattern in `names`.
+
+        Notes
+        -----
+        The matching is done using the `matches_any_pattern` function.
+        When a parameter is frozen, a message is printed to the console.
 
         Returns
         -------
-        Population
-            The population instance for chaining.
+        DNModule
+            The module instance for chaining.
         """
         if not names:
             if exclude is not None:
@@ -186,8 +198,8 @@ class AxModule(torch.nn.Module):
 
         Returns
         -------
-        list
-            List of parameters matching the provided names.
+        generator
+            Generator yielding parameters matching the provided names.
         """
         if not names:
             return self.parameters()
@@ -209,8 +221,8 @@ class AxModule(torch.nn.Module):
 
         Returns
         -------
-        list
-            List of tuples (name, parameter) matching the provided names.
+        generator
+            Generator yielding tuples (name, parameter) matching the provided names.
         """
         if not names:
             return self.named_parameters()

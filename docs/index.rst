@@ -25,21 +25,21 @@ Getting started
     import torch
     import matplotlib.pyplot as plt
 
-    import dendra as ax
+    import dendra as dn
     from dendra_models.models import smolMRG
 
     # single 2.0 µm MRG model with extracellular stimulation
     model = smolMRG([2.0], n_node=201)
 
     # point source extracellular kHz stimulation
-    ve_s = ax.isotropic_point(z=100.0, rhoe=500.0)(model)
+    ve_s = dn.isotropic_point(z=100.0, rhoe=500.0)(model)
 
     dt, tstop = 0.001, 100
     f, amp = 5, 0.5
-    i_t = ax.sin(amp=amp, freq=f)
+    i_t = dn.sin(amp=amp, freq=f)
 
     # run simulation
-    rec = ax.callbacks.Recorder(['v'], node_indices=model.c(0.9))
+    rec = dn.callbacks.Recorder(['v'], node_indices=model.c(0.9))
     model.steady_state()
     model.longrun(space=ve_s, time=i_t, n_chunks=10000, dt=dt, callbacks=[rec])
 

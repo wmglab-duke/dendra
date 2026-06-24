@@ -7,7 +7,13 @@ import numpy as np
 import torch
 
 from ..graph import share_topology_isomorphic
-from .core import Integrator, MultiIntegrator
+from .core import (
+    Integrator,
+    MultiIntegrator,
+    _as_solve_matrix,
+    _broadcast_to_shape,
+    _flatten_to_solve,
+)
 from .triton import dhs_solve_cuda, dhs_solve_multi_cuda
 
 try:
@@ -321,7 +327,7 @@ class _dhs(Integrator):
                 f"DHS integrator is not implemented for device type {device.type}."
             )
 
-        graph = [model.graph]
+        graph = model.graph
         if graph is None:
             try:
                 graph = model.assemble_graphs()
@@ -330,6 +336,8 @@ class _dhs(Integrator):
                     "Model must have a `graph` attribute or implement "
                     "`assemble_graphs()` method returning a list of graphs."
                 ) from err
+        if not isinstance(graph, list):
+            graph = [graph]
 
         parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(graph)
         parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
@@ -340,7 +348,10 @@ class _dhs(Integrator):
         )  # (N,)
         self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))  # (N,)
 
-        area_cm2 = model.area.to(device=device) * model.area_scale  # cm²
+        area_cm2 = (
+            _as_solve_matrix(model.area.to(device=device, dtype=model.dtype()), model)
+            * model.area_scale
+        )  # cm², (B,K)
 
         self.register_buffer(
             "layer_ptr", layer_ptr.to(dtype=torch.int64, device=device)
@@ -348,8 +359,7 @@ class _dhs(Integrator):
         self.order.copy_(order.to(dtype=torch.int64, device=device))
         self.parent_idx.copy_(parent_idx.to(dtype=torch.int64, device=device))  # (N,)
         self.a_geom = (
-            a_geom_t.expand(B, -1)
-            .to(device=device, dtype=model.dtype())
+            _as_solve_matrix(a_geom_t.to(device=device, dtype=model.dtype()), model)
             .clone()
             .contiguous()
         ) / model.rhoa_scale  # (B,N)
@@ -357,16 +367,18 @@ class _dhs(Integrator):
         self.scale = area_cm2
 
         cm = (
-            1e-6 * model.cm.to(device=device) * area_cm2 * model.cm_scale
+            1e-6
+            * _as_solve_matrix(model.cm.to(device=device, dtype=model.dtype()), model)
+            * area_cm2
+            * model.cm_scale
         )  # convert from µF / cm2 to F
-        self.cmdt = (
-            (cm / dt_s).expand(model.shape).reshape(B, self.K)
-        )  # (B,N) (F/s = S)
+        self.cmdt = cm / dt_s  # (B,N) (F/s = S)
 
         # extracellular
         # We will need the original node IDs from the graph for this
         # Assuming G.nodes() provides the original order [0, 1, ..., N-1]
-        original_nodes = list(range(model.graph.number_of_nodes()))
+        graph0 = graph[0]
+        original_nodes = list(range(graph0.number_of_nodes()))
         original_idx_of = {n: i for i, n in enumerate(original_nodes)}
 
         # --- Create edge indices in the ORIGINAL node order ---
@@ -428,7 +440,9 @@ class _dhs(Integrator):
         self.edge_gax_orig = self.edge_gax_orig / model.rhoa_scale  # (B, E)
 
     def step(self, model, dt, ve=None, intra=None):
-        v_new, i_membrane = self._step(model.v, dt, model.celsius, ve, intra)
+        v_new, i_membrane = self._call_kernel(
+            "_step", model.v, dt, model.celsius, ve, intra
+        )
         model.v = v_new
         if self.imem:
             model.i_membrane = i_membrane
@@ -445,12 +459,12 @@ class _dhs(Integrator):
 
         if self.mech.currents:
             itot, gtot = self.mech.i(v_old)  # shapes: base_shape
-            itot_flat = itot.view(-1, K)  # (B,K), mA/cm^2
-            gtot_flat = gtot.view(-1, K)  # (B,K), mA/(cm^2 mV)
-            scale = self.scale.view(-1, K)  # (B,K), cm^2
+            itot_flat = itot.reshape(-1, K)  # (B,K), mA/cm^2
+            gtot_flat = gtot.reshape(-1, K)  # (B,K), mA/(cm^2 mV)
+            scale = self.scale.reshape(-1, K)  # (B,K), cm^2
 
             # ionic "reversal" term + scale to absolute mA
-            f_n = (gtot_flat * v_old.view(-1, K) - itot_flat) * scale  # (B,K), mA
+            f_n = (gtot_flat * v_old.reshape(-1, K) - itot_flat) * scale  # (B,K), mA
         else:
             # no ionic currents: zero contribution
             itot_flat = None
@@ -459,7 +473,10 @@ class _dhs(Integrator):
 
         if ve is not None:
             I_edge = _edge_currents(
-                self.edge_child_orig, self.edge_parent_orig, self.edge_gax_orig, ve
+                self.edge_child_orig,
+                self.edge_parent_orig,
+                self.edge_gax_orig,
+                _flatten_to_solve(ve, K, self.base_shape),
             )  # (B, E) mA
             S = torch.zeros_like(f_n)  # (B, K)
             S.scatter_add_(
@@ -471,12 +488,12 @@ class _dhs(Integrator):
             f_n = f_n + S  # (B, K) mA
 
         if intra is not None:
-            f_n = f_n + intra.view_as(f_n)
+            f_n = f_n + _flatten_to_solve(intra, K)
 
-        v_old_flat = v_old.view(-1, K)  # (B,K)
+        v_old_flat = v_old.reshape(-1, K)  # (B,K)
         RHS = f_n + (self.cmdt * v_old_flat)  # (B,K), mA
 
-        scale = self.scale.view(-1, K)  # (B,K), cm^2
+        scale = self.scale.reshape(-1, K)  # (B,K), cm^2
         main = self.cmdt + (gtot_flat * scale)
 
         d_ = main.index_select(-1, self.solver_order)  # (B, N)
@@ -499,7 +516,7 @@ class _dhs(Integrator):
         # ---- i_membrane: net membrane current (cap + ionic) in mA ----
         i_membrane = None
         if self.imem:
-            v_new_flat = v_new.view(-1, K)  # (B,K), mV
+            v_new_flat = v_new.reshape(-1, K)  # (B,K), mV
             dv = v_new_flat - v_old_flat  # (B,K), mV
 
             dmem = main  # (B,K), A/V
@@ -1026,8 +1043,8 @@ class _dhs_multi(MultiIntegrator):
         return plan
 
     def step(self, model, dt, ve=None, intra=None):
-        v_new, i_mem = self._step(
-            model.v, dt, getattr(model, "celsius", None), ve, intra
+        v_new, i_mem = self._call_kernel(
+            "_step", model.v, dt, getattr(model, "celsius", None), ve, intra
         )
         model.v = v_new
         if self.imem:
@@ -1052,7 +1069,11 @@ class _dhs_multi(MultiIntegrator):
         self.mech.advance(v_old, dt, temp)
         itot_flat, gtot_flat = self.mech.i(v)  # both original shape
 
-        intra_flat = 0.0 if intra is None else intra.reshape(P, N_total)
+        intra_flat = (
+            0.0
+            if intra is None
+            else _broadcast_to_shape(intra, tuple(orig_shape)).reshape(P, N_total)
+        )
 
         SCALE_MECH = self.SCALE_MECH.reshape(1, -1)
 
@@ -1065,16 +1086,18 @@ class _dhs_multi(MultiIntegrator):
 
         # --- extracellular coupling (ve), vectorized on flattened indices) ---
         if ve is not None and self.EDGE_CHILD_IDX_FLAT.numel() > 0:
-            ve_flat = ve.reshape(1, -1)
-            # edge potential differences per (row, edge)
+            ve_flat = _broadcast_to_shape(ve, tuple(orig_shape)).reshape(P, N_total)
+            # edge potential differences per (outer batch row, edge)
             dV_edge = ve_flat.index_select(
                 1, self.EDGE_PARENT_IDX_FLAT
             ) - ve_flat.index_select(1, self.EDGE_CHILD_IDX_FLAT)
-            I_edge = dV_edge * self.EDGE_GAX_FLAT  # (sum_g B_g*E_g,)
+            I_edge = dV_edge * self.EDGE_GAX_FLAT.unsqueeze(0)
 
             S_flat = torch.zeros_like(f_n_flat)
-            S_flat.scatter_add_(1, self.EDGE_CHILD_IDX_FLAT.unsqueeze(0), -I_edge)
-            S_flat.scatter_add_(1, self.EDGE_PARENT_IDX_FLAT.unsqueeze(0), I_edge)
+            edge_child = self.EDGE_CHILD_IDX_FLAT.unsqueeze(0).expand(P, -1)
+            edge_parent = self.EDGE_PARENT_IDX_FLAT.unsqueeze(0).expand(P, -1)
+            S_flat.scatter_add_(1, edge_child, -I_edge)
+            S_flat.scatter_add_(1, edge_parent, I_edge)
             f_n_flat = f_n_flat + S_flat
 
         CMDT_MECH = self.CMDT_MECH.reshape(1, -1)

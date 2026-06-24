@@ -8,16 +8,19 @@ from typing import Callable, Union
 import torch
 import torch.nn.functional as F
 
-from dendra.helpers import DEBUG, REQUIRE_GRAD, logger
+from dendra.helpers import DEBUG, REQUIRE_GRAD, current_device, current_dtype, logger
 from dendra.utils import PreparedInterp1d
+from dendra.utils.dynamic_compilation import compile_generated_function
 
-from .modular import AxModule, matches_any_pattern
+from .modular import DNModule, matches_any_pattern
 from .rng import RNGModule
 
 _valid_param_type = Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
 
 
-def to_param(val, positive=False, negative=False, requires_grad=None):
+def to_param(
+    val, positive=False, negative=False, requires_grad=None, *, device=None, dtype=None
+):
     """
     Convert a value into a parameter-like object.
 
@@ -44,7 +47,15 @@ def to_param(val, positive=False, negative=False, requires_grad=None):
         return val
     if isinstance(val, torch.nn.Module):
         return val
-    val = torch.as_tensor(val, dtype=torch.float32)
+    target_device = current_device(None) if device is None else torch.device(device)
+    target_dtype = (
+        current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+    )
+    val = torch.as_tensor(
+        val,
+        device=target_device,
+        dtype=target_dtype,
+    )
     if positive:
         val = torch.clamp(val, min=0.0)
         return PositiveParam(val)
@@ -330,8 +341,11 @@ class Bounded(cacheable):
         lower_alpha: float = 0.1,
         cap_mode: str = "auto",
         cap_beta: float | None = None,
+        requires_grad: bool = None,
     ):
         super().__init__()
+        if requires_grad is None:
+            requires_grad = bool(REQUIRE_GRAD)
         self.min_val = None if min_val is None else float(min_val)
         self.max_val = None if max_val is None else float(max_val)
         if (
@@ -377,7 +391,7 @@ class Bounded(cacheable):
                 t = torch.clamp((init - self.min_val) / rng, 1e-6, 1 - 1e-6)
                 rho0 = torch.special.logit(t) / self.beta
 
-        self.rho = torch.nn.Parameter(rho0, requires_grad=True)
+        self.rho = torch.nn.Parameter(rho0, requires_grad=requires_grad)
 
     def _upper_mode(self, *, upper_only: bool) -> str:
         if self.max_val is None:
@@ -434,6 +448,64 @@ class Bounded(cacheable):
     def __len__(self):
         return self.rho.numel()
 
+    def set(self, value):
+        """
+        Set the parameter value directly, bypassing the unconstrained ``rho``.
+
+        Parameters
+        ----------
+        value : array_like
+            New value for the parameter, which will be clamped to the valid range.
+        """
+        with torch.no_grad():
+            resolved = torch.as_tensor(
+                value, dtype=self.rho.dtype, device=self.rho.device
+            )
+            self.rho.copy_(self._inverse_transform(resolved))
+
+    def _inverse_transform(self, value):
+        # This method computes the inverse of the forward mapping, used for direct setting.
+        if self.min_val is None and self.max_val is None:
+            return value
+
+        elif self.min_val is not None and self.max_val is None:
+            if self.lower_mode == "softplus":
+                y = torch.clamp(value - self.min_val, min=1e-12)
+                return softplus_inv(y, beta=self.beta, threshold=self.threshold)
+            else:
+                return value
+
+        elif self.min_val is None and self.max_val is not None:
+            if self._upper_mode(upper_only=True) == "hard-ste":
+                return value
+            else:
+                y = torch.clamp(self.max_val - value, min=1e-12)
+                return softplus_inv(y, beta=self.cap_beta, threshold=self.threshold)
+
+        else:
+            if self._upper_mode(upper_only=False) == "hard-ste":
+                return value
+            else:
+                rng = max(self.max_val - self.min_val, 1e-12)
+                t = torch.clamp((value - self.min_val) / rng, 1e-6, 1 - 1e-6)
+                return torch.special.logit(t) / self.beta
+
+    def repeat_and_reinit(self, n: int):
+        new = self.repeat(n)
+        new_p = self._inverse_transform(new)
+        self.rho = to_param(
+            torch.as_tensor(new_p, device=self.rho.device, dtype=self.rho.dtype)
+        )
+        self.clear_cache()
+        return self
+
+    def batch(self, n: int):
+        old = torch.atleast_1d(self())
+        new = old[None, :].expand(n, *old.shape).clone()
+        self.rho = to_param(self._inverse_transform(new))
+        self.clear_cache()
+        return self
+
 
 class PositiveParam(Bounded):
     """
@@ -470,6 +542,7 @@ class PositiveParam(Bounded):
         lower_alpha: float = 0.1,  # used only if include_zero=True (leaky-ste)
         cap_mode: str = "auto",
         cap_beta: float | None = None,
+        requires_grad: bool = None,
     ):
         super().__init__(
             init,
@@ -481,6 +554,7 @@ class PositiveParam(Bounded):
             lower_alpha=lower_alpha,
             cap_mode=cap_mode,
             cap_beta=cap_beta,
+            requires_grad=requires_grad,
         )
 
 
@@ -519,6 +593,7 @@ class NegativeParam(Bounded):
         upper_alpha: float = 0.1,  # used only if include_zero=True (leaky-ste)
         cap_mode: str = "auto",
         cap_beta: float | None = None,
+        requires_grad: bool = None,
     ):
         super().__init__(
             torch.neg(init),
@@ -530,6 +605,7 @@ class NegativeParam(Bounded):
             lower_alpha=upper_alpha,  # note the flipped role of alpha here
             cap_mode=cap_mode,
             cap_beta=cap_beta,
+            requires_grad=requires_grad,
         )
 
     def _compute(self, *args, **kwargs):
@@ -726,7 +802,7 @@ def add_instance_property(obj, name, func):
     obj.__class__ = sub  # replace the instance’s class in‑place
 
 
-class Referency(AxModule):
+class Referency(DNModule):
     """Mixin that allows modules to expose dynamic property references."""
 
     def setreference(self, name, func):
@@ -1008,6 +1084,11 @@ class SimpleParameterized(Referency):
                     with torch.no_grad():
                         param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
                     continue
+            elif key in self._modules:
+                module = getattr(self, key)
+                if isinstance(module, Bounded):
+                    module.set(value)
+                    continue
             else:
                 for param_name, param in self.named_parameters():
                     if matches_any_pattern([key], param_name):
@@ -1015,63 +1096,57 @@ class SimpleParameterized(Referency):
                             param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
 
 
+def _param_key_set(mapping):
+    """Return keys from a declaration mapping/set/list, treating None as empty."""
+    if mapping is None:
+        return set()
+    if hasattr(mapping, "keys"):
+        return set(mapping.keys())
+    return set(mapping)
+
+
 def check_conflicts(
-    global_params,
-    range_params,
-    batch_params,
-    global_p_params,
-    range_p_params,
-    batch_p_params,
-    global_n_params,
-    range_n_params,
-    batch_n_params,
-    params_defined_here,
+    global_params=None,
+    range_params=None,
+    batch_params=None,
+    global_p_params=None,
+    range_p_params=None,
+    batch_p_params=None,
+    global_n_params=None,
+    range_n_params=None,
+    batch_n_params=None,
+    params_defined_here=None,
     rng_defined_here=None,
     table_defined_here=None,
 ):
     """
-    Check for conflicts between global parameters, range parameters, and
-    parameters defined in the current class.
+    Check for parameter declaration conflicts across all declaration categories.
 
-    Raises ValueError if any parameter is defined in more than one category.
+    The first three arguments are kept backward-compatible with the historical
+    ``check_conflicts(global, range, batch)`` helper form used by older tests and
+    downstream code.  Newer declaration categories default to empty.
     """
-    if rng_defined_here is None:
-        rng_defined_here = set()
-    if table_defined_here is None:
-        table_defined_here = dict()
-    all_params = (
-        set(global_params.keys())
-        .union(range_params.keys())
-        .union(batch_params.keys())
-        .union(global_p_params.keys())
-        .union(range_p_params.keys())
-        .union(batch_p_params.keys())
-        .union(global_n_params.keys())
-        .union(range_n_params.keys())
-        .union(batch_n_params.keys())
-        .union(params_defined_here.keys())
-        .union(rng_defined_here.keys())
-        .union(table_defined_here.keys())
-    )
-    duplicates = set()
-
-    for param in all_params:
-        count = (
-            (param in global_params)
-            + (param in range_params)
-            + (param in batch_params)
-            + (param in global_p_params)
-            + (param in range_p_params)
-            + (param in batch_p_params)
-            + (param in global_n_params)
-            + (param in range_n_params)
-            + (param in batch_n_params)
-            + (param in params_defined_here)
-            + (param in rng_defined_here)
-            + (param in table_defined_here)
-        )
-        if count > 1:
-            duplicates.add(param)
+    groups = [
+        global_params,
+        range_params,
+        batch_params,
+        global_p_params,
+        range_p_params,
+        batch_p_params,
+        global_n_params,
+        range_n_params,
+        batch_n_params,
+        params_defined_here,
+        rng_defined_here,
+        table_defined_here,
+    ]
+    key_sets = [_param_key_set(group) for group in groups]
+    all_params = set().union(*key_sets) if key_sets else set()
+    duplicates = {
+        param
+        for param in all_params
+        if sum(param in key_set for key_set in key_sets) > 1
+    }
 
     if duplicates:
         raise ValueError(
@@ -1531,6 +1606,25 @@ class Parameterized(SimpleParameterized):
         Parameterized._global_n_declarations.append(kwargs)
 
     @staticmethod
+    def GLOBAL_SIGNED(**kwargs):
+        """
+        Declare scalar (compartment-independent) signed parameters.
+
+        Parameters
+        ----------
+        **kwargs
+            Mapping of parameter name to default value. Values are instantiated
+            once per instance and broadcast across compartments.
+        """
+        for k, v in kwargs.items():
+            if v > 0:
+                Parameterized._global_p_declarations.append({k: v})
+            elif v < 0:
+                Parameterized._global_n_declarations.append({k: v})
+            else:
+                Parameterized._global_declarations.append({k: v})
+
+    @staticmethod
     def RANGE(**kwargs):
         """
         Declare per-compartment parameters (range variables).
@@ -1671,8 +1765,25 @@ class Parameterized(SimpleParameterized):
             {func: {"low": low, "high": high, "n": n, "learnable": learnable}}
         )
 
-    def __init__(self, shape, shape_f, additional_parameters=None, **kwargs):
+    def __init__(
+        self,
+        shape,
+        shape_f,
+        additional_parameters=None,
+        *,
+        device=None,
+        dtype=None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
+        self._init_device = (
+            current_device(torch.device("cpu"))
+            if device is None
+            else torch.device(device)
+        )
+        self._init_dtype = (
+            current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+        )
         try:
             shape_p = [int(s) for s in shape]
             shape_f = [int(s) for s in shape_f]
@@ -1686,7 +1797,7 @@ class Parameterized(SimpleParameterized):
         self.range = self.__class__._range.copy()
         self.range_p = self.__class__._range_p.copy()
         self.range_n = self.__class__._range_n.copy()
-        self.batch = self.__class__._batch.copy()
+        self.batch_t = self.__class__._batch.copy()
         self.batch_p = self.__class__._batch_p.copy()
         self.batch_n = self.__class__._batch_n.copy()
         self.global_n = self.__class__._global_n.copy()
@@ -1702,8 +1813,8 @@ class Parameterized(SimpleParameterized):
             self.range = {
                 key: kwargs.get(key, value) for key, value in self.range.items()
             }
-            self.batch = {
-                key: kwargs.get(key, value) for key, value in self.batch.items()
+            self.batch_t = {
+                key: kwargs.get(key, value) for key, value in self.batch_t.items()
             }
             self.globals_p = {
                 key: kwargs.get(key, value) for key, value in self.globals_p.items()
@@ -1732,7 +1843,7 @@ class Parameterized(SimpleParameterized):
         self.instantiate_range(**self.range)
         self.instantiate_range(positive=True, **self.range_p)
         self.instantiate_range(negative=True, **self.range_n)
-        self.instantiate_batch(**self.batch)
+        self.instantiate_batch(**self.batch_t)
         self.instantiate_batch(positive=True, **self.batch_p)
         self.instantiate_batch(negative=True, **self.batch_n)
         self.instantiate_rng(**self.rng)
@@ -1754,7 +1865,7 @@ class Parameterized(SimpleParameterized):
         self.instantiate_range(**self.range)
         self.instantiate_range(positive=True, **self.range_p)
         self.instantiate_range(negative=True, **self.range_n)
-        self.instantiate_batch(**self.batch)
+        self.instantiate_batch(**self.batch_t)
         self.instantiate_batch(positive=True, **self.batch_p)
         self.instantiate_batch(negative=True, **self.batch_n)
 
@@ -1797,15 +1908,33 @@ class Parameterized(SimpleParameterized):
                         setattr(
                             self,
                             pname,
-                            to_param(pval, positive=positive, negative=negative),
+                            to_param(
+                                pval,
+                                positive=positive,
+                                negative=negative,
+                                device=self._init_device,
+                                dtype=self._init_dtype,
+                            ),
                         )
                         getattr(self, name)[pname] = getattr(self, pname)
                 else:
                     p_name = f"{name}_param"
                     self._refresh_and_set(
-                        p_name, to_param(value, positive=positive, negative=negative)
+                        p_name,
+                        to_param(
+                            value,
+                            positive=positive,
+                            negative=negative,
+                            device=self._init_device,
+                            dtype=self._init_dtype,
+                        ),
                     )
-                    self.register_buffer(name, torch.empty(()))
+                    self.register_buffer(
+                        name,
+                        torch.empty(
+                            (), device=self._init_device, dtype=self._init_dtype
+                        ),
+                    )
                     getattr(self, name).copy_(self.evaluate(p_name))
 
     def _batch_shape(self):
@@ -1845,9 +1974,21 @@ class Parameterized(SimpleParameterized):
             for name, value in kwargs.items():
                 p_name = f"{name}_param"
                 self._refresh_and_set(
-                    p_name, to_param(value, positive=positive, negative=negative)
+                    p_name,
+                    to_param(
+                        value,
+                        positive=positive,
+                        negative=negative,
+                        device=self._init_device,
+                        dtype=self._init_dtype,
+                    ),
                 )
-                self.register_buffer(name, torch.empty(self.shape_p))
+                self.register_buffer(
+                    name,
+                    torch.empty(
+                        self.shape_p, device=self._init_device, dtype=self._init_dtype
+                    ),
+                )
                 getattr(self, name).copy_(self.evaluate(p_name))
 
     def instantiate_batch(self, positive=False, negative=False, **kwargs):
@@ -1865,9 +2006,21 @@ class Parameterized(SimpleParameterized):
             for name, value in kwargs.items():
                 p_name = f"{name}_param"
                 self._refresh_and_set(
-                    p_name, to_param(value, positive=positive, negative=negative)
+                    p_name,
+                    to_param(
+                        value,
+                        positive=positive,
+                        negative=negative,
+                        device=self._init_device,
+                        dtype=self._init_dtype,
+                    ),
                 )
-                self.register_buffer(name, torch.empty(batch_shape))
+                self.register_buffer(
+                    name,
+                    torch.empty(
+                        batch_shape, device=self._init_device, dtype=self._init_dtype
+                    ),
+                )
                 getattr(self, name).copy_(self.evaluate(p_name))
 
     def instantiate_rng(self, **kwargs):
@@ -1934,7 +2087,7 @@ class Parameterized(SimpleParameterized):
                     name in self.range or name in self.range_p or name in self.range_n
                 )
                 is_batch = (
-                    name in self.batch or name in self.batch_p or name in self.batch_n
+                    name in self.batch_t or name in self.batch_p or name in self.batch_n
                 )
                 if is_range or is_batch:
                     count = 0
@@ -2028,7 +2181,7 @@ class Parameterized(SimpleParameterized):
                 name, value, key=torch.arange(math.prod(self.shape_p)), alias=alias
             )
         is_range = name in self.range or name in self.range_p or name in self.range_n
-        is_batch = name in self.batch or name in self.batch_p or name in self.batch_n
+        is_batch = name in self.batch_t or name in self.batch_p or name in self.batch_n
         if is_range or is_batch:
             positive = (name in self.range_p) or (name in self.batch_p)
             negative = (name in self.range_n) or (name in self.batch_n)
@@ -2196,11 +2349,52 @@ class Parameterized(SimpleParameterized):
             except Exception:
                 setattr(self, n, b.detach())
 
-    def parameters_dict(self):
+    def parameters_dict(self, clone=True, trainable_only=False):
         """
         Returns a dictionary of all parameters in the model.
         """
-        return {name: param.clone() for name, param in self.named_parameters()}
+        with torch.no_grad():
+            if clone:
+                if trainable_only:
+                    dct = {
+                        name: param.clone()
+                        for name, param in self.named_parameters()
+                        if param.requires_grad
+                    }
+                else:
+                    dct = {
+                        name: param.clone() for name, param in self.named_parameters()
+                    }
+            else:
+                if trainable_only:
+                    dct = {
+                        name: param
+                        for name, param in self.named_parameters()
+                        if param.requires_grad
+                    }
+                else:
+                    dct = {name: param for name, param in self.named_parameters()}
+        return dct
+
+    def load_parameters_dict(self, parameters, strict=True):
+        """
+        Load parameters from a dictionary.
+
+        Parameters
+        ----------
+        parameters : dict
+            Mapping of parameter names to tensors. The tensors are copied into the model's parameters.
+        strict : bool, optional
+            If True, raises an error if a parameter in the model is not found in the dictionary.
+        """
+        with torch.no_grad():
+            for name, param in self.named_parameters():
+                if name in parameters:
+                    param.data.copy_(parameters[name])
+                elif strict:
+                    raise KeyError(
+                        f"Parameter '{name}' not found in the provided dictionary."
+                    )
 
     @classmethod
     def all_parameter_names(cls):
@@ -2268,9 +2462,11 @@ def rebind_func_with_table(obj, func_name):
     func_code = table_function_template.format(func_name=func_name)
     if DEBUG > 0:
         logger.info(f"Generated code for {func_name}:\n{func_code}")
-    filename = "<table_function>"
-    code = compile(func_code, filename, "exec")
-    exec(code)
-    meth = locals()[f"{func_name}_with_table"]
+    meth = compile_generated_function(
+        func_code,
+        func_name=f"{func_name}_with_table",
+        filename_prefix=f"dendra.parametric.{func_name}_with_table",
+        global_ns=globals(),
+    )
     setattr(obj, f"{func_name}_original", getattr(obj, func_name))
     setattr(obj, func_name, MethodType(meth, obj))

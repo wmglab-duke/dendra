@@ -1,9 +1,14 @@
 from typing import Tuple
 
 import torch
-import torch.nn.functional as F
 
-from .core import Integrator
+from .core import (
+    Integrator,
+    _as_solve_matrix,
+    _expanded_v_init,
+    _flatten_to_solve,
+    _model_solve_shape,
+)
 
 
 def A_mv(v, diag, g_left, g_right):  # v shape (B, K), mV
@@ -214,10 +219,10 @@ class _krylov_etd1(Integrator):
         super().__init__(model, mech, imem)
         self.m = m
 
-        B = model.n_ax
-        K = model.n_comp
+        B, K = _model_solve_shape(model)
         self.B = B
         self.K = K
+        self.base_shape = tuple(model.shape)
 
         if method == "arnoldi":
             self._expm = expm_krylov_arnoldi
@@ -237,6 +242,9 @@ class _krylov_etd1(Integrator):
         self.register_buffer("kernel", torch.tensor([1.0, -2.0, 1.0]).view(1, 1, 3))
         self.register_buffer("diag", torch.tensor(0.0))
         self.register_buffer("g_ax", torch.tensor(0.0))
+        self.register_buffer("g_left", torch.tensor(0.0))
+        self.register_buffer("g_right", torch.tensor(0.0))
+        self.register_buffer("g_edge_Cinv", torch.tensor(0.0))
         self.register_buffer("cm_inv", torch.tensor(0.0))
         self.register_buffer("scale", torch.tensor(0.0))
         self.register_buffer("V_buf", torch.zeros(B, K, m))
@@ -244,60 +252,72 @@ class _krylov_etd1(Integrator):
         self.register_buffer("eye_m", torch.eye(m))
 
     def initialize(self, model, dt):
-        B, K = model.n_ax, model.n_comp
-        radius_cm = 1e-4 * model.diam / 2.0
-        dx_cm = 1e-4 * model.dx
+        B, K = _model_solve_shape(model)
+        self.B, self.K = B, K
+        radius_cm = 1e-4 * _as_solve_matrix(model.diam, model) / 2.0
+        dx_cm = 1e-4 * _as_solve_matrix(model.dx, model)
+        cm_spec = _as_solve_matrix(model.cm, model)
+        rhoa = _as_solve_matrix(model.rhoa, model)
 
         # surface area
         A_mem = 2 * torch.pi * radius_cm * dx_cm
-        cm = 1e-6 * model.cm
-        cm = cm * A_mem  # F
+        cm = 1e-6 * cm_spec * A_mem  # F
 
-        g_ax = torch.pi * radius_cm**2 / (model.rhoa * dx_cm)
-        g_ax_over_Cm = g_ax / cm
+        Ra_seg = rhoa * dx_cm / (torch.pi * radius_cm**2)
+        g_edge = 2.0 / (Ra_seg[:, :-1] + Ra_seg[:, 1:])
+        g_left = g_edge / cm[:, :-1]
+        g_right = g_edge / cm[:, 1:]
 
-        self.g_ax = g_ax_over_Cm
+        self.g_ax = g_edge
+        self.g_left = g_left
+        self.g_right = g_right
+        self.g_edge_Cinv = g_edge / cm[:, :-1]
 
-        diag = torch.zeros(B, K, device=model.device())
-        diag[:, :-1] -= self.g_ax  # − g_right
-        diag[:, 1:] -= self.g_ax  # − g_left
+        diag = torch.zeros(B, K, device=model.device(), dtype=model.dtype())
+        diag[:, :-1] -= g_left
+        diag[:, 1:] -= g_right
 
         self.diag = diag
         self.cm_inv = 1.0 / cm
         self.scale = A_mem * self.cm_inv
+        self.base_shape = tuple(model.shape)
 
     def step(self, model, dt, ve=None, intra=None):
-        model.v = self._step(model.v, dt, model.temp_c, ve, intra)
+        temp = getattr(model, "temp_c", getattr(model, "celsius", None))
+        model.v = self._call_kernel("_step", model.v, dt, temp, ve, intra)
 
     def _step(self, v, dt, temp, ve=None, intra=None):
         dt_s = dt * 1e-3
         self.mech.advance(v, dt, temp)
 
-        ires = self.mech.i(v)
-        irev = self.mech.irev()
-        gtot = self.mech.gtot(v) * self.scale
+        itot, gtot_density = self.mech.i(v)
 
-        f_n = (irev - ires) * self.scale
+        v_flat = _flatten_to_solve(v, self.K)
+        itot_flat = _flatten_to_solve(itot, self.K)
+        gtot_flat = _flatten_to_solve(gtot_density, self.K)
+        f_n = (gtot_flat * v_flat - itot_flat) * self.scale
+        gtot = gtot_flat * self.scale
 
         if ve is not None:
-            S = F.conv1d(ve.unsqueeze(1), self.kernel, padding=1).squeeze(1)
-            S[:, 0] = ve[:, 1] - ve[:, 0]  # fix boundary left
-            S[:, -1] = ve[:, -2] - ve[:, -1]  # fix boundary right
-
-            S *= self.g_ax
+            ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
+            flux = self.g_edge_Cinv * (ve_flat[:, 1:] - ve_flat[:, :-1])
+            S = torch.zeros_like(f_n)
+            S[:, 1:-1] = -flux[:, :-1] + flux[:, 1:]
+            S[:, 0] = -flux[:, 0]
+            S[:, -1] = flux[:, -1]
             f_n = f_n + S
 
         if intra is not None:
-            f_n = f_n + intra
+            f_n = f_n + _flatten_to_solve(intra, self.K, self.base_shape) * self.cm_inv
 
         diag = self.diag - gtot
         v_lin = self._expm(
-            v,
+            v_flat,
             dt_s,
             self.m,
             diag,
-            self.g_ax,
-            self.g_ax,
+            self.g_left,
+            self.g_right,
             self.V_buf,
             self.H_buf,
         )
@@ -306,13 +326,13 @@ class _krylov_etd1(Integrator):
             dt_s,
             self.m,
             diag,
-            self.g_ax,
-            self.g_ax,
+            self.g_left,
+            self.g_right,
             self.V_buf,
             self.H_buf,
             self.eye_m,
         )
-        return v_lin + v_nl
+        return (v_lin + v_nl).reshape(self.base_shape)
 
     def detach(self, model):
         model.v = model.v.detach()
@@ -321,8 +341,6 @@ class _krylov_etd1(Integrator):
         self.mech.detach()
 
     def init_v(self, model):
-        model.v[:] = model.v_init
-        model.v = model.v.detach()
+        model.v = _expanded_v_init(model).clone().detach().contiguous()
         if self.imem:
-            model.i_membrane[:] = 0.0
-            model.i_membrane.detach_()
+            model.i_membrane = torch.zeros_like(model.v).detach()

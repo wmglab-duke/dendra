@@ -119,7 +119,8 @@ def _try_chol_with_bump3x3(
     L7 = tl.where(succ1, L7a, tl.where(succ2, L7b, L7c))
     L8 = tl.where(succ1, L8a, tl.where(succ2, L8b, L8c))
 
-    return L0, L1, L2, L3, L4, L5, L6, L7, L8
+    ok = succ1 | succ2 | succ3
+    return L0, L1, L2, L3, L4, L5, L6, L7, L8, ok
 
 
 @triton.jit
@@ -156,6 +157,7 @@ def thomas_bt3_spd_fwd_kernel(
     D_ptr,  # (B, K,   3)  RHS, updated in-place
     X_ptr,  # (B, K,   3)  solution
     CHOL_ptr,  # (B, K,   9)  cache of L_k
+    INFO_ptr,  # (B, K) int32, 0 if Cholesky succeeded after optional bump
     B,
     eps_rel,
     eps_abs,
@@ -173,6 +175,7 @@ def thomas_bt3_spd_fwd_kernel(
     D = D_ptr + fid * K * 3
     X = X_ptr + fid * K * 3
     CHOL = CHOL_ptr + fid * K * 9
+    INFO = INFO_ptr + fid * K
 
     # k = 0: factor first block
     a0 = tl.load(M + 0, mask=mask)
@@ -185,7 +188,7 @@ def thomas_bt3_spd_fwd_kernel(
     a7 = tl.load(M + 7, mask=mask)
     a8 = tl.load(M + 8, mask=mask)
 
-    L0, L1, L2, L3, L4, L5, L6, L7, L8 = _try_chol_with_bump3x3(
+    L0, L1, L2, L3, L4, L5, L6, L7, L8, ok = _try_chol_with_bump3x3(
         a0,
         a1,
         a2,
@@ -198,6 +201,8 @@ def thomas_bt3_spd_fwd_kernel(
         eps_rel,
         eps_abs,
     )
+
+    tl.store(INFO + 0, tl.where(ok, 0, 1), mask=mask)
 
     # store L_0 in main and chol cache
     tl.store(M + 0, L0, mask=mask)
@@ -258,7 +263,7 @@ def thomas_bt3_spd_fwd_kernel(
         tl.store(D + k * 3 + 1, dk1, mask=mask)
         tl.store(D + k * 3 + 2, dk2, mask=mask)
 
-        L0, L1, L2, L3, L4, L5, L6, L7, L8 = _try_chol_with_bump3x3(
+        L0, L1, L2, L3, L4, L5, L6, L7, L8, ok = _try_chol_with_bump3x3(
             a0,
             a1,
             a2,
@@ -271,6 +276,8 @@ def thomas_bt3_spd_fwd_kernel(
             eps_rel,
             eps_abs,
         )
+
+        tl.store(INFO + k, tl.where(ok, 0, 1), mask=mask)
 
         tl.store(base + 0, L0, mask=mask)
         tl.store(base + 1, L1, mask=mask)
@@ -345,8 +352,8 @@ def thomas_bt3_spd_solve_with_chol_kernel(
     L_ptr,  # (B, K-1, 3)
     U_ptr,  # (B, K-1, 3)
     CHOL_ptr,  # (B, K,   9)  cached L_k
-    D_ptr,  # (B, K,   3)  RHS
-    X_ptr,  # (B, K,   3)  solution
+    D_ptr,  # (B, K,   3)  RHS, read-only
+    X_ptr,  # (B, K,   3)  modified-RHS workspace, then solution
     B,
     K: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -362,17 +369,20 @@ def thomas_bt3_spd_solve_with_chol_kernel(
     D = D_ptr + fid * K * 3
     X = X_ptr + fid * K * 3
 
-    # Make a working copy of RHS
+    # Initialize X as the modified-RHS workspace without mutating D.
     d0 = tl.load(D + 0, mask=mask)
     d1 = tl.load(D + 1, mask=mask)
     d2 = tl.load(D + 2, mask=mask)
-    # store back; we'll keep overwriting D as working buffer
-    tl.store(D + 0, d0, mask=mask)
-    tl.store(D + 1, d1, mask=mask)
-    tl.store(D + 2, d2, mask=mask)
+    tl.store(X + 0, d0, mask=mask)
+    tl.store(X + 1, d1, mask=mask)
+    tl.store(X + 2, d2, mask=mask)
 
-    # Forward sweep: incorporate lower diag bands
     for k in range(1, K):
+        # Copy rhs_k into workspace before applying the lower-band update.
+        dk0 = tl.load(D + k * 3 + 0, mask=mask)
+        dk1 = tl.load(D + k * 3 + 1, mask=mask)
+        dk2 = tl.load(D + k * 3 + 2, mask=mask)
+
         baseLchol = CHOL + (k - 1) * 9
         L0 = tl.load(baseLchol + 0, mask=mask)
         L1 = tl.load(baseLchol + 1, mask=mask)
@@ -384,9 +394,9 @@ def thomas_bt3_spd_solve_with_chol_kernel(
         L7 = tl.load(baseLchol + 7, mask=mask)
         L8 = tl.load(baseLchol + 8, mask=mask)
 
-        dprev0 = tl.load(D + (k - 1) * 3 + 0, mask=mask)
-        dprev1 = tl.load(D + (k - 1) * 3 + 1, mask=mask)
-        dprev2 = tl.load(D + (k - 1) * 3 + 2, mask=mask)
+        dprev0 = tl.load(X + (k - 1) * 3 + 0, mask=mask)
+        dprev1 = tl.load(X + (k - 1) * 3 + 1, mask=mask)
+        dprev2 = tl.load(X + (k - 1) * 3 + 2, mask=mask)
         t0, t1, t2 = _chol_solve3(
             L0, L1, L2, L3, L4, L5, L6, L7, L8, dprev0, dprev1, dprev2
         )
@@ -395,14 +405,15 @@ def thomas_bt3_spd_solve_with_chol_kernel(
         lo1 = tl.load(Lband + (k - 1) * 3 + 1, mask=mask)
         lo2 = tl.load(Lband + (k - 1) * 3 + 2, mask=mask)
 
-        dk0 = tl.load(D + k * 3 + 0, mask=mask) - lo0 * t0
-        dk1 = tl.load(D + k * 3 + 1, mask=mask) - lo1 * t1
-        dk2 = tl.load(D + k * 3 + 2, mask=mask) - lo2 * t2
-        tl.store(D + k * 3 + 0, dk0, mask=mask)
-        tl.store(D + k * 3 + 1, dk1, mask=mask)
-        tl.store(D + k * 3 + 2, dk2, mask=mask)
+        dk0 = dk0 - lo0 * t0
+        dk1 = dk1 - lo1 * t1
+        dk2 = dk2 - lo2 * t2
+        tl.store(X + k * 3 + 0, dk0, mask=mask)
+        tl.store(X + k * 3 + 1, dk1, mask=mask)
+        tl.store(X + k * 3 + 2, dk2, mask=mask)
 
-    # Backward substitution with cached L_k
+    # Backward substitution with cached L_k. X is overwritten in-place with the
+    # final solution.
     baseLchol = CHOL + (K - 1) * 9
     L0 = tl.load(baseLchol + 0, mask=mask)
     L1 = tl.load(baseLchol + 1, mask=mask)
@@ -414,9 +425,9 @@ def thomas_bt3_spd_solve_with_chol_kernel(
     L7 = tl.load(baseLchol + 7, mask=mask)
     L8 = tl.load(baseLchol + 8, mask=mask)
 
-    d0 = tl.load(D + (K - 1) * 3 + 0, mask=mask)
-    d1 = tl.load(D + (K - 1) * 3 + 1, mask=mask)
-    d2 = tl.load(D + (K - 1) * 3 + 2, mask=mask)
+    d0 = tl.load(X + (K - 1) * 3 + 0, mask=mask)
+    d1 = tl.load(X + (K - 1) * 3 + 1, mask=mask)
+    d2 = tl.load(X + (K - 1) * 3 + 2, mask=mask)
 
     x0, x1, x2 = _chol_solve3(L0, L1, L2, L3, L4, L5, L6, L7, L8, d0, d1, d2)
     tl.store(X + (K - 1) * 3 + 0, x0, mask=mask)
@@ -428,9 +439,9 @@ def thomas_bt3_spd_solve_with_chol_kernel(
         u1 = tl.load(Uband + k * 3 + 1, mask=mask)
         u2 = tl.load(Uband + k * 3 + 2, mask=mask)
 
-        dk0 = tl.load(D + k * 3 + 0, mask=mask) - u0 * x0
-        dk1 = tl.load(D + k * 3 + 1, mask=mask) - u1 * x1
-        dk2 = tl.load(D + k * 3 + 2, mask=mask) - u2 * x2
+        dk0 = tl.load(X + k * 3 + 0, mask=mask) - u0 * x0
+        dk1 = tl.load(X + k * 3 + 1, mask=mask) - u1 * x1
+        dk2 = tl.load(X + k * 3 + 2, mask=mask) - u2 * x2
 
         baseLchol = CHOL + k * 9
         L0 = tl.load(baseLchol + 0, mask=mask)
@@ -453,23 +464,109 @@ import torch  # noqa: E402
 from torch.library import triton_op, wrap_triton  # noqa: E402
 
 
-# ------------------ low-level fwd op: (x, chol) ----------------------
-@triton_op("dendra_triton::solve_bt_spd_fwd_impl", mutates_args={})
-def solve_bt_spd_fwd_impl(
-    lower: torch.Tensor,  # (B, K-1, 3)
-    main: torch.Tensor,  # (B, K,   3,3)
-    upper: torch.Tensor,  # (B, K-1, 3)
-    rhs: torch.Tensor,  # (B, K,   3)
+def _check_bt_spd_cuda_shapes(
+    lower: torch.Tensor,
+    main: torch.Tensor,
+    upper: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    require_work_contiguous: bool,
+) -> None:
+    if rhs.ndim != 3 or rhs.shape[-1] != 3:
+        raise ValueError(f"rhs must have shape (B, K, 3), got {tuple(rhs.shape)}")
+    B, K, _ = rhs.shape
+    if K < 1:
+        raise ValueError("K must be >= 1")
+    if main.shape != (B, K, 3, 3):
+        raise ValueError(
+            f"main must have shape {(B, K, 3, 3)}, got {tuple(main.shape)}"
+        )
+    if lower.shape != (B, K - 1, 3):
+        raise ValueError(
+            f"lower must have shape {(B, K - 1, 3)}, got {tuple(lower.shape)}"
+        )
+    if upper.shape != (B, K - 1, 3):
+        raise ValueError(
+            f"upper must have shape {(B, K - 1, 3)}, got {tuple(upper.shape)}"
+        )
+    if not (lower.device == main.device == upper.device == rhs.device):
+        raise ValueError("lower, main, upper, and rhs must be on the same device")
+    if rhs.device.type != "cuda":
+        raise ValueError("solve_bt_spd_cuda expects CUDA tensors")
+    if not (lower.dtype == main.dtype == upper.dtype == rhs.dtype):
+        raise ValueError("lower, main, upper, and rhs must have the same dtype")
+    if rhs.dtype not in (torch.float32, torch.float64):
+        raise TypeError("solve_bt_spd_cuda supports only float32 and float64")
+    if require_work_contiguous:
+        if not main.is_contiguous():
+            raise ValueError(
+                "main_work must be contiguous for solve_bt_spd_cuda_consume"
+            )
+        if not rhs.is_contiguous():
+            raise ValueError(
+                "rhs_work must be contiguous for solve_bt_spd_cuda_consume"
+            )
+
+
+def _check_bt_spd_chol_cuda_shapes(
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    chol: torch.Tensor,
+    rhs: torch.Tensor,
+) -> None:
+    if rhs.ndim != 3 or rhs.shape[-1] != 3:
+        raise ValueError(f"rhs must have shape (B, K, 3), got {tuple(rhs.shape)}")
+    B, K, _ = rhs.shape
+    if K < 1:
+        raise ValueError("K must be >= 1")
+    if lower.shape != (B, K - 1, 3):
+        raise ValueError(
+            f"lower must have shape {(B, K - 1, 3)}, got {tuple(lower.shape)}"
+        )
+    if upper.shape != (B, K - 1, 3):
+        raise ValueError(
+            f"upper must have shape {(B, K - 1, 3)}, got {tuple(upper.shape)}"
+        )
+    if chol.shape != (B, K, 9):
+        raise ValueError(f"chol must have shape {(B, K, 9)}, got {tuple(chol.shape)}")
+    if not (lower.device == upper.device == chol.device == rhs.device):
+        raise ValueError("lower, upper, chol, and rhs must be on the same device")
+    if rhs.device.type != "cuda":
+        raise ValueError("solve_bt_spd_solve_with_chol_impl expects CUDA tensors")
+    if not (lower.dtype == upper.dtype == chol.dtype == rhs.dtype):
+        raise ValueError("lower, upper, chol, and rhs must have the same dtype")
+    if rhs.dtype not in (torch.float32, torch.float64):
+        raise TypeError(
+            "solve_bt_spd_solve_with_chol_impl supports only float32 and float64"
+        )
+
+
+def _assert_no_chol_failures(info: torch.Tensor) -> None:
+    ok = (info == 0).all()
+    if hasattr(torch, "_assert_async"):
+        torch._assert_async(
+            ok, "solve_bt_spd_cuda: Cholesky failed after all diagonal bumps"
+        )
+    else:
+        torch._assert(ok, "solve_bt_spd_cuda: Cholesky failed after all diagonal bumps")
+
+
+# ------------------ low-level consuming fwd op: (x, chol) ------------
+@triton_op("dendra_triton::solve_bt_spd_fwd_consume_impl", mutates_args={"main", "rhs"})
+def solve_bt_spd_fwd_consume_impl(
+    lower: torch.Tensor,  # (B, K-1, 3), read-only
+    main: torch.Tensor,  # (B, K,   3,3), consumed/overwritten with L_k
+    upper: torch.Tensor,  # (B, K-1, 3), read-only
+    rhs: torch.Tensor,  # (B, K,   3), consumed/updated in-place
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, K = rhs.shape[:2]
 
     lower = lower.contiguous()
-    main = main.contiguous()
     upper = upper.contiguous()
-    rhs = rhs.contiguous()
 
     x = torch.empty_like(rhs)
     chol = torch.empty(B, K, 9, device=rhs.device, dtype=rhs.dtype)
+    info = torch.empty((B, K), device=rhs.device, dtype=torch.int32)
 
     if rhs.dtype == torch.float64:
         eps_rel, eps_abs = 1e-12, 1e-30
@@ -485,6 +582,7 @@ def solve_bt_spd_fwd_impl(
         rhs.reshape(B, -1),
         x.reshape(B, -1),
         chol.reshape(B, -1),
+        info.reshape(B, -1),
         B,
         eps_rel,
         eps_abs,
@@ -493,10 +591,11 @@ def solve_bt_spd_fwd_impl(
         num_warps=1,
         num_stages=4,
     )
+    _assert_no_chol_failures(info)
     return x, chol
 
 
-@solve_bt_spd_fwd_impl.register_fake
+@solve_bt_spd_fwd_consume_impl.register_fake
 def _(lower, main, upper, rhs):
     B, K = rhs.shape[:2]
     x = rhs.new_empty(rhs.shape)
@@ -510,8 +609,9 @@ def solve_bt_spd_solve_with_chol_impl(
     lower: torch.Tensor,  # (B, K-1, 3)
     upper: torch.Tensor,  # (B, K-1, 3)
     chol: torch.Tensor,  # (B, K,   9)
-    rhs: torch.Tensor,  # (B, K,   3)
+    rhs: torch.Tensor,  # (B, K,   3), read-only
 ) -> torch.Tensor:
+    _check_bt_spd_chol_cuda_shapes(lower, upper, chol, rhs)
     B, K = rhs.shape[:2]
 
     lower = lower.contiguous()
@@ -519,6 +619,7 @@ def solve_bt_spd_solve_with_chol_impl(
     chol = chol.contiguous()
     rhs = rhs.contiguous()
 
+    # X is first the modified-RHS workspace and then the final solution.
     x = torch.empty_like(rhs)
 
     grid = ((B + BLOCK_FIBRES - 1) // BLOCK_FIBRES,)
@@ -543,55 +644,73 @@ def _(lower, upper, chol, rhs):
     return rhs.new_empty(rhs.shape)
 
 
-def _bt_spd_setup_context(ctx, inputs, output):
-    # inputs is the tuple (lower, main, upper, rhs)
-    lower, main, upper, rhs = inputs
+class _SolveBTSPDCudaConsumeUnchecked(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, lower, main_work, upper, rhs_work):
+        # Low-level Triton op consumes main_work/rhs_work. The public wrapper
+        # clones before this call; the integrator passes fresh per-step buffers.
+        x, chol = torch.ops.dendra_triton.solve_bt_spd_fwd_consume_impl(
+            lower, main_work, upper, rhs_work
+        )
+        ctx.save_for_backward(lower, upper, x, chol)
+        return x
 
-    # output is the *tuple* returned by solve_bt_spd_fwd_impl: (x, chol)
-    x, chol = output
+    @staticmethod
+    def backward(ctx, grad_x):
+        lower, upper, x, chol = ctx.saved_tensors
 
-    # stash what we need for backward
-    ctx.save_for_backward(lower, main, upper, x, chol)
+        # Cached adjoint solve is intentionally non-consuming, so grad_x is safe.
+        op_solve = torch.ops.dendra_triton.solve_bt_spd_solve_with_chol_impl
+        g = op_solve.default(lower, upper, chol, grad_x)
 
+        grad_rhs = g
+        GX = g.unsqueeze(-1) * x.unsqueeze(-2)
+        grad_main = -0.5 * (GX + GX.transpose(-1, -2))
+        grad_upper = -(g[:, :-1, :] * x[:, 1:, :])
+        grad_lower = -(g[:, 1:, :] * x[:, :-1, :])
 
-def _bt_spd_backward(ctx, grad_x, grad_chol_ignored):
-    lower, main, upper, x, chol = ctx.saved_tensors
-
-    # 1) Solve A g = grad_x using cached Cholesky factors
-    op_solve = torch.ops.dendra_triton.solve_bt_spd_solve_with_chol_impl
-    g = op_solve.default(lower, upper, chol, grad_x)
-
-    # 2) Gradients w.r.t. inputs
-    grad_rhs = g
-    grad_main = -(g.unsqueeze(-1) * x.unsqueeze(-2))  # (B,K,3,3)
-    grad_upper = -(g[:, :-1, :] * x[:, 1:, :])  # (B,K-1,3)
-    grad_lower = -(g[:, 1:, :] * x[:, :-1, :])  # (B,K-1,3)
-
-    return grad_lower, grad_main, grad_upper, grad_rhs
+        return grad_lower, grad_main, grad_upper, grad_rhs
 
 
-solve_bt_spd_fwd_impl.register_autograd(
-    _bt_spd_backward,
-    setup_context=_bt_spd_setup_context,
-)
+def solve_bt_spd_cuda_consume_unchecked(lower, main_work, upper, rhs_work):
+    """
+    Internal unchecked consuming CUDA SPD block-Thomas solve for 3x3 systems.
+
+    This skips Python shape/dtype/workspace validation and is intended for
+    call sites, such as _bwd_euler_bt, that construct fresh solver workspaces
+    immediately before the call and establish the fixed 3x3 invariants during
+    initialization. `main_work` and `rhs_work` may be overwritten.
+    """
+    return _SolveBTSPDCudaConsumeUnchecked.apply(lower, main_work, upper, rhs_work)
+
+
+# Private alias matching the CPU package naming convention.
+_solve_bt_spd_cuda_consume_unchecked = solve_bt_spd_cuda_consume_unchecked
+
+
+def solve_bt_spd_cuda_consume(lower, main_work, upper, rhs_work):
+    """
+    Consuming CUDA SPD block-Thomas solver for 3x3 block systems.
+
+    `main_work` and `rhs_work` must be fresh, contiguous work buffers. They are
+    overwritten during factorization/elimination and must not be read after this
+    call. Use `solve_bt_spd_cuda` for non-mutating public semantics.
+    """
+    _check_bt_spd_cuda_shapes(
+        lower, main_work, upper, rhs_work, require_work_contiguous=True
+    )
+    return solve_bt_spd_cuda_consume_unchecked(lower, main_work, upper, rhs_work)
 
 
 def solve_bt_spd_cuda(lower, main, upper, rhs):
     """
-    Public-facing SPD block-Thomas solver.
+    Public non-mutating CUDA SPD block-Thomas solver for 3x3 block systems.
 
-    Same signature as before:
-        lower : (B, K-1, 3)
-        main  : (B, K,   3,3)
-        upper : (B, K-1, 3)
-        rhs   : (B, K,   3)
-
-    Returns:
-        x     : (B, K,   3)
-
-    Internally calls dendra_triton::solve_bt_spd_fwd_impl, which
-    computes both x and cached Cholesky factors chol and reuses chol
-    in backward via solve_bt_spd_solve_with_chol_impl.
+    This wrapper validates once, preserves `main` and `rhs` by cloning them into
+    contiguous workspaces, then calls the unchecked consuming Triton
+    implementation.
     """
-    x, _chol = torch.ops.dendra_triton.solve_bt_spd_fwd_impl(lower, main, upper, rhs)
-    return x
+    _check_bt_spd_cuda_shapes(lower, main, upper, rhs, require_work_contiguous=False)
+    main_work = main.clone(memory_format=torch.contiguous_format)
+    rhs_work = rhs.clone(memory_format=torch.contiguous_format)
+    return solve_bt_spd_cuda_consume_unchecked(lower, main_work, upper, rhs_work)

@@ -6,14 +6,23 @@ from typing import Dict, Literal, Optional
 import torch
 from tqdm.auto import tqdm
 
-from dendra.helpers import BACKEND, COMPILE_MODE, DYNAMIC, FULLGRAPH, JIT
+from dendra.helpers import (
+    BACKEND,
+    COMPILE_MODE,
+    DYNAMIC,
+    FULLGRAPH,
+    JIT,
+    JIT_NETWORK_OPS,
+    JIT_NETWORK_SOLVES,
+    jit_enabled_for_scope,
+)
 
 from ..callbacks import CallbackList
 from ..core import Population, _match_state_dict, make_intra
 from ..multi import concat_models, indices
 from ..parametric import is_parametric, to_param
 from ..rng import RNGMixin
-from .netcon import NetCon
+from .netcon import ContinuousCon, NetCon
 from .netstim import NetStim
 
 ConnRule = Literal[
@@ -55,54 +64,80 @@ def to_flat_idx_torch(shape, idx, device):
     return selected_indices.flatten()
 
 
+def to_flat_idx_mech(shape, mech, device):
+    # 1. Create a grid of flat indices with the same shape as the input array.
+    #    e.g., for a (2, 3) tensor, this becomes [[0, 1, 2], [3, 4, 5]]
+    indices_grid = torch.arange(torch.prod(torch.tensor(shape)), device=device).view(
+        shape
+    )
+
+    # 2. Apply the user's index to this grid. PyTorch's indexing logic
+    #    will select the corresponding flat indices for us.
+    selected_indices = mech.get(indices_grid)
+
+    # 3. Flatten the result to get a 1D tensor of flat indices.
+    return selected_indices.flatten()
+
+
 def step_pop(integrator, model, dt, ve=None, intra=None):
     integrator.step(model, dt, ve, intra)
     model.t = model.t + dt
 
 
-compiled_step_pop = torch.compile(step_pop)
+compiled_step_pop = step_pop
 
 
-@torch.compile
 def advance_populations(populations, dt, extra, intra):
     for n, pop in populations.items():
         step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
 
 
+def _advance_network_component(component, *, compile_network_ops: bool = False):
+    """Advance a network-side component.
+
+    Components may expose an explicitly compile-safe ``advance_compiled`` method.
+    We do not torch.compile arbitrary ``advance`` methods here because NetCon,
+    ContinuousCon, and NetStim contain Python/module state mutations that should
+    remain outside the default population-solve JIT path.
+    """
+    if compile_network_ops and hasattr(component, "advance_compiled"):
+        return component.advance_compiled()
+    return component.advance()
+
+
 def step(
     populations,
     synapses,
+    continuous_synapses,
+    continuous_targets,
     netstim,
     t,
     dt,
     extra: Dict[str, torch.Tensor | None] = {},
     intra: Dict[str, torch.Tensor | None] = {},
-    compiled_advance_population=True,
+    compile_network_ops=False,
 ):
     if netstim is not None:
-        netstim(t, bptt=netstim.training)
+        # NetStim has explicit heap/schedule side effects; keep it eager unless
+        # NetStim grows a compile-safe method of its own.
+        netstim(t, bptt=netstim.training, dt=dt)
+    for target in continuous_targets.values():
+        target.reset_continuous_inputs()
+    for c in continuous_synapses.values():
+        _advance_network_component(c, compile_network_ops=compile_network_ops)
     for s in synapses.values():
-        s.advance()
+        _advance_network_component(s, compile_network_ops=compile_network_ops)
 
-    if compiled_advance_population:
-        advance_populations(populations, dt, extra, intra)
-    else:
-        for n, pop in populations.items():
-            if pop.jit_in_network:
-                compiled_step_pop(
-                    pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
-                )
-            else:
-                step_pop(
-                    pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
-                )
+    # Population/integrator compilation is handled inside each integrator with
+    # scope="network_population". The stateful Python wrapper remains eager.
+    advance_populations(populations, dt, extra, intra)
 
 
 def get_local_index(population, mech, index):
     indices = torch.full_like(
         population.v, -1, dtype=torch.long, device=population.device()
     ).flatten()
-    mech_key_flat = to_flat_idx_torch(population.shape, mech.key, population.device())
+    mech_key_flat = to_flat_idx_mech(population.shape, mech, population.device())
     indices.index_copy_(
         0,
         mech_key_flat,
@@ -171,40 +206,211 @@ def prepare_indices_one_one_flat(
     return pre_idx, post_idx
 
 
-def check_weight_shape(weight, pre_idx):
+def _value_shape_description(value):
+    """Human-readable shape/type summary for connection arguments."""
+    if isinstance(value, torch.Tensor):
+        return (
+            f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
+            f"device={value.device})"
+        )
+    if isinstance(value, torch.nn.Module):
+        return f"{type(value).__name__} module"
+    if isinstance(value, (float, int, bool)):
+        return f"scalar {value!r}"
+    if hasattr(value, "__len__"):
+        try:
+            return f"{type(value).__name__}(len={len(value)})"
+        except TypeError:
+            pass
+    return type(value).__name__
+
+
+def _connection_shape_context_lines(context, *, actual_edges=None, value_len=None):
+    """Format connection context for shape-mismatch errors."""
+    if not context:
+        return []
+
+    lines = []
+    kind = context.get("kind", "event")
+    rule = context.get("rule", "<unknown>")
+    source_name = context.get("source_name", "<unknown>")
+    target_name = context.get("target_name", "<unknown>")
+    synapse_name = context.get("synapse_name", "<unknown>")
+    pre_var = context.get("pre_var", None)
+    input_name = context.get("input", None)
+
+    endpoint = (
+        f"{kind} connection {source_name} -> {target_name}:{synapse_name} "
+        f"using rule={rule!r}"
+    )
+    if pre_var is not None:
+        endpoint += f", pre_var={pre_var!r}"
+    if input_name is not None:
+        endpoint += f", input={input_name!r}"
+    lines.append(endpoint + ".")
+
+    selected_pre = context.get("selected_pre")
+    selected_post = context.get("selected_post")
+    candidate_edges = context.get("candidate_edges")
+    final_edges = context.get("final_edges", actual_edges)
+    allow_autapses = context.get("allow_autapses")
+    allow_multapses = context.get("allow_multapses")
+
+    summary = []
+    if selected_pre is not None:
+        summary.append(f"selected source elements={selected_pre}")
+    if selected_post is not None:
+        summary.append(f"selected target elements={selected_post}")
+    if candidate_edges is not None:
+        summary.append(f"candidate edges before filtering={candidate_edges}")
+    if final_edges is not None:
+        summary.append(f"edges after rule/filtering={final_edges}")
+    if allow_autapses is not None:
+        summary.append(f"allow_autapses={allow_autapses}")
+    if allow_multapses is not None:
+        summary.append(f"allow_multapses={allow_multapses}")
+    if summary:
+        lines.append("Connection summary: " + ", ".join(str(x) for x in summary) + ".")
+
+    if (
+        candidate_edges is not None
+        and final_edges is not None
+        and candidate_edges != final_edges
+    ):
+        removed = int(candidate_edges) - int(final_edges)
+        if removed > 0:
+            reasons = []
+            if allow_autapses is False and context.get("same_population"):
+                reasons.append("autapse filtering")
+            if allow_multapses is False:
+                reasons.append("duplicate/multapse filtering")
+            reason_txt = " or ".join(reasons) if reasons else "connection filtering"
+            lines.append(
+                f"{removed} candidate edge(s) were removed by {reason_txt} "
+                "before per-connection threshold/weight/delay shapes were checked."
+            )
+
+    if (
+        value_len is not None
+        and candidate_edges is not None
+        and final_edges is not None
+        and int(value_len) == int(candidate_edges)
+        and int(value_len) != int(final_edges)
+    ):
+        lines.append(
+            "The provided value length matches the unfiltered candidate edge "
+            "count, not the final connection count. If values were built from "
+            "the original pre/post arrays, either pass allow_multapses=True / "
+            "allow_autapses=True as appropriate, or apply the same filtering to "
+            "pre_idx, post_idx, and all per-edge values before calling connect."
+        )
+    else:
+        lines.append(
+            "Per-connection values must be scalar/0-D, length 1, length equal "
+            "to the final number of connections, or a repeat-compatible length "
+            "that evenly divides the final connection count."
+        )
+
+    if context.get("auto_expand"):
+        lines.append(
+            "auto_expand=True expands values after connectivity is sampled; it "
+            "is safest for scalar values or distribution/parameter modules, not "
+            "for already-expanded per-candidate tensors."
+        )
+
+    return lines
+
+
+def _raise_connection_shape_error(
+    name, value, pre_idx, *, context=None, value_len=None
+):
+    actual_edges = int(pre_idx.numel()) if torch.is_tensor(pre_idx) else len(pre_idx)
+    base = (
+        f"Invalid {name} shape for connection: {_value_shape_description(value)} "
+        f"cannot be aligned to {actual_edges} final connection(s)."
+    )
+    lines = [base]
+    lines.extend(
+        _connection_shape_context_lines(
+            context, actual_edges=actual_edges, value_len=value_len
+        )
+    )
+    raise ValueError("\n".join(lines))
+
+
+def check_weight_shape(weight, pre_idx, *, name="weight", context=None):
     """
-    Checks the shape of the weight tensor against the pre-synaptic indices.
-    If the weight is a scalar, it returns the number of pre-synaptic indices.
-    If the weight is a tensor, it checks if its shape matches the number of pre-synaptic indices.
+    Validate a scalar or 1-D per-connection value against finalized pre indices.
+
+    Returns the repeat count used by ``make_weight``/``expand``. ``context`` is
+    optional diagnostic metadata supplied by Network.connect so shape errors can
+    explain connectivity-rule filtering, autapse/multapse removal, and the
+    source/target/synapse involved.
     """
-    if isinstance(weight, float):
-        return len(pre_idx)
+    n_edges = int(pre_idx.numel()) if torch.is_tensor(pre_idx) else len(pre_idx)
+
+    if isinstance(weight, (float, int, bool)):
+        return n_edges
+
     if isinstance(weight, torch.Tensor):
         if weight.ndim == 0:
-            return len(pre_idx)
-        if weight.ndim == 1:
-            if len(weight) == 1:
-                return len(pre_idx)
-            if weight.shape[0] == len(pre_idx):
-                return 1
+            return n_edges
+        if weight.ndim != 1:
             raise ValueError(
-                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
+                f"Invalid {name} shape for connection: expected a scalar/0-D "
+                f"or 1-D tensor, got Tensor(shape={tuple(weight.shape)}, "
+                f"dtype={weight.dtype}, device={weight.device})."
             )
+        value_len = int(weight.shape[0])
+        if value_len == 1:
+            return n_edges
+        if value_len == n_edges:
+            return 1
+        if value_len > 0 and n_edges % value_len == 0:
+            return n_edges // value_len
+        _raise_connection_shape_error(
+            name, weight, pre_idx, context=context, value_len=value_len
+        )
+
     if hasattr(weight, "__len__"):
-        if len(weight) != len(pre_idx):
-            raise ValueError(
-                f"Weight tensor shape {weight.shape} does not match pre-synaptic indices shape {pre_idx.shape}."
-            )
-        return 1
+        value_len = len(weight)
+        if value_len == 1:
+            return n_edges
+        if value_len == n_edges:
+            return 1
+        if value_len > 0 and n_edges % value_len == 0:
+            return n_edges // value_len
+        _raise_connection_shape_error(
+            name, weight, pre_idx, context=context, value_len=value_len
+        )
+
     if isinstance(weight, torch.nn.Module):
-        return len(pre_idx)
-    raise TypeError(f"Unsupported type for weight: {type(weight)}.")
+        return n_edges
+
+    raise TypeError(
+        f"Unsupported type for {name}: {type(weight)}. Expected a scalar, "
+        "1-D tensor/list, torch.nn.Module, parameter, or distribution-like module."
+    )
 
 
-def expand(value, n):
+def _evaluate(value):
     if isinstance(value, torch.nn.Module):
-        return value.sample(n)
-    return torch.tensor(value).repeat(n)
+        return value()
+    return value
+
+
+def expand(value, n, *, device=None, dtype=None):
+    if isinstance(value, torch.nn.Module):
+        out = value.sample(n)
+        if torch.is_tensor(out) and (device is not None or dtype is not None):
+            out = out.to(
+                device=device if device is not None else out.device,
+                dtype=dtype
+                if dtype is not None and torch.is_floating_point(out)
+                else out.dtype,
+            )
+        return out
+    return torch.as_tensor(value, device=device, dtype=dtype).repeat(n)
 
 
 def _require(spec: dict, *names):
@@ -243,19 +449,34 @@ def batchify_index(old_shape, n: int, i: torch.Tensor) -> torch.Tensor:
     return i_n.reshape(-1)
 
 
-def make_weight(weights, n):
+def make_weight(weights, n, *, device=None, dtype=None):
     class ParameterOrDistributionWrapper(torch.nn.Module):
         """A simple wrapper for parameters or distributions that can be sampled."""
 
         def __init__(self, param):
             super().__init__()
+            if isinstance(param, torch.nn.Module) and (
+                device is not None or dtype is not None
+            ):
+                try:
+                    param = param.to(device=device, dtype=dtype)
+                except TypeError:
+                    param = param.to(device=device)
             self.param = param
 
         def sample(self, n):
             if is_parametric(self.param):
-                return self.param.repeat(n)
+                out = self.param.repeat(n)
             else:
-                return self.param.sample(n)
+                out = self.param.sample(n)
+            if torch.is_tensor(out) and (device is not None or dtype is not None):
+                out = out.to(
+                    device=device if device is not None else out.device,
+                    dtype=dtype
+                    if dtype is not None and torch.is_floating_point(out)
+                    else out.dtype,
+                )
+            return out
 
     class WeightExpander(torch.nn.Module):
         def __init__(self, weights, n):
@@ -264,7 +485,14 @@ def make_weight(weights, n):
                 [ParameterOrDistributionWrapper(w) for w in weights]
             )
             self.n = n
-            self.register_buffer("w", torch.empty(0))
+            self.register_buffer(
+                "w",
+                torch.empty(
+                    0,
+                    device=device if device is not None else None,
+                    dtype=dtype if dtype is not None else torch.float32,
+                ),
+            )
 
         def forward(self):
             return self.w
@@ -405,9 +633,49 @@ class Network(RNGMixin):
         Optional spike generator attached under the name ``netstim``.
     seed : int, optional
         Seed for network-level RNG used in stochastic wiring utilities.
+    track_netcon_events : bool, optional
+        If True, event-based NetCons allocate the historical per-connection
+        ``event_queue`` used for delivery introspection. If False (default),
+        NetCons skip that large debug queue during inference and keep only the
+        lightweight current-step ``events`` buffer.
+    netcon_delay_backend : {"dense", "sparse_calendar", "bitpacked_history"}, optional
+        Delay-line backend for event-based NetCons. ``"dense"`` is the default
+        differentiable/dense implementation. ``"sparse_calendar"`` is
+        an inference-only backend that stores pending nonzero deliveries in
+        sparse calendar buckets while preserving the existing ``net_receive``
+        dense-payload API. Can be beneficial for memory efficiency and speed on CPU
+        when networks have long delays and are not densely spiking. Should be avoided on
+        GPU. ``"bitpacked_history"`` is an inference-only backend
+        that stores packed source-spike history and reconstructs the dense
+        delivery payload from the static edge list. Suitable for networks where
+        threshold is uniform and / or determined solely by the pre-synaptic population,
+        so that the same source spike history can be shared across synapses. Can be very
+        beneficial for memory efficiency and speed on GPU for large networks with long
+        delays. The first run with 'bitpacked_history' will be slow due to CUDA kernel
+        compilation, but subsequent runs will be much faster.
+    netcon_train_backend : {"dense", "source_history", "auto"}, optional
+        Differentiable training backend for event NetCons. ``"dense"`` keeps the
+        fully general per-synapse delay buffer. ``"source_history"`` uses compact
+        source-level histories when thresholds/events are source-level; with
+        ``diff_spiking=False`` this uses packed hard source spikes and with
+        ``diff_spiking=True`` this uses floating source gates. ``"auto"`` uses
+        source history when exact and otherwise falls back to dense. Default is
+        ``"auto"`` so common source-level SNN projections get the compact
+        differentiable backend without opting in explicitly.
     """
 
-    def __init__(self, populations: Dict[str, Population], netstim=None, seed=None):
+    def __init__(
+        self,
+        populations: Dict[str, Population],
+        netstim=None,
+        seed=None,
+        *,
+        track_netcon_events: bool = False,
+        netcon_delay_backend: Literal[
+            "dense", "sparse_calendar", "bitpacked_history"
+        ] = "dense",
+        netcon_train_backend: Literal["dense", "source_history", "auto"] = "auto",
+    ):
         if any(pop.is_batched() for pop in populations.values()):
             raise ValueError(
                 "Batched populations are not supported. Implement your networks with unbatched populations and then call .batch(batch_size)."
@@ -422,9 +690,31 @@ class Network(RNGMixin):
             setattr(self, name, pop)
 
         self.netstim = netstim
+        self.track_netcon_events = bool(track_netcon_events)
+        if netcon_delay_backend not in (
+            "dense",
+            "sparse_calendar",
+            "bitpacked_history",
+        ):
+            raise ValueError(
+                "netcon_delay_backend must be one of 'dense', 'sparse_calendar', or 'bitpacked_history'."
+            )
+        self.netcon_delay_backend = netcon_delay_backend
+        if netcon_train_backend not in ("dense", "source_history", "auto"):
+            raise ValueError(
+                "netcon_train_backend must be one of 'dense', 'source_history', or 'auto'."
+            )
+        self.netcon_train_backend = netcon_train_backend
 
         self.synapse_spec = {}
         self.synapses = torch.nn.ModuleDict()
+        self.continuous_synapse_spec = {}
+        self.continuous_synapses = torch.nn.ModuleDict()
+        # Plain dict of unique target ContinuousSynapse mechanisms that need
+        # their per-step analog input buffers reset.  These mechanisms are
+        # already registered on their owning populations, so this dict does not
+        # duplicate module ownership/state_dict entries.
+        self.continuous_targets = {}
         self.dt = None
         self.built = False
 
@@ -432,45 +722,28 @@ class Network(RNGMixin):
         self.fullgraph = bool(FULLGRAPH)
         self.dynamic = bool(DYNAMIC)
         self.jit = bool(JIT)
+        self.jit_network_solves = bool(JIT_NETWORK_SOLVES)
+        self.jit_network_ops = bool(JIT_NETWORK_OPS)
+        # Legacy spelling retained as an attribute alias.
+        self.jit_in_network = self.jit_network_solves
         self.compile_mode = COMPILE_MODE.value
 
         self.is_batched = False
 
         torch._dynamo.reset()
 
-        with torch.set_grad_enabled(True):
-            if self.jit:
-                self._step_train = torch.compile(
-                    step,
-                    backend=self.backend,
-                    fullgraph=self.fullgraph,
-                    dynamic=self.dynamic,
-                    mode=self.compile_mode,
-                )
-            else:
-                self._step_train = step
-
-        with torch.set_grad_enabled(False):
-            if self.jit:
-                self._step_eval = torch.compile(
-                    step,
-                    backend=self.backend,
-                    fullgraph=self.fullgraph,
-                    dynamic=self.dynamic,
-                    mode=self.compile_mode,
-                )
-            else:
-                self._step_eval = step
+        # Keep the stateful network/population wrapper eager. Population JIT is
+        # now handled by each integrator, which compiles only its tensor kernel
+        # and leaves model state commits outside Dynamo.
+        self._step_train = step
+        self._step_eval = step
 
         # Network clock lives on CPU by default; move when needed.
         self.register_buffer(
             "t", torch.tensor(0.0, device=torch.device("cpu"), dtype=torch.float32)
         )
 
-        if all(p.jit_in_network for p in populations.values()):
-            self.use_compiled_advance_populations = True
-        else:
-            self.use_compiled_advance_populations = False
+        self.compile_network_ops = jit_enabled_for_scope("network_ops", self)
 
         # Track device signature to trigger rebuilds if placements change.
         self._device_sig = self._device_signature()
@@ -479,6 +752,130 @@ class Network(RNGMixin):
         self._syn_cache = {}
 
         self.eval()
+
+    def _refresh_compile_config_from_ctx(self):
+        """Refresh network compile policy from the active dendra.ctx."""
+        self.backend = BACKEND.value
+        self.fullgraph = bool(FULLGRAPH)
+        self.dynamic = bool(DYNAMIC)
+        self.jit = bool(JIT)
+        self.jit_network_solves = bool(JIT_NETWORK_SOLVES)
+        self.jit_network_ops = bool(JIT_NETWORK_OPS)
+        self.jit_in_network = self.jit_network_solves
+        self.compile_mode = COMPILE_MODE.value
+        self.compile_network_ops = jit_enabled_for_scope("network_ops", self)
+
+        for pop in self.populations.values():
+            refresh = getattr(pop, "_refresh_compile_config_from_ctx", None)
+            if refresh is not None:
+                refresh()
+            if getattr(pop, "integrator", None) is not None:
+                pop.integrator.configure_jit(pop, scope="network_population")
+        return self
+
+    def clear_jit_cache(self):
+        """Drop lazily compiled functions/caches from this network.
+
+        Network itself keeps only eager top-level stepping functions, but its
+        populations own compiled integrator kernels and compiled ``make_intra``
+        helpers after ``with dn.ctx(JIT=1): ...``.  Those compiled callables are
+        deliberately lazy and can be recreated after load, so they should not be
+        serialized with checkpoints or arbitrary pickle payloads.
+        """
+        self._step_train = step
+        self._step_eval = step
+        self._step = step
+
+        for pop in self.populations.values():
+            clear = getattr(pop, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+            elif getattr(pop, "integrator", None) is not None and hasattr(
+                pop.integrator, "_compiled_kernels"
+            ):
+                pop.integrator._compiled_kernels.clear()
+
+        if self.netstim is not None:
+            clear = getattr(self.netstim, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+
+        for syn in self.synapses.values():
+            clear = getattr(syn, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+        for syn in self.continuous_synapses.values():
+            clear = getattr(syn, "clear_jit_cache", None)
+            if clear is not None:
+                clear()
+        return self
+
+    def pickleable(
+        self,
+        *,
+        inplace: bool = False,
+        clone: bool = False,
+        reset_global_compiler: bool = False,
+    ):
+        """Return a pickle-friendly network handle.
+
+        By default this method is cheap and non-mutating:
+
+        .. code-block:: python
+
+            payload = {"model": net.pickleable(), "loss": loss}
+            pickle.dump(payload, f)
+
+        The live network keeps its compiled population/integrator kernels.
+        Pickling calls :meth:`__getstate__`, which strips process-local compiler
+        objects only from the serialized state.  Therefore saving a checkpoint
+        does not force the current model to recompile before continuing.
+
+        Parameters
+        ----------
+        inplace : bool, default False
+            If True, clear the live network's local JIT caches before returning
+            it.  The next JIT-enabled run may need to recompile.
+        clone : bool, default False
+            If True, return a sanitized deep copy.  This avoids mutating the
+            live network but duplicates tensor storage.
+        reset_global_compiler : bool, default False
+            Also clear global Torch compiler caches.  Leave this False when you
+            want to save and continue running with already-compiled kernels.
+        """
+        if inplace and clone:
+            raise ValueError(
+                "pickleable(...): choose at most one of inplace=True or clone=True."
+            )
+        if clone:
+            import copy as _copy
+
+            obj = _copy.deepcopy(self)
+            obj.clear_jit_cache()
+        elif inplace:
+            obj = self.clear_jit_cache()
+        else:
+            obj = self
+        if reset_global_compiler:
+            if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+                torch.compiler.reset()
+            elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
+                torch._dynamo.reset()
+        return obj
+
+    def __getstate__(self):
+        """Serialize without process-local network compile wrappers.
+
+        This is a defensive hook: direct ``pickle.dump(net, f)`` should work
+        after JIT-enabled runs without requiring callers to remember
+        ``net.pickleable()``.  Population/integrator compiled kernels are
+        stripped by their own ``__getstate__`` hooks.
+        """
+        state = self.__dict__.copy()
+        state["_step_train"] = step
+        state["_step_eval"] = step
+        state["_step"] = step
+        return state
 
     def train(self, mode=True):
         """
@@ -499,6 +896,10 @@ class Network(RNGMixin):
             pop.train(mode)
         for syn in self.synapses.values():
             syn.train(mode)
+        for syn in self.continuous_synapses.values():
+            syn.train(mode)
+        if self.netstim is not None:
+            self.netstim.train(mode)
         self.training = mode
         self._step = self._step_train
         return self
@@ -524,6 +925,10 @@ class Network(RNGMixin):
             pop.eval()
         for syn in self.synapses.values():
             syn.eval()
+        for syn in self.continuous_synapses.values():
+            syn.eval()
+        if self.netstim is not None:
+            self.netstim.eval()
         self.training = False
         self._step = self._step_eval
         return self
@@ -570,6 +975,9 @@ class Network(RNGMixin):
         """
         self.synapse_spec = {}
         self.synapses.clear()
+        self.continuous_synapse_spec = {}
+        self.continuous_synapses.clear()
+        self.continuous_targets = {}
         self.built = False
 
     def _normalize_endpoint(self, source, target):
@@ -579,6 +987,103 @@ class Network(RNGMixin):
         if isinstance(target, Population):
             target = target[:]
         return source, target, source.model, target.model
+
+    def _estimate_candidate_edges(
+        self,
+        *,
+        rule,
+        spec,
+        pre_pool,
+        post_pool,
+        source_model,
+        target_model,
+        allow_autapses: bool,
+    ):
+        """Best-effort count of candidate edges before filtering.
+
+        This is diagnostics-only. Some stochastic rules cannot know the exact
+        pre-filter count a user had in mind after random sampling, so this
+        method returns ``None`` when a useful exact estimate is unavailable.
+        """
+        rule = str(rule).replace("-", "_")
+        n_pre = int(pre_pool.numel())
+        n_post = int(post_pool.numel())
+        if rule == "one_to_one":
+            return n_pre if n_pre == n_post else None
+
+        if rule in ("all_to_all", "dense"):
+            # Candidate count before autapse/multapse filtering. Keep this O(1);
+            # exact self-pair counts for arbitrary selections are not worth an
+            # additional large tensor operation on every connect call.
+            return n_pre * n_post
+
+        if rule in ("fixed_total_number", "fixed_total"):
+            try:
+                return int(_require(spec, "N", "n"))
+            except Exception:
+                return None
+
+        if rule == "fixed_indegree":
+            try:
+                return int(_require(spec, "indegree", "in_degree", "K", "N")) * n_post
+            except Exception:
+                return None
+
+        if rule == "fixed_outdegree":
+            try:
+                return int(_require(spec, "outdegree", "out_degree", "K", "N")) * n_pre
+            except Exception:
+                return None
+
+        # pairwise_bernoulli and pairwise_poisson are stochastic; the final count
+        # is the most meaningful diagnostic value.
+        return None
+
+    def _connection_shape_context(
+        self,
+        *,
+        kind: str,
+        rule,
+        spec,
+        source_model,
+        target_model,
+        synapse,
+        pre_pool,
+        post_pool,
+        pre_idx,
+        allow_autapses: bool,
+        allow_multapses: bool,
+        auto_expand: bool,
+        pre_var=None,
+        input=None,
+    ):
+        """Build diagnostic context for threshold/weight/delay shape errors."""
+        candidate_edges = self._estimate_candidate_edges(
+            rule=rule,
+            spec=spec,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            source_model=source_model,
+            target_model=target_model,
+            allow_autapses=allow_autapses,
+        )
+        return {
+            "kind": kind,
+            "rule": str(rule).replace("-", "_"),
+            "source_name": getattr(source_model, "name", "<unnamed>"),
+            "target_name": getattr(target_model, "name", "<unnamed>"),
+            "synapse_name": getattr(synapse, "name", repr(synapse)),
+            "pre_var": pre_var,
+            "input": input,
+            "selected_pre": int(pre_pool.numel()),
+            "selected_post": int(post_pool.numel()),
+            "same_population": bool(source_model is target_model),
+            "candidate_edges": candidate_edges,
+            "final_edges": int(pre_idx.numel()),
+            "allow_autapses": bool(allow_autapses),
+            "allow_multapses": bool(allow_multapses),
+            "auto_expand": bool(auto_expand),
+        }
 
     def _flat_selection(self, selection):
         """Return selected population-flat indices for a Population/NetStim slice."""
@@ -608,6 +1113,58 @@ class Network(RNGMixin):
                 f"the synapse '{synapse}' at target locations including {bad}."
             )
 
+        return local
+
+    def _mechanism_from_pre_var(self, pre, pre_var):
+        """Return the mechanism addressed by a ``mech.<alias>.<var>`` pre_var.
+
+        ``Network`` stores source indices in population-flat coordinates.
+        Mechanism variables, however, can be local to the mechanism insertion
+        region.  When ``pre_var`` names such a mechanism-local variable, the
+        indices passed to ``NetCon`` need to be converted into that local frame.
+
+        Returns ``None`` for ordinary population variables, NetStim variables,
+        malformed strings, or pre variables whose mechanism cannot be resolved.
+        """
+        if not isinstance(pre_var, str):
+            return None
+        parts = pre_var.split(".")
+        if len(parts) < 3 or parts[0] != "mech":
+            return None
+        handler = getattr(pre, "mech", None)
+        if handler is None:
+            return None
+        alias = parts[1]
+        try:
+            return getattr(handler, alias)
+        except AttributeError:
+            mechanisms = getattr(handler, "mechanisms", None)
+            if mechanisms is None:
+                return None
+            return mechanisms.get(alias, None)
+
+    def _pre_idx_for_pre_var(self, pre, pre_idx, pre_var):
+        """Convert population-flat pre indices to the frame used by ``pre_var``.
+
+        For population-wide variables such as ``v`` or mechanisms inserted
+        everywhere, ``pre_idx`` is already correct.  For variables owned by a
+        mechanism inserted on a slice, e.g. ``mech.ctx_fs.syn_spikes``,
+        ``get_pre_var(pre).view(-1)`` is mechanism-local, so the population-flat
+        indices must be mapped to local indices using the mechanism key.
+        """
+        mech = self._mechanism_from_pre_var(pre, pre_var)
+        if mech is None or getattr(mech, "key", None) is None:
+            return pre_idx
+
+        pre_flat = pre_idx.to(device=pre.device(), dtype=torch.long)
+        local = get_local_index(pre, mech, pre_flat)
+        if torch.any(local < 0):
+            bad = pre_flat[local < 0][:10].detach().cpu().tolist()
+            raise ValueError(
+                f"Pre-synaptic variable '{pre_var}' is local to mechanism "
+                f"'{getattr(mech, 'name', '<unknown>')}', but source locations "
+                f"including {bad} are outside that mechanism's insertion region."
+            )
         return local
 
     def _all_to_all_edges(self, pre_pool, post_pool):
@@ -947,6 +1504,7 @@ class Network(RNGMixin):
         weight=1.0,
         delay=0.0,
         pre_var=None,
+        shape_context=None,
     ):
         """
         Append a finalized connection spec.
@@ -960,9 +1518,15 @@ class Network(RNGMixin):
         if source_idx.numel() == 0:
             return
 
-        n_threshold = check_weight_shape(threshold, source_idx)
-        n_weight = check_weight_shape(weight, source_idx)
-        n_delay = check_weight_shape(delay, source_idx)
+        n_threshold = check_weight_shape(
+            threshold, source_idx, name="threshold", context=shape_context
+        )
+        n_weight = check_weight_shape(
+            weight, source_idx, name="weight", context=shape_context
+        )
+        n_delay = check_weight_shape(
+            delay, source_idx, name="delay", context=shape_context
+        )
 
         self.synapse_spec.setdefault(
             (source_pop.name, target_pop.name, synapse, pre_var), []
@@ -977,6 +1541,206 @@ class Network(RNGMixin):
                 to_param(delay, positive=True),
                 n_delay,
             )
+        )
+
+    def _connect_continuous(
+        self,
+        source_pop,
+        source_idx,
+        target_pop,
+        target_idx,
+        synapse,
+        *,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+        input=None,
+        reduce="sum",
+        transform=None,
+        shape_context=None,
+    ):
+        """Append a finalized continuous-connection spec.
+
+        ``source_idx`` is in source population-flat or pre-var-local coordinates
+        after build-time conversion. ``target_idx`` is target synapse-local.
+        """
+        if source_idx.numel() == 0:
+            return
+
+        n_weight = check_weight_shape(
+            weight, source_idx, name="weight", context=shape_context
+        )
+        n_delay = check_weight_shape(
+            delay, source_idx, name="delay", context=shape_context
+        )
+
+        self.continuous_synapse_spec.setdefault(
+            (
+                source_pop.name,
+                target_pop.name,
+                synapse,
+                pre_var,
+                input,
+                reduce,
+                transform,
+            ),
+            [],
+        ).append(
+            (
+                source_idx,
+                target_idx,
+                to_param(weight, positive=True),
+                n_weight,
+                to_param(delay, positive=True),
+                n_delay,
+            )
+        )
+
+    def connect_continuous(
+        self,
+        source,
+        target,
+        synapse,
+        conn_spec=None,
+        *,
+        pre_var="v",
+        input=None,
+        weight=1.0,
+        delay=0.0,
+        reduce="sum",
+        transform=None,
+        auto_expand=False,
+        allow_autapses: Optional[bool] = None,
+        allow_multapses: Optional[bool] = None,
+    ):
+        """Connect a continuous presynaptic variable to a ContinuousSynapse.
+
+        Unlike :meth:`connect`, this method performs no thresholding.  The
+        selected ``pre_var`` is sampled each timestep, multiplied by ``weight``,
+        optionally delayed, scatter-summed into the target synapse's local shape,
+        and delivered via ``synapse.continuous_receive(..., input=input)``.
+        """
+        if not hasattr(synapse, "continuous_receive"):
+            raise TypeError(
+                "connect_continuous requires a target mechanism that implements "
+                "continuous_receive; did you subclass ContinuousSynapse?"
+            )
+
+        source, target, source_model, target_model = self._normalize_endpoint(
+            source,
+            target,
+        )
+
+        if conn_spec is None:
+            spec = {"rule": "all_to_all"}
+        elif isinstance(conn_spec, str):
+            spec = {"rule": conn_spec}
+        else:
+            spec = dict(conn_spec)
+
+        rule = spec.pop("rule", "all_to_all")
+
+        if allow_autapses is None:
+            allow_autapses = bool(spec.pop("allow_autapses", True))
+        else:
+            spec.pop("allow_autapses", None)
+
+        if allow_multapses is None:
+            allow_multapses = bool(spec.pop("allow_multapses", True))
+        else:
+            spec.pop("allow_multapses", None)
+
+        pre_pool = self._flat_selection(source)
+        post_pool = self._flat_selection(target)
+
+        self._to_synapse_local_post_idx(target_model, post_pool, synapse)
+
+        pre_idx, post_flat = self._edges_for_rule(
+            rule=rule,
+            spec=spec,
+            source_model=source_model,
+            target_model=target_model,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+        )
+
+        if pre_idx.numel() == 0:
+            return
+
+        shape_context = self._connection_shape_context(
+            kind="continuous",
+            rule=rule,
+            spec=spec,
+            source_model=source_model,
+            target_model=target_model,
+            synapse=synapse,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            pre_idx=pre_idx,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+            auto_expand=auto_expand,
+            pre_var=pre_var,
+            input=input,
+        )
+
+        post_idx = self._to_synapse_local_post_idx(
+            target_model,
+            post_flat.to(target_model.device()),
+            synapse,
+        )
+
+        if auto_expand:
+            n_connections = pre_idx.numel()
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
+        self._connect_continuous(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx,
+            synapse,
+            weight=weight,
+            delay=delay,
+            pre_var=pre_var,
+            input=input,
+            reduce=reduce,
+            transform=transform,
+            shape_context=shape_context,
+        )
+
+    def connect_continuous_one_to_one(
+        self,
+        source,
+        target,
+        synapse,
+        *,
+        pre_var="v",
+        input=None,
+        weight=1.0,
+        delay=0.0,
+        reduce="sum",
+        transform=None,
+        allow_autapses=False,
+        allow_multapses=False,
+    ):
+        """One-to-one wrapper around :meth:`connect_continuous`."""
+        return self.connect_continuous(
+            source,
+            target,
+            synapse,
+            conn_spec={"rule": "one_to_one"},
+            pre_var=pre_var,
+            input=input,
+            weight=weight,
+            delay=delay,
+            reduce=reduce,
+            transform=transform,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
         )
 
     def connect(
@@ -1062,6 +1826,22 @@ class Network(RNGMixin):
         if pre_idx.numel() == 0:
             return
 
+        shape_context = self._connection_shape_context(
+            kind="event",
+            rule=rule,
+            spec=spec,
+            source_model=source_model,
+            target_model=target_model,
+            synapse=synapse,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            pre_idx=pre_idx,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+            auto_expand=auto_expand,
+            pre_var=pre_var,
+        )
+
         post_idx = self._to_synapse_local_post_idx(
             target_model,
             post_flat.to(target_model.device()),
@@ -1084,6 +1864,7 @@ class Network(RNGMixin):
             weight=weight,
             delay=delay,
             pre_var=pre_var,
+            shape_context=shape_context,
         )
 
     def connect_one_to_one(
@@ -1258,17 +2039,32 @@ class Network(RNGMixin):
             )
             pre = getattr(self, pre_name)
             post = self.populations[post_name]
+            pre_device = pre.device()
+            pre_dtype = pre.dtype()
             post_device = post.device()
             post_dtype = post.dtype()
             pre_idx = torch.cat([s[0] for s in specs])
             post_idx = torch.cat([s[1] for s in specs])
-            thresholds = torch.cat([expand(s[2], s[3]) for s in specs])
-            weights = make_weight([s[4] for s in specs], [s[5] for s in specs])
-            delay = make_weight([s[6] for s in specs], [s[7] for s in specs])
+            thresholds = torch.cat(
+                [expand(s[2], s[3], device=pre_device, dtype=pre_dtype) for s in specs]
+            )
+            weights = make_weight(
+                [s[4] for s in specs],
+                [s[5] for s in specs],
+                device=post_device,
+                dtype=post_dtype,
+            )
+            delay = make_weight(
+                [s[6] for s in specs],
+                [s[7] for s in specs],
+                device=post_device,
+                dtype=post_dtype,
+            )
+            pre_idx_for_var = self._pre_idx_for_pre_var(pre, pre_idx, pre_var)
 
             syn = NetCon(
                 pre=pre,
-                pre_idx=pre_idx,
+                pre_idx=pre_idx_for_var,
                 thresholds=thresholds,
                 post=post,
                 post_idx=post_idx,
@@ -1278,7 +2074,14 @@ class Network(RNGMixin):
                 dt=dt,
                 pre_var=pre_var,
                 max_delay=max_delay_ms,
-            ).to(device=post_device, dtype=post_dtype)
+                track_events=self.track_netcon_events,
+                delay_backend=self.netcon_delay_backend,
+                train_delay_backend=self.netcon_train_backend,
+                device=post_device,
+                dtype=post_dtype,
+                pre_device=pre_device,
+                pre_dtype=pre_dtype,
+            )
 
             syn.setreference("t", lambda: self.t)
 
@@ -1290,6 +2093,99 @@ class Network(RNGMixin):
             self.synapses[
                 f"{pre_name}:{pre_var.replace('.', '_')}->{post_name}:{synapse.name}"
             ] = syn
+
+    def build_continuous_synapses(self, dt, max_delay_ms=None):
+        """Materialize queued continuous connection specs into ContinuousCon modules.
+
+        Connection specs are coalesced before construction, mirroring the
+        event-based NetCon builder: all user connect_continuous calls with the
+        same ``(pre_name, post_name, synapse, pre_var, input, reduce,
+        transform)`` key are concatenated into one ContinuousCon.  Separately,
+        Network owns a unique target-synapse reset list so each ContinuousSynapse
+        input buffer is reset exactly once per timestep before all analog
+        deliveries.
+        """
+        self.continuous_targets = {}
+        for group_i, (
+            (
+                pre_name,
+                post_name,
+                synapse,
+                pre_var,
+                input_name,
+                reduce,
+                transform,
+            ),
+            specs,
+        ) in enumerate(self.continuous_synapse_spec.items()):
+            pre_var = pre_var if pre_var is not None else "v"
+            pre = getattr(self, pre_name)
+            post = self.populations[post_name]
+            pre_device = pre.device()
+            pre_dtype = pre.dtype()
+            post_device = post.device()
+            post_dtype = post.dtype()
+            pre_idx = torch.cat([s[0] for s in specs])
+            post_idx = torch.cat([s[1] for s in specs])
+            weights = make_weight(
+                [s[2] for s in specs],
+                [s[3] for s in specs],
+                device=post_device,
+                dtype=post_dtype,
+            )
+            delay = make_weight(
+                [s[4] for s in specs],
+                [s[5] for s in specs],
+                device=post_device,
+                dtype=post_dtype,
+            )
+            pre_idx_for_var = self._pre_idx_for_pre_var(pre, pre_idx, pre_var)
+
+            target_name = f"{post_name}:{synapse.name}"
+            if target_name not in self.continuous_targets:
+                if not hasattr(synapse, "reset_continuous_inputs"):
+                    raise TypeError(
+                        "connect_continuous target must implement "
+                        "reset_continuous_inputs()."
+                    )
+                self.continuous_targets[target_name] = synapse
+
+            con = ContinuousCon(
+                pre=pre,
+                pre_idx=pre_idx_for_var,
+                post=post,
+                post_idx=post_idx,
+                post_syn=synapse,
+                weight=weights,
+                delay=delay,
+                dt=dt,
+                pre_var=pre_var,
+                input=input_name,
+                reduce=reduce,
+                max_delay=max_delay_ms,
+                transform=transform,
+                reset_inputs=False,
+                device=post_device,
+                dtype=post_dtype,
+                pre_device=pre_device,
+                pre_dtype=pre_dtype,
+            )
+
+            con.setreference("t", lambda: self.t)
+
+            if self.training:
+                con.train()
+            else:
+                con.eval()
+
+            iname = input_name if input_name is not None else "input"
+            # group_i makes the ModuleDict key collision-proof when distinct
+            # transforms or other non-rendered key fields are used.
+            cname = (
+                f"{group_i}:{pre_name}:{pre_var.replace('.', '_')}~>{post_name}:"
+                f"{synapse.name}:{iname}:{reduce}"
+            )
+            self.continuous_synapses[cname] = con
 
     def build(self, dt, max_delay_ms=None, force_rebuild=False):
         """
@@ -1309,13 +2205,18 @@ class Network(RNGMixin):
         Network
             Self, for chaining.
         """
+        self._refresh_compile_config_from_ctx()
         current_sig = self._device_signature()
         devices_changed = current_sig != getattr(self, "_device_sig", None)
 
         if not self.built or self.dt != dt or force_rebuild or devices_changed:
             torch._dynamo.reset()
             self.dt = dt
+            self.synapses.clear()
+            self.continuous_synapses.clear()
+            self.continuous_targets = {}
             self.build_synapses(dt, max_delay_ms=max_delay_ms)
+            self.build_continuous_synapses(dt, max_delay_ms=max_delay_ms)
             self.built = True
             self._device_sig = self._device_signature()
         return self
@@ -1337,9 +2238,16 @@ class Network(RNGMixin):
         dt : float
             Simulation timestep (ms).
         reinit_weights : bool, optional
-            Re-sample or reset synaptic weights. Default is True.
+            Re-sample or refresh synaptic weights. Default is True. When
+            initializing from a steady-state cache after an optimizer update,
+            leave this True so expanded ``WeightExpander.w`` buffers are
+            regenerated from the current weight parameters before cached pending
+            deliveries are rebuilt.
         reinit_delays : bool, optional
-            Re-sample or reset synaptic delays. Default is True.
+            Re-sample or refresh synaptic delays. Default is True. When
+            initializing from a steady-state cache after delay parameters have
+            changed, leave this True so expanded delay values and integer delay
+            metadata are regenerated before cache restore.
         t : float, optional
             Starting simulation time (ms). Default is 0.0.
         max_delay_ms : float, optional
@@ -1352,32 +2260,47 @@ class Network(RNGMixin):
         Network
             Self, for chaining.
         """
-        self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
+        self._refresh_compile_config_from_ctx()
         self.t = self.t.detach()
         self.t.fill_(t)
         for pop in self.populations.values():
             pop.t = pop.t.detach()
             pop.t.fill_(t)
-        if self._state_cache:
+
+        has_state_cache = bool(self._state_cache)
+        if has_state_cache:
             self.initialize_pops_from_state_cache()
-            self.initialize_synapses_from_state_cache()
-            clear_deliveries = False
-        else:
-            clear_deliveries = True
 
         dt_f = float(dt)
         for pop in self.populations.values():
-            if not self._state_cache:
+            if not has_state_cache:
                 pop.initialize()
             dt_pop = torch.tensor(dt_f, device=pop.device(), dtype=pop.dtype())
-            pop.integrator._initialize(pop, dt_pop)
+            pop.integrator._initialize(
+                pop,
+                dt_pop,
+                force=pop.force_integrator_reinit(),
+                compile_scope="network_population",
+            )
             pop.intra = pop.build_intra()
+        self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
+        # Always clear runtime delivery state during synapse initialization.
+        # If a state cache is present, the backend-specific restore below will
+        # rebuild the pending traffic from cached presynaptic history using the
+        # freshly expanded current weights/delays.
         self.init_synapses(
             reinit_weights=reinit_weights,
             reinit_delays=reinit_delays,
-            clear_deliveries=clear_deliveries,
+            clear_deliveries=True,
         )
+        if has_state_cache:
+            self.initialize_synapses_from_state_cache(
+                reinit_weights=reinit_weights,
+                reinit_delays=reinit_delays,
+            )
         if self.netstim is not None:
+            if hasattr(self.netstim, "set_dt"):
+                self.netstim.set_dt(dt_f)
             self.netstim.initialize()
             self.netstim.detach()
         return self
@@ -1386,18 +2309,82 @@ class Network(RNGMixin):
         for name, pop in self.populations.items():
             pop.load_state_dict(self._state_cache[name])
             pop.detach()
+            pop.initializing_from_state_cache = True
 
-    def initialize_synapses_from_state_cache(self):
+    def initialize_synapses_from_state_cache(
+        self,
+        *,
+        reinit_weights: bool = True,
+        reinit_delays: bool = True,
+    ):
+        """Restore event and continuous synapse runtime caches.
+
+        Connection classes own their backend-specific cache format.  Network only
+        routes the cached payloads to the matching module names.  This method is
+        intentionally called after :meth:`init_synapses`: expanded
+        ``WeightExpander.w`` buffers and delay metadata must already reflect the
+        current parameters before cached presynaptic history is converted back
+        into pending deliveries.  A legacy fallback is retained for older caches
+        whose event NetCon entries were stored as
+        ``(old_dt, has_spiked, is_spiking, delivery_buffer)`` tuples.
+
+        Keep ``reinit_weights=True`` and ``reinit_delays=True`` when restoring a
+        steady-state cache after optimizer updates.  Set either flag False only
+        when the corresponding expanded parameter values should be reused.
+        """
+        if not self._syn_cache:
+            return
+
+        if "event" in self._syn_cache or "continuous" in self._syn_cache:
+            event_cache = self._syn_cache.get("event", {})
+            continuous_cache = self._syn_cache.get("continuous", {})
+        else:
+            # Backward compatibility with the previous flat event-NetCon cache.
+            event_cache = self._syn_cache
+            continuous_cache = {}
+
         for name, syn in self.synapses.items():
-            old_dt, has_spiked, is_spiking, delivery_buffer = self._syn_cache[name]
-            n_limit = syn.delivery_buffer.shape[0]
-            delivery_buffer = dilate(
-                delivery_buffer, float(old_dt), float(self.dt), n_limit=n_limit
-            )
-            if not syn.skip_thresholding:
-                syn.has_spiked = (has_spiked).detach()
-                syn.is_spiking = (is_spiking).detach()
-            syn.delivery_buffer = delivery_buffer.clone().detach()
+            if name not in event_cache:
+                continue
+            cache = event_cache[name]
+            if hasattr(syn, "initialize_from_state_cache"):
+                try:
+                    syn.initialize_from_state_cache(
+                        cache,
+                        dt=self.dt,
+                        rebuild_delays=False,
+                    )
+                except TypeError:
+                    # Backward-compatible call for custom connection modules
+                    # that implemented the cache API before ``rebuild_delays``.
+                    syn.initialize_from_state_cache(cache, dt=self.dt)
+            else:
+                old_dt, has_spiked, is_spiking, delivery_buffer = cache
+                n_limit = syn.delivery_buffer.shape[0]
+                delivery_buffer = dilate(
+                    delivery_buffer, float(old_dt), float(self.dt), n_limit=n_limit
+                )
+                if not syn.skip_thresholding:
+                    syn.has_spiked = (has_spiked).detach()
+                    syn.is_spiking = (is_spiking).detach()
+                syn.delivery_buffer = delivery_buffer.clone().detach()
+
+        for name, syn in self.continuous_synapses.items():
+            if name not in continuous_cache:
+                continue
+            cache = continuous_cache[name]
+            if not hasattr(syn, "initialize_from_state_cache"):
+                raise RuntimeError(
+                    f"Continuous synapse {name!r} does not implement initialize_from_state_cache()."
+                )
+            try:
+                syn.initialize_from_state_cache(
+                    cache,
+                    dt=self.dt,
+                    rebuild_delays=False,
+                )
+            except TypeError:
+                syn.initialize_from_state_cache(cache, dt=self.dt)
 
     def initialize_(self, *args, **kwargs):
         """In-place variant of :meth:`initialize` that returns ``None``."""
@@ -1427,6 +2414,12 @@ class Network(RNGMixin):
                 reinit_delays=reinit_delays,
                 clear_deliveries=clear_deliveries,
             )
+        for syn in self.continuous_synapses.values():
+            syn.initialize(
+                reinit_weights=reinit_weights,
+                reinit_delays=reinit_delays,
+                clear_deliveries=clear_deliveries,
+            )
 
     def run(self, tstop, extra=None, callbacks=None, progressbar=False):
         """
@@ -1449,6 +2442,7 @@ class Network(RNGMixin):
         -------
         None
         """
+        self._refresh_compile_config_from_ctx()
         dt_f = float(self.dt)
         dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
 
@@ -1511,12 +2505,14 @@ class Network(RNGMixin):
                 self._step(
                     self.populations,
                     self.synapses,
+                    self.continuous_synapses,
+                    self.continuous_targets,
                     self.netstim,
                     self.t,
                     dt_f,
                     extra=extra_c,
                     intra=intra_c,
-                    compiled_advance_population=self.use_compiled_advance_populations,
+                    compile_network_ops=self.compile_network_ops,
                 )
                 self.t = self.t + dt_t
                 post_step_hook(callbacks, self)
@@ -1551,6 +2547,7 @@ class Network(RNGMixin):
             Self, with populations and NetCons batched.
         """
         _synapse_spec = self.synapse_spec.copy()
+        _continuous_synapse_spec = self.continuous_synapse_spec.copy()
         self.clear_synapses()
         _old_shapes = {}
         for name, p in self.populations.items():
@@ -1584,9 +2581,45 @@ class Network(RNGMixin):
                     new_target_idx,
                     synapse,
                     threshold,
-                    weight,
-                    delay,
+                    _evaluate(weight),
+                    _evaluate(delay),
                     pre_var=pre_var,
+                )
+        for k, v in _continuous_synapse_spec.items():
+            (
+                source_name,
+                target_name,
+                synapse,
+                pre_var,
+                input_name,
+                reduce,
+                transform,
+            ) = k
+            source_pop = getattr(self, source_name)
+            target_pop = getattr(self, target_name)
+            synapse = getattr(target_pop.mech, synapse.name)
+            for data in v:
+                source_idx, target_idx = data[0], data[1]
+                weight, delay = data[2], data[4]
+                if source_name == "netstim" and not include_netstim:
+                    new_source_idx = source_idx.repeat(n)
+                else:
+                    new_source_idx = batchify_index(
+                        _old_shapes[source_name], n, source_idx
+                    )
+                new_target_idx = batchify_index(_old_shapes[target_name], n, target_idx)
+                self._connect_continuous(
+                    source_pop,
+                    new_source_idx,
+                    target_pop,
+                    new_target_idx,
+                    synapse,
+                    weight=_evaluate(weight),
+                    delay=_evaluate(delay),
+                    pre_var=pre_var,
+                    input=input_name,
+                    reduce=reduce,
+                    transform=transform,
                 )
         self.built = False
         self.is_batched = True
@@ -1661,7 +2694,13 @@ class Network(RNGMixin):
             n: p for n, p in self.populations.items() if n not in pops_to_concatenate
         }
         new_populations[name] = concatenated
-        new_net = Network(new_populations, netstim=self.netstim)
+        new_net = Network(
+            new_populations,
+            netstim=self.netstim,
+            track_netcon_events=self.track_netcon_events,
+            netcon_delay_backend=self.netcon_delay_backend,
+            netcon_train_backend=self.netcon_train_backend,
+        )
 
         all_indices = indices(concat_pops)
         all_indices = {n: i.flatten() for n, i in zip(pops_to_concatenate, all_indices)}
@@ -1698,7 +2737,28 @@ class Network(RNGMixin):
 
         return new_net
 
-    def steady_state(self, tstop=1000, dt=0.025, progressbar=False):
+    def _enable_synapse_state_cache_recording(self):
+        """Ask connection modules to record parameter-invariant cache histories."""
+        for syn in self.synapses.values():
+            hook = getattr(syn, "enable_state_cache_recording", None)
+            if hook is not None:
+                hook()
+        for syn in self.continuous_synapses.values():
+            hook = getattr(syn, "enable_state_cache_recording", None)
+            if hook is not None:
+                hook()
+
+    def _disable_synapse_state_cache_recording(self, *, release: bool = False):
+        for syn in self.synapses.values():
+            hook = getattr(syn, "disable_state_cache_recording", None)
+            if hook is not None:
+                hook(release=release)
+        for syn in self.continuous_synapses.values():
+            hook = getattr(syn, "disable_state_cache_recording", None)
+            if hook is not None:
+                hook(release=release)
+
+    def steady_state(self, tstop=1000, dt=0.025, progressbar=False, max_delay_ms=None):
         """
         Run the network until it reaches a steady state.
 
@@ -1708,6 +2768,16 @@ class Network(RNGMixin):
             Total time to run the network in ms. Default is 1000 ms.
         dt : float, optional
             Time step in ms. Default is 0.025 ms.
+        progressbar : bool, optional
+            If True, show a progress bar during the steady-state run.
+        max_delay_ms : float, optional
+            Optional delay-horizon cap used when building synapse state for the
+            steady-state/cache run. Supplying the largest delay expected in
+            later simulations lets the cache retain enough history when delays
+            grow after optimization updates. Later calls to ``initialize`` may
+            keep the default ``reinit_weights=True`` and ``reinit_delays=True``;
+            the cached synapse histories are parameter-invariant and are replayed
+            through the current expanded weights and delays.
 
         Returns
         -------
@@ -1717,32 +2787,68 @@ class Network(RNGMixin):
         self.clear_state_cache()
         was_training = self.training
         with torch.no_grad():
-            if self.netstim is not None:
-                self.netstim._prep_start_for_steady_state(tstop)
-            self.eval()
-            self.initialize(dt, t=-tstop, force_rebuild=True)
-            self.run(tstop, progressbar=progressbar)
-            if self.netstim is not None:
-                self.netstim._reset_start_times()
-            self.cache_state()
+            try:
+                if self.netstim is not None:
+                    self.netstim._prep_start_for_steady_state(tstop)
+                self.eval()
+                self.initialize(
+                    dt,
+                    t=-tstop,
+                    max_delay_ms=max_delay_ms,
+                    force_rebuild=True,
+                )
+                # Record unweighted event/value histories during the steady-state
+                # run.  This lets the later cache restore rebuild pending
+                # deliveries with changed dt, weights, and delays.
+                self._enable_synapse_state_cache_recording()
+                self.run(tstop, progressbar=progressbar)
+                self.cache_state()
+            finally:
+                self._disable_synapse_state_cache_recording(release=True)
+                if self.netstim is not None:
+                    self.netstim._reset_start_times()
         if was_training:
             self.train()
         return self
 
     def cache_state(self):
+        """Cache population and connection runtime state for steady_state().
+
+        Populations still use their normal state_dict().  Event NetCons and
+        ContinuousCons package their own backend-specific delay/runtime state so
+        Network does not need to know whether a NetCon is dense, sparse-calendar,
+        or bitpacked-history backed.
+        """
         self._state_cache.clear()
         self._syn_cache.clear()
         for name, pop in self.populations.items():
             self._state_cache[name] = pop.state_dict()
+
+        event_cache = {}
         for name, syn in self.synapses.items():
-            self._syn_cache[name] = (
-                syn.dt,
-                syn.has_spiked.clone(),
-                syn.is_spiking.clone(),
-                torch.roll(
-                    syn.delivery_buffer, -syn.current_time_step.item(), dims=0
-                ).clone(),
-            )
+            if hasattr(syn, "state_cache"):
+                event_cache[name] = syn.state_cache()
+            else:
+                # Legacy dense fallback.
+                event_cache[name] = (
+                    syn.dt,
+                    syn.has_spiked.clone(),
+                    syn.is_spiking.clone(),
+                    torch.roll(
+                        syn.delivery_buffer, -syn.current_time_step.item(), dims=0
+                    ).clone(),
+                )
+
+        continuous_cache = {}
+        for name, syn in self.continuous_synapses.items():
+            if not hasattr(syn, "state_cache"):
+                raise RuntimeError(
+                    f"Continuous synapse {name!r} does not implement state_cache()."
+                )
+            continuous_cache[name] = syn.state_cache()
+
+        self._syn_cache["event"] = event_cache
+        self._syn_cache["continuous"] = continuous_cache
 
     def clear_state_cache(self):
         self._state_cache.clear()
@@ -1757,6 +2863,12 @@ class Network(RNGMixin):
     def set_synaptic_diff_config(self, **kwargs):
         for syn in self.synapses.values():
             syn.set_diff_config(**kwargs)
+        if self.netstim is not None and hasattr(self.netstim, "set_diff_config"):
+            # Propagate only the scheduled-time pieces NetStim understands.
+            self.netstim.set_diff_config(
+                diff_scheduled_times=kwargs.get("diff_scheduled_times", True),
+                sched_width=kwargs.get("sched_width", 1.0),
+            )
 
     # load utilities
     def load(self, state_dict):
@@ -1833,7 +2945,14 @@ class Network(RNGMixin):
         Returns a state dict of all NetCons suitable for checkpointing.
         """
         return {
-            name: syn.state_dict_for_checkpoint() for name, syn in self.synapses.items()
+            "event": {
+                name: syn.state_dict_for_checkpoint()
+                for name, syn in self.synapses.items()
+            },
+            "continuous": {
+                name: syn.state_dict_for_checkpoint()
+                for name, syn in self.continuous_synapses.items()
+            },
         }
 
     def netstim_state_dict_for_checkpoint(self):
@@ -1861,8 +2980,18 @@ class Network(RNGMixin):
         """
         for name, pop_state in state_dict["populations"].items():
             self.populations[name].restore_dict_from_checkpoint(pop_state)
-        for name, syn_state in state_dict["netcons"].items():
-            self.synapses[name].restore_dict_from_checkpoint(syn_state)
+        netcons = state_dict["netcons"]
+        # Backward compatibility: older checkpoints stored only event NetCons as
+        # a flat mapping.  New checkpoints separate event and continuous
+        # connection states.
+        if "event" in netcons or "continuous" in netcons:
+            for name, syn_state in netcons.get("event", {}).items():
+                self.synapses[name].restore_dict_from_checkpoint(syn_state)
+            for name, syn_state in netcons.get("continuous", {}).items():
+                self.continuous_synapses[name].restore_dict_from_checkpoint(syn_state)
+        else:
+            for name, syn_state in netcons.items():
+                self.synapses[name].restore_dict_from_checkpoint(syn_state)
         if state_dict["netstim"] is not None and self.netstim is not None:
             self.netstim.restore_dict_from_checkpoint(state_dict["netstim"])
         self.t = state_dict["t"]
@@ -1933,6 +3062,7 @@ class Network(RNGMixin):
             raise RuntimeError(
                 "Network.dt is None. Call net.initialize(dt=...) before longrun_checkpointed()."
             )
+        self._refresh_compile_config_from_ctx()
         if chunklength <= 0:
             raise ValueError("chunklength must be a positive integer")
 
@@ -2127,12 +3257,14 @@ class Network(RNGMixin):
                             self._step(
                                 self.populations,
                                 self.synapses,
+                                self.continuous_synapses,
+                                self.continuous_targets,
                                 self.netstim,
                                 self.t,
                                 dt_f,
                                 extra=extra_c,
                                 intra=intra_c,
-                                compiled_advance_population=self.use_compiled_advance_populations,
+                                compile_network_ops=self.compile_network_ops,
                             )
                             self.t = self.t + dt_t
 
@@ -2225,7 +3357,6 @@ def prepare_intra(intra_c, intra, local_ind):
     return intra_c
 
 
-@torch.compile
 def prepare_extra(extra, local_ind: int):
     """
     Prepares the voltage and time data for the current step.
@@ -2246,7 +3377,6 @@ def pre_step_hook(c, m):
     c.pre_step_hook(m)
 
 
-@torch.compile
 def post_step_hook(c, m):
     c.post_step_hook(m)
 

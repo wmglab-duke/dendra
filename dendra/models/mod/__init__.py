@@ -3,15 +3,20 @@ import importlib.util
 import sys
 from pathlib import Path
 
-from .alphasynapse import alphasynapse
-from .apcount import apcount
-from .exp2syn import exp2syn
-from .expsyn import expsyn
-from .fire import fire
-from .fire_r import fire_r
-from .hh import hh
-from .pas import pas
-from .spikedetect import spikedetect
+from .ALPHASYNAPSE import alphasynapse
+from .ALPHASYNAPSE_D import alpha_d, alphasynapse_d
+from .APCOUNT import apcount
+from .APCOUNT_D import apcount_d
+from .EXP2SYN import exp2syn
+from .EXPSYN import expsyn
+from .FIRE import fire
+from .FIRE_D import fire_d
+from .FIRE_R import fire_r
+from .FIRE_R_D import fire_r_d
+from .GRADED_SYNAPSE import graded_release_gate, graded_syn, sigmoid_release
+from .HH import hh
+from .PAS import pas
+from .SPIKEDETECT import spikedetect
 
 
 class MechanismContainer:
@@ -68,7 +73,7 @@ def load_mechanisms(*paths):
             if file.name == "__init__.py":
                 continue
 
-            module_name = file.stem  # e.g. "nats"
+            module_name = file.stem.lower()  # e.g. "nats"
             unique_name = f"{module_name}_{file.stat().st_ino}"  # avoids collisions
 
             spec = importlib.util.spec_from_file_location(unique_name, file)
@@ -87,3 +92,26 @@ def load_mechanisms(*paths):
                 ) from e
 
     return MechanismContainer(**mechanisms)
+
+
+__all__ = [
+    "MechanismContainer",
+    "load_mechanisms",
+    "alphasynapse",
+    "alphasynapse_d",
+    "alpha_d",
+    "apcount",
+    "apcount_d",
+    "exp2syn",
+    "expsyn",
+    "fire",
+    "fire_d",
+    "fire_r",
+    "fire_r_d",
+    "graded_release_gate",
+    "graded_syn",
+    "sigmoid_release",
+    "hh",
+    "pas",
+    "spikedetect",
+]

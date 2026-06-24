@@ -2,5 +2,5 @@ extend-exclude = ["__init__.py"]
 force-exclude  = true        # still exclude if the path is passed explicitly
 
 [lint]
-ignore = ["E701", "F403"]
+ignore = ["E701", "F403", "E741"]
 unfixable = ["E701"]

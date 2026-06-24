@@ -3,6 +3,7 @@ from typing import Callable, Optional
 import torch
 
 from dendra.helpers import DEBUG, logger
+from dendra.utils.dynamic_compilation import compile_generated_function
 
 from ._solve_utils import (
     add_underscore_to_states,
@@ -41,6 +42,94 @@ def _normalize_eliminate(eliminate):
         return dict(eliminate)
     # iterable of pairs
     return dict(eliminate)
+
+
+def _normalize_derivimplicit_options(options):
+    """Normalize method kwargs accepted by build_derivimplicit.
+
+    These values are embedded as constants in the generated ``solve`` function.
+    ``detach_newton=None`` means use the historical policy ``not self.training``;
+    ``create_graph=None`` means use the historical policy ``self.training``.
+    """
+    out = {
+        "tol": 1e-8,
+        "max_iter": 25,
+        "damping": 1.0,
+        "line_search": False,
+        "max_ls_steps": 10,
+        "ls_decay": 0.5,
+        "jacobian_regularization": 0.0,
+        "detach_newton": None,
+        "create_graph": None,
+    }
+    aliases = {
+        "iterations": "max_iter",
+        "iters": "max_iter",
+        "n_iter": "max_iter",
+        "newton_iters": "max_iter",
+        "newton_iterations": "max_iter",
+        "regularization": "jacobian_regularization",
+        "jac_regularization": "jacobian_regularization",
+        "jac_reg": "jacobian_regularization",
+    }
+    for key, value in dict(options).items():
+        key = aliases.get(key, key)
+        if key not in out:
+            valid = ", ".join(sorted(out))
+            raise ValueError(
+                f"Unknown derivimplicit option {key!r}. Valid options are: {valid}."
+            )
+        out[key] = value
+
+    out["max_iter"] = int(out["max_iter"])
+    out["max_ls_steps"] = int(out["max_ls_steps"])
+    out["tol"] = float(out["tol"])
+    out["damping"] = float(out["damping"])
+    out["ls_decay"] = float(out["ls_decay"])
+    out["jacobian_regularization"] = float(out["jacobian_regularization"])
+    out["line_search"] = bool(out["line_search"])
+
+    for nullable_bool in ("detach_newton", "create_graph"):
+        value = out[nullable_bool]
+        if value is not None:
+            out[nullable_bool] = bool(value)
+
+    if out["max_iter"] < 0:
+        raise ValueError("derivimplicit max_iter must be non-negative.")
+    if out["max_ls_steps"] < 0:
+        raise ValueError("derivimplicit max_ls_steps must be non-negative.")
+    if out["damping"] <= 0.0:
+        raise ValueError("derivimplicit damping must be positive.")
+    if not (0.0 < out["ls_decay"] < 1.0):
+        raise ValueError("derivimplicit ls_decay must be in the open interval (0, 1).")
+    if out["tol"] < 0.0:
+        raise ValueError("derivimplicit tol must be non-negative.")
+
+    return out
+
+
+def _derivimplicit_option_call_args(options):
+    detach_expr = (
+        "(not self.training)"
+        if options["detach_newton"] is None
+        else repr(options["detach_newton"])
+    )
+    create_expr = (
+        "self.training"
+        if options["create_graph"] is None
+        else repr(options["create_graph"])
+    )
+    return (
+        f"tol={options['tol']!r}, "
+        f"max_iter={options['max_iter']!r}, "
+        f"damping={options['damping']!r}, "
+        f"line_search={options['line_search']!r}, "
+        f"max_ls_steps={options['max_ls_steps']!r}, "
+        f"ls_decay={options['ls_decay']!r}, "
+        f"jacobian_regularization={options['jacobian_regularization']!r}, "
+        f"detach_newton={detach_expr}, "
+        f"create_graph={create_expr}"
+    )
 
 
 def _broadcast_dt(dt_ms: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -472,7 +561,7 @@ def derivimplicit_step(
 
 
 derivimplicit_template = """
-def solve(self, dt, {states_and_assigned}):
+def solve(self, dt, {states_and_assigned}, **kwargs):
     {locals}
     {concatenate}
     {f_str}
@@ -505,23 +594,36 @@ concatenate_string = "x = torch.stack([{states}], dim=-1)"
 empty_jacobian_template = "jac = x.new_zeros((*x.shape, x.shape[-1]))"
 unbind_template = "{states} = torch.unbind(x, dim=-1)"
 
-solve_system_jac_template = (
-    "x = derivimplicit_step(x, dt, f, jac=jac, "
-    "detach_newton=(not self.training), create_graph=self.training)"
-)
 
-solve_system_jac_fn_template = (
-    "x = derivimplicit_step(x, dt, f, jac_fn=jac_fn, "
-    "detach_newton=(not self.training), create_graph=self.training)"
-)
-
-solve_system_autograd_template = (
-    "x = derivimplicit_step(x, dt, f, "
-    "detach_newton=(not self.training), create_graph=self.training)"
-)
+def _solve_system_jac_call(options):
+    return (
+        "x = derivimplicit_step(x, dt, f, jac=jac, "
+        + _derivimplicit_option_call_args(options)
+        + ")"
+    )
 
 
-def build_derivimplicit(states, assigned, derivative, eliminate=None, pade=False):
+def _solve_system_jac_fn_call(options):
+    return (
+        "x = derivimplicit_step(x, dt, f, jac_fn=jac_fn, "
+        + _derivimplicit_option_call_args(options)
+        + ")"
+    )
+
+
+def _solve_system_autograd_call(options):
+    return (
+        "x = derivimplicit_step(x, dt, f, "
+        + _derivimplicit_option_call_args(options)
+        + ")"
+    )
+
+
+def build_derivimplicit(
+    states, assigned, derivative, eliminate=None, pade=False, **method_kwargs
+):
+    options = _normalize_derivimplicit_options(method_kwargs)
+
     # ---- validation ----
     for state in states:
         if state in assigned:
@@ -624,7 +726,7 @@ def build_derivimplicit(states, assigned, derivative, eliminate=None, pade=False
                         f"jac[..., {i}, {j}] = ({rhs_derivatives[(s, swrt)]})"
                     )
             assemble_jacobian_str = "\n    ".join(assemble_lines)
-            solve_call = solve_system_jac_template
+            solve_call = _solve_system_jac_call(options)
         else:
             # State-dependent Jacobian: jac_fn(x,t)
             jac_fn_str = jac_fn_template.format(
@@ -641,13 +743,13 @@ def build_derivimplicit(states, assigned, derivative, eliminate=None, pade=False
             )
             jac_init_str = "jac = None"
             assemble_jacobian_str = ""
-            solve_call = solve_system_jac_fn_template
+            solve_call = _solve_system_jac_fn_call(options)
     else:
         # Fallback: no analytic Jacobian available; let solver use autograd Jacobian.
         jac_fn_str = "jac_fn = None"
         jac_init_str = "jac = None"
         assemble_jacobian_str = ""
-        solve_call = solve_system_autograd_template
+        solve_call = _solve_system_autograd_call(options)
 
     # ---- elimination and returns ----
     eliminate_solves = []
@@ -680,6 +782,9 @@ def build_derivimplicit(states, assigned, derivative, eliminate=None, pade=False
     if DEBUG:
         logger.debug(f"Function:\n{solve_src}")
 
-    code = compile(solve_src, "<solve_function>", "exec")
-    exec(code)
-    return locals()["solve"]
+    return compile_generated_function(
+        solve_src,
+        func_name="solve",
+        filename_prefix="dendra.derivimplicit.solve",
+        global_ns=globals(),
+    )
