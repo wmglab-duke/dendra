@@ -8,7 +8,7 @@ Welcome to Dendra!
 - ``jit``-compilation, making it blazing fast while being (mostly) written in python
 - symbolic specification of ODE and kinetic schemes for easy implementation of new mechanisms
 - flexible extracellular stimulation with support for complex 3D fields
-- event-based network simulation with synaptic delays
+- fully differentiable event-based and continuous network simulation with synaptic delays
 - a simple API, making it easy to use for beginners and experts alike
 - implementations of a range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more (via `Dendra Models <https://gitlab.oit.duke.edu/mah148/dendra-models>`_)
 
@@ -22,37 +22,40 @@ Getting started
 
 .. code-block:: python
 
-    import torch
-    import matplotlib.pyplot as plt
+   import torch
+   import matplotlib.pyplot as plt
 
-    import dendra as dn
-    from dendra_models.models import smolMRG
+   import dendra as dn
+   from dendra_models.models import smolMRG
 
-    # single 2.0 µm MRG model with extracellular stimulation
-    model = smolMRG([2.0], n_node=201)
+   # single 2.0 µm MRG model with extracellular stimulation
+   model = smolMRG([2.0], n_node=201)
 
-    # point source extracellular kHz stimulation
-    ve_s = dn.isotropic_point(z=100.0, rhoe=500.0)(model)
+   # point source extracellular kHz stimulation
+   ve_s = dn.isotropic_point(z=200.0)(model)
 
-    dt, tstop = 0.001, 100
-    f, amp = 5, 0.5
-    i_t = dn.sin(amp=amp, freq=f)
+   dt, tstop = 0.001, 100
+   f, amp = 5, 0.5
+   i_t = dn.sin(amp=amp, freq=f)
 
-    # run simulation
-    rec = dn.callbacks.Recorder(['v'], node_indices=model.c(0.9))
-    model.steady_state()
-    model.longrun(space=ve_s, time=i_t, n_chunks=10000, dt=dt, callbacks=[rec])
+   # run simulation
+   rec = dn.callbacks.Recorder(['v'], node_indices=model.c(0.9))
+   model.steady_state()
+   model.longrun(
+      tstop=tstop, dt=dt, extra=(ve_s, i_t),
+      chunklength=1000, callbacks=[rec], progressbar=True
+   )
 
-    # visualize
-    v = rec.numpy('v')
-    plt.plot(v[:, 0, 0]-v[0, 0, 0])
-    plt.show()
+   # visualize
+   v = rec.numpy('v')
+   plt.plot(v[:, 0, 0]-v[0, 0, 0])
+   plt.show()
 
 
 Installation
 ------------
 
-Dendra targets Python 3.11+ and PyTorch 2.7+ (CUDA 12.9 wheels recommended for GPU use). A typical setup is:
+Dendra targets Python 3.11+ and PyTorch 2.8+ (CUDA 12.9+ wheels recommended for GPU use). A typical setup is:
 
 1. Create and activate an isolated environment (optional): ``conda create -n dendra python=3.12 && conda activate dendra``.
 2. Install PyTorch (choose GPU or CPU wheels): ``python -m pip install torch --index-url https://download.pytorch.org/whl/cu129``.

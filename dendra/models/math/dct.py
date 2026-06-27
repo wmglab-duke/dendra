@@ -5,7 +5,6 @@ def dct1_rfft_impl(x):
     return torch.view_as_real(torch.fft.rfft(x, dim=1))
 
 
-@torch.jit.script
 def dct1(x: torch.Tensor):
     """Discrete Cosine Transform, Type I.
 
@@ -25,7 +24,6 @@ def dct1(x: torch.Tensor):
     return dct1_rfft_impl(x)[:, :, 0].unsqueeze(1)
 
 
-@torch.jit.script
 def idct1(x: torch.Tensor, n: int):
     """The inverse of DCT-I, which is just a scaled DCT-I.
 

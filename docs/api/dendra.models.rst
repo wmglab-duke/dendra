@@ -24,3 +24,9 @@ Core
    :members:
 .. autoclass:: dendra.models.extcell.ExtCellTree
    :members:
+
+
+Synapse slot targets
+--------------------
+.. autoclass:: dendra.models.slice.SynapseSlots
+   :members:

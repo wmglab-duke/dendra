@@ -5,7 +5,6 @@ import torch
 from dendra.models.math.dct import dct1, idct1
 
 
-@torch.jit.script
 def diffuse_step_neumann_dct1(
     state: torch.Tensor, dt: float, D: float, L: float, n: int
 ) -> torch.Tensor:

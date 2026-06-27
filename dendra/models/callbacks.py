@@ -322,7 +322,6 @@ def _atleast_3d(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-@torch.jit.script
 def _detect_anomalies(x: torch.Tensor, prev) -> torch.Tensor:
     anomalous = (torch.isnan(x) | torch.isinf(x)).squeeze().any(-1)
     anomalous = torch.logical_or(anomalous, prev)
@@ -1641,7 +1640,6 @@ class Raster(ThresholdCallback):
         return ax
 
 
-@torch.jit.script
 def _increment_count(vm, vm_new, record, threshold: float):  # pragma: no cover
     m = vm_new >= threshold
     mask = m & vm  # fused compare + and
@@ -1650,7 +1648,6 @@ def _increment_count(vm, vm_new, record, threshold: float):  # pragma: no cover
     return next_mask, record
 
 
-@torch.jit.script
 def _increment_act(vm, vm_new, threshold: float):  # pragma: no cover
     m = vm_new >= threshold
     mask = m & vm  # fused compare + and
@@ -1658,7 +1655,6 @@ def _increment_act(vm, vm_new, threshold: float):  # pragma: no cover
     return next_mask, mask
 
 
-@torch.jit.script
 def _update_active(
     vm, vm_new, record, threshold: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # pragma: no cover

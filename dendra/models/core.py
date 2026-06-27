@@ -2071,7 +2071,17 @@ class Population(P, Sliceable):
                 return Intra(self, solver_injections)
         return None
 
-    def insert(self, mechanism, alias=None, index_spec=None, ic=None, **kwargs):
+    def insert(
+        self,
+        mechanism,
+        alias=None,
+        index_spec=None,
+        ic=None,
+        preserve_duplicate_indices: bool = False,
+        preserve_multiplicity: bool | None = None,
+        copies: int = 1,
+        **kwargs,
+    ):
         """
         Insert a mechanism into the model.
 
@@ -2084,6 +2094,18 @@ class Population(P, Sliceable):
         index_spec : IndexSpec, optional
             An optional index specification that defines where the mechanism should be inserted.
             If not provided, the mechanism will be inserted everywhere.
+        preserve_duplicate_indices : bool, optional
+            If True, duplicate compartment indices selected by this insertion are
+            retained as independent mechanism slots instead of being collapsed
+            into the usual unique union. This is useful for colocated point
+            processes or synapse banks that should maintain independent state
+            while scattering their currents back to the same compartment.
+        preserve_multiplicity : bool, optional
+            User-facing synonym for ``preserve_duplicate_indices``.
+        copies : int, optional
+            Number of independent copies of this insertion region to allocate.
+            ``copies > 1`` implies ``preserve_duplicate_indices=True`` and is
+            intended for compact banks of colocated point processes.
         **kwargs
             Additional keyword arguments to be passed to the compile_mechanism function.
         """
@@ -2091,6 +2113,13 @@ class Population(P, Sliceable):
             self._flag_rebuild = True
 
         validate(mechanism)
+        if preserve_multiplicity is not None:
+            preserve_duplicate_indices = bool(
+                preserve_duplicate_indices or preserve_multiplicity
+            )
+        copies = int(copies)
+        if copies < 1:
+            raise ValueError(f"copies must be a positive integer; got {copies!r}.")
 
         key = None
 
@@ -2098,12 +2127,25 @@ class Population(P, Sliceable):
             key = index_spec.index
 
         if key is None:
+            if copies != 1 or preserve_duplicate_indices:
+                raise ValueError(
+                    "copies and preserve_duplicate_indices are only supported "
+                    "for region-restricted mechanism insertions."
+                )
             self._mech_everywhere[mechanism] = (mechanism.__name__, ic, kwargs)
             return
 
         if mechanism in self._mech_everywhere:
             raise ValueError(f"Mechanism {mechanism} is already inserted everywhere.")
-        self._mech_data.setdefault(mechanism, []).append((alias, kwargs, key))
+        self._mech_data.setdefault(mechanism, []).append(
+            (
+                alias,
+                kwargs,
+                key,
+                bool(preserve_duplicate_indices or copies != 1),
+                copies,
+            )
+        )
 
     def ion_style(self, ion, einit, eadvance):
         """
@@ -2435,13 +2477,47 @@ class Population(P, Sliceable):
                 self._register_mech(m, shape, key)
 
             for mech, data in self._mech_data.items():
-                aliases, kwargs_list, keys = tuple(map(list, zip(*data)))
+                aliases = []
+                kwargs_list = []
+                keys = []
+                preserve_duplicate_indices = []
+                copies_list = []
+                for record in data:
+                    if len(record) == 3:
+                        alias, kwargs, key = record
+                        preserve = False
+                        copies = 1
+                    elif len(record) == 4:
+                        alias, kwargs, key, preserve = record
+                        copies = 1
+                    elif len(record) == 5:
+                        alias, kwargs, key, preserve, copies = record
+                    else:
+                        raise ValueError(
+                            "Mechanism insertion records must contain either "
+                            "(alias, kwargs, key), "
+                            "(alias, kwargs, key, preserve_duplicate_indices), "
+                            "or (alias, kwargs, key, preserve_duplicate_indices, copies)."
+                        )
+                    aliases.append(alias)
+                    kwargs_list.append(kwargs)
+                    keys.append(key)
+                    preserve_duplicate_indices.append(
+                        bool(preserve or int(copies) != 1)
+                    )
+                    copies_list.append(int(copies))
                 if not are_strings_unique(aliases):
                     raise ValueError(
                         f"Duplicate aliases found for mechanism {mech.__name__}."
                     )
                 m, shape, key = compile_mechanism(
-                    self, mech, keys, aliases, kwargs_list
+                    self,
+                    mech,
+                    keys,
+                    aliases,
+                    kwargs_list,
+                    preserve_duplicate_indices=preserve_duplicate_indices,
+                    copies=copies_list,
                 )
                 self._register_mech(m, shape, key)
 
@@ -2615,7 +2691,9 @@ class Population(P, Sliceable):
         exclude : str or list of str, optional
             Patterns to exclude from the search.
         fuzzy : bool, optional
-            If True, performs fuzzy matching. Default is True.
+            If True, use token-aware glob matching. Punctuation, including
+            underscores, dots, brackets, and parentheses, separates name tokens;
+            ``*`` explicitly matches zero or more characters. Default is True.
         match_case : bool, optional
             If True, matches case sensitively. Default is False.
         loc : float, optional
@@ -2629,7 +2707,7 @@ class Population(P, Sliceable):
             A slice object containing the indices of the matches.
         """
         return self[
-            :,
+            ...,
             self.find(
                 include=include,
                 exclude=exclude,
@@ -2649,7 +2727,9 @@ class Population(P, Sliceable):
         exclude : str or list of str, optional
             Patterns describing compartments to omit.
         fuzzy : bool, optional
-            If True, enable fuzzy matching. Default is True.
+            If True, use token-aware glob matching. Punctuation, including
+            underscores, dots, brackets, and parentheses, separates name tokens;
+            ``*`` explicitly matches zero or more characters. Default is True.
         match_case : bool, optional
             If True, perform case-sensitive matching. Default is False.
 
@@ -2687,7 +2767,12 @@ class Population(P, Sliceable):
         exclude : str or list of str, optional
             Patterns that must not be present. Defaults to ``'branchpoint'``.
         fuzzy : bool, optional
-            If True, enable fuzzy matching. Default is True.
+            If True, use token-aware glob matching. For example, ``"soma"``
+            matches ``"MelnickSG_soma(0.5)"`` and ``"Cell.soma[0](0.5)"``,
+            while ``"soma[0]"`` matches only that literal indexed section.
+            Adjacent letters or digits are not delimiters, so ``"myelin"`` does
+            not match ``"unmyelin"`` or ``"myelinated"``. Use ``"*myelin"``
+            to request the broader suffix match explicitly. Default is True.
         match_case : bool, optional
             If True, perform case-sensitive matching. Default is False.
         full_report : bool, optional
@@ -3631,12 +3716,21 @@ class Population(P, Sliceable):
             lines.append(f"  - {name} @ everywhere{ic_s}{kw}")
 
         for mech_cls, regions in idx:
-            # regions: List[(alias, kwargs, key)]
+            # regions: List[(alias, kwargs, key[, preserve_duplicate_indices[, copies]])]
             lines.append(f"  - {mech_cls.__name__} @ {len(regions)} region(s):")
-            for alias, kwargs, key in regions[: self._REPR_MAX_MECHS]:
+            for record in regions[: self._REPR_MAX_MECHS]:
+                alias, kwargs, key = record[:3]
+                preserve = bool(record[3]) if len(record) >= 4 else False
+                copies = int(record[4]) if len(record) >= 5 else 1
                 nm = alias if alias is not None else mech_cls.__name__
                 kw = f" {self._fmt_kwargs(kwargs)}" if (show_kwargs and kwargs) else ""
-                lines.append(f"      • {nm} @ {self._fmt_index(key)}{kw}")
+                extra = []
+                if preserve:
+                    extra.append("preserve_multiplicity=True")
+                if copies != 1:
+                    extra.append(f"copies={copies}")
+                extra_s = (" [" + ", ".join(extra) + "]") if extra else ""
+                lines.append(f"      • {nm} @ {self._fmt_index(key)}{extra_s}{kw}")
             if len(regions) > self._REPR_MAX_MECHS:
                 lines.append(f"      • …+{len(regions) - self._REPR_MAX_MECHS} more")
 
@@ -4199,6 +4293,71 @@ def _indices_to_slice_or_tensor(
         return torch_indices.to(device) if device else torch_indices
 
 
+_MORPHOLOGY_ALNUM = r"A-Za-z0-9"
+
+
+def _is_ascii_alnum(char: str) -> bool:
+    """Return whether *char* participates in a morphology identifier token."""
+    return len(char) == 1 and char.isascii() and char.isalnum()
+
+
+def _glob_body_regex(pattern: str) -> str:
+    """Escape a find pattern while retaining ``*`` as a glob wildcard."""
+    return ".*".join(re.escape(part) for part in pattern.split("*"))
+
+
+def _fuzzy_name_regex(pattern: str) -> str:
+    """Build a token-aware glob regex for morphology/name searches.
+
+    Dendra names commonly combine an owning object, a section name, an optional
+    NEURON section-array index, and a segment location, for example::
+
+        MelnickSG_soma(0.5)
+        Cell[0].soma[0](0.5)
+
+    Python's ``\b`` treats an underscore as a word character. Consequently, a
+    query such as ``"soma"`` used not to match ``"MelnickSG_soma(0.5)"`` even
+    though an underscore is a structural delimiter in these names. Use explicit
+    alphanumeric boundaries instead: punctuation (including ``_``, ``.``, ``[``,
+    ``]``, ``(``, and ``)``) separates tokens, while adjacent letters or digits do
+    not.
+
+    All characters except ``*`` are literal. An asterisk is an explicit glob
+    wildcard matching zero or more characters. Thus ``"myelin"`` remains
+    distinct from ``"unmyelin"``, while ``"*myelin"`` intentionally matches
+    both suffixes. Selectors such as ``"soma[0]"`` keep their brackets literal.
+    """
+    if not isinstance(pattern, str):
+        raise TypeError(
+            "Compartment search patterns must be strings; "
+            f"received {type(pattern).__name__}."
+        )
+    if not pattern:
+        return ""
+
+    body = _glob_body_regex(pattern)
+
+    # A leading wildcard deliberately permits an alphanumeric prefix (for
+    # example, ``*myelin`` matching ``unmyelin``). Otherwise, protect selectors
+    # that begin like identifiers from matching inside a larger identifier.
+    left = (
+        rf"(?<![{_MORPHOLOGY_ALNUM}])"
+        if pattern[0] != "*" and _is_ascii_alnum(pattern[0])
+        else ""
+    )
+
+    # Likewise, a trailing wildcard deliberately permits an alphanumeric suffix.
+    # Without one, require an identifier boundary after names and indexed
+    # selectors so ``myelin`` does not match ``myelinated`` and ``soma[0]`` does
+    # not match ``soma[0]extra``.
+    right = (
+        rf"(?![{_MORPHOLOGY_ALNUM}])"
+        if pattern[-1] != "*" and (_is_ascii_alnum(pattern[-1]) or pattern[-1] in "])")
+        else ""
+    )
+    return f"{left}{body}{right}"
+
+
 def find_indices_smart(
     data: List[str],
     include: Optional[Union[str, List[str]]] = None,
@@ -4214,9 +4373,19 @@ def find_indices_smart(
     Finds indices based on criteria and returns detailed results including local indices
     for each included pattern.
 
-    Handles complex patterns like 'axon[0]' correctly. If fuzzy=True:
-    - A simple pattern like 'axon' will match 'axon', 'axon[0]', but not 'taxons'.
-    - A complex pattern like 'axon[0]' will match strings containing the literal 'axon[0]'.
+    When ``fuzzy=True``, matching is morphology-token aware and supports
+    ``*`` as an explicit glob wildcard:
+
+    - ``"soma"`` matches ``"soma"``, ``"MelnickSG_soma(0.5)"``, and
+      ``"Cell[0].soma[0](0.5)"``, but not ``"presoma"`` or ``"somatic"``.
+    - ``"soma[0]"`` matches the literal indexed section and not ``"soma[1]"``.
+    - ``"myelin"`` does not match ``"unmyelin"``, ``"demyelin"``, or
+      ``"myelinated"`` because adjacent letters and digits remain part of the
+      same identifier token.
+    - ``"*myelin"`` deliberately matches suffixes such as ``"myelin"`` and
+      ``"unmyelin"``; ``"myelin*"`` deliberately permits a suffix.
+    - Apart from ``*``, selector characters are literal, and punctuation
+      delimits tokens.
 
     Parameters
     ----------
@@ -4227,7 +4396,8 @@ def find_indices_smart(
     exclude (Optional[Union[str, List[str]]]):
         Patterns to exclude.
     fuzzy (bool):
-        If True, performs smart whole-word/substring matching. If False, an exact match.
+        If True, performs token-aware glob matching with ``*`` as the only
+        wildcard. If False, requires an exact full-string match.
     match_case (bool):
         If True, the matching is case-sensitive.
     device (Optional[torch.device]):
@@ -4258,10 +4428,7 @@ def find_indices_smart(
 
     def _make_mask(pat: str) -> pd.Series:
         if fuzzy:
-            if re.search(r"[^a-zA-Z0-9_]", pat):
-                rgx = re.escape(pat)
-            else:
-                rgx = rf"\b{re.escape(pat)}(?![a-zA-Z0-9])"
+            rgx = _fuzzy_name_regex(pat)
             return s.str.contains(rgx, case=match_case, regex=True, na=False)
         else:
             a = s.str.lower() if not match_case else s
@@ -4479,7 +4646,7 @@ class Axon(Population):
         Slice
             A sliced view of the axon at the specified relative positions.
         """
-        return self[:, self.c(*args)]
+        return self[..., self.c(*args)]
 
 
 def _match_state_dict(
@@ -4991,6 +5158,90 @@ def _handle_pure_slice_union(
 
 
 # The main entrypoint function
+
+
+def compose_or_flatten_multiset(
+    indices: List[Any],
+    shape: Tuple[int, ...],
+    preserve_duplicate_indices: List[bool],
+    copies: List[int] | None = None,
+) -> Tuple[List[int], bool, Tuple[int, ...], List[List[int]]]:
+    """Compose mechanism placement while preserving selected duplicates.
+
+    ``compose_or_flatten_union`` intentionally collapses overlapping insertion
+    regions into one mechanism state per compartment.  That is the correct
+    default for distributed mechanisms, but it prevents efficient banks of
+    colocated point processes: several independent synapses may live at one
+    compartment and should scatter-add their currents back to that compartment.
+
+    This helper is an opt-in multiset variant.  Records marked with
+    ``preserve_duplicate_indices=True`` allocate a fresh local mechanism slot
+    for every selected compartment occurrence.  Unmarked records retain the
+    ordinary unique-sharing behavior among themselves.  The result is always a
+    flat advanced-index placement so repeated compartment keys are preserved.
+    """
+
+    empty_shape = (0,)
+    empty_locals = [[] for _ in indices]
+    if not indices:
+        return [], False, empty_shape, []
+    if not shape or not all(s > 0 for s in shape):
+        return [], False, empty_shape, empty_locals
+    if len(preserve_duplicate_indices) != len(indices):
+        raise ValueError(
+            "preserve_duplicate_indices must have one entry per mechanism insertion."
+        )
+    if copies is None:
+        copies = [1] * len(indices)
+    if len(copies) != len(indices):
+        raise ValueError("copies must have one entry per mechanism insertion.")
+    copies = [int(c) for c in copies]
+    if any(c < 1 for c in copies):
+        raise ValueError("all copy counts must be positive integers.")
+
+    total_elements = int(np.prod(shape))
+    arr = np.arange(total_elements).reshape(shape)
+
+    total_indices: List[int] = []
+    local_indices: List[List[int]] = []
+    shared_local_by_global: Dict[int, int] = {}
+
+    for idx, preserve, n_copies in zip(indices, preserve_duplicate_indices, copies):
+        try:
+            selected = np.asarray(arr[idx]).reshape(-1)
+        except IndexError as e:
+            raise IndexError(
+                f"Indexer invalid for shape. Idx: {idx}, Shape: {shape}. Error: {e}"
+            ) from e
+
+        if bool(preserve):
+            locs = []
+            selected_list = [int(g_idx) for g_idx in selected.tolist()]
+            for _copy in range(int(n_copies)):
+                for g_idx in selected_list:
+                    locs.append(len(total_indices))
+                    total_indices.append(int(g_idx))
+            local_indices.append(locs)
+            continue
+
+        unique_selected = sorted(set(int(g) for g in selected.tolist()))
+        locs = []
+        for g_idx in unique_selected:
+            local = shared_local_by_global.get(g_idx)
+            if local is None:
+                local = len(total_indices)
+                shared_local_by_global[g_idx] = local
+                total_indices.append(int(g_idx))
+            locs.append(local)
+        local_indices.append(locs)
+
+    if not total_indices:
+        return [], False, empty_shape, empty_locals
+
+    final_shape = (len(total_indices),)
+    return total_indices, False, final_shape, local_indices
+
+
 def compose_or_flatten_union(
     indices: List[Any], shape: Tuple[int, ...]
 ) -> Tuple[Union[Tuple[slice, ...], List[int]], bool, Tuple[int, ...], List[List[int]]]:
@@ -5074,7 +5325,15 @@ def compose_or_flatten_union(
         return result_indices, False, final_shape, local_indices
 
 
-def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
+def compile_mechanism(
+    model,
+    mechanism,
+    indices,
+    aliases,
+    kwargs_list,
+    preserve_duplicate_indices=None,
+    copies=None,
+):
     """
     Compile a mechanism over a set of indices with alias-specific parameters.
 
@@ -5090,6 +5349,13 @@ def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
         Aliases assigned to each mechanism instance.
     kwargs_list : list of dict
         Additional keyword arguments for each aliased mechanism.
+    preserve_duplicate_indices : list of bool, optional
+        Per-insertion flags.  When any entry is true, selected duplicate
+        compartment indices for those insertions are retained as independent
+        local mechanism slots rather than collapsed into the default union.
+    copies : list of int, optional
+        Per-insertion copy counts. Values greater than one allocate repeated
+        independent local mechanism slots for the selected region.
 
     Returns
     -------
@@ -5097,9 +5363,26 @@ def compile_mechanism(model, mechanism, indices, aliases, kwargs_list):
         Tuple ``(mechanism_instance, parameter_shape, total_index)`` ready for
         registration via :meth:`Population._register_mech`.
     """
-    total_index, is_composable, shape, local_indices = compose_or_flatten_union(
-        indices, model.core_shape()
-    )
+    if preserve_duplicate_indices is None:
+        preserve_duplicate_indices = [False] * len(indices)
+    if copies is None:
+        copies = [1] * len(indices)
+    preserve_duplicate_indices = [bool(v) for v in preserve_duplicate_indices]
+    copies = [int(c) for c in copies]
+    preserve_duplicate_indices = [
+        bool(p or c != 1) for p, c in zip(preserve_duplicate_indices, copies)
+    ]
+    if any(preserve_duplicate_indices):
+        total_index, is_composable, shape, local_indices = compose_or_flatten_multiset(
+            indices,
+            model.core_shape(),
+            preserve_duplicate_indices,
+            copies,
+        )
+    else:
+        total_index, is_composable, shape, local_indices = compose_or_flatten_union(
+            indices, model.core_shape()
+        )
 
     shape_p = shape
     shape_f = shape

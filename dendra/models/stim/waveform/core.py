@@ -261,20 +261,43 @@ class Reciprocal(Waveform):
         return f"Reciprocal({repr(self.wf)}, eps={self.eps})"
 
 
+def _repeat_broadcast_param(x, t: torch.Tensor) -> torch.Tensor:
+    """
+    Canonicalize repeat controls so sweep axes broadcast over trailing time.
+
+    For repeat parameters, 1-D and 2-D tensors are interpreted as sweep axes,
+    not time-varying vectors. Higher-rank tensors may provide an explicit
+    trailing time axis.
+    """
+    if not torch.is_tensor(x):
+        x = t.new_tensor(x)
+    if x.ndim == 0 or t.ndim == 0:
+        return x
+    if x.ndim in (1, 2):
+        return x.unsqueeze(-1)
+    T = t.shape[-1]
+    if x.shape[-1] in (1, T):
+        return x
+    return x.unsqueeze(-1)
+
+
 class _repeat(Waveform):
+    Waveform.PARAMETER(freq=1.0, delay=0.0, off=torch.inf)
+
     def __init__(
         self, waveform, freq: float, delay: float = 0.0, off: float = torch.inf
     ):
-        super(_repeat, self).__init__()
+        super(_repeat, self).__init__(freq=freq, delay=delay, off=off)
         self.waveform = waveform
-        self.freq = freq
-        self.delay = delay
-        self.off = off
 
     def fn(self, t):
-        t_adjusted = t - self.delay
-        mask = (t >= self.delay) & (t < self.off)
-        t_periodic = torch.fmod(t_adjusted, 1.0 / self.freq)
+        freq = _repeat_broadcast_param(self.freq, t)
+        delay = _repeat_broadcast_param(self.delay, t)
+        off = _repeat_broadcast_param(self.off, t)
+
+        t_adjusted = t - delay
+        mask = (t >= delay) & (t < off)
+        t_periodic = torch.fmod(t_adjusted, 1.0 / freq)
         return torch.where(mask, self.waveform.fn(t_periodic), 0.0)
 
     def __repr__(self):

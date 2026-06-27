@@ -75,7 +75,8 @@ def test_against_neuron(d_lambda):
     rec1, rec2 = sim_and_rec_neuron(d_lambda)
     asc_file = str(Path(__file__).parent / "111200A.asc")
 
-    cell = dn.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
+    with dn.ctx(DTYPE="float64"):
+        cell = dn.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
     cell.insert(hh)
     cell.soma.inject(dn.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
     r_ind = cell.find("soma", loc=0.5, as_list=True)
@@ -83,7 +84,7 @@ def test_against_neuron(d_lambda):
 
     rec = dn.callbacks.Recorder(states=["v"], node_indices=r_ind)
 
-    cell.double().initialize()
+    cell.initialize()
     cell.run(tstop=10.0, dt=0.025, callbacks=[rec])
     v = rec.numpy("v")
 
@@ -99,7 +100,8 @@ def test_against_neuron_longrun(d_lambda):
     rec1, rec2 = sim_and_rec_neuron(d_lambda)
     asc_file = str(Path(__file__).parent / "111200A.asc")
 
-    cell = dn.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
+    with dn.ctx(DTYPE="float64"):
+        cell = dn.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
     cell.insert(hh)
     cell.soma.inject(dn.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
     r_ind = cell.find("soma", loc=0.5, as_list=True)
@@ -107,7 +109,7 @@ def test_against_neuron_longrun(d_lambda):
 
     rec = dn.callbacks.Recorder(states=["v"], node_indices=r_ind)
 
-    cell.double().initialize()
+    cell.initialize()
     cell.longrun(tstop=10.0, dt=0.025, chunklength=100, callbacks=[rec])
     v = rec.numpy("v")
 

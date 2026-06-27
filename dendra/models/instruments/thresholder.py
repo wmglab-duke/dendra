@@ -841,12 +841,10 @@ class Thresholder:
             return self.ub.cpu(), self.lb.cpu()
 
 
-@torch.jit.script
 def op_mc(s: Tensor, t: Tensor) -> Tensor:
     return torch.einsum("can,cat->tan", s, t).contiguous()
 
 
-@torch.jit.script
 def op_sc(s: Tensor, t: Tensor) -> Tensor:
     return torch.einsum("an,at->tan", s, t).contiguous()
 

@@ -72,6 +72,193 @@ class IndexSpec:
         return base[self.index].reshape(-1)
 
 
+def _population_flat_indices(model, index=None) -> torch.LongTensor:
+    """Return population-flat indices selected by ``index``."""
+    grid = torch.arange(
+        math.prod(tuple(model.shape)),
+        device=model.device(),
+        dtype=torch.long,
+    ).view(tuple(model.shape))
+    if index is None:
+        return grid.reshape(-1)
+    return grid[index].reshape(-1)
+
+
+def _mechanism_slot_to_flat_index(model, synapse) -> torch.LongTensor:
+    """Return the population-flat compartment index for each local mechanism slot."""
+    if getattr(synapse, "key", None) is None:
+        return torch.arange(
+            math.prod(tuple(model.shape)),
+            device=model.device(),
+            dtype=torch.long,
+        )
+    grid = torch.arange(
+        math.prod(tuple(model.shape)),
+        device=model.device(),
+        dtype=torch.long,
+    ).view(tuple(model.shape))
+    return synapse.get(grid).reshape(-1).to(dtype=torch.long)
+
+
+@dataclass(slots=True)
+class SynapseSlots:
+    """Explicit selection of local slots inside a point-process mechanism.
+
+    A regular :class:`Slice` identifies physical compartments.  That is enough
+    for distributed mechanisms, but a banked point-process mechanism can have
+    several independent local slots attached to the same compartment.  A
+    ``SynapseSlots`` object addresses those local slots directly while retaining
+    their mapping back to parent-population compartments.
+    """
+
+    model: Any
+    synapse: Any
+    local_index: torch.LongTensor
+    slot_to_flat_index: torch.LongTensor
+    name: Optional[str] = None
+
+    def __post_init__(self):
+        device = self.model.device()
+        local_index = torch.as_tensor(
+            self.local_index, device=device, dtype=torch.long
+        ).reshape(-1)
+        slot_to_flat_index = torch.as_tensor(
+            self.slot_to_flat_index, device=device, dtype=torch.long
+        ).reshape(-1)
+
+        n_slots = int(slot_to_flat_index.numel())
+        if torch.any(local_index < 0) or torch.any(local_index >= n_slots):
+            bad = local_index[(local_index < 0) | (local_index >= n_slots)][:10]
+            raise IndexError(
+                f"Synapse slot index out of range for mechanism "
+                f"{getattr(self.synapse, 'name', type(self.synapse).__name__)!r}: "
+                f"valid range is [0, {max(n_slots - 1, 0)}], got "
+                f"{bad.detach().cpu().tolist()}."
+            )
+
+        self.local_index = local_index
+        self.slot_to_flat_index = slot_to_flat_index
+        if self.name is None:
+            model_name = getattr(self.model, "name", "<population>")
+            syn_name = getattr(self.synapse, "name", type(self.synapse).__name__)
+            self.name = f"{model_name}.{syn_name}.slots"
+
+    @classmethod
+    def from_region(
+        cls,
+        model,
+        synapse,
+        *,
+        region_index=None,
+        slot_index=None,
+        name: Optional[str] = None,
+    ) -> "SynapseSlots":
+        """Create a slot selection from a population region and/or slot index.
+
+        ``slot_index`` addresses the mechanism's absolute local slot axis.  If
+        ``region_index`` is also provided, the selected absolute slots are
+        validated against that population region.  Relative selection within an
+        already-created slot view is available through ``SynapseSlots.__getitem__``.
+        """
+        slot_to_flat = _mechanism_slot_to_flat_index(model, synapse)
+        all_local = torch.arange(
+            slot_to_flat.numel(), device=model.device(), dtype=torch.long
+        )
+
+        if slot_index is None:
+            local = all_local
+        else:
+            spec = parse_key(
+                slot_index,
+                (int(slot_to_flat.numel()),),
+                device=model.device(),
+            )
+            local = all_local.reshape(-1)[spec.index].reshape(-1)
+
+        if region_index is not None:
+            region_flat = _population_flat_indices(model, region_index)
+            if region_flat.numel() == 0:
+                if slot_index is not None and local.numel() > 0:
+                    raise ValueError(
+                        "Selected synapse slot(s) are outside the requested "
+                        "population region."
+                    )
+                local = local[:0]
+            else:
+                selected_flat = slot_to_flat.index_select(0, local)
+                mask = torch.isin(selected_flat, region_flat)
+                if slot_index is not None and not bool(torch.all(mask)):
+                    bad = local[~mask][:10].detach().cpu().tolist()
+                    raise ValueError(
+                        "Selected synapse slot(s) are outside the requested "
+                        f"population region: {bad}."
+                    )
+                local = local[mask]
+
+        return cls(
+            model=model,
+            synapse=synapse,
+            local_index=local,
+            slot_to_flat_index=slot_to_flat,
+            name=name,
+        )
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return (int(self.local_index.numel()),)
+
+    @property
+    def index(self):
+        """Slot-local indices, provided for endpoint-like introspection."""
+        return self.local_index
+
+    @property
+    def is_empty(self) -> bool:
+        return int(self.local_index.numel()) == 0
+
+    @property
+    def flat_index(self) -> torch.LongTensor:
+        """Population-flat compartment index for each selected local slot."""
+        return self.slot_to_flat_index.index_select(0, self.local_index)
+
+    @property
+    def numel(self) -> int:
+        return int(self.local_index.numel())
+
+    def __len__(self) -> int:
+        return int(self.local_index.numel())
+
+    def __getitem__(self, key) -> "SynapseSlots":
+        spec = parse_key(key, self.shape, device=self.model.device())
+        selected = self.local_index.reshape(self.shape)[spec.index].reshape(-1)
+        return SynapseSlots(
+            model=self.model,
+            synapse=self.synapse,
+            local_index=selected,
+            slot_to_flat_index=self.slot_to_flat_index,
+            name=self.name,
+        )
+
+    def to(self, device=None) -> "SynapseSlots":
+        """Return a copy of the selection tensors on ``device``."""
+        if device is None:
+            device = self.model.device()
+        return SynapseSlots(
+            model=self.model,
+            synapse=self.synapse,
+            local_index=self.local_index.to(device=device),
+            slot_to_flat_index=self.slot_to_flat_index.to(device=device),
+            name=self.name,
+        )
+
+    def __repr__(self) -> str:
+        syn_name = getattr(self.synapse, "name", type(self.synapse).__name__)
+        return (
+            f"SynapseSlots(name={self.name!r}, synapse={syn_name!r}, "
+            f"n_slots={int(self.local_index.numel())})"
+        )
+
+
 class Slice:
     """
     Indexed view onto a subset of a :class:`dendra.models.core.Population`.
@@ -525,7 +712,35 @@ class Slice:
         else:
             model.injections.append((waveform, index_spec.shape, index_spec.index))
 
-    def insert(self, mechanism, alias=None, ic=None, **kwargs):
+    def slots(self, synapse, slot_index=None, *, local_index=None):
+        """Return synapse-local slots for ``synapse`` that lie in this slice.
+
+        ``Slice`` selects physical compartments.  For banked point-process
+        mechanisms, multiple independent slots may live on each selected
+        compartment; this method exposes those slots explicitly for network
+        connectivity.
+        """
+        if local_index is not None:
+            if slot_index is not None:
+                raise ValueError("Provide either slot_index or local_index, not both.")
+            slot_index = local_index
+        return SynapseSlots.from_region(
+            self.model,
+            synapse,
+            region_index=self.index,
+            slot_index=slot_index,
+        )
+
+    def insert(
+        self,
+        mechanism,
+        alias=None,
+        ic=None,
+        preserve_duplicate_indices: bool = False,
+        preserve_multiplicity: bool | None = None,
+        copies: int = 1,
+        **kwargs,
+    ):
         """
         Insert a mechanism restricted to this slice.
 
@@ -546,6 +761,16 @@ class Slice:
             Optional initial-conditions object or configuration passed through
             to the underlying ``insert`` call. (Exact semantics depend on the
             population implementation.)
+        preserve_duplicate_indices : bool, optional
+            If True, duplicate selected compartments are retained as independent
+            mechanism slots.  This is useful for colocated point-process banks
+            that should keep separate state while scattering current to the same
+            compartment.
+        preserve_multiplicity : bool, optional
+            User-facing synonym for ``preserve_duplicate_indices``.
+        copies : int, optional
+            Number of independent copies of this insertion region to allocate.
+            ``copies > 1`` implies duplicate preservation.
         **kwargs
             Additional keyword arguments forwarded to ``model.insert``.
 
@@ -565,10 +790,17 @@ class Slice:
         """
         if self.is_empty:
             return  # no-op for empty slices
+        if preserve_multiplicity is not None:
+            preserve_duplicate_indices = bool(
+                preserve_duplicate_indices or preserve_multiplicity
+            )
         object.__getattribute__(self, "model").insert(
             mechanism,
             alias=alias,
             index_spec=object.__getattribute__(self, "index_spec"),
+            ic=ic,
+            preserve_duplicate_indices=preserve_duplicate_indices,
+            copies=copies,
             **kwargs,
         )
 
@@ -905,6 +1137,22 @@ class Sliceable:
     def __init__(self):
         # Mapping from string labels to Slice objects (populated by Slice.label)
         self._labels = {}
+
+    def slots(self, synapse, slot_index=None, *, local_index=None):
+        """Return explicit local slots inside ``synapse``.
+
+        With no ``slot_index`` this returns every local slot in the mechanism.
+        Passing ``local_index`` or ``slot_index`` selects those local slots.
+        """
+        if local_index is not None:
+            if slot_index is not None:
+                raise ValueError("Provide either slot_index or local_index, not both.")
+            slot_index = local_index
+        return SynapseSlots.from_region(
+            self,
+            synapse,
+            slot_index=slot_index,
+        )
 
     def __getitem__(self, key):
         """

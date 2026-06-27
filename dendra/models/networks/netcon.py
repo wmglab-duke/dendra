@@ -1915,8 +1915,15 @@ class NetCon(Referency):
             self.advance = self.advance_diff
 
     def _ensure_connection_spike_buffers(self):
-        """Ensure dense/training paths have per-connection threshold state."""
-        if self.has_spiked.numel() != self._n_conn:
+        """Ensure dense/training paths have only the spike state they require."""
+        # An all-NaN threshold marks ``pre_var`` as an already-computed event or
+        # gate signal. ``determine_spiking_var`` mirrors that signal directly,
+        # so allocating one threshold-history boolean per connection is pure
+        # memory overhead and can misleadingly suggest that another crossing
+        # detector is active.
+        if self.skip_thresholding:
+            self.has_spiked = torch.empty(0, device=self.pre_device, dtype=torch.bool)
+        elif self.has_spiked.numel() != self._n_conn:
             self.has_spiked = torch.zeros(
                 self._n_conn, device=self.pre_device, dtype=torch.bool
             )
