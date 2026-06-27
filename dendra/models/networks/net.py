@@ -14,6 +14,8 @@ from dendra.helpers import (
     JIT,
     JIT_NETWORK_OPS,
     JIT_NETWORK_SOLVES,
+    compile_options_key,
+    current_compile_options,
     jit_enabled_for_scope,
 )
 
@@ -778,6 +780,8 @@ class Network(RNGMixin):
         # Legacy spelling retained as an attribute alias.
         self.jit_in_network = self.jit_network_solves
         self.compile_mode = COMPILE_MODE.value
+        self.compile_options = current_compile_options()
+        self.compile_options_key = compile_options_key(self.compile_options)
 
         self.is_batched = False
 
@@ -822,6 +826,8 @@ class Network(RNGMixin):
         self.jit_network_ops = bool(JIT_NETWORK_OPS)
         self.jit_in_network = self.jit_network_solves
         self.compile_mode = COMPILE_MODE.value
+        self.compile_options = current_compile_options()
+        self.compile_options_key = compile_options_key(self.compile_options)
         self.compile_network_ops = jit_enabled_for_scope("network_ops", self)
 
         for pop in self.populations.values():

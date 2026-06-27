@@ -10,8 +10,11 @@ from dendra.helpers import (
     DYNAMIC,
     FULLGRAPH,
     IMEM,
+    compile_options_key,
+    current_compile_options,
     detach_vars,
     jit_enabled_for_scope,
+    normalize_compile_options,
 )
 
 
@@ -257,12 +260,17 @@ class Integrator(torch.nn.Module):
         rule is intentionally avoided so that network-only solve JIT does not
         leak into standalone population runs.
         """
+        owner_compile_options = getattr(model, "compile_options", None)
+        if owner_compile_options is None:
+            owner_compile_options = current_compile_options()
+        compile_options = normalize_compile_options(owner_compile_options)
         new_config = (
             bool(jit_enabled_for_scope(scope, model)),
             getattr(model, "backend", _cfg_value(BACKEND)),
             bool(getattr(model, "fullgraph", bool(FULLGRAPH))),
             bool(getattr(model, "dynamic", bool(DYNAMIC))),
             getattr(model, "compile_mode", _cfg_value(COMPILE_MODE)),
+            compile_options_key(compile_options),
             scope,
         )
         old_config = (
@@ -271,6 +279,7 @@ class Integrator(torch.nn.Module):
             getattr(self, "fullgraph", None),
             getattr(self, "dynamic", None),
             getattr(self, "compile_mode", None),
+            getattr(self, "compile_options_key", None),
             getattr(self, "compile_scope", None),
         )
         (
@@ -279,8 +288,10 @@ class Integrator(torch.nn.Module):
             self.fullgraph,
             self.dynamic,
             self.compile_mode,
+            self.compile_options_key,
             self.compile_scope,
         ) = new_config
+        self.compile_options = compile_options
         if new_config != old_config:
             self._compiled_kernels.clear()
         return self
@@ -293,6 +304,8 @@ class Integrator(torch.nn.Module):
         )
         if self.compile_mode is not None:
             kwargs["mode"] = self.compile_mode
+        if self.compile_options is not None:
+            kwargs["options"] = dict(self.compile_options)
         return kwargs
 
     def clear_jit_cache(self):
@@ -367,6 +380,7 @@ class Integrator(torch.nn.Module):
             self.fullgraph,
             self.dynamic,
             self.compile_mode,
+            self.compile_options_key,
         )
         compiled = self._compiled_kernels.get(key)
         if compiled is None:

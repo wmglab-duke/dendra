@@ -33,6 +33,8 @@ from dendra.helpers import (
     JIT,
     JIT_NETWORK_OPS,
     JIT_NETWORK_SOLVES,
+    compile_options_key,
+    current_compile_options,
     current_device,
     current_dtype,
     op_mc,
@@ -282,6 +284,8 @@ class Population(P, Sliceable):
         self.jit_in_network = self.jit_network_solves
         self.imem = bool(IMEM)
         self.compile_mode = COMPILE_MODE.value
+        self.compile_options = current_compile_options()
+        self.compile_options_key = compile_options_key(self.compile_options)
         self.initializing_from_state_cache = False
 
         if self.imem:
@@ -398,6 +402,8 @@ class Population(P, Sliceable):
         self.jit_network_ops = bool(JIT_NETWORK_OPS)
         self.jit_in_network = self.jit_network_solves
         self.compile_mode = COMPILE_MODE.value
+        self.compile_options = current_compile_options()
+        self.compile_options_key = compile_options_key(self.compile_options)
 
         make_intra_config = (
             self.jit,
@@ -405,6 +411,7 @@ class Population(P, Sliceable):
             self.fullgraph,
             self.dynamic,
             self.compile_mode,
+            self.compile_options_key,
         )
         if getattr(self, "_make_intra_config", None) != make_intra_config:
             if self.jit:
@@ -415,6 +422,8 @@ class Population(P, Sliceable):
                 )
                 if self.compile_mode is not None:
                     kwargs["mode"] = self.compile_mode
+                if self.compile_options is not None:
+                    kwargs["options"] = dict(self.compile_options)
                 self.make_intra = torch.compile(make_intra, **kwargs)
             else:
                 self.make_intra = make_intra
