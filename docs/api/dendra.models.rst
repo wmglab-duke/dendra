@@ -30,3 +30,13 @@ Synapse slot targets
 --------------------
 .. autoclass:: dendra.models.slice.SynapseSlots
    :members:
+
+
+Random parameter declarations
+-----------------------------
+.. autoclass:: dendra.models.random_parameters.RandomParameterSpec
+   :members:
+.. autoclass:: dendra.models.random_parameters.DistributionSpec
+   :members:
+.. autofunction:: dendra.models.random_parameters.available_random_distributions
+.. autofunction:: dendra.models.random_parameters.register_random_distribution

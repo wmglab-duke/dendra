@@ -2468,6 +2468,7 @@ class Parameterized(SimpleParameterized):
                     self.keys[name] = key.to(torch.long)
                 else:
                     self.keys[name] = torch.cat([self.keys[name], key.to(torch.long)])
+        return parameter
 
     def populate_parameter_buffers(self, random_generation=None):
         """
