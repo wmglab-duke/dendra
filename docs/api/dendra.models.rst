@@ -32,11 +32,13 @@ Synapse slot targets
    :members:
 
 
-Random parameter declarations
------------------------------
+Random distributions and runtime noise
+--------------------------------------
 .. autoclass:: dendra.models.random_parameters.RandomParameterSpec
+   :members:
+.. autoclass:: dendra.models.random_parameters.RuntimeNoiseSpec
    :members:
 .. autoclass:: dendra.models.random_parameters.DistributionSpec
    :members:
-.. autofunction:: dendra.models.random_parameters.available_random_distributions
 .. autofunction:: dendra.models.random_parameters.register_random_distribution
+.. autofunction:: dendra.models.random_parameters.available_random_distributions

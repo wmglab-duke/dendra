@@ -1221,6 +1221,43 @@ class Mechanism(Parameterized):
                 state_module.resample_random_parameters(force=force)
         return self
 
+    def sample_runtime_noises_(
+        self,
+        *names,
+        dt=None,
+        phase: str | None = "pre_state",
+        step_index: int | None = None,
+        force: bool = False,
+    ):
+        """Sample mechanism-level and nested-State runtime noise in-place."""
+
+        if names:
+            local = tuple(n for n in names if n in self.runtime_noises)
+            if local:
+                super().sample_runtime_noises_(
+                    *local, dt=dt, phase=phase, step_index=step_index, force=force
+                )
+        else:
+            super().sample_runtime_noises_(
+                dt=dt, phase=phase, step_index=step_index, force=force
+            )
+        for state_module in self.DE.values():
+            if names:
+                local = tuple(n for n in names if n in state_module.runtime_noises)
+                if local:
+                    state_module.sample_runtime_noises_(
+                        *local, dt=dt, phase=phase, step_index=step_index, force=force
+                    )
+            else:
+                state_module.sample_runtime_noises_(
+                    dt=dt, phase=phase, step_index=step_index, force=force
+                )
+        return self
+
+    def resample_runtime_noise(self, *names, dt=None, phase=None):
+        self.sample_runtime_noises_(*names, dt=dt, phase=phase, force=True)
+        return self
+
     def initial(self, v):
         """
         Hook for subclasses to initialize buffers from membrane potential.

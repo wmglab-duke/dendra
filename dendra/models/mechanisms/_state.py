@@ -5,10 +5,12 @@ from types import MethodType
 import torch
 
 from dendra.models.parametric import Parameterized
+from dendra.models.rng import RNGModule
 
 from ._bufferimplicit import build_bufferimplicit
 from ._cnexp import build_cnexp
 from ._derivimplicit import build_derivimplicit
+from ._euler_maruyama import build_euler_maruyama
 from ._kinetic import kinetic_to_derivatives
 from ._linearimplicit import build_linearimplicit
 from ._mechanism import classproperty
@@ -88,7 +90,13 @@ def _merge_method_config(current_method, current_kwargs, method, kwargs):
 
 
 def build_integration_func(
-    states, assigned, derivative, method, eliminate=None, **method_kwargs
+    states,
+    assigned,
+    derivative,
+    method,
+    eliminate=None,
+    diffusion=None,
+    **method_kwargs,
 ):
     """Build the integration function for a State subclass."""
     method = _canonical_method_name(method)
@@ -99,6 +107,21 @@ def build_integration_func(
         raise ValueError(
             f"Unknown integration method: {method!r}. Valid methods are: {valid}."
         ) from exc
+
+    if diffusion:
+        if method != "euler_maruyama":
+            raise ValueError(
+                "State.DIFFUSION(...) requires State.METHOD('euler_maruyama') "
+                "in v1. Voltage/cable SDE solvers are intentionally out of scope."
+            )
+        return builder(
+            states,
+            assigned,
+            derivative,
+            eliminate=eliminate,
+            diffusion=diffusion,
+            **method_kwargs,
+        )
 
     return builder(
         states,
@@ -141,6 +164,12 @@ register_integration_method(
         "linear_be",
     ),
 )
+register_integration_method(
+    "euler_maruyama",
+    build_euler_maruyama,
+    aliases=("em", "sde", "euler-maruyama"),
+)
+
 register_integration_method(
     "rosenbrock",
     build_rosenbrock1,
@@ -189,6 +218,9 @@ class State(Parameterized):
     _kinetic = set()
     _kinetic_declarations = []
 
+    _diffusion = set()
+    _diffusion_declarations = []
+
     _assigned = set()
     _assigned_declarations = []
 
@@ -219,6 +251,7 @@ class State(Parameterized):
         new_derivative = set()
         new_assigned = set()
         new_kinetic = set()
+        new_diffusion = set()
         new_method = "cnexp"
         new_method_kwargs = {}
 
@@ -232,6 +265,8 @@ class State(Parameterized):
                 new_derivative.update(base._derivative)
             if "_kinetic" in base.__dict__:
                 new_kinetic.update(base._kinetic)
+            if "_diffusion" in base.__dict__:
+                new_diffusion.update(base._diffusion)
             if "_assigned" in base.__dict__:
                 new_assigned.update(base._assigned)
 
@@ -270,6 +305,11 @@ class State(Parameterized):
                 new_kinetic.update(k_list)
             State._kinetic_declarations = []
 
+        if State._diffusion_declarations:
+            for d_list in State._diffusion_declarations:
+                new_diffusion.update(d_list)
+            State._diffusion_declarations = []
+
         if State._assigned_declarations:
             for a_list in State._assigned_declarations:
                 new_assigned.update(a_list)
@@ -294,6 +334,7 @@ class State(Parameterized):
         cls._state_buffers = new_buffers
         cls._derivative = new_derivative
         cls._kinetic = new_kinetic
+        cls._diffusion = new_diffusion
         cls._assigned = list(new_assigned)
         cls._method = new_method
         cls._method_kwargs = dict(new_method_kwargs)
@@ -357,9 +398,21 @@ class State(Parameterized):
             _derivative,
             self.method,
             eliminate=cinfo,
+            diffusion=self._diffusion,
             **self.method_kwargs,
         )
         setattr(self, "solve", MethodType(ifunc, self))
+
+        self._sde_rng_names = ()
+        if self.method == "euler_maruyama":
+            self._sde_rng_names = tuple(f"{state}_dW_rng" for state in self._state)
+            for rng_name in self._sde_rng_names:
+                if not hasattr(self, rng_name):
+                    setattr(
+                        self,
+                        rng_name,
+                        RNGModule(None, shape_p=self.shape_p, shape_f=self.shape_f),
+                    )
 
     def populate_parameter_buffers(self, random_generation=None):
         super().populate_parameter_buffers(random_generation=random_generation)
@@ -447,6 +500,17 @@ class State(Parameterized):
         State._kinetic_declarations.append(args)
 
     @staticmethod
+    def DIFFUSION(*args):
+        """Declare diffusion coefficients for Euler-Maruyama state SDEs.
+
+        Each declaration has the form ``"x = sigma"`` and represents the
+        multiplicative noise coefficient in ``dx = f(x) dt + sigma dW``.
+        V1 supports this for ``State.METHOD("euler_maruyama")`` only; voltage
+        equation noise is intentionally handled by future stochastic integrators.
+        """
+        State._diffusion_declarations.append(args)
+
+    @staticmethod
     def ASSIGNED(*args):
         """
         Declare computed per-compartment variables used in derivatives.
@@ -501,6 +565,29 @@ class State(Parameterized):
 
     def advance(self, v, dt, states):
         return self.solve(dt, **self.breakpoint(v, states), **states)
+
+    def _sde_randn_like(self, state_name: str, like: torch.Tensor) -> torch.Tensor:
+        """Detached standard-normal increment for State SDE solvers."""
+        rng_name = f"{state_name}_dW_rng"
+        rng = getattr(self, rng_name)
+        if isinstance(rng, RNGModule):
+            rng.init(like.device)
+        with torch.no_grad():
+            return rng.randn(tuple(like.shape), device=like.device, dtype=like.dtype)
+
+    def init_rng(self):
+        super().init_rng()
+        for rng_name in getattr(self, "_sde_rng_names", ()):
+            rng = getattr(self, rng_name)
+            if isinstance(rng, RNGModule):
+                rng.init(self._init_device)
+
+    def reset_rng(self):
+        super().reset_rng()
+        for rng_name in getattr(self, "_sde_rng_names", ()):
+            rng = getattr(self, rng_name)
+            if isinstance(rng, RNGModule):
+                rng.reset()
 
     def initial(self, v):
         """

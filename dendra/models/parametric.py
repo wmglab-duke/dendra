@@ -15,8 +15,11 @@ from dendra.utils.dynamic_compilation import compile_generated_function
 from .modular import DNModule, matches_any_pattern
 from .random_parameters import (
     RandomParameterSpec,
+    RuntimeNoiseSpec,
     make_random_parameter_spec,
+    make_runtime_noise_spec,
     sample_random_parameter,
+    sample_runtime_noise,
 )
 from .rng import RNGModule
 
@@ -961,11 +964,16 @@ class SimpleParameterized(Referency):
         ``sigma`` are accepted only when they uniquely identify one declared
         random variable and do not collide with an ordinary declared parameter.
         """
-        if not kwargs or not getattr(cls, "_random_parameters", None):
+        if not kwargs:
+            return dict(kwargs or {})
+        specs = []
+        specs.extend(getattr(cls, "_random_parameters", {}).values())
+        specs.extend(getattr(cls, "_runtime_noises", {}).values())
+        if not specs:
             return dict(kwargs or {})
         ordinary_names = set(cls.all_parameter_names())
         bare_to_full = {}
-        for spec in cls._random_parameters.values():
+        for spec in specs:
             for param_name in spec.params:
                 bare_to_full.setdefault(param_name, []).append(
                     spec.full_parameter_name(param_name)
@@ -1469,6 +1477,12 @@ class Parameterized(SimpleParameterized):
     _range_rand_declarations = []
     _batch_rand_declarations = []
 
+    _runtime_noises = {}
+    _runtime_noises_defined_here = {}
+    _global_noise_declarations = []
+    _range_noise_declarations = []
+    _batch_noise_declarations = []
+
     _table = {}
     _table_defined_here = {}
     _table_declarations = []
@@ -1491,6 +1505,7 @@ class Parameterized(SimpleParameterized):
         new_batch_p = {}
         new_rng = {}
         new_random_parameters = {}
+        new_runtime_noises = {}
         new_table = {}
         new_global_n = {}
         new_range_n = {}
@@ -1515,6 +1530,8 @@ class Parameterized(SimpleParameterized):
                 new_rng.update(base._rng)
             if "_random_parameters" in base.__dict__:
                 new_random_parameters.update(base._random_parameters)
+            if "_runtime_noises" in base.__dict__:
+                new_runtime_noises.update(base._runtime_noises)
             if "_table" in base.__dict__:
                 new_table.update(base._table)
             if "_global_n" in base.__dict__:
@@ -1532,6 +1549,7 @@ class Parameterized(SimpleParameterized):
         cls._batch_p_defined_here = {}
         cls._rng_defined_here = {}
         cls._random_parameters_defined_here = {}
+        cls._runtime_noises_defined_here = {}
         cls._table_defined_here = {}
         cls._global_n_defined_here = {}
         cls._range_n_defined_here = {}
@@ -1607,6 +1625,26 @@ class Parameterized(SimpleParameterized):
         Parameterized._batch_rand_declarations = []
         _expand_random_distribution_parameters(cls, cls._random_parameters_defined_here)
 
+        # Add detached runtime-noise declarations. Distribution parameters are
+        # exposed as ordinary GLOBAL/RANGE/BATCH parameters, while the sampled
+        # noise buffer itself is updated in-place during simulation.
+        for declarations in (
+            Parameterized._global_noise_declarations,
+            Parameterized._range_noise_declarations,
+            Parameterized._batch_noise_declarations,
+        ):
+            for spec in declarations:
+                if spec.name in cls._runtime_noises_defined_here:
+                    raise ValueError(
+                        f"Runtime noise {spec.name!r} declared more than once "
+                        f"on {cls.__name__}."
+                    )
+                cls._runtime_noises_defined_here[spec.name] = spec
+        Parameterized._global_noise_declarations = []
+        Parameterized._range_noise_declarations = []
+        Parameterized._batch_noise_declarations = []
+        _expand_random_distribution_parameters(cls, cls._runtime_noises_defined_here)
+
         # Add table declarations
         if Parameterized._table_declarations:
             for t_dict in Parameterized._table_declarations:
@@ -1622,12 +1660,15 @@ class Parameterized(SimpleParameterized):
         new_batch_p.update(cls._batch_p_defined_here)
         new_rng.update(cls._rng_defined_here)
         new_random_parameters.update(cls._random_parameters_defined_here)
+        new_runtime_noises.update(cls._runtime_noises_defined_here)
         new_table.update(cls._table_defined_here)
         new_global_n.update(cls._global_n_defined_here)
         new_range_n.update(cls._range_n_defined_here)
         new_batch_n.update(cls._batch_n_defined_here)
 
-        random_sample_conflicts = set(new_random_parameters) & set().union(
+        stochastic_buffer_conflicts = (
+            set(new_random_parameters) | set(new_runtime_noises)
+        ) & set().union(
             set(new_global),
             set(new_global_p),
             set(new_global_n),
@@ -1641,10 +1682,10 @@ class Parameterized(SimpleParameterized):
             set(getattr(cls, "_params_p", {}).keys()),
             set(getattr(cls, "_params_n", {}).keys()),
         )
-        if random_sample_conflicts:
+        if stochastic_buffer_conflicts:
             raise ValueError(
-                "Random parameter sample buffer names conflict with declared "
-                f"parameters: {sorted(random_sample_conflicts)}."
+                "Stochastic sample/noise buffer names conflict with declared "
+                f"parameters: {sorted(stochastic_buffer_conflicts)}."
             )
 
         check_conflicts(
@@ -1685,6 +1726,7 @@ class Parameterized(SimpleParameterized):
         cls._batch_n = new_batch_n
         cls._rng = new_rng
         cls._random_parameters = new_random_parameters
+        cls._runtime_noises = new_runtime_noises
         cls._table = new_table
 
         assign_precendence(cls)
@@ -1908,6 +1950,91 @@ class Parameterized(SimpleParameterized):
         )
 
     @staticmethod
+    def GLOBALNOISE(
+        name: str,
+        *,
+        distribution: str = "normal",
+        seed: int | None = None,
+        rng_name: str | None = None,
+        cadence: str = "step",
+        phase: str = "pre_state",
+        scale: str = "standard",
+        **distribution_parameters,
+    ):
+        """Declare a detached scalar runtime-noise buffer.
+
+        Runtime noise is resampled in-place during simulation and does not
+        preserve gradients through its distribution parameters.
+        """
+        Parameterized._global_noise_declarations.append(
+            make_runtime_noise_spec(
+                name,
+                scope="global",
+                distribution=distribution,
+                seed=seed,
+                rng_name=rng_name,
+                cadence=cadence,
+                phase=phase,
+                scale=scale,
+                **distribution_parameters,
+            )
+        )
+
+    @staticmethod
+    def RANGENOISE(
+        name: str,
+        *,
+        distribution: str = "normal",
+        seed: int | None = None,
+        rng_name: str | None = None,
+        cadence: str = "step",
+        phase: str = "pre_state",
+        scale: str = "standard",
+        **distribution_parameters,
+    ):
+        """Declare a detached per-compartment runtime-noise buffer."""
+        Parameterized._range_noise_declarations.append(
+            make_runtime_noise_spec(
+                name,
+                scope="range",
+                distribution=distribution,
+                seed=seed,
+                rng_name=rng_name,
+                cadence=cadence,
+                phase=phase,
+                scale=scale,
+                **distribution_parameters,
+            )
+        )
+
+    @staticmethod
+    def BATCHNOISE(
+        name: str,
+        *,
+        distribution: str = "normal",
+        seed: int | None = None,
+        rng_name: str | None = None,
+        cadence: str = "step",
+        phase: str = "pre_state",
+        scale: str = "standard",
+        **distribution_parameters,
+    ):
+        """Declare a detached runtime-noise buffer with BATCH shape."""
+        Parameterized._batch_noise_declarations.append(
+            make_runtime_noise_spec(
+                name,
+                scope="batch",
+                distribution=distribution,
+                seed=seed,
+                rng_name=rng_name,
+                cadence=cadence,
+                phase=phase,
+                scale=scale,
+                **distribution_parameters,
+            )
+        )
+
+    @staticmethod
     def RNG(*args, **kwargs):
         """
         Declare RNG identifiers to instantiate device-local generators.
@@ -2009,6 +2136,7 @@ class Parameterized(SimpleParameterized):
 
         self.rng = self.__class__._rng.copy()
         self.random_parameters = self.__class__._random_parameters.copy()
+        self.runtime_noises = self.__class__._runtime_noises.copy()
         self._random_parameter_generation = {}
         self._random_parameter_initialized = {}
 
@@ -2056,6 +2184,7 @@ class Parameterized(SimpleParameterized):
         self.instantiate_batch(negative=True, **self.batch_n)
         self.instantiate_rng(**self.rng)
         self.instantiate_random_parameters(**self.random_parameters)
+        self.instantiate_runtime_noises(**self.runtime_noises)
         self.instantiate_additional_parameters(additional_parameters)
 
     def reshape(self, shape_p, shape_f):
@@ -2078,6 +2207,7 @@ class Parameterized(SimpleParameterized):
         self.instantiate_batch(positive=True, **self.batch_p)
         self.instantiate_batch(negative=True, **self.batch_n)
         self.instantiate_random_parameters(**self.random_parameters)
+        self.instantiate_runtime_noises(**self.runtime_noises)
 
     def _refresh_and_set(self, name, value):
         """
@@ -2262,14 +2392,42 @@ class Parameterized(SimpleParameterized):
                     RNGModule(spec.seed, shape_p=shape, shape_f=shape),
                 )
 
+    def instantiate_runtime_noises(self, **kwargs):
+        """Allocate detached runtime-noise buffers and RNG streams."""
+        for name, spec in kwargs.items():
+            if not isinstance(spec, RuntimeNoiseSpec):
+                raise TypeError(
+                    f"Runtime noise declarations must be RuntimeNoiseSpec "
+                    f"instances; got {type(spec).__name__} for {name!r}."
+                )
+            shape = self._runtime_noise_shape(spec)
+            if hasattr(self, name):
+                self._buffers.pop(name, None)
+            self.register_buffer(
+                name,
+                torch.empty(shape, device=self._init_device, dtype=self._init_dtype),
+            )
+            if not hasattr(self, spec.effective_rng_name):
+                setattr(
+                    self,
+                    spec.effective_rng_name,
+                    RNGModule(spec.seed, shape_p=shape, shape_f=shape),
+                )
+
     def _random_parameter_shape(self, spec: RandomParameterSpec):
-        if spec.scope == "global":
+        return self._stochastic_shape(spec.scope)
+
+    def _runtime_noise_shape(self, spec: RuntimeNoiseSpec):
+        return self._stochastic_shape(spec.scope)
+
+    def _stochastic_shape(self, scope: str):
+        if scope == "global":
             return ()
-        if spec.scope == "range":
+        if scope == "range":
             return self.shape_p
-        if spec.scope == "batch":
+        if scope == "batch":
             return self._batch_shape()
-        raise ValueError(f"Unknown random parameter scope: {spec.scope!r}")
+        raise ValueError(f"Unknown stochastic scope: {scope!r}")
 
     def init_rng(self):
         """
@@ -2283,6 +2441,10 @@ class Parameterized(SimpleParameterized):
             rng_module = getattr(self, spec.effective_rng_name)
             if isinstance(rng_module, RNGModule):
                 rng_module.init(self._init_device)
+        for spec in self.runtime_noises.values():
+            rng_module = getattr(self, spec.effective_rng_name)
+            if isinstance(rng_module, RNGModule):
+                rng_module.init(self._init_device)
 
     def reset_rng(self):
         """
@@ -2293,6 +2455,10 @@ class Parameterized(SimpleParameterized):
             if isinstance(rng_module, RNGModule):
                 rng_module.reset()
         for spec in self.random_parameters.values():
+            rng_module = getattr(self, spec.effective_rng_name)
+            if isinstance(rng_module, RNGModule):
+                rng_module.reset()
+        for spec in self.runtime_noises.values():
             rng_module = getattr(self, spec.effective_rng_name)
             if isinstance(rng_module, RNGModule):
                 rng_module.reset()
@@ -2468,7 +2634,6 @@ class Parameterized(SimpleParameterized):
                     self.keys[name] = key.to(torch.long)
                 else:
                     self.keys[name] = torch.cat([self.keys[name], key.to(torch.long)])
-        return parameter
 
     def populate_parameter_buffers(self, random_generation=None):
         """
@@ -2498,6 +2663,7 @@ class Parameterized(SimpleParameterized):
         self.load_additional_parameters()
         self.apply_parametrizations()
         self._sample_random_parameters(random_generation=random_generation)
+        self.sample_runtime_noises_(force=True, phase=None, dt=1.0)
         self.make_contiguous()
 
     def _sample_random_parameters(
@@ -2551,6 +2717,62 @@ class Parameterized(SimpleParameterized):
         self._sample_random_parameters(names or None, force=force)
         return self
 
+    def sample_runtime_noises_(
+        self,
+        *names,
+        dt=None,
+        phase: str | None = "pre_state",
+        step_index: int | None = None,
+        force: bool = False,
+    ):
+        """Resample detached runtime-noise buffers in-place.
+
+        This hot path intentionally runs under ``torch.no_grad()`` and preserves
+        buffer identity. Gradients do not flow through runtime-noise distribution
+        parameters.
+        """
+        if not self.runtime_noises:
+            return False
+        selected = (
+            tuple(self.runtime_noises) if not names else tuple(str(n) for n in names)
+        )
+        phase_norm = None if phase is None else str(phase).strip().lower()
+        any_sampled = False
+        with torch.no_grad():
+            for name in selected:
+                if name not in self.runtime_noises:
+                    raise KeyError(
+                        f"Unknown runtime noise {name!r}. Available runtime noises: "
+                        f"{tuple(self.runtime_noises)}."
+                    )
+                spec = self.runtime_noises[name]
+                if phase_norm is not None and spec.phase != phase_norm:
+                    continue
+                buffer = getattr(self, name)
+                rng = getattr(self, spec.effective_rng_name)
+                if isinstance(rng, RNGModule):
+                    rng.init(buffer.device)
+                distribution_params = {
+                    p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
+                }
+                sample = sample_runtime_noise(
+                    spec,
+                    distribution_params,
+                    rng,
+                    tuple(buffer.shape),
+                    device=buffer.device,
+                    dtype=buffer.dtype,
+                    dt=dt,
+                )
+                buffer.copy_(sample.to(device=buffer.device, dtype=buffer.dtype))
+                any_sampled = True
+        return any_sampled
+
+    def resample_runtime_noise(self, *names, dt=None, phase=None):
+        """Explicitly resample detached runtime-noise buffers."""
+        self.sample_runtime_noises_(*names, dt=dt, phase=phase, force=True)
+        return self
+
     def make_contiguous(self):
         """
         Ensure all parameter buffers are contiguous in memory.
@@ -2592,6 +2814,10 @@ class Parameterized(SimpleParameterized):
             if torch.is_tensor(b) and not b.is_contiguous():
                 setattr(self, name, b.contiguous())
         for name in self.random_parameters.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
+        for name in self.runtime_noises.keys():
             b = getattr(self, name)
             if torch.is_tensor(b) and not b.is_contiguous():
                 setattr(self, name, b.contiguous())
@@ -2713,11 +2939,16 @@ class Parameterized(SimpleParameterized):
         ``sigma`` are accepted only when they uniquely identify one declared
         random variable and do not collide with an ordinary declared parameter.
         """
-        if not kwargs or not getattr(cls, "_random_parameters", None):
+        if not kwargs:
+            return dict(kwargs or {})
+        specs = []
+        specs.extend(getattr(cls, "_random_parameters", {}).values())
+        specs.extend(getattr(cls, "_runtime_noises", {}).values())
+        if not specs:
             return dict(kwargs or {})
         ordinary_names = set(cls.all_parameter_names())
         bare_to_full = {}
-        for spec in cls._random_parameters.values():
+        for spec in specs:
             for param_name in spec.params:
                 bare_to_full.setdefault(param_name, []).append(
                     spec.full_parameter_name(param_name)
@@ -2768,15 +2999,26 @@ class Parameterized(SimpleParameterized):
 
     @classmethod
     def random_distribution_parameter_names(cls):
-        """Return generated distribution-parameter names for random buffers."""
+        """Return generated distribution-parameter names for random/RUNTIME buffers."""
         names = []
         for spec in getattr(cls, "_random_parameters", {}).values():
             names.extend(spec.parameter_names)
+        for spec in getattr(cls, "_runtime_noises", {}).values():
+            names.extend(spec.parameter_names)
         return list(dict.fromkeys(names))
+
+    @classmethod
+    def runtime_noise_names(cls):
+        """Return runtime-noise buffer names declared by this class."""
+        return list(getattr(cls, "_runtime_noises", {}).keys())
 
     def has_random_parameters(self):
         """Whether this object owns any sampled random-parameter buffers."""
         return bool(getattr(self, "random_parameters", None))
+
+    def has_runtime_noises(self):
+        """Whether this object owns detached runtime-noise buffers."""
+        return bool(getattr(self, "runtime_noises", None))
 
     def dtype(self):
         """

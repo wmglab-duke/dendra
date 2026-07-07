@@ -388,7 +388,18 @@ class Integrator(torch.nn.Module):
             self._compiled_kernels[key] = compiled
         return compiled(*args, **kwargs)
 
+    def _sample_runtime_noises(self):
+        """Refresh detached runtime NOISE buffers before the compiled step kernel.
+
+        Keeping this eager avoids putting the fast in-place NOISE path inside the
+        integrator's ``torch.compile`` region. State-level SDE increments remain
+        the responsibility of the generated State solver.
+        """
+        if hasattr(self.mech, "sample_runtime_noises_"):
+            self.mech.sample_runtime_noises_(dt=self.dt, phase="pre_state")
+
     def _call_kernel(self, name: str, *args, **kwargs):
+        self._sample_runtime_noises()
         return self._kernel(name, *args, **kwargs)
 
     def _refresh_solver_shape(self, model, *, block_dim=None):

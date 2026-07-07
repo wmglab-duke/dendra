@@ -298,6 +298,59 @@ class MechanismHandler(torch.nn.Module):
                 process.resample_random_parameters(*names, force=force)
         return self
 
+    def sample_runtime_noises_(
+        self,
+        *names,
+        dt=None,
+        phase: str | None = "pre_state",
+        step_index: int | None = None,
+        force: bool = False,
+    ):
+        """Refresh detached runtime ``NOISE`` buffers on mechanisms/processes.
+
+        The handler owns the population-level collection of inserted mechanisms,
+        so the integrator calls this single method before the compiled step
+        kernel.  Individual mechanisms and nested States still own the actual
+        runtime-noise declarations and in-place sampling logic.
+        """
+
+        any_sampled = False
+        for mech in self.mechanisms.values():
+            if hasattr(mech, "sample_runtime_noises_"):
+                any_sampled = (
+                    bool(
+                        mech.sample_runtime_noises_(
+                            *names,
+                            dt=dt,
+                            phase=phase,
+                            step_index=step_index,
+                            force=force,
+                        )
+                    )
+                    or any_sampled
+                )
+        for process in self.material_processes.values():
+            if hasattr(process, "sample_runtime_noises_"):
+                any_sampled = (
+                    bool(
+                        process.sample_runtime_noises_(
+                            *names,
+                            dt=dt,
+                            phase=phase,
+                            step_index=step_index,
+                            force=force,
+                        )
+                    )
+                    or any_sampled
+                )
+        return any_sampled
+
+    def resample_runtime_noise(self, *names, dt=None, phase=None):
+        """Explicitly resample detached runtime ``NOISE`` buffers."""
+
+        self.sample_runtime_noises_(*names, dt=dt, phase=phase, force=True)
+        return self
+
     def ion_init(self, temp) -> None:
         for ion in self.ions.values():
             ion.initialize(temp)
