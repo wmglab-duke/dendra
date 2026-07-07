@@ -13,6 +13,11 @@ from dendra.utils import PreparedInterp1d
 from dendra.utils.dynamic_compilation import compile_generated_function
 
 from .modular import DNModule, matches_any_pattern
+from .random_parameters import (
+    RandomParameterSpec,
+    make_random_parameter_spec,
+    sample_random_parameter,
+)
 from .rng import RNGModule
 
 _valid_param_type = Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
@@ -948,6 +953,42 @@ class SimpleParameterized(Referency):
         return True
 
     @classmethod
+    def normalize_random_kwargs(cls, kwargs):
+        """Normalize insertion kwargs for random distribution parameters.
+
+        Canonical names such as ``rvar_mu`` and ``rvar_sigma`` are left
+        unchanged. Bare distribution-parameter names such as ``mu`` or
+        ``sigma`` are accepted only when they uniquely identify one declared
+        random variable and do not collide with an ordinary declared parameter.
+        """
+        if not kwargs or not getattr(cls, "_random_parameters", None):
+            return dict(kwargs or {})
+        ordinary_names = set(cls.all_parameter_names())
+        bare_to_full = {}
+        for spec in cls._random_parameters.values():
+            for param_name in spec.params:
+                bare_to_full.setdefault(param_name, []).append(
+                    spec.full_parameter_name(param_name)
+                )
+        out = {}
+        for key, value in dict(kwargs).items():
+            if key in ordinary_names or key not in bare_to_full:
+                out[key] = value
+                continue
+            full_names = bare_to_full[key]
+            if len(full_names) != 1:
+                raise ValueError(
+                    f"Ambiguous random distribution override {key!r}. Use one of {full_names!r}."
+                )
+            full_name = full_names[0]
+            if full_name in out:
+                raise ValueError(
+                    f"Both {key!r} and {full_name!r} were provided; use only the canonical random-parameter name."
+                )
+            out[full_name] = value
+        return out
+
+    @classmethod
     def all_parameter_names(cls):
         """
         Get all declared parameter names for the class.
@@ -1153,6 +1194,36 @@ def check_conflicts(
             f"Parameter conflict detected: {duplicates}. "
             "A parameter cannot be defined in multiple categories."
         )
+
+
+def _random_scope_maps(cls, scope: str, constraint: str):
+    if scope == "global":
+        if constraint == "positive":
+            return cls._global_p_defined_here
+        if constraint == "negative":
+            return cls._global_n_defined_here
+        return cls._global_defined_here
+    if scope == "range":
+        if constraint == "positive":
+            return cls._range_p_defined_here
+        if constraint == "negative":
+            return cls._range_n_defined_here
+        return cls._range_defined_here
+    if scope == "batch":
+        if constraint == "positive":
+            return cls._batch_p_defined_here
+        if constraint == "negative":
+            return cls._batch_n_defined_here
+        return cls._batch_defined_here
+    raise ValueError(f"Unknown random parameter scope: {scope!r}")
+
+
+def _expand_random_distribution_parameters(cls, specs):
+    for spec in specs.values():
+        for param_name, default in spec.params.items():
+            full_name = spec.full_parameter_name(param_name)
+            constraint = spec.constraints.get(param_name, "real")
+            _random_scope_maps(cls, spec.scope, constraint)[full_name] = default
 
 
 def assign_precendence(cls):
@@ -1392,6 +1463,12 @@ class Parameterized(SimpleParameterized):
     _rng_defined_here = {}
     _rng_declarations = []
 
+    _random_parameters = {}
+    _random_parameters_defined_here = {}
+    _global_rand_declarations = []
+    _range_rand_declarations = []
+    _batch_rand_declarations = []
+
     _table = {}
     _table_defined_here = {}
     _table_declarations = []
@@ -1413,6 +1490,7 @@ class Parameterized(SimpleParameterized):
         new_batch = {}
         new_batch_p = {}
         new_rng = {}
+        new_random_parameters = {}
         new_table = {}
         new_global_n = {}
         new_range_n = {}
@@ -1435,6 +1513,8 @@ class Parameterized(SimpleParameterized):
                 new_batch_p.update(base._batch_p)
             if "_rng" in base.__dict__:
                 new_rng.update(base._rng)
+            if "_random_parameters" in base.__dict__:
+                new_random_parameters.update(base._random_parameters)
             if "_table" in base.__dict__:
                 new_table.update(base._table)
             if "_global_n" in base.__dict__:
@@ -1451,6 +1531,7 @@ class Parameterized(SimpleParameterized):
         cls._batch_defined_here = {}
         cls._batch_p_defined_here = {}
         cls._rng_defined_here = {}
+        cls._random_parameters_defined_here = {}
         cls._table_defined_here = {}
         cls._global_n_defined_here = {}
         cls._range_n_defined_here = {}
@@ -1506,6 +1587,26 @@ class Parameterized(SimpleParameterized):
             for rng_dict in Parameterized._rng_declarations:
                 cls._rng_defined_here.update(rng_dict)
             Parameterized._rng_declarations = []
+
+        # Add stochastic parameter declarations. Distribution parameters are
+        # exposed as ordinary GLOBAL/RANGE/BATCH parameters.
+        for declarations in (
+            Parameterized._global_rand_declarations,
+            Parameterized._range_rand_declarations,
+            Parameterized._batch_rand_declarations,
+        ):
+            for spec in declarations:
+                if spec.name in cls._random_parameters_defined_here:
+                    raise ValueError(
+                        f"Random parameter {spec.name!r} declared more than once "
+                        f"on {cls.__name__}."
+                    )
+                cls._random_parameters_defined_here[spec.name] = spec
+        Parameterized._global_rand_declarations = []
+        Parameterized._range_rand_declarations = []
+        Parameterized._batch_rand_declarations = []
+        _expand_random_distribution_parameters(cls, cls._random_parameters_defined_here)
+
         # Add table declarations
         if Parameterized._table_declarations:
             for t_dict in Parameterized._table_declarations:
@@ -1520,10 +1621,31 @@ class Parameterized(SimpleParameterized):
         new_batch.update(cls._batch_defined_here)
         new_batch_p.update(cls._batch_p_defined_here)
         new_rng.update(cls._rng_defined_here)
+        new_random_parameters.update(cls._random_parameters_defined_here)
         new_table.update(cls._table_defined_here)
         new_global_n.update(cls._global_n_defined_here)
         new_range_n.update(cls._range_n_defined_here)
         new_batch_n.update(cls._batch_n_defined_here)
+
+        random_sample_conflicts = set(new_random_parameters) & set().union(
+            set(new_global),
+            set(new_global_p),
+            set(new_global_n),
+            set(new_range),
+            set(new_range_p),
+            set(new_range_n),
+            set(new_batch),
+            set(new_batch_p),
+            set(new_batch_n),
+            set(getattr(cls, "_params", {}).keys()),
+            set(getattr(cls, "_params_p", {}).keys()),
+            set(getattr(cls, "_params_n", {}).keys()),
+        )
+        if random_sample_conflicts:
+            raise ValueError(
+                "Random parameter sample buffer names conflict with declared "
+                f"parameters: {sorted(random_sample_conflicts)}."
+            )
 
         check_conflicts(
             cls._global_defined_here,
@@ -1562,6 +1684,7 @@ class Parameterized(SimpleParameterized):
         cls._range_n = new_range_n
         cls._batch_n = new_batch_n
         cls._rng = new_rng
+        cls._random_parameters = new_random_parameters
         cls._table = new_table
 
         assign_precendence(cls)
@@ -1703,6 +1826,88 @@ class Parameterized(SimpleParameterized):
         Parameterized._batch_n_declarations.append(kwargs)
 
     @staticmethod
+    def GLOBALRAND(
+        name: str,
+        *,
+        distribution: str = "normal",
+        resample_on_initialize: bool = True,
+        seed: int | None = None,
+        reparameterized: bool = True,
+        rng_name: str | None = None,
+        **distribution_parameters,
+    ):
+        """Declare a sampled scalar buffer with parametric distribution parameters."""
+        Parameterized._global_rand_declarations.append(
+            make_random_parameter_spec(
+                name,
+                scope="global",
+                distribution=distribution,
+                resample_on_initialize=resample_on_initialize,
+                seed=seed,
+                reparameterized=reparameterized,
+                rng_name=rng_name,
+                **distribution_parameters,
+            )
+        )
+
+    @staticmethod
+    def RANGERAND(
+        name: str,
+        *,
+        distribution: str = "normal",
+        resample_on_initialize: bool = True,
+        seed: int | None = None,
+        reparameterized: bool = True,
+        rng_name: str | None = None,
+        **distribution_parameters,
+    ):
+        """Declare a sampled per-compartment buffer.
+
+        Distribution parameters are exposed as ordinary RANGE parameters named
+        ``<name>_<distribution_parameter>``. For example,
+        ``RANGERAND('rvar', distribution='normal', mu=0, sigma=1)`` declares a
+        sampled buffer ``rvar`` plus ``rvar_mu`` and positive ``rvar_sigma``
+        range parameters that can be locally overridden at insertion time.
+        """
+        Parameterized._range_rand_declarations.append(
+            make_random_parameter_spec(
+                name,
+                scope="range",
+                distribution=distribution,
+                resample_on_initialize=resample_on_initialize,
+                seed=seed,
+                reparameterized=reparameterized,
+                rng_name=rng_name,
+                **distribution_parameters,
+            )
+        )
+
+    @staticmethod
+    def BATCHRAND(
+        name: str,
+        *,
+        distribution: str = "normal",
+        resample_on_initialize: bool = True,
+        seed: int | None = None,
+        reparameterized: bool = True,
+        rng_name: str | None = None,
+        **distribution_parameters,
+    ):
+        """Declare a sampled buffer with BATCH-shaped distribution parameters."""
+        Parameterized._batch_rand_declarations.append(
+            make_random_parameter_spec(
+                name,
+                scope="batch",
+                distribution=distribution,
+                resample_on_initialize=resample_on_initialize,
+                seed=seed,
+                reparameterized=reparameterized,
+                rng_name=rng_name,
+                **distribution_parameters,
+            )
+        )
+
+    @staticmethod
     def RNG(*args, **kwargs):
         """
         Declare RNG identifiers to instantiate device-local generators.
@@ -1803,6 +2008,9 @@ class Parameterized(SimpleParameterized):
         self.global_n = self.__class__._global_n.copy()
 
         self.rng = self.__class__._rng.copy()
+        self.random_parameters = self.__class__._random_parameters.copy()
+        self._random_parameter_generation = {}
+        self._random_parameter_initialized = {}
 
         self.in_graph_parametrizations = {}
 
@@ -1847,6 +2055,7 @@ class Parameterized(SimpleParameterized):
         self.instantiate_batch(positive=True, **self.batch_p)
         self.instantiate_batch(negative=True, **self.batch_n)
         self.instantiate_rng(**self.rng)
+        self.instantiate_random_parameters(**self.random_parameters)
         self.instantiate_additional_parameters(additional_parameters)
 
     def reshape(self, shape_p, shape_f):
@@ -1868,6 +2077,7 @@ class Parameterized(SimpleParameterized):
         self.instantiate_batch(**self.batch_t)
         self.instantiate_batch(positive=True, **self.batch_p)
         self.instantiate_batch(negative=True, **self.batch_n)
+        self.instantiate_random_parameters(**self.random_parameters)
 
     def _refresh_and_set(self, name, value):
         """
@@ -2028,6 +2238,39 @@ class Parameterized(SimpleParameterized):
             rng = RNGModule(value, shape_p=self.shape_p, shape_f=self.shape_f)
             setattr(self, name, rng)
 
+    def instantiate_random_parameters(self, **kwargs):
+        """Allocate sampled random-parameter buffers and RNG streams."""
+        for name, spec in kwargs.items():
+            if not isinstance(spec, RandomParameterSpec):
+                raise TypeError(
+                    f"Random parameter declarations must be RandomParameterSpec "
+                    f"instances; got {type(spec).__name__} for {name!r}."
+                )
+            shape = self._random_parameter_shape(spec)
+            if hasattr(self, name):
+                self._buffers.pop(name, None)
+            self.register_buffer(
+                name,
+                torch.empty(shape, device=self._init_device, dtype=self._init_dtype),
+            )
+            self._random_parameter_generation.pop(name, None)
+            self._random_parameter_initialized[name] = False
+            if not hasattr(self, spec.effective_rng_name):
+                setattr(
+                    self,
+                    spec.effective_rng_name,
+                    RNGModule(spec.seed, shape_p=shape, shape_f=shape),
+                )
+
+    def _random_parameter_shape(self, spec: RandomParameterSpec):
+        if spec.scope == "global":
+            return ()
+        if spec.scope == "range":
+            return self.shape_p
+        if spec.scope == "batch":
+            return self._batch_shape()
+        raise ValueError(f"Unknown random parameter scope: {spec.scope!r}")
+
     def init_rng(self):
         """
         Initialize all RNG modules.
@@ -2035,7 +2278,11 @@ class Parameterized(SimpleParameterized):
         for name in self.__class__._rng.keys():
             rng_module = getattr(self, name)
             if isinstance(rng_module, RNGModule):
-                rng_module.init()
+                rng_module.init(self._init_device)
+        for spec in self.random_parameters.values():
+            rng_module = getattr(self, spec.effective_rng_name)
+            if isinstance(rng_module, RNGModule):
+                rng_module.init(self._init_device)
 
     def reset_rng(self):
         """
@@ -2043,6 +2290,10 @@ class Parameterized(SimpleParameterized):
         """
         for name in self.__class__._rng.keys():
             rng_module = getattr(self, name)
+            if isinstance(rng_module, RNGModule):
+                rng_module.reset()
+        for spec in self.random_parameters.values():
+            rng_module = getattr(self, spec.effective_rng_name)
             if isinstance(rng_module, RNGModule):
                 rng_module.reset()
 
@@ -2218,7 +2469,7 @@ class Parameterized(SimpleParameterized):
                 else:
                     self.keys[name] = torch.cat([self.keys[name], key.to(torch.long)])
 
-    def populate_parameter_buffers(self):
+    def populate_parameter_buffers(self, random_generation=None):
         """
         Reset parameter buffers to defaults, then apply overrides and parametrizations.
         """
@@ -2245,7 +2496,59 @@ class Parameterized(SimpleParameterized):
             getattr(self, name).copy_(self.evaluate(p_name))
         self.load_additional_parameters()
         self.apply_parametrizations()
+        self._sample_random_parameters(random_generation=random_generation)
         self.make_contiguous()
+
+    def _sample_random_parameters(
+        self, names=None, *, force: bool = False, random_generation=None
+    ):
+        if not self.random_parameters:
+            return False
+        selected = (
+            tuple(self.random_parameters) if not names else tuple(str(n) for n in names)
+        )
+        any_sampled = False
+        for name in selected:
+            if name not in self.random_parameters:
+                raise KeyError(
+                    f"Unknown random parameter {name!r}. Available random parameters: "
+                    f"{tuple(self.random_parameters)}."
+                )
+            spec = self.random_parameters[name]
+            initialized = self._random_parameter_initialized.get(name, False)
+            if not force:
+                if not spec.resample_on_initialize and initialized:
+                    continue
+                if spec.resample_on_initialize and random_generation is not None:
+                    previous = self._random_parameter_generation.get(name, None)
+                    if previous is random_generation or previous == random_generation:
+                        continue
+            buffer = getattr(self, name)
+            rng = getattr(self, spec.effective_rng_name)
+            if isinstance(rng, RNGModule):
+                rng.init(buffer.device)
+            distribution_params = {
+                p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
+            }
+            sample = sample_random_parameter(
+                spec,
+                distribution_params,
+                rng,
+                tuple(buffer.shape),
+                device=buffer.device,
+                dtype=buffer.dtype,
+            )
+            setattr(self, name, sample.to(device=buffer.device, dtype=buffer.dtype))
+            self._random_parameter_initialized[name] = True
+            if random_generation is not None:
+                self._random_parameter_generation[name] = random_generation
+            any_sampled = True
+        return any_sampled
+
+    def resample_random_parameters(self, *names, force: bool = True):
+        """Regenerate sampled random-parameter buffers."""
+        self._sample_random_parameters(names or None, force=force)
+        return self
 
     def make_contiguous(self):
         """
@@ -2284,6 +2587,10 @@ class Parameterized(SimpleParameterized):
             if torch.is_tensor(b) and not b.is_contiguous():
                 setattr(self, name, b.contiguous())
         for name in self.__class__._batch_n.keys():
+            b = getattr(self, name)
+            if torch.is_tensor(b) and not b.is_contiguous():
+                setattr(self, name, b.contiguous())
+        for name in self.random_parameters.keys():
             b = getattr(self, name)
             if torch.is_tensor(b) and not b.is_contiguous():
                 setattr(self, name, b.contiguous())
@@ -2397,6 +2704,42 @@ class Parameterized(SimpleParameterized):
                     )
 
     @classmethod
+    def normalize_random_kwargs(cls, kwargs):
+        """Normalize insertion kwargs for random distribution parameters.
+
+        Canonical names such as ``rvar_mu`` and ``rvar_sigma`` are left
+        unchanged. Bare distribution-parameter names such as ``mu`` or
+        ``sigma`` are accepted only when they uniquely identify one declared
+        random variable and do not collide with an ordinary declared parameter.
+        """
+        if not kwargs or not getattr(cls, "_random_parameters", None):
+            return dict(kwargs or {})
+        ordinary_names = set(cls.all_parameter_names())
+        bare_to_full = {}
+        for spec in cls._random_parameters.values():
+            for param_name in spec.params:
+                bare_to_full.setdefault(param_name, []).append(
+                    spec.full_parameter_name(param_name)
+                )
+        out = {}
+        for key, value in dict(kwargs).items():
+            if key in ordinary_names or key not in bare_to_full:
+                out[key] = value
+                continue
+            full_names = bare_to_full[key]
+            if len(full_names) != 1:
+                raise ValueError(
+                    f"Ambiguous random distribution override {key!r}. Use one of {full_names!r}."
+                )
+            full_name = full_names[0]
+            if full_name in out:
+                raise ValueError(
+                    f"Both {key!r} and {full_name!r} were provided; use only the canonical random-parameter name."
+                )
+            out[full_name] = value
+        return out
+
+    @classmethod
     def all_parameter_names(cls):
         """
         Returns a list of all parameter names in the model.
@@ -2416,6 +2759,23 @@ class Parameterized(SimpleParameterized):
             cls._range_n.keys(),
         )
         return list(dict.fromkeys(ordered_names))
+
+    @classmethod
+    def random_parameter_names(cls):
+        """Return sampled random-parameter buffer names declared by this class."""
+        return list(getattr(cls, "_random_parameters", {}).keys())
+
+    @classmethod
+    def random_distribution_parameter_names(cls):
+        """Return generated distribution-parameter names for random buffers."""
+        names = []
+        for spec in getattr(cls, "_random_parameters", {}).values():
+            names.extend(spec.parameter_names)
+        return list(dict.fromkeys(names))
+
+    def has_random_parameters(self):
+        """Whether this object owns any sampled random-parameter buffers."""
+        return bool(getattr(self, "random_parameters", None))
 
     def dtype(self):
         """

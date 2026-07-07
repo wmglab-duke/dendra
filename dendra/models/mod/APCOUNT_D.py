@@ -38,7 +38,7 @@ class apcount_d(M):
 
         s_t^\mathrm{soft} = \max(g_t - g_{t-1}, 0).
 
-    The assigned spike variable is
+    The buffer-backed spike variable is
 
     .. math::
 
@@ -60,7 +60,7 @@ class apcount_d(M):
         Multiplicative scale applied to the surrogate-gradient contribution.
         Default is 1.0.
 
-    Assigned variables
+    Buffer variables
     ------------------
     n : torch.Tensor
         Accumulated hard-forward spike count with surrogate gradients.
@@ -75,7 +75,7 @@ class apcount_d(M):
     """
 
     M.RANGE(threshold=0.0, tau_gate=0.5, ste_scale=1.0)
-    M.ASSIGNED("n", "spikes", "active", "h_prev")
+    M.BUFFER("n", "spikes", "active", "h_prev")
 
     @staticmethod
     def _tensor_like(x, ref):

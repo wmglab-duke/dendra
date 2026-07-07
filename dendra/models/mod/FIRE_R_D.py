@@ -37,7 +37,7 @@ class fire_r_d(VoltageProcess):
         Multiplicative scale applied to the surrogate-gradient contribution.
         Default is 1.0.
 
-    Assigned variables
+    Buffer variables
     ------------------
     is_refractory : torch.Tensor
         Boolean hard refractory state used by the forward pass.
@@ -57,7 +57,7 @@ class fire_r_d(VoltageProcess):
         tau_gate=0.5,
         ste_scale=1.0,
     )
-    VoltageProcess.ASSIGNED(
+    VoltageProcess.BUFFER(
         "is_refractory", "time_refractory", "spike_gate", "reset_gate"
     )
 

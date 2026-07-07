@@ -361,8 +361,8 @@ class State(Parameterized):
         )
         setattr(self, "solve", MethodType(ifunc, self))
 
-    def populate_parameter_buffers(self):
-        super().populate_parameter_buffers()
+    def populate_parameter_buffers(self, random_generation=None):
+        super().populate_parameter_buffers(random_generation=random_generation)
         if self.has_q10:
             if self.include_q10_in_comp_graph:
                 self.q10 = self.calc_q10
@@ -450,6 +450,13 @@ class State(Parameterized):
     def ASSIGNED(*args):
         """
         Declare computed per-compartment variables used in derivatives.
+
+        State ASSIGNED variables form an explicit contract with
+        :meth:`breakpoint`: each declared name should be computed there and
+        returned in the breakpoint dictionary. For persistent auxiliary storage
+        that does not participate in this return contract, use
+        :meth:`BUFFER`. Mechanism-level auxiliary storage is declared with
+        ``Mechanism.BUFFER(...)``.
 
         Parameters
         ----------

@@ -1770,7 +1770,7 @@ class Population(P, Sliceable):
             for h in self.pre_initialize_hooks:
                 h(self)
 
-    def populate(self):
+    def populate(self, random_generation=None):
         """
         Populate the model with mechanisms and parameters.
 
@@ -1778,8 +1778,8 @@ class Population(P, Sliceable):
         mechanisms and parameters are properly initialized and ready for use.
         It should be called after the model's build() method.
         """
-        self.populate_parameter_buffers()
-        self.mech.populate()
+        self.populate_parameter_buffers(random_generation=random_generation)
+        self.mech.populate(random_generation=random_generation)
         return self
 
     def populate_(self):
@@ -1788,6 +1788,41 @@ class Population(P, Sliceable):
         does not return self.
         """
         self.populate()
+
+    def _has_random_parameters_resampled_on_initialize(self):
+        """Return True if this population or any mechanism redraws on initialize."""
+
+        if any(spec.resample_on_initialize for spec in self.random_parameters.values()):
+            return True
+        mech_handler = getattr(self, "mech", None)
+        if mech_handler is None:
+            return False
+        for mech in getattr(mech_handler, "mechanisms", {}).values():
+            if any(
+                spec.resample_on_initialize for spec in mech.random_parameters.values()
+            ):
+                return True
+            for state_module in getattr(mech, "DE", {}).values():
+                if any(
+                    spec.resample_on_initialize
+                    for spec in state_module.random_parameters.values()
+                ):
+                    return True
+        return False
+
+    def resample_random_parameters(self, *names, force: bool = True):
+        """Resample random parameters on the population and inserted mechanisms."""
+
+        if names:
+            local = tuple(n for n in names if n in self.random_parameters)
+            if local:
+                super().resample_random_parameters(*local, force=force)
+        else:
+            super().resample_random_parameters(force=force)
+        if hasattr(self, "mech"):
+            self.mech.resample_random_parameters(*names, force=force)
+        self.clear_steady_state()
+        return self
 
     def _restore_steady_state(self):
         if "_steady_state" in self._caches:
@@ -1815,19 +1850,34 @@ class Population(P, Sliceable):
             The initialized population instance.
         """
         self.build(force_rebuild)
+        random_generation = object() if populate_parameter_buffers else None
+        if (
+            populate_parameter_buffers
+            and "_steady_state" in self._caches
+            and self._has_random_parameters_resampled_on_initialize()
+        ):
+            self.clear_steady_state()
         if populate_parameter_buffers:
-            self.populate_parameter_buffers()
+            self.populate_parameter_buffers(random_generation=random_generation)
         self.intra = self.build_intra()
         if self._restore_steady_state():
             return self
         self.integrator.init_v(self)
         self.pre_initialize()
         self.integrator.mech.initialize(
-            self.v, self.celsius, self.diam, populate=populate_parameter_buffers
+            self.v,
+            self.celsius,
+            self.diam,
+            populate=populate_parameter_buffers,
+            random_generation=random_generation,
         )
         self.post_initialize()
         self.integrator.mech.initialize(
-            self.v, self.celsius, self.diam, populate=populate_parameter_buffers
+            self.v,
+            self.celsius,
+            self.diam,
+            populate=populate_parameter_buffers,
+            random_generation=random_generation,
         )
         self.t = torch.zeros_like(self.t).detach()
         self.initialized = True
@@ -2122,6 +2172,10 @@ class Population(P, Sliceable):
             self._flag_rebuild = True
 
         validate(mechanism)
+        if hasattr(mechanism, "normalize_mech_kwargs"):
+            kwargs = mechanism.normalize_mech_kwargs(kwargs)
+        elif hasattr(mechanism, "normalize_random_kwargs"):
+            kwargs = mechanism.normalize_random_kwargs(kwargs)
         if preserve_multiplicity is not None:
             preserve_duplicate_indices = bool(
                 preserve_duplicate_indices or preserve_multiplicity
@@ -2141,8 +2195,10 @@ class Population(P, Sliceable):
                     "copies and preserve_duplicate_indices are only supported "
                     "for region-restricted mechanism insertions."
                 )
-            self._mech_everywhere[mechanism] = (mechanism.__name__, ic, kwargs)
-            return
+            if alias is None:
+                self._mech_everywhere[mechanism] = (mechanism.__name__, ic, kwargs)
+                return
+            key = torch.arange(math.prod(self.core_shape()), dtype=torch.long)
 
         if mechanism in self._mech_everywhere:
             raise ValueError(f"Mechanism {mechanism} is already inserted everywhere.")
@@ -2479,6 +2535,8 @@ class Population(P, Sliceable):
                 key = None
                 shape = self._calc_shape_p()
                 shape_f = self.shape
+                if hasattr(mech, "normalize_random_kwargs"):
+                    kwargs = mech.normalize_random_kwargs(kwargs)
                 mech.check_kwargs(kwargs)
                 m = mech(
                     name, self.celsius, self.diam, shape, shape_f, key, ic=ic, **kwargs
@@ -5412,6 +5470,8 @@ def compile_mechanism(
     additional_parameters = {}
 
     for alias, kwargs, idx in zip(aliases, kwargs_list, local_indices):
+        if hasattr(mechanism, "normalize_random_kwargs"):
+            kwargs = mechanism.normalize_random_kwargs(kwargs)
         for k, v in kwargs.items():
             additional_parameters.setdefault(k, []).append((alias, v, idx))
 

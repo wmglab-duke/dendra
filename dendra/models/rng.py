@@ -151,26 +151,63 @@ class RNGModule(RNGMixin):
         """Initialize the RNG for a specific device."""
         self.rng = self._rng(device)
 
-    def rand(self, shape=None):
+    def _generator_for(self, device=None):
+        if device is None:
+            if self.rng is None:
+                self.init("cpu")
+            return self.rng
+        dev = torch.device(device)
+        if self.rng is None or self.rng.device != dev:
+            try:
+                self.init(dev)
+            except (RuntimeError, TypeError):
+                self.init("cpu")
+        return self.rng
+
+    def rand(self, shape=None, *, device=None, dtype=None):
         """Generate uniform random numbers in [0, 1)."""
         if shape is None:
             shape = self.shape_f
-        return torch.rand(shape, generator=self.rng)
+        gen = self._generator_for(device)
+        dev = gen.device if device is None else torch.device(device)
+        try:
+            return torch.rand(shape, generator=gen, device=dev, dtype=dtype)
+        except (RuntimeError, TypeError):
+            cpu_gen = self._rng("cpu")
+            return torch.rand(shape, generator=cpu_gen, dtype=dtype).to(dev)
 
-    def randn(self, shape=None):
+    def randn(self, shape=None, *, device=None, dtype=None):
         """Generate standard normal random numbers."""
         if shape is None:
             shape = self.shape_f
-        return torch.randn(shape, generator=self.rng)
+        gen = self._generator_for(device)
+        dev = gen.device if device is None else torch.device(device)
+        try:
+            return torch.randn(shape, generator=gen, device=dev, dtype=dtype)
+        except (RuntimeError, TypeError):
+            cpu_gen = self._rng("cpu")
+            return torch.randn(shape, generator=cpu_gen, dtype=dtype).to(dev)
+
+    def rand_like(self, tensor):
+        """Generate uniform random numbers matching ``tensor``."""
+        return self.rand(tuple(tensor.shape), device=tensor.device, dtype=tensor.dtype)
+
+    def randn_like(self, tensor):
+        """Generate normal random numbers matching ``tensor``."""
+        return self.randn(tuple(tensor.shape), device=tensor.device, dtype=tensor.dtype)
 
     def binomial(self, n, p, shape=None):
         """Generate binomial random numbers."""
         if shape is None:
             shape = self.shape_f
+        if self.rng is None:
+            self.init("cpu")
         n = torch.as_tensor(n, device=self.rng.device).expand(shape)
         p = torch.as_tensor(p, device=self.rng.device).expand(shape)
         return torch.binomial(n, p, generator=self.rng)
 
     def reset(self):
         """Reseed the RNG to its initial state."""
+        if self.rng is None:
+            self.init("cpu")
         self.rng.manual_seed(self._base_seed)

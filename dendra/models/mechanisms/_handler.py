@@ -204,11 +204,11 @@ class MechanismHandler(torch.nn.Module):
                     self._map.append((c_idx, mech, f"{ion}_with_g", scale_f))
                     self._map_exp.append((c_idx, mech, f"{ion}", scale_f))
 
-    def initialize(self, v, celsius, diameters, populate=True):
+    def initialize(self, v, celsius, diameters, populate=True, random_generation=None):
         self.make_maps()
         self.init_rng()
         if populate:
-            self.populate()
+            self.populate(random_generation=random_generation)
         self.ion_init(celsius)
         self.material_init(celsius)
         self.set_buffers(diameters)
@@ -271,19 +271,32 @@ class MechanismHandler(torch.nn.Module):
         for process in self.material_processes.values():
             process.reset_rng()
 
-    def populate(self, mech=None) -> None:
+    def populate(self, mech=None, random_generation=None) -> None:
         if mech is not None:
             if mech in self.mechanisms:
-                self.mechanisms[mech].populate()
+                self.mechanisms[mech].populate(random_generation=random_generation)
             elif mech in self.material_processes:
-                self.material_processes[mech].populate()
+                self.material_processes[mech].populate(
+                    random_generation=random_generation
+                )
             else:
                 raise KeyError(mech)
         else:
             for mech in self.mechanisms.values():
-                mech.populate()
+                mech.populate(random_generation=random_generation)
             for process in self.material_processes.values():
-                process.populate()
+                process.populate(random_generation=random_generation)
+
+    def resample_random_parameters(self, *names, force: bool = True):
+        """Resample random parameters on all mechanisms that define them."""
+
+        for mech in self.mechanisms.values():
+            if hasattr(mech, "resample_random_parameters"):
+                mech.resample_random_parameters(*names, force=force)
+        for process in self.material_processes.values():
+            if hasattr(process, "resample_random_parameters"):
+                process.resample_random_parameters(*names, force=force)
+        return self
 
     def ion_init(self, temp) -> None:
         for ion in self.ions.values():

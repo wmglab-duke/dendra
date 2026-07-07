@@ -1,6 +1,18 @@
 dendra.models.mechanisms
 ========================
 
+Declaration naming
+------------------
+
+``State.ASSIGNED(...)`` and ``Mechanism.BUFFER(...)`` have different
+semantics. ``State.ASSIGNED`` declares values that a ``State.breakpoint``
+computes and returns for use in symbolic derivatives or kinetics.
+``Mechanism.BUFFER`` declares mechanism-level storage that is populated directly
+in ``initial`` or ``breakpoint`` and can be reused by current methods.
+
+``Mechanism.ASSIGNED(...)`` is retained as a deprecated compatibility alias for
+``Mechanism.BUFFER(...)``. Prefer ``Mechanism.BUFFER`` in new mechanisms.
+
 .. autoclass:: dendra.models.mechanisms.State
    :members:
    :inherited-members: Module, object

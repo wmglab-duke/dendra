@@ -9,7 +9,7 @@ class spikedetect(M):
 
     This mechanism detects a spike when the membrane potential crosses a threshold
     *from below* between two discrete simulation steps, and exposes the result as
-    an assigned variable `spikes`.
+    a buffer variable `spikes`.
 
     The key design goal is:
 
@@ -30,7 +30,7 @@ class spikedetect(M):
     Notes
     -----
 
-    **Assigned variables**
+    **Buffer variables**
 
     - spikes: Spike indicator per compartment for the current step.
       Forward semantics are approximately 0/1 (hard), but it is differentiable
@@ -117,7 +117,7 @@ class spikedetect(M):
     """
 
     M.RANGE(threshold=0.0, tau_gate=0.5, ste_scale=1.0)
-    M.ASSIGNED("spikes", "h_prev")
+    M.BUFFER("spikes", "h_prev")
 
     def initial(self, v):
         # Initialize the gate memory to the current gate so we do NOT emit a spike at t=0
