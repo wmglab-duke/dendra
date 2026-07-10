@@ -450,9 +450,11 @@ def expand(value, n, *, device=None, dtype=None):
         if torch.is_tensor(out) and (device is not None or dtype is not None):
             out = out.to(
                 device=device if device is not None else out.device,
-                dtype=dtype
-                if dtype is not None and torch.is_floating_point(out)
-                else out.dtype,
+                dtype=(
+                    dtype
+                    if dtype is not None and torch.is_floating_point(out)
+                    else out.dtype
+                ),
             )
         return out
     return torch.as_tensor(value, device=device, dtype=dtype).repeat(n)
@@ -516,9 +518,11 @@ def make_weight(weights, n, *, device=None, dtype=None):
             if torch.is_tensor(out) and (device is not None or dtype is not None):
                 out = out.to(
                     device=device if device is not None else out.device,
-                    dtype=dtype
-                    if dtype is not None and torch.is_floating_point(out)
-                    else out.dtype,
+                    dtype=(
+                        dtype
+                        if dtype is not None and torch.is_floating_point(out)
+                        else out.dtype
+                    ),
                 )
             return out
 
@@ -2674,10 +2678,10 @@ class Network(RNGMixin):
             pop.t.fill_(t)
 
         has_state_cache = bool(self._state_cache)
-        if has_state_cache:
-            self.initialize_pops_from_state_cache()
-
         dt_f = float(dt)
+        if has_state_cache:
+            self.initialize_pops_from_state_cache(dt=dt_f)
+
         for pop in self.populations.values():
             if not has_state_cache:
                 pop.initialize()
@@ -2711,10 +2715,24 @@ class Network(RNGMixin):
             self.netstim.detach()
         return self
 
-    def initialize_pops_from_state_cache(self):
+    def initialize_pops_from_state_cache(self, *, dt=None):
         for name, pop in self.populations.items():
+            # A cache can be loaded into a fresh, structurally equivalent
+            # network. Shape timestep-dependent integrator buffers before the
+            # strict state-dict load so scalar construction defaults (for
+            # example ``cmdt``) match initialized cached tensors.
+            pop.build()
+            if dt is not None:
+                dt_pop = torch.tensor(float(dt), device=pop.device(), dtype=pop.dtype())
+                pop.integrator._initialize(
+                    pop,
+                    dt_pop,
+                    force=pop.force_integrator_reinit(),
+                    compile_scope="network_population",
+                )
             pop.load_state_dict(self._state_cache[name])
             pop.detach()
+            pop.initialized = True
             pop.initializing_from_state_cache = True
 
     def initialize_synapses_from_state_cache(
@@ -2998,7 +3016,12 @@ class Network(RNGMixin):
         tstart = self.t.item()
 
         with ctx:
-            n_steps = int(tstop / self.dt)
+            # Exact decimal multiples such as 0.3 / 0.1 can evaluate one ulp
+            # below the integer (2.999...), causing a whole step to be lost.
+            # Moving the ratio by one representable float before flooring
+            # corrects that numerical artifact without rounding partial steps.
+            step_ratio = float(tstop) / dt_f
+            n_steps = math.floor(math.nextafter(step_ratio, math.inf))
 
             if with_intra:
                 intra = {
@@ -3029,6 +3052,7 @@ class Network(RNGMixin):
                 if with_extra:
                     extra_c = prepare_extra(extra, local_ind)
 
+                pre_step_hook(callbacks, self)
                 self._step(
                     self._population_step_items,
                     self._synapse_step_items,
@@ -3379,7 +3403,17 @@ class Network(RNGMixin):
         self._state_cache.clear()
         self._syn_cache.clear()
         for name, pop in self.populations.items():
-            self._state_cache[name] = pop.state_dict()
+            live_state = pop.state_dict()
+            cached_state = live_state.__class__(
+                (
+                    key,
+                    value.detach().clone() if torch.is_tensor(value) else value,
+                )
+                for key, value in live_state.items()
+            )
+            if hasattr(live_state, "_metadata"):
+                cached_state._metadata = live_state._metadata.copy()
+            self._state_cache[name] = cached_state
 
         event_cache = {}
         for name, syn in self.synapses.items():

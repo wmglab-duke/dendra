@@ -828,6 +828,10 @@ class NetStim(DNModule, Sliceable):
             else:
                 weight_idx = value
 
+        if (time_idx < -1).any():
+            raise IndexError("time_idx must be -1 or a valid bound-source index")
+        if (weight_idx < -1).any():
+            raise IndexError("weight_idx must be -1 or a valid bound-source index")
         if (time_idx >= 0).any():
             if self._sched_t_source is None:
                 raise RuntimeError("time_idx provided but no time source is bound")
@@ -1311,7 +1315,10 @@ class NetStim(DNModule, Sliceable):
                 self._prepend_batch_dims_to_tensor(getattr(self, name), dims),
             )
 
-        self.interval = self.interval.batch(n)
+        # Parametric.batch accepts one integer dimension at a time. Apply
+        # dimensions inside-out so ``batch((2, 3))`` prepends ``(2, 3)``.
+        for dim in reversed(dims):
+            self.interval.batch(dim)
 
         old_heaps = self._sched_heaps
         repeat_count = self._flat_numel_from_shape(dims)

@@ -1,6 +1,7 @@
 image: python:3.12-slim
 
 stages:
+  - test
   - build
   - release
   - deploy
@@ -47,6 +48,22 @@ before_script:
   - python -c "import torch; print('PyTorch:', torch.__version__)"
   - python -c "import dendra; print('Dendra:', dendra.__version__)"
   - python -c "import dendra_models; print('Dendra-Models:', dendra_models.__version__)"
+
+test:
+  stage: test
+  script:
+    - python -m pip install pytest pytest-cov
+    - python -m pytest tests --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=xml --cov-report=html --cov-fail-under=39
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    when: always
+    paths:
+      - htmlcov/
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    expire_in: 1 week
 
 build_docs:
   stage: build

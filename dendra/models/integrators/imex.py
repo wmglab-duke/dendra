@@ -31,7 +31,8 @@ def arnoldi(
     H = H_buf.narrow(1, 0, m).narrow(2, 0, m).zero_()
 
     beta = torch.linalg.norm(v0, dim=1)  # (B,)
-    V[:, :, 0] = v0 / beta[:, None]
+    safe_beta = torch.where(beta > 0, beta, torch.ones_like(beta))
+    V[:, :, 0] = v0 / safe_beta[:, None]
 
     for j in range(m):
         w = diag * V[:, :, j]
@@ -66,7 +67,8 @@ def lanczos(
 
     # β₀ = ∥v0∥, and v₁ = v0/β₀
     b0 = torch.linalg.norm(v0, dim=1)
-    V[:, :, 0] = v0 / b0[:, None]
+    safe_b0 = torch.where(b0 > 0, b0, torch.ones_like(b0))
+    V[:, :, 0] = v0 / safe_b0[:, None]
     prev_v = torch.zeros_like(v0)  # just store last v_j
 
     for j in range(m):
@@ -96,7 +98,8 @@ def lanczos(
         if j + 1 < m:
             T[:, j, j + 1] = b
             T[:, j + 1, j] = b
-            V[:, :, j + 1] = w / b[:, None]
+            safe_b = torch.where(b > 0, b, torch.ones_like(b))
+            V[:, :, j + 1] = w / safe_b[:, None]
             prev_v = vj
 
     return V, T, b0
@@ -151,7 +154,10 @@ def phi1_krylov_arnoldi_g(
 
     # 1) tiny blocks  ——  use series I + ½H
     if small.any():
-        phi[small] = eye_m + 0.5 * H[small, :, 0]
+        e1 = eye_m[..., :, 0]
+        if e1.dim() == 1:
+            e1 = e1.unsqueeze(0).expand_as(phi)
+        phi[small] = e1[small] + 0.5 * H_scaled[small, :, 0]
 
     # 2) regular blocks —— single solve
     if (~small).any():
@@ -197,7 +203,10 @@ def phi1_krylov_lanczos_g(
 
     # 1) tiny blocks  ——  use series I + ½H
     if small.any():
-        phi[small] = eye_m + 0.5 * H[small, :, 0]
+        e1 = eye_m[..., :, 0]
+        if e1.dim() == 1:
+            e1 = e1.unsqueeze(0).expand_as(phi)
+        phi[small] = e1[small] + 0.5 * H_scaled[small, :, 0]
 
     # 2) regular blocks —— single solve
     if (~small).any():

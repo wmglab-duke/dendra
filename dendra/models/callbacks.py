@@ -354,7 +354,7 @@ class AnomalyDetector(Callback):
         """Clear the anomaly mask so the detector can be reused."""
         if self.rec is not None:
             self.rec = torch.zeros(
-                self.rec.shape, dtype=torch.bool, device=self.rec.device()
+                self.rec.shape, dtype=torch.bool, device=self.rec.device
             )
 
     def numpy(self):
@@ -1277,7 +1277,7 @@ class ActiveALCount(APCount):
         at_least=1,
         inv=False,
     ):
-        super().__init__(threshold, t_start_check, node_check, dt)
+        super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
         self.at_least = at_least
         self.inv = inv
 
@@ -1719,23 +1719,23 @@ def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
 
 def _sliding_window_average(x, window_size: int):
     """
-    Compute the sliding (moving) window average along axis 0 for a 4D array/tensor,
+    Compute the sliding (moving) window average along axis 0 for a tensor,
     with padding so that the output has the same shape as the input.
 
-    For an input of shape (N, C, H, W) and a given window_size, the function pads the input
-    along axis 0 using edge replication and then computes the average over every consecutive window.
-    The output shape is (N, C, H, W).
+    The function pads the input along axis 0 using edge replication and then
+    computes the average over every consecutive window. All remaining dimensions
+    are treated as independent feature channels and the output shape matches the input.
 
     Parameters
     ----------
-    x : np.ndarray or torch.Tensor
-        A 4-dimensional array/tensor with shape (N, C, H, W).
+    x : torch.Tensor
+        A tensor with time or samples along axis 0.
     window_size : int
         The size of the sliding window (must be >= 1).
 
     Returns
     -------
-    out : same type as x
+    out : torch.Tensor
         The sliding window averages computed along axis 0 with the same shape as the input.
 
     Raises
@@ -1743,7 +1743,7 @@ def _sliding_window_average(x, window_size: int):
     ValueError
         If window_size is less than 1.
     TypeError
-        If x is not a NumPy array or a PyTorch tensor.
+        If x is not a PyTorch tensor.
     """
     if window_size < 1:
         raise ValueError("window_size must be at least 1.")
@@ -1759,53 +1759,49 @@ def _sliding_window_average(x, window_size: int):
     # ---------------------------
     # PyTorch implementation
     # ---------------------------
-    # x shape: (N, C, H, W)
-    N, C, H, W = x.shape
+    if not torch.is_tensor(x):
+        raise TypeError("x must be a PyTorch tensor.")
+    if x.ndim < 1 or x.shape[0] == 0:
+        raise ValueError("x must contain at least one sample along axis 0.")
+
+    # Treat every dimension after time as an independent channel. Recorder
+    # outputs are commonly 3-D, while other callers may use 4-D tensors.
+    N = x.shape[0]
+    feature_shape = x.shape[1:]
+    channels = int(x[0].numel())
 
     # Manually pad along axis 0 (the N dimension) using replication.
     # For pad_left, replicate the first slice; for pad_right, replicate the last slice.
     left_pad = (
-        x[0:1].expand(pad_left, -1, -1, -1)
+        x[0:1].expand((pad_left, *feature_shape))
         if pad_left > 0
-        else torch.empty(0, device=x.device, dtype=x.dtype)
+        else torch.empty((0, *feature_shape), device=x.device, dtype=x.dtype)
     )
     right_pad = (
-        x[-1:].expand(pad_right, -1, -1, -1)
+        x[-1:].expand((pad_right, *feature_shape))
         if pad_right > 0
-        else torch.empty(0, device=x.device, dtype=x.dtype)
+        else torch.empty((0, *feature_shape), device=x.device, dtype=x.dtype)
     )
     # Concatenate along dimension 0.
     x_padded = torch.cat([left_pad, x, right_pad], dim=0)
     N_padded = x_padded.shape[0]  # should equal N + (window_size - 1)
 
-    # Reshape so that the padded N dimension is the "length" dimension.
-    # Collapse (C, H, W) into the channel dimension and use a batch size of 1.
-    # New shape: (1, C*H*W, N_padded)
-    x_reshaped = x_padded.permute(1, 2, 3, 0).reshape(1, C * H * W, N_padded)
+    # Reshape so that the padded time dimension is the convolution length.
+    x_reshaped = x_padded.movedim(0, -1).reshape(1, channels, N_padded)
 
-    # Create an averaging kernel for each channel.
-    # For grouped conv1d with groups = C*H*W, the kernel should have shape:
-    # (C*H*W, 1, window_size)
+    # Create an averaging kernel for each flattened feature channel.
     kernel = (
-        torch.ones(C * H * W, 1, window_size, dtype=x.dtype, device=x.device)
+        torch.ones(channels, 1, window_size, dtype=x.dtype, device=x.device)
         / window_size
     )
 
     # Perform grouped convolution along the length dimension.
-    out_conv = F.conv1d(x_reshaped, kernel, groups=C * H * W)
-    # out_conv shape: (1, C*H*W, L) where L = N_padded - window_size + 1.
+    out_conv = F.conv1d(x_reshaped, kernel, groups=channels)
     L = out_conv.shape[-1]
     if L != N:
         raise RuntimeError(f"Unexpected output length: got {L}, expected {N}.")
 
-    # Reshape back to (1, C, H, W, N) and then permute to (N, C, H, W)
-    # First, view out_conv as (1, C, H, W, N)
-    out_5d = out_conv.view(1, C, H, W, N)
-    # Permute to bring the last dimension (N) to the front: (1, N, C, H, W)
-    out_perm = out_5d.permute(0, 4, 1, 2, 3)
-    # Remove the extra batch dimension (squeeze dimension 0)
-    out = out_perm.squeeze(0)
-    return out
+    return out_conv.squeeze(0).reshape(*feature_shape, N).movedim(-1, 0)
 
 
 # Public alias retained for tests and user code; Recorder uses the private name internally.

@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 import dendra as dn
@@ -81,3 +82,55 @@ def test_network_step_matches_one_step_run():
 
     assert torch.allclose(net_step.cell.v, net_run.cell.v)
     assert torch.allclose(net_step.t, net_run.t)
+
+
+def test_population_step_accepts_singleton_time_voltage_and_returns_model():
+    cell = _cell()
+    ve = torch.zeros((1, *cell.v.shape), dtype=cell.dtype())
+
+    returned = dn.step(cell, dt=0.01, ve=ve)
+
+    assert returned is cell
+    assert cell.t.item() == pytest.approx(0.01)
+
+
+def test_population_step_validates_initialization_and_extracellular_inputs():
+    cell = dn.SingleCompartment(N=1, C=1, v_init=-65.0)
+    cell.insert(pas, g=0.001, e=-70.0)
+    cell.build()
+
+    with pytest.raises(ValueError, match="initialized"):
+        dn.step(cell, dt=0.01)
+
+    cell.initialize()
+    with pytest.raises(ValueError, match="either 've' or 'extra'"):
+        dn.step(cell, dt=0.01, ve=torch.zeros_like(cell.v), extra=(None, None))
+
+
+def test_public_step_rejects_unsupported_objects():
+    with pytest.raises(TypeError, match="Population or Network"):
+        dn.step(object(), dt=0.01)
+
+
+def test_network_step_validates_timestep_and_population_only_voltage():
+    net = dn.Network({"cell": _cell()})
+
+    with pytest.raises(RuntimeError, match="no simulation timestep"):
+        dn.step(net)
+
+    net.initialize(0.01)
+    with pytest.raises(ValueError, match="timestep is"):
+        dn.step(net, dt=0.02)
+    with pytest.raises(TypeError, match="only valid for Population"):
+        dn.step(net, ve=torch.zeros_like(net.cell.v))
+
+    assert dn.step(net, dt=0.01) is net
+
+
+def test_network_instance_step_rejects_stale_wiring():
+    net = dn.Network({"cell": _cell()})
+    net.initialize(0.01)
+    net.built = False
+
+    with pytest.raises(RuntimeError, match="wiring has changed"):
+        net.step()

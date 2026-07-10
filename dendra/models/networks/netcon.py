@@ -3514,10 +3514,14 @@ class NetCon(Referency):
             return pres
 
         # Find each pre id in CSR unique list with searchsorted
+        if self._csr_pre_ids.numel() == 0:
+            return torch.empty(0, device=self.pre_device, dtype=torch.long)
         pos = torch.searchsorted(self._csr_pre_ids, pres)
-        valid = (pos < self._csr_pre_ids.numel()) & (
-            self._csr_pre_ids.index_select(0, pos) == pres
-        )
+        valid = pos < self._csr_pre_ids.numel()
+        # ``searchsorted`` returns len(ids) for values above the largest id.
+        # Clamp only for the lookup, then retain the explicit bounds mask.
+        safe_pos = pos.clamp_max(self._csr_pre_ids.numel() - 1)
+        valid = valid & (self._csr_pre_ids.index_select(0, safe_pos) == pres)
         if not bool(valid.any()):
             return torch.empty(0, device=self.pre_device, dtype=torch.long)
 
@@ -3848,21 +3852,27 @@ class NetCon(Referency):
         if not (con_idx.numel() == tms.numel() == widx.numel()):
             raise ValueError("indices, times_ms, and weight_idx must have same length")
 
-        steps = torch.round(tms / self.dt.to(tms.dtype)).to(torch.long)
-        if not allow_past:
-            cur = self.global_step.view(())
-            keep = steps >= cur
-            con_idx, steps, widx = con_idx[keep], steps[keep], widx[keep]
-            if con_idx.numel() == 0:
-                return
-
         if (con_idx < 0).any() or (con_idx >= self.pre_idx.numel()).any():
             raise IndexError("connection index out of range")
         if (widx < 0).any() or (widx >= self._sched_w_source.numel()).any():
             raise IndexError("weight_idx out of range for bound weight source")
 
+        steps = torch.round(tms / self.dt.to(tms.dtype)).to(torch.long)
+        if not allow_past:
+            cur = self.global_step.view(())
+            keep = steps >= cur
+            con_idx, tms, steps, widx = (
+                con_idx[keep],
+                tms[keep],
+                steps[keep],
+                widx[keep],
+            )
+            if con_idx.numel() == 0:
+                return
+
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
+        self.sched_time_ms = torch.cat([self.sched_time_ms, tms.to(dtype=dtype)], dim=0)
         self.sched_weight = torch.cat(
             [
                 self.sched_weight,
@@ -3871,6 +3881,13 @@ class NetCon(Referency):
             dim=0,
         )
         self.sched_weight_idx = torch.cat([self.sched_weight_idx, widx], dim=0)
+        self.sched_time_idx = torch.cat(
+            [
+                self.sched_time_idx,
+                torch.full((con_idx.numel(),), -1, device=device, dtype=torch.long),
+            ],
+            dim=0,
+        )
 
     def schedule_time_ref(
         self,
@@ -3981,6 +3998,7 @@ class NetCon(Referency):
         # legacy step field still populated from current source values (for non-diff path)
         tms_now = self._sched_t_source.index_select(0, tidx).to(torch.float32)
         steps = torch.round(tms_now / self.dt.to(torch.float32)).to(torch.long)
+        E_before = con_idx.numel()
         if not allow_past:
             cur = self.global_step.view(())
             keep = steps >= cur
@@ -3992,23 +4010,33 @@ class NetCon(Referency):
             )
             if con_idx.numel() == 0:
                 return
+        E_after = con_idx.numel()
 
         # weight value-mode (optional)
         if torch.is_tensor(weight):
-            w = weight.to(device=device, dtype=dtype).view(-1)
-            if w.numel() not in (1, con_idx.numel()):
-                raise ValueError("weight must be scalar or same length as con_indices")
-            if w.numel() == 1:
-                w = w.expand_as(con_idx)
+            w_raw = weight.to(device=device, dtype=dtype).view(-1)
+            if w_raw.numel() == 1:
+                w = w_raw.expand(E_after)
+            elif w_raw.numel() == E_before:
+                w = w_raw[keep] if not allow_past else w_raw
+            elif w_raw.numel() == E_after:
+                w = w_raw
+            else:
+                raise ValueError(
+                    f"weight must be scalar or have length {E_before} "
+                    f"(pre-filter) or {E_after} (post-filter)"
+                )
         else:
-            w = torch.full(
-                (con_idx.numel(),), float(weight), device=device, dtype=dtype
-            )
+            w = torch.full((E_after,), float(weight), device=device, dtype=dtype)
 
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
         self.sched_time_ms = torch.cat(
-            [self.sched_time_ms, torch.zeros_like(tms_now)], dim=0
+            [
+                self.sched_time_ms,
+                torch.zeros(E_after, device=device, dtype=dtype),
+            ],
+            dim=0,
         )  # value slot 0
         self.sched_time_idx = torch.cat([self.sched_time_idx, tidx], dim=0)
         self.sched_weight = torch.cat([self.sched_weight, w], dim=0)

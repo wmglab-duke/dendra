@@ -53,6 +53,24 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](ht
     - `pip install --editable ".[dev]"`
     - `pre-commit install`
 
+## ✅ Testing and code coverage
+
+The development dependencies include `pytest` and `pytest-cov`. Run the complete test suite from the repository root with:
+
+```bash
+python -m pytest tests
+```
+
+To measure both statement and branch coverage, print uncovered line numbers in the terminal, and generate a browsable HTML report:
+
+```bash
+python -m pytest tests --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=html
+```
+
+The `TOTAL` row is the overall coverage result. Open `htmlcov/index.html` to inspect coverage by module and identify untested lines and branches. Results can vary by platform because tests requiring optional CPU solvers, NEURON, CUDA, or Triton are skipped when those dependencies or devices are unavailable.
+
+GitLab CI runs the same branch-coverage measurement on CPU for every pipeline, enforces a ratcheted minimum, and retains both a browsable HTML report and a Cobertura report for GitLab's coverage visualization.
+
 
 🥳 You're all set!
 
