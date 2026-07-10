@@ -1,5 +1,6 @@
 import inspect
 import textwrap
+import warnings
 from types import MethodType
 from typing import Dict
 
@@ -68,6 +69,7 @@ def _mechanism_advance_signature(mech) -> tuple:
                 tuple(state_module._state),
                 getattr(type(state_module), "advance", None) is State.advance,
                 getattr(type(state_module), "breakpoint", None) is State.breakpoint,
+                getattr(state_module, "method", None),
             )
         )
     return (tuple(state_layout), tuple(mech._all_states))
@@ -121,6 +123,7 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
             state_var_names = tuple(state_module._state)
             uses_default_advance = (
                 getattr(type(state_module), "advance", None) is State.advance
+                and getattr(state_module, "method", None) != "euler_heun"
             )
             uses_default_breakpoint = (
                 getattr(type(state_module), "breakpoint", None) is State.breakpoint
@@ -193,7 +196,7 @@ class Mechanism(Parameterized):
     :class:`dendra.models.parametric.Parameterized` to leverage the shared
     parameter declaration and population infrastructure.
 
-    Use uppercase classmethods (``STATE``, ``GLOBAL``, ``RANGE``, ``ASSIGNED``,
+    Use uppercase classmethods (``STATE``, ``GLOBAL``, ``RANGE``, ``BUFFER``,
     ``USEION``, ``NONSPECIFIC_CURRENT``, etc.) at class definition time to
     declare structure. Override lowercase hooks (``initial``, ``breakpoint``,
     current methods) to implement behavior.
@@ -202,20 +205,22 @@ class Mechanism(Parameterized):
       State subclass manages its own state variables and derivatives. These are
       accessible via the ``mechanism.DE`` ModuleDict.
     - ``GLOBAL/RANGE``: shared vs per-compartment parameters.
-    - ``ASSIGNED``: mechanism-level buffers (analogous to State ``BUFFER``),
+    - ``BUFFER``: mechanism-level buffers (analogous to State ``BUFFER``),
       typically set in ``initial``/``breakpoint``.
+      ``ASSIGNED`` remains as a legacy alias for this declaration.
     - ``USEION``: ionic read/write dependencies.
     - ``NONSPECIFIC_CURRENT`` / current methods: contribute to membrane balance.
-    - ``initial(self, v)``: one-time setup; set ASSIGNED buffers, etc.
-    - ``breakpoint(self, v)``: per-step computation of currents/ASSIGNED values.
+    - ``initial(self, v)``: one-time setup; set mechanism buffers, etc.
+    - ``breakpoint(self, v)``: per-step computation of currents/buffer values.
 
     Notes
     -----
-    Subclasses declare state, assigned, and ionic variables using the
-    :meth:`STATE`, :meth:`ASSIGNED`, :meth:`SAVE`, :meth:`USEION`, and
+    Subclasses declare state, mechanism-buffer, and ionic variables using the
+    :meth:`STATE`, :meth:`BUFFER`, :meth:`SAVE`, :meth:`USEION`, and
     :meth:`NONSPECIFIC_CURRENT` helpers during class definition. Override
     :meth:`initial` and :meth:`breakpoint` to populate buffers and assemble
-    currents each step.
+    currents each step. ``ASSIGNED`` is retained as a deprecated alias for
+    :meth:`BUFFER` for compatibility with older mechanism definitions.
     """
 
     _state = set()
@@ -897,17 +902,40 @@ class Mechanism(Parameterized):
         Mechanism._state_declarations.append(args)
 
     @staticmethod
-    def ASSIGNED(*args):
+    def BUFFER(*args):
         """
-        Declare mechanism-level assigned buffers (analogous to State BUFFER).
+        Declare mechanism-level buffers.
+
+        These buffers are allocated per mechanism instance and are typically
+        populated in :meth:`initial` or :meth:`breakpoint`. They are analogous
+        to :meth:`State.BUFFER` rather than :meth:`State.ASSIGNED`: unlike a
+        State ASSIGNED variable, a mechanism buffer does not have to be
+        computed and returned from a state ``breakpoint`` function.
 
         Parameters
         ----------
         *args : str
-            Names of assigned buffers to allocate per instance. Populate these
-            in :meth:`initial` or :meth:`breakpoint`.
+            Names of mechanism buffers to allocate per instance.
         """
         Mechanism._assigned_declarations.append(args)
+
+    @staticmethod
+    def ASSIGNED(*args):
+        """
+        Deprecated alias for :meth:`BUFFER`.
+
+        Mechanism-level ``ASSIGNED`` historically declared mutable buffers.
+        New code should use ``Mechanism.BUFFER(...)`` to avoid confusion with
+        ``State.ASSIGNED(...)``, whose names must be computed by a State
+        ``breakpoint`` function.
+        """
+        warnings.warn(
+            "Mechanism.ASSIGNED(...) is deprecated; use Mechanism.BUFFER(...) "
+            "for mechanism-level buffers. State.ASSIGNED(...) is unchanged.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        Mechanism.BUFFER(*args)
 
     @staticmethod
     def SAVE(*args):
@@ -1086,9 +1114,9 @@ class Mechanism(Parameterized):
 
         Notes
         -----
-        Override to compute mechanism-level :meth:`ASSIGNED` buffers and
-        assemble currents (e.g., ``ina``, ``ik``, ``il``). Called each step
-        before current accumulation.
+        Override to compute mechanism-level :meth:`BUFFER` values and assemble
+        currents (e.g., ``ina``, ``ik``, ``il``). Called each step before
+        current accumulation.
         """
         return
 
@@ -1169,13 +1197,68 @@ class Mechanism(Parameterized):
         }
         return states
 
-    def populate(self):
+    def populate(self, random_generation=None):
         """
         Populate mechanism and nested state parameter buffers.
         """
-        self.populate_parameter_buffers()
+        self.populate_parameter_buffers(random_generation=random_generation)
         for state_module in self.DE.values():
-            state_module.populate_parameter_buffers()
+            state_module.populate_parameter_buffers(random_generation=random_generation)
+
+    def resample_random_parameters(self, *names, force: bool = True):
+        """Resample mechanism-level and nested-State random parameters."""
+
+        if names:
+            local = tuple(n for n in names if n in self.random_parameters)
+            if local:
+                super().resample_random_parameters(*local, force=force)
+        else:
+            super().resample_random_parameters(force=force)
+        for state_module in self.DE.values():
+            if names:
+                local = tuple(n for n in names if n in state_module.random_parameters)
+                if local:
+                    state_module.resample_random_parameters(*local, force=force)
+            else:
+                state_module.resample_random_parameters(force=force)
+        return self
+
+    def sample_runtime_noises_(
+        self,
+        *names,
+        dt=None,
+        phase: str | None = "pre_state",
+        step_index: int | None = None,
+        force: bool = False,
+    ):
+        """Sample mechanism-level and nested-State runtime noise in-place."""
+
+        if names:
+            local = tuple(n for n in names if n in self.runtime_noises)
+            if local:
+                super().sample_runtime_noises_(
+                    *local, dt=dt, phase=phase, step_index=step_index, force=force
+                )
+        else:
+            super().sample_runtime_noises_(
+                dt=dt, phase=phase, step_index=step_index, force=force
+            )
+        for state_module in self.DE.values():
+            if names:
+                local = tuple(n for n in names if n in state_module.runtime_noises)
+                if local:
+                    state_module.sample_runtime_noises_(
+                        *local, dt=dt, phase=phase, step_index=step_index, force=force
+                    )
+            else:
+                state_module.sample_runtime_noises_(
+                    dt=dt, phase=phase, step_index=step_index, force=force
+                )
+        return self
+
+    def resample_runtime_noise(self, *names, dt=None, phase=None):
+        self.sample_runtime_noises_(*names, dt=dt, phase=phase, force=True)
+        return self
 
     def initial(self, v):
         """
@@ -1188,7 +1271,7 @@ class Mechanism(Parameterized):
 
         Notes
         -----
-        Use this to populate mechanism-level :meth:`ASSIGNED` buffers (e.g.,
+        Use this to populate mechanism-level :meth:`BUFFER` values (e.g.,
         cached conductances) or perform any one-time setup before stepping.
         """
         return
@@ -1622,7 +1705,7 @@ class Mechanism(Parameterized):
             Backend selection policy.
         buffer_name : str, optional
             Name of the registered buffer. Defaults to
-            ``f"{name}_delay_buffer"``. Existing ``ASSIGNED`` buffers can be
+            ``f"{name}_delay_buffer"``. Existing mechanism ``BUFFER`` variables can be
             reused by passing their name here.
         pointer_name : str, optional
             Name of the circular-buffer write pointer.
@@ -2229,7 +2312,7 @@ class Mechanism(Parameterized):
         )
 
         # Expose the current variable immediately for introspection, even before
-        # the first timestep.  Subclasses may also declare it with ASSIGNED.
+        # the first timestep.  Subclasses may also declare it with BUFFER.
         if not hasattr(self, current_name):
             self.register_buffer(
                 current_name, torch.zeros_like(local_mask, dtype=dtype)
@@ -2498,7 +2581,7 @@ class ContinuousSynapse(Mechanism):
         assigned = list(names)
         if keep_old:
             assigned.extend(f"{name}_old" for name in names)
-        Mechanism.ASSIGNED(*assigned)
+        Mechanism.BUFFER(*assigned)
         ContinuousSynapse._continuous_input_declarations.append((names, bool(keep_old)))
 
     def reset_continuous_inputs(self):

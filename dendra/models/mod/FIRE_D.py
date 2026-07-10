@@ -47,14 +47,14 @@ class fire_d(VoltageProcess):
         Multiplicative scale applied to the surrogate-gradient contribution.
         Default is 1.0.
 
-    Assigned variables
+    Buffer variables
     ------------------
     reset_gate : torch.Tensor
         Hard-forward 0/1 reset indicator with a smooth surrogate gradient.
     """
 
     VoltageProcess.RANGE(threshold=-50.0, rest=-65.0, tau_gate=0.5, ste_scale=1.0)
-    VoltageProcess.ASSIGNED("reset_gate")
+    VoltageProcess.BUFFER("reset_gate")
 
     @staticmethod
     def _tensor_like(x, ref):

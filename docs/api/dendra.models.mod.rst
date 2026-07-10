@@ -21,6 +21,13 @@ In-built mechanisms.
 .. autoclass:: dendra.models.mod.pas
 .. autoclass:: dendra.models.mod.spikedetect
 
+Spike detector usage
+--------------------
+
+Use ``spikedetect`` when many outgoing connections share one voltage threshold.
+Connect from ``pre_var="mech.spikedetect.spikes"`` with ``threshold=None``
+to avoid duplicate thresholding inside every NetCon.
+
 Graded / continuous synapses
 ----------------------------
 

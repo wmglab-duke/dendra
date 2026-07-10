@@ -14,6 +14,8 @@ from dendra.helpers import (
     JIT,
     JIT_NETWORK_OPS,
     JIT_NETWORK_SOLVES,
+    compile_options_key,
+    current_compile_options,
     jit_enabled_for_scope,
 )
 
@@ -22,6 +24,7 @@ from ..core import Population, _match_state_dict, make_intra
 from ..multi import concat_models, indices
 from ..parametric import is_parametric, to_param
 from ..rng import RNGMixin
+from ..slice import SynapseSlots
 from .netcon import ContinuousCon, NetCon
 from .netstim import NetStim
 
@@ -87,8 +90,50 @@ def step_pop(integrator, model, dt, ve=None, intra=None):
 compiled_step_pop = step_pop
 
 
+def _named_items(collection):
+    """Return an iterable of ``(name, component)`` pairs.
+
+    ``Network`` caches device-ordered runtime schedules as tuples of named
+    pairs, while the public ``step`` helper historically accepted dict-like
+    containers.  This adapter keeps both call styles supported.
+    """
+    return collection.items() if hasattr(collection, "items") else collection
+
+
+def _component_device(component):
+    device = getattr(component, "device", None)
+    if callable(device):
+        try:
+            return torch.device(device())
+        except Exception:
+            return torch.device("cpu")
+    if device is not None:
+        try:
+            return torch.device(device)
+        except Exception:
+            return torch.device("cpu")
+    return torch.device("cpu")
+
+
+def _accelerator_first_step_items(collection):
+    """Stable device-aware ordering for per-step component launches.
+
+    CUDA and other accelerator operations are normally enqueued asynchronously
+    from the host.  Launching accelerator work before CPU work lets CPU-bound
+    model components run while accelerator kernels are already in flight.
+    The sort is stable, so relative order is preserved within each device class.
+    """
+    items = tuple(_named_items(collection))
+
+    def priority(item):
+        dev = _component_device(item[1])
+        return 1 if dev.type in ("cpu", "meta") else 0
+
+    return tuple(sorted(items, key=priority))
+
+
 def advance_populations(populations, dt, extra, intra):
-    for n, pop in populations.items():
+    for n, pop in _named_items(populations):
         step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
 
 
@@ -121,11 +166,11 @@ def step(
         # NetStim has explicit heap/schedule side effects; keep it eager unless
         # NetStim grows a compile-safe method of its own.
         netstim(t, bptt=netstim.training, dt=dt)
-    for target in continuous_targets.values():
+    for _, target in _named_items(continuous_targets):
         target.reset_continuous_inputs()
-    for c in continuous_synapses.values():
+    for _, c in _named_items(continuous_synapses):
         _advance_network_component(c, compile_network_ops=compile_network_ops)
-    for s in synapses.values():
+    for _, s in _named_items(synapses):
         _advance_network_component(s, compile_network_ops=compile_network_ops)
 
     # Population/integrator compilation is handled inside each integrator with
@@ -426,7 +471,6 @@ def batchify_index(old_shape, n: int, i: torch.Tensor) -> torch.Tensor:
     """
     Build i_n so that:
         t_n = t.unsqueeze(0).repeat(n, *([1]*len(old_shape)))   # n copies of t
-        # (Assuming t_n is contiguous; if you used expand(), call .contiguous() before .view)
         t_n.view(-1)[i_n] == t_n.reshape(n, -1)[..., i].reshape(-1)
 
     Args:
@@ -630,7 +674,8 @@ class Network(RNGMixin):
         are built, registered as attributes, and used as sources/targets for
         connectivity.
     netstim : NetStim, optional
-        Optional spike generator attached under the name ``netstim``.
+        Optional spike generator attached under the name ``netstim``. A source
+        may also be registered later with :meth:`attach_netstim`.
     seed : int, optional
         Seed for network-level RNG used in stochastic wiring utilities.
     track_netcon_events : bool, optional
@@ -682,6 +727,11 @@ class Network(RNGMixin):
             )
         if netstim is not None and not isinstance(netstim, NetStim):
             raise TypeError("netstim must be an instance of NetStim or None.")
+        if "netstim" in populations:
+            raise ValueError(
+                "'netstim' is reserved for the optional NetStim source and "
+                "cannot be used as a biological population name."
+            )
         super(Network, self).__init__(seed=seed)
         self.populations = populations
         for name, pop in populations.items():
@@ -689,7 +739,10 @@ class Network(RNGMixin):
             pop.name = name
             setattr(self, name, pop)
 
-        self.netstim = netstim
+        # Register an empty slot first.  A NetStim supplied to the constructor
+        # is attached through the same public path used for post-construction
+        # attachment below.
+        self.netstim = None
         self.track_netcon_events = bool(track_netcon_events)
         if netcon_delay_backend not in (
             "dense",
@@ -727,6 +780,8 @@ class Network(RNGMixin):
         # Legacy spelling retained as an attribute alias.
         self.jit_in_network = self.jit_network_solves
         self.compile_mode = COMPILE_MODE.value
+        self.compile_options = current_compile_options()
+        self.compile_options_key = compile_options_key(self.compile_options)
 
         self.is_batched = False
 
@@ -744,6 +799,14 @@ class Network(RNGMixin):
         )
 
         self.compile_network_ops = jit_enabled_for_scope("network_ops", self)
+
+        self._population_step_items = _accelerator_first_step_items(self.populations)
+        self._synapse_step_items = ()
+        self._continuous_synapse_step_items = ()
+        self._continuous_target_step_items = ()
+
+        if netstim is not None:
+            self.attach_netstim(netstim)
 
         # Track device signature to trigger rebuilds if placements change.
         self._device_sig = self._device_signature()
@@ -763,6 +826,8 @@ class Network(RNGMixin):
         self.jit_network_ops = bool(JIT_NETWORK_OPS)
         self.jit_in_network = self.jit_network_solves
         self.compile_mode = COMPILE_MODE.value
+        self.compile_options = current_compile_options()
+        self.compile_options_key = compile_options_key(self.compile_options)
         self.compile_network_ops = jit_enabled_for_scope("network_ops", self)
 
         for pop in self.populations.values():
@@ -967,6 +1032,86 @@ class Network(RNGMixin):
         """
         return next(iter(self.populations.values())).dtype()
 
+    def attach_netstim(self, netstim: NetStim, *, replace: bool = False):
+        """Attach a :class:`NetStim` after network construction.
+
+        The constructor's ``netstim=`` argument remains supported, but callers
+        may now build a purely cellular network first and add an artificial
+        source later::
+
+            net = dn.Network({"cell": cell})
+            net.build(dt)
+            net.attach_netstim(dn.NetStim(N=8))
+            net.connect_one_to_one(net.netstim[:], target, synapse)
+            net.initialize(dt)
+
+        Attaching a source invalidates materialized NetCons.  Likewise, every
+        subsequent ``connect*`` call invalidates them.  Call :meth:`build` or,
+        normally, :meth:`initialize` before the next :meth:`run`.  Attaching to
+        an already initialized/running network is supported structurally, but
+        reinitialization is required because rebuilding replaces all NetCon
+        runtime queues.
+
+        Parameters
+        ----------
+        netstim : NetStim
+            Artificial spike source to register as ``network.netstim``.
+        replace : bool, default False
+            Replace an existing NetStim.  When existing NetStim-sourced
+            connection specifications are present, replacement is accepted only
+            if the new source has the same shape, because those specifications
+            store source-flat indices.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
+        """
+        if not isinstance(netstim, NetStim):
+            raise TypeError("netstim must be an instance of NetStim.")
+        if "netstim" in self.populations:
+            raise ValueError(
+                "'netstim' is reserved for the optional NetStim source and "
+                "cannot be used as a biological population name."
+            )
+
+        current = self.netstim
+        if current is netstim:
+            return self
+        if current is not None and not replace:
+            raise RuntimeError(
+                "This Network already has a NetStim. Pass replace=True to "
+                "replace it explicitly."
+            )
+
+        has_netstim_specs = any(
+            pre_name == "netstim" for pre_name, *_ in self.synapse_spec.keys()
+        ) or any(
+            pre_name == "netstim"
+            for pre_name, *_ in self.continuous_synapse_spec.keys()
+        )
+        if current is not None and has_netstim_specs:
+            old_shape = tuple(current.shape)
+            new_shape = tuple(netstim.shape)
+            if old_shape != new_shape:
+                raise ValueError(
+                    "Cannot replace a NetStim with a different shape while "
+                    "NetStim-sourced connection specifications exist: "
+                    f"old shape={old_shape}, new shape={new_shape}. Clear and "
+                    "recreate those connections first."
+                )
+
+        netstim.name = "netstim"
+        if self.dt is not None and hasattr(netstim, "set_dt"):
+            netstim.set_dt(float(self.dt))
+        netstim.train(bool(self.training))
+        self.netstim = netstim
+
+        # Existing NetCon modules were built without this source (or against a
+        # replaced source) and must not be used again until rebuilt.
+        self.built = False
+        return self
+
     def clear_synapses(self):
         """
         Remove all queued synapse specs and built NetCon modules.
@@ -981,7 +1126,7 @@ class Network(RNGMixin):
         self.built = False
 
     def _normalize_endpoint(self, source, target):
-        """Normalize full populations/devices to slice-like endpoints."""
+        """Normalize full populations/devices to endpoint objects."""
         if isinstance(source, Population) or isinstance(source, NetStim):
             source = source[:]
         if isinstance(target, Population):
@@ -1086,7 +1231,11 @@ class Network(RNGMixin):
         }
 
     def _flat_selection(self, selection):
-        """Return selected population-flat indices for a Population/NetStim slice."""
+        """Return selected endpoint ids for a Slice or SynapseSlots selection."""
+        if isinstance(selection, SynapseSlots):
+            return selection.local_index.to(
+                device=selection.model.device(), dtype=torch.long
+            )
         model = selection.model
         return to_flat_idx_torch(
             model.shape,
@@ -1094,16 +1243,74 @@ class Network(RNGMixin):
             model.device(),
         ).to(torch.long)
 
+    def _target_id_universe_size(self, target, target_model):
+        if isinstance(target, SynapseSlots):
+            return int(target.slot_to_flat_index.numel())
+        return int(target_model.v.numel())
+
+    def _post_flat_by_target_id(self, target):
+        if isinstance(target, SynapseSlots):
+            return target.slot_to_flat_index
+        return None
+
+    def _validate_target_synapse_endpoint(self, target, synapse):
+        if isinstance(target, SynapseSlots):
+            if synapse is not None and synapse is not target.synapse:
+                raise ValueError(
+                    "The target SynapseSlots selection belongs to a different "
+                    "mechanism than the supplied synapse argument."
+                )
+            return target.synapse
+        if synapse is None:
+            raise TypeError(
+                "A postsynaptic synapse mechanism is required unless target is "
+                "a SynapseSlots selection."
+            )
+        return synapse
+
+    def _target_post_idx(self, target_model, post_ids, synapse, target):
+        """Convert generated target ids to synapse-local NetCon indices."""
+        if isinstance(target, SynapseSlots):
+            return post_ids.to(device=target_model.device(), dtype=torch.long)
+        return self._to_synapse_local_post_idx(
+            target_model,
+            post_ids.to(target_model.device()),
+            synapse,
+        )
+
     def _to_synapse_local_post_idx(self, target_model, post_flat, synapse):
         """
         Convert target population-flat indices to target synapse-local indices.
 
-        Connectivity rules operate in population-flat coordinates so that
-        autapse/multapse checks are well-defined. NetCon construction expects
-        target indices local to the target-side synapse mechanism, so conversion
-        happens only after the final edge set has been generated.
+        If a mechanism has multiple local slots at one physical compartment, a
+        compartment target is ambiguous. Use ``population.slots(...)`` or
+        ``slice.slots(...)`` to target a specific local slot.
         """
         post_flat = post_flat.to(device=target_model.device(), dtype=torch.long)
+
+        mech_key_flat = to_flat_idx_mech(
+            target_model.shape, synapse, target_model.device()
+        ).to(torch.long)
+        counts = torch.zeros(
+            target_model.v.numel(), device=target_model.device(), dtype=torch.long
+        )
+        if mech_key_flat.numel() > 0:
+            counts.scatter_add_(
+                0,
+                mech_key_flat,
+                torch.ones_like(mech_key_flat, dtype=torch.long),
+            )
+        selected_counts = counts.index_select(0, post_flat)
+        if torch.any(selected_counts > 1):
+            bad = post_flat[selected_counts > 1][:10].detach().cpu().tolist()
+            raise ValueError(
+                f"Target population '{target_model.name}' has multiple local "
+                f"slots of synapse '{synapse}' at physical target locations "
+                f"including {bad}. Use population.slots(synapse, ...) or "
+                "slice.slots(synapse, ...) to target synapse-local slots "
+                "explicitly."
+            )
+
         local = get_local_index(target_model, synapse, post_flat)
 
         if torch.any(local < 0):
@@ -1114,6 +1321,39 @@ class Network(RNGMixin):
             )
 
         return local
+
+    def synapse_slots(self, target, synapse=None, *, slots=None, local_index=None):
+        """Return explicit local slots of a postsynaptic mechanism.
+
+        This is a convenience wrapper around ``Population.slots`` and
+        ``Slice.slots``. It is useful for banked point-process mechanisms where
+        several independent synapse slots may share one physical compartment.
+        """
+        if local_index is not None:
+            if slots is not None:
+                raise ValueError("Provide either slots or local_index, not both.")
+            slots = local_index
+
+        if isinstance(target, SynapseSlots):
+            if synapse is not None and synapse is not target.synapse:
+                raise ValueError(
+                    "synapse argument does not match the supplied SynapseSlots."
+                )
+            return target if slots is None else target[slots]
+
+        if synapse is None:
+            raise TypeError(
+                "synapse_slots(target, synapse, ...) requires a postsynaptic "
+                "mechanism unless target is already a SynapseSlots selection."
+            )
+
+        if isinstance(target, Population):
+            return target.slots(synapse, local_index=slots)
+        if hasattr(target, "slots"):
+            return target.slots(synapse, local_index=slots)
+        raise TypeError(
+            "target must be a Population, Slice, or SynapseSlots selection."
+        )
 
     def _mechanism_from_pre_var(self, pre, pre_var):
         """Return the mechanism addressed by a ``mech.<alias>.<var>`` pre_var.
@@ -1255,15 +1495,56 @@ class Network(RNGMixin):
         post_pool,
         allow_autapses: bool,
         allow_multapses: bool,
+        target_id_universe_size: int | None = None,
+        post_flat_by_target_id: torch.Tensor | None = None,
     ):
         """
-        Generate edges in population-flat coordinates for one connection call.
+        Generate edges for one connection call.
+
+        ``pre_pool`` always uses source population-flat coordinates. ``post_pool``
+        normally uses target population-flat coordinates. For banked point-process
+        targeting, callers may instead pass target synapse-local slot ids and set
+        ``target_id_universe_size`` plus ``post_flat_by_target_id``. Autapse
+        filtering then compares presynaptic flat indices with the physical
+        compartment reached by each local slot, while multapse filtering treats
+        local slots as distinct targets.
         """
         device = source_model.device()
         pre_pool = pre_pool.to(device=device, dtype=torch.long)
         post_pool = post_pool.to(device=device, dtype=torch.long)
         same_population = source_model is target_model
+        target_id_universe_size = int(
+            target_model.v.numel()
+            if target_id_universe_size is None
+            else target_id_universe_size
+        )
+        if post_flat_by_target_id is not None:
+            post_flat_by_target_id = post_flat_by_target_id.to(
+                device=device, dtype=torch.long
+            )
         rule = str(rule).replace("-", "_")
+
+        def _post_flat_for_ids(ids):
+            ids = ids.to(device=device, dtype=torch.long)
+            if post_flat_by_target_id is None:
+                return ids
+            return post_flat_by_target_id.index_select(0, ids)
+
+        def _filter_autapses(pre_idx, post_idx):
+            if allow_autapses or not same_population or pre_idx.numel() == 0:
+                return pre_idx, post_idx
+            post_flat = _post_flat_for_ids(post_idx)
+            keep = pre_idx.to(device=device, dtype=torch.long) != post_flat
+            return pre_idx[keep], post_idx[keep]
+
+        def _filter_multapses(pre_idx, post_idx):
+            if allow_multapses or pre_idx.numel() <= 1:
+                return pre_idx, post_idx
+            return self._drop_multapses(
+                pre_idx,
+                post_idx,
+                num_targets_total=target_id_universe_size,
+            )
 
         if rule == "one_to_one":
             if pre_pool.numel() != post_pool.numel():
@@ -1272,36 +1553,14 @@ class Network(RNGMixin):
                     "the same number of elements."
                 )
             pre_idx, post_idx = pre_pool, post_pool
-
-            if not allow_autapses:
-                pre_idx, post_idx = self._drop_autapses(
-                    pre_idx,
-                    post_idx,
-                    same_population=same_population,
-                )
-            if not allow_multapses:
-                pre_idx, post_idx = self._drop_multapses(
-                    pre_idx,
-                    post_idx,
-                    num_targets_total=target_model.v.numel(),
-                )
+            pre_idx, post_idx = _filter_autapses(pre_idx, post_idx)
+            pre_idx, post_idx = _filter_multapses(pre_idx, post_idx)
             return pre_idx, post_idx
 
         if rule in ("all_to_all", "dense"):
             pre_idx, post_idx = self._all_to_all_edges(pre_pool, post_pool)
-
-            if not allow_autapses:
-                pre_idx, post_idx = self._drop_autapses(
-                    pre_idx,
-                    post_idx,
-                    same_population=same_population,
-                )
-            if not allow_multapses:
-                pre_idx, post_idx = self._drop_multapses(
-                    pre_idx,
-                    post_idx,
-                    num_targets_total=target_model.v.numel(),
-                )
+            pre_idx, post_idx = _filter_autapses(pre_idx, post_idx)
+            pre_idx, post_idx = _filter_multapses(pre_idx, post_idx)
             return pre_idx, post_idx
 
         if rule in ("pairwise_bernoulli", "bernoulli"):
@@ -1310,12 +1569,7 @@ class Network(RNGMixin):
                 raise ValueError("pairwise_bernoulli requires 0 <= p <= 1.")
 
             pre_idx, post_idx = self._all_to_all_edges(pre_pool, post_pool)
-            if not allow_autapses:
-                pre_idx, post_idx = self._drop_autapses(
-                    pre_idx,
-                    post_idx,
-                    same_population=same_population,
-                )
+            pre_idx, post_idx = _filter_autapses(pre_idx, post_idx)
             if pre_idx.numel() == 0 or p == 0.0:
                 return pre_idx[:0], post_idx[:0]
             if p < 1.0:
@@ -1329,14 +1583,7 @@ class Network(RNGMixin):
                 )
                 pre_idx, post_idx = pre_idx[mask], post_idx[mask]
 
-            # Pairwise Bernoulli visits every pair at most once. This branch is
-            # only needed when user-supplied index selections contain repeats.
-            if not allow_multapses:
-                pre_idx, post_idx = self._drop_multapses(
-                    pre_idx,
-                    post_idx,
-                    num_targets_total=target_model.v.numel(),
-                )
+            pre_idx, post_idx = _filter_multapses(pre_idx, post_idx)
             return pre_idx, post_idx
 
         if rule == "pairwise_poisson":
@@ -1358,12 +1605,7 @@ class Network(RNGMixin):
                 )
 
             pre_idx, post_idx = self._all_to_all_edges(pre_pool, post_pool)
-            if not allow_autapses:
-                pre_idx, post_idx = self._drop_autapses(
-                    pre_idx,
-                    post_idx,
-                    same_population=same_population,
-                )
+            pre_idx, post_idx = _filter_autapses(pre_idx, post_idx)
             if pre_idx.numel() == 0 or lam == 0.0:
                 return pre_idx[:0], post_idx[:0]
 
@@ -1391,12 +1633,9 @@ class Network(RNGMixin):
             candidates_pre, candidates_post = self._all_to_all_edges(
                 pre_pool, post_pool
             )
-            if not allow_autapses:
-                candidates_pre, candidates_post = self._drop_autapses(
-                    candidates_pre,
-                    candidates_post,
-                    same_population=same_population,
-                )
+            candidates_pre, candidates_post = _filter_autapses(
+                candidates_pre, candidates_post
+            )
 
             m = candidates_pre.numel()
             if m == 0:
@@ -1435,7 +1674,8 @@ class Network(RNGMixin):
             for target in post_pool:
                 pool = pre_pool
                 if not allow_autapses and same_population:
-                    pool = pool[pool != target]
+                    target_flat = _post_flat_for_ids(target.reshape(1))[0]
+                    pool = pool[pool != target_flat]
 
                 chosen_pre = self._draw_from_pool(
                     pool,
@@ -1448,13 +1688,7 @@ class Network(RNGMixin):
 
             pre_idx = torch.cat(pre_chunks) if pre_chunks else pre_pool[:0]
             post_idx = torch.cat(post_chunks) if post_chunks else post_pool[:0]
-
-            if not allow_multapses:
-                pre_idx, post_idx = self._drop_multapses(
-                    pre_idx,
-                    post_idx,
-                    num_targets_total=target_model.v.numel(),
-                )
+            pre_idx, post_idx = _filter_multapses(pre_idx, post_idx)
             return pre_idx, post_idx
 
         if rule == "fixed_outdegree":
@@ -1469,7 +1703,8 @@ class Network(RNGMixin):
             for source in pre_pool:
                 pool = post_pool
                 if not allow_autapses and same_population:
-                    pool = pool[pool != source]
+                    post_flat = _post_flat_for_ids(pool)
+                    pool = pool[post_flat != source]
 
                 chosen_post = self._draw_from_pool(
                     pool,
@@ -1482,13 +1717,7 @@ class Network(RNGMixin):
 
             pre_idx = torch.cat(pre_chunks) if pre_chunks else pre_pool[:0]
             post_idx = torch.cat(post_chunks) if post_chunks else post_pool[:0]
-
-            if not allow_multapses:
-                pre_idx, post_idx = self._drop_multapses(
-                    pre_idx,
-                    post_idx,
-                    num_targets_total=target_model.v.numel(),
-                )
+            pre_idx, post_idx = _filter_multapses(pre_idx, post_idx)
             return pre_idx, post_idx
 
         raise ValueError(f"Unsupported connection rule: {rule!r}")
@@ -1518,6 +1747,9 @@ class Network(RNGMixin):
         if source_idx.numel() == 0:
             return
 
+        if threshold is None:
+            threshold = torch.nan
+
         n_threshold = check_weight_shape(
             threshold, source_idx, name="threshold", context=shape_context
         )
@@ -1542,6 +1774,9 @@ class Network(RNGMixin):
                 n_delay,
             )
         )
+        # A materialized NetCon set no longer represents the wiring spec after
+        # any new connection is appended.
+        self.built = False
 
     def _connect_continuous(
         self,
@@ -1595,12 +1830,13 @@ class Network(RNGMixin):
                 n_delay,
             )
         )
+        self.built = False
 
     def connect_continuous(
         self,
         source,
         target,
-        synapse,
+        synapse=None,
         conn_spec=None,
         *,
         pre_var="v",
@@ -1615,21 +1851,21 @@ class Network(RNGMixin):
     ):
         """Connect a continuous presynaptic variable to a ContinuousSynapse.
 
-        Unlike :meth:`connect`, this method performs no thresholding.  The
-        selected ``pre_var`` is sampled each timestep, multiplied by ``weight``,
-        optionally delayed, scatter-summed into the target synapse's local shape,
-        and delivered via ``synapse.continuous_receive(..., input=input)``.
+        Slot targets are supported in the same way as for event-based
+        connections: a ``SynapseSlots`` target is already in synapse-local
+        coordinates and avoids ambiguous colocated slots.
         """
+        source, target, source_model, target_model = self._normalize_endpoint(
+            source,
+            target,
+        )
+        synapse = self._validate_target_synapse_endpoint(target, synapse)
+
         if not hasattr(synapse, "continuous_receive"):
             raise TypeError(
                 "connect_continuous requires a target mechanism that implements "
                 "continuous_receive; did you subclass ContinuousSynapse?"
             )
-
-        source, target, source_model, target_model = self._normalize_endpoint(
-            source,
-            target,
-        )
 
         if conn_spec is None:
             spec = {"rule": "all_to_all"}
@@ -1653,9 +1889,10 @@ class Network(RNGMixin):
         pre_pool = self._flat_selection(source)
         post_pool = self._flat_selection(target)
 
-        self._to_synapse_local_post_idx(target_model, post_pool, synapse)
+        if not isinstance(target, SynapseSlots):
+            self._to_synapse_local_post_idx(target_model, post_pool, synapse)
 
-        pre_idx, post_flat = self._edges_for_rule(
+        pre_idx, post_ids = self._edges_for_rule(
             rule=rule,
             spec=spec,
             source_model=source_model,
@@ -1664,6 +1901,8 @@ class Network(RNGMixin):
             post_pool=post_pool,
             allow_autapses=allow_autapses,
             allow_multapses=allow_multapses,
+            target_id_universe_size=self._target_id_universe_size(target, target_model),
+            post_flat_by_target_id=self._post_flat_by_target_id(target),
         )
 
         if pre_idx.numel() == 0:
@@ -1686,11 +1925,7 @@ class Network(RNGMixin):
             input=input,
         )
 
-        post_idx = self._to_synapse_local_post_idx(
-            target_model,
-            post_flat.to(target_model.device()),
-            synapse,
-        )
+        post_idx = self._target_post_idx(target_model, post_ids, synapse, target)
 
         if auto_expand:
             n_connections = pre_idx.numel()
@@ -1716,7 +1951,7 @@ class Network(RNGMixin):
         self,
         source,
         target,
-        synapse,
+        synapse=None,
         *,
         pre_var="v",
         input=None,
@@ -1747,7 +1982,7 @@ class Network(RNGMixin):
         self,
         source,
         target,
-        synapse,
+        synapse=None,
         conn_spec=None,
         *,
         threshold=0.0,
@@ -1761,26 +1996,32 @@ class Network(RNGMixin):
         """
         Connect source to target using a NEST-style connectivity specification.
 
-        Examples
-        --------
-        >>> net.connect(pre, post, post.mech.syn, "all_to_all")
-        >>> net.connect(pre, post, post.mech.syn,
-        ...             {"rule": "pairwise_bernoulli", "p": 0.1,
-        ...              "allow_autapses": False, "allow_multapses": False})
-        >>> net.connect(pre, post, post.mech.syn,
-        ...             {"rule": "fixed_indegree", "indegree": 20})
-
-        Supported rules are ``one_to_one``, ``all_to_all``,
-        ``pairwise_bernoulli``, ``pairwise_poisson``,
-        ``fixed_total_number``, ``fixed_indegree``, and ``fixed_outdegree``.
-        For this NEST-style entry point, ``allow_autapses`` and
-        ``allow_multapses`` default to ``True`` unless specified in
-        ``conn_spec`` or as keyword arguments.
+        ``target`` may be a physical population/slice, or a ``SynapseSlots``
+        object returned by ``population.slots(...)``, ``slice.slots(...)``, or
+        ``network.synapse_slots(...)``. Slot targets remove the ambiguity that
+        arises when a banked point-process mechanism has several local slots on
+        one physical compartment.
         """
+        if isinstance(target, SynapseSlots):
+            return self.connect_to_slots(
+                source,
+                target,
+                synapse,
+                conn_spec=conn_spec,
+                threshold=threshold,
+                weight=weight,
+                delay=delay,
+                pre_var=pre_var,
+                auto_expand=auto_expand,
+                allow_autapses=allow_autapses,
+                allow_multapses=allow_multapses,
+            )
+
         source, target, source_model, target_model = self._normalize_endpoint(
             source,
             target,
         )
+        synapse = self._validate_target_synapse_endpoint(target, synapse)
 
         if conn_spec is None:
             spec = {"rule": "all_to_all"}
@@ -1807,12 +2048,12 @@ class Network(RNGMixin):
         pre_pool = self._flat_selection(source)
         post_pool = self._flat_selection(target)
 
-        # Preserve the previous contract: all explicitly selected target
-        # locations must host the requested synapse, even if a stochastic rule
-        # would later sample only a subset of them.
+        # Preserve the previous contract for physical targets: all explicitly
+        # selected target locations must host the requested synapse.  Ambiguous
+        # banked targets now raise and instruct users to select local slots.
         self._to_synapse_local_post_idx(target_model, post_pool, synapse)
 
-        pre_idx, post_flat = self._edges_for_rule(
+        pre_idx, post_ids = self._edges_for_rule(
             rule=rule,
             spec=spec,
             source_model=source_model,
@@ -1842,11 +2083,7 @@ class Network(RNGMixin):
             pre_var=pre_var,
         )
 
-        post_idx = self._to_synapse_local_post_idx(
-            target_model,
-            post_flat.to(target_model.device()),
-            synapse,
-        )
+        post_idx = self._target_post_idx(target_model, post_ids, synapse, target)
 
         if auto_expand:
             n_connections = pre_idx.numel()
@@ -1867,11 +2104,156 @@ class Network(RNGMixin):
             shape_context=shape_context,
         )
 
+    def connect_to_slots(
+        self,
+        source,
+        target,
+        synapse=None,
+        *,
+        slots=None,
+        local_index=None,
+        conn_spec=None,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+        auto_expand=False,
+        allow_autapses: Optional[bool] = None,
+        allow_multapses: Optional[bool] = None,
+    ):
+        """Connect sources to explicit synapse-local target slots.
+
+        ``target`` may be a ``SynapseSlots`` object, or a population/slice plus
+        ``synapse`` and ``slots``/``local_index``.  This is the public API for
+        banked point processes with multiple colocated local slots.
+        """
+        if local_index is not None:
+            if slots is not None:
+                raise ValueError("Provide either slots or local_index, not both.")
+            slots = local_index
+
+        if isinstance(source, Population) or isinstance(source, NetStim):
+            source = source[:]
+        source_model = source.model
+
+        target_slots = self.synapse_slots(target, synapse, slots=slots)
+        target_model = target_slots.model
+        synapse = target_slots.synapse
+
+        if conn_spec is None:
+            spec = {"rule": "all_to_all"}
+        elif isinstance(conn_spec, str):
+            spec = {"rule": conn_spec}
+        else:
+            spec = dict(conn_spec)
+
+        rule = spec.pop("rule", "all_to_all")
+
+        if allow_autapses is None:
+            allow_autapses = bool(spec.pop("allow_autapses", True))
+        else:
+            spec.pop("allow_autapses", None)
+
+        if allow_multapses is None:
+            allow_multapses = bool(spec.pop("allow_multapses", True))
+        else:
+            spec.pop("allow_multapses", None)
+
+        if threshold is None:
+            threshold = torch.nan
+
+        pre_pool = self._flat_selection(source)
+        post_pool = target_slots.local_index.to(
+            device=source_model.device(), dtype=torch.long
+        )
+
+        pre_idx, post_idx = self._edges_for_rule(
+            rule=rule,
+            spec=spec,
+            source_model=source_model,
+            target_model=target_model,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+            target_id_universe_size=int(target_slots.slot_to_flat_index.numel()),
+            post_flat_by_target_id=target_slots.slot_to_flat_index,
+        )
+
+        if pre_idx.numel() == 0:
+            return
+
+        shape_context = self._connection_shape_context(
+            kind="event",
+            rule=rule,
+            spec=spec,
+            source_model=source_model,
+            target_model=target_model,
+            synapse=synapse,
+            pre_pool=pre_pool,
+            post_pool=post_pool,
+            pre_idx=pre_idx,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+            auto_expand=auto_expand,
+            pre_var=pre_var,
+        )
+
+        if auto_expand:
+            n_connections = pre_idx.numel()
+            threshold = expand(threshold, n_connections)
+            weight = expand(weight, n_connections)
+            delay = expand(delay, n_connections)
+
+        self._connect(
+            source_model,
+            pre_idx,
+            target_model,
+            post_idx.to(device=target_model.device(), dtype=torch.long),
+            synapse,
+            threshold=threshold,
+            weight=weight,
+            delay=delay,
+            pre_var=pre_var,
+            shape_context=shape_context,
+        )
+
+    def connect_one_to_one_slots(
+        self,
+        source,
+        target,
+        synapse=None,
+        *,
+        slots=None,
+        local_index=None,
+        threshold=0.0,
+        weight=1.0,
+        delay=0.0,
+        pre_var=None,
+        allow_autapses=False,
+        allow_multapses=False,
+    ):
+        """Connect source elements one-to-one with explicit target slots."""
+        return self.connect_to_slots(
+            source,
+            target,
+            synapse,
+            slots=slots,
+            local_index=local_index,
+            conn_spec={"rule": "one_to_one"},
+            threshold=threshold,
+            weight=weight,
+            delay=delay,
+            pre_var=pre_var,
+            allow_autapses=allow_autapses,
+            allow_multapses=allow_multapses,
+        )
+
     def connect_one_to_one(
         self,
         source,
         target,
-        synapse,
+        synapse=None,
         threshold=0.0,
         weight=1.0,
         delay=0.0,
@@ -1904,7 +2286,7 @@ class Network(RNGMixin):
         self,
         source,
         target,
-        synapse,
+        synapse=None,
         threshold=0.0,
         weight=1.0,
         delay=0.0,
@@ -2038,6 +2420,12 @@ class Network(RNGMixin):
                 else ("v" if pre_name != "netstim" else "spike")
             )
             pre = getattr(self, pre_name)
+            if pre_name == "netstim" and pre is None:
+                raise RuntimeError(
+                    "The wiring specification contains NetStim-sourced "
+                    "connections, but no NetStim is attached. Call "
+                    "network.attach_netstim(netstim) before build()."
+                )
             post = self.populations[post_name]
             pre_device = pre.device()
             pre_dtype = pre.dtype()
@@ -2120,6 +2508,12 @@ class Network(RNGMixin):
         ) in enumerate(self.continuous_synapse_spec.items()):
             pre_var = pre_var if pre_var is not None else "v"
             pre = getattr(self, pre_name)
+            if pre_name == "netstim" and pre is None:
+                raise RuntimeError(
+                    "The wiring specification contains NetStim-sourced "
+                    "connections, but no NetStim is attached. Call "
+                    "network.attach_netstim(netstim) before build()."
+                )
             post = self.populations[post_name]
             pre_device = pre.device()
             pre_dtype = pre.dtype()
@@ -2187,6 +2581,17 @@ class Network(RNGMixin):
             )
             self.continuous_synapses[cname] = con
 
+    def _refresh_step_schedule(self):
+        """Cache accelerator-first launch order for timestep execution."""
+        self._population_step_items = _accelerator_first_step_items(self.populations)
+        self._synapse_step_items = _accelerator_first_step_items(self.synapses)
+        self._continuous_synapse_step_items = _accelerator_first_step_items(
+            self.continuous_synapses
+        )
+        self._continuous_target_step_items = _accelerator_first_step_items(
+            self.continuous_targets
+        )
+
     def build(self, dt, max_delay_ms=None, force_rebuild=False):
         """
         Build synaptic modules for the current wiring spec.
@@ -2219,6 +2624,7 @@ class Network(RNGMixin):
             self.build_continuous_synapses(dt, max_delay_ms=max_delay_ms)
             self.built = True
             self._device_sig = self._device_signature()
+        self._refresh_step_schedule()
         return self
 
     def initialize(
@@ -2421,6 +2827,117 @@ class Network(RNGMixin):
                 clear_deliveries=clear_deliveries,
             )
 
+    def step(self, *, extra=None, callbacks=None, loop_hooks: bool = False):
+        """Advance this network by exactly one timestep.
+
+        The timestep is the network timestep established by ``initialize(dt)``
+        or ``build(dt)``. This method preserves the same event-delivery phase
+        ordering as :meth:`run`, but avoids constructing a one-step simulation
+        loop.
+
+        Parameters
+        ----------
+        extra : dict, optional
+            Optional mapping from population name to extracellular stimulus
+            specification ``(v, t)``, with the same semantics as :meth:`run`.
+            The stimulus is evaluated at the network's current time for a
+            single timestep.
+        callbacks : sequence of Callback, optional
+            Callbacks to execute around this single step. By default ``step``
+            calls ``pre_step_hook`` and ``post_step_hook`` only.
+        loop_hooks : bool, optional
+            If ``True``, also call ``pre_loop_hook`` before the step and
+            ``post_loop_hook`` after the step.
+
+        Returns
+        -------
+        Network
+            ``self``, for chaining.
+        """
+        self._refresh_compile_config_from_ctx()
+        if self.dt is None:
+            raise RuntimeError(
+                "Network has no simulation timestep. Call initialize(dt) or "
+                "build(dt) before step()."
+            )
+        if not self.built:
+            raise RuntimeError(
+                "Network wiring has changed since the last build. Call "
+                "initialize(dt) (recommended) or build(dt) before step()."
+            )
+
+        dt_f = float(self.dt)
+        dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
+
+        ctx = nullcontext() if self.training else torch.no_grad()
+
+        intra = {}
+        for n, p in self.populations.items():
+            # Mirror Population.step/run: new injections set ``p.intra = None``.
+            # Rebuild lazily so one-step network stepping respects intracellular
+            # currents added after initialization.
+            if p.intra is None and getattr(p, "injections", None):
+                p.intra = p.build_intra()
+            if p.intra is not None:
+                intra[n] = p.intra
+
+        extra = extra if extra is not None else {}
+        extra_prepped = {}
+        for n, (v, t) in extra.items():
+            pop = self.populations[n]
+            dev, dtp = pop.device(), pop.dtype()
+            v_dev = v.to(device=dev, dtype=dtp)
+            t_dev = t.to(device=dev, dtype=dtp)
+            t0 = self.t.to(device=dev, dtype=dtp)
+            dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
+            t1 = t0 + dt_pop
+            extra_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
+        extra = extra_prepped
+
+        with_intra = bool(intra)
+        with_extra = bool(extra)
+
+        if callbacks is None:
+            callbacks = []
+        if not isinstance(callbacks, CallbackList):
+            callbacks = CallbackList(callbacks)
+        for c in callbacks:
+            c.dt = self.dt
+
+        with ctx:
+            if with_intra:
+                intra = {
+                    n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
+                    for n, intra_ in intra.items()
+                }
+
+            if loop_hooks:
+                pre_loop_hook(callbacks, self)
+            pre_step_hook(callbacks, self)
+
+            intra_c = prepare_intra({}, intra, 0) if with_intra else {}
+            extra_c = prepare_extra(extra, 0) if with_extra else {}
+
+            self._step(
+                self._population_step_items,
+                self._synapse_step_items,
+                self._continuous_synapse_step_items,
+                self._continuous_target_step_items,
+                self.netstim,
+                self.t,
+                dt_f,
+                extra=extra_c,
+                intra=intra_c,
+                compile_network_ops=self.compile_network_ops,
+            )
+            self.t = self.t + dt_t
+
+            post_step_hook(callbacks, self)
+            if loop_hooks:
+                post_loop_hook(callbacks, self)
+
+        return self
+
     def run(self, tstop, extra=None, callbacks=None, progressbar=False):
         """
         Advance the network for a fixed duration.
@@ -2443,6 +2960,16 @@ class Network(RNGMixin):
         None
         """
         self._refresh_compile_config_from_ctx()
+        if self.dt is None:
+            raise RuntimeError(
+                "Network has no simulation timestep. Call initialize(dt) or "
+                "build(dt) before run()."
+            )
+        if not self.built:
+            raise RuntimeError(
+                "Network wiring has changed since the last build. Call "
+                "initialize(dt) (recommended) or build(dt) before run()."
+            )
         dt_f = float(self.dt)
         dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
 
@@ -2503,10 +3030,10 @@ class Network(RNGMixin):
                     extra_c = prepare_extra(extra, local_ind)
 
                 self._step(
-                    self.populations,
-                    self.synapses,
-                    self.continuous_synapses,
-                    self.continuous_targets,
+                    self._population_step_items,
+                    self._synapse_step_items,
+                    self._continuous_synapse_step_items,
+                    self._continuous_target_step_items,
                     self.netstim,
                     self.t,
                     dt_f,
@@ -2548,22 +3075,50 @@ class Network(RNGMixin):
         """
         _synapse_spec = self.synapse_spec.copy()
         _continuous_synapse_spec = self.continuous_synapse_spec.copy()
-        self.clear_synapses()
-        _old_shapes = {}
+
+        # Connection specs store source indices in the source-population flat
+        # coordinate frame, but store target indices in the target *synapse*
+        # local coordinate frame.  This distinction matters for banked
+        # point-processes: several local synapse slots may live on the same
+        # physical compartment, and the mechanism's slot axis can be much
+        # smaller/larger than the owning population's compartment axis.  Capture
+        # both coordinate-frame shapes before populations are rebuilt below.
+        _old_population_shapes = {}
+        _old_synapse_shapes = {}
         for name, p in self.populations.items():
-            _old_shapes[name] = p.shape
+            _old_population_shapes[name] = tuple(p.shape)
+        if self.netstim is not None:
+            _old_population_shapes["netstim"] = tuple(self.netstim.shape)
+
+        for source_name, target_name, synapse, pre_var in _synapse_spec.keys():
+            _old_synapse_shapes[(target_name, synapse.name)] = tuple(synapse.shape_f)
+        for (
+            source_name,
+            target_name,
+            synapse,
+            pre_var,
+            input_name,
+            reduce,
+            transform,
+        ) in _continuous_synapse_spec.keys():
+            _old_synapse_shapes[(target_name, synapse.name)] = tuple(synapse.shape_f)
+
+        self.clear_synapses()
+
+        for name, p in self.populations.items():
             device = p.device()
             p.batch(n)
             p.build(force_rebuild=True)
             p.to(device)
         if include_netstim and self.netstim is not None:
-            _old_shapes["netstim"] = self.netstim.shape
             self.netstim.batch(n)
         for k, v in _synapse_spec.items():
             source_name, target_name, synapse, pre_var = k
             source_pop = getattr(self, source_name)
             target_pop = getattr(self, target_name)
-            synapse = getattr(target_pop.mech, synapse.name)
+            synapse_name = synapse.name
+            target_slot_shape = _old_synapse_shapes[(target_name, synapse_name)]
+            synapse = getattr(target_pop.mech, synapse_name)
             for data in v:
                 source_idx, target_idx = data[0], data[1]
                 threshold, weight, delay = data[2], data[4], data[6]
@@ -2571,9 +3126,9 @@ class Network(RNGMixin):
                     new_source_idx = source_idx.repeat(n)
                 else:
                     new_source_idx = batchify_index(
-                        _old_shapes[source_name], n, source_idx
+                        _old_population_shapes[source_name], n, source_idx
                     )
-                new_target_idx = batchify_index(_old_shapes[target_name], n, target_idx)
+                new_target_idx = batchify_index(target_slot_shape, n, target_idx)
                 self._connect(
                     source_pop,
                     new_source_idx,
@@ -2597,7 +3152,9 @@ class Network(RNGMixin):
             ) = k
             source_pop = getattr(self, source_name)
             target_pop = getattr(self, target_name)
-            synapse = getattr(target_pop.mech, synapse.name)
+            synapse_name = synapse.name
+            target_slot_shape = _old_synapse_shapes[(target_name, synapse_name)]
+            synapse = getattr(target_pop.mech, synapse_name)
             for data in v:
                 source_idx, target_idx = data[0], data[1]
                 weight, delay = data[2], data[4]
@@ -2605,9 +3162,9 @@ class Network(RNGMixin):
                     new_source_idx = source_idx.repeat(n)
                 else:
                     new_source_idx = batchify_index(
-                        _old_shapes[source_name], n, source_idx
+                        _old_population_shapes[source_name], n, source_idx
                     )
-                new_target_idx = batchify_index(_old_shapes[target_name], n, target_idx)
+                new_target_idx = batchify_index(target_slot_shape, n, target_idx)
                 self._connect_continuous(
                     source_pop,
                     new_source_idx,

@@ -26,7 +26,7 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 2. (Optional) Install your preferred version of PyTorch:
 
    ```{important}
-   If installing on Windows without WSL2, please follow PyTorch installation instructions [here](https://docs.pytorch.org/tutorials/unstable/inductor_windows.html) to ensure proper setup of the PyTorch Inductor backend (used by Dendra for JIT-compilation of models).
+   If installing on Windows without WSL2, please follow PyTorch installation instructions [here](https://docs.pytorch.org/tutorials/unstable/inductor_windows.html) to ensure proper setup of the PyTorch Inductor backend (used when Dendra JIT compilation is enabled).
    ```
 
    ```{tip}

@@ -16,7 +16,7 @@ class apcount(M):
     """
 
     M.RANGE(threshold=0.0)  # Threshold for spike detection
-    M.ASSIGNED("n", "active")
+    M.BUFFER("n", "active")
 
     def initial(self, v):
         self.n = torch.zeros_like(v, dtype=torch.float32)

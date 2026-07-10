@@ -68,7 +68,7 @@ class exp2syn(PP, Syn):
 
     PP.STATE(A, B)
     PP.RANGE(e=0.0)
-    PP.ASSIGNED("factor")
+    PP.BUFFER("factor")
 
     PP.NONSPECIFIC_CURRENT("i")
 

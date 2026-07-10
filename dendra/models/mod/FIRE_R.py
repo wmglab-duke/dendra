@@ -19,7 +19,7 @@ class fire_r(VoltageProcess):
     """
 
     VoltageProcess.RANGE(threshold=-50.0, rest=-65.0, refractory=5.0)
-    VoltageProcess.ASSIGNED("is_refractory", "time_refractory")
+    VoltageProcess.BUFFER("is_refractory", "time_refractory")
 
     def initial(self, v):
         self.is_refractory = torch.zeros_like(v, dtype=torch.bool)

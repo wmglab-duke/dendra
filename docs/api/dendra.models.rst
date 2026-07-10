@@ -24,3 +24,26 @@ Core
    :members:
 .. autoclass:: dendra.models.extcell.ExtCellTree
    :members:
+
+
+Synapse slot targets
+--------------------
+.. autoclass:: dendra.models.slice.SynapseSlots
+   :members:
+
+
+Random distributions, runtime noise, and State SDEs
+----------------------------------------------------
+
+Runtime ``NOISE`` declarations are detached simulation drives. For stochastic
+state dynamics, ``State.DIFFUSION`` can be paired with ``State.METHOD("euler_maruyama")``
+for Itô SDEs or ``State.METHOD("euler_heun")`` for Stratonovich SDEs.
+
+.. autoclass:: dendra.models.random_parameters.RandomParameterSpec
+   :members:
+.. autoclass:: dendra.models.random_parameters.RuntimeNoiseSpec
+   :members:
+.. autoclass:: dendra.models.random_parameters.DistributionSpec
+   :members:
+.. autofunction:: dendra.models.random_parameters.register_random_distribution
+.. autofunction:: dendra.models.random_parameters.available_random_distributions

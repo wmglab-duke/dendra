@@ -150,3 +150,5 @@ examples/*/*.pkl
 
 frontend/node_modules/
 dendra/models/heterogeneous/*.cpp
+
+.codex/

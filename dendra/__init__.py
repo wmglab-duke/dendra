@@ -31,13 +31,16 @@ from .const import (
     R,
 )
 from .helpers import (
+    COMPILE_OPTIONS,
     DEVICE,
     DTYPE,
     TF32,
     allow_tf32,
     ctx,
+    current_compile_options,
     current_device,
     current_dtype,
+    set_compile_options,
     set_jit_enabled,
     set_jit_in_network_enabled,
     set_jit_network_ops_enabled,
@@ -45,17 +48,28 @@ from .helpers import (
 )
 from .models import (
     Axon,
+    DistributionSpec,
     ExtCellAxon,
     ExtCellTree,
     Myelinated,
     NetStim,
     Network,
     Population,
+    RandomParameterSpec,
+    RuntimeNoiseSpec,
     SingleCompartment,
+    SynapseSlots,
     Tree,
     Unmyelinated,
+    available_random_distributions,
     concat_models,
     concat_slices,
+    get_random_distribution,
+    make_random_parameter_spec,
+    make_runtime_noise_spec,
+    register_random_distribution,
+    sample_random_parameter,
+    sample_runtime_noise,
 )
 from .models.fields import *
 from .models.integrators import (
@@ -76,6 +90,7 @@ from .models.integrators import (
 )
 from .models.mod import load_mechanisms
 from .models.stim.waveform import *
+from .stepping import step
 from .utils.inductor import refresh_torchinductor_precompiled_headers
 
 __all__ = [
@@ -85,10 +100,14 @@ __all__ = [
     "R",
     "FARADAY",
     "ctx",
+    "step",
     "DEVICE",
     "DTYPE",
+    "COMPILE_OPTIONS",
+    "current_compile_options",
     "current_device",
     "current_dtype",
+    "set_compile_options",
     "set_jit_enabled",
     "set_jit_network_solves_enabled",
     "set_jit_network_ops_enabled",
@@ -96,6 +115,16 @@ __all__ = [
     "callbacks",
     "mod",
     "load_mechanisms",
+    "DistributionSpec",
+    "RandomParameterSpec",
+    "RuntimeNoiseSpec",
+    "available_random_distributions",
+    "get_random_distribution",
+    "register_random_distribution",
+    "make_random_parameter_spec",
+    "make_runtime_noise_spec",
+    "sample_random_parameter",
+    "sample_runtime_noise",
     "Population",
     "SingleCompartment",
     "Axon",
@@ -106,6 +135,7 @@ __all__ = [
     "ExtCellTree",
     "NetStim",
     "Network",
+    "SynapseSlots",
     "concat_models",
     "concat_slices",
     "anisotropic_point",

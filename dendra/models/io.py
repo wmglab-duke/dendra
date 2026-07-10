@@ -227,28 +227,156 @@ def _compartments(sec) -> List[Tuple[float, int]]:
     return [((i + 0.5) / n, i) for i in range(n)]
 
 
-def _first_child_compartment(child_sec, parent_seg):
-    """Return (child_seg, idx) for the compartment that actually touches parent_seg,
-    irrespective of child orientation.  Works for any nseg, even nseg==1."""
-    d0 = h.distance(parent_seg, child_sec(0))  # parent ↔ child x=0
-    d1 = h.distance(parent_seg, child_sec(1))  # parent ↔ child x=1
-    if d0 <= d1:
-        idx = 0  # x=0 end is proximal
+def _section_orientation(sec) -> int:
+    """Return the section end (0 or 1) that faces its parent.
+
+    NEURON permits either end of a child section to be connected to its parent.
+    ``Section.orientation()`` reports that end.  Root sections conventionally
+    have orientation 0, which is also the direction used by NEURON's own node
+    ordering.
+    """
+    try:
+        orientation = float(sec.orientation())
+    except Exception:
+        orientation = float(h.section_orientation(sec=sec))
+    return 0 if orientation < 0.5 else 1
+
+
+def _segment_center(sec, idx: int):
+    nseg = int(sec.nseg)
+    if not 0 <= int(idx) < nseg:
+        raise IndexError(f"Segment index {idx} is outside section {sec} (nseg={nseg}).")
+    return sec((int(idx) + 0.5) / nseg)
+
+
+def _segment_index_for_location(sec, x: float) -> int:
+    """Return the computational segment containing a NEURON location.
+
+    Interior section locations are represented electrically by the containing
+    segment centre.  At an exact internal boundary NEURON selects the segment on
+    the x-increasing side; ``int(x*nseg)`` reproduces that convention.
+    """
+    nseg = int(sec.nseg)
+    x = min(max(float(x), 0.0), 1.0)
+    return min(int(x * nseg), nseg - 1)
+
+
+def _first_child_compartment(child_sec, parent_seg=None):
+    """Return the child compartment adjacent to the parent connection.
+
+    ``parent_seg`` is accepted for backward compatibility but is not needed:
+    the connected child end is available directly from the section orientation.
+    """
+    endpoint = _section_orientation(child_sec)
+    idx = 0 if endpoint == 0 else int(child_sec.nseg) - 1
+    return _segment_center(child_sec, idx), idx
+
+
+def _finite_ri_ohm(value_mohm: float, *, context: str) -> float:
+    """Convert NEURON's MΩ axial resistance to Ω and reject sentinel values."""
+    value_mohm = float(value_mohm)
+    # NEURON uses 1e30 MΩ for a node with no parent.  Values of this order are
+    # never a physical compartmental axial resistance and would silently
+    # disconnect a Dendra tree.
+    if not np.isfinite(value_mohm) or value_mohm >= 1e29:
+        raise ValueError(
+            f"NEURON returned a non-physical axial resistance ({value_mohm:g} MΩ) "
+            f"while importing {context}."
+        )
+    if value_mohm < 0.0:
+        raise ValueError(
+            f"NEURON returned a negative axial resistance ({value_mohm:g} MΩ) "
+            f"while importing {context}."
+        )
+    return value_mohm * 1e6
+
+
+def _center_to_endpoint_resistance_ohm(sec, endpoint_x: int) -> float:
+    """Exact NEURON resistance from an adjacent segment centre to an endpoint.
+
+    ``Segment.ri()`` is referenced to the segment's parent node.  At the
+    parent-facing endpoint, the adjacent segment centre therefore owns the
+    half-segment resistance.  At the opposite endpoint, the endpoint node owns
+    it.  Querying the root's parent-facing endpoint directly would return
+    NEURON's 1e30-MΩ no-parent sentinel, which is the bug this helper avoids.
+    """
+    endpoint_x = int(endpoint_x)
+    if endpoint_x not in (0, 1):
+        raise ValueError(f"endpoint_x must be 0 or 1, got {endpoint_x!r}.")
+
+    orientation = _section_orientation(sec)
+    idx = 0 if endpoint_x == 0 else int(sec.nseg) - 1
+    adjacent = _segment_center(sec, idx)
+    if endpoint_x == orientation:
+        value = adjacent.ri()
+        owner = adjacent
     else:
-        idx = child_sec.nseg - 1  # x=1 end is proximal
-    x_center = (idx + 0.5) / child_sec.nseg
-    return child_sec(x_center), idx
+        owner = sec(float(endpoint_x))
+        value = owner.ri()
+    return _finite_ri_ohm(
+        value,
+        context=f"half segment {adjacent} ↔ {sec}({endpoint_x}) (ri owner {owner})",
+    )
+
+
+def _same_section_resistance_ohm(seg_a, seg_b) -> float:
+    """Exact axial resistance between arbitrary centres in one section."""
+    if seg_a.sec is not seg_b.sec:
+        raise ValueError("Segments must belong to the same section.")
+    sec = seg_a.sec
+    ia = _segment_index(seg_a)
+    ib = _segment_index(seg_b)
+    if ia == ib:
+        return 0.0
+
+    orientation = _section_orientation(sec)
+    total = 0.0
+    lo, hi = sorted((ia, ib))
+    for left_idx in range(lo, hi):
+        # For orientation 0 the x-increasing centre owns the resistance to its
+        # parent node.  For orientation 1, the x-decreasing centre owns it.
+        owner_idx = left_idx + 1 if orientation == 0 else left_idx
+        owner = _segment_center(sec, owner_idx)
+        total += _finite_ri_ohm(
+            owner.ri(), context=f"centre-to-centre edge in {sec} at {owner}"
+        )
+    return total
 
 
 def r_ohm(parent_seg, child_seg):
+    """Return NEURON-equivalent axial resistance between two graph centres.
+
+    The function supports adjacent centres in one section and a direct
+    parent-section/child-section connection.  Endpoint connections include the
+    half segment on both sides; interior connections include only the child's
+    proximal half segment because NEURON attaches them to the containing parent
+    compartment node.
+    """
     if parent_seg.sec is child_seg.sec:
-        return child_seg.ri() * 1e6
-    else:
-        if child_seg.sec.parentseg().x == 0 or child_seg.sec.parentseg().x == 1:
-            child_r = child_seg.ri() * 1e6
-            parent_r = child_seg.sec.parentseg().ri() * 1e6
-            return child_r + parent_r
-        return child_seg.ri() * 1e6
+        return _same_section_resistance_ohm(parent_seg, child_seg)
+
+    child_sec = child_seg.sec
+    parent_on_parent = child_sec.parentseg()
+    if parent_on_parent is None or parent_on_parent.sec is not parent_seg.sec:
+        raise ValueError(
+            f"{parent_seg} and {child_seg} are not a direct NEURON "
+            "parent-section/child-section pair."
+        )
+
+    parent_host_idx = _segment_index_for_location(parent_seg.sec, parent_on_parent.x)
+    parent_host = _segment_center(parent_seg.sec, parent_host_idx)
+    parent_path = _same_section_resistance_ohm(parent_seg, parent_host)
+
+    parent_x = float(parent_on_parent.x)
+    if parent_x == 0.0 or parent_x == 1.0:
+        parent_path += _center_to_endpoint_resistance_ohm(parent_seg.sec, int(parent_x))
+
+    child_endpoint = _section_orientation(child_sec)
+    child_adjacent_idx = 0 if child_endpoint == 0 else int(child_sec.nseg) - 1
+    child_adjacent = _segment_center(child_sec, child_adjacent_idx)
+    child_path = _center_to_endpoint_resistance_ohm(child_sec, child_endpoint)
+    child_path += _same_section_resistance_ohm(child_adjacent, child_seg)
+    return parent_path + child_path
 
 
 def _section_axis_arrays(sec):
@@ -435,35 +563,39 @@ def _section_inv_area_between_x(sec, x0: float, x1: float) -> float:
 
 
 def edge_inv_area_integral_um_inv(parent_seg, child_seg) -> float:
-    """Return effective axial ∫ds/A for a graph edge, in µm⁻¹.
+    """Return NEURON-topology-equivalent axial ∫ds/A, in µm⁻¹.
 
-    The directed graph edge is assumed to connect the centre of ``parent_seg``
-    to the centre of ``child_seg``.  For inter-section edges, the path is split
-    into parent-centre→section-connection and child-connection→child-centre.
+    For an endpoint connection the path contains the parent-side and child-side
+    half segments.  For an interior connection, NEURON attaches the child to the
+    containing parent compartment node, so only the child-side cable contributes
+    at the junction (plus any requested path from a non-host parent centre).
     """
     if parent_seg.sec is child_seg.sec:
         return _section_inv_area_between_x(parent_seg.sec, parent_seg.x, child_seg.x)
 
-    parent_on_parent = child_seg.sec.parentseg()
-    if parent_on_parent is not None and parent_on_parent.sec is parent_seg.sec:
-        parent_part = _section_inv_area_between_x(
-            parent_seg.sec, parent_seg.x, parent_on_parent.x
+    child_sec = child_seg.sec
+    parent_on_parent = child_sec.parentseg()
+    if parent_on_parent is None or parent_on_parent.sec is not parent_seg.sec:
+        raise ValueError(
+            "Cannot infer axial section path for edge; parent/child segments do not "
+            "appear to be adjacent in NEURON section topology."
         )
-        try:
-            d0 = h.distance(parent_on_parent, child_seg.sec(0.0))
-            d1 = h.distance(parent_on_parent, child_seg.sec(1.0))
-            child_end_x = 0.0 if d0 <= d1 else 1.0
-        except Exception:
-            child_end_x = 0.0
-        child_part = _section_inv_area_between_x(
-            child_seg.sec, child_end_x, child_seg.x
-        )
-        return float(parent_part + child_part)
 
-    raise ValueError(
-        "Cannot infer axial section path for edge; parent/child segments do not "
-        "appear to be adjacent in NEURON section topology."
+    parent_host_idx = _segment_index_for_location(parent_seg.sec, parent_on_parent.x)
+    parent_host = _segment_center(parent_seg.sec, parent_host_idx)
+    parent_part = _section_inv_area_between_x(
+        parent_seg.sec, parent_seg.x, parent_host.x
     )
+
+    parent_x = float(parent_on_parent.x)
+    if parent_x == 0.0 or parent_x == 1.0:
+        parent_part += _section_inv_area_between_x(
+            parent_seg.sec, parent_host.x, parent_x
+        )
+
+    child_end_x = float(_section_orientation(child_sec))
+    child_part = _section_inv_area_between_x(child_sec, child_end_x, child_seg.x)
+    return float(parent_part + child_part)
 
 
 def _edge_diff_geom_from_resistance_um(parent_seg, child_seg, R_ohm: float) -> float:
@@ -518,6 +650,140 @@ def _edge_geometry_attrs(parent_seg, child_seg, R_ohm_value: float) -> Dict[str,
     }
 
 
+def _collect_neuron_sections(root_sec, exclude_set=None):
+    """Collect the included NEURON section subtree in deterministic DFS order."""
+    exclude_set = set() if exclude_set is None else set(exclude_set)
+    sections = []
+    stack = [root_sec]
+    visited = set()
+    while stack:
+        sec = stack.pop()
+        if sec in visited or sec in exclude_set:
+            continue
+        visited.add(sec)
+        sections.append(sec)
+        children = [child for child, _ in _sec_children(sec)]
+        # Reverse before pushing so SectionRef child order is preserved on pop.
+        stack.extend(reversed(children))
+    return sections
+
+
+def _safe_distance_um(seg_a, seg_b) -> float:
+    """Return NEURON path distance between two computational locations."""
+    value = float(h.distance(seg_a, seg_b))
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(
+            f"NEURON returned invalid path distance {value!r} between "
+            f"{seg_a} and {seg_b}."
+        )
+    return value
+
+
+def _edge_attrs_from_path(
+    *, R_ohm_value: float, L_um: float, inv_area_um_inv: float
+) -> Dict[str, float]:
+    """Create electrical and diffusion metadata for one resistor-tree edge."""
+    R_ohm_value = float(R_ohm_value)
+    L_um = float(L_um)
+    inv_area_um_inv = float(inv_area_um_inv)
+    if not np.isfinite(R_ohm_value) or R_ohm_value < 0.0:
+        raise ValueError(f"Invalid axial resistance {R_ohm_value!r} Ω.")
+    if not np.isfinite(L_um) or L_um < 0.0:
+        raise ValueError(f"Invalid axial path length {L_um!r} µm.")
+    if not np.isfinite(inv_area_um_inv) or inv_area_um_inv < 0.0:
+        raise ValueError(
+            f"Invalid axial inverse-area integral {inv_area_um_inv!r} µm⁻¹."
+        )
+    diff_geom = 1.0 / inv_area_um_inv if inv_area_um_inv > 0.0 else 0.0
+    return {
+        "L": L_um,
+        "R_ohm": R_ohm_value,
+        "diff_geom_um": float(diff_geom),
+        # Kept only while zero-volume degree-two junctions are simplified.
+        "_inv_area_um_inv": inv_area_um_inv,
+    }
+
+
+def _add_resistor_edge(graph, u, v, attrs):
+    """Add one physical resistor edge, rejecting loops/parallel paths."""
+    if u == v:
+        raise ValueError(
+            "A NEURON section connection collapsed both ends onto the same "
+            "computational node; loop/self connections cannot form a Tree."
+        )
+    if graph.has_edge(u, v):
+        raise ValueError(
+            f"Multiple axial paths were found between morphology nodes {u!r} "
+            f"and {v!r}; the imported morphology is not a tree."
+        )
+    graph.add_edge(u, v, **attrs)
+
+
+def _series_edge_attrs(first: Dict[str, float], second: Dict[str, float]):
+    """Combine two cable paths separated by a zero-area degree-two junction."""
+    return _edge_attrs_from_path(
+        R_ohm_value=float(first["R_ohm"]) + float(second["R_ohm"]),
+        L_um=float(first["L"]) + float(second["L"]),
+        inv_area_um_inv=float(first.get("_inv_area_um_inv", 0.0))
+        + float(second.get("_inv_area_um_inv", 0.0)),
+    )
+
+
+def _branchpoint_node_attrs(seg, data_func=None, *, attach_objects=True):
+    """Attributes for a zero-volume physical section junction."""
+    if not attach_objects:
+        return {"name": "branchpoint.pending"}
+    data = data_func(seg) if data_func else {}
+    attrs = {
+        "diam": float(seg.diam),
+        "L": 0.0,
+        "Ra": float(seg.sec.Ra),
+        "cm": float(seg.cm),
+        "name": "branchpoint.pending",
+        "area": 0.0,
+        "volume": 0.0,
+        "volume_um3": 0.0,
+        "volume_i": 0.0,
+        "neuron_location": str(seg),
+    }
+    attrs.update(data)
+    # Branchpoint semantics must not be overridden by a custom data function.
+    attrs.update(
+        {
+            "L": 0.0,
+            "area": 0.0,
+            "volume": 0.0,
+            "volume_um3": 0.0,
+            "volume_i": 0.0,
+            "name": "branchpoint.pending",
+        }
+    )
+    return attrs
+
+
+def _orient_resistor_tree(graph: nx.Graph, root_node) -> nx.DiGraph:
+    """Orient an undirected resistor tree away from a selected material node."""
+    if root_node not in graph:
+        raise ValueError("The selected root compartment is absent from the graph.")
+    if graph.number_of_nodes() == 0:
+        raise ValueError("Cannot orient an empty morphology graph.")
+    if not nx.is_tree(graph):
+        components = nx.number_connected_components(graph)
+        cycles = len(nx.cycle_basis(graph))
+        raise ValueError(
+            "NEURON morphology did not reduce to one resistor tree "
+            f"(components={components}, independent_cycles={cycles})."
+        )
+
+    directed = nx.DiGraph()
+    directed.add_nodes_from(
+        (node, dict(attrs)) for node, attrs in graph.nodes(data=True)
+    )
+    for parent, child in nx.bfs_edges(graph, root_node):
+        directed.add_edge(parent, child, **dict(graph.edges[parent, child]))
+    return directed
+
+
 @requires_packages("neuron")
 def neuron_to_dendra_graph(
     root_sec: Optional["nrn.Section"] = None,
@@ -527,154 +793,246 @@ def neuron_to_dendra_graph(
     extcell=None,
     exclude=None,
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
-    """
-    Build a directed acyclic graph whose nodes are NEURON compartments.
-    If `data_func` is provided, it will be used to extract compartment data. Otherwise,
-    a default function will be used (extracts xyz coordinates, and extracellular mechanism
-    properties for extcell # of layers if extcell is provided). cm, Ra, L, diam are
-    always extracted.
+    """Convert a NEURON section tree into Dendra's compartment resistor tree.
 
-    Node attributes
-    ---------------
-    volume : float
-        Compartment volume in µm³.  For pt3d morphologies this is computed by
-        clipping the section's truncated-cone sequence to the segment interval;
-        for stylized sections this falls back to a uniform cylinder.
-    volume_i : float
-        Intracellular material volume in µm³.  Currently identical to
-        ``volume`` and provided as a domain-specific alias for material processes.
+    The conversion is performed in three stages:
 
-    Edge attributes
-    ---------------
-    L : float
-        Centre-to-centre intracellular distance (µm), obtained with
-        ``h.distance(seg_prox, seg_dist)`` — identical to NEURON's own
-        geometry handling, including 3-D pt3d morphology.
-    R_ohm : float
-        Axial resistance (Ω) between those centres, taken from the distal
-        segment's ``seg.ri()`` (which returns megohms) and scaled by 1e6.
-    diff_geom_um : float
-        Diffusion geometry factor in µm.  A diffusion coefficient ``D`` in
-        µm²/ms gives an edge diffusive conductance ``D * diff_geom_um`` in
-        µm³/ms.
+    1. Create one material node per NEURON segment centre and one provisional
+       zero-area node per distinct physical section endpoint.
+    2. Merge connected endpoint nodes with each other, or with the containing
+       parent compartment for interior section connections.
+    3. Remove sealed degree-one endpoint nodes and series-collapse degree-two
+       endpoint nodes.  Junctions of degree three or greater remain explicit
+       zero-volume ``branchpoint`` nodes.
+
+    This construction mirrors NEURON's computational topology and avoids calling
+    ``ri()`` on the parentless x=0 endpoint of a root section, where NEURON
+    intentionally returns its 1e30-MΩ sentinel.
+
+    Parameters
+    ----------
+    root_sec : neuron.h.Section, optional
+        Root of the section subtree to import.  If omitted, exactly one
+        parentless section must exist in the HOC namespace.
+    attach_objects : bool, optional
+        Attach membrane/geometry metadata to graph nodes.  Electrical edge
+        metadata and ``id2seg`` are always produced.
+    data_func : callable, optional
+        Additional node metadata extractor.  Defaults to :func:`xyz`.
+    extcell : int, optional
+        Number of extracellular layers copied by the default data extractor.
+    exclude : iterable of neuron.h.Section, optional
+        Sections whose complete descendant subtrees are pruned.
+
+    Returns
+    -------
+    graph : networkx.DiGraph
+        A rooted tree with exact NEURON axial resistances in Ω.
+    id2seg : dict
+        Mapping of graph node IDs to their corresponding NEURON segment or
+        physical endpoint location.
     """
     if data_func is None:
         data_func = partial(xyz, extcell=extcell)
 
-    # 0. discover root sections -------------------------------------------------
+    # Discover a unique root if the caller did not supply one.
     if root_sec is None:
         roots = [s for s in h.allsec() if not h.SectionRef(sec=s).has_parent()]
-    else:
-        roots = [root_sec]
+        if len(roots) != 1:
+            raise AssertionError(
+                "There is more than one candidate root section in the hoc "
+                "namespace. Please specify one."
+            )
+        root_sec = roots[0]
 
-    assert len(roots) == 1, (
-        "There is more than one candidate root section in the hoc namespace. Please specify one."
-    )
+    exclude_set = set() if exclude is None else set(exclude)
+    sections = _collect_neuron_sections(root_sec, exclude_set)
+    if not sections:
+        raise ValueError("The requested NEURON subtree is empty after exclusions.")
+    section_set = set(sections)
 
-    G = nx.DiGraph()
-    id2seg = {}  # node‑id → Segment
-    segkey2id = {}  # (Section, idx) → node‑id
+    resistor_graph = nx.Graph()
+    id2seg: Dict[int, "nrn.Segment"] = {}
+    segkey2id = {}
 
-    def node_for(seg, idx):
-        """Return existing nodeid or create one for (seg.sec, idx)."""
-        key = (seg.sec, idx)
-        if key not in segkey2id:
+    # ------------------------------------------------------------------
+    # Material nodes: one per NEURON segment centre.
+    # ------------------------------------------------------------------
+    for sec in sections:
+        for x, idx in _compartments(sec):
+            seg = sec(x)
             nid = len(segkey2id)
-            segkey2id[key] = nid
+            segkey2id[(sec, idx)] = nid
             id2seg[nid] = seg
             if attach_objects:
                 data = data_func(seg) if data_func else {}
-                G.add_node(
-                    nid,
-                    diam=seg.diam,
-                    L=seg.sec.L / seg.sec.nseg,
-                    Ra=seg.sec.Ra,
-                    cm=seg.cm,
-                    name=str(seg),
-                    area=seg.area(),
+                attrs = {
+                    "diam": float(seg.diam),
+                    "L": float(sec.L) / int(sec.nseg),
+                    "Ra": float(sec.Ra),
+                    "cm": float(seg.cm),
+                    "name": str(seg),
+                    "area": float(seg.area()),
                     **_node_geometry_attrs(seg),
-                    **data,
-                )
+                }
+                attrs.update(data)
+                resistor_graph.add_node(nid, **attrs)
             else:
-                G.add_node(nid)
-        return segkey2id[key]
+                resistor_graph.add_node(nid)
 
-    # 1. depth‑first traversal --------------------------------------------------
-    stack, visited = list(roots), set()
+    # ------------------------------------------------------------------
+    # Identify physical endpoint junctions.  A child endpoint is the same
+    # electrical node as either a parent endpoint or a containing parent
+    # segment centre for an interior connection.
+    # ------------------------------------------------------------------
+    endpoint_tokens = [
+        ("endpoint", sec, endpoint) for sec in sections for endpoint in (0, 1)
+    ]
+    material_nodes = list(id2seg)
+    union_find = nx.utils.UnionFind(endpoint_tokens + material_nodes)
 
-    if exclude is not None:
-        exclude_set = set(exclude)
-        stack = [sec for sec in stack if sec not in exclude_set]
-
-    while stack:
-        sec = stack.pop()
-        if sec in visited or (exclude is not None and sec in exclude_set):
+    for child_sec in sections:
+        if child_sec is root_sec:
+            # A supplied subtree root may itself have an external parent.  That
+            # connection is intentionally cut and its endpoint becomes sealed.
             continue
-        visited.add(sec)
+        parent_loc = child_sec.parentseg()
+        if parent_loc is None or parent_loc.sec not in section_set:
+            continue
 
-        # 1a. axial neighbours inside this section -----------------------------
-        prev_id = None
-        prev_seg = None
-        for x, idx in _compartments(sec):  # proximal → distal
-            seg = sec(x)
-            nid = node_for(seg, idx)
+        child_endpoint = _section_orientation(child_sec)
+        child_token = ("endpoint", child_sec, child_endpoint)
+        parent_x = float(parent_loc.x)
+        if parent_x == 0.0 or parent_x == 1.0:
+            parent_target = ("endpoint", parent_loc.sec, int(parent_x))
+        else:
+            parent_idx = _segment_index_for_location(parent_loc.sec, parent_x)
+            parent_target = segkey2id[(parent_loc.sec, parent_idx)]
+        union_find.union(child_token, parent_target)
 
-            if prev_id is not None:
-                # exact centre‑to‑centre distance (µm)
-                L_um = h.distance(prev_seg, seg)
-                # exact axial resistance from NEURON (Ω)
-                R_ohm = r_ohm(prev_seg, seg)
-                G.add_edge(
-                    prev_id,
-                    nid,
-                    L=L_um,
-                    R_ohm=R_ohm,
-                    **_edge_geometry_attrs(prev_seg, seg, R_ohm),
-                )
+    groups = {}
+    for element in endpoint_tokens + material_nodes:
+        groups.setdefault(union_find[element], []).append(element)
 
-            prev_id, prev_seg = nid, seg
+    endpoint_to_graph_node = {}
+    provisional_junctions = []
+    next_node = len(material_nodes)
+    for members in groups.values():
+        centers = [member for member in members if isinstance(member, int)]
+        endpoints = [member for member in members if not isinstance(member, int)]
+        if len(centers) > 1:
+            raise ValueError(
+                "A NEURON connection identified multiple membrane compartments "
+                f"as one node: {centers!r}."
+            )
+        if centers:
+            graph_node = centers[0]
+        else:
+            graph_node = next_node
+            next_node += 1
+            provisional_junctions.append(graph_node)
+            _, rep_sec, rep_endpoint = endpoints[0]
+            rep_seg = rep_sec(float(rep_endpoint))
+            id2seg[graph_node] = rep_seg
+            resistor_graph.add_node(
+                graph_node,
+                **_branchpoint_node_attrs(
+                    rep_seg, data_func=data_func, attach_objects=attach_objects
+                ),
+            )
+        for endpoint in endpoints:
+            endpoint_to_graph_node[endpoint] = graph_node
 
-        # 1b. parent → child ----------------------------------------------------
-        for child_sec, x_on_parent in _sec_children(sec):
-            # -------- parent compartment (centre of hosting segment) -----
-            nseg_p = sec.nseg
-            idx_p = min(int(x_on_parent * nseg_p), nseg_p - 1)
-            parent_seg = sec((idx_p + 0.5) / nseg_p)
-            parent_id = node_for(parent_seg, idx_p)
-
-            # -------- child compartment that is *actually connected* -----
-            child_seg, idx_c = _first_child_compartment(child_sec, parent_seg)
-            child_id = node_for(child_seg, idx_c)
-
-            # exact geometry & resistance
-            L_um = h.distance(parent_seg, child_seg)  # µm
-            R_ohm = r_ohm(parent_seg, child_seg)
-
-            G.add_edge(
-                parent_id,
-                child_id,
-                L=L_um,
-                R_ohm=R_ohm,
-                **_edge_geometry_attrs(parent_seg, child_seg, R_ohm),
+    # ------------------------------------------------------------------
+    # Centre-to-centre cable edges within each section.
+    # ------------------------------------------------------------------
+    for sec in sections:
+        for left_idx in range(int(sec.nseg) - 1):
+            right_idx = left_idx + 1
+            left_seg = _segment_center(sec, left_idx)
+            right_seg = _segment_center(sec, right_idx)
+            inv_area = _section_inv_area_between_x(sec, left_seg.x, right_seg.x)
+            attrs = _edge_attrs_from_path(
+                R_ohm_value=_same_section_resistance_ohm(left_seg, right_seg),
+                L_um=_safe_distance_um(left_seg, right_seg),
+                inv_area_um_inv=inv_area,
+            )
+            _add_resistor_edge(
+                resistor_graph,
+                segkey2id[(sec, left_idx)],
+                segkey2id[(sec, right_idx)],
+                attrs,
             )
 
-            stack.append(child_sec)
+    # ------------------------------------------------------------------
+    # Half-segment edges from each section centre to each physical endpoint.
+    # Endpoint groups attached to an interior parent location already resolve
+    # directly to that parent material node.
+    # ------------------------------------------------------------------
+    for sec in sections:
+        for endpoint in (0, 1):
+            idx = 0 if endpoint == 0 else int(sec.nseg) - 1
+            center_seg = _segment_center(sec, idx)
+            center_node = segkey2id[(sec, idx)]
+            endpoint_node = endpoint_to_graph_node[("endpoint", sec, endpoint)]
+            inv_area = _section_inv_area_between_x(sec, center_seg.x, endpoint)
+            attrs = _edge_attrs_from_path(
+                R_ohm_value=_center_to_endpoint_resistance_ohm(sec, endpoint),
+                L_um=_safe_distance_um(center_seg, sec(float(endpoint))),
+                inv_area_um_inv=inv_area,
+            )
+            _add_resistor_edge(resistor_graph, center_node, endpoint_node, attrs)
+
+    # ------------------------------------------------------------------
+    # A sealed endpoint is a degree-one zero-area node and has no electrical
+    # effect.  A degree-two endpoint is exactly a pair of series resistors and
+    # can be collapsed.  True cable junctions (degree >= 3) remain explicit.
+    # ------------------------------------------------------------------
+    for junction in list(provisional_junctions):
+        if junction not in resistor_graph:
+            continue
+        degree = resistor_graph.degree(junction)
+        if degree <= 1:
+            resistor_graph.remove_node(junction)
+            id2seg.pop(junction, None)
+            continue
+        if degree == 2:
+            first_node, second_node = list(resistor_graph.neighbors(junction))
+            first_attrs = dict(resistor_graph.edges[first_node, junction])
+            second_attrs = dict(resistor_graph.edges[junction, second_node])
+            combined = _series_edge_attrs(first_attrs, second_attrs)
+            resistor_graph.remove_node(junction)
+            id2seg.pop(junction, None)
+            _add_resistor_edge(resistor_graph, first_node, second_node, combined)
+
+    root_endpoint = _section_orientation(root_sec)
+    root_idx = 0 if root_endpoint == 0 else int(root_sec.nseg) - 1
+    root_node = segkey2id[(root_sec, root_idx)]
+    G = _orient_resistor_tree(resistor_graph, root_node)
+
+    # Assign stable branchpoint names only to junctions that survived the
+    # degree-one/two simplification.
+    retained_junctions = [node for node in provisional_junctions if node in G]
+    for branch_index, node in enumerate(retained_junctions):
+        G.nodes[node]["name"] = f"branchpoint.{branch_index}"
+
+    # Internal bookkeeping is no longer needed after all series collapses.
+    for _, _, attrs in G.edges(data=True):
+        attrs.pop("_inv_area_um_inv", None)
 
     patterns = {
         "DEND": r"dend",
         "APIC": r"apic",
         "SOMA": r"soma",
-        "UNMYELIN": r"unmyelin",  # More specific pattern
-        "MYELIN": r"\bmyelin\b",  # Matches 'myelin' as a whole word
+        "UNMYELIN": r"unmyelin",
+        "MYELIN": r"\bmyelin\b",
         "AXON": r"axon",
         "NODE": r"node",
     }
-
     group_order = ["APIC", "DEND", "SOMA", "AXON", "UNMYELIN", "NODE", "MYELIN"]
 
     G, relabel_mapping = reorder_graph_by_patterns(G, patterns, group_order)
     id2seg = regenerate_id_map(id2seg, relabel_mapping)
-    fix_graph_branchpoints(G, id2seg, data_func)
     return G, id2seg
 
 
@@ -815,55 +1173,10 @@ def get_children_of_nodes(G: nx.DiGraph, node_ids):
 
 
 def fix_graph_branchpoints(G, id2seg, data_func=None):
-    children_map = get_children_of_nodes(G, find_branch_points(G))
-    to_fix = {}
-    for pre, post_list in children_map.items():
-        for idx in post_list:
-            post_seg = id2seg[idx]
-            parent_seg = post_seg.sec.parentseg()
-            if parent_seg is None:
-                continue
-            parent_x = parent_seg.x
-            if parent_x == 0 or parent_x == 1:
-                to_fix.setdefault(pre, {}).setdefault(parent_x, []).append(idx)
-    c = 0
-    for pre_idx, dct in to_fix.items():
-        for x_on_pre, post_indices in dct.items():
-            parent_seg_true = id2seg[pre_idx].sec(x_on_pre)
-            data = data_func(parent_seg_true) if data_func else {}
-            nid = len(G.nodes)
-            G.add_node(
-                nid,
-                diam=parent_seg_true.diam,
-                L=0.0,
-                Ra=parent_seg_true.sec.Ra,
-                cm=parent_seg_true.cm,
-                name=f"branchpoint.{c}.{parent_seg_true}",
-                area=parent_seg_true.area(),
-                volume=0.0,
-                volume_um3=0.0,
-                volume_i=0.0,
-                **data,
-            )
-            id2seg[nid] = parent_seg_true
-            c += 1
-            R_pre_bp = parent_seg_true.ri() * 1e6
-            G.add_edge(
-                pre_idx,
-                nid,
-                L=h.distance(id2seg[pre_idx], parent_seg_true),
-                R_ohm=R_pre_bp,
-                **_edge_geometry_attrs(id2seg[pre_idx], parent_seg_true, R_pre_bp),
-            )
-            for post_idx in post_indices:
-                G.remove_edge(pre_idx, post_idx)
-                R_bp_post = id2seg[post_idx].ri() * 1e6
-                G.add_edge(
-                    nid,
-                    post_idx,
-                    L=h.distance(parent_seg_true, id2seg[post_idx]),
-                    R_ohm=R_bp_post,
-                    **_edge_geometry_attrs(
-                        parent_seg_true, id2seg[post_idx], R_bp_post
-                    ),
-                )
+    """Deprecated compatibility hook.
+
+    Branchpoints are now constructed from NEURON section endpoints inside
+    :func:`neuron_to_dendra_graph`; no post-hoc graph rewrite is required.
+    The function remains as a no-op for callers that imported it directly.
+    """
+    return G

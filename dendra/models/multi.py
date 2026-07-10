@@ -375,14 +375,36 @@ class MultiPopulation(Population):
             # now do _mech_data
             for m_class, list_of_aliases_kwargs_keys in pop._mech_data.items():
                 idx = 0
-                for alias, kwargs, key in list_of_aliases_kwargs_keys:
+                for record in list_of_aliases_kwargs_keys:
+                    if len(record) == 3:
+                        alias, kwargs, key = record
+                        preserve_duplicate_indices = False
+                        copies = 1
+                    elif len(record) == 4:
+                        alias, kwargs, key, preserve_duplicate_indices = record
+                        copies = 1
+                    elif len(record) == 5:
+                        alias, kwargs, key, preserve_duplicate_indices, copies = record
+                    else:
+                        raise ValueError(
+                            "Mechanism insertion records must contain either "
+                            "(alias, kwargs, key), "
+                            "(alias, kwargs, key, preserve_duplicate_indices), "
+                            "or (alias, kwargs, key, preserve_duplicate_indices, copies)."
+                        )
                     index_f = key_to_flat_index(index, key)
                     if alias is not None:
                         alias_n = f"{name}_{alias}"
                     else:
                         alias_n = f"{name}_{idx}"
                         idx += 1
-                    self[:, index_f].insert(m_class, alias=alias_n, **kwargs)
+                    self[:, index_f].insert(
+                        m_class,
+                        alias=alias_n,
+                        preserve_duplicate_indices=preserve_duplicate_indices,
+                        copies=copies,
+                        **kwargs,
+                    )
 
     def batch(self, batch_size: int):
         """Create a batched view of the multi-population."""

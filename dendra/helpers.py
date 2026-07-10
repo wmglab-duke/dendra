@@ -3,10 +3,12 @@ from __future__ import annotations
 import contextlib
 import functools
 import importlib
+import json
 import logging
 import os
 import re
 import time
+from collections.abc import Mapping
 from typing import Any, Callable, ClassVar, Optional, TypeVar
 
 import numpy as np
@@ -43,6 +45,8 @@ class ctx(contextlib.ContextDecorator):
     - ``JIT_NETWORK_OPS`` (int/bool): enable network-side/event/synapse JIT
       where a component exposes a compile-safe kernel.
     - ``COMPILE_MODE`` (str): torch.compile mode (e.g., ``\"default\"``).
+    - ``COMPILE_OPTIONS`` (dict/str/None): optional ``torch.compile`` options
+      dictionary forwarded to supported compiled kernels.
     - ``DEBUG`` (int/bool): increase logging verbosity for mechanism/state
       compilation (symbolic transforms, conductance differentiation).
     - ``DEVICE`` (str/torch.device/None): default device for newly constructed
@@ -157,6 +161,87 @@ def _normalize_dtype_value(value, default=None):
     raise TypeError(f"Unsupported dtype context value {value!r}")
 
 
+_COMPILE_OPTIONS_NONE_SENTINELS = {"", "none", "null", "default", "{}"}
+
+
+def _freeze_compile_option_value(value):
+    """Return a hashable representation of a torch.compile option value."""
+    if isinstance(value, Mapping):
+        return tuple(
+            (str(k), _freeze_compile_option_value(v))
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_compile_option_value(v) for v in value)
+    if isinstance(value, set):
+        return tuple(sorted(_freeze_compile_option_value(v) for v in value))
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def normalize_compile_options(options=None):
+    """Normalize a Dendra compile-options value for ``torch.compile``.
+
+    Parameters
+    ----------
+    options : dict, Mapping, str, or None
+        Optional backend-specific options to forward to ``torch.compile``.
+        ``None``, an empty string, ``"none"``, ``"null"``, ``"default"``, and
+        ``"{}"`` all mean no options. Strings that are not sentinels must be a
+        JSON object.
+
+    Returns
+    -------
+    dict or None
+        A shallow ``dict`` copy suitable for passing as ``options=...`` to
+        ``torch.compile``.
+    """
+    if options is None:
+        return None
+    if isinstance(options, str):
+        text = options.strip()
+        if text.lower() in _COMPILE_OPTIONS_NONE_SENTINELS:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "COMPILE_OPTIONS strings must be JSON objects, e.g. "
+                "'{\"triton.cudagraphs\": true}', or one of: "
+                f"{sorted(_COMPILE_OPTIONS_NONE_SENTINELS)}."
+            ) from exc
+        options = parsed
+    if not isinstance(options, Mapping):
+        raise TypeError(
+            "COMPILE_OPTIONS must be a mapping, JSON object string, or None; "
+            f"got {type(options)!r}."
+        )
+    out = dict(options)
+    return out or None
+
+
+def compile_options_key(options=None):
+    """Return a stable hashable key for a compile-options value."""
+    normalized = normalize_compile_options(options)
+    if normalized is None:
+        return None
+    return tuple(
+        (str(k), _freeze_compile_option_value(v))
+        for k, v in sorted(normalized.items(), key=lambda item: str(item[0]))
+    )
+
+
+def current_compile_options(default=None):
+    """Return the active normalized ``torch.compile`` options dictionary."""
+    options = normalize_compile_options(COMPILE_OPTIONS.value)
+    if options is None:
+        return default
+    return options
+
+
 def current_device(default=None):
     """Return the active Dendra default device, or ``default`` when unset."""
     return _normalize_device_value(DEVICE.value, default=default)
@@ -205,6 +290,39 @@ JIT_NETWORK_SOLVES = ContextVar("JIT_NETWORK_SOLVES", getenv("JIT_IN_NETWORK", 0
 JIT_NETWORK_OPS = ContextVar("JIT_NETWORK_OPS", 0)
 JIT_IN_NETWORK = JIT_NETWORK_SOLVES
 COMPILE_MODE = ContextVar("COMPILE_MODE", "default")
+COMPILE_OPTIONS = ContextVar("COMPILE_OPTIONS", "")
+
+
+def set_compile_options(options=None, **kwargs):
+    """Set global ``torch.compile(options=...)`` for Dendra JIT call sites.
+
+    Examples
+    --------
+    >>> set_compile_options({"triton.cudagraphs": True})
+    >>> set_compile_options(None)  # clear options
+    >>> set_compile_options(**{"trace.enabled": True})
+
+    Parameters
+    ----------
+    options : Mapping, JSON str, or None
+        Options to normalize and store. ``None`` with no keyword arguments
+        clears the global options.
+    **kwargs
+        Convenience option entries merged into ``options``. Keyword entries
+        override entries from ``options``.
+
+    Returns
+    -------
+    dict or None
+        The normalized options value that was stored.
+    """
+    normalized = normalize_compile_options(options)
+    if kwargs:
+        merged = {} if normalized is None else dict(normalized)
+        merged.update(kwargs)
+        normalized = normalize_compile_options(merged)
+    COMPILE_OPTIONS.value = normalized
+    return normalized
 
 
 def set_jit_enabled(enable=True):
