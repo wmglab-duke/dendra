@@ -1,3 +1,14 @@
+## v0.17.0 (2026-07-10)
+
+### Feat
+
+- add dendra.step to advance state by one timestep
+- euler-maruyama SDE for States
+- register new random distributions for use with RAND declarations in Parameterized
+- add RAND variables to Parameterized
+- expose torch.compile options through dendra
+- PointProcess slots
+
 ## v0.16.0 (2026-06-24)
 
 ### Feat
