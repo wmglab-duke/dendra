@@ -351,10 +351,32 @@ class MultiPopulation(Population):
         for index, (name, pop) in zip(all_indices, self.populations.items()):
             label_name = name
             self[:, index.flatten()].label(label_name)
-            for label, slice in pop._labels.items():
-                getattr(self, label_name)[
-                    :, flatten_key(pop.numel(), pop.shape, slice.index)
-                ].label(label)
+            self._sync_component_labels(label_name, pop)
+
+    def _sync_component_labels(self, name, pop):
+        """Synchronize one component's nested labels on its composite slice."""
+        population_slice = getattr(self, name)
+        previous = set(
+            object.__getattribute__(population_slice, "__dict__").get(
+                "_component_label_names", ()
+            )
+        )
+        current = set(pop._labels)
+
+        for label in previous - current:
+            if label in object.__getattribute__(population_slice, "__dict__"):
+                object.__delattr__(population_slice, label)
+
+        nested_labels = []
+        for label, component_slice in pop._labels.items():
+            nested = population_slice[
+                :, flatten_key(pop.numel(), pop.shape, component_slice.index)
+            ]
+            object.__setattr__(population_slice, label, nested)
+            nested_labels.append(nested)
+
+        object.__setattr__(population_slice, "_component_label_names", current)
+        return nested_labels
 
     def reinject_all(self):
         """Reinject intracellular currents for all component populations."""
@@ -408,7 +430,13 @@ class MultiPopulation(Population):
 
     def batch(self, batch_size: int):
         """Create a batched view of the multi-population."""
+        nested_labels = []
+        for name, pop in self.populations.items():
+            nested_labels.extend(self._sync_component_labels(name, pop))
+
         super().batch(batch_size)
+        for nested_label in nested_labels:
+            nested_label._batch()
         # Do not add a leading dimension to v_init. A scalar, length-nc vector,
         # or [1, nc] tensor already expands correctly to [batch, 1, nc].
         for pop in self.populations.values():

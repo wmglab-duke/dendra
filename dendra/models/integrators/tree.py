@@ -6,7 +6,7 @@ import networkx as nx
 import numpy as np
 import torch
 
-from ..graph import share_topology_isomorphic
+from ..graph import share_topology_labeled
 from .core import (
     Integrator,
     MultiIntegrator,
@@ -52,11 +52,55 @@ try:
             WARP_ROW_BASE,
             WARP_ROW_COUNT,
         )
+
 except ImportError:
     DENDRA_SOLVERS_AVAILABLE = False
 
 
 THREADS_PER_WARP = 32
+
+
+def _validate_dhs_threads(threads: int) -> int:
+    """Validate the lane count accepted by the CPU and CUDA DHS kernels."""
+    if isinstance(threads, bool) or not isinstance(threads, int):
+        raise TypeError("threads must be a positive integer that divides 32")
+    if threads <= 0 or threads > THREADS_PER_WARP:
+        raise ValueError("threads must be in [1, 32]")
+    if THREADS_PER_WARP % threads != 0:
+        raise ValueError("threads must divide 32 (warp size)")
+    return threads
+
+
+def _validate_tree_graph(graph: nx.DiGraph) -> None:
+    """Reject graph shapes that the Hines/DHS parent representation cannot encode."""
+    if not isinstance(graph, nx.DiGraph) or graph.is_multigraph():
+        raise TypeError("morphology graph must be a networkx.DiGraph")
+    if graph.number_of_nodes() == 0:
+        raise ValueError("morphology graph must contain at least one node")
+    if not nx.is_directed_acyclic_graph(graph):
+        raise ValueError("morphology graph must be acyclic")
+
+    for node, degree in graph.in_degree():
+        if degree > 1:
+            raise ValueError(
+                f"Node {node} has {degree} parents; morphology must be a rooted tree."
+            )
+
+    roots = [node for node, degree in graph.in_degree() if degree == 0]
+    if len(roots) != 1:
+        raise ValueError(
+            f"morphology graph must have exactly one root; found {len(roots)}"
+        )
+
+    root = roots[0]
+    if len(nx.descendants(graph, root)) + 1 != graph.number_of_nodes():
+        raise ValueError("all morphology nodes must be reachable from the root")
+
+    expected_nodes = set(range(graph.number_of_nodes()))
+    if set(graph.nodes()) != expected_nodes:
+        raise ValueError(
+            "morphology node labels must be consecutive integers from 0 to K - 1"
+        )
 
 
 def build_morphology(
@@ -78,27 +122,52 @@ def build_morphology(
     depth       int32[K]  : depth of every node from the soma
     """
     K = len(parent_idx)
+    if K == 0:
+        raise ValueError("parent_idx must contain at least one node")
+
+    roots = [i for i, parent in enumerate(parent_idx) if parent == -1]
+    if len(roots) != 1:
+        raise ValueError(
+            f"parent_idx must contain exactly one root; found {len(roots)}"
+        )
+
     children = [[] for _ in range(K)]
-    root = None
+    root = roots[0]
     for i, p in enumerate(parent_idx):
         if p == -1:
-            root = i
-        else:
-            children[p].append(i)
+            continue
+        if isinstance(p, bool) or not isinstance(p, (int, np.integer)):
+            raise TypeError(f"parent index at node {i} must be an integer; got {p!r}")
+        if p < 0 or p >= K:
+            raise ValueError(
+                f"parent index at node {i} must be in [0, {K - 1}]; got {p}"
+            )
+        if p == i:
+            raise ValueError(f"node {i} cannot be its own parent")
+        children[p].append(i)
 
     depth = torch.zeros(K, dtype=torch.int32)
     q = deque([root])
+    visited = set()
     while q:
         u = q.popleft()
+        if u in visited:
+            raise ValueError("parent_idx contains a cycle")
+        visited.add(u)
         for c in children[u]:
             depth[c] = depth[u] + 1
             q.append(c)
+
+    if len(visited) != K:
+        raise ValueError(
+            "parent_idx contains a cycle or nodes unreachable from the root"
+        )
 
     return (torch.as_tensor(parent_idx, dtype=torch.int32), children, depth)
 
 
 def graph_to_parent_and_axial(
-    G: list[nx.DiGraph], dtype_axial: torch.dtype = torch.float32
+    G: nx.DiGraph | list[nx.DiGraph], dtype_axial: torch.dtype = torch.float32
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a compartmental morphology stored in a DiGraph into
@@ -115,16 +184,28 @@ def graph_to_parent_and_axial(
     The topological sort guarantees that every parent index < child index,
     matching the requirements of DHS / Hines matrix preprocessing.
     """
-    assert share_topology_isomorphic(G), "All graphs must share the same topology."
+    graphs = [G] if isinstance(G, nx.DiGraph) else list(G)
+    if not graphs:
+        raise ValueError("at least one morphology graph is required")
+    for graph in graphs:
+        _validate_tree_graph(graph)
+
+    same_topology, reason = share_topology_labeled(graphs)
+    if not same_topology:
+        raise ValueError(
+            "All morphology graphs must share the same labeled topology: " + reason
+        )
     # ------------------------------------------------------------------
     # 0. topological order and quick look‑ups
     # ------------------------------------------------------------------
-    nodes = list(nx.topological_sort(G[0]))  # length K
+    nodes = list(nx.topological_sort(graphs[0]))  # length K
     idx_of = {n: i for i, n in enumerate(nodes)}
     K = len(nodes)
 
     parent_idx = np.full(K, -1, dtype=np.int32)
-    a_geom = np.zeros((len(G), K), dtype=np.float32)
+    # Compute in double precision and cast only at the public tensor boundary.
+    # The previous float32 staging array silently truncated float64 morphologies.
+    a_geom = np.zeros((len(graphs), K), dtype=np.float64)
 
     # constant: 1 µm = 1 e‑4 cm
     microns_to_cm = 1e-4
@@ -133,7 +214,7 @@ def graph_to_parent_and_axial(
     # ------------------------------------------------------------------
     # 1. iterate over all nodes except the roots
     # ------------------------------------------------------------------
-    for j, g in enumerate(G):
+    for j, g in enumerate(graphs):
         for child in nodes:
             i = idx_of[child]
             preds = list(g.predecessors(child))
@@ -186,6 +267,11 @@ def graph_to_parent_and_axial(
             # --------------------------------------------------------------
             # 1c.  Store axial conductance  (Siemens = 1 / Ω)
             # --------------------------------------------------------------
+            if not np.isfinite(R_total) or R_total <= 0:
+                raise ValueError(
+                    f"Axial resistance for edge ({parent}, {child}) must be "
+                    f"finite and positive; got {R_total!r}."
+                )
             a_geom[j, i] = 1.0 / R_total
 
     # ------------------------------------------------------------------
@@ -213,6 +299,9 @@ def build_dhs_layers(
     order      int32[K]        elimination order (children before parent)
     layer_ptr  int32[L+1]      layer_ptr[m] … layer_ptr[m+1]-1  is layer m
     """
+    k_threads = _validate_dhs_threads(k_threads)
+    if depth.numel() == 0:
+        raise ValueError("depth must contain at least one node")
     depth_cpu = depth.cpu().numpy()
     max_d = int(depth_cpu.max())
 
@@ -273,8 +362,7 @@ class _dhs(Integrator):
     """
 
     def __init__(self, model, mech, imem=None, threads=16):
-        assert THREADS_PER_WARP % threads == 0, "threads must divide 32 (warp size)"
-        assert threads <= 32, "threads must be ≤ 32 (warp size)"
+        threads = _validate_dhs_threads(threads)
 
         super().__init__(model, mech, imem)
         self.threads = threads
@@ -558,8 +646,7 @@ class _dhs_multi(MultiIntegrator):
     ):
         from ..multi import MultiPopulation
 
-        assert THREADS_PER_WARP % threads == 0, "threads must divide 32 (warp size)"
-        assert threads <= 32, "threads must be ≤ 32 (warp size)"
+        threads = _validate_dhs_threads(threads)
         assert len(model) > 0 and isinstance(model, MultiPopulation), (
             "model must be a non-empty MultiPopulation instance"
         )

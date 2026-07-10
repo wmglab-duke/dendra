@@ -678,42 +678,66 @@ class Tree(Population):
 
         if target_directions.shape[0] == 1:
             target_directions = target_directions.repeat(self.np, 1)
+        elif target_directions.shape[0] != self.np:
+            raise ValueError(
+                "target_directions must contain either one direction or one "
+                f"direction per cell ({self.np}); got {target_directions.shape[0]}."
+            )
         target_directions = target_directions.to(device)
+
+        if torch.any(torch.linalg.vector_norm(self.directions, dim=1) == 0):
+            raise ValueError("Current cell directions must be non-zero vectors.")
+        if torch.any(torch.linalg.vector_norm(target_directions, dim=1) == 0):
+            raise ValueError("Target cell directions must be non-zero vectors.")
 
         a = F.normalize(self.directions, p=2, dim=1)
         b = F.normalize(target_directions, p=2, dim=1)
 
         # --- Use Rodrigue's formula to get the rotation matrix R ---
         # c is the cosine of the angle (dot product), shape (B,)
-        c = torch.sum(a * b, dim=1)
+        c = torch.sum(a * b, dim=1).clamp(-1.0, 1.0)
 
-        # Mask for when vectors are already aligned (identity rotation)
-        is_identity = c > 1.0 - 1e-6
-        # Mask for when vectors are anti-parallel (180-degree rotation)
-        is_anti_parallel = c < -1.0 + 1e-6
-
-        # v is the axis of rotation (cross product), shape (B, 3)
+        # The cross product contains both the rotation axis and a numerically
+        # stable sin(theta). Only truly degenerate axes need special handling;
+        # a fixed cosine threshold incorrectly turns small requested rotations
+        # into identity transforms while still updating direction metadata.
         v = torch.cross(a, b, dim=1)
+        s = torch.linalg.vector_norm(v, dim=1)
+        tolerance = 10 * torch.finfo(self.directions.dtype).eps
+        is_degenerate = s <= tolerance
+        is_identity = is_degenerate & (c >= 0)
+        is_anti_parallel = is_degenerate & (c < 0)
 
         # Handle the anti-parallel case where the cross product is near zero
         if torch.any(is_anti_parallel):
             # Find an arbitrary perpendicular axis for the 180-degree rotation
-            temp_vec = torch.tensor([1.0, 0.0, 0.0], device=device).expand(self.np, -1)
+            temp_vec = (
+                torch.tensor(
+                    [1.0, 0.0, 0.0], device=device, dtype=self.directions.dtype
+                )
+                .expand(self.np, -1)
+                .clone()
+            )
             parallel_to_temp = torch.all(
                 torch.isclose(a, temp_vec) | torch.isclose(a, -temp_vec), dim=1
             )
-            temp_vec[parallel_to_temp] = torch.tensor([0.0, 1.0, 0.0], device=device)
+            temp_vec[parallel_to_temp] = torch.tensor(
+                [0.0, 1.0, 0.0], device=device, dtype=self.directions.dtype
+            )
 
             v[is_anti_parallel] = F.normalize(
                 torch.cross(a[is_anti_parallel], temp_vec[is_anti_parallel], dim=1),
                 dim=1,
             )
 
-        # s is the sine of the angle. Clamp to prevent sqrt of negative due to float errors.
-        s = torch.sqrt(torch.clamp(1 - c * c, min=0.0))
+        # Rodrigues' formula below expects a unit rotation axis. Degenerate
+        # identity rows deliberately retain the zero axis; their matrices are
+        # replaced explicitly below.
+        safe_s = s.clamp_min(torch.finfo(self.directions.dtype).tiny)
+        v = torch.where(is_degenerate.unsqueeze(1), v, v / safe_s.unsqueeze(1))
 
         # Skew-symmetric cross-product matrix K
-        K = torch.zeros(self.np, 3, 3, device=device)
+        K = torch.zeros(self.np, 3, 3, device=device, dtype=self.directions.dtype)
         K[:, 0, 1] = -v[:, 2]
         K[:, 0, 2] = v[:, 1]
         K[:, 1, 0] = v[:, 2]
@@ -726,19 +750,21 @@ class Tree(Population):
         s_mat = s.view(self.np, 1, 1)
         c_mat = c.view(self.np, 1, 1)
 
-        I = torch.eye(3, device=device).expand(self.np, -1, -1)  # noqa: E741
+        I = torch.eye(3, device=device, dtype=self.directions.dtype).expand(
+            self.np, -1, -1
+        )  # noqa: E741
         R = I + s_mat * K + (1 - c_mat) * (K @ K)
 
         # --- Apply special cases using the (B,) shaped masks ---
         # This is now correct because `is_identity` has shape (B,)
-        R[is_identity] = torch.eye(3, device=device)
+        R[is_identity] = torch.eye(3, device=device, dtype=self.directions.dtype)
 
         # This was already correct, but the logic is now more robust
         if torch.any(is_anti_parallel):
             v_ap = v[is_anti_parallel]
             # Formula for 180-degree rotation matrix around axis v
             R_ap = 2 * torch.einsum("bi,bj->bij", v_ap, v_ap) - torch.eye(
-                3, device=device
+                3, device=device, dtype=self.directions.dtype
             )
             R[is_anti_parallel] = R_ap
 
@@ -747,7 +773,6 @@ class Tree(Population):
         # Update the cell's direction vector
         # We use b, the normalized target, for consistency
         self.directions.copy_(b)
-        self.azimuthal_rotations.fill_(0.0)
         return self
 
     def rotate_azimuthal(
@@ -771,17 +796,25 @@ class Tree(Population):
         v = F.normalize(self.directions, p=2, dim=1)
 
         # Convert angle to radians and ensure it's a (B,) tensor
-        if isinstance(azimuthal_angle, (int, float)):
-            theta = torch.full((self.np,), float(azimuthal_angle), device=device)
+        theta = torch.as_tensor(
+            azimuthal_angle, device=device, dtype=self.directions.dtype
+        )
+        if theta.numel() == 1:
+            theta = theta.reshape(()).expand(self.np).clone()
+        elif theta.numel() == self.np:
+            theta = theta.reshape(self.np)
         else:
-            theta = torch.as_tensor(azimuthal_angle).to(device).reshape(self.np)
+            raise ValueError(
+                "azimuthal_angle must be scalar or contain one angle per cell "
+                f"({self.np}); got {theta.numel()} values."
+            )
         theta_rad = torch.deg2rad(theta)
 
         c = torch.cos(theta_rad)
         s = torch.sin(theta_rad)
 
         # Skew-symmetric cross-product matrix K
-        K = torch.zeros(self.np, 3, 3, device=device)
+        K = torch.zeros(self.np, 3, 3, device=device, dtype=self.directions.dtype)
         K[:, 0, 1] = -v[:, 2]
         K[:, 0, 2] = v[:, 1]
         K[:, 1, 0] = v[:, 2]
@@ -792,7 +825,9 @@ class Tree(Population):
         s = s.view(self.np, 1, 1)
         c = c.view(self.np, 1, 1)
 
-        I = torch.eye(3, device=device).expand(self.np, -1, -1)  # noqa: E741
+        I = torch.eye(3, device=device, dtype=self.directions.dtype).expand(
+            self.np, -1, -1
+        )  # noqa: E741
         R = I + s * K + (1 - c) * (K @ K)
 
         self._apply_rotation(R, origin)
@@ -817,16 +852,19 @@ class Tree(Population):
         self.azimuthal_rotations.copy_(self.base_azimuthal_rotation.expand(self.np))
 
         morph = gather_morphology(self.graph)
+        base_x = morph["x"].to(dtype=self.x.dtype, device=self.x.device)
+        base_y = morph["y"].to(dtype=self.y.dtype, device=self.y.device)
+        base_z = morph["z"].to(dtype=self.z.dtype, device=self.z.device)
         self.x.copy_(
-            morph["x"].expand(self.np, -1).to(dtype=self.x.dtype, device=self.x.device)
+            (base_x - base_x[..., origin].unsqueeze(-1)).expand(self.np, -1)
             + x_c.unsqueeze(1)
         )
         self.y.copy_(
-            morph["y"].expand(self.np, -1).to(dtype=self.y.dtype, device=self.y.device)
+            (base_y - base_y[..., origin].unsqueeze(-1)).expand(self.np, -1)
             + y_c.unsqueeze(1)
         )
         self.z.copy_(
-            morph["z"].expand(self.np, -1).to(dtype=self.z.dtype, device=self.z.device)
+            (base_z - base_z[..., origin].unsqueeze(-1)).expand(self.np, -1)
             + z_c.unsqueeze(1)
         )
 

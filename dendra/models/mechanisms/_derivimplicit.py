@@ -104,6 +104,8 @@ def _normalize_derivimplicit_options(options):
         raise ValueError("derivimplicit ls_decay must be in the open interval (0, 1).")
     if out["tol"] < 0.0:
         raise ValueError("derivimplicit tol must be non-negative.")
+    if out["jacobian_regularization"] < 0.0:
+        raise ValueError("derivimplicit jacobian_regularization must be non-negative.")
 
     return out
 
@@ -376,9 +378,12 @@ def _derivimplicit_step_while_loop(
         else:
             t_next = t_ms_t.expand(batch_shape) + dt
 
-    eye = torch.eye(n, device=device, dtype=dtype).expand((*batch_shape, n, n))
-    dt_vec = dt[..., None] if dt.ndim > 0 else dt
-    dt_mat = dt[..., None, None] if dt.ndim > 0 else dt
+    # ``torch.while_loop`` rejects aliased captured inputs.  Expanded/view
+    # tensors are fine in eager mode but ``eye``, ``dt_vec``, and ``dt_mat``
+    # otherwise share storage with another captured value during HOP tracing.
+    eye = torch.eye(n, device=device, dtype=dtype).expand((*batch_shape, n, n)).clone()
+    dt_vec = (dt[..., None] if dt.ndim > 0 else dt).clone()
+    dt_mat = (dt[..., None, None] if dt.ndim > 0 else dt).clone()
 
     tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
     max_iter_t = torch.as_tensor(max_iter, device=device, dtype=torch.int64)
@@ -583,8 +588,8 @@ f_template = """
 
 jac_fn_template = """
     def jac_fn(x, t):
-        {unbinded_states}
         J = x.new_zeros((*x.shape, x.shape[-1]))
+        {unbinded_states}
         {assemble_jacobian}
         return J
 """
@@ -635,6 +640,8 @@ def build_derivimplicit(
 
     # Solve only non-eliminated states, preserving input order
     states_to_solve = [s for s in states if s not in eliminate]
+    if not states_to_solve:
+        raise ValueError("derivimplicit requires at least one non-eliminated state.")
 
     # Deterministic signature: states first (in given order), then assigned (sorted)
     assigned_list = list(assigned)
@@ -646,11 +653,26 @@ def build_derivimplicit(
     # ---- build stack/unbind strings ----
     concatenate = concatenate_string.format(states=", ".join(states_to_solve))
 
-    unbind = unbind_template.format(states=", ".join(states_to_solve))
-    unbind = add_underscore_to_states(unbind, states_to_solve)
+    unbind_targets = ", ".join(states_to_solve)
+    if len(states_to_solve) == 1:
+        unbind_targets += ","
+
+    # Only the assignment targets are updated-state names.  Applying the old
+    # whole-expression substitution also renamed the RHS stack variable when a
+    # mechanism state itself was named ``x`` (``torch.unbind(_x, ...)`` before
+    # ``_x`` existed).
+    updated_targets = ", ".join(f"_{state}" for state in states_to_solve)
+    if len(states_to_solve) == 1:
+        updated_targets += ","
+    unbind = f"{updated_targets} = torch.unbind(x, dim=-1)"
 
     # ---- canonicalize derivative mapping ----
     derivative = match_derivative_to_states(derivative, states)
+    missing = [s for s in states_to_solve if s not in derivative]
+    if missing:
+        raise ValueError(
+            f"derivimplicit missing derivative(s) for state(s): {missing}."
+        )
 
     # ---- build f(x,t) ----
     derivatives = [
@@ -659,7 +681,7 @@ def build_derivimplicit(
     derivatives_str = "\n        ".join(derivatives)
 
     f_str = f_template.format(
-        unbinded_states=unbind_template.format(states=", ".join(states_to_solve)),
+        unbinded_states=unbind_template.format(states=unbind_targets),
         derivatives=derivatives_str,
         states=", ".join([f"_{s}_deriv" for s in states_to_solve]),
     )
@@ -730,9 +752,7 @@ def build_derivimplicit(
         else:
             # State-dependent Jacobian: jac_fn(x,t)
             jac_fn_str = jac_fn_template.format(
-                unbinded_states=unbind_template.format(
-                    states=", ".join(states_to_solve)
-                ),
+                unbinded_states=unbind_template.format(states=unbind_targets),
                 assemble_jacobian="\n        ".join(
                     [
                         f"J[..., {i}, {j}] = ({rhs_derivatives[(s, swrt)]})"

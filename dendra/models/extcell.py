@@ -4,7 +4,7 @@ import torch
 
 from .core import Axon
 from .integrators import bwd_euler_bt, dhs_bt
-from .tree import Tree, gather_membrane, gather_morphology
+from .tree import Tree, gather_diffusion_edges, gather_membrane, gather_morphology
 
 
 class ExtCellAxon(Axon):
@@ -168,7 +168,23 @@ class ExtCellTree(Tree):
             ``(1, n_comp)``.
         """
         for key, value in morphology.items():
-            self.register_buffer(key, value.expand(self.np, -1))
+            expanded = value.expand(self.np, -1).clone()
+            self.register_buffer(
+                key, expanded.to(device=self.device(), dtype=self.dtype())
+            )
+
+    def load_diffusion_edges(self, diffusion_edges):
+        """Register child-indexed and compact tree-diffusion metadata."""
+        for key, value in diffusion_edges.items():
+            if value.dtype.is_floating_point:
+                if value.ndim == 2:
+                    value = value.expand(self.np, -1).clone()
+                else:
+                    value = value.clone()
+                value = value.to(device=self.device(), dtype=self.dtype())
+            else:
+                value = value.clone().to(device=self.device())
+            self.register_buffer(key, value)
 
     @classmethod
     def from_graph(cls, graph, N=1, n_layers=2, integrator=None, **kwargs):
@@ -194,11 +210,13 @@ class ExtCellTree(Tree):
         """
         C = len(graph.nodes)
         morphology = gather_morphology(graph)
+        diffusion_edges = gather_diffusion_edges(graph)
         membrane = gather_membrane(graph)
         membrane.update(kwargs)
         extcell = gather_extcell(graph, n_layers=n_layers)
         tree = cls(N, C, graph, n_layers=n_layers, integrator=integrator, **membrane)
         tree.load_morphology(morphology)
+        tree.load_diffusion_edges(diffusion_edges)
         tree.load_extcell(extcell)
         tree.slice("soma").label("soma")
         tree.slice("axon").label("axon")

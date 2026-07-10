@@ -281,10 +281,12 @@ def _analyze_buffer_system(states, assigned, derivative, *, bound, free):
 bufferimplicit_template = """
 def solve(self, dt, {states_and_assigned}, **kwargs):
     {locals}
-    __gamma = ({gamma_expr})
-    __source = ({source_expr})
-    __ku = ({ku_expr})
-    __kr = ({kr_expr})
+    __ref = {bound}
+    dt = torch.as_tensor(dt, dtype=__ref.dtype, device=__ref.device)
+    __gamma = torch.as_tensor(({gamma_expr}), dtype=__ref.dtype, device=__ref.device)
+    __source = torch.as_tensor(({source_expr}), dtype=__ref.dtype, device=__ref.device)
+    __ku = torch.as_tensor(({ku_expr}), dtype=__ref.dtype, device=__ref.device)
+    __kr = torch.as_tensor(({kr_expr}), dtype=__ref.dtype, device=__ref.device)
 
     __T = {free} + __gamma * {bound} + dt * __source
     __a = dt * __ku * __gamma

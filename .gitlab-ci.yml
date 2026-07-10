@@ -52,13 +52,15 @@ before_script:
 test:
   stage: test
   script:
-    - python -m pip install pytest pytest-cov
-    - python -m pytest tests --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=xml --cov-report=html --cov-fail-under=39
+    - python -m pip install pytest pytest-cov hypothesis
+    - python -m pytest tests -m cpu --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=xml --cov-report=html --cov-fail-under=59
+    - python scripts/check_coverage_floors.py coverage.json
   coverage: '/TOTAL.*\s+(\d+%)$/'
   artifacts:
     when: always
     paths:
       - htmlcov/
+      - coverage.json
     reports:
       coverage_report:
         coverage_format: cobertura

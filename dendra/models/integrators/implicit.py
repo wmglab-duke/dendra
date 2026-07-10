@@ -56,6 +56,7 @@ class _bwd_euler_sc(Integrator):
     def __init__(self, model, mech, imem=None):
         super().__init__(model, mech, imem)
         self.register_buffer("cmdt", torch.tensor(0.0))
+        self.register_buffer("area", torch.tensor(0.0))
 
     def initialize(self, model, dt):
         # model.cm: uF/cm²
@@ -205,6 +206,7 @@ class _bwd_euler_ub(Integrator):
         self.register_buffer("lower", torch.zeros(B, K - 1))
         self.register_buffer("upper", torch.zeros(B, K - 1))
         self.register_buffer("g_edge_Cinv", torch.zeros(B, K - 1))
+        self.register_buffer("g_edge_Cinv_right", torch.zeros(B, K - 1))
 
     def _select_solver(self, model):
         dev = model.device().type  # "cpu" or "cuda"
@@ -303,8 +305,8 @@ class _bwd_euler_ub(Integrator):
         g_left = g_edge / Cm[:, :-1]  # affects row i     (B,K-1)
         g_right = g_edge / Cm[:, 1:]  # affects row i+1   (B,K-1)
 
-        g_edge_Cinv = g_edge / Cm[:, :-1]  # (B, K-1)   1/s
-        self.g_edge_Cinv = g_edge_Cinv
+        self.g_edge_Cinv = g_left
+        self.g_edge_Cinv_right = g_right
 
         # ── fill solver buffers ─────────────────────────────────────
         # diagonal of the diffusive operator (base part, no ion channels yet)
@@ -314,8 +316,11 @@ class _bwd_euler_ub(Integrator):
         self.diag_base = diag
 
         # time-scaled banded matrix (Thomas / SPD will overwrite main diag later)
-        self.lower = -dt_s * g_left  # (B,K-1)  subdiag
-        self.upper = -dt_s * g_right  # (B,K-1)  superdiag
+        # For edge i <-> i+1, the upper entry belongs to row i and is
+        # normalized by C_i; the lower entry belongs to row i+1 and is
+        # normalized by C_{i+1}.
+        self.lower = -dt_s * g_right  # (B,K-1)  subdiag
+        self.upper = -dt_s * g_left  # (B,K-1)  superdiag
 
         # misc pre-computed factors used elsewhere
         self.cm_inv = Cm_inv  # (B,K)
@@ -349,11 +354,12 @@ class _bwd_euler_ub(Integrator):
         if ve is not None:
             # diffusive extracellular coupling
             ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
-            flux = self.g_edge_Cinv * (ve_flat[..., 1:] - ve_flat[..., :-1])  # (B, K-1)
+            delta_ve = ve_flat[..., 1:] - ve_flat[..., :-1]
             S = torch.zeros_like(ve_flat)  # (B, K)
-            S[..., 1:-1] = -flux[..., :-1] + flux[..., 1:]
-            S[..., 0] = -flux[..., 0]
-            S[..., -1] = flux[..., -1]
+            # A varying extracellular field enters through A @ ve.  Each side
+            # of an edge must use the capacitance of its own compartment.
+            S[..., :-1] += self.g_edge_Cinv * delta_ve
+            S[..., 1:] -= self.g_edge_Cinv_right * delta_ve
             f_n = f_n + S
 
         if intra is not None:

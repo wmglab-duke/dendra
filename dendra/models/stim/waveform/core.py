@@ -1,4 +1,5 @@
-from numbers import Number
+import math
+from numbers import Integral, Number
 from typing import Optional
 
 import numpy as np
@@ -81,11 +82,14 @@ class Waveform(SimpleParameterized):
         return self
 
     def reshape_for_intra(self):
+        if getattr(self, "_reshaped_for_intra", False):
+            return self
         for p in self.parameters():
             if p.dim() == 0:
                 pass
             else:
                 p.data = p.data.unsqueeze(0)
+        self._reshaped_for_intra = True
         return self
 
     def fn(self, t):
@@ -169,11 +173,17 @@ class Waveform(SimpleParameterized):
         )
 
     def assemble(self, start, end, dt):
-        t = torch.arange(start, end, dt, device=self.device())
+        ref = next(self.parameters(), None)
+        if ref is None:
+            ref = next(self.buffers(), torch.empty(()))
+        t = torch.arange(start, end, dt, device=ref.device, dtype=ref.dtype)
         return self(t)
 
     def assemble_chunked(self, dt, chunks):
-        t = torch.arange(0, self._tstop, dt, device=self.device())
+        ref = next(self.parameters(), None)
+        if ref is None:
+            ref = next(self.buffers(), torch.empty(()))
+        t = torch.arange(0, self._tstop, dt, device=ref.device, dtype=ref.dtype)
         t = torch.tensor_split(t, chunks)
         for t_ in t:
             yield self(t_)
@@ -237,8 +247,9 @@ class Constant(Waveform):
         self.c = float(c)
 
     def fn(self, t):
-        # Matches device/dtype/shape via broadcasting
-        return torch.full_like(t, self.c)
+        # Multiplication promotes integer time grids to the default floating
+        # dtype instead of truncating fractional constants as full_like does.
+        return torch.ones_like(t) * self.c
 
     def __repr__(self):
         return f"Constant({self.c})"
@@ -287,6 +298,9 @@ class _repeat(Waveform):
     def __init__(
         self, waveform, freq: float, delay: float = 0.0, off: float = torch.inf
     ):
+        freq_value = torch.as_tensor(freq).detach()
+        if not torch.isfinite(freq_value).all() or torch.any(freq_value <= 0):
+            raise ValueError("Repeat frequency must be finite and positive.")
         super(_repeat, self).__init__(freq=freq, delay=delay, off=off)
         self.waveform = waveform
 
@@ -393,7 +407,7 @@ class Product(Waveform):
         self.waveforms = torch.nn.ModuleList(flat)
 
     def fn(self, t):
-        result = torch.full_like(t, self.gain)
+        result = torch.ones_like(t) * self.gain
         for wf in self.waveforms:
             result = result * wf.fn(t)
         return result
@@ -464,12 +478,27 @@ class _poisson(Waveform):
         super().__init__()  # <- no kwargs
         self.waveform = waveform
         self.interval = float(interval)
+        if not math.isfinite(self.interval) or self.interval <= 0.0:
+            raise ValueError("Poisson interval must be finite and positive.")
+        if n is not None:
+            if isinstance(n, bool) or not isinstance(n, Integral):
+                raise TypeError("Poisson n must be a non-negative integer or None.")
+            if n < 0:
+                raise ValueError("Poisson n must be a non-negative integer or None.")
+            n = int(n)
         self.n = n
         self.start = float(start)
         self.noise = float(noise)
         self.off = float(off)
+        if not math.isfinite(self.start):
+            raise ValueError("Poisson start must be finite.")
+        if math.isnan(self.off):
+            raise ValueError("Poisson off must not be NaN.")
+        if not math.isfinite(self.noise) or not 0.0 <= self.noise <= 1.0:
+            raise ValueError("Poisson noise must be between 0 and 1 inclusive.")
         self.randomize_every_call = bool(randomize_every_call)
         self.generator = generator or torch.default_generator
+        self._spike_time_trailing_dims = 0
         if np.isinf(self.off) and self.n is None:
             raise ValueError(
                 "Poisson schedule needs a finite `off` time or a finite `n` "
@@ -478,8 +507,13 @@ class _poisson(Waveform):
         self.register_buffer("_spike_times", self._make_schedule(self.generator))
 
     def reshape_for_intra(self):
+        already_reshaped = getattr(self, "_reshaped_for_intra", False)
         super().reshape_for_intra()
-        self._spike_times = self._spike_times.unsqueeze(-1).unsqueeze(-1)
+        if not already_reshaped:
+            self._spike_time_trailing_dims = 2
+            self._spike_times = self._spike_times.reshape(
+                self._spike_times.shape + (1, 1)
+            )
         return self
 
     # ---------- helper ---------------------------------------------------
@@ -489,7 +523,7 @@ class _poisson(Waveform):
             # perfectly regular
             return self.interval
         # exponential sample (mean = interval)
-        u = torch.rand((), generator=gen)  # uniform (0,1)
+        u = torch.rand((), generator=gen, device=gen.device)  # uniform (0,1)
         exp_sample = -u.log() * self.interval  # Exp(λ=1/interval)
         return (1.0 - self.noise) * self.interval + self.noise * exp_sample.item()
 
@@ -504,10 +538,20 @@ class _poisson(Waveform):
             k += 1
         if not times:  # handle edge‑case: no spikes at all
             times.append(torch.inf)
-        return torch.tensor(times)
+        ref = next(self.waveform.parameters(), None)
+        if ref is None:
+            ref = next(self.waveform.buffers(), torch.empty(()))
+        return torch.tensor(times, device=ref.device, dtype=ref.dtype)
 
     def regenerate_schedule_(self) -> None:
-        self._spike_times = self._make_schedule(self.generator)
+        schedule = self._make_schedule(self.generator)
+        if hasattr(self, "_spike_times"):
+            schedule = schedule.to(self._spike_times)
+        if self._spike_time_trailing_dims:
+            schedule = schedule.reshape(
+                schedule.shape + (1,) * self._spike_time_trailing_dims
+            )
+        self._spike_times = schedule
 
     # ---------- core -----------------------------------------------------
     def fn(self, t: torch.Tensor) -> torch.Tensor:
@@ -516,12 +560,15 @@ class _poisson(Waveform):
         Assumes the wrapped waveform returns 0 for t<0 or t>duration.
         """
         if self.randomize_every_call:
-            self._spike_times = self._make_schedule(
-                self.generator
-            )  # re-generate on each call
-        # broadcast: (#spikes, |t|)  – never moves _spike_times to CPU
-        tt = t.unsqueeze(0) - self._spike_times.unsqueeze(-1)
-        return self.waveform.fn(tt).sum(dim=0)
+            self.regenerate_schedule_()
+        # Evaluate each onset independently so the spike axis can never alias a
+        # population, compartment, oscillator-component, or other leading axis
+        # of the wrapped waveform merely because their lengths happen to match.
+        responses = [
+            self.waveform.fn(t - onset.unsqueeze(-1))
+            for onset in self._spike_times.unbind(dim=0)
+        ]
+        return torch.stack(responses, dim=0).sum(dim=0)
 
     def __repr__(self):
         return f"Poisson({self.waveform}, interval={self.interval}, noise={self.noise})"

@@ -1,5 +1,6 @@
 import gc
 import multiprocessing as mp
+from numbers import Integral
 from queue import Queue
 from types import MethodType
 from typing import Dict, List, Tuple
@@ -510,6 +511,13 @@ class Recorder(Callback):
         blocking the main simulation. The process will continue running until the recorder's
         close() method is called.
         """
+        if isinstance(cache_every, bool) or not isinstance(cache_every, Integral):
+            raise TypeError("cache_every must be a positive integer.")
+        if cache_every <= 0:
+            raise ValueError("cache_every must be a positive integer.")
+        if self.cache_with_hdf5:
+            raise RuntimeError("HDF5 caching is already enabled for this Recorder.")
+
         self.hdf5_path = hdf5
         mp.set_start_method("spawn", force=True)
         self.manager = mp.Manager()
@@ -519,7 +527,7 @@ class Recorder(Callback):
         )
         self.writer_thread.start()
         self.cache_with_hdf5 = True
-        self.cache_every = cache_every
+        self.cache_every = int(cache_every)
         return self
 
     def pre_loop_hook(self, model):
@@ -539,25 +547,38 @@ class Recorder(Callback):
             self.i += 1
 
     def cache_hdf5(self):
+        populated = [bool(self.rec[s]) for s in self.states]
+        if not self.states or not any(populated):
+            return
+        if not all(populated):
+            missing = [
+                state for state, present in zip(self.states, populated) if not present
+            ]
+            raise RuntimeError(
+                "Cannot cache a partial Recorder frame; no samples were recorded "
+                f"for state(s): {', '.join(missing)}."
+            )
+
         with torch.cuda.stream(TRANSFERSTREAM):
             for s in self.states:
                 data = self.stack(s)
-                if s not in self.data_pinned:
-                    self.data_pinned[s] = torch.empty(
-                        data.shape, dtype=data.dtype, device="cpu", pin_memory=True
-                    )
-                if self.data_pinned[s].shape[0] != data.shape[0]:
-                    self.data_pinned[s] = torch.empty(
-                        data.shape, dtype=data.dtype, device="cpu", pin_memory=True
-                    )
+                # Each queued write owns its buffer. Reusing a pinned tensor can
+                # overwrite data that the asynchronous writer process has not
+                # consumed yet.
+                self.data_pinned[s] = torch.empty(
+                    data.shape,
+                    dtype=data.dtype,
+                    device="cpu",
+                    pin_memory=TRANSFERSTREAM is not None,
+                )
                 self.data_pinned[s].copy_(data, non_blocking=True)
         self.queue.put("flush")
-        chunks = data.shape
-        chunks = (chunks[0], 1, chunks[2], chunks[3])
         for s in self.states:
-            self.queue.put(
-                (s, self.run_number, self.save_count, self.data_pinned[s], chunks)
-            )
+            data = self.data_pinned[s]
+            chunks = list(data.shape)
+            if data.ndim > 1:
+                chunks[1] = 1
+            self.queue.put((s, self.run_number, self.save_count, data, tuple(chunks)))
         self.save_count += 1
 
     @nojit
@@ -588,6 +609,8 @@ class Recorder(Callback):
         """
         if self.cache_with_hdf5:
             self.cache_hdf5()
+            self.rec = {s: [] for s in self.states}
+            self.i = 0
         self.save_count = 0
         self.run_number += 1
 
@@ -646,6 +669,9 @@ class Recorder(Callback):
         if self.cache_with_hdf5:
             self.queue.put(None)
             self.writer_thread.join()
+            if self.manager is not None:
+                self.manager.shutdown()
+            self.cache_with_hdf5 = False
 
     def stack(self, var: str = None) -> torch.Tensor:
         """

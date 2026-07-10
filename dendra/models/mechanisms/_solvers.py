@@ -13,7 +13,11 @@ def _solve_linear_small(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
     n = A.shape[-1]
     if n == 1:
-        return b / A[..., 0, 0]
+        # Keep the state dimension explicit.  Without the final singleton
+        # dimension, PyTorch aligns ``(..., 1)`` and ``(...)`` from the right;
+        # batched inputs therefore either expand to the wrong shape or fail to
+        # broadcast when there is more than one batch dimension.
+        return b / A[..., 0, 0].unsqueeze(-1)
 
     if n == 2:
         a00 = A[..., 0, 0]

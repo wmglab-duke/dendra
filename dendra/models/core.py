@@ -1065,9 +1065,20 @@ class Population(P, Sliceable):
             dtype=self.dtype(),
         ).contiguous()
 
+        if ve_s.dim() not in (1, 2):
+            raise ValueError(
+                "ve_s must have shape [n_comp], [1, n_comp], or [np, n_comp]; "
+                f"got shape {tuple(ve_s.shape)}."
+            )
         if ve_s.dim() == 1:
             # [n_comp] -> [1, n_comp]
             ve_s = ve_s.unsqueeze(0)
+
+        if ve_s.size(-1) != self.nc:
+            raise ValueError(
+                f"ve_s compartment dimension ({ve_s.size(-1)}) must match "
+                f"model.nc ({self.nc})."
+            )
 
         if ve_s.size(0) == 1:
             # [1, n_comp] -> [np, n_comp]
@@ -1098,6 +1109,11 @@ class Population(P, Sliceable):
             dtype=self.dtype(),
         )
 
+        if t_tensor.dim() not in (1, 2):
+            raise ValueError(
+                "time tensor must have shape [n_t], [1, n_t], or [np, n_t]; "
+                f"got shape {tuple(t_tensor.shape)}."
+            )
         if t_tensor.dim() == 1:
             # [n_t] -> [1, n_t]
             t_tensor = t_tensor.unsqueeze(0)
@@ -1219,17 +1235,37 @@ class Population(P, Sliceable):
             time_chunks_per_contact=time_chunks_per_contact,
         )
 
-    def _expand_eval_time(self, t_eval: torch.Tensor) -> torch.Tensor:
+    def _expand_eval_time(
+        self, t_eval: torch.Tensor, *, n_steps: Optional[int] = None
+    ) -> torch.Tensor:
         """
         Normalize evaluated Waveform output to [np, n_t_chunk].
 
         Accepts:
+        - scalar (broadcast across ``n_steps`` when provided)
         - [n_t_chunk]
         - [1, n_t_chunk]
         - [np, n_t_chunk]
         """
+        if t_eval.dim() == 0:
+            if n_steps is None:
+                raise ValueError(
+                    "Scalar Waveform output requires the expected number of steps."
+                )
+            t_eval = t_eval.expand(int(n_steps))
+        if t_eval.dim() not in (1, 2):
+            raise ValueError(
+                "Waveform output must be scalar or have shape [n_t], "
+                f"[1, n_t], or [np, n_t]; got shape {tuple(t_eval.shape)}."
+            )
         if t_eval.dim() == 1:
             t_eval = t_eval.unsqueeze(0)
+
+        if n_steps is not None and t_eval.size(-1) != int(n_steps):
+            raise ValueError(
+                f"Waveform output length ({t_eval.size(-1)}) must match "
+                f"the requested chunk length ({int(n_steps)})."
+            )
 
         if t_eval.size(0) == 1:
             t_eval = t_eval.expand(self.np, -1)
@@ -1269,14 +1305,14 @@ class Population(P, Sliceable):
                 t_per_contact: List[torch.Tensor] = []
                 for wf in cfg.waveforms:
                     t_i = wf(t_chunk).to(self.dtype())
-                    t_i = self._expand_eval_time(t_i)
+                    t_i = self._expand_eval_time(t_i, n_steps=t_chunk.numel())
                     t_per_contact.append(t_i.unsqueeze(0))  # [1, np, n_t_chunk]
 
                 t_extra = torch.cat(t_per_contact, dim=0)
             else:
                 wf = cfg.waveforms[0]
                 t_extra = wf(t_chunk).to(self.dtype())
-                t_extra = self._expand_eval_time(t_extra)
+                t_extra = self._expand_eval_time(t_extra, n_steps=t_chunk.numel())
         else:
             # Non-functional: use pre-split chunks
             if cfg.multicontact:
@@ -1606,6 +1642,7 @@ class Population(P, Sliceable):
                     intra_c = None
 
                 # Integrator step
+                pre_step_hook(callbacks, self)
                 self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
                 self.t = self.t + dt_tensor
 
@@ -1700,6 +1737,10 @@ class Population(P, Sliceable):
 
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        if not isinstance(chunklength, int) or isinstance(chunklength, bool):
+            raise ValueError("chunklength must be a positive integer.")
+        if chunklength <= 0:
+            raise ValueError("chunklength must be a positive integer.")
         self._refresh_compile_config_from_ctx()
 
         intra = self.intra
@@ -1786,9 +1827,10 @@ class Population(P, Sliceable):
                         else:
                             intra_c = None
 
+                        pre_step_hook(callbacks, self)
                         self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
-                        psh(callbacks, self)
                         self.t = self.t + dt_tensor
+                        psh(callbacks, self)
 
                     post_chunk_hook(callbacks, self, t_chunk)
 
@@ -2101,7 +2143,17 @@ class Population(P, Sliceable):
         """
         if name is None:
             name = "latest"
-        self._caches[name] = self.state_dict()
+        live_state = self.state_dict()
+        cached_state = live_state.__class__(
+            (
+                key,
+                value.detach().clone() if torch.is_tensor(value) else value,
+            )
+            for key, value in live_state.items()
+        )
+        if hasattr(live_state, "_metadata"):
+            cached_state._metadata = live_state._metadata.copy()
+        self._caches[name] = cached_state
         return self
 
     def cache_(self, name: str = None):
@@ -3315,6 +3367,10 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        if not isinstance(chunklength, int) or isinstance(chunklength, bool):
+            raise ValueError("chunklength must be a positive integer.")
+        if chunklength <= 0:
+            raise ValueError("chunklength must be a positive integer.")
         self._refresh_compile_config_from_ctx()
 
         intra = self.intra
@@ -3405,6 +3461,8 @@ class Population(P, Sliceable):
                 ).to(self.dtype())
 
                 if t.numel() == 0:
+                    if return_final_state:
+                        return None, self.state_dict_for_checkpoint()
                     return None
 
                 n_chunks = math.ceil(len(t) / chunklength)
@@ -3489,6 +3547,7 @@ class Population(P, Sliceable):
                                 intra_c = None
 
                             self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+                            self.t = self.t + dt_tensor
 
                             # Replay-safe post-step callbacks (may contribute loss)
                             if callbacks:
@@ -3498,8 +3557,6 @@ class Population(P, Sliceable):
                                         continue
                                     chunk_loss, saw = _add_loss(chunk_loss, hook(self))
                                     saw_loss_local = saw_loss_local or saw
-
-                            self.t = self.t + dt_tensor
 
                         # Replay-safe post-chunk callbacks (may contribute loss)
                         if callbacks:

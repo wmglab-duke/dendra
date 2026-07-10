@@ -38,6 +38,51 @@ dev = [
     "commitizen"
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "cpu: dependency-free tests intended for the required CPU CI lane",
+    "cuda: tests that require a CUDA-capable PyTorch runtime",
+    "neuron: tests that require the optional NEURON simulator",
+    "slow: longer-running integration or simulator-comparison tests",
+    "stochastic: tests of stochastic or property-generated behavior",
+]
+
+[tool.dendra.coverage-floors]
+"dendra/data/h5.py" = 98
+"dendra/models/callbacks.py" = 84
+"dendra/models/core.py" = 56
+"dendra/models/extcell.py" = 91
+"dendra/models/fields/line.py" = 98
+"dendra/models/fields/precomputed.py" = 90
+"dendra/models/graph.py" = 91
+"dendra/models/integrators/explicit.py" = 92
+"dendra/models/integrators/implicit.py" = 83
+"dendra/models/integrators/tree.py" = 42
+"dendra/models/integrators/tree_bt.py" = 86
+"dendra/models/mechanisms/_bufferimplicit.py" = 84
+"dendra/models/mechanisms/_derivimplicit.py" = 70
+"dendra/models/mechanisms/_kinetic.py" = 90
+"dendra/models/mechanisms/_linearimplicit.py" = 87
+"dendra/models/mechanisms/_material_process.py" = 67
+"dendra/models/mechanisms/_rosenbrock.py" = 87
+"dendra/models/mechanisms/_solvers.py" = 98
+"dendra/models/mechanisms/_spatial.py" = 72
+"dendra/models/mechanisms/compilers/ast.py" = 80
+"dendra/models/multi.py" = 85
+"dendra/models/networks/net.py" = 43
+"dendra/models/networks/netcon.py" = 57
+"dendra/models/networks/netcon_bitpack_ops.py" = 49
+"dendra/models/networks/netstim.py" = 73
+"dendra/models/slice.py" = 78
+"dendra/models/stim/extra.py" = 96
+"dendra/models/stim/intra.py" = 96
+"dendra/models/stim/waveform/core.py" = 87
+"dendra/models/stim/waveform/implementations.py" = 87
+"dendra/models/tree.py" = 86
+"dendra/utils/interpolation.py" = 79
+
 [tool.setuptools.dynamic]
 version = {attr = "dendra.__version__"}
 

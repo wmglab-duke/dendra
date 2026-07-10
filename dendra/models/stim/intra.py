@@ -11,137 +11,48 @@ def avoid_smart_indexing(node_indices):
     return node_indices
 
 
-def _ensure_tuple(idx):
-    return idx if isinstance(idx, tuple) else (idx,)
-
-
-def _expand_ellipsis(idx_tuple, ndim):
-    if Ellipsis not in idx_tuple:
-        # pad with full slices to ndim once we drop Nones
-        used = sum(1 for x in idx_tuple if x is not None)
-        return idx_tuple + (slice(None),) * (ndim - used)
-    out = []
-    # count entries that actually consume a dimension (ignore None, Ellipsis)
-    used = sum(1 for x in idx_tuple if (x is not None and x is not Ellipsis))
-    need = max(0, ndim - used)
-    for x in idx_tuple:
-        if x is Ellipsis:
-            out.extend([slice(None)] * need)
-        else:
-            out.append(x)
-    return tuple(out)
-
-
-def _drop_none(idx_tuple):
-    # None (newaxis) affects result/view shape in __getitem__, but for assignment
-    # via index_put_ we only need coordinates; broadcasting of values covers shape.
-    return tuple(x for x in idx_tuple if x is not None)
-
-
-def _canonicalize_index_for_index_put(idx, shape, device):
+def _canonicalize_index_for_index_put(idx, shape, device, linear_index=None):
     """
-    Turn any valid __getitem__ index into a tuple of long/bool tensors acceptable
-    to Tensor.index_put_. Handles: ints, slices (incl. negative step), lists,
-    long tensors, 1-D and N-D boolean masks, Ellipsis, None.
+    Turn any valid tensor ``__getitem__`` index into a tuple of long tensors
+    acceptable to ``Tensor.index_put_``. Handles ints, slices, lists, long
+    tensors, 1-D and N-D boolean masks, Ellipsis, and None.
 
     Returns
     -------
     indices_tuple : tuple[torch.Tensor, ...]
         One tensor per dimension of 'shape'; all broadcastable to a common shape.
     """
-    ndim = len(shape)
-    idx = _ensure_tuple(idx)
-    idx = _expand_ellipsis(idx, ndim)
-    idx = _drop_none(idx)
+    shape = tuple(int(size) for size in shape)
+    if not shape:
+        raise ValueError("Intracellular stimulation requires a non-scalar model.")
 
-    # if shorter than ndim, pad with full slices
-    if len(idx) < ndim:
-        idx = idx + (slice(None),) * (ndim - len(idx))
+    def move_tensor_indices(value):
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device)
+        if isinstance(value, tuple):
+            return tuple(move_tensor_indices(item) for item in value)
+        return value
 
-    out_indices = []
-    dim_ptr = 0
+    idx = move_tensor_indices(idx)
 
-    def arange_dim(sz):
-        return torch.arange(sz, device=device, dtype=torch.long)
-
-    while dim_ptr < ndim:
-        sel = idx[dim_ptr]
-
-        if isinstance(sel, slice):
-            start, stop, step = sel.indices(shape[dim_ptr])
-            out_indices.append(
-                torch.arange(start, stop, step, device=device, dtype=torch.long)
-            )
-            dim_ptr += 1
-            continue
-
-        if isinstance(sel, int):
-            # normalize negative and wrap into length-1 long tensor
-            i = sel if sel >= 0 else shape[dim_ptr] + sel
-            out_indices.append(torch.tensor([i], device=device, dtype=torch.long))
-            dim_ptr += 1
-            continue
-
-        if isinstance(sel, list):
-            out_indices.append(torch.as_tensor(sel, device=device, dtype=torch.long))
-            dim_ptr += 1
-            continue
-
-        if isinstance(sel, torch.Tensor):
-            if sel.dtype == torch.bool:
-                # Boolean mask may cover 1 or more dims starting at dim_ptr.
-                m = sel.ndim
-                # Validate that mask fits the upcoming dimensions
-                if m == 0:
-                    # scalar bool -> either select entire dim (True) or select none (False)
-                    if bool(sel.item()):
-                        out_indices.append(arange_dim(shape[dim_ptr]))
-                    else:
-                        out_indices.append(
-                            torch.empty(0, device=device, dtype=torch.long)
-                        )
-                    dim_ptr += 1
-                else:
-                    # Ensure shapes match the next m dims
-                    expected = tuple(shape[dim_ptr : dim_ptr + m])
-                    if tuple(sel.shape) != expected:
-                        raise IndexError(
-                            f"Boolean mask of shape {tuple(sel.shape)} does not match "
-                            f"indexed dims {expected} starting at dim {dim_ptr}"
-                        )
-                    # Replace these m dims with per-dim index tensors from nonzero
-                    nz = torch.nonzero(sel, as_tuple=True)
-                    for t in nz:
-                        out_indices.append(t.to(device=device))
-                    dim_ptr += m
-                continue
-            else:
-                # integer-like tensor (long/int)
-                t = sel.to(device=device, dtype=torch.long)
-                out_indices.append(t)
-                dim_ptr += 1
-                continue
-
-        if sel is Ellipsis:
-            # already expanded
-            raise RuntimeError("Internal error: Ellipsis should have been expanded.")
-        if sel is None:
-            # already dropped
-            dim_ptr += 0
-            continue
-
-        # Fallback: full selection on this dim
-        out_indices.append(arange_dim(shape[dim_ptr]))
-        dim_ptr += 1
-
-    # Broadcast all index tensors to a common shape (advanced indexing rule)
-    if out_indices:
-        bshape = torch.broadcast_shapes(*[t.shape for t in out_indices])
-        out_indices = [t.expand(bshape) for t in out_indices]
-    else:
-        out_indices = ()
-
-    return tuple(out_indices)
+    # Apply the user's index to a linear coordinate grid.  This delegates the
+    # subtle mix of basic, advanced, boolean, Ellipsis, and None semantics to
+    # PyTorch itself, then converts the selected linear locations into the
+    # coordinate tuple required by index_put_.  Keeping the selected tensor's
+    # shape also preserves Cartesian slice dimensions for value broadcasting.
+    if linear_index is None:
+        numel = 1
+        for size in shape:
+            numel *= size
+        linear_index = torch.arange(numel, device=device, dtype=torch.long).reshape(
+            shape
+        )
+    elif tuple(linear_index.shape) != shape:
+        raise ValueError(
+            f"linear_index has shape {tuple(linear_index.shape)}, expected {shape}."
+        )
+    selected = linear_index[idx]
+    return tuple(torch.unravel_index(selected, shape))
 
 
 class Intra(torch.nn.Module):
@@ -162,6 +73,13 @@ class Intra(torch.nn.Module):
         self.indices = []
         self.stims = []
 
+        numel = 1
+        for size in self.shape:
+            numel *= int(size)
+        linear_index = torch.arange(
+            numel, device=self.device, dtype=torch.long
+        ).reshape(self.shape)
+
         for stim, _, idx in stims:
             if isinstance(stim, Waveform):
                 stim = stim.to(device=self.device, dtype=self.dtype)
@@ -170,7 +88,12 @@ class Intra(torch.nn.Module):
                     f"Unsupported stimulation type: {type(stim)}. Expected Waveform."
                 )
             self.indices.append(
-                _canonicalize_index_for_index_put(idx, self.shape, device=self.device)
+                _canonicalize_index_for_index_put(
+                    idx,
+                    self.shape,
+                    device=self.device,
+                    linear_index=linear_index,
+                )
             )
             self.stims.append(stim)
 

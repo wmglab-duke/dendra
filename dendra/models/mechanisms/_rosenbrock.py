@@ -28,6 +28,7 @@ from ._solve_utils import (
     match_derivative_to_states,
     modify_operations,
 )
+from ._solvers import _solve_linear_small
 from .ode import differentiate_rhs_2torch_checked
 
 # Keep custom mechanism ops available to generated RHS/Jacobian expressions.

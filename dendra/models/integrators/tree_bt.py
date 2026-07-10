@@ -13,6 +13,7 @@ from .core import (
     _flatten_to_solve,
     _model_solve_shape,
 )
+from .tree import _validate_dhs_threads, _validate_tree_graph
 from .triton import dhs_bt_solve_cuda
 
 try:
@@ -25,6 +26,7 @@ except ImportError:
 
 # ---------------- Topology helpers (local, to avoid extra deps) ----------------
 def _topo_parent_depth(G: nx.DiGraph) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+    _validate_tree_graph(G)
     nodes = list(nx.topological_sort(G))
     idx_of = {n: i for i, n in enumerate(nodes)}
     K = len(nodes)
@@ -107,7 +109,7 @@ class _dhs_bt(Integrator):
     v_vars = ["v", "vc"]
 
     def __init__(self, model, mech, imem=None, threads=16):
-        assert 32 % threads == 0 and threads <= 32
+        threads = _validate_dhs_threads(threads)
         super().__init__(model, mech, imem)
         self.threads = threads
 
@@ -204,8 +206,8 @@ class _dhs_bt(Integrator):
         # Intracellular axial (returned in SOLVER order)
         _, g_intra_solver, _ = graph_to_parent_and_axial(
             model.graph, dtype_axial=dtyp
-        )  # (K,) S
-        g_intra_solver = g_intra_solver.to(device=dev)
+        )  # (1,K) S for a single morphology
+        g_intra_solver = g_intra_solver.squeeze(0).to(device=dev)
         # Map to MECHANISM order so it matches dx/area/xraxial layout
         # solver_order[s] == mechanism index of the s-th topo (solver) node
         g_intra_mech = torch.empty_like(g_intra_solver)
@@ -214,9 +216,10 @@ class _dhs_bt(Integrator):
         # parent_idx is in SOLVER order. Map it to MECHANISM order for geometry gathers.
         parent_solver = self.parent_idx.to(torch.long)  # (K,) solver index space
         solver2mech = self.solver_order.to(torch.long)  # maps solver -> mechanism
-        parent_mech = torch.full_like(parent_solver, -1)  # (K,)
+        parent_mech = torch.full_like(parent_solver, -1)  # (K,), indexed by mechanism
         mask_nr = parent_solver >= 0
-        parent_mech[mask_nr] = solver2mech[
+        child_mech = solver2mech[mask_nr]
+        parent_mech[child_mech] = solver2mech[
             parent_solver[mask_nr]
         ]  # (K,) mechanism index space
 

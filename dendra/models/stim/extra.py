@@ -47,16 +47,30 @@ class Extra(torch.nn.Module):
             temporal waveform (Waveform instance).
         """
         super(Extra, self).__init__()
-        self.fields = []
-        self.waveforms = []
-
-        self.is_precomputed = False
+        self.is_precomputed = precomputed is not None
+        self.device = None
+        self.dtype = None
+        self.register_buffer("idx", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("increment", torch.ones(1, dtype=torch.long))
 
         if precomputed is not None:
+            if not isinstance(precomputed, torch.Tensor):
+                raise TypeError(
+                    "precomputed extracellular stimulation must be a torch.Tensor."
+                )
+            if precomputed.ndim == 0:
+                raise ValueError(
+                    "precomputed extracellular stimulation needs a time axis."
+                )
             self.register_buffer("precomputed", precomputed)
-            self.is_precomputed = True
+            self.waveforms = torch.nn.ModuleList()
             return
 
+        if not field_waveform_tuples:
+            raise ValueError("Extra requires at least one field/waveform pair.")
+
+        fields = []
+        waveforms = []
         for field, waveform in field_waveform_tuples:
             if not isinstance(field, torch.Tensor):
                 raise TypeError(
@@ -67,28 +81,33 @@ class Extra(torch.nn.Module):
                     f"Waveform must be a Waveform instance, got {type(waveform)} instead."
                 )
 
-            self.fields.append(field)
-            self.waveforms.append(waveform)
+            fields.append(field)
+            waveforms.append(waveform)
 
-        self.device = None
-        self.dtype = None
-
-        fields = torch.stack(self.fields, dim=0)
-        self.register_buffer("fields", fields)
-        self.register_buffer("waveform_stacked", torch.zeros((self.n_fields, 1)))
-
-        self.register_buffer("idx", torch.zeros(1, dtype=torch.long))
-        self.register_buffer("increment", torch.ones(1, dtype=torch.long))
+        self.n_fields = len(fields)
+        try:
+            fields_stacked = torch.stack(fields, dim=0)
+        except RuntimeError as exc:
+            raise ValueError(
+                "All extracellular fields must have the same shape."
+            ) from exc
+        self.register_buffer("fields", fields_stacked)
+        self.waveforms = torch.nn.ModuleList(waveforms)
+        self.register_buffer(
+            "waveform_stacked",
+            torch.zeros((self.n_fields, 1)),
+            persistent=False,
+        )
 
     def set_device_dtype(self, model):
         self.device = model.device()
         self.dtype = model.dtype()
 
-        self.fields = self.fields.to(device=self.device, dtype=self.dtype)
-        self.waveforms = [
-            waveform.to(device=self.device, dtype=self.dtype)
-            for waveform in self.waveforms
-        ]
+        if self.is_precomputed:
+            self.precomputed = self.precomputed.to(device=self.device, dtype=self.dtype)
+        else:
+            self.fields = self.fields.to(device=self.device, dtype=self.dtype)
+            self.waveforms.to(device=self.device, dtype=self.dtype)
 
     @classmethod
     def from_precomputed(cls, precomputed_extracellular: torch.Tensor):
@@ -108,20 +127,74 @@ class Extra(torch.nn.Module):
         return cls(field_waveform_tuples=[], precomputed=precomputed_extracellular)
 
     def forward(self):
+        position = int(self.idx.item())
+        n_time = (
+            self.precomputed.shape[-1]
+            if self.is_precomputed
+            else self.waveform_stacked.shape[-1]
+        )
+        if position < 0 or position >= n_time:
+            raise IndexError(
+                f"Extracellular stimulation is exhausted at time index {position}; "
+                f"only {n_time} samples were initialized."
+            )
         if self.is_precomputed:
-            e = self.precomputed[..., self.idx]
+            e = self.precomputed[..., position]
             self.idx += self.increment
             return e
-        t = self.waveform_stacked[..., self.idx]
-        e = torch.einsum("i...,i...->i...", self.fields, t)
+        t = self.waveform_stacked[..., position]
+        while t.ndim < self.fields.ndim:
+            t = t.unsqueeze(-1)
+        e = (self.fields * t).sum(dim=0)
         self.idx += self.increment
         return e
 
     def initialize(self, model, t):
         self.idx.zero_()
         self.set_device_dtype(model)
-        t = torch.as_tensor(t, device=self.device, dtype=self.dtype)
-        if not self.is_precomputed:
-            self.waveform_stacked = torch.stack(
-                [waveform(t) for waveform in self.waveforms], dim=0
-            )  # shape (model.shape[:], n_timepoints)
+        t = torch.atleast_1d(torch.as_tensor(t, device=self.device, dtype=self.dtype))
+        expected_shape = tuple(model.v.shape)
+        spatial_shape = (
+            tuple(self.precomputed.shape[:-1])
+            if self.is_precomputed
+            else tuple(self.fields.shape[1:])
+        )
+        try:
+            broadcast_shape = torch.broadcast_shapes(spatial_shape, expected_shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Extracellular field shape {spatial_shape} is not broadcastable "
+                f"to model shape {expected_shape}."
+            ) from exc
+        if broadcast_shape != expected_shape:
+            raise ValueError(
+                f"Extracellular field shape {spatial_shape} broadcasts beyond "
+                f"model shape {expected_shape}."
+            )
+
+        if self.is_precomputed:
+            if self.precomputed.shape[-1] != t.numel():
+                raise ValueError(
+                    "Precomputed extracellular stimulation must contain one "
+                    f"sample per timepoint; got {self.precomputed.shape[-1]} "
+                    f"samples for {t.numel()} timepoints."
+                )
+        else:
+            evaluated = []
+            for waveform in self.waveforms:
+                value = waveform(t).to(device=self.device, dtype=self.dtype)
+                if value.ndim == 0:
+                    value = value.expand_as(t)
+                if value.shape[-1] != t.numel():
+                    raise ValueError(
+                        "Waveform output must use time as its last dimension; "
+                        f"got shape {tuple(value.shape)} for {t.numel()} timepoints."
+                    )
+                evaluated.append(value)
+            try:
+                evaluated = torch.broadcast_tensors(*evaluated)
+                self.waveform_stacked = torch.stack(evaluated, dim=0)
+            except RuntimeError as exc:
+                raise ValueError(
+                    "All extracellular waveforms must return compatible shapes."
+                ) from exc

@@ -106,6 +106,8 @@ def factorize_linear_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
     # 4. convert to SymPy and extract coefficients
     syms: dict[str, sp.Expr] = {v_param: sp.symbols(v_param)}
     expr = sp.expand(_ast_to_sympy(expanded, syms))
+    if sp.simplify(sp.diff(expr, syms[v_param], 2)) != 0:
+        raise ValueError(f"Expression is not linear in {v_param!r}.")
     A = expr.coeff(syms[v_param])
     B = sp.expand(A * syms[v_param] - expr)
 
@@ -121,9 +123,9 @@ def factorize_linear_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
 
 
 def replace_v(code_str):
-    # Use a regex with word boundaries to ensure only standalone 'v' is replaced.
-    # The replacement inserts '(v + v_n) / 2' in place of v.
-    return re.sub(r"\bv\b", "(v + v_n) / 2", code_str)
+    # Replace the local voltage variable while leaving attributes such as
+    # ``self.v`` untouched.  A word boundary alone also matches after ``.``.
+    return re.sub(r"(?<![\w.])v(?!\w)", "(v + v_n) / 2", code_str)
 
 
 @lru_cache(maxsize=None)

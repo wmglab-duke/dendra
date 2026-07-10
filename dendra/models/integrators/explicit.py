@@ -11,6 +11,52 @@ from .core import (
 )
 
 
+def _reflect_pad_last(x: torch.Tensor, padding: Tuple[int, int]) -> torch.Tensor:
+    """Reflect-pad the final axis, including axes shorter than the padding.
+
+    ``torch.nn.functional.pad(..., mode="reflect")`` requires each padding
+    width to be smaller than the input axis.  A one-compartment cable therefore
+    failed even though its sealed-boundary extension is well defined.  Building
+    the reflected index map directly also handles wide smoothing stencils on
+    very short cables while preserving autograd.
+    """
+    left, right = (int(padding[0]), int(padding[1]))
+    size = int(x.shape[-1])
+    if size < 1:
+        raise ValueError("cannot reflect-pad an empty final dimension")
+    if left == 0 and right == 0:
+        return x
+    if size == 1:
+        return F.pad(x, (left, right), mode="replicate")
+
+    positions = torch.arange(-left, size + right, device=x.device, dtype=torch.long)
+    period = 2 * (size - 1)
+    positions = torch.remainder(positions, period)
+    indices = torch.where(positions < size, positions, period - positions)
+    return x.index_select(-1, indices)
+
+
+def _conv1d_forward(
+    conv: torch.nn.Conv1d, x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Run Conv1d with robust reflection padding for short final axes."""
+    padding = tuple(int(value) for value in conv._reversed_padding_repeated_twice)
+    if conv.padding_mode == "reflect" and (
+        padding[0] >= x.shape[-1] or padding[1] >= x.shape[-1]
+    ):
+        x = _reflect_pad_last(x, padding)
+        return F.conv1d(
+            x,
+            weight,
+            conv.bias,
+            conv.stride,
+            0,
+            conv.dilation,
+            conv.groups,
+        )
+    return conv._conv_forward(x, weight, conv.bias)
+
+
 def _conv_last(conv: torch.nn.Conv1d, *xs: torch.Tensor) -> torch.Tensor:
     """Apply a Conv1d stencil along the final dimension of arbitrary-shaped tensors."""
     ref = xs[0]
@@ -25,7 +71,7 @@ def _conv_last(conv: torch.nn.Conv1d, *xs: torch.Tensor) -> torch.Tensor:
 def _filter_last(filter_: torch.nn.Conv1d, x: torch.Tensor) -> torch.Tensor:
     """Apply a single-channel Conv1d filter along the final axis."""
     xf = _flatten_to_solve(x).unsqueeze(1)
-    return filter_(xf).squeeze(1).reshape_as(x)
+    return _conv1d_forward(filter_, xf, filter_.weight).squeeze(1).reshape_as(x)
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
@@ -34,7 +80,7 @@ class SymmetricConv1D(torch.nn.Conv1d):
             weight_ = (self.weight + torch.flip(self.weight, [-1])) / 2
         else:
             weight_ = self.weight
-        return self._conv_forward(x, weight_, self.bias)
+        return _conv1d_forward(self, x, weight_)
 
 
 class _euler(Integrator):
@@ -217,8 +263,8 @@ def ssd_df(v_c, v_p, v_e):
     vc = _flatten_to_solve(v_c, K)
     vp = _flatten_to_solve(v_p, K)
     ve = _flatten_to_solve(v_e, K, tuple(v_c.shape))
-    vc_p = F.pad(vc, (1, 1), "reflect")
-    ve_p = F.pad(ve, (1, 1), "reflect")
+    vc_p = _reflect_pad_last(vc, (1, 1))
+    ve_p = _reflect_pad_last(ve, (1, 1))
     ret = vc_p[:, :-2] + vc_p[:, 2:] - vp + ve_p[:, 2:] + ve_p[:, :-2] - 2 * ve
     return ret.reshape_as(v_c)
 
@@ -227,7 +273,7 @@ def ssd_df_no_ve(v_c, v_p):
     K = v_c.shape[-1]
     vc = _flatten_to_solve(v_c, K)
     vp = _flatten_to_solve(v_p, K)
-    vc_p = F.pad(vc, (1, 1), "reflect")
+    vc_p = _reflect_pad_last(vc, (1, 1))
     return (vc_p[:, :-2] + vc_p[:, 2:] - vp).reshape_as(v_c)
 
 
@@ -239,8 +285,8 @@ def ssd_df_heterogeneous(v_c, v_p, v_e, g_left, g_right):
     ve = _flatten_to_solve(v_e, K, tuple(v_c.shape))
     gl = _flatten_to_solve(g_left, K)
     gr = _flatten_to_solve(g_right, K)
-    vc_p = F.pad(vc, (1, 1), "reflect")
-    ve_p = F.pad(ve, (1, 1), "reflect")
+    vc_p = _reflect_pad_last(vc, (1, 1))
+    ve_p = _reflect_pad_last(ve, (1, 1))
     g_sum = gl + gr
     d2v_c = gl * vc_p[:, :-2] + gr * vc_p[:, 2:] - g_sum * vp
     d2v_e = gl * ve_p[:, :-2] + gr * ve_p[:, 2:] - g_sum * ve
@@ -254,7 +300,7 @@ def ssd_df_heterogeneous_no_ve(v_c, v_p, g_left, g_right):
     vp = _flatten_to_solve(v_p, K)
     gl = _flatten_to_solve(g_left, K)
     gr = _flatten_to_solve(g_right, K)
-    vc_p = F.pad(vc, (1, 1), "reflect")
+    vc_p = _reflect_pad_last(vc, (1, 1))
     g_sum = gl + gr
     return (gl * vc_p[:, :-2] + gr * vc_p[:, 2:] - g_sum * vp).reshape_as(v_c)
 

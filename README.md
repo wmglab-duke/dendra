@@ -61,15 +61,27 @@ The development dependencies include `pytest` and `pytest-cov`. Run the complete
 python -m pytest tests
 ```
 
+Tests are classified into execution lanes. The required dependency-free lane is:
+
+```bash
+python -m pytest tests -m cpu
+```
+
+Optional backend lanes can be selected with `-m cuda` or `-m neuron`; longer simulator comparisons use `-m slow`, and randomized/property-generated cases use `-m stochastic`. Markers are strict, so misspelled or undeclared markers fail during collection.
+
 To measure both statement and branch coverage, print uncovered line numbers in the terminal, and generate a browsable HTML report:
 
 ```bash
-python -m pytest tests --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=html
+python -m pytest tests -m cpu --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html
 ```
 
 The `TOTAL` row is the overall coverage result. Open `htmlcov/index.html` to inspect coverage by module and identify untested lines and branches. Results can vary by platform because tests requiring optional CPU solvers, NEURON, CUDA, or Triton are skipped when those dependencies or devices are unavailable.
 
-GitLab CI runs the same branch-coverage measurement on CPU for every pipeline, enforces a ratcheted minimum, and retains both a browsable HTML report and a Cobertura report for GitLab's coverage visualization.
+GitLab CI runs the same branch-coverage measurement on CPU for every pipeline, enforces a ratcheted global minimum, and retains JSON, browsable HTML, and Cobertura reports. Critical modules also have individual floors configured in `pyproject.toml`; validate them locally after generating `coverage.json` with:
+
+```bash
+python scripts/check_coverage_floors.py coverage.json
+```
 
 
 🥳 You're all set!
