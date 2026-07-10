@@ -18,6 +18,7 @@ API Reference
    api/dendra.models.parametric
    api/dendra.models.slice
    api/dendra.models.stim
+   api/dendra.stepping
    api/dendra.const
    api/dendra.helpers
    api/dendra.units
