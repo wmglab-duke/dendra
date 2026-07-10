@@ -1297,6 +1297,110 @@ class Population(P, Sliceable):
         ve = cfg.einsum(cfg.ve_s, t_extra)  # [n_t_chunk, np, n_comp]
         return ve.unbind(dim=0)
 
+    def step(
+        self,
+        dt: Optional[float] = None,
+        *,
+        ve: Optional[TensorLike] = None,
+        extra: Optional[ExtraSpec] = None,
+        callbacks: Optional[Sequence[Callback]] = None,
+        loop_hooks: bool = False,
+    ):
+        """Advance this population by exactly one timestep.
+
+        Parameters
+        ----------
+        dt : float, optional
+            Timestep in milliseconds. If ``None``, uses the backend default
+            ``A.dt``, matching :meth:`run`.
+        ve : Tensor, optional
+            Extracellular voltage for this single step. Pass a tensor with the
+            same per-step shape expected by the integrator, or a leading
+            singleton time dimension ``[1, ...]``.
+        extra : extracellular specification, optional
+            Higher-level extracellular stimulation specification with the same
+            semantics as :meth:`run`. It is evaluated at the model's current
+            time and converted to this step's ``ve``.
+        callbacks : sequence of Callback, optional
+            Callbacks to execute around this single step. By default ``step``
+            calls ``pre_step_hook`` and ``post_step_hook`` only.
+        loop_hooks : bool, optional
+            If ``True``, also call ``pre_loop_hook`` before the step and
+            ``post_loop_hook`` after the step. Leave this ``False`` when
+            manually stepping inside an outer user-controlled loop.
+
+        Returns
+        -------
+        Population
+            ``self``, for chaining.
+        """
+        if not self.initialized:
+            raise ValueError("Model must be initialized before stepping.")
+        self._refresh_compile_config_from_ctx()
+
+        if ve is not None and extra is not None:
+            raise ValueError("Provide either 've' or 'extra', not both.")
+
+        # Match Population.run: lazily rebuild solver-level intracellular
+        # stimulation when new injections invalidated ``self.intra``.
+        if self.intra is None:
+            self.intra = self.build_intra()
+        intra = self.intra
+        with_intra = intra is not None
+
+        device = self.device()
+        dtype = self.dtype()
+        dt = dt if dt is not None else A.dt
+        dt_f = float(dt)
+        dt_tensor = torch.tensor(dt_f, device=device, dtype=dtype)
+
+        if not isinstance(callbacks, CallbackList):
+            callbacks = CallbackList(callbacks)
+        if callbacks:
+            for c in callbacks:
+                c.dt = dt_f
+
+        ctx = nullcontext() if self.training else torch.no_grad()
+        with ctx:
+            self.integrator._initialize(
+                self,
+                dt_tensor,
+                force=self.force_integrator_reinit(),
+                compile_scope="population",
+            )
+
+            if loop_hooks:
+                pre_loop_hook(callbacks, self)
+            pre_step_hook(callbacks, self)
+
+            if ve is not None:
+                ve_c = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
+                if ve_c.dim() == self.v.dim() + 1 and int(ve_c.shape[0]) == 1:
+                    ve_c = ve_c[0]
+            elif extra is not None:
+                t_step = self.t.reshape(1).to(device=device, dtype=dtype)
+                extra_cfg = self._prepare_extra(extra, t_step, n_chunks=1)
+                ve_list = self._compute_extra_chunk(extra_cfg, 0, t_step)
+                ve_c = None if ve_list is None else ve_list[0]
+            else:
+                ve_c = None
+
+            if with_intra:
+                stims, indices = self.prep_intra(intra, 1, dt_f)
+                s = [st[0] for st in stims]
+                intra_c = self.make_intra(intra, s, indices)
+            else:
+                intra_c = None
+
+            self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+            self.t = self.t + dt_tensor
+
+            post_step_hook(callbacks, self)
+            if loop_hooks:
+                post_loop_hook(callbacks, self)
+
+        return self
+
     def run(
         self,
         ve: Optional[TensorLike] = None,
@@ -1822,6 +1926,27 @@ class Population(P, Sliceable):
         if hasattr(self, "mech"):
             self.mech.resample_random_parameters(*names, force=force)
         self.clear_steady_state()
+        return self
+
+    def resample_runtime_noise(self, *names, phase: str | None = None, dt=None):
+        """Manually refresh detached runtime NOISE buffers.
+
+        Runtime NOISE samples are detached and updated in-place. This method is
+        useful for debugging or for explicitly refreshing ``GLOBALNOISE``,
+        ``RANGENOISE``, or ``BATCHNOISE`` variables outside the normal simulation
+        phases. It does not clear the steady-state cache because runtime noise is
+        interpreted as an exogenous simulation drive rather than quenched model
+        heterogeneity.
+        """
+
+        if names:
+            local = tuple(n for n in names if n in self.runtime_noises)
+            if local:
+                super().resample_runtime_noise(*local, phase=phase, dt=dt)
+        else:
+            super().resample_runtime_noise(phase=phase, dt=dt)
+        if hasattr(self, "mech"):
+            self.mech.resample_runtime_noise(*names, phase=phase, dt=dt)
         return self
 
     def _restore_steady_state(self):

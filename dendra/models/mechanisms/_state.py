@@ -10,6 +10,7 @@ from dendra.models.rng import RNGModule
 from ._bufferimplicit import build_bufferimplicit
 from ._cnexp import build_cnexp
 from ._derivimplicit import build_derivimplicit
+from ._euler_heun import build_euler_heun
 from ._euler_maruyama import build_euler_maruyama
 from ._kinetic import kinetic_to_derivatives
 from ._linearimplicit import build_linearimplicit
@@ -109,10 +110,11 @@ def build_integration_func(
         ) from exc
 
     if diffusion:
-        if method != "euler_maruyama":
+        if method not in {"euler_maruyama", "euler_heun"}:
             raise ValueError(
                 "State.DIFFUSION(...) requires State.METHOD('euler_maruyama') "
-                "in v1. Voltage/cable SDE solvers are intentionally out of scope."
+                "or State.METHOD('euler_heun') in v1. Voltage/cable SDE solvers "
+                "are intentionally out of scope."
             )
         return builder(
             states,
@@ -120,6 +122,16 @@ def build_integration_func(
             derivative,
             eliminate=eliminate,
             diffusion=diffusion,
+            **method_kwargs,
+        )
+
+    if method in {"euler_maruyama", "euler_heun"}:
+        return builder(
+            states,
+            assigned,
+            derivative,
+            eliminate=eliminate,
+            diffusion=(),
             **method_kwargs,
         )
 
@@ -167,7 +179,12 @@ register_integration_method(
 register_integration_method(
     "euler_maruyama",
     build_euler_maruyama,
-    aliases=("em", "sde", "euler-maruyama"),
+    aliases=("em", "sde", "euler-maruyama", "ito"),
+)
+register_integration_method(
+    "euler_heun",
+    build_euler_heun,
+    aliases=("eh", "stochastic_heun", "stratonovich", "euler-heun"),
 )
 
 register_integration_method(
@@ -404,7 +421,7 @@ class State(Parameterized):
         setattr(self, "solve", MethodType(ifunc, self))
 
         self._sde_rng_names = ()
-        if self.method == "euler_maruyama":
+        if self.method in {"euler_maruyama", "euler_heun"}:
             self._sde_rng_names = tuple(f"{state}_dW_rng" for state in self._state)
             for rng_name in self._sde_rng_names:
                 if not hasattr(self, rng_name):
@@ -504,9 +521,10 @@ class State(Parameterized):
         """Declare diffusion coefficients for Euler-Maruyama state SDEs.
 
         Each declaration has the form ``"x = sigma"`` and represents the
-        multiplicative noise coefficient in ``dx = f(x) dt + sigma dW``.
-        V1 supports this for ``State.METHOD("euler_maruyama")`` only; voltage
-        equation noise is intentionally handled by future stochastic integrators.
+        multiplicative noise coefficient. ``State.METHOD("euler_maruyama")``
+        interprets this as an Itô SDE. ``State.METHOD("euler_heun")`` interprets
+        it as a Stratonovich SDE. Voltage-equation noise is intentionally handled
+        by future stochastic voltage/cable integrators.
         """
         State._diffusion_declarations.append(args)
 
@@ -538,7 +556,9 @@ class State(Parameterized):
         method : str, optional
             Integration method name.  Currently registered methods include
             ``"cnexp"``, ``"derivimplicit"``, ``"bufferimplicit"``,
-            ``"linearimplicit"``/``"sparse"``, and ``"rosenbrock"``.  Passing ``None`` leaves the inherited method
+            ``"linearimplicit"``/``"sparse"``, ``"rosenbrock"``,
+            ``"euler_maruyama"`` for Itô State SDEs, and ``"euler_heun"`` for
+            Stratonovich State SDEs. Passing ``None`` leaves the inherited method
             unchanged and only updates method kwargs.
         **kwargs
             Method-specific options captured at class-definition time and passed
@@ -564,6 +584,8 @@ class State(Parameterized):
         return {}
 
     def advance(self, v, dt, states):
+        if self.method == "euler_heun":
+            return self.solve(v, dt, states)
         return self.solve(dt, **self.breakpoint(v, states), **states)
 
     def _sde_randn_like(self, state_name: str, like: torch.Tensor) -> torch.Tensor:

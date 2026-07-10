@@ -90,6 +90,7 @@ from .models.integrators import (
 )
 from .models.mod import load_mechanisms
 from .models.stim.waveform import *
+from .stepping import step
 from .utils.inductor import refresh_torchinductor_precompiled_headers
 
 __all__ = [
@@ -99,6 +100,7 @@ __all__ = [
     "R",
     "FARADAY",
     "ctx",
+    "step",
     "DEVICE",
     "DTYPE",
     "COMPILE_OPTIONS",

@@ -139,3 +139,72 @@ def test_mechanism_handler_exposes_runtime_noise_sampling():
 
     assert sampled is True
     assert not torch.equal(first, handler.noise.eta)
+
+
+def test_state_euler_heun_is_registered_and_recomputes_diffusion_at_predictor():
+    assert "euler_heun" in valid_integration_methods()
+
+    class Geometric(State):
+        State.STATE("x")
+        State.RANGE(sigma=2.0)
+        State.ASSIGNED("diff_sigma")
+        State.DERIVATIVE("x' = 0.0")
+        State.DIFFUSION("x = diff_sigma * x")
+        State.METHOD("euler_heun")
+
+        def breakpoint(self, v, states):
+            return {"diff_sigma": self.sigma}
+
+    state = Geometric(
+        torch.tensor(36.0),
+        torch.ones(1, 1),
+        torch.arange(1),
+        shape=(1, 1),
+        shape_f=(1, 1),
+    )
+    state.populate_parameter_buffers()
+    state.init_rng()
+
+    def one_like(_shape, *, device=None, dtype=None):
+        return torch.ones(_shape, device=device, dtype=dtype)
+
+    state.x_dW_rng.randn = one_like
+    x0 = torch.ones(1, 1)
+    dt = torch.tensor(0.25)
+    out = state.advance(torch.zeros(1, 1), dt, {"x": x0})["x"]
+
+    dW = torch.sqrt(dt)
+    diff_old = 2.0 * x0
+    pred = x0 + diff_old * dW
+    diff_pred = 2.0 * pred
+    expected = x0 + 0.5 * (diff_old + diff_pred) * dW
+    assert torch.allclose(out, expected)
+
+
+def test_state_euler_heun_average_drift_option():
+    class LinearDrift(State):
+        State.STATE("x")
+        State.DERIVATIVE("x' = x")
+        State.DIFFUSION("x = 0.0")
+        State.METHOD("euler_heun", average_drift=True)
+
+    state = LinearDrift(
+        torch.tensor(36.0),
+        torch.ones(1, 1),
+        torch.arange(1),
+        shape=(1, 1),
+        shape_f=(1, 1),
+    )
+    state.populate_parameter_buffers()
+    state.init_rng()
+
+    def zero_like(_shape, *, device=None, dtype=None):
+        return torch.zeros(_shape, device=device, dtype=dtype)
+
+    state.x_dW_rng.randn = zero_like
+    x0 = torch.ones(1, 1)
+    dt = torch.tensor(0.1)
+    out = state.advance(torch.zeros(1, 1), dt, {"x": x0})["x"]
+    pred = x0 + x0 * dt
+    expected = x0 + 0.5 * (x0 + pred) * dt
+    assert torch.allclose(out, expected)

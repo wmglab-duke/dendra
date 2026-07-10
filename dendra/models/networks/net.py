@@ -2827,6 +2827,117 @@ class Network(RNGMixin):
                 clear_deliveries=clear_deliveries,
             )
 
+    def step(self, *, extra=None, callbacks=None, loop_hooks: bool = False):
+        """Advance this network by exactly one timestep.
+
+        The timestep is the network timestep established by ``initialize(dt)``
+        or ``build(dt)``. This method preserves the same event-delivery phase
+        ordering as :meth:`run`, but avoids constructing a one-step simulation
+        loop.
+
+        Parameters
+        ----------
+        extra : dict, optional
+            Optional mapping from population name to extracellular stimulus
+            specification ``(v, t)``, with the same semantics as :meth:`run`.
+            The stimulus is evaluated at the network's current time for a
+            single timestep.
+        callbacks : sequence of Callback, optional
+            Callbacks to execute around this single step. By default ``step``
+            calls ``pre_step_hook`` and ``post_step_hook`` only.
+        loop_hooks : bool, optional
+            If ``True``, also call ``pre_loop_hook`` before the step and
+            ``post_loop_hook`` after the step.
+
+        Returns
+        -------
+        Network
+            ``self``, for chaining.
+        """
+        self._refresh_compile_config_from_ctx()
+        if self.dt is None:
+            raise RuntimeError(
+                "Network has no simulation timestep. Call initialize(dt) or "
+                "build(dt) before step()."
+            )
+        if not self.built:
+            raise RuntimeError(
+                "Network wiring has changed since the last build. Call "
+                "initialize(dt) (recommended) or build(dt) before step()."
+            )
+
+        dt_f = float(self.dt)
+        dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
+
+        ctx = nullcontext() if self.training else torch.no_grad()
+
+        intra = {}
+        for n, p in self.populations.items():
+            # Mirror Population.step/run: new injections set ``p.intra = None``.
+            # Rebuild lazily so one-step network stepping respects intracellular
+            # currents added after initialization.
+            if p.intra is None and getattr(p, "injections", None):
+                p.intra = p.build_intra()
+            if p.intra is not None:
+                intra[n] = p.intra
+
+        extra = extra if extra is not None else {}
+        extra_prepped = {}
+        for n, (v, t) in extra.items():
+            pop = self.populations[n]
+            dev, dtp = pop.device(), pop.dtype()
+            v_dev = v.to(device=dev, dtype=dtp)
+            t_dev = t.to(device=dev, dtype=dtp)
+            t0 = self.t.to(device=dev, dtype=dtp)
+            dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
+            t1 = t0 + dt_pop
+            extra_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
+        extra = extra_prepped
+
+        with_intra = bool(intra)
+        with_extra = bool(extra)
+
+        if callbacks is None:
+            callbacks = []
+        if not isinstance(callbacks, CallbackList):
+            callbacks = CallbackList(callbacks)
+        for c in callbacks:
+            c.dt = self.dt
+
+        with ctx:
+            if with_intra:
+                intra = {
+                    n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
+                    for n, intra_ in intra.items()
+                }
+
+            if loop_hooks:
+                pre_loop_hook(callbacks, self)
+            pre_step_hook(callbacks, self)
+
+            intra_c = prepare_intra({}, intra, 0) if with_intra else {}
+            extra_c = prepare_extra(extra, 0) if with_extra else {}
+
+            self._step(
+                self._population_step_items,
+                self._synapse_step_items,
+                self._continuous_synapse_step_items,
+                self._continuous_target_step_items,
+                self.netstim,
+                self.t,
+                dt_f,
+                extra=extra_c,
+                intra=intra_c,
+                compile_network_ops=self.compile_network_ops,
+            )
+            self.t = self.t + dt_t
+
+            post_step_hook(callbacks, self)
+            if loop_hooks:
+                post_loop_hook(callbacks, self)
+
+        return self
+
     def run(self, tstop, extra=None, callbacks=None, progressbar=False):
         """
         Advance the network for a fixed duration.

@@ -56,10 +56,13 @@ dendra.models.mechanisms
 State SDE support
 -----------------
 
-``State.DIFFUSION(...)`` plus ``State.METHOD("euler_maruyama")`` provides v1
-Euler-Maruyama support for stochastic state variables. This applies only to
-``State`` updates; stochastic voltage/cable solvers are intentionally separate
-future work.
+``State.DIFFUSION(...)`` plus ``State.METHOD("euler_maruyama")`` provides
+Euler-Maruyama support for Itô stochastic state variables. ``State.METHOD("euler_heun")``
+provides Euler-Heun support for Stratonovich stochastic state variables. The
+Euler-Heun builder averages the old and predicted diffusion coefficients; pass
+``average_drift=True`` to average the deterministic drift term as well. These
+methods apply only to ``State`` updates; stochastic voltage/cable solvers are
+intentionally separate future work.
 
 Ion Management
 --------------

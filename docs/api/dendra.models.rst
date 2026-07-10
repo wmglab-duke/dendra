@@ -32,8 +32,13 @@ Synapse slot targets
    :members:
 
 
-Random distributions and runtime noise
---------------------------------------
+Random distributions, runtime noise, and State SDEs
+----------------------------------------------------
+
+Runtime ``NOISE`` declarations are detached simulation drives. For stochastic
+state dynamics, ``State.DIFFUSION`` can be paired with ``State.METHOD("euler_maruyama")``
+for Itô SDEs or ``State.METHOD("euler_heun")`` for Stratonovich SDEs.
+
 .. autoclass:: dendra.models.random_parameters.RandomParameterSpec
    :members:
 .. autoclass:: dendra.models.random_parameters.RuntimeNoiseSpec

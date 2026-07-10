@@ -69,6 +69,7 @@ def _mechanism_advance_signature(mech) -> tuple:
                 tuple(state_module._state),
                 getattr(type(state_module), "advance", None) is State.advance,
                 getattr(type(state_module), "breakpoint", None) is State.breakpoint,
+                getattr(state_module, "method", None),
             )
         )
     return (tuple(state_layout), tuple(mech._all_states))
@@ -122,6 +123,7 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
             state_var_names = tuple(state_module._state)
             uses_default_advance = (
                 getattr(type(state_module), "advance", None) is State.advance
+                and getattr(state_module, "method", None) != "euler_heun"
             )
             uses_default_breakpoint = (
                 getattr(type(state_module), "breakpoint", None) is State.breakpoint

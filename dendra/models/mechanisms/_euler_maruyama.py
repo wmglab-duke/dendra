@@ -1,4 +1,8 @@
+# ruff: noqa: F401
+
 import re
+
+import torch
 
 from dendra.helpers import DEBUG, logger
 from dendra.utils.dynamic_compilation import compile_generated_function

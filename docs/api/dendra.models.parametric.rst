@@ -27,7 +27,9 @@ Random parameters and runtime noise
 initialization-time heterogeneity. ``GLOBALNOISE`` / ``BATCHNOISE`` /
 ``RANGENOISE`` declare detached runtime-noise buffers that can be resampled
 during simulation. Runtime ``NOISE`` buffers are optimized for simulation and do
-not preserve gradients through their distribution parameters.
+not preserve gradients through their distribution parameters. For first-class
+State SDEs, use ``State.DIFFUSION`` with ``State.METHOD("euler_maruyama")`` for
+Itô dynamics or ``State.METHOD("euler_heun")`` for Stratonovich dynamics.
 
 .. autoclass:: dendra.models.random_parameters.RandomParameterSpec
    :members:
