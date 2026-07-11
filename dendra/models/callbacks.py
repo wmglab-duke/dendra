@@ -8,7 +8,6 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from h5py import File
 
 from dendra.utils.dynamic_compilation import compile_generated_function
@@ -1796,11 +1795,11 @@ def _sliding_window_average(x, window_size: int):
     if x.ndim < 1 or x.shape[0] == 0:
         raise ValueError("x must contain at least one sample along axis 0.")
 
-    # Treat every dimension after time as an independent channel. Recorder
-    # outputs are commonly 3-D, while other callers may use 4-D tensors.
-    N = x.shape[0]
+    # Recorder outputs are commonly 3-D, while other callers may use tensors
+    # of any rank. ``unfold`` appends the window dimension without copying the
+    # individual windows, and a regular reduction avoids backend-specific
+    # convolution primitives that may not be available on every supported CPU.
     feature_shape = x.shape[1:]
-    channels = int(x[0].numel())
 
     # Manually pad along axis 0 (the N dimension) using replication.
     # For pad_left, replicate the first slice; for pad_right, replicate the last slice.
@@ -1816,24 +1815,10 @@ def _sliding_window_average(x, window_size: int):
     )
     # Concatenate along dimension 0.
     x_padded = torch.cat([left_pad, x, right_pad], dim=0)
-    N_padded = x_padded.shape[0]  # should equal N + (window_size - 1)
 
-    # Reshape so that the padded time dimension is the convolution length.
-    x_reshaped = x_padded.movedim(0, -1).reshape(1, channels, N_padded)
-
-    # Create an averaging kernel for each flattened feature channel.
-    kernel = (
-        torch.ones(channels, 1, window_size, dtype=x.dtype, device=x.device)
-        / window_size
-    )
-
-    # Perform grouped convolution along the length dimension.
-    out_conv = F.conv1d(x_reshaped, kernel, groups=channels)
-    L = out_conv.shape[-1]
-    if L != N:
-        raise RuntimeError(f"Unexpected output length: got {L}, expected {N}.")
-
-    return out_conv.squeeze(0).reshape(*feature_shape, N).movedim(-1, 0)
+    # Unfolding dimension 0 puts the window dimension last, so reducing it
+    # preserves both the original rank and the ordering of all feature axes.
+    return x_padded.unfold(0, window_size, 1).mean(dim=-1)
 
 
 # Public alias retained for tests and user code; Recorder uses the private name internally.

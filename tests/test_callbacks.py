@@ -391,3 +391,93 @@ def test_sliding_window_known_values_and_validation():
         sliding_window_average(np.arange(3.0), 2)
     with pytest.raises(ValueError, match="at least one sample"):
         sliding_window_average(torch.empty(0, 2), 2)
+
+
+def _reference_sliding_window_average(x, window_size):
+    pad_left = window_size // 2
+    offsets = torch.arange(window_size, device=x.device) - pad_left
+    indices = torch.arange(x.shape[0], device=x.device).unsqueeze(1) + offsets
+    indices = indices.clamp(0, x.shape[0] - 1)
+    windows = x.index_select(0, indices.flatten()).reshape(
+        x.shape[0], window_size, *x.shape[1:]
+    )
+    return windows.mean(dim=1)
+
+
+@pytest.mark.parametrize("window_size", [1, 2, 3, 4, 8])
+def test_sliding_window_matches_edge_replicated_reference(window_size):
+    base = torch.arange(2 * 5 * 3, dtype=torch.float64).reshape(2, 5, 3)
+    x = base.transpose(0, 1)
+    assert not x.is_contiguous()
+
+    actual = sliding_window_average(x, window_size)
+    expected = _reference_sliding_window_average(x, window_size)
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == x.shape
+    assert actual.dtype == x.dtype
+    assert actual.device == x.device
+
+
+@pytest.mark.parametrize(
+    ("window_size", "expected"),
+    [
+        (1, [0.0, 1.0, 2.0, 3.0, 4.0]),
+        (2, [0.0, 0.5, 1.5, 2.5, 3.5]),
+        (3, [1 / 3, 1.0, 2.0, 3.0, 11 / 3]),
+        (4, [0.25, 0.75, 1.5, 2.5, 3.25]),
+    ],
+)
+def test_sliding_window_odd_and_even_alignment(window_size, expected):
+    x = torch.arange(5.0)
+    torch.testing.assert_close(
+        sliding_window_average(x, window_size), torch.tensor(expected)
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64])
+def test_sliding_window_preserves_cpu_dtype(dtype):
+    x = torch.linspace(-1, 1, 12, dtype=dtype).reshape(4, 3)
+    result = sliding_window_average(x, 4)
+    expected = _reference_sliding_window_average(x, 4)
+
+    assert result.dtype == dtype
+    assert result.device == x.device
+    torch.testing.assert_close(result, expected)
+
+
+def test_sliding_window_gradient_matches_reference():
+    x = torch.randn(5, 2, 3, dtype=torch.float64, requires_grad=True)
+    upstream = torch.randn_like(x)
+
+    result = sliding_window_average(x, 4)
+    result.backward(upstream)
+    actual_grad = x.grad.detach().clone()
+
+    x.grad = None
+    expected = _reference_sliding_window_average(x, 4)
+    expected.backward(upstream)
+    torch.testing.assert_close(x.grad, actual_grad)
+
+
+@pytest.mark.parametrize("window_size", [1, 2, 5, 8])
+def test_sliding_window_singleton_oversized_windows_are_identity(window_size):
+    x = torch.tensor([[[-3.25, 7.5]]], dtype=torch.float64, requires_grad=True)
+
+    result = sliding_window_average(x, window_size)
+
+    torch.testing.assert_close(result, x)
+    result.sum().backward()
+    torch.testing.assert_close(x.grad, torch.ones_like(x))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_sliding_window_preserves_device(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    x = torch.arange(30.0, device=device).reshape(5, 2, 3)
+    result = sliding_window_average(x, 2)
+
+    assert result.device == x.device
+    torch.testing.assert_close(result, _reference_sliding_window_average(x, 2))
