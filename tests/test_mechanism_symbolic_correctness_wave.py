@@ -14,6 +14,7 @@ from dendra.models.mechanisms._material_process import (
     ExchangeProcess,
 )
 from dendra.models.mechanisms.ode import differentiate_rhs_2torch_checked
+from dendra.models.mod import expsyn, hh
 
 
 class _LinearThenExplicit(Mechanism):
@@ -201,6 +202,69 @@ def test_class_body_declarations_override_legacy_preclass_queue_order():
         State.METHOD("cnexp")
 
     assert _StateClassBodyWins.method == "cnexp"
+
+
+@pytest.mark.parametrize(
+    "mechanism,alias_name,expected_currents",
+    [
+        (expsyn, "rename_current_oracle_expsyn", ["i"]),
+        (hh, "rename_current_oracle_hh", ["il", "ina", "ik"]),
+    ],
+)
+def test_rename_preserves_independent_nonduplicated_current_declarations(
+    mechanism, alias_name, expected_currents
+):
+    assert mechanism._currents == {"nonspecific": expected_currents}
+
+    renamed = mechanism.rename(alias_name)
+
+    assert mechanism._currents == {"nonspecific": expected_currents}
+    assert renamed._currents == {"nonspecific": expected_currents}
+    assert renamed._currents["nonspecific"] is not mechanism._currents["nonspecific"]
+
+
+def test_rename_alias_cache_is_scoped_to_source_mechanism():
+    alias_name = "shared_rename_cache_oracle"
+
+    renamed_expsyn = expsyn.rename(alias_name)
+    renamed_hh = hh.rename(alias_name)
+
+    assert renamed_expsyn is expsyn.rename(alias_name)
+    assert renamed_hh is hh.rename(alias_name)
+    assert renamed_expsyn is not renamed_hh
+    assert renamed_expsyn.i is expsyn.i
+    assert renamed_hh.il is hh.il
+
+
+def test_rename_preserves_declaration_ownership_for_future_subclass_precedence():
+    class GlobalOwner(Mechanism):
+        Mechanism.GLOBAL(precedence_probe=1.0)
+
+    class RangeOwner(Mechanism):
+        Mechanism.RANGE(precedence_probe=2.0)
+
+    renamed = GlobalOwner.rename("renamed_global_owner")
+
+    ownership_names = tuple(
+        name for name in GlobalOwner.__dict__ if name.endswith("_defined_here")
+    )
+    assert ownership_names
+    for name in ownership_names:
+        source_registry = getattr(GlobalOwner, name)
+        alias_registry = getattr(renamed, name)
+        assert alias_registry == source_registry
+        assert alias_registry is not source_registry
+
+    class SourceComposition(GlobalOwner, RangeOwner):
+        pass
+
+    class AliasComposition(renamed, RangeOwner):
+        pass
+
+    assert SourceComposition._global == {"precedence_probe": 1.0}
+    assert SourceComposition._range == {}
+    assert AliasComposition._global == SourceComposition._global
+    assert AliasComposition._range == SourceComposition._range
 
 
 def test_aborted_material_process_declarations_do_not_leak():

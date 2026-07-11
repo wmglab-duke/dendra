@@ -278,7 +278,8 @@ def test_noise_zero_schedule_matches_exact(N, starts, intervals, maxsp):
 
 
 def test_noise_zero_tiny_positive_start_does_not_fire_at_zero():
-    tiny = torch.tensor(torch.finfo(torch.float32).tiny, dtype=torch.float32).item()
+    zero = torch.tensor(0.0, dtype=torch.float32)
+    tiny = torch.nextafter(zero, torch.tensor(1.0, dtype=torch.float32)).item()
     ns = M.NetStim(
         N=2,
         interval=[1.0, 1.0],

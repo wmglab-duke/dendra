@@ -8,6 +8,7 @@ import torch
 
 from dendra.helpers import classproperty
 from dendra.models._class_declarations import (
+    _DECLARATIONS_KEY,
     consume_class_values,
     declare_class_value,
 )
@@ -298,6 +299,11 @@ class Mechanism(Parameterized):
         # as the base 'object' class does not accept them.
         super().__init_subclass__(**kwargs)
 
+        # Renamed aliases are cached per source mechanism class.  Sharing the
+        # inherited dictionary would let an alias requested from one mechanism
+        # satisfy a same-named request from an unrelated mechanism.
+        cls._renamed_aliases = {}
+
         # Start with a fresh dictionary for the new class's parameters.
         new_state = set()
         new_ion = set()
@@ -344,7 +350,12 @@ class Mechanism(Parameterized):
             if "_source_material" in base.__dict__:
                 _merge_nested_dict(new_source_material, base._source_material)
             if "_currents" in base.__dict__:
-                new_currents.update(base._currents)
+                # Current declarations are list-valued.  Copy those lists so a
+                # subclass declaration cannot append into its parent's class
+                # metadata (notably when constructing a renamed mechanism).
+                new_currents.update(
+                    {name: list(currents) for name, currents in base._currents.items()}
+                )
             if "_init" in base.__dict__:
                 new_init.update(base._init)
             if "_explicit" in base.__dict__:
@@ -2896,8 +2907,24 @@ def rename(mechanism, new_name=None):
     # 3. dict: A dictionary containing the attributes and methods of the
     #          original class. We create a copy to avoid side effects.
 
+    # ``Parameterized.__init_subclass__`` rebuilds and clears declaration-
+    # ownership registries on every new class. Preserve the source ownership
+    # metadata separately so future subclasses of the alias resolve parameter
+    # category precedence exactly as subclasses of the source class do.
+    declaration_ownership = {
+        name: value.copy()
+        for name, value in mechanism.__dict__.items()
+        if name.endswith("_defined_here")
+    }
+
     # Copy the original class's namespace dictionary.
     class_dict = dict(mechanism.__dict__)
+
+    # The computed declaration attributes copied above already describe the
+    # complete class.  Replaying its original class-body declaration journal
+    # through ``__init_subclass__`` would apply non-idempotent declarations
+    # (especially current lists) a second time.
+    class_dict.pop(_DECLARATIONS_KEY, None)
 
     # Do not clone generated monomorphic advance functions.  A renamed class may
     # be used alongside the source class; sharing the same generated `_advance`
@@ -2914,6 +2941,8 @@ def rename(mechanism, new_name=None):
         class_dict["__module__"] = mechanism.__module__
 
     new_class = type(new_name, mechanism.__bases__, class_dict)
+    for name, value in declaration_ownership.items():
+        setattr(new_class, name, value)
     new_class._name = new_name  # Set the new name attribute
 
     return new_class

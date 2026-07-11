@@ -1202,9 +1202,10 @@ class NetStim(DNModule, Sliceable):
         event_atol = _event_boundary_atol(t, next_combined, ulps=8)
         if event_atol is not None:
             # Raw ``start`` and explicit ``schedule`` times are stored directly,
-            # not reconstructed through PositiveParam.  Keep those first/scheduled
-            # events exact; apply the ulp tolerance only to stochastic-clock
-            # events after at least one spike has already advanced that clock.
+            # so their first occurrences remain exact. In particular, a positive
+            # subnormal start must not be widened into an event at zero. Apply the
+            # local-ULP tolerance only after a stochastic/deterministic renewal
+            # has advanced through PositiveParam reconstruction.
             stoch_is_active = stoch_snap <= sched_snap
             tolerance_mask = torch.logical_and(stoch_is_active, self.spike_counts > 0)
             event_atol = torch.where(

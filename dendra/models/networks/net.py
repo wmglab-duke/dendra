@@ -47,6 +47,12 @@ ConnRule = Literal[
 ]
 
 
+def _fixed_step_count(duration: float, dt: float) -> int:
+    """Return complete fixed timesteps in ``duration`` without decimal-ulp loss."""
+    step_ratio = duration / dt
+    return math.floor(math.nextafter(step_ratio, math.inf))
+
+
 def to_flat_idx_torch(shape, idx, device):
     """
     Converts any valid PyTorch index into a 1D tensor of flat indices.
@@ -697,6 +703,17 @@ class Network(RNGMixin):
         ``force_rebuild=True``). Call :meth:`build` (and typically
         :meth:`initialize`) after manual device moves to realign connectivity buffers.
 
+    .. note::
+        Event delivery follows Dendra's sampled, fixed-step ordering. At the start
+        of a timestep, NetStim and NetCon state is advanced using the currently
+        visible source state; populations are then integrated to the next sample.
+        A voltage threshold crossing created by that integration is consequently
+        observed by its NetCon on the following network step. Ordinary hard-event
+        connection delays are quantized to integer timesteps (differentiable delay
+        modes may interpolate adjacent bins). This phase convention is part of
+        Dendra's network semantics and need not match another simulator's within-step
+        event queue, even when the membrane and synaptic response kinetics agree.
+
     Parameters
     ----------
     populations : dict[str, Population]
@@ -823,9 +840,20 @@ class Network(RNGMixin):
         self._step_train = step
         self._step_eval = step
 
-        # Network clock lives on CPU by default; move when needed.
+        # Keep network time as an origin plus an integer step count.  Repeated
+        # floating-point addition can drift below an analytically exact event
+        # boundary (for example, 40 float32 additions of 0.025 are less than
+        # 1.0), delaying NetStim/NetCon events by a complete timestep.
         self.register_buffer(
-            "t", torch.tensor(0.0, device=torch.device("cpu"), dtype=torch.float32)
+            "t", torch.tensor(0.0, device=torch.device("cpu"), dtype=torch.float64)
+        )
+        self.register_buffer(
+            "_clock_origin",
+            torch.tensor(0.0, device=torch.device("cpu"), dtype=torch.float64),
+        )
+        self.register_buffer(
+            "_clock_step",
+            torch.tensor(0, device=torch.device("cpu"), dtype=torch.long),
         )
 
         self.compile_network_ops = jit_enabled_for_scope("network_ops", self)
@@ -1061,6 +1089,55 @@ class Network(RNGMixin):
         Legacy aggregate dtype (first population). For multi-device setups, prefer dtypes().
         """
         return next(iter(self.populations.values())).dtype()
+
+    def _reset_runtime_clock(self, t):
+        """Anchor the exact network clock at ``t`` with zero elapsed steps."""
+        value = torch.as_tensor(t, device=self.t.device, dtype=self.t.dtype).reshape(())
+        with torch.no_grad():
+            self._clock_origin.copy_(value)
+            self._clock_step.zero_()
+            self.t.copy_(value)
+            self._sync_population_clocks()
+
+    def _runtime_clock_value(self):
+        """Return ``origin + integer_step * dt`` without accumulated drift."""
+        if self.dt is None:
+            return self.t.detach().clone()
+        return self._clock_origin + self._clock_step.to(self.t.dtype) * float(self.dt)
+
+    def _sync_runtime_clock(self):
+        with torch.no_grad():
+            self.t.copy_(self._runtime_clock_value())
+            self._sync_population_clocks()
+
+    def _advance_runtime_clock(self):
+        with torch.no_grad():
+            self._clock_step.add_(1)
+            self.t.copy_(self._runtime_clock_value())
+            self._sync_population_clocks()
+
+    def _reanchor_runtime_clock_from_time(self):
+        """Treat public ``t`` as authoritative after external state loading."""
+        with torch.no_grad():
+            if self.dt is None:
+                self._clock_origin.copy_(self.t)
+                self._clock_step.zero_()
+            else:
+                metadata_t = self._runtime_clock_value()
+                if not torch.equal(metadata_t, self.t):
+                    # Missing/stale clock metadata (including callers editing
+                    # only public ``t``) must be re-anchored. A coherent loaded
+                    # origin/step pair is preserved exactly; subtracting the
+                    # elapsed duration can otherwise introduce a one-ulp drift.
+                    elapsed = self._clock_step.to(self.t.dtype) * float(self.dt)
+                    self._clock_origin.copy_(self.t - elapsed)
+            self._sync_runtime_clock()
+
+    def _sync_population_clocks(self):
+        """Snap population clocks to the authoritative step-derived time."""
+        for population in self.populations.values():
+            value = self.t.to(device=population.t.device, dtype=population.t.dtype)
+            population.t.copy_(value)
 
     def attach_netstim(self, netstim: NetStim, *, replace: bool = False):
         """Attach a :class:`NetStim` after network construction.
@@ -2646,10 +2723,15 @@ class Network(RNGMixin):
         self._refresh_compile_config_from_ctx()
         current_sig = self._device_signature()
         devices_changed = current_sig != getattr(self, "_device_sig", None)
+        dt_changed = self.dt is not None and self.dt != dt_f
 
         if not self.built or self.dt != dt_f or force_rebuild or devices_changed:
             torch._dynamo.reset()
             self.dt = dt_f
+            if dt_changed:
+                # A step count anchored to the previous dt cannot be reused with
+                # a new timestep. Preserve the current absolute time and re-anchor.
+                self._reset_runtime_clock(float(self.t))
             self.synapses.clear()
             self.continuous_synapses.clear()
             self.continuous_targets = {}
@@ -2719,6 +2801,11 @@ class Network(RNGMixin):
                 compile_scope="network_population",
             )
             pop.intra = pop.build_intra()
+
+        # NetCons derive their absolute scheduled-event step from ``self.t``
+        # during initialization, so synchronize all clocks before building or
+        # resetting connection state.
+        self._reset_runtime_clock(t_f)
         self.build(dt_f, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
         # Always clear runtime delivery state during synapse initialization.
         # If a state cache is present, the backend-specific restore below will
@@ -2739,14 +2826,6 @@ class Network(RNGMixin):
                 self.netstim.set_dt(dt_f)
             self.netstim.initialize()
             self.netstim.detach()
-        # Population.initialize() and state-cache loading both restore their
-        # own clocks. Apply the requested absolute start only after those
-        # transitions so Network and Population clocks begin synchronized.
-        self.t = self.t.detach()
-        self.t.fill_(t_f)
-        for pop in self.populations.values():
-            pop.t = pop.t.detach()
-            pop.t.fill_(t_f)
         return self
 
     def initialize_pops_from_state_cache(self, *, dt=None):
@@ -2919,7 +2998,7 @@ class Network(RNGMixin):
 
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         self._refresh_compile_config_from_ctx()
-        dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
+        self._sync_runtime_clock()
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
@@ -2982,7 +3061,7 @@ class Network(RNGMixin):
                 intra=intra_c,
                 compile_network_ops=self.compile_network_ops,
             )
-            self.t = self.t + dt_t
+            self._advance_runtime_clock()
 
             post_step_hook(callbacks, self)
             if loop_hooks:
@@ -3024,12 +3103,14 @@ class Network(RNGMixin):
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         self._refresh_compile_config_from_ctx()
-        dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
+        self._sync_runtime_clock()
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
         intra = {}
         for n, p in self.populations.items():
+            if p.intra is None and getattr(p, "injections", None):
+                p.intra = p.build_intra()
             if p.intra is not None:
                 intra[n] = p.intra
 
@@ -3055,8 +3136,7 @@ class Network(RNGMixin):
             # below the integer (2.999...), causing a whole step to be lost.
             # Moving the ratio by one representable float before flooring
             # corrects that numerical artifact without rounding partial steps.
-            step_ratio = tstop_f / dt_f
-            n_steps = math.floor(math.nextafter(step_ratio, math.inf))
+            n_steps = _fixed_step_count(tstop_f, dt_f)
 
             if with_intra:
                 intra = {
@@ -3100,7 +3180,7 @@ class Network(RNGMixin):
                     intra=intra_c,
                     compile_network_ops=self.compile_network_ops,
                 )
-                self.t = self.t + dt_t
+                self._advance_runtime_clock()
                 post_step_hook(callbacks, self)
                 local_ind += 1
 
@@ -3110,6 +3190,170 @@ class Network(RNGMixin):
                         progressbar.set_description(
                             f"{tstart + local_ind * dt_f:.1f} ms"
                         )
+
+            if progressbar:
+                progressbar.close()
+
+            post_loop_hook(callbacks, self)
+
+    def longrun(
+        self,
+        tstop,
+        chunklength,
+        extra=None,
+        callbacks=None,
+        progressbar=False,
+    ):
+        """Advance the network in bounded-memory chunks without resetting state.
+
+        ``longrun`` has the same timestep and event-delivery semantics as
+        :meth:`run`, but prepares intracellular and extracellular stimuli one
+        chunk at a time. Population, NetStim, and NetCon state remains live
+        across chunk boundaries. Callback loop hooks run once for the complete
+        call, while chunk hooks run once around each chunk.
+
+        Parameters
+        ----------
+        tstop : float
+            Total simulation duration in milliseconds, measured from the
+            network's current time. A final fractional timestep is ignored,
+            matching :meth:`run`.
+        chunklength : int
+            Positive number of timesteps per chunk. The final chunk may be
+            shorter.
+        extra : dict[str, tuple[torch.Tensor, object]], optional
+            Population-specific extracellular stimuli with the same public
+            format as :meth:`run`.
+        callbacks : sequence of Callback, optional
+            Callbacks invoked around the complete loop, each chunk, and each
+            timestep.
+        progressbar : bool or tqdm.tqdm, optional
+            If truthy, display progress over completed timesteps.
+
+        Returns
+        -------
+        None
+        """
+        if self.dt is None:
+            raise RuntimeError(
+                "Network has no simulation timestep. Call initialize(dt) or "
+                "build(dt) before longrun()."
+            )
+        if not self.built:
+            raise RuntimeError(
+                "Network wiring has changed since the last build. Call "
+                "initialize(dt) (recommended) or build(dt) before longrun()."
+            )
+        if not isinstance(chunklength, int) or isinstance(chunklength, bool):
+            raise ValueError("chunklength must be a positive integer.")
+        if chunklength <= 0:
+            raise ValueError("chunklength must be a positive integer.")
+
+        dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
+        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        self._refresh_compile_config_from_ctx()
+        self._sync_runtime_clock()
+
+        ctx = nullcontext() if self.training else torch.no_grad()
+
+        intra = {}
+        for name, pop in self.populations.items():
+            if pop.intra is None and getattr(pop, "injections", None):
+                pop.intra = pop.build_intra()
+            if pop.intra is not None:
+                intra[name] = pop.intra
+
+        extra = extra if extra is not None else {}
+        extra_sources = {}
+        for name, (spatial, temporal) in extra.items():
+            pop = self.populations[name]
+            device, dtype = pop.device(), pop.dtype()
+            extra_sources[name] = (
+                spatial.to(device=device, dtype=dtype),
+                temporal.to(device=device, dtype=dtype),
+            )
+
+        if callbacks is None:
+            callbacks = []
+        if not isinstance(callbacks, CallbackList):
+            callbacks = CallbackList(callbacks)
+        for callback in callbacks:
+            callback.dt = self.dt
+
+        n_steps = _fixed_step_count(tstop_f, dt_f)
+        initial_time = self.t.double().detach().clone()
+        tstart = self.t.item()
+
+        with ctx:
+            pre_loop_hook(callbacks, self)
+
+            if progressbar:
+                if not isinstance(progressbar, tqdm):
+                    progressbar = tqdm(total=n_steps, desc=f"{tstart:.1f} ms")
+
+            completed_steps = 0
+            for chunk_start in range(0, n_steps, chunklength):
+                n_chunk = min(chunklength, n_steps - chunk_start)
+                time_chunk = initial_time + dt_f * torch.arange(
+                    chunk_start,
+                    chunk_start + n_chunk,
+                    device=self.t.device,
+                    dtype=torch.double,
+                )
+                time_chunk = time_chunk.to(dtype=self.t.dtype)
+                intra_chunk = {
+                    name: (
+                        source,
+                        *self.populations[name].prep_intra(source, n_chunk, dt_f),
+                    )
+                    for name, source in intra.items()
+                }
+
+                extra_chunk = {}
+                for name, (spatial, temporal) in extra_sources.items():
+                    pop = self.populations[name]
+                    device, dtype = pop.device(), pop.dtype()
+                    dt_pop = torch.tensor(self.dt, device=device, dtype=dtype)
+                    start = self.t.to(device=device, dtype=dtype)
+                    stop = start + n_chunk * dt_pop
+                    extra_chunk[name] = (
+                        spatial,
+                        temporal.assemble(start, stop, dt_pop),
+                    )
+
+                pre_chunk_hook(callbacks, self, time_chunk)
+                for local_ind in range(n_chunk):
+                    intra_c = (
+                        prepare_intra({}, intra_chunk, local_ind) if intra_chunk else {}
+                    )
+                    extra_c = (
+                        prepare_extra(extra_chunk, local_ind) if extra_chunk else {}
+                    )
+
+                    pre_step_hook(callbacks, self)
+                    self._step(
+                        self._population_step_items,
+                        self._synapse_step_items,
+                        self._continuous_synapse_step_items,
+                        self._continuous_target_step_items,
+                        self.netstim,
+                        self.t,
+                        dt_f,
+                        extra=extra_c,
+                        intra=intra_c,
+                        compile_network_ops=self.compile_network_ops,
+                    )
+                    self._advance_runtime_clock()
+                    post_step_hook(callbacks, self)
+                    completed_steps += 1
+
+                post_chunk_hook(callbacks, self, time_chunk)
+
+                if progressbar:
+                    progressbar.update(n_chunk)
+                    progressbar.set_description(
+                        f"{tstart + completed_steps * dt_f:.1f} ms"
+                    )
 
             if progressbar:
                 progressbar.close()
@@ -3572,6 +3816,7 @@ class Network(RNGMixin):
                 state_dict, map_location=self.device(), weights_only=True
             )
         _load_compatible_state_dict_transactionally(self, state_dict)
+        self._reanchor_runtime_clock_from_time()
         return self
 
     # utilities
@@ -3685,6 +3930,8 @@ class Network(RNGMixin):
             "netcons": self.netcons_state_dict_for_checkpoint(),
             "netstim": self.netstim_state_dict_for_checkpoint(),
             "t": self.t,
+            "clock_origin": self._clock_origin,
+            "clock_step": self._clock_step,
             "structure": self.checkpoint_structure(),
         }
 
@@ -3712,6 +3959,61 @@ class Network(RNGMixin):
                 f"expected {tuple(self.t.shape)}."
             )
         restored_t = checkpoint_t.to(device=self.t.device, dtype=self.t.dtype).clone()
+        if not bool(torch.isfinite(restored_t).item()):
+            raise ValueError("Network checkpoint time must be finite.")
+
+        has_clock_origin = "clock_origin" in state_dict
+        has_clock_step = "clock_step" in state_dict
+        checkpoint_origin = state_dict.get("clock_origin", checkpoint_t)
+        if not torch.is_tensor(checkpoint_origin):
+            raise TypeError("Network checkpoint clock origin must be a tensor.")
+        if tuple(checkpoint_origin.shape) != tuple(self._clock_origin.shape):
+            raise ValueError(
+                "Network checkpoint clock origin has shape "
+                f"{tuple(checkpoint_origin.shape)}, expected "
+                f"{tuple(self._clock_origin.shape)}."
+            )
+        restored_origin = checkpoint_origin.to(
+            device=self._clock_origin.device, dtype=self._clock_origin.dtype
+        ).clone()
+        if not bool(torch.isfinite(restored_origin).item()):
+            raise ValueError("Network checkpoint clock origin must be finite.")
+
+        checkpoint_step = state_dict.get(
+            "clock_step", torch.zeros_like(self._clock_step)
+        )
+        if not torch.is_tensor(checkpoint_step):
+            raise TypeError("Network checkpoint clock step must be a tensor.")
+        if tuple(checkpoint_step.shape) != tuple(self._clock_step.shape):
+            raise ValueError(
+                "Network checkpoint clock step has shape "
+                f"{tuple(checkpoint_step.shape)}, expected "
+                f"{tuple(self._clock_step.shape)}."
+            )
+        if checkpoint_step.dtype != torch.long:
+            raise TypeError("Network checkpoint clock step must have dtype torch.long.")
+        restored_step = checkpoint_step.to(device=self._clock_step.device).clone()
+        if int(restored_step.item()) < 0:
+            raise ValueError("Network checkpoint clock step must be non-negative.")
+        if self.dt is not None:
+            elapsed = restored_step.to(restored_t.dtype) * float(self.dt)
+            metadata_t = restored_origin + elapsed
+            # A checkpoint produced by this runtime contains a coherent
+            # origin/step pair. Preserve that original anchor exactly so a
+            # restore cannot introduce a one-ulp continuation difference through
+            # subtractive re-anchoring. ``t`` remains the historically public
+            # authority for legacy checkpoints and for callers that intentionally
+            # replace only ``t``: absent or inconsistent metadata is re-anchored.
+            if not (
+                has_clock_origin
+                and has_clock_step
+                and torch.equal(metadata_t, restored_t)
+            ):
+                restored_origin = restored_t - elapsed
+            if not bool(torch.isfinite(restored_origin).item()):
+                raise ValueError(
+                    "Network checkpoint clock metadata implies a non-finite origin."
+                )
 
         checkpoint_structure = state_dict.get("structure", None)
         if checkpoint_structure is not None:
@@ -3817,6 +4119,9 @@ class Network(RNGMixin):
         if checkpoint_has_netstim:
             self.netstim.restore_dict_from_checkpoint(state_dict["netstim"])
         self.t = restored_t
+        self._clock_origin = restored_origin
+        self._clock_step = restored_step
+        self._sync_runtime_clock()
 
     def restore_dict_from_checkpoint(self, state_dict):
         """Restore a whole-network runtime checkpoint atomically."""
@@ -3900,6 +4205,12 @@ class Network(RNGMixin):
             raise RuntimeError(
                 "Network.dt is None. Call net.initialize(dt=...) before longrun_checkpointed()."
             )
+        if not self.built:
+            raise RuntimeError(
+                "Network wiring has changed since the last build. Call "
+                "initialize(dt) (recommended) or build(dt) before "
+                "longrun_checkpointed()."
+            )
         if isinstance(chunklength, bool) or not isinstance(chunklength, int):
             raise TypeError("chunklength must be a positive integer")
         if chunklength <= 0:
@@ -3907,6 +4218,7 @@ class Network(RNGMixin):
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         self._refresh_compile_config_from_ctx()
+        self._sync_runtime_clock()
 
         # Normalize callbacks.
         if callbacks is None:
@@ -3916,25 +4228,19 @@ class Network(RNGMixin):
         for c in callbacks:
             c.dt = self.dt
 
-        dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
-
-        # Build a global time grid (used only for chunking + callback timing).
-        t_grid = torch.arange(
-            self.t.double(),
-            (self.t.double() + tstop_f),
-            dt_f,
+        # Build a step-count-derived global time grid used only for chunking and
+        # callback timing. Network.run() intentionally ignores a final partial
+        # timestep, so checkpointed execution must use the same floor rule.
+        n_steps = _fixed_step_count(tstop_f, dt_f)
+        initial_time = self.t.double().detach().clone()
+        t_grid = initial_time + dt_f * torch.arange(
+            n_steps,
             dtype=torch.double,
             device=self.t.device,
-        ).to(dtype=self.t.dtype)
-
-        if t_grid.numel() == 0:
-            # Nothing to do.
-            if return_final_state:
-                return None, self.state_dict_for_checkpoint()
-            return None
-
-        n_chunks = int(math.ceil(len(t_grid) / chunklength))
-        t_chunks = torch.tensor_split(t_grid, n_chunks)
+        )
+        t_grid = t_grid.to(dtype=self.t.dtype)
+        n_chunks = int(math.ceil(n_steps / chunklength)) if n_steps else 0
+        t_chunks = torch.tensor_split(t_grid, n_chunks) if n_chunks else ()
 
         # Preprocess extra: move spatial fields to the target population devices.
         extra = extra if extra is not None else {}
@@ -3951,11 +4257,14 @@ class Network(RNGMixin):
                 extra_prepped[name] = (v_dev, tt_dev, dt_pop, dev, dtp)
 
         # Identify intra sources (prepared per chunk to bound memory).
-        intra_sources = {
-            name: pop.intra
-            for name, pop in self.populations.items()
-            if pop.intra is not None
-        }
+        intra_sources = {}
+        for name, pop in self.populations.items():
+            # New injections invalidate ``pop.intra``. Match Network.step/run/
+            # longrun by rebuilding the solver-level stimulus lazily.
+            if pop.intra is None and getattr(pop, "injections", None):
+                pop.intra = pop.build_intra()
+            if pop.intra is not None:
+                intra_sources[name] = pop.intra
 
         def _as_loss_tensor(x):
             if x is None:
@@ -4026,7 +4335,7 @@ class Network(RNGMixin):
                 state = self.state_dict_for_checkpoint()
 
                 pbar = (
-                    tqdm(total=n_chunks, desc=f"{t_grid[0].item():.1f} ms")
+                    tqdm(total=n_chunks, desc=f"{initial_time.item():.1f} ms")
                     if progressbar
                     else None
                 )
@@ -4107,7 +4416,7 @@ class Network(RNGMixin):
                                 intra=intra_c,
                                 compile_network_ops=self.compile_network_ops,
                             )
-                            self.t = self.t + dt_t
+                            self._advance_runtime_clock()
 
                             # Replay-safe loss aggregation via callback returns.
                             for cb in callbacks:

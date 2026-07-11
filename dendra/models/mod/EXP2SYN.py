@@ -64,6 +64,14 @@ class exp2syn(PP, Syn):
 
     This ensures that the synaptic response is properly normalized based on the
     time constants.
+
+    As in NEURON's ``Exp2Syn``, the effective ratio ``tau1 / tau2`` is limited
+    to ``[1e-9, 0.9999]`` during initialization. Equal, nearly equal, or
+    reversed time constants therefore approach a normalized alpha-synapse
+    response instead of producing a division by zero. Both time constants must
+    be positive and finite; invalid values raise :class:`ValueError`. For low
+    precision dtypes, the bounds are tightened to the nearest representable
+    values strictly between zero and one.
     """
 
     PP.STATE(A, B)
@@ -73,11 +81,33 @@ class exp2syn(PP, Syn):
     PP.NONSPECIFIC_CURRENT("i")
 
     def initial(self, v):
-        tau1 = self.DE["A"].tau1
+        state_a = self.DE["A"]
+        tau1 = state_a.tau1
         tau2 = self.DE["B"].tau2
-        tp = (tau1 * tau2) / (tau2 - tau1) * log(tau2 / tau1)
-        factor = -exp(-tp / tau1) + exp(-tp / tau2)
-        self.factor = 1 / factor
+        valid = torch.isfinite(tau1) & torch.isfinite(tau2) & (tau1 > 0) & (tau2 > 0)
+        if not bool(torch.all(valid).item()):
+            raise ValueError("exp2syn tau1 and tau2 must be positive and finite.")
+
+        ratio = tau1 / tau2
+        zero = torch.zeros_like(ratio)
+        one = torch.ones_like(ratio)
+        lower = torch.maximum(
+            torch.full_like(ratio, 1.0e-9), torch.nextafter(zero, one)
+        )
+        upper = torch.minimum(
+            torch.full_like(ratio, 0.9999), torch.nextafter(one, zero)
+        )
+        ratio = torch.minimum(torch.maximum(ratio, lower), upper)
+
+        # NEURON adjusts tau1 itself, so the A-state kinetics must use the same
+        # effective value as the normalization factor.
+        state_a.tau1 = ratio * tau2
+
+        # At the peak, exp(-tp/tau1) is exactly ratio times
+        # exp(-tp/tau2). This log-domain form is algebraically equivalent to
+        # NEURON's tp expression but stays finite as ratio approaches one.
+        log_denominator = torch.log1p(-ratio) + ratio / (1 - ratio) * log(ratio)
+        self.factor = exp(-log_denominator)
 
     def i(self, v):
         return (self.B - self.A) * (v - self.e)
