@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._contracts import adjoint_main_blocks, validate_tree_block
+
 
 # ============================================================
 # Fast analytic inverse for 3×3 (row‑major)
@@ -282,7 +284,7 @@ class DHSBTSolve3(torch.autograd.Function):
 
         # Solve A^T g = grad_out by reusing the same kernel
         _dhs_bt3_kernel[(grid_x,)](
-            D_blocks.reshape(B, -1).clone(),
+            adjoint_main_blocks(D_blocks).reshape(B, -1).clone(),
             G_vec.reshape(B, -1),
             grad_out.reshape(B, -1).clone(),
             g.reshape(B, -1),
@@ -320,4 +322,13 @@ def dhs_bt_solve_cuda(D_blocks, G_vec, b, parent_idx, order, layer_ptr, threads=
     """Solve A x = b on a tree for 3-component unknowns (vi, ve0, ve1).
     Inputs are expected in *solver order* (use solver_order / inv_solver_order around this call).
     """
-    return DHSBTSolve3.apply(D_blocks, G_vec, b, parent_idx, order, layer_ptr, threads)
+    validate_tree_block(D_blocks, G_vec, b, parent_idx, order, layer_ptr, threads)
+    return DHSBTSolve3.apply(
+        D_blocks.contiguous(),
+        G_vec.contiguous(),
+        b.contiguous(),
+        parent_idx.contiguous(),
+        order.contiguous(),
+        layer_ptr.contiguous(),
+        threads,
+    )

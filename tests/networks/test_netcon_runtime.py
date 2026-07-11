@@ -54,13 +54,14 @@ def test_dense_backend_selects_delay_specialization(delays, expected):
     assert torch.allclose(netcon.w, torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64))
 
 
-def test_sparse_backend_uses_calendar_storage_and_rejects_checkpoint_state():
+def test_sparse_backend_uses_calendar_storage_and_exports_checkpoint_state():
     _, netcon = _built_netcon(delay_backend="sparse_calendar")
     assert netcon.advance.__name__ == "advance_non_diff_sparse_calendar"
     assert netcon.delivery_buffer.shape == (1, 3)
 
-    with pytest.raises(RuntimeError, match="Non-dense"):
-        netcon.state_dict_for_checkpoint()
+    state = netcon.state_dict_for_checkpoint()
+    assert state["backend_state"]["kind"] == "sparse_calendar"
+    assert state["backend_state"]["sparse_calendar"] == {}
 
 
 def test_expand_pre_indices_handles_empty_missing_and_known_sources():

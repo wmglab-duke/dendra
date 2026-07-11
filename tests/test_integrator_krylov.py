@@ -20,8 +20,8 @@ def _dense_matrix(diag, g_left, g_right):
     batch, size = diag.shape
     matrix = torch.diag_embed(diag)
     rows = torch.arange(size - 1)
-    matrix[:, rows, rows + 1] = g_right
-    matrix[:, rows + 1, rows] = g_left
+    matrix[:, rows, rows + 1] = g_left
+    matrix[:, rows + 1, rows] = g_right
     return matrix
 
 
@@ -118,7 +118,15 @@ def test_krylov_phi1_matches_dense_solution(solver, symmetric):
     assert torch.allclose(actual, expected, atol=1e-10, rtol=1e-10)
 
 
-@pytest.mark.parametrize("solver", [phi1_krylov_arnoldi_g, phi1_krylov_lanczos_g])
+@pytest.mark.parametrize(
+    "solver",
+    [
+        phi1_krylov_arnoldi,
+        phi1_krylov_arnoldi_g,
+        phi1_krylov_lanczos,
+        phi1_krylov_lanczos_g,
+    ],
+)
 def test_guarded_phi1_returns_identity_action_for_zero_operator(solver):
     vector = torch.tensor([[1.0, -2.0, 0.5]], dtype=DTYPE)
     zeros_diag = torch.zeros((1, 3), dtype=DTYPE)
@@ -138,6 +146,41 @@ def test_guarded_phi1_returns_identity_action_for_zero_operator(solver):
     )
 
     assert torch.allclose(actual, vector)
+
+
+@pytest.mark.parametrize(
+    "solver",
+    [
+        phi1_krylov_arnoldi,
+        phi1_krylov_arnoldi_g,
+        phi1_krylov_lanczos,
+        phi1_krylov_lanczos_g,
+    ],
+)
+def test_phi1_handles_partial_krylov_breakdown_without_nan(solver):
+    vector = torch.tensor([[1.0, 0.0, 0.0]], dtype=DTYPE)
+    diag = torch.tensor([[-1.0, -2.0, -3.0]], dtype=DTYPE)
+    zeros_edge = torch.zeros((1, 2), dtype=DTYPE)
+    V_buf, H_buf = _workspace(1, 3, 3)
+    step = torch.tensor(0.1, dtype=DTYPE)
+
+    actual = solver(
+        vector,
+        step,
+        3,
+        diag,
+        zeros_edge,
+        zeros_edge,
+        V_buf,
+        H_buf,
+        torch.eye(3, dtype=DTYPE),
+    )
+
+    expected = torch.tensor(
+        [[(1.0 - torch.exp(-step)).item() / step.item(), 0.0, 0.0]],
+        dtype=DTYPE,
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("solver", [expm_krylov_arnoldi, expm_krylov_lanczos])

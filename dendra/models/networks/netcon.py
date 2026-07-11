@@ -1,3 +1,4 @@
+import hashlib
 import math
 from typing import Any, Dict, Literal
 
@@ -229,6 +230,85 @@ def _restore_calendar_chunks(
         if restored:
             out.setdefault(new_slot, []).extend(restored)
     return out
+
+
+def _checkpoint_calendar_chunks(calendar: dict):
+    """Copy an exact runtime calendar without normalizing its ring slots."""
+    return {
+        int(slot): [(idx.clone(), value.clone()) for idx, value in chunks]
+        for slot, chunks in calendar.items()
+        if chunks
+    }
+
+
+def _restore_checkpoint_calendar_chunks(
+    calendar: dict,
+    *,
+    idx_device,
+    idx_dtype,
+    value_device,
+    value_dtype,
+):
+    """Rebuild a checkpoint calendar on the receiving component's devices."""
+    if not isinstance(calendar, dict):
+        raise TypeError("NetCon checkpoint calendar must be a dict.")
+    restored = {}
+    for slot, chunks in calendar.items():
+        if not isinstance(slot, int):
+            raise TypeError("NetCon checkpoint calendar slots must be integers.")
+        copied = []
+        for chunk in chunks:
+            if not isinstance(chunk, (tuple, list)) or len(chunk) != 2:
+                raise TypeError(
+                    "NetCon checkpoint calendar chunks must be (index, value) pairs."
+                )
+            idx, value = chunk
+            if not torch.is_tensor(idx) or not torch.is_tensor(value):
+                raise TypeError("NetCon checkpoint calendar payloads must be tensors.")
+            if idx.ndim != 1 or value.ndim != 1 or idx.numel() != value.numel():
+                raise ValueError(
+                    "NetCon checkpoint calendar indices and values must be equally "
+                    "sized one-dimensional tensors."
+                )
+            copied.append(
+                (
+                    idx.detach().to(device=idx_device, dtype=idx_dtype).clone(),
+                    value.to(device=value_device, dtype=value_dtype).clone(),
+                )
+            )
+        if copied:
+            restored[int(slot)] = copied
+    return restored
+
+
+def _topology_tensor_digest(*tensors: torch.Tensor) -> str:
+    """Return a stable digest for small/static connection-topology tensors."""
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        value = tensor.detach().cpu().contiguous()
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _require_checkpoint_tensor(state_dict, name, *, shape, dtype=None):
+    """Validate a required runtime checkpoint tensor before rebinding state."""
+    if name not in state_dict:
+        raise KeyError(f"NetCon checkpoint is missing {name!r}.")
+    value = state_dict[name]
+    if not torch.is_tensor(value):
+        raise TypeError(f"NetCon checkpoint {name!r} must be a tensor.")
+    if tuple(value.shape) != tuple(shape):
+        raise ValueError(
+            f"NetCon checkpoint {name!r} has shape {tuple(value.shape)}, "
+            f"expected {tuple(shape)}."
+        )
+    if dtype is not None and value.dtype != dtype:
+        raise TypeError(
+            f"NetCon checkpoint {name!r} has dtype {value.dtype}, expected {dtype}."
+        )
+    return value
 
 
 class ContinuousCon(Referency):
@@ -774,10 +854,46 @@ class ContinuousCon(Referency):
         }
 
     def restore_dict_from_checkpoint(self, state_dict):
-        self.delivery_buffer = state_dict["delivery_buffer"]
-        self.current_time_step = state_dict["current_time_step"]
-        self.global_step = state_dict["global_step"]
+        if not isinstance(state_dict, dict):
+            raise TypeError("ContinuousCon checkpoint state must be a dict.")
+        delivery = _require_checkpoint_tensor(
+            state_dict,
+            "delivery_buffer",
+            shape=self.delivery_buffer.shape,
+            dtype=self.dtype,
+        )
+        current = _require_checkpoint_tensor(
+            state_dict,
+            "current_time_step",
+            shape=self.current_time_step.shape,
+            dtype=torch.long,
+        )
+        global_step = _require_checkpoint_tensor(
+            state_dict,
+            "global_step",
+            shape=self.global_step.shape,
+            dtype=torch.long,
+        )
+        current_value = int(current.detach().cpu().reshape(-1)[0].item())
+        if current_value < 0 or current_value >= int(self.max_delay_steps):
+            raise ValueError(
+                "ContinuousCon checkpoint current_time_step is outside the delay "
+                f"ring: {current_value} not in [0, {int(self.max_delay_steps)})."
+            )
+        self.delivery_buffer = delivery.to(device=self.device)
+        self.current_time_step = current.to(device=self.device)
+        self.global_step = global_step.to(device=self.device)
         return self
+
+    def checkpoint_topology_signature(self):
+        """Return immutable structure needed to validate fresh-object replay."""
+        return {
+            "kind": "continuous",
+            "n_connections": int(self._n_conn),
+            "synapse_numel": int(self._syn_numel),
+            "max_delay_steps": int(self.max_delay_steps),
+            "topology": _topology_tensor_digest(self.pre_idx, self.post_idx),
+        }
 
     # ------------------------------------------------------------------
     # Hot-path helpers
@@ -4324,7 +4440,14 @@ class NetCon(Referency):
 
         if diff_delays:
             d_ms = self.delay_ms().to(dtype)  # [n_conn]
-            lam = d_ms / self.dt.to(dtype)
+            # Detection happens after the current receive slot has already been
+            # delivered.  Consequently, even a sub-timestep physical delay can
+            # arrive no earlier than the next simulation step.  Keep the
+            # differentiable dense path aligned with inference and the compact
+            # source-history training backend; otherwise a rounded-zero delay
+            # is written into the cleared current slot and is not seen again
+            # until the circular buffer wraps.
+            lam = (d_ms / self.dt.to(dtype)).clamp_min(1.0)
             k = torch.floor(lam)
             kL = k.to(torch.long)
 
@@ -4353,7 +4476,9 @@ class NetCon(Referency):
                 vals = weighted_spikes.unsqueeze(-1) * w  # [n_conn,3]
                 buf_flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
         else:
-            future_steps = (cur_idx + self.delay_steps).remainder(self.max_delay_steps)
+            future_steps = (cur_idx + self.inference_delay_steps).remainder(
+                self.max_delay_steps
+            )
             flat = future_steps * self.syn_numel + self.post_idx
             # Integer delay: single destination per connection
             buf_flat.index_add_(0, flat, weighted_spikes)
@@ -5274,26 +5399,49 @@ class NetCon(Referency):
           they should be handled here, in a way that the user can flag.
         """
 
-        if (
-            self._use_sparse_calendar_runtime()
-            or self._use_bitpacked_history_runtime()
-            or self._use_source_history_training_runtime()
-        ):
-            raise RuntimeError(
-                "Non-dense NetCon runtime state is not supported by "
-                "state_dict_for_checkpoint() yet. Use delay_backend='dense' "
-                "for checkpointed runs."
-            )
-
+        runtime = self._checkpoint_runtime_kind()
+        compact_runtime = runtime != "dense"
         sd: Dict[str, Any] = {
-            "delivery_buffer": self.delivery_buffer,
-            "current_time_step": self.current_time_step,
-            "global_step": self.global_step,
+            "delivery_buffer": (
+                self.delivery_buffer.clone()
+                if compact_runtime
+                else self.delivery_buffer
+            ),
+            "current_time_step": (
+                self.current_time_step.clone()
+                if compact_runtime
+                else self.current_time_step
+            ),
+            "global_step": (
+                self.global_step.clone() if compact_runtime else self.global_step
+            ),
         }
 
         # Threshold-crossing history matters for spike detection when thresholds are used.
-        if not self.skip_thresholding:
-            sd["has_spiked"] = self.has_spiked
+        if not self.skip_thresholding and self.has_spiked.numel() > 0:
+            sd["has_spiked"] = (
+                self.has_spiked.clone() if compact_runtime else self.has_spiked
+            )
+
+        if compact_runtime:
+            backend_state: Dict[str, Any] = {
+                "kind": runtime,
+                "sparse_calendar": _checkpoint_calendar_chunks(self._sparse_calendar),
+                "sparse_event_calendar": _checkpoint_calendar_chunks(
+                    self._sparse_event_calendar
+                ),
+            }
+            if self.spike_history_packed.numel() > 0:
+                backend_state["spike_history_packed"] = (
+                    self.spike_history_packed.clone()
+                )
+            if self.source_gate_history.numel() > 0:
+                backend_state["source_gate_history"] = self.source_gate_history.clone()
+            if self.bitpack_source_has_spiked.numel() > 0:
+                backend_state["bitpack_source_has_spiked"] = (
+                    self.bitpack_source_has_spiked.clone()
+                )
+            sd["backend_state"] = backend_state
 
         return sd
 
@@ -5310,14 +5458,158 @@ class NetCon(Referency):
         This matches the expectation in longrun_checkpointed that restore rebinds
         mutable tensors.
         """
-        # IMPORTANT:
-        # Restore by *rebinding* tensors, not copy_(), so that:
-        # - we preserve autograd history through the state tensors, and
-        # - we don't inadvertently sever BPTT across chunk boundaries.
-        self.delivery_buffer = state_dict["delivery_buffer"]
-        self.current_time_step = state_dict["current_time_step"]
-        self.global_step = state_dict["global_step"]
+        if not isinstance(state_dict, dict):
+            raise TypeError("NetCon checkpoint state must be a dict.")
 
-        if not self.skip_thresholding and "has_spiked" in state_dict:
-            self.has_spiked = state_dict["has_spiked"]
+        runtime = self._checkpoint_runtime_kind()
+        backend_state = state_dict.get("backend_state", None)
+        if backend_state is not None and not isinstance(backend_state, dict):
+            raise TypeError("NetCon checkpoint backend_state must be a dict.")
+        checkpoint_runtime = (
+            "dense" if backend_state is None else backend_state.get("kind", None)
+        )
+        if checkpoint_runtime != runtime:
+            raise ValueError(
+                "NetCon checkpoint runtime does not match the active runtime: "
+                f"checkpoint={checkpoint_runtime!r}, active={runtime!r}."
+            )
+
+        delivery = _require_checkpoint_tensor(
+            state_dict,
+            "delivery_buffer",
+            shape=self.delivery_buffer.shape,
+            dtype=self.dtype,
+        )
+        current = _require_checkpoint_tensor(
+            state_dict,
+            "current_time_step",
+            shape=self.current_time_step.shape,
+            dtype=torch.long,
+        )
+        global_step = _require_checkpoint_tensor(
+            state_dict,
+            "global_step",
+            shape=self.global_step.shape,
+            dtype=torch.long,
+        )
+        current_value = int(current.detach().cpu().reshape(-1)[0].item())
+        if current_value < 0 or current_value >= int(self.max_delay_steps):
+            raise ValueError(
+                "NetCon checkpoint current_time_step is outside the delay ring: "
+                f"{current_value} not in [0, {int(self.max_delay_steps)})."
+            )
+
+        has_spiked = None
+        if not self.skip_thresholding and self.has_spiked.numel() > 0:
+            has_spiked = _require_checkpoint_tensor(
+                state_dict,
+                "has_spiked",
+                shape=self.has_spiked.shape,
+                dtype=torch.bool,
+            )
+
+        sparse_calendar = None
+        sparse_event_calendar = None
+        spike_history = None
+        source_gate_history = None
+        source_has_spiked = None
+        if backend_state is not None:
+            sparse_calendar = _restore_checkpoint_calendar_chunks(
+                backend_state.get("sparse_calendar", {}),
+                idx_device=self.device,
+                idx_dtype=torch.long,
+                value_device=self.device,
+                value_dtype=self.dtype,
+            )
+            sparse_event_calendar = _restore_checkpoint_calendar_chunks(
+                backend_state.get("sparse_event_calendar", {}),
+                idx_device=self.device,
+                idx_dtype=torch.long,
+                value_device=self.device,
+                value_dtype=torch.int32,
+            )
+            invalid_slots = {
+                slot
+                for slot in (*sparse_calendar, *sparse_event_calendar)
+                if slot < 0 or slot >= int(self.max_delay_steps)
+            }
+            if invalid_slots:
+                raise ValueError(
+                    "NetCon checkpoint calendar contains slots outside the delay "
+                    f"ring: {sorted(invalid_slots)}."
+                )
+            if self.spike_history_packed.numel() > 0:
+                spike_history = _require_checkpoint_tensor(
+                    backend_state,
+                    "spike_history_packed",
+                    shape=self.spike_history_packed.shape,
+                    dtype=torch.int64,
+                )
+            if self.source_gate_history.numel() > 0:
+                source_gate_history = _require_checkpoint_tensor(
+                    backend_state,
+                    "source_gate_history",
+                    shape=self.source_gate_history.shape,
+                    dtype=self.dtype,
+                )
+            if self.bitpack_source_has_spiked.numel() > 0:
+                source_has_spiked = _require_checkpoint_tensor(
+                    backend_state,
+                    "bitpack_source_has_spiked",
+                    shape=self.bitpack_source_has_spiked.shape,
+                    dtype=torch.bool,
+                )
+
+        # Restore by rebinding differentiable tensors so graph connectivity is
+        # preserved across checkpoint chunks. Integer/bool history is cloned
+        # because the next step mutates it in-place.
+        self.delivery_buffer = delivery.to(device=self.device)
+        self.current_time_step = current.to(device=self.device)
+        self.global_step = global_step.to(device=self.device)
+        if has_spiked is not None:
+            self.has_spiked = has_spiked.to(device=self.pre_device)
+        if backend_state is not None:
+            self._sparse_calendar = sparse_calendar
+            self._sparse_event_calendar = sparse_event_calendar
+            if spike_history is not None:
+                self.spike_history_packed = spike_history.to(device=self.device).clone()
+            if source_gate_history is not None:
+                self.source_gate_history = source_gate_history.to(device=self.device)
+            if source_has_spiked is not None:
+                self.bitpack_source_has_spiked = source_has_spiked.to(
+                    device=self.pre_device
+                ).clone()
         return self
+
+    def _checkpoint_runtime_kind(self) -> str:
+        if self._use_sparse_calendar_runtime():
+            return "sparse_calendar"
+        if self._use_bitpacked_history_runtime():
+            return "bitpacked_history"
+        if self._use_source_history_training_runtime():
+            return "source_history"
+        return "dense"
+
+    def checkpoint_topology_signature(self):
+        """Return immutable structure needed to validate fresh-object replay."""
+        train_flags = None
+        if self.train_flags is not None:
+            train_flags = tuple(self.train_flags)
+        return {
+            "kind": "event",
+            "n_connections": int(self._n_conn),
+            "synapse_numel": int(self._syn_numel),
+            "max_delay_steps": int(self.max_delay_steps),
+            "delay_backend": self.delay_backend,
+            "train_delay_backend": self.train_delay_backend,
+            "runtime": self._checkpoint_runtime_kind(),
+            "training": bool(self.training),
+            "track_events": bool(self.track_events),
+            "train_flags": train_flags,
+            "topology": _topology_tensor_digest(
+                self.pre_idx,
+                self.post_idx,
+                self.threshold,
+                self.thresh_is_nan,
+            ),
+        }

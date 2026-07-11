@@ -443,15 +443,40 @@ class Integrator(torch.nn.Module):
     def _initialize(self, model, dt, force=False, *, compile_scope: str = "population"):
         self.configure_jit(model, scope=compile_scope)
         if self.needs_to_be_initialized(model, dt, force):
+            previous_dt = self.dt
+            previous_shape = self.shape
+            previous_initialized = self.initialized
             self.dt = float(dt)
             self.shape = model.shape
             self._compiled_kernels.clear()
-            if hasattr(self.mech, "set_dt"):
-                self.mech.set_dt(dt)
-            else:
-                for mech in self.mech.mechanisms.values():
-                    mech.set_dt(dt)
-            self.initialize(model, dt)
+            try:
+                if hasattr(self.mech, "set_dt"):
+                    self.mech.set_dt(dt)
+                else:
+                    for mech in self.mech.mechanisms.values():
+                        mech.set_dt(dt)
+                self.initialize(model, dt)
+            except Exception:
+                # An initializer may have rebound only some workspaces before
+                # failing. Never advertise that partial state as initialized or
+                # let a retry at the same dt/shape skip reconstruction.
+                self.dt = previous_dt
+                self.shape = previous_shape
+                self.initialized = False
+                self._compiled_kernels.clear()
+                if previous_initialized and previous_dt is not None:
+                    try:
+                        if hasattr(self.mech, "set_dt"):
+                            self.mech.set_dt(previous_dt)
+                        else:
+                            for mech in self.mech.mechanisms.values():
+                                mech.set_dt(previous_dt)
+                    except Exception:
+                        # The integrator remains explicitly invalid. A later
+                        # initialize call must rebuild all timestep-dependent
+                        # state rather than using any partially restored cache.
+                        pass
+                raise
             self.initialized = True
 
     def init_v(self, model):

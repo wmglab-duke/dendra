@@ -2931,11 +2931,10 @@ def paired_pulse_recovery_from_trials(
 
     if T < 2:
         raise ValueError("Need at least 2 time samples.")
+    if n_trials < 1:
+        raise ValueError("Need at least one paired-pulse trial.")
 
-    if not torch.is_tensor(dt_ms):
-        dt_ms = torch.tensor(dt_ms, device=device, dtype=dtype)
-    else:
-        dt_ms = dt_ms.to(device=device, dtype=dtype)
+    dt_ms = _coerce_positive_scalar(dt_ms, device=device, dtype=dtype, name="dt_ms")
 
     test_amplitudes = test_amplitudes.to(device=device, dtype=dtype)
     isis_ms = isis_ms.to(device=device, dtype=dtype)
@@ -2982,6 +2981,7 @@ def paired_pulse_recovery_from_trials(
         else:
             raise ValueError("node_mask must have shape (C,) or (P, C).")
     comp_w = torch.clamp(comp_w, min=0.0)
+    has_readout = comp_w.sum(dim=-1) > 0.0
     neg_inf = torch.full_like(comp_w, -torch.inf)
     logw = torch.where(comp_w > 0, torch.log(torch.clamp(comp_w, min=eps)), neg_inf)
 
@@ -3064,6 +3064,11 @@ def paired_pulse_recovery_from_trials(
         latency_weights = comp_w * p_response_comp
         Wc = latency_weights.sum(dim=-1) + eps
         latency_ms_trial = (latency_weights * latency_ms_comp).sum(dim=-1) / Wc
+        latency_ms_trial = torch.where(
+            has_readout,
+            latency_ms_trial,
+            torch.full_like(latency_ms_trial, float("nan")),
+        )
         t_bar = (latency_weights * t_hat_test_ms).sum(dim=-1, keepdim=True) / Wc[
             :, None
         ]
@@ -3102,6 +3107,27 @@ def paired_pulse_recovery_from_trials(
             v_um_per_ms_trial = cov / (var_t_ms2 + eps)
             v_m_per_s_trial = 1e-3 * v_um_per_ms_trial
             speed_m_per_s_trial = torch.sqrt(v_m_per_s_trial * v_m_per_s_trial + eps)
+            v_um_per_ms_trial = torch.where(
+                has_readout,
+                v_um_per_ms_trial,
+                torch.full_like(v_um_per_ms_trial, float("nan")),
+            )
+            v_m_per_s_trial = torch.where(
+                has_readout,
+                v_m_per_s_trial,
+                torch.full_like(v_m_per_s_trial, float("nan")),
+            )
+            speed_m_per_s_trial = torch.where(
+                has_readout,
+                speed_m_per_s_trial,
+                torch.full_like(speed_m_per_s_trial, float("nan")),
+            )
+
+        var_t_ms2 = torch.where(
+            has_readout,
+            var_t_ms2,
+            torch.full_like(var_t_ms2, float("nan")),
+        )
 
     # ------------------------------------------------------------------
     # 3) Group by ISI and extract a differentiable threshold per group
@@ -3165,6 +3191,24 @@ def paired_pulse_recovery_from_trials(
         if success_aggregate == "soft_or":
             return 1.0 - torch.exp(torch.log(torch.clamp(1.0 - pg, min=eps)).sum())
         raise ValueError("success_aggregate must be one of {'mean', 'max', 'soft_or'}.")
+
+    def _finite_weighted_mean(
+        values: torch.Tensor, weights: torch.Tensor
+    ) -> torch.Tensor:
+        finite = torch.isfinite(values)
+        safe_values = torch.where(finite, values, torch.zeros_like(values))
+        safe_weights = torch.where(
+            finite,
+            torch.clamp(weights, min=eps),
+            torch.zeros_like(weights),
+        )
+        total_weight = safe_weights.sum()
+        mean = (safe_weights * safe_values).sum() / (total_weight + eps)
+        return torch.where(
+            total_weight > 0.0,
+            mean,
+            torch.full_like(mean, float("nan")),
+        )
 
     I_th_list, I_on_list, I_pre_list = [], [], []
     I_last_list, I_post_list, I_block_mid_list = [], [], []
@@ -3234,16 +3278,11 @@ def paired_pulse_recovery_from_trials(
         isi_weight_list.append(w_isi)
 
         if compute_latency and latency_ms_trial is not None:
-            wg = torch.clamp(pg, min=eps)
-            latency_by_isi_list.append(
-                (wg * latency_ms_trial[idx]).sum() / (wg.sum() + eps)
-            )
+            latency_by_isi_list.append(_finite_weighted_mean(latency_ms_trial[idx], pg))
             if v_m_per_s_trial is not None:
-                v_by_isi_list.append(
-                    (wg * v_m_per_s_trial[idx]).sum() / (wg.sum() + eps)
-                )
+                v_by_isi_list.append(_finite_weighted_mean(v_m_per_s_trial[idx], pg))
                 speed_by_isi_list.append(
-                    (wg * speed_m_per_s_trial[idx]).sum() / (wg.sum() + eps)
+                    _finite_weighted_mean(speed_m_per_s_trial[idx], pg)
                 )
 
         if reg_bracket_weight > 0.0:
@@ -3375,6 +3414,23 @@ def paired_pulse_recovery_from_trials(
 # =============================================================================
 
 
+def _coerce_positive_scalar(
+    value: float | torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str,
+) -> torch.Tensor:
+    """Return a finite positive scalar tensor on the requested device and dtype."""
+    out = torch.as_tensor(value, device=device, dtype=dtype)
+    if out.ndim != 0:
+        raise ValueError(f"{name} must be scalar.")
+    scalar = float(out.detach().cpu().item())
+    if not np.isfinite(scalar) or scalar <= 0.0:
+        raise ValueError(f"{name} must be positive and finite.")
+    return out
+
+
 def _coerce_pulse_times_ms(
     pulse_times_ms: torch.Tensor | Sequence[float],
     *,
@@ -3395,6 +3451,12 @@ def _coerce_pulse_times_ms(
             )
     else:
         raise ValueError("pulse_times_ms must be one- or two-dimensional.")
+    if pt.shape[1] < 1:
+        raise ValueError("pulse_times_ms must contain at least one pulse.")
+    if not bool(torch.isfinite(pt).all().item()):
+        raise ValueError("pulse_times_ms must contain only finite values.")
+    if pt.shape[1] > 1 and bool(torch.any(pt[:, 1:] <= pt[:, :-1]).item()):
+        raise ValueError("pulse_times_ms must be strictly increasing along each train.")
     return pt
 
 
@@ -3519,12 +3581,8 @@ def _gather_time_windows_FNKC(
         raise ValueError("Window fiber dimension must match X.shape[1].")
 
     device, dtype = X.device, X.dtype
-    dt = torch.as_tensor(dt_ms, device=device, dtype=dtype)
-    if dt.ndim != 0:
-        raise ValueError("dt_ms must be scalar.")
+    dt = _coerce_positive_scalar(dt_ms, device=device, dtype=dtype, name="dt_ms")
     dt_float = float(dt.detach().cpu().item())
-    if dt_float <= 0.0:
-        raise ValueError("dt_ms must be positive.")
 
     margin = torch.as_tensor(margin_ms, device=device, dtype=dtype)
     margin_float = float(margin.detach().cpu().item())
@@ -3532,9 +3590,14 @@ def _gather_time_windows_FNKC(
         raise ValueError("margin_ms must be nonnegative.")
 
     # K is a Python integer because it fixes the static gathered window length.
-    max_width = float((win_end_ms - win_start_ms).detach().max().cpu().item())
-    if max_width <= 0.0:
+    widths = win_end_ms - win_start_ms
+    if (
+        widths.numel() == 0
+        or not bool(torch.isfinite(widths).all().item())
+        or bool(torch.any(widths <= 0.0).item())
+    ):
         raise ValueError("All windows must satisfy end > start.")
+    max_width = float(widths.detach().max().cpu().item())
     K = int(np.ceil((max_width + 2.0 * margin_float) / dt_float)) + 4
     K = max(K, 2)
 
@@ -3742,10 +3805,7 @@ def activity_dependent_slowing(
         raise ValueError("chunk_pulses must be None or a positive integer.")
 
     device, dtype = V.device, V.dtype
-    if not torch.is_tensor(dt_ms):
-        dt_ms = torch.tensor(dt_ms, device=device, dtype=dtype)
-    else:
-        dt_ms = dt_ms.to(device=device, dtype=dtype)
+    dt_ms = _coerce_positive_scalar(dt_ms, device=device, dtype=dtype, name="dt_ms")
     dt_float = float(dt_ms.detach().cpu().item())
 
     pulse_times = _coerce_pulse_times_ms(
@@ -3774,6 +3834,7 @@ def activity_dependent_slowing(
     comp_w = _coerce_compartment_weights(
         node_mask, Fibs=Fibs, C=C, device=device, dtype=dtype
     )
+    has_readout = comp_w.sum(dim=-1) > 0.0
     neg_inf = torch.full_like(comp_w, -torch.inf)
     logw_comp = torch.where(
         comp_w > 0, torch.log(torch.clamp(comp_w, min=eps)), neg_inf
@@ -3835,7 +3896,7 @@ def activity_dependent_slowing(
         Z = V_win - V_spk
         score_comp = (
             torch.logsumexp(
-                kappa_V * Z + kappa_V * log_g_time[:, :, :, None],
+                kappa_V * Z + log_g_time[:, :, :, None],
                 dim=2,
             )
             / kappa_V
@@ -3844,9 +3905,7 @@ def activity_dependent_slowing(
 
         score_region = (
             torch.logsumexp(
-                kappa_V * Z
-                + kappa_V * log_g_time[:, :, :, None]
-                + logw_comp[:, None, None, :],
+                kappa_V * Z + log_g_time[:, :, :, None] + logw_comp[:, None, None, :],
                 dim=(2, 3),
             )
             / kappa_V
@@ -3871,7 +3930,7 @@ def activity_dependent_slowing(
         if use_dv_gate:
             score_dv_comp = (
                 torch.logsumexp(
-                    kappa_dv * (dV_win - dv_spk) + kappa_dv * log_g_mid[:, :, :, None],
+                    kappa_dv * (dV_win - dv_spk) + log_g_mid[:, :, :, None],
                     dim=2,
                 )
                 / kappa_dv
@@ -3882,7 +3941,7 @@ def activity_dependent_slowing(
             score_dv_region = (
                 torch.logsumexp(
                     kappa_dv * (dV_win - dv_spk)
-                    + kappa_dv * log_g_mid[:, :, :, None]
+                    + log_g_mid[:, :, :, None]
                     + logw_comp[:, None, None, :],
                     dim=(2, 3),
                 )
@@ -3900,7 +3959,7 @@ def activity_dependent_slowing(
         rel_t_mid = t_mid_win - win_start[:, :, None]
         arrival_logits = (
             beta * U
-            + beta * log_g_mid[:, :, :, None]
+            + log_g_mid[:, :, :, None]
             - lambda_early * rel_t_mid[:, :, :, None]
         )
         w_time = torch.softmax(arrival_logits, dim=2)
@@ -3910,6 +3969,11 @@ def activity_dependent_slowing(
         latency_weights = comp_w[:, None, :] * p_comp
         Wc = latency_weights.sum(dim=-1) + eps
         latency = (latency_weights * latency_comp).sum(dim=-1) / Wc
+        latency = torch.where(
+            has_readout[:, None],
+            latency,
+            torch.full_like(latency, float("nan")),
+        )
 
         t_bar = (latency_weights * t_hat_comp).sum(dim=-1, keepdim=True) / Wc[
             :, :, None
@@ -3929,6 +3993,22 @@ def activity_dependent_slowing(
             v_um_per_ms = cov / (var_t + eps)
             v_m_per_s = 1e-3 * v_um_per_ms
             speed_m_per_s = torch.sqrt(v_m_per_s * v_m_per_s + eps)
+            valid_velocity_readout = has_readout[:, None]
+            v_um_per_ms = torch.where(
+                valid_velocity_readout,
+                v_um_per_ms,
+                torch.full_like(v_um_per_ms, float("nan")),
+            )
+            v_m_per_s = torch.where(
+                valid_velocity_readout,
+                v_m_per_s,
+                torch.full_like(v_m_per_s, float("nan")),
+            )
+            speed_m_per_s = torch.where(
+                valid_velocity_readout,
+                speed_m_per_s,
+                torch.full_like(speed_m_per_s, float("nan")),
+            )
             v_um_chunks.append(v_um_per_ms)
             v_ms_chunks.append(v_m_per_s)
             speed_chunks.append(speed_m_per_s)
@@ -3949,6 +4029,12 @@ def activity_dependent_slowing(
     latency_ms = torch.cat(latency_chunks, dim=1)  # (F, N)
     latency_ess = torch.cat(ess_chunks, dim=1)  # (F, N)
     var_t_ms2 = torch.cat(var_t_chunks, dim=1)  # (F, N)
+    var_t_for_reg = var_t_ms2
+    var_t_ms2 = torch.where(
+        has_readout[:, None],
+        var_t_ms2,
+        torch.full_like(var_t_ms2, float("nan")),
+    )
 
     if return_compartment_metrics:
         p_success_comp = (
@@ -4059,7 +4145,7 @@ def activity_dependent_slowing(
             reg
             + reg_var_weight
             * F.softplus(
-                torch.tensor(min_var_ms2, device=device, dtype=dtype) - var_t_ms2
+                torch.tensor(min_var_ms2, device=device, dtype=dtype) - var_t_for_reg
             ).mean()
         )
     if reg_success_weight > 0.0:
@@ -4140,24 +4226,30 @@ def _coerce_train_frequency_hz(
             )
         isi = pulse_times_ms[:, 1:] - pulse_times_ms[:, :-1]
         mean_isi = isi.mean(dim=-1)
-        return 1000.0 / (mean_isi + eps)
+        result = 1000.0 / (mean_isi + eps)
+    else:
+        f = torch.as_tensor(frequency_hz, device=device, dtype=dtype)
+        if f.ndim == 0:
+            result = f.expand(Fibs)
+        elif f.ndim == 1 and f.numel() == 1:
+            result = f.reshape(1).expand(Fibs)
+        elif f.shape == (Fibs,):
+            result = f
+        elif f.ndim == 2 and f.shape == (Fibs, 1):
+            result = f[:, 0]
+        elif f.ndim == 2 and f.shape == (1, Fibs):
+            result = f[0]
+        else:
+            raise ValueError(
+                f"{name} must be scalar or shape (F,), where F={Fibs}; "
+                f"got {tuple(f.shape)}."
+            )
 
-    f = torch.as_tensor(frequency_hz, device=device, dtype=dtype)
-    if f.ndim == 0:
-        return f.expand(Fibs)
-    if f.ndim == 1:
-        if f.numel() == 1:
-            return f.reshape(1).expand(Fibs)
-        if f.shape == (Fibs,):
-            return f
-    if f.ndim == 2:
-        if f.shape == (Fibs, 1):
-            return f[:, 0]
-        if f.shape == (1, Fibs):
-            return f[0]
-    raise ValueError(
-        f"{name} must be scalar or shape (F,), where F={Fibs}; got {tuple(f.shape)}."
-    )
+    if not bool(torch.isfinite(result).all().item()) or bool(
+        torch.any(result <= 0.0).item()
+    ):
+        raise ValueError(f"{name} must contain only positive and finite values.")
+    return result
 
 
 def _frequency_group_ids(
@@ -4168,11 +4260,24 @@ def _frequency_group_ids(
     """Internal helper: optionally round frequencies, then return unique/group ids/counts."""
     if frequency_hz.ndim != 1:
         raise ValueError("frequency_hz must have shape (F,).")
+    if frequency_hz.numel() < 1:
+        raise ValueError("frequency_hz must contain at least one value.")
+    if not bool(torch.isfinite(frequency_hz).all().item()) or bool(
+        torch.any(frequency_hz <= 0.0).item()
+    ):
+        raise ValueError("frequency_hz must contain only positive and finite values.")
     if round_decimals is not None:
         factor = float(10**round_decimals)
         freq_group = torch.round(frequency_hz * factor) / factor
     else:
         freq_group = frequency_hz
+    if not bool(torch.isfinite(freq_group).all().item()) or bool(
+        torch.any(freq_group <= 0.0).item()
+    ):
+        raise ValueError(
+            "Rounded frequency_hz values must remain positive and finite; "
+            "use a finer round_decimals value."
+        )
     return torch.unique(
         freq_group, sorted=True, return_inverse=True, return_counts=True
     )
@@ -4917,13 +5022,23 @@ def hard_spike_arrival_times(
         raise ValueError("V must have shape (T, F, C).")
     T, Fibs, C = V.shape
     device, dtype = V.device, V.dtype
-    dt = torch.as_tensor(dt_ms, device=device, dtype=dtype)
+    dt = _coerce_positive_scalar(dt_ms, device=device, dtype=dtype, name="dt_ms")
 
     if time_window is not None and time_window_ms is not None:
         raise ValueError("Pass only one of time_window or time_window_ms.")
     if time_window_ms is not None:
-        start = max(0, int(np.floor(float(time_window_ms[0]) / float(dt.item()))))
-        end = min(T, int(np.ceil(float(time_window_ms[1]) / float(dt.item()))) + 1)
+        window_start_float = float(time_window_ms[0])
+        window_end_float = float(time_window_ms[1])
+        if (
+            not np.isfinite(window_start_float)
+            or not np.isfinite(window_end_float)
+            or window_end_float <= window_start_float
+        ):
+            raise ValueError(
+                "time_window_ms must contain finite values with end > start."
+            )
+        start = max(0, int(np.floor(window_start_float / float(dt.item()))))
+        end = min(T, int(np.ceil(window_end_float / float(dt.item()))) + 1)
     elif time_window is not None:
         start, end = int(time_window[0]), int(time_window[1])
         start = max(0, start)
@@ -4939,10 +5054,33 @@ def hard_spike_arrival_times(
         }
 
     Vw = V[start:end]
-    crossings = (Vw[:-1] < V_th) & (Vw[1:] >= V_th)
+    v0_all = Vw[:-1]
+    v1_all = Vw[1:]
+    crossings = (v0_all < V_th) & (v1_all >= V_th)
     if dv_th is not None:
-        dV = (Vw[1:] - Vw[:-1]) / dt
+        dV = (v1_all - v0_all) / dt
         crossings = crossings & (dV >= dv_th)
+
+    if interpolate:
+        frac_all = (
+            (torch.as_tensor(V_th, device=device, dtype=dtype) - v0_all)
+            / (v1_all - v0_all + 1e-12)
+        ).clamp(0.0, 1.0)
+    else:
+        frac_all = torch.ones_like(v0_all)
+    pair_index = torch.arange(end - start - 1, device=device, dtype=dtype)[
+        :, None, None
+    ]
+    candidate_time = (start + pair_index + frac_all) * dt
+
+    if time_window_ms is not None:
+        window_start = torch.as_tensor(time_window_ms[0], device=device, dtype=dtype)
+        window_end = torch.as_tensor(time_window_ms[1], device=device, dtype=dtype)
+        crossings = (
+            crossings
+            & (candidate_time >= window_start)
+            & (candidate_time <= window_end)
+        )
 
     has = crossings.any(dim=0)
     idx_rel = crossings.to(torch.int64).argmax(dim=0)  # first True, or 0 when absent
@@ -4950,16 +5088,7 @@ def hard_spike_arrival_times(
 
     fidx = torch.arange(Fibs, device=device)[:, None].expand(Fibs, C)
     cidx = torch.arange(C, device=device)[None, :].expand(Fibs, C)
-    v0 = Vw[idx0, fidx, cidx]
-    v1 = Vw[idx0 + 1, fidx, cidx]
-
-    if interpolate:
-        frac = (
-            (torch.as_tensor(V_th, device=device, dtype=dtype) - v0) / (v1 - v0 + 1e-12)
-        ).clamp(0.0, 1.0)
-        t_cross = (start + idx0.to(dtype) + frac) * dt
-    else:
-        t_cross = (start + idx0.to(dtype) + 1.0) * dt
+    t_cross = candidate_time[idx0, fidx, cidx]
     t_cross = torch.where(has, t_cross, nan)
     return {"t_cross_ms": t_cross, "has_crossing": has}
 
@@ -5626,7 +5755,13 @@ def hard_paired_pulse_recovery_from_trials(
         raise ValueError("V must have shape (T, P, C).")
     _, P, C = V.shape
     device, dtype = V.device, V.dtype
-    dt = torch.as_tensor(dt_ms, device=device, dtype=dtype)
+    if P < 1:
+        raise ValueError("Need at least one paired-pulse trial.")
+    if response_window_ms[1] <= response_window_ms[0]:
+        raise ValueError("response_window_ms must satisfy end > start.")
+    if threshold_method not in {"onset", "onset_midpoint"}:
+        raise ValueError("threshold_method must be one of {'onset', 'onset_midpoint'}.")
+    dt = _coerce_positive_scalar(dt_ms, device=device, dtype=dtype, name="dt_ms")
     test_amplitudes = test_amplitudes.to(device=device, dtype=dtype)
     isis_ms = isis_ms.to(device=device, dtype=dtype)
     if test_amplitudes.shape != (P,) or isis_ms.shape != (P,):
@@ -5794,7 +5929,10 @@ def hard_paired_pulse_recovery_from_trials(
         else torch.as_tensor(reference_latency_ms, device=device, dtype=dtype)
     )
     if latency_ref is not None:
-        latency_ref = latency_ref.expand(D) if latency_ref.ndim == 0 else latency_ref
+        if latency_ref.ndim == 0:
+            latency_ref = latency_ref.expand(D)
+        elif latency_ref.shape != (D,):
+            raise ValueError("reference_latency_ms must be scalar or shape (D,).")
         latency_shift_ms = latency_by_isi - latency_ref
         latency_shift_percent = 100.0 * latency_shift_ms / (latency_ref + eps)
     else:
@@ -5804,7 +5942,10 @@ def hard_paired_pulse_recovery_from_trials(
     velocity_percent_change = None
     if v_by_isi is not None and reference_velocity_m_per_s is not None:
         vref = torch.as_tensor(reference_velocity_m_per_s, device=device, dtype=dtype)
-        vref = vref.expand(D) if vref.ndim == 0 else vref
+        if vref.ndim == 0:
+            vref = vref.expand(D)
+        elif vref.shape != (D,):
+            raise ValueError("reference_velocity_m_per_s must be scalar or shape (D,).")
         velocity_percent_change = 100.0 * (v_by_isi - vref) / (vref + eps)
 
     return {
@@ -5877,14 +6018,20 @@ def hard_activity_dependent_slowing(
         raise ValueError("Need at least 2 time samples.")
     if response_window_ms[1] <= response_window_ms[0]:
         raise ValueError("response_window_ms must satisfy end > start.")
+    if baseline_n_pulses < 1:
+        raise ValueError("baseline_n_pulses must be >= 1.")
+    if tail_n_pulses < 1:
+        raise ValueError("tail_n_pulses must be >= 1.")
     device, dtype = V.device, V.dtype
-    dt = torch.as_tensor(dt_ms, device=device, dtype=dtype)
+    dt = _coerce_positive_scalar(dt_ms, device=device, dtype=dtype, name="dt_ms")
     dt_float = float(dt.detach().cpu().item())
 
     pulse_times = _coerce_pulse_times_ms(
         pulse_times_ms, Fibs=Fibs, device=device, dtype=dtype
     )
     N = pulse_times.shape[1]
+    if baseline_n_pulses > N:
+        raise ValueError("baseline_n_pulses cannot exceed number of pulses.")
 
     if baseline_pulse_indices is None:
         baseline_idx = torch.arange(baseline_n_pulses, device=device, dtype=torch.long)
@@ -5892,6 +6039,12 @@ def hard_activity_dependent_slowing(
         baseline_idx = torch.as_tensor(
             baseline_pulse_indices, device=device, dtype=torch.long
         ).flatten()
+        if baseline_idx.numel() < 1:
+            raise ValueError("baseline_pulse_indices must contain at least one index.")
+        if int(baseline_idx.min().item()) < 0 or int(baseline_idx.max().item()) >= N:
+            raise ValueError(
+                "baseline_pulse_indices contains an out-of-range pulse index."
+            )
     tail_k = min(int(tail_n_pulses), N)
     tail_idx = torch.arange(N - tail_k, N, device=device, dtype=torch.long)
 
@@ -5938,6 +6091,21 @@ def hard_activity_dependent_slowing(
     if dv_th is not None:
         dV_pair = (v1 - v0) / dt
         crossings = crossings & (dV_pair >= dv_th)
+
+    # The gather includes padding for boundary-safe interpolation and static
+    # window sizes. Padding must not become part of the experimental response
+    # window, so filter candidates by their actual crossing time.
+    if interpolate:
+        candidate_frac = (
+            (torch.as_tensor(V_th, device=device, dtype=dtype) - v0) / (v1 - v0 + 1e-12)
+        ).clamp(0.0, 1.0)
+        candidate_time = t0[:, :, :, None] + candidate_frac * dt
+    else:
+        candidate_time = t0[:, :, :, None] + dt
+    in_response_window = (candidate_time >= win_start[:, :, None, None]) & (
+        candidate_time <= win_end[:, :, None, None]
+    )
+    crossings = crossings & in_response_window
 
     has_comp = crossings.any(dim=2)  # (F, N, C)
     first_idx = crossings.to(torch.int64).argmax(dim=2)  # 0 if absent

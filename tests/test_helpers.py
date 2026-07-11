@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 
+import dendra as dn
 import dendra.helpers as H
 
 # --------------------------------------------------------------------------
@@ -50,6 +51,16 @@ def test_contextvar_and_ctx():
         assert H.DEBUG >= 1 and H.DEBUG > 0 and H.DEBUG.value == 1
     # restored
     assert H.DEBUG.value == orig_debug
+
+
+def test_explicit_model_dtype_overrides_context_default():
+    with H.ctx(DTYPE="float32"):
+        population = dn.Population(N=1, C=1, dtype=torch.float64)
+        netstim = dn.NetStim(N=1, dtype=torch.float64)
+
+    assert population.v.dtype == torch.float64
+    assert netstim.interval.rho.dtype == torch.float64
+    assert netstim.start.dtype == torch.float64
 
 
 def test_numpify():

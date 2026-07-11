@@ -60,6 +60,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from .netcon_bitpack_contracts import (
+    validate_delivery_structure,
+    validate_delivery_uniform_structure,
+    validate_pack_structure,
+)
+
 _EXTENSION = None
 _LAST_ERROR: Optional[BaseException] = None
 _DISABLED = False
@@ -450,18 +456,17 @@ def pack_source_spikes(
     packed_history: torch.Tensor,
     current_time_step: torch.Tensor,
 ) -> None:
-    ext = _load_extension()
-    if ext is None:
-        raise RuntimeError("NetCon bitpack C++/CUDA kernels are not available")
-    if source_spikes.dtype is not torch.bool:
-        raise TypeError("source_spikes must be torch.bool")
-    if packed_history.dtype is not torch.int64:
-        raise TypeError("packed_history must be torch.int64")
-    if current_time_step.dtype is not torch.long or current_time_step.numel() != 1:
-        raise TypeError("current_time_step must be a scalar torch.long tensor")
+    _, n_words = validate_pack_structure(
+        source_spikes, packed_history, current_time_step
+    )
     _require_cuda_contiguous("source_spikes", source_spikes)
     _require_cuda_contiguous("packed_history", packed_history)
     _require_cuda_contiguous("current_time_step", current_time_step)
+    if n_words == 0:
+        return
+    ext = _load_extension()
+    if ext is None:
+        raise RuntimeError("NetCon bitpack C++/CUDA kernels are not available")
     ext.pack_source_spikes(source_spikes, packed_history, current_time_step)
 
 
@@ -475,9 +480,16 @@ def build_delivery(
     weight: torch.Tensor,
     delivery_out: torch.Tensor,
 ) -> None:
-    ext = _load_extension()
-    if ext is None:
-        raise RuntimeError("NetCon bitpack C++/CUDA kernels are not available")
+    n_conn, _, _ = validate_delivery_structure(
+        packed_history,
+        current_time_step,
+        delay_steps,
+        conn_word_idx,
+        conn_bit_mask,
+        post_idx,
+        weight,
+        delivery_out,
+    )
     tensors = (
         packed_history,
         current_time_step,
@@ -490,20 +502,6 @@ def build_delivery(
     )
     if not all(t.is_cuda for t in tensors):
         raise RuntimeError("NetCon bitpack C++/CUDA kernels require CUDA tensors")
-    if packed_history.dtype is not torch.int64:
-        raise TypeError("packed_history must be torch.int64")
-    if current_time_step.dtype is not torch.long or current_time_step.numel() != 1:
-        raise TypeError("current_time_step must be a scalar torch.long tensor")
-    for name, tensor in (
-        ("delay_steps", delay_steps),
-        ("conn_word_idx", conn_word_idx),
-        ("conn_bit_mask", conn_bit_mask),
-        ("post_idx", post_idx),
-    ):
-        if tensor.dtype is not torch.long:
-            raise TypeError(f"{name} must be torch.long")
-    if weight.dtype != delivery_out.dtype:
-        raise TypeError("weight and delivery_out must have the same dtype")
     for name, tensor in (
         ("packed_history", packed_history),
         ("current_time_step", current_time_step),
@@ -515,6 +513,11 @@ def build_delivery(
         ("delivery_out", delivery_out),
     ):
         _require_cuda_contiguous(name, tensor)
+    if n_conn == 0:
+        return
+    ext = _load_extension()
+    if ext is None:
+        raise RuntimeError("NetCon bitpack C++/CUDA kernels are not available")
     ext.build_delivery(
         packed_history,
         current_time_step,
@@ -537,22 +540,15 @@ def build_delivery_uniform(
     weight: torch.Tensor,
     delivery_out: torch.Tensor,
 ) -> None:
-    ext = _load_extension()
-    if ext is None:
-        raise RuntimeError("NetCon bitpack C++/CUDA kernels are not available")
-    if packed_history.dtype is not torch.int64:
-        raise TypeError("packed_history must be torch.int64")
-    if current_time_step.dtype is not torch.long or current_time_step.numel() != 1:
-        raise TypeError("current_time_step must be a scalar torch.long tensor")
-    for name, tensor in (
-        ("conn_word_idx", conn_word_idx),
-        ("conn_bit_mask", conn_bit_mask),
-        ("post_idx", post_idx),
-    ):
-        if tensor.dtype is not torch.long:
-            raise TypeError(f"{name} must be torch.long")
-    if weight.dtype != delivery_out.dtype:
-        raise TypeError("weight and delivery_out must have the same dtype")
+    n_conn, _, _ = validate_delivery_uniform_structure(
+        packed_history,
+        current_time_step,
+        conn_word_idx,
+        conn_bit_mask,
+        post_idx,
+        weight,
+        delivery_out,
+    )
     for name, tensor in (
         ("packed_history", packed_history),
         ("current_time_step", current_time_step),
@@ -563,6 +559,11 @@ def build_delivery_uniform(
         ("delivery_out", delivery_out),
     ):
         _require_cuda_contiguous(name, tensor)
+    if n_conn == 0:
+        return
+    ext = _load_extension()
+    if ext is None:
+        raise RuntimeError("NetCon bitpack C++/CUDA kernels are not available")
     ext.build_delivery_uniform(
         packed_history,
         current_time_step,

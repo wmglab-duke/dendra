@@ -1,5 +1,6 @@
 import gc
 import multiprocessing as mp
+from contextlib import nullcontext
 from numbers import Integral
 from queue import Queue
 from types import MethodType
@@ -559,7 +560,12 @@ class Recorder(Callback):
                 f"for state(s): {', '.join(missing)}."
             )
 
-        with torch.cuda.stream(TRANSFERSTREAM):
+        transfer_context = (
+            torch.cuda.stream(TRANSFERSTREAM)
+            if TRANSFERSTREAM is not None
+            else nullcontext()
+        )
+        with transfer_context:
             for s in self.states:
                 data = self.stack(s)
                 # Each queued write owns its buffer. Reusing a pinned tensor can

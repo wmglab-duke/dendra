@@ -59,6 +59,26 @@ def _safe_generated_identifier(value: object) -> str:
     return out
 
 
+def _nonnegative_integer_steps(value, *, device=None, label="delay_steps"):
+    """Normalize delay metadata without silently truncating fractional values."""
+    try:
+        raw = torch.as_tensor(value, device=device)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{label} must contain non-negative integers.") from exc
+
+    if raw.dtype == torch.bool or raw.is_complex():
+        raise TypeError(f"{label} must contain non-negative integers.")
+    if raw.is_floating_point():
+        integral = torch.isfinite(raw) & (raw == torch.round(raw))
+        if not bool(torch.all(integral).item()):
+            raise ValueError(f"{label} must contain integer values.")
+
+    steps = raw.to(dtype=torch.long)
+    if bool(torch.any(steps < 0).item()):
+        raise ValueError(f"{label} must contain non-negative integers.")
+    return steps
+
+
 def _mechanism_advance_signature(mech) -> tuple:
     """Static layout signature for a generated mechanism advance fast path."""
     state_layout = []
@@ -479,7 +499,9 @@ class Mechanism(Parameterized):
             if is_composable:
                 self.key = key
             else:
-                self.register_buffer("key", torch.tensor(key, dtype=torch.long))
+                self.register_buffer(
+                    "key", torch.as_tensor(key, dtype=torch.long).detach().clone()
+                )
         else:
             self.key = None
 
@@ -852,8 +874,7 @@ class Mechanism(Parameterized):
                 # Writable material fields should be local tensors, not aliases,
                 # so mechanism state updates do not mutate the population field
                 # before the handler's commit phase.
-                if self.key is not None and local.ndim > 0:
-                    local = local.clone()
+                local = local.clone()
                 self._set_local_material_buffer(field, local)
 
         if name in self.source_material:
@@ -1738,7 +1759,10 @@ class Mechanism(Parameterized):
                 f"got {mode!r}."
             )
 
-        delay_steps = int(delay_steps)
+        delay_steps_t = _nonnegative_integer_steps(delay_steps)
+        if delay_steps_t.numel() != 1:
+            raise ValueError("delay_steps must be one non-negative integer.")
+        delay_steps = int(delay_steps_t.reshape(()).item())
         depth = max(1, delay_steps + 1)
         like = torch.as_tensor(like)
 
@@ -1758,14 +1782,24 @@ class Mechanism(Parameterized):
         buffer = torch.zeros(buffer_shape, device=like.device, dtype=like.dtype)
         pointer = torch.zeros((), device=like.device, dtype=torch.long)
 
+        buffer_replaced = False
         if buffer_name in self._buffers:
-            if clear or tuple(getattr(self, buffer_name).shape) != buffer_shape:
+            current_buffer = getattr(self, buffer_name)
+            buffer_replaced = (
+                tuple(current_buffer.shape) != buffer_shape
+                or current_buffer.device != buffer.device
+                or current_buffer.dtype != buffer.dtype
+            )
+            if clear or buffer_replaced:
                 setattr(self, buffer_name, buffer)
         else:
             self.register_buffer(buffer_name, buffer)
+            buffer_replaced = True
 
         if pointer_name in self._buffers:
-            if clear:
+            # A pointer into a newly allocated buffer has no meaningful history
+            # to preserve and may be outside the new buffer's bounds.
+            if clear or buffer_replaced:
                 setattr(self, pointer_name, pointer)
         else:
             self.register_buffer(pointer_name, pointer)
@@ -1776,6 +1810,7 @@ class Mechanism(Parameterized):
             "steps": delay_steps,
             "depth": depth,
             "axis": int(insert_axis),
+            "value_shape": tuple(like.shape),
             "mode": mode,
         }
         return getattr(self, buffer_name)
@@ -1879,7 +1914,7 @@ class Mechanism(Parameterized):
         if n_streams <= 0:
             raise ValueError("delayed-state stream axis must be non-empty.")
 
-        steps = torch.as_tensor(delay_steps, device=like.device, dtype=torch.long)
+        steps = _nonnegative_integer_steps(delay_steps, device=like.device)
         if steps.ndim == 0 or steps.numel() == 1:
             steps = steps.reshape(1).expand(n_streams).clone()
         else:
@@ -1922,21 +1957,31 @@ class Mechanism(Parameterized):
         buffer = torch.zeros(buffer_shape, device=like.device, dtype=like.dtype)
         pointer = torch.zeros((), device=like.device, dtype=torch.long)
 
+        buffer_replaced = False
         if buffer_name in self._buffers:
-            if clear or tuple(getattr(self, buffer_name).shape) != buffer_shape:
+            current_buffer = getattr(self, buffer_name)
+            buffer_replaced = (
+                tuple(current_buffer.shape) != buffer_shape
+                or current_buffer.device != buffer.device
+                or current_buffer.dtype != buffer.dtype
+            )
+            if clear or buffer_replaced:
                 setattr(self, buffer_name, buffer)
         else:
             self.register_buffer(buffer_name, buffer)
+            buffer_replaced = True
 
         if pointer_name in self._buffers:
-            if clear:
+            if clear or buffer_replaced:
                 setattr(self, pointer_name, pointer)
         else:
             self.register_buffer(pointer_name, pointer)
 
         if steps_name in self._buffers:
-            if clear or tuple(getattr(self, steps_name).shape) != tuple(steps.shape):
-                setattr(self, steps_name, steps)
+            # Delay metadata is configuration, not queue history. Re-registering
+            # with clear=False preserves compatible payload history but must still
+            # install the newly requested delay vector.
+            setattr(self, steps_name, steps)
         else:
             self.register_buffer(steps_name, steps)
 
@@ -1959,6 +2004,7 @@ class Mechanism(Parameterized):
             "axis": delay_axis,
             "stream_axis": buffer_stream_axis,
             "value_stream_axis": int(stream_axis),
+            "value_shape": tuple(like.shape),
             "n_streams": n_streams,
             "mode": mode,
             "batched": True,
@@ -1971,11 +2017,16 @@ class Mechanism(Parameterized):
         """Zero registered delayed-state buffers and reset circular pointers."""
         if not names:
             names = tuple(self._delayed_state_specs.keys())
-        with torch.no_grad():
-            for name in names:
-                spec = self._delayed_state_specs[name]
-                getattr(self, spec["buffer"]).zero_()
-                getattr(self, spec["pointer"]).zero_()
+        for name in names:
+            spec = self._delayed_state_specs[name]
+            # Shift queues may be graph-connected and their returned delayed
+            # values may be views/copies whose backward pass still references the
+            # queue. Rebinding fresh detached tensors both severs the old history
+            # and avoids invalidating an outstanding backward pass in place.
+            buffer = getattr(self, spec["buffer"])
+            pointer = getattr(self, spec["pointer"])
+            setattr(self, spec["buffer"], torch.zeros_like(buffer).detach())
+            setattr(self, spec["pointer"], torch.zeros_like(pointer).detach())
         return self
 
     def delayed_state(self, name, value, *, delay_steps=None, mode=None):
@@ -1992,9 +2043,18 @@ class Mechanism(Parameterized):
                 "Call register_delayed_state(...) during initial(...)."
             )
         spec = self._delayed_state_specs[name]
-        steps = int(spec["steps"] if delay_steps is None else delay_steps)
-        if steps <= 0:
-            return value
+        if spec.get("batched", False):
+            raise ValueError(
+                f"Delayed state {name!r} was registered with "
+                "register_delayed_states; use delayed_states(...) instead."
+            )
+        if delay_steps is None:
+            steps = int(spec["steps"])
+        else:
+            steps_t = _nonnegative_integer_steps(delay_steps)
+            if steps_t.numel() != 1:
+                raise ValueError("delay_steps must be one non-negative integer.")
+            steps = int(steps_t.reshape(()).item())
 
         selected_mode = str(spec["mode"] if mode is None else mode).lower()
         aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
@@ -2003,15 +2063,31 @@ class Mechanism(Parameterized):
             selected_mode = (
                 "shift" if (self.training or torch.is_grad_enabled()) else "circular"
             )
+        if selected_mode not in {"shift", "circular"}:
+            raise ValueError(
+                "delayed-state mode must be 'auto', 'shift', or 'circular'; "
+                f"got {selected_mode!r}."
+            )
+
+        if not torch.is_tensor(value):
+            raise TypeError("delayed_state value must be a torch.Tensor.")
+        expected_shape = spec.get("value_shape")
+        if expected_shape is None:
+            expected_shape = list(getattr(self, spec["buffer"]).shape)
+            del expected_shape[int(spec["axis"])]
+        expected_shape = tuple(expected_shape)
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"Delayed state {name!r} expected value shape {expected_shape}, "
+                f"but received {tuple(value.shape)}."
+            )
+        if steps <= 0:
+            return value
 
         if selected_mode == "circular":
             return self._delayed_state_circular(spec, value, steps)
         if selected_mode == "shift":
             return self._delayed_state_shift(spec, value, steps)
-        raise ValueError(
-            "delayed-state mode must be 'auto', 'shift', or 'circular'; "
-            f"got {selected_mode!r}."
-        )
 
     def _delayed_state_shift(self, spec, value, steps: int):
         """Graph-safe delayed-state update using an out-of-place shifted queue."""
@@ -2088,6 +2164,32 @@ class Mechanism(Parameterized):
                 "use delayed_state(...) instead."
             )
 
+        selected_mode = str(spec["mode"] if mode is None else mode).lower()
+        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
+        selected_mode = aliases.get(selected_mode, selected_mode)
+        if selected_mode == "auto":
+            selected_mode = (
+                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
+            )
+        if selected_mode not in {"shift", "circular"}:
+            raise ValueError(
+                "batched delayed-state mode must be 'auto', 'shift', or 'circular'; "
+                f"got {selected_mode!r}."
+            )
+
+        if not torch.is_tensor(values):
+            raise TypeError("delayed_states values must be a torch.Tensor.")
+        expected_shape = spec.get("value_shape")
+        if expected_shape is None:
+            expected_shape = list(getattr(self, spec["buffer"]).shape)
+            del expected_shape[int(spec["axis"])]
+        expected_shape = tuple(expected_shape)
+        if tuple(values.shape) != expected_shape:
+            raise ValueError(
+                f"Delayed state group {name!r} expected values shape "
+                f"{expected_shape}, but received {tuple(values.shape)}."
+            )
+
         # Fast all-zero shortcut for the registered delay vector.  This is a
         # Python bool stored at registration time, so it is safe under
         # torch.compile.  Avoid Tensor.item() here: the per-step path may be
@@ -2097,22 +2199,15 @@ class Mechanism(Parameterized):
 
         steps = self._delayed_states_steps(spec, values, delay_steps)
 
-        selected_mode = str(spec["mode"] if mode is None else mode).lower()
-        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
-        selected_mode = aliases.get(selected_mode, selected_mode)
-        if selected_mode == "auto":
-            selected_mode = (
-                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
-            )
-
+        runtime_override = delay_steps is not None
         if selected_mode == "circular":
-            return self._delayed_states_circular(spec, values, steps)
+            return self._delayed_states_circular(
+                spec, values, steps, validate_capacity=runtime_override
+            )
         if selected_mode == "shift":
-            return self._delayed_states_shift(spec, values, steps)
-        raise ValueError(
-            "batched delayed-state mode must be 'auto', 'shift', or 'circular'; "
-            f"got {selected_mode!r}."
-        )
+            return self._delayed_states_shift(
+                spec, values, steps, resize=runtime_override
+            )
 
     def _delayed_states_steps(self, spec, values, delay_steps=None):
         # Registered delay vectors are normalized at initialization and kept as
@@ -2121,10 +2216,16 @@ class Mechanism(Parameterized):
         if delay_steps is None:
             return getattr(self, spec["steps_buffer"])
 
-        steps = torch.as_tensor(delay_steps, device=values.device, dtype=torch.long)
+        steps = _nonnegative_integer_steps(delay_steps, device=values.device)
         if steps.ndim == 0 or steps.numel() == 1:
             return steps.reshape(1).expand(int(spec["n_streams"]))
-        return steps.reshape(-1)
+        steps = steps.reshape(-1)
+        if steps.numel() != int(spec["n_streams"]):
+            raise ValueError(
+                f"delay_steps has length {steps.numel()}, but the stream axis "
+                f"has length {int(spec['n_streams'])}."
+            )
+        return steps
 
     def _delayed_states_gather(self, buf, spec, read_idx):
         axis = int(spec["axis"])
@@ -2147,13 +2248,15 @@ class Mechanism(Parameterized):
         mask_shape[value_stream_axis] = int(spec["n_streams"])
         return (steps == 0).reshape(mask_shape)
 
-    def _delayed_states_shift(self, spec, values, steps):
+    def _delayed_states_shift(self, spec, values, steps, *, resize=False):
         """Graph-safe multi-stream delay update using a shifted queue."""
         buf_name = spec["buffer"]
         axis = int(spec["axis"])
         buf = getattr(self, buf_name)
         depth = int(buf.shape[axis])
         required_depth = int(spec.get("steps", 0)) + 1
+        if resize:
+            required_depth = int(steps.max().item()) + 1 if steps.numel() else 1
         if required_depth != depth:
             state_name = next(
                 k for k, v in self._delayed_state_specs.items() if v is spec
@@ -2180,22 +2283,27 @@ class Mechanism(Parameterized):
         setattr(self, buf_name, buf_new)
         return self._delayed_states_gather(buf_new, spec, steps)
 
-    def _delayed_states_circular(self, spec, values, steps):
+    def _delayed_states_circular(self, spec, values, steps, *, validate_capacity=False):
         """Fast eval multi-stream delay update using one in-place ring buffer."""
         buf = getattr(self, spec["buffer"])
         ptr = getattr(self, spec["pointer"])
         axis = int(spec["axis"])
         depth = int(buf.shape[axis])
 
+        if validate_capacity and bool(torch.any(steps >= depth).item()):
+            raise ValueError(
+                "Runtime delay_steps exceed the registered circular-buffer "
+                f"capacity of {depth - 1} steps. Re-register the delayed state."
+            )
+
         read_idx = torch.remainder(ptr - steps, depth)
         delayed = self._delayed_states_gather(buf, spec, read_idx)
 
         # A stream with zero delay should deliver the current value, not the
         # previous content of the circular slot that will be overwritten below.
-        if bool(spec.get("has_zero_delay", False)):
-            delayed = torch.where(
-                self._delayed_states_zero_mask(spec, values, steps), values, delayed
-            )
+        delayed = torch.where(
+            self._delayed_states_zero_mask(spec, values, steps), values, delayed
+        )
 
         with torch.no_grad():
             write_idx = ptr.reshape(1)
@@ -2248,8 +2356,10 @@ class Mechanism(Parameterized):
         self.injected_waveforms = torch.nn.ModuleList()
         self._injection_specs = []
         for name in list(self._buffers.keys()):
-            if name.startswith("_injection_mask_") or name.startswith(
-                "_injection_scale_"
+            if (
+                name.startswith("_injection_mask_")
+                or name.startswith("_injection_scale_")
+                or name.startswith("_injection_index_")
             ):
                 delattr(self, name)
         return self
@@ -2301,14 +2411,25 @@ class Mechanism(Parameterized):
         k = len(self.injected_waveforms)
         mask_name = f"_injection_mask_{k}"
         scale_name = f"_injection_scale_{k}"
+        index_name = f"_injection_index_{k}"
+        selected_index = torch.nonzero(local_mask.reshape(-1), as_tuple=False).reshape(
+            -1
+        )
         self.register_buffer(mask_name, local_mask.detach().clone())
         self.register_buffer(
             scale_name,
             torch.as_tensor(scale, device=device, dtype=dtype).detach().clone(),
         )
+        self.register_buffer(index_name, selected_index.detach().clone())
         self.injected_waveforms.append(waveform)
         self._injection_specs.append(
-            {"mask": mask_name, "scale": scale_name, "current_name": current_name}
+            {
+                "mask": mask_name,
+                "scale": scale_name,
+                "index": index_name,
+                "n_selected": int(selected_index.numel()),
+                "current_name": current_name,
+            }
         )
 
         # Expose the current variable immediately for introspection, even before
@@ -2319,12 +2440,21 @@ class Mechanism(Parameterized):
             )
         return True
 
-    def _expand_injection_value(self, value, mask, out):
+    def _expand_injection_value(
+        self,
+        value,
+        mask,
+        out,
+        *,
+        selected_index=None,
+        n_local_selected=None,
+    ):
         """Return ``value`` padded/broadcast into ``out`` at ``mask`` locations."""
         value = torch.as_tensor(value, device=out.device, dtype=out.dtype)
 
         # Bring an unbatched mask up to the current local state shape.
-        mask = mask.to(device=out.device, dtype=torch.bool)
+        local_mask = mask.to(device=out.device, dtype=torch.bool)
+        mask = local_mask
         while mask.ndim < out.ndim:
             mask = mask.unsqueeze(0)
         mask = mask.expand_as(out)
@@ -2348,7 +2478,39 @@ class Mechanism(Parameterized):
         # Vector over selected compartments.  This supports either a single
         # unbatched vector of length n_selected or a batched tensor whose last
         # dimension is n_selected.
-        n_selected = int(mask.reshape(-1).sum().item()) if out.ndim == mask.ndim else 0
+        # If the mask describes the local (unbatched) suffix, accept either one
+        # selected vector shared across batches or one vector per batch.
+        if local_mask.ndim <= out.ndim and tuple(
+            out.shape[out.ndim - local_mask.ndim :]
+        ) == tuple(local_mask.shape):
+            batch_shape = tuple(out.shape[: out.ndim - local_mask.ndim])
+            if n_local_selected is None:
+                n_local_selected = int(local_mask.reshape(-1).sum().item())
+            selected_shape = batch_shape + (n_local_selected,)
+            selected = None
+            if value.numel() == n_local_selected:
+                selected = value.reshape(
+                    (1,) * len(batch_shape) + (n_local_selected,)
+                ).expand(selected_shape)
+            else:
+                try:
+                    selected = value.expand(selected_shape)
+                except RuntimeError:
+                    pass
+            if selected is not None:
+                if selected_index is None:
+                    selected_index = torch.nonzero(
+                        local_mask.reshape(-1), as_tuple=False
+                    ).reshape(-1)
+                padded = torch.zeros_like(out).reshape(-1, local_mask.numel())
+                padded = padded.index_copy(
+                    1,
+                    selected_index.to(device=out.device),
+                    selected.reshape(-1, n_local_selected),
+                )
+                return padded.reshape_as(out)
+
+        n_selected = int(mask.reshape(-1).sum().item())
         if value.numel() == n_selected:
             padded = torch.zeros_like(out)
             padded.reshape(-1)[mask.reshape(-1)] = value.reshape(-1)
@@ -2405,10 +2567,19 @@ class Mechanism(Parameterized):
         t = torch.atleast_1d(t)
 
         for k, spec in enumerate(self._injection_specs):
+            if spec["current_name"] != current_name:
+                continue
             mask = getattr(self, spec["mask"])
             scale = getattr(self, spec["scale"])
+            selected_index = getattr(self, spec["index"])
             value = self.injected_waveforms[k](t) * scale
-            out = out + self._expand_injection_value(value, mask, out)
+            out = out + self._expand_injection_value(
+                value,
+                mask,
+                out,
+                selected_index=selected_index,
+                n_local_selected=int(spec["n_selected"]),
+            )
 
         setattr(self, current_name, out)
         return out

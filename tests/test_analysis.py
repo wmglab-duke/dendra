@@ -162,6 +162,13 @@ def test_hard_spike_arrival_times_validates_shape_and_window_selection():
         hard_spike_arrival_times(
             V, DT_MS, time_window=(0, 3), time_window_ms=(0.0, 0.3)
         )
+    for invalid_dt in (0.0, -0.1, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="positive and finite"):
+            hard_spike_arrival_times(V, invalid_dt)
+    with pytest.raises(ValueError, match="end > start"):
+        hard_spike_arrival_times(V, DT_MS, time_window_ms=(0.3, 0.3))
+    with pytest.raises(ValueError, match="finite"):
+        hard_spike_arrival_times(V, DT_MS, time_window_ms=(0.0, float("nan")))
 
 
 def test_hard_active_respects_vector_and_per_fiber_masks():

@@ -187,3 +187,25 @@ def test_cache_rejects_partial_state_frames():
     recorder.rec["v"].append(torch.tensor(1.0))
     with pytest.raises(RuntimeError, match="partial Recorder frame.*t"):
         recorder.cache_hdf5()
+
+
+def test_cpu_cache_never_enters_a_cuda_stream(monkeypatch):
+    recorder = Recorder(["v"])
+    recorder.queue = _LocalQueue()
+    recorder.rec["v"].append(torch.tensor([1.0, 2.0]))
+
+    monkeypatch.setattr(callback_module, "TRANSFERSTREAM", None)
+
+    def unexpected_cuda_stream(*args, **kwargs):
+        raise AssertionError("CPU HDF5 caching must not enter torch.cuda.stream")
+
+    monkeypatch.setattr(torch.cuda, "stream", unexpected_cuda_stream)
+    recorder.cache_hdf5()
+
+    assert recorder.data_pinned["v"].tolist() == [[1.0, 2.0]]
+    assert [
+        item if isinstance(item, str) else item[:3] for item in recorder.queue.items
+    ] == [
+        "flush",
+        ("v", 0, 0),
+    ]

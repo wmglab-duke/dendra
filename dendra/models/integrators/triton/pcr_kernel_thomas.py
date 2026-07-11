@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._contracts import validate_tridiagonal
+
 
 @triton.jit
 def _pcr_solve_kernel(
@@ -182,11 +184,5 @@ class PCRSolve(torch.autograd.Function):
 
 
 def pcr_solve_cuda_t(a, b, c, d):
-    common_dtype = b.dtype
-    common_device = b.device
-    for t, name in zip([a, b, c, d], ["a", "b", "c", "d"]):
-        if not isinstance(t, torch.Tensor):
-            raise TypeError(f"Input '{name}' must be a torch.Tensor.")
-        if t.device != common_device or t.dtype != common_dtype:
-            raise ValueError("All input tensors must have the same dtype and device.")
+    validate_tridiagonal(a, b, c, d)
     return PCRSolve.apply(a, b, c, d)

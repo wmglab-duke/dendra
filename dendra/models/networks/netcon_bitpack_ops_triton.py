@@ -11,6 +11,11 @@ from typing import Optional, Tuple
 
 import torch
 
+from .netcon_bitpack_contracts import (
+    validate_delivery_structure,
+    validate_pack_structure,
+)
+
 _BITS_PER_WORD = 63
 _PACK_BLOCK_BITS = 64
 _DELIVERY_BLOCK = 256
@@ -140,6 +145,13 @@ def last_error() -> Optional[BaseException]:
     return _last_error
 
 
+def _require_cuda_contiguous(name: str, tensor: torch.Tensor) -> None:
+    if not tensor.is_cuda:
+        raise RuntimeError(f"{name} must be a CUDA tensor")
+    if not tensor.is_contiguous():
+        raise RuntimeError(f"{name} must be contiguous")
+
+
 def pack_source_spikes(
     source_spikes: torch.Tensor,
     packed_history: torch.Tensor,
@@ -156,24 +168,21 @@ def pack_source_spikes(
     current_time_step:
         CUDA int64 scalar/length-one tensor containing the ring slot to write.
     """
+    n_source, n_words = validate_pack_structure(
+        source_spikes, packed_history, current_time_step
+    )
+    for name, tensor in (
+        ("source_spikes", source_spikes),
+        ("packed_history", packed_history),
+        ("current_time_step", current_time_step),
+    ):
+        _require_cuda_contiguous(name, tensor)
+    if n_words == 0:
+        return
+
     kernels = _define_kernels()
     if kernels is None:
         raise RuntimeError("NetCon bitpack Triton kernels are not available")
-    if not (
-        source_spikes.is_cuda and packed_history.is_cuda and current_time_step.is_cuda
-    ):
-        raise RuntimeError("NetCon bitpack Triton kernels require CUDA tensors")
-    if source_spikes.dtype != torch.bool:
-        raise TypeError("source_spikes must be torch.bool")
-    if packed_history.dtype != torch.int64:
-        raise TypeError("packed_history must be torch.int64")
-
-    n_source = int(source_spikes.numel())
-    if packed_history.ndim != 2:
-        raise ValueError("packed_history must be 2-D")
-    n_words = int(packed_history.shape[1])
-    if n_words == 0:
-        return
 
     pack_kernel, _ = kernels
     try:
@@ -207,9 +216,16 @@ def build_delivery(
     Duplicate posts are reduced with GPU atomics, preserving the same additive
     semantics as ``index_add_``/the dense NetCon backend.
     """
-    kernels = _define_kernels()
-    if kernels is None:
-        raise RuntimeError("NetCon bitpack Triton kernels are not available")
+    n_conn, max_delay_steps, n_words = validate_delivery_structure(
+        packed_history,
+        current_time_step,
+        delay_steps,
+        conn_word_idx,
+        conn_bit_mask,
+        post_idx,
+        weight,
+        delivery_out,
+    )
     tensors = (
         packed_history,
         current_time_step,
@@ -222,22 +238,27 @@ def build_delivery(
     )
     if not all(t.is_cuda for t in tensors):
         raise RuntimeError("NetCon bitpack Triton kernels require CUDA tensors")
-    if packed_history.dtype != torch.int64:
-        raise TypeError("packed_history must be torch.int64")
-    if conn_bit_mask.dtype != torch.int64:
-        raise TypeError("conn_bit_mask must be torch.int64")
-    if not torch.is_floating_point(weight) or not torch.is_floating_point(delivery_out):
-        raise TypeError("weight and delivery_out must be floating point tensors")
-    if weight.dtype != delivery_out.dtype:
-        raise TypeError("weight and delivery_out must have the same dtype")
-
-    n_conn = int(delay_steps.numel())
+    for name, tensor in zip(
+        (
+            "packed_history",
+            "current_time_step",
+            "delay_steps",
+            "conn_word_idx",
+            "conn_bit_mask",
+            "post_idx",
+            "weight",
+            "delivery_out",
+        ),
+        tensors,
+    ):
+        if not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
     if n_conn == 0:
         return
-    max_delay_steps = int(packed_history.shape[0])
-    n_words = int(packed_history.shape[1])
-    if max_delay_steps <= 0 or n_words <= 0:
-        return
+
+    kernels = _define_kernels()
+    if kernels is None:
+        raise RuntimeError("NetCon bitpack Triton kernels are not available")
 
     _, delivery_kernel = kernels
     grid = ((n_conn + _DELIVERY_BLOCK - 1) // _DELIVERY_BLOCK,)

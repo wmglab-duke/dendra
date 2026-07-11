@@ -2,13 +2,21 @@
 
 import itertools
 import math
+from numbers import Integral
 from types import MethodType
 from typing import Callable, Union
 
 import torch
 import torch.nn.functional as F
 
-from dendra.helpers import DEBUG, REQUIRE_GRAD, current_device, current_dtype, logger
+from dendra.helpers import (
+    DEBUG,
+    REQUIRE_GRAD,
+    _normalize_dtype_value,
+    current_device,
+    current_dtype,
+    logger,
+)
 from dendra.utils import PreparedInterp1d
 from dendra.utils.dynamic_compilation import compile_generated_function
 
@@ -49,15 +57,32 @@ def to_param(
     """
     if negative and positive:
         raise ValueError("Cannot set both positive and negative to True.")
+    requested_requires_grad = requires_grad
     if requires_grad is None:
         requires_grad = bool(REQUIRE_GRAD)
     if isinstance(val, torch.nn.Parameter):
+        parameter_device = val.device if device is None else torch.device(device)
+        parameter_dtype = val.dtype if dtype is None else _normalize_dtype_value(dtype)
+        converted = val.to(device=parameter_device, dtype=parameter_dtype)
+        constrained_requires_grad = (
+            val.requires_grad
+            if requested_requires_grad is None
+            else bool(requested_requires_grad)
+        )
+        if positive:
+            return PositiveParam(converted, requires_grad=constrained_requires_grad)
+        if negative:
+            return NegativeParam(converted, requires_grad=constrained_requires_grad)
+        if converted is not val or constrained_requires_grad != val.requires_grad:
+            return torch.nn.Parameter(
+                converted, requires_grad=constrained_requires_grad
+            )
         return val
     if isinstance(val, torch.nn.Module):
         return val
     target_device = current_device(None) if device is None else torch.device(device)
     target_dtype = (
-        current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+        current_dtype(torch.float32) if dtype is None else _normalize_dtype_value(dtype)
     )
     val = torch.as_tensor(
         val,
@@ -66,10 +91,10 @@ def to_param(
     )
     if positive:
         val = torch.clamp(val, min=0.0)
-        return PositiveParam(val)
+        return PositiveParam(val, requires_grad=requires_grad)
     if negative:
         val = torch.clamp(val, max=0.0)
-        return NegativeParam(val)
+        return NegativeParam(val, requires_grad=requires_grad)
     param = torch.nn.Parameter(val, requires_grad=requires_grad)
     return param
 
@@ -146,15 +171,23 @@ def softplus_inv(y, beta: float = 1.0, threshold: float = 20.0, eps: float = 1e-
     torch.Tensor
         Values ``x`` such that ``softplus(x, beta) = y``.
     """
+    beta = float(beta)
+    if not math.isfinite(beta) or beta <= 0.0:
+        raise ValueError("beta must be finite and positive.")
     y = torch.as_tensor(y)
-    y = torch.clamp(y, min=eps)  # safer for init; prevents -inf params
-    by = beta * y
+    if not y.is_floating_point():
+        y = y.to(dtype=current_dtype(torch.float32))
+    original_dtype = y.dtype
+    work = y.float() if y.dtype in {torch.float16, torch.bfloat16} else y
+    effective_eps = max(float(eps), torch.finfo(work.dtype).tiny)
+    work = torch.clamp(work, min=effective_eps)
+    by = beta * work
 
-    small = by <= threshold
-    x_small = torch.log(torch.expm1(by)) / beta
-    x_large = (by + torch.log1p(-torch.exp(-by))) / beta  # stable for large by
-
-    return torch.where(small, x_small, x_large)
+    # y + log(1 - exp(-beta*y)) / beta, written with expm1 for
+    # stable values and gradients at both small and large arguments.
+    nonlinear = work + torch.log(-torch.expm1(-by)) / beta
+    result = torch.where(by <= float(threshold), nonlinear, work)
+    return result.to(dtype=original_dtype)
 
 
 def resolve(parameter):
@@ -223,6 +256,44 @@ class cacheable(Parametric):
         """
         self._cache = None
 
+    def _apply(self, fn, recurse=True):
+        """Invalidate cached tensors before dtype or device conversion."""
+        self.clear_cache()
+        return super()._apply(fn, recurse=recurse)
+
+    def requires_grad_(self, requires_grad: bool = True):
+        """Invalidate cached graphs when freezing or unfreezing parameters."""
+        self.clear_cache()
+        return super().requires_grad_(requires_grad)
+
+    def __getstate__(self):
+        """Exclude derived tensors from deepcopy and pickle payloads."""
+        state = super().__getstate__()
+        state["_cache"] = None
+        return state
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Invalidate derived values before restoring module state."""
+        self.clear_cache()
+        return super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def forward(self, *args, **kwargs):
         """
         Compute the module output, optionally reusing cached results.
@@ -247,7 +318,7 @@ class cacheable(Parametric):
 
     def repeat(self, n: int):
         """
-        Repeat the cached value along a new leading dimension.
+        Repeat the value using the legacy sampling convention.
 
         Parameters
         ----------
@@ -257,8 +328,14 @@ class cacheable(Parametric):
         Returns
         -------
         torch.Tensor
-            Repeated cached output.
+            Repeated output. Scalars become length-``n`` vectors; existing
+            vectors are concatenated ``n`` times.
         """
+        if isinstance(n, bool) or not isinstance(n, Integral):
+            raise TypeError("n must be a non-negative integer.")
+        n = int(n)
+        if n < 0:
+            raise ValueError("n must be a non-negative integer.")
         p = self()
         return p.repeat(n)
 
@@ -337,6 +414,8 @@ class Bounded(cacheable):
     ``'sigmoid'`` when both bounds are present.
     """
 
+    _version = 2
+
     def __init__(
         self,
         init,
@@ -356,6 +435,14 @@ class Bounded(cacheable):
             requires_grad = bool(REQUIRE_GRAD)
         self.min_val = None if min_val is None else float(min_val)
         self.max_val = None if max_val is None else float(max_val)
+        if self.min_val is not None and not math.isfinite(self.min_val):
+            raise ValueError(
+                "min_val must be finite when provided; use None if unbounded."
+            )
+        if self.max_val is not None and not math.isfinite(self.max_val):
+            raise ValueError(
+                "max_val must be finite when provided; use None if unbounded."
+            )
         if (
             self.min_val is not None
             and self.max_val is not None
@@ -369,8 +456,41 @@ class Bounded(cacheable):
         self.lower_alpha = float(lower_alpha)
         self.cap_mode = cap_mode
         self.cap_beta = float(cap_beta) if cap_beta is not None else float(beta)
+        if self.lower_mode not in {"softplus", "hard-ste", "leaky-ste"}:
+            raise ValueError(f"Unknown lower_mode: {self.lower_mode}")
+        if self.cap_mode not in {"auto", "softcap", "sigmoid", "hard-ste"}:
+            raise ValueError(f"Unknown cap_mode: {self.cap_mode}")
+        if self.max_val is not None and self.min_val is None and cap_mode == "sigmoid":
+            raise ValueError(
+                "cap_mode='sigmoid' requires both min_val and max_val; use "
+                "cap_mode='softcap' for an upper-only bound."
+            )
+        if (
+            self.max_val is not None
+            and self.min_val is not None
+            and cap_mode == "softcap"
+        ):
+            raise ValueError(
+                "cap_mode='softcap' is only defined for an upper-only bound; use "
+                "cap_mode='sigmoid' when both bounds are present."
+            )
+        if (
+            self.max_val is not None
+            and self.min_val is not None
+            and cap_mode in {"auto", "sigmoid"}
+            and self.lower_mode != "softplus"
+        ):
+            raise ValueError(
+                "Non-softplus lower modes with both bounds require cap_mode='hard-ste'."
+            )
+        if not math.isfinite(self.beta) or self.beta <= 0.0:
+            raise ValueError("beta must be finite and positive.")
+        if not math.isfinite(self.cap_beta) or self.cap_beta <= 0.0:
+            raise ValueError("cap_beta must be finite and positive.")
 
-        init = torch.as_tensor(init, dtype=torch.float32)
+        init = torch.as_tensor(init)
+        if not init.is_floating_point():
+            init = init.to(dtype=current_dtype(torch.float32))
 
         # ---- init rho consistent with forward mapping ----
         if self.min_val is None and self.max_val is None:
@@ -389,17 +509,68 @@ class Bounded(cacheable):
                 rho0 = init
             else:
                 y = torch.clamp(self.max_val - init, min=1e-12)
-                rho0 = softplus_inv(y, beta=self.cap_beta, threshold=self.threshold)
+                rho0 = self.max_val - softplus_inv(
+                    y, beta=self.cap_beta, threshold=self.threshold
+                )
 
         else:
             if self._upper_mode(upper_only=False) == "hard-ste":
-                rho0 = init
+                if self.lower_mode == "softplus":
+                    y = torch.clamp(init - self.min_val, min=1e-12)
+                    rho0 = softplus_inv(y, beta=self.beta, threshold=self.threshold)
+                else:
+                    rho0 = init
             else:
                 rng = max(self.max_val - self.min_val, 1e-12)
-                t = torch.clamp((init - self.min_val) / rng, 1e-6, 1 - 1e-6)
-                rho0 = torch.special.logit(t) / self.beta
+                work = (
+                    init.float()
+                    if init.dtype in {torch.float16, torch.bfloat16}
+                    else init
+                )
+                t = torch.clamp((work - self.min_val) / rng, 1e-6, 1 - 1e-6)
+                rho0 = (torch.special.logit(t) / self.beta).to(dtype=init.dtype)
 
         self.rho = torch.nn.Parameter(rho0, requires_grad=requires_grad)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Migrate bounded-parameter coordinates saved before version 2."""
+        version = local_metadata.get("version")
+        rho_key = f"{prefix}rho"
+        if version is not None and version < 2 and rho_key in state_dict:
+            old_rho = state_dict[rho_key]
+            old_value = None
+            if getattr(self, "_auto_promoted_hard_cap", False):
+                old_value = self.min_val + (
+                    self.max_val - self.min_val
+                ) * torch.sigmoid(self.beta * old_rho)
+            elif (
+                self.min_val is not None
+                and self.max_val is not None
+                and self.cap_mode == "hard-ste"
+                and self.lower_mode == "softplus"
+            ):
+                old_value = torch.clamp(old_rho, min=self.min_val, max=self.max_val)
+            if old_value is not None:
+                state_dict[rho_key] = Bounded._inverse_transform(self, old_value)
+
+        return super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _upper_mode(self, *, upper_only: bool) -> str:
         if self.max_val is None:
@@ -446,8 +617,20 @@ class Bounded(cacheable):
 
         # Both bounds
         if self._upper_mode(upper_only=False) == "hard-ste":
-            # inclusive [min,max] with STE
-            return ste_clamp(self.rho, lo=self.min_val, hi=self.max_val)
+            # Inclusive [min,max]. Preserve the configured lower transform
+            # while applying a straight-through upper cap.
+            if self.lower_mode == "softplus":
+                lower_bounded = self.min_val + F.softplus(
+                    self.rho, beta=self.beta, threshold=self.threshold
+                )
+                return ste_clamp(lower_bounded, hi=self.max_val)
+            alpha_lo = 1.0 if self.lower_mode == "hard-ste" else self.lower_alpha
+            return ste_clamp(
+                self.rho,
+                lo=self.min_val,
+                hi=self.max_val,
+                alpha_lo=alpha_lo,
+            )
         else:
             # default: sigmoid to (min,max)
             s = torch.sigmoid(self.beta * self.rho)
@@ -470,6 +653,7 @@ class Bounded(cacheable):
                 value, dtype=self.rho.dtype, device=self.rho.device
             )
             self.rho.copy_(self._inverse_transform(resolved))
+        self.clear_cache()
 
     def _inverse_transform(self, value):
         # This method computes the inverse of the forward mapping, used for direct setting.
@@ -488,29 +672,66 @@ class Bounded(cacheable):
                 return value
             else:
                 y = torch.clamp(self.max_val - value, min=1e-12)
-                return softplus_inv(y, beta=self.cap_beta, threshold=self.threshold)
+                return self.max_val - softplus_inv(
+                    y, beta=self.cap_beta, threshold=self.threshold
+                )
 
         else:
             if self._upper_mode(upper_only=False) == "hard-ste":
+                if self.lower_mode == "softplus":
+                    y = torch.clamp(value - self.min_val, min=1e-12)
+                    return softplus_inv(y, beta=self.beta, threshold=self.threshold)
                 return value
             else:
                 rng = max(self.max_val - self.min_val, 1e-12)
-                t = torch.clamp((value - self.min_val) / rng, 1e-6, 1 - 1e-6)
-                return torch.special.logit(t) / self.beta
+                work = (
+                    value.float()
+                    if value.dtype in {torch.float16, torch.bfloat16}
+                    else value
+                )
+                t = torch.clamp((work - self.min_val) / rng, 1e-6, 1 - 1e-6)
+                return (torch.special.logit(t) / self.beta).to(dtype=value.dtype)
 
     def repeat_and_reinit(self, n: int):
-        new = self.repeat(n)
+        """Repeat along a new leading axis before optimizers are constructed."""
+        requires_grad = self.rho.requires_grad
+        device = self.rho.device
+        dtype = self.rho.dtype
+        if isinstance(n, bool) or not isinstance(n, Integral):
+            raise TypeError("n must be a non-negative integer.")
+        n = int(n)
+        if n < 0:
+            raise ValueError("n must be a non-negative integer.")
+        value = self()
+        new = value.repeat((n,) + (1,) * value.ndim)
         new_p = self._inverse_transform(new)
         self.rho = to_param(
-            torch.as_tensor(new_p, device=self.rho.device, dtype=self.rho.dtype)
+            new_p,
+            requires_grad=requires_grad,
+            device=device,
+            dtype=dtype,
         )
         self.clear_cache()
         return self
 
     def batch(self, n: int):
+        """Add a leading batch axis before optimizers are constructed."""
+        if isinstance(n, bool) or not isinstance(n, Integral):
+            raise TypeError("n must be a non-negative integer.")
+        n = int(n)
+        if n < 0:
+            raise ValueError("n must be a non-negative integer.")
+        requires_grad = self.rho.requires_grad
+        device = self.rho.device
+        dtype = self.rho.dtype
         old = torch.atleast_1d(self())
         new = old[None, :].expand(n, *old.shape).clone()
-        self.rho = to_param(self._inverse_transform(new))
+        self.rho = to_param(
+            self._inverse_transform(new),
+            requires_grad=requires_grad,
+            device=device,
+            dtype=dtype,
+        )
         self.clear_cache()
         return self
 
@@ -552,6 +773,16 @@ class PositiveParam(Bounded):
         cap_beta: float | None = None,
         requires_grad: bool = None,
     ):
+        auto_promoted_hard_cap = (
+            include_zero and max_val is not None and cap_mode == "auto"
+        )
+        if include_zero and max_val is not None:
+            if cap_mode == "auto":
+                cap_mode = "hard-ste"
+            elif cap_mode != "hard-ste":
+                raise ValueError(
+                    "include_zero with max_val requires cap_mode='hard-ste'."
+                )
         super().__init__(
             init,
             min_val=0.0,
@@ -564,6 +795,7 @@ class PositiveParam(Bounded):
             cap_beta=cap_beta,
             requires_grad=requires_grad,
         )
+        self._auto_promoted_hard_cap = auto_promoted_hard_cap
 
 
 class NegativeParam(Bounded):
@@ -603,6 +835,19 @@ class NegativeParam(Bounded):
         cap_beta: float | None = None,
         requires_grad: bool = None,
     ):
+        init = torch.as_tensor(init)
+        if min_val is not None and float(min_val) >= 0.0:
+            raise ValueError("NegativeParam min_val must be negative when provided.")
+        auto_promoted_hard_cap = (
+            include_zero and min_val is not None and cap_mode == "auto"
+        )
+        if include_zero and min_val is not None:
+            if cap_mode == "auto":
+                cap_mode = "hard-ste"
+            elif cap_mode != "hard-ste":
+                raise ValueError(
+                    "include_zero with min_val requires cap_mode='hard-ste'."
+                )
         super().__init__(
             torch.neg(init),
             min_val=0.0,
@@ -615,9 +860,14 @@ class NegativeParam(Bounded):
             cap_beta=cap_beta,
             requires_grad=requires_grad,
         )
+        self._auto_promoted_hard_cap = auto_promoted_hard_cap
 
     def _compute(self, *args, **kwargs):
         return torch.neg(super()._compute(*args, **kwargs))
+
+    def _inverse_transform(self, value):
+        value = torch.as_tensor(value, device=self.rho.device, dtype=self.rho.dtype)
+        return super()._inverse_transform(torch.neg(value))
 
 
 class Functional(torch.nn.Module):
@@ -1006,7 +1256,13 @@ class SimpleParameterized(Referency):
         dict
             Mapping from parameter names to default values.
         """
-        return list(cls._params.keys())
+        ordered_names = itertools.chain(
+            cls._params.keys(),
+            cls._params_p.keys(),
+            cls._params_n.keys(),
+            cls._flags.keys(),
+        )
+        return list(dict.fromkeys(ordered_names))
 
     def instantiate_parameters(self, positive=False, negative=False, **kwargs):
         """
@@ -1127,22 +1383,72 @@ class SimpleParameterized(Referency):
             If an unknown parameter name is provided.
         """
         for key, value in kwargs.items():
-            if key in self._params:
-                param = getattr(self, key)
-                if isinstance(param, torch.nn.Parameter):
+            matched = False
+            matched_via_pattern = False
+            if hasattr(self, key):
+                parameter = getattr(self, key)
+                if isinstance(parameter, torch.nn.Parameter):
                     with torch.no_grad():
-                        param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
-                    continue
-            elif key in self._modules:
-                module = getattr(self, key)
-                if isinstance(module, Bounded):
-                    module.set(value)
-                    continue
-            else:
-                for param_name, param in self.named_parameters():
-                    if matches_any_pattern([key], param_name):
-                        with torch.no_grad():
-                            param.data.copy_(torch.as_tensor(value, dtype=param.dtype))
+                        parameter.copy_(
+                            torch.as_tensor(
+                                value,
+                                dtype=parameter.dtype,
+                                device=parameter.device,
+                            )
+                        )
+                    matched = True
+                elif isinstance(parameter, Bounded):
+                    parameter.set(value)
+                    matched = True
+
+            if not matched:
+                pattern_parameters = [
+                    parameter
+                    for parameter_name, parameter in self.named_parameters()
+                    if matches_any_pattern([key], parameter_name)
+                ]
+                if pattern_parameters:
+                    staged = []
+                    for parameter in pattern_parameters:
+                        source = torch.as_tensor(
+                            value,
+                            dtype=parameter.dtype,
+                            device=parameter.device,
+                        )
+                        try:
+                            source = torch.broadcast_to(source, parameter.shape).clone()
+                        except RuntimeError as exc:
+                            raise ValueError(
+                                f"Value for pattern {key!r} cannot broadcast to "
+                                f"parameter shape {tuple(parameter.shape)}."
+                            ) from exc
+                        staged.append((parameter, source))
+
+                    with torch.no_grad():
+                        backups = [
+                            (parameter, parameter.clone())
+                            for parameter in pattern_parameters
+                        ]
+                        try:
+                            for parameter, source in staged:
+                                parameter.copy_(source)
+                        except Exception:
+                            for parameter, backup in backups:
+                                parameter.copy_(backup)
+                            for module in self.modules():
+                                if isinstance(module, cacheable):
+                                    module.clear_cache()
+                            raise
+                    matched = True
+                    matched_via_pattern = True
+
+            if matched_via_pattern:
+                for module in self.modules():
+                    if isinstance(module, cacheable):
+                        module.clear_cache()
+
+            if not matched:
+                raise ValueError(f"Unknown parameter or pattern: {key!r}.")
 
 
 def _param_key_set(mapping):
@@ -2114,7 +2420,9 @@ class Parameterized(SimpleParameterized):
             else torch.device(device)
         )
         self._init_dtype = (
-            current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+            current_dtype(torch.float32)
+            if dtype is None
+            else _normalize_dtype_value(dtype)
         )
         try:
             shape_p = [int(s) for s in shape]
@@ -2523,10 +2831,23 @@ class Parameterized(SimpleParameterized):
                         if is_batch:
                             key = self._collapse_batch_key(key)
                         parameter = to_param(
-                            value, positive=positive, negative=negative
+                            value,
+                            positive=positive,
+                            negative=negative,
+                            device=self._init_device,
+                            dtype=self._init_dtype,
                         )
                         if isinstance(parameter, torch.nn.Module) and not bounded:
-                            p = parameter(torch.empty(empty_shape))
+                            parameter = parameter.to(
+                                device=self._init_device, dtype=self._init_dtype
+                            )
+                            p = parameter(
+                                torch.empty(
+                                    empty_shape,
+                                    device=self._init_device,
+                                    dtype=self._init_dtype,
+                                )
+                            )
                             parametrization = build_parametrization(
                                 parameter, p, key, param_shape
                             )
@@ -2545,7 +2866,8 @@ class Parameterized(SimpleParameterized):
                                 (fill, getattr(self, p_name))
                             )
                             keys.append(key)
-                    self.keys[name] = torch.cat(keys).to(torch.long)
+                    if keys:
+                        self.keys[name] = torch.cat(keys).to(torch.long)
 
     def load_additional_parameters(self):
         """
@@ -2555,7 +2877,7 @@ class Parameterized(SimpleParameterized):
             buffer = getattr(self, name)
             additional_params = torch.cat(
                 [fill(self.resolve(p)) for fill, p in list_of_parameters]
-            )
+            ).to(device=buffer.device, dtype=buffer.dtype)
             key = self.keys[name].to(buffer.device)
             buffer.view(-1).index_copy_(0, key, additional_params)
 
@@ -2599,6 +2921,11 @@ class Parameterized(SimpleParameterized):
             )
         is_range = name in self.range or name in self.range_p or name in self.range_n
         is_batch = name in self.batch_t or name in self.batch_p or name in self.batch_n
+        if not (is_range or is_batch):
+            raise KeyError(
+                f"Unknown or non-indexable parameter {name!r}. Expected a declared "
+                "RANGE or BATCH parameter."
+            )
         if is_range or is_batch:
             positive = (name in self.range_p) or (name in self.batch_p)
             negative = (name in self.range_n) or (name in self.batch_n)
@@ -2617,23 +2944,37 @@ class Parameterized(SimpleParameterized):
             empty_shape = self._batch_shape() if is_batch else self.shape_p
             if is_batch:
                 key = self._collapse_batch_key(key)
-            parameter = to_param(value, positive=positive, negative=negative)
+            target = getattr(self, name)
+            key = key.to(device=target.device)
+            existing_key = self.keys.get(name)
+            combined_key = (
+                key.to(torch.long)
+                if existing_key is None
+                else torch.cat((existing_key.to(device=key.device), key.to(torch.long)))
+            )
+            parameter = to_param(
+                value,
+                positive=positive,
+                negative=negative,
+                device=target.device,
+                dtype=target.dtype,
+            )
             if isinstance(parameter, torch.nn.Module) and not (positive or negative):
-                p = parameter(torch.empty(empty_shape))
+                parameter = parameter.to(device=target.device, dtype=target.dtype)
+                p = parameter(
+                    torch.empty(empty_shape, device=target.device, dtype=target.dtype)
+                )
                 parametrization = build_parametrization(parameter, p, key, main_shape)
                 self.register_parametrization_in_graph(name, parametrization)
                 setattr(self, p_name, parameter)
             else:
-                setattr(self, p_name, parameter)
                 p = parameter() if (positive or negative) else parameter
                 fill = create_param_expander(p, key, main_shape)
+                setattr(self, p_name, parameter)
                 if name not in self.additional_parameters:
                     self.additional_parameters[name] = []
                 self.additional_parameters[name].append((fill, getattr(self, p_name)))
-                if name not in self.keys:
-                    self.keys[name] = key.to(torch.long)
-                else:
-                    self.keys[name] = torch.cat([self.keys[name], key.to(torch.long)])
+                self.keys[name] = combined_key
 
     def populate_parameter_buffers(self, random_generation=None):
         """
@@ -2921,14 +3262,51 @@ class Parameterized(SimpleParameterized):
         strict : bool, optional
             If True, raises an error if a parameter in the model is not found in the dictionary.
         """
+        named_parameters = dict(self.named_parameters())
+        if strict:
+            unexpected = sorted(set(parameters) - set(named_parameters))
+            if unexpected:
+                raise KeyError(
+                    f"Unexpected parameter name(s) in provided dictionary: {unexpected}."
+                )
+            missing = sorted(set(named_parameters) - set(parameters))
+            if missing:
+                raise KeyError(
+                    f"Parameter name(s) not found in the provided dictionary: {missing}."
+                )
+
+        updates = []
+        for name, param in named_parameters.items():
+            if name not in parameters:
+                continue
+            value = parameters[name]
+            if not torch.is_tensor(value):
+                raise TypeError(f"Parameter {name!r} must be loaded from a tensor.")
+            if value.shape != param.shape:
+                raise ValueError(
+                    f"Parameter {name!r} has shape {tuple(param.shape)}, but the "
+                    f"provided tensor has shape {tuple(value.shape)}."
+                )
+            # Stage an independent source snapshot before mutating any target.
+            # This makes cross-parameter swaps deterministic even when callers
+            # pass live model parameters as the input dictionary values.
+            updates.append((param, value.detach().clone()))
+
         with torch.no_grad():
-            for name, param in self.named_parameters():
-                if name in parameters:
-                    param.data.copy_(parameters[name])
-                elif strict:
-                    raise KeyError(
-                        f"Parameter '{name}' not found in the provided dictionary."
-                    )
+            backups = [(param, param.clone()) for param, _ in updates]
+            try:
+                for param, value in updates:
+                    param.copy_(value)
+            except Exception:
+                for param, backup in backups:
+                    param.copy_(backup)
+                for module in self.modules():
+                    if isinstance(module, cacheable):
+                        module.clear_cache()
+                raise
+        for module in self.modules():
+            if isinstance(module, cacheable):
+                module.clear_cache()
 
     @classmethod
     def normalize_random_kwargs(cls, kwargs):
@@ -2980,6 +3358,7 @@ class Parameterized(SimpleParameterized):
             cls._params.keys(),
             cls._params_p.keys(),
             cls._params_n.keys(),
+            cls._flags.keys(),
             cls._global.keys(),
             cls._global_p.keys(),
             cls._global_n.keys(),

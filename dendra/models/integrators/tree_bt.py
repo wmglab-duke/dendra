@@ -263,25 +263,20 @@ class _dhs_bt(Integrator):
 
         self.base_shape = tuple(list(model.shape) + [3])
 
-        # State vectors
-        if not hasattr(model, "vc"):
-            model.register_buffer(
-                "vc", torch.zeros(*model.shape, 3, device=dev, dtype=dtyp)
-            )
-        elif tuple(model.vc.shape) != tuple(model.shape) + (3,):
-            model.vc = torch.zeros(*model.shape, 3, device=dev, dtype=dtyp)
-        v0 = _expanded_v_init(model)
-        model.vc[..., 0] = v0
-        model.vc[..., 1] = 0.0
-        model.vc[..., 2] = 0.0
-        if not hasattr(model, "v"):
-            model.register_buffer(
-                "v", torch.zeros(*model.shape, device=dev, dtype=dtyp)
-            )
-        model.v[:] = v0
+        # Initializing solver geometry must not reset a live simulation.  A
+        # missing or shape-stale block state is seeded from the current
+        # membrane voltage; explicit resets remain the job of ``init_v``.
+        expected_vc_shape = tuple(model.shape) + (3,)
+        if not hasattr(model, "vc") or tuple(model.vc.shape) != expected_vc_shape:
+            vc = torch.zeros(expected_vc_shape, device=dev, dtype=dtyp)
+            vc[..., 0] = model.v.to(device=dev, dtype=dtyp)
+            if "vc" in getattr(model, "_buffers", {}):
+                model.vc = vc
+            else:
+                model.register_buffer("vc", vc)
 
     def step(self, model, dt, ve=None, intra=None):
-        vc_new, v_new = self._call_kernel(
+        result = self._call_kernel(
             "_step",
             self._flat_block_voltage(model.vc, 3),
             model.v,
@@ -290,6 +285,11 @@ class _dhs_bt(Integrator):
             ve,
             intra,
         )
+        if self.imem:
+            vc_new, v_new, i_membrane = result
+            model.i_membrane = i_membrane
+        else:
+            vc_new, v_new = result
         model.vc = vc_new
         model.v = v_new
 
@@ -346,6 +346,16 @@ class _dhs_bt(Integrator):
         inv = self.inv_solver_order
         vc_out = X_.index_select(1, inv).reshape(self.base_shape)  # (B,K,3) mV
         v_out = vc_out[..., 0] - vc_out[..., 1]  # membrane (mV)
+
+        if self.imem:
+            v_old = self._flat_voltage(v)
+            v_new = self._flat_voltage(v_out)
+            g_abs = self._flat_voltage(gtot) * self.area
+            i_abs_old = self._flat_voltage(itot) * self.area
+            i_membrane = ((self.cm_dt + g_abs) * (v_new - v_old) + i_abs_old).reshape(
+                self.shape
+            )
+            return vc_out, v_out, i_membrane
 
         return vc_out, v_out
 

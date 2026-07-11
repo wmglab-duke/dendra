@@ -34,6 +34,24 @@ def _clone_nested(value):
     return value
 
 
+def _assert_nested_equal(actual, expected):
+    if torch.is_tensor(expected):
+        assert torch.equal(actual, expected)
+        return
+    if isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_nested_equal(actual[key], expected[key])
+        return
+    if isinstance(expected, (tuple, list)):
+        assert type(actual) is type(expected)
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_nested_equal(actual_item, expected_item)
+        return
+    assert actual == expected
+
+
 def test_tensor_schedule_produces_weight_and_time_gradients():
     stim = _scheduled_stim()
     time = torch.tensor([0.2], dtype=DTYPE, requires_grad=True)
@@ -158,6 +176,19 @@ def test_checkpoint_restore_validates_schedule_heap_shape():
 
     with pytest.raises(ValueError, match="schedule heaps"):
         stim.restore_dict_from_checkpoint(checkpoint)
+
+
+def test_checkpoint_restore_shape_failure_is_atomic():
+    stim = _scheduled_stim()
+    before = _clone_nested(stim.state_dict_for_checkpoint())
+    corrupt = _clone_nested(before)
+    corrupt["shape"] = (2, 3)
+
+    with pytest.raises(ValueError, match="schedule heaps"):
+        stim.restore_dict_from_checkpoint(corrupt)
+
+    assert stim.shape == before["shape"]
+    _assert_nested_equal(stim.state_dict_for_checkpoint(), before)
 
 
 def test_batch_replicates_tensor_backed_schedules():

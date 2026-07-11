@@ -1,5 +1,8 @@
+import copy
 import gc
 import math
+import os
+from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Dict, Literal, Optional
 
@@ -20,7 +23,12 @@ from dendra.helpers import (
 )
 
 from ..callbacks import CallbackList
-from ..core import Population, _match_state_dict, make_intra
+from ..core import (
+    Population,
+    _load_compatible_state_dict_transactionally,
+    _validate_time_scalar,
+    make_intra,
+)
 from ..multi import concat_models, indices
 from ..parametric import is_parametric, to_param
 from ..rng import RNGMixin
@@ -98,6 +106,24 @@ def _named_items(collection):
     containers.  This adapter keeps both call styles supported.
     """
     return collection.items() if hasattr(collection, "items") else collection
+
+
+def _clone_checkpoint_state(value, memo=None):
+    """Clone a nested runtime checkpoint without severing autograd history."""
+    if memo is None:
+        memo = {}
+    if torch.is_tensor(value):
+        value_id = id(value)
+        if value_id not in memo:
+            memo[value_id] = value.clone()
+        return memo[value_id]
+    if isinstance(value, dict):
+        return {key: _clone_checkpoint_state(item, memo) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_clone_checkpoint_state(item, memo) for item in value)
+    if isinstance(value, list):
+        return [_clone_checkpoint_state(item, memo) for item in value]
+    return copy.deepcopy(value)
 
 
 def _component_device(component):
@@ -2614,18 +2640,19 @@ class Network(RNGMixin):
         Network
             Self, for chaining.
         """
+        dt_f = _validate_time_scalar(dt, name="dt", positive=True)
         self._refresh_compile_config_from_ctx()
         current_sig = self._device_signature()
         devices_changed = current_sig != getattr(self, "_device_sig", None)
 
-        if not self.built or self.dt != dt or force_rebuild or devices_changed:
+        if not self.built or self.dt != dt_f or force_rebuild or devices_changed:
             torch._dynamo.reset()
-            self.dt = dt
+            self.dt = dt_f
             self.synapses.clear()
             self.continuous_synapses.clear()
             self.continuous_targets = {}
-            self.build_synapses(dt, max_delay_ms=max_delay_ms)
-            self.build_continuous_synapses(dt, max_delay_ms=max_delay_ms)
+            self.build_synapses(dt_f, max_delay_ms=max_delay_ms)
+            self.build_continuous_synapses(dt_f, max_delay_ms=max_delay_ms)
             self.built = True
             self._device_sig = self._device_signature()
         self._refresh_step_schedule()
@@ -2659,7 +2686,8 @@ class Network(RNGMixin):
             changed, leave this True so expanded delay values and integer delay
             metadata are regenerated before cache restore.
         t : float, optional
-            Starting simulation time (ms). Default is 0.0.
+            Starting simulation time (ms). Finite negative values are allowed;
+            booleans and non-finite values are rejected. Default is 0.0.
         max_delay_ms : float, optional
             Maximum allowed synaptic delay. Default is None.
         force_rebuild : bool, optional
@@ -2670,15 +2698,11 @@ class Network(RNGMixin):
         Network
             Self, for chaining.
         """
+        dt_f = _validate_time_scalar(dt, name="dt", positive=True)
+        t_f = _validate_time_scalar(t, name="t", positive=None)
         self._refresh_compile_config_from_ctx()
-        self.t = self.t.detach()
-        self.t.fill_(t)
-        for pop in self.populations.values():
-            pop.t = pop.t.detach()
-            pop.t.fill_(t)
 
         has_state_cache = bool(self._state_cache)
-        dt_f = float(dt)
         if has_state_cache:
             self.initialize_pops_from_state_cache(dt=dt_f)
 
@@ -2693,7 +2717,7 @@ class Network(RNGMixin):
                 compile_scope="network_population",
             )
             pop.intra = pop.build_intra()
-        self.build(dt, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
+        self.build(dt_f, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
         # Always clear runtime delivery state during synapse initialization.
         # If a state cache is present, the backend-specific restore below will
         # rebuild the pending traffic from cached presynaptic history using the
@@ -2713,6 +2737,14 @@ class Network(RNGMixin):
                 self.netstim.set_dt(dt_f)
             self.netstim.initialize()
             self.netstim.detach()
+        # Population.initialize() and state-cache loading both restore their
+        # own clocks. Apply the requested absolute start only after those
+        # transitions so Network and Population clocks begin synchronized.
+        self.t = self.t.detach()
+        self.t.fill_(t_f)
+        for pop in self.populations.values():
+            pop.t = pop.t.detach()
+            pop.t.fill_(t_f)
         return self
 
     def initialize_pops_from_state_cache(self, *, dt=None):
@@ -2872,7 +2904,6 @@ class Network(RNGMixin):
         Network
             ``self``, for chaining.
         """
-        self._refresh_compile_config_from_ctx()
         if self.dt is None:
             raise RuntimeError(
                 "Network has no simulation timestep. Call initialize(dt) or "
@@ -2884,7 +2915,8 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before step()."
             )
 
-        dt_f = float(self.dt)
+        dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
+        self._refresh_compile_config_from_ctx()
         dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
 
         ctx = nullcontext() if self.training else torch.no_grad()
@@ -2977,7 +3009,6 @@ class Network(RNGMixin):
         -------
         None
         """
-        self._refresh_compile_config_from_ctx()
         if self.dt is None:
             raise RuntimeError(
                 "Network has no simulation timestep. Call initialize(dt) or "
@@ -2988,7 +3019,9 @@ class Network(RNGMixin):
                 "Network wiring has changed since the last build. Call "
                 "initialize(dt) (recommended) or build(dt) before run()."
             )
-        dt_f = float(self.dt)
+        dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
+        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        self._refresh_compile_config_from_ctx()
         dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
 
         ctx = nullcontext() if self.training else torch.no_grad()
@@ -3007,7 +3040,7 @@ class Network(RNGMixin):
             t_dev = t.to(device=dev, dtype=dtp)
             t0 = self.t.to(device=dev, dtype=dtp)
             dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
-            t1 = t0 + torch.tensor(tstop, device=dev, dtype=dtp)
+            t1 = t0 + torch.tensor(tstop_f, device=dev, dtype=dtp)
             extra_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
         extra = extra_prepped
 
@@ -3020,7 +3053,7 @@ class Network(RNGMixin):
             # below the integer (2.999...), causing a whole step to be lost.
             # Moving the ratio by one representable float before flooring
             # corrects that numerical artifact without rounding partial steps.
-            step_ratio = float(tstop) / dt_f
+            step_ratio = tstop_f / dt_f
             n_steps = math.floor(math.nextafter(step_ratio, math.inf))
 
             if with_intra:
@@ -3485,12 +3518,11 @@ class Network(RNGMixin):
         self
             The model instance with loaded weights
         """
-        if isinstance(state_dict, str):
+        if isinstance(state_dict, (str, os.PathLike)):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
-        matched, _ = _match_state_dict(self.state_dict(), state_dict)
-        self.load_state_dict(matched, strict=False)
+        _load_compatible_state_dict_transactionally(self, state_dict)
         return self
 
     # utilities
@@ -3554,38 +3586,204 @@ class Network(RNGMixin):
             return None
         return self.netstim.state_dict_for_checkpoint()
 
+    def checkpoint_structure(self):
+        """Return the immutable runtime structure required for exact replay."""
+        checkpoint_dt = None if self.dt is None else float(self.dt)
+        if checkpoint_dt is not None and (
+            not math.isfinite(checkpoint_dt) or checkpoint_dt <= 0.0
+        ):
+            raise ValueError(
+                "Network checkpoint timestep must be positive and finite, "
+                f"got {checkpoint_dt!r}."
+            )
+        return {
+            "dt": checkpoint_dt,
+            "training": bool(self.training),
+            "populations": {
+                name: {
+                    "class": f"{type(pop).__module__}.{type(pop).__qualname__}",
+                    "shape": tuple(int(dim) for dim in pop.shape),
+                }
+                for name, pop in self.populations.items()
+            },
+            "event": {
+                name: syn.checkpoint_topology_signature()
+                for name, syn in self.synapses.items()
+            },
+            "continuous": {
+                name: syn.checkpoint_topology_signature()
+                for name, syn in self.continuous_synapses.items()
+            },
+            "has_netstim": self.netstim is not None,
+            "netstim_shape": (
+                None
+                if self.netstim is None
+                else tuple(int(dim) for dim in self.netstim.shape)
+            ),
+        }
+
     def state_dict_for_checkpoint(self):
         """
-        Returns a state dict of the entire network suitable for checkpointing.
+        Return the mutable runtime state required to continue an exact replay.
+
+        Weights, delays, and other model parameters remain in ``state_dict()``;
+        callers restoring into a fresh object must load or construct matching
+        parameters separately. The structure fingerprint rejects mismatched
+        population/connection layouts and runtime backend modes before mutation.
         """
         return {
             "populations": self.populations_state_dict_for_checkpoint(),
             "netcons": self.netcons_state_dict_for_checkpoint(),
             "netstim": self.netstim_state_dict_for_checkpoint(),
             "t": self.t,
+            "structure": self.checkpoint_structure(),
         }
 
-    def restore_dict_from_checkpoint(self, state_dict):
-        """
-        Restores the network state from a checkpoint state dict.
-        """
-        for name, pop_state in state_dict["populations"].items():
-            self.populations[name].restore_dict_from_checkpoint(pop_state)
+    def _restore_dict_from_checkpoint_unchecked(self, state_dict):
+        if not isinstance(state_dict, Mapping):
+            raise TypeError("Network checkpoint state must be a mapping.")
+        missing = [
+            name
+            for name in ("populations", "netcons", "netstim", "t")
+            if name not in state_dict
+        ]
+        if missing:
+            raise KeyError(f"Network checkpoint is missing entries: {missing}.")
+        if not isinstance(state_dict["populations"], Mapping):
+            raise TypeError("Network checkpoint populations must be a mapping.")
+        if not isinstance(state_dict["netcons"], Mapping):
+            raise TypeError("Network checkpoint netcons must be a mapping.")
+
+        checkpoint_t = state_dict["t"]
+        if not torch.is_tensor(checkpoint_t):
+            raise TypeError("Network checkpoint time must be a tensor.")
+        if tuple(checkpoint_t.shape) != tuple(self.t.shape):
+            raise ValueError(
+                f"Network checkpoint time has shape {tuple(checkpoint_t.shape)}, "
+                f"expected {tuple(self.t.shape)}."
+            )
+        restored_t = checkpoint_t.to(device=self.t.device, dtype=self.t.dtype).clone()
+
+        checkpoint_structure = state_dict.get("structure", None)
+        if checkpoint_structure is not None:
+            if not isinstance(checkpoint_structure, Mapping):
+                raise TypeError("Network checkpoint structure must be a mapping.")
+            expected_structure = self.checkpoint_structure()
+            if checkpoint_structure != expected_structure:
+                raise ValueError(
+                    "Network checkpoint topology or runtime mode does not match "
+                    "the receiving network."
+                )
+
+        checkpoint_populations = set(state_dict["populations"])
+        expected_populations = set(self.populations)
+        missing_populations = expected_populations - checkpoint_populations
+        unknown_populations = checkpoint_populations - expected_populations
+        if missing_populations or unknown_populations:
+            raise KeyError(
+                "Network checkpoint population names do not match the network: "
+                f"missing={sorted(missing_populations)}, "
+                f"unknown={sorted(unknown_populations)}."
+            )
+
         netcons = state_dict["netcons"]
         # Backward compatibility: older checkpoints stored only event NetCons as
         # a flat mapping.  New checkpoints separate event and continuous
         # connection states.
         if "event" in netcons or "continuous" in netcons:
-            for name, syn_state in netcons.get("event", {}).items():
-                self.synapses[name].restore_dict_from_checkpoint(syn_state)
-            for name, syn_state in netcons.get("continuous", {}).items():
-                self.continuous_synapses[name].restore_dict_from_checkpoint(syn_state)
+            missing_sections = {
+                name for name in ("event", "continuous") if name not in netcons
+            }
+            if missing_sections:
+                raise KeyError(
+                    "Separated Network checkpoints must contain both event and "
+                    f"continuous NetCon sections; missing={sorted(missing_sections)}."
+                )
+            event_states = netcons.get("event", {})
+            continuous_states = netcons.get("continuous", {})
+            if not isinstance(event_states, Mapping):
+                raise TypeError("Network checkpoint event NetCons must be a mapping.")
+            if not isinstance(continuous_states, Mapping):
+                raise TypeError(
+                    "Network checkpoint continuous NetCons must be a mapping."
+                )
         else:
-            for name, syn_state in netcons.items():
-                self.synapses[name].restore_dict_from_checkpoint(syn_state)
-        if state_dict["netstim"] is not None and self.netstim is not None:
+            event_states = netcons
+            continuous_states = {}
+
+        checkpoint_event = set(event_states)
+        expected_event = set(self.synapses)
+        missing_event = expected_event - checkpoint_event
+        unknown_event = checkpoint_event - expected_event
+        if missing_event or unknown_event:
+            raise KeyError(
+                "Network checkpoint event NetCon names do not match the network: "
+                f"missing={sorted(missing_event)}, unknown={sorted(unknown_event)}."
+            )
+        checkpoint_continuous = set(continuous_states)
+        expected_continuous = set(self.continuous_synapses)
+        missing_continuous = expected_continuous - checkpoint_continuous
+        unknown_continuous = checkpoint_continuous - expected_continuous
+        if missing_continuous or unknown_continuous:
+            raise KeyError(
+                "Network checkpoint continuous NetCon names do not match the network: "
+                f"missing={sorted(missing_continuous)}, "
+                f"unknown={sorted(unknown_continuous)}."
+            )
+
+        checkpoint_has_netstim = state_dict["netstim"] is not None
+        network_has_netstim = self.netstim is not None
+        if checkpoint_has_netstim != network_has_netstim:
+            raise ValueError(
+                "Network checkpoint NetStim presence does not match the network."
+            )
+        if checkpoint_has_netstim:
+            checkpoint_netstim = state_dict["netstim"]
+            if not isinstance(checkpoint_netstim, Mapping):
+                raise TypeError("Network checkpoint NetStim state must be a mapping.")
+            if "shape" in checkpoint_netstim:
+                try:
+                    checkpoint_netstim_shape = tuple(
+                        int(dim) for dim in checkpoint_netstim["shape"]
+                    )
+                except (TypeError, ValueError) as error:
+                    raise TypeError(
+                        "Network checkpoint nested NetStim shape must be an "
+                        "iterable of integers."
+                    ) from error
+                expected_netstim_shape = tuple(int(dim) for dim in self.netstim.shape)
+                if checkpoint_netstim_shape != expected_netstim_shape:
+                    raise ValueError(
+                        "Network checkpoint nested NetStim shape does not match "
+                        f"the receiving network: checkpoint={checkpoint_netstim_shape}, "
+                        f"expected={expected_netstim_shape}."
+                    )
+
+        for name, pop_state in state_dict["populations"].items():
+            self.populations[name].restore_dict_from_checkpoint(pop_state)
+        for name, syn_state in event_states.items():
+            self.synapses[name].restore_dict_from_checkpoint(syn_state)
+        for name, syn_state in continuous_states.items():
+            self.continuous_synapses[name].restore_dict_from_checkpoint(syn_state)
+        if checkpoint_has_netstim:
             self.netstim.restore_dict_from_checkpoint(state_dict["netstim"])
-        self.t = state_dict["t"]
+        self.t = restored_t
+
+    def restore_dict_from_checkpoint(self, state_dict):
+        """Restore a whole-network runtime checkpoint atomically."""
+        previous = _clone_checkpoint_state(self.state_dict_for_checkpoint())
+        try:
+            self._restore_dict_from_checkpoint_unchecked(state_dict)
+        except Exception as restore_error:
+            try:
+                self._restore_dict_from_checkpoint_unchecked(previous)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Network checkpoint restore failed and rollback could not "
+                    "recover the previous runtime state."
+                ) from rollback_error
+            raise restore_error
+        return self
 
     # -- checkpointed run --
 
@@ -3653,9 +3851,13 @@ class Network(RNGMixin):
             raise RuntimeError(
                 "Network.dt is None. Call net.initialize(dt=...) before longrun_checkpointed()."
             )
-        self._refresh_compile_config_from_ctx()
+        if isinstance(chunklength, bool) or not isinstance(chunklength, int):
+            raise TypeError("chunklength must be a positive integer")
         if chunklength <= 0:
             raise ValueError("chunklength must be a positive integer")
+        dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
+        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        self._refresh_compile_config_from_ctx()
 
         # Normalize callbacks.
         if callbacks is None:
@@ -3665,13 +3867,12 @@ class Network(RNGMixin):
         for c in callbacks:
             c.dt = self.dt
 
-        dt_f = float(self.dt)
         dt_t = torch.tensor(self.dt, device=self.t.device, dtype=self.t.dtype)
 
         # Build a global time grid (used only for chunking + callback timing).
         t_grid = torch.arange(
             self.t.double(),
-            (self.t.double() + float(tstop)),
+            (self.t.double() + tstop_f),
             dt_f,
             dtype=torch.double,
             device=self.t.device,

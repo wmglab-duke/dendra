@@ -1,3 +1,4 @@
+import copy
 import heapq
 from collections.abc import Iterable
 from numbers import Integral
@@ -5,11 +6,29 @@ from typing import Optional
 
 import torch
 
-from dendra.helpers import current_device, current_dtype
+from dendra.helpers import _normalize_dtype_value, current_device, current_dtype
 
 from ..modular import DNModule
 from ..parametric import PositiveParam
 from ..slice import Sliceable
+
+
+def _clone_checkpoint_state(value, memo=None):
+    """Clone nested NetStim runtime state while preserving tensor history."""
+    if memo is None:
+        memo = {}
+    if torch.is_tensor(value):
+        value_id = id(value)
+        if value_id not in memo:
+            memo[value_id] = value.clone()
+        return memo[value_id]
+    if isinstance(value, dict):
+        return {key: _clone_checkpoint_state(item, memo) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_clone_checkpoint_state(item, memo) for item in value)
+    if isinstance(value, list):
+        return [_clone_checkpoint_state(item, memo) for item in value]
+    return copy.deepcopy(value)
 
 
 def _ste_gate(x, tau, *, atol=None):
@@ -126,7 +145,9 @@ class NetStim(DNModule, Sliceable):
             else torch.device(device)
         )
         init_dtype = (
-            current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+            current_dtype(torch.float32)
+            if dtype is None
+            else _normalize_dtype_value(dtype)
         )
         interval_t, start_t, noise_t, max_spikes_t, shape = (
             self._canonicalize_parameters(
@@ -1418,7 +1439,7 @@ class NetStim(DNModule, Sliceable):
             "seeder_state": self._seeder.get_state(),
         }
 
-    def restore_dict_from_checkpoint(self, state_dict):
+    def _restore_dict_from_checkpoint_unchecked(self, state_dict):
         """Restore NetStim dynamic state from :meth:`state_dict_for_checkpoint`.
 
         Important details for activation checkpointing:
@@ -1560,3 +1581,18 @@ class NetStim(DNModule, Sliceable):
         # 5) Reset per-step outputs (they will be recomputed on the next call).
         self.spikes = torch.zeros(self.shape, device=device, dtype=torch.bool)
         self.spike_gate = torch.zeros(self.shape, device=device, dtype=dtype)
+
+    def restore_dict_from_checkpoint(self, state_dict):
+        """Restore a NetStim runtime checkpoint atomically."""
+        previous = _clone_checkpoint_state(self.state_dict_for_checkpoint())
+        try:
+            return self._restore_dict_from_checkpoint_unchecked(state_dict)
+        except Exception:
+            try:
+                self._restore_dict_from_checkpoint_unchecked(previous)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "NetStim checkpoint restore failed and rollback could not "
+                    "recover the previous runtime state."
+                ) from rollback_error
+            raise

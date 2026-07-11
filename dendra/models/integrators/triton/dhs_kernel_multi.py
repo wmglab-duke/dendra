@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._contracts import validate_tree_multi
+
 
 @triton.jit
 def _multi_dhs_kernel_warp_hom(
@@ -384,7 +386,7 @@ def dhs_solve_multi_cuda(
     """
     Public entry for multi-morph DHS. Matches the signature used by `_dhs_multi.step(...)`.
     """
-    return DHSSolveMultiPacked.apply(
+    validate_tree_multi(
         d_mem,
         a_geom,
         b,
@@ -397,6 +399,24 @@ def dhs_solve_multi_cuda(
         WARP_L,
         WARP_ROW_BASE,
         WARP_ROW_COUNT,
+        K_stride,
+        L_max,
+        threads,
+        grid_x,
+    )
+    return DHSSolveMultiPacked.apply(
+        d_mem.contiguous(),
+        a_geom.contiguous(),
+        b.contiguous(),
+        P_cat.contiguous(),
+        ORDER_cat.contiguous(),
+        LAYER_PTR_cat.contiguous(),
+        WARP_P_OFF.contiguous(),
+        WARP_ORDER_OFF.contiguous(),
+        WARP_LPTR_OFF.contiguous(),
+        WARP_L.contiguous(),
+        WARP_ROW_BASE.contiguous(),
+        WARP_ROW_COUNT.contiguous(),
         K_stride,
         L_max,
         threads,

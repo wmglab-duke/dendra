@@ -103,13 +103,7 @@ def _all_close(a: torch.Tensor, b: torch.Tensor, rtol=1e-4, atol=1e-4) -> bool:
 # -----------------------------------------------------------------------------#
 # 3.  Property-based core correctness test
 # -----------------------------------------------------------------------------#
-@given(
-    data=_graph_and_tensor_batches(),
-    dtype=st.sampled_from(FLOAT_DTYPES),
-    device=st.sampled_from(["cpu"] + (["cuda"] if torch.cuda.is_available() else [])),
-)
-@settings(max_examples=200, deadline=None)
-def test_edgewise_formula_holds(data, dtype: torch.dtype, device: str):
+def _assert_edgewise_formula(data, dtype: torch.dtype, device: str):
     """
     For every edge (parent→child) in the graph and for every sample in the batch,
 
@@ -152,6 +146,20 @@ def test_edgewise_formula_holds(data, dtype: torch.dtype, device: str):
         assert torch.allclose(
             psi[:, r], torch.zeros_like(psi[:, r]), rtol=0, atol=1e-7
         ), "Root potentials must be zero."
+
+
+@given(data=_graph_and_tensor_batches(), dtype=st.sampled_from(FLOAT_DTYPES))
+@settings(max_examples=200, deadline=None)
+def test_edgewise_formula_holds(data, dtype: torch.dtype):
+    _assert_edgewise_formula(data, dtype, "cpu")
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@given(data=_graph_and_tensor_batches(), dtype=st.sampled_from(FLOAT_DTYPES))
+@settings(max_examples=100, deadline=None)
+def test_edgewise_formula_holds_cuda(data, dtype: torch.dtype):
+    _assert_edgewise_formula(data, dtype, "cuda")
 
 
 # -----------------------------------------------------------------------------#

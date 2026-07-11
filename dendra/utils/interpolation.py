@@ -588,7 +588,7 @@ class PreparedInterp1d(nn.Module):
                     ynew = y0 + m * (xq_used - x0i)
             else:
                 # ---- original path ----
-                torch.searchsorted(self._x_search, xq_used, out=ind)
+                torch.searchsorted(self._x_search, xq_used.contiguous(), out=ind)
                 ind -= 1
                 ind.clamp_(0, self._ind_hi)
 
@@ -727,7 +727,7 @@ class PreparedInterp1d(nn.Module):
                         ynew = torch.where(xq <= x_min, y_first.expand_as(ynew), ynew)
                         ynew = torch.where(xq >= x_max, y_last.expand_as(ynew), ynew)
             else:
-                torch.searchsorted(x_search, xq_used, out=ind)
+                torch.searchsorted(x_search, xq_used.contiguous(), out=ind)
                 ind -= 1
                 ind.clamp_(0, self._ind_hi)
 
@@ -1982,7 +1982,7 @@ class PreparedInterp3dRect(nn.Module):
             return ind_out, t
 
         def axis_ind_t_nu(search, ucoord, a0, inv_tab, hi, ind_out, batched_axis: bool):
-            torch.searchsorted(search, ucoord, out=ind_out)
+            torch.searchsorted(search, ucoord.contiguous(), out=ind_out)
             ind_out -= 1
             ind_out.clamp_(0, hi)
             if not batched_axis:

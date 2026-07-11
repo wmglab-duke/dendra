@@ -46,14 +46,15 @@ before_script:
   # Optional: verify in logs
   - python -c "import numpy as np; print('NumPy:', np.__version__)"
   - python -c "import torch; print('PyTorch:', torch.__version__)"
+  - python -c "import neuron; print('NEURON:', neuron.__version__)"
   - python -c "import dendra; print('Dendra:', dendra.__version__)"
   - python -c "import dendra_models; print('Dendra-Models:', dendra_models.__version__)"
 
 test:
   stage: test
   script:
-    - python -m pip install pytest pytest-cov hypothesis
-    - python -m pytest tests -m cpu --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=xml --cov-report=html --cov-fail-under=59
+    - python -m pip install pytest pytest-cov hypothesis neuron
+    - python -m pytest tests -W error -m "cpu or (neuron and not cuda)" --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=xml --cov-report=html --cov-fail-under=71
     - python scripts/check_coverage_floors.py coverage.json
   coverage: '/TOTAL.*\s+(\d+%)$/'
   artifacts:
