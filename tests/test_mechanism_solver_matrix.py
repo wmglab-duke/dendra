@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -25,8 +26,10 @@ from dendra.models.mechanisms._kinetic import (
 from dendra.models.mechanisms._linearimplicit import build_linearimplicit
 from dendra.models.mechanisms._rosenbrock import build_rosenbrock1
 from dendra.models.mechanisms._solvers import _solve_linear_small
+from dendra.models.mechanisms.compilers import source as source_compiler
 from dendra.models.mechanisms.compilers.ast import factorize_linear_in_v
 from dendra.models.mechanisms.compilers.source import safe_source
+from dendra.models.mod import expsyn
 
 DTYPE = torch.float64
 
@@ -731,6 +734,40 @@ def test_compiler_factorization_and_source():
             return 1
 
     assert "class Plain" in safe_source(Plain)
+
+
+def test_compiler_uses_the_last_duplicate_method_like_python_runtime():
+    source = """
+    class Current:
+        def i(self, v):
+            return 2 * v
+
+        def i(self, v):
+            return 3 * v
+    """
+
+    assert factorize_linear_in_v(source) == ("3", "0")
+
+
+def test_renamed_mechanism_source_fallback_does_not_require_ipython(monkeypatch):
+    alias = expsyn.rename("headless_source_probe")
+    real_getsource = inspect.getsource
+
+    def getsource_without_dynamic_class(obj):
+        if obj is alias:
+            raise OSError("dynamic class has no class-body source")
+        return real_getsource(obj)
+
+    monkeypatch.setattr(source_compiler, "IPYTHON_AVAILABLE", False)
+    monkeypatch.setattr(
+        source_compiler.inspect, "getsource", getsource_without_dynamic_class
+    )
+    factorize_linear_in_v.cache_clear()
+
+    reconstructed = safe_source(alias)
+
+    assert "class headless_source_probe" in reconstructed
+    assert factorize_linear_in_v(alias) == ("self.g", "self.e")
 
 
 def test_compiler_rejects_unsupported_or_non_linear_current():

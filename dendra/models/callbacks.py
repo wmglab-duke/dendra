@@ -15,10 +15,10 @@ from dendra.utils.dynamic_compilation import compile_generated_function
 from ..helpers import nojit
 from .backend import Backend as A
 
-if torch.cuda.is_available():
-    TRANSFERSTREAM = torch.cuda.Stream()
-else:
-    TRANSFERSTREAM = None
+# Kept as a module-level compatibility hook, but initialized lazily by Recorder.
+# Eager construction here would initialize CUDA in CPU-only HDF5 writer processes
+# whenever the host happens to expose a GPU.
+TRANSFERSTREAM = None
 
 
 class Callback(torch.nn.Module):
@@ -462,6 +462,7 @@ class Recorder(Callback):
         self.writer_thread = None
         self.data_pinned = {}
         self.stream = None
+        self._transfer_streams = {}
 
     def set_partition(self, partition=None):
         if partition is not None:
@@ -559,14 +560,21 @@ class Recorder(Callback):
                 f"for state(s): {', '.join(missing)}."
             )
 
-        transfer_context = (
-            torch.cuda.stream(TRANSFERSTREAM)
-            if TRANSFERSTREAM is not None
-            else nullcontext()
-        )
-        with transfer_context:
-            for s in self.states:
-                data = self.stack(s)
+        streams_used = {}
+        for s in self.states:
+            data = self.stack(s)
+            cuda_source = data.device.type == "cuda"
+            transfer_stream = None
+            transfer_context = nullcontext()
+            if cuda_source:  # pragma: no cover - exercised in the CUDA lane
+                transfer_stream = self._transfer_stream_for(data.device)
+                # The recorded values are normally produced on the device's
+                # current stream. Make that dependency explicit before copying
+                # on a separate transfer stream.
+                transfer_stream.wait_stream(torch.cuda.current_stream(data.device))
+                streams_used[id(transfer_stream)] = transfer_stream
+                transfer_context = torch.cuda.stream(transfer_stream)
+            with transfer_context:
                 # Each queued write owns its buffer. Reusing a pinned tensor can
                 # overwrite data that the asynchronous writer process has not
                 # consumed yet.
@@ -574,9 +582,16 @@ class Recorder(Callback):
                     data.shape,
                     dtype=data.dtype,
                     device="cpu",
-                    pin_memory=TRANSFERSTREAM is not None,
+                    pin_memory=cuda_source,
                 )
-                self.data_pinned[s].copy_(data, non_blocking=True)
+                self.data_pinned[s].copy_(data, non_blocking=cuda_source)
+
+        # The writer is a spawned process and therefore cannot synchronize the
+        # parent process's CUDA streams. Complete every device-to-host transfer
+        # before any staged CPU tensor is handed to its queue.
+        for stream in streams_used.values():  # pragma: no cover - CUDA lane
+            stream.synchronize()
+
         self.queue.put("flush")
         for s in self.states:
             data = self.data_pinned[s]
@@ -585,6 +600,35 @@ class Recorder(Callback):
                 chunks[1] = 1
             self.queue.put((s, self.run_number, self.save_count, data, tuple(chunks)))
         self.save_count += 1
+
+    def _transfer_stream_for(self, device):  # pragma: no cover - CUDA lane
+        """Return a lazily-created transfer stream on ``device``."""
+        global TRANSFERSTREAM
+
+        device = torch.device(device)
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+            device = torch.device("cuda", device_index)
+
+        stream = self._transfer_streams.get(device_index)
+        if stream is not None:
+            return stream
+
+        legacy = TRANSFERSTREAM
+        legacy_device = getattr(legacy, "device", None)
+        if legacy is not None and legacy_device is not None:
+            legacy_device = torch.device(legacy_device)
+            if legacy_device.index == device_index:
+                stream = legacy
+
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            if TRANSFERSTREAM is None and device_index == torch.cuda.current_device():
+                TRANSFERSTREAM = stream
+
+        self._transfer_streams[device_index] = stream
+        return stream
 
     @nojit
     def post_step_hook(self, model):
@@ -821,8 +865,6 @@ def _hdf5_write(queue: Queue, path: str):
         while True:
             item = queue.get()
             if item == "flush":
-                if TRANSFERSTREAM is not None:
-                    TRANSFERSTREAM.synchronize()
                 queue.task_done()
                 continue
             if item is None:

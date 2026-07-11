@@ -20,6 +20,14 @@ from dendra.models.fields.precomputed import (
     PreComputedInterpolate3DScattered,
 )
 
+# Linux Inductor currently imports torch.utils.mkldnn, whose upstream class
+# decorators emit this deprecation once per test under newer PyTorch releases.
+# Keep the warning-as-error contract for everything except that exact source.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:`torch\\.jit\\.script_method` is deprecated\\. Please switch to "
+    "`torch\\.compile` or `torch\\.export`\\.:DeprecationWarning:torch\\.jit\\._script"
+)
+
 
 class DummyModel:
     def __init__(self, x, y=None, z=None, *, graph=None, dtype=torch.float64):

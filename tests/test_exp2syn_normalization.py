@@ -88,6 +88,24 @@ def test_exp2syn_equal_taus_stay_finite_at_supported_floating_precisions(dtype):
     assert torch.all(mechanism.factor > 0)
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_exp2syn_uses_exact_current_conductance_pair_at_supported_precisions(dtype):
+    mechanism = _initialized_exp2syn(0.2, 2.0, dtype=dtype)
+    assert mechanism.i_with_g.__func__ is type(mechanism).i_with_conductance
+    with torch.no_grad():
+        mechanism.A.fill_(0.125)
+        mechanism.B.fill_(0.5)
+
+    voltage = torch.full_like(mechanism.A, -40.0)
+    current, conductance = mechanism.i_with_g(voltage)
+    expected_conductance = mechanism.B - mechanism.A
+
+    torch.testing.assert_close(conductance, expected_conductance)
+    torch.testing.assert_close(current, expected_conductance * (voltage - mechanism.e))
+
+
 def test_exp2syn_effective_tau_drives_a_kinetics_and_preserves_parameter_gradients():
     population = _exp2syn_population(0.2, 2.0, parameterized=True)
     population.train()

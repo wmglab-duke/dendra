@@ -112,6 +112,11 @@ class exp2syn(PP, Syn):
     def i(self, v):
         return (self.B - self.A) * (v - self.e)
 
+    def i_with_conductance(self, v):
+        """Return the current and its exact voltage derivative."""
+        conductance = self.B - self.A
+        return conductance * (v - self.e), conductance
+
     def net_receive(self, weights, netcon):
         weights = weights * self.factor
         self.A = self.A + weights

@@ -632,6 +632,8 @@ class Mechanism(Parameterized):
 
         # factorize current equations
         self._current_factorable = {}
+        self._current_conductance_mode = {}
+        self._current_conductance_fallback_reason = {}
         current_eqs = []
         for _, v in self._currents.items():
             current_eqs.extend(v)
@@ -644,6 +646,10 @@ class Mechanism(Parameterized):
             setattr(self, f"{k}_with_g", MethodType(eq, self))
             setattr(getattr(self.__class__, k), "factorable", factorable)
             self._current_factorable[k] = bool(factorable)
+            self._current_conductance_mode[k] = eq._dendra_conductance_mode
+            self._current_conductance_fallback_reason[k] = (
+                eq._dendra_conductance_fallback_reason
+            )
 
         # Retain the legacy aggregate attribute for downstream callers while
         # keeping the per-current truth needed by mixed mechanisms.
@@ -1133,6 +1139,13 @@ class Mechanism(Parameterized):
         """
         Declare non-specific (leak) currents produced by the mechanism.
 
+        Current methods and any properties they read must be deterministic
+        during one solver evaluation.  Symbolic conductance assembly may
+        evaluate a coefficient separately from the authored current method;
+        stateful or stochastic property access can therefore make an
+        ``(i, g)`` pair internally inconsistent.  Such currents should provide
+        an exact ``<current>_with_conductance`` method instead.
+
         Parameters
         ----------
         *args : str
@@ -1177,6 +1190,14 @@ class Mechanism(Parameterized):
         ----------
         *args : str
             Current names that should be numerically differentiated.
+
+        Notes
+        -----
+        Numerical currents use centered finite differences and support float32
+        and float64 voltage tensors.  Like any same-precision finite difference,
+        this path can lose accuracy when the current is dominated by a very
+        large voltage-independent offset.  Prefer a symbolically factorable
+        current or an exact ``<current>_with_conductance`` method when available.
         """
         declare_class_value(
             "mechanism.numerical", args, Mechanism._numerical_declarations
@@ -2943,6 +2964,14 @@ def rename(mechanism, new_name=None):
     new_class = type(new_name, mechanism.__bases__, class_dict)
     for name, value in declaration_ownership.items():
         setattr(new_class, name, value)
+    # Preserve stable source provenance for symbolic current analysis.  A
+    # ``type(...)`` alias has no class statement of its own, but its current
+    # methods are exact clones of the source mechanism.  Following this link
+    # avoids making symbolic differentiation depend on whether a platform's
+    # inspection stack happens to recover the dynamic alias body.
+    new_class._dendra_symbolic_source_class = mechanism.__dict__.get(
+        "_dendra_symbolic_source_class", mechanism
+    )
     new_class._name = new_name  # Set the new name attribute
 
     return new_class

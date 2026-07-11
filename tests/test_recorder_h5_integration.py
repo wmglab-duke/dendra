@@ -118,7 +118,9 @@ def test_population_recorder_hdf5_round_trip_across_ranks_and_boundaries(
     assert persisted.run_number == 1
     assert persisted.save_count == 0
     assert not persisted.cache_with_hdf5
-    assert not persisted.data_pinned["v"].is_pinned()
+    buffered_v = persisted.data_pinned["v"]
+    assert buffered_v.device.type == "cpu"
+    assert not buffered_v.is_pinned()
 
     with H5Reader(path) as reader:
         assert reader.vars() == ["t", "v"]
@@ -194,7 +196,10 @@ def test_cpu_cache_never_enters_a_cuda_stream(monkeypatch):
     recorder.queue = _LocalQueue()
     recorder.rec["v"].append(torch.tensor([1.0, 2.0]))
 
-    monkeypatch.setattr(callback_module, "TRANSFERSTREAM", None)
+    # CUDA availability is a property of the host, not necessarily of the
+    # recorded data. A CPU recording must stay on the ordinary CPU path even
+    # when the process owns a CUDA transfer stream.
+    monkeypatch.setattr(callback_module, "TRANSFERSTREAM", object())
 
     def unexpected_cuda_stream(*args, **kwargs):
         raise AssertionError("CPU HDF5 caching must not enter torch.cuda.stream")
@@ -203,9 +208,58 @@ def test_cpu_cache_never_enters_a_cuda_stream(monkeypatch):
     recorder.cache_hdf5()
 
     assert recorder.data_pinned["v"].tolist() == [[1.0, 2.0]]
+    assert not recorder.data_pinned["v"].is_pinned()
     assert [
         item if isinstance(item, str) else item[:3] for item in recorder.queue.items
     ] == [
         "flush",
         ("v", 0, 0),
     ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cuda_cache_uses_pinned_cpu_buffer_and_transfer_stream():
+    recorder = Recorder(["v"])
+    recorder.queue = _LocalQueue()
+    recorder.rec["v"].append(torch.tensor([1.0, 2.0], device="cuda"))
+
+    recorder.cache_hdf5()
+
+    buffered = recorder.data_pinned["v"]
+    assert buffered.device.type == "cpu"
+    assert buffered.is_pinned()
+    assert buffered.tolist() == [[1.0, 2.0]]
+    assert all(stream.query() for stream in recorder._transfer_streams.values())
+
+
+def test_hdf5_writer_flush_never_touches_cuda(tmp_path, monkeypatch):
+    class UnexpectedTransferStream:
+        def synchronize(self):
+            raise AssertionError("the HDF5 writer process must not synchronize CUDA")
+
+    queue = _LocalQueue()
+    queue.put("flush")
+    queue.put(None)
+    monkeypatch.setattr(callback_module, "TRANSFERSTREAM", UnexpectedTransferStream())
+
+    callback_module._hdf5_write(queue, str(tmp_path / "flush-only.h5"))
+
+    assert queue.completed == 2
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="multiple CUDA GPUs required")
+def test_cuda_cache_uses_a_transfer_stream_on_each_source_device():
+    recorder = Recorder(["v"])
+    recorder.queue = _LocalQueue()
+
+    for device_index in (0, 1):
+        recorder.rec["v"] = [
+            torch.tensor([float(device_index)], device=f"cuda:{device_index}")
+        ]
+        recorder.cache_hdf5()
+
+    assert set(recorder._transfer_streams) == {0, 1}
+    assert {stream.device.index for stream in recorder._transfer_streams.values()} == {
+        0,
+        1,
+    }

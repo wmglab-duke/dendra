@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from dendra.models.mechanisms import Mechanism, State
+from dendra.models.mechanisms import _symbolic as symbolic
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._material_process import (
     ClampProcess,
@@ -13,8 +14,9 @@ from dendra.models.mechanisms._material_process import (
     DiffusionProcess,
     ExchangeProcess,
 )
+from dendra.models.mechanisms.compilers.ast import factorize_linear_in_v
 from dendra.models.mechanisms.ode import differentiate_rhs_2torch_checked
-from dendra.models.mod import expsyn, hh
+from dendra.models.mod import expsyn, hh, pas
 
 
 class _LinearThenExplicit(Mechanism):
@@ -45,6 +47,109 @@ class _QuadraticNumerical(Mechanism):
 
     def i(self, v):
         return v**2
+
+
+class _ExplicitAnalyticPair(Mechanism):
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    def i(self, v):
+        return 3.0 * (v + 2.0)
+
+    def i_with_conductance(self, v):
+        conductance = torch.full_like(v, 3.0)
+        return self.i(v), conductance
+
+
+class _SavedAnalyticPair(_ExplicitAnalyticPair):
+    Mechanism.SAVE("i")
+
+
+class _ReassignedLocalCurrent(Mechanism):
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    def i(self, v):
+        conductance = 2.0
+        current = conductance * v
+        conductance = 3.0
+        return current
+
+
+class _InheritedPas(pas):
+    pass
+
+
+class _DocumentedCurrent(Mechanism):
+    Mechanism.RANGE(g=2.0, e=-5.0)
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    def i(self, v):
+        """A documented current remains eligible for symbolic factorization."""
+        driving_force = v - self.e
+        return self.g * driving_force
+
+
+SYMBOLIC_TEST_SCALE = 2.0
+
+
+class _GlobalConstantCurrent(Mechanism):
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    def i(self, v):
+        return SYMBOLIC_TEST_SCALE * v
+
+
+class _ExplicitAffineWithConflictingDerivativeDeclarations(Mechanism):
+    Mechanism.NONSPECIFIC_CURRENT("i")
+    Mechanism.EXPLICIT("i")
+    Mechanism.NUMERICAL("i")
+
+    def i(self, v):
+        return 4.0 * (v + 3.0)
+
+    def i_with_conductance(self, v):
+        return self.i(v), torch.full_like(v, 4.0)
+
+
+def _double_current(function):
+    def wrapped(self, v):
+        return 2.0 * function(self, v)
+
+    return wrapped
+
+
+class _DecoratedCurrent(Mechanism):
+    Mechanism.RANGE(g=0.5, e=-10.0)
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    @_double_current
+    def i(self, v):
+        return self.g * (v - self.e)
+
+
+class _VoltageIndependentCurrent(Mechanism):
+    Mechanism.RANGE(offset=7.0)
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    def i(self, v):
+        return self.offset
+
+
+class _AlgebraicallyZeroConductance(Mechanism):
+    Mechanism.RANGE(g=2.0, offset=7.0)
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    def i(self, v):
+        return self.g * v - self.g * v + self.offset
+
+
+class _ReassignedVoltageCurrent(Mechanism):
+    Mechanism.RANGE(g=2.0)
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    def i(self, v):
+        original_voltage = v
+        v = 3.0
+        return self.g * original_voltage + 0.0 * v
 
 
 def _mechanism(cls, *, dtype=torch.float64):
@@ -95,6 +200,8 @@ def test_dufort_frankel_factorability_is_per_current_and_order_independent(
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_numerical_current_derivative_is_scale_and_dtype_aware(dtype):
     mechanism = _mechanism(_QuadraticNumerical, dtype=dtype)
+    assert mechanism._current_conductance_mode == {"i": "numerical-declared"}
+    assert mechanism._current_conductance_fallback_reason == {"i": None}
     voltage = torch.tensor([-1.0e4, -70.0, 0.0], dtype=dtype)
 
     current, conductance = mechanism.i_with_g(voltage)
@@ -116,6 +223,173 @@ def test_numerical_current_derivative_rejects_unsupported_low_precision(dtype):
         TypeError, match="supports only torch.float32 and torch.float64"
     ):
         mechanism.i_with_g(torch.tensor([-70.0], dtype=dtype))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_explicit_analytic_current_pair_is_bound_once_and_supports_all_dtypes(dtype):
+    mechanism = _mechanism(_ExplicitAnalyticPair, dtype=dtype)
+    assert mechanism._current_conductance_mode == {"i": "analytic"}
+    assert mechanism.i_with_g.__func__._dendra_conductance_mode == "analytic"
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=dtype)
+
+    current, conductance = mechanism.i_with_g(voltage)
+
+    torch.testing.assert_close(current, 3.0 * (voltage + 2.0))
+    torch.testing.assert_close(conductance, torch.full_like(voltage, 3.0))
+
+
+def test_saved_analytic_current_pair_updates_current_mirror():
+    mechanism = _mechanism(_SavedAnalyticPair)
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=torch.float64)
+
+    current, conductance = mechanism.i_with_g(voltage)
+
+    torch.testing.assert_close(mechanism.i_, current)
+    torch.testing.assert_close(conductance, torch.full_like(voltage, 3.0))
+
+
+def test_symbolic_factorization_honors_statement_time_values_on_reassignment():
+    mechanism = _mechanism(_ReassignedLocalCurrent)
+    assert mechanism._current_conductance_mode == {"i": "symbolic"}
+    assert mechanism._current_conductance_fallback_reason == {"i": None}
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=torch.float64)
+
+    current, conductance = mechanism.i_with_g(voltage)
+
+    torch.testing.assert_close(current, 2.0 * voltage)
+    assert conductance == 2.0
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_inherited_current_is_symbolically_resolved_at_supported_precisions(dtype):
+    mechanism = _mechanism(_InheritedPas, dtype=dtype)
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=dtype)
+
+    current, conductance = mechanism.i_with_g(voltage)
+
+    torch.testing.assert_close(current, mechanism.g * (voltage - mechanism.e))
+    torch.testing.assert_close(conductance, mechanism.g.to(conductance))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_current_method_docstring_does_not_force_numerical_fallback(dtype):
+    mechanism = _mechanism(_DocumentedCurrent, dtype=dtype)
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=dtype)
+
+    current, conductance = mechanism.i_with_g(voltage)
+
+    torch.testing.assert_close(current, mechanism.g * (voltage - mechanism.e))
+    torch.testing.assert_close(conductance, mechanism.g)
+
+
+def test_unresolved_global_symbol_is_rejected_before_code_generation():
+    with pytest.raises(ValueError, match="Unresolved bare symbol.*SYMBOLIC_TEST_SCALE"):
+        factorize_linear_in_v(_GlobalConstantCurrent)
+
+    mechanism = _mechanism(_GlobalConstantCurrent)
+    assert mechanism._current_conductance_mode == {"i": "numerical-fallback"}
+    assert (
+        "Unresolved bare symbol"
+        in (mechanism._current_conductance_fallback_reason["i"])
+    )
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=torch.float64)
+    current, conductance = mechanism.i_with_g(voltage)
+
+    torch.testing.assert_close(current, SYMBOLIC_TEST_SCALE * voltage)
+    torch.testing.assert_close(
+        conductance,
+        torch.full_like(voltage, SYMBOLIC_TEST_SCALE),
+        rtol=1.0e-8,
+        atol=1.0e-8,
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_explicit_declaration_overrides_all_conductance_inference_paths(dtype):
+    mechanism = _mechanism(
+        _ExplicitAffineWithConflictingDerivativeDeclarations, dtype=dtype
+    )
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=dtype)
+
+    current, conductance = mechanism.i_with_g(voltage)
+
+    torch.testing.assert_close(current, mechanism.i(voltage))
+    assert conductance == 0.0
+    assert mechanism._current_conductance_mode == {"i": "explicit"}
+    assert mechanism._current_conductance_fallback_reason == {"i": None}
+    assert mechanism._current_factorable == {"i": False}
+    assert mechanism.factorable is False
+
+
+def test_decorated_current_is_not_misclassified_as_its_undecorated_body():
+    mechanism = _mechanism(_DecoratedCurrent)
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=torch.float64)
+
+    current, conductance = mechanism.i_with_g(voltage)
+    probe = voltage.detach().clone().requires_grad_(True)
+    expected_conductance = torch.autograd.grad(mechanism.i(probe).sum(), probe)[0]
+
+    torch.testing.assert_close(current, mechanism.i(voltage))
+    torch.testing.assert_close(conductance, expected_conductance.expand_as(conductance))
+    assert mechanism._current_conductance_mode == {"i": "numerical-fallback"}
+    assert (
+        "Decorated current methods"
+        in (mechanism._current_conductance_fallback_reason["i"])
+    )
+
+
+@pytest.mark.parametrize(
+    "mechanism_cls", [_VoltageIndependentCurrent, _AlgebraicallyZeroConductance]
+)
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_exact_zero_conductance_currents_remain_symbolic_at_all_dtypes(
+    mechanism_cls, dtype
+):
+    mechanism = _mechanism(mechanism_cls, dtype=dtype)
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=dtype)
+
+    current, conductance = mechanism.i_with_g(voltage)
+
+    torch.testing.assert_close(current, mechanism.i(voltage))
+    assert conductance == 0
+    assert mechanism._current_conductance_mode == {"i": "symbolic"}
+    assert mechanism._current_conductance_fallback_reason == {"i": None}
+
+
+def test_voltage_parameter_reassignment_uses_safe_numerical_fallback():
+    with pytest.raises(ValueError, match="reserved name 'v'"):
+        factorize_linear_in_v(_ReassignedVoltageCurrent)
+
+    mechanism = _mechanism(_ReassignedVoltageCurrent)
+    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=torch.float64)
+
+    current, conductance = mechanism.i_with_g(voltage)
+
+    torch.testing.assert_close(current, mechanism.i(voltage))
+    torch.testing.assert_close(conductance, mechanism.g.to(conductance))
+    assert mechanism._current_conductance_mode == {"i": "numerical-fallback"}
+
+
+def test_unexpected_symbolic_compiler_failures_are_not_silently_downgraded(
+    monkeypatch,
+):
+    def internal_bug(*args, **kwargs):
+        raise AssertionError("compiler invariant failed")
+
+    monkeypatch.setattr(symbolic, "linear_conductance_in_v", internal_bug)
+
+    with pytest.raises(AssertionError, match="compiler invariant failed"):
+        _mechanism(_DocumentedCurrent)
 
 
 @pytest.mark.parametrize("scheme", ["central", "forward", "backward"])
