@@ -2,12 +2,50 @@
 
 import math
 
+import networkx as nx
 import torch
 import torch.nn.functional as F
 
 from dendra.models.integrators import dhs
 
 from .core import Population
+
+
+def _normalize_tree_graph(graph):
+    """Validate a morphology tree and normalize node labels to tensor indices.
+
+    Canonical graphs whose nodes are already ``0..n-1`` are returned unchanged
+    so callers that retain the graph object keep the historical identity
+    contract. Other hashable labels are mapped to ``0..n-1`` in deterministic
+    NetworkX insertion order on a copy of the graph.
+    """
+    if not isinstance(graph, nx.Graph):
+        raise TypeError("Tree.from_graph requires a NetworkX graph.")
+    if not graph.is_directed():
+        raise ValueError("Tree morphology must be a directed graph.")
+    if graph.is_multigraph():
+        raise ValueError("Tree morphology must be a simple directed graph.")
+    if graph.number_of_nodes() == 0:
+        raise ValueError("Tree morphology must contain at least one node.")
+    if any(parent == child for parent, child in graph.edges):
+        raise ValueError("Tree morphology must not contain self-loops.")
+
+    multiple_parents = [node for node, degree in graph.in_degree() if int(degree) > 1]
+    if multiple_parents:
+        raise ValueError(
+            "Every Tree morphology node must have at most one parent; "
+            f"invalid nodes: {multiple_parents!r}."
+        )
+    if not nx.is_directed_acyclic_graph(graph):
+        raise ValueError("Tree morphology must be acyclic.")
+    if not nx.is_weakly_connected(graph):
+        raise ValueError("Tree morphology must be connected, not a forest.")
+
+    nodes = list(graph.nodes)
+    if set(nodes) == set(range(len(nodes))):
+        return graph
+    mapping = {node: index for index, node in enumerate(nodes)}
+    return nx.relabel_nodes(graph, mapping, copy=True)
 
 
 def _as_float(value, *, name: str, node=None, default=None) -> float:
@@ -343,7 +381,9 @@ class Tree(Population):
         Parameters
         ----------
         graph : networkx.DiGraph
-            Graph describing compartment connectivity.
+            Connected directed tree describing compartment connectivity. Node
+            labels that are not already ``0..n-1`` are deterministically
+            relabelled in graph insertion order on an internal copy.
         N : int, optional
             Number of population instances. Defaults to ``1``.
         integrator : callable, optional
@@ -355,7 +395,14 @@ class Tree(Population):
         -------
         Tree
             Configured tree population.
+
+        Raises
+        ------
+        ValueError
+            If the graph is empty, cyclic, disconnected, contains a self-loop,
+            or gives a node more than one parent.
         """
+        graph = _normalize_tree_graph(graph)
         C = len(graph.nodes)
         data = gather_morphology(graph)
         diffusion_edges = gather_diffusion_edges(graph)
@@ -363,13 +410,22 @@ class Tree(Population):
         membrane.update(kwargs)
         tree = cls(N, C, graph, integrator, **membrane)
         for key, value in data.items():
-            tree.register_buffer(key, value.expand(N, -1).clone().to(tree.dtype()))
+            tree.register_buffer(
+                key,
+                value.expand(N, -1)
+                .clone()
+                .to(device=tree.device(), dtype=tree.dtype()),
+            )
         for key, value in diffusion_edges.items():
             if value.dtype.is_floating_point:
                 if value.ndim == 2:
-                    value = value.expand(N, -1).clone().to(tree.dtype())
+                    value = (
+                        value.expand(N, -1)
+                        .clone()
+                        .to(device=tree.device(), dtype=tree.dtype())
+                    )
                 else:
-                    value = value.clone().to(tree.dtype())
+                    value = value.clone().to(device=tree.device(), dtype=tree.dtype())
             else:
                 value = value.clone().to(device=tree.device())
             tree.register_buffer(key, value)
@@ -615,14 +671,14 @@ class Tree(Population):
         return self.recentre(x, y, z, origin)
 
     def _get_points_as_tensor(self) -> torch.Tensor:
-        """Helper to stack x, y, z into a (B, N, 3) tensor."""
-        return torch.stack([self.x, self.y, self.z], dim=2)
+        """Stack coordinates as ``(..., neuron, compartment, xyz)``."""
+        return torch.stack([self.x, self.y, self.z], dim=-1)
 
     def _update_points_from_tensor(self, points: torch.Tensor):
-        """Helper to un-stack a (B, N, 3) tensor back into x, y, z buffers."""
-        self.x.copy_(points[:, :, 0])
-        self.y.copy_(points[:, :, 1])
-        self.z.copy_(points[:, :, 2])
+        """Copy a trailing xyz coordinate dimension back into model buffers."""
+        self.x.copy_(points[..., 0])
+        self.y.copy_(points[..., 1])
+        self.z.copy_(points[..., 2])
 
     def _apply_rotation(self, rotation_matrices: torch.Tensor, origin_idx: int):
         """
@@ -634,18 +690,17 @@ class Tree(Population):
         """
         points = self._get_points_as_tensor()
 
-        # 1. Get the origin for each cell in the batch
-        # Shape: (B, 3) -> unsqueeze to (B, 1, 3) for broadcasting
-        origins = points[:, origin_idx, :].clone().unsqueeze(1)
+        # Select the compartment axis while preserving any leading parameter
+        # batches and the physical-neuron axis.
+        origins = points[..., origin_idx, :].clone().unsqueeze(-2)
 
         # 2. Translate points so the origin is at (0,0,0)
         points_centered = points - origins
 
-        # 3. Apply the batch of rotations
-        # (B, N, 3) @ (B, 3, 3) -> (B, N, 3)
-        # We need to transpose the rotation matrices for matmul with (B,N,3)
+        # Apply one rotation per physical neuron, broadcasting it over any
+        # leading parameter-batch dimensions and all compartments.
         rotated_points_centered = points_centered @ rotation_matrices.transpose(
-            1, 2
+            -1, -2
         ).to(points.dtype)
 
         # 4. Translate points back
@@ -842,9 +897,9 @@ class Tree(Population):
         if origin is None:
             origin = self.find("soma", as_list=True)
             origin = origin[int(len(origin) / 2)]
-        x_c = self.x[:, origin]
-        y_c = self.y[:, origin]
-        z_c = self.z[:, origin]
+        x_c = self.x[..., origin]
+        y_c = self.y[..., origin]
+        z_c = self.z[..., origin]
 
         # Reset directions to the base direction
         self.directions.copy_(self.base_direction.expand(self.np, -1))
@@ -856,16 +911,16 @@ class Tree(Population):
         base_y = morph["y"].to(dtype=self.y.dtype, device=self.y.device)
         base_z = morph["z"].to(dtype=self.z.dtype, device=self.z.device)
         self.x.copy_(
-            (base_x - base_x[..., origin].unsqueeze(-1)).expand(self.np, -1)
-            + x_c.unsqueeze(1)
+            (base_x - base_x[..., origin].unsqueeze(-1)).expand_as(self.x)
+            + x_c.unsqueeze(-1)
         )
         self.y.copy_(
-            (base_y - base_y[..., origin].unsqueeze(-1)).expand(self.np, -1)
-            + y_c.unsqueeze(1)
+            (base_y - base_y[..., origin].unsqueeze(-1)).expand_as(self.y)
+            + y_c.unsqueeze(-1)
         )
         self.z.copy_(
-            (base_z - base_z[..., origin].unsqueeze(-1)).expand(self.np, -1)
-            + z_c.unsqueeze(1)
+            (base_z - base_z[..., origin].unsqueeze(-1)).expand_as(self.z)
+            + z_c.unsqueeze(-1)
         )
 
         return self

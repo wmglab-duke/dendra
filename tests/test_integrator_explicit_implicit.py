@@ -14,8 +14,6 @@ from dendra.models.integrators.explicit import (
     _rk2,
     _rk4,
     ssd_df,
-    ssd_df_heterogeneous,
-    ssd_df_heterogeneous_no_ve,
     ssd_df_no_ve,
 )
 from dendra.models.integrators.implicit import (
@@ -239,31 +237,6 @@ def test_spatial_stencils_have_known_reflect_boundary_values_and_batched_shapes(
 
     assert torch.allclose(ssd_df_no_ve(current, previous), expected_no_ve)
     assert torch.allclose(ssd_df(current, previous, extracellular), expected)
-
-
-def test_heterogeneous_spatial_stencils_match_manual_flux_weighting_and_gradients():
-    current = torch.tensor([[1.0, 3.0, 2.0, 5.0]], dtype=DTYPE, requires_grad=True)
-    previous = torch.tensor([[0.5, 2.0, 1.5, 4.0]], dtype=DTYPE)
-    extracellular = torch.tensor([[0.0, 0.5, 1.0, -0.5]], dtype=DTYPE)
-    left = torch.tensor([[0.2, 0.3, 0.4, 0.5]], dtype=DTYPE)
-    right = torch.tensor([[0.7, 0.6, 0.5, 0.4]], dtype=DTYPE)
-    cp = F.pad(current, (1, 1), mode="reflect")
-    ep = F.pad(extracellular, (1, 1), mode="reflect")
-    expected_no_ve = left * cp[:, :-2] + right * cp[:, 2:] - (left + right) * previous
-    expected = (
-        expected_no_ve
-        + left * ep[:, :-2]
-        + right * ep[:, 2:]
-        - (left + right) * extracellular
-    )
-
-    assert torch.allclose(
-        ssd_df_heterogeneous_no_ve(current, previous, left, right), expected_no_ve
-    )
-    actual = ssd_df_heterogeneous(current, previous, extracellular, left, right)
-    assert torch.allclose(actual, expected)
-    actual.square().sum().backward()
-    assert current.grad is not None and torch.isfinite(current.grad).all()
 
 
 def test_spatial_stencils_support_a_single_compartment_as_a_sealed_boundary():

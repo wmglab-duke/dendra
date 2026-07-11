@@ -199,7 +199,7 @@ def _dense_reference(multi, mechanism, voltage, dt, *, ve=None, intra=None):
             ve_group = ve_flat[:, offset : offset + width].reshape(group_shape)
             rhs = rhs.clone()
             for parent, child, edge_g in axial:
-                edge_current = (ve_group[..., parent] - ve_group[..., child]) * edge_g
+                edge_current = (ve_group[..., child] - ve_group[..., parent]) * edge_g
                 rhs[..., child] -= edge_current
                 rhs[..., parent] += edge_current
 

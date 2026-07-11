@@ -372,7 +372,11 @@ def _edge_currents(
     ve: torch.Tensor,
 ):  # (B,K)
     # diff shape (B,E)
-    diff = ve.index_select(1, edge_parent) - ve.index_select(1, edge_child)
+    # ``v`` is transmembrane voltage, while axial current is driven by the
+    # intracellular potential ``v + ve``.  The extracellular contribution on
+    # an oriented parent -> child edge is therefore g * (ve_child - ve_parent):
+    # it enters the parent RHS and leaves the child RHS.
+    diff = ve.index_select(1, edge_child) - ve.index_select(1, edge_parent)
     return diff * edge_gax
 
 
@@ -1237,11 +1241,12 @@ class _dhs_multi(MultiIntegrator):
         # --- extracellular coupling (ve), vectorized on flattened indices) ---
         if ve is not None and self.EDGE_CHILD_IDX_FLAT.numel() > 0:
             ve_flat = _broadcast_to_shape(ve, tuple(orig_shape)).reshape(P, N_total)
-            # edge potential differences per (outer batch row, edge)
-            dV_edge = ve_flat.index_select(
-                1, self.EDGE_PARENT_IDX_FLAT
-            ) - ve_flat.index_select(1, self.EDGE_CHILD_IDX_FLAT)
-            I_edge = dV_edge * self.EDGE_GAX_FLAT
+            I_edge = _edge_currents(
+                self.EDGE_CHILD_IDX_FLAT,
+                self.EDGE_PARENT_IDX_FLAT,
+                self.EDGE_GAX_FLAT,
+                ve_flat,
+            )
 
             S_flat = torch.zeros_like(f_n_flat)
             edge_child = self.EDGE_CHILD_IDX_FLAT.unsqueeze(0).expand(P, -1)

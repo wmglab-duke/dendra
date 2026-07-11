@@ -1397,7 +1397,9 @@ class NetCon(Referency):
             ``"bitpacked_history"`` is an inference-only source-spike history
             backend for large SNNs: it stores only packed source spikes over the
             delay horizon and reconstructs the dense postsynaptic receive payload
-            with Triton kernels when available.
+            with a lazy C++/CUDA extension on eligible CUDA paths, falling back
+            to PyTorch otherwise. The separate Triton implementation is an
+            experimental/reference path and is not selected automatically.
         train_delay_backend : {"dense", "source_history", "auto"}, optional
             Differentiable training delay backend. ``"dense"`` preserves the
             fully general dense differentiable delay buffer. ``"source_history"``
@@ -3317,7 +3319,7 @@ class NetCon(Referency):
             return
 
         # Pure-PyTorch fallback.  This is correct and memory-light in source
-        # space, but the Triton kernels are the intended hot path.
+        # space; the lazy C++/CUDA extension above is the normal CUDA hot path.
         slot = int(cur_idx.item())
         row = self.spike_history_packed[slot]
         row.zero_()
@@ -3335,8 +3337,11 @@ class NetCon(Referency):
             return scratch
 
         # Pure-PyTorch fallback.  It allocates connection-sized gate/values, so it
-        # is mainly for CPU, tests, and installations where Triton is not
-        # available.
+        # is mainly for CPU, tests, and installations where the C++/CUDA extension
+        # is unavailable or cannot handle the current launch. A failed native
+        # launch may have written a partial result before reporting failure, so
+        # reset the output again before constructing the complete fallback result.
+        scratch.zero_()
         rows = (cur_idx - self.inference_delay_steps).remainder(self.max_delay_steps)
         words = self.spike_history_packed[rows.reshape(-1), self.bitpack_conn_word_idx]
         gate = torch.bitwise_and(words, self.bitpack_conn_bit_mask) != 0

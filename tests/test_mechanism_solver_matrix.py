@@ -25,11 +25,7 @@ from dendra.models.mechanisms._kinetic import (
 from dendra.models.mechanisms._linearimplicit import build_linearimplicit
 from dendra.models.mechanisms._rosenbrock import build_rosenbrock1
 from dendra.models.mechanisms._solvers import _solve_linear_small
-from dendra.models.mechanisms.compilers.ast import (
-    factor_linear_in_x_from_codeblock,
-    factorize_linear_in_v,
-    replace_v,
-)
+from dendra.models.mechanisms.compilers.ast import factorize_linear_in_v
 from dendra.models.mechanisms.compilers.source import safe_source
 
 DTYPE = torch.float64
@@ -722,17 +718,13 @@ def test_compiler_factorizes_straight_line_current():
     assert reversal == "self.erev"
 
 
-def test_compiler_factorization_helpers_and_source():
+def test_compiler_factorization_and_source():
     source = """
     class Current:
         def i(self, v):
             return 2 * v - 6
     """
     assert factorize_linear_in_v(source) == ("2", "3")
-    assert replace_v("v + vtrap + self.v") == "(v + v_n) / 2 + vtrap + self.v"
-    assert factor_linear_in_x_from_codeblock(
-        "a = self.g * 2\nreturn a + self.h * v_n", x_var="v_n"
-    ) == ("2*self.g", "self.h")
 
     class Plain:
         def method(self):
@@ -754,5 +746,3 @@ def test_compiler_rejects_unsupported_or_non_linear_current():
         factorize_linear_in_v(
             "class Bad:\n    def i(self, v):\n        return v**2 + v"
         )
-    with pytest.raises(ValueError, match="not linear"):
-        factor_linear_in_x_from_codeblock("return v_n**2", x_var="v_n")

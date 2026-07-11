@@ -1,8 +1,11 @@
-"""Optional Triton kernels for NetCon bitpacked source-spike history.
+"""Experimental Triton kernels for NetCon bitpacked source-spike history.
 
-The NetCon bitpacked-history backend falls back to pure PyTorch when Triton is
-not importable or when a launch fails, so importing Dendra does not require
-Triton.  Kernels are defined lazily on first use.
+Normal ``NetCon`` operation does not dispatch to this module. Eligible CUDA
+workloads first try the lazy C++/CUDA extension in ``netcon_bitpack_ops`` and
+fall back to PyTorch when it is unavailable or a launch fails. This module is
+retained as an opt-in alternative and reference implementation; callers must
+invoke it directly. Importing Dendra does not require Triton, and these kernels
+are defined lazily on first direct use.
 """
 
 from __future__ import annotations

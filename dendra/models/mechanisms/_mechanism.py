@@ -7,6 +7,10 @@ from typing import Dict
 import torch
 
 from dendra.helpers import classproperty
+from dendra.models._class_declarations import (
+    consume_class_values,
+    declare_class_value,
+)
 from dendra.models.parametric import Parameterized
 
 from ._ions import VALENCES
@@ -348,66 +352,72 @@ class Mechanism(Parameterized):
             if "_numerical" in base.__dict__:
                 new_numerical.update(base._numerical)
 
-        if Mechanism._state_declarations:
-            for s_list in Mechanism._state_declarations:
-                new_state.update(s_list)
-            Mechanism._state_declarations = []  # Clear for next class
-        if Mechanism._ion_declarations:
-            for i_list in Mechanism._ion_declarations:
-                new_ion.update(i_list)
-            Mechanism._ion_declarations = []
-        if Mechanism._material_declarations:
-            for m_list in Mechanism._material_declarations:
-                new_material.update(m_list)
-            Mechanism._material_declarations = []
-        if Mechanism._save_declarations:
-            for s_list in Mechanism._save_declarations:
-                new_save.update(s_list)
-            Mechanism._save_declarations = []
-        if Mechanism._assigned_declarations:
-            for a_list in Mechanism._assigned_declarations:
-                new_assigned.update(a_list)
-            Mechanism._assigned_declarations = []
-        if Mechanism._read_ion_declarations:
-            for r_dict in Mechanism._read_ion_declarations:
-                new_read_ion.update(r_dict)
-            Mechanism._read_ion_declarations = []
-        if Mechanism._write_ion_declarations:
-            for w_dict in Mechanism._write_ion_declarations:
-                new_write_ion.update(w_dict)
-            Mechanism._write_ion_declarations = []
-        if Mechanism._write_ion_c_declarations:
-            for w_dict in Mechanism._write_ion_c_declarations:
-                new_write_ion_c.update(w_dict)
-            Mechanism._write_ion_c_declarations = []
-        if Mechanism._read_material_declarations:
-            for r_dict in Mechanism._read_material_declarations:
-                _merge_list_dict(new_read_material, r_dict)
-            Mechanism._read_material_declarations = []
-        if Mechanism._write_material_declarations:
-            for w_dict in Mechanism._write_material_declarations:
-                _merge_list_dict(new_write_material, w_dict)
-            Mechanism._write_material_declarations = []
-        if Mechanism._source_material_declarations:
-            for s_dict in Mechanism._source_material_declarations:
-                _merge_nested_dict(new_source_material, s_dict)
-            Mechanism._source_material_declarations = []
-        if Mechanism._currents_declarations:
-            for c_list in Mechanism._currents_declarations:
-                new_currents.setdefault("nonspecific", []).extend(c_list)
-            Mechanism._currents_declarations = []
-        if Mechanism._init_declarations:
-            for i_dict in Mechanism._init_declarations:
-                new_init.update(i_dict)
-            Mechanism._init_declarations = []
-        if Mechanism._explicit_declarations:
-            for v_list in Mechanism._explicit_declarations:
-                new_explicit.update(v_list)
-            Mechanism._explicit_declarations = []
-        if Mechanism._numerical_declarations:
-            for v_list in Mechanism._numerical_declarations:
-                new_numerical.update(v_list)
-            Mechanism._numerical_declarations = []
+        for s_list in consume_class_values(
+            cls, "mechanism.state", Mechanism._state_declarations
+        ):
+            new_state.update(s_list)
+        for i_list in consume_class_values(
+            cls, "mechanism.ion", Mechanism._ion_declarations
+        ):
+            new_ion.update(i_list)
+        for m_list in consume_class_values(
+            cls, "mechanism.material", Mechanism._material_declarations
+        ):
+            new_material.update(m_list)
+        for s_list in consume_class_values(
+            cls, "mechanism.save", Mechanism._save_declarations
+        ):
+            new_save.update(s_list)
+        for a_list in consume_class_values(
+            cls, "mechanism.assigned", Mechanism._assigned_declarations
+        ):
+            new_assigned.update(a_list)
+        for r_dict in consume_class_values(
+            cls, "mechanism.read_ion", Mechanism._read_ion_declarations
+        ):
+            new_read_ion.update(r_dict)
+        for w_dict in consume_class_values(
+            cls, "mechanism.write_ion", Mechanism._write_ion_declarations
+        ):
+            new_write_ion.update(w_dict)
+        for w_dict in consume_class_values(
+            cls, "mechanism.write_ion_c", Mechanism._write_ion_c_declarations
+        ):
+            new_write_ion_c.update(w_dict)
+        for r_dict in consume_class_values(
+            cls,
+            "mechanism.read_material",
+            Mechanism._read_material_declarations,
+        ):
+            _merge_list_dict(new_read_material, r_dict)
+        for w_dict in consume_class_values(
+            cls,
+            "mechanism.write_material",
+            Mechanism._write_material_declarations,
+        ):
+            _merge_list_dict(new_write_material, w_dict)
+        for s_dict in consume_class_values(
+            cls,
+            "mechanism.source_material",
+            Mechanism._source_material_declarations,
+        ):
+            _merge_nested_dict(new_source_material, s_dict)
+        for c_list in consume_class_values(
+            cls, "mechanism.currents", Mechanism._currents_declarations
+        ):
+            new_currents.setdefault("nonspecific", []).extend(c_list)
+        for i_dict in consume_class_values(
+            cls, "mechanism.init", Mechanism._init_declarations
+        ):
+            new_init.update(i_dict)
+        for v_list in consume_class_values(
+            cls, "mechanism.explicit", Mechanism._explicit_declarations
+        ):
+            new_explicit.update(v_list)
+        for v_list in consume_class_values(
+            cls, "mechanism.numerical", Mechanism._numerical_declarations
+        ):
+            new_numerical.update(v_list)
 
         cls.state_classes = {s.__name__: s for s in new_state}
 
@@ -551,8 +561,8 @@ class Mechanism(Parameterized):
             self.add = lambda add_to, add_what: add_to.add(add_what)
             self.put = self.put_no_op
         elif self.is_composable:
-            self.get = (
-                lambda tensor: tensor[..., *self.key] if tensor.ndim > 0 else tensor
+            self.get = lambda tensor: (
+                tensor[..., *self.key] if tensor.ndim > 0 else tensor
             )
             self.add_ = lambda add_to, add_what: add_to[..., *self.key].add_(add_what)
             self.add = lambda add_to, add_what: add_to[..., *self.key].add(add_what)
@@ -610,6 +620,7 @@ class Mechanism(Parameterized):
         self._all_states += [a for a in self._assigned]
 
         # factorize current equations
+        self._current_factorable = {}
         current_eqs = []
         for _, v in self._currents.items():
             current_eqs.extend(v)
@@ -621,7 +632,11 @@ class Mechanism(Parameterized):
             eq, factorable = build_current_eq(self, k, assign=assign)
             setattr(self, f"{k}_with_g", MethodType(eq, self))
             setattr(getattr(self.__class__, k), "factorable", factorable)
-            setattr(self, "factorable", factorable)
+            self._current_factorable[k] = bool(factorable)
+
+        # Retain the legacy aggregate attribute for downstream callers while
+        # keeping the per-current truth needed by mixed mechanisms.
+        self.factorable = all(self._current_factorable.values())
 
         self.populate()
         self.instantiate_tables()
@@ -920,7 +935,7 @@ class Mechanism(Parameterized):
         *args : type
             State module classes registered to ``Mechanism._state``.
         """
-        Mechanism._state_declarations.append(args)
+        declare_class_value("mechanism.state", args, Mechanism._state_declarations)
 
     @staticmethod
     def BUFFER(*args):
@@ -938,7 +953,9 @@ class Mechanism(Parameterized):
         *args : str
             Names of mechanism buffers to allocate per instance.
         """
-        Mechanism._assigned_declarations.append(args)
+        declare_class_value(
+            "mechanism.assigned", args, Mechanism._assigned_declarations
+        )
 
     @staticmethod
     def ASSIGNED(*args):
@@ -968,7 +985,7 @@ class Mechanism(Parameterized):
         *args : str
             Names of buffers mirrored with a trailing underscore.
         """
-        Mechanism._save_declarations.append(args)
+        declare_class_value("mechanism.save", args, Mechanism._save_declarations)
 
     @staticmethod
     def USEION(ion, read=None, write=None):
@@ -1017,7 +1034,9 @@ class Mechanism(Parameterized):
             assert w in valid, f"write {w} is not valid"
 
         if read:
-            Mechanism._read_ion_declarations.append({ion: read})
+            declare_class_value(
+                "mechanism.read_ion", {ion: read}, Mechanism._read_ion_declarations
+            )
 
         if write:
             c_write = []
@@ -1029,9 +1048,17 @@ class Mechanism(Parameterized):
                     other.append(w)
 
             if c_write:
-                Mechanism._write_ion_c_declarations.append({ion: c_write})
+                declare_class_value(
+                    "mechanism.write_ion_c",
+                    {ion: c_write},
+                    Mechanism._write_ion_c_declarations,
+                )
             if other:
-                Mechanism._write_ion_declarations.append({ion: other})
+                declare_class_value(
+                    "mechanism.write_ion",
+                    {ion: other},
+                    Mechanism._write_ion_declarations,
+                )
 
     @staticmethod
     def USEMATERIAL(material, read=None, write=None, source=None):
@@ -1067,14 +1094,28 @@ class Mechanism(Parameterized):
             return
 
         material = str(material)
-        Mechanism._material_declarations.append((material,))
+        declare_class_value(
+            "mechanism.material", (material,), Mechanism._material_declarations
+        )
 
         if read:
-            Mechanism._read_material_declarations.append({material: read})
+            declare_class_value(
+                "mechanism.read_material",
+                {material: read},
+                Mechanism._read_material_declarations,
+            )
         if write:
-            Mechanism._write_material_declarations.append({material: write})
+            declare_class_value(
+                "mechanism.write_material",
+                {material: write},
+                Mechanism._write_material_declarations,
+            )
         if source_map:
-            Mechanism._source_material_declarations.append({material: source_map})
+            declare_class_value(
+                "mechanism.source_material",
+                {material: source_map},
+                Mechanism._source_material_declarations,
+            )
 
     @staticmethod
     def NONSPECIFIC_CURRENT(*args):
@@ -1086,7 +1127,9 @@ class Mechanism(Parameterized):
         *args : str
             Current names to register as non-specific.
         """
-        Mechanism._currents_declarations.append(args)
+        declare_class_value(
+            "mechanism.currents", args, Mechanism._currents_declarations
+        )
 
     @staticmethod
     def INIT(**kwargs):
@@ -1098,7 +1141,7 @@ class Mechanism(Parameterized):
         **kwargs
             Mapping from state names to scalar initial conditions.
         """
-        Mechanism._init_declarations.append(kwargs)
+        declare_class_value("mechanism.init", kwargs, Mechanism._init_declarations)
 
     @staticmethod
     def EXPLICIT(*args):
@@ -1110,7 +1153,9 @@ class Mechanism(Parameterized):
         *args : str
             Current names that should not contribute to conductance terms.
         """
-        Mechanism._explicit_declarations.append(args)
+        declare_class_value(
+            "mechanism.explicit", args, Mechanism._explicit_declarations
+        )
 
     @staticmethod
     def NUMERICAL(*args):
@@ -1122,7 +1167,9 @@ class Mechanism(Parameterized):
         *args : str
             Current names that should be numerically differentiated.
         """
-        Mechanism._numerical_declarations.append(args)
+        declare_class_value(
+            "mechanism.numerical", args, Mechanism._numerical_declarations
+        )
 
     def breakpoint(self, v):
         """
@@ -2713,14 +2760,18 @@ class ContinuousSynapse(Mechanism):
             if "_continuous_input_old" in base.__dict__:
                 old_map.update(dict(base._continuous_input_old))
 
-        for names, keep_old in ContinuousSynapse._continuous_input_declarations:
+        declarations = consume_class_values(
+            cls,
+            "continuous_synapse.inputs",
+            ContinuousSynapse._continuous_input_declarations,
+        )
+        for names, keep_old in declarations:
             for name in names:
                 if name not in inputs:
                     inputs.append(name)
                 if keep_old:
                     old_map[name] = f"{name}_old"
 
-        ContinuousSynapse._continuous_input_declarations = []
         cls._continuous_inputs = tuple(inputs)
         cls._continuous_input_old = old_map
 
@@ -2753,7 +2804,11 @@ class ContinuousSynapse(Mechanism):
         if keep_old:
             assigned.extend(f"{name}_old" for name in names)
         Mechanism.BUFFER(*assigned)
-        ContinuousSynapse._continuous_input_declarations.append((names, bool(keep_old)))
+        declare_class_value(
+            "continuous_synapse.inputs",
+            (names, bool(keep_old)),
+            ContinuousSynapse._continuous_input_declarations,
+        )
 
     def reset_continuous_inputs(self):
         """Reset continuous input buffers before new analog deliveries.

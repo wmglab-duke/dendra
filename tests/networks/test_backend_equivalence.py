@@ -203,6 +203,35 @@ def test_bitpacked_history_crosses_the_63_bit_word_boundary():
     )
 
 
+def test_failed_native_bitpack_delivery_does_not_contaminate_torch_fallback(
+    monkeypatch,
+):
+    _, netcon = _fan_network("bitpacked_history")
+    active_word = int(netcon.bitpack_source_bit_mask.sum().item())
+    netcon.spike_history_packed.fill_(active_word)
+    scratch = torch.empty(netcon._syn_numel, dtype=netcon.dtype)
+
+    def partially_writing_failure(_cur_idx, output):
+        output.fill_(1000.0)
+        return False
+
+    monkeypatch.setattr(
+        netcon,
+        "_try_bitpack_delivery_kernel",
+        partially_writing_failure,
+    )
+
+    actual = netcon._bitpack_build_delivery_from_history(
+        netcon.current_time_step,
+        scratch,
+    )
+    expected = torch.zeros_like(scratch)
+    expected.index_add_(0, netcon.post_idx, netcon.weight())
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual, torch.tensor([9.0, 12.0], dtype=actual.dtype))
+
+
 def test_bitpacked_state_cache_resumes_pending_intrinsic_and_scheduled_events():
     original, original_netcon = _fan_network("bitpacked_history")
     original_netcon.schedule(con_indices=[5], times_ms=[0.0], weight=2.0)

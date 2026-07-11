@@ -20,6 +20,7 @@ from dendra.helpers import (
 from dendra.utils import PreparedInterp1d
 from dendra.utils.dynamic_compilation import compile_generated_function
 
+from ._class_declarations import consume_class_values, declare_class_value
 from .modular import DNModule, matches_any_pattern
 from .random_parameters import (
     RandomParameterSpec,
@@ -1123,22 +1124,30 @@ class SimpleParameterized(Referency):
         cls._params_n_defined_here = {}
         cls._flags_defined_here = {}
 
-        if SimpleParameterized._params_declarations:
-            for p_dict in SimpleParameterized._params_declarations:
-                cls._params_defined_here.update(p_dict)
-            SimpleParameterized._params_declarations = []
-        if SimpleParameterized._params_p_declarations:
-            for pp_dict in SimpleParameterized._params_p_declarations:
-                cls._params_p_defined_here.update(pp_dict)
-            SimpleParameterized._params_p_declarations = []
-        if SimpleParameterized._params_n_declarations:
-            for pn_dict in SimpleParameterized._params_n_declarations:
-                cls._params_n_defined_here.update(pn_dict)
-            SimpleParameterized._params_n_declarations = []
-        if SimpleParameterized._flags_declarations:
-            for f_dict in SimpleParameterized._flags_declarations:
-                cls._flags_defined_here.update(f_dict)
-            SimpleParameterized._flags_declarations = []
+        for p_dict in consume_class_values(
+            cls,
+            "simple_parameterized.params",
+            SimpleParameterized._params_declarations,
+        ):
+            cls._params_defined_here.update(p_dict)
+        for pp_dict in consume_class_values(
+            cls,
+            "simple_parameterized.params_p",
+            SimpleParameterized._params_p_declarations,
+        ):
+            cls._params_p_defined_here.update(pp_dict)
+        for pn_dict in consume_class_values(
+            cls,
+            "simple_parameterized.params_n",
+            SimpleParameterized._params_n_declarations,
+        ):
+            cls._params_n_defined_here.update(pn_dict)
+        for f_dict in consume_class_values(
+            cls,
+            "simple_parameterized.flags",
+            SimpleParameterized._flags_declarations,
+        ):
+            cls._flags_defined_here.update(f_dict)
 
         new_params.update(cls._params_defined_here)
         new_params_p.update(cls._params_p_defined_here)
@@ -1288,7 +1297,11 @@ class SimpleParameterized(Referency):
             flattened (no shape metadata); use :class:`Parameterized` for
             GLOBAL/RANGE/RNG categories when population-aware shapes are needed.
         """
-        SimpleParameterized._params_declarations.append(kwargs)
+        declare_class_value(
+            "simple_parameterized.params",
+            kwargs,
+            SimpleParameterized._params_declarations,
+        )
 
     @staticmethod
     def PARAMETERP(**kwargs):
@@ -1302,7 +1315,11 @@ class SimpleParameterized(Referency):
             flattened (no shape metadata); use :class:`Parameterized` for
             GLOBAL/RANGE/RNG categories when population-aware shapes are needed.
         """
-        SimpleParameterized._params_p_declarations.append(kwargs)
+        declare_class_value(
+            "simple_parameterized.params_p",
+            kwargs,
+            SimpleParameterized._params_p_declarations,
+        )
 
     @staticmethod
     def FLAG(**kwargs):
@@ -1314,7 +1331,11 @@ class SimpleParameterized(Referency):
         **kwargs
             Flag names with default boolean values.
         """
-        SimpleParameterized._flags_declarations.append(kwargs)
+        declare_class_value(
+            "simple_parameterized.flags",
+            kwargs,
+            SimpleParameterized._flags_declarations,
+        )
 
     def device(self):
         """
@@ -1862,62 +1883,74 @@ class Parameterized(SimpleParameterized):
         cls._batch_n_defined_here = {}
 
         # Add parameters declared via the GLOBAL() method
-        if Parameterized._global_declarations:
-            for p_dict in Parameterized._global_declarations:
-                cls._global_defined_here.update(p_dict)
-            Parameterized._global_declarations = []  # Clear for next class
+        for p_dict in consume_class_values(
+            cls, "parameterized.global", Parameterized._global_declarations
+        ):
+            cls._global_defined_here.update(p_dict)
         # Add parameters declared via the GLOBALP() method
-        if Parameterized._global_p_declarations:
-            for p_dict in Parameterized._global_p_declarations:
-                cls._global_p_defined_here.update(p_dict)
-            Parameterized._global_p_declarations = []
+        for p_dict in consume_class_values(
+            cls, "parameterized.global_p", Parameterized._global_p_declarations
+        ):
+            cls._global_p_defined_here.update(p_dict)
         # Add negative global declarations
-        if Parameterized._global_n_declarations:
-            for n_dict in Parameterized._global_n_declarations:
-                cls._global_n_defined_here.update(n_dict)
-            Parameterized._global_n_declarations = []
+        for n_dict in consume_class_values(
+            cls, "parameterized.global_n", Parameterized._global_n_declarations
+        ):
+            cls._global_n_defined_here.update(n_dict)
         # Add range declarations
-        if Parameterized._range_declarations:
-            for r_dict in Parameterized._range_declarations:
-                cls._range_defined_here.update(r_dict)
-            Parameterized._range_declarations = []
+        for r_dict in consume_class_values(
+            cls, "parameterized.range", Parameterized._range_declarations
+        ):
+            cls._range_defined_here.update(r_dict)
         # Add parameters declared via the RANGEP() method
-        if Parameterized._range_p_declarations:
-            for r_dict in Parameterized._range_p_declarations:
-                cls._range_p_defined_here.update(r_dict)
-            Parameterized._range_p_declarations = []
+        for r_dict in consume_class_values(
+            cls, "parameterized.range_p", Parameterized._range_p_declarations
+        ):
+            cls._range_p_defined_here.update(r_dict)
         # Add batch declarations
-        if Parameterized._batch_declarations:
-            for b_dict in Parameterized._batch_declarations:
-                cls._batch_defined_here.update(b_dict)
-            Parameterized._batch_declarations = []
+        for b_dict in consume_class_values(
+            cls, "parameterized.batch", Parameterized._batch_declarations
+        ):
+            cls._batch_defined_here.update(b_dict)
         # Add parameters declared via the BATCHP() method
-        if Parameterized._batch_p_declarations:
-            for b_dict in Parameterized._batch_p_declarations:
-                cls._batch_p_defined_here.update(b_dict)
-            Parameterized._batch_p_declarations = []
+        for b_dict in consume_class_values(
+            cls, "parameterized.batch_p", Parameterized._batch_p_declarations
+        ):
+            cls._batch_p_defined_here.update(b_dict)
         # Add negative range declarations
-        if Parameterized._range_n_declarations:
-            for n_dict in Parameterized._range_n_declarations:
-                cls._range_n_defined_here.update(n_dict)
-            Parameterized._range_n_declarations = []
+        for n_dict in consume_class_values(
+            cls, "parameterized.range_n", Parameterized._range_n_declarations
+        ):
+            cls._range_n_defined_here.update(n_dict)
         # Add negative batch declarations
-        if Parameterized._batch_n_declarations:
-            for n_dict in Parameterized._batch_n_declarations:
-                cls._batch_n_defined_here.update(n_dict)
-            Parameterized._batch_n_declarations = []
+        for n_dict in consume_class_values(
+            cls, "parameterized.batch_n", Parameterized._batch_n_declarations
+        ):
+            cls._batch_n_defined_here.update(n_dict)
         # Add rng declarations
-        if Parameterized._rng_declarations:
-            for rng_dict in Parameterized._rng_declarations:
-                cls._rng_defined_here.update(rng_dict)
-            Parameterized._rng_declarations = []
+        for rng_dict in consume_class_values(
+            cls, "parameterized.rng", Parameterized._rng_declarations
+        ):
+            cls._rng_defined_here.update(rng_dict)
 
         # Add stochastic parameter declarations. Distribution parameters are
         # exposed as ordinary GLOBAL/RANGE/BATCH parameters.
         for declarations in (
-            Parameterized._global_rand_declarations,
-            Parameterized._range_rand_declarations,
-            Parameterized._batch_rand_declarations,
+            consume_class_values(
+                cls,
+                "parameterized.global_rand",
+                Parameterized._global_rand_declarations,
+            ),
+            consume_class_values(
+                cls,
+                "parameterized.range_rand",
+                Parameterized._range_rand_declarations,
+            ),
+            consume_class_values(
+                cls,
+                "parameterized.batch_rand",
+                Parameterized._batch_rand_declarations,
+            ),
         ):
             for spec in declarations:
                 if spec.name in cls._random_parameters_defined_here:
@@ -1926,18 +1959,27 @@ class Parameterized(SimpleParameterized):
                         f"on {cls.__name__}."
                     )
                 cls._random_parameters_defined_here[spec.name] = spec
-        Parameterized._global_rand_declarations = []
-        Parameterized._range_rand_declarations = []
-        Parameterized._batch_rand_declarations = []
         _expand_random_distribution_parameters(cls, cls._random_parameters_defined_here)
 
         # Add detached runtime-noise declarations. Distribution parameters are
         # exposed as ordinary GLOBAL/RANGE/BATCH parameters, while the sampled
         # noise buffer itself is updated in-place during simulation.
         for declarations in (
-            Parameterized._global_noise_declarations,
-            Parameterized._range_noise_declarations,
-            Parameterized._batch_noise_declarations,
+            consume_class_values(
+                cls,
+                "parameterized.global_noise",
+                Parameterized._global_noise_declarations,
+            ),
+            consume_class_values(
+                cls,
+                "parameterized.range_noise",
+                Parameterized._range_noise_declarations,
+            ),
+            consume_class_values(
+                cls,
+                "parameterized.batch_noise",
+                Parameterized._batch_noise_declarations,
+            ),
         ):
             for spec in declarations:
                 if spec.name in cls._runtime_noises_defined_here:
@@ -1946,16 +1988,13 @@ class Parameterized(SimpleParameterized):
                         f"on {cls.__name__}."
                     )
                 cls._runtime_noises_defined_here[spec.name] = spec
-        Parameterized._global_noise_declarations = []
-        Parameterized._range_noise_declarations = []
-        Parameterized._batch_noise_declarations = []
         _expand_random_distribution_parameters(cls, cls._runtime_noises_defined_here)
 
         # Add table declarations
-        if Parameterized._table_declarations:
-            for t_dict in Parameterized._table_declarations:
-                cls._table_defined_here.update(t_dict)
-            Parameterized._table_declarations = []
+        for t_dict in consume_class_values(
+            cls, "parameterized.table", Parameterized._table_declarations
+        ):
+            cls._table_defined_here.update(t_dict)
 
         # Update the new global and range dictionaries with the class-specific declarations
         new_global.update(cls._global_defined_here)
@@ -2048,7 +2087,9 @@ class Parameterized(SimpleParameterized):
             Mapping of parameter name to default value. Values are instantiated
             once per instance and broadcast across compartments.
         """
-        Parameterized._global_declarations.append(kwargs)
+        declare_class_value(
+            "parameterized.global", kwargs, Parameterized._global_declarations
+        )
 
     @staticmethod
     def GLOBALP(**kwargs):
@@ -2061,7 +2102,9 @@ class Parameterized(SimpleParameterized):
             Mapping of parameter name to default value. Values are instantiated
             once per instance and broadcast across compartments.
         """
-        Parameterized._global_p_declarations.append(kwargs)
+        declare_class_value(
+            "parameterized.global_p", kwargs, Parameterized._global_p_declarations
+        )
 
     @staticmethod
     def GLOBALN(**kwargs):
@@ -2074,7 +2117,9 @@ class Parameterized(SimpleParameterized):
             Mapping of parameter name to default value. Values are instantiated
             once per instance and broadcast across compartments.
         """
-        Parameterized._global_n_declarations.append(kwargs)
+        declare_class_value(
+            "parameterized.global_n", kwargs, Parameterized._global_n_declarations
+        )
 
     @staticmethod
     def GLOBAL_SIGNED(**kwargs):
@@ -2089,11 +2134,23 @@ class Parameterized(SimpleParameterized):
         """
         for k, v in kwargs.items():
             if v > 0:
-                Parameterized._global_p_declarations.append({k: v})
+                declare_class_value(
+                    "parameterized.global_p",
+                    {k: v},
+                    Parameterized._global_p_declarations,
+                )
             elif v < 0:
-                Parameterized._global_n_declarations.append({k: v})
+                declare_class_value(
+                    "parameterized.global_n",
+                    {k: v},
+                    Parameterized._global_n_declarations,
+                )
             else:
-                Parameterized._global_declarations.append({k: v})
+                declare_class_value(
+                    "parameterized.global",
+                    {k: v},
+                    Parameterized._global_declarations,
+                )
 
     @staticmethod
     def RANGE(**kwargs):
@@ -2106,7 +2163,9 @@ class Parameterized(SimpleParameterized):
             Mapping of parameter name to default value. Values are instantiated
             with shape matching the population ``shape_p``.
         """
-        Parameterized._range_declarations.append(kwargs)
+        declare_class_value(
+            "parameterized.range", kwargs, Parameterized._range_declarations
+        )
 
     @staticmethod
     def RANGEP(**kwargs):
@@ -2119,7 +2178,9 @@ class Parameterized(SimpleParameterized):
             Mapping of parameter name to default value. Values are instantiated
             with shape matching the population ``shape_p``.
         """
-        Parameterized._range_p_declarations.append(kwargs)
+        declare_class_value(
+            "parameterized.range_p", kwargs, Parameterized._range_p_declarations
+        )
 
     @staticmethod
     def RANGEN(**kwargs):
@@ -2132,7 +2193,9 @@ class Parameterized(SimpleParameterized):
             Mapping of parameter name to default value. Values are instantiated
             with shape matching the population ``shape_p``.
         """
-        Parameterized._range_n_declarations.append(kwargs)
+        declare_class_value(
+            "parameterized.range_n", kwargs, Parameterized._range_n_declarations
+        )
 
     @staticmethod
     def BATCH(**kwargs):
@@ -2145,7 +2208,9 @@ class Parameterized(SimpleParameterized):
             Mapping of parameter name to default value. Values are instantiated
             with shape ``shape_p[:-1] + (1,)``.
         """
-        Parameterized._batch_declarations.append(kwargs)
+        declare_class_value(
+            "parameterized.batch", kwargs, Parameterized._batch_declarations
+        )
 
     @staticmethod
     def BATCHP(**kwargs):
@@ -2158,7 +2223,9 @@ class Parameterized(SimpleParameterized):
             Mapping of parameter name to default value. Values are instantiated
             with shape ``shape_p[:-1] + (1,)``.
         """
-        Parameterized._batch_p_declarations.append(kwargs)
+        declare_class_value(
+            "parameterized.batch_p", kwargs, Parameterized._batch_p_declarations
+        )
 
     @staticmethod
     def BATCHN(**kwargs):
@@ -2171,7 +2238,9 @@ class Parameterized(SimpleParameterized):
             Mapping of parameter name to default value. Values are instantiated
             with shape ``shape_p[:-1] + (1,)``.
         """
-        Parameterized._batch_n_declarations.append(kwargs)
+        declare_class_value(
+            "parameterized.batch_n", kwargs, Parameterized._batch_n_declarations
+        )
 
     @staticmethod
     def GLOBALRAND(
@@ -2185,7 +2254,8 @@ class Parameterized(SimpleParameterized):
         **distribution_parameters,
     ):
         """Declare a sampled scalar buffer with parametric distribution parameters."""
-        Parameterized._global_rand_declarations.append(
+        declare_class_value(
+            "parameterized.global_rand",
             make_random_parameter_spec(
                 name,
                 scope="global",
@@ -2195,7 +2265,8 @@ class Parameterized(SimpleParameterized):
                 reparameterized=reparameterized,
                 rng_name=rng_name,
                 **distribution_parameters,
-            )
+            ),
+            Parameterized._global_rand_declarations,
         )
 
     @staticmethod
@@ -2217,7 +2288,8 @@ class Parameterized(SimpleParameterized):
         sampled buffer ``rvar`` plus ``rvar_mu`` and positive ``rvar_sigma``
         range parameters that can be locally overridden at insertion time.
         """
-        Parameterized._range_rand_declarations.append(
+        declare_class_value(
+            "parameterized.range_rand",
             make_random_parameter_spec(
                 name,
                 scope="range",
@@ -2227,7 +2299,8 @@ class Parameterized(SimpleParameterized):
                 reparameterized=reparameterized,
                 rng_name=rng_name,
                 **distribution_parameters,
-            )
+            ),
+            Parameterized._range_rand_declarations,
         )
 
     @staticmethod
@@ -2242,7 +2315,8 @@ class Parameterized(SimpleParameterized):
         **distribution_parameters,
     ):
         """Declare a sampled buffer with BATCH-shaped distribution parameters."""
-        Parameterized._batch_rand_declarations.append(
+        declare_class_value(
+            "parameterized.batch_rand",
             make_random_parameter_spec(
                 name,
                 scope="batch",
@@ -2252,7 +2326,8 @@ class Parameterized(SimpleParameterized):
                 reparameterized=reparameterized,
                 rng_name=rng_name,
                 **distribution_parameters,
-            )
+            ),
+            Parameterized._batch_rand_declarations,
         )
 
     @staticmethod
@@ -2272,7 +2347,8 @@ class Parameterized(SimpleParameterized):
         Runtime noise is resampled in-place during simulation and does not
         preserve gradients through its distribution parameters.
         """
-        Parameterized._global_noise_declarations.append(
+        declare_class_value(
+            "parameterized.global_noise",
             make_runtime_noise_spec(
                 name,
                 scope="global",
@@ -2283,7 +2359,8 @@ class Parameterized(SimpleParameterized):
                 phase=phase,
                 scale=scale,
                 **distribution_parameters,
-            )
+            ),
+            Parameterized._global_noise_declarations,
         )
 
     @staticmethod
@@ -2299,7 +2376,8 @@ class Parameterized(SimpleParameterized):
         **distribution_parameters,
     ):
         """Declare a detached per-compartment runtime-noise buffer."""
-        Parameterized._range_noise_declarations.append(
+        declare_class_value(
+            "parameterized.range_noise",
             make_runtime_noise_spec(
                 name,
                 scope="range",
@@ -2310,7 +2388,8 @@ class Parameterized(SimpleParameterized):
                 phase=phase,
                 scale=scale,
                 **distribution_parameters,
-            )
+            ),
+            Parameterized._range_noise_declarations,
         )
 
     @staticmethod
@@ -2326,7 +2405,8 @@ class Parameterized(SimpleParameterized):
         **distribution_parameters,
     ):
         """Declare a detached runtime-noise buffer with BATCH shape."""
-        Parameterized._batch_noise_declarations.append(
+        declare_class_value(
+            "parameterized.batch_noise",
             make_runtime_noise_spec(
                 name,
                 scope="batch",
@@ -2337,7 +2417,8 @@ class Parameterized(SimpleParameterized):
                 phase=phase,
                 scale=scale,
                 **distribution_parameters,
-            )
+            ),
+            Parameterized._batch_noise_declarations,
         )
 
     @staticmethod
@@ -2355,8 +2436,10 @@ class Parameterized(SimpleParameterized):
             Mapping of RNG stream names to initial seed values. Instances receive generator
             buffers initialized with the specified seeds.
         """
-        Parameterized._rng_declarations.append(
-            {**{name: None for name in args}, **kwargs}
+        declare_class_value(
+            "parameterized.rng",
+            {**{name: None for name in args}, **kwargs},
+            Parameterized._rng_declarations,
         )
 
     @staticmethod
@@ -2399,8 +2482,10 @@ class Parameterized(SimpleParameterized):
             If True, the table values are trainable parameters. Defaults to False.
         """
         Parameterized.FLAG(**{f"usetable_{func}": False})
-        Parameterized._table_declarations.append(
-            {func: {"low": low, "high": high, "n": n, "learnable": learnable}}
+        declare_class_value(
+            "parameterized.table",
+            {func: {"low": low, "high": high, "n": n, "learnable": learnable}},
+            Parameterized._table_declarations,
         )
 
     def __init__(

@@ -1,89 +1,151 @@
+"""Helpers for navigating trees of NEURON sections."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
+from typing import Literal, Protocol, TypeAlias, overload
+
 from neuron import h
 
+__all__ = ["path_sections", "path_via"]
 
-def _parent_section(sec):
-    """
-    Return the parent Section of `sec`, or None if `sec` is a root.
 
-    Uses Section.parentseg() when available (returns a Segment or None);
-    otherwise falls back to SectionRef.has_parent()/parent (must guard
-    has_parent() to avoid an execution error). :contentReference[oaicite:1]{index=1}
+class _SectionLike(Protocol):
+    """The part of NEURON's ``Section`` interface used in this module."""
+
+    def name(self) -> str: ...
+
+    def __hash__(self) -> int: ...
+
+
+class _SectionListLike(Protocol):
+    """Structural type for a NEURON ``SectionList``."""
+
+    def __iter__(self) -> Iterator[_SectionLike]: ...
+
+    def append(self, *, sec: _SectionLike) -> None: ...
+
+
+_SectionPath: TypeAlias = list[_SectionLike]
+
+
+def _parent_section(sec: _SectionLike) -> _SectionLike | None:
+    """Return the parent of ``sec``, or ``None`` when ``sec`` is a root.
+
+    Modern NEURON versions expose :meth:`Section.parentseg`, whose result is
+    either the parent segment or ``None``.  The ``SectionRef`` branch preserves
+    compatibility with older Section implementations; ``has_parent`` must be
+    checked before accessing ``parent`` because HOC otherwise raises an error.
     """
     if hasattr(sec, "parentseg"):
-        pseg = sec.parentseg()
-        return None if pseg is None else pseg.sec
+        parent_segment = sec.parentseg()
+        return None if parent_segment is None else parent_segment.sec
 
-    sref = h.SectionRef(sec=sec)
-    return sref.parent if sref.has_parent() else None
+    section_ref = h.SectionRef(sec=sec)
+    return section_ref.parent if section_ref.has_parent() else None
 
 
-def _chain_to_root(sec):
-    """List of sections [sec, parent, parent, ..., root]."""
+def _chain_to_root(sec: _SectionLike) -> _SectionPath:
+    """Return ``sec`` and each ancestor in order, ending at its tree root."""
     chain = []
-    while sec is not None:
-        chain.append(sec)
-        sec = _parent_section(sec)
+    current: _SectionLike | None = sec
+    while current is not None:
+        chain.append(current)
+        current = _parent_section(current)
     return chain
 
 
-def _sec_key(sec):
+def _as_section_list(sections: Iterable[_SectionLike]) -> _SectionListLike:
+    """Build a NEURON ``SectionList`` in the order of ``sections``.
+
+    Appending sections explicitly works across NEURON releases; passing a
+    Python iterable to the HOC constructor is not supported consistently.
     """
-    Stable identifier for dict/set membership.
-    Section objects are usually usable directly, but name() is robust.
+    section_list = h.SectionList()
+    for section in sections:
+        section_list.append(sec=section)
+    return section_list
+
+
+def path_sections(a: _SectionLike, b: _SectionLike) -> _SectionPath | None:
+    """Return the unique simple section path from ``a`` to ``b``.
+
+    The returned Python list includes both endpoints and is ordered from
+    ``a`` to ``b``.  If the sections belong to disconnected trees, return
+    ``None``.
     """
-    return sec.name()
+    a_to_root = _chain_to_root(a)
+    b_to_root = _chain_to_root(b)
 
-
-def path_sections(a, b):
-    """
-    Unique simple section-path from section a to section b (inclusive),
-    returned as a Python list ordered [a, ..., b].
-
-    Returns None if a and b are disconnected (different trees).
-    """
-    a2r = _chain_to_root(a)
-    b2r = _chain_to_root(b)
-
-    # Map b-ancestors to index in b2r for O(1) LCA lookup
-    b_pos = {_sec_key(sec): i for i, sec in enumerate(b2r)}
-
-    lca_i = lca_j = None
-    for i, sec in enumerate(a2r):
-        j = b_pos.get(_sec_key(sec))
-        if j is not None:
-            lca_i, lca_j = i, j
+    # Locate the lowest common ancestor by walking outward from ``a``.
+    # Section names are not unique in NEURON, but Section identity is hashable
+    # and is preserved when following ``parentseg().sec``.
+    b_positions = {section: i for i, section in enumerate(b_to_root)}
+    lca_a_index = lca_b_index = None
+    for a_index, section in enumerate(a_to_root):
+        b_index = b_positions.get(section)
+        if b_index is not None:
+            lca_a_index, lca_b_index = a_index, b_index
             break
 
-    if lca_i is None:
-        return None  # disconnected
-
-    # a -> ... -> LCA
-    up = a2r[: lca_i + 1]
-    # LCA's child -> ... -> b (reverse b->...->LCA, excluding LCA)
-    down = list(reversed(b2r[:lca_j]))
-
-    return up + down
-
-
-def path_via(a, b, c, *, return_sectionlist=False):
-    """
-    Sections on a simple path from a to b that passes through c
-    (no repeated sections). Returns None if no such simple path exists.
-
-    If return_sectionlist=True, returns a NEURON h.SectionList built from
-    the resulting iterable. :contentReference[oaicite:2]{index=2}
-    """
-    p = path_sections(a, b)
-    if p is None:
+    if lca_a_index is None or lca_b_index is None:
         return None
 
-    ck = _sec_key(c)
-    if all(_sec_key(sec) != ck for sec in p):
-        # In a tree, this means there is no simple a->b path that goes through c.
+    # Ascend from a through the LCA, then descend from the LCA to b without
+    # repeating the LCA.
+    ascending = a_to_root[: lca_a_index + 1]
+    descending = list(reversed(b_to_root[:lca_b_index]))
+    return ascending + descending
+
+
+@overload
+def path_via(
+    a: _SectionLike,
+    b: _SectionLike,
+    c: _SectionLike,
+    *,
+    return_sectionlist: Literal[False] = False,
+) -> _SectionPath | None: ...
+
+
+@overload
+def path_via(
+    a: _SectionLike,
+    b: _SectionLike,
+    c: _SectionLike,
+    *,
+    return_sectionlist: Literal[True],
+) -> _SectionListLike | None: ...
+
+
+def path_via(
+    a: _SectionLike,
+    b: _SectionLike,
+    c: _SectionLike,
+    *,
+    return_sectionlist: bool = False,
+) -> _SectionPath | _SectionListLike | None:
+    """Return the simple path from ``a`` to ``b`` when it passes through ``c``.
+
+    Because NEURON sections form a tree, there is exactly one simple path
+    between connected sections.  Return ``None`` when ``a`` and ``b`` are
+    disconnected or when their path does not contain ``c``.
+
+    Parameters
+    ----------
+    a, b
+        Endpoints of the requested path.
+    c
+        Section that the path must contain.
+    return_sectionlist
+        When true, return a NEURON ``h.SectionList`` instead of a Python list.
+        Ordering and endpoint inclusion are otherwise unchanged.
+    """
+    path = path_sections(a, b)
+    if path is None:
         return None
 
-    if return_sectionlist:
-        return h.SectionList(
-            p
-        )  # SectionList can be constructed from a python iterable. :contentReference[oaicite:3]{index=3}
-    return p
+    if c not in path:
+        return None
+
+    return _as_section_list(path) if return_sectionlist else path

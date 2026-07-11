@@ -182,8 +182,8 @@ def _scalar_dense_reference(integrator, voltage, mechanism, intra=None, ve=None)
     if ve is not None:
         ve_flat = torch.broadcast_to(ve, voltage.shape).reshape_as(rhs)
         edge = integrator.edge_gax_orig * (
-            ve_flat.index_select(1, integrator.edge_parent_orig)
-            - ve_flat.index_select(1, integrator.edge_child_orig)
+            ve_flat.index_select(1, integrator.edge_child_orig)
+            - ve_flat.index_select(1, integrator.edge_parent_orig)
         )
         rhs = rhs.clone()
         rhs.scatter_add_(1, integrator.edge_child_orig.expand_as(edge), -edge)
@@ -391,6 +391,31 @@ def test_scalar_tree_uniform_extracellular_field_is_gauge_invariant():
     assert torch.allclose(shifted, baseline, rtol=0.0, atol=2e-13)
     assert not torch.allclose(driven, baseline)
     assert torch.allclose(driven, expected, rtol=2e-12, atol=2e-12)
+
+
+def test_scalar_tree_extracellular_field_has_neuron_polarity():
+    graph = _graph([(0, 1)])
+    model = TreeModel(graph)
+    model.v.fill_(-65.0)
+    mechanism = LinearMechanism(conductance=0.0)
+    integrator = _dhs(model, mechanism, threads=2)
+    integrator._initialize(model, 0.05)
+
+    baseline, _ = integrator._step(model.v, 0.05, model.celsius)
+    driven, _ = integrator._step(
+        model.v,
+        0.05,
+        model.celsius,
+        ve=torch.tensor([0.0, 5.0], dtype=DTYPE),
+    )
+
+    # NEURON's extracellular mechanism defines v as transmembrane voltage and
+    # the intracellular potential as v + vext.  Raising vext at the child
+    # therefore sends axial current toward the parent: parent depolarizes and
+    # child hyperpolarizes.
+    assert torch.equal(baseline, model.v)
+    assert driven[0, 0] > baseline[0, 0]
+    assert driven[0, 1] < baseline[0, 1]
 
 
 def test_scalar_tree_imem_matches_discrete_membrane_balance():

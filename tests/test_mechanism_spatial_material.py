@@ -48,6 +48,74 @@ def _bind(process, materials, population=None):
     return process.bind_materials(materials.__getitem__, population=population)
 
 
+def _snapshot_material_state(materials):
+    return {
+        name: {
+            field: (material._buffers[field], material._buffers[field].detach().clone())
+            for field in material.fields
+        }
+        for name, material in materials.items()
+    }
+
+
+def _assert_material_state_unchanged(materials, snapshot):
+    assert materials.keys() == snapshot.keys()
+    for name, fields in snapshot.items():
+        material = materials[name]
+        assert set(material.fields) == set(fields)
+        for field, (original, expected) in fields.items():
+            assert material._buffers[field] is original
+            assert torch.equal(material._buffers[field], expected)
+
+
+def _snapshot_module_state(module):
+    return {name: value.detach().clone() for name, value in module.state_dict().items()}
+
+
+def _assert_module_state_unchanged(module, snapshot):
+    actual = module.state_dict()
+    assert actual.keys() == snapshot.keys()
+    for name, expected in snapshot.items():
+        assert torch.equal(actual[name], expected), name
+
+
+def _snapshot_diffusion_process(process):
+    return {
+        "state": _snapshot_module_state(process),
+        "spatial_configured": process._spatial_configured,
+        "operators": tuple(
+            (
+                id(op),
+                op.configured,
+                op.solver_name,
+                op.B,
+                op.K,
+                op.base_shape,
+            )
+            for op in process._spatial_operators.values()
+        ),
+    }
+
+
+def _assert_diffusion_process_unchanged(process, snapshot):
+    _assert_module_state_unchanged(process, snapshot["state"])
+    assert process._spatial_configured is snapshot["spatial_configured"]
+    assert (
+        tuple(
+            (
+                id(op),
+                op.configured,
+                op.solver_name,
+                op.B,
+                op.K,
+                op.base_shape,
+            )
+            for op in process._spatial_operators.values()
+        )
+        == snapshot["operators"]
+    )
+
+
 class ExactClearance(ClearanceProcess):
     ClearanceProcess.CLEAR("x", field="c", rate=0.5, target=1.0)
 
@@ -320,6 +388,28 @@ def test_clearance_clamps_negative_rates_and_validates_fields():
         _bind(_process(MissingClearance), {"x": material})
 
 
+def test_clearance_multispec_late_resolution_failure_is_transactional():
+    class LateFailureClearance(ClearanceProcess):
+        ClearanceProcess.CLEAR("x", field="c", rate=0.5, target=0.0)
+        ClearanceProcess.CLEAR(
+            "y", field="c", rate="missing_clearance_rate", target=0.0
+        )
+
+    materials = {
+        "x": _material("x", [3.0, 2.0, 1.0]),
+        "y": _material("y", [4.0, 5.0, 6.0]),
+    }
+    process = _bind(_process(LateFailureClearance), materials)
+    material_snapshot = _snapshot_material_state(materials)
+    process_snapshot = _snapshot_module_state(process)
+
+    with pytest.raises(AttributeError, match="missing_clearance_rate"):
+        process.advance_materials(0.25)
+
+    _assert_material_state_unchanged(materials, material_snapshot)
+    _assert_module_state_unchanged(process, process_snapshot)
+
+
 def test_clamp_modes_and_regions():
     terminal = _material("x", [1.0, 2.0, 3.0])
     process = _bind(
@@ -352,6 +442,36 @@ def test_clamp_rejects_unknown_region_and_bad_range():
     proc = _bind(_process(BadRange), {"x": _material("x", [1, 2, 3])})
     with pytest.raises(ValueError, match="requires value"):
         proc.advance_materials(0.1)
+
+
+def test_clamp_multispec_late_resolution_failure_is_transactional():
+    class LateFailureClamp(ClampProcess):
+        ClampProcess.SET("x", field="c", value=9.0)
+        ClampProcess.SET("y", field="c", value="missing_clamp_value")
+
+    materials = {
+        "x": _material("x", [1.0, 2.0, 3.0]),
+        "y": _material("y", [4.0, 5.0, 6.0]),
+    }
+    process = _bind(_process(LateFailureClamp), materials)
+    material_snapshot = _snapshot_material_state(materials)
+    process_snapshot = _snapshot_module_state(process)
+
+    with pytest.raises(AttributeError, match="missing_clamp_value"):
+        process.advance_materials(0.1)
+
+    _assert_material_state_unchanged(materials, material_snapshot)
+    _assert_module_state_unchanged(process, process_snapshot)
+
+
+def test_transactional_multispec_success_preserves_declaration_order():
+    class SequentialClamp(ClampProcess):
+        ClampProcess.SET("x", field="c", value=4.0)
+        ClampProcess.MAX("x", field="c", value=2.0)
+
+    material = _material("x", [0.0, 1.0, 3.0])
+    _bind(_process(SequentialClamp), {"x": material}).advance_materials(0.1)
+    assert torch.equal(material.c, torch.full_like(material.c, 2.0))
 
 
 @pytest.mark.parametrize(
@@ -391,6 +511,34 @@ def test_exchange_declaration_and_field_validation():
         _bind(_process(SelfExchange), {"a": a})
 
 
+def test_exchange_multispec_late_resolution_failure_is_transactional():
+    class LateFailureExchange(ExchangeProcess):
+        ExchangeProcess.EXCHANGE("a.c", "b.c", rate=0.5, volume_a=1.0, volume_b=1.0)
+        ExchangeProcess.EXCHANGE(
+            "c.c",
+            "d.c",
+            rate="missing_exchange_rate",
+            volume_a=1.0,
+            volume_b=1.0,
+        )
+
+    materials = {
+        "a": _material("a", [2.0, 2.0, 2.0]),
+        "b": _material("b", [0.0, 0.0, 0.0]),
+        "c": _material("c", [4.0, 4.0, 4.0]),
+        "d": _material("d", [1.0, 1.0, 1.0]),
+    }
+    process = _bind(_process(LateFailureExchange), materials)
+    material_snapshot = _snapshot_material_state(materials)
+    process_snapshot = _snapshot_module_state(process)
+
+    with pytest.raises(AttributeError, match="missing_exchange_rate"):
+        process.advance_materials(0.25)
+
+    _assert_material_state_unchanged(materials, material_snapshot)
+    _assert_module_state_unchanged(process, process_snapshot)
+
+
 def test_diffusion_process_chain_known_answers_and_dt_reconfiguration():
     population = SimpleNamespace(dx=torch.ones(SHAPE), graph=None, shape=SHAPE)
     material = _material("x", [1.0, 0.0, 0.0])
@@ -405,6 +553,79 @@ def test_diffusion_process_chain_known_answers_and_dt_reconfiguration():
     matrix = torch.tensor([[1.1, -0.1, 0.0], [-0.1, 1.2, -0.1], [0.0, -0.1, 1.1]])
     expected = torch.linalg.solve(matrix, torch.tensor([1.0, 0.0, 0.0]))
     assert torch.allclose(material.c[0], expected, atol=1e-6)
+
+
+def test_diffusion_reconfiguration_preserves_eval_mode_on_staged_operators():
+    population = SimpleNamespace(dx=torch.ones(SHAPE), graph=None, shape=SHAPE)
+    material = _material("x", [1.0, 0.0, 0.0])
+    process = _bind(_process(ExplicitDiffusion), {"x": material}, population)
+    process.set_dt(0.1)
+    process.eval()
+
+    process.set_dt(0.2)
+
+    assert process.training is False
+    assert all(
+        not operator.training for operator in process._spatial_operators.values()
+    )
+
+
+def test_diffusion_late_reconfiguration_failure_is_transactional():
+    class DynamicMultiDiffusion(DiffusionProcess):
+        DiffusionProcess.METHOD("explicit", solver="dense")
+        DiffusionProcess.DIFFUSE("x", field="c", D="D_x")
+        DiffusionProcess.DIFFUSE("y", field="c", D="D_y")
+
+    population = SimpleNamespace(dx=torch.ones(SHAPE), graph=None, shape=SHAPE)
+    materials = {
+        "x": _material("x", [1.0, 0.0, 0.0]),
+        "y": _material("y", [0.0, 1.0, 0.0]),
+    }
+    process = _process(DynamicMultiDiffusion)
+    process.register_buffer("D_x", torch.tensor(1.0))
+    process.register_buffer("D_y", torch.tensor(0.5))
+    _bind(process, materials, population)
+    process.set_dt(0.1)
+
+    # Simulate a dynamic parameter disappearing before a timestep change. The
+    # first operator can be reconfigured successfully; resolution fails only on
+    # the second specification.
+    del process._buffers["D_y"]
+    material_snapshot = _snapshot_material_state(materials)
+    process_snapshot = _snapshot_diffusion_process(process)
+
+    with pytest.raises(AttributeError, match="D_y"):
+        process.set_dt(0.2)
+
+    _assert_material_state_unchanged(materials, material_snapshot)
+    _assert_diffusion_process_unchanged(process, process_snapshot)
+
+
+def test_diffusion_multispec_late_execution_failure_is_transactional():
+    class MultiDiffusion(DiffusionProcess):
+        DiffusionProcess.METHOD("explicit", solver="dense")
+        DiffusionProcess.DIFFUSE("x", field="c", D=1.0)
+        DiffusionProcess.DIFFUSE("y", field="c", D=1.0)
+
+    population = SimpleNamespace(dx=torch.ones(SHAPE), graph=None, shape=SHAPE)
+    materials = {
+        "x": _material("x", [1.0, 0.0, 0.0]),
+        "y": _material("y", [0.0, 1.0, 0.0]),
+    }
+    process = _bind(_process(MultiDiffusion), materials, population)
+    process.set_dt(0.1)
+
+    # Make the second field incompatible only after both operators have been
+    # configured. The first solve succeeds, then the second reshape fails.
+    materials["y"]._buffers["c"] = torch.tensor([[0.0, 1.0]])
+    material_snapshot = _snapshot_material_state(materials)
+    process_snapshot = _snapshot_diffusion_process(process)
+
+    with pytest.raises(RuntimeError, match="shape"):
+        process.advance_materials(0.1)
+
+    _assert_material_state_unchanged(materials, material_snapshot)
+    _assert_diffusion_process_unchanged(process, process_snapshot)
 
 
 def test_diffusion_process_tree_and_configuration_validation():

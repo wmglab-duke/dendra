@@ -5057,9 +5057,12 @@ class Axon(Population):
             **kwargs,
         )
 
-        self.register_buffer(
-            "diameters", torch.as_tensor(diameters, dtype=self.dtype())
+        diameter_values = (
+            torch.as_tensor(diameters, device=self.device(), dtype=self.dtype())
+            .clone()
+            .detach()
         )
+        self.register_buffer("diameters", diameter_values)
 
         self.n_ax = self.np
         self.n_comp = self.nc
@@ -5070,17 +5073,19 @@ class Axon(Population):
         self.x[:] = self._x()  # Initialize x positions
 
         self.cid = None
+        self._cid_label_names = set()
 
-        if torch.is_tensor(diameters):
-            diameters = diameters.to(self.dtype()).clone().detach()
-        else:
-            diameters = torch.tensor(diameters, dtype=self.dtype())
+        compartment_diameters = self.diameters
+        if compartment_diameters.ndim == 1:
+            compartment_diameters = compartment_diameters.unsqueeze(1)
 
-        if diameters.ndim == 1:
-            diameters = diameters.unsqueeze(1)
-
-        self.diam[:] = diameters
+        self.diam.copy_(compartment_diameters)
         self.diam = self.diam.detach()
+
+    def clear_labels(self):
+        """Clear slice labels and forget any CID label ownership."""
+        super().clear_labels()
+        self._cid_label_names.clear()
 
     def assemble_graphs(self):
         """
@@ -5095,8 +5100,9 @@ class Axon(Population):
         for i in range(self.n_ax):
             G = nx.path_graph(self.n_comp, create_using=nx.DiGraph)
             for node in G.nodes:
+                location = 0.5 if self.n_comp == 1 else node / (self.n_comp - 1)
                 G.nodes[node]["name"] = (
-                    f"{self.__class__.__name__}[{i}]({node / (self.n_comp - 1):.2f})"
+                    f"{self.__class__.__name__}[{i}]({location:.2f})"
                 )
                 G.nodes[node]["x"] = self.x[i, node].item()
                 G.nodes[node]["y"] = self.y[i, node].item()
@@ -5109,18 +5115,118 @@ class Axon(Population):
         return graphs
 
     def register_cid(self, cid):
-        """
-        Register a compartment identifier table for slicing utilities.
+        """Register compartment names and expose their labelled slices.
+
+        This connects a model-definition
+        :class:`~dendra.models.heterogeneous.CompartmentID` to an axon. Each
+        unique name becomes both an entry in ``_labels`` and an attribute
+        containing the corresponding :class:`~dendra.models.slice.Slice`.
 
         Parameters
         ----------
-        cid : Any
-            Object exposing ``names`` used for label-based slicing.
+        cid : dendra.models.heterogeneous.CompartmentID
+            Identifier table whose expanded ``names`` array has length
+            ``n_comp``.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            from dendra.models.core import Unmyelinated
+            from dendra.models.heterogeneous import CompartmentID
+            from dendra.units import um
+
+            axon = Unmyelinated(diameters=[8.0], L=60.0 * um, dx=10.0 * um)
+            cid = CompartmentID(["node", "internode * 2"], n_repeats=2)
+            axon.register_cid(cid)
+
+            axon.node       # compartments 0, 3, and 6
+            axon.internode  # compartments 1, 2, 4, and 5
         """
-        self.cid = cid
-        self.names = self.cid.names.tolist()
-        for name in np.unique(self.names):
-            self.slice(name).label(name)
+        if not hasattr(cid, "names"):
+            raise TypeError("cid must expose a one-dimensional 'names' sequence.")
+        raw_names = cid.names
+        names_ndim = getattr(raw_names, "ndim", None)
+        if isinstance(raw_names, (str, np.str_)) or (
+            names_ndim is not None and int(names_ndim) != 1
+        ):
+            raise TypeError("cid.names must be a one-dimensional sequence.")
+        raw_names = raw_names.tolist() if hasattr(raw_names, "tolist") else raw_names
+        if isinstance(raw_names, (str, np.str_)):
+            raise TypeError("cid.names must be a one-dimensional sequence.")
+        try:
+            names = list(raw_names)
+        except TypeError as error:
+            raise TypeError("cid.names must be a one-dimensional sequence.") from error
+        if any(not isinstance(name, (str, np.str_)) for name in names):
+            raise TypeError("Every compartment name in cid.names must be a string.")
+        names = [str(name) for name in names]
+        if len(names) != self.n_comp:
+            raise ValueError(
+                f"Axon requires {self.n_comp} compartment names, got {len(names)}."
+            )
+
+        unique_names = list(dict.fromkeys(names))
+        old_owned = set(self._cid_label_names)
+        always_reserved = {"cid", "names", "_cid_label_names", "_labels"}
+        for name in unique_names:
+            replaceable_old_label = (
+                name in old_owned
+                and name in self.__dict__
+                and self.__dict__[name] is self._labels.get(name)
+            )
+            conflicts = name in always_reserved or (
+                not replaceable_old_label
+                and (hasattr(self, name) or name in self._labels)
+            )
+            if conflicts:
+                raise ValueError(
+                    f"Compartment label {name!r} conflicts with an existing attribute."
+                )
+
+        names_array = np.asarray(names, dtype=object)
+        prepared_labels = {
+            name: self[..., np.flatnonzero(names_array == name).tolist()]
+            for name in unique_names
+        }
+
+        old_cid = self.cid
+        old_names_present = "names" in self.__dict__
+        old_names = self.__dict__.get("names")
+        old_cid_label_names = set(self._cid_label_names)
+        old_labels = dict(self._labels)
+        touched_names = old_owned | set(unique_names)
+        old_attributes = {
+            name: self.__dict__[name] for name in touched_names if name in self.__dict__
+        }
+
+        try:
+            for name in old_owned:
+                old_label = self._labels.pop(name, None)
+                if name in self.__dict__ and self.__dict__[name] is old_label:
+                    delattr(self, name)
+
+            self.cid = cid
+            self.names = names
+            for name, label in prepared_labels.items():
+                setattr(self, name, label)
+                self._labels[name] = label
+            self._cid_label_names = set(unique_names)
+        except Exception:
+            for name in touched_names:
+                if name in self.__dict__:
+                    delattr(self, name)
+            for name, value in old_attributes.items():
+                setattr(self, name, value)
+            self._labels.clear()
+            self._labels.update(old_labels)
+            self.cid = old_cid
+            self._cid_label_names = old_cid_label_names
+            if old_names_present:
+                self.names = old_names
+            elif "names" in self.__dict__:
+                delattr(self, "names")
+            raise
 
     def c(self, *args):
         """

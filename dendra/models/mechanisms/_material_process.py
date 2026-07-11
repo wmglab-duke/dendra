@@ -7,6 +7,11 @@ from typing import Any, Mapping
 
 import torch
 
+from dendra.models._class_declarations import (
+    consume_class_values,
+    declare_class_value,
+)
+
 from ._mechanism import Mechanism
 from ._spatial import SpatialOperator1D, SpatialOperatorTree
 
@@ -118,6 +123,37 @@ def _material_field_ref(ref, *, field=None) -> tuple[str, str]:
     )
 
 
+class _MaterialFieldTransaction:
+    """Stage full-field replacements and publish them only after all specs pass.
+
+    Material process updates are intentionally out-of-place, so retaining each
+    staged tensor is sufficient to preserve sequential multi-spec semantics
+    without mutating the bound ``Material`` objects before the whole process has
+    completed successfully.
+    """
+
+    def __init__(self):
+        self._pending: dict[tuple[int, str], tuple[Any, str, torch.Tensor]] = {}
+
+    @staticmethod
+    def _key(material, field: str) -> tuple[int, str]:
+        return id(material), str(field)
+
+    def read(self, material, field: str) -> torch.Tensor:
+        pending = self._pending.get(self._key(material, field))
+        if pending is not None:
+            return pending[2]
+        return material._buffers[str(field)]
+
+    def write(self, material, field: str, value: torch.Tensor) -> None:
+        field = str(field)
+        self._pending[self._key(material, field)] = (material, field, value)
+
+    def commit(self) -> None:
+        for material, field, value in self._pending.values():
+            material._buffers[field] = value
+
+
 class MaterialProcess(Mechanism):
     """Base class for full-field processes over shared Material objects.
 
@@ -146,12 +182,16 @@ class MaterialProcess(Mechanism):
             if "_material_process_method_kwargs" in base.__dict__:
                 method_kwargs = dict(base._material_process_method_kwargs)
 
-        if MaterialProcess._phase_declarations:
-            phase = MaterialProcess._phase_declarations[-1]
-            MaterialProcess._phase_declarations = []
-        if MaterialProcess._method_declarations:
-            method, method_kwargs = MaterialProcess._method_declarations[-1]
-            MaterialProcess._method_declarations = []
+        phase_declarations = consume_class_values(
+            cls, "material_process.phase", MaterialProcess._phase_declarations
+        )
+        if phase_declarations:
+            phase = phase_declarations[-1]
+        method_declarations = consume_class_values(
+            cls, "material_process.method", MaterialProcess._method_declarations
+        )
+        if method_declarations:
+            method, method_kwargs = method_declarations[-1]
 
         cls._material_process_phase = str(phase)
         cls._material_process_method = str(method).lower()
@@ -160,12 +200,18 @@ class MaterialProcess(Mechanism):
     @staticmethod
     def METHOD(method="none", **kwargs):
         """Declare the process-level numerical method."""
-        MaterialProcess._method_declarations.append((str(method).lower(), dict(kwargs)))
+        declare_class_value(
+            "material_process.method",
+            (str(method).lower(), dict(kwargs)),
+            MaterialProcess._method_declarations,
+        )
 
     @staticmethod
     def PHASE(phase="post_local"):
         """Declare the material scheduler phase for this process."""
-        MaterialProcess._phase_declarations.append(str(phase))
+        declare_class_value(
+            "material_process.phase", str(phase), MaterialProcess._phase_declarations
+        )
 
     def bind_materials(self, material_resolver, *, population=None):
         """Bind process to the Material registry and population geometry."""
@@ -247,9 +293,13 @@ class ClearanceProcess(MaterialProcess):
         for base in reversed(cls.__mro__):
             if "_clearance_specs" in base.__dict__:
                 specs.extend(list(base._clearance_specs))
-        if ClearanceProcess._clearance_declarations:
-            specs.extend(ClearanceProcess._clearance_declarations)
-            ClearanceProcess._clearance_declarations = []
+        specs.extend(
+            consume_class_values(
+                cls,
+                "clearance_process.specs",
+                ClearanceProcess._clearance_declarations,
+            )
+        )
         cls._clearance_specs = tuple(specs)
 
     @staticmethod
@@ -286,7 +336,9 @@ class ClearanceProcess(MaterialProcess):
             target,
             None if domain is None else str(domain),
         )
-        ClearanceProcess._clearance_declarations.append(spec)
+        declare_class_value(
+            "clearance_process.specs", spec, ClearanceProcess._clearance_declarations
+        )
 
     @staticmethod
     def DECAY(material, *, field=None, rate=None, target=0.0, domain=None):
@@ -377,9 +429,10 @@ class ClearanceProcess(MaterialProcess):
 
     def advance_materials(self, dt):
         dt_t = None
+        transaction = _MaterialFieldTransaction()
         for spec in type(self)._clearance_specs:
             material = self._get_material(spec.material)
-            c = material._buffers[spec.field]
+            c = transaction.read(material, spec.field)
             rate = self._resolve_quantity(spec.rate, c, what="clearance rate")
             target = self._resolve_quantity(spec.target, c, what="clearance target")
 
@@ -398,7 +451,8 @@ class ClearanceProcess(MaterialProcess):
             else:  # exact exponential relaxation
                 c_new = target + (c - target) * torch.exp(-rate * dt_t)
 
-            material._buffers[spec.field] = c_new
+            transaction.write(material, spec.field, c_new)
+        transaction.commit()
 
 
 class ClampProcess(MaterialProcess):
@@ -425,9 +479,11 @@ class ClampProcess(MaterialProcess):
         for base in reversed(cls.__mro__):
             if "_clamp_specs" in base.__dict__:
                 specs.extend(list(base._clamp_specs))
-        if ClampProcess._clamp_declarations:
-            specs.extend(ClampProcess._clamp_declarations)
-            ClampProcess._clamp_declarations = []
+        specs.extend(
+            consume_class_values(
+                cls, "clamp_process.specs", ClampProcess._clamp_declarations
+            )
+        )
         cls._clamp_specs = tuple(specs)
 
     @staticmethod
@@ -474,7 +530,9 @@ class ClampProcess(MaterialProcess):
             None if mode is None else str(mode),
             None if domain is None else str(domain),
         )
-        ClampProcess._clamp_declarations.append(spec)
+        declare_class_value(
+            "clamp_process.specs", spec, ClampProcess._clamp_declarations
+        )
 
     @staticmethod
     def SET(material, *, field=None, value=0.0, where="all", domain=None):
@@ -770,9 +828,10 @@ class ClampProcess(MaterialProcess):
 
     def advance_materials(self, dt):
         del dt  # clamps are algebraic process updates
+        transaction = _MaterialFieldTransaction()
         for key, spec in zip(self._clamp_operator_keys, type(self)._clamp_specs):
             material = self._get_material(spec.material)
-            c = material._buffers[spec.field]
+            c = transaction.read(material, spec.field)
             mode = self._effective_clamp_mode(spec)
             c_clamped = self._apply_clamp_mode(c, spec, mode)
             mask_name = self._clamp_mask_names.get(key, None)
@@ -781,7 +840,8 @@ class ClampProcess(MaterialProcess):
             else:
                 mask = self._broadcast_mask(self._buffers[mask_name], c)
                 c_new = torch.where(mask, c_clamped, c)
-            material._buffers[spec.field] = c_new
+            transaction.write(material, spec.field, c_new)
+        transaction.commit()
 
 
 class ExchangeProcess(MaterialProcess):
@@ -813,9 +873,13 @@ class ExchangeProcess(MaterialProcess):
         for base in reversed(cls.__mro__):
             if "_exchange_specs" in base.__dict__:
                 specs.extend(list(base._exchange_specs))
-        if ExchangeProcess._exchange_declarations:
-            specs.extend(ExchangeProcess._exchange_declarations)
-            ExchangeProcess._exchange_declarations = []
+        specs.extend(
+            consume_class_values(
+                cls,
+                "exchange_process.specs",
+                ExchangeProcess._exchange_declarations,
+            )
+        )
         cls._exchange_specs = tuple(specs)
 
     @staticmethod
@@ -878,7 +942,9 @@ class ExchangeProcess(MaterialProcess):
             None if domain_a is None else str(domain_a),
             None if domain_b is None else str(domain_b),
         )
-        ExchangeProcess._exchange_declarations.append(spec)
+        declare_class_value(
+            "exchange_process.specs", spec, ExchangeProcess._exchange_declarations
+        )
 
     @staticmethod
     def COUPLE(*args, **kwargs):
@@ -1114,11 +1180,12 @@ class ExchangeProcess(MaterialProcess):
 
     def advance_materials(self, dt):
         dt_t = None
+        transaction = _MaterialFieldTransaction()
         for spec in type(self)._exchange_specs:
             ma = self._get_material(spec.material_a)
             mb = self._get_material(spec.material_b)
-            a = ma._buffers[spec.field_a]
-            b = mb._buffers[spec.field_b]
+            a = transaction.read(ma, spec.field_a)
+            b = transaction.read(mb, spec.field_b)
 
             if dt_t is None:
                 dt_t = torch.as_tensor(dt, device=a.device, dtype=a.dtype)
@@ -1162,8 +1229,9 @@ class ExchangeProcess(MaterialProcess):
             a_new = torch.where(active, a_new, a)
             b_new = torch.where(active, b_new, b)
 
-            ma._buffers[spec.field_a] = a_new
-            mb._buffers[spec.field_b] = b_new
+            transaction.write(ma, spec.field_a, a_new)
+            transaction.write(mb, spec.field_b, b_new)
+        transaction.commit()
 
 
 class DiffusionProcess(MaterialProcess):
@@ -1192,9 +1260,13 @@ class DiffusionProcess(MaterialProcess):
         for base in reversed(cls.__mro__):
             if "_diffusion_specs" in base.__dict__:
                 specs.extend(list(base._diffusion_specs))
-        if DiffusionProcess._diffusion_declarations:
-            specs.extend(DiffusionProcess._diffusion_declarations)
-            DiffusionProcess._diffusion_declarations = []
+        specs.extend(
+            consume_class_values(
+                cls,
+                "diffusion_process.specs",
+                DiffusionProcess._diffusion_declarations,
+            )
+        )
         cls._diffusion_specs = tuple(specs)
 
     @staticmethod
@@ -1223,7 +1295,9 @@ class DiffusionProcess(MaterialProcess):
         spec = DiffusionSpec(
             str(material), str(field), D, None if domain is None else str(domain)
         )
-        DiffusionProcess._diffusion_declarations.append(spec)
+        declare_class_value(
+            "diffusion_process.specs", spec, DiffusionProcess._diffusion_declarations
+        )
 
     def configure_process(self, population=None):
         if self.key is not None:
@@ -1276,6 +1350,17 @@ class DiffusionProcess(MaterialProcess):
         self._diffusion_geometry_kind = self._select_geometry_kind(population)
         if self._diffusion_geometry_kind == "tree":
             self._configure_tree_geometry(population)
+        else:
+            self._configure_1d_geometry(population)
+
+        self._spatial_operators = self._new_spatial_operators()
+
+        self._validate_diffusion_specs()
+        self._spatial_configured = False
+        return None
+
+    def _new_spatial_operators(self) -> torch.nn.ModuleDict:
+        if self._diffusion_geometry_kind == "tree":
             operator_type = SpatialOperatorTree
             operator_kwargs = {
                 "solver": self._diffusion_solver,
@@ -1283,23 +1368,19 @@ class DiffusionProcess(MaterialProcess):
                 "threads": self._diffusion_threads,
             }
         else:
-            self._configure_1d_geometry(population)
             operator_type = SpatialOperator1D
             operator_kwargs = {
                 "solver": self._diffusion_solver,
                 "boundary": self._diffusion_boundary,
             }
-
-        self._spatial_operators = torch.nn.ModuleDict(
+        operators = torch.nn.ModuleDict(
             {
                 key: operator_type(**operator_kwargs)
                 for key in self._diffusion_operator_keys
             }
         )
-
-        self._validate_diffusion_specs()
-        self._spatial_configured = False
-        return None
+        operators.train(self.training)
+        return operators
 
     def _select_geometry_kind(self, population) -> str:
         """Select the spatial backend for this population.
@@ -1448,9 +1529,14 @@ class DiffusionProcess(MaterialProcess):
 
     def set_dt(self, dt):
         """Update dt and precompute diffusion operators for the current run."""
-        super().set_dt(dt)
+        # Validate and stage the mechanism dt without mutating the registered
+        # buffer. Spatial configuration may still fail on a later specification.
+        dt_new = self.dt.clone()
+        dt_new.fill_(dt)
+        dt_new = dt_new.detach()
         if hasattr(self, "_material_resolver"):
             self.configure_spatial_operators(dt)
+        self.dt = dt_new
         return None
 
     def configure_spatial_operators(self, dt):
@@ -1461,15 +1547,20 @@ class DiffusionProcess(MaterialProcess):
     def _configure_1d_spatial_operators(self, dt):
         dx = self._buffers["_mp_dx"].to(device=self.diam.device, dtype=self.diam.dtype)
         diam_base = self.diam
+        resolved = []
         for key, spec in zip(
             self._diffusion_operator_keys, type(self)._diffusion_specs
         ):
             material = self._get_material(spec.material)
             c = material._buffers[spec.field]
             D = self._resolve_quantity(spec.D, c)
+            resolved.append((key, c, D))
+
+        staged_operators = self._new_spatial_operators()
+        for key, c, D in resolved:
             diam = diam_base.to(device=c.device, dtype=c.dtype)
             dx_c = dx.to(device=c.device, dtype=c.dtype)
-            self._spatial_operators[key].configure_diffusion(
+            staged_operators[key].configure_diffusion(
                 c,
                 dt,
                 D,
@@ -1479,10 +1570,12 @@ class DiffusionProcess(MaterialProcess):
                 area_fraction=self._diffusion_area_fraction,
                 solver=self._diffusion_solver,
             )
+        self._spatial_operators = staged_operators
         self._spatial_configured = True
         return None
 
     def _configure_tree_spatial_operators(self, dt):
+        resolved = []
         for key, spec in zip(
             self._diffusion_operator_keys, type(self)._diffusion_specs
         ):
@@ -1490,7 +1583,11 @@ class DiffusionProcess(MaterialProcess):
             c = material._buffers[spec.field]
             D = self._resolve_quantity(spec.D, c)
             domain = self._effective_domain(material, spec) or "intracellular"
-            self._spatial_operators[key].configure_diffusion(
+            resolved.append((key, c, D, domain))
+
+        staged_operators = self._new_spatial_operators()
+        for key, c, D, domain in resolved:
+            staged_operators[key].configure_diffusion(
                 c,
                 dt,
                 D,
@@ -1498,6 +1595,7 @@ class DiffusionProcess(MaterialProcess):
                 domain=domain,
                 solver=self._diffusion_solver,
             )
+        self._spatial_operators = staged_operators
         self._spatial_configured = True
         return None
 
@@ -1508,14 +1606,16 @@ class DiffusionProcess(MaterialProcess):
             # manual/eager calls usable while still moving the work out of the
             # steady-state hot path after the first call.
             self.configure_spatial_operators(dt)
+        transaction = _MaterialFieldTransaction()
         for key, spec in zip(
             self._diffusion_operator_keys, type(self)._diffusion_specs
         ):
             material = self._get_material(spec.material)
-            c = material._buffers[spec.field]
+            c = transaction.read(material, spec.field)
             op = self._spatial_operators[key]
             if self._diffusion_method == "explicit":
                 c_new = op.diffuse_explicit_configured(c)
             else:
                 c_new = op.diffuse_implicit_configured(c)
-            material._buffers[spec.field] = c_new
+            transaction.write(material, spec.field, c_new)
+        transaction.commit()

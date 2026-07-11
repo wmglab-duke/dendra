@@ -277,34 +277,6 @@ def ssd_df_no_ve(v_c, v_p):
     return (vc_p[:, :-2] + vc_p[:, 2:] - vp).reshape_as(v_c)
 
 
-def ssd_df_heterogeneous(v_c, v_p, v_e, g_left, g_right):
-    """Calculates the spatial second derivative along the final axis."""
-    K = v_c.shape[-1]
-    vc = _flatten_to_solve(v_c, K)
-    vp = _flatten_to_solve(v_p, K)
-    ve = _flatten_to_solve(v_e, K, tuple(v_c.shape))
-    gl = _flatten_to_solve(g_left, K)
-    gr = _flatten_to_solve(g_right, K)
-    vc_p = _reflect_pad_last(vc, (1, 1))
-    ve_p = _reflect_pad_last(ve, (1, 1))
-    g_sum = gl + gr
-    d2v_c = gl * vc_p[:, :-2] + gr * vc_p[:, 2:] - g_sum * vp
-    d2v_e = gl * ve_p[:, :-2] + gr * ve_p[:, 2:] - g_sum * ve
-    return (d2v_c + d2v_e).reshape_as(v_c)
-
-
-def ssd_df_heterogeneous_no_ve(v_c, v_p, g_left, g_right):
-    """Calculates the spatial second derivative along the final axis without ve."""
-    K = v_c.shape[-1]
-    vc = _flatten_to_solve(v_c, K)
-    vp = _flatten_to_solve(v_p, K)
-    gl = _flatten_to_solve(g_left, K)
-    gr = _flatten_to_solve(g_right, K)
-    vc_p = _reflect_pad_last(vc, (1, 1))
-    g_sum = gl + gr
-    return (gl * vc_p[:, :-2] + gr * vc_p[:, 2:] - g_sum * vp).reshape_as(v_c)
-
-
 class _dufort_frankel_homogeneous(Integrator):
     r"""
     Dufort-Frankel explicit integrator for homogeneous morphologies.

@@ -1,3 +1,12 @@
+"""Experimental implicit-explicit integrators based on Krylov projections.
+
+This module is intentionally not re-exported from :mod:`dendra` or
+:mod:`dendra.models.integrators`. Its underscored integrator and numerical
+helpers are provisional: names, defaults, supported model geometries, and
+numerical behavior may change without the compatibility guarantees of
+Dendra's stable integrator API.
+"""
+
 from numbers import Integral
 from typing import Tuple
 
@@ -172,8 +181,11 @@ def phi1_krylov_lanczos_g(
 
 
 class _krylov_etd1(Integrator):
-    """
-    IMEX ETD1 method using Krylov subspace for the matrix exponential.
+    """Experimental IMEX ETD1 integrator using a Krylov subspace.
+
+    This implementation is available for numerical evaluation and testing but
+    is not part of Dendra's stable public integrator API. Its constructor,
+    supported geometries, and numerical behavior may change between releases.
     """
 
     def __init__(

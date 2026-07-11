@@ -1,9 +1,13 @@
+"""Tensor-shape helpers for parameter grids and model broadcasting."""
+
 from __future__ import annotations
 
 from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
+
+__all__ = ["cartesian_product", "add_dims_as_necessary"]
 
 ArrayLike1D = Union[
     torch.Tensor,
@@ -182,11 +186,6 @@ def cartesian_product(
     sizes = [int(t.numel()) for t in tensors]
     k = len(tensors)
 
-    # If any input is empty, the Cartesian product is empty.
-    if any(n == 0 for n in sizes):
-        outs = tuple(torch.empty((0,), device=device, dtype=dtype) for _ in range(k))
-        return torch.stack(outs, dim=-1) if return_stacked else outs
-
     # Precompute suffix products for repeat patterns
     # repeat_each[i] = product_{j>i} sizes[j]
     # tile[i]        = product_{j<i} sizes[j]
@@ -225,24 +224,40 @@ def cartesian_product(
 
 
 def add_dims_as_necessary(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """
-    Add singleton dimensions to `a` as necessary to make it broadcastable with `b`.
+    """Reshape a scalar or vector so that it broadcasts against ``b``.
 
-    `a` may be 0D (scalar) or 1D. `b` may be any shape. The output will have the same shape as `b`.
-    If 1D, `a` must have length equal to one of the dimensions of `b` to be broadcastable. If 0D, it can be broadcast to any shape.
+    Scalars are returned unchanged. For a vector, the first dimension of
+    ``b`` whose size matches the vector length is selected and singleton
+    dimensions are inserted around it. The returned tensor is a
+    broadcast-ready *view*; it is not expanded to the shape of ``b``.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        A scalar or one-dimensional tensor.
+    b : torch.Tensor
+        Tensor whose shape determines the desired alignment.
+
+    Returns
+    -------
+    torch.Tensor
+        ``a`` itself when scalar, or a reshaped view of ``a`` when it is a
+        vector. Device, dtype, and autograd history are preserved.
+
+    Raises
+    ------
+    ValueError
+        If ``a`` has more than one dimension or no dimension of ``b`` matches
+        the vector length.
     """
 
     if a.ndim == 0:
-        # Scalar can be broadcast to any shape
         return a
-    elif a.ndim == 1:
-        # Find a dimension in b that matches the length of a
+    if a.ndim == 1:
         for i, dim in enumerate(b.shape):
             if dim == a.shape[0]:
-                # Insert singleton dimensions before and after to align with this dimension
                 return a.reshape((1,) * i + (-1,) + (1,) * (b.ndim - i - 1))
         raise ValueError(
             f"Cannot broadcast 1D tensor of length {a.shape[0]} to shape {b.shape}."
         )
-    else:
-        raise ValueError(f"Input tensor must be 0D or 1D, but got shape {a.shape}.")
+    raise ValueError(f"Input tensor must be 0D or 1D, but got shape {a.shape}.")

@@ -6,9 +6,6 @@ import textwrap
 from functools import lru_cache
 
 import sympy as sp
-from sympy import Poly, expand, factor, symbols, sympify
-
-from dendra.helpers import DEBUG
 
 from .source import safe_source
 
@@ -120,86 +117,3 @@ def factorize_linear_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
         return re.sub(r"\bself_(\w+)\b", r"self.\1", str(expr))
 
     return _dotify(A), _dotify(C)
-
-
-def replace_v(code_str):
-    # Replace the local voltage variable while leaving attributes such as
-    # ``self.v`` untouched.  A word boundary alone also matches after ``.``.
-    return re.sub(r"(?<![\w.])v(?!\w)", "(v + v_n) / 2", code_str)
-
-
-@lru_cache(maxsize=None)
-def factor_linear_in_x_from_codeblock(code_str, x_var="v_n"):
-    lines = code_str.strip().split("\n")
-
-    # Identify self-prefixed variables
-    pattern = r"self\.(\w+)"
-    self_vars_all = re.findall(pattern, code_str)
-    self_vars_all = set(self_vars_all)
-    self_mapping = {var: f"self.{var}" for var in self_vars_all}
-
-    env = {}
-
-    def parse_expr(expr_str):
-        # Extract potential variables
-        potential_vars = set(re.findall(r"[a-zA-Z_]\w*", expr_str))
-        for var in potential_vars:
-            if var not in env:
-                env[var] = symbols(var, real=True)
-        return sympify(expr_str, locals=env)
-
-    final_expr = None
-
-    # Parse line by line
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        line_no_self = line.replace("self.", "")
-
-        if line_no_self.startswith("return "):
-            return_expr_str = line_no_self[len("return ") :].strip()
-            final_expr = parse_expr(return_expr_str)
-        elif "=" in line_no_self:
-            lhs, rhs = line_no_self.split("=", 1)
-            var_name = lhs.strip()
-            rhs_expr_str = rhs.strip()
-            rhs_expr = parse_expr(rhs_expr_str)
-            env[var_name] = rhs_expr
-        else:
-            final_expr = parse_expr(line_no_self)
-
-    if DEBUG:
-        print(f"Final expression in mech factorization: {final_expr}")
-
-    if final_expr is None:
-        raise ValueError("No final expression or return statement found.")
-
-    if x_var not in env:
-        env[x_var] = symbols(x_var, real=True)
-    x = env[x_var]
-
-    # Factor the final_expr as A + B*x
-    expr_expanded = expand(final_expr)
-    p = Poly(expr_expanded, x)
-
-    if p.degree() != 1:
-        raise ValueError("Expression is not linear in x.")
-
-    A = p.eval(0)
-    B = p.coeff_monomial(x)
-
-    # Now factor each of A and B individually
-    A_factor = factor(A)
-    B_factor = factor(B)
-
-    # Convert to strings
-    A_str = str(A_factor)
-    B_str = str(B_factor)
-
-    # Restore self. prefixes
-    for var in sorted(self_mapping.keys(), key=len, reverse=True):
-        A_str = re.sub(rf"\b{var}\b", self_mapping[var], A_str)
-        B_str = re.sub(rf"\b{var}\b", self_mapping[var], B_str)
-
-    return A_str, B_str

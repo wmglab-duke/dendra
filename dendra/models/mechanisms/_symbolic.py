@@ -1,3 +1,5 @@
+import torch  # noqa: F401 - provided to dynamically generated current functions
+
 from dendra.helpers import DEBUG, logger
 from dendra.utils.dynamic_compilation import compile_generated_function
 
@@ -23,10 +25,19 @@ def {k}(self, v):
 
 numerical_template = """
 def {k}(self, v):
+    if v.dtype not in (torch.float32, torch.float64):
+        raise TypeError(
+            "Numerical current differentiation supports only torch.float32 and "
+            "torch.float64 voltage tensors; use an analytic current/conductance "
+            "pair for lower-precision dtypes."
+        )
     i = self.{k}(v)
-    i_d = self.{k}(v + 1e-3)
+    rel_step = torch.finfo(v.dtype).eps ** (1.0 / 3.0)
+    step = rel_step * torch.maximum(torch.abs(v), torch.ones_like(v))
+    i_plus = self.{k}(v + step)
+    i_minus = self.{k}(v - step)
     {assign_to_buffer}
-    return i, (i_d - i) / (1e-3)
+    return i, (i_plus - i_minus) / (2.0 * step)
 """
 
 
@@ -79,12 +90,15 @@ def build_current_eq(mechanism, k, assign=False):
         factorable = True
         if DEBUG > 0:
             logger.info(f"Generated code for {k}:\n{code}")
-        return compile_generated_function(
-            code,
-            func_name=k,
-            filename_prefix="dendra.mechanisms.numerical",
-            global_ns=globals(),
-        ), factorable
+        return (
+            compile_generated_function(
+                code,
+                func_name=k,
+                filename_prefix="dendra.mechanisms.numerical",
+                global_ns=globals(),
+            ),
+            factorable,
+        )
     try:
         gtot, irev = factorize_linear_in_v(mechanism.__class__, method=k)
         code = build_implicit_equation(k, gtot, irev, assign)
@@ -98,9 +112,12 @@ def build_current_eq(mechanism, k, assign=False):
             factorable = False
     if DEBUG > 0:
         logger.info(f"Generated code for {k}:\n{code}")
-    return compile_generated_function(
-        code,
-        func_name=k,
-        filename_prefix="dendra.mechanisms.implicit",
-        global_ns=globals(),
-    ), factorable
+    return (
+        compile_generated_function(
+            code,
+            func_name=k,
+            filename_prefix="dendra.mechanisms.implicit",
+            global_ns=globals(),
+        ),
+        factorable,
+    )

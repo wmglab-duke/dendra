@@ -180,7 +180,7 @@ def _dense_scalar_reference(model, mechanism, voltage, dt, intra, extracellular)
         )
         for parent, child, data in graph.edges(data=True):
             conductance = 1.0 / (data["R_ohm"] * model.rhoa_scale)
-            drive = conductance * (flat_ve[row, parent] - flat_ve[row, child])
+            drive = conductance * (flat_ve[row, child] - flat_ve[row, parent])
             rhs = rhs.clone()
             rhs[parent] += drive
             rhs[child] -= drive

@@ -1657,7 +1657,9 @@ class Network(RNGMixin):
 
         if rule in ("fixed_total_number", "fixed_total"):
             n = int(_require(spec, "N", "n"))
-            if n <= 0:
+            if n < 0:
+                raise ValueError("fixed_total_number requires a non-negative count.")
+            if n == 0:
                 return pre_pool[:0], post_pool[:0]
 
             candidates_pre, candidates_post = self._all_to_all_edges(
@@ -3319,13 +3321,23 @@ class Network(RNGMixin):
         all_indices = indices(concat_pops)
         all_indices = {n: i.flatten() for n, i in zip(pops_to_concatenate, all_indices)}
 
+        def remapped_endpoint(population_name):
+            if population_name in pops_to_concatenate:
+                return new_net.populations[name]
+            if population_name == "netstim":
+                if new_net.netstim is None:
+                    raise RuntimeError(
+                        "Cannot restore a NetStim connection while concatenating "
+                        "a network without an attached NetStim."
+                    )
+                return new_net.netstim
+            return new_net.populations[population_name]
+
         # now reapply connections
         for k, v in self.synapse_spec.items():
             source_name, target_name, synapse, pre_var = k
-            if (source_pop := new_net.populations.get(name)) is None:
-                source_pop = getattr(new_net, source_name)
-            if (target_pop := new_net.populations.get(name)) is None:
-                target_pop = getattr(new_net, target_name)
+            source_pop = remapped_endpoint(source_name)
+            target_pop = remapped_endpoint(target_name)
             synapse = getattr(target_pop.mech, synapse.name)
 
             for data in v:
@@ -3334,8 +3346,11 @@ class Network(RNGMixin):
 
                 if source_name in pops_to_concatenate:
                     source_idx = all_indices[source_name][source_idx]
-                if target_name in pops_to_concatenate:
-                    target_idx = all_indices[target_name][target_idx]
+
+                # target_idx is local to the target synapse, not population-flat.
+                # Reinserted component synapses preserve their own local ordering
+                # inside the concatenated population, so it must not be offset by
+                # the owning population's compartment position.
 
                 new_net._connect(
                     source_pop,
@@ -3347,6 +3362,40 @@ class Network(RNGMixin):
                     weight,
                     delay,
                     pre_var=pre_var,
+                )
+
+        for k, v in self.continuous_synapse_spec.items():
+            (
+                source_name,
+                target_name,
+                synapse,
+                pre_var,
+                input_name,
+                reduce,
+                transform,
+            ) = k
+            source_pop = remapped_endpoint(source_name)
+            target_pop = remapped_endpoint(target_name)
+            synapse = getattr(target_pop.mech, synapse.name)
+
+            for data in v:
+                source_idx, target_idx = data[0], data[1]
+                weight, delay = data[2], data[4]
+                if source_name in pops_to_concatenate:
+                    source_idx = all_indices[source_name][source_idx]
+
+                new_net._connect_continuous(
+                    source_pop,
+                    source_idx,
+                    target_pop,
+                    target_idx,
+                    synapse,
+                    weight=weight,
+                    delay=delay,
+                    pre_var=pre_var,
+                    input=input_name,
+                    reduce=reduce,
+                    transform=transform,
                 )
 
         return new_net

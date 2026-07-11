@@ -1,7 +1,8 @@
 """Lazy C++/CUDA kernels for NetCon bitpacked source-spike history.
 
-This module intentionally keeps the same public API as the Triton/CUDA variants
-used by ``NetCon``:
+``NetCon`` dispatches to this module for its normal accelerated CUDA path. The
+separate Triton implementation mirrors the core API for direct experimental and
+reference use, but ``NetCon`` does not select it automatically:
 
     pack_source_spikes(source_spikes, packed_history, current_time_step)
     build_delivery(packed_history, current_time_step, delay_steps,

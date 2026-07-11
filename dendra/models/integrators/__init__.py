@@ -11,7 +11,8 @@ from .explicit import (
     _rk4,
 )
 
-#from .imex import _krylov_etd1
+# IMEX/Krylov implementations remain direct, explicit imports from ``.imex``
+# while that module is experimental.
 from .implicit import (
     _bwd_euler_bt,
     _bwd_euler_sc,
@@ -50,7 +51,6 @@ dufort_frankel = make_partial_integrator(_dufort_frankel)
 dufort_frankel_homogeneous = make_partial_integrator(_dufort_frankel_homogeneous)
 eulerv1 = make_partial_integrator(_eulerv1)
 
-#krylov_etd1 = partial(partial_class, _krylov_etd1)
 bwd_euler_sc = make_partial_integrator(_bwd_euler_sc)
 bwd_euler_sc_multi = make_partial_integrator(_bwd_euler_sc_multi)
 bwd_euler_ub = make_partial_integrator(_bwd_euler_ub)
@@ -73,7 +73,6 @@ __all__ = [
     "rk4",
     "dufort_frankel",
     "dufort_frankel_homogeneous",
-    #"krylov_etd1",
     "bwd_euler_sc",
     "bwd_euler_sc_multi",
     "bwd_euler_ub",

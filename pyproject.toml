@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "cython", "numpy"]
+requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -51,13 +51,15 @@ markers = [
 
 [tool.dendra.coverage-floors]
 "dendra/data/h5.py" = 98
+"dendra/models/_class_declarations.py" = 98
 "dendra/models/analysis.py" = 79
 "dendra/models/callbacks.py" = 84
-"dendra/models/core.py" = 62
+"dendra/models/core.py" = 63
 "dendra/models/extcell.py" = 91
 "dendra/models/fields/line.py" = 98
 "dendra/models/fields/precomputed.py" = 90
 "dendra/models/graph.py" = 91
+"dendra/models/heterogeneous/compartments.py" = 95
 "dendra/models/integrators/core.py" = 84
 "dendra/models/integrators/explicit.py" = 92
 "dendra/models/integrators/imex.py" = 93
@@ -68,30 +70,36 @@ markers = [
 "dendra/models/io.py" = 78
 "dendra/models/mechanisms/_bufferimplicit.py" = 84
 "dendra/models/mechanisms/_derivimplicit.py" = 70
-"dendra/models/mechanisms/_handler.py" = 73
+"dendra/models/mechanisms/_handler.py" = 75
 "dendra/models/mechanisms/_kinetic.py" = 90
 "dendra/models/mechanisms/_linearimplicit.py" = 87
-"dendra/models/mechanisms/_material_process.py" = 67
-"dendra/models/mechanisms/_mechanism.py" = 69
+"dendra/models/mechanisms/_material_process.py" = 72
+"dendra/models/mechanisms/_mechanism.py" = 72
 "dendra/models/mechanisms/_rosenbrock.py" = 87
 "dendra/models/mechanisms/_solvers.py" = 98
 "dendra/models/mechanisms/_spatial.py" = 72
+"dendra/models/mechanisms/_symbolic.py" = 72
 "dendra/models/mechanisms/compilers/ast.py" = 80
+"dendra/models/mechanisms/ode.py" = 71
 "dendra/models/multi.py" = 85
-"dendra/models/networks/net.py" = 55
-"dendra/models/networks/netcon.py" = 65
+"dendra/models/networks/net.py" = 65
+"dendra/models/networks/netcon.py" = 67
 "dendra/models/networks/netcon_bitpack_contracts.py" = 75
 "dendra/models/networks/netcon_bitpack_ops.py" = 54
 "dendra/models/networks/netstim.py" = 74
-"dendra/models/parametric.py" = 79
+"dendra/models/parametric.py" = 82
 "dendra/models/rng.py" = 93
 "dendra/models/slice.py" = 78
 "dendra/models/stim/extra.py" = 96
 "dendra/models/stim/intra.py" = 96
 "dendra/models/stim/waveform/core.py" = 87
 "dendra/models/stim/waveform/implementations.py" = 87
-"dendra/models/tree.py" = 86
+"dendra/models/tree.py" = 89
+"dendra/models/utils.py" = 85
+"dendra/opt/utils.py" = 95
 "dendra/utils/interpolation.py" = 79
+"dendra/utils/neuron.py" = 90
+"dendra/utils/tensor_ops.py" = 90
 
 [tool.setuptools.dynamic]
 version = {attr = "dendra.__version__"}
@@ -100,6 +108,15 @@ version = {attr = "dendra.__version__"}
 where = ["."]  # list of folders that contain the packages (["."] by default)
 include = ["dendra*",]  # package names should match these glob patterns (["*"] by default)
 namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
+
+[tool.setuptools.package-data]
+"dendra.models.networks" = [
+    "netcon_bitpack_kernel.cpp",
+    "netcon_bitpack_kernel.cu",
+]
+
+[tool.setuptools.exclude-package-data]
+"dendra.models.heterogeneous" = ["ops.cpp"]
 
 [tool.commitizen]
 name = "cz_conventional_commits"

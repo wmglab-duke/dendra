@@ -26,6 +26,29 @@ Core
    :members:
 
 
+Compartment identifiers
+-----------------------
+
+``CompartmentID`` describes repeating named regions while defining an axon
+model. Register it with :meth:`dendra.models.core.Axon.register_cid` to make
+those names available to Dendra's search and slicing APIs and as labelled
+attributes on the axon.
+
+.. autoclass:: dendra.models.heterogeneous.CompartmentID
+   :members:
+
+
+Morphology graph helpers
+------------------------
+
+These functions calculate weighted distances while treating a directed
+morphology graph as undirected, so paths may be measured both toward and away
+from the graph root.
+
+.. autofunction:: dendra.models.utils.distance
+.. autofunction:: dendra.models.utils.undirected_weighted_lengths
+
+
 Synapse slot targets
 --------------------
 .. autoclass:: dendra.models.slice.SynapseSlots
