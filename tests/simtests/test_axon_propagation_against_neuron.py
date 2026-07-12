@@ -210,7 +210,14 @@ def _assert_genuine_propagation(trace: np.ndarray, case: _AxonCase, dt: float):
 
 def _assert_time_aligned(actual: _Simulation, expected: _Simulation, dt: float):
     assert actual.voltage.shape == expected.voltage.shape
-    np.testing.assert_allclose(actual.time, expected.time, rtol=0.0, atol=dt * 1e-10)
+    # NEURON accumulates h.t by repeated floating-point addition; a very fine
+    # reference therefore carries a few extra picoseconds of roundoff by tstop.
+    np.testing.assert_allclose(
+        actual.time,
+        expected.time,
+        rtol=0.0,
+        atol=max(dt * 1.0e-10, 1.0e-11),
+    )
 
 
 def _rmse(actual: np.ndarray, expected: np.ndarray) -> float:
@@ -244,10 +251,13 @@ def test_active_axon_propagation_matches_neuron(case_name):
     max_abs = float(np.max(np.abs(difference)))
     rmse = _rmse(actual.voltage, expected.voltage)
     max_abs_bound, rmse_bound = {
-        "unmyelinated": (0.6, 0.1),
+        # With analytic HH rates on both sides, the conventional cable agrees
+        # to well below a microvolt across the full propagated waveform.
+        "unmyelinated": (1.0e-3, 2.0e-4),
         # The reduced node-only cable has a very steep spike upstroke; its
         # pointwise error is dominated by a sub-step phase offset. The RMSE
-        # guards the complete trajectory more tightly.
+        # guards the complete trajectory more tightly. This residual is not
+        # caused by NEURON's HH lookup table, so retain its established bound.
         "myelinated": (5.0, 0.25),
     }[case.name]
     assert max_abs < max_abs_bound and rmse < rmse_bound, (
@@ -255,46 +265,48 @@ def test_active_axon_propagation_matches_neuron(case_name):
     )
 
 
-def test_reduced_myelinated_active_propagation_converges_with_timestep():
-    """Both solvers and their cross-simulator spike features converge in time."""
+def test_reduced_myelinated_active_propagation_converges_to_fine_neuron_reference():
+    """The challenging node-only cable converges toward one fine oracle."""
     case = CASES["myelinated"]
     dts = (0.025, 0.0125, 0.00625)
-    neuron_runs = [_run_neuron(case, dt) for dt in dts]
     dendra_runs = [_run_dendra(case, dt) for dt in dts]
+    reference_dt = dts[-1] / 8.0
+    reference = _run_neuron(case, reference_dt)
+    _assert_genuine_propagation(reference.voltage, case, reference_dt)
 
-    for dt, actual, expected in zip(dts, dendra_runs, neuron_runs):
-        _assert_time_aligned(actual, expected, dt)
-        _assert_genuine_propagation(expected.voltage, case, dt)
+    sampled_references = []
+    for dt, actual in zip(dts, dendra_runs):
+        stride = round(dt / reference_dt)
+        assert dt == pytest.approx(stride * reference_dt, abs=1.0e-15)
+        sampled = _Simulation(
+            reference.time[::stride],
+            reference.voltage[::stride],
+        )
+        sampled_references.append(sampled)
+        _assert_time_aligned(actual, sampled, dt)
         _assert_genuine_propagation(actual.voltage, case, dt)
 
-    # These are independent fixed-step simulations at nested dt values. Compare
-    # actual coarse runs against the matching points of each simulator's own
-    # finest run; no interpolation or phase alignment can hide timing error.
-    for runs in (neuron_runs, dendra_runs):
-        coarse_error = _rmse(runs[0].voltage, runs[2].voltage[::4])
-        refined_error = _rmse(runs[1].voltage, runs[2].voltage[::2])
-        np.testing.assert_allclose(
-            runs[0].time, runs[2].time[::4], rtol=0.0, atol=1e-12
-        )
-        np.testing.assert_allclose(
-            runs[1].time, runs[2].time[::2], rtol=0.0, atol=1e-12
-        )
-        assert refined_error < coarse_error
-
-    cross_trace_errors = [
+    # Compare every Dendra resolution to the same substantially finer NEURON
+    # trajectory at exact nested sample times.  This measures convergence to a
+    # common physical reference rather than agreement between two same-dt,
+    # oppositely ordered first-order splittings.
+    trace_errors = [
         _rmse(actual.voltage, expected.voltage)
-        for actual, expected in zip(dendra_runs, neuron_runs)
+        for actual, expected in zip(dendra_runs, sampled_references)
     ]
-    assert cross_trace_errors[2] < cross_trace_errors[1] < cross_trace_errors[0]
+    assert trace_errors[1] < 0.65 * trace_errors[0]
+    assert trace_errors[2] < 0.65 * trace_errors[1]
+    assert trace_errors[2] < 0.2
 
+    reference_crossing, reference_peak = _spike_feature_times(reference)
     feature_errors = []
-    for actual, expected in zip(dendra_runs, neuron_runs):
+    for actual in dendra_runs:
         actual_crossing, actual_peak = _spike_feature_times(actual)
-        expected_crossing, expected_peak = _spike_feature_times(expected)
         feature_errors.append(
             max(
-                float(np.max(np.abs(actual_crossing - expected_crossing))),
-                float(np.max(np.abs(actual_peak - expected_peak))),
+                float(np.max(np.abs(actual_crossing - reference_crossing))),
+                float(np.max(np.abs(actual_peak - reference_peak))),
             )
         )
     assert feature_errors[2] < feature_errors[1] < feature_errors[0]
+    assert feature_errors[2] <= 2.0 * dts[2] + 1.0e-12

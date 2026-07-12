@@ -238,17 +238,18 @@ def _assert_simulators_close(actual, expected, *, case, polarity):
     oracle_spiked = float(expected.max()) > 20.0
     actual_spiked = float(actual.max()) > 20.0
     assert actual_spiked == oracle_spiked, diagnostics
+    # Disabling NEURON's HH rate interpolation removes the former sub-mV model
+    # discrepancy.  Keep both pointwise and trajectory-wide guards tight for
+    # every polarity, including the steep spike upstrokes.
+    assert np.allclose(actual, expected, rtol=2.0e-6, atol=5.0e-4), diagnostics
+    assert max_abs < 2.0e-3, diagnostics
+    assert rmse < 4.0e-4, diagnostics
     if not oracle_spiked:
-        assert np.allclose(actual, expected, rtol=2.0e-4, atol=3.0e-2), diagnostics
         return
 
-    # A one-step change in threshold time produces a relatively large
-    # pointwise error on a steep HH upstroke. Compare the complete waveform by
-    # RMSE, then constrain the spike timing, polarity-localized peak, amplitude,
-    # and after-hyperpolarization independently rather than hiding a phase
-    # error behind a loose pointwise tolerance.
-    assert rmse < 0.6, diagnostics
-    assert max_abs < 3.0, diagnostics
+    # Constrain spike timing, polarity-localized peak, amplitude, and
+    # after-hyperpolarization independently as semantic checks in addition to
+    # the strict waveform comparison above.
 
     expected_crossings = np.argwhere(expected > 0.0)
     actual_crossings = np.argwhere(actual > 0.0)
@@ -262,8 +263,8 @@ def _assert_simulators_close(actual, expected, *, case, polarity):
     actual_peak = np.unravel_index(np.argmax(actual), actual.shape)
     assert expected_peak[1] == actual_peak[1], diagnostics
     assert abs((actual_peak[0] - expected_peak[0]) * DT) <= DT + 1.0e-12, diagnostics
-    assert abs(float(actual.max() - expected.max())) < 0.1, diagnostics
-    assert abs(float(actual.min() - expected.min())) < 0.1, diagnostics
+    assert abs(float(actual.max() - expected.max())) < 1.0e-3, diagnostics
+    assert abs(float(actual.min() - expected.min())) < 1.0e-3, diagnostics
 
 
 @pytest.mark.parametrize("case", ["tree", "unmyelinated", "myelinated"])

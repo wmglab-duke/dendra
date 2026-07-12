@@ -186,12 +186,20 @@ class _krylov_etd1(Integrator):
     This implementation is available for numerical evaluation and testing but
     is not part of Dendra's stable public integrator API. Its constructor,
     supported geometries, and numerical behavior may change between releases.
+    Per-step membrane-current reporting is not yet defined for its exponential
+    discretization, so requesting ``imem`` raises :class:`NotImplementedError`
+    instead of exposing a stale or misleading value.
     """
 
     def __init__(
         self, model, mech, m: int = 4, method="arnoldi", guard=False, imem=None
     ):
         super().__init__(model, mech, imem)
+        if self.imem:
+            raise NotImplementedError(
+                "Experimental _krylov_etd1 does not support imem membrane-current "
+                "reporting; pass imem=False."
+            )
         B, K = _model_solve_shape(model)
         if isinstance(m, bool) or not isinstance(m, Integral):
             raise TypeError("Krylov dimension m must be an integer.")
@@ -341,11 +349,7 @@ class _krylov_etd1(Integrator):
 
     def detach(self, model):
         model.v = model.v.detach()
-        if self.imem:
-            model.i_membrane.detach_()
         self.mech.detach()
 
     def init_v(self, model):
         model.v = _expanded_v_init(model).clone().detach().contiguous()
-        if self.imem:
-            model.i_membrane = torch.zeros_like(model.v).detach()

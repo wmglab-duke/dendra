@@ -57,7 +57,7 @@ def _new_neuron_cell(name):
 
 
 def _exp2_taus(synapse_kind):
-    if synapse_kind == "exp2syn":
+    if synapse_kind in ("exp2syn", "exp2syn_hookless"):
         return SYNAPTIC_TAU1, SYNAPTIC_TAU2
     if synapse_kind == "exp2syn_equal":
         return SYNAPTIC_TAU2, SYNAPTIC_TAU2
@@ -98,13 +98,11 @@ def _run_neuron(synapse_kind):
         "pre_v": h.Vector(),
         "post_v": h.Vector(),
         "g": h.Vector(),
-        "i": h.Vector(),
     }
     recorded["time"].record(h._ref_t)
     recorded["pre_v"].record(pre(0.5)._ref_v)
     recorded["post_v"].record(post(0.5)._ref_v)
     recorded["g"].record(synapse._ref_g)
-    recorded["i"].record(synapse._ref_i)
 
     cvode = h.CVode()
     cvode.active(0)
@@ -119,6 +117,11 @@ def _run_neuron(synapse_kind):
         h.fadvance()
 
     result = {name: np.asarray(values).copy() for name, values in recorded.items()}
+    # Point-process current RANGE variables retain NEURON's earlier
+    # BREAKPOINT evaluation after fadvance().  Reconstruct current from the
+    # simultaneously sampled conductance and voltage so both simulators are
+    # compared at one explicit post-step phase.
+    result["i"] = result["g"] * (result["post_v"] - SYNAPTIC_REVERSAL)
     assert result["time"].shape == (N_STEPS + 1,)
     np.testing.assert_allclose(result["time"], np.arange(N_STEPS + 1) * DT)
     return result
@@ -157,8 +160,11 @@ def _run_dendra(synapse_kind):
         )
     elif synapse_kind.startswith("exp2syn"):
         tau1, tau2 = _exp2_taus(synapse_kind)
+        mechanism = exp2syn.rename(f"oracle_{synapse_kind}")
+        if synapse_kind == "exp2syn_hookless":
+            delattr(mechanism, "i_with_conductance")
         post.insert(
-            exp2syn.rename(f"oracle_{synapse_kind}"),
+            mechanism,
             e=SYNAPTIC_REVERSAL,
             tau1=tau1,
             tau2=tau2,
@@ -190,14 +196,31 @@ def _run_dendra(synapse_kind):
             return synapse.g.detach().clone()
         return (synapse.B - synapse.A).detach().clone()
 
-    recorder = dn.callbacks.RecorderLambda(
-        {
-            "pre_v": lambda net: net.pre.v.detach().clone(),
-            "post_v": lambda net: net.post.v.detach().clone(),
-            "g": conductance,
-            "i": lambda net: synapse.i(net.post.v).detach().clone(),
-        }
-    )
+    recorders = {
+        "pre_v": lambda net: net.pre.v.detach().clone(),
+        "post_v": lambda net: net.post.v.detach().clone(),
+        "g": conductance,
+        "i": lambda net: synapse.i(net.post.v).detach().clone(),
+    }
+    if synapse_kind.startswith("exp2syn"):
+        recorders.update(
+            {
+                "A": lambda _net: synapse.A.detach().clone(),
+                "B": lambda _net: synapse.B.detach().clone(),
+            }
+        )
+    if synapse_kind == "exp2syn_hookless":
+        recorders.update(
+            {
+                "symbolic_i": lambda net: synapse.i_with_g(net.post.v)[0]
+                .detach()
+                .clone(),
+                "symbolic_g": lambda net: synapse.i_with_g(net.post.v)[1]
+                .detach()
+                .clone(),
+            }
+        )
+    recorder = dn.callbacks.RecorderLambda(recorders)
     network.initialize(DT)
     if synapse_kind.startswith("exp2syn"):
         tau1, tau2 = _exp2_taus(synapse_kind)
@@ -205,11 +228,41 @@ def _run_dendra(synapse_kind):
         assert effective_tau1 == pytest.approx(
             _effective_exp2_tau1(tau1, tau2), rel=2.0e-7
         )
+    if synapse_kind == "exp2syn_hookless":
+        assert type(synapse)._dendra_symbolic_source_class is exp2syn
+        assert synapse._current_conductance_mode == {"i": "symbolic"}
+        assert synapse._current_conductance_fallback_reason == {"i": None}
     network.run(TSTOP, callbacks=[recorder])
     result = {
         name: recorder.numpy(name).reshape(N_STEPS + 1)
         for name in ("pre_v", "post_v", "g", "i")
     }
+    if synapse_kind == "exp2syn_hookless":
+        state_a = recorder.numpy("A").reshape(N_STEPS + 1)
+        state_b = recorder.numpy("B").reshape(N_STEPS + 1)
+        assert np.isfinite(state_a).all()
+        assert np.isfinite(state_b).all()
+        assert np.any(state_a > 0.0)
+        assert np.any(state_b > 0.0)
+        np.testing.assert_allclose(result["g"], state_b - state_a, atol=1.0e-15)
+        np.testing.assert_allclose(
+            recorder.numpy("symbolic_g").reshape(N_STEPS + 1),
+            result["g"],
+            rtol=2.0e-15,
+            atol=1.0e-15,
+        )
+        np.testing.assert_allclose(
+            recorder.numpy("symbolic_i").reshape(N_STEPS + 1),
+            result["i"],
+            rtol=2.0e-15,
+            atol=1.0e-15,
+        )
+        np.testing.assert_allclose(
+            result["i"],
+            result["g"] * (result["post_v"] - SYNAPTIC_REVERSAL),
+            rtol=2.0e-15,
+            atol=1.0e-15,
+        )
     result["time"] = np.arange(N_STEPS + 1) * DT
     return result
 
@@ -230,7 +283,10 @@ def _expected_first_conductance(synapse_kind):
     return SYNAPTIC_WEIGHT * factor * (np.exp(-DT / tau2) - np.exp(-DT / tau1))
 
 
-@pytest.mark.parametrize("synapse_kind", ["expsyn", "exp2syn", "exp2syn_equal"])
+@pytest.mark.parametrize(
+    "synapse_kind",
+    ["expsyn", "exp2syn", "exp2syn_equal", "exp2syn_hookless"],
+)
 def test_two_cell_hh_event_network_matches_neuron(synapse_kind):
     expected = _run_neuron(synapse_kind)
     actual = _run_dendra(synapse_kind)
@@ -252,12 +308,16 @@ def test_two_cell_hh_event_network_matches_neuron(synapse_kind):
     pre_diagnostics = (
         f"Presynaptic HH mismatch: max_abs={pre_max_abs:.6g} mV, rmse={pre_rmse:.6g} mV"
     )
-    assert pre_max_abs < 0.4, pre_diagnostics
-    assert pre_rmse < 0.06, pre_diagnostics
+    # With NEURON's HH rate table disabled, the presynaptic voltage solve uses
+    # the same analytic rates as Dendra.  Retain platform headroom around the
+    # observed tens-of-nanovolts-to-microvolts agreement rather than masking a
+    # future active-membrane regression behind spike-scale bounds.
+    assert pre_max_abs < 1.0e-3, pre_diagnostics
+    assert pre_rmse < 2.0e-4, pre_diagnostics
     expected_peak = int(np.argmax(expected["pre_v"]))
     actual_peak = int(np.argmax(actual["pre_v"]))
     assert abs(actual_peak - expected_peak) <= 1, pre_diagnostics
-    assert abs(float(actual["pre_v"].max() - expected["pre_v"].max())) < 0.01
+    assert abs(float(actual["pre_v"].max() - expected["pre_v"].max())) < 1.0e-4
 
     expected_delivery = int(np.flatnonzero(expected["g"] > 0.0)[0])
     actual_delivery = int(np.flatnonzero(actual["g"] > 0.0)[0])
@@ -292,8 +352,8 @@ def test_two_cell_hh_event_network_matches_neuron(synapse_kind):
     np.testing.assert_allclose(
         actual["post_v"][:common_before],
         expected["post_v"][:common_before],
-        rtol=2.0e-4,
-        atol=3.0e-3,
+        rtol=1.0e-8,
+        atol=1.0e-5,
     )
 
     # Align on the independently observed arrivals. This compares the entire
@@ -303,7 +363,7 @@ def test_two_cell_hh_event_network_matches_neuron(synapse_kind):
         len(expected["g"]) - expected_delivery,
         len(actual["g"]) - actual_delivery,
     )
-    for name, atol in (("post_v", 0.04), ("g", 1.0e-8), ("i", 0.01)):
+    for name, atol in (("post_v", 0.04), ("g", 1.0e-8), ("i", 2.0e-4)):
         expected_aligned = expected[name][
             expected_delivery : expected_delivery + n_after
         ]

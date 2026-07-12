@@ -535,10 +535,15 @@ def test_gather_extcell_custom_values_and_defaults():
 
 
 def test_extcell_axon_geometry_buffers_and_graph_export():
-    axon = ExtCellAxon(diameters=[5.0, 10.0], n_comp=3)
+    axon = ExtCellAxon(diameters=[5.0, 10.0], n_comp=3, dtype=torch.float64)
     assert axon.xraxial.shape == (2, 3, 2)
-    torch.testing.assert_close(axon.x[0], torch.tensor([-10.0, 0.0, 10.0]))
-    axon.xc[1, 2] = torch.tensor([7.0, 8.0])
+    for name in ("xraxial", "xc", "xg"):
+        assert getattr(axon, name).dtype == axon.dtype() == torch.float64
+        assert getattr(axon, name).device == axon.device()
+    torch.testing.assert_close(
+        axon.x[0], torch.tensor([-10.0, 0.0, 10.0], dtype=torch.float64)
+    )
+    axon.xc[1, 2] = torch.tensor([7.0, 8.0], dtype=torch.float64)
     graphs = axon.assemble_graphs()
     assert graphs[1].nodes[2]["xc"] == [7.0, 8.0]
     with pytest.raises(ValueError, match="Only 2 layers"):
@@ -548,14 +553,19 @@ def test_extcell_axon_geometry_buffers_and_graph_export():
 def test_extcell_tree_from_graph_broadcasts_extracellular_parameters():
     graph = _tree_graph()
     graph.nodes[0].update(xraxial=[1.0, 2.0], xc=[3.0, 4.0], xg=[5.0, 6.0])
-    tree = ExtCellTree.from_graph(graph, N=2)
+    tree = ExtCellTree.from_graph(graph, N=2, dtype=torch.float64)
     assert tree.xraxial.shape == (2, 2, 2)
+    for name in ("xraxial", "xc", "xg"):
+        assert getattr(tree, name).dtype == tree.dtype() == torch.float64
+        assert getattr(tree, name).device == tree.device()
     torch.testing.assert_close(
-        tree.xraxial[:, 0], torch.tensor([[1.0, 2.0], [1.0, 2.0]])
+        tree.xraxial[:, 0],
+        torch.tensor([[1.0, 2.0], [1.0, 2.0]], dtype=torch.float64),
     )
     torch.testing.assert_close(tree.diff_parent_index, torch.tensor([-1, 0]))
     torch.testing.assert_close(
-        tree.diff_geom_um, torch.tensor([[0.0, 1.0]]).expand(2, -1)
+        tree.diff_geom_um,
+        torch.tensor([[0.0, 1.0]], dtype=torch.float64).expand(2, -1),
     )
 
     original_second_cell = tree.x[1, 0].clone()

@@ -7,6 +7,7 @@ import torch._inductor.config as inductor_config
 
 from ..rng import _validate_rng_checkpoint_payload
 from ._material_process import MaterialProcess
+from ._materials import _canonical_material_name
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
 
 _MATERIAL_PHASE_ALIASES = {
@@ -539,12 +540,15 @@ class MechanismHandler(torch.nn.Module):
 
     def _get_material(self, name):
         """Return a generic material or an ion used through USEMATERIAL."""
-        if name in self.materials:
-            return self.materials[name]
-        if name in self.ions:
-            return self.ions[name]
+        requested = str(name)
+        canonical = _canonical_material_name(requested)
+        for candidate in dict.fromkeys((requested, canonical)):
+            if candidate in self.materials:
+                return self.materials[candidate]
+            if candidate in self.ions:
+                return self.ions[candidate]
         raise KeyError(
-            f"Unknown material {name!r}. Available materials: "
+            f"Unknown material {requested!r}. Available materials: "
             f"{list(self.materials.keys())}; ions usable as materials: {list(self.ions.keys())}."
         )
 
@@ -738,9 +742,15 @@ class MechanismHandler(torch.nn.Module):
         for c_idx, mech, fn, scale_f, factorable in self._map:
             if factorable:
                 v_in = v_half
+                i, g = scale_f(*getattr(mech, fn)(mech.get(v_in)))
             else:
                 v_in = v
-            i, g = scale_f(*getattr(mech, fn)(mech.get(v_in)))
+                current_fn = fn.removesuffix("_with_g")
+                raw_i = getattr(mech, current_fn)(mech.get(v_in))
+                if current_fn in mech._save:
+                    setattr(mech, f"{current_fn}_", raw_i)
+                i = scale_f(raw_i)
+                g = torch.zeros_like(i) if torch.is_tensor(i) else 0.0
             mech.add_(self._buf_i[c_idx], i)
             mech.add_(self._buf_g[c_idx], g)
 

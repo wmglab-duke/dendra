@@ -14,8 +14,10 @@ from ._mechanism import (
     Synapse,
     VoltageProcess,
 )
+from ._numerical import NumericalCurrentContractError
 from ._spatial import SpatialOperator1D, solve_tridiagonal_1d
 from ._state import State
+from ._symbolic import UnsafeAutomaticNumericalFallbackError
 from .validate import validate
 
 __all__ = [
@@ -39,4 +41,6 @@ __all__ = [
     "VoltageProcess",
     "Synapse",
     "State",
+    "UnsafeAutomaticNumericalFallbackError",
+    "NumericalCurrentContractError",
 ]

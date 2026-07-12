@@ -111,7 +111,10 @@ class _bwd_euler_sc_skip(Integrator):
     Applies the same implicit Euler step as :class:`_bwd_euler_sc` but only
     evaluates ionic currents when stepping. Useful when the voltage is updated
     externally (e.g., via a closed-form solution within a Mechanism) but ionic
-    currents still need to be advanced and evaluated.
+    currents still need to be advanced and evaluated. Consequently,
+    ``intra`` is not a voltage-solve input for this integrator. When ``imem``
+    is enabled, the imposed voltage transition is still included in the
+    capacitive part of the shared membrane-current contract.
 
     Parameters
     ----------
@@ -123,19 +126,39 @@ class _bwd_euler_sc_skip(Integrator):
 
     def __init__(self, model, mech, imem=None):
         super().__init__(model, mech, imem)
+        self.register_buffer("cmdt", torch.tensor(0.0))
+        self.register_buffer("area", torch.tensor(0.0))
 
     def initialize(self, model, dt):
-        pass
+        self.cmdt = (1e-6 * model.cm) / (1e-3 * dt)
+        self.area = 2 * math.pi * (1e-4 * model.diam / 2.0) * (1e-4 * model.dx)
 
     def step(self, model, dt, ve=None, intra=None):
-        model.v = self._call_kernel("_solve", model.v, dt, model.celsius, intra)
+        v_new, i_membrane = self._call_kernel(
+            "_solve", model.v, dt, model.celsius, intra
+        )
+        model.v = v_new
+        if self.imem:
+            model.i_membrane = i_membrane
 
     def _solve(self, v, dt, temp, intra=None):
         # apply voltage processes
-        v = self.mech.update_v(v)
-        self.mech.advance(v, dt, temp)
-        _ = self.mech.i(v)  # calculate currents but not conductances
-        return v
+        # Keep the pre-process voltage independent from the returned tensor.
+        # VoltageProcess implementations are documented as out-of-place, but
+        # protecting this value also makes the capacitive term robust to a
+        # custom process that aliases or mutates its input.
+        v_old = v.clone() if self.imem else None
+        v_new = self.mech.update_v(v)
+        self.mech.advance(v_new, dt, temp)
+        # No voltage solve/linearization follows, so ``itot`` is the exact
+        # mechanism current evaluated at the externally imposed voltage.
+        itot, _ = self.mech.i(v_new)
+
+        i_membrane = None
+        if self.imem:
+            i_cap = self.cmdt * (v_new - v_old)
+            i_membrane = (i_cap + itot) * self.area
+        return v_new, i_membrane
 
 
 class _bwd_euler_sc_multi(MultiIntegrator, _bwd_euler_sc):
@@ -421,6 +444,15 @@ class _bwd_euler_bt(Integrator):
         ``"spd"`` uses an SPD block solver where available. Default "inv".
     **kwargs
         Forwarded to base integrator; reserved for future solver options.
+
+    Notes
+    -----
+    When ``imem`` is enabled, public ``model.i_membrane`` is the absolute
+    transmembrane current in mA: compartment area times the outward-current
+    convention ``Cm * (v_new - v_old) / dt + I_ion(v_new)`` (with the same
+    per-step current linearization used by the voltage solve). It excludes
+    axial cable currents and applied intracellular stimulus as explicit terms;
+    those drives affect ``i_membrane`` only through the solved voltage.
     """
 
     v_vars = ["v", "vc"]
@@ -492,6 +524,8 @@ class _bwd_euler_bt(Integrator):
     def detach(self, model):
         model.vc = model.vc.detach()
         model.v = model.v.detach()
+        if self.imem:
+            model.i_membrane = model.i_membrane.detach()
         self.mech.detach()
 
     def _select_solver(self, model):
@@ -738,17 +772,15 @@ class _bwd_euler_bt(Integrator):
 
         if self.imem:
             vprev_mem = vc[..., 0] - vc[..., 1]
-            d_mem = self.cm_dt + gtot  # (B, K)  A/V
-            rhs_mem = self.cm_dt * vprev_mem.reshape(-1, self.K) + d
-            i_membrane = d_mem * _flatten_to_solve(v, self.K) - rhs_mem
-            periaxonal = torch.zeros_like(i_membrane)
-            periaxonal[:, :-1] += (vc[:, 1:, 1] - vc[:, :-1, 1]).reshape(
-                -1, self.K - 1
-            ) / self.raxial
-            periaxonal[:, 1:] += (vc[:, :-1, 1] - vc[:, 1:, 1]).reshape(
-                -1, self.K - 1
-            ) / self.raxial
-            i_membrane = (i_membrane + periaxonal).reshape_as(v)
+            delta_v = _flatten_to_solve(v, self.K) - vprev_mem.reshape(-1, self.K)
+            i_membrane = (self.cm_dt + gtot) * delta_v + itot
+            # ``i_membrane`` follows NEURON's extracellular convention exactly:
+            # area * (Cm * (v_new - v_old) / dt + I_ion(v_new)), using Dendra's
+            # outward-current sign and the solve's current linearization.  The
+            # result is absolute mA. Applied intracellular stimulus and axial
+            # currents affect it only through ``v_new``; neither is itself a
+            # transmembrane current term.
+            i_membrane = i_membrane.reshape_as(v)
 
         return vc_new, v, i_membrane
 

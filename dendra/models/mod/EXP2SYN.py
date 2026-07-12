@@ -79,6 +79,7 @@ class exp2syn(PP, Syn):
     PP.BUFFER("factor")
 
     PP.NONSPECIFIC_CURRENT("i")
+    PP.AFFINE("i")
 
     def initial(self, v):
         state_a = self.DE["A"]

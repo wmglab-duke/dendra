@@ -265,6 +265,13 @@ def test_imex_single_compartment_zero_operator_has_exact_finite_drive_step():
     torch.testing.assert_close(model.v, expected)
 
 
+def test_imex_rejects_unsupported_membrane_current_reporting():
+    model = _CableModel(shape=(1, 3))
+
+    with pytest.raises(NotImplementedError, match="does not support imem"):
+        _krylov_etd1(model, _LinearMechanism(), m=3, imem=True)
+
+
 @pytest.mark.parametrize("m", [0, -1, 4, True])
 def test_imex_rejects_invalid_krylov_dimensions(m):
     model = _CableModel(shape=(1, 3))

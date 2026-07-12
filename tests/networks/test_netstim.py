@@ -264,7 +264,12 @@ def test_noise_zero_schedule_matches_exact(N, starts, intervals, maxsp):
         N=N, interval=intervals32, start=starts32, noise=0.0, max_spikes=maxsp, seed=777
     ).initialize()
 
-    exp = times_from_schedule(starts32, intervals32, maxsp)
+    # PositiveParam is the authoritative interval representation. Its inverse
+    # transform need not reproduce every constructor float bit-for-bit on every
+    # dtype/backend, so build the oracle from the values NetStim actually uses.
+    resolved_starts = ns.start.detach().cpu().tolist()
+    resolved_intervals = ns.interval().detach().cpu().tolist()
+    exp = times_from_schedule(resolved_starts, resolved_intervals, maxsp)
     all_times = sorted(set(itertools.chain.from_iterable(exp)))
     outs = step_model(ns, all_times)
 
@@ -296,11 +301,7 @@ def test_noise_zero_tiny_positive_start_does_not_fire_at_zero():
     assert torch.equal(ns.spikes, torch.tensor([False, True]))
 
 
-def test_noise_zero_positive_param_one_ulp_interval_drift_still_fires():
-    # PositiveParam(1.5845052003860474) reconstructs the interval one float32
-    # ulp larger on current PyTorch, so the exact float32 schedule time can be
-    # just below the internal next_stoch_time. The event comparison should be
-    # tolerant to that local ulp drift without using a coarse absolute tolerance.
+def test_noise_zero_renewal_fires_at_stored_time_but_not_one_ulp_before():
     interval = torch.tensor(1.5845052203122405, dtype=torch.float32).item()
     ns = M.NetStim(
         N=1,
@@ -314,8 +315,43 @@ def test_noise_zero_positive_param_one_ulp_interval_drift_still_fires():
     ns.forward(0.0)
     assert bool(ns.spikes[0])
 
-    ns.forward(interval)
+    event_time = ns.next_stoch_time.detach().clone()
+    just_before = torch.nextafter(
+        event_time, torch.full_like(event_time, -float("inf"))
+    )
+    ns.forward(just_before)
+    assert not bool(ns.spikes[0])
+    assert ns.spike_counts.item() == 1
+    torch.testing.assert_close(ns.next_stoch_time, event_time, rtol=0.0, atol=0.0)
+
+    ns.forward(event_time)
     assert bool(ns.spikes[0])
+    assert ns.spike_counts.item() == 2
+
+
+def test_noise_zero_adjacent_ulp_renewal_times_remain_distinct():
+    one = torch.tensor(1.0, dtype=torch.float32)
+    later = torch.nextafter(one, torch.tensor(float("inf"), dtype=torch.float32))
+    offset = float(later - one)
+    ns = M.NetStim(
+        N=2,
+        interval=[1.0, 1.0],
+        start=[0.0, offset],
+        noise=0.0,
+        max_spikes=[2, 2],
+        seed=777,
+    ).initialize()
+
+    ns.forward(0.0)
+    assert torch.equal(ns.spikes, torch.tensor([True, False]))
+    ns.forward(offset)
+    assert torch.equal(ns.spikes, torch.tensor([False, True]))
+    assert ns.next_stoch_time[1].item() == later.item()
+
+    ns.forward(one)
+    assert torch.equal(ns.spikes, torch.tensor([True, False]))
+    ns.forward(later)
+    assert torch.equal(ns.spikes, torch.tensor([False, True]))
 
 
 # ------------------------------ misc ---------------------------------------------

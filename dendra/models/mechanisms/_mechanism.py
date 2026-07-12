@@ -15,6 +15,7 @@ from dendra.models._class_declarations import (
 from dendra.models.parametric import Parameterized
 
 from ._ions import VALENCES
+from ._materials import _canonical_material_name
 from ._state import State
 from ._symbolic import build_current_eq
 
@@ -49,6 +50,14 @@ def _normalize_material_source(source):
     if isinstance(source, str):
         return {source: f"{source}_source"}
     return {str(field): f"{field}_source" for field in source}
+
+
+def _mro_attribute_owner(cls, name):
+    """Return the class whose namespace supplies ``name`` under ``cls``'s MRO."""
+    for base in cls.__mro__:
+        if name in base.__dict__:
+            return base
+    return None
 
 
 # -- TorchDynamo-friendly mechanism advance generation -----------------------
@@ -255,6 +264,8 @@ class Mechanism(Parameterized):
     _assigned = set()
     _explicit = set()
     _numerical = set()
+    _affine = set()
+    _affine_method_owners = {}
 
     _state_declarations = []
     _ion_declarations = []
@@ -263,6 +274,7 @@ class Mechanism(Parameterized):
     _assigned_declarations = []
     _explicit_declarations = []
     _numerical_declarations = []
+    _affine_declarations = []
 
     _conductances = {}
     _currents = {}
@@ -312,6 +324,8 @@ class Mechanism(Parameterized):
         new_assigned = set()
         new_explicit = set()
         new_numerical = set()
+        new_affine = set()
+        inherited_affine_method_owners = {}
 
         new_read_ion = {}
         new_write_ion = {}
@@ -362,6 +376,17 @@ class Mechanism(Parameterized):
                 new_explicit.update(base._explicit)
             if "_numerical" in base.__dict__:
                 new_numerical.update(base._numerical)
+
+        # Keep every inherited affine contract until the effective current
+        # method has been selected by Python's MRO. A simple union of ``_affine``
+        # is unsafe for multiple inheritance: a lower-priority base's assertion
+        # must not apply to a different method supplied by a higher-priority
+        # base.
+        for base in cls.__mro__[1:]:
+            if "_affine_method_owners" not in base.__dict__:
+                continue
+            for current, owner in base._affine_method_owners.items():
+                inherited_affine_method_owners.setdefault(current, set()).add(owner)
 
         for s_list in consume_class_values(
             cls, "mechanism.state", Mechanism._state_declarations
@@ -429,6 +454,38 @@ class Mechanism(Parameterized):
             cls, "mechanism.numerical", Mechanism._numerical_declarations
         ):
             new_numerical.update(v_list)
+        declared_affine = set()
+        for v_list in consume_class_values(
+            cls, "mechanism.affine", Mechanism._affine_declarations
+        ):
+            declared_affine.update(v_list)
+
+        # An affine assertion belongs to the method selected when it was made.
+        # Retain an inherited assertion only when that same method owner still
+        # wins for the subclass. This handles both ordinary overrides and
+        # competing multiple-inheritance branches without relying on function
+        # object identity (an assertionless class may directly alias a base
+        # function and still constitutes a new ownership boundary).
+        new_affine_method_owners = {}
+        if "_affine" in cls.__dict__:
+            # Dynamic rename aliases copy the complete computed metadata into
+            # their namespace. Rebind those exact metadata/method clones to the
+            # owner selected in the alias's new MRO.
+            for current in cls.__dict__["_affine"]:
+                owner = _mro_attribute_owner(cls, current)
+                new_affine.add(current)
+                new_affine_method_owners[current] = owner
+        else:
+            for current, asserted_owners in inherited_affine_method_owners.items():
+                owner = _mro_attribute_owner(cls, current)
+                if owner in asserted_owners:
+                    new_affine.add(current)
+                    new_affine_method_owners[current] = owner
+
+        for current in declared_affine:
+            owner = _mro_attribute_owner(cls, current)
+            new_affine.add(current)
+            new_affine_method_owners[current] = owner
 
         cls.state_classes = {s.__name__: s for s in new_state}
 
@@ -447,6 +504,8 @@ class Mechanism(Parameterized):
         cls._init = new_init
         cls._explicit = new_explicit
         cls._numerical = new_numerical
+        cls._affine = new_affine
+        cls._affine_method_owners = new_affine_method_owners
         cls._name = None
 
     def __init__(
@@ -892,27 +951,40 @@ class Mechanism(Parameterized):
         buffers named ``<field>_source`` by default, or by the explicit local name
         supplied to ``USEMATERIAL(..., source={field: local_name})``.
         """
-        name = material.name
+        name = _canonical_material_name(material.name)
 
-        if name in self.read_material:
-            for field in self.read_material[name]:
-                self._set_local_material_buffer(
-                    field, self._material_local_view(material, field)
+        read_fields = []
+        for declared_name, fields in self.read_material.items():
+            if _canonical_material_name(declared_name) == name:
+                read_fields.extend(
+                    field for field in fields if field not in read_fields
                 )
+        for field in read_fields:
+            self._set_local_material_buffer(
+                field, self._material_local_view(material, field)
+            )
 
-        if name in self.write_material:
-            for field in self.write_material[name]:
-                local = self._material_local_view(material, field)
-                # Writable material fields should be local tensors, not aliases,
-                # so mechanism state updates do not mutate the population field
-                # before the handler's commit phase.
-                local = local.clone()
-                self._set_local_material_buffer(field, local)
+        write_fields = []
+        for declared_name, fields in self.write_material.items():
+            if _canonical_material_name(declared_name) == name:
+                write_fields.extend(
+                    field for field in fields if field not in write_fields
+                )
+        for field in write_fields:
+            local = self._material_local_view(material, field)
+            # Writable material fields should be local tensors, not aliases,
+            # so mechanism state updates do not mutate the population field
+            # before the handler's commit phase.
+            local = local.clone()
+            self._set_local_material_buffer(field, local)
 
-        if name in self.source_material:
-            for field, local_name in self.source_material[name].items():
-                local = self._material_local_view(material, field)
-                self._set_local_material_buffer(local_name, torch.zeros_like(local))
+        source_fields = {}
+        for declared_name, field_map in self.source_material.items():
+            if _canonical_material_name(declared_name) == name:
+                source_fields.update(field_map)
+        for field, local_name in source_fields.items():
+            local = self._material_local_view(material, field)
+            self._set_local_material_buffer(local_name, torch.zeros_like(local))
 
     def _init_buffers_s(self, v_init):
         for state_module in self.DE.values():
@@ -1182,22 +1254,51 @@ class Mechanism(Parameterized):
         )
 
     @staticmethod
-    def NUMERICAL(*args):
-        """
-        Mark currents as requiring numerical differentiation.
+    def AFFINE(*args):
+        """Assert that currents are exactly affine functions of voltage.
 
         Parameters
         ----------
         *args : str
-            Current names that should be numerically differentiated.
+            Current names satisfying ``I(v) = g * v + b``, where ``g`` and
+            ``b`` do not depend on ``v`` during a solver evaluation.
+
+        Notes
+        -----
+        Dufort--Frankel can center an affine current exactly between its two
+        stored voltage levels. Analytic and numerically differentiated current
+        pairs do not by themselves prove this stronger property: a nonlinear
+        current may have a perfectly valid local derivative. Use ``AFFINE``
+        when source analysis cannot establish the affine form. An incorrect
+        declaration can produce an incorrect Dufort--Frankel trajectory.
+        """
+        declare_class_value("mechanism.affine", args, Mechanism._affine_declarations)
+
+    @staticmethod
+    def NUMERICAL(*args):
+        """
+        Assert that currents are safe for numerical differentiation.
+
+        Parameters
+        ----------
+        *args : str
+            Current names that should be numerically differentiated. Each
+            current must be deterministic, side-effect free, and pointwise in
+            voltage.
 
         Notes
         -----
         Numerical currents use centered finite differences and support float32
-        and float64 voltage tensors.  Like any same-precision finite difference,
-        this path can lose accuracy when the current is dominated by a very
-        large voltage-independent offset.  Prefer a symbolically factorable
-        current or an exact ``<current>_with_conductance`` method when available.
+        and float64 voltage tensors. The declaration is an explicit assertion
+        of the pointwise/purity contract: Dendra perturbs every voltage element
+        simultaneously, which is correct for local currents but is a directional
+        derivative for currents that couple compartments or batch elements.
+        Stateful, nondeterministic, or voltage-mutating current methods are also
+        invalid because centered differences evaluate them repeatedly. Like any
+        same-precision finite difference, this path can lose accuracy when the
+        current is dominated by a very large voltage-independent offset. Prefer
+        a symbolically factorable current or an exact
+        ``<current>_with_conductance`` method when available.
         """
         declare_class_value(
             "mechanism.numerical", args, Mechanism._numerical_declarations

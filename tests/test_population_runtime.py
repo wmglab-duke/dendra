@@ -1,8 +1,12 @@
+import math
+import sys
+
 import networkx as nx
 import pytest
 import torch
 
 import dendra as dn
+from dendra.models.core import _duration_step_count
 from dendra.models.mod import pas
 from dendra.models.stim.waveform import constant
 
@@ -357,3 +361,107 @@ def test_population_run_and_longrun_share_complete_step_callback_semantics():
 
     with pytest.raises(ValueError, match="chunklength"):
         long_pop.longrun(tstop=0.1, chunklength=0, dt=0.01)
+
+
+def test_repeated_run_duration_is_independent_of_accumulated_time_roundoff():
+    class StepCounter(dn.callbacks.Callback):
+        def __init__(self):
+            super().__init__()
+            self.post_times = []
+
+        def post_step_hook(self, model):
+            self.post_times.append(float(model.t))
+
+    pop = _population(N=1, C=1)
+    callback = StepCounter()
+    expected_time = 0.0
+
+    # At the fourth call, naive arange(start, start + dt, dt) can include the
+    # nominally excluded endpoint and execute two 0.09 ms steps.
+    for step_index, dt in enumerate((0.04, 0.04, 0.09, 0.09, 0.09), start=1):
+        pop.run(tstop=dt, dt=dt, callbacks=[callback])
+        expected_time += dt
+        assert len(callback.post_times) == step_index
+        assert pop.t.item() == pytest.approx(expected_time, abs=1e-15)
+
+    assert callback.post_times == pytest.approx(
+        [0.04, 0.08, 0.17, 0.26, 0.35], abs=1e-15
+    )
+
+
+def test_positive_subnormal_duration_still_requests_one_step():
+    assert _duration_step_count(math.ulp(0.0), sys.float_info.max) == 1
+
+
+@pytest.mark.parametrize(
+    "duration,expected_steps",
+    [(0.005, 1), (0.015, 2), (0.07, 7), (0.071, 8)],
+)
+def test_run_and_longrun_share_half_open_duration_step_count(duration, expected_steps):
+    class StepCounter(dn.callbacks.Callback):
+        def __init__(self):
+            super().__init__()
+            self.steps = 0
+
+        def post_step_hook(self, model):
+            self.steps += 1
+
+    run_pop = _population(N=1, C=1)
+    long_pop = _population(N=1, C=1)
+    checkpointed_pop = _population(N=1, C=1)
+    for model in (run_pop, long_pop, checkpointed_pop):
+        for dt in (0.04, 0.04, 0.09):
+            model.step(dt=dt)
+
+    run_callback = StepCounter()
+    long_callback = StepCounter()
+    run_pop.run(tstop=duration, dt=0.01, callbacks=[run_callback])
+    long_pop.longrun(
+        tstop=duration,
+        chunklength=3,
+        dt=0.01,
+        callbacks=[long_callback],
+    )
+    _, final_state = checkpointed_pop.longrun_checkpointed(
+        tstop=duration,
+        chunklength=3,
+        dt=0.01,
+        safe_checkpoint=True,
+        return_final_state=True,
+    )
+
+    assert run_callback.steps == long_callback.steps == expected_steps
+    torch.testing.assert_close(run_pop.t, long_pop.t, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(run_pop.t, checkpointed_pop.t, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(final_state["t"], checkpointed_pop.t)
+    torch.testing.assert_close(run_pop.v, long_pop.v, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(run_pop.v, checkpointed_pop.v, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    "duration,dt",
+    [(sys.float_info.max, sys.float_info.min), (1.0e20, 1.0)],
+)
+def test_run_variants_reject_unrepresentable_step_counts_without_advancing(
+    duration, dt
+):
+    for method in ("run", "longrun", "longrun_checkpointed"):
+        pop = _population(N=1, C=1)
+        initial_v = pop.v.clone()
+        initial_t = pop.t.clone()
+
+        with pytest.raises(ValueError, match="too many simulation steps"):
+            if method == "run":
+                pop.run(tstop=duration, dt=dt)
+            elif method == "longrun":
+                pop.longrun(tstop=duration, chunklength=3, dt=dt)
+            else:
+                pop.longrun_checkpointed(
+                    tstop=duration,
+                    chunklength=3,
+                    dt=dt,
+                    safe_checkpoint=True,
+                )
+
+        torch.testing.assert_close(pop.t, initial_t, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(pop.v, initial_v, rtol=0.0, atol=0.0)

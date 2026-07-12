@@ -60,6 +60,16 @@ class _ShapedWaveform(Waveform):
         return t.new_zeros((self.rows, t.numel()))
 
 
+class _RecordingWaveform(Waveform):
+    def __init__(self):
+        super().__init__()
+        self.times = []
+
+    def fn(self, t):
+        self.times.append(t.detach().clone())
+        return torch.zeros_like(t)
+
+
 class _FakeModel:
     def __init__(self, shape=(2, 3), dtype=DTYPE):
         self.v = torch.zeros(shape, dtype=dtype)
@@ -810,3 +820,42 @@ def test_population_run_step_and_longrun_are_equivalent_with_intra_stimulation()
     torch.testing.assert_close(long_pop.v, run_pop.v)
     torch.testing.assert_close(step_pop.t, run_pop.t)
     torch.testing.assert_close(long_pop.t, run_pop.t)
+
+
+@pytest.mark.parametrize("runner", ["run", "longrun", "longrun_checkpointed"])
+def test_nonzero_origin_intra_and_functional_extra_receive_exact_time_grid(runner):
+    intra_waveform = _RecordingWaveform()
+    extra_waveform = _RecordingWaveform()
+    pop = dn.Population(N=1, C=2, v_init=-65.0, dtype=DTYPE)
+    pop.insert(pas, g=0.001, e=-70.0)
+    pop[:, 0].inject(intra_waveform)
+    pop.build()
+    pop.initialize()
+
+    for dt in (0.04, 0.04, 0.09):
+        pop.step(dt=dt)
+    intra_waveform.times.clear()
+
+    start = pop.t.detach().clone()
+    duration = 0.07
+    dt = 0.01
+    expected = start + torch.arange(7, dtype=DTYPE) * dt
+    extra = (torch.zeros_like(pop.v), extra_waveform)
+
+    if runner == "run":
+        pop.run(tstop=duration, dt=dt, extra=extra)
+    elif runner == "longrun":
+        pop.longrun(tstop=duration, dt=dt, chunklength=3, extra=extra)
+    else:
+        pop.longrun_checkpointed(
+            tstop=duration,
+            dt=dt,
+            chunklength=3,
+            extra=extra,
+            safe_checkpoint=True,
+        )
+
+    recorded_intra = torch.cat(intra_waveform.times)
+    recorded_extra = torch.cat(extra_waveform.times)
+    torch.testing.assert_close(recorded_intra, expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(recorded_extra, expected, rtol=0.0, atol=0.0)

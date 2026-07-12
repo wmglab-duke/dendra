@@ -5,7 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from dendra.models.mechanisms import Mechanism, State
+from dendra.models.mechanisms import (
+    Mechanism,
+    State,
+    UnsafeAutomaticNumericalFallbackError,
+)
 from dendra.models.mechanisms import _symbolic as symbolic
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._material_process import (
@@ -288,26 +292,18 @@ def test_current_method_docstring_does_not_force_numerical_fallback(dtype):
     torch.testing.assert_close(conductance, mechanism.g)
 
 
-def test_unresolved_global_symbol_is_rejected_before_code_generation():
+def test_unresolved_global_symbol_requires_an_explicit_safe_conductance_path():
     with pytest.raises(ValueError, match="Unresolved bare symbol.*SYMBOLIC_TEST_SCALE"):
         factorize_linear_in_v(_GlobalConstantCurrent)
 
-    mechanism = _mechanism(_GlobalConstantCurrent)
-    assert mechanism._current_conductance_mode == {"i": "numerical-fallback"}
-    assert (
-        "Unresolved bare symbol"
-        in (mechanism._current_conductance_fallback_reason["i"])
-    )
-    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=torch.float64)
-    current, conductance = mechanism.i_with_g(voltage)
-
-    torch.testing.assert_close(current, SYMBOLIC_TEST_SCALE * voltage)
-    torch.testing.assert_close(
-        conductance,
-        torch.full_like(voltage, SYMBOLIC_TEST_SCALE),
-        rtol=1.0e-8,
-        atol=1.0e-8,
-    )
+    with pytest.raises(
+        UnsafeAutomaticNumericalFallbackError,
+        match=(
+            "_GlobalConstantCurrent.*Unresolved bare symbol.*"
+            "Mechanism.NUMERICAL\\('i'\\)"
+        ),
+    ):
+        _mechanism(_GlobalConstantCurrent)
 
 
 @pytest.mark.parametrize(
@@ -329,21 +325,12 @@ def test_explicit_declaration_overrides_all_conductance_inference_paths(dtype):
     assert mechanism.factorable is False
 
 
-def test_decorated_current_is_not_misclassified_as_its_undecorated_body():
-    mechanism = _mechanism(_DecoratedCurrent)
-    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=torch.float64)
-
-    current, conductance = mechanism.i_with_g(voltage)
-    probe = voltage.detach().clone().requires_grad_(True)
-    expected_conductance = torch.autograd.grad(mechanism.i(probe).sum(), probe)[0]
-
-    torch.testing.assert_close(current, mechanism.i(voltage))
-    torch.testing.assert_close(conductance, expected_conductance.expand_as(conductance))
-    assert mechanism._current_conductance_mode == {"i": "numerical-fallback"}
-    assert (
-        "Decorated current methods"
-        in (mechanism._current_conductance_fallback_reason["i"])
-    )
+def test_decorated_current_requires_an_explicit_safe_conductance_path():
+    with pytest.raises(
+        UnsafeAutomaticNumericalFallbackError,
+        match="_DecoratedCurrent.*Decorated current methods.*pointwise",
+    ):
+        _mechanism(_DecoratedCurrent)
 
 
 @pytest.mark.parametrize(
@@ -366,18 +353,15 @@ def test_exact_zero_conductance_currents_remain_symbolic_at_all_dtypes(
     assert mechanism._current_conductance_fallback_reason == {"i": None}
 
 
-def test_voltage_parameter_reassignment_uses_safe_numerical_fallback():
+def test_voltage_parameter_reassignment_requires_explicit_numerical_opt_in():
     with pytest.raises(ValueError, match="reserved name 'v'"):
         factorize_linear_in_v(_ReassignedVoltageCurrent)
 
-    mechanism = _mechanism(_ReassignedVoltageCurrent)
-    voltage = torch.tensor([-70.0, -2.0, 5.0], dtype=torch.float64)
-
-    current, conductance = mechanism.i_with_g(voltage)
-
-    torch.testing.assert_close(current, mechanism.i(voltage))
-    torch.testing.assert_close(conductance, mechanism.g.to(conductance))
-    assert mechanism._current_conductance_mode == {"i": "numerical-fallback"}
+    with pytest.raises(
+        UnsafeAutomaticNumericalFallbackError,
+        match="_ReassignedVoltageCurrent.*reserved name 'v'.*analytic",
+    ):
+        _mechanism(_ReassignedVoltageCurrent)
 
 
 def test_unexpected_symbolic_compiler_failures_are_not_silently_downgraded(
@@ -434,6 +418,7 @@ def test_aborted_mechanism_and_state_declarations_do_not_leak():
             Mechanism.RANGE(range_ghost=2.0)
             Mechanism.BUFFER("buffer_ghost")
             Mechanism.NONSPECIFIC_CURRENT("current_ghost")
+            Mechanism.AFFINE("affine_ghost")
             raise RuntimeError("abort mechanism")
 
     class _CleanMechanism(Mechanism):
@@ -443,6 +428,7 @@ def test_aborted_mechanism_and_state_declarations_do_not_leak():
     assert "range_ghost" not in _CleanMechanism._range
     assert "buffer_ghost" not in _CleanMechanism._assigned
     assert "current_ghost" not in _CleanMechanism._currents.get("nonspecific", ())
+    assert "affine_ghost" not in _CleanMechanism._affine
 
     with pytest.raises(RuntimeError, match="abort state"):
 

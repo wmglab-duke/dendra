@@ -1,4 +1,16 @@
-"""Extended extracellular coupling models."""
+"""Extended extracellular coupling models.
+
+The two supported extracellular layers follow NEURON's ``extracellular``
+mechanism convention. ``xraxial`` is longitudinal resistance in MOhm/cm,
+``xc`` is radial capacitance density in uF/cm2, and ``xg`` is radial
+conductance density in S/cm2.  A prescribed ``extra``/``ve`` value is the bath
+battery ``e_extracellular`` in mV outside the outermost modeled layer.
+
+The block solvers store absolute circuit-node potentials as
+``vc[..., 0] = vi``, ``vc[..., 1] = vext[0]``, and
+``vc[..., 2] = vext[1]``.  Public membrane voltage therefore follows NEURON's
+sign convention, ``v = vi - vext[0]``.
+"""
 
 import torch
 
@@ -24,6 +36,9 @@ class ExtCellAxon(Axon):
         Number of extracellular layers. Only ``2`` is currently supported.
     integrator : callable, optional
         Integrator factory used to create the simulation solver.
+    **kwargs
+        Additional population parameters such as ``dtype``, ``device``,
+        ``rhoa``, and ``cm`` forwarded to :class:`~dendra.models.core.Axon`.
     """
 
     def __init__(
@@ -34,12 +49,13 @@ class ExtCellAxon(Axon):
         v_init=-80.0,
         n_layers=2,
         integrator=None,
+        **kwargs,
     ):
         if n_layers != 2:
             raise ValueError("Only 2 layers are currently supported.")
         if integrator is None:
             integrator = bwd_euler_bt()
-        super().__init__(diameters, n_comp, celsius, v_init, integrator)
+        super().__init__(diameters, n_comp, celsius, v_init, integrator, **kwargs)
         self.n_layers = n_layers
         self._register_buffers()
         self.dx[:] = 10.0
@@ -47,14 +63,16 @@ class ExtCellAxon(Axon):
 
     def _register_buffers(self):
         """Initialise extracellular parameter buffers."""
+        options = {"device": self.device(), "dtype": self.dtype()}
         self.register_buffer(
-            "xraxial", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9)
+            "xraxial",
+            torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9, **options),
         )
         self.register_buffer(
-            "xc", torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0)
+            "xc", torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0, **options)
         )
         self.register_buffer(
-            "xg", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9)
+            "xg", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9, **options)
         )
 
     def _x(self):
@@ -140,11 +158,17 @@ class ExtCellTree(Tree):
 
     def _register_buffers(self):
         """Initialise extracellular buffers for the tree morphology."""
+        options = {"device": self.device(), "dtype": self.dtype()}
         self.register_buffer(
-            "xraxial", torch.full((self.np, self.nc, self.n_layers), 1e9)
+            "xraxial",
+            torch.full((self.np, self.nc, self.n_layers), 1e9, **options),
         )
-        self.register_buffer("xc", torch.full((self.np, self.nc, self.n_layers), 0.0))
-        self.register_buffer("xg", torch.full((self.np, self.nc, self.n_layers), 1e9))
+        self.register_buffer(
+            "xc", torch.full((self.np, self.nc, self.n_layers), 0.0, **options)
+        )
+        self.register_buffer(
+            "xg", torch.full((self.np, self.nc, self.n_layers), 1e9, **options)
+        )
 
     def load_extcell(self, extcell):
         """Load extracellular parameters into buffers.

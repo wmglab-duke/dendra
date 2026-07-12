@@ -31,49 +31,12 @@ def _clone_checkpoint_state(value, memo=None):
     return copy.deepcopy(value)
 
 
-def _ste_gate(x, tau, *, atol=None):
+def _ste_gate(x, tau):
     s_soft = torch.sigmoid(x / tau)  # smooth [0,1]
-    if atol is None:
-        hard_bool = x >= 0
-    else:
-        hard_bool = x >= -atol
+    hard_bool = x >= 0
     hard = hard_bool.to(s_soft.dtype)  # hard 0/1
     gate = hard + (s_soft - s_soft.detach())  # forward==hard, backward like soft
     return gate, hard
-
-
-def _event_boundary_atol(t: torch.Tensor, event_time: torch.Tensor, *, ulps: int = 8):
-    """Return an ulp-scaled tolerance for spike-time boundary comparisons.
-
-    NetStim state is stored in floating-point buffers, and positive parameters
-    such as ``interval`` may be reconstructed through ``PositiveParam``.  That
-    can move an analytically exact deterministic event by one or a few ulps.
-    A usual ``eps * max(abs(x), 1)`` tolerance is too coarse near zero: it
-    incorrectly treats tiny positive starts as if they occurred at ``t == 0``.
-
-    This helper instead uses the local representable spacing around the actual
-    operands.  Around ordinary millisecond-scale times this accepts one-ulp
-    parametrization/reconstruction drift; around zero/subnormal times the
-    tolerance remains subnormal-scale, so positive starts are not collapsed to
-    zero.
-    """
-    if not torch.is_floating_point(t) or not torch.is_floating_point(event_time):
-        return None
-
-    pos_inf_t = torch.full_like(t, float("inf"))
-    pos_inf_e = torch.full_like(event_time, float("inf"))
-    t_spacing = torch.nextafter(t.abs(), pos_inf_t) - t.abs()
-    event_spacing = torch.nextafter(event_time.abs(), pos_inf_e) - event_time.abs()
-    spacing = torch.maximum(t_spacing, event_spacing)
-
-    # ``nextafter(inf, inf) - inf`` is NaN. Scheduled +inf entries are never the
-    # active finite event time when a spike is possible, but clamp defensively.
-    finite_spacing = torch.where(
-        torch.isfinite(spacing),
-        spacing,
-        torch.full_like(spacing, torch.finfo(t.dtype).max),
-    )
-    return int(ulps) * finite_spacing
 
 
 class NetStim(DNModule, Sliceable):
@@ -1193,25 +1156,10 @@ class NetStim(DNModule, Sliceable):
         # 1) differentiable gating (keep this under grad!)
         next_combined = torch.minimum(stoch_snap, sched_snap)
         x = t - next_combined
-        # Event times are stored in floating-point buffers and intervals may
-        # pass through PositiveParam, so a deterministic interval can place an
-        # analytically exact *later* event one or a few ulps below zero after
-        # dtype/device roundoff.  Use a local-spacing tolerance rather than
-        # ``eps * max(abs(t), 1)`` so tiny positive starts are not collapsed into
-        # an event at t == 0.
-        event_atol = _event_boundary_atol(t, next_combined, ulps=8)
-        if event_atol is not None:
-            # Raw ``start`` and explicit ``schedule`` times are stored directly,
-            # so their first occurrences remain exact. In particular, a positive
-            # subnormal start must not be widened into an event at zero. Apply the
-            # local-ULP tolerance only after a stochastic/deterministic renewal
-            # has advanced through PositiveParam reconstruction.
-            stoch_is_active = stoch_snap <= sched_snap
-            tolerance_mask = torch.logical_and(stoch_is_active, self.spike_counts > 0)
-            event_atol = torch.where(
-                tolerance_mask, event_atol, torch.zeros_like(event_atol)
-            )
-        legacy_gate, legacy_hard = _ste_gate(x, tau=self.tau, atol=event_atol)
+        # Keep the hard event boundary strictly causal. Distinct representable
+        # event times must remain distinct: an ULP-sized tolerance can make a
+        # genuinely later event fire early and consume it at the wrong call.
+        legacy_gate, legacy_hard = _ste_gate(x, tau=self.tau)
 
         max_spikes = self._broadcast_to_state(
             self.max_spikes, dtype=torch.long, device=device, name="max_spikes"

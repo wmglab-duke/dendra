@@ -106,6 +106,30 @@ def test_exp2syn_uses_exact_current_conductance_pair_at_supported_precisions(dty
     torch.testing.assert_close(current, expected_conductance * (voltage - mechanism.e))
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_exp2syn_remains_exactly_symbolic_without_analytic_pair(monkeypatch, dtype):
+    alias = exp2syn.rename("symbolic_exp2syn_probe")
+    monkeypatch.delattr(alias, "i_with_conductance")
+    population = dn.SingleCompartment(N=1, C=1, dtype=dtype)
+    population.insert(alias, tau1=0.2, tau2=2.0)
+    population.initialize()
+    mechanism = population.mech.symbolic_exp2syn_probe
+    with torch.no_grad():
+        mechanism.A.fill_(0.125)
+        mechanism.B.fill_(0.5)
+
+    voltage = torch.full_like(mechanism.A, -40.0)
+    current, conductance = mechanism.i_with_g(voltage)
+    expected_conductance = mechanism.B - mechanism.A
+
+    assert mechanism._current_conductance_mode == {"i": "symbolic"}
+    assert mechanism._current_conductance_fallback_reason == {"i": None}
+    torch.testing.assert_close(conductance, expected_conductance)
+    torch.testing.assert_close(current, mechanism.i(voltage))
+
+
 def test_exp2syn_effective_tau_drives_a_kinetics_and_preserves_parameter_gradients():
     population = _exp2syn_population(0.2, 2.0, parameterized=True)
     population.train()

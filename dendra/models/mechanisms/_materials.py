@@ -17,7 +17,7 @@ import torch
 
 from dendra.helpers import DEBUG
 
-from ..parametric import to_param
+from ..parametric import resolve, to_param
 
 
 @dataclass(frozen=True)
@@ -41,20 +41,19 @@ def _canonical_material_name(name: str) -> str:
     return MATERIAL_ALIASES.get(name, name)
 
 
-def _is_scalar(x):
-    if isinstance(x, (float, int)):
-        return True
-    return torch.is_tensor(x) and x.ndim == 0
-
-
-def _make_into_shape(shape, value):
-    if torch.is_tensor(value):
-        if value.ndim == 0 or value.numel() == 1:
-            return value.reshape(()).expand(shape).clone()
-        return value.expand(shape).clone()
-    if _is_scalar(value):
-        return torch.full(shape, value)
-    return torch.as_tensor(value).expand(shape).clone()
+def _make_into_shape(shape, value, *, like: torch.Tensor | None = None):
+    """Resolve and broadcast one material initial-value source."""
+    value = resolve(value)
+    if not torch.is_tensor(value):
+        if like is None:
+            value = torch.as_tensor(value)
+        else:
+            value = torch.as_tensor(value, device=like.device, dtype=like.dtype)
+    elif like is not None:
+        value = value.to(device=like.device, dtype=like.dtype)
+    if value.ndim == 0 or value.numel() == 1:
+        return value.reshape(()).expand(shape).clone()
+    return value.expand(shape).clone()
 
 
 def _normalize_field_specs(
@@ -71,7 +70,11 @@ def _normalize_field_specs(
     min_values = dict(min_values or {})
 
     if fields is None:
-        names = list(initial_values.keys()) or list(min_values.keys())
+        # Infer every declared field without losing minimum-only declarations.
+        # Keep the caller's initial-value order, then append new minimum keys in
+        # their own insertion order for deterministic construction/state dicts.
+        names = list(initial_values)
+        names.extend(name for name in min_values if name not in initial_values)
         field_initials = {name: initial_values.get(name, 0.0) for name in names}
     elif isinstance(fields, Mapping):
         field_initials = dict(fields)
@@ -130,6 +133,8 @@ def register_material(
         units=units,
     )
     MATERIAL_SPECS[canonical] = specs
+    if isinstance(aliases, str):
+        aliases = (aliases,)
     for alias in aliases or ():
         MATERIAL_ALIASES[str(alias)] = canonical
     return specs
@@ -146,7 +151,7 @@ def valid_materials():
 
 
 class material_defaults(ContextDecorator):
-    """Temporarily update registered material initial/min values.
+    """Temporarily update registered material initial values.
 
     This mirrors the existing ion concentration/equilibrium context managers but
     is intentionally generic.  Only fields that already exist in the registered
@@ -179,13 +184,14 @@ class material_defaults(ContextDecorator):
             if DEBUG:
                 print(self.updates)
             material_defaults._last = {}
-        self.original = {}
+        self._original_stack = []
 
     def __enter__(self):
         specs = MATERIAL_SPECS[self.material]
+        original = {}
         for field, value in self.updates.items():
             old = specs[field]
-            self.original[field] = old
+            original[field] = old
             specs[field] = MaterialFieldSpec(
                 name=old.name,
                 initial=value,
@@ -194,9 +200,11 @@ class material_defaults(ContextDecorator):
                 domain=old.domain,
                 units=old.units,
             )
+        self._original_stack.append(original)
+        return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        MATERIAL_SPECS[self.material].update(self.original)
+        MATERIAL_SPECS[self.material].update(self._original_stack.pop())
         return False
 
 
@@ -206,6 +214,12 @@ class Material(torch.nn.Module):
     A Material is present over the full compartmental shape of a population.
     Mechanisms read/write local views using Mechanism.USEMATERIAL(...), while
     MaterialProcess subclasses can operate on full fields directly.
+
+    Each field has two distinct roles: :attr:`field` is mutable runtime state,
+    while :meth:`initial_source` returns its registered initial-value parameter
+    or parametric module. :meth:`initialize` resolves that source afresh. This
+    preserves gradients to trainable initial values in training mode; evaluation
+    initialization keeps the historical detached-runtime-state behavior.
     """
 
     __constants__ = ("name",)
@@ -219,6 +233,7 @@ class Material(torch.nn.Module):
         initial_values: Mapping[str, object] | None = None,
         min_values: Mapping[str, float | None] | None = None,
         specs: Mapping[str, MaterialFieldSpec] | None = None,
+        _register_initial_sources: bool = True,
     ):
         super().__init__()
         self.name = _canonical_material_name(name)
@@ -250,16 +265,27 @@ class Material(torch.nn.Module):
         self._material_min_fields = tuple(
             field for field, spec in specs.items() if spec.min_value is not None
         )
+        self._material_has_initial_sources = bool(_register_initial_sources)
+        if self._material_has_initial_sources:
+            self._initial_sources = torch.nn.Module()
 
         for field, spec in specs.items():
             init = to_param(spec.initial)
-            init_t = _make_into_shape(shape, init)
+            if self._material_has_initial_sources:
+                setattr(self._initial_sources, field, init)
+                init_source = getattr(self._initial_sources, field)
+            else:
+                # Ion owns its historical e_init/i_init/o_init parameters and
+                # deliberately opts out of generic Material initial sources.
+                init_source = init
+            init_t = _make_into_shape(shape, init_source)
             self.register_buffer(field, init_t.clone())
-            self.register_buffer(
-                f"_initial_{field}",
-                init_t.detach().clone(),
-                persistent=False,
-            )
+            if not _register_initial_sources:
+                self.register_buffer(
+                    f"_initial_{field}",
+                    init_t.detach().clone(),
+                    persistent=False,
+                )
             if spec.min_value is not None:
                 self.register_buffer(
                     f"_min_{field}",
@@ -279,14 +305,34 @@ class Material(torch.nn.Module):
     def field_spec(self, field: str) -> MaterialFieldSpec:
         return self._field_specs[str(field)]
 
+    def initial_source(self, field: str):
+        """Return the registered parameter/module used to reset ``field``.
+
+        The returned object is the source itself, not its resolved tensor value.
+        It therefore remains visible to :meth:`named_parameters`, follows
+        device/dtype moves, and is serialized by :meth:`state_dict`.
+        """
+        field = str(field)
+        if not self._material_has_initial_sources or field not in self._material_fields:
+            raise KeyError(
+                f"Material {self.name!r} has no generic initial source for "
+                f"field {field!r}."
+            )
+        return getattr(self._initial_sources, field)
+
     def initialize(self, *args, **kwargs) -> None:
-        """Reset material fields to their declared initial values."""
+        """Reset material fields from their registered initial-value sources."""
         for field in self._material_fields:
             current = self._buffers[field]
-            init = self._buffers[f"_initial_{field}"].to(
-                device=current.device, dtype=current.dtype
+            if self._material_has_initial_sources:
+                source = self.initial_source(field)
+            else:
+                source = self._buffers[f"_initial_{field}"]
+            self._buffers[field] = _make_into_shape(
+                current.shape,
+                source,
+                like=current,
             )
-            self._buffers[field] = init.expand_as(current).clone()
         self.advance(*args, **kwargs)
         if not self.training:
             self.detach()

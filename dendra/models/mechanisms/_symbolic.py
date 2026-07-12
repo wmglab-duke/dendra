@@ -3,7 +3,38 @@ import torch  # noqa: F401 - provided to dynamically generated current functions
 from dendra.helpers import DEBUG, logger
 from dendra.utils.dynamic_compilation import compile_generated_function
 
+from ._numerical import (  # noqa: F401 - used by generated numerical functions
+    validate_declared_numerical_current,
+)
 from .compilers.ast import EXPECTED_FACTORIZATION_ERRORS, linear_conductance_in_v
+
+
+class UnsafeAutomaticNumericalFallbackError(RuntimeError):
+    """Raised when exact current conductance analysis cannot be completed.
+
+    Numerical differentiation is sound for Dendra's local conductance term only
+    when the authored current is deterministic, side-effect free, and pointwise
+    in voltage.  A failed symbolic analysis does not establish those properties,
+    so silently switching to simultaneous finite differences is unsafe.
+    """
+
+
+def _raise_unsafe_automatic_numerical_fallback(mechanism, current, cause):
+    mechanism_name = type(mechanism).__qualname__
+    reason = f"{type(cause).__name__}: {cause}"
+    raise UnsafeAutomaticNumericalFallbackError(
+        f"Could not derive an exact conductance for current {current!r} on "
+        f"{mechanism_name}: {reason}. Automatic numerical differentiation is "
+        "unsafe because it assumes a deterministic, side-effect-free, pointwise "
+        "current; coupled currents otherwise produce a directional derivative "
+        "instead of the required Jacobian diagonal. Mechanism currents must be "
+        "pointwise; model genuinely coupled voltage dependence outside local "
+        "current assembly. For a pointwise current, rewrite it as a supported "
+        "affine expression, provide an exact analytic "
+        f"{current}_with_conductance(self, v), or explicitly declare "
+        f"Mechanism.NUMERICAL({current!r}) to assert that contract."
+    ) from cause
+
 
 implicit_equation_template = """
 def {k}(self, v):
@@ -26,10 +57,13 @@ numerical_template = """
 def {k}(self, v):
     if v.dtype not in (torch.float32, torch.float64):
         raise TypeError(
-            "Numerical current differentiation supports only torch.float32 and "
+            f"Numerical current differentiation for current {k!r} on "
+            f"{{type(self).__qualname__}} supports only torch.float32 and "
             "torch.float64 voltage tensors; use an analytic current/conductance "
             "pair for lower-precision dtypes."
         )
+    if not torch.compiler.is_compiling():
+        validate_declared_numerical_current(self, {k!r}, v)
     i = self.{k}(v)
     rel_step = torch.finfo(v.dtype).eps ** (1.0 / 3.0)
     step = rel_step * torch.maximum(torch.abs(v), torch.ones_like(v))
@@ -59,6 +93,17 @@ def _annotate_conductance_path(function, mode, fallback_reason=None):
     function._dendra_conductance_mode = mode
     function._dendra_conductance_fallback_reason = fallback_reason
     return function
+
+
+def _is_affine_current(mechanism, current):
+    """Return whether Dufort--Frankel may factor this current exactly."""
+    if current in mechanism._affine:
+        return True
+    try:
+        linear_conductance_in_v(mechanism.__class__, method=current)
+    except EXPECTED_FACTORIZATION_ERRORS:
+        return False
+    return True
 
 
 def build_implicit_equation(current, gtot, assign):
@@ -127,6 +172,7 @@ def build_current_eq(mechanism, k, assign=False):
             False,
         )
     if hasattr(mechanism, f"{k}_with_conductance"):
+        factorable = _is_affine_current(mechanism, k)
         # Mechanism.__init__ binds the returned function to ``mechanism`` below.
         # Fetch the descriptor from the class so we return an unbound function;
         # returning the instance attribute here would bind ``self`` twice.
@@ -136,7 +182,7 @@ def build_current_eq(mechanism, k, assign=False):
                     getattr(mechanism.__class__, f"{k}_with_conductance"),
                     "analytic",
                 ),
-                True,
+                factorable,
             )
 
         # SAVE currents must still update their mirrored ``<current>_`` buffer.
@@ -155,11 +201,11 @@ def build_current_eq(mechanism, k, assign=False):
                 ),
                 "analytic",
             ),
-            True,
+            factorable,
         )
     if k in mechanism._numerical:
         code = build_numerical_equation(k, assign)
-        factorable = True
+        factorable = _is_affine_current(mechanism, k)
         if DEBUG > 0:
             logger.info(f"Generated code for {k}:\n{code}")
         return (
@@ -182,11 +228,7 @@ def build_current_eq(mechanism, k, assign=False):
         filename_prefix = "dendra.mechanisms.implicit"
         mode = "symbolic"
     except EXPECTED_FACTORIZATION_ERRORS as exc:
-        code = build_numerical_equation(k, assign)
-        factorable = True
-        filename_prefix = "dendra.mechanisms.numerical"
-        mode = "numerical-fallback"
-        fallback_reason = f"{type(exc).__name__}: {exc}"
+        _raise_unsafe_automatic_numerical_fallback(mechanism, k, exc)
     if DEBUG > 0:
         logger.info(f"Generated code for {k}:\n{code}")
     return (

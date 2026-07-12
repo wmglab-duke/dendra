@@ -7,7 +7,10 @@ import inspect
 import pytest
 import torch
 
-from dendra.models.mechanisms import Mechanism
+from dendra.models.mechanisms import (
+    Mechanism,
+    UnsafeAutomaticNumericalFallbackError,
+)
 from dendra.models.mechanisms import _symbolic as symbolic
 from dendra.models.mechanisms.compilers import ast as ast_compiler
 from dendra.models.mechanisms.compilers import source as source_compiler
@@ -436,7 +439,7 @@ def test_runtime_current_replacement_invalidates_symbolic_analysis_cache():
     _assert_symbolic_path(replaced, "i")
 
 
-def test_source_less_runtime_replacement_uses_numerical_fallback(monkeypatch):
+def test_source_less_runtime_replacement_requires_explicit_safe_path(monkeypatch):
     alias = _DirectAffine.rename("source_less_runtime_replaced_current")
     alias.i = _replacement_current
     real_safe_source = ast_compiler.safe_source
@@ -448,39 +451,38 @@ def test_source_less_runtime_replacement_uses_numerical_fallback(monkeypatch):
 
     monkeypatch.setattr(ast_compiler, "safe_source", source_without_replacement)
     factorize_linear_in_v.cache_clear()
-    mechanism = _mechanism(alias)
-    voltage = _voltage(torch.float64)
-    current, conductance = mechanism.i_with_g(voltage)
 
-    _assert_close(current, mechanism.i(voltage))
-    torch.testing.assert_close(
-        conductance,
-        _autograd_conductance(mechanism, "i", voltage),
-        rtol=1.0e-9,
-        atol=0.0,
-    )
-    assert mechanism._current_conductance_mode == {"i": "numerical-fallback"}
-    assert (
-        "replacement source unavailable"
-        in (mechanism._current_conductance_fallback_reason["i"])
-    )
+    with pytest.raises(UnsafeAutomaticNumericalFallbackError) as exc_info:
+        _mechanism(alias)
+
+    message = str(exc_info.value)
+    assert "source_less_runtime_replaced_current" in message
+    assert "current 'i'" in message
+    assert "SourceUnavailableError: replacement source unavailable" in message
+    assert "deterministic, side-effect-free, pointwise" in message
+    assert "i_with_conductance(self, v)" in message
+    assert "Mechanism.NUMERICAL('i')" in message
+    assert isinstance(exc_info.value.__cause__, SourceUnavailableError)
 
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_analytic_pair_is_source_independent_and_low_precision_safe(monkeypatch, dtype):
     alias = _AnalyticNonlinearPair.rename("source_independent_analytic_pair")
 
-    def unexpected_factorization(*args, **kwargs):
-        raise AssertionError("analytic pairs must bypass source factorization")
+    def unavailable_factorization(*args, **kwargs):
+        raise SourceUnavailableError("analytic current source unavailable")
 
-    monkeypatch.setattr(symbolic, "linear_conductance_in_v", unexpected_factorization)
+    monkeypatch.setattr(symbolic, "linear_conductance_in_v", unavailable_factorization)
     mechanism = _mechanism(alias, dtype)
     voltage = _voltage(dtype)
 
     current, conductance = mechanism.i_with_g(voltage)
 
     assert mechanism.i_with_g.__func__ is alias.i_with_conductance
-    assert mechanism._current_factorable == {"i": True}
+    # The exact pair remains source-independent for ordinary implicit solvers,
+    # but unavailable source cannot prove the stronger affine contract needed
+    # by Dufort--Frankel. It therefore takes that solver's explicit path.
+    assert mechanism._current_factorable == {"i": False}
     _assert_close(current, mechanism.i(voltage))
     _assert_close(conductance, 2 * mechanism.a * voltage + mechanism.b)
     _assert_close(conductance, _autograd_conductance(mechanism, "i", voltage))
@@ -519,7 +521,7 @@ def test_exact_current_paths_match_between_cpu_and_cuda(mechanism_cls, path):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_missing_source_falls_back_to_scale_aware_numerical_derivative(
+def test_missing_source_never_silently_falls_back_to_numerical_derivative(
     monkeypatch, dtype
 ):
     alias = _DirectAffine.rename("missing_source_numerical_fallback")
@@ -532,27 +534,22 @@ def test_missing_source_falls_back_to_scale_aware_numerical_derivative(
 
     monkeypatch.setattr(ast_compiler, "safe_source", unavailable_source)
     factorize_linear_in_v.cache_clear()
-    mechanism = _mechanism(alias, dtype)
-    voltage = _voltage(dtype)
 
-    current, conductance = mechanism.i_with_g(voltage)
-    assert mechanism._current_conductance_mode == {"i": "numerical-fallback"}
-    assert (
-        "SourceUnavailableError: source unavailable"
-        in (mechanism._current_conductance_fallback_reason["i"])
-    )
-    assert mechanism._current_factorable == {"i": True}
-    _assert_close(current, mechanism.i(voltage))
-    torch.testing.assert_close(
-        conductance,
-        mechanism.g.expand_as(voltage),
-        rtol=1.0e-4 if dtype == torch.float32 else 2.0e-10,
-        atol=0.0,
-    )
+    with pytest.raises(
+        UnsafeAutomaticNumericalFallbackError,
+        match=(
+            "missing_source_numerical_fallback.*"
+            "SourceUnavailableError: source unavailable.*analytic.*"
+            "Mechanism.NUMERICAL\\('i'\\)"
+        ),
+    ):
+        _mechanism(alias, dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_missing_source_numerical_fallback_rejects_low_precision(monkeypatch, dtype):
+def test_missing_source_is_rejected_before_dtype_can_mask_the_root_cause(
+    monkeypatch, dtype
+):
     alias = _DirectAffine.rename("missing_source_low_precision")
 
     def unavailable_source(obj):
@@ -562,18 +559,12 @@ def test_missing_source_numerical_fallback_rejects_low_precision(monkeypatch, dt
 
     monkeypatch.setattr(ast_compiler, "safe_source", unavailable_source)
     factorize_linear_in_v.cache_clear()
-    mechanism = _mechanism(alias, dtype)
-    assert mechanism._current_conductance_mode == {"i": "numerical-fallback"}
-    assert (
-        "SourceUnavailableError: source unavailable"
-        in (mechanism._current_conductance_fallback_reason["i"])
-    )
-    assert mechanism._current_factorable == {"i": True}
 
     with pytest.raises(
-        TypeError, match="supports only torch.float32 and torch.float64"
+        UnsafeAutomaticNumericalFallbackError,
+        match="SourceUnavailableError: source unavailable",
     ):
-        mechanism.i_with_g(_voltage(dtype))
+        _mechanism(alias, dtype)
 
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)

@@ -5,6 +5,7 @@ import itertools
 import math
 import os
 import re
+import sys
 import textwrap
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ from dendra.models.mechanisms._material_process import MaterialProcess
 from dendra.models.mechanisms._materials import (
     Material,
     MaterialFieldSpec,
+    _canonical_material_name,
     material_specs,
     valid_materials,
 )
@@ -263,6 +265,43 @@ def _validate_time_scalar(value, *, name: str, positive: bool | None) -> float:
     if positive is False and normalized < 0:
         raise ValueError(f"{name} must be non-negative.")
     return normalized
+
+
+def _duration_step_count(duration: float, dt: float) -> int:
+    """Return the half-open-grid step count for a simulation duration.
+
+    In exact arithmetic this is ``ceil(duration / dt)``.  Ratios that are only
+    a few floating-point ULPs from an integer are treated as that integer so a
+    value such as ``0.07 / 0.01`` cannot acquire a spurious extra step.
+    """
+    if duration == 0.0:
+        return 0
+    quotient = duration / dt
+    if quotient == 0.0:
+        # Preserve the non-empty half-open interval for positive subnormal
+        # durations whose quotient underflowed.
+        return 1
+    if not math.isfinite(quotient) or quotient > sys.maxsize:
+        raise ValueError("duration and dt imply too many simulation steps.")
+    nearest = round(quotient)
+    if nearest >= 1 and abs(quotient - nearest) <= 8.0 * math.ulp(quotient):
+        quotient = float(nearest)
+    n_steps = int(math.ceil(quotient))
+    if n_steps > sys.maxsize:
+        raise ValueError("duration and dt imply too many simulation steps.")
+    return max(1, n_steps)
+
+
+def _time_grid_from_step_count(
+    start: torch.Tensor,
+    n_steps: int,
+    dt: float,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Construct an exact-length float64 time grid from integer offsets."""
+    offsets = torch.arange(n_steps, device=device, dtype=torch.double)
+    return start.to(device=device, dtype=torch.double) + offsets * dt
 
 
 class Population(P, Sliceable):
@@ -707,7 +746,7 @@ class Population(P, Sliceable):
         Population
             The population instance for chaining.
         """
-        name = str(name)
+        name = _canonical_material_name(name)
         if name in valid_ions():
             raise ValueError(
                 f"{name!r} is a registered ion. Use concentrations(...) and "
@@ -1103,10 +1142,9 @@ class Population(P, Sliceable):
             Pair ``(stims, indices)`` where ``stims`` is a list of sequences
             of stimuli and ``indices`` encodes electrode mapping metadata.
         """
-        start = self.t
-        end = start + n * dt
-        t_ = torch.arange(start, end, dt, device=self.device(), dtype=self.dtype())
-        t_ = t_.to(self.device(), dtype=self.dtype())
+        t_ = _time_grid_from_step_count(self.t, n, dt, device=self.device()).to(
+            self.dtype()
+        )
         stims, indices = intra.init(t_)
         stims = [s.unbind(-1) for s in stims]
         return stims, indices
@@ -1552,10 +1590,11 @@ class Population(P, Sliceable):
             If both ``ve`` and ``extra`` are provided, a :class:`ValueError` is
             raised.
         tstop : float, optional
-            Simulation stop time in milliseconds when ``ve`` is not provided.
-            The number of simulation time steps is derived from the time grid
-            constructed from the current model time ``self.t``, ``tstop``, and
-            ``dt``. If ``ve`` is provided, this parameter is ignored.
+            Simulation duration in milliseconds to advance from the current
+            model time ``self.t`` when ``ve`` is not provided. Steps sample the
+            half-open interval ``[self.t, self.t + tstop)`` at spacing ``dt``;
+            consequently, a positive fractional final interval contributes one
+            timestep. If ``ve`` is provided, this parameter is ignored.
         dt : float, optional
             Time step size in milliseconds. If ``None``, the default value
             ``A.dt`` from the backend is used.
@@ -1585,10 +1624,12 @@ class Population(P, Sliceable):
             A.dt if dt is None else dt, name="dt", positive=True
         )
         tstop_f = None
+        duration_steps = None
         if ve is None:
             if tstop is None:
                 raise ValueError("tstop must be provided when 've' is not given.")
             tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+            duration_steps = _duration_step_count(tstop_f, dt_f)
 
         # auto-build intra if missing
         if self.intra is None:
@@ -1627,22 +1668,14 @@ class Population(P, Sliceable):
                 n = ve.shape[0]
 
                 # Construct a matching time grid for 'extra'-style helpers if needed
-                t_global = torch.arange(
-                    self.t.double(),
-                    self.t.double() + n * dt_f,
-                    dt_f,
-                    device=device,
-                    dtype=torch.double,
+                t_global = _time_grid_from_step_count(
+                    self.t, n, dt_f, device=device
                 ).to(dtype)
             else:
-                t_global = torch.arange(
-                    self.t.double(),
-                    self.t.double() + tstop_f,
-                    dt_f,
-                    device=device,
-                    dtype=torch.double,
+                n = duration_steps
+                t_global = _time_grid_from_step_count(
+                    self.t, n, dt_f, device=device
                 ).to(dtype)
-                n = t_global.size(0)
 
             # --------------------------------------------------------------
             # Prepare intra
@@ -1752,7 +1785,10 @@ class Population(P, Sliceable):
         Parameters
         ----------
         tstop : float
-            The simulation end time in milliseconds.
+            Simulation duration in milliseconds to advance from the current
+            model time ``self.t``. Steps sample the half-open interval
+            ``[self.t, self.t + tstop)`` at spacing ``dt``; consequently, a
+            positive fractional final interval contributes one timestep.
         chunklength : int
             The number of time steps to process in each chunk.
         dt : float, optional
@@ -1815,6 +1851,7 @@ class Population(P, Sliceable):
             A.dt if dt is None else dt, name="dt", positive=True
         )
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        n_steps = _duration_step_count(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
 
         intra = self.intra
@@ -1830,12 +1867,8 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 # Global time grid and chunking
                 # --------------------------------------------------------------
-                t = torch.arange(
-                    self.t.double(),
-                    self.t.double() + tstop_f,
-                    dt_f,
-                    dtype=torch.double,
-                    device=self.device(),
+                t = _time_grid_from_step_count(
+                    self.t, n_steps, dt_f, device=self.device()
                 ).to(self.dtype())
 
                 if t.numel() == 0:
@@ -2628,6 +2661,19 @@ class Population(P, Sliceable):
 
         is_material_process = isinstance(m, MaterialProcess)
 
+        def register_material_fields(target, declarations):
+            for declared_name, fields in declarations.items():
+                material_name = _canonical_material_name(declared_name)
+                current = target.setdefault(material_name, {}).setdefault(name, [])
+                current.extend(field for field in fields if field not in current)
+
+        def register_material_sources(target, declarations):
+            for declared_name, field_map in declarations.items():
+                material_name = _canonical_material_name(declared_name)
+                target.setdefault(material_name, {}).setdefault(name, {}).update(
+                    field_map
+                )
+
         if not is_material_process:
             for k, v in mech._currents.items():
                 self._m_curr.setdefault(k, {}).update({name: v})
@@ -2641,21 +2687,25 @@ class Population(P, Sliceable):
             for k, v in mech._write_ion_c.items():
                 self._ion_write_c.setdefault(k, {}).update({name: v})
 
-            for k, v in getattr(mech, "_read_material", {}).items():
-                self._material_read.setdefault(k, {}).update({name: v})
-
-            for k, v in getattr(mech, "_write_material", {}).items():
-                self._material_write.setdefault(k, {}).update({name: v})
-
-            for k, v in getattr(mech, "_source_material", {}).items():
-                self._material_source.setdefault(k, {}).update({name: v})
+            register_material_fields(
+                self._material_read, getattr(mech, "_read_material", {})
+            )
+            register_material_fields(
+                self._material_write, getattr(mech, "_write_material", {})
+            )
+            register_material_sources(
+                self._material_source, getattr(mech, "_source_material", {})
+            )
         else:
-            for k, v in getattr(mech, "_read_material", {}).items():
-                self._material_process_read.setdefault(k, {}).update({name: v})
-            for k, v in getattr(mech, "_write_material", {}).items():
-                self._material_process_write.setdefault(k, {}).update({name: v})
-            for k, v in getattr(mech, "_source_material", {}).items():
-                self._material_process_source.setdefault(k, {}).update({name: v})
+            register_material_fields(
+                self._material_process_read, getattr(mech, "_read_material", {})
+            )
+            register_material_fields(
+                self._material_process_write, getattr(mech, "_write_material", {})
+            )
+            register_material_sources(
+                self._material_process_source, getattr(mech, "_source_material", {})
+            )
 
     # -- Device and dtype methods --
 
@@ -2773,6 +2823,21 @@ class Population(P, Sliceable):
 
         if self.is_built and not (force_rebuild or self._flag_rebuild):
             return self
+
+        canonical_configs = {}
+        configured_names = {}
+        for configured_name, config in self._material_configs.items():
+            canonical = _canonical_material_name(configured_name)
+            if canonical in canonical_configs:
+                previous = configured_names[canonical]
+                raise ValueError(
+                    f"Material configurations {previous!r} and {configured_name!r} "
+                    f"both resolve to canonical material {canonical!r}. Configure "
+                    "that material through only one name."
+                )
+            canonical_configs[canonical] = config
+            configured_names[canonical] = configured_name
+        self._material_configs = canonical_configs
 
         def are_strings_unique(data: list) -> bool:
             strings_only = [item for item in data if item is not None]
@@ -2937,6 +3002,10 @@ class Population(P, Sliceable):
             self._dispatch_mechanism_injections(mech)
 
             self.integrator = self._integrator_class(self, mech, imem=self.imem)
+            # The population may have entered train/eval mode before this lazy
+            # child hierarchy existed. Newly attached modules otherwise keep
+            # torch.nn.Module's default training=True state.
+            self.integrator.train(self.training)
             self.integrator.configure_jit(self, scope="population")
             self.mech = self.integrator.mech
 
@@ -3580,7 +3649,9 @@ class Population(P, Sliceable):
         Parameters
         ----------
         tstop : float
-            Total simulation time in milliseconds.
+            Simulation duration in milliseconds to advance from the current
+            model time ``self.t``. This uses the same half-open time-grid and
+            fractional-final-step semantics as :meth:`longrun`.
         chunklength : int
             Number of time steps per checkpointed chunk.
         dt : float, optional
@@ -3653,6 +3724,7 @@ class Population(P, Sliceable):
             A.dt if dt is None else dt, name="dt", positive=True
         )
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        n_steps = _duration_step_count(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
 
         intra = self.intra
@@ -3716,12 +3788,8 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 # Global time grid and chunking
                 # --------------------------------------------------------------
-                t = torch.arange(
-                    self.t.double(),
-                    self.t.double() + tstop_f,
-                    dt_f,
-                    dtype=torch.double,
-                    device=self.device(),
+                t = _time_grid_from_step_count(
+                    self.t, n_steps, dt_f, device=self.device()
                 ).to(self.dtype())
 
                 if t.numel() == 0:

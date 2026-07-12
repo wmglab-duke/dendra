@@ -10,6 +10,7 @@ from dendra.models.integrators.explicit import (
     _dufort_frankel,
     _dufort_frankel_homogeneous,
     _euler,
+    _eulerv1,
     _filter_last,
     _rk2,
     _rk4,
@@ -286,7 +287,7 @@ def test_explicit_euler_injection_broadcasts_and_has_analytic_gradients():
         injection,
     )
     assert torch.allclose(slope, injection.expand_as(v))
-    assert torch.allclose(ionic, -injection.expand_as(v))
+    assert torch.equal(ionic, torch.zeros_like(v))
     slope.sum().backward()
     assert torch.equal(v.grad, torch.zeros_like(v))
     assert torch.equal(injection.grad, torch.full_like(injection, 2.0))
@@ -323,6 +324,61 @@ def test_explicit_euler_single_compartment_has_no_artificial_axial_current():
     assert torch.equal(model.v, before)
 
 
+@pytest.mark.parametrize(
+    "integrator_kind",
+    [
+        "euler",
+        "eulerv1",
+        "rk2",
+        "rk4",
+        "dfh",
+        "dfh-conv",
+        "df",
+        "backward-single",
+        "backward-cable",
+    ],
+)
+def test_isolated_compartment_imem_contract_excludes_explicit_stimulus_term(
+    integrator_kind,
+):
+    """Capacitive plus ionic current equals the drive by isolated-cell KCL."""
+    model = CableModel(shape=(2, 1), v_init=-3.0)
+    mechanism = LinearMechanism(g=0.0)
+    if integrator_kind == "euler":
+        integrator = _euler(model, mechanism, imem=True)
+    elif integrator_kind == "eulerv1":
+        integrator = _eulerv1(model, mechanism, imem=True)
+    elif integrator_kind == "rk2":
+        integrator = _rk2(model, mechanism, imem=True)
+    elif integrator_kind == "rk4":
+        integrator = _rk4(model, mechanism, imem=True)
+    elif integrator_kind == "dfh":
+        integrator = _dufort_frankel_homogeneous(model, mechanism, imem=True)
+    elif integrator_kind == "dfh-conv":
+        integrator = _dufort_frankel_homogeneous(model, mechanism, conv=True, imem=True)
+    elif integrator_kind == "df":
+        integrator = _dufort_frankel(model, mechanism, imem=True)
+    elif integrator_kind == "backward-single":
+        integrator = _bwd_euler_sc(model, mechanism, imem=True)
+    else:
+        integrator = _bwd_euler_ub(model, mechanism, method="pcr", imem=True)
+
+    integrator = integrator.to(dtype=DTYPE)
+    integrator._initialize(model, 0.01)
+    injections = (
+        torch.tensor([[3.0e-10], [-2.0e-10]], dtype=DTYPE),
+        torch.tensor([[-1.5e-10], [2.5e-10]], dtype=DTYPE),
+    )
+    for injection in injections:
+        integrator.step(model, 0.01, intra=injection)
+        torch.testing.assert_close(
+            model.i_membrane,
+            injection,
+            rtol=2.0e-11,
+            atol=1.0e-20,
+        )
+
+
 @pytest.mark.parametrize("conv", [False, True])
 def test_homogeneous_dufort_frankel_known_injection_balance_and_state_commit(conv):
     model = CableModel(shape=(2, 5), v_init=-2.0)
@@ -337,10 +393,15 @@ def test_homogeneous_dufort_frankel_known_injection_balance_and_state_commit(con
     previous = model.v_prev.clone()
 
     integrator.step(model, 0.1, intra=injection)
-    expected = previous + integrator.s1 * injection.expand_as(previous)
+    # The first call constructs the missing history level with a one-dt Euler
+    # step.  ``s1`` contains ``2 * dt / C``, so its stimulus contribution is
+    # halved here; later Dufort--Frankel transitions span two time levels.
+    expected = previous + 0.5 * integrator.s1 * injection.expand_as(previous)
     assert torch.allclose(model.v, expected)
     assert torch.equal(model.v_prev, torch.full_like(previous, -2.0))
-    assert torch.allclose(model.i_membrane, torch.zeros_like(model.v), atol=1e-12)
+    assert bool(model._df_history_valid)
+    assert torch.allclose(model.i_membrane, injection.expand_as(model.v), atol=1e-12)
+    assert len(mech.advance_calls) == 1
 
 
 def test_homogeneous_dufort_conv_and_direct_stencils_are_equivalent():
@@ -388,6 +449,45 @@ def test_homogeneous_dufort_conv_and_direct_stencils_are_equivalent():
     )
     conv_result = conv._step_conv(*conv_args)[0]
     assert torch.allclose(direct_result, conv_result, atol=1e-12, rtol=1e-12)
+
+
+def test_homogeneous_dufort_conv_runtime_matches_direct_with_stimulation_and_imem():
+    """The optimized stencil must preserve the full public step semantics."""
+    model_direct = CableModel(shape=(2, 5), v_init=-2.0)
+    model_conv = CableModel(shape=(2, 5), v_init=-2.0)
+    mech_direct = LinearMechanism(g=0.03, e=-4.0)
+    mech_conv = LinearMechanism(g=0.03, e=-4.0)
+    direct = _dufort_frankel_homogeneous(
+        model_direct, mech_direct, conv=False, beta=0.5, imem=True
+    ).to(dtype=DTYPE)
+    conv = _dufort_frankel_homogeneous(
+        model_conv, mech_conv, conv=True, beta=0.5, imem=True
+    ).to(dtype=DTYPE)
+    direct._initialize(model_direct, 0.01)
+    conv._initialize(model_conv, 0.01)
+
+    # Exercise the one-step history bootstrap without a stimulus.  The
+    # convolution implementation supplies an explicit zero extracellular
+    # field internally, while the direct implementation uses its no-field
+    # stencil; both routes must remain equivalent.
+    direct.step(model_direct, 0.01)
+    conv.step(model_conv, 0.01)
+    assert torch.allclose(model_conv.v, model_direct.v, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(
+        model_conv.i_membrane, model_direct.i_membrane, atol=1e-12, rtol=1e-12
+    )
+
+    ve = torch.linspace(-0.3, 0.2, 5, dtype=DTYPE)
+    intra = torch.linspace(-1.0e-10, 2.0e-10, 5, dtype=DTYPE)
+    direct.step(model_direct, 0.01, ve=ve, intra=intra)
+    conv.step(model_conv, 0.01, ve=ve, intra=intra)
+    assert torch.allclose(model_conv.v, model_direct.v, atol=1e-12, rtol=1e-12)
+    assert torch.allclose(
+        model_conv.v_prev, model_direct.v_prev, atol=1e-12, rtol=1e-12
+    )
+    assert torch.allclose(
+        model_conv.i_membrane, model_direct.i_membrane, atol=1e-12, rtol=1e-12
+    )
 
 
 def test_homogeneous_dufort_smoothing_and_init_v_work_for_batched_state():
@@ -447,6 +547,35 @@ def test_heterogeneous_dufort_preserves_uniform_voltage_and_supports_optional_in
     assert model.i_membrane.shape == model.shape
     assert torch.isfinite(model.v).all()
     assert not torch.equal(model.v, before)
+
+
+def test_heterogeneous_dufort_stimulated_startup_obeys_membrane_current_balance():
+    model = CableModel(
+        shape=(2, 5),
+        v_init=-3.0,
+        diam=torch.tensor([2.0, 3.0, 4.0, 5.0, 6.0]),
+        dx=torch.tensor([8.0, 10.0, 9.0, 12.0, 11.0]),
+    )
+    mech = LinearMechanism(g=0.025, e=-5.0)
+    integrator = _dufort_frankel(model, mech, imem=True).to(dtype=DTYPE)
+    integrator._initialize(model, 0.01)
+    initial_v = model.v.clone()
+    ve = torch.linspace(-0.1, 0.2, 5, dtype=DTYPE)
+    intra = torch.linspace(-1.0e-10, 2.0e-10, 5, dtype=DTYPE)
+
+    integrator.step(model, 0.01, ve=ve, intra=intra)
+    expected_imem = (
+        2.0 * (model.v - initial_v) / integrator.s1
+        + mech._current(initial_v) * integrator.area
+    )
+    assert torch.allclose(model.i_membrane, expected_imem, atol=1e-18, rtol=1e-12)
+    assert torch.equal(model.v_prev, initial_v)
+
+    # The subsequent no-stimulus transition exercises the other optional-input
+    # route after the Dufort history is valid.
+    integrator.step(model, 0.01)
+    assert torch.isfinite(model.v).all()
+    assert torch.isfinite(model.i_membrane).all()
 
 
 def test_heterogeneous_and_homogeneous_dufort_match_for_uniform_geometry():
@@ -529,12 +658,39 @@ def test_backward_euler_area_is_registered_for_state_and_device_migration():
 def test_backward_euler_skip_applies_voltage_process_and_evaluates_current():
     model = CableModel(shape=(2, 3), v_init=-5.0)
     mech = LinearMechanism(g=0.1, shift=1.25)
-    integrator = _bwd_euler_sc_skip(model, mech)
+    integrator = _bwd_euler_sc_skip(model, mech, imem=True)
     integrator._initialize(model, 0.1)
-    integrator.step(model, 0.1, intra=torch.ones_like(model.v))
+    old_voltage = model.v.clone()
+    ignored_intra = torch.full_like(model.v, 7.0)
+    integrator.step(model, 0.1, intra=ignored_intra)
     assert torch.equal(model.v, torch.full_like(model.v, -3.75))
+    expected_imem = (
+        integrator.cmdt * (model.v - old_voltage) + mech._current(model.v)
+    ) * integrator.area
+    torch.testing.assert_close(model.i_membrane, expected_imem, rtol=0.0, atol=0.0)
     assert mech.i_calls == 1
     assert len(mech.advance_calls) == 1
+
+
+def test_backward_euler_skip_preserves_capacitive_delta_for_aliasing_voltage_process():
+    class AliasingMechanism(LinearMechanism):
+        def update_v(self, v):
+            return v.add_(self.shift)
+
+    model = CableModel(shape=(1, 2), v_init=-5.0)
+    mech = AliasingMechanism(g=0.0, shift=1.25)
+    integrator = _bwd_euler_sc_skip(model, mech, imem=True)
+    integrator._initialize(model, 0.1)
+
+    integrator.step(model, 0.1)
+
+    expected_imem = integrator.cmdt * 1.25 * integrator.area
+    torch.testing.assert_close(
+        model.i_membrane,
+        expected_imem,
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_backward_euler_multi_commits_and_honors_write_back_switch():
@@ -728,7 +884,7 @@ def test_block_implicit_initialization_and_step_match_dense_residual():
 
     old_vc = model.vc.reshape(1, 3, 3).clone()
     ve = torch.tensor([[0.0, 0.1, -0.2]], dtype=DTYPE)
-    intra = torch.tensor([[1.0e-10, 0.0, -1.0e-10]], dtype=DTYPE)
+    intra = torch.tensor([[3.0e-9, 0.0, -2.0e-9]], dtype=DTYPE)
     integrator.step(model, 0.1, ve=ve, intra=intra)
     assert model.vc.shape == (1, 3, 3)
     assert model.v.shape == (1, 3)
@@ -747,6 +903,10 @@ def test_block_implicit_initialization_and_step_match_dense_residual():
     dense_result = _dense_block_solve(integrator.lower, main, integrator.upper, rhs)
     assert torch.allclose(model.vc, dense_result)
 
+    old_membrane_voltage = old_vc[..., 0] - old_vc[..., 1]
+    expected_imem = (integrator.cm_dt + gtot) * (model.v - old_membrane_voltage) + itot
+    torch.testing.assert_close(model.i_membrane, expected_imem, rtol=2e-12, atol=1e-18)
+
 
 def test_block_implicit_init_v_and_detach_reset_public_state():
     model = CableModel(
@@ -761,6 +921,11 @@ def test_block_implicit_init_v_and_detach_reset_public_state():
     assert torch.equal(model.vc[..., 0], model.expanded_v_init())
     assert torch.equal(model.vc[..., 1:], torch.zeros_like(model.vc[..., 1:]))
     assert torch.equal(model.i_membrane, torch.zeros_like(model.v))
+    model.v = model.v.requires_grad_()
+    model.vc = model.vc.requires_grad_()
+    model.i_membrane = model.i_membrane.requires_grad_()
     integrator.detach(model)
     assert mech.detached
-    assert not model.v.requires_grad and not model.vc.requires_grad
+    assert not model.v.requires_grad
+    assert not model.vc.requires_grad
+    assert not model.i_membrane.requires_grad

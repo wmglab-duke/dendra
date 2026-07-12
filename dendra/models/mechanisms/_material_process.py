@@ -12,6 +12,7 @@ from dendra.models._class_declarations import (
     declare_class_value,
 )
 
+from ._materials import _canonical_material_name
 from ._mechanism import Mechanism
 from ._spatial import SpatialOperator1D, SpatialOperatorTree
 
@@ -231,7 +232,14 @@ class MaterialProcess(Mechanism):
             raise RuntimeError(
                 f"MaterialProcess {self.name!r} has not been bound to materials yet."
             ) from exc
-        return resolver(str(name))
+        requested = str(name)
+        canonical = _canonical_material_name(requested)
+        try:
+            return resolver(canonical)
+        except KeyError:
+            if canonical != requested:
+                return resolver(requested)
+            raise
 
     def material_field(self, material: str, field: str) -> torch.Tensor:
         return self._get_material(material)._buffers[str(field)]

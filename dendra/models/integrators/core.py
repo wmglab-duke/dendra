@@ -234,7 +234,18 @@ def _expanded_v_init(model):
 
 
 class Integrator(torch.nn.Module):
-    r"""Base class for all integrators."""
+    r"""Base class for all integrators.
+
+    Notes
+    -----
+    When ``imem`` is enabled, every stable voltage integrator exposes
+    ``model.i_membrane`` as absolute transmembrane current in mA: capacitive
+    current plus ionic/mechanism current, using that integrator's per-step
+    voltage and current discretization. Dendra's mechanism-current convention
+    is outward-positive. Applied intracellular stimulus and axial cable
+    currents influence ``i_membrane`` through the solved voltage, but are not
+    themselves added to or subtracted from the reported transmembrane current.
+    """
 
     __constants__ = {"imem"}
     v_vars = ["v"]
