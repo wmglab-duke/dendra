@@ -307,7 +307,9 @@ def test_dense_checkpoint_state_rebinds_runtime_tensors():
 
 
 def test_diff_config_and_mode_switching_select_training_runtime():
-    _, netcon = _built_netcon()
+    # Fractional/surrogate training does not have unambiguous integer event
+    # counts, so runtime-selection coverage deliberately disables event tracking.
+    _, netcon = _built_netcon(track_events=False)
     with pytest.raises(ValueError, match="train_delay_backend"):
         netcon.set_diff_config(train_delay_backend="bad")
 

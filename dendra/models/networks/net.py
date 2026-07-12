@@ -812,6 +812,7 @@ class Network(RNGMixin):
         self.continuous_targets = {}
         self.dt = None
         self.built = False
+        self._mode_requires_initialize = False
 
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
@@ -1017,7 +1018,20 @@ class Network(RNGMixin):
         -------
         Network
             Self, for chaining.
+
+        Notes
+        -----
+        Dense-to-dense NetCon mode switches preserve queued deliveries and take
+        effect immediately. A switch that crosses a compact inference or
+        source-history runtime layout requires :meth:`initialize` before the
+        next execution call; stepping fails closed until then.
         """
+        # Validate every event connection before changing any child module.
+        # Strict compact-training policy can reject a transition (for example,
+        # after scheduled events were added); preflight keeps that rejection
+        # atomic across the complete Network.
+        for syn in self.synapses.values():
+            syn._validate_train_mode_transition(mode)
         for pop in self.populations.values():
             pop.train(mode)
         for syn in self.synapses.values():
@@ -1027,7 +1041,12 @@ class Network(RNGMixin):
         if self.netstim is not None:
             self.netstim.train(mode)
         self.training = mode
-        self._step = self._step_train
+        self._step = self._step_train if mode else self._step_eval
+        if any(
+            getattr(synapse, "_mode_requires_initialize", False)
+            for synapse in self.synapses.values()
+        ):
+            self._mode_requires_initialize = True
         return self
 
     def train_(self, mode=True):
@@ -1045,6 +1064,12 @@ class Network(RNGMixin):
         -------
         Network
             Self, for chaining.
+
+        Notes
+        -----
+        Dense-to-dense switches preserve pending traffic. Compact runtime
+        layouts must be reinitialized before execution, as described by
+        :meth:`train`.
         """
         super(Network, self).eval()
         for pop in self.populations.values():
@@ -1062,6 +1087,20 @@ class Network(RNGMixin):
     def eval_(self):
         """In-place variant of :meth:`eval` that returns ``None``."""
         self.eval()
+
+    def _require_mode_runtime_ready(self):
+        """Reject execution after a mode switch needing storage conversion."""
+        pending = [
+            name
+            for name, synapse in self.synapses.items()
+            if getattr(synapse, "_mode_requires_initialize", False)
+        ]
+        if self._mode_requires_initialize or pending:
+            raise RuntimeError(
+                "Network train/eval mode changed across incompatible NetCon "
+                "runtime layouts. Call network.initialize(dt) before execution; "
+                f"pending NetCons: {pending}."
+            )
 
     def devices(self):
         """
@@ -2867,6 +2906,7 @@ class Network(RNGMixin):
                 self.netstim.set_dt(dt_f)
             self.netstim.initialize()
             self.netstim.detach()
+        self._mode_requires_initialize = False
         return self
 
     def initialize_pops_from_state_cache(self, *, dt=None):
@@ -3036,6 +3076,7 @@ class Network(RNGMixin):
                 "Network wiring has changed since the last build. Call "
                 "initialize(dt) (recommended) or build(dt) before step()."
             )
+        self._require_mode_runtime_ready()
 
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         self._refresh_compile_config_from_ctx()
@@ -3150,6 +3191,7 @@ class Network(RNGMixin):
                 "Network wiring has changed since the last build. Call "
                 "initialize(dt) (recommended) or build(dt) before run()."
             )
+        self._require_mode_runtime_ready()
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         self._refresh_compile_config_from_ctx()
@@ -3293,6 +3335,7 @@ class Network(RNGMixin):
                 "Network wiring has changed since the last build. Call "
                 "initialize(dt) (recommended) or build(dt) before longrun()."
             )
+        self._require_mode_runtime_ready()
         if not isinstance(chunklength, int) or isinstance(chunklength, bool):
             raise ValueError("chunklength must be a positive integer.")
         if chunklength <= 0:
@@ -3939,6 +3982,7 @@ class Network(RNGMixin):
 
     def checkpoint_structure(self):
         """Return the immutable runtime structure required for exact replay."""
+        self._require_mode_runtime_ready()
         checkpoint_dt = None if self.dt is None else float(self.dt)
         if checkpoint_dt is not None and (
             not math.isfinite(checkpoint_dt) or checkpoint_dt <= 0.0
@@ -3982,6 +4026,7 @@ class Network(RNGMixin):
         parameters separately. The structure fingerprint rejects mismatched
         population/connection layouts and runtime backend modes before mutation.
         """
+        self._require_mode_runtime_ready()
         return {
             "populations": self.populations_state_dict_for_checkpoint(),
             "netcons": self.netcons_state_dict_for_checkpoint(),
@@ -4298,6 +4343,7 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before "
                 "longrun_checkpointed()."
             )
+        self._require_mode_runtime_ready()
         if isinstance(chunklength, bool) or not isinstance(chunklength, int):
             raise TypeError("chunklength must be a positive integer")
         if chunklength <= 0:

@@ -1588,6 +1588,10 @@ class NetCon(Referency):
         )
 
         self.train_flags = None
+        # A dense-to-dense mode switch can preserve the live delay ring. Compact
+        # inference/source-history layouts cannot be migrated merely by toggling
+        # nn.Module.training; Network execution rejects them until initialize().
+        self._mode_requires_initialize = False
 
         # scheduled events
         # Python-side calendar: abs_step -> list of (pre_idx:int, weight:float)
@@ -1959,6 +1963,31 @@ class NetCon(Referency):
             and self.train_delay_backend in ("source_history", "auto")
         )
 
+    def _validate_strict_source_history_policy(self):
+        """Validate a requested strict compact training policy without switching mode."""
+        if self.train_flags is None or self.train_delay_backend != "source_history":
+            return
+        if self._has_scheduled_events():
+            raise RuntimeError(
+                "NetCon train_delay_backend='source_history' currently supports "
+                "intrinsic source-level events only. Use train_delay_backend='dense' "
+                "or 'auto' for scheduled-event training."
+            )
+        self._ensure_source_level_training_metadata()
+        if not bool(getattr(self, "_bitpack_can_use", False)):
+            raise ValueError(
+                "NetCon train_delay_backend='source_history' is not exact for this "
+                f"connection: {self._bitpack_ineligible_reason}. Use "
+                "train_delay_backend='dense' or source-level thresholds/pre_var."
+            )
+
+    def _validate_train_mode_transition(self, mode: bool):
+        """Preflight mode changes that could otherwise fail after partial propagation."""
+        if not isinstance(mode, bool):
+            raise ValueError("training mode is expected to be boolean")
+        if mode and not self._mode_requires_initialize:
+            self._validate_strict_source_history_policy()
+
     def _ensure_source_level_training_metadata(self):
         """Build source-level metadata lazily for source-history training.
 
@@ -1985,26 +2014,16 @@ class NetCon(Referency):
         if not self._source_history_training_requested():
             return False
 
+        self._validate_strict_source_history_policy()
+
         self._ensure_source_level_training_metadata()
 
         if self._has_scheduled_events():
-            if self.train_delay_backend == "source_history":
-                raise RuntimeError(
-                    "NetCon train_delay_backend='source_history' currently supports "
-                    "intrinsic source-level events only. Use train_delay_backend='dense' "
-                    "or 'auto' for scheduled-event training."
-                )
             return False
 
         if bool(getattr(self, "_bitpack_can_use", False)):
             return True
 
-        if self.train_delay_backend == "source_history":
-            raise ValueError(
-                "NetCon train_delay_backend='source_history' is not exact for this "
-                f"connection: {self._bitpack_ineligible_reason}. Use "
-                "train_delay_backend='dense' or source-level thresholds/pre_var."
-            )
         return False
 
     def _source_history_diff_spiking_enabled(self) -> bool:
@@ -3558,12 +3577,25 @@ class NetCon(Referency):
           records configuration flags. ``NetCon.advance`` will dispatch to
           :meth:`advance_diff` when ``self.training = True`` and to
           :meth:`advance_non_diff` otherwise.
+        * ``track_events=True`` is supported in training only when delays,
+          spiking, and scheduled times all use hard semantics. Surrogate or
+          fractional deliveries do not define unambiguous integer event counts.
         """
         if train_delay_backend is not None:
             if train_delay_backend not in ("dense", "source_history", "auto"):
                 raise ValueError(
                     "train_delay_backend must be one of 'dense', 'source_history', or 'auto'."
                 )
+        if self.track_events and (diff_delays or diff_spiking or diff_scheduled_times):
+            raise ValueError(
+                "track_events=True in training requires hard event semantics: "
+                "set diff_delays=False, diff_spiking=False, and "
+                "diff_scheduled_times=False. Fractional surrogate deliveries "
+                "do not have unambiguous integer event counts."
+            )
+        previous_backend = self.train_delay_backend
+        previous_flags = self.train_flags
+        if train_delay_backend is not None:
             self.train_delay_backend = train_delay_backend
         self.train_flags = (
             diff_weights,
@@ -3575,11 +3607,24 @@ class NetCon(Referency):
             diff_scheduled_times,
             float(sched_width),
         )
-        # Re-select storage immediately for interactive/training-loop workflows.
-        # This is especially important for ``diff_spiking=True`` source-history
-        # training, which needs floating source-gate history rather than packed
-        # hard spikes.
-        self._refresh_training_advance_after_diff_config(clear_histories=True)
+        try:
+            self._validate_strict_source_history_policy()
+            if self._mode_requires_initialize:
+                # Validate strict source-history policy now, but do not replace
+                # the fail-closed advance sentinel or reshape live pending
+                # traffic during an incompatible mode transition.
+                if self.training:
+                    self._use_source_history_training_runtime()
+                return
+            # Re-select storage immediately for interactive/training-loop workflows.
+            # This is especially important for ``diff_spiking=True`` source-history
+            # training, which needs floating source-gate history rather than packed
+            # hard spikes.
+            self._refresh_training_advance_after_diff_config(clear_histories=True)
+        except Exception:
+            self.train_delay_backend = previous_backend
+            self.train_flags = previous_flags
+            raise
 
     @property
     def w(self):
@@ -4391,6 +4436,12 @@ class NetCon(Referency):
             _,
         ) = self.train_flags
         device, dtype = self.device, self.dtype
+        if self.track_events and (diff_delays or diff_spiking or diff_sched_times):
+            raise RuntimeError(
+                "Tracked training events require hard delay, spiking, and "
+                "scheduled-time semantics. Reconfigure this NetCon before "
+                "advancing it."
+            )
 
         # Snapshot indices for this step (avoid version bumps).
         # clone() is not necessary here; detach is enough because we never mutate
@@ -4398,9 +4449,14 @@ class NetCon(Referency):
         cur_idx = self.current_time_step.detach()  # [1], long
         gs = self.global_step.detach()  # [1], long
 
-        # 1) deliver today's payload
-        # NOTE: event_queue/events are assumed debug-only (not used for dynamics).
+        # 1) deliver today's payload and expose the matching hard-event counts.
+        # Ambiguous surrogate/fractional event tracking is rejected by
+        # set_diff_config(), so track_events here always has integer semantics.
         todays = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)  # [n_syn]
+        if self.track_events:
+            self.events.copy_(self.event_queue.index_select(0, cur_idx).squeeze(0))
+        else:
+            self.events.zero_()
         self.syn.net_receive(todays.view(*self.syn.shape_f), self)
 
         # 2) intrinsic spiking
@@ -4422,6 +4478,9 @@ class NetCon(Referency):
         # combine gates
         gate = intrinsic_gate + sched_wsum_conn  # [n_conn]
         self._record_gate_for_state_cache(gate)
+        event_counts = None
+        if self.track_events:
+            event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
 
         # weights (optionally detach)
         wvals = self.weight()
@@ -4442,6 +4501,10 @@ class NetCon(Referency):
         buf_next = self.delivery_buffer.clone()
         buf_next.index_fill_(0, cur_idx, 0.0)  # clear the row we just delivered
         buf_flat = buf_next.view(-1)
+        event_queue_next = None
+        if self.track_events:
+            event_queue_next = self.event_queue.clone()
+            event_queue_next.index_fill_(0, cur_idx, 0)
 
         if diff_delays:
             d_ms = self.delay_ms().to(dtype)  # [n_conn]
@@ -4487,9 +4550,14 @@ class NetCon(Referency):
             flat = future_steps * self.syn_numel + self.post_idx
             # Integer delay: single destination per connection
             buf_flat.index_add_(0, flat, weighted_spikes)
+            if event_queue_next is not None:
+                flat_events = future_steps * self._n_conn + self.con_range
+                event_queue_next.view(-1).index_add_(0, flat_events, event_counts)
 
         # Commit next buffer (already cleared + updated)
         self.delivery_buffer = buf_next
+        if event_queue_next is not None:
+            self.event_queue = event_queue_next
 
         # advance counters (no grad)
         with torch.no_grad():
@@ -4841,9 +4909,30 @@ class NetCon(Referency):
 
         self.is_spiking = gate.to(device=self.pre_device, dtype=self.pre_dtype)
 
+    def _advance_requires_mode_initialize(self):
+        raise RuntimeError(
+            "NetCon train/eval mode changed across incompatible runtime layouts. "
+            "Call initialize() before advancing this connection."
+        )
+
     def train(self, mode: bool = True):  # type: ignore[override]
+        previous_mode = bool(self.training)
+        previous_advance = getattr(getattr(self, "advance", None), "__name__", "")
+        self._validate_train_mode_transition(mode)
         super().train(mode)
+        if self._mode_requires_initialize:
+            return self
         if mode:
+            wants_compact_training = self._use_source_history_training_runtime()
+            if previous_mode != bool(mode) and (
+                self.delay_backend != "dense" or wants_compact_training
+            ):
+                # Preserve the existing runtime verbatim. initialize() owns the
+                # conversion to compact/dense storage and clears this guard only
+                # after every dependent buffer has been rebuilt coherently.
+                self._mode_requires_initialize = True
+                self.advance = self._advance_requires_mode_initialize
+                return self
             # Defer dense per-connection buffer allocation when the compact
             # source-history backend may be selected.  If diff flags have not
             # been configured yet, ``initialize``/``set_diff_config`` will choose
@@ -4852,10 +4941,28 @@ class NetCon(Referency):
             if self.train_flags is not None or self.train_delay_backend == "dense":
                 self._refresh_training_advance_after_diff_config(clear_histories=False)
         else:
+            # Dense training and inference share the same delay-ring layout, so
+            # switching back to evaluation can select the hard-event runtime
+            # immediately without clearing queued deliveries or moving the
+            # current ring slot.  Compact source-history/sparse runtimes may
+            # require an explicit initialize() to reshape their storage; their
+            # existing initialization path remains authoritative.
+            incompatible_compact_runtime = (
+                previous_advance == ("advance_diff_source_history")
+                or self.delay_backend != "dense"
+            )
+            if previous_mode != bool(mode) and incompatible_compact_runtime:
+                self._mode_requires_initialize = True
+                self.advance = self._advance_requires_mode_initialize
+                return self
+            if previous_advance == "advance_diff":
+                self._ensure_connection_spike_buffers()
+                self.advance = self._dense_advance_target()
             # ``eval`` is the intended mode for the bitpacked backend.  Reclaim
             # per-connection debug/spike-state storage as soon as the module enters
             # inference mode.
             self._shrink_connection_spike_buffers_for_bitpack()
+        self._mode_requires_initialize = False
         return self
 
     def eval(self):  # type: ignore[override]
@@ -5036,6 +5143,7 @@ class NetCon(Referency):
         with torch.no_grad():
             self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
         self.detach()
+        self._mode_requires_initialize = False
 
     def numel(self):
         """
@@ -5399,10 +5507,17 @@ class NetCon(Referency):
           runtime state needed to resume stepping identically mid-simulation.
         - Do NOT include weights/delays/modules here; those are model params
           and remain constant across a forward.
-        - Under the assumption that event_queue/events are only for logging,
-          we intentionally omit them. TODO: if they become essential to dynamics,
-          they should be handled here, in a way that the user can flag.
+        - Tracked event counts are public runtime state. ``events`` records the
+          most recently delivered counts, while the dense ``event_queue`` (or a
+          compact backend's event calendar) determines future observations; both
+          are retained so checkpoint replay preserves event introspection.
         """
+
+        if self._mode_requires_initialize:
+            raise RuntimeError(
+                "NetCon train/eval mode changed across incompatible runtime "
+                "layouts. Call initialize() before checkpointing this connection."
+            )
 
         runtime = self._checkpoint_runtime_kind()
         compact_runtime = runtime != "dense"
@@ -5427,6 +5542,11 @@ class NetCon(Referency):
             sd["has_spiked"] = (
                 self.has_spiked.clone() if compact_runtime else self.has_spiked
             )
+
+        if self.track_events:
+            sd["events"] = self.events.clone()
+            if hasattr(self, "event_queue"):
+                sd["event_queue"] = self.event_queue.clone()
 
         if compact_runtime:
             backend_state: Dict[str, Any] = {
@@ -5513,6 +5633,23 @@ class NetCon(Referency):
                 dtype=torch.bool,
             )
 
+        events = None
+        event_queue = None
+        if self.track_events:
+            events = _require_checkpoint_tensor(
+                state_dict,
+                "events",
+                shape=self.events.shape,
+                dtype=torch.int32,
+            )
+            if hasattr(self, "event_queue"):
+                event_queue = _require_checkpoint_tensor(
+                    state_dict,
+                    "event_queue",
+                    shape=self.event_queue.shape,
+                    dtype=torch.int32,
+                )
+
         sparse_calendar = None
         sparse_event_calendar = None
         spike_history = None
@@ -5573,6 +5710,10 @@ class NetCon(Referency):
         self.global_step = global_step.to(device=self.device)
         if has_spiked is not None:
             self.has_spiked = has_spiked.to(device=self.pre_device)
+        if events is not None:
+            self.events = events.to(device=self.device).clone()
+        if event_queue is not None:
+            self.event_queue = event_queue.to(device=self.device).clone()
         if backend_state is not None:
             self._sparse_calendar = sparse_calendar
             self._sparse_event_calendar = sparse_event_calendar

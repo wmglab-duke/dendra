@@ -92,17 +92,29 @@ def _run_neuron(synapse_kind):
     connection.threshold = SPIKE_THRESHOLD
     connection.delay = SYNAPTIC_DELAY
     connection.weight[0] = SYNAPTIC_WEIGHT
+    source_event_times = h.Vector()
+    connection.record(source_event_times)
 
     recorded = {
         "time": h.Vector(),
         "pre_v": h.Vector(),
         "post_v": h.Vector(),
-        "g": h.Vector(),
     }
     recorded["time"].record(h._ref_t)
     recorded["pre_v"].record(pre(0.5)._ref_v)
     recorded["post_v"].record(post(0.5)._ref_v)
-    recorded["g"].record(synapse._ref_g)
+    if synapse_kind == "expsyn":
+        recorded["g"] = h.Vector()
+        recorded["g"].record(synapse._ref_g)
+    else:
+        # Exp2Syn's RANGE g is evaluated in BREAKPOINT before its A/B states
+        # are advanced.  After fadvance(), _ref_g therefore describes an
+        # earlier solver phase than the simultaneously recorded voltage and
+        # states.  Record the states and derive the physical conductance below.
+        recorded["A"] = h.Vector()
+        recorded["B"] = h.Vector()
+        recorded["A"].record(synapse._ref_A)
+        recorded["B"].record(synapse._ref_B)
 
     cvode = h.CVode()
     cvode.active(0)
@@ -116,15 +128,26 @@ def _run_neuron(synapse_kind):
     while h.t < TSTOP - DT / 2:
         h.fadvance()
 
-    result = {name: np.asarray(values).copy() for name, values in recorded.items()}
+    sampled = {name: np.asarray(values).copy() for name, values in recorded.items()}
+    if synapse_kind.startswith("exp2syn"):
+        physical_g = sampled["B"] - sampled["A"]
+    else:
+        physical_g = sampled["g"]
+    result = {
+        "time": sampled["time"],
+        "pre_v": sampled["pre_v"],
+        "post_v": sampled["post_v"],
+        "g": physical_g,
+    }
     # Point-process current RANGE variables retain NEURON's earlier
-    # BREAKPOINT evaluation after fadvance().  Reconstruct current from the
-    # simultaneously sampled conductance and voltage so both simulators are
-    # compared at one explicit post-step phase.
+    # BREAKPOINT evaluation after fadvance().  For Exp2Syn the same applies to
+    # its published g RANGE variable, so g is derived from simultaneous A/B
+    # states above. Reconstruct current from simultaneous conductance and
+    # voltage so both simulators are compared at one explicit post-step phase.
     result["i"] = result["g"] * (result["post_v"] - SYNAPTIC_REVERSAL)
     assert result["time"].shape == (N_STEPS + 1,)
     np.testing.assert_allclose(result["time"], np.arange(N_STEPS + 1) * DT)
-    return result
+    return result, np.asarray(source_event_times).copy()
 
 
 def _new_dendra_cell():
@@ -288,7 +311,7 @@ def _expected_first_conductance(synapse_kind):
     ["expsyn", "exp2syn", "exp2syn_equal", "exp2syn_hookless"],
 )
 def test_two_cell_hh_event_network_matches_neuron(synapse_kind):
-    expected = _run_neuron(synapse_kind)
+    expected, expected_source_events = _run_neuron(synapse_kind)
     actual = _run_dendra(synapse_kind)
 
     assert set(actual) == set(expected)
@@ -321,12 +344,27 @@ def test_two_cell_hh_event_network_matches_neuron(synapse_kind):
 
     expected_delivery = int(np.flatnonzero(expected["g"] > 0.0)[0])
     actual_delivery = int(np.flatnonzero(actual["g"] > 0.0)[0])
-    expected_delay = (expected_delivery - expected_spike) * DT
-    # The first observable Exp2Syn conductance follows delivery by one sample
-    # because equal A/B jumps initially cancel. NEURON may also locate the
-    # source crossing within the preceding fixed step, so this is deliberately
-    # a bounded oracle sanity check rather than a cross-simulator phase claim.
-    assert SYNAPTIC_DELAY <= expected_delay <= SYNAPTIC_DELAY + 2 * DT + 1.0e-12
+    assert expected_source_events.shape == (1,)
+    expected_source_event = float(expected_source_events[0])
+    # NetCon.record reports the source event time directly. Relate it to the
+    # sampled voltage-crossing bracket (allowing NEURON's tiny event-queue
+    # epsilon at the upper boundary), rather than inferring it from conductance.
+    crossing_t0 = float(expected["time"][expected_spike - 1])
+    crossing_t1 = float(expected["time"][expected_spike])
+    event_time_tolerance = 1.0e-8
+    assert crossing_t0 < expected_source_event
+    assert expected_source_event <= crossing_t1 + event_time_tolerance
+
+    expected_arrival = expected_source_event + SYNAPTIC_DELAY
+    expected_delivery_time = float(expected["time"][expected_delivery])
+    # The phase-consistent A/B-derived Exp2Syn conductance, like ExpSyn's state,
+    # is first sampled on the fixed-step boundary following the queued arrival.
+    assert expected_arrival - event_time_tolerance <= expected_delivery_time
+    assert expected_delivery_time <= expected_arrival + DT + event_time_tolerance
+    assert not np.any(expected["g"][:expected_delivery])
+    assert expected["g"][expected_delivery] == pytest.approx(
+        _expected_first_conductance(synapse_kind), rel=2.0e-6
+    )
 
     # Dendra detects a threshold crossing from the source state on the next
     # network iteration, then delivers after its integer delay line. Keep this
@@ -356,14 +394,15 @@ def test_two_cell_hh_event_network_matches_neuron(synapse_kind):
         atol=1.0e-5,
     )
 
-    # Align on the independently observed arrivals. This compares the entire
-    # synaptic conductance/current and postsynaptic voltage response without
-    # conflating simulator-specific within-step event phases with kinetics.
+    # Align on the independently observed first physical responses. In
+    # particular, the NEURON Exp2Syn boundary is determined from A/B-derived g,
+    # not its one-BREAKPOINT-phase-stale published RANGE variable. This compares
+    # response kinetics without conflating simulator-specific event phases.
     n_after = min(
         len(expected["g"]) - expected_delivery,
         len(actual["g"]) - actual_delivery,
     )
-    for name, atol in (("post_v", 0.04), ("g", 1.0e-8), ("i", 2.0e-4)):
+    for name, atol in (("post_v", 0.04), ("g", 1.0e-8), ("i", 5.0e-4)):
         expected_aligned = expected[name][
             expected_delivery : expected_delivery + n_after
         ]
