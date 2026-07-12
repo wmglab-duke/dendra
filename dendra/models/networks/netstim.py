@@ -39,6 +39,21 @@ def _ste_gate(x, tau):
     return gate, hard
 
 
+def _causal_step_index(times: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+    """Map absolute times to the first fixed-step grid point at or after them.
+
+    Computing ``ceil(times / dt)`` directly can move an exact decimal boundary
+    by a complete step when the division rounds just above or below an integer.
+    Use the lower candidate's reconstructed grid time to decide whether one
+    additional step is required.  This also preserves adjacent representable
+    times on opposite sides of a grid boundary.
+    """
+    dt = torch.as_tensor(dt, device=times.device, dtype=times.dtype)
+    lower = torch.floor(times / dt)
+    needs_next = lower * dt < times
+    return (lower + needs_next.to(lower.dtype)).to(torch.long)
+
+
 class NetStim(DNModule, Sliceable):
     r"""
     Differentiable spike generator modeled after NEURON's NetStim.
@@ -835,7 +850,7 @@ class NetStim(DNModule, Sliceable):
                 device=device, dtype=dtype
             )
             t_eval = t_eval + src * (time_idx >= 0).to(dtype)
-        steps = torch.round(t_eval / self._dt_scalar(dtype)).to(torch.long)
+        steps = _causal_step_index(t_eval, self._dt_scalar(dtype))
         if not allow_past:
             t_last = self.t_last.detach().reshape(-1).to(device=device, dtype=dtype)
             keep = t_eval > t_last.index_select(0, flat_idx)
@@ -910,15 +925,15 @@ class NetStim(DNModule, Sliceable):
             width = max(float(getattr(self, "sched_width", 1.0)), 1e-6)
             kernel = (1.0 - (x.abs() / width)).clamp(min=0.0, max=1.0)
         else:
-            event_step = torch.round(times / dt).to(torch.long)
-            cur_step = torch.round(t_evt / dt).to(torch.long)
+            event_step = _causal_step_index(times, dt)
+            cur_step = _causal_step_index(t_evt, dt)
             kernel = (event_step == cur_step).to(dtype)
 
         amp = weights * kernel
         gate_flat.index_add_(0, flat_idx, amp)
 
-        event_step = torch.round(times / dt).to(torch.long)
-        cur_step = torch.round(t_evt / dt).to(torch.long)
+        event_step = _causal_step_index(times, dt)
+        cur_step = _causal_step_index(t_evt, dt)
         hard_evt = event_step == cur_step
         hard_counts.index_add_(0, flat_idx, hard_evt.to(torch.int32))
         return gate_flat.reshape(self.shape), (hard_counts.reshape(self.shape) > 0)
@@ -940,7 +955,9 @@ class NetStim(DNModule, Sliceable):
         ``differentiable=True`` use tensor-backed scheduling.  Tensor-backed
         schedules contribute their amplitude to ``spike_gate``; downstream
         NetCons must use ``diff_spiking=True`` to propagate gradients into the
-        scheduled times or weights.
+        scheduled times or weights. Hard events from both storage paths are
+        assigned causally to the first fixed-step grid point at or after their
+        absolute time.
         """
         if times is None:
             times = times_ms
@@ -1089,15 +1106,26 @@ class NetStim(DNModule, Sliceable):
 
     @torch.no_grad()
     @torch._dynamo.disable()  # keep everything here out of Dynamo/Inductor
-    def _consume_scheduled_tensor(self, s_sched: torch.Tensor):
+    def _consume_scheduled_heaps(self, s_sched: torch.Tensor, t: torch.Tensor):
         fired_idx = torch.nonzero(s_sched.reshape(-1), as_tuple=True)[0]
         if fired_idx is None or fired_idx.numel() == 0:
             return
 
         idx_list = fired_idx.detach().cpu().tolist()
+        t_flat = torch.broadcast_to(t.detach(), self.shape).reshape(-1)
         next_sched_flat = self.next_sched_time.reshape(-1)
         for flat_i in idx_list:
-            if self._sched_heaps[flat_i]:
+            cutoff = t_flat[flat_i]
+            heap = self._sched_heaps[flat_i]
+            # A boolean NetStim source can emit at most one spike per sampled
+            # time. Consume every heap event that is already due so duplicate or
+            # skipped-over events coalesce now instead of leaking into later
+            # timesteps as spurious spikes.
+            while (
+                heap
+                and torch.as_tensor(heap[0], device=cutoff.device, dtype=cutoff.dtype)
+                <= cutoff
+            ):
                 heapq.heappop(self._sched_heaps[flat_i])
             head = (
                 self._sched_heaps[flat_i][0]
@@ -1160,6 +1188,8 @@ class NetStim(DNModule, Sliceable):
         # event times must remain distinct: an ULP-sized tolerance can make a
         # genuinely later event fire early and consume it at the wrong call.
         legacy_gate, legacy_hard = _ste_gate(x, tau=self.tau)
+        stoch_due = t >= stoch_snap
+        heap_due = torch.logical_and(t >= sched_snap, torch.isfinite(sched_snap))
 
         max_spikes = self._broadcast_to_state(
             self.max_spikes, dtype=torch.long, device=device, name="max_spikes"
@@ -1168,7 +1198,9 @@ class NetStim(DNModule, Sliceable):
 
         sched_gate, sched_hard = self._scheduled_tensor_gate(t, dt=dt)
         can_gate = can_spike.to(dtype)
-        legacy_hard = torch.logical_and(legacy_hard, can_spike)
+        legacy_hard = torch.logical_and(
+            torch.logical_or(stoch_due, heap_due), can_spike
+        )
         sched_hard = torch.logical_and(sched_hard, can_spike)
 
         # ``spikes`` remains boolean for hard / inference consumers.
@@ -1193,17 +1225,14 @@ class NetStim(DNModule, Sliceable):
         )
         next_interval = interval * (1 - noise) + interval * noise * exp_rand
 
-        # Split origin of spikes (scheduled vs stochastic)
-        from_sched = torch.logical_and(
-            sched_snap <= stoch_snap, torch.isfinite(sched_snap)
-        )
-        s_sched = torch.logical_and(legacy_hard, from_sched)
         # Tensor-backed scheduled events are external injections and do not
         # advance the stochastic renewal clock.
 
         # 3) advance clocks
         #    a) stochastic: choose whether to backprop-through-time
-        delta = next_interval * legacy_gate * torch.logical_not(from_sched).to(dtype)
+        stoch_fires = torch.logical_and(stoch_due, can_spike)
+        heap_fires = torch.logical_and(heap_due, can_spike)
+        delta = next_interval * legacy_gate * stoch_fires.to(dtype)
 
         new_stoch = stoch_snap + delta  # <- no in-place on the buffer used in 'minimum'
 
@@ -1218,7 +1247,7 @@ class NetStim(DNModule, Sliceable):
 
         # b) scheduled: heap pops are side-effects; keep them out of the graph
         torch._dynamo.graph_break()
-        self._consume_scheduled_tensor(s_sched)
+        self._consume_scheduled_heaps(heap_fires, t)
 
         # 4) counters (not part of the computational graph)
         with torch.no_grad():

@@ -25,6 +25,7 @@ from dendra.helpers import (
 from ..callbacks import CallbackList
 from ..core import (
     Population,
+    _duration_step_budget,
     _load_compatible_state_dict_transactionally,
     _validate_time_scalar,
     make_intra,
@@ -45,12 +46,6 @@ ConnRule = Literal[
     "fixed_indegree",
     "fixed_outdegree",
 ]
-
-
-def _fixed_step_count(duration: float, dt: float) -> int:
-    """Return complete fixed timesteps in ``duration`` without decimal-ulp loss."""
-    step_ratio = duration / dt
-    return math.floor(math.nextafter(step_ratio, math.inf))
 
 
 def to_flat_idx_torch(shape, idx, device):
@@ -855,6 +850,14 @@ class Network(RNGMixin):
             "_clock_step",
             torch.tensor(0, device=torch.device("cpu"), dtype=torch.long),
         )
+        # Duration-based entrypoints execute only complete fixed timesteps.
+        # Keep requested-but-not-yet-simulated physical time separate from the
+        # public, whole-step simulation clock so partitioning a run across
+        # calls cannot silently lose a fractional timestep.
+        self.register_buffer(
+            "_duration_remainder",
+            torch.tensor(0.0, device=torch.device("cpu"), dtype=torch.float64),
+        )
 
         self.compile_network_ops = jit_enabled_for_scope("network_ops", self)
 
@@ -1138,6 +1141,23 @@ class Network(RNGMixin):
         for population in self.populations.values():
             value = self.t.to(device=population.t.device, dtype=population.t.dtype)
             population.t.copy_(value)
+
+    def _duration_budget(self, duration: float, dt: float) -> tuple[int, float]:
+        """Resolve a duration call against retained unsimulated time."""
+        pending = float(self._duration_remainder.detach().cpu().item())
+        return _duration_step_budget(duration, dt, pending)
+
+    def _set_duration_remainder(self, value: float) -> None:
+        """Commit retained physical time without mutating checkpoint aliases."""
+        self._duration_remainder = torch.tensor(
+            value,
+            device=self._duration_remainder.device,
+            dtype=torch.float64,
+        )
+
+    def _clear_duration_remainder(self) -> None:
+        """Start a fresh duration budget for a new simulation episode."""
+        self._set_duration_remainder(0.0)
 
     def attach_netstim(self, netstim: NetStim, *, replace: bool = False):
         """Attach a :class:`NetStim` after network construction.
@@ -1877,9 +1897,19 @@ class Network(RNGMixin):
                 target_idx,
                 threshold,
                 n_threshold,
-                to_param(weight, positive=True),
+                to_param(
+                    weight,
+                    positive=True,
+                    device=target_pop.device(),
+                    dtype=target_pop.dtype(),
+                ),
                 n_weight,
-                to_param(delay, positive=True),
+                to_param(
+                    delay,
+                    positive=True,
+                    device=target_pop.device(),
+                    dtype=target_pop.dtype(),
+                ),
                 n_delay,
             )
         )
@@ -1933,9 +1963,19 @@ class Network(RNGMixin):
             (
                 source_idx,
                 target_idx,
-                to_param(weight, positive=True),
+                to_param(
+                    weight,
+                    positive=True,
+                    device=target_pop.device(),
+                    dtype=target_pop.dtype(),
+                ),
                 n_weight,
-                to_param(delay, positive=True),
+                to_param(
+                    delay,
+                    positive=True,
+                    device=target_pop.device(),
+                    dtype=target_pop.dtype(),
+                ),
                 n_delay,
             )
         )
@@ -2806,6 +2846,7 @@ class Network(RNGMixin):
         # during initialization, so synchronize all clocks before building or
         # resetting connection state.
         self._reset_runtime_clock(t_f)
+        self._clear_duration_remainder()
         self.build(dt_f, max_delay_ms=max_delay_ms, force_rebuild=force_rebuild)
         # Always clear runtime delivery state during synapse initialization.
         # If a state cache is present, the backend-specific restore below will
@@ -3076,7 +3117,10 @@ class Network(RNGMixin):
         Parameters
         ----------
         tstop : float
-            Total simulation time (ms) to advance from current ``self.t``.
+            Requested simulation duration in milliseconds. Only complete
+            timesteps are executed. Any fractional remainder is retained and
+            combined with the next duration-based call, so partitioned calls
+            advance the same number of steps as their combined duration.
         extra : dict[str, tuple[torch.Tensor, object]], optional
             Optional mapping of population name to extracellular stimulus tuple
             ``(v, t)`` where ``t`` is assembled against the current time; values
@@ -3089,6 +3133,12 @@ class Network(RNGMixin):
         Returns
         -------
         None
+
+        Notes
+        -----
+        The call that completes a retained fractional timestep supplies that
+        step's ``extra`` input and callbacks; inputs from earlier no-step calls
+        are not buffered.
         """
         if self.dt is None:
             raise RuntimeError(
@@ -3104,6 +3154,8 @@ class Network(RNGMixin):
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
+
+        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
@@ -3123,7 +3175,7 @@ class Network(RNGMixin):
             t_dev = t.to(device=dev, dtype=dtp)
             t0 = self.t.to(device=dev, dtype=dtp)
             dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
-            t1 = t0 + torch.tensor(tstop_f, device=dev, dtype=dtp)
+            t1 = t0 + n_steps * dt_pop
             extra_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
         extra = extra_prepped
 
@@ -3132,11 +3184,7 @@ class Network(RNGMixin):
         tstart = self.t.item()
 
         with ctx:
-            # Exact decimal multiples such as 0.3 / 0.1 can evaluate one ulp
-            # below the integer (2.999...), causing a whole step to be lost.
-            # Moving the ratio by one representable float before flooring
-            # corrects that numerical artifact without rounding partial steps.
-            n_steps = _fixed_step_count(tstop_f, dt_f)
+            self._set_duration_remainder(duration_remainder)
 
             if with_intra:
                 intra = {
@@ -3215,9 +3263,10 @@ class Network(RNGMixin):
         Parameters
         ----------
         tstop : float
-            Total simulation duration in milliseconds, measured from the
-            network's current time. A final fractional timestep is ignored,
-            matching :meth:`run`.
+            Requested simulation duration in milliseconds. Only complete
+            timesteps are executed; a fractional remainder is retained and
+            combined with the next :meth:`run`, :meth:`longrun`, or
+            :meth:`longrun_checkpointed` call.
         chunklength : int
             Positive number of timesteps per chunk. The final chunk may be
             shorter.
@@ -3280,11 +3329,12 @@ class Network(RNGMixin):
         for callback in callbacks:
             callback.dt = self.dt
 
-        n_steps = _fixed_step_count(tstop_f, dt_f)
+        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         initial_time = self.t.double().detach().clone()
         tstart = self.t.item()
 
         with ctx:
+            self._set_duration_remainder(duration_remainder)
             pre_loop_hook(callbacks, self)
 
             if progressbar:
@@ -3815,7 +3865,14 @@ class Network(RNGMixin):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
+        has_duration_remainder = "_duration_remainder" in state_dict
         _load_compatible_state_dict_transactionally(self, state_dict)
+        if not has_duration_remainder:
+            self._clear_duration_remainder()
+        else:
+            self._set_duration_remainder(
+                float(self._duration_remainder.detach().cpu().item())
+            )
         self._reanchor_runtime_clock_from_time()
         return self
 
@@ -3932,6 +3989,7 @@ class Network(RNGMixin):
             "t": self.t,
             "clock_origin": self._clock_origin,
             "clock_step": self._clock_step,
+            "duration_remainder": self._duration_remainder,
             "structure": self.checkpoint_structure(),
         }
 
@@ -3995,6 +4053,32 @@ class Network(RNGMixin):
         restored_step = checkpoint_step.to(device=self._clock_step.device).clone()
         if int(restored_step.item()) < 0:
             raise ValueError("Network checkpoint clock step must be non-negative.")
+
+        checkpoint_remainder = state_dict.get(
+            "duration_remainder", torch.zeros_like(self._duration_remainder)
+        )
+        if not torch.is_tensor(checkpoint_remainder):
+            raise TypeError("Network checkpoint duration remainder must be a tensor.")
+        if tuple(checkpoint_remainder.shape) != tuple(self._duration_remainder.shape):
+            raise ValueError(
+                "Network checkpoint duration remainder has shape "
+                f"{tuple(checkpoint_remainder.shape)}, expected "
+                f"{tuple(self._duration_remainder.shape)}."
+            )
+        if not checkpoint_remainder.is_floating_point():
+            raise TypeError(
+                "Network checkpoint duration remainder must have a floating dtype."
+            )
+        restored_remainder = checkpoint_remainder.to(
+            device=self._duration_remainder.device,
+            dtype=torch.float64,
+        ).clone()
+        if not bool(torch.isfinite(restored_remainder).item()):
+            raise ValueError("Network checkpoint duration remainder must be finite.")
+        if float(restored_remainder.item()) < 0.0:
+            raise ValueError(
+                "Network checkpoint duration remainder must be non-negative."
+            )
         if self.dt is not None:
             elapsed = restored_step.to(restored_t.dtype) * float(self.dt)
             metadata_t = restored_origin + elapsed
@@ -4121,6 +4205,7 @@ class Network(RNGMixin):
         self.t = restored_t
         self._clock_origin = restored_origin
         self._clock_step = restored_step
+        self._duration_remainder = restored_remainder
         self._sync_runtime_clock()
 
     def restore_dict_from_checkpoint(self, state_dict):
@@ -4167,7 +4252,9 @@ class Network(RNGMixin):
         Parameters
         ----------
         tstop:
-            Total simulated time (ms).
+            Requested simulation duration in milliseconds. Only complete
+            timesteps are executed; fractional time is retained for the next
+            duration-based network call.
         chunklength:
             Number of time steps per checkpoint chunk.
         extra:
@@ -4228,10 +4315,10 @@ class Network(RNGMixin):
         for c in callbacks:
             c.dt = self.dt
 
-        # Build a step-count-derived global time grid used only for chunking and
-        # callback timing. Network.run() intentionally ignores a final partial
-        # timestep, so checkpointed execution must use the same floor rule.
-        n_steps = _fixed_step_count(tstop_f, dt_f)
+        # Use the same retained-duration budget as run()/longrun(). Exact
+        # decimal-form arithmetic keeps common decimal multiples composable
+        # without promoting a genuinely just-before-grid duration.
+        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         initial_time = self.t.double().detach().clone()
         t_grid = initial_time + dt_f * torch.arange(
             n_steps,
@@ -4329,6 +4416,7 @@ class Network(RNGMixin):
 
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
+                self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
 
                 # Snapshot boundary state after pre-loop hooks.

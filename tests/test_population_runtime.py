@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import dendra as dn
-from dendra.models.core import _duration_step_count
+from dendra.models.core import _duration_step_budget, _duration_step_count
 from dendra.models.mod import pas
 from dendra.models.stim.waveform import constant
 
@@ -389,15 +389,34 @@ def test_repeated_run_duration_is_independent_of_accumulated_time_roundoff():
     )
 
 
-def test_positive_subnormal_duration_still_requests_one_step():
-    assert _duration_step_count(math.ulp(0.0), sys.float_info.max) == 1
+def test_positive_subnormal_duration_is_retained_without_rounding_up():
+    duration = math.ulp(0.0)
+    steps, remainder = _duration_step_budget(duration, sys.float_info.max)
+    assert steps == _duration_step_count(duration, sys.float_info.max) == 0
+    assert remainder == duration
+
+
+@pytest.mark.parametrize(
+    ("steps_expected", "dt", "duration_expected"),
+    [(3, 0.1, 0.30000000000000004), (157, 0.025, 3.9250000000000003)],
+)
+def test_programmatic_exact_multiple_does_not_leave_decimal_tail(
+    steps_expected, dt, duration_expected
+):
+    duration = steps_expected * dt
+    assert duration == duration_expected
+
+    steps, remainder = _duration_step_budget(duration, dt)
+
+    assert steps == steps_expected
+    assert remainder == 0.0
 
 
 @pytest.mark.parametrize(
     "duration,expected_steps",
-    [(0.005, 1), (0.015, 2), (0.07, 7), (0.071, 8)],
+    [(0.005, 0), (0.015, 1), (0.07, 7), (0.071, 7)],
 )
-def test_run_and_longrun_share_half_open_duration_step_count(duration, expected_steps):
+def test_run_variants_share_complete_duration_step_count(duration, expected_steps):
     class StepCounter(dn.callbacks.Callback):
         def __init__(self):
             super().__init__()
@@ -434,6 +453,9 @@ def test_run_and_longrun_share_half_open_duration_step_count(duration, expected_
     torch.testing.assert_close(run_pop.t, long_pop.t, rtol=0.0, atol=0.0)
     torch.testing.assert_close(run_pop.t, checkpointed_pop.t, rtol=0.0, atol=0.0)
     torch.testing.assert_close(final_state["t"], checkpointed_pop.t)
+    assert final_state["duration_remainder"].item() == pytest.approx(
+        duration - expected_steps * 0.01
+    )
     torch.testing.assert_close(run_pop.v, long_pop.v, rtol=0.0, atol=0.0)
     torch.testing.assert_close(run_pop.v, checkpointed_pop.v, rtol=0.0, atol=0.0)
 

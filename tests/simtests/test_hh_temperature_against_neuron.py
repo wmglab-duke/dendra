@@ -20,6 +20,9 @@ N_STEPS = 800
 TSTOP = DT * N_STEPS
 CONVERGENCE_TSTOP = 1.5
 CONVERGENCE_DTS = (2.0 * DT, DT, 0.5 * DT)
+NON_EQUILIBRIUM_DTS = (4.0 * DT, 2.0 * DT, DT)
+NON_EQUILIBRIUM_REFERENCE_DT = DT / 8.0
+NON_EQUILIBRIUM_GATES = (0.2, 0.25, 0.55)
 V_INIT = -65.0
 STIMULUS_AMPLITUDE_NA = 8.0
 STIMULUS_DELAY = 0.5
@@ -49,6 +52,20 @@ SOLVE_PHASE_ERROR_BOUNDS = {
     "il": (5.0e-8, 1.0e-8),
 }
 
+# Bounds for the finest Dendra trajectory in the deliberately non-equilibrium
+# convergence oracle below.  Unlike the same-dt comparisons above, these are
+# errors against a much finer NEURON reference rather than phase-alignment
+# tolerances.
+NON_EQUILIBRIUM_FINE_ERROR_BOUNDS = {
+    "v": (0.07, 0.02),
+    "m": (0.0012, 0.0005),
+    "h": (0.0009, 0.00045),
+    "n": (0.0006, 0.0003),
+    "ina": (0.00025, 0.00007),
+    "ik": (0.00025, 0.00007),
+    "il": (0.000021, 0.000006),
+}
+
 
 def _number_of_steps(dt: float, tstop: float) -> int:
     n_steps = round(tstop / dt)
@@ -68,7 +85,11 @@ def _hh_currents(
 
 
 def _run_neuron(
-    celsius: float, *, dt: float = DT, tstop: float = TSTOP
+    celsius: float,
+    *,
+    dt: float = DT,
+    tstop: float = TSTOP,
+    initial_gates: tuple[float, float, float] | None = None,
 ) -> dict[str, np.ndarray]:
     assert h.usetable_hh == 0, "NEURON HH rate-table interpolation must be disabled"
     n_steps = _number_of_steps(dt, tstop)
@@ -92,6 +113,8 @@ def _run_neuron(
     h.celsius = celsius
     h.dt = dt
     h.finitialize(V_INIT)
+    if initial_gates is not None:
+        segment.hh.m, segment.hh.h, segment.hh.n = initial_gates
 
     rows = [
         (
@@ -129,7 +152,11 @@ def _run_neuron(
 
 
 def _run_dendra(
-    celsius: float, *, dt: float = DT, tstop: float = TSTOP
+    celsius: float,
+    *,
+    dt: float = DT,
+    tstop: float = TSTOP,
+    initial_gates: tuple[float, float, float] | None = None,
 ) -> tuple[dict[str, np.ndarray], float]:
     n_steps = _number_of_steps(dt, tstop)
     model = dn.SingleCompartment(
@@ -154,6 +181,10 @@ def _run_dendra(
     model.eval()
     model.initialize()
     mechanism = model.mech.hh
+    if initial_gates is not None:
+        mechanism.m.fill_(initial_gates[0])
+        mechanism.h.fill_(initial_gates[1])
+        mechanism.n.fill_(initial_gates[2])
 
     recorder = dn.callbacks.RecorderLambda(
         {
@@ -219,3 +250,61 @@ def test_hh_lie_split_gate_difference_converges_at_first_order():
                 f"HH {name} splitting did not converge at first order: "
                 f"errors={errors[name]!r}, ratio={ratio:.6g}"
             )
+
+
+def test_hh_nonequilibrium_trajectory_converges_to_fine_neuron_reference():
+    """Exercise the coupled solve without steady-state gate phase alignment."""
+    reference = _run_neuron(
+        22.0,
+        dt=NON_EQUILIBRIUM_REFERENCE_DT,
+        tstop=CONVERGENCE_TSTOP,
+        initial_gates=NON_EQUILIBRIUM_GATES,
+    )
+    assert tuple(reference[name][0] for name in STATE_NAMES) == pytest.approx(
+        NON_EQUILIBRIUM_GATES
+    )
+    assert np.ptp(reference["v"]) > 10.0
+
+    # Compare currents at the reported state phase, not NEURON's stale
+    # BREAKPOINT fields and not the old-gate voltage-solve phase used by the
+    # same-dt oracle above.  Dendra's recorder evaluates these same canonical
+    # expressions from its reported voltage and gates.
+    reference.update(
+        _hh_currents(reference["v"], reference["m"], reference["h"], reference["n"])
+    )
+
+    rmse_by_trace = {name: [] for name in TRACE_NAMES}
+    finest_max_abs: dict[str, float] = {}
+    for dt in NON_EQUILIBRIUM_DTS:
+        actual, _ = _run_dendra(
+            22.0,
+            dt=dt,
+            tstop=CONVERGENCE_TSTOP,
+            initial_gates=NON_EQUILIBRIUM_GATES,
+        )
+        stride = round(dt / NON_EQUILIBRIUM_REFERENCE_DT)
+        assert dt == pytest.approx(stride * NON_EQUILIBRIUM_REFERENCE_DT, abs=1.0e-14)
+        for name in TRACE_NAMES:
+            expected = reference[name][::stride]
+            assert actual[name].shape == expected.shape
+            difference = actual[name] - expected
+            assert np.isfinite(difference).all()
+            rmse_by_trace[name].append(float(np.sqrt(np.mean(difference * difference))))
+            if dt == NON_EQUILIBRIUM_DTS[-1]:
+                finest_max_abs[name] = float(np.max(np.abs(difference)))
+
+    # With gates displaced well away from their -65 mV steady state, Dendra's
+    # state-first and NEURON's voltage-first Lie splittings no longer enjoy the
+    # near-exact one-sample phase alignment of the initialized HH oracle.  Both
+    # nevertheless converge to the same coupled trajectory at first order.
+    for name, (coarse, medium, fine) in rmse_by_trace.items():
+        assert coarse > medium > fine > 0.0
+        for ratio in (coarse / medium, medium / fine):
+            assert 1.7 < ratio < 2.3, (
+                f"non-equilibrium HH {name} did not converge at first order: "
+                f"errors={rmse_by_trace[name]!r}, ratio={ratio:.6g}"
+            )
+
+        max_bound, rmse_bound = NON_EQUILIBRIUM_FINE_ERROR_BOUNDS[name]
+        assert finest_max_abs[name] < max_bound
+        assert fine < rmse_bound

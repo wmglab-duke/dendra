@@ -5,7 +5,7 @@ from typing import Any, Dict, Literal
 import torch
 
 from ..parametric import Referency
-from .netstim import NetStim
+from .netstim import NetStim, _causal_step_index
 from .spiking import update_active, update_active_diff
 from .utils import make_getattr
 
@@ -372,7 +372,7 @@ class ContinuousCon(Referency):
         if isinstance(self.transform, torch.nn.Module):
             self.transform = self.transform.to(device=self.device, dtype=self.dtype)
 
-        self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
+        self.dt = torch.tensor(dt, device=self.device, dtype=self.dtype)
         if pre_var is None:
             pre_var = "v"
         self.get_pre_var = make_getattr(pre_var)
@@ -483,7 +483,7 @@ class ContinuousCon(Referency):
         ):
             self._move_buffer(name, self.device)
         self._move_buffer("delivery_buffer", self.device, self.dtype)
-        self.dt = self.dt.to(device=self.device, dtype=torch.float32)
+        self.dt = self.dt.to(device=self.device, dtype=self.dtype)
         self.weight = self.weight.to(device=self.device, dtype=self.dtype)
         self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
 
@@ -1267,8 +1267,8 @@ class NetCon(Referency):
          - If ``diff_scheduled_times=True`` in :meth:`set_diff_config`,
            events are smeared with a differentiable triangular kernel over
            time steps, so gradients can move event times.
-         - If ``diff_scheduled_times=False``, times are rounded to the
-           nearest integer step and treated as exact.
+         - If ``diff_scheduled_times=False``, each time is assigned to the first
+           integer step at or after the event and treated as exact.
 
        In both cases, gradients flow into ``sched_t`` when using the
        differentiable configuration.
@@ -1436,7 +1436,7 @@ class NetCon(Referency):
         self.weight = self.weight.to(device=self.device, dtype=self.dtype)
         delay = delay.to(device=self.device, dtype=self.dtype)
 
-        self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
+        self.dt = torch.tensor(dt, device=self.device, dtype=self.dtype)
         self.max_delay = max_delay
         self.track_events = bool(track_events)
         if delay_backend not in ("dense", "sparse_calendar", "bitpacked_history"):
@@ -2188,7 +2188,7 @@ class NetCon(Referency):
             self._csr_conidx_sorted = self._csr_conidx_sorted.to(device=self.pre_device)
 
         # dt and parameter modules should follow the synapse device.
-        self.dt = self.dt.to(device=self.device, dtype=torch.float32)
+        self.dt = self.dt.to(device=self.device, dtype=self.dtype)
         self.weight = self.weight.to(device=self.device, dtype=self.dtype)
         self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
         self._move_sparse_calendar_to_device()
@@ -3541,8 +3541,8 @@ class NetCon(Referency):
             via :meth:`schedule_time_ref`) are handled via a differentiable
             triangular kernel over time steps. This allows gradients to move
             event times when they come from value- or reference-mode tensors.
-            If False, scheduled times are rounded to integer steps, and the
-            timing behavior is non-differentiable.
+            If False, scheduled times are assigned to the first integer step at
+            or after the event, and timing behavior is non-differentiable.
         sched_width : float, optional
             Half-width of the triangular kernel (in steps) when
             ``diff_scheduled_times=True``. A value of 1.0 yields contributions
@@ -3694,8 +3694,9 @@ class NetCon(Referency):
             Event times in milliseconds. Must be broadcast-compatible with
             the selected connections *after* filtering out past events (see
             ``allow_past``). Times are converted to steps via
-            ``round(times_ms / dt)`` for non-differentiable scheduling, and
-            interpreted as continuous values when ``diff_scheduled_times=True``.
+            the first grid step at or after the event for non-differentiable
+            scheduling, and interpreted as continuous values when
+            ``diff_scheduled_times=True``.
         weight : float or torch.Tensor, optional
             Scalar or per-event weight *multiplier* applied on top of the base
             connection weights returned by ``self.weight()``. Accepted shapes:
@@ -3738,7 +3739,7 @@ class NetCon(Referency):
                 con_indices, device=device, dtype=torch.long
             ).view(-1)
 
-        tms_raw = torch.as_tensor(times_ms, device=device, dtype=torch.float32).view(-1)
+        tms_raw = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
 
         if con_idx_raw.numel() != tms_raw.numel():
             raise ValueError("con_indices/pre_indices and times_ms must match length")
@@ -3746,7 +3747,7 @@ class NetCon(Referency):
             raise IndexError("connection index out of range")
 
         # legacy step field (used when diff_scheduled_times=False)
-        steps_raw = torch.round(tms_raw / self.dt.to(tms_raw.dtype)).to(torch.long)
+        steps_raw = _causal_step_index(tms_raw, self.dt.to(tms_raw.dtype))
 
         # optional filtering of past events
         if not allow_past:
@@ -3968,7 +3969,7 @@ class NetCon(Referency):
                 con_indices, device=device, dtype=torch.long
             ).view(-1)
 
-        tms = torch.as_tensor(times_ms, device=device, dtype=torch.float32).view(-1)
+        tms = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
         widx = torch.as_tensor(weight_idx, device=device, dtype=torch.long).view(-1)
         if not (con_idx.numel() == tms.numel() == widx.numel()):
             raise ValueError("indices, times_ms, and weight_idx must have same length")
@@ -3978,7 +3979,7 @@ class NetCon(Referency):
         if (widx < 0).any() or (widx >= self._sched_w_source.numel()).any():
             raise IndexError("weight_idx out of range for bound weight source")
 
-        steps = torch.round(tms / self.dt.to(tms.dtype)).to(torch.long)
+        steps = _causal_step_index(tms, self.dt.to(tms.dtype))
         if not allow_past:
             cur = self.global_step.view(())
             keep = steps >= cur
@@ -4115,10 +4116,10 @@ class NetCon(Referency):
         if (tidx < 0).any() or (tidx >= self._sched_t_source.numel()).any():
             raise IndexError("time_idx out of range for bound time source")
 
-        # use a zeros value-slot for times, and record the indices in sched_time_idx
-        # legacy step field still populated from current source values (for non-diff path)
-        tms_now = self._sched_t_source.index_select(0, tidx).to(torch.float32)
-        steps = torch.round(tms_now / self.dt.to(torch.float32)).to(torch.long)
+        # Use a zeros value slot for times and record sched_time_idx. Keep the
+        # legacy hard-step field populated from the current reference values.
+        tms_now = self._sched_t_source.index_select(0, tidx).to(dtype=dtype)
+        steps = _causal_step_index(tms_now, self.dt.to(dtype))
         E_before = con_idx.numel()
         if not allow_past:
             cur = self.global_step.view(())
@@ -4221,8 +4222,8 @@ class NetCon(Referency):
         use_tri_kernel : bool
             If True, use a differentiable triangular kernel in step space for
             scheduled times (used when ``diff_scheduled_times=True``). If False,
-            scheduled events are active only when the rounded step equals
-            ``gs_long``.
+            scheduled events are active only when their first causal grid step
+            equals ``gs_long``.
 
         Returns
         -------
@@ -4254,7 +4255,7 @@ class NetCon(Referency):
         t_val = self.sched_time_ms  # may be zeros if using time-by-ref only
         if self._sched_t_source is not None:
             idxt = torch.clamp(self.sched_time_idx, min=0)
-            t_src = self._sched_t_source.index_select(0, idxt).to(torch.float32)
+            t_src = self._sched_t_source.index_select(0, idxt).to(dtype=dtype)
             t_ref_mask = (self.sched_time_idx >= 0).to(t_src.dtype)
             t_val = t_val + t_src * t_ref_mask
 
@@ -4272,9 +4273,8 @@ class NetCon(Referency):
             # counts (bookkeeping): event "active" if tri>0
             cnt_evt = (tri > 0).to(torch.int32)  # [E]
         else:
-            # Step-exact firing: round(lam) == gs
-            lam = t_val.to(dtype) / self.dt.to(dtype)
-            abs_step = lam.round().to(torch.long)
+            # Step-exact, causal firing: first grid step >= event time.
+            abs_step = _causal_step_index(t_val.to(dtype), self.dt.to(dtype))
             now_mask = abs_step == gs_long.view(())
             amp_evt = w_val * now_mask.to(dtype)  # [E]
             cnt_evt = now_mask.to(torch.int32)  # [E]

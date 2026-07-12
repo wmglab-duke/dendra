@@ -322,6 +322,12 @@ def test_network_longrun_rejects_invalid_duration_without_mutation(invalid):
 def test_network_longrun_substep_duration_has_one_empty_loop_lifecycle():
     network = _build_network()
     before = _snapshot(network.state_dict_for_checkpoint())
+    expected = _snapshot(before)
+    expected["duration_remainder"] = torch.as_tensor(
+        DT / 2.0,
+        device=before["duration_remainder"].device,
+        dtype=before["duration_remainder"].dtype,
+    )
     trace = _NetworkTrace()
 
     network.longrun(DT / 2.0, chunklength=CHUNK_STEPS, callbacks=[trace])
@@ -329,7 +335,7 @@ def test_network_longrun_substep_duration_has_one_empty_loop_lifecycle():
     assert trace.pre_loop_calls == trace.post_loop_calls == 1
     assert trace.pre_chunks == trace.post_chunks == []
     assert trace.records == []
-    _assert_nested_equal(network.state_dict_for_checkpoint(), before)
+    _assert_nested_equal(network.state_dict_for_checkpoint(), expected)
 
 
 def test_network_loops_honor_injection_added_after_initialize():
@@ -377,6 +383,12 @@ def test_network_checkpointed_substep_runs_empty_loop_loss_lifecycle():
     network = _build_network(with_injection=False)
     network.train()
     before = _snapshot(network.state_dict_for_checkpoint())
+    expected = _snapshot(before)
+    expected["duration_remainder"] = torch.as_tensor(
+        DT / 2.0,
+        device=before["duration_remainder"].device,
+        dtype=before["duration_remainder"].dtype,
+    )
     callback = _EmptyCheckpointLifecycle()
 
     loss, final_state = network.longrun_checkpointed(
@@ -390,8 +402,8 @@ def test_network_checkpointed_substep_runs_empty_loop_loss_lifecycle():
     assert callback.pre_chunk_calls == callback.post_chunk_calls == 0
     assert callback.post_step_calls == 0
     torch.testing.assert_close(loss, callback.weight.square())
-    _assert_nested_equal(final_state, before)
-    _assert_nested_equal(network.state_dict_for_checkpoint(), before)
+    _assert_nested_equal(final_state, expected)
+    _assert_nested_equal(network.state_dict_for_checkpoint(), expected)
 
     loss.backward()
     torch.testing.assert_close(

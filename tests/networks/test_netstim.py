@@ -354,6 +354,65 @@ def test_noise_zero_adjacent_ulp_renewal_times_remain_distinct():
     assert torch.equal(ns.spikes, torch.tensor([False, True]))
 
 
+def test_legacy_and_weighted_schedules_share_causal_off_grid_timing():
+    legacy = M.NetStim(
+        N=1, interval=100.0, start=100.0, noise=0.0, dtype=torch.float64
+    ).initialize()
+    weighted = M.NetStim(
+        N=1, interval=100.0, start=100.0, noise=0.0, dtype=torch.float64
+    ).initialize()
+    weighted.set_diff_config(diff_scheduled_times=False)
+
+    # Schedule after the t=0 sample. The former rounded tensor path assigned
+    # this event to step zero, so it was accepted and then silently lost.
+    legacy.forward(0.0, dt=0.1)
+    weighted.forward(0.0, dt=0.1)
+    legacy.schedule(0, 0.049)
+    weighted.schedule(0, 0.049, weight=2.0)
+
+    assert not bool(legacy.forward(0.0, dt=0.1)[0])
+    assert not bool(weighted.forward(0.0, dt=0.1)[0])
+    assert bool(legacy.forward(0.1, dt=0.1)[0])
+    assert bool(weighted.forward(0.1, dt=0.1)[0])
+    assert legacy.spike_gate.item() == pytest.approx(1.0)
+    assert weighted.spike_gate.item() == pytest.approx(2.0)
+
+
+def test_duplicate_due_heap_events_coalesce_without_leaking_to_later_steps():
+    ns = M.NetStim(
+        N=1, interval=100.0, start=100.0, noise=0.0, dtype=torch.float64
+    ).initialize()
+    ns.schedule(0, [0.1, 0.1])
+
+    assert bool(ns.forward(0.1, dt=0.1)[0])
+    assert ns.spike_counts.item() == 1
+    assert ns._sched_heaps == [[]]
+    assert torch.isinf(ns.next_sched_time).all()
+
+    assert not bool(ns.forward(0.2, dt=0.1)[0])
+    assert ns.spike_counts.item() == 1
+
+
+def test_coincident_heap_and_renewal_event_advance_both_clocks_once():
+    ns = M.NetStim(
+        N=1,
+        interval=1.0,
+        start=0.1,
+        noise=0.0,
+        max_spikes=3,
+        dtype=torch.float64,
+    ).initialize()
+    ns.schedule(0, 0.1)
+
+    assert bool(ns.forward(0.1, dt=0.1)[0])
+    assert ns.spike_counts.item() == 1
+    assert ns.next_stoch_time.item() == pytest.approx(1.1)
+    assert torch.isinf(ns.next_sched_time).all()
+
+    assert not bool(ns.forward(0.2, dt=0.1)[0])
+    assert ns.spike_counts.item() == 1
+
+
 # ------------------------------ misc ---------------------------------------------
 
 

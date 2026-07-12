@@ -9,6 +9,7 @@ import sys
 import textwrap
 from contextlib import nullcontext
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import (
     Any,
     Callable,
@@ -267,29 +268,81 @@ def _validate_time_scalar(value, *, name: str, positive: bool | None) -> float:
     return normalized
 
 
-def _duration_step_count(duration: float, dt: float) -> int:
-    """Return the half-open-grid step count for a simulation duration.
+def _duration_step_budget(
+    duration: float, dt: float, pending: float = 0.0
+) -> tuple[int, float]:
+    """Resolve complete fixed steps and retained physical time exactly.
 
-    In exact arithmetic this is ``ceil(duration / dt)``.  Ratios that are only
-    a few floating-point ULPs from an integer are treated as that integer so a
-    value such as ``0.07 / 0.01`` cannot acquire a spurious extra step.
+    ``duration`` and ``pending`` are physical milliseconds requested by the
+    caller but not necessarily representable as a complete fixed step.  Decimal
+    control arithmetic avoids both binary floating-point boundary promotion and
+    the loss of nominal decimal identities such as ``0.15 + 0.15 == 0.3``.
+
+    Parameters
+    ----------
+    duration : float
+        New non-negative duration requested by this call.
+    dt : float
+        Positive fixed timestep.
+    pending : float, optional
+        Non-negative physical duration retained from earlier calls.
+
+    Returns
+    -------
+    tuple[int, float]
+        Number of complete steps and the remaining unsimulated milliseconds.
     """
-    if duration == 0.0:
-        return 0
-    quotient = duration / dt
-    if quotient == 0.0:
-        # Preserve the non-empty half-open interval for positive subnormal
-        # durations whose quotient underflowed.
-        return 1
-    if not math.isfinite(quotient) or quotient > sys.maxsize:
-        raise ValueError("duration and dt imply too many simulation steps.")
-    nearest = round(quotient)
-    if nearest >= 1 and abs(quotient - nearest) <= 8.0 * math.ulp(quotient):
-        quotient = float(nearest)
-    n_steps = int(math.ceil(quotient))
+    duration = float(duration)
+    dt = float(dt)
+    pending = float(pending)
+    if not math.isfinite(duration) or duration < 0.0:
+        raise ValueError("duration must be finite and non-negative.")
+    if not math.isfinite(dt) or dt <= 0.0:
+        raise ValueError("timestep must be finite and positive.")
+    if not math.isfinite(pending) or pending < 0.0:
+        raise ValueError("pending duration must be finite and non-negative.")
+
+    # Programmatically constructed exact multiples can carry a harmless decimal
+    # tail (for example ``157 * 0.025 == 3.9250000000000003``) even though binary
+    # division recovers the intended integer exactly. Normalize that case before
+    # decimal control arithmetic, while requiring reconstruction to preserve
+    # genuinely tiny nonzero durations whose quotient underflows to zero.
+    try:
+        binary_total = math.fsum((pending, duration))
+    except OverflowError:
+        binary_total = math.inf
+    binary_quotient = binary_total / dt if math.isfinite(binary_total) else math.inf
+    normalized_steps = None
+    if math.isfinite(binary_quotient):
+        if binary_quotient.is_integer() and binary_quotient * dt == binary_total:
+            normalized_steps = int(binary_quotient)
+        elif Fraction.from_float(dt) != Fraction(str(dt)):
+            # For decimal timesteps such as 0.1, one-ULP differences around an
+            # integer cannot reliably distinguish input roundoff from a genuine
+            # boundary. Preserve the established decimal-grid interpretation.
+            nearest = round(binary_quotient)
+            if nearest >= 1 and abs(binary_quotient - nearest) <= 8.0 * math.ulp(
+                binary_quotient
+            ):
+                normalized_steps = int(nearest)
+    if normalized_steps is not None:
+        n_steps = normalized_steps
+        if n_steps > sys.maxsize:
+            raise ValueError("duration and dt imply too many simulation steps.")
+        return n_steps, 0.0
+
+    total = Fraction(str(pending)) + Fraction(str(duration))
+    dt_exact = Fraction(str(dt))
+    n_steps = total // dt_exact
     if n_steps > sys.maxsize:
         raise ValueError("duration and dt imply too many simulation steps.")
-    return max(1, n_steps)
+    remainder = total - n_steps * dt_exact
+    return int(n_steps), float(remainder)
+
+
+def _duration_step_count(duration: float, dt: float) -> int:
+    """Return complete fixed timesteps in one duration without prior carry."""
+    return _duration_step_budget(duration, dt, 0.0)[0]
 
 
 def _time_grid_from_step_count(
@@ -374,6 +427,14 @@ class Population(P, Sliceable):
             "dx", torch.full(self.shape, 100.0, device=init_device, dtype=init_dtype)
         )
         self.register_buffer("t", torch.zeros((), device=init_device, dtype=init_dtype))
+        # Physical milliseconds requested by duration-based execution calls but
+        # not yet sufficient to form a complete fixed step.  Keep this separate
+        # from model time: explicit step() and array-driven run(ve=...) advance
+        # state without consuming the duration budget.
+        self.register_buffer(
+            "_duration_remainder",
+            torch.zeros((), device=init_device, dtype=torch.float64),
+        )
 
         # compiler stuff
         self.backend = BACKEND.value
@@ -1435,6 +1496,25 @@ class Population(P, Sliceable):
         ve = cfg.einsum(cfg.ve_s, t_extra)  # [n_t_chunk, np, n_comp]
         return ve.unbind(dim=0)
 
+    def _duration_budget(self, duration: float, dt: float) -> tuple[int, float]:
+        """Resolve a duration call against this Population's retained time."""
+        pending = float(self._duration_remainder.detach().cpu().item())
+        return _duration_step_budget(duration, dt, pending)
+
+    def _set_duration_remainder(self, value: float) -> None:
+        """Commit retained physical time without mutating checkpoint aliases."""
+        self._duration_remainder = torch.tensor(
+            value,
+            device=self._duration_remainder.device,
+            dtype=torch.float64,
+        )
+
+    def _clear_duration_remainder(self) -> None:
+        """Start a fresh duration budget for a new simulation episode."""
+        self._duration_remainder = torch.zeros(
+            (), device=self._duration_remainder.device, dtype=torch.float64
+        )
+
     def step(
         self,
         dt: Optional[float] = None,
@@ -1591,10 +1671,12 @@ class Population(P, Sliceable):
             raised.
         tstop : float, optional
             Simulation duration in milliseconds to advance from the current
-            model time ``self.t`` when ``ve`` is not provided. Steps sample the
-            half-open interval ``[self.t, self.t + tstop)`` at spacing ``dt``;
-            consequently, a positive fractional final interval contributes one
-            timestep. If ``ve`` is provided, this parameter is ignored.
+            model time ``self.t`` when ``ve`` is not provided. Only complete
+            fixed timesteps are executed. Any fractional physical duration is
+            retained and combined with the next duration-based ``run``,
+            :meth:`longrun`, or :meth:`longrun_checkpointed` call. If ``ve`` is
+            provided, its leading length is authoritative, ``tstop`` is ignored,
+            and the retained duration is left unchanged.
         dt : float, optional
             Time step size in milliseconds. If ``None``, the default value
             ``A.dt`` from the backend is used.
@@ -1623,13 +1705,16 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
+        if ve is not None and extra is not None:
+            raise ValueError("Provide either 've' or 'extra', not both.")
         tstop_f = None
         duration_steps = None
+        duration_remainder = None
         if ve is None:
             if tstop is None:
                 raise ValueError("tstop must be provided when 've' is not given.")
             tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-            duration_steps = _duration_step_count(tstop_f, dt_f)
+            duration_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
 
         # auto-build intra if missing
         if self.intra is None:
@@ -1639,9 +1724,6 @@ class Population(P, Sliceable):
             intra = self.intra
 
         with_intra = intra is not None
-
-        if ve is not None and extra is not None:
-            raise ValueError("Provide either 've' or 'extra', not both.")
 
         device = self.device()
         dtype = self.dtype()
@@ -1725,6 +1807,9 @@ class Population(P, Sliceable):
             else:
                 ve_list = None
 
+            if duration_remainder is not None:
+                self._set_duration_remainder(duration_remainder)
+
             # --------------------------------------------------------------
             # Main time-stepping loop
             # --------------------------------------------------------------
@@ -1786,9 +1871,9 @@ class Population(P, Sliceable):
         ----------
         tstop : float
             Simulation duration in milliseconds to advance from the current
-            model time ``self.t``. Steps sample the half-open interval
-            ``[self.t, self.t + tstop)`` at spacing ``dt``; consequently, a
-            positive fractional final interval contributes one timestep.
+            model time ``self.t``. Only complete fixed timesteps are executed;
+            fractional physical duration is retained and shared with subsequent
+            duration-based Population execution calls.
         chunklength : int
             The number of time steps to process in each chunk.
         dt : float, optional
@@ -1851,7 +1936,7 @@ class Population(P, Sliceable):
             A.dt if dt is None else dt, name="dt", positive=True
         )
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-        n_steps = _duration_step_count(tstop_f, dt_f)
+        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
 
         intra = self.intra
@@ -1872,6 +1957,7 @@ class Population(P, Sliceable):
                 ).to(self.dtype())
 
                 if t.numel() == 0:
+                    self._set_duration_remainder(duration_remainder)
                     return
 
                 n_chunks = math.ceil(len(t) / chunklength)
@@ -1906,6 +1992,7 @@ class Population(P, Sliceable):
                     compile_scope="population",
                 )
 
+                self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
 
                 # --------------------------------------------------------------
@@ -1994,6 +2081,7 @@ class Population(P, Sliceable):
 
         self.cache("_steady_state")
         self.t = torch.zeros_like(self.t).detach()
+        self._clear_duration_remainder()
         return self
 
     def clear_steady_state(self):
@@ -2107,6 +2195,7 @@ class Population(P, Sliceable):
             self.initialized = False
             self.post_initialize()
             self.t = torch.zeros_like(self.t).detach()
+            self._clear_duration_remainder()
             self.initialized = True
             self.initializing_from_state_cache = True
             return True
@@ -2132,6 +2221,7 @@ class Population(P, Sliceable):
         # instead of stepping a partially reset model advertised as initialized.
         self.initialized = False
         self.initializing_from_state_cache = False
+        self._clear_duration_remainder()
         existing_integrator = getattr(self, "integrator", None)
         if existing_integrator is not None:
             existing_integrator.initialized = False
@@ -2167,6 +2257,7 @@ class Population(P, Sliceable):
             random_generation=random_generation,
         )
         self.t = torch.zeros_like(self.t).detach()
+        self._clear_duration_remainder()
         self.initialized = True
         # Voltage/mechanism state was reconstructed even when topology and dt
         # were unchanged. Rebuild timestep-dependent solver workspaces before
@@ -2208,7 +2299,18 @@ class Population(P, Sliceable):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
+        has_duration_remainder = (
+            isinstance(state_dict, Mapping) and "_duration_remainder" in state_dict
+        )
         _load_compatible_state_dict_transactionally(self, state_dict)
+        if not has_duration_remainder:
+            # Normal state dictionaries created before duration carry support
+            # must not retain unrelated pending time from the receiver.
+            self._clear_duration_remainder()
+        else:
+            self._set_duration_remainder(
+                float(self._duration_remainder.detach().cpu().item())
+            )
         return self
 
     def load_(self, state_dict):
@@ -3526,6 +3628,7 @@ class Population(P, Sliceable):
             "mech": mech_dct,
             "integrator": integrator_dct,
             "t": self.t,
+            "duration_remainder": self._duration_remainder,
             "stochastic": self._stochastic_state_dict_for_checkpoint(),
         }
         return full_dct
@@ -3575,6 +3678,36 @@ class Population(P, Sliceable):
                 f"expected {tuple(self.t.shape)}."
             )
 
+        # Runtime checkpoints created before fractional-duration carry support
+        # have no entry; restoring them starts with no pending physical time.
+        if "duration_remainder" not in state_dict:
+            duration_remainder = torch.zeros(
+                (), device=self._duration_remainder.device, dtype=torch.float64
+            )
+        else:
+            duration_remainder = state_dict["duration_remainder"]
+            if not torch.is_tensor(duration_remainder):
+                raise TypeError(
+                    "Population checkpoint duration_remainder must be a tensor."
+                )
+            if tuple(duration_remainder.shape) != ():
+                raise ValueError(
+                    "Population checkpoint duration_remainder must be a scalar tensor."
+                )
+            if not torch.is_floating_point(duration_remainder):
+                raise TypeError(
+                    "Population checkpoint duration_remainder must have floating dtype."
+                )
+            duration_remainder = duration_remainder.to(
+                device=self._duration_remainder.device, dtype=torch.float64
+            ).clone()
+            duration_value = float(duration_remainder.detach().cpu().item())
+            if not math.isfinite(duration_value) or duration_value < 0.0:
+                raise ValueError(
+                    "Population checkpoint duration_remainder must be finite and "
+                    "non-negative."
+                )
+
         # Preflight stochastic metadata before any mechanism or integrator
         # field is changed. Older checkpoints remain loadable only when the
         # target Population has no Population-level stochastic declarations.
@@ -3600,6 +3733,7 @@ class Population(P, Sliceable):
         if prepared_stochastic is not None:
             self._apply_prepared_stochastic_state(prepared_stochastic)
         self.t = t.to(device=self.t.device, dtype=self.t.dtype).clone()
+        self._duration_remainder = duration_remainder
 
     def restore_dict_from_checkpoint(self, state_dict):
         """
@@ -3650,8 +3784,8 @@ class Population(P, Sliceable):
         ----------
         tstop : float
             Simulation duration in milliseconds to advance from the current
-            model time ``self.t``. This uses the same half-open time-grid and
-            fractional-final-step semantics as :meth:`longrun`.
+            model time ``self.t``. This uses the same cumulative complete-step
+            budget and retained physical-duration semantics as :meth:`longrun`.
         chunklength : int
             Number of time steps per checkpointed chunk.
         dt : float, optional
@@ -3724,7 +3858,7 @@ class Population(P, Sliceable):
             A.dt if dt is None else dt, name="dt", positive=True
         )
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-        n_steps = _duration_step_count(tstop_f, dt_f)
+        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
 
         intra = self.intra
@@ -3793,6 +3927,7 @@ class Population(P, Sliceable):
                 ).to(self.dtype())
 
                 if t.numel() == 0:
+                    self._set_duration_remainder(duration_remainder)
                     if return_final_state:
                         return None, self.state_dict_for_checkpoint()
                     return None
@@ -3820,6 +3955,10 @@ class Population(P, Sliceable):
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
+                # Commit before the first checkpoint boundary is captured so
+                # forward replay and backward restoration observe one coherent
+                # duration budget.
+                self._set_duration_remainder(duration_remainder)
                 # Capture boundary state after initialization
                 state = self.state_dict_for_checkpoint()
 
