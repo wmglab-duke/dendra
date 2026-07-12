@@ -199,17 +199,21 @@ def gather_morphology(graph):
         volume_i.append(_node_domain_volume_um3(attrs, "i", vol, node=i))
         volume_o.append(_node_domain_volume_um3(attrs, "o", vol, node=i))
 
-    volume_t = torch.tensor(volume).unsqueeze(0)
+    # Graph metadata arrives as Python floats (IEEE-754 binary64).  Preserve
+    # those values until Tree.from_graph deliberately converts the gathered
+    # buffers to the requested model dtype.  Constructing these tensors with
+    # PyTorch's default float32 would irreversibly quantize a float64 Tree.
+    volume_t = torch.tensor(volume, dtype=torch.float64).unsqueeze(0)
     return {
-        "dx": torch.tensor(L).unsqueeze(0),
-        "diam": torch.tensor(diam).unsqueeze(0),
-        "x": torch.tensor(x).unsqueeze(0),
-        "y": torch.tensor(y).unsqueeze(0),
-        "z": torch.tensor(z).unsqueeze(0),
+        "dx": torch.tensor(L, dtype=torch.float64).unsqueeze(0),
+        "diam": torch.tensor(diam, dtype=torch.float64).unsqueeze(0),
+        "x": torch.tensor(x, dtype=torch.float64).unsqueeze(0),
+        "y": torch.tensor(y, dtype=torch.float64).unsqueeze(0),
+        "z": torch.tensor(z, dtype=torch.float64).unsqueeze(0),
         "volume": volume_t,
         "volume_um3": volume_t.clone(),
-        "volume_i": torch.tensor(volume_i).unsqueeze(0),
-        "volume_o": torch.tensor(volume_o).unsqueeze(0),
+        "volume_i": torch.tensor(volume_i, dtype=torch.float64).unsqueeze(0),
+        "volume_o": torch.tensor(volume_o, dtype=torch.float64).unsqueeze(0),
     }
 
 
@@ -245,10 +249,12 @@ def gather_diffusion_edges(graph):
 
     return {
         "diff_parent_index": torch.tensor(parent_index, dtype=torch.long),
-        "diff_geom_um": torch.tensor(diff_geom).unsqueeze(0),
+        "diff_geom_um": torch.tensor(diff_geom, dtype=torch.float64).unsqueeze(0),
         "diff_edge_parent": torch.tensor(edge_parent, dtype=torch.long),
         "diff_edge_child": torch.tensor(edge_child, dtype=torch.long),
-        "diff_edge_geom_um": torch.tensor(edge_diff_geom).unsqueeze(0),
+        "diff_edge_geom_um": torch.tensor(
+            edge_diff_geom, dtype=torch.float64
+        ).unsqueeze(0),
     }
 
 
@@ -272,9 +278,9 @@ def gather_membrane(graph):
         cm.append(attrs.get("cm"))
         area.append(attrs.get("area"))
     return {
-        "rhoa": torch.tensor(rhoa).unsqueeze(0),
-        "cm": torch.tensor(cm).unsqueeze(0),
-        "area": torch.tensor(area).unsqueeze(0),
+        "rhoa": torch.tensor(rhoa, dtype=torch.float64).unsqueeze(0),
+        "cm": torch.tensor(cm, dtype=torch.float64).unsqueeze(0),
+        "area": torch.tensor(area, dtype=torch.float64).unsqueeze(0),
     }
 
 

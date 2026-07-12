@@ -35,7 +35,10 @@ def get_area_from_graph(G: nx.DiGraph) -> torch.Tensor:
 
     # area in µm² -> convert to cm²
     # 1 cm² = 1e8 µm²
-    return 1e-8 * torch.tensor(areas)
+    # Preserve Python/graph binary64 values until the owning model performs an
+    # explicit dtype conversion.  Otherwise a requested float64 Tree inherits
+    # geometry that was already rounded through PyTorch's float32 default.
+    return 1e-8 * torch.tensor(areas, dtype=torch.float64)
 
 
 def _edge_signature(G: GraphLike):

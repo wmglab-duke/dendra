@@ -122,9 +122,13 @@ def gather_extcell(graph, n_layers=2):
         xc.append(attrs.get("xc", [0.0] * n_layers))
         xg.append(attrs.get("xg", [1e9] * n_layers))
     return {
-        "xraxial": torch.tensor(xraxial).unsqueeze(0),
-        "xc": torch.tensor(xc).unsqueeze(0),
-        "xg": torch.tensor(xg).unsqueeze(0),
+        # Graph metadata arrives as Python/NEURON doubles.  Preserve that
+        # precision here so a float64 ExtCellTree does not widen values that
+        # were already rounded through PyTorch's default float32 dtype.
+        # ``from_graph`` performs the intentional final cast to model dtype.
+        "xraxial": torch.tensor(xraxial, dtype=torch.float64).unsqueeze(0),
+        "xc": torch.tensor(xc, dtype=torch.float64).unsqueeze(0),
+        "xg": torch.tensor(xg, dtype=torch.float64).unsqueeze(0),
     }
 
 

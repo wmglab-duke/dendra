@@ -86,7 +86,10 @@ def test_graph_area_requires_complete_metadata_and_converts_units():
     graph = nx.DiGraph()
     graph.add_node(0, area=2.0)
     graph.add_node(1, area=5.0)
-    assert torch.equal(get_area_from_graph(graph), torch.tensor([2.0e-8, 5.0e-8]))
+    assert torch.equal(
+        get_area_from_graph(graph),
+        torch.tensor([2.0e-8, 5.0e-8], dtype=torch.float64),
+    )
 
     del graph.nodes[1]["area"]
     assert get_area_from_graph(graph) is None

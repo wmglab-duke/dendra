@@ -524,14 +524,41 @@ def test_mesh_factories_validate_components_and_delegate(monkeypatch):
 
 def test_gather_extcell_custom_values_and_defaults():
     graph = nx.DiGraph()
-    graph.add_node(0, xraxial=[1.0, 2.0], xc=[3.0, 4.0], xg=[5.0, 6.0])
+    graph.add_node(
+        0,
+        xraxial=[1.1, 2.2],
+        xc=[0.18, 0.07],
+        xg=[0.035, 0.065],
+    )
     graph.add_node(1)
     gathered = gather_extcell(graph)
     assert set(gathered) == {"xraxial", "xc", "xg"}
     assert gathered["xraxial"].shape == (1, 2, 2)
-    torch.testing.assert_close(gathered["xraxial"][0, 0], torch.tensor([1.0, 2.0]))
-    torch.testing.assert_close(gathered["xraxial"][0, 1], torch.full((2,), 1e9))
-    torch.testing.assert_close(gathered["xc"][0, 1], torch.zeros(2))
+    assert all(value.dtype == torch.float64 for value in gathered.values())
+    torch.testing.assert_close(
+        gathered["xraxial"][0, 0],
+        torch.tensor([1.1, 2.2], dtype=torch.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        gathered["xc"][0, 0],
+        torch.tensor([0.18, 0.07], dtype=torch.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        gathered["xg"][0, 0],
+        torch.tensor([0.035, 0.065], dtype=torch.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        gathered["xraxial"][0, 1], torch.full((2,), 1e9, dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        gathered["xc"][0, 1], torch.zeros(2, dtype=torch.float64)
+    )
 
 
 def test_extcell_axon_geometry_buffers_and_graph_export():

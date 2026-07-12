@@ -81,10 +81,28 @@ def to_param(
         return val
     if isinstance(val, torch.nn.Module):
         return val
-    target_device = current_device(None) if device is None else torch.device(device)
-    target_dtype = (
-        current_dtype(torch.float32) if dtype is None else _normalize_dtype_value(dtype)
-    )
+    if torch.is_tensor(val):
+        # Existing floating tensors are already explicit dtype/device choices.
+        # Preserve them unless the caller requests a conversion; routing them
+        # through the global construction defaults first irreversibly rounds
+        # float64 model inputs (notably Material initial fields) to float32.
+        target_device = val.device if device is None else torch.device(device)
+        target_dtype = (
+            val.dtype
+            if dtype is None and val.is_floating_point()
+            else (
+                current_dtype(torch.float32)
+                if dtype is None
+                else _normalize_dtype_value(dtype)
+            )
+        )
+    else:
+        target_device = current_device(None) if device is None else torch.device(device)
+        target_dtype = (
+            current_dtype(torch.float32)
+            if dtype is None
+            else _normalize_dtype_value(dtype)
+        )
     val = torch.as_tensor(
         val,
         device=target_device,

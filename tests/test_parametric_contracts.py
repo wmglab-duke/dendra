@@ -116,6 +116,24 @@ def test_explicit_dtype_wins_over_context_default_and_survives_shape_mutation():
     assert parameter.rho.requires_grad
 
 
+def test_to_param_preserves_existing_floating_tensor_precision_by_default():
+    source = torch.tensor(
+        [0.12345678901234568, 1.9876543210987654], dtype=torch.float64
+    )
+
+    with ctx(DTYPE="float32"):
+        preserved = M.to_param(source)
+        converted = M.to_param(source, dtype=torch.float32)
+        integer = M.to_param(torch.tensor([1, 2], dtype=torch.int64))
+
+    assert preserved.dtype == torch.float64
+    torch.testing.assert_close(preserved, source, rtol=0.0, atol=0.0)
+    assert converted.dtype == torch.float32
+    torch.testing.assert_close(converted, source.float(), rtol=0.0, atol=0.0)
+    # Integer inputs still use the active floating construction default.
+    assert integer.dtype == torch.float32
+
+
 @pytest.mark.parametrize("beta", [0.0, -1.0, math.inf, math.nan])
 def test_softplus_inverse_and_bounded_reject_invalid_beta(beta):
     with pytest.raises(ValueError, match="beta.*finite and positive"):
