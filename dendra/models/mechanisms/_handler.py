@@ -1,4 +1,5 @@
 import copy
+import itertools
 from collections.abc import Mapping
 
 import torch
@@ -384,6 +385,7 @@ class MechanismHandler(torch.nn.Module):
                     self._map_exp.append((c_idx, mech, f"{ion}", scale_f))
 
     def initialize(self, v, celsius, diameters, populate=True, random_generation=None):
+        self._sync_celsius(celsius)
         self.make_maps()
         self.init_rng()
         if populate:
@@ -406,6 +408,25 @@ class MechanismHandler(torch.nn.Module):
         self.read_from_materials()
         self.write_to_ions(v)
         self.write_to_materials(v)
+
+    def _sync_celsius(self, celsius):
+        """Rebind every local temperature view before parameter population.
+
+        Population ``GLOBAL`` values are refreshed out of place during
+        ``initialize()``.  Keeping the temperature object captured when a
+        mechanism was first built can therefore retain an obsolete autograd
+        graph even when shared storage makes its numerical value appear current.
+        Q10 caches are rebuilt by ``populate()`` below, so refresh the handler,
+        mechanisms, material processes, and nested State views first.
+        """
+        self._buffers["celsius"] = celsius
+        for module in itertools.chain(
+            self.mechanisms.values(), self.material_processes.values()
+        ):
+            local_celsius = module.get(celsius)
+            module._buffers["celsius"] = local_celsius
+            for state in module.DE.values():
+                state._buffers["celsius"] = local_celsius
 
     def set_dt(self, dt):
         """Propagate timestep changes to local mechanisms and material processes.
