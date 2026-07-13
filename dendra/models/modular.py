@@ -202,7 +202,7 @@ class DNModule(torch.nn.Module):
             Generator yielding parameters matching the provided names.
         """
         if not names:
-            return self.parameters()
+            yield from self.parameters()
         else:
             for n, p in self.named_parameters():
                 if matches_any_pattern(names, n):
@@ -225,7 +225,7 @@ class DNModule(torch.nn.Module):
             Generator yielding tuples (name, parameter) matching the provided names.
         """
         if not names:
-            return self.named_parameters()
+            yield from self.named_parameters()
         else:
             for n, p in self.named_parameters():
                 if matches_any_pattern(names, n):

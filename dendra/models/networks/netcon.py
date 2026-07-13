@@ -546,6 +546,14 @@ class ContinuousCon(Referency):
             ),
         )
         self.register_buffer(
+            "delivery_mask",
+            torch.zeros(
+                (self.max_delay_steps, self._syn_numel),
+                device=self.device,
+                dtype=torch.bool,
+            ),
+        )
+        self.register_buffer(
             "con_range",
             torch.arange(self._n_conn, device=self.device, dtype=torch.long),
         )
@@ -607,10 +615,13 @@ class ContinuousCon(Referency):
             "post_idx_nz",
             "delay_steps_nz",
             "flat_delay_offsets_nz",
+            "post_delivery_mask",
+            "post_zero_delivery_mask",
             "state_cache_pre_value_history",
         ):
             self._move_buffer(name, self.device)
         self._move_buffer("delivery_buffer", self.device, self.dtype)
+        self._move_buffer("delivery_mask", self.device, torch.bool)
         self.dt = self.dt.to(device=self.device, dtype=self.dtype)
         self.weight = self.weight.to(device=self.device, dtype=self.dtype)
         self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
@@ -650,6 +661,14 @@ class ContinuousCon(Referency):
             self._set_buffer("post_idx_nz", empty)
             self._set_buffer("delay_steps_nz", empty)
             self._set_buffer("flat_delay_offsets_nz", empty)
+            self._set_buffer(
+                "post_delivery_mask",
+                torch.zeros(self._syn_numel, device=self.device, dtype=torch.bool),
+            )
+            self._set_buffer(
+                "post_zero_delivery_mask",
+                torch.zeros(self._syn_numel, device=self.device, dtype=torch.bool),
+            )
             self._has_zero_delay = False
             self._has_nonzero_delay = False
             self._all_zero_delay = False
@@ -695,6 +714,15 @@ class ContinuousCon(Referency):
         self._set_buffer("post_idx_nz", post_idx_nz)
         self._set_buffer("delay_steps_nz", delay_steps_nz)
         self._set_buffer("flat_delay_offsets_nz", flat_offsets)
+        post_delivery_mask = torch.zeros(
+            self._syn_numel, device=self.device, dtype=torch.bool
+        )
+        post_delivery_mask.index_fill_(0, self.post_idx.to(self.device), True)
+        post_zero_delivery_mask = torch.zeros_like(post_delivery_mask)
+        if post_idx_zero.numel() > 0:
+            post_zero_delivery_mask.index_fill_(0, post_idx_zero, True)
+        self._set_buffer("post_delivery_mask", post_delivery_mask)
+        self._set_buffer("post_zero_delivery_mask", post_zero_delivery_mask)
 
         if delay_steps_nz.numel() > 0:
             first = delay_steps_nz[0]
@@ -747,6 +775,11 @@ class ContinuousCon(Referency):
                 device=self.device,
                 dtype=self.dtype,
             )
+            self.delivery_mask = torch.zeros(
+                (self.max_delay_steps, self._syn_numel),
+                device=self.device,
+                dtype=torch.bool,
+            )
             self._rebuild_delay_metadata()
             self._align_buffer_devices()
             self._configure_advance_impl()
@@ -760,6 +793,7 @@ class ContinuousCon(Referency):
         self.global_step.fill_(0)
         if clear_deliveries:
             self.delivery_buffer.zero_()
+            self.delivery_mask.zero_()
 
     def detach(self):
         for n, b in self.named_buffers():
@@ -848,6 +882,7 @@ class ContinuousCon(Referency):
                 f"{tuple(age_history.shape)} vs (*, {self._n_conn})."
             )
         self.delivery_buffer.zero_()
+        self.delivery_mask.zero_()
         if self._n_conn == 0 or age_history.shape[0] <= 1:
             return
         flat = self.delivery_buffer.view(-1)
@@ -875,6 +910,7 @@ class ContinuousCon(Referency):
                 0, con_idx
             ) * self._syn_numel + post_idx.index_select(0, con_idx)
             flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
+            self.delivery_mask.view(-1).index_fill_(0, flat_idx.reshape(-1), True)
 
     def n_connections(self):
         return int(self.n.item())
@@ -889,7 +925,7 @@ class ContinuousCon(Referency):
         cur_slot = _cache_current_slot(self.current_time_step)
         cache = {
             "kind": "continuous",
-            "version": 3,
+            "version": 4,
             "dt": _cache_dt_value(self.dt),
             "max_delay_steps": int(self.max_delay_steps),
         }
@@ -909,6 +945,9 @@ class ContinuousCon(Referency):
             # that produced the already-weighted future delivery rows.
             cache["delivery_buffer"] = torch.roll(
                 self.delivery_buffer.detach(), -cur_slot, dims=0
+            ).clone()
+            cache["delivery_mask"] = torch.roll(
+                self.delivery_mask.detach(), -cur_slot, dims=0
             ).clone()
             cache["param_invariant"] = False
         return cache
@@ -933,6 +972,7 @@ class ContinuousCon(Referency):
         else:
             self._align_buffer_devices()
             self.delivery_buffer.zero_()
+            self.delivery_mask.zero_()
         old_dt = float(state_cache.get("dt", _cache_dt_value(self.dt)))
         new_dt = float(_cache_dt_value(self.dt) if dt is None else dt)
         if "pre_value_history" in state_cache:
@@ -980,6 +1020,37 @@ class ContinuousCon(Referency):
                     torch.zeros_like(restored, device=self.device, dtype=self.dtype),
                 )
             self.delivery_buffer.copy_(restored)
+            cached_mask = state_cache.get("delivery_mask", None)
+            if cached_mask is None:
+                # Version 3 and older caches did not retain delivery presence.
+                # A nonzero payload is the only recoverable evidence; genuine
+                # scheduled zeros necessarily remain a best-effort limitation.
+                cached_mask = cached != 0
+            elif not torch.is_tensor(cached_mask):
+                raise TypeError("Cached ContinuousCon delivery_mask must be a tensor")
+            else:
+                cached_mask = cached_mask.detach().to(
+                    device=self.device, dtype=torch.bool
+                )
+                if tuple(cached_mask.shape) != tuple(cached.shape):
+                    raise ValueError(
+                        "Cached ContinuousCon delivery_mask has incompatible shape: "
+                        f"{tuple(cached_mask.shape)} vs {tuple(cached.shape)}."
+                    )
+            restored_mask = _resample_continuous_time_rows(
+                cached_mask,
+                old_dt,
+                new_dt,
+                n_limit=int(self.delivery_mask.shape[0]),
+            )
+            if tuple(self.delivery_mask.shape) != tuple(restored_mask.shape):
+                self._set_buffer(
+                    "delivery_mask",
+                    torch.zeros_like(
+                        restored_mask, device=self.device, dtype=torch.bool
+                    ),
+                )
+            self.delivery_mask.copy_(restored_mask)
         self.current_time_step.zero_()
         if hasattr(self, "t"):
             step = torch.round(
@@ -995,6 +1066,7 @@ class ContinuousCon(Referency):
     def state_dict_for_checkpoint(self):
         return {
             "delivery_buffer": self.delivery_buffer,
+            "delivery_mask": self.delivery_mask,
             "current_time_step": self.current_time_step,
             "global_step": self.global_step,
         }
@@ -1020,6 +1092,28 @@ class ContinuousCon(Referency):
             shape=self.global_step.shape,
             dtype=torch.long,
         )
+        delivery_mask = state_dict.get("delivery_mask", None)
+        if delivery_mask is None:
+            # Older checkpoints cannot distinguish a scheduled zero from an
+            # empty ring slot. Preserve loadability and recover every presence
+            # bit that is inferable from the payload itself.
+            delivery_mask = delivery != 0
+        else:
+            if not torch.is_tensor(delivery_mask):
+                raise TypeError(
+                    "ContinuousCon checkpoint 'delivery_mask' must be a tensor."
+                )
+            if tuple(delivery_mask.shape) != tuple(self.delivery_mask.shape):
+                raise ValueError(
+                    "ContinuousCon checkpoint 'delivery_mask' has shape "
+                    f"{tuple(delivery_mask.shape)}, expected "
+                    f"{tuple(self.delivery_mask.shape)}."
+                )
+            if delivery_mask.dtype != torch.bool:
+                raise TypeError(
+                    "ContinuousCon checkpoint 'delivery_mask' has dtype "
+                    f"{delivery_mask.dtype}, expected torch.bool."
+                )
         current_value = int(current.detach().cpu().reshape(-1)[0].item())
         if current_value < 0 or current_value >= int(self.max_delay_steps):
             raise ValueError(
@@ -1027,6 +1121,7 @@ class ContinuousCon(Referency):
                 f"ring: {current_value} not in [0, {int(self.max_delay_steps)})."
             )
         self.delivery_buffer = delivery.to(device=self.device)
+        self.delivery_mask = delivery_mask.to(device=self.device).clone()
         self.current_time_step = current.to(device=self.device)
         self.global_step = global_step.to(device=self.device)
         return self
@@ -1093,15 +1188,18 @@ class ContinuousCon(Referency):
     def _read_and_clear_current_row(self):
         cur_idx = self.current_time_step
         delayed_delivery = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)
+        delayed_mask = self.delivery_mask.index_select(0, cur_idx).squeeze(0)
         self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
-        return cur_idx, delayed_delivery
+        self.delivery_mask.index_fill_(0, cur_idx, False)
+        return cur_idx, delayed_delivery, delayed_mask
 
-    def _deliver(self, flat_delivery):
+    def _deliver(self, flat_delivery, flat_mask):
         self.syn.continuous_receive(
             flat_delivery.view(*self.syn.shape_f),
             self,
             input=self.input,
             reduce=self.reduce,
+            mask=flat_mask.view(*self.syn.shape_f),
         )
 
     def _schedule_all_delayed_uniform(self, cur_idx, weighted):
@@ -1110,6 +1208,7 @@ class ContinuousCon(Referency):
         )
         flat = future * self._syn_numel + self.post_idx
         self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
+        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
 
     def _schedule_selected_delayed_uniform(self, cur_idx, weighted):
         vals = weighted.index_select(0, self.nonzero_con_idx)
@@ -1118,17 +1217,20 @@ class ContinuousCon(Referency):
         )
         flat = future * self._syn_numel + self.post_idx_nz
         self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
+        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
 
     def _schedule_all_delayed_mixed(self, cur_idx, weighted):
         base = cur_idx * self._syn_numel
         flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
         self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
+        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
 
     def _schedule_selected_delayed_mixed(self, cur_idx, weighted):
         vals = weighted.index_select(0, self.nonzero_con_idx)
         base = cur_idx * self._syn_numel
         flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
         self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
+        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
 
     # ------------------------------------------------------------------
     # Specialized advance paths
@@ -1139,37 +1241,43 @@ class ContinuousCon(Referency):
 
     def _advance_all_immediate(self):
         weighted = self._weighted_pre_value()
-        self._deliver(self._scatter_all(weighted))
+        self._deliver(self._scatter_all(weighted), self.post_delivery_mask)
         # All delays are zero, so current_time_step remains zero modulo one.
         self.global_step.add_(1)
 
     def _advance_all_delayed_uniform(self):
-        cur_idx, delayed_delivery = self._read_and_clear_current_row()
-        self._deliver(delayed_delivery)
+        cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
+        self._deliver(delayed_delivery, delayed_mask)
         weighted = self._weighted_pre_value()
         self._schedule_all_delayed_uniform(cur_idx, weighted)
         self._advance_counters()
 
     def _advance_all_delayed_mixed(self):
-        cur_idx, delayed_delivery = self._read_and_clear_current_row()
-        self._deliver(delayed_delivery)
+        cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
+        self._deliver(delayed_delivery, delayed_mask)
         weighted = self._weighted_pre_value()
         self._schedule_all_delayed_mixed(cur_idx, weighted)
         self._advance_counters()
 
     def _advance_mixed_uniform(self):
-        cur_idx, delayed_delivery = self._read_and_clear_current_row()
+        cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
         weighted = self._weighted_pre_value()
         immediate = self._scatter_zero_subset(weighted)
-        self._deliver(delayed_delivery + immediate)
+        self._deliver(
+            delayed_delivery + immediate,
+            delayed_mask | self.post_zero_delivery_mask,
+        )
         self._schedule_selected_delayed_uniform(cur_idx, weighted)
         self._advance_counters()
 
     def _advance_mixed(self):
-        cur_idx, delayed_delivery = self._read_and_clear_current_row()
+        cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
         weighted = self._weighted_pre_value()
         immediate = self._scatter_zero_subset(weighted)
-        self._deliver(delayed_delivery + immediate)
+        self._deliver(
+            delayed_delivery + immediate,
+            delayed_mask | self.post_zero_delivery_mask,
+        )
         self._schedule_selected_delayed_mixed(cur_idx, weighted)
         self._advance_counters()
 

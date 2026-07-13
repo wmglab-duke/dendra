@@ -436,6 +436,7 @@ def test_continuous_cache_resamples_history_and_uses_current_parameters(new_dt):
 def test_continuous_fallback_cache_preserves_a_constant_pending_signal(new_dt):
     source_net, source = _build_continuous_connection(OLD_DT)
     source.delivery_buffer.fill_(2.5)
+    source.delivery_mask.fill_(True)
     source.current_time_step.fill_(5)
     cache = source.state_cache()
     assert cache["param_invariant"] is False
@@ -445,6 +446,45 @@ def test_continuous_fallback_cache_preserves_a_constant_pending_signal(new_dt):
 
     expected = torch.full_like(resumed.delivery_buffer, 2.5)
     torch.testing.assert_close(resumed.delivery_buffer, expected, atol=0.0, rtol=0.0)
+    assert resumed.delivery_mask.all()
+
+
+def test_continuous_cache_preserves_zero_payload_presence_and_loads_legacy_cache():
+    source_net, source = _build_continuous_connection(OLD_DT)
+    source.delivery_buffer.zero_()
+    source.delivery_mask.zero_()
+    source.delivery_mask[2, 0] = True
+    source.delivery_buffer[3, 1] = 4.0
+    source.delivery_mask[3, 1] = True
+    cache = source.state_cache()
+
+    resumed_net, resumed = _build_continuous_connection(OLD_DT)
+    resumed.initialize_from_state_cache(cache, rebuild_delays=False)
+    assert torch.equal(resumed.delivery_mask, cache["delivery_mask"])
+    assert resumed.delivery_mask[2, 0]
+    assert resumed.delivery_buffer[2, 0] == 0.0
+
+    legacy = dict(cache)
+    legacy.pop("delivery_mask")
+    legacy_net, legacy_resumed = _build_continuous_connection(OLD_DT)
+    legacy_resumed.initialize_from_state_cache(legacy, rebuild_delays=False)
+    assert torch.equal(
+        legacy_resumed.delivery_mask, legacy_resumed.delivery_buffer != 0
+    )
+
+
+def test_parameter_invariant_cache_rebuilds_masks_for_zero_source_values():
+    source_net, source = _build_continuous_connection(OLD_DT)
+    source.enable_state_cache_recording()
+    _run_continuous_prefix(source_net, source)
+    cache = source.state_cache()
+    cache["pre_value_history"].zero_()
+
+    resumed_net, resumed = _build_continuous_connection(OLD_DT)
+    resumed.initialize_from_state_cache(cache, rebuild_delays=False)
+
+    assert not resumed.delivery_buffer.any()
+    assert resumed.delivery_mask.any()
 
 
 class _Scale(torch.nn.Module):
@@ -461,7 +501,7 @@ def test_continuous_cache_reapplies_current_trainable_transform():
     source.enable_state_cache_recording()
     _run_continuous_prefix(source_net, source)
     cache = source.state_cache()
-    assert cache["version"] == 3
+    assert cache["version"] == 4
     assert cache["value_layout"] == "raw"
     # A parameter-invariant cache contains raw source values, not values made
     # stale by the transform that happened to be active during recording.

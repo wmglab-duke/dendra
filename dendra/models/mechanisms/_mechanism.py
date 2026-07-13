@@ -2917,6 +2917,12 @@ class ContinuousSynapse(Mechanism):
         self.register_buffer(
             "_continuous_reset_count", torch.zeros((), dtype=torch.long)
         )
+        # Per-element delivery history for the current network step.  ContinuousCon
+        # scatters into a full synapse-shaped tensor, so a single input-level flag
+        # cannot distinguish a genuine zero delivery from an untargeted slot.
+        # These masks are ephemeral: Network resets them before every group of
+        # continuous deliveries, and they are recreated on the live input device.
+        self._continuous_received_masks = {}
 
     @staticmethod
     def INPUT(*names, keep_old=True):
@@ -2950,6 +2956,7 @@ class ContinuousSynapse(Mechanism):
         value when available, and ``x`` is then reset to zeros.  Rebinding rather
         than in-place mutation keeps the operation compatible with autograd.
         """
+        self._continuous_received_masks.clear()
         for name in self._continuous_inputs:
             current = getattr(self, name)
             old_name = self._continuous_input_old.get(name, None)
@@ -2958,7 +2965,7 @@ class ContinuousSynapse(Mechanism):
             setattr(self, name, torch.zeros_like(current))
         self._continuous_reset_count = self._continuous_reset_count + 1
 
-    def continuous_receive(self, value, con=None, input=None, reduce=None):
+    def continuous_receive(self, value, con=None, input=None, reduce=None, mask=None):
         """Receive a continuously valued presynaptic projection.
 
         Parameters
@@ -2974,6 +2981,11 @@ class ContinuousSynapse(Mechanism):
             Reduction used when multiple continuous projections target the same
             input.  Defaults to the connection's ``reduce`` attribute if present,
             otherwise ``"sum"``.
+        mask : torch.Tensor, optional
+            Boolean tensor identifying elements actually targeted by this
+            delivery. If omitted, every element is treated as delivered. This is
+            supplied by :class:`ContinuousCon` so its zero-filled scatter slots do
+            not participate in non-additive reductions.
         """
         if input is None:
             if len(self._continuous_inputs) != 1:
@@ -2994,17 +3006,43 @@ class ContinuousSynapse(Mechanism):
 
         current = getattr(self, input)
         value = value.to(device=current.device, dtype=current.dtype)
+        if mask is None:
+            delivery_mask = torch.ones_like(current, dtype=torch.bool)
+        else:
+            delivery_mask = torch.as_tensor(
+                mask, device=current.device, dtype=torch.bool
+            )
+            try:
+                delivery_mask = torch.broadcast_to(delivery_mask, current.shape)
+            except RuntimeError as error:
+                raise ValueError(
+                    f"Continuous delivery mask with shape {tuple(delivery_mask.shape)} "
+                    f"cannot be broadcast to input {input!r} with shape "
+                    f"{tuple(current.shape)}."
+                ) from error
+
+        received = self._continuous_received_masks.get(input)
+        if received is None or tuple(received.shape) != tuple(current.shape):
+            received = torch.zeros_like(current, dtype=torch.bool)
+        elif received.device != current.device:
+            received = received.to(device=current.device)
 
         if reduce in ("sum", "add"):
-            setattr(self, input, current + value)
+            update = torch.where(delivery_mask, value, torch.zeros_like(value))
+            setattr(self, input, current + update)
         elif reduce in ("set", "replace", "last"):
-            setattr(self, input, value)
+            setattr(self, input, torch.where(delivery_mask, value, current))
         elif reduce == "max":
-            setattr(self, input, torch.maximum(current, value))
+            reduced = torch.maximum(current, value)
+            update = torch.where(received, reduced, value)
+            setattr(self, input, torch.where(delivery_mask, update, current))
         elif reduce == "min":
-            setattr(self, input, torch.minimum(current, value))
+            reduced = torch.minimum(current, value)
+            update = torch.where(received, reduced, value)
+            setattr(self, input, torch.where(delivery_mask, update, current))
         else:
             raise ValueError(f"Unsupported continuous reduction mode: {reduce!r}.")
+        self._continuous_received_masks[input] = received | delivery_mask
 
 
 def rename(mechanism, new_name=None):

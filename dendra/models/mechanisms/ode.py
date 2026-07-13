@@ -438,7 +438,16 @@ def differentiate_rhs_2torch_checked(
         depends_local = False
         if state_vars:
             for s in state_vars:
-                s_sym = sp.sympify(_nmodl_preprocess(s), locals=locals_map)
+                # ``state_vars`` contains declarations drawn from ``vars``.  For an
+                # array declaration such as ``x[3]``, dependency means dependency
+                # on any indexed member of ``x``; sympifying the declaration would
+                # instead (and incorrectly) ask only about the out-of-range element
+                # ``x[3]``.  Expressions not present in ``vars`` remain useful for
+                # callers that intentionally request an exact indexed member.
+                if s in vars_list:
+                    _, s_sym = _var_to_sympy(s)
+                else:
+                    s_sym = sp.sympify(_nmodl_preprocess(s), locals=locals_map)
                 if _expr_depends_on_state(df_expr, s_sym):
                     depends_local = True
                     break

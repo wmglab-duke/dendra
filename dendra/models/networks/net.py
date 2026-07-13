@@ -2043,6 +2043,12 @@ class Network(RNGMixin):
         connections: a ``SynapseSlots`` target is already in synapse-local
         coordinates and avoids ambiguous colocated slots.
         """
+        valid_reductions = {"sum", "add", "set", "replace", "last", "min", "max"}
+        if reduce not in valid_reductions:
+            raise ValueError(
+                f"Unsupported continuous reduction mode: {reduce!r}. Expected "
+                f"one of {sorted(valid_reductions)!r}."
+            )
         source, target, source_model, target_model = self._normalize_endpoint(
             source,
             target,
