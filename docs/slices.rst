@@ -200,8 +200,9 @@ name is unsafe.  Pass ``replace=True`` to replace an existing Slice label
 explicitly; this can never replace a non-label attribute.
 
 A top-level label belongs to the population and is stored in
-``population._labels``.  A label made from a nested Slice belongs only to that
-specific parent Slice:
+``population._labels``.  A label made from a nested Slice is owned by that
+specific parent Slice and is visible through its descendants, but not through
+the population or an unrelated sibling:
 
 .. code-block:: python
 
@@ -209,11 +210,103 @@ specific parent Slice:
    dendrite[:, :2].label("proximal")
 
    dendrite.proximal           # valid
+   dendrite[0].proximal        # valid when the indices commute exactly
    # cells.proximal            # not a top-level population label
 
 Nested-label ownership prevents a short local name from leaking into the
 population namespace.  Parent and nested labels remain retained selections and
 follow the same lifecycle rules as other slices.
+
+Label ownership and propagation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A label always has exactly one owner.  Attribute lookup on a descendant Slice
+does not copy, transfer, or register that label on the descendant.  Instead,
+Dendra may *propagate* the owner's label through the descendant's retained
+indexing path when the two restrictions commute exactly.  This makes the two
+natural readings of a cell-by-compartment model equivalent:
+
+.. code-block:: python
+
+   first_soma = cells[0].soma
+   same_soma = cells.soma[0]
+
+   assert first_soma.shape == same_soma.shape
+   torch.testing.assert_close(first_soma.v, same_soma.v)
+
+This is particularly useful in network code, where ``net.hh[0].soma`` reads as
+"the soma of the first ``hh`` neuron".  Leading integer, slice, integer-array,
+and boolean selections can propagate when replaying them on ``cells.soma``
+produces exactly the same retained root coordinates, shape, order, and
+multiplicity.
+
+Propagation is intentionally not a general-purpose overlap operation.  A key
+that also restricts or rearranges the label's compartment axis, a full-rank
+mask, or another cross-axis advanced index may not commute with the label.  In
+that case Dendra raises ``AttributeError`` instead of guessing how to combine
+the selections.  Put the label first when that is the intended operation:
+
+.. code-block:: python
+
+   cells.soma[cell_key]
+
+For a true physical overlap, use the explicit
+:meth:`~dendra.models.slice.Slice.intersect` operation described below.  The
+distinction is deliberate: attribute propagation preserves the labelled
+Slice's shape semantics only when equivalence can be proved, whereas
+``intersect`` always returns its documented canonical shape.
+
+Population-owned labels are visible through descendants of that population.
+A nested label remains visible only through descendants of its owning Slice;
+an unrelated sibling cannot acquire it by name.  Label lookup is resolved from
+the nearest owner, and creating a label that would shadow a visible label is
+rejected.  Replacement and clearing update future attribute lookup without
+retargeting a Slice that was already retained in a variable.
+
+Physical labels must be selected before entering a mechanism namespace:
+
+.. code-block:: python
+
+   cells[0].soma.mech.hh.m       # valid
+   cells.soma[0].mech.hh.m       # equivalent
+   # cells[0].mech.hh.soma       # invalid: ``soma`` labels compartments
+
+Mechanism-local point-process banks remain governed by
+:class:`dendra.models.slice.SynapseSlots`; label propagation never chooses a
+slot on the user's behalf.
+
+Explicit physical intersection
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:meth:`~dendra.models.slice.Slice.intersect` combines two physical selections
+without weakening ordinary indexing or label semantics:
+
+.. code-block:: python
+
+   selected = cells[torch.tensor([3, 1, 1])]
+   selected_somas = selected.intersect(cells.soma)
+
+Both operands must be population-backed Slices from the same root population.
+When the intersection is formed, the result has a canonical one-dimensional
+shape, including for scalar and empty inputs.  It contains the entries of the
+left operand whose physical root coordinates occur anywhere in the right
+operand.  Left traversal order and left duplicate occurrences are preserved;
+duplicates and ordering on the right only define membership support and cannot
+multiply the result.  Thus ``left.intersect(right)`` never widens ``left``, and
+a disjoint intersection is a deterministic Slice with shape
+``torch.Size([0])``.
+
+The result remains an ordinary retained Slice.  If the population is batched
+*after* the intersection is formed, it gains those leading batch axes just like
+any other retained selection.  Recomputing the intersection after batching
+again produces a canonical one-dimensional result by flattening the current
+left traversal.  This lifecycle distinction preserves both the intersection
+contract at creation time and Slice's established batch-rebasing semantics.
+
+Intersection is intentionally asymmetric in order and multiplicity, even
+though its physical support is set-like.  Swap the operands only when the
+other Slice's traversal order and duplicate occurrences are the desired output
+contract.
 
 Lifecycle: batching, building, and device moves
 ------------------------------------------------

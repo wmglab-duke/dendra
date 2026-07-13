@@ -37,6 +37,7 @@ from __future__ import annotations
 import keyword
 import math
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -505,6 +506,7 @@ class Slice:
     _RESERVED = (
         "_model",
         "index_spec",
+        "_relative_index_spec",
         "_base_shape",
         "parent_slice",
         "root_model",
@@ -521,10 +523,16 @@ class Slice:
         *,
         root_model=None,
         module_path=(),
+        relative_index_spec: IndexSpec | None = None,
     ):
         # Bypass interception for internal fields
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "index_spec", index_spec)
+        object.__setattr__(
+            self,
+            "_relative_index_spec",
+            index_spec if relative_index_spec is None else relative_index_spec,
+        )
         object.__setattr__(self, "parent_slice", parent_slice)
         object.__setattr__(
             self, "root_model", model if root_model is None else root_model
@@ -603,6 +611,65 @@ class Slice:
             spec.source_shape = root_shape
 
         object.__setattr__(self, "_base_shape", root_shape)
+        return spec
+
+    def _sync_relative_index(self):
+        """Rebase this Slice's parent-relative key across new batch axes.
+
+        ``index_spec`` describes the composed selection in root-population
+        coordinates.  Label propagation additionally needs the key that was
+        applied to the immediate parent Slice.  Keeping and synchronizing that
+        key avoids trying to infer indexing history from a composed advanced
+        index, which is not generally possible.
+        """
+        spec = object.__getattribute__(self, "_relative_index_spec")
+        parent = object.__getattribute__(self, "parent_slice")
+
+        # A top-level Slice's parent-relative and root-relative selections are
+        # the same owned IndexSpec.
+        if parent is None and spec is object.__getattribute__(self, "index_spec"):
+            return self._sync_index()
+
+        root = object.__getattribute__(self, "root_model")
+        if parent is None:
+            parent_shape = tuple(root.shape)
+        else:
+            parent._sync()
+            parent_shape = tuple(parent.shape)
+
+        source_shape = tuple(spec.source_shape)
+        device = root.device()
+        index_moved = any(
+            torch.is_tensor(item) and item.device != device for item in spec.index
+        )
+        index = self._index_on_device(spec.index, device)
+
+        if parent_shape != source_shape:
+            suffix_matches = (
+                not source_shape
+                or tuple(parent_shape[-len(source_shape) :]) == source_shape
+            )
+            adds_leading_axes = (
+                len(parent_shape) >= len(source_shape) and suffix_matches
+            )
+            if not adds_leading_axes:
+                raise RuntimeError(
+                    "This Slice's relative index was created for parent shape "
+                    f"{source_shape}, but its parent now has incompatible shape "
+                    f"{parent_shape}. Create a new Slice after changing model topology."
+                )
+
+            n_new = len(parent_shape) - len(source_shape)
+            if n_new and not (index and index[0] is Ellipsis):
+                index = (slice(None),) * n_new + index
+
+        if parent_shape != source_shape or index_moved:
+            out = torch.empty(parent_shape, device=device, dtype=torch.bool)[index]
+            spec.index = index
+            spec.is_scalar = out.ndim == 0
+            spec.shape = out.shape
+            spec.source_shape = parent_shape
+
         return spec
 
     def _sync(self):
@@ -1219,6 +1286,191 @@ class Slice:
             slot_index=slot_index,
         )
 
+    def _visible_label(self, name: str):
+        """Return the nearest owned label and the relative path to this Slice."""
+        if object.__getattribute__(self, "module_path"):
+            return None
+
+        path = []
+        current = self
+        while True:
+            registry = object.__getattribute__(current, "_labels")
+            if name in registry:
+                return registry[name], tuple(reversed(path))
+
+            path.append(current)
+            parent = object.__getattribute__(current, "parent_slice")
+            if parent is None:
+                break
+            current = parent
+
+        root = object.__getattribute__(self, "root_model")
+        registry = getattr(root, "_labels", None)
+        if isinstance(registry, dict) and name in registry:
+            return registry[name], tuple(reversed(path))
+        return None
+
+    @staticmethod
+    def _is_full_slice(item) -> bool:
+        return (
+            isinstance(item, slice)
+            and item.start is None
+            and item.stop is None
+            and item.step is None
+        )
+
+    @classmethod
+    def _label_key_variants(cls, index):
+        """Yield a key plus variants with redundant full slices removed.
+
+        A label may reduce an axis that was explicitly retained as ``:`` in
+        the descendant key.  Removing only full slices is semantics-neutral
+        with respect to that axis; the subsequent root-coordinate validation
+        decides whether a variant truly commutes with the label.  ``None``,
+        advanced indices, non-full slices, and their relative ordering are
+        never rewritten.
+        """
+        index = tuple(index)
+        yield 0, index
+        full_positions = [
+            position for position, item in enumerate(index) if cls._is_full_slice(item)
+        ]
+        for count in range(1, len(full_positions) + 1):
+            for removed in combinations(full_positions, count):
+                removed = set(removed)
+                yield (
+                    count,
+                    tuple(
+                        item
+                        for position, item in enumerate(index)
+                        if position not in removed
+                    ),
+                )
+
+    def _label_propagation_error(self, name: str, detail: str | None = None):
+        message = (
+            f"Slice label {name!r} cannot be propagated through this Slice "
+            "because its relative indexing path does not commute exactly with "
+            "the labelled selection. Access the label from its owner and index "
+            "it explicitly, or use slice.intersect(owner_label) for a canonical "
+            "one-dimensional physical intersection."
+        )
+        if detail:
+            message = f"{message} {detail}"
+        raise AttributeError(message)
+
+    @staticmethod
+    def _same_label_candidate(root, left, right) -> bool:
+        """Return whether two replay candidates have identical Slice semantics."""
+        if left.shape != right.shape or left.is_scalar is not right.is_scalar:
+            return False
+        left_flat = _population_flat_indices(root, left.index)
+        right_flat = _population_flat_indices(root, right.index)
+        return bool(torch.equal(left_flat, right_flat))
+
+    def _retain_label_candidate(self, name, candidates, candidate, removed):
+        """Deduplicate replay states, keeping their least-rewritten path."""
+        root = object.__getattribute__(self, "root_model")
+        for position, (existing, existing_removed) in enumerate(candidates):
+            if self._same_label_candidate(root, candidate, existing):
+                if removed < existing_removed:
+                    candidates[position] = (candidate, removed)
+                return
+        if len(candidates) >= 256:
+            self._label_propagation_error(
+                name,
+                "The indexing path admits too many distinct full-slice rewrites "
+                "to validate safely.",
+            )
+        candidates.append((candidate, removed))
+
+    def _propagate_label(self, name: str, label, path):
+        """Replay and validate a visible label through this Slice's ancestry."""
+        if label is self:
+            return self
+        if not isinstance(label, Slice):
+            self._label_propagation_error(
+                name, "The owner's label registry does not contain a Slice."
+            )
+
+        root = object.__getattribute__(self, "root_model")
+        if object.__getattribute__(label, "root_model") is not root:
+            self._label_propagation_error(
+                name, "The labelled Slice belongs to a different root population."
+            )
+
+        self._sync()
+        label._sync()
+        label_flat = _population_flat_indices(root, label.index)
+        if int(torch.unique(label_flat).numel()) != int(label_flat.numel()):
+            self._label_propagation_error(
+                name,
+                "The label contains duplicate physical compartments, so implicit "
+                "propagation would make multiplicity ambiguous.",
+            )
+
+        current_flat = _population_flat_indices(root, self.index)
+        expected = current_flat[torch.isin(current_flat, label_flat)]
+
+        candidates = [(label, 0)]
+        replay_attempts = 0
+        for descendant in path:
+            relative = descendant._sync_relative_index()
+            replayed = []
+            for candidate, total_removed in candidates:
+                for removed, key in self._label_key_variants(relative.index):
+                    replay_attempts += 1
+                    if replay_attempts > 4096:
+                        self._label_propagation_error(
+                            name,
+                            "The indexing path admits too many full-slice rewrites "
+                            "to validate safely.",
+                        )
+                    try:
+                        replayed_candidate = candidate[key]
+                    except IndexError:
+                        continue
+                    self._retain_label_candidate(
+                        name,
+                        replayed,
+                        replayed_candidate,
+                        total_removed + removed,
+                    )
+            if not replayed:
+                self._label_propagation_error(name)
+            candidates = replayed
+
+        expected_sorted = torch.sort(expected).values
+        valid = []
+        for candidate, removed in candidates:
+            candidate_flat = _population_flat_indices(root, candidate.index)
+            if int(expected.numel()) != int(candidate_flat.numel()):
+                continue
+            if not expected.numel() or torch.equal(
+                expected_sorted, torch.sort(candidate_flat).values
+            ):
+                valid.append((candidate, candidate_flat, removed))
+
+        if valid:
+            fewest_removed = min(item[2] for item in valid)
+            minimal = [item for item in valid if item[2] == fewest_removed]
+            reference, reference_flat, _ = minimal[0]
+            for candidate, candidate_flat, _ in minimal[1:]:
+                same_semantics = (
+                    candidate.shape == reference.shape
+                    and candidate.is_scalar is reference.is_scalar
+                    and torch.equal(candidate_flat, reference_flat)
+                )
+                if not same_semantics:
+                    self._label_propagation_error(
+                        name,
+                        "Removing redundant full slices admits more than one "
+                        "shape or traversal order, so propagation is ambiguous.",
+                    )
+            return reference
+
+        self._label_propagation_error(name)
+
     def insert(
         self,
         mechanism,
@@ -1423,6 +1675,8 @@ class Slice:
             raise ValueError(
                 f"Slice label {name!r} must be a non-private Python identifier."
             )
+        if object.__getattribute__(self, "module_path"):
+            raise ValueError("Only population-backed Slices can be labelled.")
 
         parent_slice = object.__getattribute__(self, "parent_slice")
         if parent_slice is not None:
@@ -1430,8 +1684,6 @@ class Slice:
             registry = object.__getattribute__(owner, "_labels")
             owner_description = "parent Slice"
         else:
-            if object.__getattribute__(self, "module_path"):
-                raise ValueError("Only population-backed Slices can be labelled.")
             owner = object.__getattribute__(self, "root_model")
             registry = getattr(owner, "_labels", None)
             if not isinstance(registry, dict):
@@ -1445,6 +1697,14 @@ class Slice:
             raise ValueError(
                 f"Slice label {name!r} already exists on {owner_description}."
             )
+
+        if parent_slice is not None and existing is None:
+            visible = owner._visible_label(name)
+            if visible is not None:
+                raise ValueError(
+                    f"Nested Slice label {name!r} would shadow a label visible "
+                    "from an enclosing Slice or population. Choose a unique name."
+                )
 
         replaceable = existing is not None and (
             (name in vars(owner) and vars(owner)[name] is existing)
@@ -1498,10 +1758,11 @@ class Slice:
         """
         self._sync()
         root = object.__getattribute__(self, "root_model")
+        relative = parse_key(key, self.shape, device=root.device())
         idx = compose_indices(
             root.shape,
             self.index,
-            key,
+            relative.index,
             device=root.device(),
         )
         idx = parse_key(idx, root.shape, device=root.device())
@@ -1512,7 +1773,53 @@ class Slice:
             base_shape=self.base_shape,
             root_model=root,
             module_path=object.__getattribute__(self, "module_path"),
+            relative_index_spec=relative,
         )
+
+    def intersect(self, other: Slice) -> Slice:
+        """Return the physical intersection with another population Slice.
+
+        Intersection is deliberately an explicit operation because its shape
+        contract differs from ordinary Slice indexing.  At creation, the
+        result is a canonical one-dimensional Slice.  It preserves the
+        traversal order and duplicate occurrences of ``self`` while treating
+        ``other`` as a set of physical compartments.  Consequently it never
+        widens ``self`` and duplicates in ``other`` do not multiply the result.
+        As with any retained Slice, later batching prepends batch axes.
+
+        Both operands must be population-backed Slices of the same root model.
+        Mechanism-local and cross-population intersections are rejected rather
+        than guessing how their coordinate systems relate.
+        """
+        if not isinstance(other, Slice):
+            raise TypeError("Slice.intersect(other) requires another Slice.")
+
+        self_path = object.__getattribute__(self, "module_path")
+        other_path = object.__getattribute__(other, "module_path")
+        if self_path or other_path:
+            raise ValueError(
+                "Slice.intersect() is defined only for population-backed Slices."
+            )
+
+        root = object.__getattribute__(self, "root_model")
+        other_root = object.__getattribute__(other, "root_model")
+        if root is not other_root:
+            raise ValueError(
+                "Slice.intersect() operands must belong to the same root population."
+            )
+
+        self._sync()
+        other._sync()
+        grid = torch.arange(
+            math.prod(tuple(root.shape)), device=root.device(), dtype=torch.long
+        ).reshape(tuple(root.shape))
+        left = grid[self.index]
+        right = grid[other.index].reshape(-1)
+        membership = torch.isin(left, right)
+
+        # Boolean indexing supplies the public canonical 1-D contract and also
+        # retains a genuine parent-relative key for lifecycle synchronization.
+        return self[membership]
 
     # -------------------------
     # Interceptors
@@ -1556,13 +1863,16 @@ class Slice:
 
         Resolution order:
 
-        1. If ``name`` matches a buffer on the underlying PyTorch module,
+        1. If ``name`` is a label owned by this Slice or a visible ancestor,
+           return it directly or propagate it through an exactly commuting
+           relative indexing path.
+        2. If ``name`` matches a buffer on the underlying PyTorch module,
            return a sliced snapshot via :meth:`_inspect`.
-        2. If ``name`` matches a submodule, return a new :class:`Slice` that
+        3. If ``name`` matches a submodule, return a new :class:`Slice` that
            wraps the submodule but shares this slice's :class:`IndexSpec`.
-        3. If ``name`` matches a parameter, return a sliced snapshot of that
+        4. If ``name`` matches a parameter, return a sliced snapshot of that
            parameter via :meth:`_inspect`.
-        4. Otherwise, delegate attribute access directly to the wrapped model.
+        5. Otherwise, delegate attribute access directly to the wrapped model.
 
         This allows convenient access patterns such as:
 
@@ -1602,6 +1912,11 @@ class Slice:
         if name in nested_labels:
             return nested_labels[name]
 
+        visible_label = self._visible_label(name)
+        if visible_label is not None:
+            label, path = visible_label
+            return self._propagate_label(name, label, path)
+
         # Buffers: return sliced/inspected view
         if name in model._buffers:
             return self._inspect(name)
@@ -1616,14 +1931,6 @@ class Slice:
                 root_model=object.__getattribute__(self, "root_model"),
                 module_path=object.__getattribute__(self, "module_path") + (name,),
             )
-
-        if hasattr(model, "_labels"):
-            if name in model._labels:
-                raise AttributeError(
-                    f"Population label {name!r} belongs to the population, not "
-                    "to an arbitrary Slice. Access it from the population (or "
-                    "index the labelled Slice explicitly)."
-                )
 
         # Parameters (optional): often handy to read through
         if name in model._parameters:
