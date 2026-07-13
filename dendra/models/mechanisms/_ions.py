@@ -5,7 +5,7 @@ import torch
 from dendra.helpers import DEBUG
 
 from ..parametric import to_param
-from ._materials import Material
+from ._materials import Material, MaterialFieldSpec
 
 # default reversal potentials from NEURON
 REVERSAL = {"ena": 50.0, "ek": -77.0, "eca": 132.0}
@@ -207,15 +207,37 @@ class Ion(Material):
         super().__init__(
             name,
             shape,
-            fields={
-                f"i{name}": 0.0,
-                f"e{name}": e0,
-                f"{name}i": i0,
-                f"{name}o": o0,
-            },
-            min_values={
-                f"{name}i": min_concentration,
-                f"{name}o": min_concentration,
+            specs={
+                f"i{name}": MaterialFieldSpec(
+                    f"i{name}",
+                    initial=0.0,
+                    conserved=False,
+                    domain="membrane",
+                    units="mA/cm²",
+                ),
+                f"e{name}": MaterialFieldSpec(
+                    f"e{name}",
+                    initial=e0,
+                    conserved=False,
+                    domain="membrane",
+                    units="mV",
+                ),
+                f"{name}i": MaterialFieldSpec(
+                    f"{name}i",
+                    initial=i0,
+                    min_value=min_concentration,
+                    conserved=True,
+                    domain="intracellular",
+                    units="mM",
+                ),
+                f"{name}o": MaterialFieldSpec(
+                    f"{name}o",
+                    initial=o0,
+                    min_value=min_concentration,
+                    conserved=True,
+                    domain="extracellular",
+                    units="mM",
+                ),
             },
             _register_initial_sources=False,
         )

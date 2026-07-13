@@ -43,10 +43,10 @@ net.connect_one_to_one(  # netstim -> P1
     # 100 random cells in P1 receive input
     net.all.P1[torch.arange(N1)[torch.randperm(N1)[:100]]],
     net.all.mech.NMDA,
-    weight=0.1,
+    weight=0.1,  # bare µS coordinate for exp2syn
 )
 
-net.connect_prob(  # inhibitory cross-connections
+net.connect_prob(  # inhibitory cross-connections; exp2syn weights are bare µS
     net.all.P1, net.all.P2, net.all.mech.AMPA, prob=0.02, weight=1.0, delay=1.0 * ms
 )
 
@@ -54,7 +54,7 @@ net.connect_prob(
     net.all.P2, net.all.P1, net.all.mech.AMPA, prob=0.02, weight=1.0, delay=1.0 * ms
 )
 
-net.connect_prob(  # excitatory self connections
+net.connect_prob(  # excitatory self connections; exp2syn weights are bare µS
     net.all.P1, net.all.P1, net.all.mech.NMDA, prob=0.01, weight=1.0, delay=0.2 * ms
 )
 

@@ -12,6 +12,30 @@ points, and ``*B`` the (possibly empty) tuple of explicit batch dimensions.
 The full model shape is ``[*B, N, C]``; each call to ``batch(n)`` prepends one
 batch dimension.
 
+Extracellular-voltage units
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every extracellular potential that reaches the cable solver is expressed in
+**mV**.  The two input forms differ only in where the spatial/temporal product
+is formed:
+
+* Direct ``ve`` values supplied to ``Population.step(ve=...)`` or
+  ``Population.run(ve=...)`` are already extracellular potentials and must be
+  in mV.
+* For ``extra=(ve_s, time)``, Dendra multiplies the spatial value ``ve_s`` by
+  the temporal waveform value.  Their product must be in mV at every
+  compartment and time point.  Multiple contacts are summed after forming
+  each contact's product.
+
+Dendra's unit helpers are scalar conversion factors, so the runtime cannot
+infer or repair a mismatched normalization.  The analytic point and line
+sources return a lead field numerically expressed in mV/mA; pair those fields
+with a waveform in mA.  Precomputed scalar fields are intentionally more
+general: a field in mV can be paired with a dimensionless relative waveform,
+or a field normalized in mV per input unit can be paired with a waveform in
+that input unit.  See :doc:`dendra.models.fields` and :doc:`../units` for the
+full field and unit contracts.
+
 Time axes
 ~~~~~~~~~
 
@@ -105,7 +129,8 @@ A standalone Population accepts ``extra=(ve_s, time)``.  It also accepts a
 sequence of these tuples for multiple contacts.  A Network accepts a mapping
 ``extra={population_name: (ve_s, waveform)}``; Network temporal values must be
 Waveform objects.  In a multi-contact Population call, all contacts must use
-the same temporal type: either Waveforms or time-last tensors.
+the same temporal type: either Waveforms or time-last tensors.  In every case,
+``ve_s * time`` must be an extracellular potential in mV.
 
 The spatial field ``ve_s`` broadcasts to ``[*B, N, C]``:
 
@@ -143,7 +168,8 @@ Direct precomputed ``ve``
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``Population.run(ve=...)`` normalizes a **time-first** tensor to
-``[T, *B, N, C]``.  For an unbatched Population, ``[T]``, ``[T, C]``, and
+``[T, *B, N, C]``.  Its values are already potentials in mV; unlike ``extra``,
+no temporal scaling is applied.  For an unbatched Population, ``[T]``, ``[T, C]``, and
 ``[T, N, C]`` are shared, compartment-specific, and fully specified forms.
 After ``batch()``, Dendra applies the same trailing-first rule to the per-step
 payload after the leading time axis.  The unbatched forms therefore stay shared

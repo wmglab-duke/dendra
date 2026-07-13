@@ -42,9 +42,15 @@ class exp2syn(PP, Syn):
     Notes
     -----
     The synaptic conductance :math:`g` is calculated as the difference between the
-    two state variables :math:`B` and :math:`A`, scaled by the reversal potential
-    :math:`e`. Synaptic inputs are received as weights, which are added to both
-    state variables :math:`A` and :math:`B` to simulate synaptic activation.
+    two state variables, :math:`g = B - A`. The lumped current is
+    :math:`i = g(V-e)`; the reversal potential does not scale the conductance.
+
+    This is a :class:`~dendra.models.mechanisms.PointProcess`. Event weights,
+    :math:`A`, :math:`B`, and :math:`g` are numerical values in µS; for example,
+    ``weight=0.05`` means 0.05 µS. Do not multiply such a weight by
+    :data:`dendra.units.uS`. The normalized event weight is added to both state
+    variables. ``i(v)`` returns lumped, outward-positive current in nA, which
+    Dendra converts to mA/cm² using compartment area during current assembly.
 
     The factor for scaling the weights is calculated based on the time constants
     of the two states, following the formula

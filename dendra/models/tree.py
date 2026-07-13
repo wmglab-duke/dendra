@@ -495,9 +495,13 @@ class Tree(Population):
         file_path : str
             Path to the SWC morphology file.
         d_lambda : float, optional
-            Spatial discretisation factor for tree reconstruction.
+            Dimensionless spatial-discretisation factor for tree reconstruction.
         freq : float, optional
-            Temporal sampling frequency in Hz.
+            Frequency in hertz used by NEURON's d-lambda morphology
+            discretisation. Pass a raw hertz value such as ``freq=100.0``.
+            This morphology-only argument is intentionally an exception to
+            Dendra's usual kHz (1/ms) frequency convention, so do not multiply
+            it by :data:`dendra.units.Hz`.
         N : int, optional
             Number of population instances. Defaults to ``1``.
         integrator : callable, optional
@@ -536,9 +540,13 @@ class Tree(Population):
         file_path : str
             Path to the Neurolucida morphology file.
         d_lambda : float, optional
-            Spatial discretisation factor for tree reconstruction.
+            Dimensionless spatial-discretisation factor for tree reconstruction.
         freq : float, optional
-            Temporal sampling frequency in Hz.
+            Frequency in hertz used by NEURON's d-lambda morphology
+            discretisation. Pass a raw hertz value such as ``freq=100.0``.
+            This morphology-only argument is intentionally an exception to
+            Dendra's usual kHz (1/ms) frequency convention, so do not multiply
+            it by :data:`dendra.units.Hz`.
         N : int, optional
             Number of population instances. Defaults to ``1``.
         integrator : callable, optional

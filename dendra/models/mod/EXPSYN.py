@@ -29,9 +29,15 @@ class expsyn(PP, Syn):
 
     Notes
     -----
-    Synaptic inputs are received as weights, which are added to the state variable
-    :math:`g` to simulate synaptic activation. The state variable :math:`g` then
-    decays exponentially with time constant :math:`\tau`.
+    This is a :class:`~dendra.models.mechanisms.PointProcess`. Synaptic event
+    weights and the state variable :math:`g` are numerical values in µS; for
+    example, ``weight=0.05`` means 0.05 µS. Do not multiply such a weight by
+    :data:`dendra.units.uS`. Each received weight is added to :math:`g`, which
+    then decays exponentially with time constant :math:`\tau`.
+
+    ``i(v)`` returns lumped, outward-positive current in nA. Dendra converts it
+    to mA/cm² using the target compartment's membrane area during current
+    assembly.
 
     Optionally, the decay of :math:`g` can be written as
 

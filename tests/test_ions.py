@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,6 +17,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from dendra.models.mechanisms import _ions as ions  # noqa: E402  (after torch)
+from dendra.models.mechanisms._material_process import ExchangeProcess
 
 # -----------------------------------------------------------------------------
 # System‑under‑test
@@ -125,6 +127,57 @@ def test_context_validation_raises(bad_key, ctx):
 # -----------------------------------------------------------------------------
 # Ion module – initialization, Einitialisation, advance & detach
 # -----------------------------------------------------------------------------
+
+
+def test_ion_field_metadata_and_exchange_geometry_follow_physical_domains():
+    shape = (1, 2)
+    ion = ions.Ion("na", shape, einit=0, eadvance=0)
+
+    expected = {
+        "ina": ("membrane", "mA/cm²", False, None),
+        "ena": ("membrane", "mV", False, None),
+        "nai": ("intracellular", "mM", True, ions.MIN_CONCENTRATION["na"]),
+        "nao": ("extracellular", "mM", True, ions.MIN_CONCENTRATION["na"]),
+    }
+    for field, (domain, units, conserved, min_value) in expected.items():
+        spec = ion.field_spec(field)
+        assert spec.domain == domain
+        assert spec.units == units
+        assert spec.conserved is conserved
+        assert spec.min_value == min_value
+
+    class IonExchange(ExchangeProcess):
+        ExchangeProcess.METHOD("exact", require_volumes=True)
+        ExchangeProcess.EXCHANGE("na.nai", "na.nao", rate=0.5)
+
+    volume_i = torch.tensor([[1.0, 2.0]])
+    volume_o = torch.tensor([[3.0, 4.0]])
+    population = SimpleNamespace(
+        shape=shape,
+        volume_i=volume_i,
+        volume_o=volume_o,
+    )
+    process = IonExchange(
+        name="ion_exchange",
+        celsius=torch.tensor(37.0),
+        diameters=torch.ones(shape),
+        shape=shape,
+        shape_f=shape,
+    ).bind_materials({"na": ion}.__getitem__, population=population)
+
+    ion.nai.copy_(torch.tensor([[10.0, 20.0]]))
+    ion.nao.copy_(torch.tensor([[100.0, 200.0]]))
+    mass_before = volume_i * ion.nai + volume_o * ion.nao
+    process.advance_materials(0.2)
+
+    torch.testing.assert_close(
+        volume_i * ion.nai + volume_o * ion.nao,
+        mass_before,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert not torch.equal(ion.nai, torch.tensor([[10.0, 20.0]]))
+    assert not torch.equal(ion.nao, torch.tensor([[100.0, 200.0]]))
 
 
 @pytest.mark.parametrize("einit, eadvance", [(0, 0), (1, 0), (1, 1)])

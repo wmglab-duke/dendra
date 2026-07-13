@@ -42,12 +42,14 @@ class isotropic_point(Point):
     The potential is calculated using the standard point source equation:
 
     .. math::
-        V(x,y,z) = \\frac{1000 \\cdot \\rho_e}{4\\pi \\cdot r}
+        \\Phi(x,y,z) = \\frac{\\rho_e}{4\\pi r}
 
-    where :math:`r = \\sqrt{(x-x_0)^2 + (y-y_0)^2 + (z-z_0)^2} \\cdot 10^{-4}`
+    where :math:`r = \\sqrt{(x-x_0)^2 + (y-y_0)^2 + (z-z_0)^2}
+    \\cdot 10^{-4}` is the source distance in cm.
 
-    The result is in mV with an assumed unit current source, and the distance
-    is converted from μm to cm for calculation.
+    The result has units of Ω and is represented numerically as a lead field in
+    mV/mA, because Ω × mA = mV.  Equivalently, it is the potential in mV
+    produced by a 1 mA point source.
     """
 
     Point.PARAMETER(x=0.0, y=0.0, z=0.0, rhoe=300.0)
@@ -78,16 +80,23 @@ class anisotropic_point(Point):
         Resistivity in the y-direction in Ω·cm. Default is 300.0.
     rhoz : float, optional
         Resistivity in the z-direction in Ω·cm. Default is 300.0.
+
     Notes
     -----
     The potential is calculated using the anisotropic medium equation:
 
     .. math::
-        V(x,y,z) = \\frac{1000}{4\\pi \\cdot \\sqrt{\\frac{(x-x_0)^2}{\\rho_y * \\rho_z} + \\frac{(y-y_0)^2}{\\rho_x * \\rho_z} + \\frac{(z-z_0)^2}{\\rho_y * \\rho_z}}}
+        \\Phi(x,y,z) = \\frac{1}{4\\pi
+        \\sqrt{\\frac{(x-x_0)^2}{\\rho_y \\rho_z}
+        + \\frac{(y-y_0)^2}{\\rho_x \\rho_z}
+        + \\frac{(z-z_0)^2}{\\rho_x \\rho_y}}}
 
-    where distances are converted from μm to cm (x 10⁻⁴) for calculation.
+    where all coordinate differences are converted from μm to cm before the
+    expression is evaluated.
 
-    The result is in mV with an assumed unit current source.
+    The result has units of Ω and is represented numerically as a lead field in
+    mV/mA, because Ω × mA = mV.  Equivalently, it is the potential in mV
+    produced by a 1 mA point source.
     """
 
     Point.PARAMETER(x=0.0, y=0.0, z=0.0, rhox=300.0, rhoy=300.0, rhoz=300.0)
@@ -105,17 +114,18 @@ class anisotropic_point(Point):
             + (dz**2) / (self.rhox * self.rhoy)
         )
 
-        # Calculate potential in mV
+        # Lead field in Ω, represented numerically as mV/mA.
         return 1 / (4 * torch.pi * r_aniso)
 
 
 class parametric_efield(torch.nn.Module):
     """
-    A PyTorch module to generate parametric E-field vectors for a neuron model.
+    Generate quasipotentials for a grid of uniform E-field directions.
 
-    This module creates a grid of E-field directions and applies a specified
-    magnitude gradient along the neuron's z-axis (somatodendritic axis).
-    The calculation is fully vectorized for efficiency.
+    The public :meth:`forward` path treats ``model.x``, ``model.y``, and
+    ``model.z`` as coordinates in µm, accepts an E-field magnitude in V/m,
+    and returns extracellular quasipotentials in mV. The calculation is fully
+    vectorized over the sampled azimuthal and polar directions.
 
     Parameters
     ----------
@@ -124,10 +134,19 @@ class parametric_efield(torch.nn.Module):
     n_polar : int
         The number of polar/inclination angles (theta) to sample (from the z-axis).
     relative_mag_change_per_mm : Union[float, List[float], torch.Tensor]
-        The relative change of the E-field magnitude per millimeter along the
-        somatodendritic axis (z-axis). Can be a single value or a list of
-        values to be tested. A positive value means the E-field magnitude
-        increases from the soma towards negative z.
+        Percentage change in E-field magnitude per mm along the
+        somatodendritic axis (z-axis). For example, ``200.0`` means 200% per
+        mm. Can be a single value or a list of values. A positive value means
+        the E-field magnitude increases from the soma towards negative z.
+        This parameter is used by the internal spatial-gradient integration
+        path; the public :meth:`forward` path generates a uniform field.
+
+    Notes
+    -----
+    ``e_field_strength_Vm`` is the physical E-field magnitude in V/m, not a
+    Dendra conversion scalar. The returned value already has units of mV, so
+    when it is used as the spatial component of extracellular stimulation it
+    should normally be paired with a dimensionless relative waveform.
     """
 
     def __init__(
@@ -175,15 +194,15 @@ class parametric_efield(torch.nn.Module):
         Parameters
         ----------
         model : object
-            A model object that must have a `.z` attribute. The `model.z`
-            is expected to be a 2D PyTorch tensor containing the z-coordinates
-            of the neuron's compartments in millimeters, and they are all expected to be the
-            same.
+            Model whose ``x``, ``y``, and ``z`` tensors contain compartment
+            coordinates in µm.
+        e_field_strength_Vm : float, default 1.0
+            Reference E-field magnitude in V/m.
 
         Returns
         -------
-        torch.Tensor
-            A tensor containing the computed quasi-potentials for each compartment.
+        tuple[torch.Tensor, torch.Tensor]
+            E-field vectors in V/m and integrated quasipotentials in mV.
         """
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
@@ -261,6 +280,23 @@ class parametric_efield(torch.nn.Module):
         return e_fields_batched, quasi_potentials.contiguous()
 
     def forward(self, model: object, e_field_strength_Vm: float = 1.0) -> torch.Tensor:
+        """Return uniform-field quasipotentials for every sampled direction.
+
+        Parameters
+        ----------
+        model : object
+            Model whose ``x``, ``y``, and ``z`` tensors contain compartment
+            coordinates in µm.
+        e_field_strength_Vm : float, default 1.0
+            Uniform E-field magnitude in V/m.
+
+        Returns
+        -------
+        torch.Tensor
+            Quasipotentials in mV with shape
+            ``(n_azimuthal * n_polar, n_compartments)`` (plus any compatible
+            model batch dimensions).
+        """
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
         x = x / 1e6  # Convert from µm to m

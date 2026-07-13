@@ -225,6 +225,13 @@ class State(Parameterized):
       may return a dict mapping ASSIGNED names to values.
     - ``inf(self, v)``: return steady-state values for states (used for init).
     - ``calc_q10(self)``: optional temperature scaling when ``has_q10=True``.
+
+    Notes
+    -----
+    State equations advance on Dendra's millisecond time coordinate. A
+    derivative of a state ``x`` therefore has units ``unit(x)/ms``; an SDE
+    diffusion coefficient has units ``unit(x)/sqrt(ms)``. Voltage arguments are
+    in mV, ``self.celsius`` is in °C, and compartment diameters are in µm.
     """
 
     _state_buffers = set()

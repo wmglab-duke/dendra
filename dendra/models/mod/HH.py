@@ -57,17 +57,26 @@ class hh(M):
     Parameters
     ----------
     gnabar : float
-        Maximum sodium conductance (in mS/cm^2). Default is 0.12.
+        Maximum sodium conductance density in S/cm². Default is 0.12 S/cm²
+        (equivalently 120 mS/cm²).
     gkbar : float
-        Maximum potassium conductance (in mS/cm^2). Default is 0.036.
+        Maximum potassium conductance density in S/cm². Default is 0.036 S/cm²
+        (equivalently 36 mS/cm²).
     gl : float
-        Leak conductance (in mS/cm^2). Default is 0.0003.
+        Leak conductance density in S/cm². Default is 0.0003 S/cm²
+        (equivalently 0.3 mS/cm²).
     ena : float
         Sodium reversal potential (in mV). Default is 50.0.
     ek : float
         Potassium reversal potential (in mV). Default is -77.0.
     el : float
         Leak reversal potential (in mV). Default is -54.3.
+
+    Notes
+    -----
+    ``ina(v)``, ``ik(v)``, and ``il(v)`` return outward-positive current
+    densities in mA/cm². Their voltage derivatives are conductance densities in
+    S/cm².
     """
 
     M.STATE(mhn)

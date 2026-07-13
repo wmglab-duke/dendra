@@ -134,6 +134,46 @@ def flatten_key(n, shape, key):
     return indices[key].flatten()
 
 
+def _component_label_core_indices(pop, component_slice):
+    """Project a component label to one ordered structural-core sequence.
+
+    Component labels are installed on the composite model's flattened core
+    axis and therefore must describe the same ordered compartments in every
+    batch replica. Duplicate occurrences and their interleaving are retained.
+    """
+    full_shape = tuple(pop.shape)
+    core_shape = tuple(pop.core_shape())
+    core_numel = math.prod(core_shape)
+    full_grid = torch.arange(
+        math.prod(full_shape), device=pop.device(), dtype=torch.long
+    ).reshape(full_shape)
+    selected = full_grid[component_slice.index].reshape(-1)
+    if not selected.numel():
+        return selected
+
+    batch_indices = torch.div(selected, core_numel, rounding_mode="floor")
+    core_indices = torch.remainder(selected, core_numel)
+    replicas = torch.unique(batch_indices, sorted=True)
+    n_replicas = math.prod(full_shape[: -len(core_shape)]) or 1
+    expected_replicas = torch.arange(n_replicas, device=pop.device(), dtype=torch.long)
+    if not torch.equal(replicas, expected_replicas):
+        raise ValueError(
+            "A component Slice label must select the same ordered structural "
+            "compartments in every batch replica before it can be projected "
+            "onto a MultiPopulation."
+        )
+    reference = core_indices[batch_indices == replicas[0]]
+    for replica in replicas[1:]:
+        candidate = core_indices[batch_indices == replica]
+        if not torch.equal(candidate, reference):
+            raise ValueError(
+                "A component Slice label must select the same ordered structural "
+                "compartments in every batch replica before it can be projected "
+                "onto a MultiPopulation."
+            )
+    return reference
+
+
 def _expand_v_init_like(value, target_shape, *, device, dtype, name="v_init"):
     """Expand one v_init value using Population.expanded_v_init semantics.
 
@@ -356,27 +396,66 @@ class MultiPopulation(Population):
     def _sync_component_labels(self, name, pop):
         """Synchronize one component's nested labels on its composite slice."""
         population_slice = getattr(self, name)
-        previous = set(
-            object.__getattribute__(population_slice, "__dict__").get(
-                "_component_label_names", ()
-            )
-        )
-        current = set(pop._labels)
+        namespace = object.__getattribute__(population_slice, "__dict__")
+        registry = object.__getattribute__(population_slice, "_labels")
+        previous = dict(namespace.get("_component_labels", {}))
+        previous_sources = dict(namespace.get("_component_label_sources", {}))
 
-        for label in previous - current:
-            if label in object.__getattribute__(population_slice, "__dict__"):
+        # Validate the entire update before changing either namespace. A label
+        # explicitly attached to the composite component slice belongs to the
+        # user; component-label synchronization must not silently replace it.
+        for label in pop._labels:
+            previous_label = previous.get(label)
+            registered = registry.get(label)
+            attribute = namespace.get(label, _MISSING)
+            if registered is not None and registered is not previous_label:
+                raise ValueError(
+                    f"Component label {label!r} conflicts with a nested label "
+                    f"already owned by composite component {name!r}."
+                )
+            if attribute is not _MISSING and attribute is not previous_label:
+                raise ValueError(
+                    f"Component label {label!r} conflicts with an attribute "
+                    f"already present on composite component {name!r}."
+                )
+
+        component_labels = {}
+        for label, component_slice in pop._labels.items():
+            previous_label = previous.get(label)
+            unchanged = (
+                previous_label is not None
+                and previous_sources.get(label) is component_slice
+                and registry.get(label) is previous_label
+                and namespace.get(label) is previous_label
+            )
+            if unchanged:
+                component_labels[label] = previous_label
+                continue
+
+            # Project replicated batch coordinates to one exact ordered core
+            # sequence, then address the flattened component axis behind every
+            # composite batch axis.
+            core_flat = _component_label_core_indices(pop, component_slice)
+            component_labels[label] = population_slice[..., core_flat]
+
+        current = set(pop._labels)
+        for label, previous_label in previous.items():
+            if label in current:
+                continue
+            if registry.get(label) is previous_label:
+                registry.pop(label)
+            if namespace.get(label) is previous_label:
                 object.__delattr__(population_slice, label)
 
-        nested_labels = []
-        for label, component_slice in pop._labels.items():
-            nested = population_slice[
-                :, flatten_key(pop.numel(), pop.shape, component_slice.index)
-            ]
+        for label, nested in component_labels.items():
             object.__setattr__(population_slice, label, nested)
-            nested_labels.append(nested)
+            registry[label] = nested
 
-        object.__setattr__(population_slice, "_component_label_names", current)
-        return nested_labels
+        object.__setattr__(population_slice, "_component_labels", component_labels)
+        object.__setattr__(
+            population_slice, "_component_label_sources", dict(pop._labels)
+        )
+        return list(component_labels.values())
 
     def reinject_all(self):
         """Reinject intracellular currents for all component populations."""

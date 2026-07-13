@@ -1,10 +1,18 @@
 """
-Common unit scalars used throughout Dendra.
+Scalar unit conversions for Dendra's public numerical conventions.
 
-These variables define dimensionful scale factors so that parameters can be
-expressed in convenient physical units while the underlying code operates in
-normalized internal units. For example, times are expressed in milliseconds,
-voltages in millivolts, and lengths in micrometers.
+These names are ordinary :class:`float` conversion factors, not unit-carrying
+quantities. Multiply a value by one of them to express it in the base unit
+documented by the receiving API. For example, model time is expressed in
+milliseconds, voltage in millivolts, absolute injected current in milliamperes,
+and morphology length in micrometers.
+
+Do not construct compound units by algebraically combining these scalars. A
+distributed mechanism conductance, for example, is already entered as a number
+in ``S/cm²``; it is not written as ``value * S / cm**2``. Point-process method
+bodies use a separate local convention (current in nA and conductance in µS),
+described in :class:`dendra.models.mechanisms.PointProcess` and in the units
+guide.
 
 Attributes
 ----------
@@ -20,10 +28,13 @@ hours : float
 mV : float
     Millivolt voltage unit (base unit for voltage in Dendra).
 V : float
-    Volt (``1e-3 * mV``).
+    Volt (``1e3 * mV``).
 
 mA : float
-    Milliampere current unit (base unit for current in Dendra).
+    Milliampere conversion for APIs that accept absolute current, including
+    intracellular stimulation and public ``i_membrane`` values. Distributed
+    mechanism currents instead use mA/cm²; point-process method bodies use a
+    local bare-nA coordinate.
 A : float
     Ampere (``1e3 * mA``).
 uA : float
@@ -83,12 +94,13 @@ GHz : float
 
 Examples
 --------
-Use these units when specifying model parameters:
+Use these conversions with APIs whose documented base units match them:
 
 >>> from dendra import units as U
 >>> length = 100 * U.um
 >>> dt = 0.025 * U.ms
 >>> holding_potential = -65 * U.mV
+>>> injected_current = 2 * U.nA  # converted to Dendra's absolute-current unit, mA
 """
 
 # time
@@ -99,7 +111,7 @@ hours = 60.0 * minutes
 
 # voltage
 mV = 1.0
-V = 1.0e-3 * mV
+V = 1.0e3 * mV
 
 # current
 mA = 1.0

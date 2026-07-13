@@ -918,9 +918,11 @@ class ExchangeProcess(MaterialProcess):
             ``conductance`` is also omitted, defaults to the process parameter
             name ``"rate"``.
         conductance
-            Direct exchange conductance in material-volume units per ms.  This
-            is useful when the coupling itself is a geometric/permeability term.
-            Specify either ``rate`` or ``conductance``, not both.
+            Direct exchange conductance in the chosen geometry/mass-weight
+            units per ms (for example µm³/ms for volumetric fields or µm²/ms
+            for membrane-domain fields). This is useful when the coupling
+            itself is a geometric/permeability term. Specify either ``rate``
+            or ``conductance``, not both.
         volume_a, volume_b
             Optional mass/volume weights.  May be scalars, tensors, parameter
             names, or domain names such as ``"intracellular"``.  If omitted,

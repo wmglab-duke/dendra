@@ -218,15 +218,17 @@ def _canonical_material_phase(phase) -> str:
 
 
 def make_scaler(mech, area):
-    """
-    A factory that returns a scaler function.
+    """Return the mechanism-to-density conversion function.
 
-    The behavior of the scaler depends on the type of 'mech'.
-    - For Mechanism: It's an identity function (returns inputs unchanged).
-    - For PointProcess: It scales inputs by a factor derived from the area.
+    Ordinary ``Mechanism`` values already use current density in mA/cm² and
+    conductance density in S/cm², so their scaler is the identity. A
+    ``PointProcess`` instead supplies lumped current in nA and conductance in
+    µS. Dividing either by ``1e6 * area_cm2`` converts it to the corresponding
+    mA/cm² or S/cm² density. Zero-area locations are invalid for point
+    processes.
 
-    The returned scaler intelligently returns a single value for a single
-    input, or a tuple for multiple inputs.
+    The returned function yields one value for one input and a tuple for
+    multiple inputs.
     """
     if isinstance(mech, PointProcess):
         # Calculate the scaling factor once. This is a closure.

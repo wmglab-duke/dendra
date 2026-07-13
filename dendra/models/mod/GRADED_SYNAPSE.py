@@ -77,7 +77,7 @@ Example 1: explicit presynaptic gate state
 
     import dendra as dn
     from dendra.models.networks import Network
-    from dendra.models.mod.graded_syn import graded_release_gate, graded_syn
+    from dendra.models.mod import graded_release_gate, graded_syn
 
     pre = dn.Population(N=10, C=1, v_init=-60.0)
     post = dn.Population(N=10, C=1, v_init=-65.0)
@@ -115,7 +115,7 @@ Example 2: instantaneous voltage-to-release transform
 
 .. code-block:: python
 
-    from dendra.models.mod.graded_syn import graded_syn, sigmoid_release
+    from dendra.models.mod import graded_syn, sigmoid_release
 
     post.insert(graded_syn, e=0.0)
 
@@ -134,10 +134,12 @@ Notes on units
 --------------
 ``graded_syn`` is a density-style ``ContinuousSynapse`` mechanism, not a
 ``PointProcess``.  That means its current is interpreted in the same density
-convention as ordinary Dendra mechanisms.  The connection ``weight`` should
-therefore have the units/convention of conductance used by the target model.
+convention as ordinary Dendra mechanisms: current in mA/cm² and conductance in
+S/cm². With the dimensionless release gate ``s`` used in these examples, the
+connection ``weight`` and resulting ``g_pre`` are conductance densities in
+S/cm², while ``g_scale`` is dimensionless.
 
-For lumped nA/uS point-process semantics, define a separate class that combines
+For lumped nA/µS point-process semantics, define a separate class that combines
 Dendra's ``PointProcess`` with ``ContinuousSynapse``.
 """
 
@@ -163,6 +165,8 @@ class sigmoid_release(torch.nn.Module):
 
     Notes
     -----
+    Input voltage is in mV and the returned release gate is dimensionless.
+
     This transform is intended for use with ``Network.connect_continuous``:
 
     .. code-block:: python
@@ -249,7 +253,7 @@ class graded_release_gate(M):
     Parameters
     ----------
     theta : float, default -20.0
-        Presynaptic voltage at which release activation ``T(V)`` is 0.5.
+        Presynaptic voltage in mV at which release activation ``T(V)`` is 0.5.
     sigma : float, default 2.0
         Sigmoid slope factor in mV. Positive values make the gate activate with
         depolarization.
@@ -275,17 +279,17 @@ class graded_release_gate(M):
          - Description
        * - ``s``
          - ``torch.Tensor``
-         - Continuous release / gating variable in ``[0, 1]``. Use this as the
-           ``pre_var`` for :class:`graded_syn`.
+         - Dimensionless continuous release / gating variable in ``[0, 1]``.
+           Use this as the ``pre_var`` for :class:`graded_syn`.
        * - ``T``
          - ``torch.Tensor``
-         - Instantaneous voltage-dependent release activation.
+         - Dimensionless instantaneous voltage-dependent release activation.
        * - ``sinf``
          - ``torch.Tensor``
-         - Steady-state value of the release gate.
+         - Dimensionless steady-state value of the release gate.
        * - ``tau``
          - ``torch.Tensor``
-         - Voltage-dependent release-gate time constant.
+         - Voltage-dependent release-gate time constant in ms.
 
     Examples
     --------
@@ -325,15 +329,18 @@ class graded_syn(CS):
         Reversal potential in mV. Use ``e=0`` for a typical excitatory graded
         synapse, or ``e=-80`` for a typical inhibitory graded synapse.
     g_scale : float, default 1.0
-        Optional multiplicative scale applied after continuous projection
+        Optional dimensionless scale applied after continuous projection
         delivery. Usually leave this at 1 and use the connection ``weight`` as
-        the synaptic conductance scale.
+        the synaptic conductance-density scale.
 
     Notes
     -----
     ``graded_syn`` declares a continuous input buffer named ``g_pre``. The
     network resets this buffer once per timestep and then sums weighted
     presynaptic analog gates into it through ``Network.connect_continuous``.
+    When the presynaptic value is the dimensionless release gate ``s``, the
+    connection weight and ``g_pre`` are in S/cm². ``i(v)`` returns
+    outward-positive current density in mA/cm².
 
     .. rubric:: Continuous inputs
 
@@ -346,7 +353,9 @@ class graded_syn(CS):
          - Description
        * - ``g_pre``
          - ``torch.Tensor``
-         - Weighted, summed presynaptic gate delivered by ``ContinuousCon``.
+         - Weighted, summed presynaptic conductance-density drive delivered by
+           ``ContinuousCon``; in S/cm² for the documented dimensionless-gate
+           examples.
        * - ``g_pre_old``
          - ``torch.Tensor``
          - Previous-step value retained by

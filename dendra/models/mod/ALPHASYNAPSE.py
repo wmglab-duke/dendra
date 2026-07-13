@@ -20,6 +20,13 @@ class alphasynapse(M):
         The maximum conductance (in µS) of the synapse. Default is 0.0 µS.
     e : float
         The reversal potential (in mV) of the synapse. Default is 0.0 mV.
+
+    Notes
+    -----
+    This is a :class:`~dendra.models.mechanisms.PointProcess`: ``gmax`` and
+    ``g`` are numerical values in µS, while ``i(v)`` returns lumped,
+    outward-positive current in nA. Dendra converts the current to mA/cm² using
+    target compartment area during current assembly.
     """
 
     M.RANGE(onset=0.0, tau=0.1, gmax=0.0, e=0.0)

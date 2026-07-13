@@ -30,6 +30,19 @@ class Line(P):
         ``"semi_infinite"`` applies the usual factor-of-two image-source
         scaling via a ``2π`` denominator. This is only an amplitude scaling; it
         is not a full boundary-aware half-space model.
+
+    Notes
+    -----
+    The source is normalized by the *total* polyline arc length. Its return
+    value is therefore the lead field for 1 mA of total current distributed
+    uniformly over the whole polyline, not the field for 1 mA per segment or
+    per unit length. The lead field has units of Ω and is represented
+    numerically as mV/mA because ``Ω * mA = mV``. Pair it with a temporal
+    waveform in mA to obtain an extracellular potential in mV.
+
+    Splitting a straight line into more collinear segments does not change
+    this normalization. Adding geometric length does redistribute the fixed
+    total current over the longer complete polyline.
     """
 
     P.PARAMETER(rhoe=300.0, min_distance=0.0)
@@ -99,6 +112,11 @@ class Line(P):
         return phi.reshape(original_shape)
 
     def forward(self, model):
+        """Evaluate the 1 mA-total-current lead field at model coordinates.
+
+        ``model.x``, ``model.y``, and ``model.z`` are interpreted in µm. The
+        returned tensor is numerically in mV/mA.
+        """
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
         return self.fn(x, y, z)

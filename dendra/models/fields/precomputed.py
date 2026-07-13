@@ -24,11 +24,13 @@ class PreComputedInterpolate1D(torch.nn.Module):
     Parameters
     ----------
     data : torch.Tensor
-        2D tensor of shape (D, N) containing the precomputed field values (mV).
+        2D tensor of shape (D, N) containing the precomputed field values.  The
+        values retain the caller's normalization; see Notes.
     x : torch.Tensor
-        1D or 2D tensor of shape (N,) or (D, N) containing the x-coordinates corresponding to the data values.
-        If 1D, the same x-coordinates are used for all D rows. If 2D, each row can have different x-coordinates, (i.e.,
-        can be sampled at different locations along x).
+        1D or 2D tensor of shape (N,) or (D, N) containing the x-coordinates
+        in μm corresponding to the data values.  If 1D, the same x-coordinates
+        are used for all D rows. If 2D, each row can have different
+        x-coordinates (i.e., can be sampled at different locations along x).
     outside : str, optional
         Behavior for points outside the interpolation range. Options are "zero" or "point_source".
         If "point_source", the interpolation uses a point-source model outside the (optionally
@@ -50,6 +52,11 @@ class PreComputedInterpolate1D(torch.nn.Module):
     - The `outside` parameter determines how values outside the interpolation range are handled.
       If set to "point_source", a point-source extrapolation is applied based on the peak
       and boundary values of each row.
+    - Interpolation preserves the units and reference-amplitude normalization of
+      ``data``.  For extracellular stimulation, ``data`` may be an absolute
+      potential in mV paired with a dimensionless waveform, or a lead field in
+      mV per input unit paired with a waveform in that unit.  The final product
+      supplied through ``extra`` must be in mV.
     """
 
     def __init__(
@@ -283,7 +290,9 @@ class PreComputedInterpolate1D(torch.nn.Module):
         Returns
         -------
         PreComputedInterpolate1D
-            An instance of PreComputedInterpolate1D initialized with the precomputed data.
+            An instance initialized with the precomputed data converted from V
+            to mV.  This conversion preserves the ASCENT dataset's original
+            reference-amplitude normalization.
         """
         data = glob.glob(
             f"{ascent_dir}/samples/{sample}/models/{model}/sims/{sim}/fibersets_bases/0/{contact}/*.dat"
@@ -594,7 +603,9 @@ class PreComputedInterpolate3DRect(torch.nn.Module):
     z : torch.Tensor
         1D tensor of z-coordinates of the grid points (in μm).
     field : torch.Tensor
-        4D tensor of shape (Nx, Ny, Nz, ...) containing the field values at the grid points (mV).
+        Tensor of shape (Nx, Ny, Nz, ...) containing the field values at the
+        grid points.  Interpolation preserves the caller's units and
+        reference-amplitude normalization.
     **kwargs : additional keyword arguments for PreparedInterp3dRect.
 
     Notes
@@ -604,6 +615,8 @@ class PreComputedInterpolate3DRect(torch.nn.Module):
        field grid points/values are treated as constants (buffers).
     *  The module is differentiable w.r.t. the field values, but must be
        specified explicitly with learnable=True as a kwarg.
+    *  For extracellular stimulation, the interpolated field multiplied by its
+       temporal waveform must be in mV.
     """
 
     def __init__(self, x, y, z, field, **kwargs):
@@ -644,7 +657,9 @@ class PreComputedInterpolate3DScattered(torch.nn.Module):
     xyz : torch.Tensor
         A tensor of shape (N, 3) containing the coordinates (x, y, z) in μm.
     field : torch.Tensor
-        A tensor of shape (N, 1) containing the field values at the coordinates (mV).
+        A tensor of shape (N, 1) containing the field values at the coordinates.
+        Interpolation preserves the caller's units and reference-amplitude
+        normalization.
     **kwargs : additional keyword arguments for PreparedInterp3dScattered.
 
     Notes
@@ -654,6 +669,8 @@ class PreComputedInterpolate3DScattered(torch.nn.Module):
        sample points/values are treated as constants (buffers).
     *  The module is differentiable w.r.t. the field values, but must be
        specified explicitly with learnable=True as a kwarg.
+    *  For extracellular stimulation, the interpolated field multiplied by its
+       temporal waveform must be in mV.
     """
 
     def __init__(
@@ -757,6 +774,9 @@ class PreComputedInterpolate3DMesh(_MeshCoordinateTransformMixin, torch.nn.Modul
 
     Notes
     -----
+    * Scalar values retain the units and reference-amplitude normalization of
+      the supplied ``NodeData``.  For extracellular stimulation, the
+      interpolated field multiplied by its temporal waveform must be in mV.
     * The SimNIBS mesh point-location step remains CPU/NumPy/Cython based inside
       ``PreparedInterpolate3dFEM``; value gathering/blending runs in torch on the
       interpolator device.
@@ -864,7 +884,8 @@ class EfieldInterpolate3DRect(torch.nn.Module):
     z : torch.Tensor
         1D tensor of z-coordinates of the grid points (in μm).
     efield : torch.Tensor
-        4D tensor of shape (Nx, Ny, Nz, 3) containing the electric field vectors at the grid points.
+        4D tensor of shape (Nx, Ny, Nz, 3) containing the electric-field
+        vectors at the grid points in V/m.
     **kwargs : additional keyword arguments for PreparedInterp3dRect.
 
     Notes
@@ -874,6 +895,8 @@ class EfieldInterpolate3DRect(torch.nn.Module):
        E-field grid points/values are treated as constants (buffers).
     *  The module is differentiable w.r.t. the efield values, but must be
        specified explicitly with learnable=True as a kwarg.
+    *  Calling the module integrates the interpolated E-field along the model
+       morphology and returns quasipotentials in mV.
     """
 
     def __init__(self, x, y, z, efield, **kwargs):
@@ -902,7 +925,8 @@ class EfieldInterpolate3DScattered(torch.nn.Module):
     xyz : torch.Tensor
         A tensor of shape (N, 3) containing the coordinates (x, y, z) in μm.
     efield : torch.Tensor
-        A tensor of shape (N, 3) containing the electric field vectors at the coordinates.
+        A tensor of shape (N, 3) containing the electric-field vectors at the
+        coordinates in V/m.
     **kwargs : additional keyword arguments for PreparedInterp3dScattered.
 
     Notes
@@ -912,6 +936,8 @@ class EfieldInterpolate3DScattered(torch.nn.Module):
        sample points/values are treated as constants (buffers).
     *  The module is differentiable w.r.t. the efield values, but must be
        specified explicitly with learnable=True as a kwarg.
+    *  Calling the module integrates the interpolated E-field along the model
+       morphology and returns quasipotentials in mV.
     """
 
     def __init__(
@@ -969,6 +995,9 @@ class EfieldInterpolate3DMesh(_MeshCoordinateTransformMixin, torch.nn.Module):
 
     Notes
     -----
+    The supplied ``ElementData`` values must be electric-field vectors in V/m;
+    calling the module returns quasipotentials in mV.
+
     The default ``from_ElementData(..., method='linear', continuous=False)`` path
     reproduces SimNIBS' tag-wise element-to-node recovery followed by barycentric
     interpolation, which is the appropriate high-quality interpolation path for
