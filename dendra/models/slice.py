@@ -1322,12 +1322,45 @@ class Slice:
         if self.is_empty:
             return  # no-op for empty slices
         model = self.model
+        root = object.__getattribute__(self, "root_model")
+        mechanism_name = None
+        handler = getattr(root, "mech", None)
+        mechanisms = getattr(handler, "mechanisms", {})
+        for candidate_name, candidate in mechanisms.items():
+            if candidate is model:
+                mechanism_name = candidate_name
+                break
+
+        persistent_region = None
+        if mechanism_name is not None and hasattr(
+            root, "_register_slice_mechanism_parametrization"
+        ):
+            core_shape = tuple(root.core_shape())
+            core_spec = self._core_index_spec()
+            core_grid = torch.arange(
+                math.prod(core_shape), device=root.device(), dtype=torch.long
+            ).reshape(core_shape)
+            persistent_region = (
+                core_grid[core_spec.index].reshape(-1),
+                core_shape,
+            )
+
         model.parametrize(
             name,
             value,
             key=self._parameter_key(model, name),
             alias=alias,
         )
+        if persistent_region is not None:
+            core_indices, core_shape = persistent_region
+            root._register_slice_mechanism_parametrization(
+                mechanism_name,
+                name,
+                value,
+                core_indices,
+                core_shape,
+                alias,
+            )
 
     def label(self, name: str, *, replace: bool = False):
         """

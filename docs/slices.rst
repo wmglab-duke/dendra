@@ -286,7 +286,9 @@ The following operations record the Slice's logical locations:
    Register a spatial parameter override for the selected locations.  This is
    distinct from changing current mutable state with ``set``.  Batch replicas
    share a core-region parameterization unless the parameter itself explicitly
-   defines batch-varying values.
+   defines batch-varying values.  Mechanism parameter overrides are structural
+   configuration and are replayed when a forced rebuild replaces the compiled
+   mechanism instance.
 
 ``selection.slots(synapse, ...)``
    Select mechanism-local point-process slots supported by the physical Slice.

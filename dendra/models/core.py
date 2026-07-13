@@ -68,7 +68,7 @@ from dendra.models.stim.intra import Intra
 from dendra.models.stim.waveform import Waveform
 from dendra.units import mm
 
-from .slice import Sliceable
+from .slice import Slice, Sliceable, parse_key
 
 TensorLike = Union[torch.Tensor, "np.ndarray"]  # torch or numpy are supported
 
@@ -474,6 +474,11 @@ class Population(P, Sliceable):
 
         self._mech_data = {}
         self._mech_everywhere = {}
+        # Slice-scoped overrides applied to a compiled mechanism must remain
+        # structural configuration rather than state owned only by that
+        # disposable compiled instance.  Records use population-core indices
+        # so they can be replayed after batching and forced rebuilds.
+        self._slice_mechanism_parametrizations = []
 
         self._m_list = []
         self._m_name = []
@@ -2743,6 +2748,74 @@ class Population(P, Sliceable):
             )
         )
 
+    def _register_slice_mechanism_parametrization(
+        self,
+        mechanism_name,
+        name,
+        value,
+        core_indices,
+        core_shape,
+        alias,
+    ):
+        """Persist a compiled-mechanism Slice override across rebuilds."""
+        self._slice_mechanism_parametrizations.append(
+            {
+                "mechanism_name": str(mechanism_name),
+                "name": str(name),
+                "value": value,
+                "core_indices": torch.as_tensor(
+                    core_indices, dtype=torch.long, device="cpu"
+                )
+                .reshape(-1)
+                .clone(),
+                "core_shape": tuple(int(size) for size in core_shape),
+                "alias": alias,
+            }
+        )
+
+    def _apply_slice_mechanism_parametrizations(self):
+        """Replay persistent Slice overrides on the current mechanism tree."""
+        if not self._slice_mechanism_parametrizations:
+            return
+
+        core_shape = tuple(self.core_shape())
+        mechanisms = self.mech.mechanisms
+        for record in self._slice_mechanism_parametrizations:
+            recorded_shape = tuple(record["core_shape"])
+            if recorded_shape != core_shape:
+                raise RuntimeError(
+                    "A Slice-scoped mechanism parametrization was created for "
+                    f"population core shape {recorded_shape}, but the current "
+                    f"core shape is {core_shape}. Recreate the parametrization "
+                    "after changing model topology."
+                )
+
+            mechanism_name = record["mechanism_name"]
+            if mechanism_name not in mechanisms:
+                raise RuntimeError(
+                    "Cannot restore Slice-scoped parametrization for missing "
+                    f"mechanism {mechanism_name!r}."
+                )
+
+            core_indices = record["core_indices"].to(device=self.device())
+            core_key = torch.unravel_index(core_indices, core_shape)
+            spec = parse_key(core_key, core_shape, device=self.device())
+            mechanism = mechanisms[mechanism_name]
+            mechanism_slice = Slice(
+                mechanism,
+                spec,
+                base_shape=core_shape,
+                root_model=self,
+                module_path=("mech", "mechanisms", mechanism_name),
+            )
+            key = mechanism_slice._parameter_key(mechanism, record["name"])
+            mechanism.parametrize(
+                record["name"],
+                record["value"],
+                key=key,
+                alias=record["alias"],
+            )
+
     def ion_style(self, ion, einit, eadvance):
         """
         Register explicit ion handling style parameters.
@@ -3251,6 +3324,7 @@ class Population(P, Sliceable):
             self.integrator.train(self.training)
             self.integrator.configure_jit(self, scope="population")
             self.mech = self.integrator.mech
+            self._apply_slice_mechanism_parametrizations()
 
         self.is_built = True
         self._flag_rebuild = False
