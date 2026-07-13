@@ -1,3 +1,19 @@
+## v0.18.0 (2026-07-13)
+
+### Feat
+
+- fractional timsteps carry over across run boundaries
+
+### Fix
+
+- **networks**: make mode transitions and checkpoints exact
+- **mechanisms**: rebind temperature state on initialization
+- **models**: preserve float64 precision during model construction
+- improve symbolic diff robustness
+- fix Exp2Syn, Mechanism.rename, and network-clock drift
+- fix extracellular stim for Tree
+- make sliding window averaging suitable for older CPU hardware
+
 ## v0.17.0 (2026-07-10)
 
 ### Feat
