@@ -805,8 +805,47 @@ class Population(P, Sliceable):
         specs : Mapping[str, MaterialFieldSpec], optional
             Fully specified field specs.  This is the most explicit form and is
             forwarded directly to :class:`Material`.
+        domain : str or Mapping[str, str], optional
+            Spatial-domain metadata applied to every field or selected per field.
+            Common aliases are ``"i"`` / ``"intracellular"``, ``"o"`` /
+            ``"extracellular"``, and ``"membrane"``.  Geometry-aware material
+            processes use this metadata to choose an appropriate volume or area.
+        units : str or Mapping[str, str], optional
+            Descriptive unit label applied to every field or selected per field,
+            for example ``{"ip3i": "mM"}``.  Dendra preserves this label in
+            :class:`MaterialFieldSpec`, but does not convert values or perform
+            dimensional analysis; mechanism and process equations must use a
+            consistent numeric convention.
+        conserved : bool or Mapping[str, bool], optional
+            Descriptive conservation intent applied to every field or selected
+            per field.  This flag is retained as field metadata; setting it does
+            not itself enforce conservation. Conservation follows from the
+            selected operation (for example finite-volume diffusion or an
+            ``ExchangeProcess``) and compatible geometry/units.
         **field_initials
             Convenience initial values, e.g. ``model.material("ip3", ip3i=0.1)``.
+
+        Notes
+        -----
+        Generic materials have no universal physical unit.  Declare ``units``
+        when a field has one, and keep all initial values, mechanism writes,
+        additive sources, and material-process parameters consistent with it.
+        Ion concentration fields are the important built-in special case: their
+        intracellular and extracellular values use mM.
+
+        Examples
+        --------
+        A concentration-like intracellular field can make all three metadata
+        declarations explicit::
+
+            model.material(
+                "ip3",
+                fields={"ip3i": 0.1},
+                min_values={"ip3i": 0.0},
+                domain={"ip3i": "intracellular"},
+                units={"ip3i": "mM"},
+                conserved={"ip3i": True},
+            )
 
         Returns
         -------
@@ -5850,7 +5889,9 @@ class Unmyelinated(Axon):
     diameters : array_like
         Diameters of the axons in μm. Can be a single value, list, or tensor.
     L : float, optional
-        Length of the axon in mm (will be converted to μm internally). Default is 1.0 mm.
+        Requested axon length in μm. Bare values are interpreted as μm; use
+        :data:`dendra.units.mm` when specifying millimetres. Default is
+        ``1.0 * mm`` (1000 μm).
     dx : float, optional
         Spatial discretization step in μm. Default is 10.0 μm.
     celsius : float, optional
@@ -5884,7 +5925,6 @@ class Unmyelinated(Axon):
         integrator=None,
         **kwargs,
     ):
-        # L = L * 1000  # mm -> um
         n_comp = L / dx
         n_comp = math.ceil(n_comp) // 2 * 2 + 1
         self.dx_: float = dx

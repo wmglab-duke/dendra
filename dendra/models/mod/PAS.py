@@ -8,9 +8,14 @@ class pas(M):
     Parameters
     ----------
     g : float
-        The leak conductance (in mS/cm^2). Default is 0.001.
+        Leak conductance density in S/cm². Default is 0.001 S/cm²
+        (equivalently 1 mS/cm²).
     e : float
         The leak reversal potential (in mV). Default is -70.0.
+
+    Notes
+    -----
+    ``i(v)`` returns outward-positive current density in mA/cm².
     """
 
     M.RANGE(g=0.001, e=-70.0)

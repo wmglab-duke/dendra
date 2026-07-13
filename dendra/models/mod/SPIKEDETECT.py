@@ -19,13 +19,16 @@ class spikedetect(M):
     Parameters
     ----------
     threshold : float
-        Voltage threshold :math:`\theta` for spike detection.
+        Voltage threshold :math:`\theta` for spike detection, in mV. Default is
+        0.0 mV.
     tau_gate : float
         Smoothness/steepness parameter :math:`\tau_g` used to construct a
         differentiable gate from the voltage. Smaller values make the transition
-        sharper (but may produce larger gradients).
+        sharper (but may produce larger gradients). This is a voltage scale in
+        mV; default is 0.5 mV.
     ste_scale : float
-        Scalar :math:`\alpha` multiplying the surrogate-gradient contribution.
+        Dimensionless scalar :math:`\alpha` multiplying the surrogate-gradient
+        contribution. Default is 1.0.
 
     Notes
     -----

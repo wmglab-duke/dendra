@@ -193,6 +193,35 @@ def test_lfp_records_membrane_current_and_validates_imem():
         LFP(weights).pre_loop_hook(model)
 
 
+def test_lfp_point_source_lead_field_contract_produces_mv():
+    model = _DummyModel(n_ax=1, nc=2)
+    rhoe_ohm_cm = 500.0
+    distance_um = torch.tensor([[100.0, 200.0]])
+    distance_cm = distance_um * 1.0e-4
+    lead_field_mv_per_ma = rhoe_ohm_cm / (4 * torch.pi * distance_cm)
+
+    # Public i_membrane is absolute transmembrane current in mA.
+    model.integrator.i_membrane.copy_(torch.tensor([[1.0, 2.0]]))
+    lfp = LFP([lead_field_mv_per_ma])
+    lfp.pre_loop_hook(model)
+
+    expected_mv = torch.sum(model.i_membrane * lead_field_mv_per_ma)
+    torch.testing.assert_close(lfp.lfp, expected_mv.reshape(1, 1))
+
+
+def test_lfp_constructor_enforces_nonempty_list_of_same_shape_tensors():
+    field = torch.ones(1, 2)
+
+    with pytest.raises(TypeError, match="non-empty list"):
+        LFP(field)
+    with pytest.raises(ValueError, match="at least one"):
+        LFP([])
+    with pytest.raises(TypeError, match="Every v_unit entry"):
+        LFP([field, [[1.0, 2.0]]])
+    with pytest.raises(ValueError, match="same shape"):
+        LFP([field, torch.ones(2, 1)])
+
+
 # ----------------------------------------------------------------------
 # 3.  APCount & Active ---------------------------------------------------
 # ----------------------------------------------------------------------

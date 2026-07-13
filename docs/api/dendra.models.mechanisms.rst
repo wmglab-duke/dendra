@@ -1,6 +1,31 @@
 dendra.models.mechanisms
 ========================
 
+Membrane-current unit contract
+------------------------------
+
+Ordinary :class:`~dendra.models.mechanisms.Mechanism` objects are distributed
+membrane mechanisms. Their current methods return outward-positive current
+density in mA/cm², and their conductance or voltage derivative is in S/cm².
+Voltage and reversal potentials are in mV. Dendra preserves these densities
+during mechanism assembly and applies compartment area in the voltage solver.
+
+:class:`~dendra.models.mechanisms.ContinuousSynapse` follows that distributed
+contract unless it also inherits
+:class:`~dendra.models.mechanisms.PointProcess`. For a continuous input driven
+by a dimensionless presynaptic gate, a conductance-density target input and its
+connection weight are in S/cm².
+
+A :class:`~dendra.models.mechanisms.PointProcess` instead returns lumped,
+outward-positive current in nA and conductance in µS. Dendra divides both by
+``1e6 * area_cm2`` to obtain the distributed mA/cm² and S/cm² values. Built-in
+``expsyn`` and ``exp2syn`` event weights are numerical values in µS:
+``weight=0.05`` means 0.05 µS and must not be multiplied by
+:data:`dendra.units.uS`.
+
+See :doc:`../units` for the full unit table, scalar-conversion rules, material
+units, and finite extracellular-model conventions.
+
 Current conductance paths
 -------------------------
 
@@ -9,6 +34,8 @@ Dendra's implicit voltage solvers require each mechanism current to be local
 current such as ``g * (v - e)``, Dendra derives the conductance exactly from the
 Python expression. A nonlinear pointwise current can instead define an exact
 ``i_with_conductance(self, v)`` method returning ``(current, conductance)``.
+For a distributed mechanism that pair is ``(mA/cm², S/cm²)``; for a point
+process it is ``(nA, µS)`` before area normalization.
 
 Dufort--Frankel requires the stronger *affine* property
 ``I(v) = g * v + b``, with ``g`` and ``b`` independent of ``v`` during that
@@ -39,9 +66,9 @@ mutation, and registered buffer/parameter mutation (including tensor view and
 storage metadata changes), while four well-spread single-coordinate
 perturbations catch demonstrable tensor coupling. The probes restore Dendra and
 PyTorch RNG streams, the probed voltage, and registered state before raising
-:class:`NumericalCurrentContractError`. Their cost is linear in the mechanism
-state and uses a fixed number of current evaluations; no full Jacobian is
-constructed.
+:class:`~dendra.models.mechanisms.NumericalCurrentContractError`. Their cost is
+linear in the mechanism state and uses a fixed number of current evaluations;
+no full Jacobian is constructed.
 
 These bounded checks can disprove an invalid declaration but cannot prove it
 for every coordinate, state, parameter value, or control-flow path. Authors
@@ -112,6 +139,10 @@ must be represented outside the local mechanism-current assembly.
 
 .. autoclass:: dendra.models.mechanisms.Synapse
    :members: net_receive
+   :show-inheritance:
+
+.. autoclass:: dendra.models.mechanisms.ContinuousSynapse
+   :members: INPUT, reset_continuous_inputs, continuous_receive
    :show-inheritance:
 
 

@@ -331,22 +331,24 @@ class sin(Waveform):
     Parameters
     ----------
     amp : float or torch.Tensor, optional
-        Amplitude. Default is 1.0.
+        Amplitude in the desired output units (for example, mA for a current
+        waveform). Default is 1.0.
     freq : float or torch.Tensor, optional
-        Frequency. Default is 1.0.
+        Frequency in kHz (equivalently, ms⁻¹). For example, use
+        ``100 * dendra.units.Hz`` for 100 Hz. Default is 1.0 kHz.
     phase : float or torch.Tensor, optional
         Phase offset in radians. Default is 0.0.
     delay : float or torch.Tensor, optional
-        Start time. Default is 0.0.
+        Start time in ms. Default is 0.0.
     off : float or torch.Tensor, optional
-        Absolute off time. Default is infinity.
+        Absolute off time in ms. Default is infinity.
     off_after : float or torch.Tensor, optional
-        Off time relative to delay. The effective off time is
+        Off time relative to delay, in ms. The effective off time is
         ``min(off, delay + off_after)``. Default is infinity.
     tau : float or torch.Tensor, optional
-        Sigmoid temperature for differentiable delay/off edges. The forward
-        pass uses a hard gate with soft straight-through gradients. Default is
-        0.01.
+        Sigmoid temperature in ms for differentiable delay/off edges. The
+        forward pass uses a hard gate with soft straight-through gradients.
+        Default is 0.01 ms.
 
     Notes
     -----
@@ -376,19 +378,20 @@ class sin(Waveform):
     --------
     >>> import torch
     >>> import dendra as dn
-    >>> t = torch.linspace(0, 1, 100)
-    >>> waveform = dn.sin(amp=2.0, freq=10.0)
+    >>> from dendra.units import Hz, ms
+    >>> t = torch.linspace(0, 100 * ms, 1000)
+    >>> waveform = dn.sin(amp=2.0, freq=10 * Hz)
     >>> values = waveform(t)  # [T]
 
     >>> waveform = dn.sin(
     ...     amp=torch.tensor([1.0, 0.5, 0.25]),
-    ...     freq=torch.tensor([5.0, 7.0, 11.0]),
+    ...     freq=torch.tensor([5.0, 7.0, 11.0]) * Hz,
     ... )
     >>> values = waveform(t)  # [T], sum of 3 components
 
     >>> waveform = dn.sin(
     ...     amp=torch.ones(4, 3),
-    ...     freq=torch.tensor([[5.0, 7.0, 11.0]]).expand(4, 3),
+    ...     freq=torch.tensor([[5.0, 7.0, 11.0]]).expand(4, 3) * Hz,
     ... )
     >>> values = waveform(t)  # [4, T], 4 batched multitone waveforms
     """
@@ -428,22 +431,24 @@ class cos(Waveform):
     Parameters
     ----------
     amp : float or torch.Tensor, optional
-        Amplitude. Default is 1.0.
+        Amplitude in the desired output units (for example, mA for a current
+        waveform). Default is 1.0.
     freq : float or torch.Tensor, optional
-        Frequency. Default is 1.0.
+        Frequency in kHz (equivalently, ms⁻¹). For example, use
+        ``100 * dendra.units.Hz`` for 100 Hz. Default is 1.0 kHz.
     phase : float or torch.Tensor, optional
         Phase offset in radians. Default is 0.0.
     delay : float or torch.Tensor, optional
-        Start time. Default is 0.0.
+        Start time in ms. Default is 0.0.
     off : float or torch.Tensor, optional
-        Absolute off time. Default is infinity.
+        Absolute off time in ms. Default is infinity.
     off_after : float or torch.Tensor, optional
-        Off time relative to delay. The effective off time is
+        Off time relative to delay, in ms. The effective off time is
         ``min(off, delay + off_after)``. Default is infinity.
     tau : float or torch.Tensor, optional
-        Sigmoid temperature for differentiable delay/off edges. The forward
-        pass uses a hard gate with soft straight-through gradients. Default is
-        0.01.
+        Sigmoid temperature in ms for differentiable delay/off edges. The
+        forward pass uses a hard gate with soft straight-through gradients.
+        Default is 0.01 ms.
 
     Notes
     -----
@@ -473,19 +478,20 @@ class cos(Waveform):
     --------
     >>> import torch
     >>> import dendra as dn
-    >>> t = torch.linspace(0, 1, 100)
-    >>> waveform = dn.cos(amp=2.0, freq=10.0)
+    >>> from dendra.units import Hz, ms
+    >>> t = torch.linspace(0, 100 * ms, 1000)
+    >>> waveform = dn.cos(amp=2.0, freq=10 * Hz)
     >>> values = waveform(t)  # [T]
 
     >>> waveform = dn.cos(
     ...     amp=torch.tensor([1.0, 0.5, 0.25]),
-    ...     freq=torch.tensor([5.0, 7.0, 11.0]),
+    ...     freq=torch.tensor([5.0, 7.0, 11.0]) * Hz,
     ... )
     >>> values = waveform(t)  # [T], sum of 3 components
 
     >>> waveform = dn.cos(
     ...     amp=torch.ones(4, 3),
-    ...     freq=torch.tensor([[5.0, 7.0, 11.0]]).expand(4, 3),
+    ...     freq=torch.tensor([[5.0, 7.0, 11.0]]).expand(4, 3) * Hz,
     ... )
     >>> values = waveform(t)  # [4, T], 4 batched multitone waveforms
     """

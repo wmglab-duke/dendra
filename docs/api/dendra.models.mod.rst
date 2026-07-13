@@ -1,7 +1,13 @@
 dendra.models.mod
 =================
 
-In-built mechanisms.
+Built-in mechanisms. Distributed ``hh`` and ``pas`` use conductance density in
+S/cm² and return current density in mA/cm². Point-process ``alphasynapse``,
+``alphasynapse_d``, ``expsyn``, and ``exp2syn`` use conductance in µS and return
+lumped current in nA before Dendra's area normalization. For the event-driven
+point processes, a bare connection ``weight=0.05`` means 0.05 µS; do not
+multiply it by ``dendra.units.uS``. See :doc:`../units` for the complete
+contract.
 
 .. autoclass:: dendra.models.mod.alphasynapse
 .. autoclass:: dendra.models.mod.alphasynapse_d

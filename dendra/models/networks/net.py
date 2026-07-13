@@ -2043,6 +2043,12 @@ class Network(RNGMixin):
         Slot targets are supported in the same way as for event-based
         connections: a ``SynapseSlots`` target is already in synapse-local
         coordinates and avoids ambiguous colocated slots.
+
+        ``delay`` is in ms. The product of ``weight`` and the optionally
+        transformed ``pre_var`` must have the unit expected by the receiving
+        ``input`` buffer; there is no universal continuous-connection weight
+        unit. For the built-in density-style ``graded_syn`` driven by its
+        dimensionless release gate, ``weight`` and ``g_pre`` are in S/cm².
         """
         valid_reductions = {"sum", "add", "set", "replace", "last", "min", "max"}
         if reduce not in valid_reductions:
@@ -2196,6 +2202,13 @@ class Network(RNGMixin):
         ``network.synapse_slots(...)``. Slot targets remove the ambiguity that
         arises when a banked point-process mechanism has several local slots on
         one physical compartment.
+
+        ``delay`` is in ms. ``threshold`` uses the coordinate of ``pre_var``
+        (mV for the default membrane-voltage source); use ``None`` when the
+        source already provides discrete events. ``weight`` is target-defined.
+        Built-in point-process ``expsyn`` and ``exp2syn`` targets expect a bare
+        numerical value in µS, so ``weight=0.05`` means 0.05 µS and must not be
+        multiplied by :data:`dendra.units.uS`.
         """
         if isinstance(target, SynapseSlots):
             return self.connect_to_slots(
@@ -2320,7 +2333,8 @@ class Network(RNGMixin):
 
         ``target`` may be a ``SynapseSlots`` object, or a population/slice plus
         ``synapse`` and ``slots``/``local_index``.  This is the public API for
-        banked point processes with multiple colocated local slots.
+        banked point processes with multiple colocated local slots. Threshold,
+        weight, and delay follow :meth:`connect`'s unit contract.
         """
         if local_index is not None:
             if slots is not None:
@@ -2428,7 +2442,10 @@ class Network(RNGMixin):
         allow_autapses=False,
         allow_multapses=False,
     ):
-        """Connect source elements one-to-one with explicit target slots."""
+        """Connect source elements one-to-one with explicit target slots.
+
+        Threshold, weight, and delay follow :meth:`connect`'s unit contract.
+        """
         return self.connect_to_slots(
             source,
             target,
@@ -2462,7 +2479,8 @@ class Network(RNGMixin):
         This is a backward-compatible wrapper around ``connect(...,
         conn_spec={"rule": "one_to_one"})``. Unlike the general NEST-style
         ``connect`` entry point, the legacy wrapper keeps autapses disabled by
-        default.
+        default. Threshold, weight, and delay follow :meth:`connect`'s unit
+        contract.
         """
         return self.connect(
             source,
@@ -2494,7 +2512,8 @@ class Network(RNGMixin):
         Connect source to target densely, i.e. all-to-all between selections.
 
         Backward-compatible wrapper around ``connect(...,
-        conn_spec={"rule": "all_to_all"})``.
+        conn_spec={"rule": "all_to_all"})``. Threshold, weight, and delay
+        follow :meth:`connect`'s unit contract.
         """
         return self.connect(
             source,
@@ -2532,7 +2551,8 @@ class Network(RNGMixin):
         ``prob`` as the pairwise connection probability. ``strategy='poisson'``
         or ``'pairwise_poisson'`` maps to NEST ``pairwise_poisson`` and uses
         ``prob`` as ``pairwise_avg_num_conns``; for that rule,
-        ``allow_multapses`` must be ``True``.
+        ``allow_multapses`` must be ``True``. Threshold, weight, and delay
+        follow :meth:`connect`'s unit contract.
         """
         strategy = str(strategy).replace("-", "_")
         if strategy in ("bernoulli", "pairwise_bernoulli"):
@@ -2582,6 +2602,7 @@ class Network(RNGMixin):
         This maps to NEST ``fixed_total_number``. With
         ``allow_multapses=True``, pairs are drawn with replacement. With
         ``allow_multapses=False`` the sampled source-target pairs are unique.
+        Threshold, weight, and delay follow :meth:`connect`'s unit contract.
         """
         return self.connect(
             source,

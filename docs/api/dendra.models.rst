@@ -31,7 +31,7 @@ Finite two-layer extracellular models
 
 ``ExtCellAxon`` and ``ExtCellTree`` solve two finite extracellular circuit
 layers using NEURON's ``extracellular`` conventions. ``xraxial`` is in
-MOhm/cm, ``xc`` is in uF/cm2, and ``xg`` is in S/cm2. The ``extra``/``ve``
+MΩ/cm, ``xc`` is in µF/cm², and ``xg`` is in S/cm². The ``extra``/``ve``
 input is the bath battery outside the outermost layer (NEURON's
 ``e_extracellular``), not the first solved extracellular node.
 

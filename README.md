@@ -13,6 +13,9 @@ Fast, scalable, versatile, and differentiable neural simulator with support for 
 
 ## Documentation
 Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](https://mah148.pages.oit.duke.edu/dendra).
+See the [unit conventions](https://mah148.pages.oit.duke.edu/dendra/units.html)
+for the distinct distributed-mechanism, point-process, stimulation, and material
+contracts.
 
 ## Requirements
 

@@ -29,7 +29,7 @@ net.connect_one_to_one(
     net.hh[0, :],
     net.hh[0, torch.roll(torch.arange(N), -1)],
     net.hh.mech.NMDA,
-    weight=1.0,
+    weight=1.0,  # bare µS coordinate for exp2syn
     delay=5.0 * ms,
 )
 

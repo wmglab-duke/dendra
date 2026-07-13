@@ -27,15 +27,16 @@ Getting started
 
    import dendra as dn
    from dendra_models.models import smolMRG
+   from dendra.units import kHz, mA, ms, um
 
    # single 2.0 µm MRG model with extracellular stimulation
-   model = smolMRG([2.0], n_node=201)
+   model = smolMRG([2.0 * um], n_node=201)
 
-   # point source extracellular kHz stimulation
-   ve_s = dn.isotropic_point(z=200.0)(model)
+   # Analytic point-source field in mV/mA, 200 µm from the axon.
+   ve_s = dn.isotropic_point(z=200.0 * um)(model)
 
-   dt, tstop = 0.001, 100
-   f, amp = 5, 0.5
+   dt, tstop = 0.001 * ms, 100 * ms
+   f, amp = 5 * kHz, 0.5 * mA
    i_t = dn.sin(amp=amp, freq=f)
 
    # run simulation
@@ -111,6 +112,7 @@ If you use `Dendra`, consider citing the `corresponding paper <https://www.natur
    :caption: Getting started
 
    installation
+   units
 
 .. toctree::
    :hidden:
@@ -125,7 +127,6 @@ If you use `Dendra`, consider citing the `corresponding paper <https://www.natur
    :maxdepth: 1
    :caption: Miscellaneous
 
-   units
    misc
 
 .. toctree::
@@ -133,6 +134,7 @@ If you use `Dendra`, consider citing the `corresponding paper <https://www.natur
    :maxdepth: 2
    :caption: Resources
 
+   mechanisms
    slices
    dendra
    license

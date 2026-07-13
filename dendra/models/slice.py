@@ -475,7 +475,11 @@ class Slice:
 
         # Later, possibly in a different module:
         pop.soma.inject(step_current)
-        pop.dendrites.set("g_pas", torch.full(pop.dendrites.shape, 1e-4))
+        pop.dendrites.set(
+            "g",
+            torch.full(pop.dendrites.shape, 1e-4),  # S/cm²
+            mechanism="pas",
+        )
 
     Labels are also stored in ``population._labels`` (a simple ``dict``),
     allowing programmatic access via ``population._labels["soma"]``.
@@ -1270,7 +1274,7 @@ class Slice:
             soma.insert(NaTs2t, alias="Na_soma")
 
             # Insert a passive mechanism only in dendrites
-            pop[:, 1:].insert(pas, alias="pas_dend", g=1e-4)
+            pop[:, 1:].insert(pas, alias="pas_dend", g=1e-4)  # S/cm²
         """
         if self.is_empty:
             return  # no-op for empty slices
@@ -1317,6 +1321,7 @@ class Slice:
             pop[:, 0].parametrize("rhoa", 150.0)
 
             # Override a mechanism parameter in dendrites
+            # Passive conductance density is expressed in S/cm².
             pop[:, 1:].mech.pas.parametrize("g", 1e-4, alias="dend")
         """
         if self.is_empty:
@@ -1397,7 +1402,11 @@ class Slice:
 
             # Later, reuse the labels
             pop.soma.inject(step_current)
-            pop.dendrites.set("g_pas", torch.full(pop.dendrites.shape, 1e-4))
+            pop.dendrites.set(
+                "g",
+                torch.full(pop.dendrites.shape, 1e-4),  # S/cm²
+                mechanism="pas",
+            )
 
         Labels on nested slices attach to the outer slice:
 

@@ -1,9 +1,9 @@
 """Extended extracellular coupling models.
 
 The two supported extracellular layers follow NEURON's ``extracellular``
-mechanism convention. ``xraxial`` is longitudinal resistance in MOhm/cm,
-``xc`` is radial capacitance density in uF/cm2, and ``xg`` is radial
-conductance density in S/cm2.  A prescribed ``extra``/``ve`` value is the bath
+mechanism convention. ``xraxial`` is longitudinal resistance in MΩ/cm,
+``xc`` is radial capacitance density in µF/cm², and ``xg`` is radial
+conductance density in S/cm². A prescribed ``extra``/``ve`` value is the bath
 battery ``e_extracellular`` in mV outside the outermost modeled layer.
 
 The block solvers store absolute circuit-node potentials as

@@ -3999,8 +3999,10 @@ class NetCon(Referency):
             scheduling, and interpreted as continuous values when
             ``diff_scheduled_times=True``.
         weight : float or torch.Tensor, optional
-            Scalar or per-event weight *multiplier* applied on top of the base
-            connection weights returned by ``self.weight()``. Accepted shapes:
+            Dimensionless scalar or per-event weight *multiplier* applied on
+            top of the base connection weights returned by ``self.weight()``.
+            It is not another value in the target synapse's weight unit.
+            Accepted shapes:
 
             * scalar (single value): broadcast to all scheduled events;
             * tensor of length ``E_before`` (events before past-event filtering):
@@ -4108,7 +4110,9 @@ class NetCon(Referency):
         Parameters
         ----------
         source : torch.Tensor
-            Tensor containing candidate weights for scheduled events. It must:
+            Tensor containing candidate dimensionless multipliers for scheduled
+            events. Each value multiplies the target-unit base connection
+            weight; it is not itself another target-unit weight. It must:
 
             * reside on the same device as the synapse (``self.device``), and
             * have a size at least as large as any ``weight_idx`` used in
@@ -4343,10 +4347,10 @@ class NetCon(Referency):
             Must match the number of events after expanding ``pre_indices`` if
             used.
         weight : float or torch.Tensor, optional
-            Value-mode weight multiplier, as in :meth:`schedule`. May be a
-            scalar or a per-event tensor of length equal to the number of
-            scheduled events. Gradients can flow into this tensor when
-            differentiable scheduling is enabled.
+            Dimensionless value-mode weight multiplier, as in
+            :meth:`schedule`. May be a scalar or a per-event tensor of length
+            equal to the number of scheduled events. Gradients can flow into
+            this tensor when differentiable scheduling is enabled.
         allow_past : bool, optional
             If False (default), events whose current time (from the bound
             source) would be in the past relative to ``global_step`` are

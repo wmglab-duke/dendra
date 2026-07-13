@@ -34,6 +34,13 @@ class alphasynapse_d(M):
         Width of the smooth non-negative approximation in dimensionless alpha
         time units. Smaller values more closely approximate ``max(x, 0)``.
         Default is 1e-6.
+
+    Notes
+    -----
+    This is a :class:`~dendra.models.mechanisms.PointProcess`: ``gmax`` and
+    ``g`` are numerical values in µS, while ``i(v)`` returns lumped,
+    outward-positive current in nA. Dendra converts the current to mA/cm² using
+    target compartment area during current assembly.
     """
 
     M.RANGE(onset=0.0, tau=0.1, gmax=0.0, e=0.0, smooth_eps=1.0e-6)

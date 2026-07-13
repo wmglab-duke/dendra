@@ -249,6 +249,19 @@ class Mechanism(Parameterized):
 
     Notes
     -----
+    An ordinary ``Mechanism`` is a distributed membrane mechanism. Its voltage
+    and reversal potentials are in mV, each declared current method returns
+    outward-positive current density in mA/cm², and the corresponding voltage
+    derivative/conductance is in S/cm². Thus a density-style Ohmic current is
+    written directly as ``g * (v - e)`` because
+    ``S/cm² * mV = mA/cm²``. Dendra keeps these values as densities during
+    mechanism assembly and applies compartment area in the voltage solver.
+
+    Inherit from :class:`PointProcess` when a mechanism instead returns a
+    lumped current in nA and uses conductance in µS. The conversion factors in
+    :mod:`dendra.units` are plain scalars for documented public base units; do
+    not form density units with expressions such as ``S / cm**2``.
+
     Subclasses declare state, mechanism-buffer, and ionic variables using the
     :meth:`STATE`, :meth:`BUFFER`, :meth:`SAVE`, :meth:`USEION`, and
     :meth:`NONSPECIFIC_CURRENT` helpers during class definition. Override
@@ -529,9 +542,9 @@ class Mechanism(Parameterized):
         name : str
             Mechanism alias. If ``None``, falls back to the class name.
         celsius : Tensor or float
-            Temperature values broadcastable to the mechanism shape.
+            Temperature in °C, broadcastable to the mechanism shape.
         diameters : Tensor
-            Compartment diameters shared with sub-components.
+            Compartment diameters in µm, shared with sub-components.
         shape : tuple of int
             Base shape for parameter tensors (without batch dimensions).
         shape_f : tuple of int
@@ -2799,7 +2812,7 @@ class VoltageProcess(Mechanism):
     Mechanism subtype that updates the membrane potential ``v``.
 
     Subclasses must implement :meth:`update_v` to return a new membrane potential
-    tensor each time step.
+    tensor each time step. Both its input and return value are in mV.
     """
 
     def update_v(self, v: torch.Tensor) -> torch.Tensor:
@@ -2810,12 +2823,12 @@ class VoltageProcess(Mechanism):
         Parameters
         ----------
         v : torch.Tensor
-            Membrane potential tensor to be advanced.
+            Membrane potential tensor in mV to be advanced.
 
         Returns
         -------
         torch.Tensor
-            New membrane potential values.
+            New membrane potential values in mV.
         """
         raise NotImplementedError(
             "VoltageProcess.update_v() must be implemented in subclasses."
@@ -2824,13 +2837,26 @@ class VoltageProcess(Mechanism):
 
 class PointProcess(Mechanism):
     """
-    A PointProcess is a Mechanism that delivers a lumped current (units nA)
-    to a single point in space. Channel conductances must be in units uS.
+    Base class for a mechanism that delivers lumped current at one location.
 
-    Implementing a Mechanism as PointProcess simply instructs Dendra to scale
-    the currents and conductances by the area of the relevant compartments to translate
-    them to densities. As such, they cannot be inserted at branchpoints
-    (which have 0 area), and doing so will produce a numerical error.
+    A point-process current method returns a numerical value in nA and its
+    conductance or voltage derivative is in µS. Voltage remains in mV, so an
+    Ohmic method can use ``g * (v - e)`` directly because ``µS * mV = nA``.
+    Built-in ``expsyn`` and ``exp2syn`` event weights are consequently numerical
+    values in µS (for example, ``weight=0.05`` means 0.05 µS).
+
+    Dendra divides point-process currents and conductances by
+    ``1e6 * area_cm2`` before adding them to distributed membrane densities.
+    This conversion makes nA into mA/cm² and µS into S/cm². It also means a
+    point process cannot be inserted at a zero-area branchpoint.
+
+    Notes
+    -----
+    Point-process nA/µS values are a local mechanism coordinate convention.
+    Do not multiply a built-in point-process weight or conductance parameter by
+    :data:`dendra.units.uS`, which converts a value to the absolute-S convention
+    used elsewhere. To convert, for example, 50 nS into the required µS
+    coordinate, use ``50 * dendra.units.nS / dendra.units.uS``.
     """
 
     pass
@@ -2849,6 +2875,11 @@ class Synapse(Mechanism):
 
     The `net_receive` method must be overridden in subclasses to implement
     specific behavior for how the synapse responds to incoming spikes.
+
+    ``NetCon`` weights inherit their units from the target synapse. For the
+    built-in point-process ``expsyn`` and ``exp2syn`` mechanisms, weights are
+    numerical values in µS. A custom density-style ``Synapse`` may define a
+    different weight contract and should document it explicitly.
     """
 
     def net_receive(self, weights, netcon):
@@ -2892,6 +2923,14 @@ class ContinuousSynapse(Mechanism):
     named input, which is the natural behavior for convergent synaptic currents.
     The previous timestep's input is also available as ``<input>_old`` when the
     input was declared with the default ``keep_old=True``.
+
+    A ``ContinuousSynapse`` follows the ordinary distributed
+    :class:`Mechanism` unit contract unless it also inherits
+    :class:`PointProcess`: current in mA/cm² and conductance in S/cm². The
+    product of a connection weight and its transformed presynaptic value must
+    have the units declared for the target input buffer. For a dimensionless
+    presynaptic gate delivered to a conductance-density input, the weight is in
+    S/cm².
 
     Example
     -------

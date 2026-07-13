@@ -877,21 +877,25 @@ def _hdf5_write(queue: Queue, path: str):
 
 
 class LFP(Callback):
-    """
-    Callback for recording Local Field Potential (LFP) signals during simulation.
+    """Record extracellular potentials from transmembrane currents.
 
-    This callback records the dot product between the membrane current distribution
-    and a unit vector representing the relative contribution of each compartment
-    to the LFP at each time step.
+    For each recording contact, this callback takes the dot product between the
+    model's absolute transmembrane current and a reciprocal lead field. Public
+    ``model.i_membrane`` is in mA, so a lead field in mV/mA produces a recorded
+    potential in mV.
 
     Parameters
     ----------
     v_unit : list of torch.Tensor
-        List of tensors representing the unit vector for the electrode configuration.
-        Each tensor should have the same shaape as model.shape == model.i_membrane.shape.
+        Non-empty list containing one reciprocal lead-field tensor per recording
+        contact. Each tensor must have the same shape and should be
+        broadcast-compatible with ``model.i_membrane`` under ``rule``. Lead-field
+        values must be in mV/mA (numerically equivalent to Ω); the constructor
+        stacks the list along a leading contact dimension. Pass ``[lead_field]``
+        for one contact.
     rule : str, optional
         Einstein summation rule for computing the dot product. Default is None,
-        which uses the rule '...,n...->n' which sums over all dimensions except
+        which uses the rule ``"...,n...->n"`` and sums over all dimensions except
         the field index.
 
     Notes
@@ -903,7 +907,7 @@ class LFP(Callback):
     Attributes
     ----------
     v_unit : torch.Tensor
-        Tensor version of the unit vector, moved to the model's device.
+        Stacked lead fields in mV/mA, moved to the model's device.
     lfp : torch.Tensor
         Tensor of LFP values at each time step.
     t : torch.Tensor
@@ -911,20 +915,22 @@ class LFP(Callback):
 
     Examples
     --------
-    >>> # Creating a point electrode 100 μm above the middle of the axon
+    >>> # Create a point recording contact at (0, 0, 100) μm.
     >>> import torch
     >>> from dendra.models import callbacks
     >>>
-    >>> # Define a unit vector for a point electrode
-    >>> distance = 100  # μm
-    >>> r = torch.sqrt(z**2 + model.x()**2) * 1e-4
-    >>> v_unit = 1000 / (4 * torch.pi * 500 * r)
+    >>> # Isotropic reciprocal lead field: rhoe / (4*pi*r), in mV/mA.
+    >>> rhoe = 500.0  # Ω·cm
+    >>> r_cm = torch.sqrt(
+    ...     model.x**2 + model.y**2 + (model.z - 100.0)**2
+    ... ) * 1e-4
+    >>> lead_field = rhoe / (4 * torch.pi * r_cm)
     >>>
-    >>> # Create the LFP callback
-    >>> lfp_callback = callbacks.LFP(v_unit)
+    >>> # The constructor takes a list, with one tensor per recording contact.
+    >>> lfp_callback = callbacks.LFP([lead_field])
     >>>
     >>> # Run the simulation with the callback
-    >>> model.run(ve, callbacks=[lfp_callback])
+    >>> model.run(tstop, callbacks=[lfp_callback])
     >>>
     >>> # Get the LFP signal as a NumPy array
     >>> lfp_signal = lfp_callback.numpy()
@@ -934,6 +940,18 @@ class LFP(Callback):
 
     def __init__(self, v_unit: list[torch.Tensor], rule=None):
         super().__init__()
+        if not isinstance(v_unit, list):
+            raise TypeError(
+                "v_unit must be a non-empty list of lead-field tensors; "
+                "pass [lead_field] for one recording contact."
+            )
+        if not v_unit:
+            raise ValueError("v_unit must contain at least one lead-field tensor.")
+        if not all(isinstance(field, torch.Tensor) for field in v_unit):
+            raise TypeError("Every v_unit entry must be a torch.Tensor.")
+        field_shape = v_unit[0].shape
+        if any(field.shape != field_shape for field in v_unit[1:]):
+            raise ValueError("All v_unit lead-field tensors must have the same shape.")
         self._lfp = []
         self._t = []
         self.register_buffer("v_unit", torch.stack(v_unit))
