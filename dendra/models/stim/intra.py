@@ -55,6 +55,97 @@ def _canonicalize_index_for_index_put(idx, shape, device, linear_index=None):
     return tuple(torch.unravel_index(selected, shape))
 
 
+def _retained_leading_batch_shape(indices, batch_shape):
+    """Return batch axes proven to remain a full leading Cartesian prefix.
+
+    Basic full-batch selections produced by ``Population`` and ``Network``
+    retain this layout.  Integer, ``None``, boolean, or advanced indexing can
+    remove or reorder axes, so shape alone is not enough to identify them.
+    Conservatively disabling the batch-only fallback in those cases prevents a
+    neuron/compartment axis from being silently mistaken for a batch axis.
+    """
+    batch_shape = tuple(int(size) for size in batch_shape)
+    if not batch_shape or not indices:
+        return ()
+
+    selection_shape = tuple(torch.broadcast_shapes(*[item.shape for item in indices]))
+    batch_rank = len(batch_shape)
+    if len(selection_shape) < batch_rank or selection_shape[:batch_rank] != batch_shape:
+        return ()
+
+    for axis, size in enumerate(batch_shape):
+        view_shape = [1] * len(selection_shape)
+        view_shape[axis] = size
+        expected = torch.arange(
+            size, device=indices[axis].device, dtype=indices[axis].dtype
+        ).reshape(view_shape)
+        if not torch.equal(indices[axis], expected.expand(selection_shape)):
+            return ()
+
+    # The spatial selection must be shared across the retained batch grid.
+    # Advanced indexing can otherwise pair a different compartment with each
+    # batch coordinate while leaving an apparently valid leading dimension.
+    for spatial_index in indices[batch_rank:]:
+        for axis, size in enumerate(batch_shape):
+            if size <= 1:
+                continue
+            first = spatial_index.select(axis, 0).unsqueeze(axis)
+            if not torch.equal(spatial_index, first.expand(selection_shape)):
+                return ()
+    return batch_shape
+
+
+def _expand_stimulus_to_selection(stim, selection_shape, batch_shape=()):
+    """Broadcast one waveform sample to its indexed model selection.
+
+    Ordinary PyTorch trailing broadcasting is tried first, preserving inputs
+    such as ``[C]`` for a ``[B, N, C]`` selection.  If that fails, a low-rank
+    value may broadcast to the model's explicit batch shape and is then padded
+    with singleton selection axes.  Thus ``[B]`` works for a soma selection of
+    shape ``[B, 1, 1]``.  Explicit singleton axes disambiguate intent when batch
+    and spatial dimensions happen to have the same size.
+    """
+    selection_shape = tuple(int(size) for size in selection_shape)
+    stimulus_shape = tuple(stim.shape)
+    batch_shape = tuple(int(size) for size in batch_shape)
+
+    if any(size == 0 for size in selection_shape):
+        # There is nothing to write.  Returning an empty value with the exact
+        # selection shape also keeps index_put_ happy for arbitrary empty masks.
+        return stim.new_empty(selection_shape)
+
+    try:
+        return torch.broadcast_to(stim, selection_shape)
+    except RuntimeError as exc:
+        trailing_error = exc
+
+    batch_rank = len(batch_shape)
+    if batch_rank and 0 < stim.ndim <= batch_rank:
+        # Standard Population/Network selections retain the explicit batch axes
+        # at the front.  Right-align within that prefix so an inner sweep [B]
+        # survives a later outer batch(), becoming [outer, B, ...].
+        selected_batch_shape = selection_shape[:batch_rank]
+        if len(selected_batch_shape) == batch_rank:
+            try:
+                batch_value = torch.broadcast_to(stim, selected_batch_shape)
+                candidate = batch_value.reshape(
+                    *selected_batch_shape,
+                    *(1,) * (len(selection_shape) - batch_rank),
+                )
+                return candidate.expand(selection_shape)
+            except RuntimeError:
+                pass
+
+    raise ValueError(
+        "Intracellular waveform sample shape "
+        f"{stimulus_shape} cannot broadcast to selected model shape "
+        f"{selection_shape}. Ordinary trailing PyTorch broadcasting is tried "
+        "first; a batch-only fallback accepts values broadcastable to explicit "
+        f"batch shape {batch_shape}. Use singleton axes to disambiguate batch "
+        "and spatial intent."
+    ) from trailing_error
+
+
 class Intra(torch.nn.Module):
     def __init__(self, model, stims):
         """
@@ -67,10 +158,12 @@ class Intra(torch.nn.Module):
         """
         super(Intra, self).__init__()
         self.shape = model.v.shape
+        self.batch_shape = tuple(model.v.shape[:-2])
         self.dtype = model.dtype()
         self.device = model.device()
 
         self.indices = []
+        self.selected_batch_shapes = []
         self.stims = []
 
         numel = 1
@@ -87,13 +180,15 @@ class Intra(torch.nn.Module):
                 raise TypeError(
                     f"Unsupported stimulation type: {type(stim)}. Expected Waveform."
                 )
-            self.indices.append(
-                _canonicalize_index_for_index_put(
-                    idx,
-                    self.shape,
-                    device=self.device,
-                    linear_index=linear_index,
-                )
+            indices = _canonicalize_index_for_index_put(
+                idx,
+                self.shape,
+                device=self.device,
+                linear_index=linear_index,
+            )
+            self.indices.append(indices)
+            self.selected_batch_shapes.append(
+                _retained_leading_batch_shape(indices, self.batch_shape)
             )
             self.stims.append(stim)
 
@@ -120,14 +215,23 @@ class Intra(torch.nn.Module):
         Returns
         -------
         torch.Tensor
-            Tensor of intracellular current values with shape [n_cells, n_comps].
+            Tensor of intracellular current values with the full model shape
+            ``[*batch, n_cells, n_comps]``.  Each per-step waveform value may be
+            scalar, exactly match its indexed selection, use ordinary trailing
+            broadcasting, or (when that fails) broadcast over explicit batch
+            axes (``[B]`` to ``[B, 1, 1]``).  Use explicit singleton axes when
+            equal-sized batch and spatial axes would otherwise be ambiguous.
         """
         intra = torch.zeros(self.shape, device=self.device, dtype=self.dtype)
-        for stim, idx in zip(stims, inds):
-            bshape = ()
+        for stim, idx, selected_batch_shape in zip(
+            stims, inds, self.selected_batch_shapes
+        ):
+            selection_shape = ()
             if len(idx) > 0:
-                bshape = torch.broadcast_shapes(*[t.shape for t in idx])
-                stim = stim.expand(bshape)
+                selection_shape = torch.broadcast_shapes(*[t.shape for t in idx])
+                stim = _expand_stimulus_to_selection(
+                    stim, selection_shape, selected_batch_shape
+                )
             intra.index_put_(idx, stim, accumulate=True)
         return intra
 

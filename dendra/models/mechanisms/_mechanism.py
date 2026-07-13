@@ -2527,7 +2527,8 @@ class Mechanism(Parameterized):
         Returns
         -------
         bool
-            ``True`` if the mechanism accepted the injection, otherwise ``False``.
+            ``True`` only if the mechanism accepts complete ownership of the
+            injection.  Returning ``False`` leaves delivery to the solver path.
         """
         return False
 
@@ -2563,6 +2564,10 @@ class Mechanism(Parameterized):
         :meth:`evaluate_injections` evaluates all registered waveforms at the
         current mechanism time and returns a tensor shaped like the local voltage
         argument, with zeros outside the targeted compartments.
+
+        Registration succeeds only when this mechanism covers every targeted
+        population location.  Partial overlap returns ``False`` without storing
+        state so the solver can deliver the full injection exactly once.
         """
         device = self.diam.device
         dtype = self.diam.dtype
@@ -2586,6 +2591,19 @@ class Mechanism(Parameterized):
             local_mask = self.get(full_mask)
 
         if local_mask.numel() == 0 or not bool(torch.any(local_mask).item()):
+            return False
+
+        # ``True`` from Mechanism.inject means that this mechanism owns the
+        # complete population-level injection.  Reject partial overlap before
+        # registering anything so the solver fallback can safely deliver the
+        # whole stimulus without duplicating covered locations.
+        local_coverage = local_mask.to(dtype=torch.bool)
+        full_coverage = self.put(
+            local_coverage,
+            torch.zeros_like(full_mask),
+            full_mask,
+        ).to(dtype=torch.bool)
+        if not bool(torch.all(full_coverage[full_mask]).item()):
             return False
 
         k = len(self.injected_waveforms)
@@ -2745,6 +2763,11 @@ class Mechanism(Parameterized):
             )
         t = torch.as_tensor(t, device=v.device, dtype=v.dtype)
         t = torch.atleast_1d(t)
+        if t.numel() != 1:
+            raise ValueError(
+                "Mechanism waveform injections are evaluated one timestep at a "
+                f"time; got {t.numel()} time values."
+            )
 
         for k, spec in enumerate(self._injection_specs):
             if spec["current_name"] != current_name:
@@ -2753,6 +2776,12 @@ class Mechanism(Parameterized):
             scale = getattr(self, spec["scale"])
             selected_index = getattr(self, spec["index"])
             value = self.injected_waveforms[k](t) * scale
+            # Dendra Waveforms always return time on the last axis.  This
+            # method evaluates one timestep, so remove that singleton before
+            # applying spatial/batch broadcasting.  Custom modules that return
+            # a spatial value directly remain supported.
+            if value.ndim > 0 and value.shape[-1] == 1:
+                value = value.squeeze(-1)
             out = out + self._expand_injection_value(
                 value,
                 mask,

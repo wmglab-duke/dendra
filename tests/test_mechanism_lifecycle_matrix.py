@@ -59,6 +59,21 @@ class _ConstantWaveform(torch.nn.Module):
         return self.value
 
 
+class _InjectionProbe:
+    def __init__(self, accepts):
+        self.accepts = accepts
+        self.calls = []
+
+    def inject(self, waveform, **kwargs):
+        self.calls.append((waveform, kwargs))
+        return self.accepts
+
+
+class _InjectionHandler:
+    def __init__(self, **mechanisms):
+        self.mechanisms = mechanisms
+
+
 def _base_mechanism(shape=(2, 3), *, key=None):
     return Mechanism(
         "base",
@@ -68,6 +83,17 @@ def _base_mechanism(shape=(2, 3), *, key=None):
         shape,
         key=key,
     )
+
+
+def _population_with_registered_injection(*, accepted=False):
+    population = dendra.Population(N=1, C=1, dtype=torch.float64)
+    waveform = dendra.constant(value=1.0)
+    index = (slice(None), slice(None))
+    spec = (waveform, tuple(population.v[index].shape), index)
+    population.injections = [spec]
+    population.mechanism_injections = [spec]
+    population.mechanism_injection_accepted = [accepted]
+    return population
 
 
 def _registered_single(delay, mode):
@@ -535,6 +561,66 @@ def test_waveform_injection_rejects_an_empty_population_overlap():
     assert not accepted
     assert len(mech.injected_waveforms) == 0
     assert not mech._injection_specs
+
+
+def test_waveform_injection_evaluates_builtin_time_last_values_at_scalar_time():
+    mech = _base_mechanism()
+    waveform = dendra.constant(value=torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64))
+    assert waveform(torch.tensor([0.0], dtype=torch.float64)).shape == (3, 1)
+    assert mech.register_waveform_injection(
+        waveform,
+        index=(slice(None), slice(None)),
+        model_shape=(2, 3),
+    )
+
+    actual = mech.evaluate_injections(t=0.0)
+    expected = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64).expand(2, 3)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_waveform_injection_rejects_partial_model_coverage_without_state():
+    mech = _base_mechanism(key=torch.tensor([0, 1], dtype=torch.long))
+    buffers_before = set(mech._buffers)
+
+    accepted = mech.register_waveform_injection(
+        dendra.constant(value=2.0),
+        index=(slice(None), slice(None)),
+        model_shape=(2, 3),
+    )
+
+    assert not accepted
+    assert len(mech.injected_waveforms) == 0
+    assert not mech._injection_specs
+    assert set(mech._buffers) == buffers_before
+    assert not hasattr(mech, "i_inj")
+
+
+def test_mechanism_injection_dispatch_stops_after_first_full_acceptor():
+    population = _population_with_registered_injection()
+    first = _InjectionProbe(accepts=True)
+    second = _InjectionProbe(accepts=True)
+    handler = _InjectionHandler(first=first, second=second)
+
+    population._dispatch_mechanism_injections(handler)
+
+    assert len(first.calls) == 1
+    assert second.calls == []
+    assert population.mechanism_injection_accepted == [True]
+    assert population.build_intra() is None
+
+
+def test_fresh_mechanism_handler_recomputes_stale_injection_acceptance():
+    population = _population_with_registered_injection(accepted=True)
+    rejecting = _InjectionProbe(accepts=False)
+
+    population._dispatch_mechanism_injections(
+        _InjectionHandler(rejecting=rejecting),
+        reset_acceptance=True,
+    )
+
+    assert len(rejecting.calls) == 1
+    assert population.mechanism_injection_accepted == [False]
+    assert population.build_intra() is not None
 
 
 def test_waveform_selected_vectors_expand_across_batch_dimensions():

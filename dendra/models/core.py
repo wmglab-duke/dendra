@@ -83,17 +83,18 @@ class _ExtraConfig:
     enabled: bool
     multicontact: bool
     functional: bool
-    ve_s: Optional[torch.Tensor] = None  # [np, n_comp] or [n_contacts, np, n_comp]
+    # [*batch, np, n_comp] or [n_contacts, *batch, np, n_comp]
+    ve_s: Optional[torch.Tensor] = None
     einsum: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None
 
     # If functional: list of Waveform (one per contact)
     waveforms: Optional[List["Waveform"]] = None
 
-    # If non-functional, single contact: list of [np, n_t_chunk] tensors (len = n_chunks)
+    # Single contact: list of [*batch, np, n_t_chunk] tensors.
     time_chunks_single: Optional[List[torch.Tensor]] = None
 
     # If non-functional, multi-contact:
-    # list over contacts, each is list over chunks -> [np, n_t_chunk]
+    # list over contacts, each is list over chunks -> [*batch, np, n_t_chunk]
     time_chunks_per_contact: Optional[List[List[torch.Tensor]]] = None
 
 
@@ -1211,16 +1212,109 @@ class Population(P, Sliceable):
         return stims, indices
 
     # extracellular helpers
+    def _broadcast_step_value(
+        self, value: TensorLike, *, name: str, dtype=None
+    ) -> torch.Tensor:
+        """Normalize one spatial/per-step value to the full Population shape.
+
+        Ordinary trailing PyTorch broadcasting is authoritative.  If that
+        fails, a value that broadcasts to the explicit batch shape is treated
+        as batch-only and padded with singleton population/compartment axes.
+        This fallback makes ``[B]`` useful for a ``[B, N, C]`` model without
+        changing the established meaning of ``[C]`` when ``B == C``.
+        """
+        value_t = torch.as_tensor(
+            value,
+            device=self.device(),
+            dtype=self.dtype() if dtype is None else dtype,
+        )
+        target_shape = tuple(self.v.shape)
+        try:
+            return torch.broadcast_to(value_t, target_shape)
+        except RuntimeError as exc:
+            trailing_error = exc
+
+        batch_shape = tuple(self.v.shape[:-2])
+        if batch_shape and 0 < value_t.ndim <= len(batch_shape):
+            try:
+                batch_value = torch.broadcast_to(value_t, batch_shape)
+                candidate = batch_value.reshape(*batch_shape, 1, 1)
+                return torch.broadcast_to(candidate, target_shape)
+            except RuntimeError:
+                pass
+
+        raise ValueError(
+            f"{name} shape {tuple(value_t.shape)} is not broadcastable to "
+            f"model shape {target_shape}. Ordinary trailing PyTorch "
+            "broadcasting is tried first; a batch-only fallback accepts values "
+            f"broadcastable to batch shape {batch_shape}. Use explicit singleton "
+            "axes to disambiguate batch and spatial intent."
+        ) from trailing_error
+
+    def _normalize_precomputed_ve(self, value: TensorLike) -> torch.Tensor:
+        """Normalize time-first extracellular voltages to ``[T, *model]``."""
+        value_t = torch.as_tensor(
+            value,
+            device=self.device(),
+            dtype=self.dtype(),
+        )
+        if value_t.dim() == 0:
+            raise ValueError(
+                "Precomputed ve needs a leading time axis; got a scalar tensor."
+            )
+
+        n_steps = int(value_t.shape[0])
+        payload_shape = tuple(value_t.shape[1:])
+        model_shape = tuple(self.v.shape)
+        target_shape = (n_steps, *model_shape)
+        trailing_error = None
+        if len(payload_shape) <= len(model_shape):
+            trailing_shape = (
+                n_steps,
+                *(1,) * (len(model_shape) - len(payload_shape)),
+                *payload_shape,
+            )
+            try:
+                candidate = value_t.reshape(trailing_shape)
+                return torch.broadcast_to(candidate, target_shape)
+            except RuntimeError as exc:
+                trailing_error = exc
+
+        batch_shape = tuple(self.v.shape[:-2])
+        if batch_shape and 0 < len(payload_shape) <= len(batch_shape):
+            batch_aligned_shape = (
+                n_steps,
+                *(1,) * (len(batch_shape) - len(payload_shape)),
+                *payload_shape,
+            )
+            try:
+                batch_value = torch.broadcast_to(
+                    value_t.reshape(batch_aligned_shape), (n_steps, *batch_shape)
+                )
+                candidate = batch_value.reshape(n_steps, *batch_shape, 1, 1)
+                return torch.broadcast_to(candidate, target_shape)
+            except RuntimeError:
+                pass
+
+        raise ValueError(
+            f"Precomputed ve per-step shape {payload_shape} is not "
+            f"broadcastable to model shape {model_shape}. Ordinary trailing "
+            "PyTorch broadcasting is tried first; a batch-only fallback accepts "
+            f"payloads broadcastable to batch shape {batch_shape}. Use explicit "
+            "singleton axes to disambiguate batch and spatial intent."
+        ) from trailing_error
+
     def _normalize_spatial(self, ve_s_raw: TensorLike) -> torch.Tensor:
         """
-        Normalize a spatial field tensor to shape [np, n_comp].
+        Normalize a spatial field tensor to the full model shape.
 
-        Accepts:
-        - [n_comp]
-        - [1, n_comp]
-        - [np, n_comp]
-
-        Broadcasting from leading dimension 1 to np where needed.
+        For an unbatched Population this accepts ``[n_comp]``,
+        ``[1, n_comp]``, or ``[np, n_comp]``.  After ``batch()``, an
+        unbatched field remains valid and is shared by every batch replica;
+        ``[*batch, np, n_comp]`` provides replica-specific fields.  A tensor
+        uses ordinary trailing broadcasting first.  Only if that fails may a
+        low-rank tensor broadcast right-aligned within the explicit batch shape
+        and then be padded with singleton neuron/compartment axes.
         """
         ve_s = torch.as_tensor(
             ve_s_raw,
@@ -1228,28 +1322,21 @@ class Population(P, Sliceable):
             dtype=self.dtype(),
         ).contiguous()
 
-        if ve_s.dim() not in (1, 2):
+        if ve_s.dim() == 0:
             raise ValueError(
-                "ve_s must have shape [n_comp], [1, n_comp], or [np, n_comp]; "
-                f"got shape {tuple(ve_s.shape)}."
+                "ve_s needs at least one spatial or batch dimension; got a scalar."
             )
-        if ve_s.dim() == 1:
-            # [n_comp] -> [1, n_comp]
-            ve_s = ve_s.unsqueeze(0)
-
-        if ve_s.size(-1) != self.nc:
+        try:
+            ve_s = self._broadcast_step_value(ve_s, name="ve_s")
+        except ValueError as exc:
+            axis_name = (
+                "compartment"
+                if int(ve_s.shape[-1]) not in (1, int(self.nc))
+                else "leading"
+            )
             raise ValueError(
-                f"ve_s compartment dimension ({ve_s.size(-1)}) must match "
-                f"model.nc ({self.nc})."
-            )
-
-        if ve_s.size(0) == 1:
-            # [1, n_comp] -> [np, n_comp]
-            ve_s = ve_s.expand(self.np, -1)
-        elif ve_s.size(0) != self.np:
-            raise ValueError(
-                f"ve_s leading dimension ({ve_s.size(0)}) must be 1 or np ({self.np})."
-            )
+                f"ve_s has an incompatible {axis_name} dimension: {exc}"
+            ) from exc
 
         return ve_s
 
@@ -1257,14 +1344,13 @@ class Population(P, Sliceable):
         self, time_raw: TensorLike, t_global: torch.Tensor
     ) -> torch.Tensor:
         """
-        Normalize a time tensor to shape [np, n_t] matching the global time grid.
+        Normalize a time tensor to ``[*batch, np, n_t]``.
 
-        Accepts:
-        - [n_t]
-        - [1, n_t]
-        - [np, n_t]
-
-        Broadcasting from leading dimension 1 to np where needed.
+        The last axis is always time.  Unbatched ``[np, n_t]`` inputs remain
+        valid after batching and are shared across replicas.  Ordinary trailing
+        broadcasting is tried first; only on failure may low-rank leading axes
+        broadcast right-aligned within the explicit batch shape and be shared
+        over neurons.  ``[*batch, 1, n_t]`` makes per-batch intent explicit.
         """
         t_tensor = torch.as_tensor(
             time_raw,
@@ -1272,31 +1358,65 @@ class Population(P, Sliceable):
             dtype=self.dtype(),
         )
 
-        if t_tensor.dim() not in (1, 2):
+        if t_tensor.dim() == 0:
             raise ValueError(
-                "time tensor must have shape [n_t], [1, n_t], or [np, n_t]; "
+                "time tensor needs a trailing time axis; "
                 f"got shape {tuple(t_tensor.shape)}."
             )
-        if t_tensor.dim() == 1:
-            # [n_t] -> [1, n_t]
-            t_tensor = t_tensor.unsqueeze(0)
-
-        if t_tensor.size(0) == 1:
-            # [1, n_t] -> [np, n_t]
-            t_tensor = t_tensor.expand(self.np, -1)
-        elif t_tensor.size(0) != self.np:
-            raise ValueError(
-                f"time tensor leading dimension ({t_tensor.size(0)}) "
-                f"must be 1 or np ({self.np})."
-            )
-
         if t_tensor.size(-1) != t_global.size(0):
             raise ValueError(
                 f"time tensor length ({t_tensor.size(-1)}) must match "
                 f"the number of simulation steps ({t_global.size(0)})."
             )
+        return self._normalize_temporal_values(
+            t_tensor,
+            n_steps=int(t_global.size(0)),
+            name="time tensor",
+        )
 
-        return t_tensor
+    def _normalize_temporal_values(
+        self,
+        value: torch.Tensor,
+        *,
+        n_steps: int,
+        name: str,
+    ) -> torch.Tensor:
+        """Broadcast trailing-time data to ``[*batch, np, n_steps]``."""
+        if value.dim() == 0:
+            value = value.expand(n_steps)
+        if value.size(-1) != n_steps:
+            raise ValueError(
+                f"{name} chunk length ({value.size(-1)}) must match the "
+                f"requested chunk length ({n_steps})."
+            )
+
+        target_leading = tuple(self.v.shape[:-1])
+        leading = tuple(value.shape[:-1])
+        batch_shape = tuple(self.v.shape[:-2])
+        target_shape = (*target_leading, n_steps)
+        try:
+            return torch.broadcast_to(value, target_shape)
+        except RuntimeError as exc:
+            trailing_error = exc
+
+        if batch_shape and 0 < len(leading) <= len(batch_shape):
+            try:
+                batch_value = torch.broadcast_to(
+                    value,
+                    (*batch_shape, n_steps),
+                )
+                candidate = batch_value.reshape(*batch_shape, 1, n_steps)
+                return torch.broadcast_to(candidate, target_shape)
+            except RuntimeError:
+                pass
+
+        raise ValueError(
+            f"{name} leading dimension shape {leading} is not broadcastable "
+            f"to model batch/population shape {target_leading}. Ordinary trailing "
+            "PyTorch broadcasting is tried first; a batch-only fallback accepts "
+            f"leading values broadcastable to batch shape {batch_shape}. Use "
+            "explicit singleton axes to disambiguate batch and population intent."
+        ) from trailing_error
 
     def _prepare_extra(
         self,
@@ -1316,7 +1436,13 @@ class Population(P, Sliceable):
 
         # Normalize to list[(ve_s, time_spec)]
         if isinstance(extra, tuple):
-            extra_pairs = [extra]
+            # A tuple is usually one ``(space, time)`` contact, but users may
+            # naturally supply a tuple of contact pairs as the documented
+            # sequence form.  Recognize that nested structure explicitly.
+            tuple_of_pairs = bool(extra) and all(
+                isinstance(item, tuple) and len(item) == 2 for item in extra
+            )
+            extra_pairs = list(extra) if tuple_of_pairs else [extra]
         else:
             extra_pairs = list(extra)
 
@@ -1402,42 +1528,28 @@ class Population(P, Sliceable):
         self, t_eval: torch.Tensor, *, n_steps: Optional[int] = None
     ) -> torch.Tensor:
         """
-        Normalize evaluated Waveform output to [np, n_t_chunk].
+        Normalize evaluated Waveform output to ``[*batch, np, n_t_chunk]``.
 
         Accepts:
         - scalar (broadcast across ``n_steps`` when provided)
         - [n_t_chunk]
         - [1, n_t_chunk]
         - [np, n_t_chunk]
+
+        Batched values follow the same trailing-first, batch-only-fallback
+        convention as :meth:`_normalize_time_tensor`.
         """
-        if t_eval.dim() == 0:
-            if n_steps is None:
+        if n_steps is None:
+            if t_eval.dim() == 0:
                 raise ValueError(
                     "Scalar Waveform output requires the expected number of steps."
                 )
-            t_eval = t_eval.expand(int(n_steps))
-        if t_eval.dim() not in (1, 2):
-            raise ValueError(
-                "Waveform output must be scalar or have shape [n_t], "
-                f"[1, n_t], or [np, n_t]; got shape {tuple(t_eval.shape)}."
-            )
-        if t_eval.dim() == 1:
-            t_eval = t_eval.unsqueeze(0)
-
-        if n_steps is not None and t_eval.size(-1) != int(n_steps):
-            raise ValueError(
-                f"Waveform output length ({t_eval.size(-1)}) must match "
-                f"the requested chunk length ({int(n_steps)})."
-            )
-
-        if t_eval.size(0) == 1:
-            t_eval = t_eval.expand(self.np, -1)
-        elif t_eval.size(0) != self.np:
-            raise ValueError(
-                f"Waveform evaluation leading dimension ({t_eval.size(0)}) "
-                f"must be 1 or np ({self.np})."
-            )
-        return t_eval
+            n_steps = int(t_eval.size(-1))
+        return self._normalize_temporal_values(
+            t_eval,
+            n_steps=int(n_steps),
+            name="Waveform output",
+        )
 
     def _compute_extra_chunk(
         self,
@@ -1532,13 +1644,15 @@ class Population(P, Sliceable):
             Timestep in milliseconds. If ``None``, uses the backend default
             ``A.dt``, matching :meth:`run`.
         ve : Tensor, optional
-            Extracellular voltage for this single step. Pass a tensor with the
-            same per-step shape expected by the integrator, or a leading
-            singleton time dimension ``[1, ...]``.
+            Extracellular voltage for this single step, normalized to
+            ``[*batch, np, n_comp]``. Ordinary trailing PyTorch broadcasting is
+            tried first. If it fails, low-rank data may broadcast right-aligned
+            within the explicit batch shape and be shared spatially. A leading
+            singleton time dimension ``[1, ...]`` is also accepted.
         extra : extracellular specification, optional
             Higher-level extracellular stimulation specification with the same
-            semantics as :meth:`run`. It is evaluated at the model's current
-            time and converted to this step's ``ve``.
+            shape and broadcasting semantics as :meth:`run`. It is evaluated
+            at the model's current time and converted to this step's ``ve``.
         callbacks : sequence of Callback, optional
             Callbacks to execute around this single step. By default ``step``
             calls ``pre_step_hook`` and ``post_step_hook`` only.
@@ -1597,6 +1711,7 @@ class Population(P, Sliceable):
                 ve_c = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
                 if ve_c.dim() == self.v.dim() + 1 and int(ve_c.shape[0]) == 1:
                     ve_c = ve_c[0]
+                ve_c = self._broadcast_step_value(ve_c, name="ve").contiguous()
             elif extra is not None:
                 t_step = self.t.reshape(1).to(device=device, dtype=dtype)
                 extra_cfg = self._prepare_extra(extra, t_step, n_chunks=1)
@@ -1636,32 +1751,39 @@ class Population(P, Sliceable):
         Parameters
         ----------
         ve : Tensor, optional
-            Precomputed extracellular voltage tensor. Shape should be
-            ``[n_timesteps, np, n_comp]`` or broadcast-compatible with that.
-            If provided, ``extra`` is ignored and the number of time steps
-            is inferred from ``ve.shape[0]``.
-        extra : (Tensor, Waveform or Tensor) or sequence of such tuples, optional
+            Precomputed time-first extracellular voltage, normalized to
+            ``[n_timesteps, *batch, np, n_comp]``. Payload axes after time use
+            ordinary trailing broadcasting first; low-rank payloads may use a
+            right-aligned batch-only fallback. Use
+            ``[n_timesteps, *batch, 1, 1]`` for explicit per-batch, spatially
+            shared input. The number of time steps is inferred from
+            ``ve.shape[0]``.
+        extra : tuple or sequence of tuples, optional
             Extracellular input specification(s), with the same semantics as
             :meth:`longrun`.
 
             Each specification is a tuple ``(ve_s, time)``:
 
-            * ``ve_s``: spatial field tensor with shape ``[np, n_comp]`` or
-              ``[1, n_comp]``. A leading dimension of ``1`` is broadcast to ``np``.
+            * ``ve_s`` is normalized to ``[*batch, np, n_comp]``.
 
-            * ``time``: either a :class:`Waveform` object (functional specification)
-              or a tensor with shape ``[np, n_timesteps]`` or ``[1, n_timesteps]``.
-              A leading dimension of ``1`` is broadcast to ``np``. The last
-              dimension must match the number of simulation time steps.
+            * ``time`` is either a :class:`Waveform` or a time-last tensor
+              normalized to ``[*batch, np, n_timesteps]``.
+
+            Both values use ordinary trailing broadcasting first. Only if that
+            fails may low-rank value axes broadcast right-aligned within the
+            explicit batch shape and then be shared over spatial axes. Explicit
+            singleton axes disambiguate equal-size batch and spatial dimensions.
 
             If a single tuple is provided, the method uses a single-contact
             formulation with :func:`op_sc`. If a sequence of tuples is provided,
             each tuple is treated as one electrode contact, and the method
             automatically switches to multi-contact mode using :func:`op_mc`:
 
-            * Spatial fields are stacked to shape ``[n_contacts, np, n_comp]``.
+            * Spatial fields are stacked to shape
+              ``[n_contacts, *batch, np, n_comp]``.
             * Functional (Waveform) inputs are evaluated per time step and
-              expanded/concatenated to shape ``[n_contacts, np, n_timesteps]``.
+              expanded/concatenated to shape
+              ``[n_contacts, *batch, np, n_timesteps]``.
             * Non-functional (tensor) inputs are normalized once to that shape.
 
             Mixing :class:`Waveform` and tensor time specifications across contacts
@@ -1729,7 +1851,7 @@ class Population(P, Sliceable):
         dtype = self.dtype()
 
         if ve is not None:
-            ve = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
+            ve = self._normalize_precomputed_ve(ve).contiguous()
 
         # dt as scalar and tensor
         dt_tensor = torch.tensor(dt_f, device=device, dtype=dtype)
@@ -1879,31 +2001,33 @@ class Population(P, Sliceable):
         dt : float, optional
             The simulation time step in milliseconds. If ``None``, the default value
             from the backend will be used.
-        extra : (Tensor, Waveform or Tensor) or sequence of such tuples, optional
+        extra : tuple or sequence of tuples, optional
             Extracellular input specification(s).
 
             Each specification is a tuple ``(ve_s, time)``:
 
-            * ``ve_s``: spatial field tensor with shape ``[n_p, n_comp]`` or
-              ``[1, n_comp]``. A leading dimension of ``1`` is broadcast to ``n_p``.
-            * ``time``: either a :class:`Waveform` object (functional specification)
-              or a tensor with shape ``[n_p, n_timesteps]`` or ``[1, n_timesteps]``.
-              A leading dimension of ``1`` is broadcast to ``n_p``. The last
-              dimension must match the number of simulation time steps.
+            * ``ve_s`` is normalized to ``[*batch, n_p, n_comp]``.
+            * ``time`` is either a :class:`Waveform` or a time-last tensor
+              normalized to ``[*batch, n_p, n_timesteps]``.
+
+            Both use ordinary trailing broadcasting first, followed only on
+            failure by a low-rank, right-aligned batch-only fallback. Explicit
+            singleton axes disambiguate equal-size batch and spatial dimensions.
 
             If a single tuple is provided, the method uses a single-contact
             formulation with :func:`op_sc`. If a sequence of tuples is provided,
             each tuple is treated as one electrode contact, and the method
             automatically switches to multi-contact mode with :func:`op_mc`:
 
-            * In multi-contact mode, the spatial field tensors are stacked to shape
-              ``[n_contacts, n_p, n_comp]``.
+            * In multi-contact mode, spatial fields are stacked to shape
+              ``[n_contacts, *batch, n_p, n_comp]``.
             * For a functional specification (all ``time`` are :class:`Waveform`),
               each waveform is evaluated per chunk and per contact and then
-              expanded/concatenated to shape ``[n_contacts, n_p, n_t_chunk]``.
+              expanded/concatenated to shape
+              ``[n_contacts, *batch, n_p, n_t_chunk]``.
             * For a non-functional specification (all ``time`` are tensors), the
               raw time tensors are pre-split into chunks and concatenated to the
-              same shape ``[n_contacts, n_p, n_t_chunk]``.
+              same shape ``[n_contacts, *batch, n_p, n_t_chunk]``.
 
             Mixing :class:`Waveform` and tensor time specifications across
             contacts is not supported and will raise a :class:`ValueError`.
@@ -1939,6 +2063,10 @@ class Population(P, Sliceable):
         n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
 
+        # Match step()/run(): injections registered after initialization
+        # invalidate ``self.intra`` and are rebuilt lazily on first use.
+        if self.intra is None:
+            self.intra = self.build_intra()
         intra = self.intra
         with_intra = intra is not None
 
@@ -2001,7 +2129,9 @@ class Population(P, Sliceable):
                 for i, t_chunk in enumerate(t_chunks):
                     if with_intra:
                         stims, indices = intra.init(t_chunk)
-                        stims = [s.unbind(0) for s in stims]
+                        # Waveform output always carries time on its last axis;
+                        # leading axes are population batch/sweep axes.
+                        stims = [s.unbind(-1) for s in stims]
 
                     if with_extra:
                         ve_list = self._compute_extra_chunk(extra_cfg, i, t_chunk)
@@ -2449,32 +2579,43 @@ class Population(P, Sliceable):
             )
         return self
 
-    def _dispatch_mechanism_injections(self, mech_handler=None, *, start=0):
-        """Offer stored waveform injections to built mechanisms."""
+    def _dispatch_mechanism_injections(
+        self, mech_handler=None, *, start=0, reset_acceptance=False
+    ):
+        """Offer each stored waveform injection to at most one mechanism.
+
+        Returning ``True`` from ``Mechanism.inject`` claims complete ownership
+        of that injection.  The first accepting mechanism wins; otherwise the
+        solver-level :class:`Intra` path remains responsible for it.
+        """
         mech_handler = self.mech if mech_handler is None else mech_handler
         if mech_handler is None:
             return
         if not self.mechanism_injections:
             return
 
+        if reset_acceptance:
+            self.mechanism_injection_accepted = [False] * len(self.mechanism_injections)
+
         model_shape = tuple(self.shape)
         for inj_i, (waveform, shape, index) in enumerate(
             self.mechanism_injections[start:], start
         ):
             accepted = bool(self.mechanism_injection_accepted[inj_i])
+            if accepted:
+                continue
             for mech in mech_handler.mechanisms.values():
-                accepted = (
-                    bool(
-                        mech.inject(
-                            waveform,
-                            index=index,
-                            shape=shape,
-                            model_shape=model_shape,
-                            model=self,
-                        )
+                accepted = bool(
+                    mech.inject(
+                        waveform,
+                        index=index,
+                        shape=shape,
+                        model_shape=model_shape,
+                        model=self,
                     )
-                    or accepted
                 )
+                if accepted:
+                    break
             self.mechanism_injection_accepted[inj_i] = accepted
 
     def delete_injections(self):
@@ -3101,7 +3242,7 @@ class Population(P, Sliceable):
 
             # Give mechanisms a chance to consume waveform injections directly.
             # Mechanisms that do not implement injection support ignore these.
-            self._dispatch_mechanism_injections(mech)
+            self._dispatch_mechanism_injections(mech, reset_acceptance=True)
 
             self.integrator = self._integrator_class(self, mech, imem=self.imem)
             # The population may have entered train/eval mode before this lazy
@@ -3454,6 +3595,28 @@ class Population(P, Sliceable):
 
         _batch_tensor_attr("v")
 
+        def _batch_injection_specs(specs):
+            """Rebase stored slice indices onto the new leading batch axis."""
+            batched = []
+            for waveform, _, index in specs:
+                current_index = index if isinstance(index, tuple) else (index,)
+                new_index = (
+                    current_index
+                    if current_index and current_index[0] is Ellipsis
+                    else (slice(None),) + current_index
+                )
+                selected_shape = tuple(self.v[new_index].shape)
+                batched.append((waveform, selected_shape, new_index))
+            return batched
+
+        # Injection specs capture their index tuple when inject() is called;
+        # unlike named Slice objects, they therefore cannot update themselves.
+        # Promote both solver and mechanism registries so inject-then-batch and
+        # batch-then-inject address the same replicated compartments.
+        self.injections = _batch_injection_specs(self.injections)
+        self.mechanism_injections = _batch_injection_specs(self.mechanism_injections)
+        self.intra = None
+
         state_vars = {"v_prev", "vc"}
         integrator = getattr(self, "integrator", None)
         if integrator is not None:
@@ -3466,8 +3629,8 @@ class Population(P, Sliceable):
             _batch_tensor_attr("i_membrane")
 
         self.reshape(self._calc_shape_p(), self.shape)
-        for slice in self._labels.values():
-            slice._batch()
+        for population_slice in self._labels.values():
+            population_slice._batch()
         # now batch x, y, z
         self.x = self.x.unsqueeze(0).expand(n, *self.x.shape).clone()
         self.y = self.y.unsqueeze(0).expand(n, *self.y.shape).clone()
@@ -3792,7 +3955,8 @@ class Population(P, Sliceable):
             Time step size in milliseconds. If None, uses the global default
             ``A.dt``.
         extra : ExtraSpec, optional
-            Extracellular configuration for the run. See :class:`ExtraSpec` for details.
+            Extracellular configuration with the same ``(ve_s, time)`` shape
+            and trailing-first broadcasting contract as :meth:`longrun`.
         callbacks : Sequence[Callback] or CallbackList, optional
             Sequence of callback hooks to run at various points during the simulation.
             See :class:`Callback` for details.
@@ -3861,6 +4025,10 @@ class Population(P, Sliceable):
         n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
 
+        # Match step()/run(): injections registered after initialization
+        # invalidate ``self.intra`` and are rebuilt lazily on first use.
+        if self.intra is None:
+            self.intra = self.build_intra()
         intra = self.intra
         with_intra = intra is not None
 
@@ -3992,7 +4160,9 @@ class Population(P, Sliceable):
 
                         if with_intra:
                             stims, indices = intra.init(t_chunk_local)
-                            stims = [s.unbind(0) for s in stims]
+                            # Waveform output always carries time on its last
+                            # axis; leading axes are population batch/sweep axes.
+                            stims = [s.unbind(-1) for s in stims]
                         else:
                             stims, indices = None, None
 

@@ -527,6 +527,27 @@ def test_extra_contraction_operators_match_direct_broadcasted_products():
     assert op_mc(space_mc, time_mc).is_contiguous()
 
 
+def test_public_extra_contraction_operators_support_batched_ellipses():
+    space = torch.arange(2 * 3 * 4 * 5, dtype=DTYPE).reshape(2, 3, 4, 5)
+    time = (1.0 + torch.arange(2 * 3 * 4 * 6, dtype=DTYPE)).reshape(2, 3, 4, 6)
+    expected_single = time.movedim(-1, 0).unsqueeze(-1) * space
+
+    actual_single = op_sc(space, time)
+    assert actual_single.shape == (6, 2, 3, 4, 5)
+    assert actual_single.is_contiguous()
+    torch.testing.assert_close(actual_single, expected_single)
+
+    space_mc = torch.stack((space, 2.0 * space))
+    time_mc = torch.stack((time, 3.0 * time))
+    expected_mc = (space_mc.unsqueeze(-2) * time_mc.unsqueeze(-1)).sum(0)
+    expected_mc = expected_mc.movedim(-2, 0)
+
+    actual_mc = op_mc(space_mc, time_mc)
+    assert actual_mc.shape == (6, 2, 3, 4, 5)
+    assert actual_mc.is_contiguous()
+    torch.testing.assert_close(actual_mc, expected_mc)
+
+
 @pytest.mark.parametrize("multicontact", [False, True])
 def test_ve_from_s_t_expands_single_population_inputs(multicontact):
     n_pop = 3
