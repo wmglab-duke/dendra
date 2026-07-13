@@ -1,18 +1,4 @@
-import numpy as np
-from Cython.Build import cythonize
-from setuptools import Extension, setup
-
-ext_modules = cythonize(
-    [
-        Extension(
-            name="dendra.models.heterogeneous.ops",
-            sources=["./dendra/models/heterogeneous/ops.pyx"],
-            include_dirs=[np.get_include()],
-            extra_compile_args=["-O3", "-DNPY_NO_DEPRECATED_API=NPY_1_9_API_VERSION"],
-        ),
-    ],
-    language_level=3,
-)
+from setuptools import setup
 
 setup(
     install_requires=[
@@ -58,5 +44,4 @@ setup(
             "pytest-xdist",
         ],
     },
-    ext_modules=ext_modules,
 )

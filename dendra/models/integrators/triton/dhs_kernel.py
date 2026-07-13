@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._contracts import validate_tree
+
 # ==============================================================================
 # 1. The Triton Kernel
 # ==============================================================================
@@ -405,4 +407,13 @@ def dhs_solve_cuda(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads=32):
     wraps the `autograd.Function` to handle the solver's execution and gradient
     computation.
     """
-    return DHSSolvePacked.apply(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads)
+    validate_tree(d_mem, a_geom, b, parent_idx, order, layer_ptr, threads)
+    return DHSSolvePacked.apply(
+        d_mem.contiguous(),
+        a_geom.contiguous(),
+        b.contiguous(),
+        parent_idx.contiguous(),
+        order.contiguous(),
+        layer_ptr.contiguous(),
+        threads,
+    )

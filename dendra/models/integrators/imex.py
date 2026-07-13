@@ -1,3 +1,13 @@
+"""Experimental implicit-explicit integrators based on Krylov projections.
+
+This module is intentionally not re-exported from :mod:`dendra` or
+:mod:`dendra.models.integrators`. Its underscored integrator and numerical
+helpers are provisional: names, defaults, supported model geometries, and
+numerical behavior may change without the compatibility guarantees of
+Dendra's stable integrator API.
+"""
+
+from numbers import Integral
 from typing import Tuple
 
 import torch
@@ -13,8 +23,8 @@ from .core import (
 
 def A_mv(v, diag, g_left, g_right):  # v shape (B, K), mV
     out = diag * v
-    out[:, :-1] += g_right * v[:, 1:]
-    out[:, 1:] += g_left * v[:, :-1]
+    out[:, :-1] += g_left * v[:, 1:]
+    out[:, 1:] += g_right * v[:, :-1]
     return out
 
 
@@ -31,12 +41,13 @@ def arnoldi(
     H = H_buf.narrow(1, 0, m).narrow(2, 0, m).zero_()
 
     beta = torch.linalg.norm(v0, dim=1)  # (B,)
-    V[:, :, 0] = v0 / beta[:, None]
+    safe_beta = torch.where(beta > 0, beta, torch.ones_like(beta))
+    V[:, :, 0] = v0 / safe_beta[:, None]
 
     for j in range(m):
         w = diag * V[:, :, j]
-        w[:, :-1] += g_right * V[:, 1:, j]
-        w[:, 1:] += g_left * V[:, :-1, j]
+        w[:, :-1] += g_left * V[:, 1:, j]
+        w[:, 1:] += g_right * V[:, :-1, j]
 
         Vj = V[:, :, : j + 1]  # (B,K,j+1)
         coef = torch.einsum("bkj,bk->bj", Vj, w)  # (B,j+1)
@@ -66,15 +77,16 @@ def lanczos(
 
     # β₀ = ∥v0∥, and v₁ = v0/β₀
     b0 = torch.linalg.norm(v0, dim=1)
-    V[:, :, 0] = v0 / b0[:, None]
+    safe_b0 = torch.where(b0 > 0, b0, torch.ones_like(b0))
+    V[:, :, 0] = v0 / safe_b0[:, None]
     prev_v = torch.zeros_like(v0)  # just store last v_j
 
     for j in range(m):
         vj = V[:, :, j]  # (B,K)
         # w = A·vj
         w = diag * vj
-        w[:, :-1] += g_right * vj[:, 1:]
-        w[:, 1:] += g_left * vj[:, :-1]
+        w[:, :-1] += g_left * vj[:, 1:]
+        w[:, 1:] += g_right * vj[:, :-1]
 
         if j == 0:
             # First step: subtract α₀ v₁
@@ -96,7 +108,8 @@ def lanczos(
         if j + 1 < m:
             T[:, j, j + 1] = b
             T[:, j + 1, j] = b
-            V[:, :, j + 1] = w / b[:, None]
+            safe_b = torch.where(b > 0, b, torch.ones_like(b))
+            V[:, :, j + 1] = w / safe_b[:, None]
             prev_v = vj
 
     return V, T, b0
@@ -116,6 +129,17 @@ def expm_krylov_lanczos(v, h, m: int, diag, g_left, g_right, V, H):
     return torch.einsum("bkm,bm->bk", V, y)
 
 
+def _phi1_projected_action(H_scaled: torch.Tensor) -> torch.Tensor:
+    """Evaluate ``phi1(H_scaled) @ e1`` without inverting ``H_scaled``."""
+    m = H_scaled.shape[-1]
+    e1 = H_scaled.new_zeros(H_scaled.shape[:-1] + (1,))
+    e1[..., 0, 0] = 1.0
+    top = torch.cat((H_scaled, e1), dim=-1)
+    bottom = H_scaled.new_zeros(H_scaled.shape[:-2] + (1, m + 1))
+    augmented = torch.cat((top, bottom), dim=-2)
+    return torch.matrix_exp(augmented)[..., :m, m]
+
+
 def phi1_krylov_arnoldi(
     v, h, m: int, diag, g_left, g_right, V_buf, H_buf, eye_m, tol: float = 1e-12
 ) -> torch.Tensor:
@@ -123,10 +147,7 @@ def phi1_krylov_arnoldi(
 
     H_scaled = h * H
 
-    expH = torch.matrix_exp(H_scaled)  # (B,m,m)
-    rhs = (expH - eye_m)[..., :, 0]  # (B,m)
-
-    phi, _ = torch.linalg.solve_ex(H_scaled, rhs)  # (B,m)
+    phi = _phi1_projected_action(H_scaled)
 
     # project back : V · φ · βe₁
     y = phi * beta.unsqueeze(1)  # (B,m,1)
@@ -136,30 +157,7 @@ def phi1_krylov_arnoldi(
 def phi1_krylov_arnoldi_g(
     v, h, m: int, diag, g_left, g_right, V_buf, H_buf, eye_m, tol: float = 1e-12
 ) -> torch.Tensor:
-    V, H, beta = arnoldi(v, m, diag, g_left, g_right, V_buf, H_buf)
-
-    H_scaled = h * H
-
-    expH = torch.matrix_exp(H_scaled)  # (B,m,m)
-    rhs = (expH - eye_m)[..., :, 0]  # (B,m)
-
-    # LU solve: φ1 = (hH)^{-1}(expH - I)  —— but guard tiny H
-    small = H.abs().sum(dim=(1, 2)) < tol  # (B,)
-
-    # allocate output
-    phi = torch.empty_like(rhs)
-
-    # 1) tiny blocks  ——  use series I + ½H
-    if small.any():
-        phi[small] = eye_m + 0.5 * H[small, :, 0]
-
-    # 2) regular blocks —— single solve
-    if (~small).any():
-        phi[~small], _ = torch.linalg.solve_ex(H_scaled[~small], rhs[~small])
-
-    # project back : V · φ · βe₁
-    y = phi * beta.unsqueeze(1)  # (B,m,1)
-    return torch.einsum("bkm, bm -> bk", V, y)  # (B,K)
+    return phi1_krylov_arnoldi(v, h, m, diag, g_left, g_right, V_buf, H_buf, eye_m, tol)
 
 
 def phi1_krylov_lanczos(
@@ -169,10 +167,7 @@ def phi1_krylov_lanczos(
 
     H_scaled = h * H
 
-    expH = torch.matrix_exp(H_scaled)  # (B,m,m)
-    rhs = (expH - eye_m)[..., :, 0].contiguous()  # (B,m)
-
-    phi, _ = torch.linalg.solve_ex(H_scaled, rhs)
+    phi = _phi1_projected_action(H_scaled)
 
     # project back : V · φ · βe₁
     y = phi * beta.unsqueeze(1)  # (B,m,1)
@@ -182,44 +177,39 @@ def phi1_krylov_lanczos(
 def phi1_krylov_lanczos_g(
     v, h, m: int, diag, g_left, g_right, V_buf, H_buf, eye_m, tol: float = 1e-12
 ) -> torch.Tensor:
-    V, H, beta = lanczos(v, m, diag, g_left, g_right, V_buf, H_buf)
-
-    H_scaled = h * H
-
-    expH = torch.matrix_exp(H_scaled)  # (B,m,m)
-    rhs = (expH - eye_m)[..., :, 0].contiguous()  # (B,m)
-
-    # LU solve: φ1 = (hH)^{-1}(expH - I)  —— but guard tiny H
-    small = H.abs().sum(dim=(1, 2)) < tol  # (B,)
-
-    # allocate output once
-    phi = torch.empty_like(rhs)
-
-    # 1) tiny blocks  ——  use series I + ½H
-    if small.any():
-        phi[small] = eye_m + 0.5 * H[small, :, 0]
-
-    # 2) regular blocks —— single solve
-    if (~small).any():
-        phi[~small], _ = torch.linalg.solve_ex(H_scaled[~small], rhs[~small])
-
-    # project back : V · φ · βe₁
-    y = phi * beta.unsqueeze(1)  # (B,m,1)
-    return torch.einsum("bkm, bm -> bk", V, y)  # (B,K)
+    return phi1_krylov_lanczos(v, h, m, diag, g_left, g_right, V_buf, H_buf, eye_m, tol)
 
 
 class _krylov_etd1(Integrator):
-    """
-    IMEX ETD1 method using Krylov subspace for the matrix exponential.
+    """Experimental IMEX ETD1 integrator using a Krylov subspace.
+
+    This implementation is available for numerical evaluation and testing but
+    is not part of Dendra's stable public integrator API. Its constructor,
+    supported geometries, and numerical behavior may change between releases.
+    Per-step membrane-current reporting is not yet defined for its exponential
+    discretization, so requesting ``imem`` raises :class:`NotImplementedError`
+    instead of exposing a stale or misleading value.
     """
 
     def __init__(
         self, model, mech, m: int = 4, method="arnoldi", guard=False, imem=None
     ):
         super().__init__(model, mech, imem)
-        self.m = m
-
+        if self.imem:
+            raise NotImplementedError(
+                "Experimental _krylov_etd1 does not support imem membrane-current "
+                "reporting; pass imem=False."
+            )
         B, K = _model_solve_shape(model)
+        if isinstance(m, bool) or not isinstance(m, Integral):
+            raise TypeError("Krylov dimension m must be an integer.")
+        m = int(m)
+        if m < 1 or m > K:
+            raise ValueError(
+                f"Krylov dimension m must satisfy 1 <= m <= K ({K}); got {m}."
+            )
+        self.m = m
+        self.method = method
         self.B = B
         self.K = K
         self.base_shape = tuple(model.shape)
@@ -245,6 +235,7 @@ class _krylov_etd1(Integrator):
         self.register_buffer("g_left", torch.tensor(0.0))
         self.register_buffer("g_right", torch.tensor(0.0))
         self.register_buffer("g_edge_Cinv", torch.tensor(0.0))
+        self.register_buffer("g_edge_Cinv_right", torch.tensor(0.0))
         self.register_buffer("cm_inv", torch.tensor(0.0))
         self.register_buffer("scale", torch.tensor(0.0))
         self.register_buffer("V_buf", torch.zeros(B, K, m))
@@ -253,7 +244,18 @@ class _krylov_etd1(Integrator):
 
     def initialize(self, model, dt):
         B, K = _model_solve_shape(model)
+        if self.m > K:
+            raise ValueError(
+                f"Krylov dimension m must satisfy 1 <= m <= K ({K}); got {self.m}."
+            )
         self.B, self.K = B, K
+        self.V_buf = torch.zeros(
+            B, K, self.m, device=model.device(), dtype=model.dtype()
+        )
+        self.H_buf = torch.zeros(
+            B, self.m, self.m, device=model.device(), dtype=model.dtype()
+        )
+        self.eye_m = torch.eye(self.m, device=model.device(), dtype=model.dtype())
         radius_cm = 1e-4 * _as_solve_matrix(model.diam, model) / 2.0
         dx_cm = 1e-4 * _as_solve_matrix(model.dx, model)
         cm_spec = _as_solve_matrix(model.cm, model)
@@ -268,10 +270,22 @@ class _krylov_etd1(Integrator):
         g_left = g_edge / cm[:, :-1]
         g_right = g_edge / cm[:, 1:]
 
+        if self.method == "lanczos":
+            tolerance = 10 * torch.finfo(g_left.dtype).eps
+            if not torch.allclose(
+                g_left, g_right, rtol=tolerance, atol=0.0, equal_nan=False
+            ):
+                raise ValueError(
+                    "method='lanczos' requires a symmetric cable operator "
+                    "(equal adjacent membrane capacitances); use method='arnoldi' "
+                    "for nonuniform geometry or capacitance."
+                )
+
         self.g_ax = g_edge
         self.g_left = g_left
         self.g_right = g_right
-        self.g_edge_Cinv = g_edge / cm[:, :-1]
+        self.g_edge_Cinv = g_left
+        self.g_edge_Cinv_right = g_right
 
         diag = torch.zeros(B, K, device=model.device(), dtype=model.dtype())
         diag[:, :-1] -= g_left
@@ -300,11 +314,10 @@ class _krylov_etd1(Integrator):
 
         if ve is not None:
             ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
-            flux = self.g_edge_Cinv * (ve_flat[:, 1:] - ve_flat[:, :-1])
+            delta_ve = ve_flat[:, 1:] - ve_flat[:, :-1]
             S = torch.zeros_like(f_n)
-            S[:, 1:-1] = -flux[:, :-1] + flux[:, 1:]
-            S[:, 0] = -flux[:, 0]
-            S[:, -1] = flux[:, -1]
+            S[:, :-1] += self.g_edge_Cinv * delta_ve
+            S[:, 1:] -= self.g_edge_Cinv_right * delta_ve
             f_n = f_n + S
 
         if intra is not None:
@@ -336,11 +349,7 @@ class _krylov_etd1(Integrator):
 
     def detach(self, model):
         model.v = model.v.detach()
-        if self.imem:
-            model.i_membrane.detach_()
         self.mech.detach()
 
     def init_v(self, model):
         model.v = _expanded_v_init(model).clone().detach().contiguous()
-        if self.imem:
-            model.i_membrane = torch.zeros_like(model.v).detach()

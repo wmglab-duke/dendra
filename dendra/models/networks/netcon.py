@@ -1,10 +1,11 @@
+import hashlib
 import math
 from typing import Any, Dict, Literal
 
 import torch
 
 from ..parametric import Referency
-from .netstim import NetStim
+from .netstim import NetStim, _causal_step_index
 from .spiking import update_active, update_active_diff
 from .utils import make_getattr
 
@@ -231,6 +232,85 @@ def _restore_calendar_chunks(
     return out
 
 
+def _checkpoint_calendar_chunks(calendar: dict):
+    """Copy an exact runtime calendar without normalizing its ring slots."""
+    return {
+        int(slot): [(idx.clone(), value.clone()) for idx, value in chunks]
+        for slot, chunks in calendar.items()
+        if chunks
+    }
+
+
+def _restore_checkpoint_calendar_chunks(
+    calendar: dict,
+    *,
+    idx_device,
+    idx_dtype,
+    value_device,
+    value_dtype,
+):
+    """Rebuild a checkpoint calendar on the receiving component's devices."""
+    if not isinstance(calendar, dict):
+        raise TypeError("NetCon checkpoint calendar must be a dict.")
+    restored = {}
+    for slot, chunks in calendar.items():
+        if not isinstance(slot, int):
+            raise TypeError("NetCon checkpoint calendar slots must be integers.")
+        copied = []
+        for chunk in chunks:
+            if not isinstance(chunk, (tuple, list)) or len(chunk) != 2:
+                raise TypeError(
+                    "NetCon checkpoint calendar chunks must be (index, value) pairs."
+                )
+            idx, value = chunk
+            if not torch.is_tensor(idx) or not torch.is_tensor(value):
+                raise TypeError("NetCon checkpoint calendar payloads must be tensors.")
+            if idx.ndim != 1 or value.ndim != 1 or idx.numel() != value.numel():
+                raise ValueError(
+                    "NetCon checkpoint calendar indices and values must be equally "
+                    "sized one-dimensional tensors."
+                )
+            copied.append(
+                (
+                    idx.detach().to(device=idx_device, dtype=idx_dtype).clone(),
+                    value.to(device=value_device, dtype=value_dtype).clone(),
+                )
+            )
+        if copied:
+            restored[int(slot)] = copied
+    return restored
+
+
+def _topology_tensor_digest(*tensors: torch.Tensor) -> str:
+    """Return a stable digest for small/static connection-topology tensors."""
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        value = tensor.detach().cpu().contiguous()
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _require_checkpoint_tensor(state_dict, name, *, shape, dtype=None):
+    """Validate a required runtime checkpoint tensor before rebinding state."""
+    if name not in state_dict:
+        raise KeyError(f"NetCon checkpoint is missing {name!r}.")
+    value = state_dict[name]
+    if not torch.is_tensor(value):
+        raise TypeError(f"NetCon checkpoint {name!r} must be a tensor.")
+    if tuple(value.shape) != tuple(shape):
+        raise ValueError(
+            f"NetCon checkpoint {name!r} has shape {tuple(value.shape)}, "
+            f"expected {tuple(shape)}."
+        )
+    if dtype is not None and value.dtype != dtype:
+        raise TypeError(
+            f"NetCon checkpoint {name!r} has dtype {value.dtype}, expected {dtype}."
+        )
+    return value
+
+
 class ContinuousCon(Referency):
     """Continuous analog projection between a presynaptic variable and a postsynaptic mechanism.
 
@@ -292,7 +372,7 @@ class ContinuousCon(Referency):
         if isinstance(self.transform, torch.nn.Module):
             self.transform = self.transform.to(device=self.device, dtype=self.dtype)
 
-        self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
+        self.dt = torch.tensor(dt, device=self.device, dtype=self.dtype)
         if pre_var is None:
             pre_var = "v"
         self.get_pre_var = make_getattr(pre_var)
@@ -403,7 +483,7 @@ class ContinuousCon(Referency):
         ):
             self._move_buffer(name, self.device)
         self._move_buffer("delivery_buffer", self.device, self.dtype)
-        self.dt = self.dt.to(device=self.device, dtype=torch.float32)
+        self.dt = self.dt.to(device=self.device, dtype=self.dtype)
         self.weight = self.weight.to(device=self.device, dtype=self.dtype)
         self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
 
@@ -774,10 +854,46 @@ class ContinuousCon(Referency):
         }
 
     def restore_dict_from_checkpoint(self, state_dict):
-        self.delivery_buffer = state_dict["delivery_buffer"]
-        self.current_time_step = state_dict["current_time_step"]
-        self.global_step = state_dict["global_step"]
+        if not isinstance(state_dict, dict):
+            raise TypeError("ContinuousCon checkpoint state must be a dict.")
+        delivery = _require_checkpoint_tensor(
+            state_dict,
+            "delivery_buffer",
+            shape=self.delivery_buffer.shape,
+            dtype=self.dtype,
+        )
+        current = _require_checkpoint_tensor(
+            state_dict,
+            "current_time_step",
+            shape=self.current_time_step.shape,
+            dtype=torch.long,
+        )
+        global_step = _require_checkpoint_tensor(
+            state_dict,
+            "global_step",
+            shape=self.global_step.shape,
+            dtype=torch.long,
+        )
+        current_value = int(current.detach().cpu().reshape(-1)[0].item())
+        if current_value < 0 or current_value >= int(self.max_delay_steps):
+            raise ValueError(
+                "ContinuousCon checkpoint current_time_step is outside the delay "
+                f"ring: {current_value} not in [0, {int(self.max_delay_steps)})."
+            )
+        self.delivery_buffer = delivery.to(device=self.device)
+        self.current_time_step = current.to(device=self.device)
+        self.global_step = global_step.to(device=self.device)
         return self
+
+    def checkpoint_topology_signature(self):
+        """Return immutable structure needed to validate fresh-object replay."""
+        return {
+            "kind": "continuous",
+            "n_connections": int(self._n_conn),
+            "synapse_numel": int(self._syn_numel),
+            "max_delay_steps": int(self.max_delay_steps),
+            "topology": _topology_tensor_digest(self.pre_idx, self.post_idx),
+        }
 
     # ------------------------------------------------------------------
     # Hot-path helpers
@@ -1151,8 +1267,8 @@ class NetCon(Referency):
          - If ``diff_scheduled_times=True`` in :meth:`set_diff_config`,
            events are smeared with a differentiable triangular kernel over
            time steps, so gradients can move event times.
-         - If ``diff_scheduled_times=False``, times are rounded to the
-           nearest integer step and treated as exact.
+         - If ``diff_scheduled_times=False``, each time is assigned to the first
+           integer step at or after the event and treated as exact.
 
        In both cases, gradients flow into ``sched_t`` when using the
        differentiable configuration.
@@ -1281,7 +1397,9 @@ class NetCon(Referency):
             ``"bitpacked_history"`` is an inference-only source-spike history
             backend for large SNNs: it stores only packed source spikes over the
             delay horizon and reconstructs the dense postsynaptic receive payload
-            with Triton kernels when available.
+            with a lazy C++/CUDA extension on eligible CUDA paths, falling back
+            to PyTorch otherwise. The separate Triton implementation is an
+            experimental/reference path and is not selected automatically.
         train_delay_backend : {"dense", "source_history", "auto"}, optional
             Differentiable training delay backend. ``"dense"`` preserves the
             fully general dense differentiable delay buffer. ``"source_history"``
@@ -1318,7 +1436,7 @@ class NetCon(Referency):
         self.weight = self.weight.to(device=self.device, dtype=self.dtype)
         delay = delay.to(device=self.device, dtype=self.dtype)
 
-        self.dt = torch.tensor(dt, device=self.device, dtype=torch.float32)
+        self.dt = torch.tensor(dt, device=self.device, dtype=self.dtype)
         self.max_delay = max_delay
         self.track_events = bool(track_events)
         if delay_backend not in ("dense", "sparse_calendar", "bitpacked_history"):
@@ -1470,6 +1588,10 @@ class NetCon(Referency):
         )
 
         self.train_flags = None
+        # A dense-to-dense mode switch can preserve the live delay ring. Compact
+        # inference/source-history layouts cannot be migrated merely by toggling
+        # nn.Module.training; Network execution rejects them until initialize().
+        self._mode_requires_initialize = False
 
         # scheduled events
         # Python-side calendar: abs_step -> list of (pre_idx:int, weight:float)
@@ -1841,6 +1963,31 @@ class NetCon(Referency):
             and self.train_delay_backend in ("source_history", "auto")
         )
 
+    def _validate_strict_source_history_policy(self):
+        """Validate a requested strict compact training policy without switching mode."""
+        if self.train_flags is None or self.train_delay_backend != "source_history":
+            return
+        if self._has_scheduled_events():
+            raise RuntimeError(
+                "NetCon train_delay_backend='source_history' currently supports "
+                "intrinsic source-level events only. Use train_delay_backend='dense' "
+                "or 'auto' for scheduled-event training."
+            )
+        self._ensure_source_level_training_metadata()
+        if not bool(getattr(self, "_bitpack_can_use", False)):
+            raise ValueError(
+                "NetCon train_delay_backend='source_history' is not exact for this "
+                f"connection: {self._bitpack_ineligible_reason}. Use "
+                "train_delay_backend='dense' or source-level thresholds/pre_var."
+            )
+
+    def _validate_train_mode_transition(self, mode: bool):
+        """Preflight mode changes that could otherwise fail after partial propagation."""
+        if not isinstance(mode, bool):
+            raise ValueError("training mode is expected to be boolean")
+        if mode and not self._mode_requires_initialize:
+            self._validate_strict_source_history_policy()
+
     def _ensure_source_level_training_metadata(self):
         """Build source-level metadata lazily for source-history training.
 
@@ -1867,26 +2014,16 @@ class NetCon(Referency):
         if not self._source_history_training_requested():
             return False
 
+        self._validate_strict_source_history_policy()
+
         self._ensure_source_level_training_metadata()
 
         if self._has_scheduled_events():
-            if self.train_delay_backend == "source_history":
-                raise RuntimeError(
-                    "NetCon train_delay_backend='source_history' currently supports "
-                    "intrinsic source-level events only. Use train_delay_backend='dense' "
-                    "or 'auto' for scheduled-event training."
-                )
             return False
 
         if bool(getattr(self, "_bitpack_can_use", False)):
             return True
 
-        if self.train_delay_backend == "source_history":
-            raise ValueError(
-                "NetCon train_delay_backend='source_history' is not exact for this "
-                f"connection: {self._bitpack_ineligible_reason}. Use "
-                "train_delay_backend='dense' or source-level thresholds/pre_var."
-            )
         return False
 
     def _source_history_diff_spiking_enabled(self) -> bool:
@@ -2070,7 +2207,7 @@ class NetCon(Referency):
             self._csr_conidx_sorted = self._csr_conidx_sorted.to(device=self.pre_device)
 
         # dt and parameter modules should follow the synapse device.
-        self.dt = self.dt.to(device=self.device, dtype=torch.float32)
+        self.dt = self.dt.to(device=self.device, dtype=self.dtype)
         self.weight = self.weight.to(device=self.device, dtype=self.dtype)
         self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
         self._move_sparse_calendar_to_device()
@@ -3201,7 +3338,7 @@ class NetCon(Referency):
             return
 
         # Pure-PyTorch fallback.  This is correct and memory-light in source
-        # space, but the Triton kernels are the intended hot path.
+        # space; the lazy C++/CUDA extension above is the normal CUDA hot path.
         slot = int(cur_idx.item())
         row = self.spike_history_packed[slot]
         row.zero_()
@@ -3219,8 +3356,11 @@ class NetCon(Referency):
             return scratch
 
         # Pure-PyTorch fallback.  It allocates connection-sized gate/values, so it
-        # is mainly for CPU, tests, and installations where Triton is not
-        # available.
+        # is mainly for CPU, tests, and installations where the C++/CUDA extension
+        # is unavailable or cannot handle the current launch. A failed native
+        # launch may have written a partial result before reporting failure, so
+        # reset the output again before constructing the complete fallback result.
+        scratch.zero_()
         rows = (cur_idx - self.inference_delay_steps).remainder(self.max_delay_steps)
         words = self.spike_history_packed[rows.reshape(-1), self.bitpack_conn_word_idx]
         gate = torch.bitwise_and(words, self.bitpack_conn_bit_mask) != 0
@@ -3420,8 +3560,8 @@ class NetCon(Referency):
             via :meth:`schedule_time_ref`) are handled via a differentiable
             triangular kernel over time steps. This allows gradients to move
             event times when they come from value- or reference-mode tensors.
-            If False, scheduled times are rounded to integer steps, and the
-            timing behavior is non-differentiable.
+            If False, scheduled times are assigned to the first integer step at
+            or after the event, and timing behavior is non-differentiable.
         sched_width : float, optional
             Half-width of the triangular kernel (in steps) when
             ``diff_scheduled_times=True``. A value of 1.0 yields contributions
@@ -3437,12 +3577,25 @@ class NetCon(Referency):
           records configuration flags. ``NetCon.advance`` will dispatch to
           :meth:`advance_diff` when ``self.training = True`` and to
           :meth:`advance_non_diff` otherwise.
+        * ``track_events=True`` is supported in training only when delays,
+          spiking, and scheduled times all use hard semantics. Surrogate or
+          fractional deliveries do not define unambiguous integer event counts.
         """
         if train_delay_backend is not None:
             if train_delay_backend not in ("dense", "source_history", "auto"):
                 raise ValueError(
                     "train_delay_backend must be one of 'dense', 'source_history', or 'auto'."
                 )
+        if self.track_events and (diff_delays or diff_spiking or diff_scheduled_times):
+            raise ValueError(
+                "track_events=True in training requires hard event semantics: "
+                "set diff_delays=False, diff_spiking=False, and "
+                "diff_scheduled_times=False. Fractional surrogate deliveries "
+                "do not have unambiguous integer event counts."
+            )
+        previous_backend = self.train_delay_backend
+        previous_flags = self.train_flags
+        if train_delay_backend is not None:
             self.train_delay_backend = train_delay_backend
         self.train_flags = (
             diff_weights,
@@ -3454,11 +3607,24 @@ class NetCon(Referency):
             diff_scheduled_times,
             float(sched_width),
         )
-        # Re-select storage immediately for interactive/training-loop workflows.
-        # This is especially important for ``diff_spiking=True`` source-history
-        # training, which needs floating source-gate history rather than packed
-        # hard spikes.
-        self._refresh_training_advance_after_diff_config(clear_histories=True)
+        try:
+            self._validate_strict_source_history_policy()
+            if self._mode_requires_initialize:
+                # Validate strict source-history policy now, but do not replace
+                # the fail-closed advance sentinel or reshape live pending
+                # traffic during an incompatible mode transition.
+                if self.training:
+                    self._use_source_history_training_runtime()
+                return
+            # Re-select storage immediately for interactive/training-loop workflows.
+            # This is especially important for ``diff_spiking=True`` source-history
+            # training, which needs floating source-gate history rather than packed
+            # hard spikes.
+            self._refresh_training_advance_after_diff_config(clear_histories=True)
+        except Exception:
+            self.train_delay_backend = previous_backend
+            self.train_flags = previous_flags
+            raise
 
     @property
     def w(self):
@@ -3514,10 +3680,14 @@ class NetCon(Referency):
             return pres
 
         # Find each pre id in CSR unique list with searchsorted
+        if self._csr_pre_ids.numel() == 0:
+            return torch.empty(0, device=self.pre_device, dtype=torch.long)
         pos = torch.searchsorted(self._csr_pre_ids, pres)
-        valid = (pos < self._csr_pre_ids.numel()) & (
-            self._csr_pre_ids.index_select(0, pos) == pres
-        )
+        valid = pos < self._csr_pre_ids.numel()
+        # ``searchsorted`` returns len(ids) for values above the largest id.
+        # Clamp only for the lookup, then retain the explicit bounds mask.
+        safe_pos = pos.clamp_max(self._csr_pre_ids.numel() - 1)
+        valid = valid & (self._csr_pre_ids.index_select(0, safe_pos) == pres)
         if not bool(valid.any()):
             return torch.empty(0, device=self.pre_device, dtype=torch.long)
 
@@ -3569,8 +3739,9 @@ class NetCon(Referency):
             Event times in milliseconds. Must be broadcast-compatible with
             the selected connections *after* filtering out past events (see
             ``allow_past``). Times are converted to steps via
-            ``round(times_ms / dt)`` for non-differentiable scheduling, and
-            interpreted as continuous values when ``diff_scheduled_times=True``.
+            the first grid step at or after the event for non-differentiable
+            scheduling, and interpreted as continuous values when
+            ``diff_scheduled_times=True``.
         weight : float or torch.Tensor, optional
             Scalar or per-event weight *multiplier* applied on top of the base
             connection weights returned by ``self.weight()``. Accepted shapes:
@@ -3613,7 +3784,7 @@ class NetCon(Referency):
                 con_indices, device=device, dtype=torch.long
             ).view(-1)
 
-        tms_raw = torch.as_tensor(times_ms, device=device, dtype=torch.float32).view(-1)
+        tms_raw = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
 
         if con_idx_raw.numel() != tms_raw.numel():
             raise ValueError("con_indices/pre_indices and times_ms must match length")
@@ -3621,7 +3792,7 @@ class NetCon(Referency):
             raise IndexError("connection index out of range")
 
         # legacy step field (used when diff_scheduled_times=False)
-        steps_raw = torch.round(tms_raw / self.dt.to(tms_raw.dtype)).to(torch.long)
+        steps_raw = _causal_step_index(tms_raw, self.dt.to(tms_raw.dtype))
 
         # optional filtering of past events
         if not allow_past:
@@ -3843,26 +4014,32 @@ class NetCon(Referency):
                 con_indices, device=device, dtype=torch.long
             ).view(-1)
 
-        tms = torch.as_tensor(times_ms, device=device, dtype=torch.float32).view(-1)
+        tms = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
         widx = torch.as_tensor(weight_idx, device=device, dtype=torch.long).view(-1)
         if not (con_idx.numel() == tms.numel() == widx.numel()):
             raise ValueError("indices, times_ms, and weight_idx must have same length")
-
-        steps = torch.round(tms / self.dt.to(tms.dtype)).to(torch.long)
-        if not allow_past:
-            cur = self.global_step.view(())
-            keep = steps >= cur
-            con_idx, steps, widx = con_idx[keep], steps[keep], widx[keep]
-            if con_idx.numel() == 0:
-                return
 
         if (con_idx < 0).any() or (con_idx >= self.pre_idx.numel()).any():
             raise IndexError("connection index out of range")
         if (widx < 0).any() or (widx >= self._sched_w_source.numel()).any():
             raise IndexError("weight_idx out of range for bound weight source")
 
+        steps = _causal_step_index(tms, self.dt.to(tms.dtype))
+        if not allow_past:
+            cur = self.global_step.view(())
+            keep = steps >= cur
+            con_idx, tms, steps, widx = (
+                con_idx[keep],
+                tms[keep],
+                steps[keep],
+                widx[keep],
+            )
+            if con_idx.numel() == 0:
+                return
+
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
+        self.sched_time_ms = torch.cat([self.sched_time_ms, tms.to(dtype=dtype)], dim=0)
         self.sched_weight = torch.cat(
             [
                 self.sched_weight,
@@ -3871,6 +4048,13 @@ class NetCon(Referency):
             dim=0,
         )
         self.sched_weight_idx = torch.cat([self.sched_weight_idx, widx], dim=0)
+        self.sched_time_idx = torch.cat(
+            [
+                self.sched_time_idx,
+                torch.full((con_idx.numel(),), -1, device=device, dtype=torch.long),
+            ],
+            dim=0,
+        )
 
     def schedule_time_ref(
         self,
@@ -3977,10 +4161,11 @@ class NetCon(Referency):
         if (tidx < 0).any() or (tidx >= self._sched_t_source.numel()).any():
             raise IndexError("time_idx out of range for bound time source")
 
-        # use a zeros value-slot for times, and record the indices in sched_time_idx
-        # legacy step field still populated from current source values (for non-diff path)
-        tms_now = self._sched_t_source.index_select(0, tidx).to(torch.float32)
-        steps = torch.round(tms_now / self.dt.to(torch.float32)).to(torch.long)
+        # Use a zeros value slot for times and record sched_time_idx. Keep the
+        # legacy hard-step field populated from the current reference values.
+        tms_now = self._sched_t_source.index_select(0, tidx).to(dtype=dtype)
+        steps = _causal_step_index(tms_now, self.dt.to(dtype))
+        E_before = con_idx.numel()
         if not allow_past:
             cur = self.global_step.view(())
             keep = steps >= cur
@@ -3992,23 +4177,33 @@ class NetCon(Referency):
             )
             if con_idx.numel() == 0:
                 return
+        E_after = con_idx.numel()
 
         # weight value-mode (optional)
         if torch.is_tensor(weight):
-            w = weight.to(device=device, dtype=dtype).view(-1)
-            if w.numel() not in (1, con_idx.numel()):
-                raise ValueError("weight must be scalar or same length as con_indices")
-            if w.numel() == 1:
-                w = w.expand_as(con_idx)
+            w_raw = weight.to(device=device, dtype=dtype).view(-1)
+            if w_raw.numel() == 1:
+                w = w_raw.expand(E_after)
+            elif w_raw.numel() == E_before:
+                w = w_raw[keep] if not allow_past else w_raw
+            elif w_raw.numel() == E_after:
+                w = w_raw
+            else:
+                raise ValueError(
+                    f"weight must be scalar or have length {E_before} "
+                    f"(pre-filter) or {E_after} (post-filter)"
+                )
         else:
-            w = torch.full(
-                (con_idx.numel(),), float(weight), device=device, dtype=dtype
-            )
+            w = torch.full((E_after,), float(weight), device=device, dtype=dtype)
 
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
         self.sched_time_ms = torch.cat(
-            [self.sched_time_ms, torch.zeros_like(tms_now)], dim=0
+            [
+                self.sched_time_ms,
+                torch.zeros(E_after, device=device, dtype=dtype),
+            ],
+            dim=0,
         )  # value slot 0
         self.sched_time_idx = torch.cat([self.sched_time_idx, tidx], dim=0)
         self.sched_weight = torch.cat([self.sched_weight, w], dim=0)
@@ -4072,8 +4267,8 @@ class NetCon(Referency):
         use_tri_kernel : bool
             If True, use a differentiable triangular kernel in step space for
             scheduled times (used when ``diff_scheduled_times=True``). If False,
-            scheduled events are active only when the rounded step equals
-            ``gs_long``.
+            scheduled events are active only when their first causal grid step
+            equals ``gs_long``.
 
         Returns
         -------
@@ -4105,7 +4300,7 @@ class NetCon(Referency):
         t_val = self.sched_time_ms  # may be zeros if using time-by-ref only
         if self._sched_t_source is not None:
             idxt = torch.clamp(self.sched_time_idx, min=0)
-            t_src = self._sched_t_source.index_select(0, idxt).to(torch.float32)
+            t_src = self._sched_t_source.index_select(0, idxt).to(dtype=dtype)
             t_ref_mask = (self.sched_time_idx >= 0).to(t_src.dtype)
             t_val = t_val + t_src * t_ref_mask
 
@@ -4123,9 +4318,8 @@ class NetCon(Referency):
             # counts (bookkeeping): event "active" if tri>0
             cnt_evt = (tri > 0).to(torch.int32)  # [E]
         else:
-            # Step-exact firing: round(lam) == gs
-            lam = t_val.to(dtype) / self.dt.to(dtype)
-            abs_step = lam.round().to(torch.long)
+            # Step-exact, causal firing: first grid step >= event time.
+            abs_step = _causal_step_index(t_val.to(dtype), self.dt.to(dtype))
             now_mask = abs_step == gs_long.view(())
             amp_evt = w_val * now_mask.to(dtype)  # [E]
             cnt_evt = now_mask.to(torch.int32)  # [E]
@@ -4242,6 +4436,12 @@ class NetCon(Referency):
             _,
         ) = self.train_flags
         device, dtype = self.device, self.dtype
+        if self.track_events and (diff_delays or diff_spiking or diff_sched_times):
+            raise RuntimeError(
+                "Tracked training events require hard delay, spiking, and "
+                "scheduled-time semantics. Reconfigure this NetCon before "
+                "advancing it."
+            )
 
         # Snapshot indices for this step (avoid version bumps).
         # clone() is not necessary here; detach is enough because we never mutate
@@ -4249,9 +4449,14 @@ class NetCon(Referency):
         cur_idx = self.current_time_step.detach()  # [1], long
         gs = self.global_step.detach()  # [1], long
 
-        # 1) deliver today's payload
-        # NOTE: event_queue/events are assumed debug-only (not used for dynamics).
+        # 1) deliver today's payload and expose the matching hard-event counts.
+        # Ambiguous surrogate/fractional event tracking is rejected by
+        # set_diff_config(), so track_events here always has integer semantics.
         todays = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)  # [n_syn]
+        if self.track_events:
+            self.events.copy_(self.event_queue.index_select(0, cur_idx).squeeze(0))
+        else:
+            self.events.zero_()
         self.syn.net_receive(todays.view(*self.syn.shape_f), self)
 
         # 2) intrinsic spiking
@@ -4273,6 +4478,9 @@ class NetCon(Referency):
         # combine gates
         gate = intrinsic_gate + sched_wsum_conn  # [n_conn]
         self._record_gate_for_state_cache(gate)
+        event_counts = None
+        if self.track_events:
+            event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
 
         # weights (optionally detach)
         wvals = self.weight()
@@ -4293,10 +4501,21 @@ class NetCon(Referency):
         buf_next = self.delivery_buffer.clone()
         buf_next.index_fill_(0, cur_idx, 0.0)  # clear the row we just delivered
         buf_flat = buf_next.view(-1)
+        event_queue_next = None
+        if self.track_events:
+            event_queue_next = self.event_queue.clone()
+            event_queue_next.index_fill_(0, cur_idx, 0)
 
         if diff_delays:
             d_ms = self.delay_ms().to(dtype)  # [n_conn]
-            lam = d_ms / self.dt.to(dtype)
+            # Detection happens after the current receive slot has already been
+            # delivered.  Consequently, even a sub-timestep physical delay can
+            # arrive no earlier than the next simulation step.  Keep the
+            # differentiable dense path aligned with inference and the compact
+            # source-history training backend; otherwise a rounded-zero delay
+            # is written into the cleared current slot and is not seen again
+            # until the circular buffer wraps.
+            lam = (d_ms / self.dt.to(dtype)).clamp_min(1.0)
             k = torch.floor(lam)
             kL = k.to(torch.long)
 
@@ -4325,13 +4544,20 @@ class NetCon(Referency):
                 vals = weighted_spikes.unsqueeze(-1) * w  # [n_conn,3]
                 buf_flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
         else:
-            future_steps = (cur_idx + self.delay_steps).remainder(self.max_delay_steps)
+            future_steps = (cur_idx + self.inference_delay_steps).remainder(
+                self.max_delay_steps
+            )
             flat = future_steps * self.syn_numel + self.post_idx
             # Integer delay: single destination per connection
             buf_flat.index_add_(0, flat, weighted_spikes)
+            if event_queue_next is not None:
+                flat_events = future_steps * self._n_conn + self.con_range
+                event_queue_next.view(-1).index_add_(0, flat_events, event_counts)
 
         # Commit next buffer (already cleared + updated)
         self.delivery_buffer = buf_next
+        if event_queue_next is not None:
+            self.event_queue = event_queue_next
 
         # advance counters (no grad)
         with torch.no_grad():
@@ -4683,9 +4909,30 @@ class NetCon(Referency):
 
         self.is_spiking = gate.to(device=self.pre_device, dtype=self.pre_dtype)
 
+    def _advance_requires_mode_initialize(self):
+        raise RuntimeError(
+            "NetCon train/eval mode changed across incompatible runtime layouts. "
+            "Call initialize() before advancing this connection."
+        )
+
     def train(self, mode: bool = True):  # type: ignore[override]
+        previous_mode = bool(self.training)
+        previous_advance = getattr(getattr(self, "advance", None), "__name__", "")
+        self._validate_train_mode_transition(mode)
         super().train(mode)
+        if self._mode_requires_initialize:
+            return self
         if mode:
+            wants_compact_training = self._use_source_history_training_runtime()
+            if previous_mode != bool(mode) and (
+                self.delay_backend != "dense" or wants_compact_training
+            ):
+                # Preserve the existing runtime verbatim. initialize() owns the
+                # conversion to compact/dense storage and clears this guard only
+                # after every dependent buffer has been rebuilt coherently.
+                self._mode_requires_initialize = True
+                self.advance = self._advance_requires_mode_initialize
+                return self
             # Defer dense per-connection buffer allocation when the compact
             # source-history backend may be selected.  If diff flags have not
             # been configured yet, ``initialize``/``set_diff_config`` will choose
@@ -4694,10 +4941,28 @@ class NetCon(Referency):
             if self.train_flags is not None or self.train_delay_backend == "dense":
                 self._refresh_training_advance_after_diff_config(clear_histories=False)
         else:
+            # Dense training and inference share the same delay-ring layout, so
+            # switching back to evaluation can select the hard-event runtime
+            # immediately without clearing queued deliveries or moving the
+            # current ring slot.  Compact source-history/sparse runtimes may
+            # require an explicit initialize() to reshape their storage; their
+            # existing initialization path remains authoritative.
+            incompatible_compact_runtime = (
+                previous_advance == ("advance_diff_source_history")
+                or self.delay_backend != "dense"
+            )
+            if previous_mode != bool(mode) and incompatible_compact_runtime:
+                self._mode_requires_initialize = True
+                self.advance = self._advance_requires_mode_initialize
+                return self
+            if previous_advance == "advance_diff":
+                self._ensure_connection_spike_buffers()
+                self.advance = self._dense_advance_target()
             # ``eval`` is the intended mode for the bitpacked backend.  Reclaim
             # per-connection debug/spike-state storage as soon as the module enters
             # inference mode.
             self._shrink_connection_spike_buffers_for_bitpack()
+        self._mode_requires_initialize = False
         return self
 
     def eval(self):  # type: ignore[override]
@@ -4878,6 +5143,7 @@ class NetCon(Referency):
         with torch.no_grad():
             self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
         self.detach()
+        self._mode_requires_initialize = False
 
     def numel(self):
         """
@@ -5241,31 +5507,66 @@ class NetCon(Referency):
           runtime state needed to resume stepping identically mid-simulation.
         - Do NOT include weights/delays/modules here; those are model params
           and remain constant across a forward.
-        - Under the assumption that event_queue/events are only for logging,
-          we intentionally omit them. TODO: if they become essential to dynamics,
-          they should be handled here, in a way that the user can flag.
+        - Tracked event counts are public runtime state. ``events`` records the
+          most recently delivered counts, while the dense ``event_queue`` (or a
+          compact backend's event calendar) determines future observations; both
+          are retained so checkpoint replay preserves event introspection.
         """
 
-        if (
-            self._use_sparse_calendar_runtime()
-            or self._use_bitpacked_history_runtime()
-            or self._use_source_history_training_runtime()
-        ):
+        if self._mode_requires_initialize:
             raise RuntimeError(
-                "Non-dense NetCon runtime state is not supported by "
-                "state_dict_for_checkpoint() yet. Use delay_backend='dense' "
-                "for checkpointed runs."
+                "NetCon train/eval mode changed across incompatible runtime "
+                "layouts. Call initialize() before checkpointing this connection."
             )
 
+        runtime = self._checkpoint_runtime_kind()
+        compact_runtime = runtime != "dense"
         sd: Dict[str, Any] = {
-            "delivery_buffer": self.delivery_buffer,
-            "current_time_step": self.current_time_step,
-            "global_step": self.global_step,
+            "delivery_buffer": (
+                self.delivery_buffer.clone()
+                if compact_runtime
+                else self.delivery_buffer
+            ),
+            "current_time_step": (
+                self.current_time_step.clone()
+                if compact_runtime
+                else self.current_time_step
+            ),
+            "global_step": (
+                self.global_step.clone() if compact_runtime else self.global_step
+            ),
         }
 
         # Threshold-crossing history matters for spike detection when thresholds are used.
-        if not self.skip_thresholding:
-            sd["has_spiked"] = self.has_spiked
+        if not self.skip_thresholding and self.has_spiked.numel() > 0:
+            sd["has_spiked"] = (
+                self.has_spiked.clone() if compact_runtime else self.has_spiked
+            )
+
+        if self.track_events:
+            sd["events"] = self.events.clone()
+            if hasattr(self, "event_queue"):
+                sd["event_queue"] = self.event_queue.clone()
+
+        if compact_runtime:
+            backend_state: Dict[str, Any] = {
+                "kind": runtime,
+                "sparse_calendar": _checkpoint_calendar_chunks(self._sparse_calendar),
+                "sparse_event_calendar": _checkpoint_calendar_chunks(
+                    self._sparse_event_calendar
+                ),
+            }
+            if self.spike_history_packed.numel() > 0:
+                backend_state["spike_history_packed"] = (
+                    self.spike_history_packed.clone()
+                )
+            if self.source_gate_history.numel() > 0:
+                backend_state["source_gate_history"] = self.source_gate_history.clone()
+            if self.bitpack_source_has_spiked.numel() > 0:
+                backend_state["bitpack_source_has_spiked"] = (
+                    self.bitpack_source_has_spiked.clone()
+                )
+            sd["backend_state"] = backend_state
 
         return sd
 
@@ -5282,14 +5583,179 @@ class NetCon(Referency):
         This matches the expectation in longrun_checkpointed that restore rebinds
         mutable tensors.
         """
-        # IMPORTANT:
-        # Restore by *rebinding* tensors, not copy_(), so that:
-        # - we preserve autograd history through the state tensors, and
-        # - we don't inadvertently sever BPTT across chunk boundaries.
-        self.delivery_buffer = state_dict["delivery_buffer"]
-        self.current_time_step = state_dict["current_time_step"]
-        self.global_step = state_dict["global_step"]
+        if not isinstance(state_dict, dict):
+            raise TypeError("NetCon checkpoint state must be a dict.")
 
-        if not self.skip_thresholding and "has_spiked" in state_dict:
-            self.has_spiked = state_dict["has_spiked"]
+        runtime = self._checkpoint_runtime_kind()
+        backend_state = state_dict.get("backend_state", None)
+        if backend_state is not None and not isinstance(backend_state, dict):
+            raise TypeError("NetCon checkpoint backend_state must be a dict.")
+        checkpoint_runtime = (
+            "dense" if backend_state is None else backend_state.get("kind", None)
+        )
+        if checkpoint_runtime != runtime:
+            raise ValueError(
+                "NetCon checkpoint runtime does not match the active runtime: "
+                f"checkpoint={checkpoint_runtime!r}, active={runtime!r}."
+            )
+
+        delivery = _require_checkpoint_tensor(
+            state_dict,
+            "delivery_buffer",
+            shape=self.delivery_buffer.shape,
+            dtype=self.dtype,
+        )
+        current = _require_checkpoint_tensor(
+            state_dict,
+            "current_time_step",
+            shape=self.current_time_step.shape,
+            dtype=torch.long,
+        )
+        global_step = _require_checkpoint_tensor(
+            state_dict,
+            "global_step",
+            shape=self.global_step.shape,
+            dtype=torch.long,
+        )
+        current_value = int(current.detach().cpu().reshape(-1)[0].item())
+        if current_value < 0 or current_value >= int(self.max_delay_steps):
+            raise ValueError(
+                "NetCon checkpoint current_time_step is outside the delay ring: "
+                f"{current_value} not in [0, {int(self.max_delay_steps)})."
+            )
+
+        has_spiked = None
+        if not self.skip_thresholding and self.has_spiked.numel() > 0:
+            has_spiked = _require_checkpoint_tensor(
+                state_dict,
+                "has_spiked",
+                shape=self.has_spiked.shape,
+                dtype=torch.bool,
+            )
+
+        events = None
+        event_queue = None
+        if self.track_events:
+            events = _require_checkpoint_tensor(
+                state_dict,
+                "events",
+                shape=self.events.shape,
+                dtype=torch.int32,
+            )
+            if hasattr(self, "event_queue"):
+                event_queue = _require_checkpoint_tensor(
+                    state_dict,
+                    "event_queue",
+                    shape=self.event_queue.shape,
+                    dtype=torch.int32,
+                )
+
+        sparse_calendar = None
+        sparse_event_calendar = None
+        spike_history = None
+        source_gate_history = None
+        source_has_spiked = None
+        if backend_state is not None:
+            sparse_calendar = _restore_checkpoint_calendar_chunks(
+                backend_state.get("sparse_calendar", {}),
+                idx_device=self.device,
+                idx_dtype=torch.long,
+                value_device=self.device,
+                value_dtype=self.dtype,
+            )
+            sparse_event_calendar = _restore_checkpoint_calendar_chunks(
+                backend_state.get("sparse_event_calendar", {}),
+                idx_device=self.device,
+                idx_dtype=torch.long,
+                value_device=self.device,
+                value_dtype=torch.int32,
+            )
+            invalid_slots = {
+                slot
+                for slot in (*sparse_calendar, *sparse_event_calendar)
+                if slot < 0 or slot >= int(self.max_delay_steps)
+            }
+            if invalid_slots:
+                raise ValueError(
+                    "NetCon checkpoint calendar contains slots outside the delay "
+                    f"ring: {sorted(invalid_slots)}."
+                )
+            if self.spike_history_packed.numel() > 0:
+                spike_history = _require_checkpoint_tensor(
+                    backend_state,
+                    "spike_history_packed",
+                    shape=self.spike_history_packed.shape,
+                    dtype=torch.int64,
+                )
+            if self.source_gate_history.numel() > 0:
+                source_gate_history = _require_checkpoint_tensor(
+                    backend_state,
+                    "source_gate_history",
+                    shape=self.source_gate_history.shape,
+                    dtype=self.dtype,
+                )
+            if self.bitpack_source_has_spiked.numel() > 0:
+                source_has_spiked = _require_checkpoint_tensor(
+                    backend_state,
+                    "bitpack_source_has_spiked",
+                    shape=self.bitpack_source_has_spiked.shape,
+                    dtype=torch.bool,
+                )
+
+        # Restore by rebinding differentiable tensors so graph connectivity is
+        # preserved across checkpoint chunks. Integer/bool history is cloned
+        # because the next step mutates it in-place.
+        self.delivery_buffer = delivery.to(device=self.device)
+        self.current_time_step = current.to(device=self.device)
+        self.global_step = global_step.to(device=self.device)
+        if has_spiked is not None:
+            self.has_spiked = has_spiked.to(device=self.pre_device)
+        if events is not None:
+            self.events = events.to(device=self.device).clone()
+        if event_queue is not None:
+            self.event_queue = event_queue.to(device=self.device).clone()
+        if backend_state is not None:
+            self._sparse_calendar = sparse_calendar
+            self._sparse_event_calendar = sparse_event_calendar
+            if spike_history is not None:
+                self.spike_history_packed = spike_history.to(device=self.device).clone()
+            if source_gate_history is not None:
+                self.source_gate_history = source_gate_history.to(device=self.device)
+            if source_has_spiked is not None:
+                self.bitpack_source_has_spiked = source_has_spiked.to(
+                    device=self.pre_device
+                ).clone()
         return self
+
+    def _checkpoint_runtime_kind(self) -> str:
+        if self._use_sparse_calendar_runtime():
+            return "sparse_calendar"
+        if self._use_bitpacked_history_runtime():
+            return "bitpacked_history"
+        if self._use_source_history_training_runtime():
+            return "source_history"
+        return "dense"
+
+    def checkpoint_topology_signature(self):
+        """Return immutable structure needed to validate fresh-object replay."""
+        train_flags = None
+        if self.train_flags is not None:
+            train_flags = tuple(self.train_flags)
+        return {
+            "kind": "event",
+            "n_connections": int(self._n_conn),
+            "synapse_numel": int(self._syn_numel),
+            "max_delay_steps": int(self.max_delay_steps),
+            "delay_backend": self.delay_backend,
+            "train_delay_backend": self.train_delay_backend,
+            "runtime": self._checkpoint_runtime_kind(),
+            "training": bool(self.training),
+            "track_events": bool(self.track_events),
+            "train_flags": train_flags,
+            "topology": _topology_tensor_digest(
+                self.pre_idx,
+                self.post_idx,
+                self.threshold,
+                self.thresh_is_nan,
+            ),
+        }

@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
+from ._contracts import copy_rhs_workspace, validate_block_tridiagonal
+
 
 # ---------------------------------------------------------------------
 # 3x3 analytic inverse ------------------------------------------------
@@ -198,8 +200,11 @@ def thomas_bt3_solve(
     x     : (B, K,   3)
     """
     B, K = rhs.shape[:2]
-    out = torch.empty_like(rhs)
+    out = torch.empty_like(rhs, memory_format=torch.contiguous_format)
     minv = torch.empty(B, K, 9, device=main.device, dtype=main.dtype)
+    # The kernel uses its RHS pointer as elimination workspace.  Keep the
+    # torch.library non-mutating contract and callers' tensors intact.
+    rhs_work = copy_rhs_workspace(rhs)
 
     grid = ((B + BLOCK_FIBRES - 1) // BLOCK_FIBRES,)
 
@@ -208,7 +213,7 @@ def thomas_bt3_solve(
         lower.reshape(B, -1),
         main.reshape(B, -1),
         upper.reshape(B, -1),
-        rhs.reshape(B, -1),
+        rhs_work.reshape(B, -1),
         out.reshape(B, -1),
         minv.reshape(B, -1),
         B,
@@ -266,4 +271,5 @@ thomas_bt3_solve.register_autograd(_bt3_backward, setup_context=_bt3_setup_conte
 # Backwards-compatible alias used by integrators / __init__.py
 def thomas_solve_cuda_bt(lower, main, upper, rhs):
     """Backward-compatible alias for the Triton block-Thomas solver."""
+    validate_block_tridiagonal(lower, main, upper, rhs)
     return thomas_bt3_solve(lower, main, upper, rhs)

@@ -13,6 +13,7 @@ from .core import (
     _flatten_to_solve,
     _model_solve_shape,
 )
+from .tree import _validate_dhs_threads, _validate_tree_graph
 from .triton import dhs_bt_solve_cuda
 
 try:
@@ -25,6 +26,7 @@ except ImportError:
 
 # ---------------- Topology helpers (local, to avoid extra deps) ----------------
 def _topo_parent_depth(G: nx.DiGraph) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+    _validate_tree_graph(G)
     nodes = list(nx.topological_sort(G))
     idx_of = {n: i for i, n in enumerate(nodes)}
     K = len(nodes)
@@ -107,7 +109,7 @@ class _dhs_bt(Integrator):
     v_vars = ["v", "vc"]
 
     def __init__(self, model, mech, imem=None, threads=16):
-        assert 32 % threads == 0 and threads <= 32
+        threads = _validate_dhs_threads(threads)
         super().__init__(model, mech, imem)
         self.threads = threads
 
@@ -204,8 +206,8 @@ class _dhs_bt(Integrator):
         # Intracellular axial (returned in SOLVER order)
         _, g_intra_solver, _ = graph_to_parent_and_axial(
             model.graph, dtype_axial=dtyp
-        )  # (K,) S
-        g_intra_solver = g_intra_solver.to(device=dev)
+        )  # (1,K) S for a single morphology
+        g_intra_solver = g_intra_solver.squeeze(0).to(device=dev)
         # Map to MECHANISM order so it matches dx/area/xraxial layout
         # solver_order[s] == mechanism index of the s-th topo (solver) node
         g_intra_mech = torch.empty_like(g_intra_solver)
@@ -214,9 +216,10 @@ class _dhs_bt(Integrator):
         # parent_idx is in SOLVER order. Map it to MECHANISM order for geometry gathers.
         parent_solver = self.parent_idx.to(torch.long)  # (K,) solver index space
         solver2mech = self.solver_order.to(torch.long)  # maps solver -> mechanism
-        parent_mech = torch.full_like(parent_solver, -1)  # (K,)
+        parent_mech = torch.full_like(parent_solver, -1)  # (K,), indexed by mechanism
         mask_nr = parent_solver >= 0
-        parent_mech[mask_nr] = solver2mech[
+        child_mech = solver2mech[mask_nr]
+        parent_mech[child_mech] = solver2mech[
             parent_solver[mask_nr]
         ]  # (K,) mechanism index space
 
@@ -260,25 +263,20 @@ class _dhs_bt(Integrator):
 
         self.base_shape = tuple(list(model.shape) + [3])
 
-        # State vectors
-        if not hasattr(model, "vc"):
-            model.register_buffer(
-                "vc", torch.zeros(*model.shape, 3, device=dev, dtype=dtyp)
-            )
-        elif tuple(model.vc.shape) != tuple(model.shape) + (3,):
-            model.vc = torch.zeros(*model.shape, 3, device=dev, dtype=dtyp)
-        v0 = _expanded_v_init(model)
-        model.vc[..., 0] = v0
-        model.vc[..., 1] = 0.0
-        model.vc[..., 2] = 0.0
-        if not hasattr(model, "v"):
-            model.register_buffer(
-                "v", torch.zeros(*model.shape, device=dev, dtype=dtyp)
-            )
-        model.v[:] = v0
+        # Initializing solver geometry must not reset a live simulation.  A
+        # missing or shape-stale block state is seeded from the current
+        # membrane voltage; explicit resets remain the job of ``init_v``.
+        expected_vc_shape = tuple(model.shape) + (3,)
+        if not hasattr(model, "vc") or tuple(model.vc.shape) != expected_vc_shape:
+            vc = torch.zeros(expected_vc_shape, device=dev, dtype=dtyp)
+            vc[..., 0] = model.v.to(device=dev, dtype=dtyp)
+            if "vc" in getattr(model, "_buffers", {}):
+                model.vc = vc
+            else:
+                model.register_buffer("vc", vc)
 
     def step(self, model, dt, ve=None, intra=None):
-        vc_new, v_new = self._call_kernel(
+        result = self._call_kernel(
             "_step",
             self._flat_block_voltage(model.vc, 3),
             model.v,
@@ -287,6 +285,11 @@ class _dhs_bt(Integrator):
             ve,
             intra,
         )
+        if self.imem:
+            vc_new, v_new, i_membrane = result
+            model.i_membrane = i_membrane
+        else:
+            vc_new, v_new = result
         model.vc = vc_new
         model.v = v_new
 
@@ -343,6 +346,16 @@ class _dhs_bt(Integrator):
         inv = self.inv_solver_order
         vc_out = X_.index_select(1, inv).reshape(self.base_shape)  # (B,K,3) mV
         v_out = vc_out[..., 0] - vc_out[..., 1]  # membrane (mV)
+
+        if self.imem:
+            v_old = self._flat_voltage(v)
+            v_new = self._flat_voltage(v_out)
+            g_abs = self._flat_voltage(gtot) * self.area
+            i_abs_old = self._flat_voltage(itot) * self.area
+            i_membrane = ((self.cm_dt + g_abs) * (v_new - v_old) + i_abs_old).reshape(
+                self.shape
+            )
+            return vc_out, v_out, i_membrane
 
         return vc_out, v_out
 

@@ -7,9 +7,15 @@ from typing import Dict
 import torch
 
 from dendra.helpers import classproperty
+from dendra.models._class_declarations import (
+    _DECLARATIONS_KEY,
+    consume_class_values,
+    declare_class_value,
+)
 from dendra.models.parametric import Parameterized
 
 from ._ions import VALENCES
+from ._materials import _canonical_material_name
 from ._state import State
 from ._symbolic import build_current_eq
 
@@ -46,6 +52,14 @@ def _normalize_material_source(source):
     return {str(field): f"{field}_source" for field in source}
 
 
+def _mro_attribute_owner(cls, name):
+    """Return the class whose namespace supplies ``name`` under ``cls``'s MRO."""
+    for base in cls.__mro__:
+        if name in base.__dict__:
+            return base
+    return None
+
+
 # -- TorchDynamo-friendly mechanism advance generation -----------------------
 
 
@@ -57,6 +71,26 @@ def _safe_generated_identifier(value: object) -> str:
     if out[0].isdigit():
         out = f"_{out}"
     return out
+
+
+def _nonnegative_integer_steps(value, *, device=None, label="delay_steps"):
+    """Normalize delay metadata without silently truncating fractional values."""
+    try:
+        raw = torch.as_tensor(value, device=device)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{label} must contain non-negative integers.") from exc
+
+    if raw.dtype == torch.bool or raw.is_complex():
+        raise TypeError(f"{label} must contain non-negative integers.")
+    if raw.is_floating_point():
+        integral = torch.isfinite(raw) & (raw == torch.round(raw))
+        if not bool(torch.all(integral).item()):
+            raise ValueError(f"{label} must contain integer values.")
+
+    steps = raw.to(dtype=torch.long)
+    if bool(torch.any(steps < 0).item()):
+        raise ValueError(f"{label} must contain non-negative integers.")
+    return steps
 
 
 def _mechanism_advance_signature(mech) -> tuple:
@@ -230,6 +264,8 @@ class Mechanism(Parameterized):
     _assigned = set()
     _explicit = set()
     _numerical = set()
+    _affine = set()
+    _affine_method_owners = {}
 
     _state_declarations = []
     _ion_declarations = []
@@ -238,6 +274,7 @@ class Mechanism(Parameterized):
     _assigned_declarations = []
     _explicit_declarations = []
     _numerical_declarations = []
+    _affine_declarations = []
 
     _conductances = {}
     _currents = {}
@@ -274,6 +311,11 @@ class Mechanism(Parameterized):
         # as the base 'object' class does not accept them.
         super().__init_subclass__(**kwargs)
 
+        # Renamed aliases are cached per source mechanism class.  Sharing the
+        # inherited dictionary would let an alias requested from one mechanism
+        # satisfy a same-named request from an unrelated mechanism.
+        cls._renamed_aliases = {}
+
         # Start with a fresh dictionary for the new class's parameters.
         new_state = set()
         new_ion = set()
@@ -282,6 +324,8 @@ class Mechanism(Parameterized):
         new_assigned = set()
         new_explicit = set()
         new_numerical = set()
+        new_affine = set()
+        inherited_affine_method_owners = {}
 
         new_read_ion = {}
         new_write_ion = {}
@@ -320,7 +364,12 @@ class Mechanism(Parameterized):
             if "_source_material" in base.__dict__:
                 _merge_nested_dict(new_source_material, base._source_material)
             if "_currents" in base.__dict__:
-                new_currents.update(base._currents)
+                # Current declarations are list-valued.  Copy those lists so a
+                # subclass declaration cannot append into its parent's class
+                # metadata (notably when constructing a renamed mechanism).
+                new_currents.update(
+                    {name: list(currents) for name, currents in base._currents.items()}
+                )
             if "_init" in base.__dict__:
                 new_init.update(base._init)
             if "_explicit" in base.__dict__:
@@ -328,66 +377,115 @@ class Mechanism(Parameterized):
             if "_numerical" in base.__dict__:
                 new_numerical.update(base._numerical)
 
-        if Mechanism._state_declarations:
-            for s_list in Mechanism._state_declarations:
-                new_state.update(s_list)
-            Mechanism._state_declarations = []  # Clear for next class
-        if Mechanism._ion_declarations:
-            for i_list in Mechanism._ion_declarations:
-                new_ion.update(i_list)
-            Mechanism._ion_declarations = []
-        if Mechanism._material_declarations:
-            for m_list in Mechanism._material_declarations:
-                new_material.update(m_list)
-            Mechanism._material_declarations = []
-        if Mechanism._save_declarations:
-            for s_list in Mechanism._save_declarations:
-                new_save.update(s_list)
-            Mechanism._save_declarations = []
-        if Mechanism._assigned_declarations:
-            for a_list in Mechanism._assigned_declarations:
-                new_assigned.update(a_list)
-            Mechanism._assigned_declarations = []
-        if Mechanism._read_ion_declarations:
-            for r_dict in Mechanism._read_ion_declarations:
-                new_read_ion.update(r_dict)
-            Mechanism._read_ion_declarations = []
-        if Mechanism._write_ion_declarations:
-            for w_dict in Mechanism._write_ion_declarations:
-                new_write_ion.update(w_dict)
-            Mechanism._write_ion_declarations = []
-        if Mechanism._write_ion_c_declarations:
-            for w_dict in Mechanism._write_ion_c_declarations:
-                new_write_ion_c.update(w_dict)
-            Mechanism._write_ion_c_declarations = []
-        if Mechanism._read_material_declarations:
-            for r_dict in Mechanism._read_material_declarations:
-                _merge_list_dict(new_read_material, r_dict)
-            Mechanism._read_material_declarations = []
-        if Mechanism._write_material_declarations:
-            for w_dict in Mechanism._write_material_declarations:
-                _merge_list_dict(new_write_material, w_dict)
-            Mechanism._write_material_declarations = []
-        if Mechanism._source_material_declarations:
-            for s_dict in Mechanism._source_material_declarations:
-                _merge_nested_dict(new_source_material, s_dict)
-            Mechanism._source_material_declarations = []
-        if Mechanism._currents_declarations:
-            for c_list in Mechanism._currents_declarations:
-                new_currents.setdefault("nonspecific", []).extend(c_list)
-            Mechanism._currents_declarations = []
-        if Mechanism._init_declarations:
-            for i_dict in Mechanism._init_declarations:
-                new_init.update(i_dict)
-            Mechanism._init_declarations = []
-        if Mechanism._explicit_declarations:
-            for v_list in Mechanism._explicit_declarations:
-                new_explicit.update(v_list)
-            Mechanism._explicit_declarations = []
-        if Mechanism._numerical_declarations:
-            for v_list in Mechanism._numerical_declarations:
-                new_numerical.update(v_list)
-            Mechanism._numerical_declarations = []
+        # Keep every inherited affine contract until the effective current
+        # method has been selected by Python's MRO. A simple union of ``_affine``
+        # is unsafe for multiple inheritance: a lower-priority base's assertion
+        # must not apply to a different method supplied by a higher-priority
+        # base.
+        for base in cls.__mro__[1:]:
+            if "_affine_method_owners" not in base.__dict__:
+                continue
+            for current, owner in base._affine_method_owners.items():
+                inherited_affine_method_owners.setdefault(current, set()).add(owner)
+
+        for s_list in consume_class_values(
+            cls, "mechanism.state", Mechanism._state_declarations
+        ):
+            new_state.update(s_list)
+        for i_list in consume_class_values(
+            cls, "mechanism.ion", Mechanism._ion_declarations
+        ):
+            new_ion.update(i_list)
+        for m_list in consume_class_values(
+            cls, "mechanism.material", Mechanism._material_declarations
+        ):
+            new_material.update(m_list)
+        for s_list in consume_class_values(
+            cls, "mechanism.save", Mechanism._save_declarations
+        ):
+            new_save.update(s_list)
+        for a_list in consume_class_values(
+            cls, "mechanism.assigned", Mechanism._assigned_declarations
+        ):
+            new_assigned.update(a_list)
+        for r_dict in consume_class_values(
+            cls, "mechanism.read_ion", Mechanism._read_ion_declarations
+        ):
+            new_read_ion.update(r_dict)
+        for w_dict in consume_class_values(
+            cls, "mechanism.write_ion", Mechanism._write_ion_declarations
+        ):
+            new_write_ion.update(w_dict)
+        for w_dict in consume_class_values(
+            cls, "mechanism.write_ion_c", Mechanism._write_ion_c_declarations
+        ):
+            new_write_ion_c.update(w_dict)
+        for r_dict in consume_class_values(
+            cls,
+            "mechanism.read_material",
+            Mechanism._read_material_declarations,
+        ):
+            _merge_list_dict(new_read_material, r_dict)
+        for w_dict in consume_class_values(
+            cls,
+            "mechanism.write_material",
+            Mechanism._write_material_declarations,
+        ):
+            _merge_list_dict(new_write_material, w_dict)
+        for s_dict in consume_class_values(
+            cls,
+            "mechanism.source_material",
+            Mechanism._source_material_declarations,
+        ):
+            _merge_nested_dict(new_source_material, s_dict)
+        for c_list in consume_class_values(
+            cls, "mechanism.currents", Mechanism._currents_declarations
+        ):
+            new_currents.setdefault("nonspecific", []).extend(c_list)
+        for i_dict in consume_class_values(
+            cls, "mechanism.init", Mechanism._init_declarations
+        ):
+            new_init.update(i_dict)
+        for v_list in consume_class_values(
+            cls, "mechanism.explicit", Mechanism._explicit_declarations
+        ):
+            new_explicit.update(v_list)
+        for v_list in consume_class_values(
+            cls, "mechanism.numerical", Mechanism._numerical_declarations
+        ):
+            new_numerical.update(v_list)
+        declared_affine = set()
+        for v_list in consume_class_values(
+            cls, "mechanism.affine", Mechanism._affine_declarations
+        ):
+            declared_affine.update(v_list)
+
+        # An affine assertion belongs to the method selected when it was made.
+        # Retain an inherited assertion only when that same method owner still
+        # wins for the subclass. This handles both ordinary overrides and
+        # competing multiple-inheritance branches without relying on function
+        # object identity (an assertionless class may directly alias a base
+        # function and still constitutes a new ownership boundary).
+        new_affine_method_owners = {}
+        if "_affine" in cls.__dict__:
+            # Dynamic rename aliases copy the complete computed metadata into
+            # their namespace. Rebind those exact metadata/method clones to the
+            # owner selected in the alias's new MRO.
+            for current in cls.__dict__["_affine"]:
+                owner = _mro_attribute_owner(cls, current)
+                new_affine.add(current)
+                new_affine_method_owners[current] = owner
+        else:
+            for current, asserted_owners in inherited_affine_method_owners.items():
+                owner = _mro_attribute_owner(cls, current)
+                if owner in asserted_owners:
+                    new_affine.add(current)
+                    new_affine_method_owners[current] = owner
+
+        for current in declared_affine:
+            owner = _mro_attribute_owner(cls, current)
+            new_affine.add(current)
+            new_affine_method_owners[current] = owner
 
         cls.state_classes = {s.__name__: s for s in new_state}
 
@@ -406,6 +504,8 @@ class Mechanism(Parameterized):
         cls._init = new_init
         cls._explicit = new_explicit
         cls._numerical = new_numerical
+        cls._affine = new_affine
+        cls._affine_method_owners = new_affine_method_owners
         cls._name = None
 
     def __init__(
@@ -479,7 +579,9 @@ class Mechanism(Parameterized):
             if is_composable:
                 self.key = key
             else:
-                self.register_buffer("key", torch.tensor(key, dtype=torch.long))
+                self.register_buffer(
+                    "key", torch.as_tensor(key, dtype=torch.long).detach().clone()
+                )
         else:
             self.key = None
 
@@ -529,8 +631,8 @@ class Mechanism(Parameterized):
             self.add = lambda add_to, add_what: add_to.add(add_what)
             self.put = self.put_no_op
         elif self.is_composable:
-            self.get = (
-                lambda tensor: tensor[..., *self.key] if tensor.ndim > 0 else tensor
+            self.get = lambda tensor: (
+                tensor[..., *self.key] if tensor.ndim > 0 else tensor
             )
             self.add_ = lambda add_to, add_what: add_to[..., *self.key].add_(add_what)
             self.add = lambda add_to, add_what: add_to[..., *self.key].add(add_what)
@@ -588,6 +690,9 @@ class Mechanism(Parameterized):
         self._all_states += [a for a in self._assigned]
 
         # factorize current equations
+        self._current_factorable = {}
+        self._current_conductance_mode = {}
+        self._current_conductance_fallback_reason = {}
         current_eqs = []
         for _, v in self._currents.items():
             current_eqs.extend(v)
@@ -599,7 +704,15 @@ class Mechanism(Parameterized):
             eq, factorable = build_current_eq(self, k, assign=assign)
             setattr(self, f"{k}_with_g", MethodType(eq, self))
             setattr(getattr(self.__class__, k), "factorable", factorable)
-            setattr(self, "factorable", factorable)
+            self._current_factorable[k] = bool(factorable)
+            self._current_conductance_mode[k] = eq._dendra_conductance_mode
+            self._current_conductance_fallback_reason[k] = (
+                eq._dendra_conductance_fallback_reason
+            )
+
+        # Retain the legacy aggregate attribute for downstream callers while
+        # keeping the per-current truth needed by mixed mechanisms.
+        self.factorable = all(self._current_factorable.values())
 
         self.populate()
         self.instantiate_tables()
@@ -838,28 +951,40 @@ class Mechanism(Parameterized):
         buffers named ``<field>_source`` by default, or by the explicit local name
         supplied to ``USEMATERIAL(..., source={field: local_name})``.
         """
-        name = material.name
+        name = _canonical_material_name(material.name)
 
-        if name in self.read_material:
-            for field in self.read_material[name]:
-                self._set_local_material_buffer(
-                    field, self._material_local_view(material, field)
+        read_fields = []
+        for declared_name, fields in self.read_material.items():
+            if _canonical_material_name(declared_name) == name:
+                read_fields.extend(
+                    field for field in fields if field not in read_fields
                 )
+        for field in read_fields:
+            self._set_local_material_buffer(
+                field, self._material_local_view(material, field)
+            )
 
-        if name in self.write_material:
-            for field in self.write_material[name]:
-                local = self._material_local_view(material, field)
-                # Writable material fields should be local tensors, not aliases,
-                # so mechanism state updates do not mutate the population field
-                # before the handler's commit phase.
-                if self.key is not None and local.ndim > 0:
-                    local = local.clone()
-                self._set_local_material_buffer(field, local)
+        write_fields = []
+        for declared_name, fields in self.write_material.items():
+            if _canonical_material_name(declared_name) == name:
+                write_fields.extend(
+                    field for field in fields if field not in write_fields
+                )
+        for field in write_fields:
+            local = self._material_local_view(material, field)
+            # Writable material fields should be local tensors, not aliases,
+            # so mechanism state updates do not mutate the population field
+            # before the handler's commit phase.
+            local = local.clone()
+            self._set_local_material_buffer(field, local)
 
-        if name in self.source_material:
-            for field, local_name in self.source_material[name].items():
-                local = self._material_local_view(material, field)
-                self._set_local_material_buffer(local_name, torch.zeros_like(local))
+        source_fields = {}
+        for declared_name, field_map in self.source_material.items():
+            if _canonical_material_name(declared_name) == name:
+                source_fields.update(field_map)
+        for field, local_name in source_fields.items():
+            local = self._material_local_view(material, field)
+            self._set_local_material_buffer(local_name, torch.zeros_like(local))
 
     def _init_buffers_s(self, v_init):
         for state_module in self.DE.values():
@@ -899,7 +1024,7 @@ class Mechanism(Parameterized):
         *args : type
             State module classes registered to ``Mechanism._state``.
         """
-        Mechanism._state_declarations.append(args)
+        declare_class_value("mechanism.state", args, Mechanism._state_declarations)
 
     @staticmethod
     def BUFFER(*args):
@@ -917,7 +1042,9 @@ class Mechanism(Parameterized):
         *args : str
             Names of mechanism buffers to allocate per instance.
         """
-        Mechanism._assigned_declarations.append(args)
+        declare_class_value(
+            "mechanism.assigned", args, Mechanism._assigned_declarations
+        )
 
     @staticmethod
     def ASSIGNED(*args):
@@ -947,7 +1074,7 @@ class Mechanism(Parameterized):
         *args : str
             Names of buffers mirrored with a trailing underscore.
         """
-        Mechanism._save_declarations.append(args)
+        declare_class_value("mechanism.save", args, Mechanism._save_declarations)
 
     @staticmethod
     def USEION(ion, read=None, write=None):
@@ -996,7 +1123,9 @@ class Mechanism(Parameterized):
             assert w in valid, f"write {w} is not valid"
 
         if read:
-            Mechanism._read_ion_declarations.append({ion: read})
+            declare_class_value(
+                "mechanism.read_ion", {ion: read}, Mechanism._read_ion_declarations
+            )
 
         if write:
             c_write = []
@@ -1008,9 +1137,17 @@ class Mechanism(Parameterized):
                     other.append(w)
 
             if c_write:
-                Mechanism._write_ion_c_declarations.append({ion: c_write})
+                declare_class_value(
+                    "mechanism.write_ion_c",
+                    {ion: c_write},
+                    Mechanism._write_ion_c_declarations,
+                )
             if other:
-                Mechanism._write_ion_declarations.append({ion: other})
+                declare_class_value(
+                    "mechanism.write_ion",
+                    {ion: other},
+                    Mechanism._write_ion_declarations,
+                )
 
     @staticmethod
     def USEMATERIAL(material, read=None, write=None, source=None):
@@ -1046,26 +1183,49 @@ class Mechanism(Parameterized):
             return
 
         material = str(material)
-        Mechanism._material_declarations.append((material,))
+        declare_class_value(
+            "mechanism.material", (material,), Mechanism._material_declarations
+        )
 
         if read:
-            Mechanism._read_material_declarations.append({material: read})
+            declare_class_value(
+                "mechanism.read_material",
+                {material: read},
+                Mechanism._read_material_declarations,
+            )
         if write:
-            Mechanism._write_material_declarations.append({material: write})
+            declare_class_value(
+                "mechanism.write_material",
+                {material: write},
+                Mechanism._write_material_declarations,
+            )
         if source_map:
-            Mechanism._source_material_declarations.append({material: source_map})
+            declare_class_value(
+                "mechanism.source_material",
+                {material: source_map},
+                Mechanism._source_material_declarations,
+            )
 
     @staticmethod
     def NONSPECIFIC_CURRENT(*args):
         """
         Declare non-specific (leak) currents produced by the mechanism.
 
+        Current methods and any properties they read must be deterministic
+        during one solver evaluation.  Symbolic conductance assembly may
+        evaluate a coefficient separately from the authored current method;
+        stateful or stochastic property access can therefore make an
+        ``(i, g)`` pair internally inconsistent.  Such currents should provide
+        an exact ``<current>_with_conductance`` method instead.
+
         Parameters
         ----------
         *args : str
             Current names to register as non-specific.
         """
-        Mechanism._currents_declarations.append(args)
+        declare_class_value(
+            "mechanism.currents", args, Mechanism._currents_declarations
+        )
 
     @staticmethod
     def INIT(**kwargs):
@@ -1077,7 +1237,7 @@ class Mechanism(Parameterized):
         **kwargs
             Mapping from state names to scalar initial conditions.
         """
-        Mechanism._init_declarations.append(kwargs)
+        declare_class_value("mechanism.init", kwargs, Mechanism._init_declarations)
 
     @staticmethod
     def EXPLICIT(*args):
@@ -1089,19 +1249,60 @@ class Mechanism(Parameterized):
         *args : str
             Current names that should not contribute to conductance terms.
         """
-        Mechanism._explicit_declarations.append(args)
+        declare_class_value(
+            "mechanism.explicit", args, Mechanism._explicit_declarations
+        )
 
     @staticmethod
-    def NUMERICAL(*args):
-        """
-        Mark currents as requiring numerical differentiation.
+    def AFFINE(*args):
+        """Assert that currents are exactly affine functions of voltage.
 
         Parameters
         ----------
         *args : str
-            Current names that should be numerically differentiated.
+            Current names satisfying ``I(v) = g * v + b``, where ``g`` and
+            ``b`` do not depend on ``v`` during a solver evaluation.
+
+        Notes
+        -----
+        Dufort--Frankel can center an affine current exactly between its two
+        stored voltage levels. Analytic and numerically differentiated current
+        pairs do not by themselves prove this stronger property: a nonlinear
+        current may have a perfectly valid local derivative. Use ``AFFINE``
+        when source analysis cannot establish the affine form. An incorrect
+        declaration can produce an incorrect Dufort--Frankel trajectory.
         """
-        Mechanism._numerical_declarations.append(args)
+        declare_class_value("mechanism.affine", args, Mechanism._affine_declarations)
+
+    @staticmethod
+    def NUMERICAL(*args):
+        """
+        Assert that currents are safe for numerical differentiation.
+
+        Parameters
+        ----------
+        *args : str
+            Current names that should be numerically differentiated. Each
+            current must be deterministic, side-effect free, and pointwise in
+            voltage.
+
+        Notes
+        -----
+        Numerical currents use centered finite differences and support float32
+        and float64 voltage tensors. The declaration is an explicit assertion
+        of the pointwise/purity contract: Dendra perturbs every voltage element
+        simultaneously, which is correct for local currents but is a directional
+        derivative for currents that couple compartments or batch elements.
+        Stateful, nondeterministic, or voltage-mutating current methods are also
+        invalid because centered differences evaluate them repeatedly. Like any
+        same-precision finite difference, this path can lose accuracy when the
+        current is dominated by a very large voltage-independent offset. Prefer
+        a symbolically factorable current or an exact
+        ``<current>_with_conductance`` method when available.
+        """
+        declare_class_value(
+            "mechanism.numerical", args, Mechanism._numerical_declarations
+        )
 
     def breakpoint(self, v):
         """
@@ -1738,7 +1939,10 @@ class Mechanism(Parameterized):
                 f"got {mode!r}."
             )
 
-        delay_steps = int(delay_steps)
+        delay_steps_t = _nonnegative_integer_steps(delay_steps)
+        if delay_steps_t.numel() != 1:
+            raise ValueError("delay_steps must be one non-negative integer.")
+        delay_steps = int(delay_steps_t.reshape(()).item())
         depth = max(1, delay_steps + 1)
         like = torch.as_tensor(like)
 
@@ -1758,14 +1962,24 @@ class Mechanism(Parameterized):
         buffer = torch.zeros(buffer_shape, device=like.device, dtype=like.dtype)
         pointer = torch.zeros((), device=like.device, dtype=torch.long)
 
+        buffer_replaced = False
         if buffer_name in self._buffers:
-            if clear or tuple(getattr(self, buffer_name).shape) != buffer_shape:
+            current_buffer = getattr(self, buffer_name)
+            buffer_replaced = (
+                tuple(current_buffer.shape) != buffer_shape
+                or current_buffer.device != buffer.device
+                or current_buffer.dtype != buffer.dtype
+            )
+            if clear or buffer_replaced:
                 setattr(self, buffer_name, buffer)
         else:
             self.register_buffer(buffer_name, buffer)
+            buffer_replaced = True
 
         if pointer_name in self._buffers:
-            if clear:
+            # A pointer into a newly allocated buffer has no meaningful history
+            # to preserve and may be outside the new buffer's bounds.
+            if clear or buffer_replaced:
                 setattr(self, pointer_name, pointer)
         else:
             self.register_buffer(pointer_name, pointer)
@@ -1776,6 +1990,7 @@ class Mechanism(Parameterized):
             "steps": delay_steps,
             "depth": depth,
             "axis": int(insert_axis),
+            "value_shape": tuple(like.shape),
             "mode": mode,
         }
         return getattr(self, buffer_name)
@@ -1879,7 +2094,7 @@ class Mechanism(Parameterized):
         if n_streams <= 0:
             raise ValueError("delayed-state stream axis must be non-empty.")
 
-        steps = torch.as_tensor(delay_steps, device=like.device, dtype=torch.long)
+        steps = _nonnegative_integer_steps(delay_steps, device=like.device)
         if steps.ndim == 0 or steps.numel() == 1:
             steps = steps.reshape(1).expand(n_streams).clone()
         else:
@@ -1922,21 +2137,31 @@ class Mechanism(Parameterized):
         buffer = torch.zeros(buffer_shape, device=like.device, dtype=like.dtype)
         pointer = torch.zeros((), device=like.device, dtype=torch.long)
 
+        buffer_replaced = False
         if buffer_name in self._buffers:
-            if clear or tuple(getattr(self, buffer_name).shape) != buffer_shape:
+            current_buffer = getattr(self, buffer_name)
+            buffer_replaced = (
+                tuple(current_buffer.shape) != buffer_shape
+                or current_buffer.device != buffer.device
+                or current_buffer.dtype != buffer.dtype
+            )
+            if clear or buffer_replaced:
                 setattr(self, buffer_name, buffer)
         else:
             self.register_buffer(buffer_name, buffer)
+            buffer_replaced = True
 
         if pointer_name in self._buffers:
-            if clear:
+            if clear or buffer_replaced:
                 setattr(self, pointer_name, pointer)
         else:
             self.register_buffer(pointer_name, pointer)
 
         if steps_name in self._buffers:
-            if clear or tuple(getattr(self, steps_name).shape) != tuple(steps.shape):
-                setattr(self, steps_name, steps)
+            # Delay metadata is configuration, not queue history. Re-registering
+            # with clear=False preserves compatible payload history but must still
+            # install the newly requested delay vector.
+            setattr(self, steps_name, steps)
         else:
             self.register_buffer(steps_name, steps)
 
@@ -1959,6 +2184,7 @@ class Mechanism(Parameterized):
             "axis": delay_axis,
             "stream_axis": buffer_stream_axis,
             "value_stream_axis": int(stream_axis),
+            "value_shape": tuple(like.shape),
             "n_streams": n_streams,
             "mode": mode,
             "batched": True,
@@ -1971,11 +2197,16 @@ class Mechanism(Parameterized):
         """Zero registered delayed-state buffers and reset circular pointers."""
         if not names:
             names = tuple(self._delayed_state_specs.keys())
-        with torch.no_grad():
-            for name in names:
-                spec = self._delayed_state_specs[name]
-                getattr(self, spec["buffer"]).zero_()
-                getattr(self, spec["pointer"]).zero_()
+        for name in names:
+            spec = self._delayed_state_specs[name]
+            # Shift queues may be graph-connected and their returned delayed
+            # values may be views/copies whose backward pass still references the
+            # queue. Rebinding fresh detached tensors both severs the old history
+            # and avoids invalidating an outstanding backward pass in place.
+            buffer = getattr(self, spec["buffer"])
+            pointer = getattr(self, spec["pointer"])
+            setattr(self, spec["buffer"], torch.zeros_like(buffer).detach())
+            setattr(self, spec["pointer"], torch.zeros_like(pointer).detach())
         return self
 
     def delayed_state(self, name, value, *, delay_steps=None, mode=None):
@@ -1992,9 +2223,18 @@ class Mechanism(Parameterized):
                 "Call register_delayed_state(...) during initial(...)."
             )
         spec = self._delayed_state_specs[name]
-        steps = int(spec["steps"] if delay_steps is None else delay_steps)
-        if steps <= 0:
-            return value
+        if spec.get("batched", False):
+            raise ValueError(
+                f"Delayed state {name!r} was registered with "
+                "register_delayed_states; use delayed_states(...) instead."
+            )
+        if delay_steps is None:
+            steps = int(spec["steps"])
+        else:
+            steps_t = _nonnegative_integer_steps(delay_steps)
+            if steps_t.numel() != 1:
+                raise ValueError("delay_steps must be one non-negative integer.")
+            steps = int(steps_t.reshape(()).item())
 
         selected_mode = str(spec["mode"] if mode is None else mode).lower()
         aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
@@ -2003,15 +2243,31 @@ class Mechanism(Parameterized):
             selected_mode = (
                 "shift" if (self.training or torch.is_grad_enabled()) else "circular"
             )
+        if selected_mode not in {"shift", "circular"}:
+            raise ValueError(
+                "delayed-state mode must be 'auto', 'shift', or 'circular'; "
+                f"got {selected_mode!r}."
+            )
+
+        if not torch.is_tensor(value):
+            raise TypeError("delayed_state value must be a torch.Tensor.")
+        expected_shape = spec.get("value_shape")
+        if expected_shape is None:
+            expected_shape = list(getattr(self, spec["buffer"]).shape)
+            del expected_shape[int(spec["axis"])]
+        expected_shape = tuple(expected_shape)
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"Delayed state {name!r} expected value shape {expected_shape}, "
+                f"but received {tuple(value.shape)}."
+            )
+        if steps <= 0:
+            return value
 
         if selected_mode == "circular":
             return self._delayed_state_circular(spec, value, steps)
         if selected_mode == "shift":
             return self._delayed_state_shift(spec, value, steps)
-        raise ValueError(
-            "delayed-state mode must be 'auto', 'shift', or 'circular'; "
-            f"got {selected_mode!r}."
-        )
 
     def _delayed_state_shift(self, spec, value, steps: int):
         """Graph-safe delayed-state update using an out-of-place shifted queue."""
@@ -2088,6 +2344,32 @@ class Mechanism(Parameterized):
                 "use delayed_state(...) instead."
             )
 
+        selected_mode = str(spec["mode"] if mode is None else mode).lower()
+        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
+        selected_mode = aliases.get(selected_mode, selected_mode)
+        if selected_mode == "auto":
+            selected_mode = (
+                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
+            )
+        if selected_mode not in {"shift", "circular"}:
+            raise ValueError(
+                "batched delayed-state mode must be 'auto', 'shift', or 'circular'; "
+                f"got {selected_mode!r}."
+            )
+
+        if not torch.is_tensor(values):
+            raise TypeError("delayed_states values must be a torch.Tensor.")
+        expected_shape = spec.get("value_shape")
+        if expected_shape is None:
+            expected_shape = list(getattr(self, spec["buffer"]).shape)
+            del expected_shape[int(spec["axis"])]
+        expected_shape = tuple(expected_shape)
+        if tuple(values.shape) != expected_shape:
+            raise ValueError(
+                f"Delayed state group {name!r} expected values shape "
+                f"{expected_shape}, but received {tuple(values.shape)}."
+            )
+
         # Fast all-zero shortcut for the registered delay vector.  This is a
         # Python bool stored at registration time, so it is safe under
         # torch.compile.  Avoid Tensor.item() here: the per-step path may be
@@ -2097,22 +2379,15 @@ class Mechanism(Parameterized):
 
         steps = self._delayed_states_steps(spec, values, delay_steps)
 
-        selected_mode = str(spec["mode"] if mode is None else mode).lower()
-        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
-        selected_mode = aliases.get(selected_mode, selected_mode)
-        if selected_mode == "auto":
-            selected_mode = (
-                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
-            )
-
+        runtime_override = delay_steps is not None
         if selected_mode == "circular":
-            return self._delayed_states_circular(spec, values, steps)
+            return self._delayed_states_circular(
+                spec, values, steps, validate_capacity=runtime_override
+            )
         if selected_mode == "shift":
-            return self._delayed_states_shift(spec, values, steps)
-        raise ValueError(
-            "batched delayed-state mode must be 'auto', 'shift', or 'circular'; "
-            f"got {selected_mode!r}."
-        )
+            return self._delayed_states_shift(
+                spec, values, steps, resize=runtime_override
+            )
 
     def _delayed_states_steps(self, spec, values, delay_steps=None):
         # Registered delay vectors are normalized at initialization and kept as
@@ -2121,10 +2396,16 @@ class Mechanism(Parameterized):
         if delay_steps is None:
             return getattr(self, spec["steps_buffer"])
 
-        steps = torch.as_tensor(delay_steps, device=values.device, dtype=torch.long)
+        steps = _nonnegative_integer_steps(delay_steps, device=values.device)
         if steps.ndim == 0 or steps.numel() == 1:
             return steps.reshape(1).expand(int(spec["n_streams"]))
-        return steps.reshape(-1)
+        steps = steps.reshape(-1)
+        if steps.numel() != int(spec["n_streams"]):
+            raise ValueError(
+                f"delay_steps has length {steps.numel()}, but the stream axis "
+                f"has length {int(spec['n_streams'])}."
+            )
+        return steps
 
     def _delayed_states_gather(self, buf, spec, read_idx):
         axis = int(spec["axis"])
@@ -2147,13 +2428,15 @@ class Mechanism(Parameterized):
         mask_shape[value_stream_axis] = int(spec["n_streams"])
         return (steps == 0).reshape(mask_shape)
 
-    def _delayed_states_shift(self, spec, values, steps):
+    def _delayed_states_shift(self, spec, values, steps, *, resize=False):
         """Graph-safe multi-stream delay update using a shifted queue."""
         buf_name = spec["buffer"]
         axis = int(spec["axis"])
         buf = getattr(self, buf_name)
         depth = int(buf.shape[axis])
         required_depth = int(spec.get("steps", 0)) + 1
+        if resize:
+            required_depth = int(steps.max().item()) + 1 if steps.numel() else 1
         if required_depth != depth:
             state_name = next(
                 k for k, v in self._delayed_state_specs.items() if v is spec
@@ -2180,22 +2463,27 @@ class Mechanism(Parameterized):
         setattr(self, buf_name, buf_new)
         return self._delayed_states_gather(buf_new, spec, steps)
 
-    def _delayed_states_circular(self, spec, values, steps):
+    def _delayed_states_circular(self, spec, values, steps, *, validate_capacity=False):
         """Fast eval multi-stream delay update using one in-place ring buffer."""
         buf = getattr(self, spec["buffer"])
         ptr = getattr(self, spec["pointer"])
         axis = int(spec["axis"])
         depth = int(buf.shape[axis])
 
+        if validate_capacity and bool(torch.any(steps >= depth).item()):
+            raise ValueError(
+                "Runtime delay_steps exceed the registered circular-buffer "
+                f"capacity of {depth - 1} steps. Re-register the delayed state."
+            )
+
         read_idx = torch.remainder(ptr - steps, depth)
         delayed = self._delayed_states_gather(buf, spec, read_idx)
 
         # A stream with zero delay should deliver the current value, not the
         # previous content of the circular slot that will be overwritten below.
-        if bool(spec.get("has_zero_delay", False)):
-            delayed = torch.where(
-                self._delayed_states_zero_mask(spec, values, steps), values, delayed
-            )
+        delayed = torch.where(
+            self._delayed_states_zero_mask(spec, values, steps), values, delayed
+        )
 
         with torch.no_grad():
             write_idx = ptr.reshape(1)
@@ -2248,8 +2536,10 @@ class Mechanism(Parameterized):
         self.injected_waveforms = torch.nn.ModuleList()
         self._injection_specs = []
         for name in list(self._buffers.keys()):
-            if name.startswith("_injection_mask_") or name.startswith(
-                "_injection_scale_"
+            if (
+                name.startswith("_injection_mask_")
+                or name.startswith("_injection_scale_")
+                or name.startswith("_injection_index_")
             ):
                 delattr(self, name)
         return self
@@ -2301,14 +2591,25 @@ class Mechanism(Parameterized):
         k = len(self.injected_waveforms)
         mask_name = f"_injection_mask_{k}"
         scale_name = f"_injection_scale_{k}"
+        index_name = f"_injection_index_{k}"
+        selected_index = torch.nonzero(local_mask.reshape(-1), as_tuple=False).reshape(
+            -1
+        )
         self.register_buffer(mask_name, local_mask.detach().clone())
         self.register_buffer(
             scale_name,
             torch.as_tensor(scale, device=device, dtype=dtype).detach().clone(),
         )
+        self.register_buffer(index_name, selected_index.detach().clone())
         self.injected_waveforms.append(waveform)
         self._injection_specs.append(
-            {"mask": mask_name, "scale": scale_name, "current_name": current_name}
+            {
+                "mask": mask_name,
+                "scale": scale_name,
+                "index": index_name,
+                "n_selected": int(selected_index.numel()),
+                "current_name": current_name,
+            }
         )
 
         # Expose the current variable immediately for introspection, even before
@@ -2319,12 +2620,21 @@ class Mechanism(Parameterized):
             )
         return True
 
-    def _expand_injection_value(self, value, mask, out):
+    def _expand_injection_value(
+        self,
+        value,
+        mask,
+        out,
+        *,
+        selected_index=None,
+        n_local_selected=None,
+    ):
         """Return ``value`` padded/broadcast into ``out`` at ``mask`` locations."""
         value = torch.as_tensor(value, device=out.device, dtype=out.dtype)
 
         # Bring an unbatched mask up to the current local state shape.
-        mask = mask.to(device=out.device, dtype=torch.bool)
+        local_mask = mask.to(device=out.device, dtype=torch.bool)
+        mask = local_mask
         while mask.ndim < out.ndim:
             mask = mask.unsqueeze(0)
         mask = mask.expand_as(out)
@@ -2348,7 +2658,39 @@ class Mechanism(Parameterized):
         # Vector over selected compartments.  This supports either a single
         # unbatched vector of length n_selected or a batched tensor whose last
         # dimension is n_selected.
-        n_selected = int(mask.reshape(-1).sum().item()) if out.ndim == mask.ndim else 0
+        # If the mask describes the local (unbatched) suffix, accept either one
+        # selected vector shared across batches or one vector per batch.
+        if local_mask.ndim <= out.ndim and tuple(
+            out.shape[out.ndim - local_mask.ndim :]
+        ) == tuple(local_mask.shape):
+            batch_shape = tuple(out.shape[: out.ndim - local_mask.ndim])
+            if n_local_selected is None:
+                n_local_selected = int(local_mask.reshape(-1).sum().item())
+            selected_shape = batch_shape + (n_local_selected,)
+            selected = None
+            if value.numel() == n_local_selected:
+                selected = value.reshape(
+                    (1,) * len(batch_shape) + (n_local_selected,)
+                ).expand(selected_shape)
+            else:
+                try:
+                    selected = value.expand(selected_shape)
+                except RuntimeError:
+                    pass
+            if selected is not None:
+                if selected_index is None:
+                    selected_index = torch.nonzero(
+                        local_mask.reshape(-1), as_tuple=False
+                    ).reshape(-1)
+                padded = torch.zeros_like(out).reshape(-1, local_mask.numel())
+                padded = padded.index_copy(
+                    1,
+                    selected_index.to(device=out.device),
+                    selected.reshape(-1, n_local_selected),
+                )
+                return padded.reshape_as(out)
+
+        n_selected = int(mask.reshape(-1).sum().item())
         if value.numel() == n_selected:
             padded = torch.zeros_like(out)
             padded.reshape(-1)[mask.reshape(-1)] = value.reshape(-1)
@@ -2405,10 +2747,19 @@ class Mechanism(Parameterized):
         t = torch.atleast_1d(t)
 
         for k, spec in enumerate(self._injection_specs):
+            if spec["current_name"] != current_name:
+                continue
             mask = getattr(self, spec["mask"])
             scale = getattr(self, spec["scale"])
+            selected_index = getattr(self, spec["index"])
             value = self.injected_waveforms[k](t) * scale
-            out = out + self._expand_injection_value(value, mask, out)
+            out = out + self._expand_injection_value(
+                value,
+                mask,
+                out,
+                selected_index=selected_index,
+                n_local_selected=int(spec["n_selected"]),
+            )
 
         setattr(self, current_name, out)
         return out
@@ -2542,14 +2893,18 @@ class ContinuousSynapse(Mechanism):
             if "_continuous_input_old" in base.__dict__:
                 old_map.update(dict(base._continuous_input_old))
 
-        for names, keep_old in ContinuousSynapse._continuous_input_declarations:
+        declarations = consume_class_values(
+            cls,
+            "continuous_synapse.inputs",
+            ContinuousSynapse._continuous_input_declarations,
+        )
+        for names, keep_old in declarations:
             for name in names:
                 if name not in inputs:
                     inputs.append(name)
                 if keep_old:
                     old_map[name] = f"{name}_old"
 
-        ContinuousSynapse._continuous_input_declarations = []
         cls._continuous_inputs = tuple(inputs)
         cls._continuous_input_old = old_map
 
@@ -2582,7 +2937,11 @@ class ContinuousSynapse(Mechanism):
         if keep_old:
             assigned.extend(f"{name}_old" for name in names)
         Mechanism.BUFFER(*assigned)
-        ContinuousSynapse._continuous_input_declarations.append((names, bool(keep_old)))
+        declare_class_value(
+            "continuous_synapse.inputs",
+            (names, bool(keep_old)),
+            ContinuousSynapse._continuous_input_declarations,
+        )
 
     def reset_continuous_inputs(self):
         """Reset continuous input buffers before new analog deliveries.
@@ -2670,8 +3029,24 @@ def rename(mechanism, new_name=None):
     # 3. dict: A dictionary containing the attributes and methods of the
     #          original class. We create a copy to avoid side effects.
 
+    # ``Parameterized.__init_subclass__`` rebuilds and clears declaration-
+    # ownership registries on every new class. Preserve the source ownership
+    # metadata separately so future subclasses of the alias resolve parameter
+    # category precedence exactly as subclasses of the source class do.
+    declaration_ownership = {
+        name: value.copy()
+        for name, value in mechanism.__dict__.items()
+        if name.endswith("_defined_here")
+    }
+
     # Copy the original class's namespace dictionary.
     class_dict = dict(mechanism.__dict__)
+
+    # The computed declaration attributes copied above already describe the
+    # complete class.  Replaying its original class-body declaration journal
+    # through ``__init_subclass__`` would apply non-idempotent declarations
+    # (especially current lists) a second time.
+    class_dict.pop(_DECLARATIONS_KEY, None)
 
     # Do not clone generated monomorphic advance functions.  A renamed class may
     # be used alongside the source class; sharing the same generated `_advance`
@@ -2688,6 +3063,16 @@ def rename(mechanism, new_name=None):
         class_dict["__module__"] = mechanism.__module__
 
     new_class = type(new_name, mechanism.__bases__, class_dict)
+    for name, value in declaration_ownership.items():
+        setattr(new_class, name, value)
+    # Preserve stable source provenance for symbolic current analysis.  A
+    # ``type(...)`` alias has no class statement of its own, but its current
+    # methods are exact clones of the source mechanism.  Following this link
+    # avoids making symbolic differentiation depend on whether a platform's
+    # inspection stack happens to recover the dynamic alias body.
+    new_class._dendra_symbolic_source_class = mechanism.__dict__.get(
+        "_dendra_symbolic_source_class", mechanism
+    )
     new_class._name = new_name  # Set the new name attribute
 
     return new_class

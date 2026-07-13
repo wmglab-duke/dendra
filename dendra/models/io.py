@@ -5,12 +5,26 @@ except ImportError:
 
 import re
 from functools import partial
+from os import PathLike
 from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
 
 from ..helpers import requires_packages
+
+
+def _positive_finite(value, *, name: str) -> float:
+    """Normalize a positive finite scalar used by morphology discretization."""
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be a real number, not a boolean.")
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a real number.") from error
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be positive and finite, got {value!r}.")
+    return value
 
 
 def xyz(seg, extcell=None):
@@ -83,12 +97,18 @@ def lambda_f(sec, freq_hz):
     """
     from math import pi, sqrt
 
+    freq_hz = _positive_finite(freq_hz, name="freq_hz")
+    rhoa = _positive_finite(sec.Ra, name="section Ra")
+    cm = _positive_finite(sec.cm, name="section cm")
+    section_length = _positive_finite(sec.L, name="section L")
+
     # make sure diam/3‑D info are up to date
     h.define_shape()
 
     n3d = int(h.n3d(sec=sec))
     if n3d < 2:  # no 3‑D points → uniform cylinder shortcut
-        return 1e5 * sqrt(sec.diam / (4 * pi * freq_hz * sec.Ra * sec.cm))
+        diameter = _positive_finite(sec.diam, name="section diameter")
+        return 1e5 * sqrt(diameter / (4 * pi * freq_hz * rhoa * cm))
 
     # --- piecewise integration along 3‑D centre line ------------------------
     x1 = h.arc3d(0, sec=sec)
@@ -97,14 +117,18 @@ def lambda_f(sec, freq_hz):
     for i in range(1, n3d):
         x2 = h.arc3d(i, sec=sec)
         d2 = h.diam3d(i, sec=sec)
-        lam += (x2 - x1) / sqrt(d1 + d2)
+        diameter_sum = _positive_finite(
+            d1 + d2, name=f"section diameter sum at pt3d interval {i - 1}:{i}"
+        )
+        lam += (x2 - x1) / sqrt(diameter_sum)
         x1, d1 = x2, d2
 
     # convert to “length‑in‑units‑of‑λ”
-    lam *= sqrt(2.0) * 1e-5 * sqrt(4 * pi * freq_hz * sec.Ra * sec.cm)
+    lam *= sqrt(2.0) * 1e-5 * sqrt(4 * pi * freq_hz * rhoa * cm)
+    lam = _positive_finite(lam, name="section electrotonic length")
 
     # return the actual λ (µm)
-    return sec.L / lam
+    return section_length / lam
 
 
 @requires_packages("neuron")
@@ -117,6 +141,8 @@ def apply_d_lambda(all_sections: List, d_lambda: float = 0.1, freq: float = 100.
         d_lambda (float): The d_lambda value to apply.
         freq (float): The frequency for the d_lambda application.
     """
+    d_lambda = _positive_finite(d_lambda, name="d_lambda")
+    freq = _positive_finite(freq, name="freq")
     h.define_shape()
 
     for sec in all_sections:
@@ -127,7 +153,11 @@ def apply_d_lambda(all_sections: List, d_lambda: float = 0.1, freq: float = 100.
 
 @requires_packages("neuron")
 def read_swc(
-    file_path: str, d_lambda=0.1, freq=100.0, data_func=None, **kwargs
+    file_path: str | PathLike[str],
+    d_lambda=0.1,
+    freq=100.0,
+    data_func=None,
+    **kwargs,
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read an SWC file and return the contents."""
 
@@ -147,7 +177,7 @@ def read_swc(
             return "SWCCell"
 
     reader = h.Import3d_SWC_read()
-    reader.input(file_path)
+    reader.input(str(file_path))
     importer = h.Import3d_GUI(reader, 0)
 
     cell = Cell(importer)
@@ -166,7 +196,11 @@ def read_swc(
 
 @requires_packages("neuron")
 def read_neurolucida(
-    file_path: str, d_lambda=0.1, freq=100.0, data_func=None, **kwargs
+    file_path: str | PathLike[str],
+    d_lambda=0.1,
+    freq=100.0,
+    data_func=None,
+    **kwargs,
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
     """Read a Neurolucida file and return the contents."""
 
@@ -187,7 +221,7 @@ def read_neurolucida(
 
     reader = h.Import3d_Neurolucida3()
     reader.quiet = 1
-    reader.input(file_path)
+    reader.input(str(file_path))
     importer = h.Import3d_GUI(reader, 0)
 
     cell = Cell(importer)

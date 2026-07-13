@@ -9,6 +9,10 @@
 - expose torch.compile options through dendra
 - PointProcess slots
 
+### Fix
+
+- make duration-based Population and Network runs composable by retaining incomplete fixed timesteps across calls
+
 ## v0.16.0 (2026-06-24)
 
 ### Feat

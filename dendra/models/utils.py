@@ -1,63 +1,95 @@
+"""Reusable helpers for model morphology graphs."""
+
+from collections.abc import Iterable
+
 import networkx as nx
 import torch
 
+__all__ = ["distance", "undirected_weighted_lengths"]
+
 
 def distance(cell, origin, targets):
-    """
-    Calculate the distance between two nodes in a cell.
+    """Return undirected, length-weighted distances between cell compartments.
 
     Parameters
     ----------
-    cell : Cell
-        The cell object containing the graph.
-    idx1 : int
-        The index of the first node.
-    idx2 : int
-        The index of the second node.
+    cell : object
+        An object whose ``graph`` attribute is a NetworkX graph. Edges are
+        weighted by their ``L`` attribute.
+    origin : node label or slice
+        Source node. A slice is resolved against the graph's node iteration
+        order; for compatibility, the first selected node is used.
+    targets : node label, iterable of node labels, or slice
+        Destination node or nodes. A slice is resolved against the graph's
+        node iteration order.
 
     Returns
     -------
-    float
-        The distance between the two nodes.
+    torch.Tensor
+        One distance per requested target, in target order. Unreachable
+        targets have distance ``inf``. A scalar target produces a one-element
+        tensor.
+
+    Raises
+    ------
+    ValueError
+        If the cell has no graph or an origin slice selects no nodes.
     """
     graph = cell.graph
     if graph is None:
         raise ValueError("Graph is not defined for this cell.")
+
+    nodes = list(graph.nodes)
     if isinstance(origin, slice):
-        origin = list(range(len(graph.nodes)))[origin][0]
+        selected = nodes[origin]
+        if not selected:
+            raise ValueError("The origin slice selects no graph nodes.")
+        origin = selected[0]
     if isinstance(targets, slice):
-        targets = list(range(len(graph.nodes)))[targets]
+        targets = nodes[targets]
     return undirected_weighted_lengths(graph, origin, targets)
 
 
 def undirected_weighted_lengths(G: nx.DiGraph, origin, targets, weight_attr="L"):
-    """
+    """Return shortest-path distances while ignoring edge direction.
+
     Parameters
     ----------
-    G : nx.DiGraph
-        Directed graph whose edges carry an attribute `weight_attr`
-        (e.g. "L").
+    G : nx.Graph
+        Graph whose edges carry the numeric attribute named by
+        ``weight_attr``. Directed graphs are viewed as undirected.
     origin : node label
         The single source node.
-    targets : iterable
-        An iterable of node labels for which you want distances.
+    targets : node label or iterable of node labels
+        Node or nodes for which to return distances. A node label that is
+        itself iterable, such as a tuple, is treated as a scalar when it is
+        present in ``G``.
     weight_attr : str, optional
-        Name of the edge attribute that stores the length/weight. Default: "L".
+        Edge attribute storing length or weight. Defaults to ``"L"``.
 
     Returns
     -------
-    dict
-        {target_node: shortest-path length (sum of `weight_attr`), ...}.
-        If a target is unreachable it is omitted (or you can map it to
-        `float("inf")`, see example).
+    torch.Tensor
+        A one-dimensional CPU tensor containing one distance per target.
+        Unreachable targets are represented by ``inf``.
     """
-    # Treat the digraph as *undirected* without copying edge data
     UG = G.to_undirected(as_view=True)
-
-    # One Dijkstra run from the origin gives all lengths in O((V+E) log V)
     lengths = nx.single_source_dijkstra_path_length(
         UG, source=origin, weight=weight_attr
     )
 
-    # Return only the distances you asked for
+    # Node labels can themselves be iterable (most notably tuple labels), so
+    # graph membership is the most reliable scalar check. Unhashable values
+    # simply fall through to normal iterable handling.
+    try:
+        scalar_target = targets in G
+    except TypeError:
+        scalar_target = False
+    if (
+        scalar_target
+        or isinstance(targets, (str, bytes))
+        or not isinstance(targets, Iterable)
+    ):
+        targets = (targets,)
+
     return torch.tensor([lengths.get(t, float("inf")) for t in targets])

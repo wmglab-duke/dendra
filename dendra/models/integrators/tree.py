@@ -6,7 +6,7 @@ import networkx as nx
 import numpy as np
 import torch
 
-from ..graph import share_topology_isomorphic
+from ..graph import share_topology_labeled
 from .core import (
     Integrator,
     MultiIntegrator,
@@ -52,11 +52,55 @@ try:
             WARP_ROW_BASE,
             WARP_ROW_COUNT,
         )
+
 except ImportError:
     DENDRA_SOLVERS_AVAILABLE = False
 
 
 THREADS_PER_WARP = 32
+
+
+def _validate_dhs_threads(threads: int) -> int:
+    """Validate the lane count accepted by the CPU and CUDA DHS kernels."""
+    if isinstance(threads, bool) or not isinstance(threads, int):
+        raise TypeError("threads must be a positive integer that divides 32")
+    if threads <= 0 or threads > THREADS_PER_WARP:
+        raise ValueError("threads must be in [1, 32]")
+    if THREADS_PER_WARP % threads != 0:
+        raise ValueError("threads must divide 32 (warp size)")
+    return threads
+
+
+def _validate_tree_graph(graph: nx.DiGraph) -> None:
+    """Reject graph shapes that the Hines/DHS parent representation cannot encode."""
+    if not isinstance(graph, nx.DiGraph) or graph.is_multigraph():
+        raise TypeError("morphology graph must be a networkx.DiGraph")
+    if graph.number_of_nodes() == 0:
+        raise ValueError("morphology graph must contain at least one node")
+    if not nx.is_directed_acyclic_graph(graph):
+        raise ValueError("morphology graph must be acyclic")
+
+    for node, degree in graph.in_degree():
+        if degree > 1:
+            raise ValueError(
+                f"Node {node} has {degree} parents; morphology must be a rooted tree."
+            )
+
+    roots = [node for node, degree in graph.in_degree() if degree == 0]
+    if len(roots) != 1:
+        raise ValueError(
+            f"morphology graph must have exactly one root; found {len(roots)}"
+        )
+
+    root = roots[0]
+    if len(nx.descendants(graph, root)) + 1 != graph.number_of_nodes():
+        raise ValueError("all morphology nodes must be reachable from the root")
+
+    expected_nodes = set(range(graph.number_of_nodes()))
+    if set(graph.nodes()) != expected_nodes:
+        raise ValueError(
+            "morphology node labels must be consecutive integers from 0 to K - 1"
+        )
 
 
 def build_morphology(
@@ -78,27 +122,52 @@ def build_morphology(
     depth       int32[K]  : depth of every node from the soma
     """
     K = len(parent_idx)
+    if K == 0:
+        raise ValueError("parent_idx must contain at least one node")
+
+    roots = [i for i, parent in enumerate(parent_idx) if parent == -1]
+    if len(roots) != 1:
+        raise ValueError(
+            f"parent_idx must contain exactly one root; found {len(roots)}"
+        )
+
     children = [[] for _ in range(K)]
-    root = None
+    root = roots[0]
     for i, p in enumerate(parent_idx):
         if p == -1:
-            root = i
-        else:
-            children[p].append(i)
+            continue
+        if isinstance(p, bool) or not isinstance(p, (int, np.integer)):
+            raise TypeError(f"parent index at node {i} must be an integer; got {p!r}")
+        if p < 0 or p >= K:
+            raise ValueError(
+                f"parent index at node {i} must be in [0, {K - 1}]; got {p}"
+            )
+        if p == i:
+            raise ValueError(f"node {i} cannot be its own parent")
+        children[p].append(i)
 
     depth = torch.zeros(K, dtype=torch.int32)
     q = deque([root])
+    visited = set()
     while q:
         u = q.popleft()
+        if u in visited:
+            raise ValueError("parent_idx contains a cycle")
+        visited.add(u)
         for c in children[u]:
             depth[c] = depth[u] + 1
             q.append(c)
+
+    if len(visited) != K:
+        raise ValueError(
+            "parent_idx contains a cycle or nodes unreachable from the root"
+        )
 
     return (torch.as_tensor(parent_idx, dtype=torch.int32), children, depth)
 
 
 def graph_to_parent_and_axial(
-    G: list[nx.DiGraph], dtype_axial: torch.dtype = torch.float32
+    G: nx.DiGraph | list[nx.DiGraph], dtype_axial: torch.dtype = torch.float32
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Convert a compartmental morphology stored in a DiGraph into
@@ -115,25 +184,58 @@ def graph_to_parent_and_axial(
     The topological sort guarantees that every parent index < child index,
     matching the requirements of DHS / Hines matrix preprocessing.
     """
-    assert share_topology_isomorphic(G), "All graphs must share the same topology."
+    graphs = [G] if isinstance(G, nx.DiGraph) else list(G)
+    if not graphs:
+        raise ValueError("at least one morphology graph is required")
+    for graph in graphs:
+        _validate_tree_graph(graph)
+
+    same_topology, reason = share_topology_labeled(graphs)
+    if not same_topology:
+        raise ValueError(
+            "All morphology graphs must share the same labeled topology: " + reason
+        )
     # ------------------------------------------------------------------
     # 0. topological order and quick look‑ups
     # ------------------------------------------------------------------
-    nodes = list(nx.topological_sort(G[0]))  # length K
+    nodes = list(nx.topological_sort(graphs[0]))  # length K
     idx_of = {n: i for i, n in enumerate(nodes)}
     K = len(nodes)
 
     parent_idx = np.full(K, -1, dtype=np.int32)
-    a_geom = np.zeros((len(G), K), dtype=np.float32)
+    # Compute in double precision and cast only at the public tensor boundary.
+    # The previous float32 staging array silently truncated float64 morphologies.
+    a_geom = np.zeros((len(graphs), K), dtype=np.float64)
 
     # constant: 1 µm = 1 e‑4 cm
     microns_to_cm = 1e-4
     pi = np.pi
 
+    def positive_geometry(graph, node, name):
+        value = graph.nodes[node][name]
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as err:
+            raise TypeError(
+                f"Geometry attribute {name!r} on node {node} must be a scalar; "
+                f"got {value!r}."
+            ) from err
+        if not np.isfinite(value):
+            raise ValueError(
+                f"Geometry attribute {name!r} on node {node} must be finite; "
+                f"got {value!r}."
+            )
+        if value <= 0:
+            raise ValueError(
+                f"Geometry attribute {name!r} on node {node} must be positive; "
+                f"got {value!r}."
+            )
+        return value
+
     # ------------------------------------------------------------------
     # 1. iterate over all nodes except the roots
     # ------------------------------------------------------------------
-    for j, g in enumerate(G):
+    for j, g in enumerate(graphs):
         for child in nodes:
             i = idx_of[child]
             preds = list(g.predecessors(child))
@@ -162,16 +264,16 @@ def graph_to_parent_and_axial(
             if R_total is None:
                 try:
                     # child geometry
-                    L_i = g.nodes[child]["L"] * microns_to_cm  # cm
-                    d_i_cm = g.nodes[child]["diam"] * microns_to_cm
+                    L_i = positive_geometry(g, child, "L") * microns_to_cm  # cm
+                    d_i_cm = positive_geometry(g, child, "diam") * microns_to_cm
                     r_i_cm = 0.5 * d_i_cm
-                    rho_i = g.nodes[child]["Ra"]  # Ω·cm
+                    rho_i = positive_geometry(g, child, "Ra")  # Ω·cm
 
                     # parent geometry
-                    L_p = g.nodes[parent]["L"] * microns_to_cm
-                    d_p_cm = g.nodes[parent]["diam"] * microns_to_cm
+                    L_p = positive_geometry(g, parent, "L") * microns_to_cm
+                    d_p_cm = positive_geometry(g, parent, "diam") * microns_to_cm
                     r_p_cm = 0.5 * d_p_cm
-                    rho_p = g.nodes[parent]["Ra"]  # Ω·cm
+                    rho_p = positive_geometry(g, parent, "Ra")  # Ω·cm
                 except KeyError as err:
                     raise KeyError(
                         f"Missing geometry attribute {err} on node; "
@@ -186,6 +288,11 @@ def graph_to_parent_and_axial(
             # --------------------------------------------------------------
             # 1c.  Store axial conductance  (Siemens = 1 / Ω)
             # --------------------------------------------------------------
+            if not np.isfinite(R_total) or R_total <= 0:
+                raise ValueError(
+                    f"Axial resistance for edge ({parent}, {child}) must be "
+                    f"finite and positive; got {R_total!r}."
+                )
             a_geom[j, i] = 1.0 / R_total
 
     # ------------------------------------------------------------------
@@ -213,6 +320,25 @@ def build_dhs_layers(
     order      int32[K]        elimination order (children before parent)
     layer_ptr  int32[L+1]      layer_ptr[m] … layer_ptr[m+1]-1  is layer m
     """
+    k_threads = _validate_dhs_threads(k_threads)
+    if not torch.is_tensor(depth):
+        raise TypeError("depth must be a one-dimensional integer tensor")
+    if depth.ndim != 1:
+        raise ValueError(
+            f"depth must be one-dimensional; got shape {tuple(depth.shape)}"
+        )
+    if depth.numel() == 0:
+        raise ValueError("depth must contain at least one node")
+    if depth.dtype not in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }:
+        raise TypeError(f"depth must use an integer dtype; got {depth.dtype}")
+    if bool((depth < 0).any()):
+        raise ValueError("depth values must be nonnegative")
     depth_cpu = depth.cpu().numpy()
     max_d = int(depth_cpu.max())
 
@@ -246,7 +372,11 @@ def _edge_currents(
     ve: torch.Tensor,
 ):  # (B,K)
     # diff shape (B,E)
-    diff = ve.index_select(1, edge_parent) - ve.index_select(1, edge_child)
+    # ``v`` is transmembrane voltage, while axial current is driven by the
+    # intracellular potential ``v + ve``.  The extracellular contribution on
+    # an oriented parent -> child edge is therefore g * (ve_child - ve_parent):
+    # it enters the parent RHS and leaves the child RHS.
+    diff = ve.index_select(1, edge_child) - ve.index_select(1, edge_parent)
     return diff * edge_gax
 
 
@@ -273,8 +403,7 @@ class _dhs(Integrator):
     """
 
     def __init__(self, model, mech, imem=None, threads=16):
-        assert THREADS_PER_WARP % threads == 0, "threads must divide 32 (warp size)"
-        assert threads <= 32, "threads must be ≤ 32 (warp size)"
+        threads = _validate_dhs_threads(threads)
 
         super().__init__(model, mech, imem)
         self.threads = threads
@@ -339,7 +468,9 @@ class _dhs(Integrator):
         if not isinstance(graph, list):
             graph = [graph]
 
-        parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(graph)
+        parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(
+            graph, dtype_axial=model.dtype()
+        )
         parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
         order, layer_ptr = build_dhs_layers(depth, self.threads)
 
@@ -386,11 +517,14 @@ class _dhs(Integrator):
         edge_parent_orig_list = []
         edge_gax_orig_list = []
 
-        node_order_list = node_order
+        solver_idx_of = {node: index for index, node in enumerate(node_order)}
 
         for i, g in enumerate(graph):
             edge_gax_orig_list_ = []
-            for child_node, _ in g.nodes(data=True):
+            # Iterate in one canonical mechanism order for every morphology.
+            # Graph insertion order is not semantic and may differ across a
+            # heterogeneous batch even when the labeled topology is identical.
+            for child_node in original_nodes:
                 preds = list(g.predecessors(child_node))
                 if not preds:
                     continue  # Skip root nodes
@@ -407,9 +541,8 @@ class _dhs(Integrator):
 
                 # a_geom_t is in solver_order, so we need to find the child's
                 # index in the solver order to get its correct conductance.
-                # We can use the list `node_order_list` returned from graph_to_parent_and_axial
-                # which maps solver_order_index -> original_node_id
-                solver_idx_of_child = node_order_list.index(child_node)
+                # ``node_order`` maps solver index -> original node label.
+                solver_idx_of_child = solver_idx_of[child_node]
                 edge_gax_orig_list_.append(a_geom_t[i, solver_idx_of_child].item())
             edge_gax_orig_list.append(edge_gax_orig_list_)
 
@@ -558,8 +691,7 @@ class _dhs_multi(MultiIntegrator):
     ):
         from ..multi import MultiPopulation
 
-        assert THREADS_PER_WARP % threads == 0, "threads must divide 32 (warp size)"
-        assert threads <= 32, "threads must be ≤ 32 (warp size)"
+        threads = _validate_dhs_threads(threads)
         assert len(model) > 0 and isinstance(model, MultiPopulation), (
             "model must be a non-empty MultiPopulation instance"
         )
@@ -599,6 +731,16 @@ class _dhs_multi(MultiIntegrator):
     def initialize(self, models, dt: float):
         assert len(models) == self.num_groups
 
+        # ``initialize`` is also the shape/dt reinitialization path.  Keep all
+        # Python-side group metadata idempotent rather than appending a second
+        # copy of the old plan on every rebuild.
+        self.group_B = []
+        self.group_K = []
+        self.group_L = []
+        self.base_shapes = []
+        self._plan_cache.clear()
+        self._scratch_sig = None
+
         if self.write_back:
             self._calc_splits(models)
 
@@ -622,6 +764,21 @@ class _dhs_multi(MultiIntegrator):
             self.solve = _dhs_multi_solve_cpu
 
         dt_s = dt * 1e-3
+        P = int(np.prod(models.shape[:-2])) if len(models.shape) > 2 else 1
+        self.P = P
+
+        def group_planes(value, mdl, B_g, K_g, name):
+            """Broadcast one group parameter to ``(P, B_g, K_g)``."""
+
+            value = value.to(device=dev0, dtype=mdl.dtype())
+            try:
+                value = torch.broadcast_to(value, tuple(mdl.shape))
+            except RuntimeError as err:
+                raise ValueError(
+                    f"{name} for a multi-tree group must broadcast to model "
+                    f"shape {tuple(mdl.shape)}; got {tuple(value.shape)}."
+                ) from err
+            return value.reshape(P, B_g, K_g)
 
         P_list, ORDER_list, LPTR_list = [], [], []
         L_list = []
@@ -637,10 +794,6 @@ class _dhs_multi(MultiIntegrator):
         for g, mdl in enumerate(models):
             K_g = int(mdl.shape[-1])
             B_g = int(mdl.shape[-2]) if len(mdl.shape) > 1 else 1
-
-            n_batch_dims = len(mdl.shape) - 2
-            if n_batch_dims > 0:
-                selection = tuple([0] * n_batch_dims)
 
             self.base_shapes.append((B_g, K_g))
             B_list.append(B_g)
@@ -668,14 +821,25 @@ class _dhs_multi(MultiIntegrator):
             solver_order_g = torch.as_tensor(node_order, dtype=torch.int64, device=dev0)
             inv_solver_g = torch.argsort(solver_order_g, dim=0)
 
-            area_cm2 = mdl.area.to(device=dev0, dtype=mdl.dtype())  # (1, K_g)
-            cm = 1e-6 * mdl.cm.to(device=dev0, dtype=mdl.dtype())
-            if n_batch_dims > 0:
-                cm = cm[selection]
-            cm = cm * area_cm2
-            cmdt_g = (cm / dt_s).expand(B_g, -1).contiguous()  # (B_g, K_g)
-            a_geom_g = a_geom_t.expand(B_g, -1).to(device=dev0, dtype=mdl.dtype())
-            scale_g = area_cm2.expand(B_g, -1).contiguous()  # (B_g, K_g)
+            # Match the physical scaling contract of the scalar DHS solver.
+            # These are population-specific, so applying the composite model's
+            # globals after concatenation would be incorrect.  Retain all
+            # leading batch planes: RANGE parameters can legitimately differ
+            # between those planes after ``MultiPopulation.batch``.
+            area_cm2 = group_planes(mdl.area, mdl, B_g, K_g, "area")
+            area_cm2 = area_cm2 * group_planes(
+                mdl.area_scale, mdl, B_g, K_g, "area_scale"
+            )
+            cm_density = group_planes(mdl.cm, mdl, B_g, K_g, "cm")
+            cm_scale = group_planes(mdl.cm_scale, mdl, B_g, K_g, "cm_scale")
+            cmdt_g = (1e-6 * cm_density * area_cm2 * cm_scale / dt_s).contiguous()
+
+            a_geom_base = a_geom_t.to(device=dev0, dtype=mdl.dtype()).expand(B_g, -1)
+            rhoa_scale = group_planes(
+                mdl.rhoa_scale, mdl, B_g, K_g, "rhoa_scale"
+            ).index_select(-1, solver_order_g)
+            a_geom_g = a_geom_base.unsqueeze(0).expand(P, -1, -1) / rhoa_scale
+            scale_g = area_cm2.contiguous()
 
             P_list.append(parent_idx.to(dtype=torch.int64, device=dev0))
             ORDER_list.append(order_g.to(dtype=torch.int64, device=dev0))
@@ -820,15 +984,16 @@ class _dhs_multi(MultiIntegrator):
             )
             return
 
-        a_flat = torch.zeros((self.B_total, self.K_stride), device=dev0, dtype=dtype0)
-        c_flat = torch.zeros((self.B_total, self.K_stride), device=dev0, dtype=dtype0)
-        s_flat = torch.zeros((self.B_total, self.K_stride), device=dev0, dtype=dtype0)
+        plane_shape = (P, self.B_total, self.K_stride)
+        a_flat = torch.zeros(plane_shape, device=dev0, dtype=dtype0)
+        c_flat = torch.zeros(plane_shape, device=dev0, dtype=dtype0)
+        s_flat = torch.zeros(plane_shape, device=dev0, dtype=dtype0)
         for g, (B_g, K_g) in enumerate(zip(B_list, K_list)):
             r0 = int(self.ROW_OFF[g])
             r1 = r0 + B_g
-            a_flat[r0:r1, :K_g].copy_(a_rows[g])  # solver order
-            c_flat[r0:r1, :K_g].copy_(cmdt_rows[g])  # mechanism order
-            s_flat[r0:r1, :K_g].copy_(scale_rows[g])  # mechanism order
+            a_flat[:, r0:r1, :K_g].copy_(a_rows[g])  # solver order
+            c_flat[:, r0:r1, :K_g].copy_(cmdt_rows[g])  # mechanism order
+            s_flat[:, r0:r1, :K_g].copy_(scale_rows[g])  # mechanism order
         self.register_buffer("a_geom_flat", a_flat)
         self.register_buffer("cmdt_flat", c_flat)
         self.register_buffer("scale_flat", s_flat)
@@ -848,23 +1013,17 @@ class _dhs_multi(MultiIntegrator):
             inv_cols = self.INV_SOLVER_cat[soff : soff + K_g]  # mechanism m -> solver s
             mech_cols_inv.append(inv_cols.repeat(B_g))  # (B_g*K_g,)
 
-            cmdt_mech_flat.append(self.cmdt_flat[r0:r1, :K_g].reshape(-1))
-            scale_mech_flat.append(self.scale_flat[r0:r1, :K_g].reshape(-1))
+            cmdt_mech_flat.append(self.cmdt_flat[:, r0:r1, :K_g].reshape(P, -1))
+            scale_mech_flat.append(self.scale_flat[:, r0:r1, :K_g].reshape(P, -1))
 
         self.register_buffer("MECH_ROWS", torch.cat(mech_rows, 0))
         self.register_buffer("MECH_COLS_INV", torch.cat(mech_cols_inv, 0))
-        self.register_buffer("CMDT_MECH", torch.cat(cmdt_mech_flat, 0))
-        self.register_buffer("SCALE_MECH", torch.cat(scale_mech_flat, 0))
+        self.register_buffer("CMDT_MECH", torch.cat(cmdt_mech_flat, 1))
+        self.register_buffer("SCALE_MECH", torch.cat(scale_mech_flat, 1))
 
-        self.N_mech = int(
-            self.CMDT_MECH.numel()
-        )  # total # of mechanism elements (sum_g B_g*K_g)
+        self.N_mech = int(self.CMDT_MECH.shape[1])
         PLANE_LIN_BASE = self.MECH_ROWS * self.K_stride + self.MECH_COLS_INV
         self.register_buffer("PLANE_LIN_BASE", PLANE_LIN_BASE.to(torch.long))
-
-        # reset caches whenever we (re)initialize
-        self._plan_cache.clear()
-        self._scratch_sig = None
 
         # ---------- extracellular edge maps (for ve) ----------
         edge_child_idx_flat_all = []
@@ -872,7 +1031,11 @@ class _dhs_multi(MultiIntegrator):
         edge_gax_flat_all = []
 
         for g, (mdl, B_g, K_g) in enumerate(zip(models, self.group_B, self.group_K)):
-            G = mdl.graph
+            graph = mdl.graph
+            if graph is None:
+                graph = mdl.assemble_graphs()
+            graphs = graph if isinstance(graph, list) else [graph]
+            G = graphs[0]
 
             # Build mapping: node_label -> solver index (fast lookup)
             # `self.SOLVER_cat[soff:soff+K_g]` maps solver_index -> original_node_label
@@ -880,13 +1043,14 @@ class _dhs_multi(MultiIntegrator):
             solver_nodes = self.SOLVER_cat[soff : soff + K_g].tolist()
             solver_idx_of = {node_label: s for s, node_label in enumerate(solver_nodes)}
 
-            # Edge lists in ORIGINAL node order
+            # Edge lists in canonical ORIGINAL node order.  Graph insertion
+            # order is not semantic and can differ across otherwise identical
+            # morphologies.
             edge_child = []
             edge_parent = []
-            edge_gax = []
+            edge_solver_col = []
 
-            # If nodes are 0..K_g-1 (typical), this is O(E). If labels differ, this still works.
-            for child_node, _data in G.nodes(data=True):
+            for child_node in range(K_g):
                 preds = list(G.predecessors(child_node))
                 if not preds:
                     continue
@@ -901,9 +1065,7 @@ class _dhs_multi(MultiIntegrator):
 
                 # axial for the child's connection: take from a_geom_t at child's solver index
                 s_child = solver_idx_of[child_node]
-                edge_gax.append(
-                    a_rows[g][0, s_child].item()
-                )  # (B_g,K_g) -> any row, same geom
+                edge_solver_col.append(s_child)
 
             if len(edge_child) == 0:
                 continue  # degenerate, no edges
@@ -914,7 +1076,12 @@ class _dhs_multi(MultiIntegrator):
             edge_parent = torch.tensor(
                 edge_parent, dtype=torch.int64, device=dev0
             )  # (E_g,)
-            edge_gax = torch.tensor(edge_gax, dtype=dtype0, device=dev0)  # (E_g,)
+            edge_solver_col = torch.tensor(
+                edge_solver_col, dtype=torch.int64, device=dev0
+            )
+            # Preserve per-neuron heterogeneous geometry and the rhoa_scale
+            # dependency instead of round-tripping through Python ``.item()``.
+            edge_gax = a_rows[g].index_select(2, edge_solver_col)  # (P, B_g, E_g)
 
             # Repeat across batch rows and convert to FLAT mechanism indices
             rows = torch.arange(B_g, device=dev0, dtype=torch.int64).repeat_interleave(
@@ -926,7 +1093,7 @@ class _dhs_multi(MultiIntegrator):
 
             child_flat = g_mech_off + rows * K_g + child_cols
             parent_flat = g_mech_off + rows * K_g + parent_cols
-            gax_flat = edge_gax.repeat(B_g)  # (B_g*E_g,)
+            gax_flat = edge_gax.reshape(P, -1)  # (P, B_g*E_g)
 
             edge_child_idx_flat_all.append(child_flat)
             edge_parent_idx_flat_all.append(parent_flat)
@@ -939,7 +1106,7 @@ class _dhs_multi(MultiIntegrator):
             self.register_buffer(
                 "EDGE_PARENT_IDX_FLAT", torch.cat(edge_parent_idx_flat_all, 0)
             )
-            self.register_buffer("EDGE_GAX_FLAT", torch.cat(edge_gax_flat_all, 0))
+            self.register_buffer("EDGE_GAX_FLAT", torch.cat(edge_gax_flat_all, 1))
         else:
             # empty placeholders
             self.register_buffer(
@@ -949,33 +1116,16 @@ class _dhs_multi(MultiIntegrator):
                 "EDGE_PARENT_IDX_FLAT", torch.empty(0, dtype=torch.int64, device=dev0)
             )
             self.register_buffer(
-                "EDGE_GAX_FLAT", torch.empty(0, dtype=dtype0, device=dev0)
+                "EDGE_GAX_FLAT", torch.empty(P, 0, dtype=dtype0, device=dev0)
             )
 
         # ---------- allocate step scratch ----------
+        rows_total = P * self.B_total
         self._d_plane = torch.empty(
-            (self.B_total, self.K_stride), device=dev0, dtype=dtype0
+            (rows_total, self.K_stride), device=dev0, dtype=dtype0
         )
-        self._b_plane = torch.empty(
-            (self.B_total, self.K_stride), device=dev0, dtype=dtype0
-        )
-
-        P = int(np.prod(models.shape[:-2])) if len(models.shape) > 2 else 1
-        self.P = P
+        self._b_plane = torch.empty_like(self._d_plane)
         self._get_tiled_plan(P, dev0)
-
-        if models.is_batched():
-            Btot, Kstride = self.B_total, self.K_stride
-            rows_total = P * Btot
-            if (
-                self._d_plane is None
-                or self._d_plane.shape[0] != rows_total
-                or self._d_plane.shape[1] != Kstride
-            ):
-                self._d_plane = torch.empty(
-                    (rows_total, Kstride), device=dev0, dtype=dtype0
-                )
-                self._b_plane = torch.empty_like(self._d_plane)
 
     def _get_tiled_plan(self, P: int, device: torch.device):
         """
@@ -988,6 +1138,11 @@ class _dhs_multi(MultiIntegrator):
         cached = self._plan_cache.get(key, None)
         if cached is not None:
             return cached
+        if self.a_geom_flat.shape[0] != P:
+            raise ValueError(
+                "Packed multi-tree geometry is stale for the requested batch "
+                f"planes: initialized for {self.a_geom_flat.shape[0]}, got {P}."
+            )
 
         Btot, Kstride = self.B_total, self.K_stride
         plane_stride = Btot * Kstride
@@ -1004,7 +1159,7 @@ class _dhs_multi(MultiIntegrator):
 
         if P == 1:
             plan = dict(
-                a_geom_eff=self.a_geom_flat,  # (Btot, Kstride)
+                a_geom_eff=self.a_geom_flat[0],  # (Btot, Kstride)
                 WARP_P_OFF=self.WARP_P_OFF,
                 WARP_ORDER_OFF=self.WARP_ORDER_OFF,
                 WARP_LPTR_OFF=self.WARP_LPTR_OFF,
@@ -1016,10 +1171,9 @@ class _dhs_multi(MultiIntegrator):
                 rows_total=rows_total,
             )
         else:
-            # Tile geometry rows and warp plan P times
-            a_geom_eff = self.a_geom_flat.repeat(
-                P, 1
-            ).contiguous()  # materialize – kernel expects proper row stride
+            # Geometry can differ across leading batch planes.  Flatten the
+            # already packed planes in the same P-major order as the RHS.
+            a_geom_eff = self.a_geom_flat.reshape(P * Btot, Kstride).contiguous()
 
             W = int(self.grid_x)
             row_base_offsets = (
@@ -1075,7 +1229,7 @@ class _dhs_multi(MultiIntegrator):
             else _broadcast_to_shape(intra, tuple(orig_shape)).reshape(P, N_total)
         )
 
-        SCALE_MECH = self.SCALE_MECH.reshape(1, -1)
+        SCALE_MECH = self.SCALE_MECH.reshape(P, N_total)
 
         # 2) assemble in mechanism order
         v_old_flat = v_old.reshape(P, N_total)  # (P, N_total)
@@ -1087,11 +1241,12 @@ class _dhs_multi(MultiIntegrator):
         # --- extracellular coupling (ve), vectorized on flattened indices) ---
         if ve is not None and self.EDGE_CHILD_IDX_FLAT.numel() > 0:
             ve_flat = _broadcast_to_shape(ve, tuple(orig_shape)).reshape(P, N_total)
-            # edge potential differences per (outer batch row, edge)
-            dV_edge = ve_flat.index_select(
-                1, self.EDGE_PARENT_IDX_FLAT
-            ) - ve_flat.index_select(1, self.EDGE_CHILD_IDX_FLAT)
-            I_edge = dV_edge * self.EDGE_GAX_FLAT.unsqueeze(0)
+            I_edge = _edge_currents(
+                self.EDGE_CHILD_IDX_FLAT,
+                self.EDGE_PARENT_IDX_FLAT,
+                self.EDGE_GAX_FLAT,
+                ve_flat,
+            )
 
             S_flat = torch.zeros_like(f_n_flat)
             edge_child = self.EDGE_CHILD_IDX_FLAT.unsqueeze(0).expand(P, -1)
@@ -1100,7 +1255,7 @@ class _dhs_multi(MultiIntegrator):
             S_flat.scatter_add_(1, edge_parent, I_edge)
             f_n_flat = f_n_flat + S_flat
 
-        CMDT_MECH = self.CMDT_MECH.reshape(1, -1)
+        CMDT_MECH = self.CMDT_MECH.reshape(P, N_total)
 
         RHS_flat = f_n_flat + CMDT_MECH * v_old_flat
         MAIN_flat = CMDT_MECH + gtot_mech * SCALE_MECH

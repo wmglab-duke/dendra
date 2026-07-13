@@ -217,6 +217,7 @@ class Ion(Material):
                 f"{name}i": min_concentration,
                 f"{name}o": min_concentration,
             },
+            _register_initial_sources=False,
         )
 
         self.rzf = R / (VALENCES[name] * FARADAY)

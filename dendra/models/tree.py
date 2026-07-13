@@ -2,12 +2,50 @@
 
 import math
 
+import networkx as nx
 import torch
 import torch.nn.functional as F
 
 from dendra.models.integrators import dhs
 
 from .core import Population
+
+
+def _normalize_tree_graph(graph):
+    """Validate a morphology tree and normalize node labels to tensor indices.
+
+    Canonical graphs whose nodes are already ``0..n-1`` are returned unchanged
+    so callers that retain the graph object keep the historical identity
+    contract. Other hashable labels are mapped to ``0..n-1`` in deterministic
+    NetworkX insertion order on a copy of the graph.
+    """
+    if not isinstance(graph, nx.Graph):
+        raise TypeError("Tree.from_graph requires a NetworkX graph.")
+    if not graph.is_directed():
+        raise ValueError("Tree morphology must be a directed graph.")
+    if graph.is_multigraph():
+        raise ValueError("Tree morphology must be a simple directed graph.")
+    if graph.number_of_nodes() == 0:
+        raise ValueError("Tree morphology must contain at least one node.")
+    if any(parent == child for parent, child in graph.edges):
+        raise ValueError("Tree morphology must not contain self-loops.")
+
+    multiple_parents = [node for node, degree in graph.in_degree() if int(degree) > 1]
+    if multiple_parents:
+        raise ValueError(
+            "Every Tree morphology node must have at most one parent; "
+            f"invalid nodes: {multiple_parents!r}."
+        )
+    if not nx.is_directed_acyclic_graph(graph):
+        raise ValueError("Tree morphology must be acyclic.")
+    if not nx.is_weakly_connected(graph):
+        raise ValueError("Tree morphology must be connected, not a forest.")
+
+    nodes = list(graph.nodes)
+    if set(nodes) == set(range(len(nodes))):
+        return graph
+    mapping = {node: index for index, node in enumerate(nodes)}
+    return nx.relabel_nodes(graph, mapping, copy=True)
 
 
 def _as_float(value, *, name: str, node=None, default=None) -> float:
@@ -161,17 +199,21 @@ def gather_morphology(graph):
         volume_i.append(_node_domain_volume_um3(attrs, "i", vol, node=i))
         volume_o.append(_node_domain_volume_um3(attrs, "o", vol, node=i))
 
-    volume_t = torch.tensor(volume).unsqueeze(0)
+    # Graph metadata arrives as Python floats (IEEE-754 binary64).  Preserve
+    # those values until Tree.from_graph deliberately converts the gathered
+    # buffers to the requested model dtype.  Constructing these tensors with
+    # PyTorch's default float32 would irreversibly quantize a float64 Tree.
+    volume_t = torch.tensor(volume, dtype=torch.float64).unsqueeze(0)
     return {
-        "dx": torch.tensor(L).unsqueeze(0),
-        "diam": torch.tensor(diam).unsqueeze(0),
-        "x": torch.tensor(x).unsqueeze(0),
-        "y": torch.tensor(y).unsqueeze(0),
-        "z": torch.tensor(z).unsqueeze(0),
+        "dx": torch.tensor(L, dtype=torch.float64).unsqueeze(0),
+        "diam": torch.tensor(diam, dtype=torch.float64).unsqueeze(0),
+        "x": torch.tensor(x, dtype=torch.float64).unsqueeze(0),
+        "y": torch.tensor(y, dtype=torch.float64).unsqueeze(0),
+        "z": torch.tensor(z, dtype=torch.float64).unsqueeze(0),
         "volume": volume_t,
         "volume_um3": volume_t.clone(),
-        "volume_i": torch.tensor(volume_i).unsqueeze(0),
-        "volume_o": torch.tensor(volume_o).unsqueeze(0),
+        "volume_i": torch.tensor(volume_i, dtype=torch.float64).unsqueeze(0),
+        "volume_o": torch.tensor(volume_o, dtype=torch.float64).unsqueeze(0),
     }
 
 
@@ -207,10 +249,12 @@ def gather_diffusion_edges(graph):
 
     return {
         "diff_parent_index": torch.tensor(parent_index, dtype=torch.long),
-        "diff_geom_um": torch.tensor(diff_geom).unsqueeze(0),
+        "diff_geom_um": torch.tensor(diff_geom, dtype=torch.float64).unsqueeze(0),
         "diff_edge_parent": torch.tensor(edge_parent, dtype=torch.long),
         "diff_edge_child": torch.tensor(edge_child, dtype=torch.long),
-        "diff_edge_geom_um": torch.tensor(edge_diff_geom).unsqueeze(0),
+        "diff_edge_geom_um": torch.tensor(
+            edge_diff_geom, dtype=torch.float64
+        ).unsqueeze(0),
     }
 
 
@@ -234,9 +278,9 @@ def gather_membrane(graph):
         cm.append(attrs.get("cm"))
         area.append(attrs.get("area"))
     return {
-        "rhoa": torch.tensor(rhoa).unsqueeze(0),
-        "cm": torch.tensor(cm).unsqueeze(0),
-        "area": torch.tensor(area).unsqueeze(0),
+        "rhoa": torch.tensor(rhoa, dtype=torch.float64).unsqueeze(0),
+        "cm": torch.tensor(cm, dtype=torch.float64).unsqueeze(0),
+        "area": torch.tensor(area, dtype=torch.float64).unsqueeze(0),
     }
 
 
@@ -343,7 +387,9 @@ class Tree(Population):
         Parameters
         ----------
         graph : networkx.DiGraph
-            Graph describing compartment connectivity.
+            Connected directed tree describing compartment connectivity. Node
+            labels that are not already ``0..n-1`` are deterministically
+            relabelled in graph insertion order on an internal copy.
         N : int, optional
             Number of population instances. Defaults to ``1``.
         integrator : callable, optional
@@ -355,7 +401,14 @@ class Tree(Population):
         -------
         Tree
             Configured tree population.
+
+        Raises
+        ------
+        ValueError
+            If the graph is empty, cyclic, disconnected, contains a self-loop,
+            or gives a node more than one parent.
         """
+        graph = _normalize_tree_graph(graph)
         C = len(graph.nodes)
         data = gather_morphology(graph)
         diffusion_edges = gather_diffusion_edges(graph)
@@ -363,13 +416,22 @@ class Tree(Population):
         membrane.update(kwargs)
         tree = cls(N, C, graph, integrator, **membrane)
         for key, value in data.items():
-            tree.register_buffer(key, value.expand(N, -1).clone().to(tree.dtype()))
+            tree.register_buffer(
+                key,
+                value.expand(N, -1)
+                .clone()
+                .to(device=tree.device(), dtype=tree.dtype()),
+            )
         for key, value in diffusion_edges.items():
             if value.dtype.is_floating_point:
                 if value.ndim == 2:
-                    value = value.expand(N, -1).clone().to(tree.dtype())
+                    value = (
+                        value.expand(N, -1)
+                        .clone()
+                        .to(device=tree.device(), dtype=tree.dtype())
+                    )
                 else:
-                    value = value.clone().to(tree.dtype())
+                    value = value.clone().to(device=tree.device(), dtype=tree.dtype())
             else:
                 value = value.clone().to(device=tree.device())
             tree.register_buffer(key, value)
@@ -615,14 +677,14 @@ class Tree(Population):
         return self.recentre(x, y, z, origin)
 
     def _get_points_as_tensor(self) -> torch.Tensor:
-        """Helper to stack x, y, z into a (B, N, 3) tensor."""
-        return torch.stack([self.x, self.y, self.z], dim=2)
+        """Stack coordinates as ``(..., neuron, compartment, xyz)``."""
+        return torch.stack([self.x, self.y, self.z], dim=-1)
 
     def _update_points_from_tensor(self, points: torch.Tensor):
-        """Helper to un-stack a (B, N, 3) tensor back into x, y, z buffers."""
-        self.x.copy_(points[:, :, 0])
-        self.y.copy_(points[:, :, 1])
-        self.z.copy_(points[:, :, 2])
+        """Copy a trailing xyz coordinate dimension back into model buffers."""
+        self.x.copy_(points[..., 0])
+        self.y.copy_(points[..., 1])
+        self.z.copy_(points[..., 2])
 
     def _apply_rotation(self, rotation_matrices: torch.Tensor, origin_idx: int):
         """
@@ -634,18 +696,17 @@ class Tree(Population):
         """
         points = self._get_points_as_tensor()
 
-        # 1. Get the origin for each cell in the batch
-        # Shape: (B, 3) -> unsqueeze to (B, 1, 3) for broadcasting
-        origins = points[:, origin_idx, :].clone().unsqueeze(1)
+        # Select the compartment axis while preserving any leading parameter
+        # batches and the physical-neuron axis.
+        origins = points[..., origin_idx, :].clone().unsqueeze(-2)
 
         # 2. Translate points so the origin is at (0,0,0)
         points_centered = points - origins
 
-        # 3. Apply the batch of rotations
-        # (B, N, 3) @ (B, 3, 3) -> (B, N, 3)
-        # We need to transpose the rotation matrices for matmul with (B,N,3)
+        # Apply one rotation per physical neuron, broadcasting it over any
+        # leading parameter-batch dimensions and all compartments.
         rotated_points_centered = points_centered @ rotation_matrices.transpose(
-            1, 2
+            -1, -2
         ).to(points.dtype)
 
         # 4. Translate points back
@@ -678,42 +739,66 @@ class Tree(Population):
 
         if target_directions.shape[0] == 1:
             target_directions = target_directions.repeat(self.np, 1)
+        elif target_directions.shape[0] != self.np:
+            raise ValueError(
+                "target_directions must contain either one direction or one "
+                f"direction per cell ({self.np}); got {target_directions.shape[0]}."
+            )
         target_directions = target_directions.to(device)
+
+        if torch.any(torch.linalg.vector_norm(self.directions, dim=1) == 0):
+            raise ValueError("Current cell directions must be non-zero vectors.")
+        if torch.any(torch.linalg.vector_norm(target_directions, dim=1) == 0):
+            raise ValueError("Target cell directions must be non-zero vectors.")
 
         a = F.normalize(self.directions, p=2, dim=1)
         b = F.normalize(target_directions, p=2, dim=1)
 
         # --- Use Rodrigue's formula to get the rotation matrix R ---
         # c is the cosine of the angle (dot product), shape (B,)
-        c = torch.sum(a * b, dim=1)
+        c = torch.sum(a * b, dim=1).clamp(-1.0, 1.0)
 
-        # Mask for when vectors are already aligned (identity rotation)
-        is_identity = c > 1.0 - 1e-6
-        # Mask for when vectors are anti-parallel (180-degree rotation)
-        is_anti_parallel = c < -1.0 + 1e-6
-
-        # v is the axis of rotation (cross product), shape (B, 3)
+        # The cross product contains both the rotation axis and a numerically
+        # stable sin(theta). Only truly degenerate axes need special handling;
+        # a fixed cosine threshold incorrectly turns small requested rotations
+        # into identity transforms while still updating direction metadata.
         v = torch.cross(a, b, dim=1)
+        s = torch.linalg.vector_norm(v, dim=1)
+        tolerance = 10 * torch.finfo(self.directions.dtype).eps
+        is_degenerate = s <= tolerance
+        is_identity = is_degenerate & (c >= 0)
+        is_anti_parallel = is_degenerate & (c < 0)
 
         # Handle the anti-parallel case where the cross product is near zero
         if torch.any(is_anti_parallel):
             # Find an arbitrary perpendicular axis for the 180-degree rotation
-            temp_vec = torch.tensor([1.0, 0.0, 0.0], device=device).expand(self.np, -1)
+            temp_vec = (
+                torch.tensor(
+                    [1.0, 0.0, 0.0], device=device, dtype=self.directions.dtype
+                )
+                .expand(self.np, -1)
+                .clone()
+            )
             parallel_to_temp = torch.all(
                 torch.isclose(a, temp_vec) | torch.isclose(a, -temp_vec), dim=1
             )
-            temp_vec[parallel_to_temp] = torch.tensor([0.0, 1.0, 0.0], device=device)
+            temp_vec[parallel_to_temp] = torch.tensor(
+                [0.0, 1.0, 0.0], device=device, dtype=self.directions.dtype
+            )
 
             v[is_anti_parallel] = F.normalize(
                 torch.cross(a[is_anti_parallel], temp_vec[is_anti_parallel], dim=1),
                 dim=1,
             )
 
-        # s is the sine of the angle. Clamp to prevent sqrt of negative due to float errors.
-        s = torch.sqrt(torch.clamp(1 - c * c, min=0.0))
+        # Rodrigues' formula below expects a unit rotation axis. Degenerate
+        # identity rows deliberately retain the zero axis; their matrices are
+        # replaced explicitly below.
+        safe_s = s.clamp_min(torch.finfo(self.directions.dtype).tiny)
+        v = torch.where(is_degenerate.unsqueeze(1), v, v / safe_s.unsqueeze(1))
 
         # Skew-symmetric cross-product matrix K
-        K = torch.zeros(self.np, 3, 3, device=device)
+        K = torch.zeros(self.np, 3, 3, device=device, dtype=self.directions.dtype)
         K[:, 0, 1] = -v[:, 2]
         K[:, 0, 2] = v[:, 1]
         K[:, 1, 0] = v[:, 2]
@@ -726,19 +811,21 @@ class Tree(Population):
         s_mat = s.view(self.np, 1, 1)
         c_mat = c.view(self.np, 1, 1)
 
-        I = torch.eye(3, device=device).expand(self.np, -1, -1)  # noqa: E741
+        I = torch.eye(3, device=device, dtype=self.directions.dtype).expand(
+            self.np, -1, -1
+        )  # noqa: E741
         R = I + s_mat * K + (1 - c_mat) * (K @ K)
 
         # --- Apply special cases using the (B,) shaped masks ---
         # This is now correct because `is_identity` has shape (B,)
-        R[is_identity] = torch.eye(3, device=device)
+        R[is_identity] = torch.eye(3, device=device, dtype=self.directions.dtype)
 
         # This was already correct, but the logic is now more robust
         if torch.any(is_anti_parallel):
             v_ap = v[is_anti_parallel]
             # Formula for 180-degree rotation matrix around axis v
             R_ap = 2 * torch.einsum("bi,bj->bij", v_ap, v_ap) - torch.eye(
-                3, device=device
+                3, device=device, dtype=self.directions.dtype
             )
             R[is_anti_parallel] = R_ap
 
@@ -747,7 +834,6 @@ class Tree(Population):
         # Update the cell's direction vector
         # We use b, the normalized target, for consistency
         self.directions.copy_(b)
-        self.azimuthal_rotations.fill_(0.0)
         return self
 
     def rotate_azimuthal(
@@ -771,17 +857,25 @@ class Tree(Population):
         v = F.normalize(self.directions, p=2, dim=1)
 
         # Convert angle to radians and ensure it's a (B,) tensor
-        if isinstance(azimuthal_angle, (int, float)):
-            theta = torch.full((self.np,), float(azimuthal_angle), device=device)
+        theta = torch.as_tensor(
+            azimuthal_angle, device=device, dtype=self.directions.dtype
+        )
+        if theta.numel() == 1:
+            theta = theta.reshape(()).expand(self.np).clone()
+        elif theta.numel() == self.np:
+            theta = theta.reshape(self.np)
         else:
-            theta = torch.as_tensor(azimuthal_angle).to(device).reshape(self.np)
+            raise ValueError(
+                "azimuthal_angle must be scalar or contain one angle per cell "
+                f"({self.np}); got {theta.numel()} values."
+            )
         theta_rad = torch.deg2rad(theta)
 
         c = torch.cos(theta_rad)
         s = torch.sin(theta_rad)
 
         # Skew-symmetric cross-product matrix K
-        K = torch.zeros(self.np, 3, 3, device=device)
+        K = torch.zeros(self.np, 3, 3, device=device, dtype=self.directions.dtype)
         K[:, 0, 1] = -v[:, 2]
         K[:, 0, 2] = v[:, 1]
         K[:, 1, 0] = v[:, 2]
@@ -792,7 +886,9 @@ class Tree(Population):
         s = s.view(self.np, 1, 1)
         c = c.view(self.np, 1, 1)
 
-        I = torch.eye(3, device=device).expand(self.np, -1, -1)  # noqa: E741
+        I = torch.eye(3, device=device, dtype=self.directions.dtype).expand(
+            self.np, -1, -1
+        )  # noqa: E741
         R = I + s * K + (1 - c) * (K @ K)
 
         self._apply_rotation(R, origin)
@@ -807,9 +903,9 @@ class Tree(Population):
         if origin is None:
             origin = self.find("soma", as_list=True)
             origin = origin[int(len(origin) / 2)]
-        x_c = self.x[:, origin]
-        y_c = self.y[:, origin]
-        z_c = self.z[:, origin]
+        x_c = self.x[..., origin]
+        y_c = self.y[..., origin]
+        z_c = self.z[..., origin]
 
         # Reset directions to the base direction
         self.directions.copy_(self.base_direction.expand(self.np, -1))
@@ -817,17 +913,20 @@ class Tree(Population):
         self.azimuthal_rotations.copy_(self.base_azimuthal_rotation.expand(self.np))
 
         morph = gather_morphology(self.graph)
+        base_x = morph["x"].to(dtype=self.x.dtype, device=self.x.device)
+        base_y = morph["y"].to(dtype=self.y.dtype, device=self.y.device)
+        base_z = morph["z"].to(dtype=self.z.dtype, device=self.z.device)
         self.x.copy_(
-            morph["x"].expand(self.np, -1).to(dtype=self.x.dtype, device=self.x.device)
-            + x_c.unsqueeze(1)
+            (base_x - base_x[..., origin].unsqueeze(-1)).expand_as(self.x)
+            + x_c.unsqueeze(-1)
         )
         self.y.copy_(
-            morph["y"].expand(self.np, -1).to(dtype=self.y.dtype, device=self.y.device)
-            + y_c.unsqueeze(1)
+            (base_y - base_y[..., origin].unsqueeze(-1)).expand_as(self.y)
+            + y_c.unsqueeze(-1)
         )
         self.z.copy_(
-            morph["z"].expand(self.np, -1).to(dtype=self.z.dtype, device=self.z.device)
-            + z_c.unsqueeze(1)
+            (base_z - base_z[..., origin].unsqueeze(-1)).expand_as(self.z)
+            + z_c.unsqueeze(-1)
         )
 
         return self

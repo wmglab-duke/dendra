@@ -588,7 +588,7 @@ class PreparedInterp1d(nn.Module):
                     ynew = y0 + m * (xq_used - x0i)
             else:
                 # ---- original path ----
-                torch.searchsorted(self._x_search, xq_used, out=ind)
+                torch.searchsorted(self._x_search, xq_used.contiguous(), out=ind)
                 ind -= 1
                 ind.clamp_(0, self._ind_hi)
 
@@ -727,7 +727,7 @@ class PreparedInterp1d(nn.Module):
                         ynew = torch.where(xq <= x_min, y_first.expand_as(ynew), ynew)
                         ynew = torch.where(xq >= x_max, y_last.expand_as(ynew), ynew)
             else:
-                torch.searchsorted(x_search, xq_used, out=ind)
+                torch.searchsorted(x_search, xq_used.contiguous(), out=ind)
                 ind -= 1
                 ind.clamp_(0, self._ind_hi)
 
@@ -1982,7 +1982,7 @@ class PreparedInterp3dRect(nn.Module):
             return ind_out, t
 
         def axis_ind_t_nu(search, ucoord, a0, inv_tab, hi, ind_out, batched_axis: bool):
-            torch.searchsorted(search, ucoord, out=ind_out)
+            torch.searchsorted(search, ucoord.contiguous(), out=ind_out)
             ind_out -= 1
             ind_out.clamp_(0, hi)
             if not batched_axis:
@@ -2505,9 +2505,9 @@ class PreparedInterp3dRect(nn.Module):
                 den2 = torch.where(
                     h1l * (h0l + h1l) == 0, torch.full_like(h1l, eps), h1l * (h0l + h1l)
                 )
-                c0 = (2.0 / den0)[:, None, None, None, None]
-                c1 = (-2.0 / den01)[:, None, None, None, None]
-                c2 = (2.0 / den2)[:, None, None, None, None]
+                c0 = (2.0 / den0)[:, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None]
                 d2[:, 0, :, :, :] = (
                     c0 * f[:, 0, :, :, :]
                     + c1 * f[:, 1, :, :, :]
@@ -2526,9 +2526,9 @@ class PreparedInterp3dRect(nn.Module):
                 den2 = torch.where(
                     h1r * (h0r + h1r) == 0, torch.full_like(h1r, eps), h1r * (h0r + h1r)
                 )
-                c0 = (2.0 / den0)[:, None, None, None, None]
-                c1 = (-2.0 / den01)[:, None, None, None, None]
-                c2 = (2.0 / den2)[:, None, None, None, None]
+                c0 = (2.0 / den0)[:, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None]
                 d2[:, -1, :, :, :] = (
                     c0 * f[:, -3, :, :, :]
                     + c1 * f[:, -2, :, :, :]
@@ -2578,9 +2578,9 @@ class PreparedInterp3dRect(nn.Module):
                 den2 = torch.where(
                     h1l * (h0l + h1l) == 0, torch.full_like(h1l, eps), h1l * (h0l + h1l)
                 )
-                c0 = (2.0 / den0)[:, None, None, None, None]
-                c1 = (-2.0 / den01)[:, None, None, None, None]
-                c2 = (2.0 / den2)[:, None, None, None, None]
+                c0 = (2.0 / den0)[:, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None]
                 d2[:, :, 0, :, :] = (
                     c0 * f[:, :, 0, :, :]
                     + c1 * f[:, :, 1, :, :]
@@ -2598,9 +2598,9 @@ class PreparedInterp3dRect(nn.Module):
                 den2 = torch.where(
                     h1r * (h0r + h1r) == 0, torch.full_like(h1r, eps), h1r * (h0r + h1r)
                 )
-                c0 = (2.0 / den0)[:, None, None, None, None]
-                c1 = (-2.0 / den01)[:, None, None, None, None]
-                c2 = (2.0 / den2)[:, None, None, None, None]
+                c0 = (2.0 / den0)[:, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None]
                 d2[:, :, -1, :, :] = (
                     c0 * f[:, :, -3, :, :]
                     + c1 * f[:, :, -2, :, :]
@@ -2650,9 +2650,9 @@ class PreparedInterp3dRect(nn.Module):
                 den2 = torch.where(
                     h1l * (h0l + h1l) == 0, torch.full_like(h1l, eps), h1l * (h0l + h1l)
                 )
-                c0 = (2.0 / den0)[:, None, None, None, None]
-                c1 = (-2.0 / den01)[:, None, None, None, None]
-                c2 = (2.0 / den2)[:, None, None, None, None]
+                c0 = (2.0 / den0)[:, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None]
                 d2[:, :, :, 0, :] = (
                     c0 * f[:, :, :, 0, :]
                     + c1 * f[:, :, :, 1, :]
@@ -2670,9 +2670,9 @@ class PreparedInterp3dRect(nn.Module):
                 den2 = torch.where(
                     h1r * (h0r + h1r) == 0, torch.full_like(h1r, eps), h1r * (h0r + h1r)
                 )
-                c0 = (2.0 / den0)[:, None, None, None, None]
-                c1 = (-2.0 / den01)[:, None, None, None, None]
-                c2 = (2.0 / den2)[:, None, None, None, None]
+                c0 = (2.0 / den0)[:, None, None, None]
+                c1 = (-2.0 / den01)[:, None, None, None]
+                c2 = (2.0 / den2)[:, None, None, None]
                 d2[:, :, :, -1, :] = (
                     c0 * f[:, :, :, -3, :]
                     + c1 * f[:, :, :, -2, :]
@@ -3514,6 +3514,15 @@ class PreparedInterp3dScattered(nn.Module):
         """
         Unified kNN: returns (idx, d2) with d2 squared distances.
         """
+        # Keep empty query batches well-defined for every backend.  In particular,
+        # the torch fallback otherwise derives a zero chunk size when
+        # ``chunk_size <= 0`` and calls ``range(..., step=0)``.
+        if xq.shape[0] == 0:
+            return (
+                torch.empty((0, k), device=xq.device, dtype=torch.long),
+                torch.empty((0, k), device=xq.device, dtype=xq.dtype),
+            )
+
         backend = self._select_backend(xq.device)
 
         if backend == "torch":

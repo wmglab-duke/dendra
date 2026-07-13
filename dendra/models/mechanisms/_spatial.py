@@ -523,12 +523,22 @@ def _build_tree_morphology(
         raise ValueError("tree morphology must have one root with parent=-1")
 
     depth = torch.zeros(K, dtype=torch.int32)
+    visited = torch.zeros(K, dtype=torch.bool)
+    visited[root] = True
     q = deque([root])
     while q:
         u = q.popleft()
         for child in children[u]:
+            if visited[child]:
+                raise ValueError("tree morphology contains a cycle")
+            visited[child] = True
             depth[child] = depth[u] + 1
             q.append(child)
+
+    if not bool(torch.all(visited)):
+        raise ValueError(
+            "tree morphology must be connected; unreachable nodes may form a cycle"
+        )
 
     return torch.as_tensor(parent_idx, dtype=torch.int32), children, depth
 
@@ -754,9 +764,14 @@ class SpatialOperatorTree(torch.nn.Module):
         self, *, solver: str = "auto", boundary: str = "sealed", threads: int = 16
     ):
         super().__init__()
-        if THREADS_PER_WARP % int(threads) != 0 or int(threads) > THREADS_PER_WARP:
+        threads = int(threads)
+        if (
+            threads <= 0
+            or threads > THREADS_PER_WARP
+            or THREADS_PER_WARP % threads != 0
+        ):
             raise ValueError(
-                "threads must divide 32 and be <= 32 for DHS-style tree solves"
+                "threads must be positive, divide 32, and be <= 32 for DHS-style tree solves"
             )
         self.solver = _normalize_solver_name(solver)
         self.boundary = str(boundary or "sealed").lower()
@@ -764,7 +779,7 @@ class SpatialOperatorTree(torch.nn.Module):
             raise NotImplementedError(
                 "SpatialOperatorTree MVP supports only sealed/no-flux boundaries."
             )
-        self.threads = int(threads)
+        self.threads = threads
         self.configured = False
         self.solver_name = "unconfigured"
         self._solve = None

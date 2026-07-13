@@ -1,16 +1,21 @@
 """Core data structures and utilities for Dendra population models."""
 
+import copy
 import itertools
 import math
+import os
 import re
+import sys
 import textwrap
 from contextlib import nullcontext
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import (
     Any,
     Callable,
     Dict,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
@@ -33,6 +38,7 @@ from dendra.helpers import (
     JIT,
     JIT_NETWORK_OPS,
     JIT_NETWORK_SOLVES,
+    _normalize_dtype_value,
     compile_options_key,
     current_compile_options,
     current_device,
@@ -50,12 +56,14 @@ from dendra.models.mechanisms._material_process import MaterialProcess
 from dendra.models.mechanisms._materials import (
     Material,
     MaterialFieldSpec,
+    _canonical_material_name,
     material_specs,
     valid_materials,
 )
 from dendra.models.mechanisms.validate import validate
 from dendra.models.modular import matches_any_pattern
 from dendra.models.parametric import Parameterized as P
+from dendra.models.rng import _validate_rng_checkpoint_payload
 from dendra.models.stim.intra import Intra
 from dendra.models.stim.waveform import Waveform
 from dendra.units import mm
@@ -203,6 +211,152 @@ def make_intra(intra, stims, indices):
     return intra(stims, indices)
 
 
+def _clone_nested_state(value, *, detach_tensors=False, memo=None):
+    """Clone tensors and mutable containers in a nested runtime-state payload.
+
+    Tensor identity aliases are preserved.  ``detach_tensors`` is intended for
+    rollback snapshots; checkpoint boundary clones keep their autograd history.
+    """
+    if memo is None:
+        memo = {}
+    if torch.is_tensor(value):
+        key = id(value)
+        if key not in memo:
+            tensor = value.detach() if detach_tensors else value
+            memo[key] = tensor.clone()
+        return memo[key]
+    if isinstance(value, Mapping):
+        items = [
+            (key, _clone_nested_state(item, detach_tensors=detach_tensors, memo=memo))
+            for key, item in value.items()
+        ]
+        try:
+            cloned = value.__class__(items)
+        except TypeError:
+            cloned = dict(items)
+        if hasattr(value, "_metadata"):
+            cloned._metadata = copy.deepcopy(value._metadata)
+        return cloned
+    if isinstance(value, list):
+        return [
+            _clone_nested_state(item, detach_tensors=detach_tensors, memo=memo)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _clone_nested_state(item, detach_tensors=detach_tensors, memo=memo)
+            for item in value
+        )
+    return copy.deepcopy(value)
+
+
+def _validate_time_scalar(value, *, name: str, positive: bool | None) -> float:
+    """Normalize one finite scalar simulation-time argument."""
+
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be a real scalar, not a boolean.")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a real scalar.") from error
+    if not math.isfinite(normalized):
+        raise ValueError(f"{name} must be finite.")
+    if positive is True and normalized <= 0:
+        raise ValueError(f"{name} must be positive.")
+    if positive is False and normalized < 0:
+        raise ValueError(f"{name} must be non-negative.")
+    return normalized
+
+
+def _duration_step_budget(
+    duration: float, dt: float, pending: float = 0.0
+) -> tuple[int, float]:
+    """Resolve complete fixed steps and retained physical time exactly.
+
+    ``duration`` and ``pending`` are physical milliseconds requested by the
+    caller but not necessarily representable as a complete fixed step.  Decimal
+    control arithmetic avoids both binary floating-point boundary promotion and
+    the loss of nominal decimal identities such as ``0.15 + 0.15 == 0.3``.
+
+    Parameters
+    ----------
+    duration : float
+        New non-negative duration requested by this call.
+    dt : float
+        Positive fixed timestep.
+    pending : float, optional
+        Non-negative physical duration retained from earlier calls.
+
+    Returns
+    -------
+    tuple[int, float]
+        Number of complete steps and the remaining unsimulated milliseconds.
+    """
+    duration = float(duration)
+    dt = float(dt)
+    pending = float(pending)
+    if not math.isfinite(duration) or duration < 0.0:
+        raise ValueError("duration must be finite and non-negative.")
+    if not math.isfinite(dt) or dt <= 0.0:
+        raise ValueError("timestep must be finite and positive.")
+    if not math.isfinite(pending) or pending < 0.0:
+        raise ValueError("pending duration must be finite and non-negative.")
+
+    # Programmatically constructed exact multiples can carry a harmless decimal
+    # tail (for example ``157 * 0.025 == 3.9250000000000003``) even though binary
+    # division recovers the intended integer exactly. Normalize that case before
+    # decimal control arithmetic, while requiring reconstruction to preserve
+    # genuinely tiny nonzero durations whose quotient underflows to zero.
+    try:
+        binary_total = math.fsum((pending, duration))
+    except OverflowError:
+        binary_total = math.inf
+    binary_quotient = binary_total / dt if math.isfinite(binary_total) else math.inf
+    normalized_steps = None
+    if math.isfinite(binary_quotient):
+        if binary_quotient.is_integer() and binary_quotient * dt == binary_total:
+            normalized_steps = int(binary_quotient)
+        elif Fraction.from_float(dt) != Fraction(str(dt)):
+            # For decimal timesteps such as 0.1, one-ULP differences around an
+            # integer cannot reliably distinguish input roundoff from a genuine
+            # boundary. Preserve the established decimal-grid interpretation.
+            nearest = round(binary_quotient)
+            if nearest >= 1 and abs(binary_quotient - nearest) <= 8.0 * math.ulp(
+                binary_quotient
+            ):
+                normalized_steps = int(nearest)
+    if normalized_steps is not None:
+        n_steps = normalized_steps
+        if n_steps > sys.maxsize:
+            raise ValueError("duration and dt imply too many simulation steps.")
+        return n_steps, 0.0
+
+    total = Fraction(str(pending)) + Fraction(str(duration))
+    dt_exact = Fraction(str(dt))
+    n_steps = total // dt_exact
+    if n_steps > sys.maxsize:
+        raise ValueError("duration and dt imply too many simulation steps.")
+    remainder = total - n_steps * dt_exact
+    return int(n_steps), float(remainder)
+
+
+def _duration_step_count(duration: float, dt: float) -> int:
+    """Return complete fixed timesteps in one duration without prior carry."""
+    return _duration_step_budget(duration, dt, 0.0)[0]
+
+
+def _time_grid_from_step_count(
+    start: torch.Tensor,
+    n_steps: int,
+    dt: float,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Construct an exact-length float64 time grid from integer offsets."""
+    offsets = torch.arange(n_steps, device=device, dtype=torch.double)
+    return start.to(device=device, dtype=torch.double) + offsets * dt
+
+
 class Population(P, Sliceable):
     """
     Base class for a population of multicompartment neurons.
@@ -241,7 +395,9 @@ class Population(P, Sliceable):
             else torch.device(device)
         )
         init_dtype = (
-            current_dtype(torch.float32) if dtype is None else current_dtype(dtype)
+            current_dtype(torch.float32)
+            if dtype is None
+            else _normalize_dtype_value(dtype)
         )
         super().__init__((N, C), (N, C), device=init_device, dtype=init_dtype, **kwargs)
         Sliceable.__init__(self)
@@ -271,6 +427,14 @@ class Population(P, Sliceable):
             "dx", torch.full(self.shape, 100.0, device=init_device, dtype=init_dtype)
         )
         self.register_buffer("t", torch.zeros((), device=init_device, dtype=init_dtype))
+        # Physical milliseconds requested by duration-based execution calls but
+        # not yet sufficient to form a complete fixed step.  Keep this separate
+        # from model time: explicit step() and array-driven run(ve=...) advance
+        # state without consuming the duration budget.
+        self.register_buffer(
+            "_duration_remainder",
+            torch.zeros((), device=init_device, dtype=torch.float64),
+        )
 
         # compiler stuff
         self.backend = BACKEND.value
@@ -643,7 +807,7 @@ class Population(P, Sliceable):
         Population
             The population instance for chaining.
         """
-        name = str(name)
+        name = _canonical_material_name(name)
         if name in valid_ions():
             raise ValueError(
                 f"{name!r} is a registered ion. Use concentrations(...) and "
@@ -1039,10 +1203,9 @@ class Population(P, Sliceable):
             Pair ``(stims, indices)`` where ``stims`` is a list of sequences
             of stimuli and ``indices`` encodes electrode mapping metadata.
         """
-        start = self.t
-        end = start + n * dt
-        t_ = torch.arange(start, end, dt, device=self.device(), dtype=self.dtype())
-        t_ = t_.to(self.device(), dtype=self.dtype())
+        t_ = _time_grid_from_step_count(self.t, n, dt, device=self.device()).to(
+            self.dtype()
+        )
         stims, indices = intra.init(t_)
         stims = [s.unbind(-1) for s in stims]
         return stims, indices
@@ -1065,9 +1228,20 @@ class Population(P, Sliceable):
             dtype=self.dtype(),
         ).contiguous()
 
+        if ve_s.dim() not in (1, 2):
+            raise ValueError(
+                "ve_s must have shape [n_comp], [1, n_comp], or [np, n_comp]; "
+                f"got shape {tuple(ve_s.shape)}."
+            )
         if ve_s.dim() == 1:
             # [n_comp] -> [1, n_comp]
             ve_s = ve_s.unsqueeze(0)
+
+        if ve_s.size(-1) != self.nc:
+            raise ValueError(
+                f"ve_s compartment dimension ({ve_s.size(-1)}) must match "
+                f"model.nc ({self.nc})."
+            )
 
         if ve_s.size(0) == 1:
             # [1, n_comp] -> [np, n_comp]
@@ -1098,6 +1272,11 @@ class Population(P, Sliceable):
             dtype=self.dtype(),
         )
 
+        if t_tensor.dim() not in (1, 2):
+            raise ValueError(
+                "time tensor must have shape [n_t], [1, n_t], or [np, n_t]; "
+                f"got shape {tuple(t_tensor.shape)}."
+            )
         if t_tensor.dim() == 1:
             # [n_t] -> [1, n_t]
             t_tensor = t_tensor.unsqueeze(0)
@@ -1219,17 +1398,37 @@ class Population(P, Sliceable):
             time_chunks_per_contact=time_chunks_per_contact,
         )
 
-    def _expand_eval_time(self, t_eval: torch.Tensor) -> torch.Tensor:
+    def _expand_eval_time(
+        self, t_eval: torch.Tensor, *, n_steps: Optional[int] = None
+    ) -> torch.Tensor:
         """
         Normalize evaluated Waveform output to [np, n_t_chunk].
 
         Accepts:
+        - scalar (broadcast across ``n_steps`` when provided)
         - [n_t_chunk]
         - [1, n_t_chunk]
         - [np, n_t_chunk]
         """
+        if t_eval.dim() == 0:
+            if n_steps is None:
+                raise ValueError(
+                    "Scalar Waveform output requires the expected number of steps."
+                )
+            t_eval = t_eval.expand(int(n_steps))
+        if t_eval.dim() not in (1, 2):
+            raise ValueError(
+                "Waveform output must be scalar or have shape [n_t], "
+                f"[1, n_t], or [np, n_t]; got shape {tuple(t_eval.shape)}."
+            )
         if t_eval.dim() == 1:
             t_eval = t_eval.unsqueeze(0)
+
+        if n_steps is not None and t_eval.size(-1) != int(n_steps):
+            raise ValueError(
+                f"Waveform output length ({t_eval.size(-1)}) must match "
+                f"the requested chunk length ({int(n_steps)})."
+            )
 
         if t_eval.size(0) == 1:
             t_eval = t_eval.expand(self.np, -1)
@@ -1269,14 +1468,14 @@ class Population(P, Sliceable):
                 t_per_contact: List[torch.Tensor] = []
                 for wf in cfg.waveforms:
                     t_i = wf(t_chunk).to(self.dtype())
-                    t_i = self._expand_eval_time(t_i)
+                    t_i = self._expand_eval_time(t_i, n_steps=t_chunk.numel())
                     t_per_contact.append(t_i.unsqueeze(0))  # [1, np, n_t_chunk]
 
                 t_extra = torch.cat(t_per_contact, dim=0)
             else:
                 wf = cfg.waveforms[0]
                 t_extra = wf(t_chunk).to(self.dtype())
-                t_extra = self._expand_eval_time(t_extra)
+                t_extra = self._expand_eval_time(t_extra, n_steps=t_chunk.numel())
         else:
             # Non-functional: use pre-split chunks
             if cfg.multicontact:
@@ -1296,6 +1495,25 @@ class Population(P, Sliceable):
         #                    t_extra [n_contacts, np, n_t_chunk]
         ve = cfg.einsum(cfg.ve_s, t_extra)  # [n_t_chunk, np, n_comp]
         return ve.unbind(dim=0)
+
+    def _duration_budget(self, duration: float, dt: float) -> tuple[int, float]:
+        """Resolve a duration call against this Population's retained time."""
+        pending = float(self._duration_remainder.detach().cpu().item())
+        return _duration_step_budget(duration, dt, pending)
+
+    def _set_duration_remainder(self, value: float) -> None:
+        """Commit retained physical time without mutating checkpoint aliases."""
+        self._duration_remainder = torch.tensor(
+            value,
+            device=self._duration_remainder.device,
+            dtype=torch.float64,
+        )
+
+    def _clear_duration_remainder(self) -> None:
+        """Start a fresh duration budget for a new simulation episode."""
+        self._duration_remainder = torch.zeros(
+            (), device=self._duration_remainder.device, dtype=torch.float64
+        )
 
     def step(
         self,
@@ -1338,6 +1556,10 @@ class Population(P, Sliceable):
             raise ValueError("Model must be initialized before stepping.")
         self._refresh_compile_config_from_ctx()
 
+        dt_f = _validate_time_scalar(
+            A.dt if dt is None else dt, name="dt", positive=True
+        )
+
         if ve is not None and extra is not None:
             raise ValueError("Provide either 've' or 'extra', not both.")
 
@@ -1350,8 +1572,6 @@ class Population(P, Sliceable):
 
         device = self.device()
         dtype = self.dtype()
-        dt = dt if dt is not None else A.dt
-        dt_f = float(dt)
         dt_tensor = torch.tensor(dt_f, device=device, dtype=dtype)
 
         if not isinstance(callbacks, CallbackList):
@@ -1450,10 +1670,13 @@ class Population(P, Sliceable):
             If both ``ve`` and ``extra`` are provided, a :class:`ValueError` is
             raised.
         tstop : float, optional
-            Simulation stop time in milliseconds when ``ve`` is not provided.
-            The number of simulation time steps is derived from the time grid
-            constructed from the current model time ``self.t``, ``tstop``, and
-            ``dt``. If ``ve`` is provided, this parameter is ignored.
+            Simulation duration in milliseconds to advance from the current
+            model time ``self.t`` when ``ve`` is not provided. Only complete
+            fixed timesteps are executed. Any fractional physical duration is
+            retained and combined with the next duration-based ``run``,
+            :meth:`longrun`, or :meth:`longrun_checkpointed` call. If ``ve`` is
+            provided, its leading length is authoritative, ``tstop`` is ignored,
+            and the retained duration is left unchanged.
         dt : float, optional
             Time step size in milliseconds. If ``None``, the default value
             ``A.dt`` from the backend is used.
@@ -1479,6 +1702,20 @@ class Population(P, Sliceable):
             raise ValueError("Model must be initialized before running.")
         self._refresh_compile_config_from_ctx()
 
+        dt_f = _validate_time_scalar(
+            A.dt if dt is None else dt, name="dt", positive=True
+        )
+        if ve is not None and extra is not None:
+            raise ValueError("Provide either 've' or 'extra', not both.")
+        tstop_f = None
+        duration_steps = None
+        duration_remainder = None
+        if ve is None:
+            if tstop is None:
+                raise ValueError("tstop must be provided when 've' is not given.")
+            tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+            duration_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+
         # auto-build intra if missing
         if self.intra is None:
             intra = self.build_intra()
@@ -1488,9 +1725,6 @@ class Population(P, Sliceable):
 
         with_intra = intra is not None
 
-        if ve is not None and extra is not None:
-            raise ValueError("Provide either 've' or 'extra', not both.")
-
         device = self.device()
         dtype = self.dtype()
 
@@ -1498,9 +1732,7 @@ class Population(P, Sliceable):
             ve = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
 
         # dt as scalar and tensor
-        dt = dt if dt is not None else A.dt
-        dt_f = float(dt)
-        dt_tensor = torch.tensor(dt, device=device, dtype=dtype)
+        dt_tensor = torch.tensor(dt_f, device=device, dtype=dtype)
 
         local_ind = 0
         tstart = self.t.item()
@@ -1518,25 +1750,14 @@ class Population(P, Sliceable):
                 n = ve.shape[0]
 
                 # Construct a matching time grid for 'extra'-style helpers if needed
-                t_global = torch.arange(
-                    self.t.double(),
-                    self.t.double() + n * dt_f,
-                    dt_f,
-                    device=device,
-                    dtype=torch.double,
+                t_global = _time_grid_from_step_count(
+                    self.t, n, dt_f, device=device
                 ).to(dtype)
             else:
-                if tstop is None:
-                    raise ValueError("tstop must be provided when 've' is not given.")
-
-                t_global = torch.arange(
-                    self.t.double(),
-                    self.t.double() + tstop,
-                    dt_f,
-                    device=device,
-                    dtype=torch.double,
+                n = duration_steps
+                t_global = _time_grid_from_step_count(
+                    self.t, n, dt_f, device=device
                 ).to(dtype)
-                n = t_global.size(0)
 
             # --------------------------------------------------------------
             # Prepare intra
@@ -1586,6 +1807,9 @@ class Population(P, Sliceable):
             else:
                 ve_list = None
 
+            if duration_remainder is not None:
+                self._set_duration_remainder(duration_remainder)
+
             # --------------------------------------------------------------
             # Main time-stepping loop
             # --------------------------------------------------------------
@@ -1606,6 +1830,7 @@ class Population(P, Sliceable):
                     intra_c = None
 
                 # Integrator step
+                pre_step_hook(callbacks, self)
                 self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
                 self.t = self.t + dt_tensor
 
@@ -1645,7 +1870,10 @@ class Population(P, Sliceable):
         Parameters
         ----------
         tstop : float
-            The simulation end time in milliseconds.
+            Simulation duration in milliseconds to advance from the current
+            model time ``self.t``. Only complete fixed timesteps are executed;
+            fractional physical duration is retained and shared with subsequent
+            duration-based Population execution calls.
         chunklength : int
             The number of time steps to process in each chunk.
         dt : float, optional
@@ -1700,15 +1928,22 @@ class Population(P, Sliceable):
 
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        if not isinstance(chunklength, int) or isinstance(chunklength, bool):
+            raise ValueError("chunklength must be a positive integer.")
+        if chunklength <= 0:
+            raise ValueError("chunklength must be a positive integer.")
+        dt_f = _validate_time_scalar(
+            A.dt if dt is None else dt, name="dt", positive=True
+        )
+        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
 
         intra = self.intra
         with_intra = intra is not None
 
         # dt scalars
-        dt = dt if dt is not None else A.dt
-        dt_f = float(dt)
-        dt_tensor = torch.tensor(dt, device=self.device(), dtype=self.dtype())
+        dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
 
         psh = post_step_hook
 
@@ -1717,15 +1952,12 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 # Global time grid and chunking
                 # --------------------------------------------------------------
-                t = torch.arange(
-                    self.t.double(),
-                    self.t.double() + tstop,
-                    dt_f,
-                    dtype=torch.double,
-                    device=self.device(),
+                t = _time_grid_from_step_count(
+                    self.t, n_steps, dt_f, device=self.device()
                 ).to(self.dtype())
 
                 if t.numel() == 0:
+                    self._set_duration_remainder(duration_remainder)
                     return
 
                 n_chunks = math.ceil(len(t) / chunklength)
@@ -1760,6 +1992,7 @@ class Population(P, Sliceable):
                     compile_scope="population",
                 )
 
+                self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
 
                 # --------------------------------------------------------------
@@ -1786,9 +2019,10 @@ class Population(P, Sliceable):
                         else:
                             intra_c = None
 
+                        pre_step_hook(callbacks, self)
                         self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
-                        psh(callbacks, self)
                         self.t = self.t + dt_tensor
+                        psh(callbacks, self)
 
                     post_chunk_hook(callbacks, self, t_chunk)
 
@@ -1818,13 +2052,15 @@ class Population(P, Sliceable):
         The steady state can be restored later by calling model.initialize().
         """
 
+        dt_f = _validate_time_scalar(dt, name="dt", positive=True)
+        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         self._refresh_compile_config_from_ctx()
         self.clear_steady_state()
 
         self.initialize()
-        self.integrator._initialize(self, dt, force=True, compile_scope="population")
+        self.integrator._initialize(self, dt_f, force=True, compile_scope="population")
 
-        maxiter = int(tstop / dt)
+        maxiter = int(tstop_f / dt_f)
 
         with torch.no_grad():
             if with_ve:
@@ -1839,12 +2075,13 @@ class Population(P, Sliceable):
             else:
                 intra = None
 
-            dt = torch.tensor(dt, device=self.device(), dtype=self.dtype())
+            dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
             for _ in tqdm(range(maxiter), desc="Steady state "):
-                self._step(self.integrator, self, dt, ve, intra)
+                self._step(self.integrator, self, dt_tensor, ve, intra)
 
         self.cache("_steady_state")
         self.t = torch.zeros_like(self.t).detach()
+        self._clear_duration_remainder()
         return self
 
     def clear_steady_state(self):
@@ -1952,8 +2189,13 @@ class Population(P, Sliceable):
     def _restore_steady_state(self):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
+            # ``restore`` marks ordinary named-cache restores usable. A
+            # steady-state initialization still has a post-initialize phase,
+            # so keep this transition fail-closed until every hook succeeds.
+            self.initialized = False
             self.post_initialize()
             self.t = torch.zeros_like(self.t).detach()
+            self._clear_duration_remainder()
             self.initialized = True
             self.initializing_from_state_cache = True
             return True
@@ -1974,6 +2216,16 @@ class Population(P, Sliceable):
         Population
             The initialized population instance.
         """
+        # Initialization is a state transition, not a best-effort refresh.  If
+        # any build/population/hook phase fails, callers must repair and retry
+        # instead of stepping a partially reset model advertised as initialized.
+        self.initialized = False
+        self.initializing_from_state_cache = False
+        self._clear_duration_remainder()
+        existing_integrator = getattr(self, "integrator", None)
+        if existing_integrator is not None:
+            existing_integrator.initialized = False
+
         self.build(force_rebuild)
         random_generation = object() if populate_parameter_buffers else None
         if (
@@ -2005,9 +2257,12 @@ class Population(P, Sliceable):
             random_generation=random_generation,
         )
         self.t = torch.zeros_like(self.t).detach()
+        self._clear_duration_remainder()
         self.initialized = True
-        if force_rebuild:
-            self.integrator.initialized = False
+        # Voltage/mechanism state was reconstructed even when topology and dt
+        # were unchanged. Rebuild timestep-dependent solver workspaces before
+        # the next step in every case.
+        self.integrator.initialized = False
         return self
 
     def initialize_(self):
@@ -2040,12 +2295,22 @@ class Population(P, Sliceable):
         self
             The model instance with loaded weights
         """
-        if isinstance(state_dict, str):
+        if isinstance(state_dict, (str, os.PathLike)):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
-        matched, _ = _match_state_dict(self.state_dict(), state_dict)
-        self.load_state_dict(matched, strict=False)
+        has_duration_remainder = (
+            isinstance(state_dict, Mapping) and "_duration_remainder" in state_dict
+        )
+        _load_compatible_state_dict_transactionally(self, state_dict)
+        if not has_duration_remainder:
+            # Normal state dictionaries created before duration carry support
+            # must not retain unrelated pending time from the receiver.
+            self._clear_duration_remainder()
+        else:
+            self._set_duration_remainder(
+                float(self._duration_remainder.detach().cpu().item())
+            )
         return self
 
     def load_(self, state_dict):
@@ -2101,7 +2366,7 @@ class Population(P, Sliceable):
         """
         if name is None:
             name = "latest"
-        self._caches[name] = self.state_dict()
+        self._caches[name] = _clone_nested_state(self.state_dict(), detach_tensors=True)
         return self
 
     def cache_(self, name: str = None):
@@ -2145,7 +2410,7 @@ class Population(P, Sliceable):
         """
         if name is None:
             name = "latest"
-        self.load_state_dict(self._caches[name])
+        _load_population_cache_transactionally(self, self._caches[name])
         self.initialized = True
         return self
 
@@ -2498,6 +2763,19 @@ class Population(P, Sliceable):
 
         is_material_process = isinstance(m, MaterialProcess)
 
+        def register_material_fields(target, declarations):
+            for declared_name, fields in declarations.items():
+                material_name = _canonical_material_name(declared_name)
+                current = target.setdefault(material_name, {}).setdefault(name, [])
+                current.extend(field for field in fields if field not in current)
+
+        def register_material_sources(target, declarations):
+            for declared_name, field_map in declarations.items():
+                material_name = _canonical_material_name(declared_name)
+                target.setdefault(material_name, {}).setdefault(name, {}).update(
+                    field_map
+                )
+
         if not is_material_process:
             for k, v in mech._currents.items():
                 self._m_curr.setdefault(k, {}).update({name: v})
@@ -2511,21 +2789,25 @@ class Population(P, Sliceable):
             for k, v in mech._write_ion_c.items():
                 self._ion_write_c.setdefault(k, {}).update({name: v})
 
-            for k, v in getattr(mech, "_read_material", {}).items():
-                self._material_read.setdefault(k, {}).update({name: v})
-
-            for k, v in getattr(mech, "_write_material", {}).items():
-                self._material_write.setdefault(k, {}).update({name: v})
-
-            for k, v in getattr(mech, "_source_material", {}).items():
-                self._material_source.setdefault(k, {}).update({name: v})
+            register_material_fields(
+                self._material_read, getattr(mech, "_read_material", {})
+            )
+            register_material_fields(
+                self._material_write, getattr(mech, "_write_material", {})
+            )
+            register_material_sources(
+                self._material_source, getattr(mech, "_source_material", {})
+            )
         else:
-            for k, v in getattr(mech, "_read_material", {}).items():
-                self._material_process_read.setdefault(k, {}).update({name: v})
-            for k, v in getattr(mech, "_write_material", {}).items():
-                self._material_process_write.setdefault(k, {}).update({name: v})
-            for k, v in getattr(mech, "_source_material", {}).items():
-                self._material_process_source.setdefault(k, {}).update({name: v})
+            register_material_fields(
+                self._material_process_read, getattr(mech, "_read_material", {})
+            )
+            register_material_fields(
+                self._material_process_write, getattr(mech, "_write_material", {})
+            )
+            register_material_sources(
+                self._material_process_source, getattr(mech, "_source_material", {})
+            )
 
     # -- Device and dtype methods --
 
@@ -2643,6 +2925,21 @@ class Population(P, Sliceable):
 
         if self.is_built and not (force_rebuild or self._flag_rebuild):
             return self
+
+        canonical_configs = {}
+        configured_names = {}
+        for configured_name, config in self._material_configs.items():
+            canonical = _canonical_material_name(configured_name)
+            if canonical in canonical_configs:
+                previous = configured_names[canonical]
+                raise ValueError(
+                    f"Material configurations {previous!r} and {configured_name!r} "
+                    f"both resolve to canonical material {canonical!r}. Configure "
+                    "that material through only one name."
+                )
+            canonical_configs[canonical] = config
+            configured_names[canonical] = configured_name
+        self._material_configs = canonical_configs
 
         def are_strings_unique(data: list) -> bool:
             strings_only = [item for item in data if item is not None]
@@ -2807,6 +3104,10 @@ class Population(P, Sliceable):
             self._dispatch_mechanism_injections(mech)
 
             self.integrator = self._integrator_class(self, mech, imem=self.imem)
+            # The population may have entered train/eval mode before this lazy
+            # child hierarchy existed. Newly attached modules otherwise keep
+            # torch.nn.Module's default training=True state.
+            self.integrator.train(self.training)
             self.integrator.configure_jit(self, scope="population")
             self.mech = self.integrator.mech
 
@@ -3194,6 +3495,124 @@ class Population(P, Sliceable):
         self._labels.clear()
 
     # -- gradient checkpointing --
+    def _stochastic_state_dict_for_checkpoint(self):
+        """Snapshot Population-level RAND/NOISE buffers and RNG streams."""
+        buffer_names = []
+        rng_names = []
+
+        for name in self.__class__._rng:
+            rng_names.append(name)
+        for specs in (self.random_parameters, self.runtime_noises):
+            for name, spec in specs.items():
+                buffer_names.append(name)
+                rng_names.append(spec.effective_rng_name)
+
+        buffers = {}
+        for name in dict.fromkeys(buffer_names):
+            value = getattr(self, name)
+            if not torch.is_tensor(value):
+                raise TypeError(
+                    f"Population stochastic buffer {name!r} must be a tensor."
+                )
+            buffers[name] = value.clone()
+
+        rng_states = {}
+        for name in dict.fromkeys(rng_names):
+            rng = getattr(self, name)
+            if not hasattr(rng, "rng_state"):
+                raise TypeError(
+                    f"Population stochastic generator {name!r} does not expose "
+                    "rng_state()."
+                )
+            rng_states[name] = {
+                "base_seed": int(rng._base_seed),
+                "rng_state": _clone_nested_state(rng.rng_state(), detach_tensors=True),
+            }
+
+        return {"buffers": buffers, "rng_states": rng_states}
+
+    def _prepare_stochastic_state_from_checkpoint(self, state_dict):
+        """Validate and normalize Population stochastic checkpoint state."""
+
+        if not isinstance(state_dict, Mapping):
+            raise TypeError("Population stochastic checkpoint state must be a mapping.")
+        if "buffers" not in state_dict or "rng_states" not in state_dict:
+            raise KeyError(
+                "Population stochastic checkpoint requires 'buffers' and "
+                "'rng_states' entries."
+            )
+
+        expected = self._stochastic_state_dict_for_checkpoint()
+        buffers = state_dict["buffers"]
+        rng_states = state_dict["rng_states"]
+        if not isinstance(buffers, Mapping) or not isinstance(rng_states, Mapping):
+            raise TypeError(
+                "Population stochastic checkpoint buffers and RNG states must be mappings."
+            )
+        if set(buffers) != set(expected["buffers"]):
+            raise ValueError(
+                "Population stochastic checkpoint buffer names do not match this "
+                f"model: expected {sorted(expected['buffers'])}, got {sorted(buffers)}."
+            )
+        if set(rng_states) != set(expected["rng_states"]):
+            raise ValueError(
+                "Population stochastic checkpoint RNG names do not match this "
+                f"model: expected {sorted(expected['rng_states'])}, "
+                f"got {sorted(rng_states)}."
+            )
+
+        prepared_buffers = {}
+        for name, candidate in buffers.items():
+            reference = getattr(self, name)
+            if not torch.is_tensor(candidate):
+                raise TypeError(
+                    f"Population stochastic checkpoint buffer {name!r} must be a tensor."
+                )
+            if tuple(candidate.shape) != tuple(reference.shape):
+                raise ValueError(
+                    f"Population stochastic checkpoint buffer {name!r} has shape "
+                    f"{tuple(candidate.shape)}, expected {tuple(reference.shape)}."
+                )
+            prepared_buffers[name] = candidate.to(
+                device=reference.device, dtype=reference.dtype
+            ).clone()
+
+        prepared_rng_states = {}
+        for name, rng_payload in rng_states.items():
+            try:
+                prepared_rng_states[name] = _validate_rng_checkpoint_payload(
+                    rng_payload, allow_legacy=True
+                )
+            except (KeyError, RuntimeError, TypeError, ValueError) as error:
+                raise type(error)(
+                    f"Invalid Population stochastic RNG payload {name!r}: {error}"
+                ) from error
+
+        return prepared_buffers, prepared_rng_states
+
+    def _apply_prepared_stochastic_state(self, prepared_state):
+        """Apply state returned by
+        :meth:`_prepare_stochastic_state_from_checkpoint`.
+        """
+
+        buffers, rng_states = prepared_state
+        for name, restored in buffers.items():
+            setattr(self, name, restored)
+        for name, (base_seed, rng_state) in rng_states.items():
+            rng = getattr(self, name)
+            if base_seed is None:
+                # Early checkpoint payloads stored only the raw device-state
+                # mapping. Preserve the target's constructor seed for reset_rng().
+                rng.set_rng_state(rng_state)
+            else:
+                rng.set_extra_state({"base_seed": base_seed, "rng_state": rng_state})
+
+    def _restore_stochastic_state_from_checkpoint(self, state_dict):
+        """Restore a Population stochastic checkpoint payload."""
+
+        prepared = self._prepare_stochastic_state_from_checkpoint(state_dict)
+        self._apply_prepared_stochastic_state(prepared)
+
     def state_dict_for_checkpoint(self):
         """
         Get state dictionary for gradient checkpointing.
@@ -3209,8 +3628,112 @@ class Population(P, Sliceable):
             "mech": mech_dct,
             "integrator": integrator_dct,
             "t": self.t,
+            "duration_remainder": self._duration_remainder,
+            "stochastic": self._stochastic_state_dict_for_checkpoint(),
         }
         return full_dct
+
+    def _restore_dict_from_checkpoint_unchecked(self, state_dict):
+        if not isinstance(state_dict, Mapping):
+            raise TypeError("Population checkpoint state must be a mapping.")
+        missing = [
+            name for name in ("mech", "integrator", "t") if name not in state_dict
+        ]
+        if missing:
+            raise KeyError(f"Population checkpoint is missing entries: {missing}.")
+        if not isinstance(state_dict["integrator"], Mapping):
+            raise TypeError("Population checkpoint integrator state must be a mapping.")
+
+        expected_integrator = self.integrator.mutable_state_dict(self)
+        restored_integrator = {}
+        for name, reference in expected_integrator.items():
+            if name not in state_dict["integrator"]:
+                raise KeyError(
+                    f"Population checkpoint integrator state is missing {name!r}."
+                )
+            candidate = state_dict["integrator"][name]
+            if torch.is_tensor(reference):
+                if not torch.is_tensor(candidate):
+                    raise TypeError(
+                        f"Population checkpoint integrator state {name!r} must be a tensor."
+                    )
+                if tuple(candidate.shape) != tuple(reference.shape):
+                    raise ValueError(
+                        f"Population checkpoint integrator state {name!r} has shape "
+                        f"{tuple(candidate.shape)}, expected {tuple(reference.shape)}."
+                    )
+                candidate = candidate.to(
+                    device=reference.device, dtype=reference.dtype
+                ).clone()
+            else:
+                candidate = copy.deepcopy(candidate)
+            restored_integrator[name] = candidate
+
+        t = state_dict["t"]
+        if not torch.is_tensor(t):
+            raise TypeError("Population checkpoint time must be a tensor.")
+        if tuple(t.shape) != tuple(self.t.shape):
+            raise ValueError(
+                f"Population checkpoint time has shape {tuple(t.shape)}, "
+                f"expected {tuple(self.t.shape)}."
+            )
+
+        # Runtime checkpoints created before fractional-duration carry support
+        # have no entry; restoring them starts with no pending physical time.
+        if "duration_remainder" not in state_dict:
+            duration_remainder = torch.zeros(
+                (), device=self._duration_remainder.device, dtype=torch.float64
+            )
+        else:
+            duration_remainder = state_dict["duration_remainder"]
+            if not torch.is_tensor(duration_remainder):
+                raise TypeError(
+                    "Population checkpoint duration_remainder must be a tensor."
+                )
+            if tuple(duration_remainder.shape) != ():
+                raise ValueError(
+                    "Population checkpoint duration_remainder must be a scalar tensor."
+                )
+            if not torch.is_floating_point(duration_remainder):
+                raise TypeError(
+                    "Population checkpoint duration_remainder must have floating dtype."
+                )
+            duration_remainder = duration_remainder.to(
+                device=self._duration_remainder.device, dtype=torch.float64
+            ).clone()
+            duration_value = float(duration_remainder.detach().cpu().item())
+            if not math.isfinite(duration_value) or duration_value < 0.0:
+                raise ValueError(
+                    "Population checkpoint duration_remainder must be finite and "
+                    "non-negative."
+                )
+
+        # Preflight stochastic metadata before any mechanism or integrator
+        # field is changed. Older checkpoints remain loadable only when the
+        # target Population has no Population-level stochastic declarations.
+        prepared_stochastic = None
+        if "stochastic" in state_dict:
+            prepared_stochastic = self._prepare_stochastic_state_from_checkpoint(
+                state_dict["stochastic"]
+            )
+        elif any(
+            (
+                self.__class__._rng,
+                self.random_parameters,
+                self.runtime_noises,
+            )
+        ):
+            raise KeyError(
+                "Population checkpoint predates stochastic-state support but this "
+                "model declares Population-level RNG/RAND/NOISE state."
+            )
+
+        self.mech.restore_mutable_state_dict(state_dict["mech"])
+        self.integrator.restore_mutable_state_dict(self, restored_integrator)
+        if prepared_stochastic is not None:
+            self._apply_prepared_stochastic_state(prepared_stochastic)
+        self.t = t.to(device=self.t.device, dtype=self.t.dtype).clone()
+        self._duration_remainder = duration_remainder
 
     def restore_dict_from_checkpoint(self, state_dict):
         """
@@ -3221,9 +3744,19 @@ class Population(P, Sliceable):
         state_dict : dict
             State dictionary containing model parameters and buffers.
         """
-        self.mech.restore_mutable_state_dict(state_dict["mech"])
-        self.integrator.restore_mutable_state_dict(self, state_dict["integrator"])
-        self.t = state_dict["t"]
+        previous = self.state_dict_for_checkpoint()
+        try:
+            self._restore_dict_from_checkpoint_unchecked(state_dict)
+        except Exception:
+            try:
+                self._restore_dict_from_checkpoint_unchecked(previous)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Population checkpoint restore failed and rollback could not "
+                    "recover the previous runtime state."
+                ) from rollback_error
+            raise
+        return self
 
     def longrun_checkpointed(
         self,
@@ -3250,7 +3783,9 @@ class Population(P, Sliceable):
         Parameters
         ----------
         tstop : float
-            Total simulation time in milliseconds.
+            Simulation duration in milliseconds to advance from the current
+            model time ``self.t``. This uses the same cumulative complete-step
+            budget and retained physical-duration semantics as :meth:`longrun`.
         chunklength : int
             Number of time steps per checkpointed chunk.
         dt : float, optional
@@ -3315,15 +3850,22 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        if not isinstance(chunklength, int) or isinstance(chunklength, bool):
+            raise ValueError("chunklength must be a positive integer.")
+        if chunklength <= 0:
+            raise ValueError("chunklength must be a positive integer.")
+        dt_f = _validate_time_scalar(
+            A.dt if dt is None else dt, name="dt", positive=True
+        )
+        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
 
         intra = self.intra
         with_intra = intra is not None
 
         # dt scalars
-        dt = dt if dt is not None else A.dt
-        dt_f = float(dt)
-        dt_tensor = torch.tensor(dt, device=self.device(), dtype=self.dtype())
+        dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
 
         # Normalize callback container
         if not isinstance(callbacks, CallbackList):
@@ -3356,55 +3898,38 @@ class Population(P, Sliceable):
             We preserve object-identity aliasing within the dict (if the same tensor
             object is referenced multiple times) by memoizing clones.
             """
-            memo: Dict[int, torch.Tensor] = {}
-
-            def _clone_any(v):
-                if not torch.is_tensor(v):
-                    return v
-                key = id(v)
-                if key in memo:
-                    return memo[key]
-                out = v.clone()
-                memo[key] = out
-                return out
-
-            mech_in = sd.get("mech", {})
-            integ_in = sd.get("integrator", {})
-
-            mech_out = {k: _clone_any(v) for k, v in mech_in.items()}
-            integ_out = {k: _clone_any(v) for k, v in integ_in.items()}
-
-            return {
-                "mech": mech_out,
-                "integrator": integ_out,
-                "t": _clone_any(sd["t"]),
-            }
+            return _clone_nested_state(sd)
 
         def _copy_state_containers(sd: Dict[str, Any]) -> Dict[str, Any]:
             """
-            Copy only the dict containers (not tensors). Useful to protect the
+            Copy only nested containers (not tensors). Useful to protect the
             backward-restore hook from accidental user mutation of the returned dict.
             """
-            return {
-                "mech": dict(sd.get("mech", {})),
-                "integrator": dict(sd.get("integrator", {})),
-                "t": sd["t"],
-            }
+
+            def _copy(value):
+                if isinstance(value, Mapping):
+                    return {key: _copy(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [_copy(item) for item in value]
+                if isinstance(value, tuple):
+                    return tuple(_copy(item) for item in value)
+                return value
+
+            return _copy(sd)
 
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
                 # --------------------------------------------------------------
                 # Global time grid and chunking
                 # --------------------------------------------------------------
-                t = torch.arange(
-                    self.t.double(),
-                    self.t.double() + tstop,
-                    dt_f,
-                    dtype=torch.double,
-                    device=self.device(),
+                t = _time_grid_from_step_count(
+                    self.t, n_steps, dt_f, device=self.device()
                 ).to(self.dtype())
 
                 if t.numel() == 0:
+                    self._set_duration_remainder(duration_remainder)
+                    if return_final_state:
+                        return None, self.state_dict_for_checkpoint()
                     return None
 
                 n_chunks = math.ceil(len(t) / chunklength)
@@ -3430,6 +3955,10 @@ class Population(P, Sliceable):
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
+                # Commit before the first checkpoint boundary is captured so
+                # forward replay and backward restoration observe one coherent
+                # duration budget.
+                self._set_duration_remainder(duration_remainder)
                 # Capture boundary state after initialization
                 state = self.state_dict_for_checkpoint()
 
@@ -3489,6 +4018,7 @@ class Population(P, Sliceable):
                                 intra_c = None
 
                             self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+                            self.t = self.t + dt_tensor
 
                             # Replay-safe post-step callbacks (may contribute loss)
                             if callbacks:
@@ -3498,8 +4028,6 @@ class Population(P, Sliceable):
                                         continue
                                     chunk_loss, saw = _add_loss(chunk_loss, hook(self))
                                     saw_loss_local = saw_loss_local or saw
-
-                            self.t = self.t + dt_tensor
 
                         # Replay-safe post-chunk callbacks (may contribute loss)
                         if callbacks:
@@ -4736,9 +5264,12 @@ class Axon(Population):
             **kwargs,
         )
 
-        self.register_buffer(
-            "diameters", torch.as_tensor(diameters, dtype=self.dtype())
+        diameter_values = (
+            torch.as_tensor(diameters, device=self.device(), dtype=self.dtype())
+            .clone()
+            .detach()
         )
+        self.register_buffer("diameters", diameter_values)
 
         self.n_ax = self.np
         self.n_comp = self.nc
@@ -4749,17 +5280,19 @@ class Axon(Population):
         self.x[:] = self._x()  # Initialize x positions
 
         self.cid = None
+        self._cid_label_names = set()
 
-        if torch.is_tensor(diameters):
-            diameters = diameters.to(self.dtype()).clone().detach()
-        else:
-            diameters = torch.tensor(diameters, dtype=self.dtype())
+        compartment_diameters = self.diameters
+        if compartment_diameters.ndim == 1:
+            compartment_diameters = compartment_diameters.unsqueeze(1)
 
-        if diameters.ndim == 1:
-            diameters = diameters.unsqueeze(1)
-
-        self.diam[:] = diameters
+        self.diam.copy_(compartment_diameters)
         self.diam = self.diam.detach()
+
+    def clear_labels(self):
+        """Clear slice labels and forget any CID label ownership."""
+        super().clear_labels()
+        self._cid_label_names.clear()
 
     def assemble_graphs(self):
         """
@@ -4774,8 +5307,9 @@ class Axon(Population):
         for i in range(self.n_ax):
             G = nx.path_graph(self.n_comp, create_using=nx.DiGraph)
             for node in G.nodes:
+                location = 0.5 if self.n_comp == 1 else node / (self.n_comp - 1)
                 G.nodes[node]["name"] = (
-                    f"{self.__class__.__name__}[{i}]({node / (self.n_comp - 1):.2f})"
+                    f"{self.__class__.__name__}[{i}]({location:.2f})"
                 )
                 G.nodes[node]["x"] = self.x[i, node].item()
                 G.nodes[node]["y"] = self.y[i, node].item()
@@ -4788,18 +5322,118 @@ class Axon(Population):
         return graphs
 
     def register_cid(self, cid):
-        """
-        Register a compartment identifier table for slicing utilities.
+        """Register compartment names and expose their labelled slices.
+
+        This connects a model-definition
+        :class:`~dendra.models.heterogeneous.CompartmentID` to an axon. Each
+        unique name becomes both an entry in ``_labels`` and an attribute
+        containing the corresponding :class:`~dendra.models.slice.Slice`.
 
         Parameters
         ----------
-        cid : Any
-            Object exposing ``names`` used for label-based slicing.
+        cid : dendra.models.heterogeneous.CompartmentID
+            Identifier table whose expanded ``names`` array has length
+            ``n_comp``.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            from dendra.models.core import Unmyelinated
+            from dendra.models.heterogeneous import CompartmentID
+            from dendra.units import um
+
+            axon = Unmyelinated(diameters=[8.0], L=60.0 * um, dx=10.0 * um)
+            cid = CompartmentID(["node", "internode * 2"], n_repeats=2)
+            axon.register_cid(cid)
+
+            axon.node       # compartments 0, 3, and 6
+            axon.internode  # compartments 1, 2, 4, and 5
         """
-        self.cid = cid
-        self.names = self.cid.names.tolist()
-        for name in np.unique(self.names):
-            self.slice(name).label(name)
+        if not hasattr(cid, "names"):
+            raise TypeError("cid must expose a one-dimensional 'names' sequence.")
+        raw_names = cid.names
+        names_ndim = getattr(raw_names, "ndim", None)
+        if isinstance(raw_names, (str, np.str_)) or (
+            names_ndim is not None and int(names_ndim) != 1
+        ):
+            raise TypeError("cid.names must be a one-dimensional sequence.")
+        raw_names = raw_names.tolist() if hasattr(raw_names, "tolist") else raw_names
+        if isinstance(raw_names, (str, np.str_)):
+            raise TypeError("cid.names must be a one-dimensional sequence.")
+        try:
+            names = list(raw_names)
+        except TypeError as error:
+            raise TypeError("cid.names must be a one-dimensional sequence.") from error
+        if any(not isinstance(name, (str, np.str_)) for name in names):
+            raise TypeError("Every compartment name in cid.names must be a string.")
+        names = [str(name) for name in names]
+        if len(names) != self.n_comp:
+            raise ValueError(
+                f"Axon requires {self.n_comp} compartment names, got {len(names)}."
+            )
+
+        unique_names = list(dict.fromkeys(names))
+        old_owned = set(self._cid_label_names)
+        always_reserved = {"cid", "names", "_cid_label_names", "_labels"}
+        for name in unique_names:
+            replaceable_old_label = (
+                name in old_owned
+                and name in self.__dict__
+                and self.__dict__[name] is self._labels.get(name)
+            )
+            conflicts = name in always_reserved or (
+                not replaceable_old_label
+                and (hasattr(self, name) or name in self._labels)
+            )
+            if conflicts:
+                raise ValueError(
+                    f"Compartment label {name!r} conflicts with an existing attribute."
+                )
+
+        names_array = np.asarray(names, dtype=object)
+        prepared_labels = {
+            name: self[..., np.flatnonzero(names_array == name).tolist()]
+            for name in unique_names
+        }
+
+        old_cid = self.cid
+        old_names_present = "names" in self.__dict__
+        old_names = self.__dict__.get("names")
+        old_cid_label_names = set(self._cid_label_names)
+        old_labels = dict(self._labels)
+        touched_names = old_owned | set(unique_names)
+        old_attributes = {
+            name: self.__dict__[name] for name in touched_names if name in self.__dict__
+        }
+
+        try:
+            for name in old_owned:
+                old_label = self._labels.pop(name, None)
+                if name in self.__dict__ and self.__dict__[name] is old_label:
+                    delattr(self, name)
+
+            self.cid = cid
+            self.names = names
+            for name, label in prepared_labels.items():
+                setattr(self, name, label)
+                self._labels[name] = label
+            self._cid_label_names = set(unique_names)
+        except Exception:
+            for name in touched_names:
+                if name in self.__dict__:
+                    delattr(self, name)
+            for name, value in old_attributes.items():
+                setattr(self, name, value)
+            self._labels.clear()
+            self._labels.update(old_labels)
+            self.cid = old_cid
+            self._cid_label_names = old_cid_label_names
+            if old_names_present:
+                self.names = old_names
+            elif "names" in self.__dict__:
+                delattr(self, "names")
+            raise
 
     def c(self, *args):
         """
@@ -4842,34 +5476,45 @@ class Axon(Population):
 
 
 def _match_state_dict(
-    state_dict_a: Dict[str, torch.Tensor],
-    state_dict_b: Dict[str, torch.Tensor],
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    state_dict_a: Dict[str, Any],
+    state_dict_b: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Match tensors between two state dictionaries based on key names and shapes.
-    This function filters a state dictionary to find tensors that have matching keys
-    and identical shapes in another state dictionary, which is useful for selective
-    parameter loading or model weight comparisons.
+    Match entries between two state dictionaries based on key names and compatibility.
+
+    Tensor entries must have identical shapes. Non-tensor entries, such as the
+    dictionaries produced by ``nn.Module.get_extra_state()``, are compatible when
+    the corresponding key exists and both entries are non-tensors.
 
     Parameters
     ----------
-    state_dict_a : Dict[str, torch.Tensor]
+    state_dict_a : Dict[str, Any]
         First state dictionary used as reference for key and shape matching.
-    state_dict_b : Dict[str, torch.Tensor]
+    state_dict_b : Dict[str, Any]
         Second state dictionary to filter based on keys and shapes in state_dict_a.
     Returns
     -------
-    Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
+    Tuple[Dict[str, Any], Dict[str, Any]]
         A tuple containing:
         - matched_state_dict: Dictionary with entries from state_dict_b that have
           matching keys and shapes in state_dict_a.
         - unmatched_state_dict: Dictionary with remaining entries from state_dict_b
           that don't have matching keys or shapes in state_dict_a.
     """
+
+    def compatible(reference, candidate):
+        reference_is_tensor = torch.is_tensor(reference)
+        candidate_is_tensor = torch.is_tensor(candidate)
+        if reference_is_tensor != candidate_is_tensor:
+            return False
+        if reference_is_tensor:
+            return reference.shape == candidate.shape
+        return True
+
     matched_state_dict = {
         key: state
         for (key, state) in state_dict_b.items()
-        if key in state_dict_a and state.shape == state_dict_a[key].shape
+        if key in state_dict_a and compatible(state_dict_a[key], state)
     }
     unmatched_state_dict = {
         key: state
@@ -4877,6 +5522,75 @@ def _match_state_dict(
         if key not in matched_state_dict
     }
     return matched_state_dict, unmatched_state_dict
+
+
+def _load_state_dict_transactionally(module, state_dict, *, strict: bool):
+    """Load module state without exposing mutations from a failed load."""
+
+    if not isinstance(state_dict, Mapping):
+        raise TypeError("state_dict must be a mapping.")
+    rollback_state = _clone_nested_state(module.state_dict(), detach_tensors=True)
+    try:
+        return module.load_state_dict(state_dict, strict=strict)
+    except Exception:
+        try:
+            module.load_state_dict(rollback_state, strict=True)
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "State-dictionary load failed and rollback could not recover the "
+                "previous module state."
+            ) from rollback_error
+        raise
+
+
+def _load_population_cache_transactionally(population, state_dict):
+    """Restore a named Population cache while rebuilding solver workspaces.
+
+    Direct buffers owned by an integrator are derived from morphology, parameters,
+    and the next step's ``dt``.  They are therefore not runtime state, and their
+    shapes may legitimately change when a lazily initialized solver first runs.
+    Keep the live workspace buffers during the strict state-dictionary load and
+    invalidate the integrator so the next step reconstructs them.  Every other
+    key retains strict, transactional loading semantics.
+    """
+
+    if not isinstance(state_dict, Mapping):
+        raise TypeError("Cached population state must be a mapping.")
+
+    live_state = population.state_dict()
+    prepared = dict(state_dict)
+    integrator = getattr(population, "integrator", None)
+    if integrator is not None:
+        prefix = "integrator."
+        # Inject current direct workspace buffers. Nested mechanism state
+        # (``integrator.mech.*``), including unexpected keys, remains part of
+        # the strict snapshot validation.
+        for name in integrator._buffers:
+            key = f"{prefix}{name}"
+            if key in live_state:
+                prepared[key] = live_state[key]
+
+    result = _load_state_dict_transactionally(population, prepared, strict=True)
+    if integrator is not None:
+        integrator.initialized = False
+    return result
+
+
+def _load_compatible_state_dict_transactionally(module, state_dict):
+    """Apply compatible state entries without exposing partial failed loads.
+
+    Shape-incompatible and unknown entries retain the historical ``load()``
+    behavior and are ignored. If loading a compatible entry raises (for example,
+    because an RNG ``_extra_state`` payload is corrupt), every earlier mutation is
+    rolled back before the original exception is re-raised.
+    """
+    if not isinstance(state_dict, Mapping):
+        raise TypeError(
+            "state_dict must be a mapping or a path containing a state dictionary."
+        )
+    live_state = module.state_dict()
+    matched, _ = _match_state_dict(live_state, state_dict)
+    _load_state_dict_transactionally(module, matched, strict=False)
 
 
 class Unmyelinated(Axon):

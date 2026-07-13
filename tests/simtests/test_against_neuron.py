@@ -45,20 +45,23 @@ def sim_and_rec_neuron(d_lambda):
     rec2 = h.Vector()
     rec2.record(cell.dend[86](0.5)._ref_v)
 
+    cvode = h.CVode()
+    cvode.active(0)
+    h.secondorder = 0
+    h.celsius = 6.3
     h.dt = 0.025
-    h.finitialize()
+    h.finitialize(-65.0)
     while h.t < 10.0:
         h.fadvance()
     return np.array(rec1), np.array(rec2)
 
 
-def assert_neuron_close(actual, expected, *, label, atol=2e-2, rtol=1e-5):
+def assert_neuron_close(actual, expected, *, label, atol=2e-5, rtol=1e-8):
     """Assert simulator agreement with diagnostics useful for drift debugging.
 
-    NEURON and Dendra differ in implementation details and may vary slightly
-    across NEURON/PyTorch/platform versions.  This test is intended to catch
-    meaningful numerical regressions, not fail on a few ulps to sub-microvolt
-    solver drift.
+    With NEURON's HH rate table disabled by the simtest fixture, both solvers
+    evaluate the same analytic rates.  Keep a small platform margin around the
+    observed microvolt-scale CPU agreement.
     """
     expected = expected[: actual.shape[0]]
     diff = actual - expected
@@ -147,5 +150,7 @@ def test_against_neuron_cuda(d_lambda, threads, N):
     r1 = v[:, 0, 0]
     r2 = v[:, 0, 1]
 
-    assert_neuron_close(r1, rec1, label="soma voltage")
-    assert_neuron_close(r2, rec2, label="dend[86] voltage")
+    # The GPU solver is a separate numerical lane; retain its established
+    # cross-platform tolerance until these oracles can run in GPU CI.
+    assert_neuron_close(r1, rec1, label="CUDA soma voltage", atol=2e-2, rtol=1e-5)
+    assert_neuron_close(r2, rec2, label="CUDA dend[86] voltage", atol=2e-2, rtol=1e-5)

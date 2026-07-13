@@ -7,6 +7,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style-plastic&logo=PyTorch&logoColor=white)](https://pytorch.com)
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/downloads/)
 [![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Coverage](https://gitlab.oit.duke.edu/mah148/dendra/badges/main/coverage.svg?job=test)](https://gitlab.oit.duke.edu/mah148/dendra/-/pipelines?ref=main)
 
 Fast, scalable, versatile, and differentiable neural simulator with support for extracellular fields. Useful to implement and train high-throughput GPU-compatible models.
 
@@ -19,7 +20,7 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](ht
 `dendra` has been tested on Windows 11 under WSL2 (Ubuntu 22.04), Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux), and macOS (Tahoe 26.3).
 
 ### Python dependencies
-`dendra` requires Python 3.11+ and PyTorch 2.8+. For GPU support, CUDA 12.9+ is required for best performance. **We recommend installing the most recent stable version of PyTorch that supports your CUDA version**. If you have an older GPU that is not compatible with the latest CUDA, you may need to install an older version of PyTorch that supports your CUDA version. See the [PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/) for more details.
+`dendra` requires Python 3.11+, PyTorch 2.8+, and NEURON. For GPU support, CUDA 12.9+ is required for best performance. **We recommend installing the most recent stable version of PyTorch that supports your CUDA version**. If you have an older GPU that is not compatible with the latest CUDA, you may need to install an older version of PyTorch that supports your CUDA version. See the [PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/) for more details.
 
 ## 🖥️ Installation
 
@@ -52,6 +53,45 @@ Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](ht
 - Install `--editable` with dev dependencies & install `pre-commit`:
     - `pip install --editable ".[dev]"`
     - `pre-commit install`
+
+## ✅ Testing and code coverage
+
+The development dependencies include `pytest` and `pytest-cov`. Run the complete test suite from the repository root with:
+
+```bash
+python -m pytest tests
+```
+
+Tests are classified into execution lanes. The required CI lane combines the portable CPU suite with every non-CUDA NEURON integration and reference test:
+
+```bash
+python -m pytest tests -W error -m "cpu or (neuron and not cuda)"
+```
+
+This expression runs each selected test once: `cpu` covers tests that require neither CUDA nor NEURON, while `neuron and not cuda` adds the required simulator-backed CPU tests without pulling GPU comparisons into the lane. CUDA and Triton-dependent cases remain separate and can be selected with `-m cuda`; `-m "neuron and cuda"` narrows that lane to NEURON comparisons on CUDA. Longer comparisons also carry `slow`, and randomized/property-generated cases carry `stochastic`. Markers are strict, so misspelled or undeclared markers fail during collection.
+
+On a CUDA/Triton worker, run the accelerator lane independently:
+
+```bash
+python -c "import torch, triton; assert torch.cuda.is_available()"
+python -m pytest tests -W error -m cuda
+```
+
+Keep accelerator coverage artifacts separate from the required CPU/NEURON percentage. Kernel correctness is enforced primarily through dense numerical oracles, gradient checks, boundary-shape contracts, and backend-equivalence tests.
+
+To measure both statement and branch coverage, print uncovered line numbers in the terminal, and generate a browsable HTML report:
+
+```bash
+python -m pytest tests -W error -m "cpu or (neuron and not cuda)" --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html
+```
+
+The `TOTAL` row is the overall coverage result. Open `htmlcov/index.html` to inspect coverage by module and identify untested lines and branches. The required lane installs and exercises NEURON; CUDA and Triton remain outside this coverage measurement, and results can still vary when optional CPU solvers are unavailable.
+
+GitLab CI runs this same non-CUDA branch-coverage measurement for every pipeline, enforces a ratcheted global minimum, and retains JSON, browsable HTML, and Cobertura reports. Critical modules also have individual floors configured in `pyproject.toml`; validate them locally after generating `coverage.json` with:
+
+```bash
+python scripts/check_coverage_floors.py coverage.json
+```
 
 
 🥳 You're all set!

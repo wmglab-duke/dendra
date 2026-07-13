@@ -4,6 +4,7 @@ import torch
 from dendra.models.integrators.tridiag import pcr_solve_t
 from dendra.models.integrators.triton import (
     dhs_solve_cuda,
+    pcr_solve_cuda_t,
     thomas_solve_cuda_bt,
     thomas_solve_cuda_t,
 )
@@ -182,7 +183,8 @@ def test_pcr_forward_pass(K, device):
     d = torch.randn(B, K, device=device)
 
     # 1. Get the solution from the PCR implementation
-    x_computed = pcr_solve_t(a, b, c, d)
+    solve = pcr_solve_t if device == "cpu" else pcr_solve_cuda_t
+    x_computed = solve(a, b, c, d)
 
     # 2. Get the expected solution using a trusted solver
     x_expected_list = []

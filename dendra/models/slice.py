@@ -672,7 +672,7 @@ class Slice:
 
         with torch.no_grad():
             getattr(model, var)[idx] = value
-            setattr(mech, var, getattr(mech, var).detach())
+            setattr(model, var, getattr(model, var).detach())
 
     def inject(self, waveform):
         """
@@ -1341,7 +1341,7 @@ def concat_slices(slices: Sequence[Slice], dim: int = -1) -> Slice:
         raise ValueError("At least one slice must be provided for concatenation.")
 
     base_model = slices[0].model
-    base_shape = list(slices[0].base_shape)
+    base_shape = tuple(base_model.shape)
 
     indices = []
     shapes = []
@@ -1353,32 +1353,22 @@ def concat_slices(slices: Sequence[Slice], dim: int = -1) -> Slice:
 
     final_shape = _assess_shape_compatibility(shapes, dim)
 
+    flat_index_map = torch.arange(
+        math.prod(base_shape), device=base_model.device(), dtype=torch.long
+    ).reshape(base_shape)
+    selected_indices = [flat_index_map[idx] for idx in indices]
     if dim is None:
-        # Flatten all slices before concatenation
-        flat_indices = []
-        for idx, shape in zip(indices, shapes):
-            flat_idx = torch.arange(np.prod(shape), device=base_model.device()).reshape(
-                shape
-            )[idx]
-            flat_indices.append(flat_idx.flatten())
-        concatenated_idx = torch.cat(flat_indices)
-        new_index = (concatenated_idx,)
+        selected_indices = [selected.reshape(-1) for selected in selected_indices]
+        concatenated_idx = torch.cat(selected_indices)
     else:
-        # Concatenate along the specified dimension
-        dim_indices = []
-        for idx in indices:
-            dim_indices.append(
-                torch.arange(base_shape[dim], device=base_model.device())[idx[dim]]
-            )
-        concatenated_idx = _merge_indices(dim_indices)
-        new_index = list(indices[0])
-        new_index[dim] = concatenated_idx
-        new_index = tuple(new_index)
+        normalized_dim = dim if dim >= 0 else dim + len(shapes[0])
+        concatenated_idx = torch.cat(selected_indices, dim=normalized_dim)
+    new_index = torch.unravel_index(concatenated_idx, base_shape)
 
     return Slice(
         base_model,
         IndexSpec(index=new_index, shape=final_shape, is_scalar=False),
-        base_shape=tuple(base_shape),
+        base_shape=base_shape,
     )
 
 
@@ -1390,8 +1380,8 @@ def _assess_shape_compatibility(shapes: Sequence[Sequence[int]], dim: Optional[i
     shapes : Sequence[Sequence[int]]
         Shapes to assess.
     dim : int or None
-        Dimension along which concatenation is intended. If None, all shapes
-        must be identical when flattened.
+        Dimension along which concatenation is intended. If None, each slice
+        is flattened independently and the resulting vectors are concatenated.
 
     Raises
     ------
@@ -1400,17 +1390,16 @@ def _assess_shape_compatibility(shapes: Sequence[Sequence[int]], dim: Optional[i
     """
 
     # first convert negative dim to positive
-    if dim is not None and dim < 0:
-        dim += len(shapes[0])
-
-    if dim is None:
-        # All shapes must have the same number of elements when flattened
-        numel_set = {int(np.prod(shape)) for shape in shapes}
-        if len(numel_set) > 1:
+    if dim is not None:
+        ndim = len(shapes[0])
+        if dim < 0:
+            dim += ndim
+        if dim < 0 or dim >= ndim:
             raise ValueError(
-                "All slices must have the same number of elements when flattened for concatenation."
+                f"Concatenation dimension {dim} is out of range for {ndim}D slices."
             )
-    else:
+
+    if dim is not None:
         # All shapes must match in all dimensions except ``dim``
         ref_shape = list(shapes[0])
         for shape in shapes[1:]:
@@ -1450,11 +1439,16 @@ def _merge_indices(indices: Sequence[torch.Tensor]) -> torch.Tensor:
     """
     concatenated = torch.cat(indices)
 
+    # A singleton/empty selection has no meaningful stride. Repeated indices
+    # likewise cannot be represented by a valid Python slice (step zero).
+    if concatenated.numel() < 2:
+        return concatenated
+
     # Check if the concatenated indices form a contiguous range
     # with a uniform step (may not be 1)
 
     diffs = concatenated[1:] - concatenated[:-1]
-    if torch.all(diffs == diffs[0]):
+    if diffs[0] > 0 and torch.all(diffs == diffs[0]):
         start = concatenated[0].item()
         stop = concatenated[-1].item() + diffs[0].item()
         step = diffs[0].item()

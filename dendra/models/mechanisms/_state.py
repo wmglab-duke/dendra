@@ -4,6 +4,10 @@ from types import MethodType
 
 import torch
 
+from dendra.models._class_declarations import (
+    consume_class_values,
+    declare_class_value,
+)
 from dendra.models.parametric import Parameterized
 from dendra.models.rng import RNGModule
 
@@ -302,42 +306,36 @@ class State(Parameterized):
                     base.__dict__.get("method_kwargs", {}),
                 )
 
-        if State._state_declarations:
-            for s_list in State._state_declarations:
-                new_state.update(s_list)
-            State._state_declarations = []
-
-        if State._state_buffers_declarations:
-            for b_list in State._state_buffers_declarations:
-                new_buffers.update(b_list)
-            State._state_buffers_declarations = []
-
-        if State._derivative_declarations:
-            for d_list in State._derivative_declarations:
-                new_derivative.update(d_list)
-            State._derivative_declarations = []
-
-        if State._kinetic_declarations:
-            for k_list in State._kinetic_declarations:
-                new_kinetic.update(k_list)
-            State._kinetic_declarations = []
-
-        if State._diffusion_declarations:
-            for d_list in State._diffusion_declarations:
-                new_diffusion.update(d_list)
-            State._diffusion_declarations = []
-
-        if State._assigned_declarations:
-            for a_list in State._assigned_declarations:
-                new_assigned.update(a_list)
-            State._assigned_declarations = []
-
-        if State._method_declarations:
-            for method_name, method_kwargs in State._method_declarations:
-                new_method, new_method_kwargs = _merge_method_config(
-                    new_method, new_method_kwargs, method_name, method_kwargs
-                )
-            State._method_declarations = []
+        for s_list in consume_class_values(
+            cls, "state.state", State._state_declarations
+        ):
+            new_state.update(s_list)
+        for b_list in consume_class_values(
+            cls, "state.buffers", State._state_buffers_declarations
+        ):
+            new_buffers.update(b_list)
+        for d_list in consume_class_values(
+            cls, "state.derivative", State._derivative_declarations
+        ):
+            new_derivative.update(d_list)
+        for k_list in consume_class_values(
+            cls, "state.kinetic", State._kinetic_declarations
+        ):
+            new_kinetic.update(k_list)
+        for d_list in consume_class_values(
+            cls, "state.diffusion", State._diffusion_declarations
+        ):
+            new_diffusion.update(d_list)
+        for a_list in consume_class_values(
+            cls, "state.assigned", State._assigned_declarations
+        ):
+            new_assigned.update(a_list)
+        for method_name, method_kwargs in consume_class_values(
+            cls, "state.method", State._method_declarations
+        ):
+            new_method, new_method_kwargs = _merge_method_config(
+                new_method, new_method_kwargs, method_name, method_kwargs
+            )
 
         new_method = _canonical_method_name(new_method)
         if new_method not in _INTEGRATION_BUILDERS:
@@ -475,7 +473,7 @@ class State(Parameterized):
         *args : str
             Names of state variables advanced by the integrator.
         """
-        State._state_declarations.append(args)
+        declare_class_value("state.state", args, State._state_declarations)
 
     @staticmethod
     def BUFFER(*args):
@@ -490,7 +488,7 @@ class State(Parameterized):
         *args : str
             Buffer names to allocate.
         """
-        State._state_buffers_declarations.append(args)
+        declare_class_value("state.buffers", args, State._state_buffers_declarations)
 
     @staticmethod
     def DERIVATIVE(*args):
@@ -502,7 +500,7 @@ class State(Parameterized):
         *args : str
             Derivative expressions like ``"m' = (minf - m) / tau"``.
         """
-        State._derivative_declarations.append(args)
+        declare_class_value("state.derivative", args, State._derivative_declarations)
 
     @staticmethod
     def KINETIC(*args):
@@ -514,7 +512,7 @@ class State(Parameterized):
         *args : str
             Kinetic expressions like ``"~ a <-> b (alpha, beta)"``.
         """
-        State._kinetic_declarations.append(args)
+        declare_class_value("state.kinetic", args, State._kinetic_declarations)
 
     @staticmethod
     def DIFFUSION(*args):
@@ -526,7 +524,7 @@ class State(Parameterized):
         it as a Stratonovich SDE. Voltage-equation noise is intentionally handled
         by future stochastic voltage/cable integrators.
         """
-        State._diffusion_declarations.append(args)
+        declare_class_value("state.diffusion", args, State._diffusion_declarations)
 
     @staticmethod
     def ASSIGNED(*args):
@@ -545,7 +543,7 @@ class State(Parameterized):
         *args : str
             Names of ASSIGNED variables to be set in :meth:`breakpoint`.
         """
-        State._assigned_declarations.append(args)
+        declare_class_value("state.assigned", args, State._assigned_declarations)
 
     @staticmethod
     def METHOD(method=None, **kwargs):
@@ -572,7 +570,9 @@ class State(Parameterized):
         """
         if method is not None:
             method = _canonical_method_name(method)
-        State._method_declarations.append((method, dict(kwargs)))
+        declare_class_value(
+            "state.method", (method, dict(kwargs)), State._method_declarations
+        )
 
     def breakpoint(self, v, states):
         """

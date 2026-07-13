@@ -297,10 +297,15 @@ class PreComputedInterpolate1D(torch.nn.Module):
         x_data = natsorted(x_data)
         x_data = [np.loadtxt(f, skiprows=1)[:, -1].flatten() for f in x_data]
 
-        assert len(data) == len(x_data), "Number of data files and x files must match."
-        assert all(d.shape[0] == x.shape[0] for d, x in zip(data, x_data)), (
-            "Each data file must have the same number of rows as its corresponding x file."
-        )
+        if not data or not x_data:
+            raise ValueError("ASCENT field and coordinate files must both be present.")
+        if len(data) != len(x_data):
+            raise ValueError("Number of data files and x files must match.")
+        if not all(d.shape[0] == x.shape[0] for d, x in zip(data, x_data)):
+            raise ValueError(
+                "Each data file must have the same number of rows as its "
+                "corresponding x file."
+            )
 
         if not all(d.shape[0] == data[0].shape[0] for d in data):
             # we need to resample to a common number of points (e.g. max) for the batch interpolation; we'll let the class handle that with interpolation
@@ -311,8 +316,15 @@ class PreComputedInterpolate1D(torch.nn.Module):
             data_resampled = []
             x_data_resampled = []
             for d, x in zip(data, x_data):
-                interp = PreparedInterp1d(x=x, y=d)
-                x_resampled = torch.linspace(x.min(), x.max(), n_resampled)
+                x_tensor = torch.as_tensor(x, dtype=torch.float64)
+                data_tensor = torch.as_tensor(d, dtype=x_tensor.dtype)
+                interp = PreparedInterp1d(x=x_tensor, y=data_tensor)
+                x_resampled = torch.linspace(
+                    x_tensor.min(),
+                    x_tensor.max(),
+                    n_resampled,
+                    dtype=x_tensor.dtype,
+                )
                 d_resampled = interp(x_resampled)
                 data_resampled.append(d_resampled.flatten().cpu().numpy())
                 x_data_resampled.append(x_resampled.flatten().cpu().numpy())
@@ -551,6 +563,11 @@ class PreComputedInterpolate1D(torch.nn.Module):
         Q = x_2d.shape[0]
 
         idx = self._normalize_indices(indices, Q=Q, device=x.device)
+        if idx is None and self.interp.batched and self.interp.D == 1 and Q != 1:
+            # A single LUT is unambiguous and should broadcast across arbitrary
+            # model batches. PreComputedInterpolate1D normalizes all tables to
+            # 2-D, so make that shared-table intent explicit to PreparedInterp1d.
+            idx = torch.zeros(Q, dtype=torch.long, device=x.device)
 
         # Call PreparedInterp1d correctly (indices is keyword-only in the newer implementation)
         if idx is None:
@@ -646,10 +663,14 @@ class PreComputedInterpolate3DScattered(torch.nn.Module):
         **kwargs,
     ):
         super().__init__()
-        assert xyz.shape[0] == field.shape[0] and field.shape[1] == 1
-
         xyz = torch.as_tensor(xyz)
         field = torch.as_tensor(field)
+        if xyz.ndim != 2 or xyz.shape[1] != 3:
+            raise ValueError("xyz must have shape (N, 3).")
+        if field.ndim != 2 or field.shape[1] != 1:
+            raise ValueError("field must have shape (N, 1).")
+        if xyz.shape[0] != field.shape[0]:
+            raise ValueError("xyz and field must contain the same number of samples.")
 
         self.interpolator = PreparedInterp3dScattered(
             points=xyz,
@@ -900,10 +921,12 @@ class EfieldInterpolate3DScattered(torch.nn.Module):
         **kwargs,
     ):
         super().__init__()
-        assert xyz.shape == efield.shape and xyz.shape[1] == 3
-
         xyz = torch.as_tensor(xyz)
         efield = torch.as_tensor(efield)
+        if xyz.ndim != 2 or xyz.shape[1] != 3:
+            raise ValueError("xyz must have shape (N, 3).")
+        if efield.shape != xyz.shape:
+            raise ValueError("efield must have the same (N, 3) shape as xyz.")
 
         self.interpolator = PreparedInterp3dScattered(
             points=xyz,

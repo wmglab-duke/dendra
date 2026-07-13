@@ -31,6 +31,7 @@ from ._solve_utils import (
     extract_vars,
     match_derivative_to_states,
 )
+from ._solvers import _solve_linear_small
 from .ode import (
     TorchCodePrinter,
     _build_locals,
@@ -497,7 +498,7 @@ def _render_ngeneric(states_to_solve, A, b, options):
         [
             "__rhs = __x + __dt_vec * __b",
             "__x_new = _solve_linear_small(__M, __rhs)",
-            f"{', '.join('_' + s for s in states_to_solve)} = torch.unbind(__x_new, dim=-1)",
+            f"{', '.join('_' + s for s in states_to_solve)}{',' if n == 1 else ''} = torch.unbind(__x_new, dim=-1)",
         ]
     )
     return "\n    ".join(lines)

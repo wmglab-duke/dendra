@@ -32,15 +32,20 @@ def _time_broadcast_param(x, t: torch.Tensor) -> torch.Tensor:
 
     Rules:
       - scalars (0-dim) are fine as-is
-      - if last dim is already 1, fine (explicit time axis)
-      - if last dim equals T, treat as time-varying and keep
-      - otherwise append a trailing singleton dim, e.g. [B] -> [B,1], [B,C] -> [B,C,1]
+      - scalar-time evaluation preserves the parameter shape
+      - if the last dim is already 1, keep that explicit broadcast axis
+      - otherwise append a trailing singleton time dim, e.g. [B] -> [B,1]
+        and [B,C] -> [B,C,1]
+
+    Parameter axes are never inferred to be time merely because their length
+    happens to equal the number of evaluation points. The old heuristic made
+    output rank depend on ``T`` and silently confused population/compartment
+    axes with time.
     """
     x = _as_tensor_like(x, t)
-    if x.ndim == 0:
+    if x.ndim == 0 or t.ndim == 0:
         return x
-    T = t.shape[-1]
-    if x.shape[-1] in (1, T):
+    if x.shape[-1] == 1:
         return x
     return x.unsqueeze(-1)
 
@@ -843,4 +848,5 @@ class constant(Waveform):
     Waveform.PARAMETER(value=0.0)
 
     def fn(self, t):
-        return _time_broadcast_param(self.value, t)
+        value = _time_broadcast_param(self.value, t)
+        return value + torch.zeros_like(t)

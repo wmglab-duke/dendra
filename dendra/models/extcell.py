@@ -1,10 +1,22 @@
-"""Extended extracellular coupling models."""
+"""Extended extracellular coupling models.
+
+The two supported extracellular layers follow NEURON's ``extracellular``
+mechanism convention. ``xraxial`` is longitudinal resistance in MOhm/cm,
+``xc`` is radial capacitance density in uF/cm2, and ``xg`` is radial
+conductance density in S/cm2.  A prescribed ``extra``/``ve`` value is the bath
+battery ``e_extracellular`` in mV outside the outermost modeled layer.
+
+The block solvers store absolute circuit-node potentials as
+``vc[..., 0] = vi``, ``vc[..., 1] = vext[0]``, and
+``vc[..., 2] = vext[1]``.  Public membrane voltage therefore follows NEURON's
+sign convention, ``v = vi - vext[0]``.
+"""
 
 import torch
 
 from .core import Axon
 from .integrators import bwd_euler_bt, dhs_bt
-from .tree import Tree, gather_membrane, gather_morphology
+from .tree import Tree, gather_diffusion_edges, gather_membrane, gather_morphology
 
 
 class ExtCellAxon(Axon):
@@ -24,6 +36,9 @@ class ExtCellAxon(Axon):
         Number of extracellular layers. Only ``2`` is currently supported.
     integrator : callable, optional
         Integrator factory used to create the simulation solver.
+    **kwargs
+        Additional population parameters such as ``dtype``, ``device``,
+        ``rhoa``, and ``cm`` forwarded to :class:`~dendra.models.core.Axon`.
     """
 
     def __init__(
@@ -34,12 +49,13 @@ class ExtCellAxon(Axon):
         v_init=-80.0,
         n_layers=2,
         integrator=None,
+        **kwargs,
     ):
         if n_layers != 2:
             raise ValueError("Only 2 layers are currently supported.")
         if integrator is None:
             integrator = bwd_euler_bt()
-        super().__init__(diameters, n_comp, celsius, v_init, integrator)
+        super().__init__(diameters, n_comp, celsius, v_init, integrator, **kwargs)
         self.n_layers = n_layers
         self._register_buffers()
         self.dx[:] = 10.0
@@ -47,14 +63,16 @@ class ExtCellAxon(Axon):
 
     def _register_buffers(self):
         """Initialise extracellular parameter buffers."""
+        options = {"device": self.device(), "dtype": self.dtype()}
         self.register_buffer(
-            "xraxial", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9)
+            "xraxial",
+            torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9, **options),
         )
         self.register_buffer(
-            "xc", torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0)
+            "xc", torch.full((self.n_ax, self.n_comp, self.n_layers), 0.0, **options)
         )
         self.register_buffer(
-            "xg", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9)
+            "xg", torch.full((self.n_ax, self.n_comp, self.n_layers), 1e9, **options)
         )
 
     def _x(self):
@@ -104,9 +122,13 @@ def gather_extcell(graph, n_layers=2):
         xc.append(attrs.get("xc", [0.0] * n_layers))
         xg.append(attrs.get("xg", [1e9] * n_layers))
     return {
-        "xraxial": torch.tensor(xraxial).unsqueeze(0),
-        "xc": torch.tensor(xc).unsqueeze(0),
-        "xg": torch.tensor(xg).unsqueeze(0),
+        # Graph metadata arrives as Python/NEURON doubles.  Preserve that
+        # precision here so a float64 ExtCellTree does not widen values that
+        # were already rounded through PyTorch's default float32 dtype.
+        # ``from_graph`` performs the intentional final cast to model dtype.
+        "xraxial": torch.tensor(xraxial, dtype=torch.float64).unsqueeze(0),
+        "xc": torch.tensor(xc, dtype=torch.float64).unsqueeze(0),
+        "xg": torch.tensor(xg, dtype=torch.float64).unsqueeze(0),
     }
 
 
@@ -140,11 +162,17 @@ class ExtCellTree(Tree):
 
     def _register_buffers(self):
         """Initialise extracellular buffers for the tree morphology."""
+        options = {"device": self.device(), "dtype": self.dtype()}
         self.register_buffer(
-            "xraxial", torch.full((self.np, self.nc, self.n_layers), 1e9)
+            "xraxial",
+            torch.full((self.np, self.nc, self.n_layers), 1e9, **options),
         )
-        self.register_buffer("xc", torch.full((self.np, self.nc, self.n_layers), 0.0))
-        self.register_buffer("xg", torch.full((self.np, self.nc, self.n_layers), 1e9))
+        self.register_buffer(
+            "xc", torch.full((self.np, self.nc, self.n_layers), 0.0, **options)
+        )
+        self.register_buffer(
+            "xg", torch.full((self.np, self.nc, self.n_layers), 1e9, **options)
+        )
 
     def load_extcell(self, extcell):
         """Load extracellular parameters into buffers.
@@ -168,7 +196,23 @@ class ExtCellTree(Tree):
             ``(1, n_comp)``.
         """
         for key, value in morphology.items():
-            self.register_buffer(key, value.expand(self.np, -1))
+            expanded = value.expand(self.np, -1).clone()
+            self.register_buffer(
+                key, expanded.to(device=self.device(), dtype=self.dtype())
+            )
+
+    def load_diffusion_edges(self, diffusion_edges):
+        """Register child-indexed and compact tree-diffusion metadata."""
+        for key, value in diffusion_edges.items():
+            if value.dtype.is_floating_point:
+                if value.ndim == 2:
+                    value = value.expand(self.np, -1).clone()
+                else:
+                    value = value.clone()
+                value = value.to(device=self.device(), dtype=self.dtype())
+            else:
+                value = value.clone().to(device=self.device())
+            self.register_buffer(key, value)
 
     @classmethod
     def from_graph(cls, graph, N=1, n_layers=2, integrator=None, **kwargs):
@@ -194,11 +238,13 @@ class ExtCellTree(Tree):
         """
         C = len(graph.nodes)
         morphology = gather_morphology(graph)
+        diffusion_edges = gather_diffusion_edges(graph)
         membrane = gather_membrane(graph)
         membrane.update(kwargs)
         extcell = gather_extcell(graph, n_layers=n_layers)
         tree = cls(N, C, graph, n_layers=n_layers, integrator=integrator, **membrane)
         tree.load_morphology(morphology)
+        tree.load_diffusion_edges(diffusion_edges)
         tree.load_extcell(extcell)
         tree.slice("soma").label("soma")
         tree.slice("axon").label("axon")

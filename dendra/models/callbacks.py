@@ -1,12 +1,13 @@
 import gc
 import multiprocessing as mp
+from contextlib import nullcontext
+from numbers import Integral
 from queue import Queue
 from types import MethodType
 from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from h5py import File
 
 from dendra.utils.dynamic_compilation import compile_generated_function
@@ -14,10 +15,10 @@ from dendra.utils.dynamic_compilation import compile_generated_function
 from ..helpers import nojit
 from .backend import Backend as A
 
-if torch.cuda.is_available():
-    TRANSFERSTREAM = torch.cuda.Stream()
-else:
-    TRANSFERSTREAM = None
+# Kept as a module-level compatibility hook, but initialized lazily by Recorder.
+# Eager construction here would initialize CUDA in CPU-only HDF5 writer processes
+# whenever the host happens to expose a GPU.
+TRANSFERSTREAM = None
 
 
 class Callback(torch.nn.Module):
@@ -354,7 +355,7 @@ class AnomalyDetector(Callback):
         """Clear the anomaly mask so the detector can be reused."""
         if self.rec is not None:
             self.rec = torch.zeros(
-                self.rec.shape, dtype=torch.bool, device=self.rec.device()
+                self.rec.shape, dtype=torch.bool, device=self.rec.device
             )
 
     def numpy(self):
@@ -461,6 +462,7 @@ class Recorder(Callback):
         self.writer_thread = None
         self.data_pinned = {}
         self.stream = None
+        self._transfer_streams = {}
 
     def set_partition(self, partition=None):
         if partition is not None:
@@ -510,6 +512,13 @@ class Recorder(Callback):
         blocking the main simulation. The process will continue running until the recorder's
         close() method is called.
         """
+        if isinstance(cache_every, bool) or not isinstance(cache_every, Integral):
+            raise TypeError("cache_every must be a positive integer.")
+        if cache_every <= 0:
+            raise ValueError("cache_every must be a positive integer.")
+        if self.cache_with_hdf5:
+            raise RuntimeError("HDF5 caching is already enabled for this Recorder.")
+
         self.hdf5_path = hdf5
         mp.set_start_method("spawn", force=True)
         self.manager = mp.Manager()
@@ -519,7 +528,7 @@ class Recorder(Callback):
         )
         self.writer_thread.start()
         self.cache_with_hdf5 = True
-        self.cache_every = cache_every
+        self.cache_every = int(cache_every)
         return self
 
     def pre_loop_hook(self, model):
@@ -539,26 +548,87 @@ class Recorder(Callback):
             self.i += 1
 
     def cache_hdf5(self):
-        with torch.cuda.stream(TRANSFERSTREAM):
-            for s in self.states:
-                data = self.stack(s)
-                if s not in self.data_pinned:
-                    self.data_pinned[s] = torch.empty(
-                        data.shape, dtype=data.dtype, device="cpu", pin_memory=True
-                    )
-                if self.data_pinned[s].shape[0] != data.shape[0]:
-                    self.data_pinned[s] = torch.empty(
-                        data.shape, dtype=data.dtype, device="cpu", pin_memory=True
-                    )
-                self.data_pinned[s].copy_(data, non_blocking=True)
-        self.queue.put("flush")
-        chunks = data.shape
-        chunks = (chunks[0], 1, chunks[2], chunks[3])
-        for s in self.states:
-            self.queue.put(
-                (s, self.run_number, self.save_count, self.data_pinned[s], chunks)
+        populated = [bool(self.rec[s]) for s in self.states]
+        if not self.states or not any(populated):
+            return
+        if not all(populated):
+            missing = [
+                state for state, present in zip(self.states, populated) if not present
+            ]
+            raise RuntimeError(
+                "Cannot cache a partial Recorder frame; no samples were recorded "
+                f"for state(s): {', '.join(missing)}."
             )
+
+        streams_used = {}
+        for s in self.states:
+            data = self.stack(s)
+            cuda_source = data.device.type == "cuda"
+            transfer_stream = None
+            transfer_context = nullcontext()
+            if cuda_source:  # pragma: no cover - exercised in the CUDA lane
+                transfer_stream = self._transfer_stream_for(data.device)
+                # The recorded values are normally produced on the device's
+                # current stream. Make that dependency explicit before copying
+                # on a separate transfer stream.
+                transfer_stream.wait_stream(torch.cuda.current_stream(data.device))
+                streams_used[id(transfer_stream)] = transfer_stream
+                transfer_context = torch.cuda.stream(transfer_stream)
+            with transfer_context:
+                # Each queued write owns its buffer. Reusing a pinned tensor can
+                # overwrite data that the asynchronous writer process has not
+                # consumed yet.
+                self.data_pinned[s] = torch.empty(
+                    data.shape,
+                    dtype=data.dtype,
+                    device="cpu",
+                    pin_memory=cuda_source,
+                )
+                self.data_pinned[s].copy_(data, non_blocking=cuda_source)
+
+        # The writer is a spawned process and therefore cannot synchronize the
+        # parent process's CUDA streams. Complete every device-to-host transfer
+        # before any staged CPU tensor is handed to its queue.
+        for stream in streams_used.values():  # pragma: no cover - CUDA lane
+            stream.synchronize()
+
+        self.queue.put("flush")
+        for s in self.states:
+            data = self.data_pinned[s]
+            chunks = list(data.shape)
+            if data.ndim > 1:
+                chunks[1] = 1
+            self.queue.put((s, self.run_number, self.save_count, data, tuple(chunks)))
         self.save_count += 1
+
+    def _transfer_stream_for(self, device):  # pragma: no cover - CUDA lane
+        """Return a lazily-created transfer stream on ``device``."""
+        global TRANSFERSTREAM
+
+        device = torch.device(device)
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+            device = torch.device("cuda", device_index)
+
+        stream = self._transfer_streams.get(device_index)
+        if stream is not None:
+            return stream
+
+        legacy = TRANSFERSTREAM
+        legacy_device = getattr(legacy, "device", None)
+        if legacy is not None and legacy_device is not None:
+            legacy_device = torch.device(legacy_device)
+            if legacy_device.index == device_index:
+                stream = legacy
+
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            if TRANSFERSTREAM is None and device_index == torch.cuda.current_device():
+                TRANSFERSTREAM = stream
+
+        self._transfer_streams[device_index] = stream
+        return stream
 
     @nojit
     def post_step_hook(self, model):
@@ -588,6 +658,8 @@ class Recorder(Callback):
         """
         if self.cache_with_hdf5:
             self.cache_hdf5()
+            self.rec = {s: [] for s in self.states}
+            self.i = 0
         self.save_count = 0
         self.run_number += 1
 
@@ -646,6 +718,9 @@ class Recorder(Callback):
         if self.cache_with_hdf5:
             self.queue.put(None)
             self.writer_thread.join()
+            if self.manager is not None:
+                self.manager.shutdown()
+            self.cache_with_hdf5 = False
 
     def stack(self, var: str = None) -> torch.Tensor:
         """
@@ -790,8 +865,6 @@ def _hdf5_write(queue: Queue, path: str):
         while True:
             item = queue.get()
             if item == "flush":
-                if TRANSFERSTREAM is not None:
-                    TRANSFERSTREAM.synchronize()
                 queue.task_done()
                 continue
             if item is None:
@@ -1277,7 +1350,7 @@ class ActiveALCount(APCount):
         at_least=1,
         inv=False,
     ):
-        super().__init__(threshold, t_start_check, node_check, dt)
+        super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
         self.at_least = at_least
         self.inv = inv
 
@@ -1719,23 +1792,23 @@ def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
 
 def _sliding_window_average(x, window_size: int):
     """
-    Compute the sliding (moving) window average along axis 0 for a 4D array/tensor,
+    Compute the sliding (moving) window average along axis 0 for a tensor,
     with padding so that the output has the same shape as the input.
 
-    For an input of shape (N, C, H, W) and a given window_size, the function pads the input
-    along axis 0 using edge replication and then computes the average over every consecutive window.
-    The output shape is (N, C, H, W).
+    The function pads the input along axis 0 using edge replication and then
+    computes the average over every consecutive window. All remaining dimensions
+    are treated as independent feature channels and the output shape matches the input.
 
     Parameters
     ----------
-    x : np.ndarray or torch.Tensor
-        A 4-dimensional array/tensor with shape (N, C, H, W).
+    x : torch.Tensor
+        A tensor with time or samples along axis 0.
     window_size : int
         The size of the sliding window (must be >= 1).
 
     Returns
     -------
-    out : same type as x
+    out : torch.Tensor
         The sliding window averages computed along axis 0 with the same shape as the input.
 
     Raises
@@ -1743,7 +1816,7 @@ def _sliding_window_average(x, window_size: int):
     ValueError
         If window_size is less than 1.
     TypeError
-        If x is not a NumPy array or a PyTorch tensor.
+        If x is not a PyTorch tensor.
     """
     if window_size < 1:
         raise ValueError("window_size must be at least 1.")
@@ -1759,53 +1832,35 @@ def _sliding_window_average(x, window_size: int):
     # ---------------------------
     # PyTorch implementation
     # ---------------------------
-    # x shape: (N, C, H, W)
-    N, C, H, W = x.shape
+    if not torch.is_tensor(x):
+        raise TypeError("x must be a PyTorch tensor.")
+    if x.ndim < 1 or x.shape[0] == 0:
+        raise ValueError("x must contain at least one sample along axis 0.")
+
+    # Recorder outputs are commonly 3-D, while other callers may use tensors
+    # of any rank. ``unfold`` appends the window dimension without copying the
+    # individual windows, and a regular reduction avoids backend-specific
+    # convolution primitives that may not be available on every supported CPU.
+    feature_shape = x.shape[1:]
 
     # Manually pad along axis 0 (the N dimension) using replication.
     # For pad_left, replicate the first slice; for pad_right, replicate the last slice.
     left_pad = (
-        x[0:1].expand(pad_left, -1, -1, -1)
+        x[0:1].expand((pad_left, *feature_shape))
         if pad_left > 0
-        else torch.empty(0, device=x.device, dtype=x.dtype)
+        else torch.empty((0, *feature_shape), device=x.device, dtype=x.dtype)
     )
     right_pad = (
-        x[-1:].expand(pad_right, -1, -1, -1)
+        x[-1:].expand((pad_right, *feature_shape))
         if pad_right > 0
-        else torch.empty(0, device=x.device, dtype=x.dtype)
+        else torch.empty((0, *feature_shape), device=x.device, dtype=x.dtype)
     )
     # Concatenate along dimension 0.
     x_padded = torch.cat([left_pad, x, right_pad], dim=0)
-    N_padded = x_padded.shape[0]  # should equal N + (window_size - 1)
 
-    # Reshape so that the padded N dimension is the "length" dimension.
-    # Collapse (C, H, W) into the channel dimension and use a batch size of 1.
-    # New shape: (1, C*H*W, N_padded)
-    x_reshaped = x_padded.permute(1, 2, 3, 0).reshape(1, C * H * W, N_padded)
-
-    # Create an averaging kernel for each channel.
-    # For grouped conv1d with groups = C*H*W, the kernel should have shape:
-    # (C*H*W, 1, window_size)
-    kernel = (
-        torch.ones(C * H * W, 1, window_size, dtype=x.dtype, device=x.device)
-        / window_size
-    )
-
-    # Perform grouped convolution along the length dimension.
-    out_conv = F.conv1d(x_reshaped, kernel, groups=C * H * W)
-    # out_conv shape: (1, C*H*W, L) where L = N_padded - window_size + 1.
-    L = out_conv.shape[-1]
-    if L != N:
-        raise RuntimeError(f"Unexpected output length: got {L}, expected {N}.")
-
-    # Reshape back to (1, C, H, W, N) and then permute to (N, C, H, W)
-    # First, view out_conv as (1, C, H, W, N)
-    out_5d = out_conv.view(1, C, H, W, N)
-    # Permute to bring the last dimension (N) to the front: (1, N, C, H, W)
-    out_perm = out_5d.permute(0, 4, 1, 2, 3)
-    # Remove the extra batch dimension (squeeze dimension 0)
-    out = out_perm.squeeze(0)
-    return out
+    # Unfolding dimension 0 puts the window dimension last, so reducing it
+    # preserves both the original rank and the ordering of all feature axes.
+    return x_padded.unfold(0, window_size, 1).mean(dim=-1)
 
 
 # Public alias retained for tests and user code; Recorder uses the private name internally.

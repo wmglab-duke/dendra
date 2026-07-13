@@ -1,6 +1,8 @@
 # -- adapted from now defunct bluebrain/nmodl repository --
+import math
 import re
 from importlib import import_module
+from numbers import Real
 from typing import Optional
 
 import sympy as sp
@@ -389,6 +391,18 @@ def differentiate_rhs_2torch_checked(
         ok: True if expression is torch-safe per _validate_torch_expression
         depends_on_any_state: True if the returned derivative expr depends on any of state_vars
     """
+    if isinstance(fd_eps, bool) or not isinstance(fd_eps, Real):
+        raise TypeError("fd_eps must be a positive, finite real number")
+    fd_eps = float(fd_eps)
+    if not math.isfinite(fd_eps) or fd_eps <= 0.0:
+        raise ValueError("fd_eps must be positive and finite")
+
+    scheme = str(fd_scheme).lower().strip()
+    if scheme not in {"central", "forward", "backward"}:
+        raise ValueError(
+            f"Unsupported fd_scheme={fd_scheme!r}. Use 'central', 'forward', or 'backward'."
+        )
+
     # ---- parse RHS (required for both symbolic and FD routes) ----
     try:
         diff_string = _nmodl_preprocess(diff_string)
@@ -462,7 +476,6 @@ def differentiate_rhs_2torch_checked(
     # ---- 2) Finite-difference fallback (still returns a torch-valid string) ----
     try:
         eps = sp.Float(fd_eps)
-        scheme = fd_scheme.lower().strip()
 
         if scheme == "central":
             f_plus = f_expr.subs({wrt_sym: wrt_sym + eps})
@@ -476,11 +489,6 @@ def differentiate_rhs_2torch_checked(
         elif scheme == "backward":
             f_minus = f_expr.subs({wrt_sym: wrt_sym - eps})
             df_fd = (f_expr - f_minus) / eps
-
-        else:
-            raise ValueError(
-                f"Unsupported fd_scheme={fd_scheme!r}. Use 'central', 'forward', or 'backward'."
-            )
 
         if simplify:
             # Often cancels out the variable and reduces the FD expression dramatically

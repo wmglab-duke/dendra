@@ -11,6 +11,52 @@ from .core import (
 )
 
 
+def _reflect_pad_last(x: torch.Tensor, padding: Tuple[int, int]) -> torch.Tensor:
+    """Reflect-pad the final axis, including axes shorter than the padding.
+
+    ``torch.nn.functional.pad(..., mode="reflect")`` requires each padding
+    width to be smaller than the input axis.  A one-compartment cable therefore
+    failed even though its sealed-boundary extension is well defined.  Building
+    the reflected index map directly also handles wide smoothing stencils on
+    very short cables while preserving autograd.
+    """
+    left, right = (int(padding[0]), int(padding[1]))
+    size = int(x.shape[-1])
+    if size < 1:
+        raise ValueError("cannot reflect-pad an empty final dimension")
+    if left == 0 and right == 0:
+        return x
+    if size == 1:
+        return F.pad(x, (left, right), mode="replicate")
+
+    positions = torch.arange(-left, size + right, device=x.device, dtype=torch.long)
+    period = 2 * (size - 1)
+    positions = torch.remainder(positions, period)
+    indices = torch.where(positions < size, positions, period - positions)
+    return x.index_select(-1, indices)
+
+
+def _conv1d_forward(
+    conv: torch.nn.Conv1d, x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Run Conv1d with robust reflection padding for short final axes."""
+    padding = tuple(int(value) for value in conv._reversed_padding_repeated_twice)
+    if conv.padding_mode == "reflect" and (
+        padding[0] >= x.shape[-1] or padding[1] >= x.shape[-1]
+    ):
+        x = _reflect_pad_last(x, padding)
+        return F.conv1d(
+            x,
+            weight,
+            conv.bias,
+            conv.stride,
+            0,
+            conv.dilation,
+            conv.groups,
+        )
+    return conv._conv_forward(x, weight, conv.bias)
+
+
 def _conv_last(conv: torch.nn.Conv1d, *xs: torch.Tensor) -> torch.Tensor:
     """Apply a Conv1d stencil along the final dimension of arbitrary-shaped tensors."""
     ref = xs[0]
@@ -25,7 +71,7 @@ def _conv_last(conv: torch.nn.Conv1d, *xs: torch.Tensor) -> torch.Tensor:
 def _filter_last(filter_: torch.nn.Conv1d, x: torch.Tensor) -> torch.Tensor:
     """Apply a single-channel Conv1d filter along the final axis."""
     xf = _flatten_to_solve(x).unsqueeze(1)
-    return filter_(xf).squeeze(1).reshape_as(x)
+    return _conv1d_forward(filter_, xf, filter_.weight).squeeze(1).reshape_as(x)
 
 
 class SymmetricConv1D(torch.nn.Conv1d):
@@ -34,7 +80,7 @@ class SymmetricConv1D(torch.nn.Conv1d):
             weight_ = (self.weight + torch.flip(self.weight, [-1])) / 2
         else:
             weight_ = self.weight
-        return self._conv_forward(x, weight_, self.bias)
+        return _conv1d_forward(self, x, weight_)
 
 
 class _euler(Integrator):
@@ -93,13 +139,12 @@ class _euler(Integrator):
 
     def FRK(self, v, ve, area, cm, ra, intra=None):
         d2v = _conv_last(self.ssd, v, ve)
-        if intra is None:
-            i_ion = self.mech.iexp(v) * area
-            return cm * ((ra * d2v) - i_ion), i_ion
-        else:
+        i_ion = self.mech.iexp(v) * area
+        i_drive = i_ion
+        if intra is not None:
             intra = _broadcast_to_shape(intra, tuple(v.shape))
-            i_ion = self.mech.iexp(v) * area - intra
-            return cm * ((ra * d2v) - i_ion), i_ion
+            i_drive = i_drive - intra
+        return cm * ((ra * d2v) - i_drive), i_ion
 
     def step(self, model, dt, ve=None, intra=None):
         if ve is None:
@@ -217,8 +262,8 @@ def ssd_df(v_c, v_p, v_e):
     vc = _flatten_to_solve(v_c, K)
     vp = _flatten_to_solve(v_p, K)
     ve = _flatten_to_solve(v_e, K, tuple(v_c.shape))
-    vc_p = F.pad(vc, (1, 1), "reflect")
-    ve_p = F.pad(ve, (1, 1), "reflect")
+    vc_p = _reflect_pad_last(vc, (1, 1))
+    ve_p = _reflect_pad_last(ve, (1, 1))
     ret = vc_p[:, :-2] + vc_p[:, 2:] - vp + ve_p[:, 2:] + ve_p[:, :-2] - 2 * ve
     return ret.reshape_as(v_c)
 
@@ -227,36 +272,8 @@ def ssd_df_no_ve(v_c, v_p):
     K = v_c.shape[-1]
     vc = _flatten_to_solve(v_c, K)
     vp = _flatten_to_solve(v_p, K)
-    vc_p = F.pad(vc, (1, 1), "reflect")
+    vc_p = _reflect_pad_last(vc, (1, 1))
     return (vc_p[:, :-2] + vc_p[:, 2:] - vp).reshape_as(v_c)
-
-
-def ssd_df_heterogeneous(v_c, v_p, v_e, g_left, g_right):
-    """Calculates the spatial second derivative along the final axis."""
-    K = v_c.shape[-1]
-    vc = _flatten_to_solve(v_c, K)
-    vp = _flatten_to_solve(v_p, K)
-    ve = _flatten_to_solve(v_e, K, tuple(v_c.shape))
-    gl = _flatten_to_solve(g_left, K)
-    gr = _flatten_to_solve(g_right, K)
-    vc_p = F.pad(vc, (1, 1), "reflect")
-    ve_p = F.pad(ve, (1, 1), "reflect")
-    g_sum = gl + gr
-    d2v_c = gl * vc_p[:, :-2] + gr * vc_p[:, 2:] - g_sum * vp
-    d2v_e = gl * ve_p[:, :-2] + gr * ve_p[:, 2:] - g_sum * ve
-    return (d2v_c + d2v_e).reshape_as(v_c)
-
-
-def ssd_df_heterogeneous_no_ve(v_c, v_p, g_left, g_right):
-    """Calculates the spatial second derivative along the final axis without ve."""
-    K = v_c.shape[-1]
-    vc = _flatten_to_solve(v_c, K)
-    vp = _flatten_to_solve(v_p, K)
-    gl = _flatten_to_solve(g_left, K)
-    gr = _flatten_to_solve(g_right, K)
-    vc_p = F.pad(vc, (1, 1), "reflect")
-    g_sum = gl + gr
-    return (gl * vc_p[:, :-2] + gr * vc_p[:, 2:] - g_sum * vp).reshape_as(v_c)
 
 
 class _dufort_frankel_homogeneous(Integrator):
@@ -264,9 +281,13 @@ class _dufort_frankel_homogeneous(Integrator):
     Dufort-Frankel explicit integrator for homogeneous morphologies.
 
     Uses the Dufort-Frankel scheme on the cable diffusion term to achieve
-    unconditional stability for the linear part while keeping ionic currents
-    explicit. Optionally applies periodic spatial smoothing. Can compute with
-    either convolution-based or direct finite-difference stencils.
+    unconditional stability for the linear part. Currents proven or declared
+    affine in voltage are centered exactly between the stored time levels;
+    other currents are evaluated explicitly with zero Dufort conductance. A
+    one-``dt`` forward-Euler step constructs the missing history level after
+    initialization or a timestep change. Optionally applies periodic spatial
+    smoothing. Can compute with either convolution-based or direct
+    finite-difference stencils.
 
     Parameters
     ----------
@@ -283,12 +304,20 @@ class _dufort_frankel_homogeneous(Integrator):
     """
 
     __constants__ = ["beta", "smoothing", "smooth_every", "imem"]
-    v_vars = ["v", "v_prev"]
+    v_vars = ["v", "v_prev", "_df_history_valid", "_df_history_dt"]
 
     def __init__(self, model, mech, beta=1.0, smooth_every=100, conv=False, imem=None):
         super().__init__(model, mech, imem)
 
         model.register_buffer("v_prev", _expanded_v_init(model).clone().detach())
+        model.register_buffer(
+            "_df_history_valid",
+            torch.zeros((), dtype=torch.bool, device=model.v.device),
+        )
+        model.register_buffer(
+            "_df_history_dt",
+            torch.full((), torch.nan, dtype=model.v.dtype, device=model.v.device),
+        )
 
         self.register_buffer("area", torch.tensor(0.0))
         self.register_buffer("s1", torch.tensor(0.0))
@@ -338,6 +367,12 @@ class _dufort_frankel_homogeneous(Integrator):
         ra = (rhoa * dx) / (torch.pi * radii**2)
         self.s1 = 2 * dt / cm
         self.s2 = self.s1 / ra
+        if model.shape[-1] == 1:
+            # A sealed one-compartment cable has no axial edge. Reflection is
+            # useful for boundary stencils on longer cables, but treating the
+            # lone compartment as its own neighbour creates spurious temporal
+            # coupling in the two-level Dufort update.
+            self.s2 = torch.zeros_like(self.s2)
         self.s3 = self.area * self.s1
         self.s4 = 1 + self.s2
         self.f64 = model.dtype() == torch.float64
@@ -347,28 +382,81 @@ class _dufort_frankel_homogeneous(Integrator):
         else:
             self.method = self._step
 
+        # Forced coefficient rebuilds in training do not invalidate a same-dt
+        # history. A genuine timestep change does, including after restoring a
+        # checkpoint into a fresh integrator instance.
+        dt_value = torch.as_tensor(
+            dt, dtype=model._df_history_dt.dtype, device=model._df_history_dt.device
+        )
+        if not bool(torch.all(model._df_history_dt == dt_value).item()):
+            model._df_history_valid = torch.zeros_like(model._df_history_valid)
+        model._df_history_dt = torch.full_like(model._df_history_dt, float(dt_value))
+
     def step(self, model, dt, ve=None, intra=None):
         if ve is None:
             if self.conv:
                 ve = self.ve_zero
-        v_new, v_prev_new, i_membrane = self._call_kernel(
-            "_step_conv" if self.conv else "_step",
-            model.v,
-            model.v_prev,
-            ve,
-            self.s1,
-            self.s2,
-            self.s3,
-            self.s4,
-            self.area,
-            dt,
-            model.celsius,
-            intra,
-        )
+        if bool(torch.all(model._df_history_valid).item()):
+            v_new, v_prev_new, i_membrane = self._call_kernel(
+                "_step_conv" if self.conv else "_step",
+                model.v,
+                model.v_prev,
+                ve,
+                self.s1,
+                self.s2,
+                self.s3,
+                self.s4,
+                self.area,
+                dt,
+                model.celsius,
+                intra,
+            )
+        else:
+            v_new, v_prev_new, i_membrane = self._call_kernel(
+                "_step_initial",
+                model.v,
+                ve,
+                self.s1,
+                self.s2,
+                self.area,
+                dt,
+                model.celsius,
+                intra,
+            )
         model.v = v_new
         model.v_prev = v_prev_new
+        model._df_history_valid = torch.ones_like(model._df_history_valid)
         if self.imem:
             model.i_membrane = i_membrane
+
+    def _step_initial(self, v, ve, s1, s2, area, dt, temp, intra=None):
+        """Construct the missing previous time level with one Euler step."""
+        if ve is None:
+            laplacian = ssd_df_no_ve(v, v) - v
+        else:
+            laplacian = ssd_df(v, v, ve) - v
+
+        self.mech.advance(v, dt, temp)
+        i_ion = self.mech.iexp(v) * area
+        i_drive = i_ion
+        if intra is not None:
+            i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
+
+        # s1 and s2 contain 2*dt.  The starter advances exactly one dt.
+        v_new = v + 0.5 * s2 * laplacian - 0.5 * s1 * i_drive
+        i_mem = self.mech.itot(v)
+
+        if self.smoothing:
+            v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
+                self.filter, v_new
+            )
+
+        i_membrane = None
+        if self.imem:
+            i_cap = 2.0 * (v_new - v) / s1
+            i_membrane = i_cap + i_mem * area
+
+        return v_new, v, i_membrane
 
     def _step(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra=None
@@ -381,12 +469,11 @@ class _dufort_frankel_homogeneous(Integrator):
         self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
 
+        i_drive = i_ion * area
         if intra is not None:
-            i_ion = i_ion * area - _broadcast_to_shape(intra, tuple(v.shape))
-        else:
-            i_ion = i_ion * area
+            i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
 
-        v_new = (v_prev + d2v - s1 * i_ion) / (s4 + 0.5 * gtot * s3)
+        v_new = (v_prev + d2v - s1 * i_drive) / (s4 + 0.5 * gtot * s3)
 
         i_mem = self.mech.itot(v)
 
@@ -398,12 +485,7 @@ class _dufort_frankel_homogeneous(Integrator):
         i_membrane = None
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
-            if intra is not None:
-                i_membrane = (
-                    i_cap + i_mem * area - _broadcast_to_shape(intra, tuple(v.shape))
-                )
-            else:
-                i_membrane = i_cap + i_mem * area
+            i_membrane = i_cap + i_mem * area
 
         return v_new, v, i_membrane
 
@@ -426,12 +508,11 @@ class _dufort_frankel_homogeneous(Integrator):
         self.mech.advance(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
 
+        i_drive = i_ion * area
         if intra is not None:
-            i_ion = i_ion * area - _broadcast_to_shape(intra, tuple(v.shape))
-        else:
-            i_ion = i_ion * area
+            i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
 
-        v_new = (v_prev + d2v - s1 * i_ion) / (s4 + 0.5 * gtot * s3)
+        v_new = (v_prev + d2v - s1 * i_drive) / (s4 + 0.5 * gtot * s3)
 
         i_mem = self.mech.itot(v)
 
@@ -443,12 +524,7 @@ class _dufort_frankel_homogeneous(Integrator):
         i_membrane = None
         if self.imem:
             i_cap = (v_new - v_prev) / self.s1
-            if intra is not None:
-                i_membrane = (
-                    i_cap + i_mem * area - _broadcast_to_shape(intra, tuple(v.shape))
-                )
-            else:
-                i_membrane = i_cap + i_mem * area
+            i_membrane = i_cap + i_mem * area
 
         return v_new, v, i_membrane
 
@@ -456,6 +532,8 @@ class _dufort_frankel_homogeneous(Integrator):
         v0 = _expanded_v_init(model).clone().detach().contiguous()
         model.v = v0.clone()
         model.v_prev = v0.clone()
+        model._df_history_valid = torch.zeros_like(model._df_history_valid)
+        model._df_history_dt = torch.full_like(model._df_history_dt, torch.nan)
         if self.imem:
             model.i_membrane = torch.zeros_like(model.v).detach()
 
@@ -466,8 +544,12 @@ class _dufort_frankel(Integrator):
 
     Extends the Dufort-Frankel scheme to non-uniform cable geometries by
     computing compartment-specific axial conductances. The method maintains
-    unconditional stability for the linear diffusion term while treating ionic
-    currents explicitly and optionally smoothing voltages.
+    unconditional stability for the linear diffusion term. Currents proven or
+    declared affine in voltage are centered exactly between the stored time
+    levels; other currents are evaluated explicitly with zero Dufort
+    conductance. A one-``dt`` forward-Euler step constructs the missing history
+    level after initialization or a timestep change. Voltage smoothing remains
+    optional.
 
     Parameters
     ----------
@@ -481,12 +563,20 @@ class _dufort_frankel(Integrator):
     """
 
     __constants__ = ["beta", "smoothing", "smooth_every", "imem"]
-    v_vars = ["v", "v_prev"]
+    v_vars = ["v", "v_prev", "_df_history_valid", "_df_history_dt"]
 
     def __init__(self, model, mech, beta=1.0, smooth_every=100, imem=None):
         super().__init__(model, mech, imem)
 
         model.register_buffer("v_prev", _expanded_v_init(model).clone().detach())
+        model.register_buffer(
+            "_df_history_valid",
+            torch.zeros((), dtype=torch.bool, device=model.v.device),
+        )
+        model.register_buffer(
+            "_df_history_dt",
+            torch.full((), torch.nan, dtype=model.v.dtype, device=model.v.device),
+        )
 
         self.register_buffer("area", torch.tensor(0.0))
         self.register_buffer("s1", torch.tensor(0.0))
@@ -526,12 +616,15 @@ class _dufort_frankel(Integrator):
         radii_cm = diam / 20000.0
         ra_comp = (rhoa * dx_cm) / (torch.pi * radii_cm**2)
         ra_flat = _flatten_to_solve(ra_comp)
-        ra_padded = F.pad(ra_flat, (1, 1), "reflect")
+        ra_padded = _reflect_pad_last(ra_flat, (1, 1))
         r_left = 0.5 * (ra_padded[:, :-2] + ra_padded[:, 1:-1])
         r_right = 0.5 * (ra_padded[:, 1:-1] + ra_padded[:, 2:])
 
         g_left = (1.0 / r_left).reshape(model.shape)
         g_right = (1.0 / r_right).reshape(model.shape)
+        if model.shape[-1] == 1:
+            g_left = torch.zeros_like(g_left)
+            g_right = torch.zeros_like(g_right)
 
         self.s1 = (2 * dt) / cm_total
         self.s3 = self.area * self.s1
@@ -543,22 +636,79 @@ class _dufort_frankel(Integrator):
         self.ve_zero = torch.zeros_like(model.v)
 
         self.initialized = True
+        dt_value = torch.as_tensor(
+            dt, dtype=model._df_history_dt.dtype, device=model._df_history_dt.device
+        )
+        if not bool(torch.all(model._df_history_dt == dt_value).item()):
+            model._df_history_valid = torch.zeros_like(model._df_history_valid)
+        model._df_history_dt = torch.full_like(model._df_history_dt, float(dt_value))
 
     def step(self, model, dt, ve=None, intra=None):
-        # The step logic is simplified as we no longer branch on `conv`
-        v_new, v_prev_new, i_membrane = self._call_kernel(
-            "_step",
-            model.v,
-            model.v_prev,
-            ve,
-            dt,
-            model.celsius,
-            intra,
-        )
+        if bool(torch.all(model._df_history_valid).item()):
+            v_new, v_prev_new, i_membrane = self._call_kernel(
+                "_step",
+                model.v,
+                model.v_prev,
+                ve,
+                dt,
+                model.celsius,
+                intra,
+            )
+        else:
+            v_new, v_prev_new, i_membrane = self._call_kernel(
+                "_step_initial",
+                model.v,
+                ve,
+                dt,
+                model.celsius,
+                intra,
+            )
         model.v = v_new
         model.v_prev = v_prev_new
+        model._df_history_valid = torch.ones_like(model._df_history_valid)
         if self.imem:
             model.i_membrane = i_membrane
+
+    def _step_initial(self, v, ve, dt, temp, intra=None):
+        """Construct the missing previous time level with one Euler step."""
+        K = v.shape[-1]
+        v_flat = _flatten_to_solve(v, K)
+        c_left = _flatten_to_solve(self.c_left, K)
+        c_right = _flatten_to_solve(self.c_right, K)
+        v_padded = _reflect_pad_last(v_flat, (1, 1))
+
+        delta_axial = 0.5 * c_left * (v_padded[:, :-2] - v_flat)
+        delta_axial = delta_axial + 0.5 * c_right * (v_padded[:, 2:] - v_flat)
+        if ve is not None:
+            ve_flat = _flatten_to_solve(ve, K, tuple(v.shape))
+            ve_padded = _reflect_pad_last(ve_flat, (1, 1))
+            delta_axial = delta_axial + 0.5 * c_left * (ve_padded[:, :-2] - ve_flat)
+            delta_axial = delta_axial + 0.5 * c_right * (ve_padded[:, 2:] - ve_flat)
+
+        self.mech.advance(v, dt, temp)
+        area = _flatten_to_solve(self.area, K)
+        s1 = _flatten_to_solve(self.s1, K)
+        i_ion_stim = _flatten_to_solve(self.mech.iexp(v), K) * area
+        if intra is not None:
+            i_ion_stim = i_ion_stim - _flatten_to_solve(intra, K, tuple(v.shape))
+
+        v_new_flat = v_flat + delta_axial - 0.5 * s1 * i_ion_stim
+        v_new = v_new_flat.reshape_as(v)
+        i_mem = self.mech.itot(v)
+
+        if self.smoothing:
+            v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
+                self.filter, v_new
+            )
+            v_new_flat = _flatten_to_solve(v_new, K)
+
+        i_membrane = None
+        if self.imem:
+            i_cap = 2.0 * (v_new_flat - v_flat) / s1
+            i_membrane = i_cap + _flatten_to_solve(i_mem, K) * area
+            i_membrane = i_membrane.reshape_as(v)
+
+        return v_new, v, i_membrane
 
     def _step(
         self,
@@ -577,13 +727,13 @@ class _dufort_frankel(Integrator):
         c_right = _flatten_to_solve(self.c_right, K)
         c_axial = _flatten_to_solve(self.c_axial, K)
 
-        v_padded = F.pad(v_flat, (1, 1), "reflect")
+        v_padded = _reflect_pad_last(v_flat, (1, 1))
         num_v_prev = v_prev_flat * (1 - c_axial)
         num_axial_v = c_left * v_padded[:, :-2] + c_right * v_padded[:, 2:]
 
         if ve is not None:
             ve_flat = _flatten_to_solve(ve, K, tuple(v.shape))
-            ve_padded = F.pad(ve_flat, (1, 1), "reflect")
+            ve_padded = _reflect_pad_last(ve_flat, (1, 1))
             num_axial_ve = c_left * (ve_padded[:, :-2] - ve_flat) + c_right * (
                 ve_padded[:, 2:] - ve_flat
             )
@@ -616,8 +766,6 @@ class _dufort_frankel(Integrator):
         if self.imem:
             i_cap = (_flatten_to_solve(v_new, K) - v_prev_flat) / s1
             i_membrane = i_cap + _flatten_to_solve(i_mem, K) * area
-            if intra is not None:
-                i_membrane = i_membrane - _flatten_to_solve(intra, K, tuple(v.shape))
             i_membrane = i_membrane.reshape_as(v)
 
         return v_new, v, i_membrane
@@ -627,5 +775,7 @@ class _dufort_frankel(Integrator):
         v0 = _expanded_v_init(model).clone().detach().contiguous()
         model.v = v0.clone()
         model.v_prev = v0.clone()
+        model._df_history_valid = torch.zeros_like(model._df_history_valid)
+        model._df_history_dt = torch.full_like(model._df_history_dt, torch.nan)
         if self.imem:
             model.i_membrane = torch.zeros_like(model.v).detach()
