@@ -1,3 +1,9 @@
+## v0.19.0 (2026-07-13)
+
+### Feat
+
+- **slice**: commuting Slices & explicit intersection
+
 ## v0.18.1 (2026-07-13)
 
 ### Fix
