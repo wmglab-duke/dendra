@@ -649,3 +649,315 @@ def test_diffusion_process_tree_and_configuration_validation():
             {"x": _material("x", [1, 0])},
             bad_population,
         )
+
+
+def test_graph_diffusion_geometry_fallbacks_and_batched_topology_contracts():
+    direct = nx.DiGraph()
+    direct.add_edge(0, 1, diff_geom_um=2.5, R_ohm=1.0)
+    assert spatial._edge_diff_geom_from_graph(direct, 0, 1) == pytest.approx(2.5)
+
+    resistance = nx.DiGraph()
+    resistance.add_node(0, Ra=80.0)
+    resistance.add_node(1, Ra=120.0)
+    resistance.add_edge(0, 1, R_ohm=2.0e6)
+    assert spatial._edge_diff_geom_from_graph(resistance, 0, 1) == pytest.approx(0.5)
+    del resistance.nodes[0]["Ra"]
+    assert spatial._edge_diff_geom_from_graph(resistance, 0, 1) == pytest.approx(0.6)
+    resistance.nodes[0]["Ra"] = 80.0
+    del resistance.nodes[1]["Ra"]
+    assert spatial._edge_diff_geom_from_graph(resistance, 0, 1) == pytest.approx(0.4)
+    del resistance.nodes[0]["Ra"]
+    with pytest.raises(KeyError, match="neither endpoint has Ra"):
+        spatial._edge_diff_geom_from_graph(resistance, 0, 1)
+
+    stylized = nx.DiGraph()
+    stylized.add_node(0, diam=2.0)
+    stylized.add_node(1, diam=4.0)
+    stylized.add_edge(0, 1, L=3.0)
+    a0, a1 = torch.pi * 1.0**2, torch.pi * 2.0**2
+    expected = 1.0 / (0.5 * 3.0 / a0 + 0.5 * 3.0 / a1)
+    assert spatial._edge_diff_geom_from_graph(stylized, 0, 1) == pytest.approx(
+        float(expected)
+    )
+    stylized.edges[0, 1]["L"] = 0.0
+    assert spatial._edge_diff_geom_from_graph(stylized, 0, 1) == 0.0
+    stylized.edges[0, 1]["L"] = 3.0
+    stylized.nodes[1]["diam"] = 0.0
+    assert spatial._edge_diff_geom_from_graph(stylized, 0, 1) == 0.0
+
+    graph_a = nx.DiGraph()
+    graph_a.add_edge(0, 1, diff_geom_um=1.0)
+    graph_a.add_edge(0, 2, diff_geom_um=2.0)
+    graph_b = nx.DiGraph()
+    graph_b.add_edge(0, 1, diff_geom_um=3.0)
+    graph_b.add_edge(0, 2, diff_geom_um=4.0)
+    parent, geometry, nodes = spatial.graph_to_parent_and_diffusion(
+        [graph_a, graph_b], dtype=torch.float64
+    )
+    assert parent.tolist() == [-1, 0, 0]
+    assert nodes == [0, 1, 2]
+    torch.testing.assert_close(
+        geometry,
+        torch.tensor([[0.0, 1.0, 2.0], [0.0, 3.0, 4.0]], dtype=torch.float64),
+    )
+
+    different_order = nx.DiGraph()
+    different_order.add_edge(0, 2, diff_geom_um=1.0)
+    different_order.add_edge(2, 1, diff_geom_um=1.0)
+    with pytest.raises(AssertionError, match="topological order"):
+        spatial.graph_to_parent_and_diffusion([graph_a, different_order])
+
+    different_parent = nx.DiGraph()
+    different_parent.add_edge(0, 1, diff_geom_um=1.0)
+    different_parent.add_edge(1, 2, diff_geom_um=1.0)
+    with pytest.raises(AssertionError, match="parent/child topology"):
+        spatial.graph_to_parent_and_diffusion([graph_a, different_parent])
+
+
+def test_tree_diffusion_batched_geometry_and_tensor_dt_match_dense_oracle():
+    graph_a = nx.DiGraph()
+    graph_a.add_edge(2, 0, diff_geom_um=0.5)
+    graph_a.add_edge(2, 1, diff_geom_um=1.5)
+    graph_b = nx.DiGraph()
+    graph_b.add_edge(2, 0, diff_geom_um=2.0)
+    graph_b.add_edge(2, 1, diff_geom_um=0.75)
+    volume = torch.tensor([[1.0, 1.5, 0.75], [2.0, 0.5, 1.25]], dtype=torch.float64)
+    concentration = torch.tensor(
+        [[0.25, 1.5, 0.75], [1.25, 0.1, 2.0]], dtype=torch.float64
+    )
+    diffusivity = torch.tensor(
+        [[0.5, 1.0, 1.5], [1.25, 0.75, 0.25]], dtype=torch.float64
+    )
+    dt = torch.tensor([[0.1, 0.1, 0.1], [0.2, 0.2, 0.2]], dtype=torch.float64)
+    model = SimpleNamespace(graph=[graph_a, graph_b], volume_i=volume)
+    operator = spatial.SpatialOperatorTree(solver="dense", threads=4)
+    operator.configure_diffusion(concentration, dt, diffusivity, model, solver="dense")
+    actual = operator.diffuse_implicit_configured(concentration)
+
+    expected_rows = []
+    for row, graph in enumerate((graph_a, graph_b)):
+        dmem = volume[row] / dt[row]
+        matrix = torch.diag(dmem).clone()
+        for parent, child, attrs in graph.edges(data=True):
+            coupling = (
+                0.5
+                * (diffusivity[row, parent] + diffusivity[row, child])
+                * attrs["diff_geom_um"]
+            )
+            matrix[parent, parent] += coupling
+            matrix[child, child] += coupling
+            matrix[parent, child] -= coupling
+            matrix[child, parent] -= coupling
+        expected_rows.append(torch.linalg.solve(matrix, dmem * concentration[row]))
+    expected = torch.stack(expected_rows)
+    torch.testing.assert_close(actual, expected, atol=2.0e-15, rtol=2.0e-15)
+    torch.testing.assert_close(
+        (volume * actual).sum(-1),
+        (volume * concentration).sum(-1),
+        atol=2.0e-15,
+        rtol=2.0e-15,
+    )
+
+    too_many_graphs = SimpleNamespace(
+        graph=[graph_a, graph_b, graph_a], volume_i=volume
+    )
+    with pytest.raises(ValueError, match="graph batch has 3 rows"):
+        spatial.SpatialOperatorTree(solver="dense").configure_diffusion(
+            concentration, 0.1, diffusivity, too_many_graphs, solver="dense"
+        )
+
+
+def test_clamp_region_masks_cover_graph_alias_tensor_boolean_and_indices():
+    process = _process(ClampProcess, shape=(2, 4))
+    like = torch.zeros((2, 4))
+    graph = nx.DiGraph([(0, 1), (0, 2), (2, 3)])
+    population = SimpleNamespace(graph=[graph])
+
+    for alias in ("", "all", "everywhere", "global", "none"):
+        assert process._build_where_mask(alias, like, population=population) is None
+
+    terminal = process._build_where_mask("leaves", like, population=population)
+    root = process._build_where_mask("soma", like, population=population)
+    assert torch.equal(
+        terminal,
+        torch.tensor([[False, True, False, True], [False, True, False, True]]),
+    )
+    assert torch.equal(
+        root,
+        torch.tensor([[True, False, False, False], [True, False, False, False]]),
+    )
+
+    process.register_buffer("named_mask", torch.tensor([False, True, False, True]))
+    assert torch.equal(
+        process._build_where_mask("named_mask", like), process.named_mask
+    )
+    assert process._build_where_mask(True, like) is None
+    assert not process._build_where_mask(False, like).any()
+    assert torch.equal(
+        process._build_where_mask(torch.tensor([1, 0, 1, 0]), like),
+        torch.tensor([True, False, True, False]),
+    )
+    assert process._build_where_mask(slice(1, 3), like).tolist() == [
+        [False, True, True, False],
+        [False, True, True, False],
+    ]
+    assert process._build_where_mask((slice(None), 2), like).tolist() == [
+        [False, False, True, False],
+        [False, False, True, False],
+    ]
+    assert process._build_where_mask([0, 3], like).tolist() == [
+        [True, False, False, True],
+        [True, False, False, True],
+    ]
+    with pytest.raises(ValueError, match="Could not interpret"):
+        process._build_where_mask(object(), like)
+    with pytest.raises(ValueError, match="Unsupported clamp region"):
+        process._build_where_mask("missing_mask", like)
+
+    no_graph = SimpleNamespace(graph=None)
+    empty = torch.zeros((1, 0))
+    assert not process._terminal_mask(empty, no_graph).any()
+    assert not process._root_mask(empty, no_graph).any()
+    assert process._terminal_mask(like, no_graph)[0].tolist() == [
+        True,
+        False,
+        False,
+        True,
+    ]
+    assert process._root_mask(like, no_graph)[0].tolist() == [
+        True,
+        False,
+        False,
+        False,
+    ]
+
+
+def test_exchange_geometry_domains_aliases_and_negative_rate_policy():
+    class GeometryExchange(ExchangeProcess):
+        ExchangeProcess.METHOD("exact", require_volumes=True)
+        ExchangeProcess.EXCHANGE(
+            "a.c",
+            "b.c",
+            rate=0.5,
+            volume_a="intracellular",
+            volume_b="extracellular",
+        )
+
+    volume_i = torch.tensor([[1.0, 2.0, 3.0]])
+    volume_o = torch.tensor([[4.0, 5.0, 6.0]])
+    area_cm2 = torch.tensor([[2.0e-8, 3.0e-8, 4.0e-8]])
+    population = SimpleNamespace(
+        volume_i=volume_i,
+        volume_o=volume_o,
+        dx=torch.ones_like(volume_i),
+        area=area_cm2,
+        shape=SHAPE,
+    )
+    materials = {
+        "a": _material("a", [2.0, 3.0, 4.0], domain="intracellular"),
+        "b": _material("b", [0.5, 0.25, 1.0], domain="extracellular"),
+    }
+    process = _bind(_process(GeometryExchange), materials, population)
+    before_mass = volume_i * materials["a"].c + volume_o * materials["b"].c
+    process.advance_materials(0.2)
+    after_mass = volume_i * materials["a"].c + volume_o * materials["b"].c
+    torch.testing.assert_close(after_mass, before_mass, atol=2.0e-6, rtol=2.0e-6)
+
+    like = materials["a"].c
+    for alias in ("auto", "field", "domain", "i", "volume_i"):
+        torch.testing.assert_close(
+            process._resolve_exchange_volume(
+                alias, like, domain="intracellular", what="test"
+            ),
+            volume_i,
+        )
+    for alias in ("o", "volume_o", "extracellular_volume"):
+        torch.testing.assert_close(
+            process._resolve_exchange_volume(
+                alias, like, domain="extracellular", what="test"
+            ),
+            volume_o,
+        )
+    for alias in ("area", "surface_area", "membrane_area"):
+        torch.testing.assert_close(
+            process._resolve_exchange_volume(alias, like, domain=None, what="test"),
+            area_cm2 * 1.0e8,
+        )
+    torch.testing.assert_close(
+        process._resolve_exchange_volume(
+            torch.tensor(7.0), like, domain=None, what="test"
+        ),
+        torch.tensor(7.0),
+    )
+    assert process._resolve_exchange_volume(3.0, like, domain=None, what="test") == 3
+
+    class NegativeExchange(ExchangeProcess):
+        ExchangeProcess.EXCHANGE("a.c", "b.c", rate=-1.0, volume_a=1.0, volume_b=1.0)
+
+    a = _material("a", [2.0, 3.0, 4.0])
+    b = _material("b", [0.0, 1.0, 2.0])
+    _bind(_process(NegativeExchange), {"a": a, "b": b}).advance_materials(0.5)
+    torch.testing.assert_close(a.c, torch.tensor([[2.0, 3.0, 4.0]]))
+    torch.testing.assert_close(b.c, torch.tensor([[0.0, 1.0, 2.0]]))
+
+    class MissingRequiredVolume(ExchangeProcess):
+        ExchangeProcess.METHOD("exact", require_volumes=True)
+        ExchangeProcess.EXCHANGE("a.c", "b.c", rate=1.0)
+
+    missing = {
+        "a": _material("a", [1.0, 2.0, 3.0], domain="extracellular"),
+        "b": _material("b", [3.0, 2.0, 1.0], domain="extracellular"),
+    }
+    missing_process = _bind(_process(MissingRequiredVolume), missing)
+    missing_snapshot = _snapshot_material_state(missing)
+    with pytest.raises(NotImplementedError, match="Could not infer"):
+        missing_process.advance_materials(0.1)
+    _assert_material_state_unchanged(missing, missing_snapshot)
+
+
+def test_diffusion_geometry_kind_and_material_volume_failure_contracts():
+    graph = nx.DiGraph()
+    graph.add_edge(0, 1, diff_geom_um=1.0)
+    population = SimpleNamespace(
+        graph=graph,
+        volume_i=torch.tensor([[1.0, 2.0]]),
+        volume_o=torch.tensor([[3.0, 4.0]]),
+        shape=(1, 2),
+    )
+    process = _bind(
+        _process(ImplicitDiffusion, shape=(1, 2)),
+        {"x": _material("x", [1.0, 0.0])},
+        population,
+    )
+    torch.testing.assert_close(process.material_volume("cytosol"), population.volume_i)
+    torch.testing.assert_close(process.material_volume("outside"), population.volume_o)
+    with pytest.raises(NotImplementedError, match="Membrane"):
+        process.material_volume("surface")
+    with pytest.raises(NotImplementedError, match="Unsupported"):
+        process.material_volume("nucleus")
+
+    missing_edges = nx.DiGraph()
+    missing_edges.add_edge(0, 1)
+    with pytest.raises(RuntimeError, match="diff_geom_um or R_ohm"):
+        _bind(
+            _process(ImplicitDiffusion, shape=(1, 2)),
+            {"x": _material("x", [1.0, 0.0])},
+            SimpleNamespace(
+                graph=missing_edges,
+                volume_i=torch.ones((1, 2)),
+                shape=(1, 2),
+            ),
+        )
+
+    class ExtracellularDiffusion(DiffusionProcess):
+        DiffusionProcess.DIFFUSE("x", field="c", D=1.0, domain="extracellular")
+
+    material = _material("x", [1.0, 0.0], domain="extracellular")
+    snapshot = _snapshot_material_state({"x": material})
+    with pytest.raises(NotImplementedError, match="only supports intracellular"):
+        _bind(
+            _process(ExtracellularDiffusion, shape=(1, 2)),
+            {"x": material},
+            population,
+        )
+    _assert_material_state_unchanged({"x": material}, snapshot)

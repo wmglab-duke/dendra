@@ -493,11 +493,18 @@ def ve_from_s_t(space, time, n, device, multicontact=False):
 
 
 def op_mc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("can,cat->tan", s, t).contiguous()
+    """Combine contact, batch/population, space, and time axes.
+
+    ``s`` has shape ``[contact, ..., compartment]`` and ``t`` has shape
+    ``[contact, ..., time]``.  The ellipsis is broadcast by ``einsum`` and is
+    retained between the leading time axis and trailing compartment axis.
+    """
+    return torch.einsum("c...n,c...t->t...n", s, t).contiguous()
 
 
 def op_sc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("an,at->tan", s, t).contiguous()
+    """Combine broadcast batch/population space and time tensors."""
+    return torch.einsum("...n,...t->t...n", s, t).contiguous()
 
 
 F = TypeVar("F", bound=Callable[..., Any])

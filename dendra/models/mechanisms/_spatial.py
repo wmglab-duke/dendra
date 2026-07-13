@@ -680,9 +680,11 @@ def graph_to_parent_and_diffusion(graphs, dtype: torch.dtype = torch.float32):
 
 
 def _select_dhs_solver(solver: str | None, device: torch.device | str, *, threads: int):
-    mode = _normalize_solver_name(solver)
+    # Resolve tree-specific automatic aliases before the generic tridiagonal
+    # aliases: the latter maps ``custom`` to an explicit Thomas request.
+    mode = str(solver or "auto").lower()
     aliases = {"dhs": "auto", "hines": "auto", "tree": "auto", "custom": "auto"}
-    mode = aliases.get(mode, mode)
+    mode = aliases.get(mode, _normalize_solver_name(mode))
     dev_type = torch.device(device).type if not isinstance(device, str) else device
 
     if mode in {"dense", "debug", "torch", "linalg"}:

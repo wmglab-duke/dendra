@@ -27,6 +27,7 @@ from ..core import (
     Population,
     _duration_step_budget,
     _load_compatible_state_dict_transactionally,
+    _time_grid_from_step_count,
     _validate_time_scalar,
     make_intra,
 )
@@ -2043,6 +2044,12 @@ class Network(RNGMixin):
         connections: a ``SynapseSlots`` target is already in synapse-local
         coordinates and avoids ambiguous colocated slots.
         """
+        valid_reductions = {"sum", "add", "set", "replace", "last", "min", "max"}
+        if reduce not in valid_reductions:
+            raise ValueError(
+                f"Unsupported continuous reduction mode: {reduce!r}. Expected "
+                f"one of {sorted(valid_reductions)!r}."
+            )
         source, target, source_model, target_model = self._normalize_endpoint(
             source,
             target,
@@ -3051,9 +3058,12 @@ class Network(RNGMixin):
         ----------
         extra : dict, optional
             Optional mapping from population name to extracellular stimulus
-            specification ``(v, t)``, with the same semantics as :meth:`run`.
-            The stimulus is evaluated at the network's current time for a
-            single timestep.
+            specification ``(v, waveform)``, with the same semantics as
+            :meth:`run`. For a population shaped ``[*batch, np, n_comp]``, the
+            spatial value is normalized to that shape and the time-last
+            Waveform output to ``[*batch, np, 1]``. Ordinary trailing
+            broadcasting is tried first, followed only on failure by a
+            low-rank, right-aligned batch-only fallback.
         callbacks : sequence of Callback, optional
             Callbacks to execute around this single step. By default ``step``
             calls ``pre_step_hook`` and ``post_step_hook`` only.
@@ -3096,15 +3106,17 @@ class Network(RNGMixin):
 
         extra = extra if extra is not None else {}
         extra_prepped = {}
-        for n, (v, t) in extra.items():
-            pop = self.populations[n]
-            dev, dtp = pop.device(), pop.dtype()
-            v_dev = v.to(device=dev, dtype=dtp)
-            t_dev = t.to(device=dev, dtype=dtp)
-            t0 = self.t.to(device=dev, dtype=dtp)
-            dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
-            t1 = t0 + dt_pop
-            extra_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
+        with nullcontext() if self.training else torch.no_grad():
+            for n, (v, t) in extra.items():
+                pop = self.populations[n]
+                dev, dtp = pop.device(), pop.dtype()
+                v_dev = pop._normalize_spatial(v)
+                t0 = self.t.to(device=dev, dtype=dtp)
+                t_grid = _time_grid_from_step_count(t0, 1, dt_f, device=dev).to(dtp)
+                values = _evaluate_extra_waveform(
+                    pop, t, t_grid, n_steps=1, name=f"extra[{n!r}] Waveform output"
+                )
+                extra_prepped[n] = (v_dev, values)
         extra = extra_prepped
 
         with_intra = bool(intra)
@@ -3164,8 +3176,12 @@ class Network(RNGMixin):
             advance the same number of steps as their combined duration.
         extra : dict[str, tuple[torch.Tensor, object]], optional
             Optional mapping of population name to extracellular stimulus tuple
-            ``(v, t)`` where ``t`` is assembled against the current time; values
-            are moved to the network device/dtype.
+            ``(v, waveform)``. For each population, ``v`` is normalized to
+            ``[*batch, np, n_comp]`` and the time-last Waveform output to
+            ``[*batch, np, n_timesteps]``. Ordinary trailing broadcasting is
+            tried first; only on failure may low-rank value axes use a
+            right-aligned batch-only fallback. Explicit singleton axes
+            disambiguate equal-size batch and spatial dimensions.
         callbacks : list[Callback], optional
             Callbacks invoked each step (wrapped in :class:`CallbackList`).
         progressbar : bool or tqdm.tqdm, optional
@@ -3210,15 +3226,23 @@ class Network(RNGMixin):
 
         extra = extra if extra is not None else {}
         extra_prepped = {}
-        for n, (v, t) in extra.items():
-            pop = self.populations[n]
-            dev, dtp = pop.device(), pop.dtype()
-            v_dev = v.to(device=dev, dtype=dtp)
-            t_dev = t.to(device=dev, dtype=dtp)
-            t0 = self.t.to(device=dev, dtype=dtp)
-            dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
-            t1 = t0 + n_steps * dt_pop
-            extra_prepped[n] = (v_dev, t_dev.assemble(t0, t1, dt_pop))
+        with nullcontext() if self.training else torch.no_grad():
+            for n, (v, t) in extra.items():
+                pop = self.populations[n]
+                dev, dtp = pop.device(), pop.dtype()
+                v_dev = pop._normalize_spatial(v)
+                t0 = self.t.to(device=dev, dtype=dtp)
+                t_grid = _time_grid_from_step_count(t0, n_steps, dt_f, device=dev).to(
+                    dtp
+                )
+                values = _evaluate_extra_waveform(
+                    pop,
+                    t,
+                    t_grid,
+                    n_steps=n_steps,
+                    name=f"extra[{n!r}] Waveform output",
+                )
+                extra_prepped[n] = (v_dev, values)
         extra = extra_prepped
 
         with_intra = bool(intra)
@@ -3314,7 +3338,7 @@ class Network(RNGMixin):
             shorter.
         extra : dict[str, tuple[torch.Tensor, object]], optional
             Population-specific extracellular stimuli with the same public
-            format as :meth:`run`.
+            ``(v, waveform)`` format and shape contract as :meth:`run`.
         callbacks : sequence of Callback, optional
             Callbacks invoked around the complete loop, each chunk, and each
             timestep.
@@ -3357,13 +3381,13 @@ class Network(RNGMixin):
 
         extra = extra if extra is not None else {}
         extra_sources = {}
-        for name, (spatial, temporal) in extra.items():
-            pop = self.populations[name]
-            device, dtype = pop.device(), pop.dtype()
-            extra_sources[name] = (
-                spatial.to(device=device, dtype=dtype),
-                temporal.to(device=device, dtype=dtype),
-            )
+        with nullcontext() if self.training else torch.no_grad():
+            for name, (spatial, temporal) in extra.items():
+                pop = self.populations[name]
+                extra_sources[name] = (
+                    pop._normalize_spatial(spatial),
+                    temporal,
+                )
 
         if callbacks is None:
             callbacks = []
@@ -3406,12 +3430,20 @@ class Network(RNGMixin):
                 for name, (spatial, temporal) in extra_sources.items():
                     pop = self.populations[name]
                     device, dtype = pop.device(), pop.dtype()
-                    dt_pop = torch.tensor(self.dt, device=device, dtype=dtype)
                     start = self.t.to(device=device, dtype=dtype)
-                    stop = start + n_chunk * dt_pop
+                    t_grid = _time_grid_from_step_count(
+                        start, n_chunk, dt_f, device=device
+                    ).to(dtype)
+                    values = _evaluate_extra_waveform(
+                        pop,
+                        temporal,
+                        t_grid,
+                        n_steps=n_chunk,
+                        name=f"extra[{name!r}] Waveform output",
+                    )
                     extra_chunk[name] = (
                         spatial,
-                        temporal.assemble(start, stop, dt_pop),
+                        values,
                     )
 
                 pre_chunk_hook(callbacks, self, time_chunk)
@@ -4303,7 +4335,8 @@ class Network(RNGMixin):
         chunklength:
             Number of time steps per checkpoint chunk.
         extra:
-            Optional extracellular specification (same as :meth:`run`).
+            Optional population-specific ``(v, waveform)`` mapping with the
+            same shape and broadcasting contract as :meth:`run`.
         callbacks:
             Optional list of callbacks.
         progressbar:
@@ -4384,10 +4417,8 @@ class Network(RNGMixin):
                     raise KeyError(f"extra specified for unknown population '{name}'")
                 pop = self.populations[name]
                 dev, dtp = pop.device(), pop.dtype()
-                v_dev = v.to(device=dev, dtype=dtp)
-                tt_dev = tt.to(device=dev, dtype=dtp)
-                dt_pop = torch.tensor(self.dt, device=dev, dtype=dtp)
-                extra_prepped[name] = (v_dev, tt_dev, dt_pop, dev, dtp)
+                v_dev = pop._normalize_spatial(v)
+                extra_prepped[name] = (v_dev, tt, dev, dtp)
 
         # Identify intra sources (prepared per chunk to bound memory).
         intra_sources = {}
@@ -4506,15 +4537,24 @@ class Network(RNGMixin):
                             for name, (
                                 v_dev,
                                 tt_dev,
-                                dt_pop,
                                 dev,
                                 dtp,
                             ) in extra_prepped.items():
                                 t0 = self.t.to(device=dev, dtype=dtp)
-                                t1 = t0 + (dt_pop * int(len(t_chunk_local)))
+                                chunk_steps = int(len(t_chunk_local))
+                                t_grid_local = _time_grid_from_step_count(
+                                    t0, chunk_steps, dt_f, device=dev
+                                ).to(dtp)
+                                values = _evaluate_extra_waveform(
+                                    self.populations[name],
+                                    tt_dev,
+                                    t_grid_local,
+                                    n_steps=chunk_steps,
+                                    name=f"extra[{name!r}] Waveform output",
+                                )
                                 extra_ts[name] = (
                                     v_dev,
-                                    tt_dev.assemble(t0, t1, dt_pop),
+                                    values,
                                 )
 
                         chunk_loss = None
@@ -4535,7 +4575,7 @@ class Network(RNGMixin):
                             extra_c = {}
                             if len(extra_ts) > 0:
                                 for name, (v_dev, ts) in extra_ts.items():
-                                    extra_c[name] = v_dev * ts[i_t]
+                                    extra_c[name] = v_dev * ts[..., i_t].unsqueeze(-1)
 
                             # Advance network dynamics.
                             self._step(
@@ -4645,7 +4685,24 @@ def prepare_extra(extra, local_ind: int):
     """
     Prepares the voltage and time data for the current step.
     """
-    return {n: v * t[local_ind] for n, (v, t) in extra.items()}
+    return {n: v * t[..., local_ind].unsqueeze(-1) for n, (v, t) in extra.items()}
+
+
+def _evaluate_extra_waveform(pop, waveform, time_grid, *, n_steps, name):
+    """Place and evaluate one Network waveform before another can move it.
+
+    ``Module.to`` mutates a waveform in place.  Evaluating immediately is
+    therefore essential when the same Waveform object is shared by populations
+    with different devices or dtypes; deferred references would all observe the
+    placement requested for the final population.
+    """
+    waveform = waveform.to(device=pop.device(), dtype=pop.dtype())
+    values = waveform(time_grid)
+    return pop._normalize_temporal_values(
+        values,
+        n_steps=n_steps,
+        name=name,
+    )
 
 
 # callback helpers

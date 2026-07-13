@@ -24,6 +24,44 @@ def _cache_current_slot(step) -> int:
     return int(step)
 
 
+def _round_half_up_time_indices(
+    count: int,
+    numerator_dt: float,
+    denominator_dt: float,
+    *,
+    device,
+) -> torch.Tensor:
+    """Return robust nearest-step indices without device float64 requirements.
+
+    Cache translation is a cold path, so calculate the floating-point positions
+    on CPU.  This keeps the operation compatible with devices such as MPS and a
+    small scale-aware tolerance makes documented half-up ties stable when a
+    decimal ratio (for example 0.3 / 0.2) lands one ULP below its ideal value.
+    """
+    count = int(count)
+    if count <= 0:
+        return torch.empty(0, device=device, dtype=torch.long)
+    positions = torch.arange(count, dtype=torch.float64) * (
+        float(numerator_dt) / float(denominator_dt)
+    )
+    tolerance = (
+        torch.maximum(positions.abs(), torch.ones_like(positions))
+        * torch.finfo(torch.float64).eps
+        * 8.0
+    )
+    indices = torch.floor(positions + 0.5 + tolerance).to(torch.long)
+    return indices.to(device=device)
+
+
+def _round_half_up_time_index(
+    index: int, numerator_dt: float, denominator_dt: float
+) -> int:
+    """Scalar counterpart of :func:`_round_half_up_time_indices`."""
+    value = float(index) * float(numerator_dt) / float(denominator_dt)
+    tolerance = max(abs(value), 1.0) * torch.finfo(torch.float64).eps * 8.0
+    return int(math.floor(value + 0.5 + tolerance))
+
+
 def _dilate_time_rows(
     rows: torch.Tensor,
     old_dt: float,
@@ -48,13 +86,54 @@ def _dilate_time_rows(
     if float(old_dt) == float(new_dt) and T == n_limit:
         return rows.detach().clone()
 
-    idx_f = torch.arange(T, device=rows.device, dtype=torch.float64) * (
-        float(old_dt) / float(new_dt)
+    idx = _round_half_up_time_indices(
+        T,
+        old_dt,
+        new_dt,
+        device=rows.device,
     )
-    idx = torch.floor(idx_f + 0.5).to(torch.long).clamp(0, n_limit - 1)
+    idx.clamp_(0, n_limit - 1)
     out = torch.zeros((n_limit, E), device=rows.device, dtype=rows.dtype)
     out.index_add_(0, idx, rows)
     return out
+
+
+def _resample_continuous_time_rows(
+    rows: torch.Tensor,
+    old_dt: float,
+    new_dt: float,
+    *,
+    n_limit: int,
+) -> torch.Tensor:
+    """Nearest-neighbor resample a future continuous-signal delay line.
+
+    Continuous projections represent one analog sample at each time row.  Unlike
+    event payloads, two old samples that map to one coarser row must not be
+    summed, and a finer grid must not insert zero-valued gaps.  The connection
+    delays themselves use nearest-step quantization, so nearest-neighbor sampling
+    gives the matching deterministic cache-translation rule.
+    """
+    if rows.ndim != 2:
+        raise ValueError("cached continuous time rows must be 2D")
+    n_limit = int(n_limit)
+    T, E = rows.shape
+    if n_limit <= 0:
+        return rows.new_zeros((0, E))
+    if T == 0:
+        return rows.new_zeros((n_limit, E))
+    if float(old_dt) == float(new_dt) and T == n_limit:
+        return rows.detach().clone()
+
+    old_idx = _round_half_up_time_indices(
+        n_limit,
+        new_dt,
+        old_dt,
+        device=rows.device,
+    )
+    # Endpoint hold is the only stable reconstruction when timestep rounding
+    # makes the new physical horizon slightly longer than the cached one.
+    old_idx.clamp_(0, T - 1)
+    return rows.index_select(0, old_idx).detach().clone()
 
 
 def _dilate_packed_time_rows(
@@ -76,10 +155,13 @@ def _dilate_packed_time_rows(
     if float(old_dt) == float(new_dt) and T == n_limit:
         return rows.detach().clone()
 
-    idx_f = torch.arange(T, device=rows.device, dtype=torch.float64) * (
-        float(old_dt) / float(new_dt)
+    idx = _round_half_up_time_indices(
+        T,
+        old_dt,
+        new_dt,
+        device=rows.device,
     )
-    idx = torch.floor(idx_f + 0.5).to(torch.long).clamp(0, n_limit - 1)
+    idx.clamp_(0, n_limit - 1)
     out = torch.zeros((n_limit, W), device=rows.device, dtype=rows.dtype)
     # n_limit is delay depth, not connection count; this loop is out of the hot path.
     for old_i, new_i in enumerate(idx.detach().cpu().tolist()):
@@ -147,12 +229,57 @@ def _dilate_history_age_rows(
     if float(old_dt) == float(new_dt) and T == n_limit:
         return rows.detach().clone()
 
-    idx_f = torch.arange(T, device=rows.device, dtype=torch.float64) * (
-        float(old_dt) / float(new_dt)
+    idx = _round_half_up_time_indices(
+        T,
+        old_dt,
+        new_dt,
+        device=rows.device,
     )
-    idx = torch.floor(idx_f + 0.5).to(torch.long).clamp(0, n_limit - 1)
+    idx.clamp_(0, n_limit - 1)
     out = torch.zeros((n_limit, E), device=rows.device, dtype=rows.dtype)
     out.index_add_(0, idx, rows)
+    return out
+
+
+def _resample_continuous_history_age_rows(
+    rows: torch.Tensor,
+    old_dt: float,
+    new_dt: float,
+    *,
+    n_limit: int,
+) -> torch.Tensor:
+    """Nearest-neighbor resample age-ordered continuous source values.
+
+    Age row 0 is the next-write ring slot and is not a historical sample.  For
+    finer grids, ages younger than the newest cached sample therefore hold that
+    newest sample.  Requests just outside the cached physical horizon hold the
+    oldest endpoint instead of introducing a discontinuous zero.
+    """
+    if rows.ndim != 2:
+        raise ValueError("cached continuous age rows must be 2D")
+    n_limit = int(n_limit)
+    T, E = rows.shape
+    if n_limit <= 0:
+        return rows.new_zeros((0, E))
+    if T <= 1:
+        return rows.new_zeros((n_limit, E))
+    if float(old_dt) == float(new_dt) and T == n_limit:
+        return rows.detach().clone()
+
+    out = rows.new_zeros((n_limit, E))
+    if n_limit <= 1:
+        return out
+    old_ages = _round_half_up_time_indices(
+        n_limit,
+        new_dt,
+        old_dt,
+        device=rows.device,
+    )[1:]
+    # Age zero is not a sample.  Hold the newest/oldest cached endpoint when a
+    # finer grid or quantized horizon asks just outside the available interval.
+    old_ages.clamp_(1, T - 1)
+    target_ages = torch.arange(1, n_limit, device=rows.device, dtype=torch.long)
+    out.index_copy_(0, target_ages, rows.index_select(0, old_ages))
     return out
 
 
@@ -175,10 +302,13 @@ def _dilate_packed_history_age_rows(
     if float(old_dt) == float(new_dt) and T == n_limit:
         return rows.detach().clone()
 
-    idx_f = torch.arange(T, device=rows.device, dtype=torch.float64) * (
-        float(old_dt) / float(new_dt)
+    idx = _round_half_up_time_indices(
+        T,
+        old_dt,
+        new_dt,
+        device=rows.device,
     )
-    idx = torch.floor(idx_f + 0.5).to(torch.long).clamp(0, n_limit - 1)
+    idx.clamp_(0, n_limit - 1)
     out = torch.zeros((n_limit, W), device=rows.device, dtype=rows.dtype)
     for old_i, new_i in enumerate(idx.detach().cpu().tolist()):
         out[int(new_i)].bitwise_or_(rows[old_i])
@@ -215,9 +345,7 @@ def _restore_calendar_chunks(
     out = {}
     depth = max(1, int(depth))
     for rel_slot, chunks in cached_calendar.items():
-        new_slot = int(
-            math.floor(float(rel_slot) * float(old_dt) / float(new_dt) + 0.5)
-        )
+        new_slot = _round_half_up_time_index(rel_slot, old_dt, new_dt)
         new_slot = max(0, min(depth - 1, new_slot))
         restored = []
         for idx, val in chunks:
@@ -418,6 +546,14 @@ class ContinuousCon(Referency):
             ),
         )
         self.register_buffer(
+            "delivery_mask",
+            torch.zeros(
+                (self.max_delay_steps, self._syn_numel),
+                device=self.device,
+                dtype=torch.bool,
+            ),
+        )
+        self.register_buffer(
             "con_range",
             torch.arange(self._n_conn, device=self.device, dtype=torch.long),
         )
@@ -479,10 +615,13 @@ class ContinuousCon(Referency):
             "post_idx_nz",
             "delay_steps_nz",
             "flat_delay_offsets_nz",
+            "post_delivery_mask",
+            "post_zero_delivery_mask",
             "state_cache_pre_value_history",
         ):
             self._move_buffer(name, self.device)
         self._move_buffer("delivery_buffer", self.device, self.dtype)
+        self._move_buffer("delivery_mask", self.device, torch.bool)
         self.dt = self.dt.to(device=self.device, dtype=self.dtype)
         self.weight = self.weight.to(device=self.device, dtype=self.dtype)
         self.delay_ms = self.delay_ms.to(device=self.device, dtype=self.dtype)
@@ -522,6 +661,14 @@ class ContinuousCon(Referency):
             self._set_buffer("post_idx_nz", empty)
             self._set_buffer("delay_steps_nz", empty)
             self._set_buffer("flat_delay_offsets_nz", empty)
+            self._set_buffer(
+                "post_delivery_mask",
+                torch.zeros(self._syn_numel, device=self.device, dtype=torch.bool),
+            )
+            self._set_buffer(
+                "post_zero_delivery_mask",
+                torch.zeros(self._syn_numel, device=self.device, dtype=torch.bool),
+            )
             self._has_zero_delay = False
             self._has_nonzero_delay = False
             self._all_zero_delay = False
@@ -567,6 +714,15 @@ class ContinuousCon(Referency):
         self._set_buffer("post_idx_nz", post_idx_nz)
         self._set_buffer("delay_steps_nz", delay_steps_nz)
         self._set_buffer("flat_delay_offsets_nz", flat_offsets)
+        post_delivery_mask = torch.zeros(
+            self._syn_numel, device=self.device, dtype=torch.bool
+        )
+        post_delivery_mask.index_fill_(0, self.post_idx.to(self.device), True)
+        post_zero_delivery_mask = torch.zeros_like(post_delivery_mask)
+        if post_idx_zero.numel() > 0:
+            post_zero_delivery_mask.index_fill_(0, post_idx_zero, True)
+        self._set_buffer("post_delivery_mask", post_delivery_mask)
+        self._set_buffer("post_zero_delivery_mask", post_zero_delivery_mask)
 
         if delay_steps_nz.numel() > 0:
             first = delay_steps_nz[0]
@@ -619,6 +775,11 @@ class ContinuousCon(Referency):
                 device=self.device,
                 dtype=self.dtype,
             )
+            self.delivery_mask = torch.zeros(
+                (self.max_delay_steps, self._syn_numel),
+                device=self.device,
+                dtype=torch.bool,
+            )
             self._rebuild_delay_metadata()
             self._align_buffer_devices()
             self._configure_advance_impl()
@@ -632,6 +793,7 @@ class ContinuousCon(Referency):
         self.global_step.fill_(0)
         if clear_deliveries:
             self.delivery_buffer.zero_()
+            self.delivery_mask.zero_()
 
     def detach(self):
         for n, b in self.named_buffers():
@@ -655,12 +817,14 @@ class ContinuousCon(Referency):
         return self
 
     def enable_state_cache_recording(self, *, horizon_steps: int | None = None):
-        """Record unweighted presynaptic values for parameter-invariant steady-state cache.
+        """Record raw presynaptic values for parameter-invariant steady-state cache.
 
         The recorded history is used by ``state_cache()`` to rebuild pending
-        continuous deliveries with the *current* weights and delays during a
-        later ``initialize_from_state_cache()`` call.  It is only intended for
-        steady-state/cache runs, not for the hot simulation path.
+        continuous deliveries with the *current* transform, weights, and delays
+        during a later ``initialize_from_state_cache()`` call.  Transforms used
+        with this cache path must be deterministic, memoryless functions of one
+        source-value vector.  The recorder is only intended for
+        steady-state/cache runs, not the hot simulation path.
         """
         steps = (
             int(horizon_steps)
@@ -707,7 +871,9 @@ class ContinuousCon(Referency):
             x.detach().to(self.device, self.dtype)
         )
 
-    def _materialize_delivery_from_pre_value_history(self, age_history: torch.Tensor):
+    def _materialize_delivery_from_pre_value_history(
+        self, age_history: torch.Tensor, *, apply_transform: bool = True
+    ):
         """Rebuild the dense continuous delay buffer from unweighted value history."""
         age_history = age_history.detach().to(device=self.device, dtype=self.dtype)
         if age_history.ndim != 2 or age_history.shape[1] != self._n_conn:
@@ -716,6 +882,7 @@ class ContinuousCon(Referency):
                 f"{tuple(age_history.shape)} vs (*, {self._n_conn})."
             )
         self.delivery_buffer.zero_()
+        self.delivery_mask.zero_()
         if self._n_conn == 0 or age_history.shape[0] <= 1:
             return
         flat = self.delivery_buffer.view(-1)
@@ -728,9 +895,13 @@ class ContinuousCon(Referency):
             keep = remaining >= 0
             if not bool(keep.any()):
                 continue
-            vals = age_history[age].index_select(
-                0, torch.nonzero(keep, as_tuple=False).flatten()
-            )
+            row = age_history[age]
+            if apply_transform and self._has_transform:
+                # Cache reconstruction initializes detached runtime state. Apply
+                # the current memoryless transform to the complete connection
+                # row before selecting the edges whose deliveries remain pending.
+                row = self.transform(row).detach()
+            vals = row.index_select(0, torch.nonzero(keep, as_tuple=False).flatten())
             if vals.numel() == 0:
                 continue
             con_idx = torch.nonzero(keep, as_tuple=False).flatten()
@@ -739,6 +910,7 @@ class ContinuousCon(Referency):
                 0, con_idx
             ) * self._syn_numel + post_idx.index_select(0, con_idx)
             flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
+            self.delivery_mask.view(-1).index_fill_(0, flat_idx.reshape(-1), True)
 
     def n_connections(self):
         return int(self.n.item())
@@ -753,7 +925,7 @@ class ContinuousCon(Referency):
         cur_slot = _cache_current_slot(self.current_time_step)
         cache = {
             "kind": "continuous",
-            "version": 2,
+            "version": 4,
             "dt": _cache_dt_value(self.dt),
             "max_delay_steps": int(self.max_delay_steps),
         }
@@ -766,12 +938,16 @@ class ContinuousCon(Referency):
                 self.state_cache_pre_value_history.detach(), cur_slot
             )
             cache["history_layout"] = "age"
+            cache["value_layout"] = "raw"
             cache["param_invariant"] = True
         else:
             # Backward-compatible fallback: this is tied to the weights/delays
             # that produced the already-weighted future delivery rows.
             cache["delivery_buffer"] = torch.roll(
                 self.delivery_buffer.detach(), -cur_slot, dims=0
+            ).clone()
+            cache["delivery_mask"] = torch.roll(
+                self.delivery_mask.detach(), -cur_slot, dims=0
             ).clone()
             cache["param_invariant"] = False
         return cache
@@ -796,6 +972,7 @@ class ContinuousCon(Referency):
         else:
             self._align_buffer_devices()
             self.delivery_buffer.zero_()
+            self.delivery_mask.zero_()
         old_dt = float(state_cache.get("dt", _cache_dt_value(self.dt)))
         new_dt = float(_cache_dt_value(self.dt) if dt is None else dt)
         if "pre_value_history" in state_cache:
@@ -804,13 +981,22 @@ class ContinuousCon(Referency):
                 .detach()
                 .to(device=self.device, dtype=self.dtype)
             )
-            hist = _dilate_history_age_rows(
+            hist = _resample_continuous_history_age_rows(
                 hist,
                 old_dt,
                 new_dt,
                 n_limit=int(self.max_delay_steps),
             )
-            self._materialize_delivery_from_pre_value_history(hist)
+            # Version 2 caches recorded already-transformed values.  Keep those
+            # loadable without applying the transform twice; version 3 stores raw
+            # source values and deliberately replays the current transform.
+            raw_values = (
+                state_cache.get("value_layout") == "raw"
+                or int(state_cache.get("version", 2)) >= 3
+            )
+            self._materialize_delivery_from_pre_value_history(
+                hist, apply_transform=raw_values
+            )
         else:
             cached = (
                 state_cache["delivery_buffer"]
@@ -822,7 +1008,7 @@ class ContinuousCon(Referency):
                     "Cached ContinuousCon delivery_buffer has incompatible shape: "
                     f"{tuple(cached.shape)} vs (*, {self._syn_numel})."
                 )
-            restored = _dilate_time_rows(
+            restored = _resample_continuous_time_rows(
                 cached,
                 old_dt,
                 new_dt,
@@ -834,6 +1020,37 @@ class ContinuousCon(Referency):
                     torch.zeros_like(restored, device=self.device, dtype=self.dtype),
                 )
             self.delivery_buffer.copy_(restored)
+            cached_mask = state_cache.get("delivery_mask", None)
+            if cached_mask is None:
+                # Version 3 and older caches did not retain delivery presence.
+                # A nonzero payload is the only recoverable evidence; genuine
+                # scheduled zeros necessarily remain a best-effort limitation.
+                cached_mask = cached != 0
+            elif not torch.is_tensor(cached_mask):
+                raise TypeError("Cached ContinuousCon delivery_mask must be a tensor")
+            else:
+                cached_mask = cached_mask.detach().to(
+                    device=self.device, dtype=torch.bool
+                )
+                if tuple(cached_mask.shape) != tuple(cached.shape):
+                    raise ValueError(
+                        "Cached ContinuousCon delivery_mask has incompatible shape: "
+                        f"{tuple(cached_mask.shape)} vs {tuple(cached.shape)}."
+                    )
+            restored_mask = _resample_continuous_time_rows(
+                cached_mask,
+                old_dt,
+                new_dt,
+                n_limit=int(self.delivery_mask.shape[0]),
+            )
+            if tuple(self.delivery_mask.shape) != tuple(restored_mask.shape):
+                self._set_buffer(
+                    "delivery_mask",
+                    torch.zeros_like(
+                        restored_mask, device=self.device, dtype=torch.bool
+                    ),
+                )
+            self.delivery_mask.copy_(restored_mask)
         self.current_time_step.zero_()
         if hasattr(self, "t"):
             step = torch.round(
@@ -849,6 +1066,7 @@ class ContinuousCon(Referency):
     def state_dict_for_checkpoint(self):
         return {
             "delivery_buffer": self.delivery_buffer,
+            "delivery_mask": self.delivery_mask,
             "current_time_step": self.current_time_step,
             "global_step": self.global_step,
         }
@@ -874,6 +1092,28 @@ class ContinuousCon(Referency):
             shape=self.global_step.shape,
             dtype=torch.long,
         )
+        delivery_mask = state_dict.get("delivery_mask", None)
+        if delivery_mask is None:
+            # Older checkpoints cannot distinguish a scheduled zero from an
+            # empty ring slot. Preserve loadability and recover every presence
+            # bit that is inferable from the payload itself.
+            delivery_mask = delivery != 0
+        else:
+            if not torch.is_tensor(delivery_mask):
+                raise TypeError(
+                    "ContinuousCon checkpoint 'delivery_mask' must be a tensor."
+                )
+            if tuple(delivery_mask.shape) != tuple(self.delivery_mask.shape):
+                raise ValueError(
+                    "ContinuousCon checkpoint 'delivery_mask' has shape "
+                    f"{tuple(delivery_mask.shape)}, expected "
+                    f"{tuple(self.delivery_mask.shape)}."
+                )
+            if delivery_mask.dtype != torch.bool:
+                raise TypeError(
+                    "ContinuousCon checkpoint 'delivery_mask' has dtype "
+                    f"{delivery_mask.dtype}, expected torch.bool."
+                )
         current_value = int(current.detach().cpu().reshape(-1)[0].item())
         if current_value < 0 or current_value >= int(self.max_delay_steps):
             raise ValueError(
@@ -881,6 +1121,7 @@ class ContinuousCon(Referency):
                 f"ring: {current_value} not in [0, {int(self.max_delay_steps)})."
             )
         self.delivery_buffer = delivery.to(device=self.device)
+        self.delivery_mask = delivery_mask.to(device=self.device).clone()
         self.current_time_step = current.to(device=self.device)
         self.global_step = global_step.to(device=self.device)
         return self
@@ -918,9 +1159,11 @@ class ContinuousCon(Referency):
         x = x_full.reshape(-1).index_select(0, self.pre_idx)
         if x.device != self.device or x.dtype != self.dtype:
             x = x.to(device=self.device, dtype=self.dtype)
+        # Record raw selected values. Restore reapplies the current memoryless
+        # transform so parameter updates cannot leave stale transformed traffic.
+        self._record_pre_value_for_state_cache(x)
         if self._has_transform:
             x = self.transform(x)
-        self._record_pre_value_for_state_cache(x)
         return x
 
     def _weighted_pre_value(self):
@@ -945,15 +1188,18 @@ class ContinuousCon(Referency):
     def _read_and_clear_current_row(self):
         cur_idx = self.current_time_step
         delayed_delivery = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)
+        delayed_mask = self.delivery_mask.index_select(0, cur_idx).squeeze(0)
         self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
-        return cur_idx, delayed_delivery
+        self.delivery_mask.index_fill_(0, cur_idx, False)
+        return cur_idx, delayed_delivery, delayed_mask
 
-    def _deliver(self, flat_delivery):
+    def _deliver(self, flat_delivery, flat_mask):
         self.syn.continuous_receive(
             flat_delivery.view(*self.syn.shape_f),
             self,
             input=self.input,
             reduce=self.reduce,
+            mask=flat_mask.view(*self.syn.shape_f),
         )
 
     def _schedule_all_delayed_uniform(self, cur_idx, weighted):
@@ -962,6 +1208,7 @@ class ContinuousCon(Referency):
         )
         flat = future * self._syn_numel + self.post_idx
         self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
+        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
 
     def _schedule_selected_delayed_uniform(self, cur_idx, weighted):
         vals = weighted.index_select(0, self.nonzero_con_idx)
@@ -970,17 +1217,20 @@ class ContinuousCon(Referency):
         )
         flat = future * self._syn_numel + self.post_idx_nz
         self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
+        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
 
     def _schedule_all_delayed_mixed(self, cur_idx, weighted):
         base = cur_idx * self._syn_numel
         flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
         self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
+        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
 
     def _schedule_selected_delayed_mixed(self, cur_idx, weighted):
         vals = weighted.index_select(0, self.nonzero_con_idx)
         base = cur_idx * self._syn_numel
         flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
         self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
+        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
 
     # ------------------------------------------------------------------
     # Specialized advance paths
@@ -991,37 +1241,43 @@ class ContinuousCon(Referency):
 
     def _advance_all_immediate(self):
         weighted = self._weighted_pre_value()
-        self._deliver(self._scatter_all(weighted))
+        self._deliver(self._scatter_all(weighted), self.post_delivery_mask)
         # All delays are zero, so current_time_step remains zero modulo one.
         self.global_step.add_(1)
 
     def _advance_all_delayed_uniform(self):
-        cur_idx, delayed_delivery = self._read_and_clear_current_row()
-        self._deliver(delayed_delivery)
+        cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
+        self._deliver(delayed_delivery, delayed_mask)
         weighted = self._weighted_pre_value()
         self._schedule_all_delayed_uniform(cur_idx, weighted)
         self._advance_counters()
 
     def _advance_all_delayed_mixed(self):
-        cur_idx, delayed_delivery = self._read_and_clear_current_row()
-        self._deliver(delayed_delivery)
+        cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
+        self._deliver(delayed_delivery, delayed_mask)
         weighted = self._weighted_pre_value()
         self._schedule_all_delayed_mixed(cur_idx, weighted)
         self._advance_counters()
 
     def _advance_mixed_uniform(self):
-        cur_idx, delayed_delivery = self._read_and_clear_current_row()
+        cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
         weighted = self._weighted_pre_value()
         immediate = self._scatter_zero_subset(weighted)
-        self._deliver(delayed_delivery + immediate)
+        self._deliver(
+            delayed_delivery + immediate,
+            delayed_mask | self.post_zero_delivery_mask,
+        )
         self._schedule_selected_delayed_uniform(cur_idx, weighted)
         self._advance_counters()
 
     def _advance_mixed(self):
-        cur_idx, delayed_delivery = self._read_and_clear_current_row()
+        cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
         weighted = self._weighted_pre_value()
         immediate = self._scatter_zero_subset(weighted)
-        self._deliver(delayed_delivery + immediate)
+        self._deliver(
+            delayed_delivery + immediate,
+            delayed_mask | self.post_zero_delivery_mask,
+        )
         self._schedule_selected_delayed_mixed(cur_idx, weighted)
         self._advance_counters()
 
@@ -5293,18 +5549,6 @@ class NetCon(Referency):
         new_dt = float(_cache_dt_value(self.dt) if dt is None else dt)
         backend_state = state_cache.get("backend_state", {})
 
-        if "has_spiked" in state_cache:
-            hs = (
-                state_cache["has_spiked"]
-                .detach()
-                .to(device=self.pre_device, dtype=torch.bool)
-            )
-            self._restore_source_has_spiked_from_connection_cache(hs)
-            if self.has_spiked.numel() > 0:
-                if hs.numel() == self.has_spiked.numel():
-                    self.has_spiked.copy_(hs.reshape_as(self.has_spiked))
-                else:
-                    self.has_spiked = hs.clone()
         if "is_spiking" in state_cache and self.is_spiking.numel() > 0:
             isp = (
                 state_cache["is_spiking"]
@@ -5365,28 +5609,6 @@ class NetCon(Referency):
                     depth=int(self.spike_history_packed.shape[0]),
                 )
                 self.spike_history_packed.copy_(ring_hist)
-
-            if (
-                "bitpack_source_has_spiked" in backend_state
-                and hasattr(self, "bitpack_source_has_spiked")
-                and self.bitpack_source_has_spiked.numel() > 0
-            ):
-                src_hs = (
-                    backend_state["bitpack_source_has_spiked"]
-                    .detach()
-                    .to(device=self.pre_device, dtype=torch.bool)
-                )
-                self.bitpack_source_has_spiked.copy_(
-                    src_hs.reshape_as(self.bitpack_source_has_spiked)
-                )
-                if self.has_spiked.numel() == self._n_conn and src_hs.numel() > 0:
-                    source_pos = torch.searchsorted(
-                        self.bitpack_source_pre_idx.to(
-                            device=self.pre_device, dtype=torch.long
-                        ),
-                        self.pre_idx.to(device=self.pre_device, dtype=torch.long),
-                    )
-                    self.has_spiked.copy_(src_hs.index_select(0, source_pos))
 
             if self._use_bitpacked_history_runtime():
                 self.delivery_buffer.zero_()
@@ -5484,6 +5706,45 @@ class NetCon(Referency):
                         n_limit=int(self.event_queue.shape[0]),
                     )
                     self.event_queue.copy_(ev_restored)
+
+        # Reapply threshold latches only after reconstructing runtime history.
+        # Compact-history allocation clears these latches as part of its normal
+        # fresh-episode setup; restoring them earlier would spuriously re-arm a
+        # source that was already above threshold at the cache boundary.
+        if "has_spiked" in state_cache:
+            hs = (
+                state_cache["has_spiked"]
+                .detach()
+                .to(device=self.pre_device, dtype=torch.bool)
+            )
+            self._restore_source_has_spiked_from_connection_cache(hs)
+            if self.has_spiked.numel() > 0:
+                if hs.numel() == self.has_spiked.numel():
+                    self.has_spiked.copy_(hs.reshape_as(self.has_spiked))
+                else:
+                    self.has_spiked = hs.clone()
+
+        if (
+            "bitpack_source_has_spiked" in backend_state
+            and hasattr(self, "bitpack_source_has_spiked")
+            and self.bitpack_source_has_spiked.numel() > 0
+        ):
+            src_hs = (
+                backend_state["bitpack_source_has_spiked"]
+                .detach()
+                .to(device=self.pre_device, dtype=torch.bool)
+            )
+            self.bitpack_source_has_spiked.copy_(
+                src_hs.reshape_as(self.bitpack_source_has_spiked)
+            )
+            if self.has_spiked.numel() == self._n_conn and src_hs.numel() > 0:
+                source_pos = torch.searchsorted(
+                    self.bitpack_source_pre_idx.to(
+                        device=self.pre_device, dtype=torch.long
+                    ),
+                    self.pre_idx.to(device=self.pre_device, dtype=torch.long),
+                )
+                self.has_spiked.copy_(src_hs.index_select(0, source_pos))
 
         self.current_time_step.zero_()
         if hasattr(self, "t"):

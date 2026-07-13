@@ -2527,7 +2527,8 @@ class Mechanism(Parameterized):
         Returns
         -------
         bool
-            ``True`` if the mechanism accepted the injection, otherwise ``False``.
+            ``True`` only if the mechanism accepts complete ownership of the
+            injection.  Returning ``False`` leaves delivery to the solver path.
         """
         return False
 
@@ -2563,6 +2564,10 @@ class Mechanism(Parameterized):
         :meth:`evaluate_injections` evaluates all registered waveforms at the
         current mechanism time and returns a tensor shaped like the local voltage
         argument, with zeros outside the targeted compartments.
+
+        Registration succeeds only when this mechanism covers every targeted
+        population location.  Partial overlap returns ``False`` without storing
+        state so the solver can deliver the full injection exactly once.
         """
         device = self.diam.device
         dtype = self.diam.dtype
@@ -2586,6 +2591,19 @@ class Mechanism(Parameterized):
             local_mask = self.get(full_mask)
 
         if local_mask.numel() == 0 or not bool(torch.any(local_mask).item()):
+            return False
+
+        # ``True`` from Mechanism.inject means that this mechanism owns the
+        # complete population-level injection.  Reject partial overlap before
+        # registering anything so the solver fallback can safely deliver the
+        # whole stimulus without duplicating covered locations.
+        local_coverage = local_mask.to(dtype=torch.bool)
+        full_coverage = self.put(
+            local_coverage,
+            torch.zeros_like(full_mask),
+            full_mask,
+        ).to(dtype=torch.bool)
+        if not bool(torch.all(full_coverage[full_mask]).item()):
             return False
 
         k = len(self.injected_waveforms)
@@ -2745,6 +2763,11 @@ class Mechanism(Parameterized):
             )
         t = torch.as_tensor(t, device=v.device, dtype=v.dtype)
         t = torch.atleast_1d(t)
+        if t.numel() != 1:
+            raise ValueError(
+                "Mechanism waveform injections are evaluated one timestep at a "
+                f"time; got {t.numel()} time values."
+            )
 
         for k, spec in enumerate(self._injection_specs):
             if spec["current_name"] != current_name:
@@ -2753,6 +2776,12 @@ class Mechanism(Parameterized):
             scale = getattr(self, spec["scale"])
             selected_index = getattr(self, spec["index"])
             value = self.injected_waveforms[k](t) * scale
+            # Dendra Waveforms always return time on the last axis.  This
+            # method evaluates one timestep, so remove that singleton before
+            # applying spatial/batch broadcasting.  Custom modules that return
+            # a spatial value directly remain supported.
+            if value.ndim > 0 and value.shape[-1] == 1:
+                value = value.squeeze(-1)
             out = out + self._expand_injection_value(
                 value,
                 mask,
@@ -2917,6 +2946,12 @@ class ContinuousSynapse(Mechanism):
         self.register_buffer(
             "_continuous_reset_count", torch.zeros((), dtype=torch.long)
         )
+        # Per-element delivery history for the current network step.  ContinuousCon
+        # scatters into a full synapse-shaped tensor, so a single input-level flag
+        # cannot distinguish a genuine zero delivery from an untargeted slot.
+        # These masks are ephemeral: Network resets them before every group of
+        # continuous deliveries, and they are recreated on the live input device.
+        self._continuous_received_masks = {}
 
     @staticmethod
     def INPUT(*names, keep_old=True):
@@ -2950,6 +2985,7 @@ class ContinuousSynapse(Mechanism):
         value when available, and ``x`` is then reset to zeros.  Rebinding rather
         than in-place mutation keeps the operation compatible with autograd.
         """
+        self._continuous_received_masks.clear()
         for name in self._continuous_inputs:
             current = getattr(self, name)
             old_name = self._continuous_input_old.get(name, None)
@@ -2958,7 +2994,7 @@ class ContinuousSynapse(Mechanism):
             setattr(self, name, torch.zeros_like(current))
         self._continuous_reset_count = self._continuous_reset_count + 1
 
-    def continuous_receive(self, value, con=None, input=None, reduce=None):
+    def continuous_receive(self, value, con=None, input=None, reduce=None, mask=None):
         """Receive a continuously valued presynaptic projection.
 
         Parameters
@@ -2974,6 +3010,11 @@ class ContinuousSynapse(Mechanism):
             Reduction used when multiple continuous projections target the same
             input.  Defaults to the connection's ``reduce`` attribute if present,
             otherwise ``"sum"``.
+        mask : torch.Tensor, optional
+            Boolean tensor identifying elements actually targeted by this
+            delivery. If omitted, every element is treated as delivered. This is
+            supplied by :class:`ContinuousCon` so its zero-filled scatter slots do
+            not participate in non-additive reductions.
         """
         if input is None:
             if len(self._continuous_inputs) != 1:
@@ -2994,17 +3035,43 @@ class ContinuousSynapse(Mechanism):
 
         current = getattr(self, input)
         value = value.to(device=current.device, dtype=current.dtype)
+        if mask is None:
+            delivery_mask = torch.ones_like(current, dtype=torch.bool)
+        else:
+            delivery_mask = torch.as_tensor(
+                mask, device=current.device, dtype=torch.bool
+            )
+            try:
+                delivery_mask = torch.broadcast_to(delivery_mask, current.shape)
+            except RuntimeError as error:
+                raise ValueError(
+                    f"Continuous delivery mask with shape {tuple(delivery_mask.shape)} "
+                    f"cannot be broadcast to input {input!r} with shape "
+                    f"{tuple(current.shape)}."
+                ) from error
+
+        received = self._continuous_received_masks.get(input)
+        if received is None or tuple(received.shape) != tuple(current.shape):
+            received = torch.zeros_like(current, dtype=torch.bool)
+        elif received.device != current.device:
+            received = received.to(device=current.device)
 
         if reduce in ("sum", "add"):
-            setattr(self, input, current + value)
+            update = torch.where(delivery_mask, value, torch.zeros_like(value))
+            setattr(self, input, current + update)
         elif reduce in ("set", "replace", "last"):
-            setattr(self, input, value)
+            setattr(self, input, torch.where(delivery_mask, value, current))
         elif reduce == "max":
-            setattr(self, input, torch.maximum(current, value))
+            reduced = torch.maximum(current, value)
+            update = torch.where(received, reduced, value)
+            setattr(self, input, torch.where(delivery_mask, update, current))
         elif reduce == "min":
-            setattr(self, input, torch.minimum(current, value))
+            reduced = torch.minimum(current, value)
+            update = torch.where(received, reduced, value)
+            setattr(self, input, torch.where(delivery_mask, update, current))
         else:
             raise ValueError(f"Unsupported continuous reduction mode: {reduce!r}.")
+        self._continuous_received_masks[input] = received | delivery_mask
 
 
 def rename(mechanism, new_name=None):

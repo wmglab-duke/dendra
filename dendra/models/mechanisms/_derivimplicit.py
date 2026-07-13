@@ -13,15 +13,6 @@ from ._solve_utils import (
 from ._solvers import _solve_linear_small
 from .ode import differentiate_rhs_2torch_checked
 
-# Optional: faster Jacobian via torch.func if available
-try:
-    from torch.func import jacrev, vmap
-
-    _HAS_TORCH_FUNC = True
-except Exception:
-    _HAS_TORCH_FUNC = False
-
-
 # -- helpers --
 
 
@@ -167,6 +158,39 @@ def _broadcast_jac(
     return Jf.expand((*batch_shape, n, n))
 
 
+def _autograd_batch_jacobian(
+    f: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
+    x: torch.Tensor,
+    t_next: Optional[torch.Tensor],
+    *,
+    create_graph: bool,
+) -> torch.Tensor:
+    """Return the independent-state Jacobian for every batch member.
+
+    ``f`` is defined on the complete batched state.  Calling it on one flattened
+    row is not generally valid: time and mechanism parameters captured by the
+    callback can themselves be batched.  The solver assumes batch members are
+    independent, as required by its block-diagonal Newton systems.  For each
+    state component, differentiate the sum across members to produce those
+    diagonal blocks without materializing a quadratic full-batch Jacobian.
+    """
+    *batch_shape, n = x.shape
+    x_for_jacobian = x if x.requires_grad else x.detach().requires_grad_(True)
+    values = f(x_for_jacobian, t_next)
+    # Keep a zero-dependence path for RHS components that are constant in state.
+    values = values + 0.0 * x_for_jacobian
+    rows = []
+    for output_index in range(n):
+        (row,) = torch.autograd.grad(
+            values[..., output_index].sum(),
+            x_for_jacobian,
+            create_graph=create_graph,
+            retain_graph=True,
+        )
+        rows.append(row)
+    return torch.stack(rows, dim=-2).reshape(*batch_shape, n, n)
+
+
 def _get_dynamo_disable():
     # fall back to the public torch.compiler.disable.
     if hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "disable"):
@@ -240,15 +264,21 @@ def _derivimplicit_step_eager(
     # Initial guess
     x = x_t.clone()
 
-    if jac is not None and (not line_search):
+    if (
+        jac is not None
+        and (not line_search)
+        and damping == 1.0
+        and jacobian_regularization == 0.0
+        and max_iter > 0
+    ):
         # One Newton step is exact for affine RHS
         r = residual(x)
+        if inf_norm_global(r).detach().item() < tol:
+            return x.detach() if detach_newton else x
         Jf0 = _broadcast_jac(jac, batch_shape, n, like=x_t)
         J = eye - dt_mat * Jf0
-        if jacobian_regularization != 0.0:
-            J = J + jacobian_regularization * eye
         dx = _solve_linear_small(J, -r)
-        return x + damping * dx
+        return x + dx
 
     for _ in range(max_iter):
         # Detach strategy:
@@ -282,26 +312,12 @@ def _derivimplicit_step_eager(
                     create_graph=create_graph,
                 )
             else:
-                # Batched jacobian via torch.func if available; fallback to loop
-                if _HAS_TORCH_FUNC:
-                    flat = x_var.reshape(-1, n)
-
-                    def single_f(z):
-                        return f(z, t_next)
-
-                    Jflat = vmap(jacrev(single_f))(flat)  # (B, n, n)
-                    Jf = Jflat.reshape(*batch_shape, n, n)
-                else:
-                    flat = x_var.reshape(-1, n)
-                    Js = []
-                    for i in range(flat.shape[0]):
-                        Ji = torch.autograd.functional.jacobian(
-                            lambda z: f(z, t_next),
-                            flat[i],
-                            create_graph=create_graph,
-                        )
-                        Js.append(Ji)
-                    Jf = torch.stack(Js, dim=0).reshape(*batch_shape, n, n)
+                Jf = _autograd_batch_jacobian(
+                    f,
+                    x_var,
+                    t_next,
+                    create_graph=create_graph,
+                )
 
         # Residual Jacobian: J = I - dt * df/dx
         J = eye - dt_mat * Jf
@@ -401,15 +417,20 @@ def _derivimplicit_step_while_loop(
     def residual(x: torch.Tensor) -> torch.Tensor:
         return x - x_t.detach() - dt_vec * eval_f(x)
 
-    if jac is not None and (not line_search):
+    if (
+        jac is not None
+        and (not line_search)
+        and damping == 1.0
+        and jacobian_regularization == 0.0
+        and max_iter > 0
+    ):
         # One Newton step is exact for affine RHS
         r = residual(x0)
         Jf0 = _broadcast_jac(jac, batch_shape, n, like=x_t)
         J = eye - dt_mat * Jf0
-        if jacobian_regularization != 0.0:
-            J = J + jacobian_regularization * eye
         dx = _solve_linear_small(J, -r)
-        return x0 + damping_t * dx
+        should_step = torch.amax(r.abs()) >= tol_t
+        return torch.where(should_step, x0 + dx, x0)
 
     # If constant jac, precompute J outside the loop
     use_const_jac = jac is not None

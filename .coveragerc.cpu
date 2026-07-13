@@ -1,0 +1,12 @@
+[run]
+# The required CPU/NEURON lane cannot execute these accelerator-only Triton
+# kernel bodies.  Keep this list explicit: contracts, package dispatch,
+# network Triton operations, and GPU diagnostics remain in the CPU report.
+omit =
+    dendra/models/integrators/triton/bt_kernel.py
+    dendra/models/integrators/triton/bt_spd_kernel.py
+    dendra/models/integrators/triton/dhs_kernel.py
+    dendra/models/integrators/triton/dhs_kernel_bt.py
+    dendra/models/integrators/triton/dhs_kernel_multi.py
+    dendra/models/integrators/triton/pcr_kernel_thomas.py
+    dendra/models/integrators/triton/t_kernel_thomas.py

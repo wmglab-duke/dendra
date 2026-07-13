@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import configparser
 import json
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "check_coverage_floors.py"
+ROOT = Path(__file__).parents[1]
+CPU_COVERAGE_CONFIG = ROOT / ".coveragerc.cpu"
+CPU_KERNEL_OMISSIONS = {
+    "dendra/models/integrators/triton/bt_kernel.py",
+    "dendra/models/integrators/triton/bt_spd_kernel.py",
+    "dendra/models/integrators/triton/dhs_kernel.py",
+    "dendra/models/integrators/triton/dhs_kernel_bt.py",
+    "dendra/models/integrators/triton/dhs_kernel_multi.py",
+    "dendra/models/integrators/triton/pcr_kernel_thomas.py",
+    "dendra/models/integrators/triton/t_kernel_thomas.py",
+}
 
 
 def _write_policy_fixture(tmp_path, *, actual=None, floor=80.0, include=True):
@@ -60,3 +72,27 @@ def test_coverage_policy_reports_invalid_configuration(tmp_path):
     result = _run_policy(config, report)
     assert result.returncode == 2
     assert "configuration error" in result.stderr
+
+
+def test_cpu_coverage_omits_only_accelerator_kernel_bodies():
+    config = configparser.ConfigParser()
+    assert config.read(CPU_COVERAGE_CONFIG) == [str(CPU_COVERAGE_CONFIG)]
+
+    omissions = {
+        path.strip() for path in config.get("run", "omit").splitlines() if path.strip()
+    }
+    assert omissions == CPU_KERNEL_OMISSIONS
+    assert all("*" not in path for path in omissions)
+
+    # CPU-testable interfaces around the kernels must stay measurable.
+    assert "dendra/models/integrators/triton/__init__.py" not in omissions
+    assert "dendra/models/integrators/triton/_contracts.py" not in omissions
+    assert "dendra/models/networks/netcon_bitpack_ops_triton.py" not in omissions
+    assert "dendra/utils/gpu.py" not in omissions
+
+
+def test_required_coverage_commands_use_cpu_scope():
+    ci = (ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "--cov-config=.coveragerc.cpu" in ci
+    assert "--cov-config=.coveragerc.cpu" in readme

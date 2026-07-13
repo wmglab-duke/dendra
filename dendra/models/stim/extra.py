@@ -20,11 +20,11 @@ def ve_from_s_t(space, time, n, device, multicontact=False):
 
 
 def op_mc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("can,cat->tan", s, t).contiguous()
+    return torch.einsum("c...n,c...t->t...n", s, t).contiguous()
 
 
 def op_sc(s: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    return torch.einsum("an,at->tan", s, t).contiguous()
+    return torch.einsum("...n,...t->t...n", s, t).contiguous()
 
 
 class Extra(torch.nn.Module):
