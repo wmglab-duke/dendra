@@ -133,5 +133,6 @@ If you use `Dendra`, consider citing the `corresponding paper <https://www.natur
    :maxdepth: 2
    :caption: Resources
 
+   slices
    dendra
    license

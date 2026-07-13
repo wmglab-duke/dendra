@@ -34,6 +34,7 @@ indices in a safe and convenient way.
 
 from __future__ import annotations
 
+import keyword
 import math
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Tuple, Union
@@ -41,8 +42,19 @@ from typing import Any, Optional, Sequence, Tuple, Union
 import numpy as np
 import torch
 
-# Anything NumPy or PyTorch accepts in __getitem__
-IndexElement = Union[int, slice, np.ndarray, list, tuple]
+# Common NumPy/PyTorch indexing elements.  PyTorch accepts a few additional
+# array-like objects at runtime; ``parse_key`` remains the source of truth.
+IndexElement = Union[
+    int,
+    bool,
+    slice,
+    np.ndarray,
+    torch.Tensor,
+    list,
+    tuple,
+    type(Ellipsis),
+    None,
+]
 
 
 @dataclass(slots=True)
@@ -52,24 +64,48 @@ class IndexSpec:
     Attributes
     ----------
     index : tuple of IndexElement
-        Expanded index without ellipsis or ``None`` axes.
+        Stable, owned indexing key.  The outer container is always a tuple;
+        ``Ellipsis`` and ``None`` are retained because they are meaningful
+        parts of PyTorch indexing semantics.
     is_scalar : bool
         ``True`` when the result is scalar valued.
-    shape : tuple of int
+    shape : torch.Size
         Shape produced by applying ``index`` to a tensor.
+    source_shape : tuple of int
+        Logical model shape against which the index was last resolved.  Slice
+        uses this to preserve a core-region selection when leading batch axes
+        are added.
     """
 
     index: Tuple[IndexElement, ...]
     is_scalar: bool
-    shape: Tuple[int, ...]
+    shape: torch.Size
+    source_shape: Tuple[int, ...] = ()
 
     def to_key(self, model) -> torch.LongTensor:
-        """Given a model with shape `shape_p`, return a flat key tensor."""
-        # Build a flat index map once and apply the slice directly.
+        """Return selected flat parameter-storage keys for ``model``."""
+        storage_shape = tuple(model.shape_p)
+        logical_shape = tuple(getattr(model, "shape", storage_shape))
         base = torch.arange(
-            math.prod(model.shape_p), device=model.device(), dtype=torch.long
-        ).view(model.shape_p)
-        return base[self.index].reshape(-1)
+            math.prod(storage_shape), device=model.device(), dtype=torch.long
+        ).view(storage_shape)
+        try:
+            base = torch.broadcast_to(base, logical_shape)
+        except RuntimeError:
+            pass
+        selected = base[self.index].reshape(-1)
+        if selected.numel() < 2:
+            return selected
+        seen = set()
+        positions = []
+        for position, value in enumerate(selected.detach().cpu().tolist()):
+            if value not in seen:
+                seen.add(value)
+                positions.append(position)
+        return selected.index_select(
+            0,
+            torch.as_tensor(positions, device=selected.device, dtype=torch.long),
+        )
 
 
 def _population_flat_indices(model, index=None) -> torch.LongTensor:
@@ -287,7 +323,7 @@ class Slice:
 
     The :class:`Slice` object is a lightweight, logical view that:
 
-    * Stores a canonicalised :class:`IndexSpec` describing the selection.
+    * Stores an owned :class:`IndexSpec` describing the selection.
     * Provides methods for reading and writing model and mechanism state
       restricted to that selection.
     * Supports targeted intracellular current injections via :meth:`inject`.
@@ -332,8 +368,8 @@ class Slice:
         assert torch.allclose(distal_mid.v, direct.v)
 
     Internally, :func:`compose_indices` is used to compute an equivalent index
-    into the original population without ever materialising intermediate
-    tensors. This keeps nested slicing both expressive and efficient.
+    into the original population. It materialises an integer coordinate map,
+    but never materialises or copies the population state itself.
 
     Reading state: :meth:`inspect` and :meth:`get`
     ----------------------------------------------
@@ -356,7 +392,8 @@ class Slice:
     ----------------------
     For common cases, you can also rely on attribute access instead of calling
     :meth:`get` explicitly. The :class:`Slice` intercepts attribute access and
-    returns a sliced view of buffers, parameters, and submodules:
+    returns a sliced snapshot of buffers and parameters, or a retained Slice
+    wrapper for submodules:
 
     .. code-block:: python
 
@@ -390,9 +427,9 @@ class Slice:
         # Assuming ``v`` is a registered buffer on ``pop``
         soma.v = torch.full(soma.shape, -65.0, device=pop.device())
 
-    Both pathways perform writes under ``torch.no_grad()`` and call
-    ``detach_()`` afterwards to preserve the tensor identity but drop autograd
-    history, which is typically what you want inside a simulation loop.
+    Both pathways validate the complete update first, then copy it under
+    ``torch.no_grad()``. Registered tensor identity, dtype, device and unrelated
+    entries are preserved.
 
     Current injection: :meth:`inject`
     ---------------------------------
@@ -450,57 +487,167 @@ class Slice:
     index_spec : IndexSpec
         Canonicalised description of the selection (index, shape, scalar flag).
     base_shape : tuple of int
-        Shape of the original population before any slicing was applied.
+        Current logical shape of the owning population, including batch axes.
     parent_slice : Slice or None
         Parent slice if this slice was created from another slice.
 
     Notes
     -----
-    :class:`Slice` is a pure view; creating or discarding slices does not copy
-    simulation state. The main cost is that of the underlying tensor indexing
-    when :meth:`inspect`, :meth:`set`, attribute access, or other operations
-    are performed.
+    A :class:`Slice` owns no simulation state. Read operations deliberately
+    return non-aliasing tensor snapshots, while writes mutate the registered
+    state on the owning model through the explicit Slice mutation contract.
     """
 
-    _RESERVED = ("model", "index_spec", "base_shape", "parent_slice")
+    _RESERVED = (
+        "_model",
+        "index_spec",
+        "_base_shape",
+        "parent_slice",
+        "root_model",
+        "module_path",
+        "_labels",
+    )
 
     def __init__(
-        self, model, index_spec: IndexSpec, base_shape=None, parent_slice=None
+        self,
+        model,
+        index_spec: IndexSpec,
+        base_shape=None,
+        parent_slice=None,
+        *,
+        root_model=None,
+        module_path=(),
     ):
         # Bypass interception for internal fields
-        object.__setattr__(self, "model", model)
+        object.__setattr__(self, "_model", model)
         object.__setattr__(self, "index_spec", index_spec)
         object.__setattr__(self, "parent_slice", parent_slice)
+        object.__setattr__(
+            self, "root_model", model if root_model is None else root_model
+        )
+        object.__setattr__(self, "module_path", tuple(module_path))
+        object.__setattr__(self, "_labels", {})
         if base_shape is None:
-            base_shape = model.shape
-        object.__setattr__(self, "base_shape", base_shape)
+            base_shape = index_spec.source_shape or tuple(
+                (model if root_model is None else root_model).shape
+            )
+        if not index_spec.source_shape:
+            index_spec.source_shape = tuple(base_shape)
+        object.__setattr__(self, "_base_shape", tuple(base_shape))
+
+    def _sync_model(self):
+        """Resolve a wrapped submodule against the population's live module tree."""
+        root = object.__getattribute__(self, "root_model")
+        current = root
+        path = object.__getattribute__(self, "module_path")
+        for part in path:
+            modules = getattr(current, "_modules", {})
+            if part not in modules or modules[part] is None:
+                dotted = ".".join(path)
+                raise RuntimeError(
+                    f"Slice submodule {dotted!r} is no longer present on the model. "
+                    "Create a new Slice after changing the model structure."
+                )
+            current = modules[part]
+        object.__setattr__(self, "_model", current)
+        return current
+
+    @staticmethod
+    def _index_on_device(index, device):
+        """Move owned tensor indices with the model while preserving key syntax."""
+        moved = []
+        for item in index:
+            if torch.is_tensor(item):
+                moved.append(item.to(device=device))
+            else:
+                moved.append(item)
+        return tuple(moved)
+
+    def _sync_index(self):
+        """Rebase a logical core selection across newly added batch axes."""
+        root = object.__getattribute__(self, "root_model")
+        root_shape = tuple(root.shape)
+        spec = object.__getattribute__(self, "index_spec")
+        source_shape = tuple(spec.source_shape)
+        device = root.device()
+
+        index_moved = any(
+            torch.is_tensor(item) and item.device != device for item in spec.index
+        )
+        index = self._index_on_device(spec.index, device)
+        if root_shape != source_shape:
+            adds_leading_axes = (
+                len(root_shape) >= len(source_shape)
+                and tuple(root_shape[-len(source_shape) :]) == source_shape
+            )
+            if not adds_leading_axes:
+                raise RuntimeError(
+                    "This Slice was created for logical model shape "
+                    f"{source_shape}, but the model now has incompatible shape "
+                    f"{root_shape}. Create a new Slice after changing model topology."
+                )
+
+            n_new = len(root_shape) - len(source_shape)
+            if n_new and not (index and index[0] is Ellipsis):
+                index = (slice(None),) * n_new + index
+
+        if root_shape != source_shape or index_moved:
+            out = torch.empty(root_shape, device=device, dtype=torch.bool)[index]
+            spec.index = index
+            spec.is_scalar = out.ndim == 0
+            spec.shape = out.shape
+            spec.source_shape = root_shape
+
+        object.__setattr__(self, "_base_shape", root_shape)
+        return spec
+
+    def _sync(self):
+        self._sync_model()
+        return self._sync_index()
+
+    @property
+    def model(self):
+        """Live population or submodule wrapped by this Slice."""
+        return self._sync_model()
+
+    @property
+    def base_shape(self):
+        """Current logical shape of the owning population."""
+        self._sync_index()
+        return object.__getattribute__(self, "_base_shape")
 
     # -------------------------
     # Simple, safe properties
     # -------------------------
     @property
     def index(self) -> Tuple[IndexElement, ...]:
-        """Canonical index (tuple) describing this slice."""
-        return object.__getattribute__(self, "index_spec").index
+        """Stable tuple index describing this slice in the current model layout."""
+        return self._sync().index
 
     @property
     def shape(self):
         """Shape produced by applying :attr:`index` to the underlying population."""
-        return object.__getattribute__(self, "index_spec").shape
+        return self._sync().shape
 
     @property
     def is_scalar(self) -> bool:
         """Whether the selection is scalar-valued (no remaining dimensions)."""
-        return object.__getattribute__(self, "index_spec").is_scalar
+        return self._sync().is_scalar
 
     def numel(self) -> int:
         """Return the number of selected elements."""
-        return int(np.prod(object.__getattribute__(self, "index_spec").shape))
+        return math.prod(self.shape)
+
+    def __len__(self) -> int:
+        """Return the size of the first selected dimension, like ``len(tensor)``."""
+        if self.is_scalar:
+            raise TypeError("len() of a scalar Slice")
+        return int(self.shape[0])
 
     @property
     def name(self) -> str:
         """Name of the underlying population (delegated from ``model.name``)."""
-        return object.__getattribute__(self, "model").name
+        return self.model.name
 
     @property
     def is_empty(self) -> bool:
@@ -508,11 +655,367 @@ class Slice:
         return self.numel() == 0
 
     # -------------------------
+    # Spatial tensor routing
+    # -------------------------
+    def _root_shape(self) -> tuple[int, ...]:
+        return tuple(object.__getattribute__(self, "root_model").shape)
+
+    def _core_ndim(self) -> int:
+        root = object.__getattribute__(self, "root_model")
+        core_shape = getattr(root, "core_shape", None)
+        if callable(core_shape):
+            return len(tuple(core_shape()))
+        return len(self._root_shape())
+
+    @staticmethod
+    def _is_mapper(model) -> bool:
+        return (
+            getattr(model, "key", None) is not None
+            and callable(getattr(model, "get", None))
+            and callable(getattr(model, "put", None))
+        )
+
+    def _find_mapper(self, owner):
+        if self._is_mapper(owner):
+            return owner
+
+        root = object.__getattribute__(self, "root_model")
+        current = root
+        mapper = current if self._is_mapper(current) else None
+        for part in object.__getattribute__(self, "module_path"):
+            current = current._modules[part]
+            if self._is_mapper(current):
+                mapper = current
+            if current is owner:
+                break
+        return mapper
+
+    @staticmethod
+    def _missing_value(dtype: torch.dtype):
+        if dtype.is_floating_point or dtype.is_complex:
+            return torch.nan
+        return 0
+
+    @staticmethod
+    def _values_equal(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        equal = left == right
+        if left.is_floating_point() or left.is_complex():
+            equal = equal | (torch.isnan(left) & torch.isnan(right))
+        return equal
+
+    def _mapper_is_unique(self, mapper) -> bool:
+        cached = getattr(mapper, "_dendra_slice_mapping_is_unique", None)
+        if cached is not None:
+            return bool(cached)
+
+        root = object.__getattribute__(self, "root_model")
+        logical_shape = tuple(root.shape)
+        grid = torch.arange(
+            math.prod(logical_shape), device=root.device(), dtype=torch.long
+        ).reshape(logical_shape)
+        mapped = mapper.get(grid).reshape(-1)
+        unique = int(torch.unique(mapped).numel()) == int(mapped.numel())
+        setattr(mapper, "_dendra_slice_mapping_is_unique", unique)
+        return unique
+
+    def _logical_tensor(self, owner, name: str, tensor: torch.Tensor, mapper=None):
+        """Return ``tensor`` expanded/scattered into population coordinates."""
+        root_shape = self._root_shape()
+        if tensor.ndim == 0:
+            raise ValueError(
+                f"{name!r} is global scalar state and has no Slice coordinates; "
+                f"access it on {type(owner).__name__} directly."
+            )
+
+        if mapper is None:
+            mapper = self._find_mapper(owner)
+
+        if mapper is not None:
+            if name == "key":
+                raise ValueError(
+                    "Mechanism key metadata is not a spatial field; access it on "
+                    "the mechanism directly."
+                )
+            if not self._mapper_is_unique(mapper):
+                raise ValueError(
+                    "This mechanism has multiple independent slots at the same "
+                    "physical compartment. A physical Slice cannot represent "
+                    "slot-local state; access the mechanism storage directly or "
+                    "select explicit SynapseSlots."
+                )
+            template = torch.empty(root_shape, device=tensor.device, dtype=tensor.dtype)
+            local_shape = tuple(mapper.get(template).shape)
+            try:
+                broadcast_shape = torch.broadcast_shapes(
+                    tuple(tensor.shape), local_shape
+                )
+            except RuntimeError as error:
+                raise ValueError(
+                    f"{name!r} with storage shape {tuple(tensor.shape)} is not "
+                    f"spatially compatible with mechanism shape {local_shape}."
+                ) from error
+            if tuple(broadcast_shape) != local_shape:
+                raise ValueError(
+                    f"{name!r} with storage shape {tuple(tensor.shape)} is not "
+                    f"spatially compatible with mechanism shape {local_shape}."
+                )
+            local = torch.broadcast_to(tensor, local_shape)
+            dense = torch.full(
+                root_shape,
+                self._missing_value(tensor.dtype),
+                device=tensor.device,
+                dtype=tensor.dtype,
+            )
+            dense = mapper.put(local, dense, template)
+            return dense, local_shape, mapper
+
+        if tensor.ndim < self._core_ndim():
+            raise ValueError(
+                f"{name!r} with shape {tuple(tensor.shape)} is not spatially "
+                f"indexed over model shape {root_shape}; access it on the owning "
+                "model directly."
+            )
+        try:
+            broadcast_shape = torch.broadcast_shapes(tuple(tensor.shape), root_shape)
+        except RuntimeError as error:
+            raise ValueError(
+                f"{name!r} with shape {tuple(tensor.shape)} is not spatially "
+                f"compatible with model shape {root_shape}."
+            ) from error
+        if tuple(broadcast_shape) != root_shape:
+            raise ValueError(
+                f"{name!r} with shape {tuple(tensor.shape)} is not spatially "
+                f"compatible with model shape {root_shape}."
+            )
+        return torch.broadcast_to(tensor, root_shape), root_shape, None
+
+    def _support_mask(self, mapper, local_shape, *, device) -> torch.Tensor:
+        root_shape = self._root_shape()
+        local = torch.ones(local_shape, device=device, dtype=torch.bool)
+        dense = torch.zeros(root_shape, device=device, dtype=torch.bool)
+        template = torch.empty(root_shape, device=device, dtype=torch.bool)
+        return mapper.put(local, dense, template)
+
+    def _read_tensor(self, owner, name: str, tensor: torch.Tensor, mapper=None):
+        spec = self._sync()
+        logical, local_shape, mapper = self._logical_tensor(
+            owner, name, tensor, mapper=mapper
+        )
+        if mapper is not None and not (
+            tensor.dtype.is_floating_point or tensor.dtype.is_complex
+        ):
+            support = self._support_mask(mapper, local_shape, device=tensor.device)
+            if not bool(torch.all(support[spec.index])):
+                raise ValueError(
+                    f"Slice includes locations where mechanism field {name!r} is "
+                    "not present, and its dtype has no NaN missing-value marker."
+                )
+        return logical[spec.index].clone()
+
+    def _registered_tensor(self, owner, name: str) -> torch.Tensor:
+        buffers = getattr(owner, "_buffers", {})
+        parameters = getattr(owner, "_parameters", {})
+        if name in buffers:
+            tensor = buffers[name]
+        elif name in parameters:
+            tensor = parameters[name]
+        else:
+            raise AttributeError(
+                f"{type(owner).__name__}.{name} is not a registered writable "
+                "buffer or Parameter."
+            )
+        if tensor is None or not torch.is_tensor(tensor):
+            raise AttributeError(f"{name!r} is not a writable tensor field.")
+        return tensor
+
+    def _assignment_values(self, index, value, tensor: torch.Tensor):
+        root_shape = self._root_shape()
+        coordinates = torch.arange(
+            math.prod(root_shape), device=tensor.device, dtype=torch.long
+        ).reshape(root_shape)[index]
+        assigned = torch.empty(
+            coordinates.shape, device=tensor.device, dtype=tensor.dtype
+        )
+        try:
+            assigned[...] = value
+        except (RuntimeError, TypeError, ValueError) as error:
+            value_shape = tuple(value.shape) if torch.is_tensor(value) else "scalar"
+            raise ValueError(
+                f"Cannot assign value with shape {value_shape} to Slice shape "
+                f"{tuple(coordinates.shape)}."
+            ) from error
+
+        flat_coordinates = coordinates.reshape(-1)
+        if flat_coordinates.numel() > 1:
+            order = torch.argsort(flat_coordinates)
+            sorted_coordinates = flat_coordinates[order]
+            sorted_values = assigned.reshape(-1)[order]
+            repeated = sorted_coordinates[1:] == sorted_coordinates[:-1]
+            conflicts = repeated & ~self._values_equal(
+                sorted_values[1:], sorted_values[:-1]
+            )
+            if bool(torch.any(conflicts)):
+                raise ValueError(
+                    "Slice contains repeated physical locations with conflicting "
+                    "assigned values. Use one value per physical location."
+                )
+        return assigned
+
+    def _collapse_to_storage(
+        self, logical: torch.Tensor, storage_shape: tuple[int, ...], *, name: str
+    ) -> torch.Tensor:
+        logical_shape = tuple(logical.shape)
+        if len(storage_shape) > len(logical_shape):
+            raise ValueError(
+                f"Cannot represent logical field {name!r} in storage shape "
+                f"{storage_shape}."
+            )
+        aligned = (1,) * (len(logical_shape) - len(storage_shape)) + storage_shape
+        if any(s not in (1, d) for s, d in zip(aligned, logical_shape)):
+            raise ValueError(
+                f"Cannot represent logical field {name!r} in storage shape "
+                f"{storage_shape}."
+            )
+
+        collapsed = logical
+        for dim, (stored, expanded) in enumerate(zip(aligned, logical_shape)):
+            if stored == 1 and expanded != 1:
+                representative = collapsed.narrow(dim, 0, 1)
+                if not bool(
+                    torch.all(
+                        self._values_equal(
+                            collapsed, representative.expand_as(collapsed)
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        f"Slice write to {name!r} requests different values along "
+                        "a dimension shared by its broadcast storage. The field "
+                        "cannot represent batch-dependent values."
+                    )
+                collapsed = representative
+        return collapsed.reshape(storage_shape)
+
+    def _write_tensor(self, owner, name: str, value, mapper=None):
+        spec = self._sync()
+        tensor = self._registered_tensor(owner, name)
+        logical, local_shape, mapper = self._logical_tensor(
+            owner, name, tensor, mapper=mapper
+        )
+
+        with torch.no_grad():
+            assigned = self._assignment_values(spec.index, value, tensor)
+            if mapper is None and tuple(tensor.shape) == self._root_shape():
+                tensor[spec.index] = assigned
+                return self
+
+            if mapper is not None:
+                support = self._support_mask(mapper, local_shape, device=tensor.device)
+                if not bool(torch.all(support[spec.index])):
+                    raise ValueError(
+                        f"Slice write to mechanism field {name!r} includes locations "
+                        "outside that mechanism's insertion region."
+                    )
+
+            updated = logical.clone()
+            updated[spec.index] = assigned
+            stored = mapper.get(updated) if mapper is not None else updated
+            collapsed = self._collapse_to_storage(
+                stored, tuple(tensor.shape), name=name
+            )
+            tensor.copy_(collapsed)
+        return self
+
+    @staticmethod
+    def _stable_unique_indices(indices: torch.Tensor) -> torch.LongTensor:
+        """Return first-occurrence unique indices without changing their order."""
+        flat = indices.reshape(-1).to(dtype=torch.long)
+        if flat.numel() < 2:
+            return flat
+        seen = set()
+        positions = []
+        for position, value in enumerate(flat.detach().cpu().tolist()):
+            if value not in seen:
+                seen.add(value)
+                positions.append(position)
+        return flat.index_select(
+            0, torch.as_tensor(positions, device=flat.device, dtype=torch.long)
+        )
+
+    def _parameter_key(self, model, name: str) -> torch.LongTensor:
+        """Map a logical Slice selection into a parameter field's storage."""
+        spec = self._sync()
+        target = getattr(model, name)
+        if not torch.is_tensor(target):
+            raise ValueError(f"Parameter field {name!r} is not tensor-valued.")
+        storage_indices = torch.arange(
+            target.numel(), device=target.device, dtype=torch.long
+        ).reshape(target.shape)
+        logical, local_shape, mapper = self._logical_tensor(
+            model, name, storage_indices
+        )
+        if mapper is not None:
+            support = self._support_mask(mapper, local_shape, device=target.device)
+            if not bool(torch.all(support[spec.index])):
+                raise ValueError(
+                    f"Slice parameterization of {name!r} includes locations "
+                    "outside that mechanism's insertion region."
+                )
+        return self._stable_unique_indices(logical[spec.index])
+
+    def _core_index_spec(self, *, preserve_multiplicity: bool = False) -> IndexSpec:
+        """Project logical batch coordinates onto structural core coordinates."""
+        spec = self._sync()
+        root = object.__getattribute__(self, "root_model")
+        root_shape = tuple(root.shape)
+        core_shape = tuple(root.core_shape())
+        core_numel = math.prod(core_shape)
+        full = torch.arange(
+            math.prod(root_shape), device=root.device(), dtype=torch.long
+        ).reshape(root_shape)
+        selected = full[spec.index].reshape(-1)
+        core_indices = torch.remainder(selected, core_numel)
+
+        if preserve_multiplicity and core_indices.numel() > 0:
+            batch_indices = torch.div(selected, core_numel, rounding_mode="floor")
+            counts: dict[tuple[int, int], int] = {}
+            order = []
+            for batch_index, core_index in zip(
+                batch_indices.detach().cpu().tolist(),
+                core_indices.detach().cpu().tolist(),
+            ):
+                pair = (batch_index, core_index)
+                counts[pair] = counts.get(pair, 0) + 1
+                if core_index not in order:
+                    order.append(core_index)
+            max_counts = {
+                core_index: max(
+                    count
+                    for (batch_index, candidate), count in counts.items()
+                    if candidate == core_index
+                )
+                for core_index in order
+            }
+            projected = [
+                core_index
+                for core_index in order
+                for _ in range(max_counts[core_index])
+            ]
+            core_indices = torch.as_tensor(
+                projected, device=root.device(), dtype=torch.long
+            )
+        else:
+            core_indices = self._stable_unique_indices(core_indices)
+
+        core_key = torch.unravel_index(core_indices, core_shape)
+        return parse_key(core_key, core_shape, device=root.device())
+
+    # -------------------------
     # Public API
     # -------------------------
     def inspect(self, var: str, mechanism: Optional[str] = None) -> Any:
         """
-        Return a read-only view of ``var`` constrained to the slice.
+        Return a non-aliasing snapshot of ``var`` constrained to the slice.
 
         This is the main low-level accessor for reading model or mechanism
         state. It honours any sparse/keyed storage used by mechanisms and
@@ -531,9 +1034,8 @@ class Slice:
         Returns
         -------
         Any
-            Sliced value of the requested attribute. For tensors, the leading
-            dimensions match :attr:`shape` of the slice. The exact return type
-            depends on how the underlying model stores ``var``.
+            Snapshot of the requested spatial tensor with shape
+            :attr:`shape`. Global and non-spatial tensors raise ``ValueError``.
 
         Examples
         --------
@@ -550,18 +1052,22 @@ class Slice:
 
             m_gate = soma.inspect("m", mechanism="NaTs2t")
         """
-        model = object.__getattribute__(self, "model")
-        idx = object.__getattribute__(self, "index_spec").index
+        model = self.model
 
         if mechanism is not None:
             mech = model.mech.mechanisms[mechanism]
-            if mech.key is None:
-                return getattr(mech, var)[idx]
-            dummy = torch.tensor(torch.nan, device=model.device(), dtype=model.dtype())
-            dummy = mech.put(getattr(mech, var), dummy, model.v)
-            return dummy[idx]
+            value = getattr(mech, var)
+            if not torch.is_tensor(value):
+                raise TypeError(
+                    f"Mechanism field {mechanism}.{var} is not tensor-valued."
+                )
+            mapper = mech if self._is_mapper(mech) else None
+            return self._read_tensor(mech, var, value, mapper=mapper)
 
-        return getattr(model, var)[idx]
+        value = getattr(model, var)
+        if not torch.is_tensor(value):
+            raise TypeError(f"{type(model).__name__}.{var} is not tensor-valued.")
+        return self._read_tensor(model, var, value)
 
     def _inspect(self, var: str):
         """Inspect ``var`` on the wrapped model without mechanism handling.
@@ -570,22 +1076,15 @@ class Slice:
         buffers, parameters and submodules. It respects sparse/keyed storage
         when the underlying model exposes a ``key`` attribute.
         """
-        model = object.__getattribute__(self, "model")
-        base_shape = object.__getattribute__(self, "base_shape")
-        idx = object.__getattribute__(self, "index_spec").index
-
-        if getattr(model, "key", None) is not None:
-            v = getattr(model, var)
-            dummy = torch.tensor(torch.nan, device=v.device, dtype=v.dtype)
-            dummy = model.put(
-                v, dummy, torch.empty(base_shape, device=v.device, dtype=v.dtype)
-            )
-            return dummy[idx]
-        return getattr(model, var)[idx]
+        model = self.model
+        value = getattr(model, var)
+        if not torch.is_tensor(value):
+            raise TypeError(f"{type(model).__name__}.{var} is not tensor-valued.")
+        return self._read_tensor(model, var, value)
 
     def get(self, var: str, mechanism: Optional[str] = None) -> torch.Tensor:
         """
-        Convenience alias for :meth:`inspect` returning a tensor.
+        Convenience alias for :meth:`inspect` returning a tensor snapshot.
 
         This method simply forwards to :meth:`inspect` and is provided for
         readability in user code that predominantly deals with tensor-valued
@@ -601,7 +1100,7 @@ class Slice:
         Returns
         -------
         torch.Tensor
-            Tensor view of the requested variable restricted to the slice.
+            Non-aliasing tensor snapshot restricted to the slice.
 
         Examples
         --------
@@ -617,10 +1116,9 @@ class Slice:
         Write ``value`` into ``var`` constrained to the slice.
 
         This is the main low-level mutator for updating state on a subset of
-        compartments. The write is performed in-place under ``torch.no_grad()``
-        and followed by ``detach_()`` on the underlying tensor to drop autograd
-        history while preserving identity (important when the tensor is a
-        registered buffer).
+        compartments. The complete update is validated before an in-place copy
+        under ``torch.no_grad()``. Registered buffer or Parameter identity,
+        dtype, device and unrelated entries are preserved.
 
         Parameters
         ----------
@@ -651,28 +1149,14 @@ class Slice:
 
             soma.set("m", new_m_values, mechanism="NaTs2t")
         """
-        model = object.__getattribute__(self, "model")
-        idx = object.__getattribute__(self, "index_spec").index
+        model = self.model
 
         if mechanism is not None:
             mech = model.mech.mechanisms[mechanism]
-            if mech.key is None:
-                with torch.no_grad():
-                    getattr(mech, var)[idx] = value
-                    setattr(mech, var, getattr(mech, var).detach())
-                return
+            mapper = mech if self._is_mapper(mech) else None
+            return self._write_tensor(mech, var, value, mapper=mapper)
 
-            dummy = torch.tensor(torch.nan, device=model.device(), dtype=model.dtype())
-            dummy = mech.put(getattr(mech, var), dummy, model.v)
-            with torch.no_grad():
-                dummy[idx] = value
-                getattr(mech, var).copy_(mech.get(dummy))
-                setattr(mech, var, getattr(mech, var).detach())
-            return
-
-        with torch.no_grad():
-            getattr(model, var)[idx] = value
-            setattr(model, var, getattr(model, var).detach())
+        return self._write_tensor(model, var, value)
 
     def inject(self, waveform):
         """
@@ -705,8 +1189,8 @@ class Slice:
         """
         if self.is_empty:
             return  # no-op for empty slices
-        model = object.__getattribute__(self, "model")
-        index_spec = object.__getattribute__(self, "index_spec")
+        model = self.model
+        index_spec = self._sync()
         if hasattr(model, "register_injection"):
             model.register_injection(waveform, index_spec)
         else:
@@ -725,7 +1209,7 @@ class Slice:
                 raise ValueError("Provide either slot_index or local_index, not both.")
             slot_index = local_index
         return SynapseSlots.from_region(
-            self.model,
+            object.__getattribute__(self, "root_model"),
             synapse,
             region_index=self.index,
             slot_index=slot_index,
@@ -794,10 +1278,13 @@ class Slice:
             preserve_duplicate_indices = bool(
                 preserve_duplicate_indices or preserve_multiplicity
             )
-        object.__getattribute__(self, "model").insert(
+        structural_index = self._core_index_spec(
+            preserve_multiplicity=preserve_duplicate_indices and int(copies) == 1
+        )
+        self.model.insert(
             mechanism,
             alias=alias,
-            index_spec=object.__getattribute__(self, "index_spec"),
+            index_spec=structural_index,
             ic=ic,
             preserve_duplicate_indices=preserve_duplicate_indices,
             copies=copies,
@@ -834,16 +1321,15 @@ class Slice:
         """
         if self.is_empty:
             return  # no-op for empty slices
-        model = object.__getattribute__(self, "model")
-        index_spec = object.__getattribute__(self, "index_spec")
+        model = self.model
         model.parametrize(
             name,
             value,
-            key=index_spec.to_key(model),
+            key=self._parameter_key(model, name),
             alias=alias,
         )
 
-    def label(self, name: str):
+    def label(self, name: str, *, replace: bool = False):
         """
         Attach a label to the slice for convenient, reusable access.
 
@@ -855,7 +1341,17 @@ class Slice:
         Parameters
         ----------
         name : str
-            Attribute name to use as the label.
+            Non-private Python identifier to use as the label. Existing model
+            attributes and Slice API names are reserved.
+        replace : bool, optional
+            Replace an existing Slice label with the same owner and name. This
+            never permits replacement of a non-label attribute. Defaults to
+            ``False``.
+
+        Returns
+        -------
+        Slice
+            This Slice, allowing ``region = pop[key].label("region")``.
 
         Examples
         --------
@@ -879,14 +1375,52 @@ class Slice:
 
             distal.distal_proximal.set("gNa", 0.0)
         """
+        if not isinstance(name, str):
+            raise TypeError("Slice label names must be strings.")
+        if not name.isidentifier() or keyword.iskeyword(name) or name.startswith("_"):
+            raise ValueError(
+                f"Slice label {name!r} must be a non-private Python identifier."
+            )
+
         parent_slice = object.__getattribute__(self, "parent_slice")
         if parent_slice is not None:
-            # Attach label to the *wrapper* safely (avoid buffer interception)
-            object.__setattr__(parent_slice, name, self)
-            return
-        model = object.__getattribute__(self, "model")
-        setattr(model, name, self)
-        model._labels[name] = self
+            owner = parent_slice
+            registry = object.__getattribute__(owner, "_labels")
+            owner_description = "parent Slice"
+        else:
+            if object.__getattribute__(self, "module_path"):
+                raise ValueError("Only population-backed Slices can be labelled.")
+            owner = object.__getattribute__(self, "root_model")
+            registry = getattr(owner, "_labels", None)
+            if not isinstance(registry, dict):
+                raise ValueError("The owning model does not support Slice labels.")
+            owner_description = type(owner).__name__
+
+        existing = registry.get(name)
+        if existing is self:
+            return self
+        if existing is not None and not replace:
+            raise ValueError(
+                f"Slice label {name!r} already exists on {owner_description}."
+            )
+
+        replaceable = existing is not None and (
+            (name in vars(owner) and vars(owner)[name] is existing)
+            or getattr(owner, name, None) is existing
+        )
+        if hasattr(owner, name) and not (replace and replaceable):
+            raise ValueError(
+                f"Slice label {name!r} conflicts with an existing attribute on "
+                f"{owner_description}."
+            )
+
+        # Validation above completes before either namespace is changed.
+        if parent_slice is not None:
+            object.__setattr__(owner, name, self)
+        else:
+            setattr(owner, name, self)
+        registry[name] = self
+        return self
 
     def __getitem__(self, key):
         """
@@ -920,19 +1454,22 @@ class Slice:
             direct = pop[:, 7:9]
             assert torch.allclose(mid_distal.v, direct.v)
         """
-        model = object.__getattribute__(self, "model")
+        self._sync()
+        root = object.__getattribute__(self, "root_model")
         idx = compose_indices(
-            model.shape,
-            object.__getattribute__(self, "index"),
+            root.shape,
+            self.index,
             key,
-            device=model.device(),
+            device=root.device(),
         )
-        idx = parse_key(idx, model.shape, device=model.device())
+        idx = parse_key(idx, root.shape, device=root.device())
         return type(self)(
-            model,
+            self.model,
             idx,
             parent_slice=self,
-            base_shape=object.__getattribute__(self, "base_shape"),
+            base_shape=self.base_shape,
+            root_model=root,
+            module_path=object.__getattribute__(self, "module_path"),
         )
 
     # -------------------------
@@ -944,50 +1481,32 @@ class Slice:
 
         Behaviour is as follows:
 
-        * Writing an attribute whose name matches a registered buffer on the
-          underlying PyTorch module writes only to the slice portion of that
-          buffer (and then detaches it).
-        * Assignments to reserved/internal attributes (``model``,
-          ``index_spec``, ``base_shape``, ``parent_slice``) bypass interception.
-        * All other assignments set attributes directly on the :class:`Slice`
-          instance itself.
+        * Writing an attribute whose name matches a registered spatial buffer
+          or Parameter uses the same validated writer as :meth:`set`.
+        * Internal attributes used by Slice itself bypass interception.
+        * Unknown, global, and non-spatial assignments raise rather than
+          creating transient wrapper metadata.
 
-        This allows natural syntax such as ``pop[:, 0].v = value`` for buffer
-        updates, while still permitting arbitrary user-defined attributes on a
-        slice object.
+        This allows natural syntax such as ``pop[:, 0].v = value`` while making
+        misspelled field names deterministic failures.
         """
-        # Always allow internal fields
-        if name in Slice._RESERVED:
+        # Always allow internal fields used by construction and synchronization.
+        if name in type(self)._RESERVED:
             object.__setattr__(self, name, value)
             return
 
-        # Safely fetch model without triggering our __getattr__
-        model = object.__getattribute__(self, "model")
-        base_shape = object.__getattribute__(self, "base_shape")
-        idx = object.__getattribute__(self, "index_spec").index
-
-        # Intercept writes to model buffers
-        buffers = model._buffers  # nn.Module guarantee
-        if name in buffers:
-            buf = buffers[name]
-            if getattr(model, "key", None) is not None:
-                with torch.no_grad():
-                    dummy = torch.tensor(torch.nan, device=buf.device, dtype=buf.dtype)
-                    dummy = model.put(
-                        buf,
-                        dummy,
-                        torch.empty(base_shape, device=buf.device, dtype=buf.dtype),
-                    )
-                    dummy[idx] = value
-                    buffers[name] = model.get(dummy).detach()
-                    return
-            with torch.no_grad():
-                buf[idx] = value
-                buffers[name] = buf.detach()  # drop history but keep identity
+        model = self.model
+        if name in getattr(model, "_buffers", {}) or name in getattr(
+            model, "_parameters", {}
+        ):
+            self._write_tensor(model, name, value)
             return
 
-        # Otherwise set on this wrapper
-        object.__setattr__(self, name, value)
+        raise AttributeError(
+            f"Cannot assign unknown or non-writable Slice attribute {name!r}. "
+            "Slice assignment is limited to registered spatial buffers and "
+            "Parameters; use slice.set(...) for an explicit field write."
+        )
 
     def __getattr__(self, name: str) -> Any:
         """
@@ -996,10 +1515,10 @@ class Slice:
         Resolution order:
 
         1. If ``name`` matches a buffer on the underlying PyTorch module,
-           return a sliced view via :meth:`_inspect`.
+           return a sliced snapshot via :meth:`_inspect`.
         2. If ``name`` matches a submodule, return a new :class:`Slice` that
            wraps the submodule but shares this slice's :class:`IndexSpec`.
-        3. If ``name`` matches a parameter, return a sliced view of that
+        3. If ``name`` matches a parameter, return a sliced snapshot of that
            parameter via :meth:`_inspect`.
         4. Otherwise, delegate attribute access directly to the wrapped model.
 
@@ -1028,9 +1547,18 @@ class Slice:
         """
         # Only runs if normal lookup failed
         try:
-            model = object.__getattribute__(self, "model")
+            object.__getattribute__(self, "root_model")
         except AttributeError:
-            raise AttributeError(f"{type(self).__name__} has no attribute {name!r}")
+            raise AttributeError(
+                f"{type(self).__name__} has no attribute {name!r}"
+            ) from None
+        model = object.__getattribute__(self, "_sync_model")()
+
+        self._sync_index()
+
+        nested_labels = object.__getattribute__(self, "_labels")
+        if name in nested_labels:
+            return nested_labels[name]
 
         # Buffers: return sliced/inspected view
         if name in model._buffers:
@@ -1042,38 +1570,42 @@ class Slice:
             return type(self)(
                 sub,
                 object.__getattribute__(self, "index_spec"),
-                base_shape=object.__getattribute__(self, "base_shape"),
+                base_shape=self.base_shape,
+                root_model=object.__getattribute__(self, "root_model"),
+                module_path=object.__getattribute__(self, "module_path") + (name,),
             )
 
         if hasattr(model, "_labels"):
             if name in model._labels:
-                model = object.__getattribute__(self, "model")
-                idx = compose_indices(
-                    model.shape,
-                    model._labels[name].index,
-                    object.__getattribute__(self, "index"),
-                    device=model.device(),
-                )
-                idx = parse_key(idx, model.shape, device=model.device())
-                return type(self)(
-                    model,
-                    idx,
-                    base_shape=object.__getattribute__(self, "base_shape"),
+                raise AttributeError(
+                    f"Population label {name!r} belongs to the population, not "
+                    "to an arbitrary Slice. Access it from the population (or "
+                    "index the labelled Slice explicitly)."
                 )
 
         # Parameters (optional): often handy to read through
         if name in model._parameters:
             return self._inspect(name)
 
-        # Fallback: delegate to the wrapped model (methods, attrs, etc.)
-        return getattr(model, name)
+        # Derived tensor properties (for example ``Population.area``) retain
+        # Slice semantics even though they are not registered buffers.
+        value = getattr(model, name)
+        if torch.is_tensor(value):
+            return self._read_tensor(model, name, value)
+
+        kind = "method" if callable(value) else "attribute"
+        raise AttributeError(
+            f"{name!r} is a model-wide {kind}, not Slice-scoped state. "
+            f"Access slice.model.{name} explicitly if whole-model behavior is "
+            "intended."
+        )
 
     # -------------------------
     # Misc
     # -------------------------
     def __repr__(self):
         """Return a developer-friendly representation summarising the selection."""
-        spec = object.__getattribute__(self, "index_spec")
+        spec = self._sync()
         return (
             f"Slice(index={spec.index}, shape={spec.shape}, is_scalar={spec.is_scalar})"
         )
@@ -1082,28 +1614,11 @@ class Slice:
         """
         Promote the slice to include a leading batch dimension.
 
-        This internal helper prepends a leading ``slice(None)`` to the current
-        index (unless the first element is already an ellipsis), recomputes the
-        resulting shape, and updates the :class:`IndexSpec` in-place. It is
-        typically used when switching from unbatched to batched simulation
-        layouts.
+        This internal helper synchronizes the index with every newly added
+        leading batch axis, recomputes the result shape, and updates the shared
+        :class:`IndexSpec` in place.
         """
-        model = object.__getattribute__(self, "model")
-        index_spec = object.__getattribute__(self, "index_spec")
-
-        current_index = index_spec.index
-        new_index = (
-            current_index
-            if (current_index and current_index[0] is Ellipsis)
-            else (slice(None),) + current_index
-        )
-        index_spec.index = new_index
-
-        test = torch.empty(model.shape, device=model.device(), dtype=model.dtype())[
-            new_index
-        ]
-        index_spec.is_scalar = test.ndim == 0
-        index_spec.shape = test.shape
+        self._sync()
 
 
 class Sliceable:
@@ -1181,7 +1696,7 @@ class Sliceable:
             soma.label("soma")
             pop.soma.inject(step_current)
         """
-        index = parse_key(key, self.shape)
+        index = parse_key(key, self.shape, device=self.device())
         return Slice(self, index)
 
 
@@ -1227,7 +1742,8 @@ def compose_indices(shape, idx1, idx2, *, device="cpu"):
         torch.allclose(t[idx1][idx2], t[idx3])
 
     holds. It is used to implement slicing of slices without materialising
-    intermediate tensors.
+    intermediate *state* tensors; it does allocate an integer coordinate map
+    with ``prod(shape)`` entries.
 
     Parameters
     ----------
@@ -1271,6 +1787,19 @@ def compose_indices(shape, idx1, idx2, *, device="cpu"):
     return idx3  # use as t[idx3]
 
 
+def _own_index_item(item, *, device=None):
+    """Copy mutable array indices so a Slice cannot change behind its metadata."""
+    if torch.is_tensor(item):
+        return item.detach().clone().to(device=device)
+    if isinstance(item, np.ndarray):
+        return torch.as_tensor(item.copy(), device=device)
+    if isinstance(item, list):
+        if not item:
+            return torch.empty(0, device=device, dtype=torch.long)
+        return torch.as_tensor(item, device=device).clone()
+    return item
+
+
 def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
     """Normalise an indexing key for a tensor with ``shape``.
 
@@ -1300,16 +1829,20 @@ def parse_key(key: Any, shape: Sequence[int], device=None) -> IndexSpec:
     >>> spec.index
     (slice(None, None, None), 0)
     >>> spec.shape
-    (10,)
+    torch.Size([10])
     >>> spec.is_scalar
     False
     """
-    out = torch.empty(shape, device=device)[key]  # type: ignore
+    shape = tuple(int(dim) for dim in shape)
+    raw_index = key if isinstance(key, tuple) else (key,)
+    index = tuple(_own_index_item(item, device=device) for item in raw_index)
+    out = torch.empty(shape, device=device, dtype=torch.bool)[index]
 
     return IndexSpec(
-        index=key,
+        index=index,
         is_scalar=out.ndim == 0,
         shape=out.shape,
+        source_shape=shape,
     )
 
 
@@ -1367,8 +1900,15 @@ def concat_slices(slices: Sequence[Slice], dim: int = -1) -> Slice:
 
     return Slice(
         base_model,
-        IndexSpec(index=new_index, shape=final_shape, is_scalar=False),
+        IndexSpec(
+            index=new_index,
+            shape=torch.Size(final_shape),
+            is_scalar=False,
+            source_shape=base_shape,
+        ),
         base_shape=base_shape,
+        root_model=object.__getattribute__(slices[0], "root_model"),
+        module_path=object.__getattribute__(slices[0], "module_path"),
     )
 
 
@@ -1405,7 +1945,8 @@ def _assess_shape_compatibility(shapes: Sequence[Sequence[int]], dim: Optional[i
         for shape in shapes[1:]:
             if len(shape) != len(ref_shape):
                 raise ValueError(
-                    "All slices must have the same number of dimensions for concatenation."
+                    "All slices must have the same number of dimensions for "
+                    "concatenation."
                 )
             for d in range(len(shape)):
                 if d != dim and shape[d] != ref_shape[d]:

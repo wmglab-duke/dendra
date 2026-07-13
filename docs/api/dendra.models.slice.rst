@@ -1,6 +1,9 @@
 dendra.models.slice
 ===================
 
+The user-facing semantics, including indexing, mutation, labels, batching,
+rebuilds, and repeated-index behavior, are defined in :doc:`../slices`.
+
 Slice
 -----
 .. autoclass:: dendra.models.slice.Slice
