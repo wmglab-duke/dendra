@@ -1,3 +1,13 @@
+## v0.18.1 (2026-07-13)
+
+### Fix
+
+- **slice**: preserve mechanism parameterizations across rebuilds
+- **slice**: define safe indexing mutation and lifecycle semantics
+- **batching**: standardize and document dendra stim batching semantics
+- **solvers**: harden implicit and symbolic solver correctness
+- **networks**: make state cache translation exact across runtimes
+
 ## v0.18.0 (2026-07-13)
 
 ### Feat
