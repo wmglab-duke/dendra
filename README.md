@@ -77,15 +77,15 @@ python -c "import torch, triton; assert torch.cuda.is_available()"
 python -m pytest tests -W error -m cuda
 ```
 
-Keep accelerator coverage artifacts separate from the required CPU/NEURON percentage. Kernel correctness is enforced primarily through dense numerical oracles, gradient checks, boundary-shape contracts, and backend-equivalence tests.
+Keep accelerator coverage artifacts separate from the required CPU/NEURON percentage. Kernel correctness is enforced primarily through dense numerical oracles, gradient checks, boundary-shape contracts, and backend-equivalence tests. The required CPU report uses `.coveragerc.cpu` to omit only the seven accelerator-only Triton kernel bodies; their contracts, dispatch and fallback paths, network Triton operations, and GPU diagnostics remain in its coverage denominator.
 
 To measure both statement and branch coverage, print uncovered line numbers in the terminal, and generate a browsable HTML report:
 
 ```bash
-python -m pytest tests -W error -m "cpu or (neuron and not cuda)" --cov=dendra --cov-branch --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html
+python -m pytest tests -W error -m "cpu or (neuron and not cuda)" --cov=dendra --cov-branch --cov-config=.coveragerc.cpu --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html
 ```
 
-The `TOTAL` row is the overall coverage result. Open `htmlcov/index.html` to inspect coverage by module and identify untested lines and branches. The required lane installs and exercises NEURON; CUDA and Triton remain outside this coverage measurement, and results can still vary when optional CPU solvers are unavailable.
+The `TOTAL` row is the overall coverage result. Open `htmlcov/index.html` to inspect coverage by module and identify untested lines and branches. The required lane installs and exercises NEURON; accelerator execution remains outside this measurement, while CPU-testable CUDA/Triton interfaces remain covered. Results can still vary when optional CPU solvers are unavailable.
 
 GitLab CI runs this same non-CUDA branch-coverage measurement for every pipeline, enforces a ratcheted global minimum, and retains JSON, browsable HTML, and Cobertura reports. Critical modules also have individual floors configured in `pyproject.toml`; validate them locally after generating `coverage.json` with:
 

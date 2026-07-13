@@ -1276,10 +1276,9 @@ def vis_threshold_mollweide_2d(
 # Optional: use Matplotlib colormaps if you pass a Matplotlib name
 def _mpl_to_plotly_colorscale(cmap_name_or_obj="viridis", n=256):
     try:
-        import matplotlib.cm as cm
         import matplotlib.colors as mcolors
 
-        cm_obj = cm.get_cmap(cmap_name_or_obj)
+        cm_obj = mpl.colormaps.get_cmap(cmap_name_or_obj)
         return [[i / (n - 1), mcolors.to_hex(cm_obj(i / (n - 1)))] for i in range(n)]
     except Exception:
         # Fallback to a sensible Plotly scale if matplotlib isn't available
@@ -1694,7 +1693,12 @@ def vis_morphology_by_layer(
     x_span = np.ptp(xs)
     y_span = np.ptp(ys)
 
-    ratio = x_span / y_span if y_span > 0 else 1
+    ratio = x_span / y_span if y_span > 0 else 1.0
+    if not np.isfinite(ratio) or ratio <= 0:
+        # A valid unbranched tree has every node at the same horizontal
+        # position.  Use a square canvas rather than dividing by its zero
+        # horizontal span below.
+        ratio = 1.0
 
     if ratio > 1:
         figsize = (8 * ratio, 8)
