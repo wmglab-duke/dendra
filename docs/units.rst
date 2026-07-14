@@ -52,6 +52,13 @@ membrane area in cm² or axial length in cm. Public ``model.i_membrane`` is an
 absolute, outward-positive transmembrane current in mA; it is not a current
 density.
 
+Native :class:`~dendra.models.morphology.Morphology` declarations use these
+same morphology units. Stylized ``L``/``diam`` values and pt3d coordinates are
+in µm, ``rhoa`` is in Ω·cm, and ``cm`` is in µF/cm². Compilation retains the
+canonical geometry in binary64 before a constructed model deliberately casts
+its buffers to the configured model dtype. See :ref:`native-morphologies` for
+the complete section and connection contract.
+
 Distributed membrane-mechanism contract
 ----------------------------------------
 
@@ -255,3 +262,4 @@ See also
 * :doc:`mechanisms`
 * :doc:`advanced/A0_mechanisms_and_ions_materials`
 * :doc:`api/dendra.models.mechanisms`
+* :ref:`native-morphologies`

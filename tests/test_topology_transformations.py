@@ -14,6 +14,7 @@ from dendra.models.graph import (
     share_topology_isomorphic,
     share_topology_labeled,
 )
+from dendra.models.integrators.tree import _dhs_multi
 from dendra.models.mod import pas
 from dendra.models.multi import (
     MultiPopulation,
@@ -361,6 +362,89 @@ def test_concat_models_preserves_state_geometry_labels_stimuli_and_mechanisms():
     )
 
 
+def test_plain_population_concat_preserves_physical_fields_and_voltage_step():
+    left = dn.Population(
+        N=1,
+        C=2,
+        v_init=[-58.0, -62.0],
+        cm=torch.tensor([[0.7, 1.9]], dtype=DTYPE),
+        rhoa=torch.tensor([[71.0, 113.0]], dtype=DTYPE),
+        cm_scale=0.65,
+        rhoa_scale=1.4,
+        area_scale=1.7,
+        dtype=DTYPE,
+    )
+    right = dn.Population(
+        N=2,
+        C=1,
+        v_init=-66.0,
+        cm=torch.tensor([[2.3], [3.1]], dtype=DTYPE),
+        rhoa=torch.tensor([[127.0], [149.0]], dtype=DTYPE),
+        cm_scale=1.55,
+        rhoa_scale=0.75,
+        area_scale=0.8,
+        dtype=DTYPE,
+    )
+    left.diam.copy_(torch.tensor([[3.0, 7.0]], dtype=DTYPE))
+    left.dx.copy_(torch.tensor([[11.0, 17.0]], dtype=DTYPE))
+    right.diam.copy_(torch.tensor([[13.0], [19.0]], dtype=DTYPE))
+    right.dx.copy_(torch.tensor([[23.0], [29.0]], dtype=DTYPE))
+    left.insert(pas, g=0.0017, e=-71.0)
+    right.insert(pas, g=0.0023, e=-68.0)
+
+    multi = dn.concat_models({"left": left, "right": right})
+    expected_fields = {
+        name: torch.cat(
+            [
+                torch.broadcast_to(getattr(population, name), population.shape).reshape(
+                    -1
+                )
+                for population in (left, right)
+            ]
+        ).reshape(1, -1)
+        for name in (
+            "cm",
+            "rhoa",
+            "cm_scale",
+            "rhoa_scale",
+            "area_scale",
+            "diam",
+            "dx",
+            "area",
+        )
+    }
+    for name, expected in expected_fields.items():
+        torch.testing.assert_close(getattr(multi, name), expected)
+
+    # Initialization repopulates RANGE/GLOBALP buffers. Projected physical
+    # values and scale factors must therefore be constructor state rather than
+    # transient copies.
+    for population in (left, right, multi):
+        population.initialize()
+    for name, expected in expected_fields.items():
+        torch.testing.assert_close(getattr(multi, name), expected)
+
+    dt = 0.075
+    left_intra = torch.tensor([[2.0e-8, -3.0e-8]], dtype=DTYPE)
+    right_intra = torch.tensor([[5.0e-8], [-7.0e-8]], dtype=DTYPE)
+    for population, intra in ((left, left_intra), (right, right_intra)):
+        population.integrator._initialize(population, dt)
+        population.integrator.step(population, dt, intra=intra)
+    expected_voltage = torch.cat([left.v.reshape(-1), right.v.reshape(-1)]).reshape(
+        1, -1
+    )
+
+    multi.integrator._initialize(multi, dt)
+    multi.integrator.step(
+        multi,
+        dt,
+        intra=torch.cat([left_intra.reshape(-1), right_intra.reshape(-1)]).reshape(
+            1, -1
+        ),
+    )
+    torch.testing.assert_close(multi.v, expected_voltage, rtol=1e-13, atol=1e-13)
+
+
 def test_multi_v_init_overrides_validate_names_shapes_and_preserve_omissions():
     left = _population(n=2, c=2, v_init=[-60.0, -61.0])
     right = _population(n=1, c=2, v_init=[-62.0, -63.0])
@@ -412,7 +496,7 @@ def test_multi_batch_resynchronizes_component_label_lifecycle():
     assert multi.composite_only.shape == (2, 1)
 
 
-def test_multi_validation_rejects_empty_batched_mixed_and_heterogeneous_inputs():
+def test_multi_validation_rejects_empty_batched_and_heterogeneous_inputs():
     with pytest.raises(ValueError, match="At least one"):
         MultiPopulation()
     with pytest.raises(ValueError, match="At least one"):
@@ -430,10 +514,34 @@ def test_multi_validation_rejects_empty_batched_mixed_and_heterogeneous_inputs()
         MultiPopulation(double=double, single=single)
 
     tree = dn.Tree.from_graph(_morphology_graph(), dtype=DTYPE)
-    with pytest.raises(TypeError, match="Incompatible"):
-        _assess_type_and_make_integrator({"plain": double, "tree": tree})
+    mixed_integrator = _assess_type_and_make_integrator({"plain": double, "tree": tree})
+    assert issubclass(mixed_integrator, _dhs_multi)
     assert callable(_assess_type_and_make_integrator({"plain": double}))
     assert callable(_assess_type_and_make_integrator({"tree": tree}))
+
+
+def test_multi_solver_selection_rejects_block_state_tree_and_axon_models():
+    ext_tree = dn.ExtCellTree.from_graph(_morphology_graph(), dtype=DTYPE)
+    ext_axon = dn.ExtCellAxon(n_comp=3, dtype=DTYPE)
+
+    for name, population in (("tree", ext_tree), ("axon", ext_axon)):
+        with pytest.raises(TypeError, match="require a block multi-solver"):
+            _assess_type_and_make_integrator({name: population})
+        with pytest.raises(TypeError, match="require a block multi-solver"):
+            MultiPopulation(
+                integrator=lambda *args, **kwargs: None, **{name: population}
+            )
+
+
+def test_multi_solver_selection_detects_custom_vc_state_capability():
+    population = _population(n=1, c=1)
+
+    class BlockStateIntegrator:
+        v_vars = ["v", "vc"]
+
+    population._integrator_class = BlockStateIntegrator
+    with pytest.raises(TypeError, match="require a block multi-solver"):
+        _assess_type_and_make_integrator({"custom": population})
 
 
 def test_gather_morphology_honors_explicit_domains_and_cylinder_fallback():

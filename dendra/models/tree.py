@@ -1,5 +1,6 @@
 """Tree-shaped population models and supporting utilities."""
 
+import keyword
 import math
 
 import networkx as nx
@@ -9,6 +10,62 @@ import torch.nn.functional as F
 from dendra.models.integrators import dhs
 
 from .core import Population
+from .morphology import CompartmentGraph, Morphology
+
+_RESERVED_COMPARTMENT_LABELS = frozenset({"internal_nodes"})
+
+
+def _is_safe_slice_label(model, name):
+    """Return whether a canonical morphology label can become an attribute."""
+    return (
+        isinstance(name, str)
+        and name not in _RESERVED_COMPARTMENT_LABELS
+        and name.isidentifier()
+        and not keyword.iskeyword(name)
+        and not name.startswith("_")
+        and (name in model._labels or not hasattr(model, name))
+    )
+
+
+def _register_compartment_graph_labels(model, graph, ordered=None):
+    """Install collision-free canonical regions as population Slice labels.
+
+    ``ordered`` may override storage order for a label. Native Section labels
+    use it to retain increasing Section coordinate even when a child is attached
+    through its ``1`` end and therefore appears reversed in tree traversal.
+    """
+    label_names = sorted(
+        {label for labels in graph.metadata.labels for label in labels}
+    )
+    for label in label_names:
+        indices = (
+            tuple(ordered[label])
+            if ordered is not None and label in ordered
+            else graph.nodes_with_label(label)
+        )
+        if not indices or not _is_safe_slice_label(model, label):
+            continue
+        existing = model._labels.get(label)
+        candidate = model[:, torch.as_tensor(indices, device=model.device())]
+        if existing is not None:
+            if ordered is not None and label in ordered:
+                candidate.label(label, replace=True)
+            # Otherwise legacy Tree labels (soma/dend/apic/axon) already use
+            # the same public name and retain their established search order.
+            continue
+        candidate.label(label)
+
+
+def _register_canonical_internal_nodes(model, graph):
+    """Define material nodes from canonical kind metadata, not node names."""
+    indices = tuple(
+        node for node, kind in enumerate(graph.metadata.kind) if kind == "compartment"
+    )
+    if not indices:
+        raise ValueError("A Tree compartment graph must contain a material node.")
+    model[:, torch.as_tensor(indices, device=model.device())].label(
+        "internal_nodes", replace=True
+    )
 
 
 def _normalize_tree_graph(graph):
@@ -311,6 +368,7 @@ class Tree(Population):
             integrator = dhs()
         super().__init__(N, C, integrator=integrator, **kwargs)
         self._graph = graph
+        self._compartment_graph = None
         names = []
 
         if graph is not None:
@@ -356,6 +414,16 @@ class Tree(Population):
     def graph(self):
         """networkx.DiGraph: Underlying morphology graph."""
         return self._graph
+
+    @property
+    def compartment_graph(self):
+        """Canonical immutable morphology snapshot aligned to model storage.
+
+        The legacy :attr:`graph` view remains available for NetworkX-based
+        interoperability. ``compartment_graph`` records the validated geometry,
+        topology, material domains, and provenance used at construction time.
+        """
+        return self._compartment_graph
 
     def material_volume(self, domain="intracellular"):
         """Return the volume/mass buffer appropriate for a material domain.
@@ -409,6 +477,7 @@ class Tree(Population):
             or gives a node more than one parent.
         """
         graph = _normalize_tree_graph(graph)
+        compartment_graph = CompartmentGraph.from_networkx(graph)
         C = len(graph.nodes)
         data = gather_morphology(graph)
         diffusion_edges = gather_diffusion_edges(graph)
@@ -439,6 +508,76 @@ class Tree(Population):
         tree.slice("axon").label("axon")
         tree.slice("dend").label("dend")
         tree.slice("apic").label("apic")
+        tree._compartment_graph = compartment_graph
+        _register_canonical_internal_nodes(tree, compartment_graph)
+        _register_compartment_graph_labels(tree, compartment_graph)
+        return tree
+
+    @classmethod
+    def from_compartment_graph(cls, graph, N=1, integrator=None, **kwargs):
+        """Construct a Tree from Dendra's canonical compartment graph.
+
+        Parameters
+        ----------
+        graph : dendra.models.morphology.CompartmentGraph
+            Immutable scalar compartment resistor tree.
+        N : int, optional
+            Number of copies of the morphology.
+        integrator : callable, optional
+            Scalar tree integrator factory.
+        **kwargs
+            Membrane parameter overrides forwarded to :meth:`from_graph`.
+        """
+        if cls.from_graph.__func__ is not Tree.from_graph.__func__:
+            raise NotImplementedError(
+                f"{cls.__name__}.from_compartment_graph requires an explicit "
+                "adapter because this subclass defines custom from_graph semantics."
+            )
+        if not isinstance(graph, CompartmentGraph):
+            raise TypeError("graph must be a CompartmentGraph.")
+        tree = cls.from_graph(graph.to_networkx(), N=N, integrator=integrator, **kwargs)
+        tree._compartment_graph = graph
+        _register_compartment_graph_labels(tree, graph)
+        return tree
+
+    @classmethod
+    def from_morphology(cls, morphology, N=1, integrator=None, **kwargs):
+        """Discretize a native Section morphology and construct a Tree.
+
+        Native and NEURON-authored morphologies converge on the same scalar
+        compartment resistor-graph contract. Compilation is a snapshot:
+        subsequently adding Sections to the source builder cannot mutate the
+        constructed model.
+
+        Parameters
+        ----------
+        morphology : dendra.models.morphology.Morphology
+            Connected native Section tree with explicit ``nseg`` values.
+        N : int, optional
+            Number of population instances.
+        integrator : callable, optional
+            Scalar tree integrator factory.
+        **kwargs
+            Membrane parameter overrides forwarded to :meth:`from_graph`.
+        """
+        if not isinstance(morphology, Morphology):
+            raise TypeError("morphology must be a Morphology.")
+        graph = morphology.compile()
+        tree = cls.from_compartment_graph(graph, N=N, integrator=integrator, **kwargs)
+
+        ordered_labels = {}
+        for section in morphology.sections:
+            section_nodes = sorted(
+                (
+                    node
+                    for node, section_name in enumerate(graph.metadata.section_name)
+                    if section_name == section.name
+                ),
+                key=lambda node: graph.metadata.segment_index[node],
+            )
+            for label in section.labels:
+                ordered_labels.setdefault(label, []).extend(section_nodes)
+        _register_compartment_graph_labels(tree, graph, ordered=ordered_labels)
         return tree
 
     @classmethod

@@ -26,6 +26,51 @@ Core
    :members:
 
 
+Native morphology construction
+------------------------------
+
+Dendra-native :class:`~dendra.models.morphology.Morphology` declarations and
+NEURON-authored morphologies both produce the scalar compartment-resistor graph
+consumed by :class:`~dendra.models.tree.Tree`. See
+:doc:`dendra.models.morphology` for the declaration and canonical graph APIs,
+and :doc:`../basics/02a_native_morphologies` for the connection contract and a
+worked example.
+
+
+Packed scalar populations
+-------------------------
+
+:func:`dendra.concat_models` packs independent scalar systems into one solver
+launch without adding electrical edges between them. Ordinary ``Population``
+and ``SingleCompartment`` models are represented as one-node trees, ``Tree``
+retains its rooted compartment graph, and ``Unmyelinated``/``Myelinated`` use
+live tensor path geometry. These component types may be mixed, then explicitly
+batched on the returned model:
+
+.. code-block:: python
+
+   packed = dendra.concat_models(
+       {
+           "point_cells": point_population,
+           "dendrites": tree_population,
+           "fibres": axon_population,
+       },
+       write_back=True,
+   )
+   packed.batch(32)
+
+All components must initially be unbatched and share a device and dtype.
+``write_back=True`` keeps each component's public voltage synchronized after a
+step; ``False`` updates only the composite voltage. Finite-extracellular
+``ExtCellTree``/``ExtCellAxon`` states require a block multi-solver and are
+rejected by this scalar path.
+
+.. autofunction:: dendra.models.multi.concat_models
+
+.. autoclass:: dendra.models.multi.MultiPopulation
+   :members:
+
+
 Finite two-layer extracellular models
 -------------------------------------
 

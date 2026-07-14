@@ -23,13 +23,7 @@ import torch
 import dendra.models.callbacks as callbacks
 import dendra.models.mod as mod
 
-from .const import (
-    FARADAY,
-    PI,
-    TAU,
-    E,
-    R,
-)
+from .const import FARADAY, PI, TAU, E, R
 from .helpers import (
     COMPILE_OPTIONS,
     DEVICE,
@@ -48,15 +42,22 @@ from .helpers import (
 )
 from .models import (
     Axon,
+    CompartmentGeometry,
+    CompartmentGraph,
+    CompartmentMetadata,
+    CompartmentTopology,
     DistributionSpec,
     ExtCellAxon,
     ExtCellTree,
+    Morphology,
     Myelinated,
     NetStim,
     Network,
     Population,
     RandomParameterSpec,
     RuntimeNoiseSpec,
+    Section,
+    SectionLocation,
     SingleCompartment,
     SynapseSlots,
     Tree,
@@ -125,6 +126,13 @@ __all__ = [
     "sample_random_parameter",
     "sample_runtime_noise",
     "Population",
+    "Morphology",
+    "Section",
+    "SectionLocation",
+    "CompartmentTopology",
+    "CompartmentGeometry",
+    "CompartmentMetadata",
+    "CompartmentGraph",
     "SingleCompartment",
     "Axon",
     "Unmyelinated",

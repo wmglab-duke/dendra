@@ -1,5 +1,4 @@
 import logging
-import math
 import warnings
 from typing import Optional, Tuple
 
@@ -61,8 +60,8 @@ class _bwd_euler_sc(Integrator):
     def initialize(self, model, dt):
         # model.cm: uF/cm²
         # dt: ms
-        self.cmdt = (1e-6 * model.cm) / (1e-3 * dt)
-        self.area = 2 * math.pi * (1e-4 * model.diam / 2.0) * (1e-4 * model.dx)  # cm²
+        self.cmdt = (1e-6 * model.cm * model.cm_scale) / (1e-3 * dt)
+        self.area = model.area * model.area_scale
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._call_kernel(
@@ -130,8 +129,8 @@ class _bwd_euler_sc_skip(Integrator):
         self.register_buffer("area", torch.tensor(0.0))
 
     def initialize(self, model, dt):
-        self.cmdt = (1e-6 * model.cm) / (1e-3 * dt)
-        self.area = 2 * math.pi * (1e-4 * model.diam / 2.0) * (1e-4 * model.dx)
+        self.cmdt = (1e-6 * model.cm * model.cm_scale) / (1e-3 * dt)
+        self.area = model.area * model.area_scale
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._call_kernel(
@@ -306,13 +305,17 @@ class _bwd_euler_ub(Integrator):
 
         diam = _as_solve_matrix(model.diam, model)
         dx = _as_solve_matrix(model.dx, model)
-        cm = _as_solve_matrix(model.cm, model)
-        rhoa = _as_solve_matrix(model.rhoa, model)
+        cm = _as_solve_matrix(model.cm, model) * _as_solve_matrix(model.cm_scale, model)
+        rhoa = _as_solve_matrix(model.rhoa, model) * _as_solve_matrix(
+            model.rhoa_scale, model
+        )
 
         # ── geometry (all element-wise) ──────────────────────────────
         radius_cm = 1e-4 * diam / 2.0  # µm → cm   (B,K)
         dx_cm = 1e-4 * dx  # µm → cm   (B,K)
-        area_cm2 = 2 * torch.pi * radius_cm * dx_cm  # cm²
+        area_cm2 = _as_solve_matrix(model.area, model) * _as_solve_matrix(
+            model.area_scale, model
+        )
 
         Cm = 1e-6 * cm * area_cm2  # F   (B,K)
         Cm_inv = 1.0 / Cm  # 1/F

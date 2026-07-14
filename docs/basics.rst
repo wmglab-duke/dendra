@@ -12,5 +12,6 @@ Basics
    basics/01c_multicontact.ipynb
    basics/01d_thresholding.ipynb
    basics/02_branched_morphologies.ipynb
+   basics/02a_native_morphologies.rst
    basics/03_networks.ipynb
    basics/04_gradient_descent.ipynb

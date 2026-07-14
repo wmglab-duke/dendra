@@ -4,6 +4,15 @@ from .backend import Backend
 from .core import Axon, Myelinated, Population, SingleCompartment, Unmyelinated
 from .distributions import *
 from .extcell import ExtCellAxon, ExtCellTree
+from .morphology import (
+    CompartmentGeometry,
+    CompartmentGraph,
+    CompartmentMetadata,
+    CompartmentTopology,
+    Morphology,
+    Section,
+    SectionLocation,
+)
 from .multi import MultiPopulation, concat_models
 from .networks import *
 from .random_parameters import *

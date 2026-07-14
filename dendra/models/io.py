@@ -52,8 +52,7 @@ def xyz(seg, extcell=None):
         y_arr = np.array([sec.y3d(i) for i in range(n3d)], dtype=float)
         z_arr = np.array([sec.z3d(i) for i in range(n3d)], dtype=float)
 
-        seg_x = float(seg.x)
-        seg_x = min(max(seg_x, 0.0), 1.0)
+        seg_x = _pt3d_x(sec, float(seg.x))
 
         total_arc = float(arc_l[-1]) if len(arc_l) else 0.0
         if total_arc <= 0.0:
@@ -276,6 +275,18 @@ def _section_orientation(sec) -> int:
     return 0 if orientation < 0.5 else 1
 
 
+def _pt3d_x(sec, section_x: float) -> float:
+    """Map NEURON's logical section coordinate onto stored pt3d arclength.
+
+    ``section_orientation()==1`` means the logical section runs opposite the
+    order of its pt3d points.  NEURON already applies that reversal to segment
+    diameter, area, and axial resistance.  Geometry extracted directly from
+    ``arc3d`` must apply it explicitly as well.
+    """
+    section_x = min(max(float(section_x), 0.0), 1.0)
+    return section_x if _section_orientation(sec) == 0 else 1.0 - section_x
+
+
 def _segment_center(sec, idx: int):
     nseg = int(sec.nseg)
     if not 0 <= int(idx) < nseg:
@@ -333,6 +344,12 @@ def _center_to_endpoint_resistance_ohm(sec, endpoint_x: int) -> float:
     half-segment resistance.  At the opposite endpoint, the endpoint node owns
     it.  Querying the root's parent-facing endpoint directly would return
     NEURON's 1e30-MΩ no-parent sentinel, which is the bug this helper avoids.
+
+    For a reversed section, NEURON also reverses the mapping between logical
+    ``Segment.x`` and stored pt3d arclength.  The last logical centre remains
+    parent-adjacent and owns the correct (possibly tapered) half-segment
+    resistance; raw pt3d geometry consumers must account for the reversal
+    separately via :func:`_pt3d_x`.
     """
     endpoint_x = int(endpoint_x)
     if endpoint_x not in (0, 1):
@@ -461,11 +478,10 @@ def _segment_index(seg) -> int:
 
 
 def _section_s_um(sec, x: float) -> float:
-    """Map normalized section coordinate x in [0, 1] to arclength µm."""
+    """Map logical section coordinate x in [0, 1] to pt3d arclength µm."""
     arc, _ = _section_axis_arrays(sec)
     total = float(arc[-1]) if arc.size else float(getattr(sec, "L", 0.0))
-    x = min(max(float(x), 0.0), 1.0)
-    return x * total
+    return _pt3d_x(sec, x) * total
 
 
 def _diam_at_s_um(s_um: float, arc: np.ndarray, diam: np.ndarray) -> float:
@@ -581,11 +597,12 @@ def segment_volume_um3(seg) -> float:
         return float(np.pi * L * (0.5 * d) ** 2)
 
     idx = _segment_index(seg)
-    total = _section_s_um(sec, 1.0)
+    arc, _ = _section_axis_arrays(sec)
+    total = float(arc[-1]) if arc.size else 0.0
     if total <= 0.0:
         return 0.0
-    s0 = total * idx / nseg
-    s1 = total * (idx + 1) / nseg
+    s0 = _section_s_um(sec, idx / nseg)
+    s1 = _section_s_um(sec, (idx + 1) / nseg)
     return _integrate_section_interval(sec, s0, s1, quantity="volume")
 
 

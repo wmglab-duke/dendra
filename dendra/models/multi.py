@@ -5,11 +5,64 @@ import math
 import torch
 
 from ..helpers import logger
-from .core import Population
+from .core import Axon, Population
 from .integrators import bwd_euler_sc_multi, dhs_multi
 from .tree import Tree
 
 _MISSING = object()
+
+
+def _uses_block_voltage_state(population):
+    """Return whether a population requires a block-valued voltage solve.
+
+    Multi-solver selection must follow the electrical state carried by a model,
+    rather than only its Python inheritance.  In particular, ``ExtCellTree``
+    is a ``Tree`` subclass but its integrator evolves the additional ``vc``
+    circuit state and therefore cannot be passed to scalar DHS.
+    """
+    if getattr(population, "n_layers", 0):
+        return True
+
+    candidates = (
+        getattr(population, "integrator", None),
+        getattr(population, "_integrator_class", None),
+    )
+    return any(
+        "vc" in tuple(getattr(candidate, "v_vars", ()))
+        for candidate in candidates
+        if candidate is not None
+    )
+
+
+def _multi_solver_capability(population):
+    """Describe the currently supported multi-solver capability of a model."""
+    if _uses_block_voltage_state(population):
+        return "block"
+    if isinstance(population, Tree):
+        return "scalar_tree"
+    if isinstance(population, Axon):
+        return "scalar_path"
+    if isinstance(population, MultiPopulation):
+        return "unsupported"
+    if isinstance(population, Population):
+        return "scalar_independent"
+    return "unsupported"
+
+
+def _reject_block_populations(populations):
+    """Fail closed while no block-state multi-solver is implemented."""
+    block = [
+        name
+        for name, population in populations.items()
+        if _multi_solver_capability(population) == "block"
+    ]
+    if block:
+        names = ", ".join(repr(name) for name in block)
+        raise TypeError(
+            "Block-state population(s) "
+            f"{names} require a block multi-solver; scalar dhs_multi and "
+            "bwd_euler_sc_multi cannot evolve their extracellular circuit state."
+        )
 
 
 def _assess_type_and_make_integrator(populations, threads=16, write_back=True):
@@ -38,11 +91,26 @@ def _assess_type_and_make_integrator(populations, threads=16, write_back=True):
     """
     if not populations:
         raise ValueError("At least one population is required.")
-    if all(isinstance(pop, Tree) for pop in populations.values()):
-        return dhs_multi(threads=threads, write_back=write_back)
-    if all(type(pop) is Population for pop in populations.values()):
+    _reject_block_populations(populations)
+    capabilities = {_multi_solver_capability(pop) for pop in populations.values()}
+    if capabilities == {"scalar_independent"}:
         return bwd_euler_sc_multi(write_back=write_back)
-    raise TypeError("Incompatible population types.")
+    scalar_capabilities = {"scalar_independent", "scalar_tree", "scalar_path"}
+    if capabilities and capabilities <= scalar_capabilities:
+        return dhs_multi(threads=threads, write_back=write_back)
+
+    unsupported = [
+        name
+        for name, population in populations.items()
+        if _multi_solver_capability(population) == "unsupported"
+    ]
+    names = ", ".join(repr(name) for name in unsupported)
+    raise TypeError(
+        "Population(s) "
+        f"{names} do not expose a supported scalar multi-solver topology. "
+        "Supported components are ordinary Population, Tree, and scalar Axon "
+        "models."
+    )
 
 
 def _check_celsius(celsius, populations):
@@ -62,16 +130,30 @@ def concat_models(
     celsius=37.0,
     v_init=None,
 ):
-    """Concatenate multiple populations into a :class:`MultiPopulation`.
+    """Pack independent scalar populations into one :class:`MultiPopulation`.
+
+    Ordinary :class:`~dendra.models.core.Population` and
+    :class:`~dendra.models.core.SingleCompartment` models, branched
+    :class:`~dendra.models.tree.Tree` models, and scalar
+    :class:`~dendra.models.core.Axon` subclasses can be combined in one call.
+    Mixed scalar components use the universal packed DHS solver; a collection
+    containing only independent point compartments keeps the optimized
+    single-compartment multi-integrator.
+
+    Concatenation does not create axial edges between component populations.
+    It packs their independent electrical systems into one launch and exposes
+    each component name as a labelled Slice on the composite model.
 
     Parameters
     ----------
     populations : dict[str, Population]
-        Mapping of names to populations to concatenate.
+        Mapping of unique component names to unbatched scalar populations. All
+        components must share a device and dtype.
     threads : int, optional
-        Number of solver threads for dendritic tree models.
+        DHS lane count for packed Tree/Axon groups. Must divide 32.
     write_back : bool, optional
-        Whether integrators should write-back states in-place.
+        If ``True``, write solved voltage views back to every component after
+        each step. If ``False``, only the composite voltage is updated.
     celsius : float, optional
         Common simulation temperature.
     v_init : scalar, tensor-like, dict[str, tensor-like], optional
@@ -83,7 +165,16 @@ def concat_models(
     Returns
     -------
     MultiPopulation
-        Combined population.
+        Combined population. Call :meth:`MultiPopulation.batch` on this result
+        when explicit leading batch dimensions are required.
+
+    Notes
+    -----
+    Finite-extracellular :class:`~dendra.models.extcell.ExtCellTree` and
+    :class:`~dendra.models.extcell.ExtCellAxon` models carry block-valued
+    voltage state and are intentionally rejected until a packed block-DHS
+    solver is available. Nested ``MultiPopulation`` objects are likewise
+    unsupported.
     """
     _check_celsius(celsius, populations)
     integrator = _assess_type_and_make_integrator(
@@ -126,6 +217,38 @@ def indices(populations):
 def key_to_flat_index(indices, key):
     """Convert a structured key into flattened indices."""
     return indices[key].flatten()
+
+
+def _concat_component_field(populations, name):
+    """Project one component field onto the composite's flattened core.
+
+    Leading batch dimensions are retained.  The final two component dimensions
+    are flattened into the single structural axis used by MultiPopulation.
+    """
+    parts = []
+    batch_shape = None
+    for population_name, population in populations.items():
+        value = getattr(population, name)
+        population_batch_shape = tuple(population.shape[:-2])
+        if batch_shape is None:
+            batch_shape = population_batch_shape
+        elif population_batch_shape != batch_shape:
+            raise ValueError(
+                "All component populations must have the same leading batch "
+                f"shape; got {batch_shape} and {population_batch_shape}."
+            )
+        try:
+            value = torch.broadcast_to(value, tuple(population.shape))
+        except RuntimeError as error:
+            raise ValueError(
+                f"Component field {name!r} on population {population_name!r} "
+                f"must broadcast to shape {tuple(population.shape)}; got "
+                f"{tuple(value.shape)}."
+            ) from error
+        parts.append(value.reshape(*population_batch_shape, -1))
+
+    flattened = torch.cat(parts, dim=-1)
+    return flattened.unsqueeze(-2).contiguous()
 
 
 def flatten_key(n, shape, key):
@@ -266,7 +389,12 @@ def _concat_population_v_init(populations, v_init=None):
 
 
 class MultiPopulation(Population):
-    """Population composed of multiple independent sub-populations.
+    """One packed model composed of independent scalar sub-populations.
+
+    Prefer :func:`concat_models` so Dendra can select the appropriate packed
+    scalar integrator. Component topology, geometry, physical scale factors,
+    mechanisms, injections, initial voltages, and structural labels remain
+    component-specific; temperature is shared by the composite.
 
     Parameters
     ----------
@@ -281,7 +409,15 @@ class MultiPopulation(Population):
         are component population names and omitted populations keep their own
         ``v_init``.
     **populations
-        Mapping of population names to instances.
+        Mapping of population names to unbatched instances on one device and
+        dtype. Supported public components are ordinary Population,
+        SingleCompartment, Tree, Unmyelinated, and Myelinated models.
+
+    Notes
+    -----
+    ``write_back=True`` is an integrator-factory option supplied by
+    :func:`concat_models`, not a constructor argument here. ExtCell block
+    states and nested MultiPopulation components are rejected fail-closed.
     """
 
     def __init__(self, integrator=None, celsius=37.0, v_init=None, **populations):
@@ -289,6 +425,11 @@ class MultiPopulation(Population):
             raise ValueError("At least one population is required.")
         if any(b.is_batched() for b in populations.values()):
             raise ValueError("All populations must be unbatched.")
+
+        # There is not yet a packed block-tree solver.  Check this even when a
+        # caller supplies an explicit integrator so a scalar multi-integrator
+        # cannot silently discard the extracellular circuit state.
+        _reject_block_populations(populations)
 
         # Check all populations are on the same device/dtype before composing
         # tensor-valued v_init values from them.
@@ -308,6 +449,17 @@ class MultiPopulation(Population):
             if v_init is None or isinstance(v_init, dict)
             else v_init
         )
+        composite_cm = _concat_component_field(populations, "cm")
+        composite_rhoa = _concat_component_field(populations, "rhoa")
+        component_fields = {
+            name: _concat_component_field(populations, name)
+            for name in ("diam", "dx", "x", "y", "z")
+        }
+        component_area = _concat_component_field(populations, "area")
+        component_scales = {
+            name: _concat_component_field(populations, name)
+            for name in ("cm_scale", "rhoa_scale", "area_scale")
+        }
 
         init_device = next(iter(devices))
         init_dtype = next(iter(dtypes))
@@ -319,7 +471,19 @@ class MultiPopulation(Population):
             v_init=composite_v_init,
             device=init_device,
             dtype=init_dtype,
+            cm=composite_cm,
+            rhoa=composite_rhoa,
         )
+
+        # Population geometry buffers are not declared RANGE parameters, so
+        # construct them explicitly from the component models.  Keeping the
+        # exact component area separately also preserves graph-supplied areas
+        # that cannot necessarily be reconstructed from ``diam * dx``.
+        for name, value in component_fields.items():
+            getattr(self, name).copy_(value)
+        for name, value in component_scales.items():
+            setattr(self, name, value)
+        self.register_buffer("_component_area", component_area)
 
         self.populations = torch.nn.ModuleDict(populations)
 
@@ -341,6 +505,14 @@ class MultiPopulation(Population):
         self.reinsert_all()
         self.reinject_all()
         self.register_labels()
+
+    @property
+    def area(self):
+        """Component membrane areas in the composite core ordering."""
+        component_area = getattr(self, "_component_area", None)
+        if component_area is not None:
+            return component_area
+        return super().area
 
     def __iter__(self):
         return iter(self.populations.values())
@@ -364,13 +536,57 @@ class MultiPopulation(Population):
         """Keep composite buffers on the same device/dtype as components."""
         device = self.device()
         dtype = self.dtype()
-        for name in ("v", "diam", "dx", "x", "y", "z"):
+        for name in (
+            "v",
+            "cm",
+            "rhoa",
+            "cm_scale",
+            "rhoa_scale",
+            "area_scale",
+            "diam",
+            "dx",
+            "x",
+            "y",
+            "z",
+            "_component_area",
+        ):
             if hasattr(self, name):
                 setattr(self, name, getattr(self, name).to(device=device, dtype=dtype))
         if hasattr(self, "t"):
             self.t = self.t.to(device=device, dtype=dtype)
         if self.imem and self.i_membrane is not None:
             self.i_membrane = self.i_membrane.to(device=device, dtype=dtype)
+
+    def _refresh_component_fields(self):
+        """Refresh composite physical fields from the component populations.
+
+        Component parameter graphs remain the source of truth.  In particular,
+        Myelinated computes its effective axial resistivity through a parameter
+        graph, so retaining constructor-time copies would silently discard that
+        transform during a composite initialization.
+        """
+        for name in (
+            "cm",
+            "rhoa",
+            "cm_scale",
+            "rhoa_scale",
+            "area_scale",
+            "diam",
+            "dx",
+            "x",
+            "y",
+            "z",
+        ):
+            setattr(self, name, _concat_component_field(self.populations, name))
+        self._component_area = _concat_component_field(self.populations, "area")
+        self._sync_core_buffers_to_population_device()
+
+    def populate_parameter_buffers(self, random_generation=None):
+        """Populate component parameters, then synchronize composite geometry."""
+        for population in self.populations.values():
+            population.populate_parameter_buffers(random_generation=random_generation)
+        super().populate_parameter_buffers(random_generation=random_generation)
+        self._refresh_component_fields()
 
     def set_v_init(self, v_init):
         """Set composite initial voltage, with optional per-population mapping.

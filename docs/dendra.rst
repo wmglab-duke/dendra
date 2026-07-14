@@ -13,6 +13,7 @@ API Reference
    api/dendra.models.instruments
    api/dendra.models.integrators
    api/dendra.models.mechanisms
+   api/dendra.models.morphology
    api/dendra.models.mod
    api/dendra.models.networks
    api/dendra.models.parametric

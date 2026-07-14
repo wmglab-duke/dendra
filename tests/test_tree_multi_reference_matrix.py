@@ -387,6 +387,48 @@ def test_multi_tree_preserves_plane_varying_geometry_and_its_gradients():
         assert torch.allclose(got, want, rtol=4e-10, atol=4e-10)
 
 
+def test_multi_tree_multistep_gradients_match_dense_reference():
+    """Packed scratch storage must not invalidate tensors saved for BPTT."""
+
+    model, mechanism, integrator = _make_multi()
+    dt = 0.041
+    integrator._initialize(model, dt)
+    voltage, intra, ve = _sample_inputs(model)
+    voltage.requires_grad_()
+    intra.requires_grad_()
+    ve.requires_grad_()
+    mechanism.conductance.requires_grad_()
+    mechanism.reversal.requires_grad_()
+
+    actual_1, _ = integrator._step(voltage, dt, model.celsius, ve=ve, intra=intra)
+    actual_2, _ = integrator._step(actual_1, dt, model.celsius, ve=ve, intra=intra)
+
+    expected_1 = _dense_reference(model, mechanism, voltage, dt, ve=ve, intra=intra)
+    expected_2 = _dense_reference(model, mechanism, expected_1, dt, ve=ve, intra=intra)
+    assert torch.allclose(actual_2, expected_2, rtol=5e-12, atol=5e-12)
+
+    weights = torch.linspace(0.4, 1.3, actual_2.numel(), dtype=DTYPE).reshape_as(
+        actual_2
+    )
+    differentiable_inputs = (
+        voltage,
+        intra,
+        ve,
+        mechanism.conductance,
+        mechanism.reversal,
+    )
+    actual_grad = torch.autograd.grad(
+        (actual_2.square() * weights).sum(),
+        differentiable_inputs,
+        retain_graph=True,
+    )
+    expected_grad = torch.autograd.grad(
+        (expected_2.square() * weights).sum(), differentiable_inputs
+    )
+    for got, want in zip(actual_grad, expected_grad):
+        assert torch.allclose(got, want, rtol=8e-10, atol=8e-10)
+
+
 def test_multi_tree_common_mode_and_uniform_extracellular_gauge_are_invariant():
     model, mechanism, integrator = _make_multi()
     mechanism.conductance.zero_()
