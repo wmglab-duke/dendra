@@ -74,6 +74,116 @@ def test_native_compilation_is_repeatable_parent_first_and_field_aligned():
     assert first.metadata.kind.count("compartment") == 7
 
 
+def test_section_name_is_an_automatic_label_covering_the_whole_section():
+    morphology = dn.Morphology()
+    soma = morphology.section("soma", L=30.0, diam=10.0, nseg=3, labels="cell_body")
+
+    assert soma.labels == frozenset({"soma", "cell_body"})
+
+    graph = morphology.compile()
+    soma_nodes = _section_nodes(graph, "soma")
+    assert len(soma_nodes) == soma.nseg
+    assert graph.metadata.section_name == ("soma",) * soma.nseg
+    assert graph.metadata.name == tuple(
+        f"soma({(index + 0.5) / soma.nseg:.12g})" for index in range(soma.nseg)
+    )
+    assert all("soma" in graph.metadata.labels[node] for node in soma_nodes)
+    assert all("cell_body" in graph.metadata.labels[node] for node in soma_nodes)
+
+    model = dn.Tree.from_morphology(morphology)
+    assert model.soma.index[-1].tolist() == soma_nodes
+    assert model.cell_body.index[-1].tolist() == soma_nodes
+
+
+@pytest.mark.parametrize("name", (None, "", "   "))
+def test_section_name_must_be_a_nonempty_string_atomically(name):
+    morphology = dn.Morphology()
+
+    with pytest.raises(ValueError, match="non-empty strings"):
+        morphology.section(name, L=10.0, diam=2.0)
+
+    assert morphology.sections == ()
+
+
+def test_section_names_are_unique_atomically():
+    morphology = dn.Morphology()
+    soma = morphology.section("soma", L=10.0, diam=8.0)
+
+    with pytest.raises(ValueError, match="already exists"):
+        morphology.section("soma", L=20.0, diam=2.0)
+
+    assert morphology.sections == (soma,)
+
+
+@pytest.mark.parametrize("model_cls", (dn.Tree, dn.Cable), ids=("tree", "cable"))
+def test_shared_labels_union_whole_sections_in_declaration_and_authored_x_order(
+    model_cls,
+):
+    morphology = dn.Morphology()
+    # Declare the child first and connect through its authored x=1 end. Graph
+    # traversal therefore disagrees with both declaration and authored-x order.
+    child = morphology.section("child", L=40.0, diam=2.0, nseg=4, labels="excitable")
+    root = morphology.section("root", L=20.0, diam=8.0, nseg=2, labels="excitable")
+    child.connect(root.at(1.0), child_end=1)
+
+    model = model_cls.from_morphology(morphology)
+    graph = model.compartment_graph
+    selected = model.excitable.index[-1].tolist()
+    provenance = [
+        (graph.metadata.section_name[node], graph.metadata.section_x[node])
+        for node in selected
+    ]
+
+    assert provenance == [
+        ("child", pytest.approx(0.125)),
+        ("child", pytest.approx(0.375)),
+        ("child", pytest.approx(0.625)),
+        ("child", pytest.approx(0.875)),
+        ("root", pytest.approx(0.25)),
+        ("root", pytest.approx(0.75)),
+    ]
+    assert len(selected) == child.nseg + root.nseg
+    assert set(selected) == set(graph.nodes_with_label("excitable"))
+
+
+def test_explicit_label_cannot_reuse_an_existing_section_name_atomically():
+    morphology = dn.Morphology()
+    soma = morphology.section("soma", L=10.0, diam=8.0)
+    before_sections = morphology.sections
+    before_graph = morphology.compile()
+
+    with pytest.raises(ValueError, match=r"(?i)section.*label|label.*section"):
+        morphology.section("dend", L=20.0, diam=2.0, labels="soma")
+
+    assert morphology.sections == before_sections
+    assert morphology.compile() == before_graph
+
+    # A rejected declaration must not reserve its name or otherwise poison the
+    # builder; a corrected declaration remains possible.
+    dend = morphology.section("dend", L=20.0, diam=2.0, labels="neurite")
+    dend.connect(soma.at(1.0), child_end=0)
+    assert morphology.compile().n_compartments == 2
+
+
+def test_section_name_cannot_reuse_an_existing_explicit_label_atomically():
+    morphology = dn.Morphology()
+    dend = morphology.section("dend", L=20.0, diam=2.0, labels={"neurite", "soma"})
+    before_sections = morphology.sections
+    before_graph = morphology.compile()
+
+    with pytest.raises(ValueError, match=r"(?i)section.*label|label.*section"):
+        morphology.section("soma", L=10.0, diam=8.0)
+
+    assert morphology.sections == before_sections
+    assert morphology.compile() == before_graph
+
+    # The failed name declaration has no partial effects: an unrelated valid
+    # Section can still be added and connected normally.
+    axon = morphology.section("axon", L=30.0, diam=1.0)
+    axon.connect(dend.at(1.0), child_end=0)
+    assert morphology.compile().n_compartments == 2
+
+
 def test_builder_validation_failures_are_atomic_and_repairable():
     morphology = dn.Morphology()
 

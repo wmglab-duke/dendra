@@ -56,8 +56,10 @@ Native :class:`~dendra.models.morphology.Morphology` declarations use these
 same morphology units. Stylized ``L``/``diam`` values and pt3d coordinates are
 in µm, ``rhoa`` is in Ω·cm, and ``cm`` is in µF/cm². Compilation retains the
 canonical geometry in binary64 before a constructed model deliberately casts
-its buffers to the configured model dtype. See :ref:`native-morphologies` for
-the complete section and connection contract.
+its buffers to the configured model dtype. Generic unbranched
+:class:`~dendra.models.core.Cable` models preserve the compiled edge resistance
+in Ω and membrane area in cm² when using the fast tridiagonal solver. See
+:ref:`native-morphologies` for the complete section and connection contract.
 
 Distributed membrane-mechanism contract
 ----------------------------------------

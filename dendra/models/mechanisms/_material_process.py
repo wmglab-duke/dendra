@@ -1248,9 +1248,10 @@ class DiffusionProcess(MaterialProcess):
     """Finite-volume diffusion process for full population-wide material fields.
 
     MVP scope:
-      - one-dimensional unbranched Axon geometry along the final tensor axis
-      - branched Tree geometry using the DHS/Hines spatial operator when Tree
-        material-geometry buffers are available
+      - analytic one-dimensional unbranched geometry along the final tensor
+        axis for specialized Axon models without a compartment graph
+      - canonical graph geometry using the DHS/Hines spatial operator for Tree
+        and native Cable models when material-geometry buffers are available
       - sealed/no-flux boundaries
       - intracellular/cytosolic domain
       - explicit and implicit methods, with implicit as the default
@@ -1395,10 +1396,10 @@ class DiffusionProcess(MaterialProcess):
     def _select_geometry_kind(self, population) -> str:
         """Select the spatial backend for this population.
 
-        Unbranched Axon populations expose ``graph=None`` and use the analytic 1D
-        finite-volume geometry.  Tree populations expose a graph; for those we
-        require the material-geometry buffers added by the Tree geometry patch so
-        that pt3d-aware volumes and edge diffusion geometry are used rather than
+        Specialized Axon populations expose ``graph=None`` and use analytic 1D
+        finite-volume geometry. Tree and native Cable populations expose a
+        graph; for those we require canonical material-geometry buffers so that
+        pt3d-aware volumes and edge diffusion geometry are used rather than
         stylized ``diam*L`` approximations.
         """
         graph = getattr(population, "graph", None)
@@ -1410,9 +1411,10 @@ class DiffusionProcess(MaterialProcess):
         )
         if not has_volume:
             raise RuntimeError(
-                "DiffusionProcess detected a Tree/graph morphology, but the model "
-                "does not expose material volume buffers. Apply the Tree material-"
-                "geometry patch so Tree.gather_morphology(...) registers volume_i/volume."
+                "DiffusionProcess detected a graph morphology, but the model "
+                "does not expose material volume buffers. Construct the model "
+                "through a supported Tree or native Cable morphology adapter so "
+                "volume_i/volume is registered."
             )
 
         # SpatialOperatorTree currently precomputes topology/couplings from graph
@@ -1433,9 +1435,9 @@ class DiffusionProcess(MaterialProcess):
 
         if not has_edge_geom_graph:
             raise RuntimeError(
-                "DiffusionProcess detected a Tree/graph morphology, but graph edges "
-                "do not expose diff_geom_um or R_ohm. Patch the NEURON graph import "
-                "path to add edge['diff_geom_um'] before using Tree material diffusion."
+                "DiffusionProcess detected a graph morphology, but graph edges "
+                "do not expose diff_geom_um or R_ohm. Use a supported native or "
+                "NEURON morphology adapter that preserves edge diffusion geometry."
             )
         return "tree"
 

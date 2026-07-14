@@ -58,6 +58,7 @@ templates_path = ["_templates"]
 # This pattern also affects html_static_path and html_extra_path.
 exclude_patterns = [
     "_build",
+    "README.md",
     "Thumbs.db",
     ".DS_Store",
     "__MACOSX",
@@ -92,8 +93,8 @@ html_title = ""
 html_logo = "_static/logo-light.png"
 html_theme = "shibuya"
 html_theme_options = {
-    "light_logo": "logo-light.png",  # file is _static/logo-light.png
-    "dark_logo": "logo-dark.png",  # file is _static/logo-dark.png
+    "light_logo": "_static/logo-light.png",
+    "dark_logo": "_static/logo-dark.png",
     "accent_color": "cyan",
     "gitlab_url": "https://gitlab.oit.duke.edu/mah148/dendra",
 }

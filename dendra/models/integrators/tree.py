@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from ..graph import share_topology_labeled
+from .cable import unbranched_edge_conductance
 from .core import (
     Integrator,
     MultiIntegrator,
@@ -90,11 +91,12 @@ def _scalar_dhs_group(model, P: int, device: torch.device) -> _ScalarDHSGroup:
 
     Ordinary ``Population(N, C)`` instances are represented by ``N * C``
     independent one-node trees.  Tree models retain their imported rooted
-    topology.  Axons use an identity-ordered path and derive axial conductance
-    directly from tensor geometry so batch planes and gradients are preserved.
+    topology. Cable models use an identity-ordered path and obtain axial
+    conductance from exact canonical edges when available, otherwise from the
+    specialized Axon tensor geometry.
     """
     # Lazy imports avoid the core -> integrators -> core import cycle.
-    from ..core import Axon, Population
+    from ..core import Cable, Population
     from ..multi import MultiPopulation
     from ..tree import Tree
 
@@ -140,34 +142,17 @@ def _scalar_dhs_group(model, P: int, device: torch.device) -> _ScalarDHSGroup:
             a_geom=a_geom.unsqueeze(0).expand(P, -1, -1) / rhoa_scale,
         )
 
-    if isinstance(model, Axon):
+    if isinstance(model, Cable):
         B = int(model.shape[-2])
         K = int(model.shape[-1])
         solver_order = torch.arange(K, dtype=torch.int64, device=device)
         parent_idx = solver_order - 1
-
-        diam = _scalar_group_planes(model.diam, model, P, B, K, "diam", device=device)
-        dx = _scalar_group_planes(model.dx, model, P, B, K, "dx", device=device)
-        rhoa = _scalar_group_planes(model.rhoa, model, P, B, K, "rhoa", device=device)
-        rhoa_scale = _scalar_group_planes(
-            model.rhoa_scale,
-            model,
-            P,
-            B,
-            K,
-            "rhoa_scale",
-            device=device,
-        )
-
-        radius_cm = diam * (0.5e-4)
-        dx_cm = dx * 1e-4
-        segment_resistance = rhoa * rhoa_scale * dx_cm / (torch.pi * radius_cm.square())
-        root = torch.zeros_like(segment_resistance[..., :1])
+        edge_conductance = unbranched_edge_conductance(model).reshape(P, B, K - 1)
         if K == 1:
-            a_geom = root
+            a_geom = torch.zeros(P, B, 1, dtype=dtype, device=device)
         else:
-            edge = 2.0 / (segment_resistance[..., :-1] + segment_resistance[..., 1:])
-            a_geom = torch.cat((root, edge), dim=-1)
+            root = torch.zeros(P, B, 1, dtype=dtype, device=device)
+            a_geom = torch.cat((root, edge_conductance), dim=-1)
         return _ScalarDHSGroup(
             B=B,
             K=K,
@@ -189,7 +174,7 @@ def _scalar_dhs_group(model, P: int, device: torch.device) -> _ScalarDHSGroup:
 
     raise TypeError(
         f"{type(model).__name__} does not expose a supported scalar DHS "
-        "topology; expected ordinary Population, Tree, or scalar Axon."
+        "topology; expected ordinary Population, Tree, or scalar Cable."
     )
 
 
@@ -535,6 +520,8 @@ class _dhs(Integrator):
     Based on Zhang et al., Nat. Commun. 14, 5798 (2023).
     """
 
+    supports_unbranched_cable = True
+
     def __init__(self, model, mech, imem=None, threads=16):
         threads = _validate_dhs_threads(threads)
 
@@ -612,21 +599,47 @@ class _dhs(Integrator):
         )  # (N,)
         self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))  # (N,)
 
-        area_cm2 = (
-            _as_solve_matrix(model.area.to(device=device, dtype=model.dtype()), model)
-            * model.area_scale
-        )  # cm², (B,K)
+        area_cm2 = _as_solve_matrix(
+            model.area.to(device=device, dtype=model.dtype()), model
+        ) * _as_solve_matrix(model.area_scale, model)  # cm², (B,K)
 
         self.register_buffer(
             "layer_ptr", layer_ptr.to(dtype=torch.int64, device=device)
         )  # (L+1,)
         self.order.copy_(order.to(dtype=torch.int64, device=device))
         self.parent_idx.copy_(parent_idx.to(dtype=torch.int64, device=device))  # (N,)
-        self.a_geom = (
-            _as_solve_matrix(a_geom_t.to(device=device, dtype=model.dtype()), model)
-            .clone()
-            .contiguous()
-        ) / model.rhoa_scale  # (B,N)
+        rhoa_scale_mech = None
+        canonical_node_conductance = None
+        if getattr(model, "_canonical_edge_resistance_ohm", None) is not None:
+            # The canonical model buffer is the numerical source of truth for
+            # both unbranched solvers. In particular, ``float32 -> float64``
+            # widens that buffer but cannot recreate the CompartmentGraph's
+            # original binary64 values. Reading graph R here would therefore
+            # make DHS disagree with UB after an otherwise valid dtype move.
+            canonical_edges = unbranched_edge_conductance(model)
+            canonical_node_conductance = torch.cat(
+                (
+                    torch.zeros(
+                        canonical_edges.shape[0],
+                        1,
+                        device=canonical_edges.device,
+                        dtype=canonical_edges.dtype,
+                    ),
+                    canonical_edges,
+                ),
+                dim=1,
+            )
+            self.a_geom = canonical_node_conductance.index_select(
+                1, self.solver_order
+            ).contiguous()
+        else:
+            rhoa_scale_mech = _as_solve_matrix(model.rhoa_scale, model)
+            rhoa_scale_solver = rhoa_scale_mech.index_select(1, self.solver_order)
+            self.a_geom = (
+                _as_solve_matrix(a_geom_t.to(device=device, dtype=model.dtype()), model)
+                .clone()
+                .contiguous()
+            ) / rhoa_scale_solver  # (B,N), solver order
 
         self.scale = area_cm2
 
@@ -634,7 +647,7 @@ class _dhs(Integrator):
             1e-6
             * _as_solve_matrix(model.cm.to(device=device, dtype=model.dtype()), model)
             * area_cm2
-            * model.cm_scale
+            * _as_solve_matrix(model.cm_scale, model)
         )  # convert from µF / cm2 to F
         self.cmdt = cm / dt_s  # (B,N) (F/s = S)
 
@@ -694,16 +707,22 @@ class _dhs(Integrator):
         )
 
         # Convert lists to tensors and register them as buffers
-        self.register_buffer(
-            "edge_child_orig",
-            torch.tensor(edge_child_orig_list, dtype=torch.int64, device=device),
+        edge_child_orig = torch.tensor(
+            edge_child_orig_list, dtype=torch.int64, device=device
         )
+        self.register_buffer("edge_child_orig", edge_child_orig)
         self.register_buffer(
             "edge_parent_orig",
             torch.tensor(edge_parent_orig_list, dtype=torch.int64, device=device),
         )
         self.register_buffer("edge_gax_orig", edge_gax_orig)
-        self.edge_gax_orig = self.edge_gax_orig / model.rhoa_scale  # (B, E)
+        if canonical_node_conductance is None:
+            edge_rhoa_scale = rhoa_scale_mech.index_select(1, edge_child_orig)
+            self.edge_gax_orig = self.edge_gax_orig / edge_rhoa_scale  # (B, E)
+        else:
+            self.edge_gax_orig = canonical_node_conductance.index_select(
+                1, edge_child_orig
+            )
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._call_kernel(
@@ -804,7 +823,7 @@ class _dhs_multi(MultiIntegrator):
     Multi-model DHS integrator for heterogeneous scalar cable systems.
 
     Packs ordinary independent populations as one-node trees, branched Tree
-    morphologies, and Axon paths into padded flat buffers (shared stride
+    morphologies, and Cable paths into padded flat buffers (shared stride
     ``K_stride = max K_g``). Per-group offsets allow one CUDA/CPU kernel to
     process every scalar group in one launch. Optional extracellular coupling
     is applied through the same child/parent edge representation.
@@ -1152,7 +1171,7 @@ class _dhs_multi(MultiIntegrator):
         for g, (B_g, K_g) in enumerate(zip(self.group_B, self.group_K)):
             # Derive original mechanism columns from the canonical solver
             # topology. This is valid for every adapter, including one-node
-            # point groups, and avoids reconstructing Axon graphs through
+            # point groups, and avoids reconstructing Cable graphs through
             # scalar ``.item()`` calls.
             soff = int(self.SOLVER_OFF[g])
             solver_nodes = self.SOLVER_cat[soff : soff + K_g]

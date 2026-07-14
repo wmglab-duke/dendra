@@ -967,9 +967,8 @@ class PreparedInterp1dUniform(nn.Module):
         ----------
         x_new : torch.Tensor
             Query points at which to evaluate the interpolant(s).
-            Accepted shapes:
-                - (P,) for unbatched interpolation
-                - (Q, P) for batched interpolation with Q batches
+            Accepted shapes are ``(P,)`` for unbatched interpolation and
+            ``(Q, P)`` for batched interpolation with ``Q`` batches.
         indices : int or sequence of int or torch.Tensor, optional
             Mapping from query rows in `x_new` to LUT rows in `x`/`y` (batched mode).
         outside : {"clamp", "zero", "fill"}, optional

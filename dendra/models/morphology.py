@@ -223,7 +223,15 @@ class CompartmentGeometry:
 
 @dataclass(frozen=True, slots=True)
 class CompartmentMetadata:
-    """Immutable provenance and structural labels for graph nodes."""
+    """Immutable provenance and structural labels for graph nodes.
+
+    ``name`` is the generated per-node display/search name, for example
+    ``"soma(0.5)"``. ``section_name`` is the unique authored
+    :class:`Section` identity from which a material compartment was compiled.
+    ``labels`` contains reusable structural region tags; for native Sections it
+    also includes that Section's name. Retained junction nodes have no source
+    Section and therefore use ``None`` provenance and an empty label set.
+    """
 
     name: tuple[str, ...]
     kind: tuple[Literal["compartment", "junction"], ...]
@@ -377,6 +385,125 @@ class CompartmentGraph:
         label = str(label)
         return tuple(
             node for node, labels in enumerate(self.metadata.labels) if label in labels
+        )
+
+    def path_ordered(self) -> CompartmentGraph:
+        """Return an equivalent graph ordered from one cable end to the other.
+
+        The generic unbranched :class:`dendra.Cable` backend requires its final
+        tensor dimension to follow physical path order.  A canonical rooted
+        tree need not already have that ordering: a valid unbranched morphology
+        can have its rooted node in the middle of the physical cable.  This
+        method validates the stronger material-only path contract and returns a
+        new immutable snapshot whose parent array is ``(-1, 0, 1, ...)``.
+
+        Orientation is deterministic.  If the original root is a physical end
+        it remains the first node; otherwise the lower-numbered end is first.
+        Provenance, authored Section coordinates, labels, and exact edge
+        geometry are retained while node IDs are remapped to storage order.
+
+        Raises
+        ------
+        ValueError
+            If any node is an algebraic junction or the underlying undirected
+            graph is not one simple path.
+        """
+        size = self.n_compartments
+        junctions = [
+            node
+            for node, kind in enumerate(self.metadata.kind)
+            if kind != "compartment"
+        ]
+        if junctions:
+            raise ValueError(
+                "An unbranched Cable may contain only material compartments; "
+                f"found junction node(s) {junctions}."
+            )
+
+        adjacency: list[list[int]] = [[] for _ in range(size)]
+        edge_source: dict[frozenset[int], int] = {}
+        for child, parent in enumerate(self.topology.parent_index):
+            if parent == -1:
+                continue
+            adjacency[parent].append(child)
+            adjacency[child].append(parent)
+            edge_source[frozenset((parent, child))] = child
+
+        if size == 1:
+            order = [0]
+        else:
+            degrees = [len(neighbors) for neighbors in adjacency]
+            if any(degree > 2 for degree in degrees):
+                raise ValueError(
+                    "A Cable morphology must be unbranched; its compartment "
+                    "graph contains a node with degree greater than two."
+                )
+            ends = [node for node, degree in enumerate(degrees) if degree == 1]
+            if len(ends) != 2:
+                raise ValueError(
+                    "A Cable morphology must be one connected simple path with "
+                    "exactly two ends."
+                )
+            root = self.topology.root
+            start = root if root in ends else min(ends)
+            order = []
+            previous = -1
+            current = start
+            while current != -1:
+                order.append(current)
+                following = [node for node in adjacency[current] if node != previous]
+                if len(following) > 1:
+                    raise ValueError("A Cable morphology cannot branch.")
+                previous, current = current, following[0] if following else -1
+            if len(order) != size:
+                raise ValueError("A Cable morphology must be one connected path.")
+
+        node_geometry_fields = (
+            "length_um",
+            "diameter_um",
+            "area_um2",
+            "volume_um3",
+            "volume_i_um3",
+            "volume_o_um3",
+            "x_um",
+            "y_um",
+            "z_um",
+            "rhoa_ohm_cm",
+            "cm_uF_cm2",
+        )
+        geometry = {
+            name: tuple(getattr(self.geometry, name)[node] for node in order)
+            for name in node_geometry_fields
+        }
+        edge_fields = (
+            "edge_length_um",
+            "edge_resistance_ohm",
+            "edge_diff_geom_um",
+        )
+        for name in edge_fields:
+            values = [0.0]
+            for left, right in zip(order, order[1:]):
+                source = edge_source[frozenset((left, right))]
+                values.append(getattr(self.geometry, name)[source])
+            geometry[name] = tuple(values)
+
+        metadata_fields = (
+            "name",
+            "kind",
+            "section_name",
+            "segment_index",
+            "section_x",
+            "labels",
+        )
+        metadata = {
+            name: tuple(getattr(self.metadata, name)[node] for node in order)
+            for name in metadata_fields
+        }
+        return CompartmentGraph(
+            topology=CompartmentTopology(tuple([-1, *range(size - 1)])),
+            geometry=CompartmentGeometry(**geometry),
+            metadata=CompartmentMetadata(**metadata),
+            schema_version=self.schema_version,
         )
 
     def to_networkx(self) -> nx.DiGraph:
@@ -588,7 +715,11 @@ class CompartmentGraph:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class Section:
-    """One named cable section in a native :class:`Morphology`."""
+    """One named cable section in a native :class:`Morphology`.
+
+    ``name`` is the Section's unique authored identity. ``labels`` is its
+    immutable set of structural region tags and always includes ``name``.
+    """
 
     name: str
     nseg: int
@@ -681,6 +812,50 @@ class Morphology:
         A stylized section requires ``L`` and scalar ``diam``. A pt3d section
         requires at least two ``(x, y, z, diameter)`` points and derives its
         length from the centerline. The two geometry forms cannot be mixed.
+
+        Parameters
+        ----------
+        name : str
+            Unique, non-empty authored Section identity. The exact name is used
+            for connection bookkeeping and compiled ``section_name`` provenance,
+            and is automatically included among the Section's labels. Section
+            names are reserved: an explicit label on another Section cannot use
+            the same string.
+        L : float, optional
+            Stylized-cylinder length in µm. Required with ``diam`` and mutually
+            exclusive with ``points``.
+        diam : float, optional
+            Stylized-cylinder diameter in µm. Required with ``L`` and mutually
+            exclusive with ``points``.
+        points : sequence of (x, y, z, diameter), optional
+            At least two pt3d samples in µm. Length is derived from centerline
+            arclength.
+        nseg : int, optional
+            Positive number of computational compartments. Default is 1.
+        rhoa : float, optional
+            Section intracellular resistivity in Ω·cm. Defaults to the owning
+            Morphology's value.
+        cm : float, optional
+            Section specific membrane capacitance in µF/cm². Defaults to the
+            owning Morphology's value.
+        labels : str or iterable of str, optional
+            Reusable structural region tags applied to every material
+            compartment compiled from this Section. Labels may be shared by
+            multiple Sections to form union selections. The Section ``name`` is
+            added automatically and need not be supplied here.
+
+        Returns
+        -------
+        Section
+            The immutable declaration owned by this Morphology.
+
+        Notes
+        -----
+        After constructing a :class:`~dendra.models.tree.Tree` or
+        :class:`~dendra.models.core.Cable`, collision-free labels that are safe
+        Python identifiers become population-owned Slice attributes. All labels
+        remain available in the compiled graph's metadata even when an
+        attribute cannot be installed.
         """
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Section names must be non-empty strings.")
@@ -689,7 +864,32 @@ class Morphology:
         nseg = _positive_integer(nseg, name=f"section {name!r} nseg")
         if isinstance(labels, str):
             labels = (labels,)
-        normalized_labels = frozenset({name, *(str(label) for label in labels)})
+        explicit_labels = frozenset(str(label) for label in labels)
+
+        existing_names = self._sections.keys()
+        conflicting_names = sorted(explicit_labels.intersection(existing_names))
+        if conflicting_names:
+            conflicts = ", ".join(repr(value) for value in conflicting_names)
+            raise ValueError(
+                f"Section {name!r} labels conflict with existing Section "
+                f"name(s): {conflicts}. Section names are reserved and cannot "
+                "be explicit labels on another Section."
+            )
+
+        conflicting_sections = sorted(
+            section.name
+            for section in self._sections.values()
+            if name != section.name and name in section.labels
+        )
+        if conflicting_sections:
+            owners = ", ".join(repr(value) for value in conflicting_sections)
+            raise ValueError(
+                f"Section name {name!r} conflicts with an explicit label on "
+                f"existing Section(s): {owners}. Section names are reserved "
+                "and cannot be reused as another Section's label."
+            )
+
+        normalized_labels = explicit_labels | {name}
 
         if points is None:
             if L is None or diam is None:

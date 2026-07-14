@@ -33,8 +33,10 @@ NetStim
 
 Synapse slot targets
 --------------------
-.. autoclass:: dendra.models.networks.SynapseSlots
-   :members:
+
+Network endpoints can use :class:`dendra.models.slice.SynapseSlots` to address
+local slots in banked point-process mechanisms. Its canonical API reference is
+:doc:`dendra.models.slice`.
 
 NetCon internals
 ----------------

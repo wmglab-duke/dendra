@@ -53,6 +53,23 @@ def test_contextvar_and_ctx():
     assert H.DEBUG.value == orig_debug
 
 
+def test_runtime_contract_validation_context_is_normalized_and_atomic():
+    original = H.RUNTIME_CONTRACT_VALIDATION.value
+
+    with H.ctx(RUNTIME_CONTRACT_VALIDATION=" STRICT "):
+        assert H.RUNTIME_CONTRACT_VALIDATION.value == "strict"
+        assert H.current_runtime_contract_validation() == "strict"
+        assert dn.RUNTIME_CONTRACT_VALIDATION is H.RUNTIME_CONTRACT_VALIDATION
+
+    assert H.RUNTIME_CONTRACT_VALIDATION.value == original
+    assert H.normalize_runtime_contract_validation("Versioned") == "versioned"
+
+    with pytest.raises(ValueError, match="versioned.*strict.*initialize"):
+        with H.ctx(RUNTIME_CONTRACT_VALIDATION="unsafe"):
+            pass
+    assert H.RUNTIME_CONTRACT_VALIDATION.value == original
+
+
 def test_explicit_model_dtype_overrides_context_default():
     with H.ctx(DTYPE="float32"):
         population = dn.Population(N=1, C=1, dtype=torch.float64)

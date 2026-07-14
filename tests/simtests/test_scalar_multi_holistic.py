@@ -98,6 +98,66 @@ def _native_tree(*, variant: int, active: bool, injected: bool = True):
     return model
 
 
+def _native_cable(*, active: bool, injected: bool = True, amplitude=None):
+    """Build a tapered native path that cannot be reduced to fiber diameter."""
+    morphology = dn.Morphology(rhoa=90.0, cm=1.0)
+    source = morphology.section(
+        "source",
+        points=[(-12.0, 0.0, 0.0, 16.0), (12.0, 0.0, 0.0, 10.0)],
+        nseg=1,
+        rhoa=75.0,
+        cm=0.85,
+        labels=("membrane", "cable_stimulus"),
+    )
+    middle = morphology.section(
+        "middle",
+        points=[
+            (12.0, 0.0, 0.0, 5.0),
+            (18.0, 65.0, 7.0, 3.2),
+            (42.0, 108.0, -3.0, 1.8),
+        ],
+        nseg=4,
+        rhoa=125.0,
+        cm=1.2,
+        labels=("membrane", "cable_middle"),
+    )
+    # Authored distal-to-proximal. Native child_end=1 keeps authored x stable
+    # while ordering the tridiagonal solve from the physical source to the tip.
+    tip = morphology.section(
+        "tip",
+        points=[(88.0, 154.0, 12.0, 0.6), (42.0, 108.0, -3.0, 2.0)],
+        nseg=4,
+        rhoa=170.0,
+        cm=1.05,
+        labels=("membrane", "cable_tip"),
+    )
+    middle.connect(source.at(1.0), child_end=0)
+    tip.connect(middle.at(1.0), child_end=1)
+
+    model = dn.Cable.from_morphology(
+        morphology,
+        N=1,
+        celsius=CELSIUS,
+        v_init=V_INIT,
+        dtype=DTYPE,
+    )
+    if active:
+        model.membrane.insert(hh)
+        default_amplitude = 8.0 * nA
+    else:
+        model.membrane.insert(pas, g=2.4e-4, e=-71.0)
+        default_amplitude = 0.16 * nA
+    if injected:
+        model.cable_stimulus.inject(
+            dn.mono_rect(
+                amp=default_amplitude if amplitude is None else amplitude,
+                delay=0.30,
+                pw=0.50,
+            )
+        )
+    return model
+
+
 def _unmyelinated(*, active: bool, injected: bool = True, amplitude=None):
     model = dn.Unmyelinated(
         diameters=[2.2],
@@ -161,6 +221,7 @@ def _factories(*names: str, active: bool) -> dict[str, _Builder]:
     available: dict[str, _Builder] = {
         "tree_a": lambda: _native_tree(variant=0, active=active),
         "tree_b": lambda: _native_tree(variant=1, active=active),
+        "native_cable": lambda: _native_cable(active=active),
         "unmyelinated": lambda: _unmyelinated(active=active),
         "myelinated": lambda: _myelinated(active=active),
     }
@@ -216,8 +277,20 @@ def _run_packed(
         ("tree_a", "unmyelinated"),
         ("tree_a", "myelinated"),
         ("tree_a", "unmyelinated", "myelinated"),
+        ("native_cable", "tree_a"),
+        ("native_cable", "unmyelinated", "myelinated"),
+        ("native_cable", "tree_a", "unmyelinated", "myelinated"),
     ],
-    ids=("trees", "axons", "tree-unmyelinated", "tree-myelinated", "all"),
+    ids=(
+        "trees",
+        "axons",
+        "tree-unmyelinated",
+        "tree-myelinated",
+        "tree-and-axons",
+        "native-cable-tree",
+        "native-cable-axons",
+        "all-scalar-paths",
+    ),
 )
 def test_passive_scalar_combinations_match_independent_public_runs(names):
     """Packing changes launch layout, never a component trajectory."""
@@ -238,11 +311,17 @@ def test_passive_scalar_combinations_match_independent_public_runs(names):
     assert model.t.item() == pytest.approx(tstop)
 
 
-def test_active_tree_and_both_axon_types_match_independent_trajectories():
+def test_active_native_cable_tree_and_both_axon_types_match_independent_trajectories():
     """HH state evolution and propagated spikes remain component-local."""
     dt = 0.0125
     tstop = 4.0
-    factories = _factories("tree_a", "unmyelinated", "myelinated", active=True)
+    factories = _factories(
+        "native_cable",
+        "tree_a",
+        "unmyelinated",
+        "myelinated",
+        active=True,
+    )
 
     expected = _run_standalone(factories, dt=dt, tstop=tstop)
     _, _, actual = _run_packed(factories, dt=dt, tstop=tstop)
@@ -250,6 +329,62 @@ def test_active_tree_and_both_axon_types_match_independent_trajectories():
     for name in factories:
         torch.testing.assert_close(actual[name], expected[name], rtol=3e-9, atol=3e-8)
         assert float(actual[name].amax()) > -20.0
+
+
+def test_packed_native_cable_uses_exact_canonical_edge_resistance():
+    """Packed DHS consumes compiled edges, not a center-cylinder surrogate."""
+    dt = 0.025
+    tstop = 2.0
+    cable = _native_cable(active=False)
+
+    # The tapered pt3d path is intentionally one for which reconstructing each
+    # edge from center diameter and length is detectably wrong. The standalone
+    # Tree below therefore serves as an independent exact-edge solver oracle.
+    radius_cm = cable.diam * 1.0e-4 / 2.0
+    segment_resistance = (
+        cable.rhoa * cable.dx * 1.0e-4 / (torch.pi * radius_cm.square())
+    )
+    cylindrical_conductance = 2.0 / (
+        segment_resistance[..., :-1] + segment_resistance[..., 1:]
+    )
+    canonical_conductance = cable.edge_resistance_ohm[..., 1:].reciprocal()
+    relative_difference = (
+        (cylindrical_conductance - canonical_conductance) / canonical_conductance
+    ).abs()
+    assert float(relative_difference.amax()) > 0.05
+
+    tree = dn.Tree.from_compartment_graph(
+        cable.compartment_graph,
+        N=1,
+        celsius=CELSIUS,
+        v_init=V_INIT,
+        dtype=DTYPE,
+    )
+    tree.membrane.insert(pas, g=2.4e-4, e=-71.0)
+    tree.cable_stimulus.inject(dn.mono_rect(amp=0.16 * nA, delay=0.30, pw=0.50))
+    tree_recorder = dn.callbacks.Recorder(states=["v"])
+    tree.eval()
+    tree.initialize()
+    tree.run(tstop=tstop, dt=dt, callbacks=[tree_recorder])
+    expected = torch.from_numpy(tree_recorder.numpy("v"))
+
+    # Include a legacy Axon so this exercises heterogeneous packing and the
+    # native Cable and legacy cylinder paths in the same dhs_multi launch.
+    legacy_axon = _unmyelinated(active=False, injected=False)
+    packed = dn.concat_models(
+        {"native_cable": cable, "legacy_axon": legacy_axon},
+        celsius=CELSIUS,
+        threads=2,
+    )
+    packed_recorder = dn.callbacks.RecorderLambda(
+        {"native_cable": lambda _: cable.v.clone()}
+    )
+    packed.eval()
+    packed.initialize()
+    packed.run(tstop=tstop, dt=dt, callbacks=[packed_recorder])
+    actual = torch.from_numpy(packed_recorder.numpy("native_cable"))
+
+    torch.testing.assert_close(actual, expected, rtol=2e-10, atol=2e-10)
 
 
 def test_packing_does_not_electrically_connect_components():
@@ -269,10 +404,180 @@ def test_packing_does_not_electrically_connect_components():
     assert float((actual["driven_tree"] - actual["driven_tree"][0]).abs().amax()) > 0.02
 
 
+def test_native_cable_obeys_disabled_writeback_contract():
+    """write_back=False updates the packed Slice, not the source Cable state."""
+    cable = _native_cable(active=False)
+    tree = _native_tree(variant=0, active=False)
+    packed = dn.concat_models(
+        {"native_cable": cable, "tree": tree},
+        celsius=CELSIUS,
+        write_back=False,
+        threads=2,
+    )
+    packed.eval()
+    packed.initialize()
+    component_initial = cable.v.clone()
+    packed_initial = packed.native_cable.v.clone()
+    packed.run(tstop=1.0, dt=0.025)
+
+    torch.testing.assert_close(cable.v, component_initial, rtol=0, atol=0)
+    assert not torch.equal(packed.native_cable.v, packed_initial)
+
+
+def test_packed_native_cable_rejects_geometry_mutation_before_state_advances():
+    """Packed public execution revalidates each component's frozen geometry."""
+    dt = 0.025
+    cable = _native_cable(active=False)
+    tree = _native_tree(variant=0, active=False)
+    packed = dn.concat_models(
+        {"native_cable": cable, "tree": tree},
+        celsius=CELSIUS,
+        threads=2,
+    )
+    packed.eval()
+    packed.initialize()
+    packed.run(tstop=dt, dt=dt)
+
+    # Mutation happens only after a successful packed step, exercising the
+    # validation boundary on a continuation with an already-built integrator.
+    cable._canonical_edge_resistance_ohm[..., 1].mul_(1.01)
+    packed_time = packed.t.clone()
+    packed_voltage = packed.v.clone()
+    cable_voltage = cable.v.clone()
+    tree_voltage = tree.v.clone()
+
+    with pytest.raises(RuntimeError, match="edge_resistance.*modified"):
+        packed.run(tstop=dt, dt=dt)
+
+    # Contract validation precedes duration accounting, mechanisms, callbacks,
+    # or a solver launch; both packed and writeback component state are atomic.
+    torch.testing.assert_close(packed.t, packed_time, rtol=0, atol=0)
+    torch.testing.assert_close(packed.v, packed_voltage, rtol=0, atol=0)
+    torch.testing.assert_close(cable.v, cable_voltage, rtol=0, atol=0)
+    torch.testing.assert_close(tree.v, tree_voltage, rtol=0, atol=0)
+
+
+def test_packed_native_cable_dependency_change_requires_reinitialization():
+    """Component scale changes cannot use stale concatenated DHS coefficients."""
+    dt = 0.025
+    cable = _native_cable(active=False)
+    tree = _native_tree(variant=0, active=False)
+    packed = dn.concat_models(
+        {"native_cable": cable, "tree": tree},
+        celsius=CELSIUS,
+        threads=2,
+    )
+    packed.eval()
+    packed.initialize()
+    packed.run(tstop=dt, dt=dt)
+
+    cable.rhoa_scale.mul_(1.125)
+    packed_time = packed.t.clone()
+    packed_voltage = packed.v.clone()
+    cable_voltage = cable.v.clone()
+    tree_voltage = tree.v.clone()
+
+    with pytest.raises(RuntimeError, match="initializ"):
+        packed.run(tstop=dt, dt=dt)
+
+    torch.testing.assert_close(packed.t, packed_time, rtol=0, atol=0)
+    torch.testing.assert_close(packed.v, packed_voltage, rtol=0, atol=0)
+    torch.testing.assert_close(cable.v, cable_voltage, rtol=0, atol=0)
+    torch.testing.assert_close(tree.v, tree_voltage, rtol=0, atol=0)
+
+    packed.initialize()
+    packed.run(tstop=dt, dt=dt)
+    assert float(packed.t) == pytest.approx(dt)
+
+
+@pytest.mark.parametrize("name", ("rhoa_scale", "cm"))
+def test_training_packed_dependency_change_requires_owner_reinitialization(name):
+    """A training rebuild cannot silently bless stale concatenated fields."""
+    dt = 0.025
+    cable = _native_cable(active=False)
+    tree = _native_tree(variant=0, active=False)
+    packed = dn.concat_models(
+        {"native_cable": cable, "tree": tree},
+        celsius=CELSIUS,
+        threads=2,
+    )
+    packed.train()
+    packed.initialize()
+    packed.step(dt=dt)
+
+    dependency = getattr(cable, name)
+    changed = dependency.detach().clone() * 1.125
+    dependency.mul_(1.125)
+    packed_field_before = getattr(packed, name).clone()
+    packed_time = packed.t.clone()
+    packed_voltage = packed.v.clone()
+    cable_voltage = cable.v.clone()
+    tree_voltage = tree.v.clone()
+
+    with pytest.raises(RuntimeError, match="initializ"):
+        packed.step(dt=dt)
+
+    torch.testing.assert_close(packed.t, packed_time, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(packed.v, packed_voltage, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(cable.v, cable_voltage, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(tree.v, tree_voltage, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        getattr(packed, name), packed_field_before, rtol=0.0, atol=0.0
+    )
+
+    # Skipping parameter repopulation retains the intentional child override,
+    # while owner initialization refreshes the concatenated solver source.
+    packed.initialize(populate_parameter_buffers=False)
+    torch.testing.assert_close(getattr(cable, name), changed, rtol=0.0, atol=0.0)
+    expected = torch.broadcast_to(changed, cable.shape).reshape(-1)
+    actual = getattr(packed, name).reshape(-1)[: expected.numel()]
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    packed.step(dt=dt)
+    assert float(packed.t) == pytest.approx(dt)
+
+
+def test_packed_inference_cable_dependency_change_is_rejected_atomically():
+    """Packed execution also snapshots unversioned component dependencies."""
+    dt = 0.025
+    with torch.inference_mode():
+        cable = _native_cable(active=False)
+        tree = _native_tree(variant=0, active=False)
+        packed = dn.concat_models(
+            {"native_cable": cable, "tree": tree},
+            celsius=CELSIUS,
+            threads=2,
+        )
+        packed.eval()
+        packed.initialize()
+        packed.run(tstop=dt, dt=dt)
+
+        assert torch.is_inference(cable.rhoa_scale)
+        packed_time = packed.t.clone()
+        packed_voltage = packed.v.clone()
+        cable_voltage = cable.v.clone()
+        tree_voltage = tree.v.clone()
+
+        cable.rhoa_scale.mul_(1.125)
+        with dn.ctx(RUNTIME_CONTRACT_VALIDATION="versioned"):
+            with pytest.raises(RuntimeError, match="initializ"):
+                packed.run(tstop=dt, dt=dt)
+
+        torch.testing.assert_close(packed.t, packed_time, rtol=0, atol=0)
+        torch.testing.assert_close(packed.v, packed_voltage, rtol=0, atol=0)
+        torch.testing.assert_close(cable.v, cable_voltage, rtol=0, atol=0)
+        torch.testing.assert_close(tree.v, tree_voltage, rtol=0, atol=0)
+
+
 def _run_batched(*, packed: bool, amplitudes: torch.Tensor, dt: float, tstop: float):
     factories = {
         "tree": lambda: _native_tree(variant=0, active=False, injected=False),
+        "native_cable": lambda: _native_cable(active=False, injected=False),
         "axon": lambda: _unmyelinated(
+            active=False,
+            amplitude=amplitudes,
+        ),
+        "myelinated": lambda: _myelinated(
             active=False,
             amplitude=amplitudes,
         ),
@@ -282,9 +587,13 @@ def _run_batched(*, packed: bool, amplitudes: torch.Tensor, dt: float, tstop: fl
         for name, factory in factories.items():
             model = factory().batch(amplitudes.shape[0])
             if name == "tree":
-                model.injection_site.inject(
-                    dn.mono_rect(amp=amplitudes, delay=0.25, pw=0.65)
-                )
+                stimulus_site = model.injection_site
+            elif name == "native_cable":
+                stimulus_site = model.cable_stimulus
+            else:
+                stimulus_site = None
+            if stimulus_site is not None:
+                stimulus_site.inject(dn.mono_rect(amp=amplitudes, delay=0.25, pw=0.65))
             recorder = dn.callbacks.Recorder(states=["v"])
             model.eval()
             model.initialize()
@@ -297,6 +606,9 @@ def _run_batched(*, packed: bool, amplitudes: torch.Tensor, dt: float, tstop: fl
         amplitudes.shape[0]
     )
     model.tree.injection_site.inject(dn.mono_rect(amp=amplitudes, delay=0.25, pw=0.65))
+    model.native_cable.cable_stimulus.inject(
+        dn.mono_rect(amp=amplitudes, delay=0.25, pw=0.65)
+    )
     recorder = dn.callbacks.RecorderLambda(
         {
             name: (lambda _, component=component: component.v.clone())

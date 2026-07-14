@@ -13,6 +13,7 @@ try:
 except ImportError:
     DENDRA_SOLVERS_AVAILABLE = False
 
+from .cable import unbranched_edge_conductance
 from .core import (
     Integrator,
     MultiIntegrator,
@@ -194,6 +195,8 @@ class _bwd_euler_ub(Integrator):
         If truthy, accumulate membrane currents each step. Default None.
     """
 
+    supports_unbranched_cable = True
+
     def __init__(
         self, model, mech, method: str = "inv", clip_scale_backward=None, **kw
     ):
@@ -303,16 +306,9 @@ class _bwd_euler_ub(Integrator):
         self.B, self.K = B, K
         dt_s = dt * 1e-3  # s
 
-        diam = _as_solve_matrix(model.diam, model)
-        dx = _as_solve_matrix(model.dx, model)
         cm = _as_solve_matrix(model.cm, model) * _as_solve_matrix(model.cm_scale, model)
-        rhoa = _as_solve_matrix(model.rhoa, model) * _as_solve_matrix(
-            model.rhoa_scale, model
-        )
 
         # ── geometry (all element-wise) ──────────────────────────────
-        radius_cm = 1e-4 * diam / 2.0  # µm → cm   (B,K)
-        dx_cm = 1e-4 * dx  # µm → cm   (B,K)
         area_cm2 = _as_solve_matrix(model.area, model) * _as_solve_matrix(
             model.area_scale, model
         )
@@ -320,12 +316,10 @@ class _bwd_euler_ub(Integrator):
         Cm = 1e-6 * cm * area_cm2  # F   (B,K)
         Cm_inv = 1.0 / Cm  # 1/F
 
-        # segment axial resistance  (Ω cm)
-        Ra_seg = rhoa * dx_cm / (torch.pi * radius_cm**2)  # (B,K)
-
         # ── edge axial conductance between centres i ↔ i+1 ──────────
-        # harmonic mean:   g_edge = 2 / (Ra_i + Ra_{i+1})
-        g_edge = 2.0 / (Ra_seg[:, :-1] + Ra_seg[:, 1:])  # (B,K-1)
+        # Native Cable uses exact compiled edge resistance; conventional Axon
+        # models retain the established half-cylinder reconstruction.
+        g_edge = unbranched_edge_conductance(model)
 
         # convert to   g / C    (1/s)   for each adjoining cell
         g_left = g_edge / Cm[:, :-1]  # affects row i     (B,K-1)
@@ -408,7 +402,12 @@ class _bwd_euler_ub(Integrator):
         d_s = RHS
 
         # solve tridiagonal system
-        if self.use_gc_variant:
+        if self.K == 1:
+            # Tridiagonal extension kernels require at least one off-diagonal.
+            # A one-compartment Cable is the same scalar implicit system and
+            # has the exact closed-form solution below.
+            v_np1 = d_s / b_s
+        elif self.use_gc_variant:
             # GC variant only valid for Thomas solver
             v_np1 = self._solve(a_s, b_s, c_s, d_s, self.clip_scale)
         else:

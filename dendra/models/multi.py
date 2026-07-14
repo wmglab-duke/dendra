@@ -5,7 +5,7 @@ import math
 import torch
 
 from ..helpers import logger
-from .core import Axon, Population
+from .core import Cable, Population
 from .integrators import bwd_euler_sc_multi, dhs_multi
 from .tree import Tree
 
@@ -40,7 +40,7 @@ def _multi_solver_capability(population):
         return "block"
     if isinstance(population, Tree):
         return "scalar_tree"
-    if isinstance(population, Axon):
+    if isinstance(population, Cable):
         return "scalar_path"
     if isinstance(population, MultiPopulation):
         return "unsupported"
@@ -108,8 +108,8 @@ def _assess_type_and_make_integrator(populations, threads=16, write_back=True):
     raise TypeError(
         "Population(s) "
         f"{names} do not expose a supported scalar multi-solver topology. "
-        "Supported components are ordinary Population, Tree, and scalar Axon "
-        "models."
+        "Supported components are ordinary Population, Tree, and scalar Cable "
+        "models (including Axon subclasses)."
     )
 
 
@@ -135,7 +135,8 @@ def concat_models(
     Ordinary :class:`~dendra.models.core.Population` and
     :class:`~dendra.models.core.SingleCompartment` models, branched
     :class:`~dendra.models.tree.Tree` models, and scalar
-    :class:`~dendra.models.core.Axon` subclasses can be combined in one call.
+    :class:`~dendra.models.core.Cable` models (including Axon subclasses) can
+    be combined in one call.
     Mixed scalar components use the universal packed DHS solver; a collection
     containing only independent point compartments keeps the optimized
     single-compartment multi-integrator.
@@ -150,7 +151,7 @@ def concat_models(
         Mapping of unique component names to unbatched scalar populations. All
         components must share a device and dtype.
     threads : int, optional
-        DHS lane count for packed Tree/Axon groups. Must divide 32.
+        DHS lane count for packed Tree/Cable groups. Must divide 32.
     write_back : bool, optional
         If ``True``, write solved voltage views back to every component after
         each step. If ``False``, only the composite voltage is updated.
@@ -411,7 +412,7 @@ class MultiPopulation(Population):
     **populations
         Mapping of population names to unbatched instances on one device and
         dtype. Supported public components are ordinary Population,
-        SingleCompartment, Tree, Unmyelinated, and Myelinated models.
+        SingleCompartment, Tree, Cable, Unmyelinated, and Myelinated models.
 
     Notes
     -----
@@ -532,6 +533,174 @@ class MultiPopulation(Population):
             return next(iter(populations.values())).dtype()
         return Population.dtype(self)
 
+    def _validate_static_runtime_contracts(self, mode):
+        """Validate immutable component contracts without using child solvers."""
+        for population in self.populations.values():
+            population._validate_static_runtime_contracts(mode)
+
+    def _runtime_workspace_rebuild_pending(self):
+        """Require owner initialization to refresh concatenated component fields."""
+        # A forced packed-integrator rebuild consumes the MultiPopulation's
+        # concatenated copies; it does not call _refresh_component_fields().
+        # Therefore training-mode force=True alone cannot make a changed child
+        # dependency current. Fail closed until MultiPopulation.initialize().
+        return False
+
+    def _integrator_workspace_contract_signature(self):
+        """Track packed copies and every component solver dependency."""
+        local = []
+        for name in (
+            "cm",
+            "rhoa",
+            "cm_scale",
+            "rhoa_scale",
+            "area_scale",
+            "diam",
+            "dx",
+            "_component_area",
+        ):
+            value = getattr(self, name, None)
+            if not torch.is_tensor(value):
+                return None
+            try:
+                version = value._version
+            except RuntimeError:
+                version = None
+            local.append(
+                (
+                    name,
+                    id(value),
+                    version,
+                    tuple(value.shape),
+                    tuple(value.stride()),
+                    value.storage_offset(),
+                    value.dtype,
+                    value.device,
+                    value.layout,
+                    value.data_ptr(),
+                )
+            )
+        components = tuple(
+            (name, population._integrator_workspace_contract_signature())
+            for name, population in self.populations.items()
+        )
+        return tuple(local), components
+
+    def _record_unversioned_integrator_workspace_values(self, signature):
+        """Snapshot packed inference-tensor inputs that expose no versions."""
+        local_signature, component_signatures = signature
+        local_snapshots = None
+        if any(entry[2] is None for entry in local_signature):
+            local_snapshots = tuple(
+                (name, getattr(self, name).detach().clone())
+                for name in (
+                    "cm",
+                    "rhoa",
+                    "cm_scale",
+                    "rhoa_scale",
+                    "area_scale",
+                    "diam",
+                    "dx",
+                    "_component_area",
+                )
+            )
+
+        component_snapshots = {}
+        signatures = dict(component_signatures)
+        for name, population in self.populations.items():
+            component_signature = signatures.get(name)
+            value_names = getattr(
+                population, "_UNVERSIONED_WORKSPACE_VALUE_TENSORS", ()
+            )
+            if (
+                component_signature is not None
+                and value_names
+                and any(entry[2] is None for entry in component_signature)
+            ):
+                component_snapshots[name] = tuple(
+                    (field, getattr(population, field).detach().clone())
+                    for field in value_names
+                )
+
+        self._validated_unversioned_workspace_values = (
+            local_snapshots,
+            component_snapshots,
+        )
+
+    def _unversioned_integrator_workspace_values_match(self, signature=None):
+        """Compare packed inference dependencies with their built snapshots."""
+        if signature is None:
+            signature = self._integrator_workspace_contract_signature()
+        if signature is None:
+            return True
+        local_signature, component_signatures = signature
+        local_needs_values = any(entry[2] is None for entry in local_signature)
+        component_needs_values = {
+            name
+            for name, component_signature in component_signatures
+            if component_signature is not None
+            and any(entry[2] is None for entry in component_signature)
+        }
+        if not local_needs_values and not component_needs_values:
+            return True
+
+        snapshots = getattr(self, "_validated_unversioned_workspace_values", None)
+        if snapshots is None:
+            return False
+        local_snapshots, component_snapshots = snapshots
+        if local_needs_values and (
+            local_snapshots is None
+            or not all(
+                torch.equal(getattr(self, name), expected)
+                for name, expected in local_snapshots
+            )
+        ):
+            return False
+        for name in component_needs_values:
+            expected_values = component_snapshots.get(name)
+            if expected_values is None:
+                return False
+            population = self.populations[name]
+            if not all(
+                torch.equal(getattr(population, field), expected)
+                for field, expected in expected_values
+            ):
+                return False
+        return True
+
+    def __getstate__(self):
+        """Serialize packed workspace validity without process-local identities."""
+        state = super().__getstate__()
+        current = self._integrator_workspace_contract_signature()
+        integrator = getattr(self, "integrator", None)
+        state["_serialized_integrator_workspace_contract_valid"] = bool(
+            current is not None
+            and integrator is not None
+            and integrator.initialized
+            and current
+            == getattr(self, "_validated_integrator_workspace_signature", None)
+            and self._unversioned_integrator_workspace_values_match(current)
+        )
+        state["_validated_integrator_workspace_signature"] = None
+        state["_validated_unversioned_workspace_values"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Rebase a coherent packed workspace after deserialization."""
+        workspace_was_valid = bool(
+            state.pop("_serialized_integrator_workspace_contract_valid", False)
+        )
+        super().__setstate__(state)
+        self._validated_integrator_workspace_signature = None
+        self._validated_unversioned_workspace_values = None
+        if workspace_was_valid:
+            self._record_integrator_workspace_contracts()
+
+    def _validate_integrator_rebuild_contracts(self):
+        """Validate component contracts before packed solver workspace rebuilds."""
+        for population in self.populations.values():
+            population._validate_integrator_rebuild_contracts()
+
     def _sync_core_buffers_to_population_device(self):
         """Keep composite buffers on the same device/dtype as components."""
         device = self.device()
@@ -586,6 +755,10 @@ class MultiPopulation(Population):
         for population in self.populations.values():
             population.populate_parameter_buffers(random_generation=random_generation)
         super().populate_parameter_buffers(random_generation=random_generation)
+        self._refresh_component_fields()
+
+    def _refresh_parameter_views_for_initialization(self):
+        """Refresh packed copies even when direct overrides skip repopulation."""
         self._refresh_component_fields()
 
     def set_v_init(self, v_init):

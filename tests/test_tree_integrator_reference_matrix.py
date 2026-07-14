@@ -142,7 +142,10 @@ def _graphs_for_batched_scalar():
 def _add_edge_laplacian(matrix, graph, *, channel=0, shell_g=None, rhoa_scale=1.0):
     for parent, child, data in graph.edges(data=True):
         if shell_g is None:
-            conductance = 1.0 / (data["R_ohm"] * rhoa_scale)
+            child_scale = (
+                rhoa_scale[child] if torch.is_tensor(rhoa_scale) else rhoa_scale
+            )
+            conductance = 1.0 / (data["R_ohm"] * child_scale)
         else:
             conductance = shell_g[child]
         p = (
@@ -168,18 +171,21 @@ def _dense_scalar_reference(model, mechanism, voltage, dt, intra, extracellular)
     flat_cm = model.cm.reshape_as(flat_voltage)
     flat_intra = torch.broadcast_to(intra, voltage.shape).reshape_as(flat_voltage)
     flat_ve = torch.broadcast_to(extracellular, voltage.shape).reshape_as(flat_voltage)
+    flat_rhoa_scale = torch.broadcast_to(
+        torch.as_tensor(model.rhoa_scale, dtype=voltage.dtype), voltage.shape
+    ).reshape_as(flat_voltage)
     output = []
     for row, graph in enumerate(graphs):
         area = flat_area[row]
         cmdt = 1e-6 * flat_cm[row] * area * model.cm_scale / (dt * 1e-3)
         membrane_g = mechanism.conductance * area
         matrix = torch.diag(cmdt + membrane_g)
-        _add_edge_laplacian(matrix, graph, rhoa_scale=model.rhoa_scale)
+        _add_edge_laplacian(matrix, graph, rhoa_scale=flat_rhoa_scale[row])
         rhs = (
             cmdt * flat_voltage[row] + membrane_g * mechanism.reversal + flat_intra[row]
         )
         for parent, child, data in graph.edges(data=True):
-            conductance = 1.0 / (data["R_ohm"] * model.rhoa_scale)
+            conductance = 1.0 / (data["R_ohm"] * flat_rhoa_scale[row, child])
             drive = conductance * (flat_ve[row, child] - flat_ve[row, parent])
             rhs = rhs.clone()
             rhs[parent] += drive
@@ -264,6 +270,13 @@ def _dense_block_reference(model, mechanism, vc, voltage, dt, intra, extracellul
 
 def test_scalar_tree_matches_independent_dense_system_and_input_gradients():
     model = _TreeModel(_graphs_for_batched_scalar())
+    model.rhoa_scale = torch.tensor(
+        [
+            [0.7, 1.1, 1.6, 0.85, 1.35],
+            [1.4, 0.75, 1.2, 1.8, 0.95],
+        ],
+        dtype=DTYPE,
+    )
     mechanism = _LinearMechanism(conductance=3.2e-4, reversal=-47.5)
     integrator = _dhs(model, mechanism, threads=2)
     dt = 0.19

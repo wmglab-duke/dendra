@@ -908,10 +908,6 @@ class LFP(Callback):
     ----------
     v_unit : torch.Tensor
         Stacked lead fields in mV/mA, moved to the model's device.
-    lfp : torch.Tensor
-        Tensor of LFP values at each time step.
-    t : torch.Tensor
-        Tensor of timestamps corresponding to each LFP value.
 
     Examples
     --------
@@ -982,10 +978,12 @@ class LFP(Callback):
 
     @property
     def lfp(self):
+        """Tensor of recorded LFP values at each time step."""
         return torch.stack(self._lfp)
 
     @property
     def t(self):
+        """Tensor of timestamps corresponding to the recorded LFP values."""
         return torch.tensor(self._t)
 
     def numpy(self):
@@ -1032,8 +1030,6 @@ class ThresholdCallback(Callback):
         Indices of nodes being monitored.
     i : int
         Time step counter.
-    dt : float
-        Time step size in ms.
 
     """
 
@@ -1075,6 +1071,7 @@ class ThresholdCallback(Callback):
 
     @property
     def dt(self):
+        """Time step size in ms."""
         return self._dt
 
     @dt.setter

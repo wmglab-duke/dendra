@@ -57,6 +57,18 @@ class ctx(contextlib.ContextDecorator):
       in populations (required for LFP calculations).
     - ``USETABLES`` (int/bool): toggle lookup tables declared via ``TABLE`` on
       State/Mechanism.
+    - ``RUNTIME_CONTRACT_VALIDATION`` (str): runtime validation policy for
+      protected model contracts. ``"versioned"`` (default) performs cheap
+      mutation-version checks, revalidates frozen values after a change, and
+      rejects stale solver-workspace dependencies. ``"strict"`` performs full
+      frozen-value validation at every public execution boundary, while
+      ``"initialize"`` skips repeated boundary scans. Mandatory checks remain
+      at construction, initialization/workspace rebuild, state restore, and
+      direct geometry access. The last mode is unsafe if protected geometry or
+      solver-affecting inputs are mutated after initialization. Writes through
+      ``.data``, NumPy/DLPack aliases, or raw storage can bypass mutation-version
+      tracking; ``"strict"`` can diagnose frozen-contract corruption, but such
+      writes remain unsupported for mutable workspace inputs.
     - ``TF32`` is available but typically not toggled here.
 
     Example
@@ -77,6 +89,7 @@ class ctx(contextlib.ContextDecorator):
         self.old_context: dict[str, Any] = {
             k: v.value for k, v in ContextVar._cache.items()
         }
+        resolved = []
         for k, v in self.kwargs.items():
             key = CONTEXT_ALIASES.get(k, k)
             if key not in ContextVar._cache:
@@ -86,6 +99,10 @@ class ctx(contextlib.ContextDecorator):
                     f"Unknown Dendra context variable {k!r}. "
                     f"Valid keys: {valid}. Legacy aliases: {aliases}."
                 )
+            if key == "RUNTIME_CONTRACT_VALIDATION":
+                v = normalize_runtime_contract_validation(v)
+            resolved.append((key, v))
+        for key, v in resolved:
             ContextVar._cache[key].value = v
 
     def __exit__(self, *args):
@@ -252,6 +269,30 @@ def current_dtype(default=None):
     return _normalize_dtype_value(DTYPE.value, default=default)
 
 
+_RUNTIME_CONTRACT_VALIDATION_MODES = ("versioned", "strict", "initialize")
+
+
+def normalize_runtime_contract_validation(value) -> str:
+    """Return a canonical runtime-contract validation mode.
+
+    Modes are case-insensitive and surrounding whitespace is ignored. The
+    canonical values are ``"versioned"``, ``"strict"``, and ``"initialize"``.
+    """
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode in _RUNTIME_CONTRACT_VALIDATION_MODES:
+            return mode
+    expected = ", ".join(repr(mode) for mode in _RUNTIME_CONTRACT_VALIDATION_MODES)
+    raise ValueError(
+        f"RUNTIME_CONTRACT_VALIDATION must be one of {expected}; got {value!r}."
+    )
+
+
+def current_runtime_contract_validation() -> str:
+    """Return the active canonical runtime-contract validation mode."""
+    return normalize_runtime_contract_validation(RUNTIME_CONTRACT_VALIDATION.value)
+
+
 # Backward-compatible context-key aliases. The exported variable
 # ``JIT_IN_NETWORK`` below points at ``JIT_NETWORK_SOLVES`` as well, but ctx()
 # needs a key-level alias so ``with dendra.ctx(JIT_IN_NETWORK=0): ...`` keeps
@@ -270,6 +311,7 @@ CUDA = ContextVar("CUDA", int(torch.cuda.is_available()))
 PADE = ContextVar("PADE", -1)
 REQUIRE_GRAD = ContextVar("REQUIRE_GRAD", 0)
 USETABLES = ContextVar("USETABLES", 1)
+RUNTIME_CONTRACT_VALIDATION = ContextVar("RUNTIME_CONTRACT_VALIDATION", "versioned")
 
 BACKEND = ContextVar("BACKEND", "inductor")
 FULLGRAPH = ContextVar("FULLGRAPH", 0)

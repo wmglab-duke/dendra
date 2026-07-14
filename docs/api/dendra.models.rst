@@ -11,6 +11,8 @@ Core
 `Population` subclasses
 -----------------------
 .. autoclass:: dendra.models.core.SingleCompartment
+.. autoclass:: dendra.models.core.Cable
+   :members:
 .. autoclass:: dendra.models.core.Axon
    :members:
 .. autoclass:: dendra.models.core.Unmyelinated
@@ -31,7 +33,9 @@ Native morphology construction
 
 Dendra-native :class:`~dendra.models.morphology.Morphology` declarations and
 NEURON-authored morphologies both produce the scalar compartment-resistor graph
-consumed by :class:`~dendra.models.tree.Tree`. See
+consumed by :class:`~dendra.models.tree.Tree`, or by the tridiagonal
+:class:`~dendra.models.core.Cable` fast path when the graph is one unbranched
+material cable. See
 :doc:`dendra.models.morphology` for the declaration and canonical graph APIs,
 and :doc:`../basics/02a_native_morphologies` for the connection contract and a
 worked example.
@@ -43,9 +47,10 @@ Packed scalar populations
 :func:`dendra.concat_models` packs independent scalar systems into one solver
 launch without adding electrical edges between them. Ordinary ``Population``
 and ``SingleCompartment`` models are represented as one-node trees, ``Tree``
-retains its rooted compartment graph, and ``Unmyelinated``/``Myelinated`` use
-live tensor path geometry. These component types may be mixed, then explicitly
-batched on the returned model:
+retains its rooted compartment graph, native ``Cable`` retains exact canonical
+path edges, and ``Unmyelinated``/``Myelinated`` use live specialized tensor
+geometry. These component types may be mixed, then explicitly batched on the
+returned model:
 
 .. code-block:: python
 
@@ -117,8 +122,10 @@ from the graph root.
 
 Synapse slot targets
 --------------------
-.. autoclass:: dendra.models.slice.SynapseSlots
-   :members:
+
+:class:`dendra.models.slice.SynapseSlots` explicitly selects local slots in a
+banked point-process mechanism. Its canonical API reference is
+:doc:`dendra.models.slice`.
 
 
 Random distributions, runtime noise, and State SDEs
@@ -128,11 +135,8 @@ Runtime ``NOISE`` declarations are detached simulation drives. For stochastic
 state dynamics, ``State.DIFFUSION`` can be paired with ``State.METHOD("euler_maruyama")``
 for Itô SDEs or ``State.METHOD("euler_heun")`` for Stratonovich SDEs.
 
-.. autoclass:: dendra.models.random_parameters.RandomParameterSpec
-   :members:
-.. autoclass:: dendra.models.random_parameters.RuntimeNoiseSpec
-   :members:
-.. autoclass:: dendra.models.random_parameters.DistributionSpec
-   :members:
-.. autofunction:: dendra.models.random_parameters.register_random_distribution
-.. autofunction:: dendra.models.random_parameters.available_random_distributions
+The canonical API reference for
+:class:`dendra.models.random_parameters.RandomParameterSpec`,
+:class:`dendra.models.random_parameters.RuntimeNoiseSpec`,
+:class:`dendra.models.random_parameters.DistributionSpec`, and the distribution
+registry helpers is :doc:`dendra.models.parametric`.
