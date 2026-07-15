@@ -74,6 +74,9 @@ class CableModel(torch.nn.Module):
         self.register_buffer("dx", full(dx))
         self.register_buffer("cm", full(cm))
         self.register_buffer("rhoa", full(rhoa))
+        self.register_buffer("cm_scale", torch.tensor(1.0, dtype=DTYPE))
+        self.register_buffer("rhoa_scale", torch.tensor(1.0, dtype=DTYPE))
+        self.register_buffer("area_scale", torch.tensor(1.0, dtype=DTYPE))
 
         shell_shape = self.shape + (max(n_layers, 1),)
         self.register_buffer("xraxial", torch.full(shell_shape, 2.0, dtype=DTYPE))
@@ -85,6 +88,12 @@ class CableModel(torch.nn.Module):
 
     def dtype(self):
         return self.v.dtype
+
+    @property
+    def area(self):
+        radius_cm = 1.0e-4 * self.diam / 2.0
+        length_cm = 1.0e-4 * self.dx
+        return 2.0 * torch.pi * radius_cm * length_cm
 
     def expanded_v_init(self):
         value = torch.as_tensor(self.v_init, dtype=self.v.dtype, device=self.v.device)
@@ -655,6 +664,23 @@ def test_backward_euler_area_is_registered_for_state_and_device_migration():
     assert integrator.area.dtype == DTYPE
 
 
+@pytest.mark.parametrize("integrator_class", [_bwd_euler_sc, _bwd_euler_sc_skip])
+def test_backward_euler_single_compartment_applies_geometry_scales(
+    integrator_class,
+):
+    model = CableModel(shape=(1, 2), diam=4.0, dx=20.0, cm=1.5)
+    model.cm_scale = torch.tensor([[2.0, 0.5]], dtype=DTYPE)
+    model.area_scale = torch.tensor([[3.0, 0.25]], dtype=DTYPE)
+    integrator = integrator_class(model, LinearMechanism()).to(dtype=DTYPE)
+
+    integrator._initialize(model, 0.2)
+
+    expected_cmdt = 1.0e-6 * model.cm * model.cm_scale / (0.2e-3)
+    expected_area = model.area * model.area_scale
+    torch.testing.assert_close(integrator.cmdt, expected_cmdt)
+    torch.testing.assert_close(integrator.area, expected_area)
+
+
 def test_backward_euler_skip_applies_voltage_process_and_evaluates_current():
     model = CableModel(shape=(2, 3), v_init=-5.0)
     mech = LinearMechanism(g=0.1, shift=1.25)
@@ -721,6 +747,37 @@ def test_unbranched_implicit_geometry_builds_correct_asymmetric_bands():
     assert torch.allclose(integrator.upper, expected_upper)
     assert torch.allclose(integrator.lower, expected_lower)
     assert integrator.diag_base.shape == (1, 4)
+
+
+def test_unbranched_implicit_applies_capacitance_area_and_resistivity_scales():
+    model = CableModel(
+        shape=(1, 3),
+        cm=torch.tensor([1.0, 2.0, 3.0]),
+        diam=torch.tensor([2.0, 3.0, 4.0]),
+        dx=torch.tensor([8.0, 10.0, 12.0]),
+        rhoa=torch.tensor([80.0, 100.0, 120.0]),
+    )
+    model.cm_scale = torch.tensor([[0.5, 1.5, 2.0]], dtype=DTYPE)
+    model.area_scale = torch.tensor([[2.0, 0.75, 1.25]], dtype=DTYPE)
+    model.rhoa_scale = torch.tensor([[1.4, 0.6, 1.8]], dtype=DTYPE)
+    integrator = _bwd_euler_ub(model, LinearMechanism(), method="pcr").to(dtype=DTYPE)
+    dt = 0.15
+
+    integrator._initialize(model, dt)
+
+    radius = 1.0e-4 * model.diam / 2.0
+    length = 1.0e-4 * model.dx
+    area = model.area * model.area_scale
+    capacitance = 1.0e-6 * model.cm * model.cm_scale * area
+    resistance = model.rhoa * model.rhoa_scale * length / (torch.pi * radius.square())
+    edge = 2.0 / (resistance[:, :-1] + resistance[:, 1:])
+    torch.testing.assert_close(
+        integrator.upper, -(dt * 1.0e-3) * edge / capacitance[:, :-1]
+    )
+    torch.testing.assert_close(
+        integrator.lower, -(dt * 1.0e-3) * edge / capacitance[:, 1:]
+    )
+    torch.testing.assert_close(integrator.cm_inv, capacitance.reciprocal())
 
 
 def test_unbranched_implicit_step_matches_dense_linear_system_and_gradients():

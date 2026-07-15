@@ -1,6 +1,7 @@
 """Core data structures and utilities for Dendra population models."""
 
 import copy
+import hashlib
 import itertools
 import math
 import os
@@ -43,6 +44,7 @@ from dendra.helpers import (
     current_compile_options,
     current_device,
     current_dtype,
+    current_runtime_contract_validation,
     op_mc,
     op_sc,
 )
@@ -556,6 +558,10 @@ class Population(P, Sliceable):
         """
         return self.training or self.initializing_from_state_cache
 
+    def _runtime_workspace_rebuild_pending(self):
+        """Whether direct execution will refresh all tracked workspace inputs."""
+        return self.force_integrator_reinit()
+
     def _refresh_compile_config_from_ctx(self):
         """Refresh compile flags from dendra.ctx / ContextVar state.
 
@@ -717,6 +723,87 @@ class Population(P, Sliceable):
                     .expand(self.np, -1)
                 )
         return self.diam * 1e-4 * torch.pi * self.dx * 1e-4  # in cm²
+
+    def _validate_static_runtime_contracts(self, mode):
+        """Validate subclass-specific static contracts before public execution."""
+        return None
+
+    def _integrator_workspace_contract_signature(self):
+        """Return metadata for inputs captured by this model's solver workspace."""
+        return None
+
+    def _record_integrator_workspace_contracts(self):
+        """Record solver inputs only after a workspace was built successfully."""
+        signature = self._integrator_workspace_contract_signature()
+        if signature is not None:
+            self._validated_integrator_workspace_signature = signature
+            self._record_unversioned_integrator_workspace_values(signature)
+
+    def _record_unversioned_integrator_workspace_values(self, signature):
+        """Optionally snapshot dependencies whose tensors expose no versions."""
+        return None
+
+    def _unversioned_integrator_workspace_values_match(self, signature=None):
+        """Return whether any required unversioned dependency snapshots match."""
+        return True
+
+    def _validate_integrator_workspace_contracts(self, *, rebuild_pending=False):
+        """Reject execution with a stale, already-built solver workspace."""
+        signature = self._integrator_workspace_contract_signature()
+        if signature is None:
+            return
+        integrator = getattr(self, "integrator", None)
+        if integrator is None or not integrator.initialized:
+            # Population stepping will build the workspace before using it.
+            return
+        expected = getattr(self, "_validated_integrator_workspace_signature", None)
+        if (
+            expected != signature
+            or not self._unversioned_integrator_workspace_values_match(signature)
+        ):
+            if rebuild_pending:
+                # Direct Population training rebuilds its integrator before the
+                # next numerical step. Network execution passes False because
+                # it cannot refresh one population in isolation.
+                return
+            raise RuntimeError(
+                f"{type(self).__name__} solver-affecting inputs changed after "
+                "its integrator workspace was built. Reinitialize the model "
+                "before continuing (or reinitialize its owning Network or "
+                "MultiPopulation). Use initialize(populate_parameter_buffers=False) "
+                "when an intentional direct buffer override must be retained."
+            )
+
+    def _validate_runtime_contracts(self, *, workspace_rebuild_pending=False):
+        """Validate static and cached-workspace contracts before execution."""
+        mode = current_runtime_contract_validation()
+        if mode == "initialize":
+            return
+        self._validate_static_runtime_contracts(mode)
+        self._validate_integrator_workspace_contracts(
+            rebuild_pending=workspace_rebuild_pending
+        )
+
+    def _validate_integrator_rebuild_contracts(self):
+        """Validate static contracts immediately before solver workspace rebuilds."""
+        return None
+
+    def _apply(self, fn, recurse=True):
+        """Apply dtype/device transforms and invalidate derived solver workspaces."""
+        voltage = getattr(self, "v", None)
+        before = (voltage.device, voltage.dtype) if torch.is_tensor(voltage) else None
+        result = super()._apply(fn, recurse=recurse)
+        voltage = getattr(self, "v", None)
+        after = (voltage.device, voltage.dtype) if torch.is_tensor(voltage) else None
+        if before != after:
+            integrator = getattr(self, "integrator", None)
+            if integrator is not None:
+                # Coefficients must be recomputed at the destination precision
+                # and for the selected device backend. MechanismHandler._apply
+                # separately moves its non-state scratch and rebuilds scaling
+                # closures, so direct Population execution can rebuild lazily.
+                integrator.initialized = False
+        return result
 
     def numel(self, include_batch_dimensions=True):
         """
@@ -1712,6 +1799,9 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before stepping.")
+        self._validate_runtime_contracts(
+            workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
+        )
         self._refresh_compile_config_from_ctx()
 
         dt_f = _validate_time_scalar(
@@ -1866,6 +1956,9 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        self._validate_runtime_contracts(
+            workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
+        )
         self._refresh_compile_config_from_ctx()
 
         dt_f = _validate_time_scalar(
@@ -2096,6 +2189,9 @@ class Population(P, Sliceable):
 
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        self._validate_runtime_contracts(
+            workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
+        )
         if not isinstance(chunklength, int) or isinstance(chunklength, bool):
             raise ValueError("chunklength must be a positive integer.")
         if chunklength <= 0:
@@ -2375,6 +2471,10 @@ class Population(P, Sliceable):
             return True
         return False
 
+    def _refresh_parameter_views_for_initialization(self):
+        """Refresh subclass-owned derived parameter views before state setup."""
+        return None
+
     def initialize(self, force_rebuild=False, populate_parameter_buffers=True):
         """
         Build, populate, and initialize mechanisms for simulation.
@@ -2410,6 +2510,7 @@ class Population(P, Sliceable):
             self.clear_steady_state()
         if populate_parameter_buffers:
             self.populate_parameter_buffers(random_generation=random_generation)
+        self._refresh_parameter_views_for_initialization()
         self.intra = self.build_intra()
         if self._restore_steady_state():
             return self
@@ -3143,7 +3244,7 @@ class Population(P, Sliceable):
 
     def to(self, *args, **kwargs):
         """
-        Move the population to a new device or dtype, rebuilding if necessary.
+        Move the population to a new device or dtype.
 
         Parameters
         ----------
@@ -3156,6 +3257,14 @@ class Population(P, Sliceable):
         -------
         Population
             The population instance after conversion.
+
+        Notes
+        -----
+        Changing device or dtype after initialization moves mechanism scratch,
+        rebuilds point-process scaling closures, and invalidates derived solver
+        coefficients. Direct Population execution rebuilds the solver workspace
+        lazily. If this population belongs to an already-built Network,
+        reinitialize the Network before execution so all owner state is current.
         """
         self.build()
         return super().to(*args, **kwargs)
@@ -3391,7 +3500,20 @@ class Population(P, Sliceable):
         Population
             The population instance with detached states.
         """
+        workspace_signature = self._integrator_workspace_contract_signature()
+        workspace_was_valid = bool(
+            workspace_signature is not None
+            and self.integrator.initialized
+            and workspace_signature
+            == getattr(self, "_validated_integrator_workspace_signature", None)
+            and self._unversioned_integrator_workspace_values_match(workspace_signature)
+        )
         self.integrator.detach(self)
+        if workspace_was_valid:
+            # Detach is value preserving but rebinds tensors, so rebase only a
+            # workspace that was coherent before the operation. Never bless a
+            # pre-existing stale dependency accidentally.
+            self._record_integrator_workspace_contracts()
         return self
 
     def detach_(self):
@@ -4127,6 +4249,9 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        self._validate_runtime_contracts(
+            workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
+        )
         if not isinstance(chunklength, int) or isinstance(chunklength, bool):
             raise ValueError("chunklength must be a positive integer.")
         if chunklength <= 0:
@@ -5218,12 +5343,13 @@ class Population(P, Sliceable):
         show_mechanism_parameters: bool = False,
         indent: int = 2,
     ) -> str:
-        """
-        Human-friendly, block-formatted summary:
+        """Return a human-friendly, block-formatted summary.
 
-        Population {
-          ...
-        }
+        For example::
+
+            Population {
+              ...
+            }
         """
         name = self._get_name()  # nn.Module hook (defaults to class name)
 
@@ -5504,7 +5630,829 @@ def find_indices_smart(
     return FindResult(total_idx, local_idx_map, local_sz_map, total_sz)
 
 
-class Axon(Population):
+class Cable(Population):
+    """Generic unbranched cable using Dendra's tridiagonal fast path.
+
+    ``Cable`` is the geometry-general counterpart to :class:`Axon`.  It can
+    represent any material-only native Section morphology whose compiled
+    electrical graph is one simple path, including tapered pt3d Sections and
+    heterogeneous Section membrane properties.  Exact compiled membrane areas
+    and axial edge resistances remain the numerical source of truth.
+
+    Construct native cables with :meth:`from_morphology` or
+    :meth:`from_compartment_graph`.  The ordinary constructor is primarily the
+    shared implementation base for specialized path models such as
+    :class:`Axon`.
+    """
+
+    _supports_native_cable_factory = True
+
+    _CANONICAL_RUNTIME_CONTRACT_TENSORS = (
+        "diam",
+        "dx",
+        "rhoa",
+        "volume",
+        "volume_um3",
+        "volume_i",
+        "volume_o",
+        "diff_geom_um",
+        "_canonical_area_cm2",
+        "_canonical_edge_resistance_ohm",
+        "diff_parent_index",
+        "_canonical_morphology_fingerprint",
+        "_canonical_geometry_reference",
+        "rhoa_scale",
+    )
+
+    _SOLVER_WORKSPACE_CONTRACT_TENSORS = (
+        "cm",
+        "cm_scale",
+        "area_scale",
+        "rhoa_scale",
+        "diam",
+        "dx",
+        "rhoa",
+    )
+
+    _UNVERSIONED_WORKSPACE_VALUE_TENSORS = (
+        "cm",
+        "cm_scale",
+        "area_scale",
+        "rhoa_scale",
+    )
+
+    def __init__(self, N, C, graph=None, integrator=None, **kwargs):
+        if graph is not None:
+            raise TypeError(
+                "Cable graph topology cannot be supplied to the low-level "
+                "constructor. Use Cable.from_morphology(...) or "
+                "Cable.from_compartment_graph(...) so path order and exact "
+                "geometry are validated together."
+            )
+        if integrator is None:
+            integrator = bwd_euler_ub()
+        if self._supports_native_cable_factory and not getattr(
+            integrator, "supports_unbranched_cable", False
+        ):
+            raise TypeError(
+                "Generic Cable requires an integrator that declares "
+                "supports_unbranched_cable=True. Use bwd_euler_ub(...) for "
+                "the tridiagonal fast path or dhs(...) for the graph solver."
+            )
+        super().__init__(N, C, integrator=integrator, **kwargs)
+        self._graph = None
+        self._compartment_graph = None
+        self.register_buffer("_canonical_area_cm2", None)
+        self.register_buffer("_canonical_edge_resistance_ohm", None)
+        self.register_buffer("_canonical_morphology_fingerprint", None)
+        self.register_buffer("_canonical_geometry_reference", None)
+        self._canonical_morphology_fingerprint_reference = None
+        self._validated_runtime_contract_signature = None
+        self._validated_integrator_workspace_signature = None
+        self._validated_unversioned_workspace_values = None
+
+    def __getstate__(self):
+        """Serialize without process-local tensor identity/version metadata."""
+        state = super().__getstate__()
+        current_workspace = self._integrator_workspace_contract_signature()
+        integrator = getattr(self, "integrator", None)
+        state["_serialized_integrator_workspace_contract_valid"] = bool(
+            current_workspace is not None
+            and integrator is not None
+            and integrator.initialized
+            and current_workspace
+            == getattr(self, "_validated_integrator_workspace_signature", None)
+            and self._unversioned_integrator_workspace_values_match(current_workspace)
+        )
+        state["_validated_runtime_contract_signature"] = None
+        state["_validated_integrator_workspace_signature"] = None
+        state["_validated_unversioned_workspace_values"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Rebase valid process-local workspace metadata after deserialization."""
+        workspace_was_valid = bool(
+            state.pop("_serialized_integrator_workspace_contract_valid", False)
+        )
+        super().__setstate__(state)
+        self._validated_runtime_contract_signature = None
+        self._validated_integrator_workspace_signature = None
+        self._validated_unversioned_workspace_values = None
+        if workspace_was_valid:
+            self._record_integrator_workspace_contracts()
+
+    @staticmethod
+    def _fingerprint_compartment_graph(graph) -> bytes:
+        """Return a stable digest of canonical topology, geometry, and metadata."""
+        geometry_fields = tuple(
+            (
+                name,
+                tuple(float(value).hex() for value in getattr(graph.geometry, name)),
+            )
+            for name in graph.geometry.__dataclass_fields__
+        )
+        metadata_fields = (
+            ("name", tuple(graph.metadata.name)),
+            ("kind", tuple(graph.metadata.kind)),
+            ("section_name", tuple(graph.metadata.section_name)),
+            ("segment_index", tuple(graph.metadata.segment_index)),
+            (
+                "section_x",
+                tuple(
+                    None if value is None else float(value).hex()
+                    for value in graph.metadata.section_x
+                ),
+            ),
+            (
+                "labels",
+                tuple(tuple(sorted(labels)) for labels in graph.metadata.labels),
+            ),
+        )
+        payload = (
+            int(graph.schema_version),
+            tuple(graph.topology.parent_index),
+            geometry_fields,
+            metadata_fields,
+        )
+        return hashlib.sha256(repr(payload).encode("utf-8")).digest()
+
+    def _tensor_contract_signature(self, names, *, require_versions):
+        """Return identity/version/storage metadata for the named tensors."""
+        signature = []
+        for name in names:
+            value = getattr(self, name, None)
+            if not torch.is_tensor(value):
+                return None
+            try:
+                version = value._version
+            except RuntimeError:
+                # Tensors created under torch.inference_mode() deliberately do
+                # not expose version counters. Static versioned validation must
+                # fall back to a full scan. Workspace metadata can still prove
+                # identity/device/dtype stability. Exact value snapshots cover
+                # ordinary inference-tensor mutations; only writes through
+                # raw aliases remain outside the supported contract.
+                if require_versions:
+                    return None
+                version = None
+            metadata = (
+                tuple(value.shape),
+                tuple(value.stride()),
+                value.storage_offset(),
+                value.dtype,
+                value.device,
+                value.layout,
+                value.data_ptr(),
+            )
+            signature.append((name, id(value), version, metadata))
+        return tuple(signature)
+
+    def _runtime_contract_signature(self):
+        """Return a cheap change signature, or ``None`` without version counters."""
+        return self._tensor_contract_signature(
+            self._CANONICAL_RUNTIME_CONTRACT_TENSORS,
+            require_versions=True,
+        )
+
+    def _integrator_workspace_contract_signature(self):
+        """Track native Cable inputs captured in exact-edge solver coefficients."""
+        if self._compartment_graph is None:
+            # Legacy Axon subclasses expose parametrized geometry whose public
+            # tensors may be reconstructed out of place on access. Their
+            # established training/reinitialization lifecycle remains separate
+            # from the immutable native-Cable contract implemented here.
+            return None
+        return self._tensor_contract_signature(
+            self._SOLVER_WORKSPACE_CONTRACT_TENSORS,
+            require_versions=False,
+        )
+
+    def _record_unversioned_integrator_workspace_values(self, signature):
+        """Snapshot mutable workspace inputs only when versions are unavailable."""
+        if any(entry[2] is None for entry in signature):
+            self._validated_unversioned_workspace_values = tuple(
+                (name, getattr(self, name).detach().clone())
+                for name in self._UNVERSIONED_WORKSPACE_VALUE_TENSORS
+            )
+        else:
+            self._validated_unversioned_workspace_values = None
+
+    def _unversioned_integrator_workspace_values_match(self, signature=None):
+        """Compare inference-tensor dependencies against their built values."""
+        if signature is None:
+            signature = self._integrator_workspace_contract_signature()
+        if signature is None or not any(entry[2] is None for entry in signature):
+            return True
+        snapshots = self._validated_unversioned_workspace_values
+        if snapshots is None:
+            return False
+        return all(
+            torch.equal(getattr(self, name), expected) for name, expected in snapshots
+        )
+
+    def _validate_canonical_geometry(self):
+        """Fail closed if immutable compiled geometry has been edited in place."""
+        if self._compartment_graph is None:
+            return
+        reference = self._canonical_geometry_reference
+        if reference is None:
+            raise RuntimeError("Native Cable canonical geometry reference is missing.")
+
+        checks = (
+            ("diam", self.diam),
+            ("dx", self.dx),
+            ("rhoa", self.rhoa),
+            ("volume", self.volume),
+            ("volume_um3", self.volume_um3),
+            ("volume_i", self.volume_i),
+            ("volume_o", self.volume_o),
+            ("diff_geom_um", self.diff_geom_um),
+            ("_canonical_area_cm2", self._canonical_area_cm2),
+            ("_canonical_edge_resistance_ohm", self._canonical_edge_resistance_ohm),
+        )
+        if reference.shape[0] != len(checks):
+            raise RuntimeError("Native Cable canonical geometry reference is invalid.")
+        for index, (name, actual) in enumerate(checks):
+            try:
+                actual_view = torch.broadcast_to(actual, self.shape)
+                reference_view = torch.broadcast_to(reference[index], self.shape)
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"Native Cable compiled geometry buffer {name!r} no longer "
+                    f"broadcasts to model shape {self.shape}. Recompile the "
+                    "Morphology instead of editing compiled geometry."
+                ) from error
+            # rhoa is a bounded RANGE parameter. Cross-dtype state restoration
+            # can round its internal unconstrained coordinate once before the
+            # public value is reconstructed, so permit only representation-
+            # scale roundoff there; all direct geometry buffers remain exact.
+            equal = torch.equal(actual_view, reference_view)
+            if name == "rhoa" and not equal:
+                eps = torch.finfo(actual_view.dtype).eps
+                equal = torch.allclose(
+                    actual_view,
+                    reference_view,
+                    rtol=4.0 * eps,
+                    atol=0.0,
+                )
+            if not equal:
+                raise RuntimeError(
+                    f"Native Cable compiled geometry buffer {name!r} was modified. "
+                    "Compiled diam/dx/rhoa, area, volume, and edge geometry are "
+                    "immutable; edit the Morphology and construct a new Cable."
+                )
+
+        expected_parent = torch.as_tensor(
+            self._compartment_graph.topology.parent_index,
+            device=self.diff_parent_index.device,
+            dtype=self.diff_parent_index.dtype,
+        )
+        if not torch.equal(self.diff_parent_index, expected_parent):
+            raise RuntimeError(
+                "Native Cable compiled geometry buffer 'diff_parent_index' was "
+                "modified. Edit the Morphology and construct a new Cable."
+            )
+
+        fingerprint_reference = self._canonical_morphology_fingerprint_reference
+        fingerprint = self._canonical_morphology_fingerprint
+        if fingerprint_reference is None:
+            raise RuntimeError(
+                "Native Cable canonical morphology fingerprint reference is missing."
+            )
+        expected_fingerprint = torch.as_tensor(
+            list(fingerprint_reference),
+            device=fingerprint.device,
+            dtype=fingerprint.dtype,
+        )
+        if not torch.equal(fingerprint, expected_fingerprint):
+            raise RuntimeError(
+                "Native Cable canonical morphology fingerprint was modified. "
+                "Edit the Morphology and construct a new Cable."
+            )
+
+        scale = torch.broadcast_to(self.rhoa_scale, self.shape).reshape(
+            -1, self.shape[-1]
+        )
+        if scale.shape[-1] > 1 and not torch.equal(
+            scale, scale[:, :1].expand_as(scale)
+        ):
+            raise ValueError(
+                "A canonical Cable supports only spatially uniform rhoa_scale "
+                "within each cable. Exact edge totals cannot recover distinct "
+                "left/right half-path scaling."
+            )
+
+        # Cache only a state which has passed every value-level contract above.
+        # ``None`` is intentional for inference tensors: their missing version
+        # counters force a full scan at every versioned validation boundary.
+        self._validated_runtime_contract_signature = self._runtime_contract_signature()
+
+    def initialize(self, *args, **kwargs):
+        """Validate frozen native geometry before entering the normal lifecycle."""
+        self._validate_canonical_geometry()
+        try:
+            result = super().initialize(*args, **kwargs)
+            self._validate_canonical_geometry()
+        except Exception:
+            self.initialized = False
+            if self.integrator is not None:
+                self.integrator.initialized = False
+            raise
+        return result
+
+    def _validate_static_runtime_contracts(self, mode):
+        """Validate native compiled geometry at public execution boundaries."""
+        if self._compartment_graph is None:
+            return
+
+        if mode == "strict":
+            self._validate_canonical_geometry()
+            return
+
+        signature = self._runtime_contract_signature()
+        if signature is None or signature != self._validated_runtime_contract_signature:
+            self._validate_canonical_geometry()
+
+    def _validate_integrator_rebuild_contracts(self):
+        """Fully validate geometry before rebuilding cached solver coefficients."""
+        self._validate_canonical_geometry()
+
+    def _preflight_incoming_canonical_geometry(self, state_dict, prefix):
+        """Validate frozen checkpoint geometry before any tensor is copied."""
+        self._validate_canonical_geometry()
+        local_reference = self._canonical_geometry_reference
+        reference_key = f"{prefix}_canonical_geometry_reference"
+        incoming_reference = state_dict.get(reference_key)
+        if (
+            not torch.is_tensor(incoming_reference)
+            or not torch.is_floating_point(incoming_reference)
+            or tuple(incoming_reference.shape) != tuple(local_reference.shape)
+        ):
+            raise RuntimeError(
+                "Cannot load a native Cable checkpoint with missing or corrupt "
+                "canonical geometry."
+            )
+
+        # The same binary64 graph may have been deliberately materialized in a
+        # different model dtype. Compare both references in the less precise of
+        # the two dtypes so float32 <-> float64 restoration remains exact at the
+        # intentional cast boundary, without weakening same-dtype validation.
+        incoming_eps = torch.finfo(incoming_reference.dtype).eps
+        local_eps = torch.finfo(local_reference.dtype).eps
+        comparison_dtype = (
+            incoming_reference.dtype
+            if incoming_eps >= local_eps
+            else local_reference.dtype
+        )
+        incoming_reference_native_cpu = incoming_reference.detach().cpu()
+        incoming_reference_cpu = incoming_reference_native_cpu.to(
+            device="cpu", dtype=comparison_dtype
+        )
+        local_reference_cpu = local_reference.detach().to(
+            device="cpu", dtype=comparison_dtype
+        )
+        if not torch.equal(incoming_reference_cpu, local_reference_cpu):
+            raise RuntimeError(
+                "Cannot load a native Cable checkpoint with corrupt canonical "
+                "geometry inconsistent with its morphology fingerprint."
+            )
+
+        checks = (
+            ("diam", 0),
+            ("dx", 1),
+            ("rhoa", 2),
+            ("volume", 3),
+            ("volume_um3", 4),
+            ("volume_i", 5),
+            ("volume_o", 6),
+            ("diff_geom_um", 7),
+            ("_canonical_area_cm2", 8),
+            ("_canonical_edge_resistance_ohm", 9),
+        )
+        for name, index in checks:
+            candidate = state_dict.get(f"{prefix}{name}")
+            current = getattr(self, name)
+            if (
+                not torch.is_tensor(candidate)
+                or not torch.is_floating_point(candidate)
+                or tuple(candidate.shape) != tuple(current.shape)
+            ):
+                raise RuntimeError(
+                    "Cannot load a native Cable checkpoint with missing or "
+                    f"corrupt canonical geometry buffer {name!r}."
+                )
+            candidate_cpu = candidate.detach().cpu()
+            try:
+                expected = torch.broadcast_to(
+                    incoming_reference_native_cpu[index].to(dtype=candidate_cpu.dtype),
+                    candidate_cpu.shape,
+                )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    "Cannot load a native Cable checkpoint with corrupt canonical "
+                    f"geometry buffer {name!r}."
+                ) from error
+            equal = torch.equal(candidate_cpu, expected)
+            if name == "rhoa" and not equal:
+                eps = torch.finfo(candidate_cpu.dtype).eps
+                equal = torch.allclose(
+                    candidate_cpu,
+                    expected,
+                    rtol=4.0 * eps,
+                    atol=0.0,
+                )
+            if not equal:
+                raise RuntimeError(
+                    "Cannot load a native Cable checkpoint with corrupt canonical "
+                    f"geometry buffer {name!r}."
+                )
+
+        parent_key = f"{prefix}diff_parent_index"
+        incoming_parent = state_dict.get(parent_key)
+        if (
+            not torch.is_tensor(incoming_parent)
+            or incoming_parent.dtype != self.diff_parent_index.dtype
+            or not torch.equal(
+                incoming_parent.detach().cpu(),
+                self.diff_parent_index.detach().cpu(),
+            )
+        ):
+            raise RuntimeError(
+                "Cannot load a native Cable checkpoint with corrupt canonical "
+                "geometry buffer 'diff_parent_index'."
+            )
+
+    def _preserve_local_canonical_geometry_during_load(self, state_dict, prefix):
+        """Replace validated frozen payload entries with target-local values."""
+        frozen = {
+            "diam": self.diam,
+            "dx": self.dx,
+            "rhoa": self.rhoa,
+            "volume": self.volume,
+            "volume_um3": self.volume_um3,
+            "volume_i": self.volume_i,
+            "volume_o": self.volume_o,
+            "diff_geom_um": self.diff_geom_um,
+            "diff_parent_index": self.diff_parent_index,
+            "_canonical_area_cm2": self._canonical_area_cm2,
+            "_canonical_edge_resistance_ohm": (self._canonical_edge_resistance_ohm),
+            "_canonical_morphology_fingerprint": (
+                self._canonical_morphology_fingerprint
+            ),
+            "_canonical_geometry_reference": self._canonical_geometry_reference,
+        }
+        for name, value in frozen.items():
+            key = f"{prefix}{name}"
+            if key in state_dict:
+                state_dict[key] = value.detach().clone()
+
+        # ``rhoa`` is a bounded RANGE parameter. Its public buffer and the
+        # unconstrained source coordinate must remain one target-local pair;
+        # retaining only the public value would let the next parameter
+        # population silently recreate lower-precision checkpoint geometry.
+        for name, value in self.rhoa_param.state_dict().items():
+            key = f"{prefix}rhoa_param.{name}"
+            if key not in state_dict:
+                continue
+            state_dict[key] = (
+                value.detach().clone()
+                if torch.is_tensor(value)
+                else copy.deepcopy(value)
+            )
+
+        # A built model contains aliases/snapshots of the same morphology in
+        # its handler, mechanisms, material processes, and material spatial
+        # operators. Preserve those target-local copies too. Mutable mechanism
+        # and material state remains loadable; only geometry-derived entries
+        # are replaced.
+        for name, value in self.state_dict().items():
+            leaf = name.rsplit(".", 1)[-1]
+            handler_area = name in {"mech.area", "integrator.mech.area"}
+            nested_geometry = "." in name and (
+                handler_area
+                or leaf == "diam"
+                or leaf.startswith("_mp_")
+                or "._spatial_operators." in name
+            )
+            if not nested_geometry:
+                continue
+            key = f"{prefix}{name}"
+            if key not in state_dict:
+                continue
+            state_dict[key] = (
+                value.detach().clone()
+                if torch.is_tensor(value)
+                else copy.deepcopy(value)
+            )
+
+        # Direct state_dict loading can occur after the timestep workspace was
+        # initialized. Child buffers are copied after this hook returns, so
+        # force the next public step to rebuild every geometry-derived solver
+        # workspace from the preserved target sources.
+        if self.integrator is not None:
+            self.integrator.initialized = False
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Reject checkpoints authored for a different canonical morphology."""
+        key = f"{prefix}_canonical_morphology_fingerprint"
+        current = self._canonical_morphology_fingerprint
+        incoming = state_dict.get(key)
+        if (current is None) != (incoming is None):
+            raise RuntimeError(
+                "Cannot load state between a canonical native Cable and a "
+                "non-canonical Cable/Axon model."
+            )
+        if current is not None:
+            if not torch.is_tensor(incoming) or not torch.equal(
+                current.detach().cpu(), incoming.detach().cpu()
+            ):
+                raise RuntimeError(
+                    "Cannot load a native Cable checkpoint into a different "
+                    "canonical morphology. Topology, geometry, or provenance differs."
+                )
+            self._preflight_incoming_canonical_geometry(state_dict, prefix)
+            self._preserve_local_canonical_geometry_during_load(state_dict, prefix)
+        return super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def state_dict_for_checkpoint(self):
+        """Include canonical identity in runtime/activation checkpoints."""
+        self._validate_canonical_geometry()
+        state = super().state_dict_for_checkpoint()
+        fingerprint = self._canonical_morphology_fingerprint
+        if fingerprint is not None:
+            state["canonical_morphology_fingerprint"] = fingerprint.clone()
+        return state
+
+    def _restore_dict_from_checkpoint_unchecked(self, state_dict):
+        """Reject runtime state from a different canonical morphology first."""
+        self._validate_canonical_geometry()
+        fingerprint = self._canonical_morphology_fingerprint
+        incoming = state_dict.get("canonical_morphology_fingerprint")
+        if fingerprint is not None:
+            if not torch.is_tensor(incoming) or not torch.equal(
+                fingerprint.detach().cpu(), incoming.detach().cpu()
+            ):
+                raise RuntimeError(
+                    "Cannot restore a native Cable runtime checkpoint into a "
+                    "different canonical morphology."
+                )
+        elif incoming is not None:
+            raise RuntimeError(
+                "Cannot restore canonical native Cable state into a "
+                "non-canonical Cable/Axon model."
+            )
+        return super()._restore_dict_from_checkpoint_unchecked(state_dict)
+
+    @property
+    def graph(self):
+        """Fresh NetworkX path view aligned to model compartment storage."""
+        self._validate_canonical_geometry()
+        return self._canonical_graph_view()
+
+    def _canonical_graph_view(self):
+        """Return a defensive graph whose edge numerics match model buffers.
+
+        ``_compartment_graph`` and ``_graph`` retain the binary64 morphology
+        snapshot used for provenance and checkpoint identity.  A dtype move is
+        intentionally different: for example, float32 -> float64 widens the
+        already-rounded model buffers and cannot recover the original binary64
+        geometry.  Runtime graph consumers must therefore read resistance and
+        diffusion geometry from the same model-dtype frozen buffers as the UB
+        voltage solver and material process, rather than silently switching
+        back to the provenance precision through ``_graph``.
+        """
+        if self._graph is None:
+            return None
+
+        graph = self._graph.copy()
+        resistance = torch.broadcast_to(
+            self._canonical_edge_resistance_ohm, self.shape
+        ).reshape(-1, self.nc)[0]
+        diffusion = torch.broadcast_to(self.diff_geom_um, self.shape).reshape(
+            -1, self.nc
+        )[0]
+        for child, parent in enumerate(self._compartment_graph.topology.parent_index):
+            if parent == -1:
+                continue
+            edge = graph.edges[parent, child]
+            edge["R_ohm"] = resistance[child].detach().item()
+            edge["diff_geom_um"] = diffusion[child].detach().item()
+        return graph
+
+    @property
+    def compartment_graph(self):
+        """Immutable path-ordered canonical morphology snapshot, if present."""
+        return self._compartment_graph
+
+    @property
+    def area(self):
+        """Exact compiled membrane area for native cables, in cm²."""
+        self._validate_canonical_geometry()
+        area = self._canonical_area_cm2
+        if area is not None:
+            # Mechanism construction may retain this tensor as registered
+            # state. Materialize broadcasted batch axes so state restoration
+            # never attempts to copy into a zero-stride expanded view.
+            return torch.broadcast_to(area, self.shape).clone()
+        return super().area
+
+    @property
+    def edge_resistance_ohm(self):
+        """Child-indexed exact axial resistance, including a zero root entry."""
+        self._validate_canonical_geometry()
+        resistance = self._canonical_edge_resistance_ohm
+        if resistance is None:
+            return None
+        return torch.broadcast_to(resistance, self.shape).clone()
+
+    def material_volume(self, domain="intracellular"):
+        """Return an exact native-cable material-domain volume buffer."""
+        self._validate_canonical_geometry()
+        domain = str(domain or "intracellular").lower()
+        if domain in {"i", "inside", "cytosol", "cytoplasm", "intracellular"}:
+            name = "volume_i"
+        elif domain in {"o", "outside", "extracellular"}:
+            name = "volume_o"
+        elif domain in {"total", "volume", "all"}:
+            name = "volume"
+        elif domain in {"membrane", "surface", "area"}:
+            return self.area
+        else:
+            raise ValueError(f"Unsupported material domain {domain!r} for Cable.")
+        if not hasattr(self, name):
+            raise RuntimeError(
+                "Exact material volumes are available only on a Cable built "
+                "from a canonical compartment graph."
+            )
+        return getattr(self, name)
+
+    def assemble_graphs(self):
+        """Return one exact path graph view per core population member."""
+        self._validate_canonical_geometry()
+        graph = self._canonical_graph_view()
+        if graph is None:
+            raise RuntimeError(
+                "Cable graph assembly requires construction from a canonical "
+                "compartment graph."
+            )
+        return [graph.copy() for _ in range(self.np)]
+
+    @classmethod
+    def from_compartment_graph(cls, graph, N=1, integrator=None, **kwargs):
+        """Construct a fast generic cable from a canonical material path.
+
+        The source graph is reordered deterministically from one physical end
+        to the other.  Branches and retained zero-area junctions are rejected.
+        Exact edge resistance and membrane area are retained rather than being
+        reconstructed from center diameter and compartment length.
+        """
+        from .morphology import CompartmentGraph
+        from .tree import (
+            _register_canonical_internal_nodes,
+            _register_compartment_graph_labels,
+        )
+
+        if not getattr(cls, "_supports_native_cable_factory", False):
+            raise NotImplementedError(
+                f"{cls.__name__}.from_compartment_graph requires an explicit "
+                "adapter because that class defines specialized path geometry. "
+                "Use Cable.from_compartment_graph for a generic native path."
+            )
+        if not isinstance(graph, CompartmentGraph):
+            raise TypeError("graph must be a CompartmentGraph.")
+        if "rhoa" in kwargs:
+            raise ValueError(
+                "A canonical Cable's exact edge resistance already incorporates "
+                "Section rhoa. Set rhoa on the source Morphology instead of "
+                "overriding it during construction."
+            )
+
+        path = graph.path_ordered()
+        geometry = path.geometry
+        C = path.n_compartments
+        cm = kwargs.pop("cm", geometry.cm_uF_cm2)
+        cable = cls(
+            N,
+            C,
+            integrator=integrator,
+            cm=cm,
+            rhoa=geometry.rhoa_ohm_cm,
+            **kwargs,
+        )
+        cable._graph = path.to_networkx()
+
+        def expanded(values, *, scale=1.0):
+            # Canonical morphology calculations and unit conversions happen in
+            # binary64; cast only the final value to the configured model dtype.
+            value = torch.as_tensor(values, dtype=torch.float64)
+            if scale != 1.0:
+                value = value * scale
+            value = value.to(device=cable.device(), dtype=cable.dtype()).reshape(1, C)
+            return value.expand(N, -1).clone()
+
+        cable.dx.copy_(expanded(geometry.length_um))
+        cable.diam.copy_(expanded(geometry.diameter_um))
+        cable.x.copy_(expanded(geometry.x_um))
+        cable.y.copy_(expanded(geometry.y_um))
+        cable.z.copy_(expanded(geometry.z_um))
+        cable._canonical_area_cm2 = expanded(geometry.area_um2, scale=1e-8)
+        cable._canonical_edge_resistance_ohm = expanded(geometry.edge_resistance_ohm)
+        fingerprint = cls._fingerprint_compartment_graph(path)
+        cable._canonical_morphology_fingerprint_reference = fingerprint
+        cable._canonical_morphology_fingerprint = torch.tensor(
+            list(fingerprint),
+            device=cable.device(),
+            dtype=torch.uint8,
+        )
+
+        for name, values in (
+            ("volume", geometry.volume_um3),
+            ("volume_um3", geometry.volume_um3),
+            ("volume_i", geometry.volume_i_um3),
+            ("volume_o", geometry.volume_o_um3),
+            ("diff_geom_um", geometry.edge_diff_geom_um),
+        ):
+            cable.register_buffer(name, expanded(values))
+        cable.register_buffer(
+            "diff_parent_index",
+            torch.as_tensor(
+                path.topology.parent_index,
+                device=cable.device(),
+                dtype=torch.long,
+            ),
+        )
+
+        cable.names = list(path.metadata.name)
+        cable._compartment_graph = path
+        cable._canonical_geometry_reference = (
+            torch.stack(
+                (
+                    cable.diam[:1],
+                    cable.dx[:1],
+                    cable.rhoa[:1],
+                    cable.volume[:1],
+                    cable.volume_um3[:1],
+                    cable.volume_i[:1],
+                    cable.volume_o[:1],
+                    cable.diff_geom_um[:1],
+                    cable._canonical_area_cm2[:1],
+                    cable._canonical_edge_resistance_ohm[:1],
+                ),
+                dim=0,
+            )
+            .detach()
+            .clone()
+        )
+        _register_canonical_internal_nodes(cable, path)
+        _register_compartment_graph_labels(cable, path)
+        return cable
+
+    @classmethod
+    def from_morphology(cls, morphology, N=1, integrator=None, **kwargs):
+        """Compile a native Section path and construct a generic Cable."""
+        from .morphology import Morphology
+        from .tree import _register_compartment_graph_labels
+
+        if not isinstance(morphology, Morphology):
+            raise TypeError("morphology must be a Morphology.")
+        cable = cls.from_compartment_graph(
+            morphology.compile(), N=N, integrator=integrator, **kwargs
+        )
+        graph = cable.compartment_graph
+        ordered_labels = {}
+        for section in morphology.sections:
+            section_nodes = sorted(
+                (
+                    node
+                    for node, section_name in enumerate(graph.metadata.section_name)
+                    if section_name == section.name
+                ),
+                key=lambda node: graph.metadata.segment_index[node],
+            )
+            for label in section.labels:
+                ordered_labels.setdefault(label, []).extend(section_nodes)
+        _register_compartment_graph_labels(cable, graph, ordered=ordered_labels)
+        return cable
+
+
+class Axon(Cable):
     """
     Base 1D fiber class.
 
@@ -5520,6 +6468,8 @@ class Axon(Population):
       lie along the x-axis (y=z=0), with the central compartment at x=0 (thereby
       spanning from -axon_length/2 to axon_length/2).
     """
+
+    _supports_native_cable_factory = False
 
     __constants__ = [
         "n_ax",

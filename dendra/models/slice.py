@@ -487,12 +487,8 @@ class Slice:
 
     Attributes
     ----------
-    model : Population
-        Underlying population (or submodule) providing the state and methods.
     index_spec : IndexSpec
         Canonicalised description of the selection (index, shape, scalar flag).
-    base_shape : tuple of int
-        Current logical shape of the owning population, including batch axes.
     parent_slice : Slice or None
         Parent slice if this slice was created from another slice.
 

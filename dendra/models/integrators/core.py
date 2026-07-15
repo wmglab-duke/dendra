@@ -452,8 +452,18 @@ class Integrator(torch.nn.Module):
         return not self.initialized or self.dt != float(dt) or self.shape != model.shape
 
     def _initialize(self, model, dt, force=False, *, compile_scope: str = "population"):
+        needs_initialize = self.needs_to_be_initialized(model, dt, force)
+        if needs_initialize:
+            # Geometry-derived workspaces must never be built from a model that
+            # violates its static contracts. This hook is independent of the
+            # public runtime-validation policy and runs before this integrator
+            # mutates compiler settings, timestep state, or solver buffers.
+            validate = getattr(model, "_validate_integrator_rebuild_contracts", None)
+            if validate is not None:
+                validate()
+
         self.configure_jit(model, scope=compile_scope)
-        if self.needs_to_be_initialized(model, dt, force):
+        if needs_initialize:
             previous_dt = self.dt
             previous_shape = self.shape
             previous_initialized = self.initialized
@@ -467,6 +477,9 @@ class Integrator(torch.nn.Module):
                     for mech in self.mech.mechanisms.values():
                         mech.set_dt(dt)
                 self.initialize(model, dt)
+                record = getattr(model, "_record_integrator_workspace_contracts", None)
+                if record is not None:
+                    record()
             except Exception:
                 # An initializer may have rebound only some workspaces before
                 # failing. Never advertise that partial state as initialized or

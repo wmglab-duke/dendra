@@ -20,6 +20,19 @@ _CREATED = []
 _COUNTER = 0
 
 
+@pytest.fixture(autouse=True)
+def _delete_created_sections_after_test():
+    """Keep this unit module from leaking HOC sections into simtest oracles."""
+    existing = {section.name() for section in h.allsec()}
+    try:
+        yield
+    finally:
+        for section in list(h.allsec()):
+            if section.name() not in existing:
+                h.delete_section(sec=section)
+        _CREATED.clear()
+
+
 def _section(prefix, *, L, diam, Ra, nseg):
     global _COUNTER
     _COUNTER += 1
@@ -160,6 +173,43 @@ def test_reversed_child_orientation_is_oriented_away_from_root():
         near = _node_for_segment(id2seg, child, idx)
         far = _node_for_segment(id2seg, child, idx - 1)
         assert graph.has_edge(near, far)
+
+
+def test_reversed_taper_geometry_tracks_neuron_logical_orientation():
+    """Electrical and extracted pt3d geometry must describe the same path."""
+    root = _section("root_reverse_taper", L=20.0, diam=10.0, Ra=100.0, nseg=1)
+    child = h.Section(name="child_reverse_taper")
+    child.pt3dclear()
+    child.pt3dadd(0.0, 0.0, 0.0, 1.0)
+    child.pt3dadd(100.0, 0.0, 0.0, 4.0)
+    child.Ra = 120.0
+    child.cm = 1.0
+    child.nseg = 2
+    child.connect(root(1.0), 1.0)
+    _CREATED.append(child)
+
+    graph, id2seg = neuron_to_dendra_graph(root)
+    root_node = _node_for_segment(id2seg, root, 0)
+    child_node = _node_for_segment(id2seg, child, 1)
+
+    # With orientation=1, logical x runs opposite stored pt3d arclength.
+    # NEURON's ri() already follows logical x; Dendra's diffusion geometry
+    # must reverse raw pt3d integration to describe that same cable path.
+    expected = (root(1.0).ri() + child(0.75).ri()) * 1e6
+    actual = graph.edges[root_node, child_node]["R_ohm"]
+    assert actual == pytest.approx(expected, rel=1e-12)
+    inverse_area = 1.0 / graph.edges[root_node, child_node]["diff_geom_um"]
+    parent_inverse_area = root(1.0).ri() * 1e6 / (float(root.Ra) * 1e4)
+    child_inverse_area = child(0.75).ri() * 1e6 / (float(child.Ra) * 1e4)
+    assert inverse_area == pytest.approx(
+        parent_inverse_area + child_inverse_area, rel=3e-7
+    )
+
+    child_attrs = graph.nodes[child_node]
+    assert child_attrs["x"] == pytest.approx(25.0, rel=1e-12)
+    # The logical x=0.75 segment occupies raw pt3d arclength [0, 0.5].
+    expected_volume = math.pi * 50.0 * (0.5**2 + 0.5 * 1.25 + 1.25**2) / 3.0
+    assert child_attrs["volume"] == pytest.approx(expected_volume, rel=1e-12)
 
 
 def test_nonroot_proximal_endpoint_branch_has_one_physical_junction():

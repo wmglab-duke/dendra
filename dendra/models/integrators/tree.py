@@ -1,4 +1,5 @@
 from collections import deque
+from dataclasses import dataclass
 from functools import partial
 from typing import List, Tuple
 
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 
 from ..graph import share_topology_labeled
+from .cable import unbranched_edge_conductance
 from .core import (
     Integrator,
     MultiIntegrator,
@@ -58,6 +60,122 @@ except ImportError:
 
 
 THREADS_PER_WARP = 32
+
+
+@dataclass(frozen=True)
+class _ScalarDHSGroup:
+    """One component's topology and geometry in packed DHS solver order."""
+
+    B: int
+    K: int
+    parent_idx: torch.Tensor
+    solver_order: torch.Tensor
+    a_geom: torch.Tensor
+
+
+def _scalar_group_planes(value, model, P, B, K, name, *, device):
+    """Broadcast a scalar-group field to ``(P, B, K)`` without detaching it."""
+    value = value.to(device=device, dtype=model.dtype())
+    try:
+        value = torch.broadcast_to(value, tuple(model.shape))
+    except RuntimeError as err:
+        raise ValueError(
+            f"{name} for a scalar DHS group must broadcast to model shape "
+            f"{tuple(model.shape)}; got {tuple(value.shape)}."
+        ) from err
+    return value.reshape(P, B, K)
+
+
+def _scalar_dhs_group(model, P: int, device: torch.device) -> _ScalarDHSGroup:
+    """Adapt a supported scalar population to the universal DHS row contract.
+
+    Ordinary ``Population(N, C)`` instances are represented by ``N * C``
+    independent one-node trees.  Tree models retain their imported rooted
+    topology. Cable models use an identity-ordered path and obtain axial
+    conductance from exact canonical edges when available, otherwise from the
+    specialized Axon tensor geometry.
+    """
+    # Lazy imports avoid the core -> integrators -> core import cycle.
+    from ..core import Cable, Population
+    from ..multi import MultiPopulation
+    from ..tree import Tree
+
+    dtype = model.dtype()
+
+    if isinstance(model, Tree):
+        B = int(model.shape[-2])
+        K = int(model.shape[-1])
+        graph = model.graph
+        if graph is None:
+            try:
+                graph = model.assemble_graphs()
+            except Exception as err:
+                raise ValueError(
+                    "A scalar Tree group must expose `graph` or implement "
+                    "`assemble_graphs()`."
+                ) from err
+        graphs = graph if isinstance(graph, list) else [graph]
+        if len(graphs) not in (1, B):
+            raise ValueError(
+                "A scalar Tree group must provide one shared morphology graph "
+                f"or one graph per neuron ({B}); got {len(graphs)}."
+            )
+        parent_idx, a_geom, node_order = graph_to_parent_and_axial(
+            graphs, dtype_axial=dtype
+        )
+        solver_order = torch.as_tensor(node_order, dtype=torch.int64, device=device)
+        a_geom = a_geom.to(device=device, dtype=dtype).expand(B, -1)
+        rhoa_scale = _scalar_group_planes(
+            model.rhoa_scale,
+            model,
+            P,
+            B,
+            K,
+            "rhoa_scale",
+            device=device,
+        ).index_select(-1, solver_order)
+        return _ScalarDHSGroup(
+            B=B,
+            K=K,
+            parent_idx=parent_idx.to(dtype=torch.int64, device=device),
+            solver_order=solver_order,
+            a_geom=a_geom.unsqueeze(0).expand(P, -1, -1) / rhoa_scale,
+        )
+
+    if isinstance(model, Cable):
+        B = int(model.shape[-2])
+        K = int(model.shape[-1])
+        solver_order = torch.arange(K, dtype=torch.int64, device=device)
+        parent_idx = solver_order - 1
+        edge_conductance = unbranched_edge_conductance(model).reshape(P, B, K - 1)
+        if K == 1:
+            a_geom = torch.zeros(P, B, 1, dtype=dtype, device=device)
+        else:
+            root = torch.zeros(P, B, 1, dtype=dtype, device=device)
+            a_geom = torch.cat((root, edge_conductance), dim=-1)
+        return _ScalarDHSGroup(
+            B=B,
+            K=K,
+            parent_idx=parent_idx,
+            solver_order=solver_order,
+            a_geom=a_geom,
+        )
+
+    if isinstance(model, Population) and not isinstance(model, MultiPopulation):
+        B = int(np.prod(model.core_shape()))
+        K = 1
+        return _ScalarDHSGroup(
+            B=B,
+            K=K,
+            parent_idx=torch.tensor([-1], dtype=torch.int64, device=device),
+            solver_order=torch.zeros(1, dtype=torch.int64, device=device),
+            a_geom=torch.zeros(P, B, K, dtype=dtype, device=device),
+        )
+
+    raise TypeError(
+        f"{type(model).__name__} does not expose a supported scalar DHS "
+        "topology; expected ordinary Population, Tree, or scalar Cable."
+    )
 
 
 def _validate_dhs_threads(threads: int) -> int:
@@ -402,6 +520,8 @@ class _dhs(Integrator):
     Based on Zhang et al., Nat. Commun. 14, 5798 (2023).
     """
 
+    supports_unbranched_cable = True
+
     def __init__(self, model, mech, imem=None, threads=16):
         threads = _validate_dhs_threads(threads)
 
@@ -479,21 +599,47 @@ class _dhs(Integrator):
         )  # (N,)
         self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))  # (N,)
 
-        area_cm2 = (
-            _as_solve_matrix(model.area.to(device=device, dtype=model.dtype()), model)
-            * model.area_scale
-        )  # cm², (B,K)
+        area_cm2 = _as_solve_matrix(
+            model.area.to(device=device, dtype=model.dtype()), model
+        ) * _as_solve_matrix(model.area_scale, model)  # cm², (B,K)
 
         self.register_buffer(
             "layer_ptr", layer_ptr.to(dtype=torch.int64, device=device)
         )  # (L+1,)
         self.order.copy_(order.to(dtype=torch.int64, device=device))
         self.parent_idx.copy_(parent_idx.to(dtype=torch.int64, device=device))  # (N,)
-        self.a_geom = (
-            _as_solve_matrix(a_geom_t.to(device=device, dtype=model.dtype()), model)
-            .clone()
-            .contiguous()
-        ) / model.rhoa_scale  # (B,N)
+        rhoa_scale_mech = None
+        canonical_node_conductance = None
+        if getattr(model, "_canonical_edge_resistance_ohm", None) is not None:
+            # The canonical model buffer is the numerical source of truth for
+            # both unbranched solvers. In particular, ``float32 -> float64``
+            # widens that buffer but cannot recreate the CompartmentGraph's
+            # original binary64 values. Reading graph R here would therefore
+            # make DHS disagree with UB after an otherwise valid dtype move.
+            canonical_edges = unbranched_edge_conductance(model)
+            canonical_node_conductance = torch.cat(
+                (
+                    torch.zeros(
+                        canonical_edges.shape[0],
+                        1,
+                        device=canonical_edges.device,
+                        dtype=canonical_edges.dtype,
+                    ),
+                    canonical_edges,
+                ),
+                dim=1,
+            )
+            self.a_geom = canonical_node_conductance.index_select(
+                1, self.solver_order
+            ).contiguous()
+        else:
+            rhoa_scale_mech = _as_solve_matrix(model.rhoa_scale, model)
+            rhoa_scale_solver = rhoa_scale_mech.index_select(1, self.solver_order)
+            self.a_geom = (
+                _as_solve_matrix(a_geom_t.to(device=device, dtype=model.dtype()), model)
+                .clone()
+                .contiguous()
+            ) / rhoa_scale_solver  # (B,N), solver order
 
         self.scale = area_cm2
 
@@ -501,7 +647,7 @@ class _dhs(Integrator):
             1e-6
             * _as_solve_matrix(model.cm.to(device=device, dtype=model.dtype()), model)
             * area_cm2
-            * model.cm_scale
+            * _as_solve_matrix(model.cm_scale, model)
         )  # convert from µF / cm2 to F
         self.cmdt = cm / dt_s  # (B,N) (F/s = S)
 
@@ -561,16 +707,22 @@ class _dhs(Integrator):
         )
 
         # Convert lists to tensors and register them as buffers
-        self.register_buffer(
-            "edge_child_orig",
-            torch.tensor(edge_child_orig_list, dtype=torch.int64, device=device),
+        edge_child_orig = torch.tensor(
+            edge_child_orig_list, dtype=torch.int64, device=device
         )
+        self.register_buffer("edge_child_orig", edge_child_orig)
         self.register_buffer(
             "edge_parent_orig",
             torch.tensor(edge_parent_orig_list, dtype=torch.int64, device=device),
         )
         self.register_buffer("edge_gax_orig", edge_gax_orig)
-        self.edge_gax_orig = self.edge_gax_orig / model.rhoa_scale  # (B, E)
+        if canonical_node_conductance is None:
+            edge_rhoa_scale = rhoa_scale_mech.index_select(1, edge_child_orig)
+            self.edge_gax_orig = self.edge_gax_orig / edge_rhoa_scale  # (B, E)
+        else:
+            self.edge_gax_orig = canonical_node_conductance.index_select(
+                1, edge_child_orig
+            )
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._call_kernel(
@@ -668,12 +820,13 @@ class _dhs(Integrator):
 
 class _dhs_multi(MultiIntegrator):
     r"""
-    Multi-model DHS integrator for batches of tree morphologies.
+    Multi-model DHS integrator for heterogeneous scalar cable systems.
 
-    Packs multiple morphologies into padded flat buffers (shared stride
-    ``K_stride = max K_g``) and records per-group offsets so a single CUDA/CPU
-    kernel can process all groups in one launch. Supports optional extracellular
-    coupling via edge currents when ``ve`` is supplied.
+    Packs ordinary independent populations as one-node trees, branched Tree
+    morphologies, and Cable paths into padded flat buffers (shared stride
+    ``K_stride = max K_g``). Per-group offsets allow one CUDA/CPU kernel to
+    process every scalar group in one launch. Optional extracellular coupling
+    is applied through the same child/parent edge representation.
 
     Parameters
     ----------
@@ -767,19 +920,6 @@ class _dhs_multi(MultiIntegrator):
         P = int(np.prod(models.shape[:-2])) if len(models.shape) > 2 else 1
         self.P = P
 
-        def group_planes(value, mdl, B_g, K_g, name):
-            """Broadcast one group parameter to ``(P, B_g, K_g)``."""
-
-            value = value.to(device=dev0, dtype=mdl.dtype())
-            try:
-                value = torch.broadcast_to(value, tuple(mdl.shape))
-            except RuntimeError as err:
-                raise ValueError(
-                    f"{name} for a multi-tree group must broadcast to model "
-                    f"shape {tuple(mdl.shape)}; got {tuple(value.shape)}."
-                ) from err
-            return value.reshape(P, B_g, K_g)
-
         P_list, ORDER_list, LPTR_list = [], [], []
         L_list = []
         SOLVER_list, INV_SOLVER_list = [], []
@@ -792,33 +932,17 @@ class _dhs_multi(MultiIntegrator):
 
         # ---------- per-group topology & params ----------
         for g, mdl in enumerate(models):
-            K_g = int(mdl.shape[-1])
-            B_g = int(mdl.shape[-2]) if len(mdl.shape) > 1 else 1
+            group = _scalar_dhs_group(mdl, P, dev0)
+            B_g, K_g = group.B, group.K
 
             self.base_shapes.append((B_g, K_g))
             B_list.append(B_g)
             K_list.append(K_g)
 
-            graph = mdl.graph
-            if graph is None:
-                try:
-                    graph = mdl.assemble_graphs()
-                except Exception as err:
-                    raise ValueError(
-                        "Each model must have a `graph` attribute or implement "
-                        "`assemble_graphs()` method returning a list of graphs."
-                    ) from err
-
-            if not isinstance(graph, list):
-                graph = [graph]
-
-            parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(
-                graph, dtype_axial=mdl.dtype()
-            )
-            parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
+            parent_idx, _, depth = build_morphology(group.parent_idx.tolist())
             order_g, layer_ptr_g = build_dhs_layers(depth, self.threads)
 
-            solver_order_g = torch.as_tensor(node_order, dtype=torch.int64, device=dev0)
+            solver_order_g = group.solver_order
             inv_solver_g = torch.argsort(solver_order_g, dim=0)
 
             # Match the physical scaling contract of the scalar DHS solver.
@@ -826,19 +950,33 @@ class _dhs_multi(MultiIntegrator):
             # globals after concatenation would be incorrect.  Retain all
             # leading batch planes: RANGE parameters can legitimately differ
             # between those planes after ``MultiPopulation.batch``.
-            area_cm2 = group_planes(mdl.area, mdl, B_g, K_g, "area")
-            area_cm2 = area_cm2 * group_planes(
-                mdl.area_scale, mdl, B_g, K_g, "area_scale"
+            area_cm2 = _scalar_group_planes(
+                mdl.area, mdl, P, B_g, K_g, "area", device=dev0
             )
-            cm_density = group_planes(mdl.cm, mdl, B_g, K_g, "cm")
-            cm_scale = group_planes(mdl.cm_scale, mdl, B_g, K_g, "cm_scale")
+            area_cm2 = area_cm2 * _scalar_group_planes(
+                mdl.area_scale,
+                mdl,
+                P,
+                B_g,
+                K_g,
+                "area_scale",
+                device=dev0,
+            )
+            cm_density = _scalar_group_planes(
+                mdl.cm, mdl, P, B_g, K_g, "cm", device=dev0
+            )
+            cm_scale = _scalar_group_planes(
+                mdl.cm_scale,
+                mdl,
+                P,
+                B_g,
+                K_g,
+                "cm_scale",
+                device=dev0,
+            )
             cmdt_g = (1e-6 * cm_density * area_cm2 * cm_scale / dt_s).contiguous()
 
-            a_geom_base = a_geom_t.to(device=dev0, dtype=mdl.dtype()).expand(B_g, -1)
-            rhoa_scale = group_planes(
-                mdl.rhoa_scale, mdl, B_g, K_g, "rhoa_scale"
-            ).index_select(-1, solver_order_g)
-            a_geom_g = a_geom_base.unsqueeze(0).expand(P, -1, -1) / rhoa_scale
+            a_geom_g = group.a_geom
             scale_g = area_cm2.contiguous()
 
             P_list.append(parent_idx.to(dtype=torch.int64, device=dev0))
@@ -1030,57 +1168,25 @@ class _dhs_multi(MultiIntegrator):
         edge_parent_idx_flat_all = []
         edge_gax_flat_all = []
 
-        for g, (mdl, B_g, K_g) in enumerate(zip(models, self.group_B, self.group_K)):
-            graph = mdl.graph
-            if graph is None:
-                graph = mdl.assemble_graphs()
-            graphs = graph if isinstance(graph, list) else [graph]
-            G = graphs[0]
-
-            # Build mapping: node_label -> solver index (fast lookup)
-            # `self.SOLVER_cat[soff:soff+K_g]` maps solver_index -> original_node_label
+        for g, (B_g, K_g) in enumerate(zip(self.group_B, self.group_K)):
+            # Derive original mechanism columns from the canonical solver
+            # topology. This is valid for every adapter, including one-node
+            # point groups, and avoids reconstructing Cable graphs through
+            # scalar ``.item()`` calls.
             soff = int(self.SOLVER_OFF[g])
-            solver_nodes = self.SOLVER_cat[soff : soff + K_g].tolist()
-            solver_idx_of = {node_label: s for s, node_label in enumerate(solver_nodes)}
-
-            # Edge lists in canonical ORIGINAL node order.  Graph insertion
-            # order is not semantic and can differ across otherwise identical
-            # morphologies.
-            edge_child = []
-            edge_parent = []
-            edge_solver_col = []
-
-            for child_node in range(K_g):
-                preds = list(G.predecessors(child_node))
-                if not preds:
-                    continue
-                parent_node = preds[0]
-
-                # original indices (mechanism columns) are the node labels
-                child_idx_orig = int(child_node)
-                parent_idx_orig = int(parent_node)
-
-                edge_child.append(child_idx_orig)
-                edge_parent.append(parent_idx_orig)
-
-                # axial for the child's connection: take from a_geom_t at child's solver index
-                s_child = solver_idx_of[child_node]
-                edge_solver_col.append(s_child)
-
-            if len(edge_child) == 0:
+            solver_nodes = self.SOLVER_cat[soff : soff + K_g]
+            parent_solver = P_list[g]
+            edge_solver_col = torch.arange(K_g, dtype=torch.int64, device=dev0)[
+                parent_solver >= 0
+            ]
+            if edge_solver_col.numel() == 0:
                 continue  # degenerate, no edges
+            edge_parent_solver = parent_solver.index_select(0, edge_solver_col)
+            edge_child = solver_nodes.index_select(0, edge_solver_col)
+            edge_parent = solver_nodes.index_select(0, edge_parent_solver)
 
-            edge_child = torch.tensor(
-                edge_child, dtype=torch.int64, device=dev0
-            )  # (E_g,)
-            edge_parent = torch.tensor(
-                edge_parent, dtype=torch.int64, device=dev0
-            )  # (E_g,)
-            edge_solver_col = torch.tensor(
-                edge_solver_col, dtype=torch.int64, device=dev0
-            )
             # Preserve per-neuron heterogeneous geometry and the rhoa_scale
-            # dependency instead of round-tripping through Python ``.item()``.
+            # dependency without round-tripping through Python scalars.
             edge_gax = a_rows[g].index_select(2, edge_solver_col)  # (P, B_g, E_g)
 
             # Repeat across batch rows and convert to FLAT mechanism indices
@@ -1264,14 +1370,38 @@ class _dhs_multi(MultiIntegrator):
         plan = self._get_tiled_plan(P, device)
         PLIN_flat = plan["PLIN_flat"]
 
-        # Zero & scatter by linear indices (fast, vectorized)
-        self._b_plane.view(-1).zero_().index_copy_(0, PLIN_flat, RHS_flat.view(-1))
-        self._d_plane.view(-1).zero_().index_copy_(0, PLIN_flat, MAIN_flat.view(-1))
+        # Zero & scatter by linear indices (fast, vectorized).  The packed
+        # solver's autograd rule saves its diagonal input for the adjoint solve.
+        # Reusing and mutating ``self._d_plane`` on a later time step therefore
+        # invalidates the first step's saved tensor during BPTT.  Preserve the
+        # allocation-free inference path, but give differentiable solves fresh
+        # storage whose version cannot be changed by a subsequent step.
+        differentiable_solve = torch.is_grad_enabled() and any(
+            value.requires_grad for value in (MAIN_flat, RHS_flat, plan["a_geom_eff"])
+        )
+        if differentiable_solve:
+            b_plane = (
+                torch.zeros_like(self._b_plane)
+                .view(-1)
+                .index_copy(0, PLIN_flat, RHS_flat.view(-1))
+                .view_as(self._b_plane)
+            )
+            d_plane = (
+                torch.zeros_like(self._d_plane)
+                .view(-1)
+                .index_copy(0, PLIN_flat, MAIN_flat.view(-1))
+                .view_as(self._d_plane)
+            )
+        else:
+            self._b_plane.view(-1).zero_().index_copy_(0, PLIN_flat, RHS_flat.view(-1))
+            self._d_plane.view(-1).zero_().index_copy_(0, PLIN_flat, MAIN_flat.view(-1))
+            b_plane = self._b_plane
+            d_plane = self._d_plane
 
         v_out_solver = self.solve(
-            self._d_plane,
+            d_plane,
             plan["a_geom_eff"],
-            self._b_plane,
+            b_plane,
             self.P_cat,
             self.ORDER_cat,
             self.LAYER_PTR_cat,

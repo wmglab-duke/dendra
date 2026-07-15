@@ -10,6 +10,7 @@ from matplotlib.path import Path as MplPath
 
 from dendra.models.core import (
     Axon,
+    Cable,
     Myelinated,
     Population,
     SingleCompartment,
@@ -401,6 +402,7 @@ def draw_class_hierarchy(
 classes = [
     Population,
     SingleCompartment,
+    Cable,
     Axon,
     Unmyelinated,
     Myelinated,
@@ -411,6 +413,7 @@ classes = [
 
 highlight = [
     SingleCompartment,
+    Cable,
     Unmyelinated,
     Myelinated,
     ExtCellAxon,
@@ -421,7 +424,8 @@ highlight = [
 descriptions = {
     Population: "generic multicompartment population",
     SingleCompartment: "point-neuron / one-compartment population",
-    Axon: "1D cable-like axonal fiber population",
+    Cable: "geometry-general unbranched native morphology",
+    Axon: "specialized fiber-parameterized cable family",
     Unmyelinated: "uniform spatial discretization",
     Myelinated: "nodes of Ranvier + diameter-scaled internodes",
     ExtCellAxon: "axon with two-layer extracellular coupling (accurate myelination)",

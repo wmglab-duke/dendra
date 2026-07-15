@@ -1133,6 +1133,24 @@ class Network(RNGMixin):
         """
         return next(iter(self.populations.values())).dtype()
 
+    def _validate_population_runtime_contracts(self):
+        """Validate population-specific static contracts before execution."""
+        not_ready = [
+            name
+            for name, population in self.populations.items()
+            if population.integrator is None or not population.integrator.initialized
+        ]
+        if not_ready:
+            names = ", ".join(repr(name) for name in not_ready)
+            raise RuntimeError(
+                "Network population integrator workspaces are not initialized "
+                f"for {names}. Call Network.initialize(dt) before continuing; "
+                "Network execution cannot safely rebuild an individual "
+                "population workspace in isolation."
+            )
+        for population in self.populations.values():
+            population._validate_runtime_contracts()
+
     def _reset_runtime_clock(self, t):
         """Anchor the exact network clock at ``t`` with zero elapsed steps."""
         value = torch.as_tensor(t, device=self.t.device, dtype=self.t.dtype).reshape(())
@@ -3108,6 +3126,7 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before step()."
             )
         self._require_mode_runtime_ready()
+        self._validate_population_runtime_contracts()
 
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         self._refresh_compile_config_from_ctx()
@@ -3229,6 +3248,7 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before run()."
             )
         self._require_mode_runtime_ready()
+        self._validate_population_runtime_contracts()
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         self._refresh_compile_config_from_ctx()
@@ -3381,6 +3401,7 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before longrun()."
             )
         self._require_mode_runtime_ready()
+        self._validate_population_runtime_contracts()
         if not isinstance(chunklength, int) or isinstance(chunklength, bool):
             raise ValueError("chunklength must be a positive integer.")
         if chunklength <= 0:
@@ -4398,6 +4419,7 @@ class Network(RNGMixin):
                 "longrun_checkpointed()."
             )
         self._require_mode_runtime_ready()
+        self._validate_population_runtime_contracts()
         if isinstance(chunklength, bool) or not isinstance(chunklength, int):
             raise TypeError("chunklength must be a positive integer")
         if chunklength <= 0:

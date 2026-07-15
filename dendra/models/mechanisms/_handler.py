@@ -366,6 +366,25 @@ class MechanismHandler(torch.nn.Module):
         else:
             inductor_config.cpp_wrapper = True
 
+    def _apply(self, fn, recurse=True):
+        """Move registered state plus current scratch and scaling closures."""
+        result = super()._apply(fn, recurse=recurse)
+
+        # Current aggregation scratch is intentionally kept out of state_dict,
+        # but Module._apply therefore cannot discover it. Preserve an
+        # initialized handler across Population.float()/double()/to() by moving
+        # these tensors explicitly.
+        if getattr(self, "i_g_buffers_initialized", False):
+            self._buf_i = [fn(buffer) for buffer in self._buf_i]
+            self._buf_g = [fn(buffer) for buffer in self._buf_g]
+
+        # Point-process density scalers close over an area-derived tensor.
+        # Rebuild the maps after area/mechanism conversion so no callable keeps
+        # a source-device or source-dtype tensor alive.
+        if hasattr(self, "_map"):
+            self.make_maps()
+        return result
+
     def make_maps(self):
         """
         Create the mapping of current indices to mechanisms and their functions.

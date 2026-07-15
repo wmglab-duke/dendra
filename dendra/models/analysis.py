@@ -989,15 +989,18 @@ def compute_rheobase_chronaxie(
 
     Parameters
     ----------
-    pws : array-like or torch.Tensor, shape (D,)
-        Pulse widths. Units are arbitrary but determine the returned chronaxie
-        units. For Dendra chronaxie analyses this is usually milliseconds.
+    pws : array-like or torch.Tensor
+        One-dimensional pulse widths with shape ``(D,)``. Units are arbitrary
+        but determine the returned chronaxie units. For Dendra chronaxie
+        analyses this is usually milliseconds.
 
-    thresholds : array-like or torch.Tensor, shape (D,)
-        Activation thresholds in current units.
+    thresholds : array-like or torch.Tensor
+        One-dimensional activation thresholds with shape ``(D,)``, in current
+        units.
 
-    weights : array-like or torch.Tensor, optional, shape (D,)
-        Optional nonnegative weights for each pulse-width/threshold pair.
+    weights : array-like or torch.Tensor, optional
+        Optional one-dimensional nonnegative weights with shape ``(D,)``, one
+        for each pulse-width/threshold pair.
 
     fit_domain : {"current", "charge", "log_current"}, default="current"
         How to fit the Weiss/Lapicque relation
@@ -1867,9 +1870,9 @@ def plot_activation_heatmap_from_chronaxie_output(
     1) **Estimated threshold curve overlay** (`overlay_threshold=True`)
 
        - `threshold_kind="I_th"` overlays `chron_out["I_th"]` vs `chron_out["pw_unique_ms"]`
-       - `threshold_kind="fit"` overlays the Lapicque curve computed from
-         `chron_out["rheobase"]` and `chron_out["chronaxie_ms"]`:
-           I_fit(d) = I_r * (1 + c/d)
+       - `threshold_kind="fit"` overlays the Lapicque curve
+         ``I_fit(d) = I_r * (1 + c / d)`` computed from
+         `chron_out["rheobase"]` and `chron_out["chronaxie_ms"]`
        - `threshold_kind="both"` overlays both, if available
 
        If `overlay_bracket_band=True` and `chron_out["bracket"]` exists with keys
@@ -1915,8 +1918,9 @@ def plot_activation_heatmap_from_chronaxie_output(
         - ``"chronaxie_ms"`` : torch.Tensor scalar (or float)
         - ``"bracket"`` : dict with keys ``"I_low"``, ``"I_high"`` (each shape (D,))
 
-    amplitudes : array-like, shape (P,)
-        Per-trial amplitude values aligned with the trials used to compute `chron_out`.
+    amplitudes : array-like
+        Per-trial amplitude values with shape ``(P,)``, aligned with the trials
+        used to compute `chron_out`.
 
         **Important sign/strength convention**
         If your chronaxie estimator used a different monotone “strength” variable than raw
