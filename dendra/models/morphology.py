@@ -12,8 +12,8 @@ This module deliberately separates two representations:
     arrays use deterministic integer compartment IDs. NetworkX is supported as
     an interoperability view, but is not the semantic source of truth.
 
-The first implementation uses explicit ``nseg`` values. A d-lambda
-discretization policy belongs in a later layer and is intentionally not inferred.
+Every Section retains an explicit ``nseg`` value. Callers may author it directly
+or apply the native d-lambda policy from current geometry and electrical values.
 """
 
 from __future__ import annotations
@@ -752,6 +752,25 @@ class Section:
     def is_pt3d(self) -> bool:
         return len(self.points) > 2 or self.diam is None
 
+    def lambda_f(self, *, freq_hz: float = 100.0) -> float:
+        """Return this Section's AC space constant in µm.
+
+        The calculation is the native equivalent of NEURON's ``lambda_f``
+        discretization helper. Stylized Sections use their uniform diameter;
+        pt3d Sections evaluate the compiler-representable authored profile with
+        NEURON's control-interval approximation along centerline arclength.
+        ``freq_hz`` is a raw frequency in hertz, not Dendra's usual kHz
+        simulation-frequency coordinate. The calculation uses the same
+        binary64-representable spans as :meth:`Morphology.compile`.
+
+        This method performs analysis only and does not change ``nseg``. Use
+        :meth:`Morphology.apply_d_lambda` to select and apply compartment
+        counts across the owning Morphology.
+        """
+        self._owner._resolve_section(self)
+        freq_hz = _positive(freq_hz, name="freq_hz")
+        return _section_lambda_f(self, freq_hz)
+
     def at(self, x: float) -> SectionLocation:
         """Return an immutable normalized location on this section."""
         self._owner._resolve_section(self)
@@ -796,6 +815,20 @@ class Section:
             cm=cm,
             labels=labels,
         )
+
+    def delete(self, *, recursive: bool = False) -> tuple[str, ...]:
+        """Delete this Section from its owning Morphology.
+
+        A leaf Section can be deleted directly. A Section with children is
+        rejected unless ``recursive=True``, in which case the complete
+        descendant subtree is deleted. The returned names follow the original
+        Section declaration order.
+
+        Deletion invalidates this Section and any saved locations on it for
+        future authoring operations. Existing compiled graphs and instantiated
+        models remain independent snapshots.
+        """
+        return self._owner.delete_section(self, recursive=recursive)
 
     def connect(self, parent: SectionLocation, *, child_end: int = 0) -> Section:
         """Connect one endpoint of this section to a parent location."""
@@ -913,6 +946,103 @@ class Morphology:
                 "with this Morphology."
             )
         return section
+
+    def delete_section(
+        self, section: str | Section, *, recursive: bool = False
+    ) -> tuple[str, ...]:
+        """Delete one Section or an explicitly requested descendant subtree.
+
+        Parameters
+        ----------
+        section : str or Section
+            Exact name or canonical Section owned by this Morphology.
+        recursive : bool, optional
+            If false (default), a Section with children is rejected. If true,
+            delete the Section and every descendant connected below it.
+
+        Returns
+        -------
+        tuple of str
+            Deleted Section names in their original declaration order.
+
+        Notes
+        -----
+        The complete deletion set is validated before mutation. Deleting the
+        sole root, or recursively deleting a complete tree, is allowed and
+        leaves an empty Morphology that cannot be compiled until a new tree is
+        declared. Surviving Sections retain their identity, declaration order,
+        and connections. Imported SWC type provenance associated with deleted
+        Sections is removed as part of the same transaction.
+
+        Deleted Section and SectionLocation objects become stale and are
+        rejected by later authoring operations, even if a new Section reuses a
+        deleted name. Previously compiled graphs and instantiated models are
+        independent snapshots and are not changed.
+        """
+        if not isinstance(recursive, (bool, np.bool_)):
+            raise TypeError("recursive must be a boolean.")
+        recursive = bool(recursive)
+        current = self._resolve_section(section)
+
+        section_names = set(self._sections)
+        children: dict[str, list[str]] = {name: [] for name in self._sections}
+        for child_name, connection in self._connections.items():
+            if (
+                not isinstance(connection, _Connection)
+                or child_name != connection.child_name
+                or connection.child_name not in section_names
+                or connection.parent_name not in section_names
+            ):
+                raise RuntimeError(
+                    "The Morphology connection registry is inconsistent; "
+                    "deletion was not applied."
+                )
+            children[connection.parent_name].append(connection.child_name)
+
+        # Public connection operations prevent cycles. Validate that invariant
+        # here as well so deletion never partially repairs or silently removes a
+        # corrupted private registry.
+        completed: set[str] = set()
+        for start in self._sections:
+            chain: set[str] = set()
+            name = start
+            while name in self._connections and name not in completed:
+                if name in chain:
+                    raise RuntimeError(
+                        "The Morphology connection registry contains a cycle; "
+                        "deletion was not applied."
+                    )
+                chain.add(name)
+                name = self._connections[name].parent_name
+            completed.update(chain)
+
+        direct_children = children[current.name]
+        if direct_children and not recursive:
+            child_names = ", ".join(repr(name) for name in direct_children)
+            raise ValueError(
+                f"Section {current.name!r} has child Sections ({child_names}); "
+                "pass recursive=True to delete the complete descendant subtree."
+            )
+
+        deleted = {current.name}
+        if recursive:
+            stack = list(reversed(direct_children))
+            while stack:
+                name = stack.pop()
+                deleted.add(name)
+                stack.extend(reversed(children[name]))
+
+        deleted_names = tuple(name for name in self._sections if name in deleted)
+
+        # Commit only after ownership, option, and complete-subtree validation.
+        # Connections are child-keyed, so every deleted Section's incoming edge
+        # is removed with its declaration. Recursive closure guarantees that no
+        # surviving edge can retain a deleted parent.
+        for name in deleted_names:
+            self._connections.pop(name, None)
+            self._sections.pop(name)
+            self._swc_section_types.pop(name, None)
+        return deleted_names
 
     def update_section(
         self,
@@ -1034,6 +1164,62 @@ class Morphology:
         for field_name, value in replacements.items():
             object.__setattr__(current, field_name, value)
         return current
+
+    def apply_d_lambda(
+        self, *, d_lambda: float = 0.1, freq_hz: float = 100.0
+    ) -> dict[str, int]:
+        """Select and apply NEURON-compatible d-lambda compartment counts.
+
+        Parameters
+        ----------
+        d_lambda : float, optional
+            Positive dimensionless maximum compartment length as a fraction of
+            the AC space constant. Default is ``0.1``.
+        freq_hz : float, optional
+            Positive raw frequency in hertz at which the space constant is
+            evaluated. This is deliberately named ``freq_hz`` because Dendra's
+            ordinary simulation-frequency coordinate is kHz. Default is
+            ``100.0``.
+
+        Returns
+        -------
+        dict of str to int
+            Selected odd ``nseg`` values keyed by Section name in original
+            declaration order.
+
+        Notes
+        -----
+        Every wavelength and compartment count is validated before any Section
+        is modified. The method then updates ``nseg`` in place while preserving
+        Section identity, connections, labels, and declaration order. Existing
+        compiled graphs and instantiated models remain independent snapshots;
+        compile or construct a new model to use the new discretization.
+
+        The calculation and odd-count rounding rule match Dendra's
+        NEURON-backed ``apply_d_lambda`` helper, but operate directly on native
+        stylized or pt3d geometry and require no NEURON objects.
+        """
+        d_lambda = _positive(d_lambda, name="d_lambda")
+        freq_hz = _positive(freq_hz, name="freq_hz")
+
+        selected: dict[str, int] = {}
+        for section in self._sections.values():
+            wavelength = _section_lambda_f(section, freq_hz)
+            scaled_wavelength = _positive(
+                d_lambda * wavelength,
+                name=f"section {section.name!r} d-lambda wavelength",
+            )
+            normalized_length = _positive(
+                section.L / scaled_wavelength,
+                name=f"section {section.name!r} d-lambda electrotonic length",
+            )
+            nseg = int((normalized_length + 0.9) / 2.0) * 2 + 1
+            selected[section.name] = max(1, nseg)
+
+        # Commit only after every Section and result has been validated.
+        for name, nseg in selected.items():
+            object.__setattr__(self._sections[name], "nseg", nseg)
+        return selected
 
     def _update_section_location(
         self, location: SectionLocation, *, diam: float
@@ -2421,6 +2607,10 @@ class Morphology:
             title=title,
         )
 
+    def __getitem__(self, key: str) -> Section:
+        """Return the Section with the exact name ``key``."""
+        return self._sections[key]
+
 
 def _normalize_points(
     points: Sequence[Sequence[float]], *, section_name: str
@@ -2459,6 +2649,51 @@ def _polyline_arclength(
             points[index - 1][:3], points[index][:3]
         )
     return arc
+
+
+def _section_lambda_f(section: Section, freq_hz: float) -> float:
+    """Evaluate classic lambda_f over the compiler-representable cable spans."""
+    frequency_factor = _positive(
+        4.0 * math.pi * freq_hz * section.rhoa * section.cm,
+        name=f"section {section.name!r} lambda_f frequency factor",
+    )
+
+    if not section.is_pt3d:
+        if section.diam is None:
+            raise RuntimeError(
+                f"Stylized Section {section.name!r} has no scalar diameter."
+            )
+        wavelength = 1e5 * math.sqrt(section.diam / frequency_factor)
+        return _positive(
+            wavelength, name=f"section {section.name!r} lambda_f wavelength"
+        )
+
+    electrotonic_integral = 0.0
+    positive_interval = 0
+    for length, first_diam, second_diam, discontinuity in _section_interval_spans(
+        section, 0.0, section.L
+    ):
+        if discontinuity:
+            continue
+        diameter_sum = _positive(
+            first_diam + second_diam,
+            name=(
+                f"section {section.name!r} lambda_f diameter sum at pt3d "
+                f"interval {positive_interval}:{positive_interval + 1}"
+            ),
+        )
+        electrotonic_integral += length / math.sqrt(diameter_sum)
+        positive_interval += 1
+    electrotonic_integral = _positive(
+        electrotonic_integral,
+        name=f"section {section.name!r} lambda_f diameter integral",
+    )
+    electrotonic_length = _positive(
+        electrotonic_integral * math.sqrt(2.0) * 1e-5 * math.sqrt(frequency_factor),
+        name=f"section {section.name!r} lambda_f electrotonic length",
+    )
+    wavelength = section.L / electrotonic_length
+    return _positive(wavelength, name=f"section {section.name!r} lambda_f wavelength")
 
 
 def _interpolate_point(

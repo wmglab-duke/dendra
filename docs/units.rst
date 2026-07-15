@@ -84,7 +84,20 @@ normalized Neurolucida centerlines and diameters in µm, preserving
 same-coordinate diameter steps. Classic SWC has no faithful representation for
 their annular membrane surface, so SWC export rejects a Morphology containing
 one. Neither format defines Dendra's ``rhoa``, ``cm``, or ``nseg``; those are
-explicit loader arguments.
+explicit loader arguments. In particular, loader ``nseg`` is a uniform initial
+positive integer for the native Section declarations, not a d-lambda policy or
+a reinterpretation of geometry samples as compartments.
+
+:meth:`~dendra.models.morphology.Section.lambda_f` returns an AC space constant
+in µm from the Section's current geometry, ``rhoa`` in Ω·cm, and ``cm`` in
+µF/cm². Its ``freq_hz`` argument is a raw numerical frequency in Hz.
+:meth:`~dendra.models.morphology.Morphology.apply_d_lambda` uses the same raw-Hz
+argument; its ``d_lambda`` argument is a positive dimensionless fraction, and
+it assigns dimensionless odd integer ``nseg`` counts. These APIs intentionally
+use the ``_hz`` suffix to distinguish raw hertz from the normal Dendra
+frequency coordinate used by waveforms. For example, pass ``freq_hz=100.0``
+for 100 Hz; do not pass ``100.0 * Hz``, because the latter evaluates to
+``0.1`` in Dendra's kHz coordinate.
 
 Native Morphology visualizations label authored coordinates, diameters,
 connection gaps, and distance-profile positions in µm. Centerline linewidth is
@@ -292,8 +305,11 @@ helpers is explicitly in Hz. APIs whose names end in ``_hz`` likewise expect
 raw Hz. Electric-field data are in V/m even though integrated extracellular
 potentials are in mV. The native ``Morphology.from_swc`` and
 ``Morphology.from_asc`` loaders do not apply d-lambda: their ``nseg`` argument
-is an explicit positive integer, and SWC/ASC geometry samples are not numerical
-compartments.
+is an explicit initial positive integer, and SWC/ASC geometry samples are not
+numerical compartments. Call
+:meth:`~dendra.models.morphology.Morphology.apply_d_lambda` with, for example,
+``d_lambda=0.1`` and ``freq_hz=100.0`` after loading or editing when native
+d-lambda selection is desired.
 
 See also
 --------

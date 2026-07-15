@@ -100,8 +100,89 @@ authoring API; ASC import coalesces them. When a discontinuity lies exactly on
 a compartment boundary, its area belongs to the lower-x compartment, matching
 NEURON.
 
-``nseg`` is deliberately explicit in this first API.  Native d-lambda or other
-automatic discretization policies are not yet inferred.
+``nseg`` is explicit declaration state. Supply it directly when the desired
+count is known, or replace the initial counts later with the native d-lambda
+policy described below. Geometry samples remain authoring controls, not
+implicit computational compartments.
+
+Choose direct or d-lambda discretization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every Section always has one explicit positive integer ``nseg``. For a
+read-only estimate, :meth:`~dendra.Section.lambda_f` returns that Section's AC
+space constant in µm using its current geometry, ``rhoa``, and ``cm``:
+
+.. code-block:: python
+
+   wavelength_um = apic.lambda_f(freq_hz=100.0)
+
+``freq_hz`` is deliberately named: it accepts a raw numerical frequency in
+hertz, unlike Dendra's usual waveform-frequency coordinate in kHz. Pass
+``100.0`` for 100 Hz, **not** ``100.0 * Hz`` (which evaluates to Dendra's
+``0.1`` kHz coordinate). The method is analytical and never changes ``nseg``.
+For pt3d Sections it uses NEURON's classic control-interval approximation over
+the compiler-representable authored diameter profile, using the same binary64
+centerline spans as native compilation. This approximation combines each
+positive-length control interval with its two endpoint diameters and is
+intentionally distinct from the exact tapered-frustum integration used for
+area, volume, and axial resistance. A same-coordinate diameter step has zero
+centerline interval and therefore contributes zero electrotonic length to this
+estimate, although compilation still retains its exact annular membrane area.
+
+Use :meth:`~dendra.Morphology.apply_d_lambda` to select and assign counts for
+every current Section:
+
+.. code-block:: python
+
+   policy_morphology = dn.Morphology(rhoa=100.0, cm=1.0)
+   policy_soma = policy_morphology.section(
+       "soma",
+       L=20.0 * um,
+       diam=20.0 * um,
+       nseg=1,
+   )
+   policy_dend = policy_morphology.section(
+       "dend",
+       L=1000.0 * um,
+       diam=2.0 * um,
+       nseg=1,
+       labels="dendrite",
+   )
+   policy_dend.connect(policy_soma.at(1.0), child_end=0)
+
+   coarse_graph = policy_morphology.compile()
+   selected = policy_morphology.apply_d_lambda(
+       d_lambda=0.1,   # Dimensionless fraction of lambda_f.
+       freq_hz=100.0,  # Raw Hz.
+   )
+
+   assert selected == {
+       section.name: section.nseg for section in policy_morphology.sections
+   }
+   assert all(nseg >= 1 and nseg % 2 == 1 for nseg in selected.values())
+
+   refined_graph = policy_morphology.compile()
+   assert coarse_graph.n_compartments == 2
+   assert refined_graph.n_compartments == sum(selected.values())
+   refined_tree = dn.Tree.from_morphology(policy_morphology)
+
+``d_lambda`` is a positive dimensionless target for compartment length as a
+fraction of ``lambda_f(freq_hz=...)``. Dendra applies the same odd-count
+rounding rule as its NEURON-backed importer, so every selected ``nseg`` is odd.
+The returned dictionary maps exact Section names to those counts in declaration
+order. The operation is a one-time authoring edit, not a live policy: a later
+geometry, ``rhoa``, or ``cm`` update does not silently rediscretize the
+Morphology. Reapply d-lambda when desired, or override an individual count with
+``section.update(nseg=...)``.
+
+Application is transactional. Dendra validates the positive finite
+``d_lambda`` and ``freq_hz`` values and calculates every Section's count before
+changing any declaration; a failure leaves all prior ``nseg`` values intact.
+Section identities, labels, connections, declaration order, and saved
+locations are retained. Previously compiled graphs and instantiated models are
+independent snapshots, as ``coarse_graph`` demonstrates above. Compile or
+construct a new model after applying the policy. Applying it to an empty
+Morphology returns an empty dictionary after validating its arguments.
 
 Section names and region labels
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -169,7 +250,7 @@ seven-column SWC node tree:
 
    # Inspect or edit the native declaration before constructing a model.
    morphology.plot_shape()
-   morphology.sections[0].update(nseg=3)
+   morphology.apply_d_lambda(d_lambda=0.1, freq_hz=100.0)
    tree = dn.Tree.from_morphology(morphology)
 
 The SWC loader is native and does not call NEURON. It preserves finite xyz
@@ -184,14 +265,19 @@ deterministic and collision-free—such as ``soma_0``, ``axon_0``,
 can add project-specific semantics without discarding the raw ID.
 
 SWC carries neither Dendra electrical properties nor a numerical
-discretization. ``rhoa``, ``cm``, and the uniform initial ``nseg`` are therefore
-explicit import policy. Geometry samples are not treated as compartments;
-update Section ``nseg`` values before constructing a model when a finer policy
-is required. The importer rejects forests, cycles, duplicate IDs, missing
-parents, non-finite values, non-positive radii, and zero-length edges rather
-than repairing them silently. A non-soma root whose type has no same-type cable
-continuation is likewise rejected: preserving that isolated annotation would
-otherwise require inventing geometry or silently retyping the root.
+discretization. ``rhoa``, ``cm``, and ``nseg`` are therefore explicit import
+policy. The loader's positive integer ``nseg`` is a uniform *initial* count for
+the newly declared Sections; it does not apply d-lambda while parsing, and
+geometry samples are not treated as compartments. After inspecting or editing
+the native declaration, either update selected Section counts directly or call
+:meth:`~dendra.Morphology.apply_d_lambda` once to replace all initial counts.
+This separation lets the d-lambda calculation observe any imported-geometry,
+``rhoa``, or ``cm`` edits made after loading. The importer rejects forests,
+cycles, duplicate IDs, missing parents, non-finite values, non-positive radii,
+and zero-length edges rather than repairing them silently. A non-soma root
+whose type has no same-type cable continuation is likewise rejected:
+preserving that isolated annotation would otherwise require inventing geometry
+or silently retyping the root.
 
 A common SWC convention represents a soma by one type-1 point. A point alone
 cannot define a positive-length cable, so the default
@@ -228,6 +314,7 @@ normalized cable interpretation into native pt3d Sections:
        cm=1.0,
        nseg=1,
    )
+   morphology.apply_d_lambda(d_lambda=0.1, freq_hz=100.0)
 
    # A file with disconnected reconstructions requires an exact generated root.
    component = dn.Morphology.from_asc(
@@ -247,7 +334,12 @@ replaced by NEURON's fallback stylized geometry.
 
 ASC import preserves the selected NEURON-normalized cable topology,
 centerlines, diameters, logical attachments, and explicit Dendra electrical
-policy. It is not a lossless ASC document parser: source formatting, comments,
+policy. As with native SWC loading, ``nseg`` is a uniform initial declaration;
+the later ``apply_d_lambda`` call is an explicit, independently repeatable
+authoring step. This differs from the older :meth:`dendra.Tree.from_swc` and
+:meth:`dendra.Tree.from_asc` constructors, which intentionally apply their
+NEURON-backed d-lambda policy during immediate model import. Native ASC loading
+is not a lossless document parser: source formatting, comments,
 colors, markers, properties, spines, trace IDs, original soma contours, and
 components not selected by ``root`` are not retained. The returned
 ``Morphology`` contains no live NEURON objects and is the editable Dendra source
@@ -373,6 +465,100 @@ Sections. Each Section receives a resolved value when it is declared, so
 changing a Morphology default affects only Sections declared afterward. Update
 existing Sections explicitly when a new value should apply to them; Dendra
 does not guess whether an existing value was inherited or supplied explicitly.
+
+Delete and replace section subtrees
+-----------------------------------
+
+Use :meth:`~dendra.Section.delete` or
+:meth:`~dendra.Morphology.delete_section` to remove authored Sections. The
+object-oriented and explicit forms are equivalent:
+
+.. code-block:: python
+
+   deleted = morphology.delete_section("terminal")
+   # Equivalent when starting from the same undeleted declaration:
+   # deleted = terminal.delete()
+
+Both methods return the deleted Section names as a tuple in their original
+declaration order. The default ``recursive=False`` is deliberately safe: a
+Section with children cannot be deleted because doing so would orphan them or
+require Dendra to guess how they should be reparented. Set ``recursive=True``
+to remove the selected Section and its complete descendant subtree. Its parent
+and sibling subtrees remain untouched; Dendra removes the incoming connection
+and the connections internal to the deleted subtree without reconnecting
+anything implicitly.
+
+Deletion is transactional and uses the same ownership rules as updates. An
+unknown name, a Section from another Morphology, a copied/noncanonical Section,
+or an already deleted Section is rejected without changing the declaration.
+Any imported SWC type provenance for deleted Sections is removed as well.
+Saved Section and SectionLocation handles belonging to retained Sections stay
+valid, while handles into the deleted subtree become stale and are rejected.
+
+For example, an entire branched axonal arbor can be replaced by one straight
+axon while retaining its attachment to the soma:
+
+.. code-block:: python
+
+   editable = dn.Morphology()
+   soma = editable.section("soma", L=20 * um, diam=20 * um)
+
+   axon_root = editable.section(
+       "axon[0]",
+       points=[
+           (0 * um, 0 * um, 0 * um, 1 * um),
+           (50 * um, 0 * um, 0 * um, 1 * um),
+       ],
+       nseg=11,
+       labels="axon",
+   )
+   collateral = editable.section(
+       "axon[1]",
+       points=[
+           (25 * um, 0 * um, 0 * um, 0.8 * um),
+           (25 * um, 40 * um, 0 * um, 0.6 * um),
+       ],
+       nseg=7,
+       labels="axon",
+   )
+   terminal = editable.section(
+       "axon[2]",
+       points=[
+           (50 * um, 0 * um, 0 * um, 0.8 * um),
+           (90 * um, -20 * um, 0 * um, 0.5 * um),
+       ],
+       nseg=7,
+       labels="axon",
+   )
+
+   # This retained parent location remains valid after deleting the child arbor.
+   axon_attachment = soma.at(0.0)
+   axon_root.connect(axon_attachment, child_end=0)
+   collateral.connect(axon_root.at(0.5), child_end=0)
+   terminal.connect(axon_root.at(1.0), child_end=0)
+
+   removed = axon_root.delete(recursive=True)
+   assert removed == ("axon[0]", "axon[1]", "axon[2]")
+
+   straight_axon = editable.section(
+       "axon[0]",  # A deleted name may be reused by a new canonical Section.
+       points=[
+           (0 * um, 0 * um, 0 * um, 1 * um),
+           (500 * um, 0 * um, 0 * um, 1 * um),
+       ],
+       nseg=51,
+       labels="axon",
+   )
+   straight_axon.connect(axon_attachment, child_end=0)
+
+   revised_tree = dn.Tree.from_morphology(editable)
+
+Deleting the sole root, including a complete tree with ``recursive=True``, is
+allowed and leaves an empty editable Morphology. As usual,
+:meth:`~dendra.Morphology.compile` and model construction reject an empty
+declaration until a new root is authored. Previously compiled graphs and
+instantiated models are immutable snapshots and are not altered by deletion;
+compile or construct a new model to observe the revised morphology.
 
 Connect sections
 ----------------
@@ -986,16 +1172,17 @@ Current scope
 The native morphology API currently supports:
 
 * one connected scalar resistor tree with one root;
-* explicit, fixed ``nseg`` values; and
+* explicit per-Section ``nseg`` values, including transactional native
+  d-lambda selection from current geometry and electrical properties; and
 * construction of scalar :class:`dendra.Tree` populations, or fast
   :class:`dendra.Cable` populations for material-only unbranched paths, whose
   ``N`` members share that morphology.
 
 It does not yet define finite-extracellular/double-cable circuit layers for
 :class:`dendra.ExtCellTree` or :class:`dendra.ExtCellAxon`, a packed block-DHS
-representation, native d-lambda discretization, or per-population-member graph
-variation.  Those extensions can build on the canonical contract without
-changing the section connection rules described here.
+representation, or per-population-member graph variation. Those extensions can
+build on the canonical contract without changing the section connection rules
+described here.
 
 See also
 --------
