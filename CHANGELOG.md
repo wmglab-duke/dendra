@@ -1,3 +1,10 @@
+## v0.20.0 (2026-07-15)
+
+### Feat
+
+- **models**: implemented Cable class to consume unbranched native morphology
+- **morpholgy**: v1 native morphology spec
+
 ## v0.19.0 (2026-07-13)
 
 ### Feat
