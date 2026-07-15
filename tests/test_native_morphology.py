@@ -60,6 +60,130 @@ def test_pt3d_section_uses_frustum_geometry_and_centerline_coordinates():
     )
 
 
+def test_pt3d_diameter_step_matches_neuron_annular_surface_and_edge_geometry():
+    morphology = Morphology(rhoa=100.0)
+    morphology.section(
+        "axon",
+        points=(
+            (0.0, 0.0, 0.0, 2.0),
+            (5.0, 0.0, 0.0, 2.0),
+            (5.0, 0.0, 0.0, 4.0),
+            (10.0, 0.0, 0.0, 4.0),
+        ),
+        nseg=2,
+    )
+
+    graph = morphology.compile()
+
+    # NEURON assigns an abrupt step on a compartment boundary to the interval
+    # ending at that boundary. The 2 -> 4 um step contributes the annulus 3*pi.
+    assert graph.geometry.diameter_um == pytest.approx((2.0, 4.0))
+    assert graph.geometry.area_um2 == pytest.approx((13.0 * math.pi, 20.0 * math.pi))
+    assert graph.geometry.volume_um3 == pytest.approx((5.0 * math.pi, 20.0 * math.pi))
+    assert graph.geometry.edge_length_um == pytest.approx((0.0, 5.0))
+    assert graph.geometry.edge_resistance_ohm[1] == pytest.approx(
+        100.0 * 1e4 * 3.125 / math.pi
+    )
+
+
+def test_decimal_diameter_step_on_boundary_is_owned_upstream_without_a_sliver():
+    morphology = Morphology(rhoa=100.0)
+    morphology.section(
+        "axon",
+        points=(
+            (0.0, 0.0, 0.0, 2.0),
+            (0.1, 0.0, 0.0, 2.0),
+            (0.1, 0.0, 0.0, 4.0),
+            (0.3, 0.0, 0.0, 4.0),
+        ),
+        nseg=3,
+    )
+
+    graph = morphology.compile()
+
+    # In binary64, (1 / 3) * 0.3 is one ULP below 0.1. These authored values
+    # nevertheless describe the same mathematical compartment boundary. The
+    # complete 3*pi annulus and the incoming cable span belong upstream, with
+    # no microscopic frustum sliver leaking into the next compartment.
+    assert graph.geometry.diameter_um == pytest.approx((2.0, 4.0, 4.0))
+    assert graph.geometry.area_um2 == pytest.approx(
+        (3.2 * math.pi, 0.4 * math.pi, 0.4 * math.pi)
+    )
+    assert graph.geometry.volume_um3 == pytest.approx(
+        (0.1 * math.pi, 0.4 * math.pi, 0.4 * math.pi)
+    )
+    assert graph.geometry.edge_resistance_ohm[1:] == pytest.approx(
+        (100.0 * 1e4 * 0.0625 / math.pi, 100.0 * 1e4 * 0.025 / math.pi)
+    )
+
+
+def test_genuinely_off_boundary_diameter_step_remains_downstream():
+    offset = 1e-12
+    morphology = Morphology()
+    morphology.section(
+        "axon",
+        points=(
+            (0.0, 0.0, 0.0, 2.0),
+            (0.1 + offset, 0.0, 0.0, 2.0),
+            (0.1 + offset, 0.0, 0.0, 4.0),
+            (0.3, 0.0, 0.0, 4.0),
+        ),
+        nseg=3,
+    )
+
+    graph = morphology.compile()
+
+    # The ULP-level boundary snap must not become a geometric tolerance. This
+    # step is physically downstream of x=1/3, so its annulus belongs to the
+    # second compartment and the first remains an ordinary d=2 cylinder.
+    assert graph.geometry.area_um2[0] == pytest.approx(0.2 * math.pi)
+    assert graph.geometry.area_um2[1] == pytest.approx((3.4 - 2.0 * offset) * math.pi)
+    assert graph.geometry.volume_um3[0] == pytest.approx(0.1 * math.pi)
+    assert graph.geometry.volume_um3[1] == pytest.approx((0.4 - 3.0 * offset) * math.pi)
+
+
+@pytest.mark.parametrize(
+    ("points", "expected_areas"),
+    [
+        (
+            ((0.0, 0.0, 0.0, 2.0), (0.0, 0.0, 0.0, 4.0), (10.0, 0.0, 0.0, 4.0)),
+            (23.0 * math.pi, 20.0 * math.pi),
+        ),
+        (
+            ((0.0, 0.0, 0.0, 2.0), (10.0, 0.0, 0.0, 2.0), (10.0, 0.0, 0.0, 4.0)),
+            (10.0 * math.pi, 13.0 * math.pi),
+        ),
+    ],
+)
+def test_pt3d_endpoint_diameter_steps_belong_to_the_adjacent_compartment(
+    points, expected_areas
+):
+    morphology = Morphology()
+    morphology.section("cable", points=points, nseg=2)
+
+    graph = morphology.compile()
+
+    assert graph.geometry.area_um2 == pytest.approx(expected_areas)
+
+
+def test_pt3d_compartment_diameter_is_the_exact_arclength_mean():
+    morphology = Morphology()
+    morphology.section(
+        "dend",
+        points=(
+            (0.0, 0.0, 0.0, 2.0),
+            (2.0, 0.0, 0.0, 2.0),
+            (10.0, 0.0, 0.0, 4.0),
+        ),
+    )
+
+    graph = morphology.compile()
+
+    # Sampling at the geometric centre would give 2.75 um. NEURON instead
+    # exposes the arclength mean: (2*2 + 8*(2+4)/2) / 10 = 2.8 um.
+    assert graph.geometry.diameter_um == pytest.approx((2.8,))
+
+
 def test_endpoint_branch_retains_unlabelled_zero_volume_junction():
     morphology = Morphology()
     soma = morphology.section("soma", L=10.0, diam=10.0)

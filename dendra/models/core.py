@@ -6321,7 +6321,7 @@ class Cable(Population):
         The source graph is reordered deterministically from one physical end
         to the other.  Branches and retained zero-area junctions are rejected.
         Exact edge resistance and membrane area are retained rather than being
-        reconstructed from center diameter and compartment length.
+        reconstructed from one representative compartment diameter and length.
         """
         from .morphology import CompartmentGraph
         from .tree import (
@@ -6426,7 +6426,12 @@ class Cable(Population):
 
     @classmethod
     def from_morphology(cls, morphology, N=1, integrator=None, **kwargs):
-        """Compile a native Section path and construct a generic Cable."""
+        """Compile a native Section path and construct a generic Cable.
+
+        Construction takes an immutable snapshot. Later Section updates on the
+        source Morphology do not affect this Cable; call ``from_morphology``
+        again to build a Cable from the revised declaration.
+        """
         from .morphology import Morphology
         from .tree import _register_compartment_graph_labels
 

@@ -434,8 +434,12 @@ def _section_axis_arrays(sec):
     """Return pt3d/stylized arclength and diameter arrays in µm.
 
     NEURON sections with pt3d morphology are represented as a sequence of
-    truncated cones.  For stylized sections without pt3d points we fall back
-    to a uniform cylinder using ``sec.L`` and ``sec.diam``.
+    truncated cones. Repeated arclengths are retained because NEURON uses two
+    coincident controls with different diameters to encode an instantaneous
+    diameter step. The zero-length step contributes no volume or axial
+    resistance, while its incoming and outgoing diameters define the adjacent
+    positive-length frusta. For stylized sections without pt3d points we fall
+    back to a uniform cylinder using ``sec.L`` and ``sec.diam``.
     """
     try:
         n3d = int(sec.n3d())
@@ -450,13 +454,12 @@ def _section_axis_arrays(sec):
             arc = np.array([h.arc3d(i, sec=sec) for i in range(n3d)], dtype=float)
             diam = np.array([h.diam3d(i, sec=sec) for i in range(n3d)], dtype=float)
 
-        # Ensure a nondecreasing arclength grid and remove duplicate points.
+        # Ensure a nondecreasing arclength grid. Keep repeated arclengths: a
+        # stable ordering preserves the incoming/outgoing sides of a diameter
+        # discontinuity authored as coincident pt3d controls.
         order = np.argsort(arc, kind="stable")
         arc = arc[order]
         diam = diam[order]
-        keep = np.concatenate(([True], np.diff(arc) > 0.0))
-        arc = arc[keep]
-        diam = diam[keep]
 
         if arc.size >= 2 and float(arc[-1] - arc[0]) > 0.0:
             if arc[0] != 0.0:
@@ -482,14 +485,6 @@ def _section_s_um(sec, x: float) -> float:
     arc, _ = _section_axis_arrays(sec)
     total = float(arc[-1]) if arc.size else float(getattr(sec, "L", 0.0))
     return _pt3d_x(sec, x) * total
-
-
-def _diam_at_s_um(s_um: float, arc: np.ndarray, diam: np.ndarray) -> float:
-    if arc.size == 0:
-        return 0.0
-    if arc.size == 1 or float(arc[-1] - arc[0]) <= 0.0:
-        return float(diam[0])
-    return float(np.interp(float(s_um), arc, diam))
 
 
 def _integrate_frustum_volume_um3(
@@ -557,12 +552,22 @@ def _integrate_section_interval(
 
     out = 0.0
     for a0, a1, d0_raw, d1_raw in zip(arc[:-1], arc[1:], diam[:-1], diam[1:]):
+        span = float(a1) - float(a0)
+        # A repeated arclength with a new diameter is an instantaneous step.
+        # It has no volume or axial resistance. The stable controls on either
+        # side still supply the correct endpoint diameters to their respective
+        # positive-length frusta.
+        if span <= 0.0:
+            continue
         lo = max(lo_all, float(a0))
         hi = min(hi_all, float(a1))
         if hi <= lo:
             continue
-        d_lo = _diam_at_s_um(lo, arc, diam)
-        d_hi = _diam_at_s_um(hi, arc, diam)
+        lo_fraction = (lo - float(a0)) / span
+        hi_fraction = (hi - float(a0)) / span
+        diameter_delta = float(d1_raw) - float(d0_raw)
+        d_lo = float(d0_raw) + lo_fraction * diameter_delta
+        d_hi = float(d0_raw) + hi_fraction * diameter_delta
         if quantity == "volume":
             out += _integrate_frustum_volume_um3(lo, hi, d_lo, d_hi)
         elif quantity == "inv_area":

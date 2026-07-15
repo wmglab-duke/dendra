@@ -315,9 +315,11 @@ def generate_colors(n):
 
 def palette_hsv(n, *, s=0.65, v=0.9, seed=0):
     """Return n colours as hex strings by uniform hue spacing in HSV space."""
-    random.seed(seed)  # repeatable order if desired
     hues = [i / n for i in range(n)]
-    random.shuffle(hues)  # break up any obvious gradients
+    # Palette generation must not reset application-level random streams merely
+    # because a figure was drawn.  A private generator preserves the exact
+    # historical colors and repeatable order without touching global state.
+    random.Random(seed).shuffle(hues)
     return [mpl.colors.to_hex(colorsys.hsv_to_rgb(h, s, v)) for h in hues]
 
 

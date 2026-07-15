@@ -52,6 +52,13 @@ contracts.
 - If you want to build and run the documentation locally:
     - `pip install ".[doc]"`
 
+- If you want interactive Matplotlib figures inside Jupyter:
+    - `pip install ".[jupyter]"`
+    - Restart the entire Jupyter server—not only the kernel—then select
+      `%matplotlib widget` before plotting.
+    - Separate server/kernel environments need compatible ipympl installations
+      in both; see the [interactive Jupyter setup](docs/installation.md#interactive-jupyter-figures).
+
 ### ⚙️ Installing for development
 - Install `--editable` with dev dependencies & install `pre-commit`:
     - `pip install --editable ".[dev]"`
