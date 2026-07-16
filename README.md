@@ -87,6 +87,21 @@ python -c "import torch, triton; assert torch.cuda.is_available()"
 python -m pytest tests -W error -m cuda
 ```
 
+The native NetCon CUDA kernels also have a dedicated Compute Sanitizer lane:
+
+```bash
+python scripts/run_cuda_sanitizers.py
+```
+
+This runs memcheck, racecheck, initcheck, and synccheck with source line
+information. For reliable initcheck results, the CUDA toolkit used to compile
+the native extension must have the same major version as PyTorch's CUDA
+runtime; the runner detects mismatches, skips initcheck in the all-tools lane,
+and explains how to restore that coverage. On WSL with a WDDM GPU, sanitizer
+availability can depend on Windows driver and debugging-interface support; see
+NVIDIA's
+[operating-system-specific Compute Sanitizer documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#operating-system-specific-behavior).
+
 Keep accelerator coverage artifacts separate from the required CPU/NEURON percentage. Kernel correctness is enforced primarily through dense numerical oracles, gradient checks, boundary-shape contracts, and backend-equivalence tests. The required CPU report uses `.coveragerc.cpu` to omit only the seven accelerator-only Triton kernel bodies; their contracts, dispatch and fallback paths, network Triton operations, and GPU diagnostics remain in its coverage denominator.
 
 To measure both statement and branch coverage, print uncovered line numbers in the terminal, and generate a browsable HTML report:

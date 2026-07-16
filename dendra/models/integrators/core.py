@@ -4,6 +4,10 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
+from dendra._bootstrap import (
+    reset_torch_compiler,
+    torch_compiler_warning_context,
+)
 from dendra.helpers import (
     BACKEND,
     COMPILE_MODE,
@@ -360,10 +364,7 @@ class Integrator(torch.nn.Module):
         else:
             obj = self
         if reset_global_compiler:
-            if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
-                torch.compiler.reset()
-            elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
-                torch._dynamo.reset()
+            reset_torch_compiler()
         return obj
 
     def __getstate__(self):
@@ -393,11 +394,12 @@ class Integrator(torch.nn.Module):
             self.compile_mode,
             self.compile_options_key,
         )
-        compiled = self._compiled_kernels.get(key)
-        if compiled is None:
-            compiled = torch.compile(fn, **self._compile_kwargs())
-            self._compiled_kernels[key] = compiled
-        return compiled(*args, **kwargs)
+        with torch_compiler_warning_context():
+            compiled = self._compiled_kernels.get(key)
+            if compiled is None:
+                compiled = torch.compile(fn, **self._compile_kwargs())
+                self._compiled_kernels[key] = compiled
+            return compiled(*args, **kwargs)
 
     def _sample_runtime_noises(self):
         """Refresh detached runtime NOISE buffers before the compiled step kernel.

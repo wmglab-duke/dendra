@@ -200,6 +200,12 @@ def thomas_bt3_solve(
     x     : (B, K,   3)
     """
     B, K = rhs.shape[:2]
+    # The Triton kernel performs flat pointer arithmetic and therefore requires
+    # standard contiguous block storage. ``reshape`` is not a sufficient
+    # contract boundary for arbitrary strided views inside a custom Triton op.
+    lower = lower.contiguous()
+    main = main.contiguous()
+    upper = upper.contiguous()
     out = torch.empty_like(rhs, memory_format=torch.contiguous_format)
     minv = torch.empty(B, K, 9, device=main.device, dtype=main.dtype)
     # The kernel uses its RHS pointer as elimination workspace.  Keep the
