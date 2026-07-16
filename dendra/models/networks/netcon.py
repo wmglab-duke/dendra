@@ -1,13 +1,37 @@
 import hashlib
 import math
+import warnings
 from typing import Any, Dict, Literal
 
 import torch
 
+from ...helpers import current_native_extension_policy
 from ..parametric import Referency
 from .netstim import NetStim, _causal_step_index
 from .spiking import update_active, update_active_diff
 from .utils import make_getattr
+
+
+def _handle_native_bitpack_failure(operation: str, exc: BaseException | None) -> bool:
+    """Apply the configured policy to an eligible CUDA native-path failure."""
+    policy = current_native_extension_policy()
+    cause = exc or RuntimeError("native NetCon bitpack extension is unavailable")
+    detail = (
+        f"NetCon native CUDA bitpack {operation} failed. Cause: {cause!r}. "
+        "Run `dendra doctor` for environment diagnostics."
+    )
+    if policy == "require":
+        raise RuntimeError(
+            f"{detail} Pure-PyTorch fallback is disabled by "
+            "NATIVE_EXTENSION_POLICY='require'."
+        ) from cause
+    if policy == "warn":
+        warnings.warn(
+            f"{detail} Falling back to the pure-PyTorch implementation.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return False
 
 
 def _cache_dt_value(dt) -> float:
@@ -3528,17 +3552,23 @@ class NetCon(Referency):
     ) -> bool:
         if not source_spikes.is_cuda or self.spike_history_packed.dtype != torch.int64:
             return False
-        try:
-            from . import netcon_bitpack_ops as bitpack_ops
+        from . import netcon_bitpack_ops as bitpack_ops
 
-            if not bitpack_ops.is_available():
-                return False
+        try:
+            available = bitpack_ops.is_available()
+        except Exception as exc:
+            return _handle_native_bitpack_failure("source-spike packing", exc)
+        if not available:
+            return _handle_native_bitpack_failure(
+                "source-spike packing", bitpack_ops.last_error()
+            )
+        try:
             bitpack_ops.pack_source_spikes(
                 source_spikes, self.spike_history_packed, cur_idx
             )
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            return _handle_native_bitpack_failure("source-spike packing", exc)
 
     def _try_bitpack_delivery_kernel(
         self, cur_idx: torch.Tensor, scratch: torch.Tensor
@@ -3549,11 +3579,17 @@ class NetCon(Referency):
             or (not torch.is_floating_point(scratch))
         ):
             return False
-        try:
-            from . import netcon_bitpack_ops as bitpack_ops
+        from . import netcon_bitpack_ops as bitpack_ops
 
-            if not bitpack_ops.is_available():
-                return False
+        try:
+            available = bitpack_ops.is_available()
+        except Exception as exc:
+            return _handle_native_bitpack_failure("delivery construction", exc)
+        if not available:
+            return _handle_native_bitpack_failure(
+                "delivery construction", bitpack_ops.last_error()
+            )
+        try:
             if getattr(self, "_dense_delay_uniform", False) and hasattr(
                 bitpack_ops, "build_delivery_uniform"
             ):
@@ -3579,8 +3615,8 @@ class NetCon(Referency):
                     scratch,
                 )
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            return _handle_native_bitpack_failure("delivery construction", exc)
 
     def _bitpack_pack_source_spikes(
         self, source_spikes: torch.Tensor, cur_idx: torch.Tensor

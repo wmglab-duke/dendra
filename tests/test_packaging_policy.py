@@ -53,3 +53,11 @@ def test_jupyter_install_docs_cover_shared_and_split_environments():
     assert "do not run `jupyter lab build`" in prose
     assert "jupyter labextension list" in prose
     assert "Failed to load model class 'MPLCanvasModel'" in prose
+
+
+def test_doctor_console_script_and_module_entrypoint_are_packaged():
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert config["project"]["scripts"]["dendra"] == "dendra.cli:main"
+    assert (ROOT / "dendra" / "cli.py").is_file()
+    assert (ROOT / "dendra" / "__main__.py").is_file()

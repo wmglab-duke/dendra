@@ -24,10 +24,12 @@ import dendra.models.callbacks as callbacks
 import dendra.models.mod as mod
 
 from .const import FARADAY, PI, TAU, E, R
+from .diagnostics import doctor
 from .helpers import (
     COMPILE_OPTIONS,
     DEVICE,
     DTYPE,
+    NATIVE_EXTENSION_POLICY,
     RUNTIME_CONTRACT_VALIDATION,
     TF32,
     allow_tf32,
@@ -35,7 +37,9 @@ from .helpers import (
     current_compile_options,
     current_device,
     current_dtype,
+    current_native_extension_policy,
     current_runtime_contract_validation,
+    normalize_native_extension_policy,
     normalize_runtime_contract_validation,
     set_compile_options,
     set_jit_enabled,
@@ -104,16 +108,20 @@ __all__ = [
     "R",
     "FARADAY",
     "ctx",
+    "doctor",
     "step",
     "DEVICE",
     "DTYPE",
+    "NATIVE_EXTENSION_POLICY",
     "RUNTIME_CONTRACT_VALIDATION",
     "COMPILE_OPTIONS",
     "current_compile_options",
     "current_device",
     "current_dtype",
+    "current_native_extension_policy",
     "current_runtime_contract_validation",
     "normalize_runtime_contract_validation",
+    "normalize_native_extension_policy",
     "set_compile_options",
     "set_jit_enabled",
     "set_jit_network_solves_enabled",

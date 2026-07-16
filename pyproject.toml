@@ -41,6 +41,9 @@ dev = [
     "commitizen"
 ]
 
+[project.scripts]
+dendra = "dendra.cli:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers"

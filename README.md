@@ -64,6 +64,42 @@ contracts.
     - `pip install --editable ".[dev]"`
     - `pre-commit install`
 
+### GPU deployment diagnostics
+
+Run the deployment doctor after installing Dendra:
+
+```bash
+dendra doctor --require-cuda
+# Equivalent when the console script is not on PATH:
+python -m dendra doctor --require-cuda
+```
+
+The default doctor is inspection-only: it reports the PyTorch/CUDA runtime,
+visible GPUs, NVCC and C++ compiler discovery, CUDA-version alignment, packaged
+native sources, selected GPU architectures, cache writability, and matching
+cached artifacts without compiling, loading, or launching a native extension.
+An explicit probe opts into a JIT build and tiny end-to-end kernel smoke test:
+
+```bash
+dendra doctor --require-cuda --probe-native-bitpack
+```
+
+The optional NetCon CUDA extension retains its correct pure-PyTorch fallback by
+default. Deployments that must not silently change performance paths can scope a
+stricter policy locally:
+
+```python
+import dendra as dn
+
+with dn.ctx(NATIVE_EXTENSION_POLICY="require"):
+    network.run(...)
+```
+
+The supported policies are `"fallback"` (default), `"warn"`, and
+`"require"`. Set `NATIVE_EXTENSION_POLICY=require` before importing Dendra
+to make the policy process-wide. It is enforced only when an eligible native
+CUDA path is attempted; CPU and dense-backend execution are unaffected.
+
 ## ✅ Testing and code coverage
 
 The development dependencies include `pytest` and `pytest-cov`. Run the complete test suite from the repository root with:

@@ -53,9 +53,14 @@ Relevant environment overrides:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -74,7 +79,7 @@ _LAST_BUILD_INFO: Dict[str, object] = {}
 
 _BITS_PER_WORD = 63
 _DEFAULT_BASE_EXTENSION_NAME = "dendra_netcon_bitpack_ops"
-_BUILD_KEY_VERSION = "autoarch_cache_v1"
+_BUILD_KEY_VERSION = "toolchain_cache_v2"
 
 _NAMED_ARCHES = {
     # Keep these aligned with PyTorch's conventional TORCH_CUDA_ARCH_LIST names.
@@ -321,10 +326,104 @@ def _hash_sources(sources: Sequence[str]) -> str:
     return h.hexdigest()
 
 
+def _resolved_cuda_home() -> Optional[Path]:
+    explicit = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if explicit:
+        return Path(os.path.expandvars(explicit)).expanduser()
+    try:
+        from torch.utils.cpp_extension import CUDA_HOME
+    except Exception:
+        return None
+    return Path(CUDA_HOME).expanduser() if CUDA_HOME else None
+
+
+def _resolve_command(
+    command: Optional[str], fallbacks: Sequence[str]
+) -> Tuple[str, Optional[str]]:
+    raw = command.strip() if command else ""
+    if not raw:
+        raw = next((candidate for candidate in fallbacks if candidate), "")
+    if not raw:
+        return "", None
+    try:
+        parts = shlex.split(os.path.expandvars(raw))
+    except ValueError:
+        parts = [raw]
+    if not parts:
+        return raw, None
+    executable = str(Path(parts[0]).expanduser())
+    resolved = shutil.which(executable)
+    if resolved is None and Path(executable).is_file():
+        resolved = executable
+    if resolved is not None:
+        try:
+            resolved = str(Path(resolved).resolve())
+        except OSError:
+            pass
+    return raw, resolved
+
+
+def _command_version(executable: Optional[str]) -> Optional[str]:
+    if executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    output = " ".join(result.stdout.split())
+    return output[:2048] or None
+
+
+def native_toolchain_info() -> Dict[str, object]:
+    """Return non-mutating native build-toolchain diagnostics and cache inputs."""
+    cuda_home = _resolved_cuda_home()
+    nvcc_fallbacks = []
+    if cuda_home is not None:
+        nvcc_fallbacks.append(str(cuda_home / "bin" / "nvcc"))
+    nvcc_fallbacks.append("nvcc")
+    nvcc_command, nvcc_path = _resolve_command(
+        os.environ.get("CUDACXX"), nvcc_fallbacks
+    )
+    cxx_command, cxx_path = _resolve_command(os.environ.get("CXX"), ("c++", "g++"))
+    return {
+        "cuda_home": str(cuda_home) if cuda_home is not None else None,
+        "cudacxx": os.environ.get("CUDACXX", ""),
+        "nvcc_command": nvcc_command,
+        "nvcc_path": nvcc_path,
+        "nvcc_version": _command_version(nvcc_path),
+        "cc": os.environ.get("CC", ""),
+        "cxx_command": cxx_command,
+        "cxx_path": cxx_path,
+        "cxx_version": _command_version(cxx_path),
+        "cuda_host_cxx": os.environ.get("CUDAHOSTCXX", ""),
+        "nvcc_prepend_flags": os.environ.get("NVCC_PREPEND_FLAGS", ""),
+        "cpath": os.environ.get("CPATH", ""),
+        "cplus_include_path": os.environ.get("CPLUS_INCLUDE_PATH", ""),
+        "library_path": os.environ.get("LIBRARY_PATH", ""),
+        "python_soabi": sysconfig.get_config_var("SOABI"),
+        "torch_cxx11_abi": getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", None),
+        "lineinfo": _truthy_env("DENDRA_NETCON_BITPACK_LINEINFO", False),
+        "os_name": os.name,
+    }
+
+
 def _extension_identity(
-    sources: Sequence[str], arch_list: Sequence[str], arch_flags: Sequence[str]
+    sources: Sequence[str],
+    arch_list: Sequence[str],
+    arch_flags: Sequence[str],
+    *,
+    toolchain: Optional[Dict[str, object]] = None,
 ) -> Tuple[str, Path, str]:
     source_hash = _hash_sources(sources)
+    if toolchain is None:
+        toolchain = native_toolchain_info()
     metadata = "|".join(
         [
             _BUILD_KEY_VERSION,
@@ -334,6 +433,7 @@ def _extension_identity(
             f"arch_list={';'.join(arch_list)}",
             f"arch_flags={';'.join(arch_flags)}",
             f"source_hash={source_hash}",
+            "toolchain=" + json.dumps(toolchain, sort_keys=True, separators=(",", ":")),
         ]
     )
     build_key = hashlib.sha256(metadata.encode("utf8")).hexdigest()[:16]
@@ -354,6 +454,55 @@ def _extension_identity(
     return name, build_dir, source_hash
 
 
+def _cached_extension_artifacts(build_dir: Path, extension_name: str) -> List[str]:
+    if not build_dir.is_dir():
+        return []
+    suffixes = (".so", ".pyd", ".dll", ".dylib")
+    patterns = tuple(f"{extension_name}*{suffix}" for suffix in suffixes)
+    return sorted(
+        {
+            str(path)
+            for pattern in patterns
+            for path in build_dir.glob(pattern)
+            if path.is_file()
+        }
+    )
+
+
+def planned_build_info() -> Dict[str, object]:
+    """Return the native bitpack build plan without compiling or loading it."""
+    here = Path(__file__).resolve().parent
+    sources = [
+        str(here / "netcon_bitpack_kernel.cpp"),
+        str(here / "netcon_bitpack_kernel.cu"),
+    ]
+    arch_list = _resolve_cuda_arch_list()
+    arch_flags = _cuda_gencode_flags(arch_list)
+    toolchain = native_toolchain_info()
+    name, build_dir, source_hash = _extension_identity(
+        sources, arch_list, arch_flags, toolchain=toolchain
+    )
+    cached_artifacts = _cached_extension_artifacts(build_dir, name)
+    return {
+        "extension_name": name,
+        "build_directory": str(build_dir),
+        "cache_root": str(_dendra_cache_root()),
+        "sources": sources,
+        "missing_sources": [source for source in sources if not Path(source).is_file()],
+        "source_hash": source_hash[:16],
+        "arch_list": list(arch_list),
+        "arch_flags": list(arch_flags),
+        "torch_version": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "python": (
+            f"{sys.version_info.major}.{sys.version_info.minor}."
+            f"{sys.version_info.micro}"
+        ),
+        "toolchain": toolchain,
+        "cached_artifacts": cached_artifacts,
+    }
+
+
 def _load_extension():
     global _EXTENSION, _LAST_BUILD_INFO
     if _EXTENSION is not None:
@@ -367,22 +516,18 @@ def _load_extension():
     try:
         from torch.utils.cpp_extension import load
 
-        here = Path(__file__).resolve().parent
-        sources = [
-            str(here / "netcon_bitpack_kernel.cpp"),
-            str(here / "netcon_bitpack_kernel.cu"),
-        ]
-        missing = [s for s in sources if not Path(s).exists()]
+        plan = planned_build_info()
+        _LAST_BUILD_INFO = dict(plan)
+        sources = list(plan["sources"])
+        missing = list(plan["missing_sources"])
         if missing:
             raise FileNotFoundError(
                 f"missing NetCon bitpack extension sources: {missing}"
             )
 
-        arch_list = _resolve_cuda_arch_list()
-        arch_flags = _cuda_gencode_flags(arch_list)
-        name, build_dir, source_hash = _extension_identity(
-            sources, arch_list, arch_flags
-        )
+        arch_flags = list(plan["arch_flags"])
+        name = str(plan["extension_name"])
+        build_dir = Path(str(plan["build_directory"]))
         build_dir.mkdir(parents=True, exist_ok=True)
 
         verbose = _truthy_env("DENDRA_NETCON_BITPACK_VERBOSE", False)
@@ -391,19 +536,6 @@ def _load_extension():
             extra_cuda_cflags.append("-lineinfo")
 
         extra_cflags = ["/O2"] if os.name == "nt" else ["-O3"]
-
-        _LAST_BUILD_INFO = {
-            "extension_name": name,
-            "build_directory": str(build_dir),
-            "cache_root": str(_dendra_cache_root()),
-            "sources": sources,
-            "source_hash": source_hash[:16],
-            "arch_list": list(arch_list),
-            "arch_flags": list(arch_flags),
-            "torch_version": torch.__version__,
-            "torch_cuda": torch.version.cuda,
-            "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        }
 
         _EXTENSION = load(
             name=name,
@@ -415,8 +547,11 @@ def _load_extension():
             with_cuda=True,
             keep_intermediates=True,
         )
+        _LAST_BUILD_INFO["cached_artifacts"] = _cached_extension_artifacts(
+            build_dir, name
+        )
         return _EXTENSION
-    except BaseException as exc:  # pragma: no cover - depends on CUDA toolchain
+    except Exception as exc:  # pragma: no cover - depends on CUDA toolchain
         _disable(exc)
         return None
 
