@@ -24,9 +24,12 @@ from dataclasses import dataclass
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.artist import Artist
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+from matplotlib.text import Text
+from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 
 from ._morphology_scene import (
@@ -770,6 +773,226 @@ def _shape_legend(legend, family_count: int) -> bool:
     if legend == "auto":
         return family_count <= 16
     raise ValueError("legend must be a boolean or exactly 'auto'.")
+
+
+class _ShapeAxisIndicator(Artist):
+    """Screen-fixed xyz triad projected through an owning 3-D Axes camera."""
+
+    _AXES = (
+        ("x", "#d62728"),
+        ("y", "#2ca02c"),
+        ("z", "#1f77b4"),
+    )
+    _FALLBACK_DIRECTIONS = np.asarray(
+        ((1.0, -0.25), (-0.45, 0.85), (0.25, 1.0)), dtype=float
+    )
+
+    def __init__(self, ax) -> None:
+        super().__init__()
+        self.axes = ax
+        self.set_figure(ax.figure)
+        self.set_gid("morphology-shape-axis-indicator")
+        self.set_in_layout(False)
+        self.set_clip_on(False)
+        self.set_zorder(30)
+        self.base = np.asarray((0.075, 0.075), dtype=float)
+        self.radius = 0.055
+        self.projected_vectors = np.zeros((3, 2), dtype=float)
+        self.projected_endpoints = np.repeat(self.base[None, :], 3, axis=0)
+        self.arrows = []
+        self.end_on_markers = []
+        self.labels = []
+        for name, color in self._AXES:
+            arrow = FancyArrowPatch(
+                tuple(self.base),
+                tuple(self.base),
+                transform=ax.transAxes,
+                arrowstyle="-|>",
+                mutation_scale=8.0,
+                linewidth=1.35,
+                color=color,
+                shrinkA=0.0,
+                shrinkB=0.0,
+                clip_on=False,
+                zorder=30,
+            )
+            arrow.set_figure(ax.figure)
+            arrow.axes = ax
+            arrow.set_gid(f"morphology-shape-axis:{name}")
+            marker = Line2D(
+                [self.base[0]],
+                [self.base[1]],
+                transform=ax.transAxes,
+                marker="o",
+                markersize=3.4,
+                markerfacecolor="none",
+                markeredgecolor=color,
+                markeredgewidth=1.1,
+                linestyle="none",
+                clip_on=False,
+                zorder=30,
+            )
+            marker.set_figure(ax.figure)
+            marker.axes = ax
+            marker.set_gid(f"morphology-shape-axis-end-on:{name}")
+            marker.set_visible(False)
+            label = Text(
+                x=self.base[0],
+                y=self.base[1],
+                text=name,
+                color=color,
+                fontsize=7.5,
+                fontweight="semibold",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                clip_on=False,
+                zorder=30,
+            )
+            label.set_figure(ax.figure)
+            label.axes = ax
+            label.set_gid(f"morphology-shape-axis-label:{name}")
+            self.arrows.append(arrow)
+            self.end_on_markers.append(marker)
+            self.labels.append(label)
+
+    def _camera_vectors(self) -> np.ndarray:
+        limits = np.asarray(
+            (self.axes.get_xlim3d(), self.axes.get_ylim3d(), self.axes.get_zlim3d()),
+            dtype=float,
+        )
+        center = limits.mean(axis=1)
+        half_spans = 0.25 * np.abs(limits[:, 1] - limits[:, 0])
+        half_spans = np.where(half_spans > 0.0, half_spans, 1.0)
+        points = np.vstack((center, center + np.diag(half_spans)))
+        projected = np.column_stack(
+            proj3d.proj_transform(
+                points[:, 0],
+                points[:, 1],
+                points[:, 2],
+                self.axes.get_proj(),
+            )
+        )
+        display = self.axes.transData.transform(projected[:, :2])
+        axes_coordinates = self.axes.transAxes.inverted().transform(display)
+        return np.asarray(axes_coordinates[1:] - axes_coordinates[0], dtype=float)
+
+    def _update_children(self) -> None:
+        vectors = self._camera_vectors()
+        if not np.isfinite(vectors).all():
+            vectors = self._FALLBACK_DIRECTIONS.copy()
+        endpoints = []
+        unit_vectors = []
+        for index, vector in enumerate(vectors):
+            magnitude = float(np.linalg.norm(vector))
+            if magnitude <= 1e-10:
+                unit = np.zeros(2, dtype=float)
+                endpoint = self.base.copy()
+                self.arrows[index].set_visible(False)
+                self.end_on_markers[index].set_visible(True)
+                label_direction = self._FALLBACK_DIRECTIONS[index]
+                label_direction /= np.linalg.norm(label_direction)
+            else:
+                unit = vector / magnitude
+                endpoint = self.base + self.radius * unit
+                self.arrows[index].set_visible(True)
+                self.arrows[index].set_positions(tuple(self.base), tuple(endpoint))
+                self.end_on_markers[index].set_visible(False)
+                label_direction = unit
+            self.labels[index].set_position(tuple(endpoint + 0.014 * label_direction))
+            endpoints.append(endpoint)
+            unit_vectors.append(unit)
+        self.projected_vectors = np.asarray(unit_vectors, dtype=float)
+        self.projected_endpoints = np.asarray(endpoints, dtype=float)
+
+    def draw(self, renderer) -> None:
+        if not self.get_visible():
+            return
+        self._update_children()
+        for arrow, marker, label in zip(self.arrows, self.end_on_markers, self.labels):
+            if arrow.get_visible():
+                arrow.draw(renderer)
+            if marker.get_visible():
+                marker.draw(renderer)
+            label.draw(renderer)
+        self.stale = False
+
+    def get_children(self):
+        return tuple(self.arrows + self.end_on_markers + self.labels)
+
+
+class _Shape3DInteraction:
+    """Small addition to Axes3D navigation: scroll-wheel centered zoom."""
+
+    def __init__(self, fig, ax) -> None:
+        self.fig = fig
+        self.ax = ax
+        self.connection_id = fig.canvas.mpl_connect("scroll_event", self)
+
+    def disconnect(self) -> None:
+        self.fig.canvas.mpl_disconnect(self.connection_id)
+
+    def __call__(self, event) -> None:
+        if event.inaxes is not self.ax:
+            return
+        try:
+            step = float(event.step)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if not math.isfinite(step) or step == 0.0:
+            return
+        factor = 0.9 ** float(np.clip(step, -20.0, 20.0))
+        for getter, setter in (
+            (self.ax.get_xlim3d, self.ax.set_xlim3d),
+            (self.ax.get_ylim3d, self.ax.set_ylim3d),
+            (self.ax.get_zlim3d, self.ax.set_zlim3d),
+        ):
+            first, second = getter()
+            center = 0.5 * (first + second)
+            half_span = 0.5 * (second - first) * factor
+            setter(center - half_span, center + half_span)
+        self.fig.canvas.draw_idle()
+
+
+def _replace_shape_axis_indicator(ax, *, show: bool) -> None:
+    previous = getattr(ax, "_dendra_shape_axis_indicator", None)
+    if previous is not None:
+        previous.remove()
+    ax._dendra_shape_axis_indicator = None
+    if show:
+        indicator = _ShapeAxisIndicator(ax)
+        ax.add_artist(indicator)
+        ax._dendra_shape_axis_indicator = indicator
+
+
+def _configure_shape_3d_interaction(fig, ax, *, interactive: bool) -> None:
+    previous = getattr(ax, "_dendra_shape_interaction", None)
+    if previous is not None:
+        previous.disconnect()
+    ax._dendra_shape_interaction = None
+    if not interactive:
+        return
+
+    backend = str(mpl.get_backend())
+    normalized = backend.casefold()
+    static_backends = {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}
+    if "matplotlib_inline" in normalized or normalized in static_backends:
+        warnings.warn(
+            f"interactive=True requested while Matplotlib is using the static "
+            f"{backend!r} backend; the shape will render, but rotation and zoom "
+            "events cannot be delivered. In Jupyter, install the optional "
+            "backend with `pip install 'dendra[jupyter]'` (or `pip install "
+            "ipympl`). If the kernel and Jupyter server use separate "
+            "environments, install a compatible ipympl in both. Stop and "
+            "restart the entire Jupyter server—not only the kernel—then refresh "
+            "the page and run `%matplotlib widget` before creating the figure. "
+            "A desktop GUI backend also works.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+    ax.set_navigate(True)
+    ax.mouse_init()
+    ax._dendra_shape_interaction = _Shape3DInteraction(fig, ax)
 
 
 def _warn_shape_connection_gaps(
@@ -1779,6 +2002,8 @@ def plot_morphology_shape_3d(
     connection_tolerance_um: float = 1e-9,
     legend: bool | str = "auto",
     show_axes: bool = False,
+    show_axis_indicator: bool = True,
+    interactive: bool = False,
     ax=None,
     figsize: tuple[float, float] = (9, 8),
     dpi: int = 150,
@@ -1795,11 +2020,17 @@ def plot_morphology_shape_3d(
     )
     if not isinstance(show_axes, (bool, np.bool_)):
         raise TypeError("show_axes must be a boolean.")
+    if not isinstance(show_axis_indicator, (bool, np.bool_)):
+        raise TypeError("show_axis_indicator must be a boolean.")
+    if not isinstance(interactive, (bool, np.bool_)):
+        raise TypeError("interactive must be a boolean.")
     scene = build_morphology_scene(morphology) if _scene is None else _scene
     shape_context = _shape_color_context(scene)
     show_legend = _shape_legend(legend, len(shape_context.family_colors))
     context = shape_context.colors
     fig, ax = _new_3d_axes(ax, figsize=figsize, dpi=dpi)
+    _replace_shape_axis_indicator(ax, show=bool(show_axis_indicator))
+    _configure_shape_3d_interaction(fig, ax, interactive=bool(interactive))
 
     if not scene.sections:
         ax.text2D(0.5, 0.5, "Empty Morphology", transform=ax.transAxes, ha="center")

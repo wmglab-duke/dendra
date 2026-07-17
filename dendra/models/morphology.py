@@ -2156,6 +2156,8 @@ class Morphology:
         connection_tolerance_um: float = 1e-9,
         legend: bool | Literal["auto"] = "auto",
         show_axes: bool = False,
+        show_axis_indicator: bool = True,
+        interactive: bool = False,
         ax: object | None = None,
         figsize: tuple[float, float] = (9, 8),
         dpi: int = 150,
@@ -2170,9 +2172,24 @@ class Morphology:
         :meth:`plot_3d` and :meth:`inspect` instead.
 
         Parameters are the same as :meth:`plot_shape`, except that no projection
-        ``view`` is required and ``figsize`` defaults to ``(9, 8)``. A supplied
-        axes must be a Matplotlib 3-D axes. The method returns ``(Figure, Axes)``,
-        does not mutate the Morphology, and never calls ``show``.
+        ``view`` is required and ``figsize`` defaults to ``(9, 8)``.
+        ``show_axis_indicator=True`` adds a compact, screen-fixed x/y/z triad in
+        the lower left even while the full coordinate axes remain hidden. The
+        triad follows camera rotation without changing the morphology's limits.
+
+        Set ``interactive=True`` to explicitly request event-driven Matplotlib
+        navigation. Left drag rotates, middle drag pans, right drag zooms, and
+        the scroll wheel zooms around the current view. An event-capable backend
+        must be selected before creating the figure—for example,
+        ``%matplotlib widget`` with the optional ``ipympl`` package in Jupyter,
+        or a desktop GUI backend. A static backend emits an actionable warning;
+        this method never changes the backend or calls ``show``. Matplotlib 3-D
+        axes may already expose their native drag navigation on a live backend
+        when ``interactive`` is left false; the flag requests and validates that
+        capability and adds Dendra's scroll-wheel zoom.
+
+        A supplied axes must be a Matplotlib 3-D axes. The method returns
+        ``(Figure, Axes)`` and does not mutate the Morphology.
         """
         from .morphology_visualization import plot_morphology_shape_3d
 
@@ -2183,6 +2200,8 @@ class Morphology:
             connection_tolerance_um=connection_tolerance_um,
             legend=legend,
             show_axes=show_axes,
+            show_axis_indicator=show_axis_indicator,
+            interactive=interactive,
             ax=ax,
             figsize=figsize,
             dpi=dpi,
