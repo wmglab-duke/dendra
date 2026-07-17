@@ -1013,6 +1013,7 @@ def test_shape_views_render_an_empty_morphology_and_an_incomplete_forest():
     assert [text.get_text() for text in empty_3d_ax.texts] == ["Empty Morphology"]
     assert empty_ax.get_title() == ""
     assert empty_3d_ax.get_title() == ""
+    assert empty_3d_ax._dendra_shape_axis_indicator is not None
     _draw(empty_fig)
     _draw(empty_3d_fig)
 
@@ -1169,6 +1170,164 @@ def test_shape_show_axes_reenables_axes_when_reusing_handles(dimensionality):
         assert returned_ax._axis3don is True
     assert returned_fig is fig
     assert returned_ax is ax
+    _draw(fig)
+
+
+def test_plot_shape_3d_axis_indicator_is_screen_fixed_and_tracks_camera():
+    morphology = dn.Morphology()
+    morphology.section(
+        "cable",
+        points=((0.0, 0.0, 0.0, 3.0), (12.0, 4.0, 7.0, 1.0)),
+    )
+
+    fig, ax = morphology.plot_shape_3d(legend=False)
+    limits_before = (ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d())
+    _draw(fig)
+    indicator = ax._dendra_shape_axis_indicator
+
+    assert indicator in ax.artists
+    assert indicator.get_gid() == "morphology-shape-axis-indicator"
+    assert ax._axis3don is False
+    assert [label.get_text() for label in indicator.labels] == ["x", "y", "z"]
+    assert [arrow.get_edgecolor() for arrow in indicator.arrows] == pytest.approx(
+        [
+            matplotlib.colors.to_rgba("#d62728"),
+            matplotlib.colors.to_rgba("#2ca02c"),
+            matplotlib.colors.to_rgba("#1f77b4"),
+        ]
+    )
+    assert np.isfinite(indicator.projected_endpoints).all()
+    assert np.all(indicator.projected_endpoints >= 0.0)
+    assert np.all(indicator.projected_endpoints <= 0.16)
+    assert (ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()) == limits_before
+
+    initial_vectors = indicator.projected_vectors.copy()
+    ax.view_init(elev=8.0, azim=42.0, roll=13.0)
+    _draw(fig)
+    assert np.isfinite(indicator.projected_vectors).all()
+    assert not np.allclose(indicator.projected_vectors, initial_vectors)
+    assert np.allclose(indicator.base, (0.075, 0.075))
+    lengths = np.linalg.norm(
+        indicator.projected_endpoints - indicator.base[None, :], axis=1
+    )
+    assert np.all((np.isclose(lengths, indicator.radius)) | np.isclose(lengths, 0.0))
+    assert (ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()) == limits_before
+
+    # An axis viewed exactly end-on becomes a labelled ring rather than a
+    # numerically unstable zero-length arrow.
+    ax.view_init(elev=0.0, azim=0.0, roll=0.0)
+    _draw(fig)
+    assert np.isfinite(indicator.projected_endpoints).all()
+    assert any(marker.get_visible() for marker in indicator.end_on_markers)
+
+
+def test_plot_shape_3d_axis_indicator_can_be_removed_when_reusing_axes():
+    morphology = dn.Morphology()
+    morphology.section("cable", L=10.0, diam=2.0)
+
+    fig, ax = morphology.plot_shape_3d(legend=False)
+    first = ax._dendra_shape_axis_indicator
+    assert first in ax.artists
+
+    returned_fig, returned_ax = morphology.plot_shape_3d(legend=False, ax=ax)
+    second = ax._dendra_shape_axis_indicator
+    assert returned_fig is fig
+    assert returned_ax is ax
+    assert second is not first
+    assert first not in ax.artists
+    assert [artist for artist in ax.artists if artist is second] == [second]
+
+    morphology.plot_shape_3d(
+        legend=False,
+        show_axis_indicator=False,
+        ax=ax,
+    )
+    assert ax._dendra_shape_axis_indicator is None
+    assert second not in ax.artists
+    _draw(fig)
+
+
+def test_plot_shape_3d_interactive_enables_navigation_and_scroll_zoom(
+    monkeypatch,
+):
+    morphology = dn.Morphology()
+    morphology.section(
+        "cable",
+        points=((0.0, 0.0, 0.0, 2.0), (10.0, 3.0, 5.0, 1.0)),
+    )
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d")
+    ax.disable_mouse_rotation()
+    ax.set_navigate(False)
+    monkeypatch.setattr(
+        matplotlib, "get_backend", lambda: "module://ipympl.backend_nbagg"
+    )
+
+    returned_fig, returned_ax = morphology.plot_shape_3d(
+        interactive=True,
+        legend=False,
+        ax=ax,
+    )
+    _draw(fig)
+    controller = ax._dendra_shape_interaction
+
+    assert returned_fig is fig
+    assert returned_ax is ax
+    assert controller is not None
+    assert ax.get_navigate() is True
+    assert ax._rotate_btn == [1]
+    assert ax._pan_btn == [2]
+    assert ax._zoom_btn == [3]
+
+    before = np.asarray(
+        [
+            np.diff(ax.get_xlim3d())[0],
+            np.diff(ax.get_ylim3d())[0],
+            np.diff(ax.get_zlim3d())[0],
+        ]
+    )
+    display_x, display_y = ax.transAxes.transform((0.5, 0.5))
+    event = MouseEvent(
+        "scroll_event",
+        fig.canvas,
+        display_x,
+        display_y,
+        step=1,
+    )
+    fig.canvas.callbacks.process("scroll_event", event)
+    after = np.asarray(
+        [
+            np.diff(ax.get_xlim3d())[0],
+            np.diff(ax.get_ylim3d())[0],
+            np.diff(ax.get_zlim3d())[0],
+        ]
+    )
+    np.testing.assert_allclose(after, 0.9 * before)
+
+    morphology.plot_shape_3d(interactive=False, legend=False, ax=ax)
+    assert ax._dendra_shape_interaction is None
+    _draw(fig)
+
+
+def test_plot_shape_3d_interactive_warns_for_static_inline_backend(
+    monkeypatch,
+):
+    morphology = dn.Morphology()
+    morphology.section("cable", L=10.0, diam=2.0)
+    monkeypatch.setattr(
+        matplotlib,
+        "get_backend",
+        lambda: "module://matplotlib_inline.backend_inline",
+    )
+
+    with pytest.warns(RuntimeWarning, match=r"dendra\[jupyter\]|ipympl") as caught:
+        fig, ax = morphology.plot_shape_3d(interactive=True)
+
+    message = str(caught[0].message)
+    assert "rotation and zoom" in message
+    assert "separate environments" in message
+    assert "entire Jupyter server" in message
+    assert ax._dendra_shape_interaction is not None
     _draw(fig)
 
 
@@ -1924,6 +2083,8 @@ def test_empty_morphology_renders_in_every_public_view():
         ("plot_shape_3d", {"radial_segments": 1}, ValueError),
         ("plot_shape_3d", {"legend": None}, ValueError),
         ("plot_shape_3d", {"show_axes": "yes"}, TypeError),
+        ("plot_shape_3d", {"show_axis_indicator": 1}, TypeError),
+        ("plot_shape_3d", {"interactive": "yes"}, TypeError),
         ("plot_shape_3d", {"figsize": (9.0,)}, TypeError),
         ("plot_topology", {"node_size": float("inf")}, ValueError),
         ("plot_topology", {"branchpoint_size": 0.0}, ValueError),

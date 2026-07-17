@@ -689,7 +689,30 @@ Section. ``legend="auto"`` shows this compact key for at most 16 families, so
 a reconstruction with hundreds of indexed dendritic Sections can still have a
 useful four-region legend. Set ``legend=False`` to hide it or ``legend=True``
 to force it. Axes, titles, point controls, compartment markers, orientation
-arrows, annotations, and connection glyphs are absent by default.
+arrows, annotations, and connection glyphs are absent by default. The 3-D shape
+view retains only a compact x/y/z orientation triad in its lower-left corner.
+The triad is anchored to the display rather than the morphology coordinates,
+follows camera rotation, and never changes the data limits. Set
+``show_axis_indicator=False`` to remove it; ``show_axes=True`` independently
+enables the full physical coordinate axes.
+
+Matplotlib 3-D axes can rotate and zoom whenever they are displayed through an
+event-capable backend. To request that behavior explicitly—and add scroll-wheel
+zoom—select the backend before creating the figure and pass
+``interactive=True``:
+
+.. code-block:: ipython
+
+   %matplotlib widget
+   fig_shape_3d, ax_shape_3d = morphology.plot_shape_3d(interactive=True)
+
+Left drag rotates, middle drag pans, right drag zooms, and the scroll wheel
+zooms the current view. Static inline output still renders the figure but cannot
+receive those events, so Dendra emits an actionable warning rather than trying
+to change Matplotlib's backend. See :ref:`interactive-jupyter` for installation,
+server/kernel environment, and restart guidance. A desktop GUI backend works as
+well; call ``plt.show()`` if that environment does not display returned figures
+automatically.
 
 The shape renderer uses the authored declaration, not ``nseg`` or the compiled
 graph, and never invents placement. Spatially coherent child tubes meet
