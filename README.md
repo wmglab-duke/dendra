@@ -52,10 +52,53 @@ contracts.
 - If you want to build and run the documentation locally:
     - `pip install ".[doc]"`
 
+- If you want interactive Matplotlib figures inside Jupyter:
+    - `pip install ".[jupyter]"`
+    - Restart the entire Jupyter server—not only the kernel—then select
+      `%matplotlib widget` before plotting.
+    - Separate server/kernel environments need compatible ipympl installations
+      in both; see the [interactive Jupyter setup](docs/installation.md#interactive-jupyter-figures).
+
 ### ⚙️ Installing for development
 - Install `--editable` with dev dependencies & install `pre-commit`:
     - `pip install --editable ".[dev]"`
     - `pre-commit install`
+
+### GPU deployment diagnostics
+
+Run the deployment doctor after installing Dendra:
+
+```bash
+dendra doctor --require-cuda
+# Equivalent when the console script is not on PATH:
+python -m dendra doctor --require-cuda
+```
+
+The default doctor is inspection-only: it reports the PyTorch/CUDA runtime,
+visible GPUs, NVCC and C++ compiler discovery, CUDA-version alignment, packaged
+native sources, selected GPU architectures, cache writability, and matching
+cached artifacts without compiling, loading, or launching a native extension.
+An explicit probe opts into a JIT build and tiny end-to-end kernel smoke test:
+
+```bash
+dendra doctor --require-cuda --probe-native-bitpack
+```
+
+The optional NetCon CUDA extension retains its correct pure-PyTorch fallback by
+default. Deployments that must not silently change performance paths can scope a
+stricter policy locally:
+
+```python
+import dendra as dn
+
+with dn.ctx(NATIVE_EXTENSION_POLICY="require"):
+    network.run(...)
+```
+
+The supported policies are `"fallback"` (default), `"warn"`, and
+`"require"`. Set `NATIVE_EXTENSION_POLICY=require` before importing Dendra
+to make the policy process-wide. It is enforced only when an eligible native
+CUDA path is attempted; CPU and dense-backend execution are unaffected.
 
 ## ✅ Testing and code coverage
 
@@ -79,6 +122,21 @@ On a CUDA/Triton worker, run the accelerator lane independently:
 python -c "import torch, triton; assert torch.cuda.is_available()"
 python -m pytest tests -W error -m cuda
 ```
+
+The native NetCon CUDA kernels also have a dedicated Compute Sanitizer lane:
+
+```bash
+python scripts/run_cuda_sanitizers.py
+```
+
+This runs memcheck, racecheck, initcheck, and synccheck with source line
+information. For reliable initcheck results, the CUDA toolkit used to compile
+the native extension must have the same major version as PyTorch's CUDA
+runtime; the runner detects mismatches, skips initcheck in the all-tools lane,
+and explains how to restore that coverage. On WSL with a WDDM GPU, sanitizer
+availability can depend on Windows driver and debugging-interface support; see
+NVIDIA's
+[operating-system-specific Compute Sanitizer documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#operating-system-specific-behavior).
 
 Keep accelerator coverage artifacts separate from the required CPU/NEURON percentage. Kernel correctness is enforced primarily through dense numerical oracles, gradient checks, boundary-shape contracts, and backend-equivalence tests. The required CPU report uses `.coveragerc.cpu` to omit only the seven accelerator-only Triton kernel bodies; their contracts, dispatch and fallback paths, network Triton operations, and GPU diagnostics remain in its coverage denominator.
 

@@ -9,6 +9,7 @@ from typing import Dict, Literal, Optional
 import torch
 from tqdm.auto import tqdm
 
+from dendra._bootstrap import reset_torch_compiler
 from dendra.helpers import (
     BACKEND,
     COMPILE_MODE,
@@ -829,7 +830,7 @@ class Network(RNGMixin):
 
         self.is_batched = False
 
-        torch._dynamo.reset()
+        reset_torch_compiler(prefer_public=False)
 
         # Keep the stateful network/population wrapper eager. Population JIT is
         # now handled by each integrator, which compiles only its tensor kernel
@@ -985,10 +986,7 @@ class Network(RNGMixin):
         else:
             obj = self
         if reset_global_compiler:
-            if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
-                torch.compiler.reset()
-            elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
-                torch._dynamo.reset()
+            reset_torch_compiler()
         return obj
 
     def __getstate__(self):
@@ -2851,7 +2849,7 @@ class Network(RNGMixin):
         dt_changed = self.dt is not None and self.dt != dt_f
 
         if not self.built or self.dt != dt_f or force_rebuild or devices_changed:
-            torch._dynamo.reset()
+            reset_torch_compiler(prefer_public=False)
             self.dt = dt_f
             if dt_changed:
                 # A step count anchored to the previous dt cannot be reused with

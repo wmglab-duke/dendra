@@ -30,6 +30,10 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
+from dendra._bootstrap import (
+    reset_torch_compiler,
+    torch_compiler_warning_context,
+)
 from dendra.helpers import (
     BACKEND,
     COMPILE_MODE,
@@ -515,7 +519,7 @@ class Population(P, Sliceable):
         self.pre_initialize_hooks: List[Callable] = []
         self.post_initialize_hooks: List[Callable] = []
 
-        torch._dynamo.reset()
+        reset_torch_compiler(prefer_public=False)
 
         # Keep the state-mutating Population/Integrator wrapper eager.  JIT
         # settings are propagated to the integrator, which compiles only its
@@ -600,11 +604,16 @@ class Population(P, Sliceable):
                     kwargs["mode"] = self.compile_mode
                 if self.compile_options is not None:
                     kwargs["options"] = dict(self.compile_options)
-                self.make_intra = torch.compile(make_intra, **kwargs)
+                with torch_compiler_warning_context():
+                    self.make_intra = torch.compile(make_intra, **kwargs)
             else:
                 self.make_intra = make_intra
             self._make_intra_config = make_intra_config
         return self
+
+    def _call_make_intra(self, intra, stims, indices):
+        with torch_compiler_warning_context():
+            return self.make_intra(intra, stims, indices)
 
     def clear_jit_cache(self):
         """Drop lazily compiled functions attached to this population.
@@ -671,10 +680,7 @@ class Population(P, Sliceable):
         else:
             obj = self
         if reset_global_compiler:
-            if hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
-                torch.compiler.reset()
-            elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
-                torch._dynamo.reset()
+            reset_torch_compiler()
         return obj
 
     def __getstate__(self):
@@ -1857,7 +1863,7 @@ class Population(P, Sliceable):
             if with_intra:
                 stims, indices = self.prep_intra(intra, 1, dt_f)
                 s = [st[0] for st in stims]
-                intra_c = self.make_intra(intra, s, indices)
+                intra_c = self._call_make_intra(intra, s, indices)
             else:
                 intra_c = None
 
@@ -2084,7 +2090,7 @@ class Population(P, Sliceable):
                 # Intracellular stimulation for this step
                 if with_intra:
                     s = [st[local_ind] for st in stims]
-                    intra_c = self.make_intra(intra, s, indices)
+                    intra_c = self._call_make_intra(intra, s, indices)
                 else:
                     intra_c = None
 
@@ -2285,7 +2291,7 @@ class Population(P, Sliceable):
 
                         if with_intra:
                             s = [st[j] for st in stims]
-                            intra_c = self.make_intra(intra, s, indices)
+                            intra_c = self._call_make_intra(intra, s, indices)
                         else:
                             intra_c = None
 
@@ -4421,7 +4427,7 @@ class Population(P, Sliceable):
 
                             if with_intra:
                                 s = [st[j] for st in stims]
-                                intra_c = self.make_intra(intra, s, indices)
+                                intra_c = self._call_make_intra(intra, s, indices)
                             else:
                                 intra_c = None
 
@@ -6321,7 +6327,7 @@ class Cable(Population):
         The source graph is reordered deterministically from one physical end
         to the other.  Branches and retained zero-area junctions are rejected.
         Exact edge resistance and membrane area are retained rather than being
-        reconstructed from center diameter and compartment length.
+        reconstructed from one representative compartment diameter and length.
         """
         from .morphology import CompartmentGraph
         from .tree import (
@@ -6426,7 +6432,12 @@ class Cable(Population):
 
     @classmethod
     def from_morphology(cls, morphology, N=1, integrator=None, **kwargs):
-        """Compile a native Section path and construct a generic Cable."""
+        """Compile a native Section path and construct a generic Cable.
+
+        Construction takes an immutable snapshot. Later Section updates on the
+        source Morphology do not affect this Cable; call ``from_morphology``
+        again to build a Cable from the revised declaration.
+        """
         from .morphology import Morphology
         from .tree import _register_compartment_graph_labels
 

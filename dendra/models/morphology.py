@@ -12,15 +12,19 @@ This module deliberately separates two representations:
     arrays use deterministic integer compartment IDs. NetworkX is supported as
     an interoperability view, but is not the semantic source of truth.
 
-The first implementation uses explicit ``nseg`` values. A d-lambda
-discretization policy belongs in a later layer and is intentionally not inferred.
+Every Section retains an explicit ``nseg`` value. Callers may author it directly
+or apply the native d-lambda policy from current geometry and electrical values.
 """
 
 from __future__ import annotations
 
 import math
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from os import PathLike
+from pathlib import Path
+from types import MappingProxyType
 from typing import Iterable, Literal, Sequence
 
 import networkx as nx
@@ -145,7 +149,14 @@ class CompartmentTopology:
 
 @dataclass(frozen=True, slots=True)
 class CompartmentGeometry:
-    """Immutable binary64 node geometry and child-indexed axial edge data."""
+    """Immutable binary64 node geometry and child-indexed axial edge data.
+
+    For geometry produced by :meth:`Morphology.compile`, ``diameter_um`` is
+    the arclength-mean diameter of each material compartment, matching
+    NEURON's segment-diameter convention. It is descriptive metadata rather
+    than a cylindrical approximation: ``area_um2``, ``volume_um3``, and the
+    axial edge fields retain the exact compiled tapered-cable integrals.
+    """
 
     length_um: tuple[float, ...]
     diameter_um: tuple[float, ...]
@@ -718,7 +729,10 @@ class Section:
     """One named cable section in a native :class:`Morphology`.
 
     ``name`` is the Section's unique authored identity. ``labels`` is its
-    immutable set of structural region tags and always includes ``name``.
+    read-only set of structural region tags and always includes ``name``.
+    Attribute assignment is disabled; :meth:`update` performs a validated,
+    transactional edit through the owning Morphology while preserving this
+    object's identity.
     """
 
     name: str
@@ -730,19 +744,91 @@ class Section:
     cm: float
     labels: frozenset[str]
     _owner: Morphology = field(repr=False, compare=False)
+    _location_controls: tuple[tuple[float, int], ...] = field(
+        default=(), repr=False, compare=False
+    )
 
     @property
     def is_pt3d(self) -> bool:
         return len(self.points) > 2 or self.diam is None
 
+    def lambda_f(self, *, freq_hz: float = 100.0) -> float:
+        """Return this Section's AC space constant in µm.
+
+        The calculation is the native equivalent of NEURON's ``lambda_f``
+        discretization helper. Stylized Sections use their uniform diameter;
+        pt3d Sections evaluate the compiler-representable authored profile with
+        NEURON's control-interval approximation along centerline arclength.
+        ``freq_hz`` is a raw frequency in hertz, not Dendra's usual kHz
+        simulation-frequency coordinate. The calculation uses the same
+        binary64-representable spans as :meth:`Morphology.compile`.
+
+        This method performs analysis only and does not change ``nseg``. Use
+        :meth:`Morphology.apply_d_lambda` to select and apply compartment
+        counts across the owning Morphology.
+        """
+        self._owner._resolve_section(self)
+        freq_hz = _positive(freq_hz, name="freq_hz")
+        return _section_lambda_f(self, freq_hz)
+
     def at(self, x: float) -> SectionLocation:
         """Return an immutable normalized location on this section."""
+        self._owner._resolve_section(self)
         x = _real(x, name=f"location on section {self.name!r}")
         if not 0.0 <= x <= 1.0:
             raise ValueError(
                 "Section locations must lie in the closed interval [0, 1]."
             )
         return SectionLocation(self, x)
+
+    def update(
+        self,
+        *,
+        L: float | None = None,
+        diam: float | None = None,
+        points: Sequence[Sequence[float]] | None = None,
+        nseg: int | None = None,
+        rhoa: float | None = None,
+        cm: float | None = None,
+        labels: str | Iterable[str] | None = None,
+    ) -> Section:
+        """Transactionally update this authored Section and return it.
+
+        ``rhoa``, ``cm``, and ``nseg`` are whole-Section properties. Stylized
+        Sections may update ``L`` and ``diam``; pt3d Sections replace geometry
+        through ``points`` because their length and diameter profile are
+        derived. Use ``section.at(x).update(diam=...)`` for one pt3d diameter
+        control point. Supplying ``points`` can promote a stylized Section to
+        pt3d. ``labels`` replaces the explicit set, with ``name`` re-added.
+
+        Existing compiled graphs and instantiated models are independent
+        snapshots. Compile or construct a new model to observe an update.
+        ``None`` means unchanged for every argument.
+        """
+        return self._owner.update_section(
+            self,
+            L=L,
+            diam=diam,
+            points=points,
+            nseg=nseg,
+            rhoa=rhoa,
+            cm=cm,
+            labels=labels,
+        )
+
+    def delete(self, *, recursive: bool = False) -> tuple[str, ...]:
+        """Delete this Section from its owning Morphology.
+
+        A leaf Section can be deleted directly. A Section with children is
+        rejected unless ``recursive=True``, in which case the complete
+        descendant subtree is deleted. The returned names follow the original
+        Section declaration order.
+
+        Deletion invalidates this Section and any saved locations on it for
+        future authoring operations. Existing compiled graphs and instantiated
+        models remain independent snapshots.
+        """
+        return self._owner.delete_section(self, recursive=recursive)
 
     def connect(self, parent: SectionLocation, *, child_end: int = 0) -> Section:
         """Connect one endpoint of this section to a parent location."""
@@ -752,7 +838,7 @@ class Section:
 
 @dataclass(frozen=True, slots=True)
 class SectionLocation:
-    """A normalized location on a native section."""
+    """An immutable normalized selector on a native Section's current geometry."""
 
     section: Section
     x: float
@@ -764,6 +850,26 @@ class SectionLocation:
                 "Section locations must lie in the closed interval [0, 1]."
             )
         object.__setattr__(self, "x", x)
+
+    def update(self, *, diam: float) -> Section:
+        """Edit or insert a pt3d diameter control point at this location.
+
+        Diameter remains linearly interpolated between neighboring authored
+        samples. The centerline path, ``nseg``, and electrical properties are
+        unchanged; an inserted point may re-express the same path length within
+        binary64 roundoff. If coordinate precision cannot represent a distinct
+        control point, the update is rejected. A location containing an abrupt
+        diameter discontinuity has two authored diameter limits and is therefore
+        ambiguous; replace the complete Section ``points`` to edit either side.
+        Location-scoped ``rhoa`` and ``cm`` are not defined by the current
+        whole-Section electrical contract.
+
+        Returns
+        -------
+        Section
+            The canonical owning Section after a successful update.
+        """
+        return self.section._owner._update_section_location(self, diam=diam)
 
 
 @dataclass(frozen=True, slots=True)
@@ -786,14 +892,455 @@ class Morphology:
     """
 
     def __init__(self, *, rhoa: float = 100.0, cm: float = 1.0):
-        self.rhoa = _positive(rhoa, name="default rhoa")
-        self.cm = _positive(cm, name="default cm")
+        self.rhoa = rhoa
+        self.cm = cm
         self._sections: dict[str, Section] = {}
         self._connections: dict[str, _Connection] = {}
+        self._swc_section_types: dict[str, int] = {}
+
+    @property
+    def rhoa(self) -> float:
+        """Validated default axial resistivity for subsequently declared Sections."""
+        return self._rhoa
+
+    @rhoa.setter
+    def rhoa(self, value: float) -> None:
+        self._rhoa = _positive(value, name="default rhoa")
+
+    @property
+    def cm(self) -> float:
+        """Validated specific-capacitance default for later Sections."""
+        return self._cm
+
+    @cm.setter
+    def cm(self, value: float) -> None:
+        self._cm = _positive(value, name="default cm")
 
     @property
     def sections(self) -> tuple[Section, ...]:
         return tuple(self._sections.values())
+
+    @property
+    def swc_section_types(self) -> Mapping[str, int]:
+        """Read-only imported SWC type provenance keyed by generated Section.
+
+        Manually authored Sections and non-SWC imports have no entry. Pass this
+        mapping explicitly to :meth:`to_swc` or :meth:`write_swc` to retain raw
+        type IDs; export never guesses types from names or labels.
+        """
+        return MappingProxyType(self._swc_section_types)
+
+    def _resolve_section(self, section: str | Section) -> Section:
+        if isinstance(section, str):
+            try:
+                return self._sections[section]
+            except KeyError as error:
+                raise KeyError(f"Unknown Section name {section!r}.") from error
+        if not isinstance(section, Section):
+            raise TypeError("section must be a Section or an exact Section name.")
+        if section._owner is not self:
+            raise ValueError("The Section belongs to a different Morphology.")
+        if self._sections.get(section.name) is not section:
+            raise ValueError(
+                f"Section {section.name!r} is not the canonical Section registered "
+                "with this Morphology."
+            )
+        return section
+
+    def delete_section(
+        self, section: str | Section, *, recursive: bool = False
+    ) -> tuple[str, ...]:
+        """Delete one Section or an explicitly requested descendant subtree.
+
+        Parameters
+        ----------
+        section : str or Section
+            Exact name or canonical Section owned by this Morphology.
+        recursive : bool, optional
+            If false (default), a Section with children is rejected. If true,
+            delete the Section and every descendant connected below it.
+
+        Returns
+        -------
+        tuple of str
+            Deleted Section names in their original declaration order.
+
+        Notes
+        -----
+        The complete deletion set is validated before mutation. Deleting the
+        sole root, or recursively deleting a complete tree, is allowed and
+        leaves an empty Morphology that cannot be compiled until a new tree is
+        declared. Surviving Sections retain their identity, declaration order,
+        and connections. Imported SWC type provenance associated with deleted
+        Sections is removed as part of the same transaction.
+
+        Deleted Section and SectionLocation objects become stale and are
+        rejected by later authoring operations, even if a new Section reuses a
+        deleted name. Previously compiled graphs and instantiated models are
+        independent snapshots and are not changed.
+        """
+        if not isinstance(recursive, (bool, np.bool_)):
+            raise TypeError("recursive must be a boolean.")
+        recursive = bool(recursive)
+        current = self._resolve_section(section)
+
+        section_names = set(self._sections)
+        children: dict[str, list[str]] = {name: [] for name in self._sections}
+        for child_name, connection in self._connections.items():
+            if (
+                not isinstance(connection, _Connection)
+                or child_name != connection.child_name
+                or connection.child_name not in section_names
+                or connection.parent_name not in section_names
+            ):
+                raise RuntimeError(
+                    "The Morphology connection registry is inconsistent; "
+                    "deletion was not applied."
+                )
+            children[connection.parent_name].append(connection.child_name)
+
+        # Public connection operations prevent cycles. Validate that invariant
+        # here as well so deletion never partially repairs or silently removes a
+        # corrupted private registry.
+        completed: set[str] = set()
+        for start in self._sections:
+            chain: set[str] = set()
+            name = start
+            while name in self._connections and name not in completed:
+                if name in chain:
+                    raise RuntimeError(
+                        "The Morphology connection registry contains a cycle; "
+                        "deletion was not applied."
+                    )
+                chain.add(name)
+                name = self._connections[name].parent_name
+            completed.update(chain)
+
+        direct_children = children[current.name]
+        if direct_children and not recursive:
+            child_names = ", ".join(repr(name) for name in direct_children)
+            raise ValueError(
+                f"Section {current.name!r} has child Sections ({child_names}); "
+                "pass recursive=True to delete the complete descendant subtree."
+            )
+
+        deleted = {current.name}
+        if recursive:
+            stack = list(reversed(direct_children))
+            while stack:
+                name = stack.pop()
+                deleted.add(name)
+                stack.extend(reversed(children[name]))
+
+        deleted_names = tuple(name for name in self._sections if name in deleted)
+
+        # Commit only after ownership, option, and complete-subtree validation.
+        # Connections are child-keyed, so every deleted Section's incoming edge
+        # is removed with its declaration. Recursive closure guarantees that no
+        # surviving edge can retain a deleted parent.
+        for name in deleted_names:
+            self._connections.pop(name, None)
+            self._sections.pop(name)
+            self._swc_section_types.pop(name, None)
+        return deleted_names
+
+    def update_section(
+        self,
+        section: str | Section,
+        *,
+        L: float | None = None,
+        diam: float | None = None,
+        points: Sequence[Sequence[float]] | None = None,
+        nseg: int | None = None,
+        rhoa: float | None = None,
+        cm: float | None = None,
+        labels: str | Iterable[str] | None = None,
+    ) -> Section:
+        """Transactionally update a named Section while preserving its identity.
+
+        Parameters use the same units and validation as :meth:`section`.
+        ``rhoa``, ``cm``, and ``nseg`` apply to the complete Section. Stylized
+        Sections may update ``L`` and ``diam``. A complete pt3d centerline or
+        diameter-profile replacement uses ``points``; use
+        :meth:`SectionLocation.update` for one local diameter control point.
+        Passing ``points`` for a stylized Section promotes it to pt3d; the
+        reverse pt3d-to-stylized conversion is unsupported by this update API.
+        ``labels`` replaces the explicit labels, while the Section name remains
+        automatic. ``None`` means unchanged for every optional argument.
+
+        The canonical Section object and all existing :class:`SectionLocation`
+        references remain valid. Connections and declaration order are
+        preserved. Previously compiled graphs and instantiated models are
+        immutable snapshots and are not changed by this authoring edit.
+
+        Returns
+        -------
+        Section
+            The same canonical Section object after a successful update.
+        """
+        current = self._resolve_section(section)
+
+        if points is not None and (L is not None or diam is not None):
+            raise ValueError("Do not combine points with L or diam in an update.")
+        if points is not None:
+            new_points = _normalize_points(points, section_name=current.name)
+            new_length = _positive(
+                _polyline_arclength(new_points)[-1],
+                name=f"section {current.name!r} derived L",
+            )
+            new_diameter = None
+            new_location_controls: tuple[tuple[float, int], ...] = ()
+        elif current.is_pt3d:
+            if L is not None or diam is not None:
+                raise ValueError(
+                    "A pt3d Section derives L and its diameter profile from "
+                    "points; replace points to update its geometry."
+                )
+            new_points = current.points
+            new_length = current.L
+            new_diameter = None
+            new_location_controls = current._location_controls
+        else:
+            new_length = (
+                current.L
+                if L is None
+                else _positive(L, name=f"section {current.name!r} L")
+            )
+            new_diameter = (
+                current.diam
+                if diam is None
+                else _positive(diam, name=f"section {current.name!r} diam")
+            )
+            new_points = (
+                (0.0, 0.0, 0.0, new_diameter),
+                (0.0, 0.0, new_length, new_diameter),
+            )
+            new_location_controls = ()
+
+        new_nseg = (
+            current.nseg
+            if nseg is None
+            else _positive_integer(nseg, name=f"section {current.name!r} nseg")
+        )
+        new_rhoa = (
+            current.rhoa
+            if rhoa is None
+            else _positive(rhoa, name=f"section {current.name!r} rhoa")
+        )
+        new_cm = (
+            current.cm
+            if cm is None
+            else _positive(cm, name=f"section {current.name!r} cm")
+        )
+
+        if labels is None:
+            new_labels = current.labels
+        else:
+            if isinstance(labels, str):
+                labels = (labels,)
+            explicit_labels = frozenset(str(label) for label in labels)
+            conflicting_names = sorted(
+                explicit_labels.intersection(self._sections).difference({current.name})
+            )
+            if conflicting_names:
+                conflicts = ", ".join(repr(value) for value in conflicting_names)
+                raise ValueError(
+                    f"Section {current.name!r} labels conflict with Section "
+                    f"name(s): {conflicts}. Section names are reserved and "
+                    "cannot be explicit labels on another Section."
+                )
+            new_labels = explicit_labels | {current.name}
+
+        replacements = {
+            "nseg": new_nseg,
+            "L": new_length,
+            "diam": new_diameter,
+            "points": new_points,
+            "rhoa": new_rhoa,
+            "cm": new_cm,
+            "labels": new_labels,
+            "_location_controls": new_location_controls,
+        }
+        for field_name, value in replacements.items():
+            object.__setattr__(current, field_name, value)
+        return current
+
+    def apply_d_lambda(
+        self, *, d_lambda: float = 0.1, freq_hz: float = 100.0
+    ) -> dict[str, int]:
+        """Select and apply NEURON-compatible d-lambda compartment counts.
+
+        Parameters
+        ----------
+        d_lambda : float, optional
+            Positive dimensionless maximum compartment length as a fraction of
+            the AC space constant. Default is ``0.1``.
+        freq_hz : float, optional
+            Positive raw frequency in hertz at which the space constant is
+            evaluated. This is deliberately named ``freq_hz`` because Dendra's
+            ordinary simulation-frequency coordinate is kHz. Default is
+            ``100.0``.
+
+        Returns
+        -------
+        dict of str to int
+            Selected odd ``nseg`` values keyed by Section name in original
+            declaration order.
+
+        Notes
+        -----
+        Every wavelength and compartment count is validated before any Section
+        is modified. The method then updates ``nseg`` in place while preserving
+        Section identity, connections, labels, and declaration order. Existing
+        compiled graphs and instantiated models remain independent snapshots;
+        compile or construct a new model to use the new discretization.
+
+        The calculation and odd-count rounding rule match Dendra's
+        NEURON-backed ``apply_d_lambda`` helper, but operate directly on native
+        stylized or pt3d geometry and require no NEURON objects.
+        """
+        d_lambda = _positive(d_lambda, name="d_lambda")
+        freq_hz = _positive(freq_hz, name="freq_hz")
+
+        selected: dict[str, int] = {}
+        for section in self._sections.values():
+            wavelength = _section_lambda_f(section, freq_hz)
+            scaled_wavelength = _positive(
+                d_lambda * wavelength,
+                name=f"section {section.name!r} d-lambda wavelength",
+            )
+            normalized_length = _positive(
+                section.L / scaled_wavelength,
+                name=f"section {section.name!r} d-lambda electrotonic length",
+            )
+            nseg = int((normalized_length + 0.9) / 2.0) * 2 + 1
+            selected[section.name] = max(1, nseg)
+
+        # Commit only after every Section and result has been validated.
+        for name, nseg in selected.items():
+            object.__setattr__(self._sections[name], "nseg", nseg)
+        return selected
+
+    def _update_section_location(
+        self, location: SectionLocation, *, diam: float
+    ) -> Section:
+        if not isinstance(location, SectionLocation):
+            raise TypeError("location must be returned by Section.at().")
+        section = self._resolve_section(location.section)
+        if not section.is_pt3d:
+            raise ValueError(
+                "Localized diameter updates require a pt3d Section; replace "
+                "points explicitly to promote a stylized Section."
+            )
+        diameter = _positive(diam, name=f"diameter at {section.name!r}({location.x!r})")
+
+        controls = dict(section._location_controls)
+        controlled_index = controls.get(location.x)
+        if controlled_index is not None:
+            if not 0 <= controlled_index < len(section.points):
+                raise RuntimeError(
+                    f"Section {section.name!r} has invalid local-control provenance."
+                )
+            new_points = list(section.points)
+            existing = new_points[controlled_index]
+            new_points[controlled_index] = (*existing[:3], diameter)
+            object.__setattr__(section, "points", tuple(new_points))
+            return section
+
+        arc = _polyline_arclength(section.points)
+        sample_x = [float(value / arc[-1]) for value in arc]
+        sample_x[0] = 0.0
+        sample_x[-1] = 1.0
+        exact_samples = [
+            index for index, value in enumerate(sample_x) if value == location.x
+        ]
+        exact_sample_set = set(exact_samples)
+        if any(
+            index in exact_sample_set
+            and index + 1 in exact_sample_set
+            and section.points[index][:3] == section.points[index + 1][:3]
+            for index in range(len(section.points) - 1)
+        ):
+            raise ValueError(
+                f"Location {section.name!r}({location.x!r}) contains an abrupt "
+                "diameter discontinuity with multiple authored controls; a "
+                "localized diameter update is ambiguous. Replace the complete "
+                "Section points instead."
+            )
+        if exact_samples:
+            matched = exact_samples[-1]
+            new_points = list(section.points)
+            existing = new_points[matched]
+            new_points[matched] = (*existing[:3], diameter)
+            controls[location.x] = matched
+            object.__setattr__(section, "points", tuple(new_points))
+            object.__setattr__(section, "_location_controls", tuple(controls.items()))
+            return section
+
+        point = _interpolate_point(section, location.x * section.L)
+        insertion = int(np.searchsorted(sample_x, location.x, side="right"))
+        segment = min(max(insertion - 1, 0), len(section.points) - 2)
+        tolerance = _location_representation_tolerance(section, segment, point)
+
+        # Interpolation may round a requested position onto an existing sample.
+        # Alias it only when that sample also represents the requested normalized
+        # arclength within the documented binary64 precision bound.
+        adjacent = {
+            index
+            for index in (insertion - 1, insertion)
+            if 0 <= index < len(section.points)
+        }
+        matching = [
+            index for index in adjacent if section.points[index][:3] == point[:3]
+        ]
+        if matching:
+            matched = min(matching, key=lambda index: abs(sample_x[index] - location.x))
+            if abs(sample_x[matched] - location.x) > tolerance:
+                raise _unrepresentable_location(section, location.x)
+            new_points = list(section.points)
+            existing = new_points[matched]
+            new_points[matched] = (*existing[:3], diameter)
+            controls[location.x] = matched
+            object.__setattr__(section, "points", tuple(new_points))
+            object.__setattr__(section, "_location_controls", tuple(controls.items()))
+            return section
+
+        candidate = list(section.points)
+        candidate.insert(insertion, (*point[:3], diameter))
+        try:
+            normalized_points = _normalize_points(candidate, section_name=section.name)
+        except ValueError as error:
+            if "must have distinct coordinates" not in str(error):
+                raise
+            raise _unrepresentable_location(section, location.x) from None
+
+        candidate_arc = _polyline_arclength(normalized_points)
+        candidate_length = _positive(
+            candidate_arc[-1], name=f"section {section.name!r} derived L"
+        )
+        if not (
+            candidate_arc[insertion - 1]
+            < candidate_arc[insertion]
+            < candidate_arc[insertion + 1]
+        ):
+            raise _unrepresentable_location(section, location.x)
+        realized_x = float(candidate_arc[insertion] / candidate_length)
+        if abs(realized_x - location.x) > tolerance:
+            raise _unrepresentable_location(section, location.x)
+
+        shifted_controls = {
+            x: index + (index >= insertion) for x, index in controls.items()
+        }
+        shifted_controls[location.x] = insertion
+
+        # Commit only after geometry and representability validation succeeds.
+        object.__setattr__(section, "points", normalized_points)
+        object.__setattr__(section, "L", candidate_length)
+        object.__setattr__(section, "diam", None)
+        object.__setattr__(
+            section, "_location_controls", tuple(shifted_controls.items())
+        )
+        return section
 
     def section(
         self,
@@ -829,7 +1376,11 @@ class Morphology:
             exclusive with ``points``.
         points : sequence of (x, y, z, diameter), optional
             At least two pt3d samples in µm. Length is derived from centerline
-            arclength.
+            arclength. Consecutive samples may share coordinates only when their
+            diameters differ; this represents an abrupt, zero-arclength diameter
+            step with an annular membrane surface but no length, volume, or
+            axial resistance. The complete Section must retain positive
+            centerline length.
         nseg : int, optional
             Positive number of computational compartments. Default is 1.
         rhoa : float, optional
@@ -847,7 +1398,8 @@ class Morphology:
         Returns
         -------
         Section
-            The immutable declaration owned by this Morphology.
+            The declaration owned by this Morphology. Its fields are read-only;
+            use :meth:`Section.update` for validated authoring edits.
 
         Notes
         -----
@@ -904,7 +1456,10 @@ class Morphology:
             if L is not None or diam is not None:
                 raise ValueError("pt3d sections cannot also specify L or diam.")
             normalized_points = _normalize_points(points, section_name=name)
-            length = _polyline_arclength(normalized_points)[-1]
+            length = _positive(
+                _polyline_arclength(normalized_points)[-1],
+                name=f"section {name!r} derived L",
+            )
             diameter = None
 
         section = Section(
@@ -956,9 +1511,9 @@ class Morphology:
             raise TypeError("child must be a Section or SectionLocation.")
         if isinstance(child_end, (bool, np.bool_)) or child_end not in (0, 1):
             raise ValueError("child_end must be exactly 0 or 1.")
-        if parent.section._owner is not self or child_section._owner is not self:
-            raise ValueError("Both connected sections must belong to this Morphology.")
-        if parent.section is child_section:
+        parent_section = self._resolve_section(parent.section)
+        child_section = self._resolve_section(child_section)
+        if parent_section is child_section:
             raise ValueError("A section cannot be connected to itself.")
         if child_section.name in self._connections:
             raise ValueError(f"Section {child_section.name!r} already has a parent.")
@@ -979,7 +1534,16 @@ class Morphology:
         )
 
     def compile(self) -> CompartmentGraph:
-        """Validate and discretize the declared section tree in binary64."""
+        """Validate and discretize the declared Section tree in binary64.
+
+        Pt3d compartments retain exact tapered-frustum membrane area, volume,
+        and axial inverse-area integrals. An abrupt repeated-coordinate
+        diameter step contributes its NEURON-compatible annular membrane area
+        but no centerline length, volume, or axial resistance; a step exactly
+        on a compartment boundary belongs to the lower-x compartment. Material
+        ``diameter_um`` metadata is the arclength mean over the compartment,
+        not a point sample used to reconstruct these exact integrals.
+        """
         if not self._sections:
             raise ValueError("Cannot compile an empty Morphology.")
         roots = [name for name in self._sections if name not in self._connections]
@@ -1008,6 +1572,1045 @@ class Morphology:
 
         return _compile_morphology(self, root_name)
 
+    @classmethod
+    def from_swc(
+        cls,
+        file_path: str | PathLike[str],
+        *,
+        rhoa: float = 100.0,
+        cm: float = 1.0,
+        nseg: int = 1,
+        single_point_soma: Literal["sphere", "error"] = "sphere",
+        type_labels: Mapping[int, str | Iterable[str]] | None = None,
+    ) -> Morphology:
+        """Load a classic SWC node tree as a native Morphology declaration.
+
+        The pure-Python loader preserves finite xyz samples, radii, rooted
+        connectivity, and raw structure type IDs without applying NEURON's
+        d-lambda discretization or repair heuristics. Maximal root-away paths of
+        one downstream SWC type become pt3d Sections; branches and type changes
+        start a new Section at the shared parent sample.
+
+        Parameters
+        ----------
+        file_path : path-like
+            UTF-8 SWC file containing the seven classic columns ``id type x y
+            z radius parent``. Blank lines, full-line comments, and inline
+            ``#`` comments are accepted. Rows may appear in any order.
+        rhoa : float, optional
+            Positive default axial resistivity in Ω·cm. SWC does not carry this
+            electrical property. Default is ``100``.
+        cm : float, optional
+            Positive default specific capacitance in µF/cm². SWC does not carry
+            this electrical property. Default is ``1``.
+        nseg : int, optional
+            Positive compartment count assigned independently to every
+            generated Section. SWC samples describe geometry, not numerical
+            compartments. Default is ``1``.
+        single_point_soma : {'sphere', 'error'}, optional
+            A common type-1 root has no positive-length cable of its own.
+            ``"sphere"`` creates the NEURON-compatible three-point x-axis cable
+            surrogate centered on the sample with length and diameter ``2r``;
+            its lateral area equals a sphere's surface area, though its volume
+            remains cylindrical. ``"error"`` rejects this ambiguity. Default
+            is ``"sphere"``.
+        type_labels : mapping, optional
+            Additional shared labels for selected integer SWC type IDs. Every
+            imported Section always receives ``swc_type_<id>`` plus Dendra's
+            conventional semantic labels where defined.
+
+        Returns
+        -------
+        Morphology
+            Native, editable pt3d Sections with deterministic collision-free
+            names such as ``soma_0`` and ``basal_dendrite_0``.
+
+        Notes
+        -----
+        Exactly one root is required. Duplicate IDs, unknown parents, cycles,
+        non-positive radii, non-finite values, and zero-length edges are
+        rejected rather than repaired silently. Structural integer IDs are
+        parsed exactly rather than through binary64. A non-soma root must have a
+        same-type child so its type can belong to a positive-length Section;
+        an isolated root-type discontinuity is rejected instead of being
+        silently retyped. SWC cannot preserve original Section
+        names/boundaries, labels, ``nseg``, ``rhoa``, or ``cm``.
+        :attr:`swc_section_types` retains raw type provenance for an explicit
+        re-export via ``section_types=morphology.swc_section_types``.
+        """
+        from .morphology_io import morphology_from_swc
+
+        return morphology_from_swc(
+            cls,
+            file_path,
+            rhoa=rhoa,
+            cm=cm,
+            nseg=nseg,
+            single_point_soma=single_point_soma,
+            type_labels=type_labels,
+        )
+
+    @classmethod
+    def from_asc(
+        cls,
+        file_path: str | PathLike[str],
+        *,
+        root: str | None = None,
+        rhoa: float = 100.0,
+        cm: float = 1.0,
+        nseg: int = 1,
+    ) -> Morphology:
+        """Load NEURON's normalized interpretation of a Neurolucida ASC file.
+
+        Neurolucida V3 text includes contours, nested cable trees, spines,
+        markers, colors, arbitrary properties, and repair conventions. Dendra
+        therefore delegates this compatibility grammar to NEURON's mature
+        ``Import3d_Neurolucida3`` reader, then immediately snapshots the chosen
+        cable tree into editable native pt3d Sections. The returned object holds
+        no NEURON references.
+
+        Parameters
+        ----------
+        file_path : path-like
+            Neurolucida V3 ASCII morphology.
+        root : str, optional
+            Exact generated root Section name, such as ``"soma[0]"``. A file
+            with several disconnected cable trees is rejected unless one root
+            is selected explicitly; candidates are listed in the error.
+        rhoa : float, optional
+            Positive axial resistivity in Ω·cm for every imported Section.
+            ASC does not define this electrical value. Default is ``100``.
+        cm : float, optional
+            Positive specific capacitance in µF/cm² for every imported Section.
+            ASC does not define this electrical value. Default is ``1``.
+        nseg : int, optional
+            Positive compartment count assigned to every imported Section.
+            No d-lambda policy is inferred from geometry. Default is ``1``.
+
+        Returns
+        -------
+        Morphology
+            A native snapshot with NEURON-generated names such as ``soma[0]``,
+            ``axon[3]``, ``dend[8]``, and ``apic[1]`` and corresponding shared
+            structural labels.
+
+        Notes
+        -----
+        Centerlines, diameters, topology, logical attachment locations, and the
+        selected cable component are preserved after NEURON normalization.
+        Exact duplicate pt3d samples are coalesced. Consecutive samples at the
+        same coordinate with different diameters are preserved as abrupt
+        zero-length diameter steps, including their annular membrane area. A
+        Section with no positive centerline length after coalescing is rejected.
+        Source formatting, comments, colors, markers, properties,
+        spines, original trace identifiers, and soma contour boundaries are not
+        retained. NEURON may repair or approximate source geometry and stores
+        pt3d values at its own precision. When NEURON makes its recoverable
+        logical connection from an outlying main branch to the nearest soma,
+        Dendra emits one :class:`RuntimeWarning` containing NEURON's repair
+        diagnostics before snapshotting that topology. This method intentionally
+        complements the pure-Python, sample-preserving :meth:`from_swc` loader.
+        """
+        from .morphology_io import morphology_from_asc
+
+        return morphology_from_asc(
+            cls,
+            file_path,
+            root=root,
+            rhoa=rhoa,
+            cm=cm,
+            nseg=nseg,
+        )
+
+    def to_swc(
+        self,
+        *,
+        section_types: Mapping[str, int] | None = None,
+        default_type: int = 0,
+        connection_tolerance_um: float = 1e-9,
+    ) -> str:
+        """Serialize the authored centerline tree in SWC format.
+
+        Parameters
+        ----------
+        section_types : mapping of str to int, optional
+            SWC structure type for each exactly named Section. Unlisted
+            Sections use ``default_type``. No type is inferred from Section
+            names or labels.
+        default_type : int, optional
+            Non-negative SWC structure type for unlisted Sections. The default
+            is ``0`` (undefined).
+        connection_tolerance_um : float, optional
+            Maximum spatial separation, in micrometers, allowed between a
+            parent attachment and its connected child endpoint. SWC combines
+            topology and geometry, so larger discrepancies are rejected. The
+            default is ``1e-9``.
+
+        Returns
+        -------
+        str
+            Deterministic SWC text ending in a newline.
+
+        Notes
+        -----
+        SWC export describes the authored Section centerlines, not the
+        compartment graph produced by :meth:`compile`. It therefore does not
+        encode ``nseg``, ``rhoa``, ``cm``, Section names, or labels. Importing
+        the result may choose a different electrical discretization.
+
+        A shared connection is represented by one SWC sample carrying the
+        parent's type and radius. Classic SWC cannot retain distinct radii on
+        the two sides of that single junction. It also cannot represent the
+        annular membrane surface of a repeated-coordinate diameter step, so
+        export rejects a Morphology containing such a discontinuity rather
+        than silently discarding geometry or writing a zero-length SWC edge.
+        """
+        return _morphology_to_swc(
+            self,
+            section_types=section_types,
+            default_type=default_type,
+            connection_tolerance_um=connection_tolerance_um,
+        )
+
+    def write_swc(
+        self,
+        file_path: str | PathLike[str],
+        *,
+        section_types: Mapping[str, int] | None = None,
+        default_type: int = 0,
+        connection_tolerance_um: float = 1e-9,
+    ) -> None:
+        """Validate and write the authored centerline tree as UTF-8 SWC.
+
+        The complete document is serialized before the destination is opened,
+        so a morphology validation error cannot truncate an existing file.
+        See :meth:`to_swc` for the export contract and keyword arguments.
+        """
+        text = self.to_swc(
+            section_types=section_types,
+            default_type=default_type,
+            connection_tolerance_um=connection_tolerance_um,
+        )
+        Path(file_path).write_text(text, encoding="utf-8", newline="\n")
+
+    def plot(
+        self,
+        *,
+        view: Literal["x", "y", "z"] = "y",
+        color_by: str = "section",
+        highlight: str | Iterable[str] | None = None,
+        show_points: bool = True,
+        show_connections: bool = True,
+        show_compartments: bool = False,
+        show_orientation: bool = True,
+        annotate_sections: bool = False,
+        annotate_connections: bool = False,
+        connection_tolerance_um: float = 1e-9,
+        diameter_scale: float = 0.35,
+        min_linewidth: float = 0.75,
+        legend: bool = True,
+        cmap: str = "viridis",
+        ax: object | None = None,
+        figsize: tuple[float, float] = (8, 8),
+        dpi: int = 150,
+        title: str | None = None,
+    ) -> object:
+        """Plot an orthographic view of the authored morphology.
+
+        The plot is a read-only view of the current :class:`Section`
+        declarations. It shows authored centerlines and optional authoring
+        diagnostics without compiling a :class:`CompartmentGraph` or
+        constructing a simulation model.
+
+        Parameters
+        ----------
+        view : {"x", "y", "z"}, optional
+            Coordinate axis to look along (and therefore omit from the plot).
+            For example, ``view="y"`` displays x against z. Default is
+            ``"y"``.
+        color_by : str, optional
+            Attribute used to color Section paths. ``"section"`` assigns a
+            deterministic categorical color to each exact Section identity.
+            Scalar morphology fields such as ``"length"``, ``"diameter"``,
+            ``"nseg"``, ``"rhoa"``, and ``"cm"`` use a continuous color
+            scale. Default is ``"section"``.
+        highlight : str or iterable of str, optional
+            Exact Section name or shared structural label, or several of
+            either. Matching Sections remain prominent and other Sections are
+            muted. ``None`` highlights the complete morphology.
+        show_points : bool, optional
+            Show authored pt3d control points. Stylized Sections expose their
+            two canonical local endpoints. Default is ``True``.
+        show_connections : bool, optional
+            Show electrical attachment markers and spatial-gap diagnostics.
+            These glyphs describe connectivity; a line between spatially
+            separated endpoints is not an authored physical cable. Default is
+            ``True``.
+        show_compartments : bool, optional
+            Overlay the compartment centers implied by each Section's
+            ``nseg`` declaration. This is an authoring preview and does not
+            compile the solver graph. Default is ``False``.
+        show_orientation : bool, optional
+            Draw increasing authored Section x along a local authored span and
+            mark the ``0`` or ``1`` child endpoint facing each parent. A child
+            attached through ``child_end=1`` retains its authored x direction.
+            Default is ``True``.
+        annotate_sections : bool, optional
+            Annotate paths with exact Section names. Default is ``False``.
+        annotate_connections : bool, optional
+            Annotate attachments with parent x and child endpoint values.
+            Default is ``False``.
+        connection_tolerance_um : float, optional
+            Spatial separation, in µm, at or below which connected attachment
+            points are classified as within visualization tolerance rather
+            than as a true spatial gap. Nonzero separation remains visible.
+            This neither changes electrical connectivity nor applies the
+            stricter SWC export contract. Default is ``1e-9``.
+        diameter_scale : float, optional
+            Scale converting authored diameter in µm to relative screen-space
+            line width. Rendered thickness is an expressive encoding, not a
+            geometrically to-scale tube radius. Default is ``0.35``.
+        min_linewidth : float, optional
+            Minimum visible centerline width in display points. Default is
+            ``0.75``.
+        legend : bool, optional
+            Show a categorical legend or numeric color key as appropriate.
+            Default is ``True``.
+        cmap : str, optional
+            Matplotlib colormap name used for continuous coloring. Default is
+            ``"viridis"``.
+        ax : object, optional
+            Existing Matplotlib axes to draw into. A new figure and axes are
+            created when omitted.
+        figsize : tuple of float, optional
+            Width and height in inches for a newly created figure. Ignored
+            when ``ax`` is supplied. Default is ``(8, 8)``.
+        dpi : int, optional
+            Resolution of a newly created figure. Ignored when ``ax`` is
+            supplied. Default is ``150``.
+        title : str, optional
+            Figure title. ``None`` uses the renderer's descriptive default.
+
+        Returns
+        -------
+        object
+            The Matplotlib ``(Figure, Axes)`` pair returned by the renderer.
+
+        Notes
+        -----
+        Relative geometry is displayed exactly as authored. In particular,
+        :meth:`connect` does not translate or rotate a child, and stylized
+        Sections use local canonical coordinates, so electrically connected
+        paths may overlap or remain spatially separated. At extreme binary64
+        magnitudes, a numerical origin or scale may be applied to the display
+        coordinates; every such transform is printed on the axes. Tapered
+        authored spans may be subdivided visually to interpolate width/color,
+        but this does not alter the Morphology. A repeated-coordinate diameter
+        step is retained in the scene data, but a centerline drawing cannot
+        display its annular surface; use :meth:`plot_shape` or
+        :meth:`plot_shape_3d` to see that shoulder. The method never calls
+        ``show``; display, save, or further customize the returned figure
+        explicitly.
+        """
+        from .morphology_visualization import plot_morphology
+
+        return plot_morphology(
+            self,
+            view=view,
+            color_by=color_by,
+            highlight=highlight,
+            show_points=show_points,
+            show_connections=show_connections,
+            show_compartments=show_compartments,
+            show_orientation=show_orientation,
+            annotate_sections=annotate_sections,
+            annotate_connections=annotate_connections,
+            connection_tolerance_um=connection_tolerance_um,
+            diameter_scale=diameter_scale,
+            min_linewidth=min_linewidth,
+            legend=legend,
+            cmap=cmap,
+            ax=ax,
+            figsize=figsize,
+            dpi=dpi,
+            title=title,
+        )
+
+    def plot_3d(
+        self,
+        *,
+        color_by: str = "section",
+        highlight: str | Iterable[str] | None = None,
+        show_points: bool = True,
+        show_connections: bool = True,
+        show_compartments: bool = False,
+        show_orientation: bool = True,
+        annotate_sections: bool = False,
+        annotate_connections: bool = False,
+        connection_tolerance_um: float = 1e-9,
+        diameter_scale: float = 0.35,
+        min_linewidth: float = 0.75,
+        legend: bool = True,
+        cmap: str = "viridis",
+        ax: object | None = None,
+        figsize: tuple[float, float] = (9, 8),
+        dpi: int = 150,
+        title: str | None = None,
+    ) -> object:
+        """Plot the authored morphology in three spatial dimensions.
+
+        This method has the same authoring-layer semantics as :meth:`plot`,
+        but preserves x, y, and z. It is useful for checking pt3d placement,
+        taper, orientation, and whether electrically attached points are also
+        spatially coherent.
+
+        Parameters
+        ----------
+        color_by : str, optional
+            Attribute used to color Section paths. ``"section"`` is
+            categorical; ``"length"``, ``"diameter"``, ``"nseg"``,
+            ``"rhoa"``, and ``"cm"`` provide continuous encodings. Default
+            is ``"section"``.
+        highlight : str or iterable of str, optional
+            Exact Section name or shared label, or several of either, to keep
+            prominent while muting non-matches. Default is ``None``.
+        show_points : bool, optional
+            Show authored pt3d controls or stylized canonical endpoints.
+            Default is ``True``.
+        show_connections : bool, optional
+            Show electrical attachment markers and spatial-gap diagnostics.
+            Diagnostic connectors are not physical centerline segments.
+            Default is ``True``.
+        show_compartments : bool, optional
+            Overlay centers implied by authored ``nseg`` values without
+            compiling a solver graph. Default is ``False``.
+        show_orientation : bool, optional
+            Draw increasing authored Section x on a local span and mark each
+            connected child endpoint as ``0`` or ``1``. Default is ``True``.
+        annotate_sections : bool, optional
+            Annotate paths with exact Section names. Default is ``False``.
+        annotate_connections : bool, optional
+            Annotate electrical attachments with their normalized locations.
+            Default is ``False``.
+        connection_tolerance_um : float, optional
+            Visual coincidence tolerance for connected coordinates, in µm.
+            It does not alter connectivity, compilation, or SWC validation.
+            Default is ``1e-9``.
+        diameter_scale : float, optional
+            Conversion from diameter in µm to relative display width. The
+            result is not a metrically exact solid tube. Default is ``0.35``.
+        min_linewidth : float, optional
+            Minimum centerline width in display points. Default is ``0.75``.
+        legend : bool, optional
+            Show the Section legend or numeric color key. Default is ``True``.
+        cmap : str, optional
+            Matplotlib colormap name for numeric coloring. Default is
+            ``"viridis"``.
+        ax : object, optional
+            Existing three-dimensional Matplotlib axes. A new 3D axes is
+            created when omitted.
+        figsize : tuple of float, optional
+            New figure size in inches. Ignored when ``ax`` is supplied.
+            Default is ``(9, 8)``.
+        dpi : int, optional
+            New figure resolution. Ignored when ``ax`` is supplied. Default is
+            ``150``.
+        title : str, optional
+            Figure title. ``None`` uses the renderer's descriptive default.
+
+        Returns
+        -------
+        object
+            The Matplotlib ``(Figure, 3D Axes)`` pair from the renderer.
+
+        Notes
+        -----
+        The current declaration is read without mutation or compilation.
+        Existing :class:`CompartmentGraph`, :class:`~dendra.models.tree.Tree`,
+        and :class:`~dendra.models.core.Cable` snapshots are not consulted.
+        Extreme-coordinate display origins/scales and extreme color-value
+        divisors are disclosed on the figure. As in :meth:`plot`, a diagnostic
+        centerline cannot show the annular surface of a zero-length diameter
+        step; the shape views render it as a shoulder. No display call is made
+        implicitly.
+        """
+        from .morphology_visualization import plot_morphology_3d
+
+        return plot_morphology_3d(
+            self,
+            color_by=color_by,
+            highlight=highlight,
+            show_points=show_points,
+            show_connections=show_connections,
+            show_compartments=show_compartments,
+            show_orientation=show_orientation,
+            annotate_sections=annotate_sections,
+            annotate_connections=annotate_connections,
+            connection_tolerance_um=connection_tolerance_um,
+            diameter_scale=diameter_scale,
+            min_linewidth=min_linewidth,
+            legend=legend,
+            cmap=cmap,
+            ax=ax,
+            figsize=figsize,
+            dpi=dpi,
+            title=title,
+        )
+
+    def plot_shape(
+        self,
+        *,
+        view: Literal["x", "y", "z"] = "y",
+        diameter_scale: float = 1.0,
+        radial_segments: int = 8,
+        connection_tolerance_um: float = 1e-9,
+        legend: bool | Literal["auto"] = "auto",
+        show_axes: bool = False,
+        ax: object | None = None,
+        figsize: tuple[float, float] = (8, 8),
+        dpi: int = 150,
+        title: str | None = None,
+    ) -> object:
+        """Draw a quiet orthographic view of the physical cable envelope.
+
+        Unlike :meth:`plot`, this renderer uses authored diameters as radii in
+        morphology coordinate units rather than as screen-space line widths.
+        It constructs closed, linearly tapered tubes around the authored pt3d
+        centerlines, colors them by structural morphology family, and omits
+        diagnostic points, arrows, connection glyphs, annotations, and titles
+        by default. Indexed Sections such as ``dend[0]`` and ``dend[1]`` share
+        the canonical ``dend`` color used by :func:`~dendra.models.visualization.vis_2d`.
+
+        Parameters
+        ----------
+        view : {'x', 'y', 'z'}, optional
+            Axis viewed along. ``"y"`` produces an x-z projection. Default is
+            ``"y"``.
+        diameter_scale : float, optional
+            Positive multiplier for every physical diameter. ``1`` preserves
+            authored proportions; larger values intentionally exaggerate thin
+            cables for display. Default is ``1``.
+        radial_segments : int, optional
+            Number of sides in each circular tube ring. Larger values make a
+            smoother surface at greater rendering cost. Must be at least 3;
+            default is ``8``.
+        connection_tolerance_um : float, optional
+            Spatial-gap threshold in µm. A single warning is emitted when an
+            electrical connection exceeds it; no artificial bridge is drawn.
+            Default is ``1e-9``.
+        legend : bool or {'auto'}, optional
+            Show structural color families. ``"auto"`` shows the legend for
+            at most 16 families, avoiding an unusable key while retaining a
+            compact legend for large imported cells. Default is ``"auto"``.
+        show_axes : bool, optional
+            Show physical coordinate axes. Default is ``False``.
+        ax : object, optional
+            Existing two-dimensional Matplotlib axes. A new figure and axes are
+            created when omitted.
+        figsize : tuple of float, optional
+            New figure size in inches. Ignored when ``ax`` is supplied.
+        dpi : int, optional
+            New figure resolution. Ignored when ``ax`` is supplied.
+        title : str, optional
+            Optional explicit title. The default adds no title.
+
+        Returns
+        -------
+        object
+            The Matplotlib ``(Figure, Axes)`` pair.
+
+        Notes
+        -----
+        The surface is a faithful tapered-cable envelope of the authored
+        Section data, not a histological reconstruction or a boolean union at
+        branches. It does not use ``nseg`` or compile the Morphology. Connected
+        stylized Sections retain their canonical local z-axis and may overlap;
+        use coherent pt3d coordinates for a meaningful whole-cell shape. Two
+        coincident controls with different diameters are rendered as concentric
+        rings and the corresponding annular shoulder, without inventing cable
+        length. Exact Section provenance remains available on the rendered
+        collection even when several Sections share one family color. The
+        method never mutates the declaration or calls ``show``.
+        """
+        from .morphology_visualization import plot_morphology_shape
+
+        return plot_morphology_shape(
+            self,
+            view=view,
+            diameter_scale=diameter_scale,
+            radial_segments=radial_segments,
+            connection_tolerance_um=connection_tolerance_um,
+            legend=legend,
+            show_axes=show_axes,
+            ax=ax,
+            figsize=figsize,
+            dpi=dpi,
+            title=title,
+        )
+
+    def plot_shape_3d(
+        self,
+        *,
+        diameter_scale: float = 1.0,
+        radial_segments: int = 8,
+        connection_tolerance_um: float = 1e-9,
+        legend: bool | Literal["auto"] = "auto",
+        show_axes: bool = False,
+        ax: object | None = None,
+        figsize: tuple[float, float] = (9, 8),
+        dpi: int = 150,
+        title: str | None = None,
+    ) -> object:
+        """Draw the authored physical cable envelope as a quiet 3-D surface.
+
+        This is the rotatable three-dimensional counterpart of
+        :meth:`plot_shape`. Diameters remain in morphology coordinate units;
+        its structural family colors and compact legend are identical to the
+        2-D view. Diagnostic metadata and connection glyphs belong to
+        :meth:`plot_3d` and :meth:`inspect` instead.
+
+        Parameters are the same as :meth:`plot_shape`, except that no projection
+        ``view`` is required and ``figsize`` defaults to ``(9, 8)``. A supplied
+        axes must be a Matplotlib 3-D axes. The method returns ``(Figure, Axes)``,
+        does not mutate the Morphology, and never calls ``show``.
+        """
+        from .morphology_visualization import plot_morphology_shape_3d
+
+        return plot_morphology_shape_3d(
+            self,
+            diameter_scale=diameter_scale,
+            radial_segments=radial_segments,
+            connection_tolerance_um=connection_tolerance_um,
+            legend=legend,
+            show_axes=show_axes,
+            ax=ax,
+            figsize=figsize,
+            dpi=dpi,
+            title=title,
+        )
+
+    def plot_topology(
+        self,
+        *,
+        highlight: str | Iterable[str] | None = None,
+        interactive: bool = False,
+        node_scale: float = 8.0,
+        min_node_size: float = 12.0,
+        max_node_size: float | None = 240.0,
+        branchpoint_scale: float = 1.35,
+        min_branchpoint_size: float = 24.0,
+        max_branchpoint_size: float | None = 300.0,
+        junction_size: float = 52.0,
+        edge_scale: float = 0.12,
+        min_edge_width: float = 0.35,
+        max_edge_width: float | None = 3.0,
+        node_size: float | None = None,
+        branchpoint_size: float | None = None,
+        edge_width: float | None = None,
+        legend: bool = True,
+        ax: object | None = None,
+        figsize: tuple[float, float] = (10, 7),
+        dpi: int = 150,
+        title: str | None = None,
+    ) -> object:
+        """Draw the flat, coordinate-independent compartment connectivity graph.
+
+        Every material compartment is a node colored by its exact authored
+        Section name. Retained zero-area algebraic junctions are separate
+        neutral nodes. Edges are the canonical axial connections after
+        endpoint removal, degree-two junction collapse, and
+        interior-attachment resolution. The graph contains no per-node text;
+        optional hover cards expose the underlying node metadata. Layout depth
+        and spacing are schematic rather than morphological distances.
+
+        Parameters
+        ----------
+        highlight : str or iterable of str, optional
+            Exact Section name or shared label, or several of either, to keep
+            prominent while muting non-matching material compartments.
+            Unlabelled algebraic junctions remain neutral structural context.
+            Default is ``None``.
+        interactive : bool, optional
+            Enable Matplotlib motion-event hover cards without adding a Dendra
+            runtime dependency. Hovering over a material node reports its
+            generated name, Section, segment, x, labels, length,
+            arclength-mean diameter, integrated area/volume, ``rhoa``, ``cm``,
+            and spatial center. Select an event-capable backend before creating
+            the figure:
+            for example, a GUI backend or ``%matplotlib widget`` with the
+            optional ``ipympl`` package (available through
+            ``dendra[jupyter]``). Restart the complete Jupyter server after
+            installation, not only its kernel. A separately installed kernel
+            and server both need compatible ipympl components. Static inline
+            and saved raster output cannot react to pointer motion; an inline
+            notebook call emits an actionable warning. Default is ``False``.
+        node_scale : float, optional
+            Scale from material-compartment arclength-mean diameter in µm to
+            marker area in display points². Default is ``8``.
+        min_node_size, max_node_size : float or None, optional
+            Visible bounds for material-compartment marker areas. The default
+            bounds are ``12`` and ``240`` points²; ``None`` removes the upper
+            bound.
+        branchpoint_scale : float, optional
+            Additional marker-area factor for a material forking compartment.
+            Default is ``1.35``.
+        min_branchpoint_size, max_branchpoint_size : float or None, optional
+            Visible bounds for material-fork marker areas after scaling. The
+            defaults are ``24`` and ``300`` points²; ``None`` removes the
+            upper bound.
+        junction_size : float, optional
+            Fixed marker area for a zero-area algebraic junction. Junctions
+            have no physical diameter to encode. Default is ``52`` points².
+        edge_scale : float, optional
+            Scale from the mean of the material endpoints' arclength-mean
+            diameters in µm to edge width in display points. A junction
+            endpoint is excluded because its stored geometry is not material.
+            Default is ``0.12``.
+        min_edge_width, max_edge_width : float or None, optional
+            Visible bounds for scaled edge widths. The defaults are ``0.35``
+            and ``3`` points; ``None`` removes the upper bound.
+        node_size, branchpoint_size, edge_width : float or None, optional
+            Explicit fixed-size compatibility overrides. ``node_size`` fixes
+            ordinary material markers; ``branchpoint_size`` fixes both
+            material-fork and algebraic-junction markers; ``edge_width`` fixes
+            every edge. ``None`` (the default) uses diameter scaling.
+        legend : bool, optional
+            Show exact Section-name colors and structural glyphs. Default is
+            ``True``.
+        ax : object, optional
+            Existing Matplotlib axes. A new figure and axes are created when
+            omitted.
+        figsize : tuple of float, optional
+            New figure size in inches. Ignored when ``ax`` is supplied.
+            Default is ``(10, 7)``.
+        dpi : int, optional
+            New figure resolution. Ignored when ``ax`` is supplied. Default is
+            ``150``.
+        title : str, optional
+            Figure title. ``None`` uses the renderer's descriptive default.
+
+        Returns
+        -------
+        object
+            The Matplotlib ``(Figure, Axes)`` pair from the renderer.
+
+        Notes
+        -----
+        A complete Morphology uses the exact topology produced by
+        :meth:`compile`. A partially authored forest is compiled one connected
+        component at a time, retaining exact per-component compartment
+        semantics without requiring a single root.
+
+        Any node with at least three neighbors in the undirected compartment
+        graph is a graph branchpoint. A Section-colored diamond distinguishes
+        a material forking compartment; a neutral ``X`` distinguishes a
+        retained zero-area algebraic junction. This invariant definition does
+        not misclassify an arbitrary degree-two solver root. Junction hover
+        cards deliberately omit copied storage fields that are not material
+        properties; their marker size and incident-edge scaling likewise never
+        use those copied fields. Scaling changes display geometry only, while
+        highlighting changes alpha only. The title's branchpoint count includes
+        both glyph classes. The method does not mutate the declaration or call
+        ``show``.
+        """
+        from .morphology_visualization import plot_morphology_topology
+
+        return plot_morphology_topology(
+            self,
+            highlight=highlight,
+            interactive=interactive,
+            node_scale=node_scale,
+            min_node_size=min_node_size,
+            max_node_size=max_node_size,
+            branchpoint_scale=branchpoint_scale,
+            min_branchpoint_size=min_branchpoint_size,
+            max_branchpoint_size=max_branchpoint_size,
+            junction_size=junction_size,
+            edge_scale=edge_scale,
+            min_edge_width=min_edge_width,
+            max_edge_width=max_edge_width,
+            node_size=node_size,
+            branchpoint_size=branchpoint_size,
+            edge_width=edge_width,
+            legend=legend,
+            ax=ax,
+            figsize=figsize,
+            dpi=dpi,
+            title=title,
+        )
+
+    def plot_section_topology(
+        self,
+        *,
+        color_by: str = "section",
+        highlight: str | Iterable[str] | None = None,
+        show_parameters: bool = True,
+        show_labels: bool = True,
+        show_compartments: bool = True,
+        annotate_connections: bool = True,
+        connection_tolerance_um: float = 1e-9,
+        legend: bool = True,
+        cmap: str = "viridis",
+        ax: object | None = None,
+        figsize: tuple[float, float] = (10, 7),
+        dpi: int = 150,
+        title: str | None = None,
+    ) -> object:
+        """Draw the authored Section tree/forest as a labelled schematic.
+
+        This authoring-level companion to :meth:`plot_topology` uses one box per
+        Section and can display authoring parameters, structural labels,
+        ``nseg`` rulers, connection locations, and spatial-gap diagnostics.
+        It does not compile the compartment graph and therefore describes the
+        declaration rather than solver-node connectivity.
+
+        Parameters
+        ----------
+        color_by : str, optional
+            ``"section"``, ``"length"``, ``"diameter"``, ``"nseg"``,
+            ``"rhoa"``, or ``"cm"``. Default is ``"section"``.
+        highlight : str or iterable of str, optional
+            Exact Section name or shared label, or several of either, to keep
+            prominent while muting non-matches. Default is ``None``.
+        show_parameters : bool, optional
+            Include geometry, length, ``rhoa``, and ``cm`` in each Section box.
+            Default is ``True``.
+        show_labels : bool, optional
+            Include shared structural labels in each Section box. Default is
+            ``True``.
+        show_compartments : bool, optional
+            Draw the declared ``nseg`` ruler and count. This is an authoring
+            preview, not the compiled graph. Default is ``True``.
+        annotate_connections : bool, optional
+            Include attachment locations, child endpoints, and spatial-gap
+            status on graph edges. Default is ``True``.
+        connection_tolerance_um : float, optional
+            Non-negative visual tolerance in µm for classifying connection
+            coordinates as coincident. Default is ``1e-9``.
+        legend : bool, optional
+            Show the Section-name legend or numeric color scale. Default is
+            ``True``.
+        cmap : str, optional
+            Matplotlib colormap for numeric ``color_by`` modes. Default is
+            ``"viridis"``.
+        ax : object, optional
+            Existing two-dimensional Matplotlib axes. A new figure and axes
+            are created when omitted.
+        figsize : tuple of float, optional
+            New figure size in inches. Ignored when ``ax`` is supplied.
+            Default is ``(10, 7)``.
+        dpi : int, optional
+            New figure resolution. Ignored when ``ax`` is supplied. Default is
+            ``150``.
+        title : str, optional
+            Figure title. ``None`` uses the renderer's descriptive default.
+
+        Returns
+        -------
+        object
+            The Matplotlib ``(Figure, Axes)`` pair. The method never calls
+            ``show``.
+        """
+        from .morphology_visualization import plot_morphology_section_topology
+
+        return plot_morphology_section_topology(
+            self,
+            color_by=color_by,
+            highlight=highlight,
+            show_parameters=show_parameters,
+            show_labels=show_labels,
+            show_compartments=show_compartments,
+            annotate_connections=annotate_connections,
+            connection_tolerance_um=connection_tolerance_um,
+            legend=legend,
+            cmap=cmap,
+            ax=ax,
+            figsize=figsize,
+            dpi=dpi,
+            title=title,
+        )
+
+    def plot_diameter_profile(
+        self,
+        *,
+        sections: str | Section | Iterable[str | Section] | None = None,
+        highlight: str | Iterable[str] | None = None,
+        x_axis: Literal["normalized", "distance"] = "normalized",
+        show_points: bool = True,
+        show_compartments: bool = True,
+        show_connections: bool = True,
+        legend: bool = True,
+        ax: object | None = None,
+        figsize: tuple[float, float] = (9, 5),
+        dpi: int = 150,
+        title: str | None = None,
+    ) -> object:
+        """Plot authored diameter as a function of position along Sections.
+
+        Stylized cylinders appear as constant profiles. Pt3d Sections use
+        their piecewise-linear diameter controls, making this view especially
+        useful after :meth:`SectionLocation.update` inserts or edits a local
+        control point. Repeated-coordinate controls have the same horizontal
+        position and draw an abrupt diameter step as a vertical segment.
+
+        Parameters
+        ----------
+        sections : Section, str, or iterable, optional
+            Exact Section object or name, or several of either, to include.
+            ``None`` includes all Sections in declaration order.
+        highlight : str or iterable of str, optional
+            Exact Section name or shared structural label, or several of
+            either, to emphasize while muting non-matches. It does not filter
+            the selected ``sections``. Default is ``None``.
+        x_axis : {"normalized", "distance"}, optional
+            Horizontal coordinate. ``"normalized"`` uses each Section's
+            authored x in ``[0, 1]``; ``"distance"`` uses centerline distance
+            in µm from authored x=0. Default is ``"normalized"``.
+        show_points : bool, optional
+            Mark authored diameter control points. Default is ``True``.
+        show_compartments : bool, optional
+            Mark centers or intervals implied by authored ``nseg`` values,
+            without compiling a solver graph. Default is ``True``.
+        show_connections : bool, optional
+            Mark normalized parent attachment positions and child endpoints on
+            included profiles. These marks describe electrical connectivity,
+            not a continuous global path-distance coordinate. Default is
+            ``True``.
+        legend : bool, optional
+            Show the Section legend. Default is ``True``.
+        ax : object, optional
+            Existing Matplotlib axes. A new figure and axes are created when
+            omitted.
+        figsize : tuple of float, optional
+            New figure size in inches. Ignored when ``ax`` is supplied.
+            Default is ``(9, 5)``.
+        dpi : int, optional
+            New figure resolution. Ignored when ``ax`` is supplied. Default is
+            ``150``.
+        title : str, optional
+            Figure title. ``None`` uses the renderer's descriptive default.
+
+        Returns
+        -------
+        object
+            The Matplotlib ``(Figure, Axes)`` pair from the renderer.
+
+        Notes
+        -----
+        Each Section retains its own authored coordinate and orientation;
+        connected profiles are not concatenated into a global cable axis. The
+        current declaration is read without mutation or compilation, and no
+        display call is made implicitly.
+        """
+        from .morphology_visualization import plot_morphology_diameter_profile
+
+        return plot_morphology_diameter_profile(
+            self,
+            sections=sections,
+            highlight=highlight,
+            x_axis=x_axis,
+            show_points=show_points,
+            show_compartments=show_compartments,
+            show_connections=show_connections,
+            legend=legend,
+            ax=ax,
+            figsize=figsize,
+            dpi=dpi,
+            title=title,
+        )
+
+    def inspect(
+        self,
+        *,
+        highlight: str | Iterable[str] | None = None,
+        show_points: bool = True,
+        show_compartments: bool = True,
+        show_orientation: bool = True,
+        annotate_sections: bool = False,
+        annotate_connections: bool = True,
+        connection_tolerance_um: float = 1e-9,
+        figsize: tuple[float, float] = (16, 9),
+        dpi: int = 150,
+        title: str | None = None,
+    ) -> object:
+        """Build a coordinated dashboard for human morphology validation.
+
+        The dashboard combines complementary spatial projections with exact
+        compartment topology and diameter/discretization diagnostics. All
+        panels describe one read-only snapshot of the current authored
+        declaration.
+
+        Parameters
+        ----------
+        highlight : str or iterable of str, optional
+            Exact Section name or shared structural label, or several of
+            either, to emphasize consistently across panels. Default is
+            ``None``.
+        show_points : bool, optional
+            Show authored pt3d controls and stylized endpoints. Default is
+            ``True``.
+        show_compartments : bool, optional
+            Show centers or counts implied by authored ``nseg`` declarations
+            in the spatial and diameter-profile panels. These are authoring
+            previews; the topology panel always shows the canonical compiled
+            graph regardless of this option. Default is ``True``.
+        show_orientation : bool, optional
+            Mark increasing authored x and the connected child endpoint.
+            Default is ``True``.
+        annotate_sections : bool, optional
+            Label spatial paths with exact Section names. Default is ``False``.
+        annotate_connections : bool, optional
+            Label electrical attachments with parent x and child endpoint
+            values once, on the z-projection panel. Default is ``True``.
+        connection_tolerance_um : float, optional
+            Visual threshold, in µm, for distinguishing coincident attachment
+            coordinates from spatial gaps. It does not change electrical
+            connectivity or validate SWC export. Default is ``1e-9``.
+        figsize : tuple of float, optional
+            Dashboard width and height in inches. Default is ``(16, 9)``.
+        dpi : int, optional
+            Dashboard resolution. Default is ``150``.
+        title : str, optional
+            Dashboard title. ``None`` uses the renderer's descriptive default.
+
+        Returns
+        -------
+        object
+            The Matplotlib figure and coordinated axes returned by the
+            dashboard renderer.
+
+        Notes
+        -----
+        Authored centerline coordinates and electrical connection semantics
+        are deliberately shown as distinct information. Connected stylized
+        Sections may overlap because :meth:`connect` does not place them in a
+        shared coordinate frame. The topology panel canonically compiles each
+        connected component of the detached declaration snapshot; this gives
+        a complete Morphology the same graph as :meth:`compile` while keeping
+        an incomplete forest inspectable. The dashboard does not mutate the
+        Morphology, consult an existing model snapshot, or display itself
+        implicitly.
+        """
+        from .morphology_visualization import inspect_morphology
+
+        return inspect_morphology(
+            self,
+            highlight=highlight,
+            show_points=show_points,
+            show_compartments=show_compartments,
+            show_orientation=show_orientation,
+            annotate_sections=annotate_sections,
+            annotate_connections=annotate_connections,
+            connection_tolerance_um=connection_tolerance_um,
+            figsize=figsize,
+            dpi=dpi,
+            title=title,
+        )
+
+    def __getitem__(self, key: str) -> Section:
+        """Return the Section with the exact name ``key``."""
+        return self._sections[key]
+
 
 def _normalize_points(
     points: Sequence[Sequence[float]], *, section_name: str
@@ -1028,10 +2631,11 @@ def _normalize_points(
         normalized.append((x, y, z, diameter))
     for index, (first, second) in enumerate(zip(normalized, normalized[1:])):
         distance = math.dist(first[:3], second[:3])
-        if distance <= 0.0:
+        if distance == 0.0 and first[3] == second[3]:
             raise ValueError(
                 f"Consecutive pt3d points {index} and {index + 1} on "
-                f"{section_name!r} must have distinct coordinates."
+                f"{section_name!r} must have distinct coordinates or different "
+                "diameters. Exact duplicate controls are redundant."
             )
     return tuple(normalized)
 
@@ -1047,11 +2651,64 @@ def _polyline_arclength(
     return arc
 
 
+def _section_lambda_f(section: Section, freq_hz: float) -> float:
+    """Evaluate classic lambda_f over the compiler-representable cable spans."""
+    frequency_factor = _positive(
+        4.0 * math.pi * freq_hz * section.rhoa * section.cm,
+        name=f"section {section.name!r} lambda_f frequency factor",
+    )
+
+    if not section.is_pt3d:
+        if section.diam is None:
+            raise RuntimeError(
+                f"Stylized Section {section.name!r} has no scalar diameter."
+            )
+        wavelength = 1e5 * math.sqrt(section.diam / frequency_factor)
+        return _positive(
+            wavelength, name=f"section {section.name!r} lambda_f wavelength"
+        )
+
+    electrotonic_integral = 0.0
+    positive_interval = 0
+    for length, first_diam, second_diam, discontinuity in _section_interval_spans(
+        section, 0.0, section.L
+    ):
+        if discontinuity:
+            continue
+        diameter_sum = _positive(
+            first_diam + second_diam,
+            name=(
+                f"section {section.name!r} lambda_f diameter sum at pt3d "
+                f"interval {positive_interval}:{positive_interval + 1}"
+            ),
+        )
+        electrotonic_integral += length / math.sqrt(diameter_sum)
+        positive_interval += 1
+    electrotonic_integral = _positive(
+        electrotonic_integral,
+        name=f"section {section.name!r} lambda_f diameter integral",
+    )
+    electrotonic_length = _positive(
+        electrotonic_integral * math.sqrt(2.0) * 1e-5 * math.sqrt(frequency_factor),
+        name=f"section {section.name!r} lambda_f electrotonic length",
+    )
+    wavelength = section.L / electrotonic_length
+    return _positive(wavelength, name=f"section {section.name!r} lambda_f wavelength")
+
+
 def _interpolate_point(
     section: Section, s_um: float
 ) -> tuple[float, float, float, float]:
     arc = _polyline_arclength(section.points)
     s_um = min(max(float(s_um), 0.0), float(arc[-1]))
+    # Endpoint locations retain endpoint identity even when a tiny terminal
+    # span is lost while accumulating a much larger binary64 arclength. The
+    # generic interval lookup cannot distinguish that last control from the
+    # preceding one when both accumulated coordinates round to arc[-1].
+    if s_um <= 0.0:
+        return section.points[0]
+    if s_um >= float(arc[-1]):
+        return section.points[-1]
     index = min(int(np.searchsorted(arc, s_um, side="right")) - 1, len(arc) - 2)
     index = max(index, 0)
     span = float(arc[index + 1] - arc[index])
@@ -1064,33 +2721,359 @@ def _interpolate_point(
     )
 
 
-def _section_integrals(
+def _location_representation_tolerance(
+    section: Section,
+    segment: int,
+    point: tuple[float, float, float, float],
+) -> float:
+    """Bound normalized-location error from binary64 coordinate resolution."""
+    first = section.points[segment]
+    second = section.points[segment + 1]
+    coordinate_resolution = math.hypot(
+        *(
+            max(
+                math.ulp(first[axis]),
+                math.ulp(second[axis]),
+                math.ulp(point[axis]),
+            )
+            for axis in range(3)
+        )
+    )
+    normalized_resolution = coordinate_resolution / section.L
+    baseline = 1024.0 * np.finfo(np.float64).eps
+    return min(1e-9, max(baseline, 16.0 * normalized_resolution))
+
+
+def _unrepresentable_location(section: Section, x: float) -> ValueError:
+    return ValueError(
+        f"Location {section.name!r}({x!r}) cannot be represented as a distinct "
+        "pt3d control point at the current coordinate precision. Re-center or "
+        "rescale the authored coordinates."
+    )
+
+
+def _swc_type(value: int, *, name: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be a non-negative integer.")
+    out = int(value)
+    if out < 0:
+        raise ValueError(f"{name} must be non-negative, got {out!r}.")
+    return out
+
+
+def _format_swc_float(value: float) -> str:
+    if value == 0.0:
+        return "0"
+    return np.format_float_positional(float(value), unique=True, trim="-")
+
+
+def _morphology_to_swc(
+    morphology: Morphology,
+    *,
+    section_types: Mapping[str, int] | None,
+    default_type: int,
+    connection_tolerance_um: float,
+) -> str:
+    default_type = _swc_type(default_type, name="default_type")
+    tolerance = _nonnegative(connection_tolerance_um, name="connection_tolerance_um")
+    if section_types is None:
+        section_types = {}
+    elif not isinstance(section_types, Mapping):
+        raise TypeError("section_types must be a mapping from Section names to ints.")
+
+    normalized_types: dict[str, int] = {}
+    for section_name, type_id in section_types.items():
+        if not isinstance(section_name, str):
+            raise TypeError("section_types keys must be exact Section name strings.")
+        normalized_types[section_name] = _swc_type(
+            type_id, name=f"section_types[{section_name!r}]"
+        )
+    unknown_names = sorted(set(normalized_types).difference(morphology._sections))
+    if unknown_names:
+        raise ValueError(
+            "section_types contains unknown Section name(s): "
+            + ", ".join(repr(name) for name in unknown_names)
+            + "."
+        )
+
+    discontinuous_sections = [
+        section.name
+        for section in morphology.sections
+        if any(
+            first[:3] == second[:3] and first[3] != second[3]
+            for first, second in zip(section.points, section.points[1:])
+        )
+    ]
+    if discontinuous_sections:
+        names = ", ".join(repr(name) for name in discontinuous_sections)
+        raise ValueError(
+            "Cannot export abrupt zero-length diameter discontinuities to SWC "
+            f"without losing geometry (Section(s): {names}). Dendra's SWC "
+            "contract requires positive-length edges and cannot encode the "
+            "annular membrane surface of a repeated-coordinate diameter step."
+        )
+
+    # This performs the complete connected-tree validation before any output is
+    # produced. The graph itself is intentionally not used for morphometric
+    # serialization: its nodes are computational compartment centers.
+    morphology.compile()
+
+    root_name = next(
+        name for name in morphology._sections if name not in morphology._connections
+    )
+    children: dict[str, list[str]] = {name: [] for name in morphology._sections}
+    for child_name in morphology._sections:
+        connection = morphology._connections.get(child_name)
+        if connection is not None:
+            children[connection.parent_name].append(child_name)
+
+    for connection in morphology._connections.values():
+        parent = morphology._sections[connection.parent_name]
+        child = morphology._sections[connection.child_name]
+        parent_point = _interpolate_point(parent, connection.parent_x * parent.L)
+        child_point = _interpolate_point(child, connection.child_end * child.L)
+        separation = math.dist(parent_point[:3], child_point[:3])
+        if separation > tolerance:
+            raise ValueError(
+                f"Cannot export connection from Section {parent.name!r} at "
+                f"x={connection.parent_x!r} to Section {child.name!r} endpoint "
+                f"x={connection.child_end}: their coordinates are separated by "
+                f"{separation!r} µm, exceeding connection_tolerance_um="
+                f"{tolerance!r}. SWC edges encode both topology and geometry; "
+                "author spatially coherent pt3d points before exporting."
+            )
+
+    # An authored control is identified by its source index as well as its
+    # normalized position. Distinct controls can share the same binary64 x
+    # when a tiny span follows a very large accumulated arclength; a mapping or
+    # set keyed only by x would silently discard one of them.
+    samples: dict[str, tuple[tuple[float, int | None], ...]] = {}
+    location_samples: dict[str, dict[float, tuple[float, int | None]]] = {}
+    for section in morphology.sections:
+        arc = _polyline_arclength(section.points)
+        sample_xs = [float(value / arc[-1]) for value in arc]
+        sample_xs[0] = 0.0
+        sample_xs[-1] = 1.0
+        section_samples: list[tuple[float, int | None]] = [
+            (section_x, point_index) for point_index, section_x in enumerate(sample_xs)
+        ]
+        authored_xs = set(sample_xs)
+        connection_xs = {
+            morphology._connections[child_name].parent_x
+            for child_name in children[section.name]
+        }
+        section_samples.extend(
+            (section_x, None)
+            for section_x in connection_xs
+            if section_x not in authored_xs
+        )
+        section_samples.sort(
+            key=lambda sample: (
+                sample[0],
+                len(section.points) if sample[1] is None else sample[1],
+            )
+        )
+        samples[section.name] = tuple(section_samples)
+
+        by_location = {sample[0]: sample for sample in section_samples}
+        # Endpoint locations select the actual first/last authored controls.
+        # At a colliding interior x, _interpolate_point's right-sided lookup
+        # likewise selects the last control at that accumulated arclength.
+        by_location[0.0] = section_samples[0]
+        by_location[1.0] = section_samples[-1]
+        location_samples[section.name] = by_location
+
+    lines = [
+        "# Dendra Morphology SWC export",
+        "# id type x y z radius parent",
+        "# Coordinates and radii are in micrometers.",
+    ]
+    node_ids: dict[tuple[str, float], int] = {}
+    next_node_id = 1
+    stack = [root_name]
+    while stack:
+        section_name = stack.pop()
+        section = morphology._sections[section_name]
+        connection = morphology._connections.get(section_name)
+        section_samples = samples[section_name]
+        if connection is None:
+            oriented_samples = section_samples
+            parent_id = -1
+            attached_sample = None
+        else:
+            attached_x = float(connection.child_end)
+            oriented_samples = (
+                section_samples
+                if connection.child_end == 0
+                else tuple(reversed(section_samples))
+            )
+            parent_id = node_ids[(connection.parent_name, connection.parent_x)]
+            node_ids[(section_name, attached_x)] = parent_id
+            attached_sample = location_samples[section_name][attached_x]
+
+        swc_type = normalized_types.get(section_name, default_type)
+        for sample in oriented_samples:
+            if sample == attached_sample:
+                continue
+            section_x, point_index = sample
+            if point_index is None:
+                # Parent attachments may introduce a sample between authored
+                # controls. Authored controls themselves are emitted verbatim
+                # so normalization and interpolation cannot perturb source
+                # coordinates or diameters during a round trip.
+                point = _interpolate_point(section, section_x * section.L)
+            else:
+                point = section.points[point_index]
+            node_id = next_node_id
+            next_node_id += 1
+            if sample == location_samples[section_name][section_x]:
+                node_ids[(section_name, section_x)] = node_id
+            lines.append(
+                " ".join(
+                    (
+                        str(node_id),
+                        str(swc_type),
+                        _format_swc_float(point[0]),
+                        _format_swc_float(point[1]),
+                        _format_swc_float(point[2]),
+                        _format_swc_float(0.5 * point[3]),
+                        str(parent_id),
+                    )
+                )
+            )
+            parent_id = node_id
+
+        stack.extend(reversed(children[section_name]))
+
+    return "\n".join(lines) + "\n"
+
+
+def _section_interval_limits(
     section: Section, s0: float, s1: float
-) -> tuple[float, float, float]:
-    """Return lateral area, volume, and inverse-area integral for an interval."""
+) -> tuple[float, float]:
     if s1 < s0:
         s0, s1 = s1, s0
     s0 = max(0.0, min(float(s0), section.L))
     s1 = max(0.0, min(float(s1), section.L))
+    return s0, s1
+
+
+def _arclengths_equal_within_roundoff(first: float, second: float) -> bool:
+    """Return whether two computed arclengths differ by only a few ULPs."""
+    if first == second:
+        return True
+    tolerance = 8.0 * max(math.ulp(first), math.ulp(second))
+    return abs(first - second) <= tolerance
+
+
+def _snap_arclength_to_span_endpoint(
+    value: float, first: float, second: float
+) -> float:
+    """Snap a computed interval boundary to the nearest coincident control."""
+    candidates = [
+        endpoint
+        for endpoint in (first, second)
+        if _arclengths_equal_within_roundoff(value, endpoint)
+    ]
+    if not candidates:
+        return value
+    return min(candidates, key=lambda endpoint: (abs(value - endpoint), endpoint))
+
+
+def _section_interval_spans(section: Section, s0: float, s1: float):
+    """Yield clipped pt3d spans, retaining zero-length diameter steps.
+
+    The final boolean distinguishes an abrupt same-coordinate diameter change
+    from an ordinary positive-arclength truncated-cone span. NEURON assigns a
+    discontinuity exactly on a compartment boundary to the interval ending at
+    that boundary; a discontinuity at Section x=0 belongs to the first interval.
+    """
+    s0, s1 = _section_interval_limits(section, s0, s1)
     if s1 <= s0:
-        return 0.0, 0.0, 0.0
+        return
     arc = _polyline_arclength(section.points)
-    boundaries = [s0]
-    boundaries.extend(float(value) for value in arc[1:-1] if s0 < value < s1)
-    boundaries.append(s1)
+    for index, (first, second) in enumerate(zip(section.points, section.points[1:])):
+        a0 = float(arc[index])
+        a1 = float(arc[index + 1])
+        if first[:3] == second[:3]:
+            lower_match = _arclengths_equal_within_roundoff(a0, s0)
+            upper_match = _arclengths_equal_within_roundoff(a0, s1)
+            if lower_match or upper_match:
+                # A shared boundary belongs to the interval ending there. If
+                # an exceptionally short interval is within tolerance of both
+                # ends, select the nearer boundary (and the upper one on a tie).
+                lower_distance = abs(a0 - s0) if lower_match else math.inf
+                upper_distance = abs(a0 - s1) if upper_match else math.inf
+                include = upper_distance <= lower_distance
+            else:
+                include = s0 < a0 < s1
+            # The first authored control is exactly at zero and its step has no
+            # upstream interval, so it belongs to the first compartment.
+            if (s0 == 0.0 and a0 == 0.0) or include:
+                yield 0.0, first[3], second[3], True
+            continue
+
+        snapped_s0 = _snap_arclength_to_span_endpoint(s0, a0, a1)
+        snapped_s1 = _snap_arclength_to_span_endpoint(s1, a0, a1)
+        lo = max(snapped_s0, a0)
+        hi = min(snapped_s1, a1)
+        if hi <= lo:
+            continue
+        span = a1 - a0
+        if span <= 0.0:
+            # A positive coordinate displacement can be lost when accumulated
+            # after an enormous arclength. The Section's binary64 L likewise
+            # cannot resolve that span, so it contributes no representable
+            # normalized interval here.
+            continue
+        lo_fraction = (lo - a0) / span
+        hi_fraction = (hi - a0) / span
+        d0 = first[3] + lo_fraction * (second[3] - first[3])
+        d1 = first[3] + hi_fraction * (second[3] - first[3])
+        yield hi - lo, float(d0), float(d1), False
+
+
+def _section_integrals(
+    section: Section, s0: float, s1: float
+) -> tuple[float, float, float]:
+    """Return lateral area, volume, and inverse-area integral for an interval."""
     area = 0.0
     volume = 0.0
     inv_area = 0.0
-    for lo, hi in zip(boundaries, boundaries[1:]):
-        d0 = max(_interpolate_point(section, lo)[3], _DIAMETER_EPS)
-        d1 = max(_interpolate_point(section, hi)[3], _DIAMETER_EPS)
-        length = hi - lo
+    for length, d0_raw, d1_raw, discontinuity in _section_interval_spans(
+        section, s0, s1
+    ):
+        d0 = max(d0_raw, _DIAMETER_EPS)
+        d1 = max(d1_raw, _DIAMETER_EPS)
         r0 = 0.5 * d0
         r1 = 0.5 * d1
+        if discontinuity:
+            # A zero-arclength truncated cone is the annular membrane surface
+            # used by NEURON for an abrupt pt3d diameter step. It carries no
+            # material volume and no axial resistance.
+            area += math.pi * (r0 + r1) * abs(r1 - r0)
+            continue
         area += math.pi * (r0 + r1) * math.hypot(length, r1 - r0)
         volume += math.pi * length * (r0 * r0 + r0 * r1 + r1 * r1) / 3.0
         inv_area += 4.0 * length / (math.pi * d0 * d1)
     return float(area), float(volume), float(inv_area)
+
+
+def _section_mean_diameter(section: Section, s0: float, s1: float) -> float:
+    """Return NEURON-compatible arclength-mean diameter for one interval."""
+    s0, s1 = _section_interval_limits(section, s0, s1)
+    interval_length = s1 - s0
+    if interval_length <= 0.0:
+        raise ValueError("A compartment diameter interval must have positive length.")
+    diameter_integral = math.fsum(
+        0.5 * (d0 + d1) * length
+        for length, d0, d1, discontinuity in _section_interval_spans(section, s0, s1)
+        if not discontinuity
+    )
+    return _positive(
+        diameter_integral / interval_length,
+        name=f"section {section.name!r} compartment mean diameter",
+    )
 
 
 @dataclass(slots=True)
@@ -1143,13 +3126,16 @@ def _compile_morphology(morphology: Morphology, root_name: str) -> CompartmentGr
             x1 = (index + 1) / section.nseg
             x_center = (index + 0.5) / section.nseg
             center = _interpolate_point(section, x_center * section.L)
+            mean_diameter = _section_mean_diameter(
+                section, x0 * section.L, x1 * section.L
+            )
             area, volume, _ = _section_integrals(
                 section, x0 * section.L, x1 * section.L
             )
             material_id[(section.name, index)] = next_node
             nodes[next_node] = _MutableNode(
                 length_um=section.L / section.nseg,
-                diameter_um=center[3],
+                diameter_um=mean_diameter,
                 area_um2=area,
                 volume_um3=volume,
                 x_um=center[0],

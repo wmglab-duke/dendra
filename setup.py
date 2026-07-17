@@ -17,6 +17,9 @@ setup(
         "ninja",
     ],
     extras_require={
+        "jupyter": [
+            "ipympl >= 0.9.5",
+        ],
         "doc": [
             "jupyter_contrib_nbextensions",
             "notebook <= 6.4.12",

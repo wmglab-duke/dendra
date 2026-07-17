@@ -10,7 +10,49 @@ import sys
 import tempfile
 import uuid
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
+
+
+@contextmanager
+def torch_compiler_warning_context():
+    """Filter only known PyTorch compiler deprecations in strict-warning runs."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*torch\.jit\.script_method.*deprecated.*",
+            category=DeprecationWarning,
+            module=r"torch\.jit\._script",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                r".*torch\.autograd\.function\.Function.*should not be "
+                r"instantiated\..*Methods on autograd functions.*"
+            ),
+            category=DeprecationWarning,
+        )
+        yield
+
+
+def reset_torch_compiler(*, prefer_public: bool = True) -> None:
+    """Reset Torch compiler state without leaking PyTorch-internal warnings.
+
+    PyTorch 2.13 can emit deprecations for ``torch.jit.script_method`` while
+    lazily initializing Inductor and for internal ``autograd.Function``
+    handling while tracing custom functions. Dendra still treats every other
+    warning as actionable; only those upstream deprecations are filtered around
+    compiler operations that trigger them.
+    """
+    import torch
+
+    with torch_compiler_warning_context():
+        if not prefer_public and hasattr(torch, "_dynamo"):
+            torch._dynamo.reset()
+        elif hasattr(torch, "compiler") and hasattr(torch.compiler, "reset"):
+            torch.compiler.reset()
+        elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
+            torch._dynamo.reset()
 
 
 def _truthy(x: str | None) -> bool:

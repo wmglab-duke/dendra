@@ -54,12 +54,59 @@ density.
 
 Native :class:`~dendra.models.morphology.Morphology` declarations use these
 same morphology units. Stylized ``L``/``diam`` values and pt3d coordinates are
-in µm, ``rhoa`` is in Ω·cm, and ``cm`` is in µF/cm². Compilation retains the
+in µm, ``rhoa`` is in Ω·cm, and ``cm`` is in µF/cm². The same conventions apply
+to :meth:`~dendra.models.morphology.Section.update`,
+:meth:`~dendra.models.morphology.SectionLocation.update`, and
+:meth:`~dendra.models.morphology.Morphology.update_section`; in particular, a
+location-scoped ``diam`` update is expressed in µm. Compilation retains the
 canonical geometry in binary64 before a constructed model deliberately casts
-its buffers to the configured model dtype. Generic unbranched
+its buffers to the configured model dtype. A compiled material compartment's
+``diameter_um`` is its arclength-mean diameter, matching NEURON's segment
+convention; exact membrane area, volume, and axial resistance are integrated
+independently and are not reconstructed from that representative value.
+Consecutive pt3d controls at the same xyz with different diameters represent a
+zero-length step: they contribute annular membrane area in µm² but no length,
+volume, or axial resistance. Generic unbranched
 :class:`~dendra.models.core.Cable` models preserve the compiled edge resistance
 in Ω and membrane area in cm² when using the fast tridiagonal solver. See
 :ref:`native-morphologies` for the complete section and connection contract.
+When :meth:`~dendra.models.morphology.Morphology.to_swc` or
+:meth:`~dendra.models.morphology.Morphology.write_swc` exports the authored
+centerlines, SWC ``x``, ``y``, ``z``, and radius are likewise written in µm;
+the SWC radius is one half of the authored diameter. SWC does not carry
+Dendra's electrical units or discretization fields such as ``rhoa``, ``cm``,
+or ``nseg``.
+
+:meth:`~dendra.models.morphology.Morphology.from_swc` reads SWC coordinates and
+radii in µm and converts each radius to an authored diameter in µm.
+:meth:`~dendra.models.morphology.Morphology.from_asc` snapshots NEURON's
+normalized Neurolucida centerlines and diameters in µm, preserving
+same-coordinate diameter steps. Classic SWC has no faithful representation for
+their annular membrane surface, so SWC export rejects a Morphology containing
+one. Neither format defines Dendra's ``rhoa``, ``cm``, or ``nseg``; those are
+explicit loader arguments. In particular, loader ``nseg`` is a uniform initial
+positive integer for the native Section declarations, not a d-lambda policy or
+a reinterpretation of geometry samples as compartments.
+
+:meth:`~dendra.models.morphology.Section.lambda_f` returns an AC space constant
+in µm from the Section's current geometry, ``rhoa`` in Ω·cm, and ``cm`` in
+µF/cm². Its ``freq_hz`` argument is a raw numerical frequency in Hz.
+:meth:`~dendra.models.morphology.Morphology.apply_d_lambda` uses the same raw-Hz
+argument; its ``d_lambda`` argument is a positive dimensionless fraction, and
+it assigns dimensionless odd integer ``nseg`` counts. These APIs intentionally
+use the ``_hz`` suffix to distinguish raw hertz from the normal Dendra
+frequency coordinate used by waveforms. For example, pass ``freq_hz=100.0``
+for 100 Hz; do not pass ``100.0 * Hz``, because the latter evaluates to
+``0.1`` in Dendra's kHz coordinate.
+
+Native Morphology visualizations label authored coordinates, diameters,
+connection gaps, and distance-profile positions in µm. Centerline linewidth is
+only a relative screen-space diameter encoding and must not be interpreted as
+a metrically to-scale tube thickness. In contrast,
+:meth:`~dendra.models.morphology.Morphology.plot_shape` and
+:meth:`~dendra.models.morphology.Morphology.plot_shape_3d` construct tube radii
+in morphology data units; ``diameter_scale=1`` preserves the authored physical
+ratio between centerline length and diameter.
 
 Distributed membrane-mechanism contract
 ----------------------------------------
@@ -256,7 +303,13 @@ waveform frequencies use Dendra's kHz coordinate, but the ``freq`` argument of
 ``Tree.from_swc`` / ``Tree.from_asc`` and related D-lambda morphology-import
 helpers is explicitly in Hz. APIs whose names end in ``_hz`` likewise expect
 raw Hz. Electric-field data are in V/m even though integrated extracellular
-potentials are in mV.
+potentials are in mV. The native ``Morphology.from_swc`` and
+``Morphology.from_asc`` loaders do not apply d-lambda: their ``nseg`` argument
+is an explicit initial positive integer, and SWC/ASC geometry samples are not
+numerical compartments. Call
+:meth:`~dendra.models.morphology.Morphology.apply_d_lambda` with, for example,
+``d_lambda=0.1`` and ``freq_hz=100.0`` after loading or editing when native
+d-lambda selection is desired.
 
 See also
 --------

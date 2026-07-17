@@ -12,6 +12,7 @@ from neuron import h
 from dendra.models.io import (
     apply_d_lambda,
     edge_diff_geom_um,
+    edge_inv_area_integral_um_inv,
     lambda_f,
     neuron_to_dendra_graph,
     r_ohm,
@@ -20,6 +21,7 @@ from dendra.models.io import (
     segment_volume_um3,
     xyz,
 )
+from dendra.models.morphology import Morphology
 
 pytestmark = pytest.mark.neuron
 
@@ -126,6 +128,171 @@ def test_pt3d_coordinates_extracellular_layers_volume_and_diffusion_geometry():
     )
 
 
+def test_pt3d_diameter_step_preserves_incoming_and_outgoing_frusta():
+    section = _section("diameter_step", nseg=2)
+    h.pt3dclear(sec=section)
+    controls = (
+        (0.0, 0.0, 0.0, 1.0),
+        (5.0, 0.0, 0.0, 2.0),
+        (5.0, 0.0, 0.0, 4.0),
+        (10.0, 0.0, 0.0, 3.0),
+    )
+    for control in controls:
+        h.pt3dadd(*control, sec=section)
+
+    def frustum_volume(length, d0, d1):
+        return math.pi * length * (d0 * d0 + d0 * d1 + d1 * d1) / 12.0
+
+    def frustum_area(length, d0, d1):
+        return math.pi * (d0 + d1) / 2.0 * math.hypot(length, (d1 - d0) / 2.0)
+
+    expected_left_volume = frustum_volume(5.0, 1.0, 2.0)
+    expected_right_volume = frustum_volume(5.0, 4.0, 3.0)
+    expected_annular_area = math.pi * (4.0**2 - 2.0**2) / 4.0
+    expected_area = (
+        frustum_area(5.0, 1.0, 2.0)
+        + expected_annular_area
+        + frustum_area(5.0, 4.0, 3.0)
+    )
+    segments = list(section)
+    assert segment_volume_um3(segments[0]) == pytest.approx(
+        expected_left_volume, rel=1e-12
+    )
+    assert segment_volume_um3(segments[1]) == pytest.approx(
+        expected_right_volume, rel=1e-12
+    )
+    assert sum(segment_volume_um3(seg) for seg in segments) == pytest.approx(
+        sum(float(seg.volume()) for seg in segments), rel=1e-12
+    )
+
+    # The centre-to-centre path uses the incoming taper from d=1.5 to d=2,
+    # skips the zero-length jump, then uses the outgoing taper from d=4 to
+    # d=3.5. The discontinuity contributes neither volume nor axial path.
+    expected_inv_area = 4.0 * 2.5 / (math.pi * 1.5 * 2.0) + 4.0 * 2.5 / (
+        math.pi * 4.0 * 3.5
+    )
+    actual_inv_area = edge_inv_area_integral_um_inv(segments[0], segments[1])
+    assert actual_inv_area == pytest.approx(expected_inv_area, rel=1e-12)
+    assert edge_diff_geom_um(segments[0], segments[1]) == pytest.approx(
+        1.0 / expected_inv_area, rel=1e-12
+    )
+    expected_resistance_ohm = float(section.Ra) * 1e4 * expected_inv_area
+    assert r_ohm(segments[0], segments[1]) == pytest.approx(
+        expected_resistance_ohm, rel=1e-12
+    )
+    assert sum(float(seg.area()) for seg in segments) == pytest.approx(
+        expected_area, rel=1e-12
+    )
+
+    graph, _ = neuron_to_dendra_graph(section)
+    assert sum(float(attrs["volume"]) for _, attrs in graph.nodes(data=True)) == (
+        pytest.approx(expected_left_volume + expected_right_volume, rel=1e-12)
+    )
+    assert sum(float(attrs["area"]) for _, attrs in graph.nodes(data=True)) == (
+        pytest.approx(sum(float(seg.area()) for seg in segments), rel=1e-12)
+    )
+    _, _, edge_attrs = next(iter(graph.edges(data=True)))
+    assert edge_attrs["R_ohm"] == pytest.approx(expected_resistance_ohm, rel=1e-12)
+    assert edge_attrs["diff_geom_um"] == pytest.approx(
+        1.0 / expected_inv_area, rel=1e-12
+    )
+
+
+def test_native_decimal_boundary_diameter_step_matches_neuron_geometry():
+    controls = (
+        (0.0, 0.0, 0.0, 2.0),
+        (0.1, 0.0, 0.0, 2.0),
+        (0.1, 0.0, 0.0, 4.0),
+        (0.3, 0.0, 0.0, 4.0),
+    )
+    morphology = Morphology(rhoa=100.0)
+    morphology.section("cable", points=controls, nseg=3)
+    native = morphology.compile()
+
+    section = _section("decimal_boundary_step", Ra=100.0, nseg=3)
+    h.pt3dclear(sec=section)
+    for control in controls:
+        h.pt3dadd(*control, sec=section)
+    segments = list(section)
+
+    # NEURON stores pt3d controls at its own precision, so comparison needs a
+    # small tolerance. Both implementations nevertheless assign the complete
+    # annular shoulder to the upstream segment despite 0.1 and 0.3 not being
+    # exactly representable in binary floating point.
+    annular_area = 3.0 * math.pi
+    assert float(segments[0].area()) > annular_area
+    assert float(segments[1].area()) < annular_area
+    assert native.geometry.area_um2[0] > annular_area
+    assert native.geometry.area_um2[1] < annular_area
+    assert native.geometry.area_um2 == pytest.approx(
+        tuple(float(segment.area()) for segment in segments), rel=5e-7
+    )
+    assert native.geometry.volume_um3 == pytest.approx(
+        tuple(float(segment.volume()) for segment in segments), rel=5e-7
+    )
+    assert native.geometry.diameter_um == pytest.approx(
+        tuple(float(segment.diam) for segment in segments), rel=5e-7
+    )
+    assert native.geometry.edge_resistance_ohm[1:] == pytest.approx(
+        tuple(float(segment.ri()) * 1e6 for segment in segments[1:]), rel=5e-7
+    )
+
+
+def test_bundled_neurolucida_diameter_step_matches_neuron_geometry():
+    asc_path = Path(__file__).parents[1] / "docs" / "basics" / "example.asc"
+    h.load_file("import3d.hoc")
+    reader = h.Import3d_Neurolucida3()
+    reader.quiet = 1
+    reader.input(str(asc_path))
+    importer = h.Import3d_GUI(reader, 0)
+
+    class ImportedCell:
+        def __init__(self):
+            importer.instantiate(self)
+
+    cell = ImportedCell()
+    section = next(sec for sec in cell.all if str(sec.name()).endswith(".dend[13]"))
+    repeated = [
+        index
+        for index in range(1, int(section.n3d()))
+        if (
+            section.x3d(index),
+            section.y3d(index),
+            section.z3d(index),
+        )
+        == (
+            section.x3d(index - 1),
+            section.y3d(index - 1),
+            section.z3d(index - 1),
+        )
+        and section.diam3d(index) != section.diam3d(index - 1)
+    ]
+    assert repeated == [6]
+    assert section.diam3d(5) == pytest.approx(0.33)
+    assert section.diam3d(6) == pytest.approx(0.67)
+
+    expected_volume = sum(float(seg.volume()) for seg in section)
+    actual_volume = sum(segment_volume_um3(seg) for seg in section)
+    assert actual_volume == pytest.approx(expected_volume, rel=1e-12)
+
+    expected_inv_area = 0.0
+    for index in range(1, int(section.n3d())):
+        length = float(section.arc3d(index) - section.arc3d(index - 1))
+        if length > 0.0:
+            expected_inv_area += (
+                4.0
+                * length
+                / (
+                    math.pi
+                    * float(section.diam3d(index - 1))
+                    * float(section.diam3d(index))
+                )
+            )
+    assert edge_inv_area_integral_um_inv(section(0.0), section(1.0)) == (
+        pytest.approx(expected_inv_area, rel=1e-12)
+    )
+
+
 def test_swc_pathlike_import_preserves_parameters_and_branch_topology(tmp_path):
     swc_path = tmp_path / "small-branched.swc"
     swc_path.write_text(
@@ -160,6 +327,36 @@ def test_swc_pathlike_import_preserves_parameters_and_branch_topology(tmp_path):
     ]
     assert len(branchpoints) == 1
     assert graph.out_degree(branchpoints[0]) == 2
+
+
+def test_native_morphology_swc_export_is_neuron_importable(tmp_path):
+    morphology = Morphology()
+    soma = morphology.section(
+        "soma",
+        points=((0.0, 0.0, 0.0, 8.0), (0.0, 0.0, 20.0, 8.0)),
+    )
+    dendrite_a = morphology.section(
+        "dendrite_a",
+        points=((0.0, 0.0, 10.0, 2.0), (10.0, 0.0, 15.0, 1.0)),
+    )
+    dendrite_b = morphology.section(
+        "dendrite_b",
+        points=((0.0, 0.0, 10.0, 2.0), (-10.0, 0.0, 15.0, 1.0)),
+    )
+    dendrite_a.connect(soma.at(0.5), child_end=0)
+    dendrite_b.connect(soma.at(0.5), child_end=0)
+
+    swc_path = tmp_path / "native-export.swc"
+    morphology.write_swc(
+        swc_path,
+        section_types={"soma": 1, "dendrite_a": 3, "dendrite_b": 3},
+    )
+    graph, id2seg = read_swc(swc_path, d_lambda=0.5, freq=100.0)
+
+    _assert_physical_tree(graph)
+    assert set(id2seg) == set(graph)
+    assert sum(graph.out_degree(node) == 2 for node in graph) == 1
+    assert sum(graph.out_degree(node) == 0 for node in graph) == 2
 
 
 def test_neurolucida_pathlike_import_applies_electrical_overrides():

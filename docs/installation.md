@@ -53,7 +53,8 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 
 ## Optional extras
 
-- Jupyter support: `pip install ".[jupyter]"`
+- Interactive Jupyter plots: `pip install ".[jupyter]"`. See the
+  {ref}`interactive Jupyter setup <interactive-jupyter>` below.
 
 - CPU implicit solvers: install the companion package [`dendra-solvers`](https://gitlab.oit.duke.edu/mah148/dendra-solvers) (required only for CPU implicit methods; GPU solvers are included by default). Also required to build the documentation.
 
@@ -67,6 +68,57 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
   ```
 
 - Library of models: install the companion package [`dendra-models`](https://gitlab.oit.duke.edu/mah148/dendra-models) for additional pre-defined neuron & network models.
+
+(interactive-jupyter)=
+### Interactive Jupyter figures
+
+The optional `ipympl` package has two cooperating parts: a Python backend in
+the notebook kernel and a prebuilt `jupyter-matplotlib` extension in the
+environment running the Jupyter server.
+
+When the server and kernel use the same environment:
+
+1. Install the extra in that environment:
+
+   ```sh
+   pip install ".[jupyter]"
+   ```
+
+2. Save your notebooks and stop the **entire Jupyter server**. Restarting only
+   the kernel is insufficient after the first installation because the
+   already-running Lab frontend has not discovered the new extension. Relaunch
+   Jupyter from the activated environment, for example:
+
+   ```sh
+   python -m jupyter lab
+   ```
+
+3. Open or hard-refresh the Lab page, start a fresh kernel, and select the
+   backend before creating figures:
+
+   ```ipython
+   %matplotlib widget
+   ```
+
+If the server and kernel use **separate environments**, install Dendra and
+ipympl in the kernel environment, then install a compatible—preferably the
+same—ipympl release in the environment that launches the per-user Jupyter
+server. Restart both. On a managed JupyterHub, server-side installation may
+require an administrator. For JupyterLab 3/4 and Notebook 7, ipympl ships a
+prebuilt extension: do not run `jupyter lab build` or manually install a Lab
+extension.
+
+To verify the server side, run `jupyter labextension list` with the executable
+that launches Jupyter. It should report both `jupyter-matplotlib` and
+`@jupyter-widgets/jupyterlab-manager` as `enabled` and `OK`. In the kernel,
+`import sys, ipympl; print(sys.executable, ipympl.__version__)` identifies the
+Python environment and backend version.
+
+The browser error `Failed to load model class 'MPLCanvasModel' from module
+'jupyter-matplotlib'` means the kernel backend is active but the current Lab
+page did not load a compatible frontend module. In a shared environment,
+restart the whole server and open a fresh page. In a split environment, verify
+the server-side installation before restarting.
 
 ## Verify the install
 

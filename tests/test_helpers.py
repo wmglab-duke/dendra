@@ -70,6 +70,23 @@ def test_runtime_contract_validation_context_is_normalized_and_atomic():
     assert H.RUNTIME_CONTRACT_VALIDATION.value == original
 
 
+def test_native_extension_policy_context_is_normalized_and_atomic():
+    original = H.NATIVE_EXTENSION_POLICY.value
+
+    with H.ctx(NATIVE_EXTENSION_POLICY=" REQUIRE "):
+        assert H.NATIVE_EXTENSION_POLICY.value == "require"
+        assert H.current_native_extension_policy() == "require"
+        assert dn.NATIVE_EXTENSION_POLICY is H.NATIVE_EXTENSION_POLICY
+
+    assert H.NATIVE_EXTENSION_POLICY.value == original
+    assert H.normalize_native_extension_policy("Warn") == "warn"
+
+    with pytest.raises(ValueError, match="fallback.*warn.*require"):
+        with H.ctx(NATIVE_EXTENSION_POLICY="silent"):
+            pass
+    assert H.NATIVE_EXTENSION_POLICY.value == original
+
+
 def test_explicit_model_dtype_overrides_context_default():
     with H.ctx(DTYPE="float32"):
         population = dn.Population(N=1, C=1, dtype=torch.float64)

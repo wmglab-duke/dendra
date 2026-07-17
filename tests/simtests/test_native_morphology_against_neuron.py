@@ -116,6 +116,35 @@ def test_native_tapered_branch_and_reversed_child_match_neuron_compartment_graph
     )
 
 
+@pytest.mark.parametrize(
+    "points",
+    (
+        # Section-start, internal-compartment-boundary, and Section-end steps.
+        ((0, 0, 0, 2), (0, 0, 0, 4), (10, 0, 0, 4)),
+        ((0, 0, 0, 2), (5, 0, 0, 2), (5, 0, 0, 4), (10, 0, 0, 4)),
+        ((0, 0, 0, 2), (10, 0, 0, 2), (10, 0, 0, 4)),
+    ),
+    ids=("section-start", "compartment-boundary", "section-end"),
+)
+def test_native_diameter_steps_match_neuron_compartment_graph(points):
+    rhoa = 103.0
+    cm = 1.17
+    morphology = dn.Morphology(rhoa=rhoa, cm=cm)
+    morphology.section("step", points=points, nseg=2)
+    nrn_section = _neuron_section(
+        "diameter_step", points=points, nseg=2, rhoa=rhoa, cm=cm
+    )
+
+    native_graph = morphology.compile().to_networkx()
+    neuron_graph, _ = neuron_to_dendra_graph(nrn_section)
+
+    assert _graphs_match_physics(
+        native_graph,
+        neuron_graph,
+        section_names=("step",),
+    )
+
+
 @pytest.mark.parametrize("parent_x", [0.5, 2.0 / 3.0])
 def test_native_interior_attachment_matches_neuron_boundary_selection(parent_x):
     rhoa = 91.0

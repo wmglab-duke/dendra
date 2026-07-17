@@ -159,8 +159,8 @@ def thomas_bt3_spd_fwd_kernel(
     CHOL_ptr,  # (B, K,   9)  cache of L_k
     INFO_ptr,  # (B, K) int32, 0 if Cholesky succeeded after optional bump
     B,
-    eps_rel,
-    eps_abs,
+    eps_rel: tl.constexpr,
+    eps_abs: tl.constexpr,
     K: tl.constexpr,
     BLOCK: tl.constexpr,
 ):  # pragma: no cover

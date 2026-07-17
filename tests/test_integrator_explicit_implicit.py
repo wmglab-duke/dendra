@@ -986,3 +986,252 @@ def test_block_implicit_init_v_and_detach_reset_public_state():
     assert not model.v.requires_grad
     assert not model.vc.requires_grad
     assert not model.i_membrane.requires_grad
+
+
+class _TrajectoryMechanism(LinearMechanism):
+    """Passive mechanism without per-step diagnostic tensor retention."""
+
+    def advance(self, v, dt, temp):
+        pass
+
+
+class _CompiledTrajectoryMechanism(_TrajectoryMechanism):
+    def i(self, v):
+        return self._current(v), self._g(v)
+
+
+def _trajectory_model(dtype, device):
+    compartments = 13
+    position = torch.linspace(-1.0, 1.0, compartments, dtype=DTYPE)
+    initial = (-66.0 + 4.0 * position).expand(2, compartments).clone()
+    initial[1] += 1.5 * torch.cos(torch.pi * position)
+    model = CableModel(
+        shape=(2, compartments),
+        v_init=initial,
+        diam=2.2 + 0.8 * (position + 1.0),
+        dx=7.0 + 5.0 * (position + 1.0).square(),
+        cm=0.75 + 0.6 * (position + 1.0),
+        rhoa=75.0 + 55.0 * (1.0 - position.square()),
+        n_layers=2,
+    )
+    shell_position = position.expand(2, compartments)
+    model.xraxial[..., 0] = 1.6 + 0.5 * (shell_position + 1.0)
+    model.xraxial[..., 1] = 2.4 + 0.7 * (1.0 - shell_position)
+    model.xc[..., 0] = 0.28 + 0.08 * shell_position.square()
+    model.xc[..., 1] = 0.17 + 0.06 * (shell_position + 1.0)
+    model.xg[..., 0] = 1.2e-4 + 0.5e-4 * (shell_position + 1.0)
+    model.xg[..., 1] = 1.8e-4 + 0.7e-4 * (1.0 - shell_position)
+    return model.to(device=device, dtype=dtype)
+
+
+def _trajectory_drives(dtype, steps, compartments):
+    time = torch.arange(steps, dtype=dtype)
+    position = torch.linspace(-1.0, 1.0, compartments, dtype=dtype)
+    batch_scale = torch.tensor([1.0, -0.65], dtype=dtype).reshape(1, 2, 1)
+    spatial = position.reshape(1, 1, compartments)
+    ve = batch_scale * (
+        3.2 * torch.sin(0.031 * time).reshape(steps, 1, 1) * spatial
+        + 0.9 * torch.cos(0.017 * time).reshape(steps, 1, 1) * (spatial.square() - 0.35)
+    )
+    intra = (
+        2.5e-9
+        * torch.cos(0.023 * time).reshape(steps, 1, 1)
+        * (1.0 + 0.4 * spatial)
+        * torch.tensor([1.0, 0.75], dtype=dtype).reshape(1, 2, 1)
+    )
+    return ve.contiguous(), intra.contiguous()
+
+
+def _trajectory_state(model, *, block):
+    values = [model.v.reshape(-1)]
+    if block:
+        values.append(model.vc.reshape(-1))
+    return torch.cat(values)
+
+
+def _implicit_cpu_cuda_trajectory(*, method, dtype, block):
+    dt = 0.05
+    steps = 512
+    checkpoint_stride = 16
+    cpu_model = _trajectory_model(dtype, "cpu")
+    gpu_model = _trajectory_model(dtype, "cuda")
+    cpu_mechanism = _TrajectoryMechanism(g=0.014, e=-60.5)
+    gpu_mechanism = _TrajectoryMechanism(g=0.014, e=-60.5)
+    integrator_cls = _bwd_euler_bt if block else _bwd_euler_ub
+    cpu_integrator = integrator_cls(cpu_model, cpu_mechanism, method=method).to(
+        dtype=dtype
+    )
+    gpu_integrator = integrator_cls(gpu_model, gpu_mechanism, method=method).to(
+        device="cuda", dtype=dtype
+    )
+    cpu_integrator._initialize(cpu_model, dt)
+    gpu_integrator._initialize(gpu_model, dt)
+
+    ve_cpu, intra_cpu = _trajectory_drives(dtype, steps, cpu_model.shape[-1])
+    ve_gpu = ve_cpu.cuda()
+    intra_gpu = intra_cpu.cuda()
+    cpu_trace = [_trajectory_state(cpu_model, block=block).clone()]
+    gpu_trace = [_trajectory_state(gpu_model, block=block).cpu()]
+
+    with torch.no_grad():
+        for step in range(steps):
+            cpu_integrator.step(cpu_model, dt, ve=ve_cpu[step], intra=intra_cpu[step])
+            gpu_integrator.step(gpu_model, dt, ve=ve_gpu[step], intra=intra_gpu[step])
+            if (step + 1) % checkpoint_stride == 0:
+                cpu_trace.append(_trajectory_state(cpu_model, block=block).clone())
+                gpu_trace.append(_trajectory_state(gpu_model, block=block).cpu())
+
+    return torch.stack(cpu_trace), torch.stack(gpu_trace)
+
+
+def _cuda_compiled_trajectory(*, method, dtype, block, jit):
+    dt, steps, checkpoint_stride = 0.05, 64, 8
+    model = _trajectory_model(dtype, "cuda")
+    model.jit = bool(jit)
+    model.backend = "inductor"
+    model.fullgraph = True
+    model.dynamic = False
+    model.compile_mode = None
+    model.compile_options = None
+    mechanism = _CompiledTrajectoryMechanism(g=0.014, e=-60.5)
+    integrator_cls = _bwd_euler_bt if block else _bwd_euler_ub
+    integrator = integrator_cls(model, mechanism, method=method).to(
+        device="cuda", dtype=dtype
+    )
+    integrator._initialize(model, dt)
+    ve, intra = _trajectory_drives(dtype, steps, model.shape[-1])
+    ve = ve.cuda()
+    intra = intra.cuda()
+    trace = [_trajectory_state(model, block=block).cpu()]
+
+    with torch.no_grad():
+        for step in range(steps):
+            integrator.step(model, dt, ve=ve[step], intra=intra[step])
+            if (step + 1) % checkpoint_stride == 0:
+                trace.append(_trajectory_state(model, block=block).cpu())
+
+    return torch.stack(trace), bool(integrator._compiled_kernels)
+
+
+def _compile_trajectory_tolerances(*, dtype, block):
+    if dtype == torch.float32 and not block:
+        return 2.0e-5, 8.0e-6
+    if dtype == torch.float32:
+        return 1.0e-3, 5.0e-4
+    if not block:
+        return 1.0e-12, 3.0e-13
+    return 1.0e-11, 3.0e-12
+
+
+def _assert_trajectory_drift(cpu_trace, gpu_trace, *, method, dtype, block):
+    assert torch.isfinite(cpu_trace).all()
+    assert torch.isfinite(gpu_trace).all()
+    assert torch.max(torch.abs(cpu_trace[-1] - cpu_trace[0])) > 1.0e-4
+    difference = gpu_trace - cpu_trace
+    max_abs = float(difference.abs().max())
+    rmse = float(difference.square().mean().sqrt())
+
+    if not block and dtype == torch.float32:
+        max_tolerance, rmse_tolerance = 2.0e-4, 8.0e-5
+    elif not block:
+        max_tolerance, rmse_tolerance = 3.0e-13, 1.0e-13
+    elif dtype == torch.float64:
+        max_tolerance, rmse_tolerance = 5.0e-10, 2.0e-10
+    else:
+        membrane_width = cpu_trace.shape[1] // 4
+        membrane_difference = difference[:, :membrane_width]
+        membrane_max = float(membrane_difference.abs().max())
+        membrane_rmse = float(membrane_difference.square().mean().sqrt())
+        assert membrane_max <= 2.5e-4 and membrane_rmse <= 8.0e-5, (
+            f"block {method} float32 membrane-voltage drift exceeded tolerance: "
+            f"max_abs={membrane_max:.6g}, rmse={membrane_rmse:.6g}"
+        )
+
+        # The absolute intracellular/extracellular variables are substantially
+        # less well conditioned than their physical membrane-voltage difference
+        # in float32. Keep their current backend-specific ceilings explicit so
+        # future numerical improvements ratchet these values downward.
+        if method == "thomas":
+            max_tolerance, rmse_tolerance = 6.0e-3, 3.0e-3
+        else:
+            max_tolerance, rmse_tolerance = 1.5e-1, 6.0e-2
+
+    label = f"{'block' if block else 'unbranched'} {method}"
+    assert max_abs <= max_tolerance and rmse <= rmse_tolerance, (
+        f"{label} CPU/GPU drift exceeded tolerance: "
+        f"max_abs={max_abs:.6g}, rmse={rmse:.6g}, "
+        f"limits=({max_tolerance:.6g}, {rmse_tolerance:.6g})"
+    )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not DENDRA_SOLVERS_AVAILABLE,
+    reason="CUDA and dendra_solvers are required",
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("method", ["pcr", "thomas"])
+def test_unbranched_implicit_long_horizon_cpu_cuda_trajectory(method, dtype):
+    cpu_trace, gpu_trace = _implicit_cpu_cuda_trajectory(
+        method=method, dtype=dtype, block=False
+    )
+    _assert_trajectory_drift(
+        cpu_trace, gpu_trace, method=method, dtype=dtype, block=False
+    )
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not DENDRA_SOLVERS_AVAILABLE,
+    reason="CUDA and dendra_solvers are required",
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("method", ["thomas", "spd"])
+def test_block_implicit_long_horizon_cpu_cuda_trajectory(method, dtype):
+    cpu_trace, gpu_trace = _implicit_cpu_cuda_trajectory(
+        method=method, dtype=dtype, block=True
+    )
+    _assert_trajectory_drift(
+        cpu_trace, gpu_trace, method=method, dtype=dtype, block=True
+    )
+
+
+@pytest.mark.cuda
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "method,block", [("pcr", False), ("spd", True)], ids=["scalar-pcr", "block-spd"]
+)
+def test_implicit_cuda_fullgraph_trajectory_matches_eager_and_repeats(
+    method, block, dtype
+):
+    eager, eager_compiled = _cuda_compiled_trajectory(
+        method=method, dtype=dtype, block=block, jit=False
+    )
+    first, first_compiled = _cuda_compiled_trajectory(
+        method=method, dtype=dtype, block=block, jit=True
+    )
+    second, second_compiled = _cuda_compiled_trajectory(
+        method=method, dtype=dtype, block=block, jit=True
+    )
+
+    assert eager_compiled is False
+    assert first_compiled is True
+    assert second_compiled is True
+    assert torch.equal(first, second)
+    difference = first - eager
+    max_abs = float(difference.abs().max())
+    rmse = float(difference.square().mean().sqrt())
+    max_tolerance, rmse_tolerance = _compile_trajectory_tolerances(
+        dtype=dtype, block=block
+    )
+    if block and dtype == torch.float32:
+        membrane_width = eager.shape[1] // 4
+        membrane_difference = difference[:, :membrane_width]
+        assert float(membrane_difference.abs().max()) <= 1.0e-4
+    assert max_abs <= max_tolerance and rmse <= rmse_tolerance, (
+        f"compiled {method} trajectory drift exceeded tolerance: "
+        f"max_abs={max_abs:.6g}, rmse={rmse:.6g}, "
+        f"limits=({max_tolerance:.6g}, {rmse_tolerance:.6g})"
+    )

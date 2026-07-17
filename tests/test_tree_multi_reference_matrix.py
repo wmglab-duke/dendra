@@ -8,6 +8,7 @@ import torch
 
 import dendra as dn
 from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE, _dhs_multi
+from dendra.models.integrators.triton import dhs_solve_multi_cuda
 
 DTYPE = torch.float64
 pytestmark = pytest.mark.skipif(
@@ -63,7 +64,7 @@ def _graph(edges, *, nodes, areas, cms, resistances):
     return graph
 
 
-def _make_multi(*, batch=None, imem=False, write_back=True):
+def _make_multi(*, batch=None, imem=False, write_back=True, threads=2):
     branched = _graph(
         [(2, 0), (2, 1), (0, 3)],
         nodes=[3, 1, 0, 2],
@@ -97,7 +98,11 @@ def _make_multi(*, batch=None, imem=False, write_back=True):
     reversal = torch.linspace(-58.0, -43.0, n_total, dtype=DTYPE)
     mechanism = LinearMechanism(conductance, reversal)
     integrator = _dhs_multi(
-        multi, mechanism, imem=imem, threads=2, write_back=write_back
+        multi,
+        mechanism,
+        imem=imem,
+        threads=threads,
+        write_back=write_back,
     )
     return multi, mechanism, integrator
 
@@ -493,3 +498,76 @@ def test_multi_tree_invalid_group_topology_fails_initialization_atomically():
         integrator._initialize(model, 0.05)
     assert integrator.initialized is False
     assert integrator.dt is None
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("threads", [1, 2, 4, 8, 16, 32])
+def test_multi_tree_cpu_cuda_value_and_gradient_parity(threads):
+    dt = 0.043
+    cpu_model, cpu_mechanism, cpu_integrator = _make_multi(batch=2, threads=threads)
+    gpu_model, gpu_mechanism, gpu_integrator = _make_multi(batch=2, threads=threads)
+    gpu_model.cuda()
+    gpu_integrator.cuda()
+
+    cpu_integrator._initialize(cpu_model, dt)
+    gpu_integrator._initialize(gpu_model, dt)
+    assert gpu_integrator.solve.func is dhs_solve_multi_cuda
+
+    cpu_voltage, cpu_intra, cpu_ve = _sample_inputs(cpu_model)
+    cpu_voltage.requires_grad_()
+    cpu_intra.requires_grad_()
+    cpu_ve.requires_grad_()
+    cpu_mechanism.conductance.requires_grad_()
+    cpu_mechanism.reversal.requires_grad_()
+
+    gpu_voltage = cpu_voltage.detach().cuda().requires_grad_()
+    gpu_intra = cpu_intra.detach().cuda().requires_grad_()
+    gpu_ve = cpu_ve.detach().cuda().requires_grad_()
+    gpu_mechanism.conductance.requires_grad_()
+    gpu_mechanism.reversal.requires_grad_()
+
+    cpu_actual, _ = cpu_integrator._step(
+        cpu_voltage, dt, cpu_model.celsius, ve=cpu_ve, intra=cpu_intra
+    )
+    gpu_actual, _ = gpu_integrator._step(
+        gpu_voltage, dt, gpu_model.celsius, ve=gpu_ve, intra=gpu_intra
+    )
+    cpu_expected = _dense_reference(
+        cpu_model,
+        cpu_mechanism,
+        cpu_voltage,
+        dt,
+        ve=cpu_ve,
+        intra=cpu_intra,
+    )
+
+    torch.testing.assert_close(cpu_actual, cpu_expected, rtol=3.0e-12, atol=3.0e-12)
+    torch.testing.assert_close(gpu_actual.cpu(), cpu_actual, rtol=3.0e-10, atol=3.0e-10)
+
+    cpu_weights = torch.linspace(0.7, 1.4, cpu_actual.numel(), dtype=DTYPE).reshape_as(
+        cpu_actual
+    )
+    gpu_weights = cpu_weights.cuda()
+    cpu_inputs = (
+        cpu_voltage,
+        cpu_intra,
+        cpu_ve,
+        cpu_mechanism.conductance,
+        cpu_mechanism.reversal,
+    )
+    gpu_inputs = (
+        gpu_voltage,
+        gpu_intra,
+        gpu_ve,
+        gpu_mechanism.conductance,
+        gpu_mechanism.reversal,
+    )
+    cpu_grad = torch.autograd.grad(
+        (cpu_actual.square() * cpu_weights).sum(), cpu_inputs
+    )
+    gpu_grad = torch.autograd.grad(
+        (gpu_actual.square() * gpu_weights).sum(), gpu_inputs
+    )
+    for got, want in zip(gpu_grad, cpu_grad):
+        torch.testing.assert_close(got.cpu(), want, rtol=3.0e-8, atol=3.0e-9)

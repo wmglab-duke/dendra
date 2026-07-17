@@ -1,4 +1,5 @@
 import importlib
+import random
 
 import matplotlib
 
@@ -67,11 +68,13 @@ def _no_show(monkeypatch):
 
 
 def test_palette_hsv_length_and_format():
+    state = random.getstate()
     colors = VIS.palette_hsv(10)
     assert len(colors) == 10
     assert all(color.startswith("#") and len(color) == 7 for color in colors)
     assert VIS.palette_hsv(10) == colors
     assert VIS.palette_hsv(0) == []
+    assert random.getstate() == state
 
 
 def test_parula_registered():

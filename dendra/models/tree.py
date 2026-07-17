@@ -546,8 +546,9 @@ class Tree(Population):
 
         Native and NEURON-authored morphologies converge on the same scalar
         compartment resistor-graph contract. Compilation is a snapshot:
-        subsequently adding Sections to the source builder cannot mutate the
-        constructed model.
+        subsequently adding or updating Sections on the source builder cannot
+        mutate the constructed model. Call ``from_morphology`` again to build
+        a model from the revised declaration.
 
         Parameters
         ----------

@@ -69,6 +69,12 @@ class ctx(contextlib.ContextDecorator):
       ``.data``, NumPy/DLPack aliases, or raw storage can bypass mutation-version
       tracking; ``"strict"`` can diagnose frozen-contract corruption, but such
       writes remain unsupported for mutable workspace inputs.
+    - ``NATIVE_EXTENSION_POLICY`` (str): policy for optional native accelerator
+      extensions. ``"fallback"`` (default) silently uses the correct portable
+      implementation when a native extension cannot load or launch, ``"warn"``
+      emits a warning before falling back, and ``"require"`` raises instead of
+      permitting a silent performance-path change. The policy is enforced only
+      when a native accelerator path is eligible; CPU execution is unaffected.
     - ``TF32`` is available but typically not toggled here.
 
     Example
@@ -101,6 +107,8 @@ class ctx(contextlib.ContextDecorator):
                 )
             if key == "RUNTIME_CONTRACT_VALIDATION":
                 v = normalize_runtime_contract_validation(v)
+            elif key == "NATIVE_EXTENSION_POLICY":
+                v = normalize_native_extension_policy(v)
             resolved.append((key, v))
         for key, v in resolved:
             ContextVar._cache[key].value = v
@@ -293,6 +301,26 @@ def current_runtime_contract_validation() -> str:
     return normalize_runtime_contract_validation(RUNTIME_CONTRACT_VALIDATION.value)
 
 
+_NATIVE_EXTENSION_POLICIES = ("fallback", "warn", "require")
+
+
+def normalize_native_extension_policy(value) -> str:
+    """Return a canonical optional-native-extension policy."""
+    if isinstance(value, str):
+        policy = value.strip().lower()
+        if policy in _NATIVE_EXTENSION_POLICIES:
+            return policy
+    expected = ", ".join(repr(mode) for mode in _NATIVE_EXTENSION_POLICIES)
+    raise ValueError(
+        f"NATIVE_EXTENSION_POLICY must be one of {expected}; got {value!r}."
+    )
+
+
+def current_native_extension_policy() -> str:
+    """Return the active canonical optional-native-extension policy."""
+    return normalize_native_extension_policy(NATIVE_EXTENSION_POLICY.value)
+
+
 # Backward-compatible context-key aliases. The exported variable
 # ``JIT_IN_NETWORK`` below points at ``JIT_NETWORK_SOLVES`` as well, but ctx()
 # needs a key-level alias so ``with dendra.ctx(JIT_IN_NETWORK=0): ...`` keeps
@@ -313,6 +341,7 @@ REQUIRE_GRAD = ContextVar("REQUIRE_GRAD", 0)
 USETABLES = ContextVar("USETABLES", 1)
 RUNTIME_CONTRACT_VALIDATION = ContextVar("RUNTIME_CONTRACT_VALIDATION", "versioned")
 
+NATIVE_EXTENSION_POLICY = ContextVar("NATIVE_EXTENSION_POLICY", "fallback")
 BACKEND = ContextVar("BACKEND", "inductor")
 FULLGRAPH = ContextVar("FULLGRAPH", 0)
 DYNAMIC = ContextVar("DYNAMIC", 0)

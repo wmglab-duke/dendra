@@ -7,6 +7,7 @@ import torch
 
 import dendra as dn
 from dendra.models.mod import expsyn
+from dendra.models.networks import netcon as netcon_module
 from dendra.models.networks import netcon_bitpack_ops as bitpack_ops
 
 DT = 0.1
@@ -232,6 +233,30 @@ def test_failed_native_bitpack_delivery_does_not_contaminate_torch_fallback(
     torch.testing.assert_close(actual, torch.tensor([9.0, 12.0], dtype=actual.dtype))
 
 
+def test_native_bitpack_failure_obeys_scoped_policy():
+    cause = RuntimeError("compiler mismatch")
+
+    with dn.ctx(NATIVE_EXTENSION_POLICY="fallback"):
+        assert (
+            netcon_module._handle_native_bitpack_failure("delivery construction", cause)
+            is False
+        )
+
+    with dn.ctx(NATIVE_EXTENSION_POLICY="warn"):
+        with pytest.warns(RuntimeWarning, match="compiler mismatch"):
+            assert (
+                netcon_module._handle_native_bitpack_failure(
+                    "delivery construction", cause
+                )
+                is False
+            )
+
+    with dn.ctx(NATIVE_EXTENSION_POLICY="require"):
+        with pytest.raises(RuntimeError, match="fallback is disabled") as raised:
+            netcon_module._handle_native_bitpack_failure("delivery construction", cause)
+    assert raised.value.__cause__ is cause
+
+
 def test_bitpacked_state_cache_resumes_pending_intrinsic_and_scheduled_events():
     original, original_netcon = _fan_network("bitpacked_history")
     original_netcon.schedule(con_indices=[5], times_ms=[0.0], weight=2.0)
@@ -385,23 +410,50 @@ def test_auto_arch_resolution_clamps_newer_devices_and_includes_ptx(monkeypatch)
         bitpack_ops._auto_cuda_arch_list("invalid")
 
 
-def test_extension_identity_is_stable_and_sensitive_to_sources(tmp_path, monkeypatch):
+def test_extension_identity_is_sensitive_to_sources_and_toolchain(
+    tmp_path, monkeypatch
+):
     source = tmp_path / "kernel.cpp"
     source.write_text("one", encoding="utf8")
     build_dir = tmp_path / "build"
     monkeypatch.setenv("DENDRA_NETCON_BITPACK_BUILD_DIR", str(build_dir))
     monkeypatch.setenv("DENDRA_NETCON_BITPACK_EXTENSION_BASE_NAME", "custom-name")
+    toolchain = {"cxx_path": "/usr/bin/g++-10", "nvcc_version": "13.0"}
 
-    first = bitpack_ops._extension_identity([str(source)], ["8.6"], ["flag"])
-    again = bitpack_ops._extension_identity([str(source)], ["8.6"], ["flag"])
+    first = bitpack_ops._extension_identity(
+        [str(source)], ["8.6"], ["flag"], toolchain=toolchain
+    )
+    again = bitpack_ops._extension_identity(
+        [str(source)], ["8.6"], ["flag"], toolchain=toolchain
+    )
     source.write_text("two", encoding="utf8")
-    changed = bitpack_ops._extension_identity([str(source)], ["8.6"], ["flag"])
+    source_changed = bitpack_ops._extension_identity(
+        [str(source)], ["8.6"], ["flag"], toolchain=toolchain
+    )
+    toolchain["cxx_path"] = "/opt/compiler/g++"
+    toolchain_changed = bitpack_ops._extension_identity(
+        [str(source)], ["8.6"], ["flag"], toolchain=toolchain
+    )
 
     assert first == again
     assert first[0].startswith("custom_name_")
     assert first[1] == build_dir
-    assert first[0] != changed[0]
-    assert first[2] != changed[2]
+    assert first[0] != source_changed[0]
+    assert first[2] != source_changed[2]
+    assert source_changed[0] != toolchain_changed[0]
+
+
+def test_cached_extension_artifacts_ignore_stale_build_identities(tmp_path):
+    current_so = tmp_path / "expected_abc.so"
+    current_pyd = tmp_path / "expected_abc.pyd"
+    stale = tmp_path / "expected_old.so"
+    unrelated = tmp_path / "dependency.so"
+    for path in (current_so, current_pyd, stale, unrelated):
+        path.touch()
+
+    artifacts = bitpack_ops._cached_extension_artifacts(tmp_path, "expected_abc")
+
+    assert artifacts == sorted([str(current_pyd), str(current_so)])
 
 
 def test_bitpack_kernel_wrappers_validate_types_and_cpu_contract(monkeypatch):

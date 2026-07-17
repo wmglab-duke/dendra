@@ -10,6 +10,9 @@ readme = "README.md"
 dynamic = ["version", "dependencies"]
 
 [project.optional-dependencies]
+jupyter = [
+    "ipympl >= 0.9.5",
+]
 doc = [
     "jupyter_contrib_nbextensions",
     "notebook <= 6.4.12",
@@ -37,6 +40,9 @@ dev = [
     "pytest-xdist",
     "commitizen"
 ]
+
+[project.scripts]
+dendra = "dendra.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
