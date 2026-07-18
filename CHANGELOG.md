@@ -1,3 +1,16 @@
+## v0.21.1 (2026-07-17)
+
+### Fix
+
+- **visualization**: interactive 3d morphology plot
+
+## v0.21.0 (2026-07-17)
+
+### Feat
+
+- **morphologies**: delete sections; refine discretization using d_lambda rule
+- **morphologies**: edit & visualize morphologies
+
 ## v0.20.0 (2026-07-15)
 
 ### Feat

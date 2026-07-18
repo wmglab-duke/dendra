@@ -2,7 +2,7 @@
 
 import os
 
-__version__ = "0.20.0"
+__version__ = "0.21.1"
 
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
 os.environ.setdefault("MKL_DYNAMIC", "FALSE")
