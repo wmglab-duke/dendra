@@ -3005,6 +3005,11 @@ class Parameterized(SimpleParameterized):
         alias : str, optional
             Alias name for the override. If None, a numeric suffix is used.
 
+        Returns
+        -------
+        str
+            Resolved alias used to register the override.
+
         Examples
         --------
         >>> print(model.rhoa)  # Original parameter
@@ -3078,6 +3083,7 @@ class Parameterized(SimpleParameterized):
                     self.additional_parameters[name] = []
                 self.additional_parameters[name].append((fill, getattr(self, p_name)))
                 self.keys[name] = combined_key
+            return alias
 
     def populate_parameter_buffers(self, random_generation=None):
         """

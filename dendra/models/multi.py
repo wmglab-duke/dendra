@@ -5,11 +5,106 @@ import math
 import torch
 
 from ..helpers import logger
-from .core import Cable, Population
+from .core import (
+    Cable,
+    Population,
+    _core_key_from_flat,
+    _global_configuration_values_equal,
+    _mechanism_global_parameter_names,
+    _mechanism_initial_defaults,
+    _unpack_mechanism_insertion_record,
+)
 from .integrators import bwd_euler_sc_multi, dhs_multi
 from .tree import Tree
 
 _MISSING = object()
+
+
+def _global_defaults_by_name(mechanism):
+    """Collect every owner-specific default for each GLOBAL parameter name."""
+    defaults = {}
+    for owner in (mechanism, *tuple(getattr(mechanism, "_state", ()))):
+        for declaration in ("_global", "_global_p", "_global_n"):
+            for name, value in getattr(owner, declaration, {}).items():
+                defaults.setdefault(name, []).append(value)
+    return defaults
+
+
+def _component_explicit_globals(population, mechanism):
+    """Return one component's explicit class-wide GLOBAL overrides."""
+    global_names = _mechanism_global_parameter_names(mechanism)
+    explicit = {}
+    everywhere = population._mech_everywhere.get(mechanism)
+    if everywhere is not None:
+        explicit.update(
+            {
+                name: value
+                for name, value in everywhere[2].items()
+                if name in global_names
+            }
+        )
+    for name, value in population._mech_data_base_kwargs.get(mechanism, {}).items():
+        if name in explicit and not _global_configuration_values_equal(
+            explicit[name], value
+        ):
+            raise ValueError(
+                f"Mechanism {mechanism.__name__!r} has different class-wide "
+                f"GLOBAL values for {name!r} in one component population."
+            )
+        explicit[name] = value
+    return explicit
+
+
+def _merged_global_overrides(populations):
+    """Validate and merge component GLOBAL semantics by exact mechanism class."""
+    configurations = {}
+    for component_name, population in populations.items():
+        mechanisms = set(population._mech_everywhere) | set(population._mech_data)
+        for mechanism in mechanisms:
+            configurations.setdefault(mechanism, []).append(
+                (
+                    component_name,
+                    _component_explicit_globals(population, mechanism),
+                )
+            )
+
+    merged = {}
+    for mechanism, component_configs in configurations.items():
+        defaults = _global_defaults_by_name(mechanism)
+        parameter_names = set().union(*(set(config) for _, config in component_configs))
+        mechanism_overrides = {}
+        for parameter_name in parameter_names:
+            explicit = [
+                (component_name, config[parameter_name])
+                for component_name, config in component_configs
+                if parameter_name in config
+            ]
+            selected_component, selected_value = explicit[0]
+            for component_name, value in explicit[1:]:
+                if not _global_configuration_values_equal(selected_value, value):
+                    raise ValueError(
+                        f"Mechanism {mechanism.__name__!r} has a different "
+                        f"class-wide GLOBAL value for {parameter_name!r} in "
+                        f"components {selected_component!r} and {component_name!r}."
+                    )
+
+            for component_name, config in component_configs:
+                if parameter_name in config:
+                    continue
+                owner_defaults = defaults.get(parameter_name, ())
+                if any(
+                    not _global_configuration_values_equal(selected_value, default)
+                    for default in owner_defaults
+                ):
+                    raise ValueError(
+                        f"Mechanism {mechanism.__name__!r} has explicit "
+                        f"class-wide GLOBAL value {parameter_name!r} in component "
+                        f"{selected_component!r}, but component {component_name!r} "
+                        "uses a different declared default."
+                    )
+            mechanism_overrides[parameter_name] = selected_value
+        merged[mechanism] = mechanism_overrides
+    return merged
 
 
 def _uses_block_voltage_state(population):
@@ -856,32 +951,53 @@ class MultiPopulation(Population):
     def reinsert_all(self):
         """Recreate mechanisms for all component populations."""
         all_indices = indices(self.populations)
+        merged_globals = _merged_global_overrides(self.populations)
         for index, (name, pop) in zip(all_indices, self.populations.items()):
             # first do _mech_everywhere
-            for m_class, (_, _, kwargs) in pop._mech_everywhere.items():
+            for m_class, (_, ic, kwargs) in pop._mech_everywhere.items():
                 alias = name
-                index_f = index.flatten()
-                self[:, index_f].insert(m_class, alias=alias, **kwargs)
+                global_names = _mechanism_global_parameter_names(m_class)
+                indexed_kwargs = {
+                    parameter_name: value
+                    for parameter_name, value in kwargs.items()
+                    if parameter_name not in global_names
+                }
+                effective_ic = _mechanism_initial_defaults(m_class)
+                effective_ic.update(ic or {})
+                local_flat = torch.arange(math.prod(pop.core_shape()), dtype=torch.long)
+                excluded = torch.as_tensor(
+                    pop._mech_exclusions.get(m_class, []), dtype=torch.long
+                ).reshape(-1)
+                if excluded.numel():
+                    local_flat = local_flat[~torch.isin(local_flat, excluded)]
+                local_key = _core_key_from_flat(local_flat, tuple(pop.core_shape()))
+                index_f = key_to_flat_index(index, local_key)
+                self[:, index_f].insert(
+                    m_class,
+                    alias=alias,
+                    ic=effective_ic,
+                    **merged_globals[m_class],
+                    **indexed_kwargs,
+                )
             # now do _mech_data
             for m_class, list_of_aliases_kwargs_keys in pop._mech_data.items():
                 idx = 0
+                global_names = _mechanism_global_parameter_names(m_class)
+                effective_ic = _mechanism_initial_defaults(m_class)
+                effective_ic.update(pop._mech_data_ic.get(m_class) or {})
                 for record in list_of_aliases_kwargs_keys:
-                    if len(record) == 3:
-                        alias, kwargs, key = record
-                        preserve_duplicate_indices = False
-                        copies = 1
-                    elif len(record) == 4:
-                        alias, kwargs, key, preserve_duplicate_indices = record
-                        copies = 1
-                    elif len(record) == 5:
-                        alias, kwargs, key, preserve_duplicate_indices, copies = record
-                    else:
-                        raise ValueError(
-                            "Mechanism insertion records must contain either "
-                            "(alias, kwargs, key), "
-                            "(alias, kwargs, key, preserve_duplicate_indices), "
-                            "or (alias, kwargs, key, preserve_duplicate_indices, copies)."
-                        )
+                    (
+                        alias,
+                        kwargs,
+                        key,
+                        preserve_duplicate_indices,
+                        copies,
+                    ) = _unpack_mechanism_insertion_record(record)
+                    indexed_kwargs = {
+                        parameter_name: value
+                        for parameter_name, value in kwargs.items()
+                        if parameter_name not in global_names
+                    }
                     index_f = key_to_flat_index(index, key)
                     if alias is not None:
                         alias_n = f"{name}_{alias}"
@@ -891,9 +1007,11 @@ class MultiPopulation(Population):
                     self[:, index_f].insert(
                         m_class,
                         alias=alias_n,
+                        ic=effective_ic,
                         preserve_duplicate_indices=preserve_duplicate_indices,
                         copies=copies,
-                        **kwargs,
+                        **merged_globals[m_class],
+                        **indexed_kwargs,
                     )
 
     def batch(self, batch_size: int):

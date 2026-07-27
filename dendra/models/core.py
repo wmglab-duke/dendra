@@ -69,12 +69,13 @@ from dendra.models.mechanisms._materials import (
 from dendra.models.mechanisms.validate import validate
 from dendra.models.modular import matches_any_pattern
 from dendra.models.parametric import Parameterized as P
+from dendra.models.parametric import create_param_expander
 from dendra.models.rng import _validate_rng_checkpoint_payload
 from dendra.models.stim.intra import Intra
 from dendra.models.stim.waveform import Waveform
 from dendra.units import mm
 
-from .slice import Slice, Sliceable, parse_key
+from .slice import IndexSpec, Slice, Sliceable, parse_key
 
 TensorLike = Union[torch.Tensor, "np.ndarray"]  # torch or numpy are supported
 
@@ -126,6 +127,284 @@ def get_unique_keys(list_of_dicts):
     for dictionary in list_of_dicts:
         unique_keys.update(dictionary.keys())
     return unique_keys
+
+
+def _index_to_cpu(index):
+    """Clone structural indexing metadata onto CPU-owned storage."""
+    if isinstance(index, torch.Tensor):
+        return index.detach().to(device="cpu").clone()
+    if isinstance(index, np.ndarray):
+        return index.copy()
+    if isinstance(index, tuple):
+        return tuple(_index_to_cpu(item) for item in index)
+    if isinstance(index, list):
+        return [_index_to_cpu(item) for item in index]
+    return index
+
+
+def _core_flat_indices(index, shape):
+    """Materialize a structural selector as physical core-flat indices."""
+    if isinstance(index, IndexSpec):
+        index = index.index
+    index = _index_to_cpu(index)
+    grid = torch.arange(math.prod(shape), dtype=torch.long).reshape(shape)
+    return grid[index].reshape(-1)
+
+
+def _stable_unique_long(values):
+    """Return first-occurrence unique values as a CPU LongTensor."""
+    values = torch.as_tensor(values, dtype=torch.long, device="cpu").reshape(-1)
+    if values.numel() < 2:
+        return values.clone()
+    seen = set()
+    positions = []
+    for position, value in enumerate(values.tolist()):
+        if value not in seen:
+            seen.add(value)
+            positions.append(position)
+    return values.index_select(0, torch.as_tensor(positions, dtype=torch.long))
+
+
+def _sorted_unique_long(values):
+    """Return sorted unique values as a CPU LongTensor."""
+    values = torch.as_tensor(values, dtype=torch.long, device="cpu").reshape(-1)
+    if values.numel() == 0:
+        return values.clone()
+    return torch.unique(values, sorted=True)
+
+
+def _core_key_from_flat(values, shape):
+    """Encode physical flat indices as a dimension-correct advanced key."""
+    values = torch.as_tensor(values, dtype=torch.long, device="cpu").reshape(-1)
+    return tuple(coord.clone() for coord in torch.unravel_index(values, shape))
+
+
+def _unpack_mechanism_insertion_record(record):
+    """Normalize legacy and current sparse mechanism insertion records."""
+    if len(record) == 3:
+        alias, kwargs, key = record
+        preserve = False
+        copies = 1
+    elif len(record) == 4:
+        alias, kwargs, key, preserve = record
+        copies = 1
+    elif len(record) == 5:
+        alias, kwargs, key, preserve, copies = record
+    else:
+        raise ValueError(
+            "Mechanism insertion records must contain either "
+            "(alias, kwargs, key), "
+            "(alias, kwargs, key, preserve_duplicate_indices), "
+            "or (alias, kwargs, key, preserve_duplicate_indices, copies)."
+        )
+    copies = int(copies)
+    return alias, kwargs, key, bool(preserve or copies != 1), copies
+
+
+def _configuration_values_equal(left, right):
+    """Compare nested initial-condition configuration without tensor ambiguity."""
+    if left is right:
+        return True
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return left.keys() == right.keys() and all(
+            _configuration_values_equal(left[key], right[key]) for key in left
+        )
+    if torch.is_tensor(left) or torch.is_tensor(right):
+        try:
+            return torch.equal(torch.as_tensor(left), torch.as_tensor(right))
+        except (TypeError, ValueError, RuntimeError):
+            return False
+    try:
+        result = left == right
+    except Exception:
+        return False
+    return bool(result) if isinstance(result, (bool, np.bool_)) else False
+
+
+def _global_configuration_values_equal(left, right):
+    """Compare GLOBAL values after scalar numeric representation differences."""
+    if _configuration_values_equal(left, right):
+        return True
+    try:
+        left_tensor = torch.as_tensor(left).detach()
+        right_tensor = torch.as_tensor(right).detach()
+    except (TypeError, ValueError, RuntimeError):
+        return False
+    if left_tensor.numel() != 1 or right_tensor.numel() != 1:
+        return False
+    if left_tensor.dtype == torch.bool or right_tensor.dtype == torch.bool:
+        return False
+
+    numeric_kinds = {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    }
+    if (
+        left_tensor.dtype not in numeric_kinds
+        or right_tensor.dtype not in numeric_kinds
+    ):
+        return False
+    if not (
+        left_tensor.is_floating_point() or right_tensor.is_floating_point()
+    ) and not (left_tensor.is_complex() or right_tensor.is_complex()):
+        return bool(left_tensor.item() == right_tensor.item())
+
+    def explicitly_typed(value):
+        return torch.is_tensor(value) or isinstance(value, (np.ndarray, np.generic))
+
+    typed_float_dtypes = [
+        tensor.dtype
+        for value, tensor in ((left, left_tensor), (right, right_tensor))
+        if explicitly_typed(value)
+        and (tensor.is_floating_point() or tensor.is_complex())
+    ]
+    if typed_float_dtypes:
+        for dtype in set(typed_float_dtypes):
+            if dtype not in (torch.complex64, torch.complex128) and (
+                left_tensor.is_complex() or right_tensor.is_complex()
+            ):
+                return False
+            try:
+                left_comparable = torch.as_tensor(
+                    left, device="cpu", dtype=dtype
+                ).detach()
+                right_comparable = torch.as_tensor(
+                    right, device="cpu", dtype=dtype
+                ).detach()
+            except (TypeError, ValueError, RuntimeError):
+                return False
+            if not torch.equal(left_comparable, right_comparable):
+                return False
+        return True
+    return bool(left_tensor.item() == right_tensor.item())
+
+
+def _mechanism_spatial_parameter_names(mechanism):
+    """Collect spatial RANGE names declared by a mechanism and its states."""
+    names = set()
+    for owner in (mechanism, *tuple(getattr(mechanism, "_state", ()))):
+        for declaration in ("_range", "_range_p", "_range_n"):
+            names.update(getattr(owner, declaration, {}).keys())
+    return names
+
+
+def _mechanism_batch_parameter_names(mechanism):
+    """Collect BATCH names declared by a mechanism and its states."""
+    names = set()
+    for owner in (mechanism, *tuple(getattr(mechanism, "_state", ()))):
+        for declaration in ("_batch", "_batch_p", "_batch_n"):
+            names.update(getattr(owner, declaration, {}).keys())
+    return names
+
+
+def _mechanism_global_parameter_names(mechanism):
+    """Collect GLOBAL parameter names declared by a mechanism and its states."""
+    names = set()
+    for owner in (mechanism, *tuple(getattr(mechanism, "_state", ()))):
+        for declaration in ("_global", "_global_p", "_global_n"):
+            names.update(getattr(owner, declaration, {}).keys())
+    return names
+
+
+def _mechanism_initial_defaults(mechanism):
+    """Return class-declared mechanism state initial values."""
+    return dict(getattr(mechanism, "_init", {}))
+
+
+def _project_indexed_override(
+    value,
+    old_core_indices,
+    keep_mask,
+    core_shape,
+    *,
+    context,
+):
+    """Project an indexed override onto its surviving physical support."""
+    old_core_indices = torch.as_tensor(
+        old_core_indices, dtype=torch.long, device="cpu"
+    ).reshape(-1)
+    keep_mask = torch.as_tensor(keep_mask, dtype=torch.bool, device="cpu").reshape(-1)
+    if keep_mask.numel() != old_core_indices.numel():
+        raise RuntimeError(
+            f"{context}: internal override support and retention mask disagree."
+        )
+    if bool(torch.all(keep_mask)):
+        return value
+
+    if isinstance(value, torch.nn.Module):
+        raise ValueError(
+            f"{context} uses a module-valued override whose support cannot be "
+            "projected safely. Remove the whole override region or replace it "
+            "with a scalar/Tensor override before deleting compartments."
+        )
+
+    if isinstance(value, (bool, int, float, complex, np.number)):
+        return value
+
+    try:
+        tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{context} has unsupported value type {type(value).__name__}; "
+            "Dendra cannot safely project it after a partial deletion."
+        ) from exc
+
+    if tensor.ndim == 0:
+        return value
+
+    key = old_core_indices.to(device=tensor.device)
+    try:
+        expand = create_param_expander(tensor, key, tuple(core_shape))
+        expanded = expand(tensor).reshape(-1)
+    except (IndexError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"{context} with shape {tuple(tensor.shape)} cannot be projected "
+            "safely onto the surviving mechanism support."
+        ) from exc
+
+    projected = expanded.index_select(
+        0,
+        torch.nonzero(keep_mask, as_tuple=False).reshape(-1).to(device=expanded.device),
+    ).clone()
+    if isinstance(value, torch.nn.Parameter):
+        return torch.nn.Parameter(
+            projected.detach(), requires_grad=bool(value.requires_grad)
+        )
+    return projected
+
+
+def _validate_deletion_stable_batch_override(value, *, context):
+    """Reject BATCH layouts whose row association cannot be preserved safely."""
+    if isinstance(value, torch.nn.Module):
+        raise ValueError(
+            f"{context} uses a module-valued BATCH override. Dendra cannot "
+            "prove that its row association survives a structural deletion."
+        )
+    if isinstance(value, (bool, int, float, complex, np.number)):
+        return
+    try:
+        tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{context} has unsupported BATCH override type {type(value).__name__}."
+        ) from exc
+    if tensor.numel() == 1:
+        return
+    raise ValueError(
+        f"{context} is a non-scalar BATCH override. A deletion can change the "
+        "compiled mechanism's row groups, so Dendra cannot preserve this value "
+        "unambiguously. Use a scalar BATCH value, delete the whole mechanism, "
+        "or rebuild the final placement explicitly."
+    )
 
 
 def follows_pattern(base_pattern, target_string):
@@ -480,6 +759,17 @@ class Population(P, Sliceable):
 
         self._mech_data = {}
         self._mech_everywhere = {}
+        # Everywhere insertions can be cropped without losing their class-wide
+        # constructor kwargs or initial conditions.  Values are physical
+        # population-core flat indices excluded from the dense insertion.
+        self._mech_exclusions = {}
+        # Initial conditions are class-wide for a compiled sparse mechanism:
+        # one mechanism instance is built from the union of all region records.
+        self._mech_data_ic = {}
+        # GLOBAL parameters are likewise class-wide. Region records hold only
+        # indexed RANGE/BATCH overrides; conflicting GLOBAL values cannot be
+        # represented by one compiled mechanism instance.
+        self._mech_data_base_kwargs = {}
         # Slice-scoped overrides applied to a compiled mechanism must remain
         # structural configuration rather than state owned only by that
         # disposable compiled instance.  Records use population-core indices
@@ -694,6 +984,57 @@ class Population(P, Sliceable):
         state["make_intra"] = make_intra
         state["_make_intra_config"] = None
         return state
+
+    def __setstate__(self, state):
+        """Restore populations serialized before mechanism deletion support."""
+        state.setdefault("_mech_exclusions", {})
+        state.setdefault("_mech_data_ic", {})
+        state.setdefault("_mech_data_base_kwargs", {})
+
+        # Sparse insertion records historically stored GLOBAL and indexed
+        # parameters together. GLOBAL values now belong to the one compiled
+        # mechanism instance, so migrate old records before either direct build
+        # or MultiPopulation reinsertion can reinterpret them as spatial data.
+        migrated_data = {}
+        base_kwargs_by_mechanism = {
+            mechanism: dict(values)
+            for mechanism, values in state["_mech_data_base_kwargs"].items()
+        }
+        for mechanism, records in state.get("_mech_data", {}).items():
+            global_names = _mechanism_global_parameter_names(mechanism)
+            base_kwargs = base_kwargs_by_mechanism.setdefault(mechanism, {})
+            migrated_records = []
+            for record in records:
+                alias, kwargs, key, preserve, copies = (
+                    _unpack_mechanism_insertion_record(record)
+                )
+                indexed_kwargs = dict(kwargs)
+                for name in indexed_kwargs.keys() & global_names:
+                    value = indexed_kwargs.pop(name)
+                    if name in base_kwargs and not _global_configuration_values_equal(
+                        base_kwargs[name], value
+                    ):
+                        raise ValueError(
+                            "Cannot restore serialized Population: sparse "
+                            f"mechanism {mechanism.__name__!r} contains "
+                            f"conflicting class-wide GLOBAL values for {name!r}."
+                        )
+                    base_kwargs[name] = value
+                migrated_records.append(
+                    (
+                        alias,
+                        indexed_kwargs,
+                        _index_to_cpu(key),
+                        preserve,
+                        copies,
+                    )
+                )
+            migrated_data[mechanism] = migrated_records
+            if not base_kwargs:
+                base_kwargs_by_mechanism.pop(mechanism, None)
+        state["_mech_data"] = migrated_data
+        state["_mech_data_base_kwargs"] = base_kwargs_by_mechanism
+        super().__setstate__(state)
 
     @property
     def shape(self):
@@ -2812,6 +3153,90 @@ class Population(P, Sliceable):
                 return Intra(self, solver_injections)
         return None
 
+    def _invalidate_mechanism_structure(self):
+        """Fail closed after a successful mechanism-layout mutation."""
+        if self.is_built:
+            self._flag_rebuild = True
+        self.initialized = False
+        self.initializing_from_state_cache = False
+        integrator = getattr(self, "integrator", None)
+        if integrator is not None:
+            integrator.initialized = False
+        self.intra = None
+        self.mechanism_injection_accepted = [
+            False for _ in self.mechanism_injection_accepted
+        ]
+        self.clear_steady_state()
+
+    def _configured_mechanism_names(self, mechanism):
+        """Return runtime names associated with one configured mechanism class."""
+        names = {
+            str(getattr(mechanism, "_name", None) or mechanism.__name__),
+            str(mechanism.__name__),
+        }
+        if mechanism in self._mech_everywhere:
+            names.add(str(self._mech_everywhere[mechanism][0]))
+        return names
+
+    def _configured_mechanism_class_for_instance(self, name, instance):
+        """Resolve a parametrized runtime proxy back to its configured class."""
+        candidates = set(self._mech_everywhere) | set(self._mech_data)
+        named = [
+            mechanism
+            for mechanism in candidates
+            if str(name) in self._configured_mechanism_names(mechanism)
+            and isinstance(instance, mechanism)
+        ]
+        if len(named) == 1:
+            return named[0]
+        return type(instance)
+
+    def _mechanism_support_flat(self, mechanism):
+        """Return sorted physical core support for a configured mechanism class."""
+        core_shape = tuple(self.core_shape())
+        support = []
+        if mechanism in self._mech_everywhere:
+            all_indices = torch.arange(math.prod(core_shape), dtype=torch.long)
+            excluded = torch.as_tensor(
+                self._mech_exclusions.get(mechanism, []), dtype=torch.long
+            ).reshape(-1)
+            if excluded.numel():
+                all_indices = all_indices[~torch.isin(all_indices, excluded)]
+            support.append(all_indices)
+        for record in self._mech_data.get(mechanism, ()):
+            _, _, key, _, _ = _unpack_mechanism_insertion_record(record)
+            support.append(_core_flat_indices(key, core_shape))
+        if not support:
+            return torch.empty(0, dtype=torch.long)
+        return _sorted_unique_long(torch.cat(support))
+
+    def _sparse_mechanism_slot_domain(self, mechanism):
+        """Return physical core indices in compiled sparse-slot order."""
+        records = self._mech_data.get(mechanism, ())
+        if not records:
+            return torch.empty(0, dtype=torch.long)
+        keys = []
+        preserve = []
+        copies = []
+        for record in records:
+            _, _, key, keep_duplicates, n_copies = _unpack_mechanism_insertion_record(
+                record
+            )
+            keys.append(key)
+            preserve.append(keep_duplicates)
+            copies.append(n_copies)
+        if any(preserve):
+            total_index, _, _, _ = compose_or_flatten_multiset(
+                keys, tuple(self.core_shape()), preserve, copies
+            )
+            return torch.as_tensor(total_index, dtype=torch.long)
+        total_index, is_composable, _, _ = compose_or_flatten_union(
+            keys, tuple(self.core_shape())
+        )
+        if is_composable:
+            return _core_flat_indices(total_index, tuple(self.core_shape()))
+        return torch.as_tensor(total_index, dtype=torch.long).reshape(-1)
+
     def insert(
         self,
         mechanism,
@@ -2835,6 +3260,10 @@ class Population(P, Sliceable):
         index_spec : IndexSpec, optional
             An optional index specification that defines where the mechanism should be inserted.
             If not provided, the mechanism will be inserted everywhere.
+        ic : dict, optional
+            Initial values for mechanism state fields. For region-restricted
+            insertions these values are class-wide because all regions of one
+            mechanism class compile into one mechanism instance.
         preserve_duplicate_indices : bool, optional
             If True, duplicate compartment indices selected by this insertion are
             retained as independent mechanism slots instead of being collapsed
@@ -2848,11 +3277,10 @@ class Population(P, Sliceable):
             ``copies > 1`` implies ``preserve_duplicate_indices=True`` and is
             intended for compact banks of colocated point processes.
         **kwargs
-            Additional keyword arguments to be passed to the compile_mechanism function.
+            Mechanism parameters. RANGE/BATCH values are restricted to the
+            insertion region. GLOBAL values are class-wide; later insertion
+            records for the same class must use compatible GLOBAL values.
         """
-        if self.is_built:
-            self._flag_rebuild = True
-
         validate(mechanism)
         if hasattr(mechanism, "normalize_mech_kwargs"):
             kwargs = mechanism.normalize_mech_kwargs(kwargs)
@@ -2869,7 +3297,7 @@ class Population(P, Sliceable):
         key = None
 
         if index_spec is not None:
-            key = index_spec.index
+            key = _index_to_cpu(index_spec.index)
 
         if key is None:
             if copies != 1 or preserve_duplicate_indices:
@@ -2878,25 +3306,469 @@ class Population(P, Sliceable):
                     "for region-restricted mechanism insertions."
                 )
             if alias is None:
+                if mechanism in self._mech_everywhere:
+                    raise ValueError(
+                        f"Mechanism {mechanism} is already inserted everywhere."
+                    )
+                if self._mech_data.get(mechanism):
+                    raise ValueError(
+                        f"Mechanism {mechanism} already has region-restricted "
+                        "insertions and cannot also be inserted everywhere."
+                    )
                 self._mech_everywhere[mechanism] = (mechanism.__name__, ic, kwargs)
+                self._mech_exclusions.pop(mechanism, None)
+                self._invalidate_mechanism_structure()
                 return
-            key = torch.arange(math.prod(self.core_shape()), dtype=torch.long)
+            key = _core_key_from_flat(
+                torch.arange(math.prod(self.core_shape()), dtype=torch.long),
+                tuple(self.core_shape()),
+            )
 
         if mechanism in self._mech_everywhere:
             raise ValueError(f"Mechanism {mechanism} is already inserted everywhere.")
+        existing_ic = self._mech_data_ic.get(mechanism)
+        if ic is not None:
+            if existing_ic is not None and not _configuration_values_equal(
+                existing_ic, ic
+            ):
+                raise ValueError(
+                    f"Mechanism {mechanism} already has different class-wide "
+                    "initial conditions for another insertion region."
+                )
+
+        global_names = _mechanism_global_parameter_names(mechanism)
+        global_kwargs = {name: kwargs[name] for name in kwargs.keys() & global_names}
+        indexed_kwargs = {
+            name: value for name, value in kwargs.items() if name not in global_names
+        }
+        existing_base_kwargs = self._mech_data_base_kwargs.get(mechanism, {})
+        planned_base_kwargs = dict(existing_base_kwargs)
+        for name, value in global_kwargs.items():
+            if name in planned_base_kwargs and not _global_configuration_values_equal(
+                planned_base_kwargs[name], value
+            ):
+                raise ValueError(
+                    f"Mechanism {mechanism} already has a different class-wide "
+                    f"GLOBAL value for {name!r}."
+                )
+            planned_base_kwargs[name] = value
+
+        if ic is not None:
+            self._mech_data_ic[mechanism] = ic
+        if planned_base_kwargs:
+            self._mech_data_base_kwargs[mechanism] = planned_base_kwargs
         self._mech_data.setdefault(mechanism, []).append(
             (
                 alias,
-                kwargs,
-                key,
+                indexed_kwargs,
+                _index_to_cpu(key),
                 bool(preserve_duplicate_indices or copies != 1),
                 copies,
             )
         )
+        self._invalidate_mechanism_structure()
+
+    def delete(self, mechanism, index=None, *, strict=False):
+        """Delete a mechanism class everywhere or where it intersects a region.
+
+        Parameters
+        ----------
+        mechanism : type
+            Exact mechanism class to remove.
+        index : IndexSpec or object, optional
+            Physical population-core selection to remove. ``None`` (the
+            default) removes every configured placement of ``mechanism``.
+        strict : bool, default False
+            If True, require the mechanism to exist at every selected physical
+            compartment and fail atomically otherwise. If False, delete only
+            the intersection between the selection and current support; a
+            missing class or empty intersection is a no-op.
+
+        Notes
+        -----
+        Deletion subtracts selected support from every overlapping insertion
+        record, including all duplicate/copy slots at those compartments.
+        Reinitialize the population after a successful deletion.
+        """
+        changed = self._delete_mechanism_configuration(
+            mechanism,
+            index=index,
+            strict=strict,
+        )
+        if changed:
+            self._invalidate_mechanism_structure()
+
+    def delete_all(self, index=None):
+        """Delete every mechanism class present in a population region.
+
+        Parameters
+        ----------
+        index : IndexSpec or object, optional
+            Physical population-core selection. ``None`` (the default) removes
+            every configured mechanism placement from the Population.
+
+        Notes
+        -----
+        This operation uses intersection semantics for every exact configured
+        mechanism class. Planning and projection are transactional across
+        classes: if any affected configuration cannot be projected safely, no
+        mechanism configuration or lifecycle state is changed.
+        """
+        normalized_index = index
+        if index is not None:
+            core_shape = tuple(self.core_shape())
+            requested = _stable_unique_long(_core_flat_indices(index, core_shape))
+            if requested.numel() == 0:
+                return
+            normalized_index = _core_key_from_flat(requested, core_shape)
+
+        mechanisms = list(self._mech_everywhere)
+        mechanisms.extend(
+            mechanism
+            for mechanism, records in self._mech_data.items()
+            if records and mechanism not in self._mech_everywhere
+        )
+        if not mechanisms:
+            return
+
+        registry_objects = {
+            "_mech_everywhere": self._mech_everywhere,
+            "_mech_exclusions": self._mech_exclusions,
+            "_mech_data": self._mech_data,
+            "_mech_data_ic": self._mech_data_ic,
+            "_mech_data_base_kwargs": self._mech_data_base_kwargs,
+            "_slice_mechanism_parametrizations": (
+                self._slice_mechanism_parametrizations
+            ),
+        }
+        snapshots = {
+            "_mech_everywhere": dict(registry_objects["_mech_everywhere"]),
+            "_mech_exclusions": dict(registry_objects["_mech_exclusions"]),
+            "_mech_data": dict(registry_objects["_mech_data"]),
+            "_mech_data_ic": dict(registry_objects["_mech_data_ic"]),
+            "_mech_data_base_kwargs": dict(registry_objects["_mech_data_base_kwargs"]),
+            "_slice_mechanism_parametrizations": list(
+                registry_objects["_slice_mechanism_parametrizations"]
+            ),
+        }
+        changed = False
+        try:
+            for mechanism in mechanisms:
+                changed = (
+                    self._delete_mechanism_configuration(
+                        mechanism,
+                        index=normalized_index,
+                        strict=False,
+                    )
+                    or changed
+                )
+        except Exception:
+            for name, snapshot in snapshots.items():
+                registry = registry_objects[name]
+                registry.clear()
+                if isinstance(registry, dict):
+                    registry.update(snapshot)
+                else:
+                    registry.extend(snapshot)
+                setattr(self, name, registry)
+            raise
+
+        if changed:
+            self._invalidate_mechanism_structure()
+
+    def _delete_mechanism_configuration(
+        self,
+        mechanism,
+        index=None,
+        *,
+        strict=False,
+    ):
+        """Plan and commit one class deletion without invalidating lifecycle."""
+        validate(mechanism)
+        requested = None
+        if index is not None:
+            core_shape = tuple(self.core_shape())
+            requested = _stable_unique_long(_core_flat_indices(index, core_shape))
+        configured = mechanism in self._mech_everywhere or bool(
+            self._mech_data.get(mechanism)
+        )
+        if not configured:
+            if strict:
+                raise ValueError(
+                    f"Mechanism {getattr(mechanism, '__name__', mechanism)!r} "
+                    "is not inserted in this Population."
+                )
+            return False
+
+        mechanism_names = self._configured_mechanism_names(mechanism)
+
+        def record_matches(record):
+            recorded_class = record.get("mechanism_class")
+            if recorded_class is not None:
+                if recorded_class is mechanism:
+                    return True
+                configured_classes = set(self._mech_everywhere) | set(self._mech_data)
+                try:
+                    is_runtime_proxy = (
+                        recorded_class not in configured_classes
+                        and issubclass(recorded_class, mechanism)
+                    )
+                except TypeError:
+                    is_runtime_proxy = False
+                return bool(
+                    is_runtime_proxy and record.get("mechanism_name") in mechanism_names
+                )
+            return record.get("mechanism_name") in mechanism_names
+
+        if index is None:
+            new_parametrizations = [
+                record
+                for record in self._slice_mechanism_parametrizations
+                if not record_matches(record)
+            ]
+            self._mech_everywhere.pop(mechanism, None)
+            self._mech_exclusions.pop(mechanism, None)
+            self._mech_data.pop(mechanism, None)
+            self._mech_data_ic.pop(mechanism, None)
+            self._mech_data_base_kwargs.pop(mechanism, None)
+            self._slice_mechanism_parametrizations = new_parametrizations
+            return True
+
+        if requested.numel() == 0:
+            return False
+
+        old_support = self._mechanism_support_flat(mechanism)
+        supported = torch.isin(requested, old_support)
+        if strict and not bool(torch.all(supported)):
+            missing = requested[~supported][:10].tolist()
+            raise ValueError(
+                f"Cannot delete mechanism {mechanism.__name__!r}: selected "
+                f"physical core indices {missing} do not currently host that "
+                "exact mechanism class. No changes were made."
+            )
+        requested = requested[supported]
+        if requested.numel() == 0:
+            return False
+
+        remaining_support = old_support[~torch.isin(old_support, requested)]
+        planned_everywhere = self._mech_everywhere.get(mechanism)
+        planned_exclusions = self._mech_exclusions.get(mechanism)
+        batch_names = _mechanism_batch_parameter_names(mechanism)
+
+        if planned_everywhere is not None:
+            configured_name, configured_ic, configured_kwargs = planned_everywhere
+            excluded = torch.as_tensor(
+                [] if planned_exclusions is None else planned_exclusions,
+                dtype=torch.long,
+            ).reshape(-1)
+            old_everywhere_support = torch.arange(
+                math.prod(core_shape), dtype=torch.long
+            )
+            if excluded.numel():
+                old_everywhere_support = old_everywhere_support[
+                    ~torch.isin(old_everywhere_support, excluded)
+                ]
+            everywhere_keep = ~torch.isin(old_everywhere_support, requested)
+            planned_exclusions = _sorted_unique_long(torch.cat((excluded, requested)))
+            if not bool(torch.any(everywhere_keep)):
+                planned_everywhere = None
+                planned_exclusions = None
+            elif not bool(torch.all(everywhere_keep)):
+                for parameter_name in configured_kwargs.keys() & batch_names:
+                    _validate_deletion_stable_batch_override(
+                        configured_kwargs[parameter_name],
+                        context=(
+                            f"Mechanism {mechanism.__name__!r} everywhere "
+                            f"parameter {parameter_name!r}"
+                        ),
+                    )
+                indexed_names = _mechanism_spatial_parameter_names(mechanism)
+                configured_kwargs = {
+                    name: (
+                        _project_indexed_override(
+                            value,
+                            old_everywhere_support,
+                            everywhere_keep,
+                            core_shape,
+                            context=(
+                                f"Mechanism {mechanism.__name__!r} everywhere "
+                                f"parameter {name!r}"
+                            ),
+                        )
+                        if name in indexed_names
+                        else value
+                    )
+                    for name, value in configured_kwargs.items()
+                }
+                if configured_ic is not None:
+                    configured_ic = {
+                        name: _project_indexed_override(
+                            value,
+                            old_everywhere_support,
+                            everywhere_keep,
+                            core_shape,
+                            context=(
+                                f"Mechanism {mechanism.__name__!r} everywhere "
+                                f"initial condition {name!r}"
+                            ),
+                        )
+                        for name, value in configured_ic.items()
+                    }
+                planned_everywhere = (
+                    configured_name,
+                    configured_ic,
+                    configured_kwargs,
+                )
+
+        planned_records = []
+        planned_sparse_ic = self._mech_data_ic.get(mechanism)
+        old_sparse_domain = self._sparse_mechanism_slot_domain(mechanism)
+        indexed_names = _mechanism_spatial_parameter_names(mechanism)
+        for record_number, record in enumerate(self._mech_data.get(mechanism, ())):
+            alias, kwargs, key, preserve, copies = _unpack_mechanism_insertion_record(
+                record
+            )
+            selected = _core_flat_indices(key, core_shape)
+            if preserve:
+                value_domain = selected.repeat(copies)
+                value_keep = ~torch.isin(value_domain, requested)
+                key_keep = ~torch.isin(selected, requested)
+                retained = selected[key_keep]
+            else:
+                value_domain = _sorted_unique_long(selected)
+                value_keep = ~torch.isin(value_domain, requested)
+                retained = value_domain[value_keep]
+
+            if retained.numel() == 0:
+                continue
+
+            for parameter_name in kwargs.keys() & batch_names:
+                _validate_deletion_stable_batch_override(
+                    kwargs[parameter_name],
+                    context=(
+                        f"Mechanism {mechanism.__name__!r} insertion record "
+                        f"{record_number} parameter {parameter_name!r}"
+                    ),
+                )
+
+            projected_kwargs = kwargs
+            if not bool(torch.all(value_keep)):
+                projected_kwargs = {
+                    name: (
+                        _project_indexed_override(
+                            value,
+                            value_domain,
+                            value_keep,
+                            core_shape,
+                            context=(
+                                f"Mechanism {mechanism.__name__!r} insertion "
+                                f"record {record_number} parameter {name!r}"
+                            ),
+                        )
+                        if name in indexed_names
+                        else value
+                    )
+                    for name, value in kwargs.items()
+                }
+            planned_records.append(
+                (
+                    alias,
+                    projected_kwargs,
+                    _core_key_from_flat(retained, core_shape),
+                    preserve,
+                    copies,
+                )
+            )
+
+        if (
+            planned_records
+            and planned_sparse_ic is not None
+            and old_sparse_domain.numel()
+        ):
+            sparse_keep = ~torch.isin(old_sparse_domain, requested)
+            if not bool(torch.all(sparse_keep)):
+                planned_sparse_ic = {
+                    name: _project_indexed_override(
+                        value,
+                        old_sparse_domain,
+                        sparse_keep,
+                        core_shape,
+                        context=(
+                            f"Mechanism {mechanism.__name__!r} sparse initial "
+                            f"condition {name!r}"
+                        ),
+                    )
+                    for name, value in planned_sparse_ic.items()
+                }
+
+        planned_parametrizations = []
+        for record_number, record in enumerate(self._slice_mechanism_parametrizations):
+            if not record_matches(record):
+                planned_parametrizations.append(record)
+                continue
+
+            old_indices = torch.as_tensor(
+                record["core_indices"], dtype=torch.long, device="cpu"
+            ).reshape(-1)
+            keep = torch.isin(old_indices, remaining_support)
+            if not bool(torch.any(keep)):
+                continue
+            if record["name"] in batch_names:
+                _validate_deletion_stable_batch_override(
+                    record["value"],
+                    context=(
+                        f"Slice parametrization {record_number} for mechanism "
+                        f"{record['mechanism_name']!r}, parameter "
+                        f"{record['name']!r}"
+                    ),
+                )
+            if bool(torch.all(keep)):
+                planned_parametrizations.append(record)
+                continue
+
+            projected = dict(record)
+            if record["name"] in indexed_names:
+                projected["value"] = _project_indexed_override(
+                    record["value"],
+                    old_indices,
+                    keep,
+                    core_shape,
+                    context=(
+                        f"Slice parametrization {record_number} for mechanism "
+                        f"{record['mechanism_name']!r}, parameter {record['name']!r}"
+                    ),
+                )
+            projected["core_indices"] = old_indices[keep].clone()
+            projected["mechanism_class"] = mechanism
+            planned_parametrizations.append(projected)
+
+        # Commit only after support and every affected value have been validated.
+        if planned_everywhere is None:
+            self._mech_everywhere.pop(mechanism, None)
+            self._mech_exclusions.pop(mechanism, None)
+        else:
+            self._mech_everywhere[mechanism] = planned_everywhere
+            if planned_exclusions is None or planned_exclusions.numel() == 0:
+                self._mech_exclusions.pop(mechanism, None)
+            else:
+                self._mech_exclusions[mechanism] = planned_exclusions.clone()
+
+        if planned_records:
+            self._mech_data[mechanism] = planned_records
+            if planned_sparse_ic is not None:
+                self._mech_data_ic[mechanism] = planned_sparse_ic
+        else:
+            self._mech_data.pop(mechanism, None)
+            if planned_everywhere is None:
+                self._mech_data_ic.pop(mechanism, None)
+                self._mech_data_base_kwargs.pop(mechanism, None)
+        self._slice_mechanism_parametrizations = planned_parametrizations
+        return True
 
     def _register_slice_mechanism_parametrization(
         self,
         mechanism_name,
+        mechanism_class,
         name,
         value,
         core_indices,
@@ -2907,6 +3779,7 @@ class Population(P, Sliceable):
         self._slice_mechanism_parametrizations.append(
             {
                 "mechanism_name": str(mechanism_name),
+                "mechanism_class": mechanism_class,
                 "name": str(name),
                 "value": value,
                 "core_indices": torch.as_tensor(
@@ -3169,6 +4042,29 @@ class Population(P, Sliceable):
                 self._material_process_source, getattr(mech, "_source_material", {})
             )
 
+    def _reset_compiled_mechanism_registries(self):
+        """Clear metadata derived exclusively from the pending insertion config."""
+        self._m_list = []
+        self._m_name = []
+        self._m_keys = []
+        self._m_curr = {}
+        self._m_shape = {}
+
+        self._ion_read = {}
+        self._ion_write = {}
+        self._ion_write_c = {}
+
+        self._material_read = {}
+        self._material_write = {}
+        self._material_source = {}
+        self._material_process_read = {}
+        self._material_process_write = {}
+        self._material_process_source = {}
+
+        self._all_read = {}
+        self._all_write = {}
+        self._all_write_c = {}
+
     # -- Device and dtype methods --
 
     def cuda(self, device=None):
@@ -3294,6 +4190,11 @@ class Population(P, Sliceable):
         if self.is_built and not (force_rebuild or self._flag_rebuild):
             return self
 
+        # Every entry below is derived from _mech_everywhere/_mech_data. A
+        # rebuild must start from a blank registry; appending to the previous
+        # graph leaves removed mechanisms, currents, ions, and materials live.
+        self._reset_compiled_mechanism_registries()
+
         canonical_configs = {}
         configured_names = {}
         for configured_name, config in self._material_configs.items():
@@ -3322,15 +4223,50 @@ class Population(P, Sliceable):
 
         with conc, eq:
             for mech, (name, ic, kwargs) in self._mech_everywhere.items():
-                key = None
-                shape = self._calc_shape_p()
-                shape_f = self.shape
-                if hasattr(mech, "normalize_random_kwargs"):
-                    kwargs = mech.normalize_random_kwargs(kwargs)
-                mech.check_kwargs(kwargs)
-                m = mech(
-                    name, self.celsius, self.diam, shape, shape_f, key, ic=ic, **kwargs
-                )
+                excluded = torch.as_tensor(
+                    self._mech_exclusions.get(mech, []), dtype=torch.long
+                ).reshape(-1)
+                if excluded.numel() == 0:
+                    key = None
+                    shape = self._calc_shape_p()
+                    shape_f = self.shape
+                    if hasattr(mech, "normalize_random_kwargs"):
+                        kwargs = mech.normalize_random_kwargs(kwargs)
+                    mech.check_kwargs(kwargs)
+                    m = mech(
+                        name,
+                        self.celsius,
+                        self.diam,
+                        shape,
+                        shape_f,
+                        key,
+                        ic=ic,
+                        **kwargs,
+                    )
+                else:
+                    all_indices = torch.arange(
+                        math.prod(self.core_shape()), dtype=torch.long
+                    )
+                    remaining = all_indices[~torch.isin(all_indices, excluded)]
+                    if remaining.numel() == 0:
+                        raise RuntimeError(
+                            f"Mechanism {mech.__name__!r} has no remaining "
+                            "support but is still configured for insertion."
+                        )
+                    remaining_key = _core_key_from_flat(
+                        remaining, tuple(self.core_shape())
+                    )
+                    m, shape, key = compile_mechanism(
+                        self,
+                        mech,
+                        [remaining_key],
+                        [None],
+                        [{}],
+                        ic=ic,
+                        base_kwargs=kwargs,
+                        name=name,
+                        force_flat=True,
+                    )
                 self._register_mech(m, shape, key)
 
             for mech, data in self._mech_data.items():
@@ -3340,22 +4276,9 @@ class Population(P, Sliceable):
                 preserve_duplicate_indices = []
                 copies_list = []
                 for record in data:
-                    if len(record) == 3:
-                        alias, kwargs, key = record
-                        preserve = False
-                        copies = 1
-                    elif len(record) == 4:
-                        alias, kwargs, key, preserve = record
-                        copies = 1
-                    elif len(record) == 5:
-                        alias, kwargs, key, preserve, copies = record
-                    else:
-                        raise ValueError(
-                            "Mechanism insertion records must contain either "
-                            "(alias, kwargs, key), "
-                            "(alias, kwargs, key, preserve_duplicate_indices), "
-                            "or (alias, kwargs, key, preserve_duplicate_indices, copies)."
-                        )
+                    alias, kwargs, key, preserve, copies = (
+                        _unpack_mechanism_insertion_record(record)
+                    )
                     aliases.append(alias)
                     kwargs_list.append(kwargs)
                     keys.append(key)
@@ -3375,6 +4298,8 @@ class Population(P, Sliceable):
                     kwargs_list,
                     preserve_duplicate_indices=preserve_duplicate_indices,
                     copies=copies_list,
+                    ic=self._mech_data_ic.get(mech),
+                    base_kwargs=self._mech_data_base_kwargs.get(mech),
                 )
                 self._register_mech(m, shape, key)
 
@@ -7484,6 +8409,11 @@ def compile_mechanism(
     kwargs_list,
     preserve_duplicate_indices=None,
     copies=None,
+    *,
+    ic=None,
+    base_kwargs=None,
+    name=None,
+    force_flat=False,
 ):
     """
     Compile a mechanism over a set of indices with alias-specific parameters.
@@ -7507,6 +8437,15 @@ def compile_mechanism(
     copies : list of int, optional
         Per-insertion copy counts. Values greater than one allocate repeated
         independent local mechanism slots for the selected region.
+    ic : dict, optional
+        Class-wide initial-condition overrides for the compiled mechanism.
+    base_kwargs : dict, optional
+        Constructor-level parameters applied uniformly across the compiled
+        support. Alias-specific values remain in ``kwargs_list``.
+    name : str, optional
+        Explicit runtime mechanism name.
+    force_flat : bool, optional
+        Store an otherwise composable placement as a flat sparse slot axis.
 
     Returns
     -------
@@ -7535,6 +8474,42 @@ def compile_mechanism(
             indices, model.core_shape()
         )
 
+    base_kwargs = dict(base_kwargs or {})
+
+    def cannot_target_composed_shape(value):
+        if isinstance(value, torch.nn.Module):
+            return False
+        try:
+            value = torch.as_tensor(value)
+        except (TypeError, ValueError):
+            return False
+        if value.ndim == 0:
+            return False
+        try:
+            torch.broadcast_to(value, shape)
+        except RuntimeError:
+            return value.numel() == math.prod(shape)
+        return False
+
+    indexed_base_names = _mechanism_spatial_parameter_names(mechanism)
+    shape_sensitive_values = [
+        value for key, value in base_kwargs.items() if key in indexed_base_names
+    ]
+    if ic is not None:
+        shape_sensitive_values.extend(ic.values())
+    force_flat = bool(
+        force_flat
+        or (
+            is_composable
+            and any(cannot_target_composed_shape(v) for v in shape_sensitive_values)
+        )
+    )
+    if force_flat and is_composable:
+        core_grid = np.arange(math.prod(model.core_shape())).reshape(model.core_shape())
+        total_index = np.asarray(core_grid[total_index]).reshape(-1).tolist()
+        shape = (len(total_index),)
+        is_composable = False
+
     shape_p = shape
     shape_f = shape
 
@@ -7560,9 +8535,12 @@ def compile_mechanism(
             additional_parameters.setdefault(k, []).append((alias, v, idx))
 
     mechanism.check_kwargs(additional_parameters)
+    if hasattr(mechanism, "normalize_random_kwargs"):
+        base_kwargs = mechanism.normalize_random_kwargs(base_kwargs)
+    mechanism.check_kwargs(base_kwargs)
 
     m = mechanism(
-        None,
+        name,
         model.celsius,
         model.diam,
         shape_p,
@@ -7570,6 +8548,8 @@ def compile_mechanism(
         key=total_index,
         is_composable=is_composable,
         additional_parameters=additional_parameters,
+        ic=ic,
+        **base_kwargs,
     )
 
     return m, shape_p, total_index

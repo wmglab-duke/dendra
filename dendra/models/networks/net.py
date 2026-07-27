@@ -1436,6 +1436,24 @@ class Network(RNGMixin):
             return target.slot_to_flat_index
         return None
 
+    def _require_live_target_synapse(self, target_model, synapse):
+        """Reject mechanism objects whose owning Population has been rebuilt."""
+        handler = getattr(target_model, "mech", None)
+        mechanisms = getattr(handler, "mechanisms", {})
+        name = getattr(synapse, "name", None)
+        live = mechanisms[name] if name is not None and name in mechanisms else None
+        if live is not synapse:
+            raise RuntimeError(
+                "The postsynaptic mechanism object is stale or does not belong "
+                f"to the current mechanism graph of population "
+                f"{getattr(target_model, 'name', '<unnamed>')!r}. Population "
+                "mechanisms are replaced by structural rebuilds. Reacquire the "
+                "mechanism (and recreate any SynapseSlots); if connection "
+                "specifications already exist, call network.clear_synapses() "
+                "and reconnect them."
+            )
+        return synapse
+
     def _validate_target_synapse_endpoint(self, target, synapse):
         if isinstance(target, SynapseSlots):
             if synapse is not None and synapse is not target.synapse:
@@ -1443,13 +1461,13 @@ class Network(RNGMixin):
                     "The target SynapseSlots selection belongs to a different "
                     "mechanism than the supplied synapse argument."
                 )
-            return target.synapse
+            return self._require_live_target_synapse(target.model, target.synapse)
         if synapse is None:
             raise TypeError(
                 "A postsynaptic synapse mechanism is required unless target is "
                 "a SynapseSlots selection."
             )
-        return synapse
+        return self._require_live_target_synapse(target.model, synapse)
 
     def _target_post_idx(self, target_model, post_ids, synapse, target):
         """Convert generated target ids to synapse-local NetCon indices."""
@@ -2659,6 +2677,7 @@ class Network(RNGMixin):
                     "network.attach_netstim(netstim) before build()."
                 )
             post = self.populations[post_name]
+            self._require_live_target_synapse(post, synapse)
             pre_device = pre.device()
             pre_dtype = pre.dtype()
             post_device = post.device()
@@ -2747,6 +2766,7 @@ class Network(RNGMixin):
                     "network.attach_netstim(netstim) before build()."
                 )
             post = self.populations[post_name]
+            self._require_live_target_synapse(post, synapse)
             pre_device = pre.device()
             pre_dtype = pre.dtype()
             post_device = post.device()

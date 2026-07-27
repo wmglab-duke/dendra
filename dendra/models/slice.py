@@ -328,7 +328,8 @@ class Slice:
     * Provides methods for reading and writing model and mechanism state
       restricted to that selection.
     * Supports targeted intracellular current injections via :meth:`inject`.
-    * Restricts mechanism insertion to that subset via :meth:`insert`.
+    * Restricts mechanism insertion and removal to that subset via
+      :meth:`insert`, :meth:`delete`, and :meth:`delete_all`.
     * Can itself be sliced again; see *Nested slices* below.
 
     Importantly, a :class:`Slice` does **not** own any numerical state.
@@ -1494,9 +1495,8 @@ class Slice:
             the model. If ``None``, the default aliasing behaviour of
             ``model.insert`` is used.
         ic : Any, optional
-            Optional initial-conditions object or configuration passed through
-            to the underlying ``insert`` call. (Exact semantics depend on the
-            population implementation.)
+            Optional initial-condition mapping. It is class-wide because all
+            regions of one mechanism class compile into one mechanism instance.
         preserve_duplicate_indices : bool, optional
             If True, duplicate selected compartments are retained as independent
             mechanism slots.  This is useful for colocated point-process banks
@@ -1508,7 +1508,9 @@ class Slice:
             Number of independent copies of this insertion region to allocate.
             ``copies > 1`` implies duplicate preservation.
         **kwargs
-            Additional keyword arguments forwarded to ``model.insert``.
+            Mechanism parameters forwarded to ``model.insert``. RANGE/BATCH
+            values apply to this Slice; GLOBAL values are class-wide and must
+            agree across insertion records for the same mechanism class.
 
         Notes
         -----
@@ -1542,6 +1544,57 @@ class Slice:
             copies=copies,
             **kwargs,
         )
+
+    def delete(self, mechanism, *, strict=False):
+        """Delete a mechanism class where it intersects this Slice.
+
+        Parameters
+        ----------
+        mechanism : type
+            Exact mechanism class to remove.
+        strict : bool, default False
+            If True, require every selected physical compartment to host the
+            mechanism and fail atomically otherwise. If False, remove the
+            mechanism only where it is present.
+
+        Notes
+        -----
+        Overlapping insertion aliases are all cropped, and every
+        copied/duplicate mechanism slot at a selected physical compartment is
+        removed. On a batched population, the Slice is projected onto the
+        shared structural core, so the deletion applies to every batch replica.
+        Calling this method on an empty Slice is a no-op. Reinitialize the
+        population after a successful deletion.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            # Remove pas from dendrites while retaining it in the soma.
+            pop.dendrites.delete(pas)
+
+            # Remove the class from all remaining compartments.
+            pop.delete(pas)
+        """
+        if self.is_empty:
+            return
+        root = object.__getattribute__(self, "root_model")
+        structural_index = self._core_index_spec()
+        root.delete(mechanism, index=structural_index, strict=strict)
+
+    def delete_all(self):
+        """Delete every mechanism class present anywhere in this Slice.
+
+        The operation uses physical support-intersection semantics for each
+        exact configured class and is transactional across classes. On a
+        batched Population the structural selection applies to every replica.
+        An empty Slice is a no-op. Reinitialize after a successful deletion.
+        """
+        if self.is_empty:
+            return
+        root = object.__getattribute__(self, "root_model")
+        structural_index = self._core_index_spec()
+        root.delete_all(index=structural_index)
 
     def parametrize(self, name, value, alias=None):
         """
@@ -1598,7 +1651,7 @@ class Slice:
                 core_shape,
             )
 
-        model.parametrize(
+        resolved_alias = model.parametrize(
             name,
             value,
             key=self._parameter_key(model, name),
@@ -1606,13 +1659,20 @@ class Slice:
         )
         if persistent_region is not None:
             core_indices, core_shape = persistent_region
+            mechanism_class = type(model)
+            resolve_class = getattr(
+                root, "_configured_mechanism_class_for_instance", None
+            )
+            if resolve_class is not None:
+                mechanism_class = resolve_class(mechanism_name, model)
             root._register_slice_mechanism_parametrization(
                 mechanism_name,
+                mechanism_class,
                 name,
                 value,
                 core_indices,
                 core_shape,
-                alias,
+                resolved_alias,
             )
 
     def label(self, name: str, *, replace: bool = False):

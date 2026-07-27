@@ -1005,7 +1005,7 @@ class Mechanism(Parameterized):
             for state_name in state_names:
                 if state_name in self._init_params:
                     buffer_tensor = (
-                        torch.tensor(
+                        torch.as_tensor(
                             self._init_params[state_name],
                             device=v_init.device,
                             dtype=v_init.dtype,
