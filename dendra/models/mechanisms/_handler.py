@@ -297,6 +297,18 @@ class MechanismHandler(torch.nn.Module):
 
         self.write_ion_c = write_ion_c if write_ion_c is not None else {}
         self.read_ion = read_ion if read_ion is not None else {}
+        self._ion_current_reads = tuple(
+            (ion, f"i{ion}", mech_name)
+            for ion, mechanism_reads in self.read_ion.items()
+            for mech_name, fields in mechanism_reads.items()
+            if f"i{ion}" in fields
+        )
+        self.current_read_ions = tuple(
+            sorted({ion for ion, _, _ in self._ion_current_reads})
+        )
+        self._ion_current_reader_names = tuple(
+            dict.fromkeys(mech_name for _, _, mech_name in self._ion_current_reads)
+        )
         self.read_material = read_material if read_material is not None else {}
         self.write_material = write_material if write_material is not None else {}
         self.source_material = source_material if source_material is not None else {}
@@ -328,6 +340,18 @@ class MechanismHandler(torch.nn.Module):
             for material_name, material in materials.items():
                 self.materials[material_name] = material
                 setattr(self, f"{material_name}_material", material)
+
+        # Safe defaults for directly constructed handlers. ``make_maps``
+        # replaces these with dependency-specialized tuples during normal
+        # Population initialization.
+        self._pre_current_mechanism_names = tuple(self.mechanisms)
+        self._current_evaluation_mechanisms = tuple(self.mechanisms.values())
+        self._ion_current_frame_ions = tuple(sorted(self.ions))
+        current_names = tuple(self.currents)
+        self._ion_current_frame_indices = tuple(
+            current_names.index(f"i{ion}") if f"i{ion}" in current_names else -1
+            for ion in self._ion_current_frame_ions
+        )
 
         for process in self.material_processes.values():
             process.bind_materials(self._get_material, population=population)
@@ -405,6 +429,61 @@ class MechanismHandler(torch.nn.Module):
                     )
                     self._map_exp.append((c_idx, mech, f"{ion}", scale_f))
 
+        current_names = tuple(self.currents)
+        current_name_to_index = {
+            current_name: current_index
+            for current_index, current_name in enumerate(current_names)
+        }
+        self._ion_current_frame_ions = tuple(sorted(self.ions))
+        self._ion_current_frame_indices = tuple(
+            current_name_to_index.get(f"i{ion}", -1)
+            for ion in self._ion_current_frame_ions
+        )
+        self._ion_current_indices = tuple(
+            current_name_to_index[f"i{ion}"]
+            for ion in self.current_read_ions
+            if f"i{ion}" in current_name_to_index
+        )
+        current_index_set = set(self._ion_current_indices)
+        self._map_exp_ion_reads = tuple(
+            entry for entry in self._map_exp if entry[0] in current_index_set
+        )
+        source_mechanisms = []
+        for _, mech, _, _ in self._map_exp_ion_reads:
+            if all(mech is not source for source in source_mechanisms):
+                source_mechanisms.append(mech)
+        self._ion_current_sources = tuple(source_mechanisms)
+
+        reader_names = set(self._ion_current_reader_names)
+        current_source_names = {
+            mech_name
+            for current_map in self.currents.values()
+            for mech_name in current_map
+        }
+        cyclic = sorted(reader_names.intersection(current_source_names))
+        if cyclic:
+            raise ValueError(
+                "Mechanisms that READ iion cannot also contribute membrane "
+                f"current in the same scheduler phase: {cyclic}. Split current "
+                "generation and current-driven state into separate mechanisms."
+            )
+        current_reading_voltage_processes = sorted(
+            name for name in reader_names if name in self.voltage_processes
+        )
+        if current_reading_voltage_processes:
+            raise ValueError(
+                "VoltageProcess mechanisms cannot READ iion because voltage "
+                "processes run before current evaluation: "
+                f"{current_reading_voltage_processes}."
+            )
+
+        self._pre_current_mechanism_names = tuple(
+            name for name in self.mechanisms if name not in reader_names
+        )
+        self._current_evaluation_mechanisms = tuple(
+            self.mechanisms[name] for name in self._pre_current_mechanism_names
+        )
+
     def initialize(self, v, celsius, diameters, populate=True, random_generation=None):
         self._sync_celsius(celsius)
         self.make_maps()
@@ -417,8 +496,22 @@ class MechanismHandler(torch.nn.Module):
         self.init_i_g_bufs(v)
         self.read_from_ions()
         self.read_from_materials()
-        self.compute_initial_conditions(v)
-        self.i(v)
+        if self._ion_current_reads:
+            for mech_name in self._pre_current_mechanism_names:
+                mech = self.mechanisms[mech_name]
+                mech._init_buffers_s(mech.get(v))
+            self.i(v)
+            initial_frame = self.capture_ion_current_frame()
+            self._publish_ion_current_frame(initial_frame)
+            for mech_name in self._ion_current_reader_names:
+                mech = self.mechanisms[mech_name]
+                local_v = mech.get(v)
+                mech._init_buffers_s(local_v)
+                mech.breakpoint(local_v)
+        else:
+            self.compute_initial_conditions(v)
+            self.i(v)
+            self._publish_ion_current_frame(self.capture_ion_current_frame())
         self.write_to_ions(v)
         self.write_to_materials(v)
         for ion in self.ions.values():
@@ -669,26 +762,161 @@ class MechanismHandler(torch.nn.Module):
                     for s in mech.DE.values():
                         s._buffers[conc] = ion_conc
 
-    def advance(self, v, dt, temp):
-        for mech_name, mech in self.mechanisms.items():
-            mech._advance(mech.get(v), dt)
+    def capture_ion_current_frame(self):
+        """Return the latest per-ion currents as an ephemeral solver frame.
 
-        # write ion concentrations and generic material fields
+        Frame slots follow ``_ion_current_frame_ions`` and retain their
+        autograd graphs. Current evaluation rebinds its scratch tensors, so a
+        captured Runge--Kutta stage remains stable across later stages.
+        """
+        frame = []
+        for ion, current_index in zip(
+            self._ion_current_frame_ions, self._ion_current_frame_indices
+        ):
+            if current_index >= 0:
+                frame.append(self._buf_i[current_index])
+            else:
+                frame.append(torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"]))
+        return tuple(frame)
+
+    def capture_ion_conductance_frame(self):
+        """Return per-ion conductances aligned with the latest current frame."""
+        frame = []
+        for ion, current_index in zip(
+            self._ion_current_frame_ions, self._ion_current_frame_indices
+        ):
+            if current_index >= 0:
+                frame.append(self._buf_g[current_index])
+            else:
+                frame.append(torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"]))
+        return tuple(frame)
+
+    def _publish_ion_current_frame(self, current_frame):
+        """Commit a solver-selected frame to shared ions and local readers."""
+        if len(current_frame) != len(self._ion_current_frame_ions):
+            raise ValueError(
+                "Ion-current frame has "
+                f"{len(current_frame)} slots; expected "
+                f"{len(self._ion_current_frame_ions)}."
+            )
+
+        frame_by_ion = {}
+        for ion, current in zip(self._ion_current_frame_ions, current_frame):
+            current_field = f"i{ion}"
+            self.ions[ion]._buffers[current_field] = current
+            frame_by_ion[ion] = current
+
+        for ion, current_field, mech_name in self._ion_current_reads:
+            current = frame_by_ion[ion]
+            mech = self.mechanisms[mech_name]
+            local_current = mech.get(current)
+            mech._buffers[current_field] = local_current
+            for state in mech.DE.values():
+                state._buffers[current_field] = local_current
+
+    def _read_current_from_ions(self, v):
+        """Refresh declared ionic-current reads before state advancement.
+
+        Re-evaluate currents at the voltage and channel state presented to
+        this advance. The shared ``i{ion}`` buffer may otherwise contain an
+        intermediate solver-stage or diagnostic evaluation. Pull only the
+        current fields here so existing concentration phase semantics remain
+        unchanged.
+        """
+        if not self._ion_current_reads:
+            return
+
+        for source in self._ion_current_sources:
+            source.breakpoint(source.get(v))
+
+        for current_index in self._ion_current_indices:
+            self._buf_i[current_index] = torch.zeros_like(self._buf_i[current_index])
+
+        for c_idx, mech, fn, scale_f in self._map_exp_ion_reads:
+            current = scale_f(getattr(mech, fn)(mech.get(v)))
+            mech.add_(self._buf_i[c_idx], current)
+
+        for ion, current_field, _ in self._ion_current_reads:
+            if self.update_ion_buf.get(ion, False):
+                buffer_index = self.ion_to_buff_idx[ion]
+                self.ions[ion]._buffers[current_field] = self._buf_i[buffer_index]
+            else:
+                self.ions[ion]._buffers[current_field] = torch.zeros_like(
+                    self.ions[ion]._buffers[current_field]
+                )
+
+        for ion, current_field, mech_name in self._ion_current_reads:
+            mech = self.mechanisms[mech_name]
+            current = mech.get(self.ions[ion]._buffers[current_field])
+            mech._buffers[current_field] = current
+            for state in mech.DE.values():
+                state._buffers[current_field] = current
+
+    def _finish_advance(self, v, dt, temp):
+        """Commit mechanism writes and refresh all shared derived state."""
         self.write_to_ions(v)
         self.write_to_materials(v)
 
-        # run full-field material processes such as diffusion
         self.advance_material_processes(dt)
 
-        # update equilibrium potentials and generic material guards/derived fields
         for ion in self.ions.values():
             ion.advance(temp)
         for material in self.materials.values():
             material.advance(temp)
 
-        # read ion concentrations/equilibria and generic material fields
         self.read_from_ions()
         self.read_from_materials()
+
+    def advance_pre_current(self, v, dt, temp):
+        """Advance state without a declared dependency on this step's iion."""
+        if not self._ion_current_reads:
+            self.advance(v, dt, temp)
+            return
+
+        for mech_name in self._pre_current_mechanism_names:
+            mech = self.mechanisms[mech_name]
+            mech._advance(mech.get(v), dt)
+
+    def advance_post_current(self, v, dt, temp, current_frame):
+        """Publish the accepted current, advance its readers, and commit state.
+
+        Current readers receive the same state-update voltage used by the
+        pre-current phase. The accepted frame supplies the solver's current
+        quadrature (midpoint/RK-weighted/linearized endpoint). This split is
+        exact for flux-driven states such as concentration dynamics; a state
+        coupled independently to solver-stage voltage requires a dedicated
+        coupled integrator.
+        """
+        if not self._ion_current_reads:
+            self._publish_ion_current_frame(current_frame)
+            return
+
+        self._publish_ion_current_frame(current_frame)
+        for mech_name in self._ion_current_reader_names:
+            mech = self.mechanisms[mech_name]
+            local_v = mech.get(v)
+            mech.breakpoint(local_v)
+            mech._advance(local_v, dt)
+
+        self._finish_advance(v, dt, temp)
+
+    def advance(self, v, dt, temp):
+        """Compatibility one-shot advance that refreshes declared iion reads.
+
+        Stable integrators use ``advance_pre_current`` and
+        ``advance_post_current`` so the solver-selected current frame is the
+        only frame published to ions and current-reading mechanisms.
+        """
+        self._read_current_from_ions(v)
+
+        for mech_name in self._ion_current_reader_names:
+            mech = self.mechanisms[mech_name]
+            mech.breakpoint(mech.get(v))
+
+        for mech_name, mech in self.mechanisms.items():
+            mech._advance(mech.get(v), dt)
+
+        self._finish_advance(v, dt, temp)
 
     def detach_i_g_bufs(self):
         if not self.i_g_buffers_initialized:
@@ -709,8 +937,12 @@ class MechanismHandler(torch.nn.Module):
             material.detach()
         self.detach_i_g_bufs()
 
+    # Current evaluators fill ephemeral scratch and preserve the normal
+    # breakpoint/SAVE side effects, but do not overwrite committed shared Ion
+    # or current-reader fields. ``advance_post_current`` publishes the frame
+    # selected by the solver.
     def i(self, v):
-        for mech in self.mechanisms.values():
+        for mech in self._current_evaluation_mechanisms:
             mech.breakpoint(mech.get(v))
 
         if not self.currents:
@@ -733,15 +965,10 @@ class MechanismHandler(torch.nn.Module):
         tot_i = torch.stack(self._buf_i).sum(dim=0)
         tot_g = torch.stack(self._buf_g).sum(dim=0)
 
-        # expose per-ion currents
-        for ion, ion_h in self.ions.items():
-            if self.update_ion_buf.get(ion, False):
-                ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
-
         return tot_i, tot_g
 
     def iexp(self, v):
-        for mech in self.mechanisms.values():
+        for mech in self._current_evaluation_mechanisms:
             mech.breakpoint(mech.get(v))
 
         if not self.currents:
@@ -758,15 +985,10 @@ class MechanismHandler(torch.nn.Module):
         # sum up currents and conductances
         tot_i = torch.stack(self._buf_i).sum(dim=0)
 
-        # expose per-ion currents
-        for ion, ion_h in self.ions.items():
-            if self.update_ion_buf.get(ion, False):
-                ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
-
         return tot_i
 
     def idf(self, v, v_prev):
-        for mech in self.mechanisms.values():
+        for mech in self._current_evaluation_mechanisms:
             mech.breakpoint(mech.get(v))
 
         if not self.currents:
@@ -812,10 +1034,6 @@ class MechanismHandler(torch.nn.Module):
         for c_idx, mech, fn, scale_f in self._map_exp:
             i = scale_f(getattr(mech, fn)(mech.get(v)))
             mech.add_(self._buf_i[c_idx], i)
-
-        for ion, ion_h in self.ions.items():
-            if self.update_ion_buf.get(ion, False):
-                ion_h._buffers[f"i{ion}"] = self._buf_i[self.ion_to_buff_idx[ion]]
 
         return torch.stack(self._buf_i).sum(dim=0)
 

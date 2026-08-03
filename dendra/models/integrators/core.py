@@ -266,6 +266,58 @@ class Integrator(torch.nn.Module):
         self.compile_scope = "population"
         self.configure_jit(model, scope="population")
 
+    def _advance_pre_current(self, v, dt, temp):
+        """Advance mechanism state that does not depend on this step's current.
+
+        ``MechanismHandler`` exposes a phased scheduler. The fallback keeps
+        lightweight/custom mechanism handlers compatible with the integrator
+        API used by tests and downstream projects.
+        """
+        advance = getattr(self.mech, "advance_pre_current", None)
+        if advance is None:
+            self.mech.advance(v, dt, temp)
+        else:
+            advance(v, dt, temp)
+
+    def _advance_post_current(self, v, dt, temp, ion_current_frame):
+        """Commit an accepted ionic-current frame and finish mechanism state."""
+        advance = getattr(self.mech, "advance_post_current", None)
+        if advance is not None:
+            advance(v, dt, temp, ion_current_frame)
+
+    def _capture_ion_current_frame(self):
+        """Capture the current evaluation's reader-facing per-ion currents."""
+        capture = getattr(self.mech, "capture_ion_current_frame", None)
+        return () if capture is None else capture()
+
+    def _capture_ion_conductance_frame(self):
+        """Capture per-ion conductances aligned with the current frame."""
+        capture = getattr(self.mech, "capture_ion_conductance_frame", None)
+        return () if capture is None else capture()
+
+    @staticmethod
+    def _combine_ion_current_frames(frames, weights):
+        """Combine solver-stage frames without detaching their autograd graphs."""
+        if not frames or not frames[0]:
+            return ()
+        return tuple(
+            sum(weight * frame[index] for frame, weight in zip(frames, weights))
+            for index in range(len(frames[0]))
+        )
+
+    @staticmethod
+    def _linearize_ion_current_frame(
+        current_frame,
+        conductance_frame,
+        delta_v,
+        conductance_scale=1.0,
+    ):
+        """Evaluate an affine per-ion frame at a solver-selected voltage."""
+        return tuple(
+            current + conductance_scale * conductance * delta_v
+            for current, conductance in zip(current_frame, conductance_frame)
+        )
+
     def configure_jit(self, model, *, scope: str = "population"):
         """Copy compiler settings from the owner for a specific execution scope.
 

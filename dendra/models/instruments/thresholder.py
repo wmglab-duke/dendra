@@ -105,6 +105,9 @@ class Thresholder:
         bounds are initialised heuristically from ``model.diameters`` using
         ``0.2 / (diameter / 5)**2`` per element. Either ``ub`` must be
         provided or ``model.diameters`` must be set.
+    lb : optional
+        Initial lower bound(s) on threshold amplitudes. If ``None``, lower
+        bounds are initialised to zero.
     fix_bound_up : float, optional
         Multiplicative factor used to increase the upper bound during the
         bound-fixing stage when a response is still clearly subthreshold,
@@ -212,6 +215,7 @@ class Thresholder:
         time: Optional[Waveform] = None,
         bases: Optional[Union[npt.NDArray, Tensor]] = None,
         ub=None,
+        lb=None,
         fix_bound_up=2.0,
         fix_bound_down=0.1,
         max_tries_bound_fix=10,
@@ -219,6 +223,7 @@ class Thresholder:
         atol=None,
         rtol=None,
         chunklength=None,
+        mode="arithmetic",
     ):
         self.model = model
         self.chunklength = chunklength
@@ -236,6 +241,11 @@ class Thresholder:
         self.field_nan_ignore = None
         self._space_no_nan = None
         self._bases_no_nan = None
+
+        valid_modes = ["arithmetic", "geometric"]
+        if mode not in valid_modes:
+            raise ValueError(f"Invalid mode '{mode}'. Valid options are {valid_modes}.")
+        self.mode = mode
 
         if bases is None and (space is None and time is None):
             raise ValueError(
@@ -299,7 +309,15 @@ class Thresholder:
                     )
                 self.ub = 0.2 * torch.ones_like(self.diams) / (self.diams / 5) ** 2
             self.ub_initial = self.ub.clone()
-            self.lb = torch.zeros_like(self.ub)
+            if lb is not None:
+                self.lb = torch.as_tensor(
+                    lb, device=model.device(), dtype=model.dtype()
+                ) * torch.ones(
+                    self.model.np, device=model.device(), dtype=model.dtype()
+                )
+            else:
+                self.lb = torch.zeros_like(self.ub)
+            self.lb_initial = self.lb.clone()
 
         self.fix_bound_up = fix_bound_up
         self.fix_bound_down = fix_bound_down
@@ -807,13 +825,13 @@ class Thresholder:
 
         with torch.no_grad():
             awindow = self.ub - self.lb
-            rwindow = awindow / self.ub
+            rwindow = awindow / (self.lb + 1e-12)
             msk = self.check_tolerance(awindow, rwindow, atol=atol, rtol=rtol)
             msk = msk & ~self._ignored_like(msk)
             tries = 0
 
             while bool(torch.any(msk)) and (tries < self.max_tries_thresh):
-                stimamp = (self.ub + self.lb) / 2
+                stimamp = self.calc_stimamp()
                 mask = self.check_active(
                     tstop, dt, _scale_by_partition(stimamp, self.model_partition)
                 )
@@ -823,7 +841,7 @@ class Thresholder:
                 self.ub[a_thr] = stimamp[a_thr]
                 self.lb[b_thr] = stimamp[b_thr]
                 awindow = self.ub - self.lb
-                rwindow = awindow / self.ub
+                rwindow = awindow / (self.lb + 1e-12)
                 msk = self.check_tolerance(awindow, rwindow, atol=atol, rtol=rtol)
                 msk = msk & ~self._ignored_like(msk)
                 tries += 1
@@ -839,6 +857,14 @@ class Thresholder:
                 self.lb[self.ignore] = torch.nan
 
             return self.ub.cpu(), self.lb.cpu()
+
+    def calc_stimamp(self):
+        if self.mode == "arithmetic":
+            return (self.ub + self.lb) / 2
+        elif self.mode == "geometric":
+            return torch.sqrt(self.ub * self.lb)
+        else:
+            raise ValueError(f"Unknown mode '{self.mode}'.")
 
 
 def op_mc(s: Tensor, t: Tensor) -> Tensor:

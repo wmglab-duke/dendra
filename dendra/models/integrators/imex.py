@@ -302,9 +302,11 @@ class _krylov_etd1(Integrator):
 
     def _step(self, v, dt, temp, ve=None, intra=None):
         dt_s = dt * 1e-3
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
 
         itot, gtot_density = self.mech.i(v)
+        ion_current_frame = self._capture_ion_current_frame()
+        ion_conductance_frame = self._capture_ion_conductance_frame()
 
         v_flat = _flatten_to_solve(v, self.K)
         itot_flat = _flatten_to_solve(itot, self.K)
@@ -345,7 +347,19 @@ class _krylov_etd1(Integrator):
             self.H_buf,
             self.eye_m,
         )
-        return (v_lin + v_nl).reshape(self.base_shape)
+        v_new = (v_lin + v_nl).reshape(self.base_shape)
+
+        # ETD integrates the affine current over its voltage trajectory, so a
+        # unique per-ion average would require ion-wise exponential quadrature.
+        # Use the first-order endpoint value for current-driven state coupling;
+        # it is consistent with this ETD1 method and needs no extra evaluation.
+        accepted_frame = self._linearize_ion_current_frame(
+            ion_current_frame,
+            ion_conductance_frame,
+            v_new - v,
+        )
+        self._advance_post_current(v, dt, temp, accepted_frame)
+        return v_new
 
     def detach(self, model):
         model.v = model.v.detach()

@@ -721,7 +721,7 @@ def test_handler_noncurrent_ion_is_safe_across_current_apis():
     assert torch.count_nonzero(handler.ions["na"].ina) == 0
 
 
-def test_handler_exposes_actual_ionic_current_across_current_apis():
+def test_handler_current_diagnostics_require_explicit_ion_frame_commit():
     shape = (1, 2)
     celsius = torch.full(shape, 34.0, dtype=torch.float64)
     sodium = _SodiumLeak("sodium", celsius, torch.ones(shape), shape, shape).to(
@@ -739,13 +739,17 @@ def test_handler_exposes_actual_ionic_current_across_current_apis():
     handler.init_i_g_bufs(torch.zeros(shape, dtype=torch.float64))
     v = torch.tensor([[-70.0, -50.0]], dtype=torch.float64)
     expected = 0.01 * (v - 50.0)
+    committed = ion.ina.clone()
 
     current, _ = handler.i(v)
     torch.testing.assert_close(current, expected)
-    torch.testing.assert_close(ion.ina, expected)
+    torch.testing.assert_close(ion.ina, committed)
     torch.testing.assert_close(handler.iexp(v), expected)
-    torch.testing.assert_close(ion.ina, expected)
+    torch.testing.assert_close(ion.ina, committed)
     torch.testing.assert_close(handler.itot(v), expected)
+    torch.testing.assert_close(ion.ina, committed)
+
+    handler._publish_ion_current_frame(handler.capture_ion_current_frame())
     torch.testing.assert_close(ion.ina, expected)
 
 

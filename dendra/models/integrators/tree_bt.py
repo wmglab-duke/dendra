@@ -295,13 +295,15 @@ class _dhs_bt(Integrator):
 
     def _step(self, vc, v, dt, temp, ve=None, intra=None):
         # Update mechanisms in mV / mA/cm^2
-        v = self.mech.update_v(v)
-        self.mech.advance(v, dt, temp)
-        itot, gtot = self.mech.i(v)  # itot: mA/cm^2, gtot: S/cm^2
+        v_state = self.mech.update_v(v)
+        self._advance_pre_current(v_state, dt, temp)
+        itot, gtot = self.mech.i(v_state)  # itot: mA/cm^2, gtot: S/cm^2
+        ion_current_frame = self._capture_ion_current_frame()
+        ion_conductance_frame = self._capture_ion_conductance_frame()
 
         # RHS (mechanism order), keep everything in mV/mA/S:
         # d_lin = (g*v - itot) * area  [mA]
-        v_flat = self._flat_voltage(v)
+        v_flat = self._flat_voltage(v_state)
         d_lin = (
             self._flat_voltage(gtot) * v_flat - self._flat_voltage(itot)
         ) * self.area
@@ -347,14 +349,24 @@ class _dhs_bt(Integrator):
         vc_out = X_.index_select(1, inv).reshape(self.base_shape)  # (B,K,3) mV
         v_out = vc_out[..., 0] - vc_out[..., 1]  # membrane (mV)
 
+        i_membrane = None
         if self.imem:
-            v_old = self._flat_voltage(v)
+            v_old = self._flat_voltage(v_state)
             v_new = self._flat_voltage(v_out)
             g_abs = self._flat_voltage(gtot) * self.area
             i_abs_old = self._flat_voltage(itot) * self.area
             i_membrane = ((self.cm_dt + g_abs) * (v_new - v_old) + i_abs_old).reshape(
                 self.shape
             )
+
+        accepted_frame = self._linearize_ion_current_frame(
+            ion_current_frame,
+            ion_conductance_frame,
+            v_out - v_state,
+        )
+        self._advance_post_current(v_state, dt, temp, accepted_frame)
+
+        if self.imem:
             return vc_out, v_out, i_membrane
 
         return vc_out, v_out

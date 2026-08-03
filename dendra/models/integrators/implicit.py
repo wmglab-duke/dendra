@@ -75,8 +75,10 @@ class _bwd_euler_sc(Integrator):
     def _solve(self, v, dt, temp, intra=None):
         # apply voltage processes
         v = self.mech.update_v(v)
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
         itot, gtot = self.mech.i(v)
+        ion_current_frame = self._capture_ion_current_frame()
+        ion_conductance_frame = self._capture_ion_conductance_frame()
 
         denom = self.cmdt + gtot
 
@@ -99,6 +101,13 @@ class _bwd_euler_sc(Integrator):
             i_ion = itot + gtot * (v_new - v)  # mA/cm^2
             i_mem_dens = i_cap + i_ion
             i_membrane = i_mem_dens * self.area  # mA
+
+        accepted_frame = self._linearize_ion_current_frame(
+            ion_current_frame,
+            ion_conductance_frame,
+            v_new - v,
+        )
+        self._advance_post_current(v, dt, temp, accepted_frame)
 
         return v_new, i_membrane
 
@@ -149,15 +158,17 @@ class _bwd_euler_sc_skip(Integrator):
         # custom process that aliases or mutates its input.
         v_old = v.clone() if self.imem else None
         v_new = self.mech.update_v(v)
-        self.mech.advance(v_new, dt, temp)
+        self._advance_pre_current(v_new, dt, temp)
         # No voltage solve/linearization follows, so ``itot`` is the exact
         # mechanism current evaluated at the externally imposed voltage.
         itot, _ = self.mech.i(v_new)
+        ion_current_frame = self._capture_ion_current_frame()
 
         i_membrane = None
         if self.imem:
             i_cap = self.cmdt * (v_new - v_old)
             i_membrane = (i_cap + itot) * self.area
+        self._advance_post_current(v_new, dt, temp, ion_current_frame)
         return v_new, i_membrane
 
 
@@ -360,9 +371,11 @@ class _bwd_euler_ub(Integrator):
         dt_s = dt * 1e-3
 
         v = self.mech.update_v(v)  # apply voltage processes
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
 
         itot, gtot = self.mech.i(v)  # public voltage shape
+        ion_current_frame = self._capture_ion_current_frame()
+        ion_conductance_frame = self._capture_ion_conductance_frame()
 
         v_flat = _flatten_to_solve(v, self.K)
         itot = _flatten_to_solve(itot, self.K)
@@ -424,7 +437,15 @@ class _bwd_euler_ub(Integrator):
             dmem = Cdt + g_abs  # A/V
             i_membrane = (dmem * (v_np1 - v_flat) + i_abs).reshape(self.base_shape)
 
-        return v_np1.reshape(self.base_shape), i_membrane
+        v_new = v_np1.reshape(self.base_shape)
+        accepted_frame = self._linearize_ion_current_frame(
+            ion_current_frame,
+            ion_conductance_frame,
+            v_new - v,
+        )
+        self._advance_post_current(v, dt, temp, accepted_frame)
+
+        return v_new, i_membrane
 
 
 class _bwd_euler_bt(Integrator):
@@ -730,15 +751,17 @@ class _bwd_euler_bt(Integrator):
         xg = self.xg[..., -1]
 
         # apply voltage processes
-        v = self.mech.update_v(v)
+        v_state = self.mech.update_v(v)
 
         # advance gating
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v_state, dt, temp)
 
-        itot, gtot = self.mech.i(v)
+        itot, gtot = self.mech.i(v_state)
+        ion_current_frame = self._capture_ion_current_frame()
+        ion_conductance_frame = self._capture_ion_conductance_frame()
 
         # linearized ionic conductances & reversal
-        v_flat = _flatten_to_solve(v, self.K)
+        v_flat = _flatten_to_solve(v_state, self.K)
         gtot = _flatten_to_solve(gtot, self.K) * self.area
 
         itot = _flatten_to_solve(itot, self.K) * self.area  # (B, K)
@@ -768,13 +791,13 @@ class _bwd_euler_bt(Integrator):
         vc_new = self._solve(self.lower, B_work, self.upper, D_work).reshape(
             self.base_shape
         )  # (model.shape)
-        v = vc_new[..., 0] - vc_new[..., 1]  # v = vi - ve0
+        v_new = vc_new[..., 0] - vc_new[..., 1]  # v = vi - ve0
 
         i_membrane = None
 
         if self.imem:
             vprev_mem = vc[..., 0] - vc[..., 1]
-            delta_v = _flatten_to_solve(v, self.K) - vprev_mem.reshape(-1, self.K)
+            delta_v = _flatten_to_solve(v_new, self.K) - vprev_mem.reshape(-1, self.K)
             i_membrane = (self.cm_dt + gtot) * delta_v + itot
             # ``i_membrane`` follows NEURON's extracellular convention exactly:
             # area * (Cm * (v_new - v_old) / dt + I_ion(v_new)), using Dendra's
@@ -782,9 +805,16 @@ class _bwd_euler_bt(Integrator):
             # result is absolute mA. Applied intracellular stimulus and axial
             # currents affect it only through ``v_new``; neither is itself a
             # transmembrane current term.
-            i_membrane = i_membrane.reshape_as(v)
+            i_membrane = i_membrane.reshape_as(v_new)
 
-        return vc_new, v, i_membrane
+        accepted_frame = self._linearize_ion_current_frame(
+            ion_current_frame,
+            ion_conductance_frame,
+            v_new - v_state,
+        )
+        self._advance_post_current(v_state, dt, temp, accepted_frame)
+
+        return vc_new, v_new, i_membrane
 
 
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
