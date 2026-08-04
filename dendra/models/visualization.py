@@ -1173,6 +1173,7 @@ def vis_threshold_mollweide_2d(
     offset_in_degrees=False,
     normalize_to_min=False,
     mark_min=False,
+    rasterize=True,
     # ───────── interpolation ────────
     grid_res_deg=2.0,
     interp_method="cubic",
@@ -1281,7 +1282,16 @@ def vis_threshold_mollweide_2d(
         fig = plt.figure(figsize=(8, 4.6))
         ax = fig.add_subplot(111, projection="mollweide")
 
-    im = ax.pcolormesh(Lon, Lat, Thr, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+    im = ax.pcolormesh(
+        Lon,
+        Lat,
+        Thr,
+        shading="auto",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        rasterized=rasterize,
+    )
     ax.grid(True, alpha=0.3)
 
     if mark_min:

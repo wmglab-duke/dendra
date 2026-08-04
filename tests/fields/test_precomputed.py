@@ -1,3 +1,4 @@
+import networkx as nx
 import numpy as np
 import pytest
 import torch
@@ -5,8 +6,12 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from dendra.models.fields.precomputed import (
+    EfieldInterpolate3DMesh,
+    EfieldInterpolate3DRect,
     EfieldInterpolate3DScattered,
     PreComputedInterpolate1D,
+    PreComputedInterpolate3DMesh,
+    PreComputedInterpolate3DRect,
     PreComputedInterpolate3DScattered,
 )
 
@@ -235,3 +240,150 @@ def test_shape_mismatch_raises():
     z = torch.zeros(1, 3)  # mismatched shape
     with pytest.raises(RuntimeError):
         interp._interp(x, y, z)
+
+
+def test_interpolate1d_population_row_bank_repeats_over_rank4_batches():
+    x_table = torch.tensor([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]], dtype=torch.float64)
+    data = x_table + torch.tensor([[0.0], [10.0]], dtype=torch.float64)
+    field = PreComputedInterpolate1D(data=data, x=x_table, outside="clamp")
+    query = torch.tensor([0.25, 1.5], dtype=torch.float64)
+    query = query.reshape(1, 1, 1, 2).expand(2, 3, 2, 2).clone()
+    model = DummyModel(query, dtype=torch.float64)
+
+    out = field(model)
+    expected = query + torch.tensor([0.0, 10.0], dtype=torch.float64).view(1, 1, 2, 1)
+
+    assert out.shape == query.shape
+    torch.testing.assert_close(out, expected.expand_as(query))
+
+
+def test_interpolate1d_rejects_ambiguous_table_bank_without_indices():
+    x_table = torch.arange(3.0, dtype=torch.float64).expand(3, -1).clone()
+    field = PreComputedInterpolate1D(data=x_table, x=x_table, outside="clamp")
+    model = DummyModel(torch.ones(2, 2, 2), dtype=torch.float64)
+
+    with pytest.raises(ValueError, match=r"requires D == 1, D == Q, or D == N"):
+        field(model)
+
+
+def test_interpolate1d_explicit_indices_still_map_arbitrary_table_banks():
+    x_table = torch.arange(3.0, dtype=torch.float64).expand(3, -1).clone()
+    data = x_table + torch.tensor([[0.0], [10.0], [20.0]], dtype=torch.float64)
+    field = PreComputedInterpolate1D(data=data, x=x_table, outside="clamp")
+    query = torch.ones(2, 2, 2, dtype=torch.float64)
+    indices = torch.tensor([2, 1, 0, 2])
+
+    out = field(DummyModel(query, dtype=torch.float64), indices=indices)
+    expected = query.reshape(4, 2) + torch.tensor([20.0, 10.0, 0.0, 20.0])[:, None]
+
+    torch.testing.assert_close(out, expected.reshape_as(query))
+
+
+def test_interpolate1d_rejects_empty_explicit_indices():
+    x_table = torch.arange(3.0, dtype=torch.float64).reshape(1, -1)
+    field = PreComputedInterpolate1D(data=x_table, x=x_table, outside="clamp")
+    model = DummyModel(torch.ones(2, 1, 2), dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="at least one LUT-row index"):
+        field(model, indices=[])
+
+
+def _chain_graph(n):
+    graph = nx.DiGraph()
+    graph.add_nodes_from(range(n))
+    graph.add_edges_from((i, i + 1) for i in range(n - 1))
+    return graph
+
+
+def _rank4_model(dtype=torch.float64):
+    x = torch.tensor([0.0, 0.5, 1.0], dtype=dtype)
+    x = x.reshape(1, 1, 1, 3).expand(2, 2, 1, 3).clone()
+    model = DummyModel(x, torch.zeros_like(x), torch.zeros_like(x), dtype=dtype)
+    model.graph = _chain_graph(3)
+    return model
+
+
+def _flatten_model(model):
+    flat = DummyModel(
+        model.x.reshape(-1, model.x.shape[-1]),
+        model.y.reshape(-1, model.y.shape[-1]),
+        model.z.reshape(-1, model.z.shape[-1]),
+        dtype=model.x.dtype,
+    )
+    flat.graph = model.graph
+    return flat
+
+
+def test_rectilinear_and_scattered_scalar_fields_preserve_rank4_shape():
+    axis = torch.tensor([-1.0, 1.0], dtype=torch.float64)
+    scalar_rect = PreComputedInterpolate3DRect(
+        axis, axis, axis, torch.ones(2, 2, 2, dtype=torch.float64)
+    )
+    xyz = torch.tensor(
+        [[-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        dtype=torch.float64,
+    )
+    scalar_scattered = PreComputedInterpolate3DScattered(
+        xyz,
+        torch.ones(3, 1, dtype=torch.float64),
+        method="nearest",
+        k=1,
+        knn_backend="torch",
+    )
+    model = _rank4_model()
+
+    for field in (scalar_rect, scalar_scattered):
+        out = field(model)
+        flat = field(_flatten_model(model)).reshape_as(out)
+        assert out.shape == model.x.shape
+        torch.testing.assert_close(out, flat)
+
+
+def test_rectilinear_and_scattered_vector_fields_preserve_rank4_shape():
+    axis = torch.tensor([-1.0, 1.0], dtype=torch.float64)
+    vector = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
+    rect_values = vector.view(1, 1, 1, 3).expand(2, 2, 2, 3).clone()
+    vector_rect = EfieldInterpolate3DRect(axis, axis, axis, rect_values)
+    xyz = torch.tensor(
+        [[-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        dtype=torch.float64,
+    )
+    vector_scattered = EfieldInterpolate3DScattered(
+        xyz,
+        vector.expand(3, 3).clone(),
+        method="nearest",
+        k=1,
+        knn_backend="torch",
+    )
+    model = _rank4_model()
+
+    for field in (vector_rect, vector_scattered):
+        out = field(model)
+        flat = field(_flatten_model(model)).reshape_as(out)
+        assert out.shape == model.x.shape
+        torch.testing.assert_close(out, flat)
+
+
+class _ConstantMeshInterpolator(torch.nn.Module):
+    def __init__(self, values):
+        super().__init__()
+        self.register_buffer("values", torch.as_tensor(values))
+
+    def forward(self, xyz_q, *, squeeze=False):
+        return self.values.reshape(1, -1).expand(xyz_q.shape[0], -1)
+
+
+def test_mesh_scalar_and_vector_fields_preserve_rank4_shape():
+    scalar = PreComputedInterpolate3DMesh(_ConstantMeshInterpolator([2.0]))
+    vector = EfieldInterpolate3DMesh(_ConstantMeshInterpolator([1.0, 2.0, 3.0]))
+    model = _rank4_model(dtype=torch.float32)
+
+    scalar_out = scalar(model)
+    vector_out = vector(model)
+    scalar_flat = scalar(_flatten_model(model)).reshape_as(scalar_out)
+    vector_flat = vector(_flatten_model(model)).reshape_as(vector_out)
+
+    assert scalar_out.shape == model.x.shape
+    assert vector_out.shape == model.x.shape
+    torch.testing.assert_close(scalar_out, scalar_flat)
+    torch.testing.assert_close(vector_out, vector_flat)

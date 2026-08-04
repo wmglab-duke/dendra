@@ -7,6 +7,8 @@ import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from dendra.models.fields.line import line3d
+
 # ---------------------------------------------------------------------------
 MODULE_NAME = "dendra.models.fields.analytic"
 
@@ -187,3 +189,136 @@ def test_device_and_dtype_propagation_cuda():
     out = efield(model)
     assert out.device == device
     assert out.dtype == torch.float16
+
+
+class ShapedDummyModel:
+    """Dummy preserving an explicitly supplied ``(*batch, N, C)`` shape."""
+
+    def __init__(self, x, y=None, z=None):
+        self.x = torch.as_tensor(x)
+        self.y = torch.zeros_like(self.x) if y is None else torch.as_tensor(y)
+        self.z = torch.zeros_like(self.x) if z is None else torch.as_tensor(z)
+        self.graph = None
+
+    def device(self):
+        return self.x.device
+
+    def dtype(self):
+        return self.x.dtype
+
+
+def test_point_fields_preserve_rank4_model_shape():
+    coords = torch.arange(1.0, 25.0, dtype=torch.float64).reshape(2, 3, 1, 4)
+    for source in (isotropic_point(), anisotropic_point()):
+        out = source.fn(coords, coords + 2.0, coords - 3.0)
+        flat = source.fn(
+            coords.reshape(-1, 4),
+            (coords + 2.0).reshape(-1, 4),
+            (coords - 3.0).reshape(-1, 4),
+        ).reshape_as(coords)
+        assert out.shape == coords.shape
+        torch.testing.assert_close(out, flat)
+
+
+def test_line_field_preserves_rank4_model_shape():
+    source = line3d(
+        start=[-10.0, 0.0, 0.0],
+        end=[10.0, 0.0, 0.0],
+        min_distance=1.0,
+    ).to(dtype=torch.float64)
+    x = torch.arange(24.0, dtype=torch.float64).reshape(2, 3, 1, 4) + 20.0
+    y = x + 3.0
+    z = x - 7.0
+
+    out = source.fn(x, y, z)
+    flat = source.fn(x.reshape(-1, 4), y.reshape(-1, 4), z.reshape(-1, 4)).reshape_as(x)
+
+    assert out.shape == x.shape
+    torch.testing.assert_close(out, flat)
+
+
+def test_parametric_efield_pairs_directions_with_batched_model_lanes():
+    field = parametric_efield(2, 2)
+    n_directions = 4
+    n_compartments = 3
+    x = torch.arange(n_directions * n_compartments, dtype=torch.float64).reshape(
+        n_directions, 1, n_compartments
+    )
+    y = x + 5.0
+    z = x - 2.0
+
+    out = field(ShapedDummyModel(x, y, z))
+
+    expected = []
+    for direction in range(n_directions):
+        generated = field(ShapedDummyModel(x[direction], y[direction], z[direction]))
+        expected.append(generated[direction])
+    expected = torch.stack(expected).unsqueeze(1)
+
+    assert out.shape == x.shape
+    torch.testing.assert_close(out, expected)
+
+
+def test_parametric_efield_single_direction_broadcasts_over_rank4_model():
+    field = parametric_efield(1, 1)
+    z = torch.arange(24.0, dtype=torch.float64).reshape(2, 3, 1, 4)
+    model = ShapedDummyModel(torch.zeros_like(z), z + 7.0, z)
+
+    out = field(model, e_field_strength_Vm=2.5)
+
+    assert out.shape == z.shape
+    torch.testing.assert_close(out, -2.5 * z / 1000.0)
+
+
+def test_parametric_efield_single_direction_preserves_explicit_singleton_axes():
+    field = parametric_efield(1, 1)
+    z = torch.arange(4.0, dtype=torch.float64).reshape(1, 1, 4)
+
+    out = field(ShapedDummyModel(torch.zeros_like(z), z, z))
+
+    assert out.shape == z.shape
+
+
+def test_parametric_efield_single_lane_generation_collapses_singleton_axes():
+    field = parametric_efield(2, 2)
+    z = torch.tensor([[[[0.0, 1000.0]]]], dtype=torch.float64)
+
+    out = field(ShapedDummyModel(torch.zeros_like(z), z, z))
+    reference = field(
+        ShapedDummyModel(
+            torch.zeros(1, 2, dtype=torch.float64),
+            torch.tensor([[0.0, 1000.0]], dtype=torch.float64),
+            torch.tensor([[0.0, 1000.0]], dtype=torch.float64),
+        )
+    )
+
+    assert out.shape == (4, 2)
+    torch.testing.assert_close(out, reference)
+
+
+def test_parametric_efield_rejects_ambiguous_direction_lane_mapping():
+    field = parametric_efield(3, 1)
+    coords = torch.zeros(2, 1, 4)
+
+    with pytest.raises(ValueError, match=r"D=3 and Q=2"):
+        field(ShapedDummyModel(coords))
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.0, 2.5, "2"])
+def test_parametric_efield_requires_strict_positive_integer_counts(value):
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        parametric_efield(value, 1)
+
+
+def test_parametric_efield_casts_integer_like_counts_to_python_int():
+    field = parametric_efield(torch.tensor(2, dtype=torch.long), 1)
+    assert field.n_phi == 2
+    assert type(field.n_phi) is int
+
+
+def test_parametric_gradient_path_rejects_multiple_logical_model_lanes():
+    field = parametric_efield(1, 1, relative_mag_change_per_mm=20.0)
+    coords = torch.zeros(2, 1, 4)
+
+    with pytest.raises(ValueError, match="requires exactly one logical model lane"):
+        field._parametric_efield__forward(ShapedDummyModel(coords))

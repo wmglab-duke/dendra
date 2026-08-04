@@ -33,6 +33,9 @@ class Line(P):
 
     Notes
     -----
+    Model coordinates follow ``(*batch, N, C)`` and the returned scalar lead
+    field preserves that shape exactly; all leading axes are independent.
+
     The source is normalized by the *total* polyline arc length. Its return
     value is therefore the lead field for 1 mA of total current distributed
     uniformly over the whole polyline, not the field for 1 mA per segment or

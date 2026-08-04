@@ -12,50 +12,79 @@ def calculate_quasipotentials_batched_coords(
     z_batch: torch.Tensor,
     e_fields_batch: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Calculate extracellular quasipotentials (ψ) for batches of E-fields and
-    corresponding coordinates using PyTorch.
+    """Integrate E-fields for coordinates with arbitrary leading batch axes.
 
-    Optimized for cases where both the E-field and neuron coordinates vary per
-    batch while the graph topology stays constant. Computations run on the
-    device of the input tensors.
+    The final coordinate axis is always the morphology/node axis. All axes
+    before it are logical population or batch axes and are preserved exactly::
+
+        coordinates:  (*leading, C)
+        E-fields:      (*leading, C, 3)
+        result:        (*leading, C)
+
+    Internally the leading axes are flattened, the common morphology graph is
+    traversed once, and the result is restored to the input coordinate shape.
+    This makes rank-2, rank-3, and higher-rank model coordinates equivalent to
+    evaluating each leading-axis member independently.
 
     Parameters
     ----------
     G : nx.DiGraph
         Directed graph for the constant neuron morphology with edges from
         parent to child; node IDs must match tensor indices.
-    x_batch : torch.Tensor
-        X-coordinates of shape (B, N) in microns (µm).
-    y_batch : torch.Tensor
-        Y-coordinates of shape (B, N) in microns (µm).
-    z_batch : torch.Tensor
-        Z-coordinates of shape (B, N) in microns (µm).
+    x_batch, y_batch, z_batch : torch.Tensor
+        Coordinates of identical shape ``(*leading, C)`` in microns (µm),
+        where ``C`` equals ``G.number_of_nodes()``.
     e_fields_batch : torch.Tensor
-        E-fields of shape (B, N, 3) in Volts/meter (V/m).
+        E-fields of shape ``(*leading, C, 3)`` in Volts/meter (V/m).
 
     Returns
     -------
     torch.Tensor
-        Tensor of shape (B, N) containing the quasipotential ψ for each batch
-        instance and node in millivolts (mV).
+        Quasipotentials in millivolts with the same shape as the coordinate
+        tensors. Device, differentiability, and the common promoted floating
+        dtype of the coordinates and E-field are preserved.
     """
     # --- Step 1: Input Validation and Data Preparation ---
     num_nodes = G.number_of_nodes()
-    batch_size = e_fields_batch.shape[0]
-    device = e_fields_batch.device  # Use the device of the input tensors
+    if num_nodes < 1:
+        raise ValueError("Graph must contain at least one morphology node.")
+    coord_shape = x_batch.shape
 
-    if not (x_batch.shape == y_batch.shape == z_batch.shape == (batch_size, num_nodes)):
+    if x_batch.ndim < 1:
+        raise ValueError("Coordinate tensors must have shape (*leading, C).")
+    if not (x_batch.shape == y_batch.shape == z_batch.shape):
         raise ValueError(
-            f"Shape mismatch: x, y, z batches must have shape ({batch_size}, {num_nodes})."
+            "Shape mismatch: x, y, and z must have identical shapes; got "
+            f"{tuple(x_batch.shape)}, {tuple(y_batch.shape)}, and "
+            f"{tuple(z_batch.shape)}."
         )
-    if e_fields_batch.shape != (batch_size, num_nodes, 3):
+    if coord_shape[-1] != num_nodes:
         raise ValueError(
-            f"Shape mismatch: e_fields_batch must have shape ({batch_size}, {num_nodes}, 3)."
+            "The final coordinate axis must match the morphology graph: "
+            f"got {coord_shape[-1]} compartments but the graph has {num_nodes} nodes."
         )
+    expected_efield_shape = (*coord_shape, 3)
+    if e_fields_batch.shape != expected_efield_shape:
+        raise ValueError(
+            "Shape mismatch: e_fields_batch must have shape "
+            f"{expected_efield_shape}; got {tuple(e_fields_batch.shape)}."
+        )
+    tensors = (x_batch, y_batch, z_batch, e_fields_batch)
+    if not all(t.device == x_batch.device for t in tensors):
+        raise ValueError("Coordinates and E-fields must be on the same device.")
+    if not all(torch.is_floating_point(t) for t in tensors):
+        raise TypeError("Coordinates and E-fields must be floating-point tensors.")
+
+    leading_shape = coord_shape[:-1]
+    batch_size = x_batch.numel() // num_nodes
+    work_dtype = x_batch.dtype
+    for tensor in (y_batch, z_batch, e_fields_batch):
+        work_dtype = torch.promote_types(work_dtype, tensor.dtype)
 
     # Stack coordinates into a single (B, N, 3) tensor for easier indexing.
-    coords_batch = torch.stack([x_batch, y_batch, z_batch], dim=2)
+    coords_batch = torch.stack([x_batch, y_batch, z_batch], dim=-1)
+    coords_batch = coords_batch.reshape(batch_size, num_nodes, 3).to(work_dtype)
+    e_fields_batch = e_fields_batch.reshape(batch_size, num_nodes, 3).to(work_dtype)
 
     # --- Step 2: Unit Conversion ---
     coords_batch_m = coords_batch * 1e-6  # Convert µm to m
@@ -71,8 +100,8 @@ def calculate_quasipotentials_batched_coords(
     psi_batch = torch.full(
         (batch_size, num_nodes),
         torch.nan,
-        dtype=coords_batch.dtype,  # Use the same dtype as coordinates
-        device=device,
+        dtype=work_dtype,
+        device=x_batch.device,
     )
 
     # The queue for the BFS is a standard Python object
@@ -126,4 +155,4 @@ def calculate_quasipotentials_batched_coords(
             f"Warning: Traversal visited {visited_count} nodes, but graph has {num_nodes} nodes."
         )
 
-    return psi_batch
+    return psi_batch.reshape(*leading_shape, num_nodes)

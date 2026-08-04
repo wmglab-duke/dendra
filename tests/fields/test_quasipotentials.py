@@ -228,3 +228,63 @@ def test_large_batch_cuda_smoke():
     psi = calculate_quasipotentials_batched_coords(G, x, y, z, efields)
 
     assert psi.shape == (B, N) and psi.is_cuda
+
+
+def test_arbitrary_leading_axes_match_flattened_lane_evaluation():
+    G = _dummy_graph(3)
+    torch.manual_seed(10)
+    coords = torch.randn(2, 3, 1, 3, 3, dtype=torch.float64)
+    efields = torch.randn(2, 3, 1, 3, 3, dtype=torch.float64)
+    x, y, z = (coords[..., component] for component in range(3))
+
+    actual = calculate_quasipotentials_batched_coords(G, x, y, z, efields)
+    flat = calculate_quasipotentials_batched_coords(
+        G,
+        x.reshape(-1, 3),
+        y.reshape(-1, 3),
+        z.reshape(-1, 3),
+        efields.reshape(-1, 3, 3),
+    )
+
+    assert actual.shape == x.shape
+    torch.testing.assert_close(actual, flat.reshape_as(actual))
+
+
+def test_arbitrary_leading_axes_preserve_gradients_and_promote_dtype():
+    G = _dummy_graph(3)
+    coords = torch.randn(2, 1, 2, 3, 3, dtype=torch.float32, requires_grad=True)
+    efields = torch.randn(2, 1, 2, 3, 3, dtype=torch.float64, requires_grad=True)
+    x, y, z = (coords[..., component] for component in range(3))
+
+    psi = calculate_quasipotentials_batched_coords(G, x, y, z, efields)
+    psi.square().sum().backward()
+
+    assert psi.shape == coords.shape[:-1]
+    assert psi.dtype == torch.float64
+    assert coords.grad is not None and torch.isfinite(coords.grad).all()
+    assert efields.grad is not None and torch.isfinite(efields.grad).all()
+
+
+def test_dtype_promotion_includes_every_coordinate_component():
+    G = _dummy_graph(3)
+    x = torch.randn(2, 1, 3, dtype=torch.float32, requires_grad=True)
+    y = torch.randn(2, 1, 3, dtype=torch.float64, requires_grad=True)
+    z = torch.randn(2, 1, 3, dtype=torch.float32, requires_grad=True)
+    efields = torch.randn(2, 1, 3, 3, dtype=torch.float32, requires_grad=True)
+
+    psi = calculate_quasipotentials_batched_coords(G, x, y, z, efields)
+    psi.square().sum().backward()
+
+    assert psi.dtype == torch.float64
+    for tensor in (x, y, z, efields):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+
+
+def test_arbitrary_leading_axes_validate_full_efield_shape():
+    G = _dummy_graph(3)
+    coords = torch.zeros(2, 1, 3)
+    efields = torch.zeros(2, 3, 3)
+
+    with pytest.raises(ValueError, match="e_fields_batch must have shape"):
+        calculate_quasipotentials_batched_coords(G, coords, coords, coords, efields)
