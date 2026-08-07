@@ -693,6 +693,22 @@ class Slice:
         return self._sync().index
 
     @property
+    def flat_index(self) -> torch.LongTensor:
+        """Return selected locations as population-flat integer indices.
+
+        The result is always a one-dimensional ``torch.long`` tensor on the
+        population's device.  Its order and multiplicity match the flattened
+        Slice result, so scalar selections contain one index, empty selections
+        contain none, and repeated selections retain their repeats.  A fresh
+        tensor is materialized on every access and may be sampled, permuted, or
+        otherwise modified without changing this Slice.  Access materializes
+        an integer grid with one entry per location in the logical population.
+        """
+        spec = self._sync()
+        root = object.__getattribute__(self, "root_model")
+        return _population_flat_indices(root, spec.index)
+
+    @property
     def shape(self):
         """Shape produced by applying :attr:`index` to the underlying population."""
         return self._sync().shape
@@ -1733,6 +1749,14 @@ class Slice:
             )
         if object.__getattribute__(self, "module_path"):
             raise ValueError("Only population-backed Slices can be labelled.")
+
+        slice_api_names = set(type(self)._RESERVED)
+        for cls in type(self).__mro__:
+            slice_api_names.update(vars(cls))
+        if name in slice_api_names:
+            raise ValueError(
+                f"Slice label {name!r} conflicts with an existing Slice API name."
+            )
 
         parent_slice = object.__getattribute__(self, "parent_slice")
         if parent_slice is not None:

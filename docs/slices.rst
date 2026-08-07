@@ -85,6 +85,14 @@ The following introspection has tensor-like meaning:
    The total number of selected entries, including repeated entries.  A scalar
    Slice has one element; an empty Slice has zero.
 
+``selection.flat_index``
+   A one-dimensional ``torch.long`` tensor containing the selected locations as
+   offsets into the flattened root population.  Its order and multiplicity
+   match ``selection``.  The returned tensor is an owned snapshot, so it can be
+   sampled or permuted without changing the retained Slice.  It reflects the
+   population layout at access time; reacquire it after batching or moving the
+   population, and unravel it against the shape from that same layout.
+
 Consequently, ``len(selection)`` and ``selection.numel()`` differ for a
 multidimensional selection:
 
@@ -94,6 +102,22 @@ multidimensional selection:
    assert region.shape == torch.Size([2, 3])
    assert len(region) == 2
    assert region.numel() == 6
+
+The flat numeric form makes arbitrary reordering and subsampling explicit.  To
+turn transformed flat indices back into a Slice, unravel them against the
+population shape:
+
+.. code-block:: python
+
+   flat = region.flat_index
+   order = torch.randperm(flat.numel(), device=flat.device)
+   shuffled_flat = flat[order]
+   shuffled = cells[torch.unravel_index(shuffled_flat, cells.shape)]
+
+   torch.testing.assert_close(
+       shuffled.v,
+       region.v.reshape(-1)[order],
+   )
 
 Reading state returns snapshots
 -------------------------------
