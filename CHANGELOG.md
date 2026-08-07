@@ -1,3 +1,19 @@
+## v0.22.0 (2026-08-07)
+
+### Feat
+
+- **core**: delete mechanisms
+
+### Fix
+
+- **slice**: expose flat_index for slice
+- **fields**: field and thresholder updated to work with batched models
+- **ions**: fix stale ion currents in mechanisms that read ionic currents
+
+### Refactor
+
+- specialized step_population and step_network
+
 ## v0.21.1 (2026-07-17)
 
 ### Fix
