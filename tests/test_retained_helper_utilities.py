@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+from dendra.models.tree import Tree
 from dendra.models.utils import distance, undirected_weighted_lengths
 from dendra.utils.tensor_ops import add_dims_as_necessary, cartesian_product
 
@@ -58,6 +59,75 @@ def test_distance_resolves_slices_against_noninteger_graph_nodes():
 
     # The origin is "middle" and the targets are "root" and "tip".
     torch.testing.assert_close(result, torch.tensor([2.0, 3.5]))
+
+
+def _canonical_tree_graph():
+    graph = nx.DiGraph()
+    for node in (2, 3, 0, 1):
+        region = "soma" if node == 3 else "apic"
+        graph.add_node(
+            node,
+            name=f"Cell.{region}[{node}](0.5)",
+            L=10.0,
+            diam=1.0,
+            Ra=100.0,
+            cm=1.0,
+            area=31.4,
+            x=float(node),
+            y=0.0,
+            z=0.0,
+        )
+    graph.add_edge(3, 0, L=2.0, R_ohm=1.0, diff_geom_um=1.0)
+    graph.add_edge(0, 1, L=3.0, R_ohm=1.0, diff_geom_um=1.0)
+    graph.add_edge(0, 2, L=5.0, R_ohm=1.0, diff_geom_um=1.0)
+
+    return graph
+
+
+def test_distance_resolves_canonical_tree_slices_in_compartment_storage_order():
+    graph = _canonical_tree_graph()
+    cell = Tree.from_graph(graph, N=1)
+
+    assert list(cell.graph.nodes) == [2, 3, 0, 1]
+    assert cell.find("soma") == slice(3, 4)
+    assert cell.find("apic") == slice(0, 3)
+    torch.testing.assert_close(
+        distance(cell, cell.find("soma"), cell.find("apic")),
+        torch.tensor([2.0, 5.0, 7.0]),
+    )
+
+
+def test_distance_accepts_tensor_node_indices_for_canonical_tree():
+    graph = _canonical_tree_graph()
+    cell = Tree.from_graph(graph, N=1)
+
+    torch.testing.assert_close(
+        distance(cell, torch.tensor(3), torch.tensor([0, 2])),
+        torch.tensor([2.0, 7.0]),
+    )
+
+
+def test_distance_rejects_a_misaligned_canonical_graph_view():
+    cell = Tree.from_graph(_canonical_tree_graph(), N=1)
+    cell.graph.remove_node(2)
+
+    with pytest.raises(ValueError, match="not aligned with its canonical"):
+        distance(cell, cell.find("soma"), cell.find("apic"))
+
+
+def test_distance_applies_explicit_scalar_origin_offset():
+    cell = SimpleNamespace(graph=_weighted_graph())
+
+    result = distance(cell, "root", ["middle", "tip"], origin_offset=1.25)
+
+    torch.testing.assert_close(result, torch.tensor([3.25, 6.75]))
+
+
+def test_distance_rejects_non_scalar_origin_offset():
+    cell = SimpleNamespace(graph=_weighted_graph())
+
+    with pytest.raises(ValueError, match="origin_offset must be a scalar"):
+        distance(cell, "root", ["tip"], origin_offset=[1.0, 2.0])
 
 
 def test_distance_reports_missing_graph_and_empty_origin_slice():

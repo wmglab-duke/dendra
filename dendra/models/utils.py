@@ -8,7 +8,25 @@ import torch
 __all__ = ["distance", "undirected_weighted_lengths"]
 
 
-def distance(cell, origin, targets):
+def _slice_resolution_nodes(cell, graph):
+    """Return the node order represented by population compartment slices."""
+    compartment_graph = getattr(cell, "compartment_graph", None)
+    if compartment_graph is None:
+        return list(graph.nodes)
+
+    n_compartments = compartment_graph.n_compartments
+    storage_nodes = range(n_compartments)
+    if graph.number_of_nodes() != n_compartments or set(graph.nodes) != set(
+        storage_nodes
+    ):
+        raise ValueError(
+            "The cell's NetworkX graph is not aligned with its canonical "
+            "compartment graph; expected node IDs 0..n_compartments-1."
+        )
+    return storage_nodes
+
+
+def distance(cell, origin, targets, *, origin_offset=0.0):
     """Return undirected, length-weighted distances between cell compartments.
 
     Parameters
@@ -17,11 +35,18 @@ def distance(cell, origin, targets):
         An object whose ``graph`` attribute is a NetworkX graph. Edges are
         weighted by their ``L`` attribute.
     origin : node label or slice
-        Source node. A slice is resolved against the graph's node iteration
-        order; for compatibility, the first selected node is used.
+        Source node. For a canonical Dendra cell, a slice is resolved against
+        compartment storage order. For a generic graph-bearing object, it is
+        resolved against graph node iteration order. The first selected node
+        is used.
     targets : node label, iterable of node labels, or slice
-        Destination node or nodes. A slice is resolved against the graph's
-        node iteration order.
+        Destination node or nodes. Slice resolution follows the same canonical
+        storage-order or generic graph-order rule as ``origin``.
+    origin_offset : float or scalar tensor, optional
+        Additional path length added to every result. This makes endpoint
+        origins explicit when the graph stores compartment-center distances;
+        for example, a one-segment soma origin at ``soma(0)`` may require half
+        the soma length. Defaults to zero.
 
     Returns
     -------
@@ -33,21 +58,35 @@ def distance(cell, origin, targets):
     Raises
     ------
     ValueError
-        If the cell has no graph or an origin slice selects no nodes.
+        If the graph is unavailable or misaligned with canonical storage, or
+        if an origin, target, or offset selector is invalid.
     """
     graph = cell.graph
     if graph is None:
         raise ValueError("Graph is not defined for this cell.")
 
-    nodes = list(graph.nodes)
+    nodes = _slice_resolution_nodes(cell, graph)
     if isinstance(origin, slice):
         selected = nodes[origin]
         if not selected:
             raise ValueError("The origin slice selects no graph nodes.")
         origin = selected[0]
+    if torch.is_tensor(origin):
+        if origin.numel() != 1:
+            raise ValueError("origin must identify exactly one graph node.")
+        origin = origin.detach().cpu().item()
     if isinstance(targets, slice):
         targets = nodes[targets]
-    return undirected_weighted_lengths(graph, origin, targets)
+    if torch.is_tensor(targets):
+        if targets.ndim > 1:
+            raise ValueError("targets must be a scalar or one-dimensional node list.")
+        targets = targets.detach().cpu()
+        targets = targets.item() if targets.ndim == 0 else targets.tolist()
+    lengths = undirected_weighted_lengths(graph, origin, targets)
+    offset = torch.as_tensor(origin_offset, dtype=lengths.dtype, device=lengths.device)
+    if offset.numel() != 1:
+        raise ValueError("origin_offset must be a scalar path length.")
+    return lengths + offset.reshape(())
 
 
 def undirected_weighted_lengths(G: nx.DiGraph, origin, targets, weight_attr="L"):

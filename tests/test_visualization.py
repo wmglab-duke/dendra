@@ -231,6 +231,75 @@ def test_vis_threshold_mollweide_degree_normalization_and_custom_axis():
     assert returned is ax
     assert ax.figure.axes[-1].get_xlabel() == "Threshold |E| / min"
     assert any(label.get_text() == "0°" for label in ax.get_xticklabels())
+    assert ax.get_ylabel() == r"Polar angle $\theta$"
+
+
+@pytest.mark.parametrize(
+    ("flip_polar", "expected"),
+    [
+        (False, ["180°", "90°", "0°"]),
+        (True, ["0°", "90°", "180°"]),
+    ],
+)
+def test_vis_threshold_mollweide_theta_tick_labels(flip_polar, expected):
+    phi = np.array([-150, -90, -30, 30, 90, 150, -120, 0, 120])
+    theta = np.array([20, 50, 80, 110, 140, 160, 130, 40, 100])
+    threshold = np.arange(1, 10, dtype=float)
+
+    ax = VIS.vis_threshold_mollweide_2d(
+        phi,
+        theta,
+        threshold,
+        angles_in_degrees=True,
+        flip_polar=flip_polar,
+        polar_tick_mode="theta",
+        azimuth_offset=0,
+        offset_in_degrees=True,
+        interp_method="nearest",
+        grid_res_deg=30,
+    )
+    ax.set_yticks([-np.pi / 2, 0.0, np.pi / 2])
+    ax.figure.canvas.draw()
+
+    assert [label.get_text() for label in ax.get_yticklabels()] == expected
+    assert ax.get_ylabel() == r"Polar angle $\theta$"
+
+
+def test_vis_threshold_mollweide_latitude_tick_mode():
+    phi = np.array([-150, -90, -30, 30, 90, 150, -120, 0, 120])
+    theta = np.array([20, 50, 80, 110, 140, 160, 130, 40, 100])
+    threshold = np.arange(1, 10, dtype=float)
+
+    ax = VIS.vis_threshold_mollweide_2d(
+        phi,
+        theta,
+        threshold,
+        angles_in_degrees=True,
+        polar_tick_mode="latitude",
+        azimuth_offset=0,
+        offset_in_degrees=True,
+        interp_method="nearest",
+        grid_res_deg=30,
+    )
+    ax.set_yticks([-np.pi / 2, 0.0, np.pi / 2])
+    ax.figure.canvas.draw()
+
+    assert [label.get_text() for label in ax.get_yticklabels()] == [
+        "-90°",
+        "0°",
+        "90°",
+    ]
+    assert ax.get_ylabel() == "Latitude"
+
+
+def test_vis_threshold_mollweide_rejects_unknown_polar_tick_mode():
+    with pytest.raises(ValueError, match="polar_tick_mode"):
+        VIS.vis_threshold_mollweide_2d(
+            [0.0],
+            [0.0],
+            [1.0],
+            polar_tick_mode="co-latitude",
+        )
 
 
 def test_vis_threshold_3d_surface_and_minimum_marker():

@@ -1080,12 +1080,12 @@ def neuron_to_dendra_graph(
         "DEND": r"dend",
         "APIC": r"apic",
         "SOMA": r"soma",
-        "UNMYELIN": r"unmyelin",
         "MYELIN": r"\bmyelin\b",
-        "AXON": r"axon",
+        "AIS": r"axon_initial_segment",
+        "AXON": r"\baxon\b",
         "NODE": r"node",
     }
-    group_order = ["APIC", "DEND", "SOMA", "AXON", "UNMYELIN", "NODE", "MYELIN"]
+    group_order = ["APIC", "DEND", "SOMA", "AIS", "AXON", "NODE", "MYELIN"]
 
     G, relabel_mapping = reorder_graph_by_patterns(G, patterns, group_order)
     id2seg = regenerate_id_map(id2seg, relabel_mapping)

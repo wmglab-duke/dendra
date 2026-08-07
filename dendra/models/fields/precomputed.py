@@ -57,6 +57,11 @@ class PreComputedInterpolate1D(torch.nn.Module):
       potential in mV paired with a dimensionless waveform, or a lead field in
       mV per input unit paired with a waveform in that unit.  The final product
       supplied through ``extra`` must be in mV.
+    - Model coordinates follow the field contract ``(*batch, N, C)``. A single
+      LUT row broadcasts everywhere. A bank of ``N`` rows aligns with the model
+      population axis and repeats over every outer batch axis. A bank with one
+      row per flattened logical lane also aligns row-wise. Other mappings are
+      ambiguous and require explicit ``indices``.
     """
 
     def __init__(
@@ -358,6 +363,9 @@ class PreComputedInterpolate1D(torch.nn.Module):
 
         idx = torch.as_tensor(indices, dtype=torch.long, device=device).reshape(-1)
 
+        if idx.numel() == 0:
+            raise ValueError("indices must contain at least one LUT-row index.")
+
         if idx.numel() == 1:
             return idx.expand(Q)
 
@@ -561,22 +569,49 @@ class PreComputedInterpolate1D(torch.nn.Module):
         model : dendra.models.Population
             Model with .x coordinates where field is evaluated.
         indices : array-like of int, optional
-            Indices selecting which LUT row to use for each query point. If None, uses row 0 for all points
-            (or the only row if LUT is unbatched). If provided, must have length 1 or Q (number of query points).
+            Indices selecting the LUT row for each flattened logical model lane.
+            A scalar broadcasts, a length-``Q`` vector maps every lane, and a
+            shorter vector that tiles evenly is repeated in flattened row-major
+            lane order. If omitted, the automatic mappings described in Notes
+            apply.
         """
         x = model.x
         self.to(device=x.device, dtype=x.dtype)
 
         shape = x.shape
+        if x.ndim < 2:
+            raise ValueError(
+                "model.x must have shape (*batch, N, C), including population "
+                "and compartment axes."
+            )
         x_2d = x.reshape(-1, x.shape[-1])  # (Q,P)
         Q = x_2d.shape[0]
 
         idx = self._normalize_indices(indices, Q=Q, device=x.device)
-        if idx is None and self.interp.batched and self.interp.D == 1 and Q != 1:
-            # A single LUT is unambiguous and should broadcast across arbitrary
-            # model batches. PreComputedInterpolate1D normalizes all tables to
-            # 2-D, so make that shared-table intent explicit to PreparedInterp1d.
-            idx = torch.zeros(Q, dtype=torch.long, device=x.device)
+        if idx is None and self.interp.batched:
+            n_tables = self.interp.D
+            n_population = x.shape[-2]
+            if n_tables == 1:
+                # PreComputedInterpolate1D stores even a shared table as (1,S),
+                # so explicitly select row zero for every flattened lane.
+                idx = torch.zeros(Q, dtype=torch.long, device=x.device)
+            elif n_tables == Q:
+                # PreparedInterp1d's implicit row-wise mapping is exact.
+                idx = None
+            elif n_tables == n_population:
+                # Flattening (*batch,N,C) makes N the fastest-changing logical
+                # axis, so repeat the population LUT bank for each outer batch.
+                idx = torch.arange(n_tables, dtype=torch.long, device=x.device)
+                idx = idx.repeat(Q // n_population)
+            else:
+                raise ValueError(
+                    "Cannot infer a PreComputedInterpolate1D LUT-row mapping: "
+                    f"the table bank has D={n_tables} rows, while model.x has "
+                    f"shape {tuple(shape)} (Q={Q} flattened logical lanes and "
+                    f"N={n_population} population rows). Automatic mapping "
+                    "requires D == 1, D == Q, or D == N; provide explicit "
+                    "indices otherwise."
+                )
 
         # Call PreparedInterp1d correctly (indices is keyword-only in the newer implementation)
         if idx is None:
@@ -610,6 +645,7 @@ class PreComputedInterpolate3DRect(torch.nn.Module):
 
     Notes
     -----
+    *  Model coordinates and the scalar result have shape ``(*batch, N, C)``.
     *  All operations remain on the same device/dtype as the model.
     *  The module is differentiable w.r.t. the model's coordinates; the
        field grid points/values are treated as constants (buffers).
@@ -641,7 +677,7 @@ class PreComputedInterpolate3DRect(torch.nn.Module):
         Returns
         -------
         field : torch.Tensor
-            Tensor of shape (B, K, ...) containing the interpolated field values at the model
+            Tensor with the same ``(*batch, N, C)`` shape as model coordinates.
         """
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
@@ -664,6 +700,7 @@ class PreComputedInterpolate3DScattered(torch.nn.Module):
 
     Notes
     -----
+    *  Model coordinates and the scalar result have shape ``(*batch, N, C)``.
     *  All operations remain on the same device/dtype as the model.
     *  The module is differentiable w.r.t. the model's coordinates; the
        sample points/values are treated as constants (buffers).
@@ -713,7 +750,7 @@ class PreComputedInterpolate3DScattered(torch.nn.Module):
         Returns
         -------
         field : torch.Tensor
-            Tensor of shape (B, K, ...) containing the interpolated field values at the model
+            Tensor with the same ``(*batch, N, C)`` shape as model coordinates.
         """
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
@@ -774,6 +811,7 @@ class PreComputedInterpolate3DMesh(_MeshCoordinateTransformMixin, torch.nn.Modul
 
     Notes
     -----
+    * Model coordinates and the scalar result have shape ``(*batch, N, C)``.
     * Scalar values retain the units and reference-amplitude normalization of
       the supplied ``NodeData``.  For extracellular stimulation, the
       interpolated field multiplied by its temporal waveform must be in mV.
@@ -890,6 +928,9 @@ class EfieldInterpolate3DRect(torch.nn.Module):
 
     Notes
     -----
+    *  Model coordinates have shape ``(*batch, N, C)``; interpolated vectors
+       have one trailing component axis and quasipotentials preserve the model
+       coordinate shape.
     *  All operations remain on the same device/dtype as the model.
     *  The module is differentiable w.r.t. the model's coordinates; the
        E-field grid points/values are treated as constants (buffers).
@@ -931,6 +972,9 @@ class EfieldInterpolate3DScattered(torch.nn.Module):
 
     Notes
     -----
+    *  Model coordinates have shape ``(*batch, N, C)``; interpolated vectors
+       have one trailing component axis and quasipotentials preserve the model
+       coordinate shape.
     *  All operations remain on the same device/dtype as the model.
     *  The module is differentiable w.r.t. the model's coordinates; the
        sample points/values are treated as constants (buffers).
@@ -995,6 +1039,10 @@ class EfieldInterpolate3DMesh(_MeshCoordinateTransformMixin, torch.nn.Module):
 
     Notes
     -----
+    Model coordinates have shape ``(*batch, N, C)``; interpolated vectors have
+    one trailing component axis and quasipotentials preserve the coordinate
+    shape.
+
     The supplied ``ElementData`` values must be electric-field vectors in V/m;
     calling the module returns quasipotentials in mV.
 

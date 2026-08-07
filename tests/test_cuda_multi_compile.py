@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tests.test_tree_multi_reference_matrix import (
+from .test_tree_multi_reference_matrix import (
     LinearMechanism,
     _make_multi,
     _sample_inputs,

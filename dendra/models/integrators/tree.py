@@ -737,7 +737,7 @@ class _dhs(Integrator):
         v = self.mech.update_v(v)  # apply voltage processes
         v_old = v
 
-        self.mech.advance(v_old, dt, temp)
+        self._advance_pre_current(v_old, dt, temp)
 
         itot = None
         gtot_flat = None
@@ -755,6 +755,9 @@ class _dhs(Integrator):
             itot_flat = None
             gtot_flat = torch.zeros_like(self.cmdt)  # (B,K)
             f_n = torch.zeros_like(self.cmdt)
+
+        ion_current_frame = self._capture_ion_current_frame()
+        ion_conductance_frame = self._capture_ion_conductance_frame()
 
         if ve is not None:
             I_edge = _edge_currents(
@@ -814,6 +817,13 @@ class _dhs(Integrator):
             # I_mem = (C/dt + G_abs)*Δv + I_ion_old   (mA, code units)
             i_mem_flat = dmem * dv + i_abs_old  # (B,K), mA
             i_membrane = i_mem_flat.reshape(self.base_shape)
+
+        accepted_frame = self._linearize_ion_current_frame(
+            ion_current_frame,
+            ion_conductance_frame,
+            v_new - v_old,
+        )
+        self._advance_post_current(v_old, dt, temp, accepted_frame)
 
         return v_new, i_membrane
 
@@ -1326,8 +1336,10 @@ class _dhs_multi(MultiIntegrator):
         v = self.mech.update_v(v)
         v_old = v
 
-        self.mech.advance(v_old, dt, temp)
+        self._advance_pre_current(v_old, dt, temp)
         itot_flat, gtot_flat = self.mech.i(v)  # both original shape
+        ion_current_frame = self._capture_ion_current_frame()
+        ion_conductance_frame = self._capture_ion_conductance_frame()
 
         intra_flat = (
             0.0
@@ -1435,5 +1447,12 @@ class _dhs_multi(MultiIntegrator):
             # I_mem = dmem * ΔV + I_ion_old  (mA, code units)
             i_mem_flat = dmem_flat * dv_flat + i_abs_old_flat  # (P, N_total)
             i_mem = i_mem_flat.reshape(orig_shape)  # (..., 1, N_total)
+
+        accepted_frame = self._linearize_ion_current_frame(
+            ion_current_frame,
+            ion_conductance_frame,
+            v_new - v_old,
+        )
+        self._advance_post_current(v_old, dt, temp, accepted_frame)
 
         return v_new, i_mem

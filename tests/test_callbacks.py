@@ -22,6 +22,7 @@ from dendra.models.callbacks import (
     Recorder,
     RecorderLambda,
     ThresholdCallback,
+    _Active,
     sliding_window_average,
 )
 
@@ -61,6 +62,28 @@ class _DummyModel:
         if item == "i_membrane":
             return self.integrator.i_membrane
         raise AttributeError(item)
+
+
+class _BatchedDummyModel(_DummyModel):
+    """Shape-aware stand-in with explicit and repeatable model batch axes."""
+
+    def __init__(self, batch_shape, n_ax=2, nc=8, device="cpu"):
+        self._device = torch.device(device)
+        self.n_ax, self.nc = n_ax, nc
+        full_shape = (*batch_shape, n_ax, nc)
+        self.integrator = types.SimpleNamespace(
+            mech=types.SimpleNamespace(
+                hh=types.SimpleNamespace(m=torch.zeros(full_shape, device=self._device))
+            ),
+            i_membrane=torch.zeros(full_shape, device=self._device),
+            imem=True,
+        )
+        self.v = torch.zeros(full_shape, device=self._device)
+        self.t = 0.0
+
+    @property
+    def shape(self):
+        return tuple(self.v.shape)
 
 
 # ----------------------------------------------------------------------
@@ -144,6 +167,29 @@ def test_recorder_mechanism_state_partition_sampling_and_reset():
     assert rec.i == 0
     assert all(not values for values in rec.rec.values())
     rec.close()
+
+
+def test_recorder_partition_max_preserves_repeated_batch_axes():
+    model = _BatchedDummyModel(batch_shape=(2, 3), n_ax=1, nc=6)
+    values = torch.arange(6.0).expand(model.shape).clone()
+    batch_offsets = 10 * torch.arange(6.0).reshape(2, 3, 1, 1)
+    model.v.copy_(values + batch_offsets)
+    model.integrator.mech.hh.m.copy_(model.v + 100)
+
+    rec = Recorder(states=["v", "hh.m"], max_only=True, partition=[2, 4])
+    rec.pre_loop_hook(model)
+
+    expected = torch.stack(
+        [model.v[..., :2].amax(dim=-1), model.v[..., 2:].amax(dim=-1)],
+        dim=-1,
+    )
+    assert rec.stack("v").shape == (1, 2, 3, 1, 2)
+    torch.testing.assert_close(rec.stack("v")[0], expected)
+
+    # Time is reduced by max_only; the state and partition axes remain final.
+    assert rec.stack().shape == (2, 3, 1, 2, 2)
+    torch.testing.assert_close(rec.stack()[..., 0, :], expected)
+    torch.testing.assert_close(rec.stack()[..., 1, :], expected + 100)
 
 
 @pytest.mark.parametrize(
@@ -353,6 +399,85 @@ def test_active_variants_support_partitions_counts_and_inversion():
     total.record = record
     assert torch.equal(total.is_active(), torch.tensor([True, False]))
     assert total.numpy().tolist() == [True, False]
+
+
+@pytest.mark.parametrize("batch_shape", [(4,), (2, 3)])
+def test_threshold_callbacks_preserve_rank3_and_repeated_batch_axes(batch_shape):
+    model = _BatchedDummyModel(batch_shape=batch_shape, n_ax=1, nc=4)
+    counter = APCount(threshold=1.0, node_check=[0, -1])
+    counter.pre_loop_hook(model)
+
+    expected_record_shape = (*batch_shape, 1, 2)
+    assert counter.record.shape == expected_record_shape
+    assert counter.state_cache.shape == expected_record_shape
+    assert torch.equal(counter.node_check, torch.tensor([0, 3]))
+
+    # Prime the below-threshold state, then fire only the last logical lane.
+    counter.post_step_hook(model)
+    target = (*[size - 1 for size in batch_shape], 0, 0)
+    model.v[target] = 2.0
+    counter.post_step_hook(model)
+    assert counter.record[target] == 1
+    assert torch.count_nonzero(counter.record) == 1
+
+    active_nodes = ActiveAL(at_least=1)
+    active_nodes.record = counter.record
+    logical_target = target[:-1]
+    active = active_nodes.is_active()
+    assert active.shape == (*batch_shape, 1)
+    assert active[logical_target]
+    assert torch.count_nonzero(active) == 1
+
+    partitioned = active_nodes.is_active([1, 1])
+    assert partitioned.shape == (*batch_shape, 1, 2)
+    assert partitioned[(*logical_target, 0)]
+    assert not partitioned[(*logical_target, 1)]
+
+    total = ActiveALCount(at_least=1)
+    total.record = counter.record
+    assert total.is_active().shape == (*batch_shape, 1)
+    assert total.is_active([1, 1]).shape == (*batch_shape, 1, 2)
+
+
+def test_threshold_callbacks_reject_out_of_range_compartment_indices():
+    model = _BatchedDummyModel(batch_shape=(2,), n_ax=1, nc=4)
+
+    for node_check in ([4], [-5]):
+        callback = APCount(node_check=node_check)
+        with pytest.raises(IndexError, match="valid compartment indices"):
+            callback.pre_loop_hook(model)
+
+    callback = APCount(node_check=[-4, 3])
+    callback.pre_loop_hook(model)
+    assert torch.equal(callback.node_check, torch.tensor([0, 3]))
+
+
+def test_legacy_active_and_raster_use_final_node_axis_for_batched_models():
+    model = _BatchedDummyModel(batch_shape=(2, 3), n_ax=1, nc=4)
+
+    active = _Active(threshold=1.0, node_check=[-1], dt=0.1)
+    active.pre_loop_hook(model)
+    assert active.record.shape == (2, 3, 1)
+    assert active.state_cache.shape == (2, 3, 1, 1)
+    model.v[1, 2, 0, -1] = 2.0
+    active.post_step_hook(model)
+    assert active.is_active().shape == (2, 3, 1)
+    assert active.is_active()[1, 2, 0]
+    assert torch.count_nonzero(active.is_active()) == 1
+
+    model.v.zero_()
+    raster = Raster(threshold=1.0, node_check=[0, -1], dt=0.1)
+    raster.pre_loop_hook(model)
+    raster.post_step_hook(model)
+    model.v[0, 1, 0, -1] = 2.0
+    raster.post_step_hook(model)
+
+    spikes = raster.stack()
+    assert spikes.shape == (2, 2, 3, 1, 2)
+    assert spikes[1, 0, 1, 0, 1]
+    assert torch.count_nonzero(spikes) == 1
+    with pytest.raises(ValueError, match="supports unbatched records"):
+        raster.plot(np.array([1.0]), "diameter")
 
 
 @pytest.mark.parametrize(

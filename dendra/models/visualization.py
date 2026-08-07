@@ -11,6 +11,7 @@ import torch
 from matplotlib import cm
 from matplotlib.collections import LineCollection
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap
+from matplotlib.ticker import FuncFormatter
 from scipy.interpolate import griddata
 
 try:
@@ -1134,6 +1135,31 @@ def _relabel_longitude_ticks(
     ax.set_xticklabels(label_text)
 
 
+def _set_mollweide_polar_ticks(ax, *, flip_polar, mode):
+    """Label a Mollweide axis using polar angle or projected latitude."""
+    if mode == "theta":
+
+        def angle_from_latitude(latitude):
+            latitude_deg = np.rad2deg(latitude)
+            return 90.0 + latitude_deg if flip_polar else 90.0 - latitude_deg
+
+        ylabel = r"Polar angle $\theta$"
+    elif mode == "latitude":
+        angle_from_latitude = np.rad2deg
+        ylabel = "Latitude"
+    else:
+        raise ValueError("polar_tick_mode must be 'theta' or 'latitude'")
+
+    def format_angle(latitude, _position):
+        degrees = float(np.round(angle_from_latitude(latitude), decimals=10))
+        if np.isclose(degrees, 0.0):
+            degrees = 0.0
+        return f"{degrees:g}°"
+
+    ax.yaxis.set_major_formatter(FuncFormatter(format_angle))
+    ax.set_ylabel(ylabel)
+
+
 def vis_threshold_mollweide_2d(
     phi,
     theta,
@@ -1142,10 +1168,12 @@ def vis_threshold_mollweide_2d(
     # ───────── data options ─────────
     angles_in_degrees=False,
     flip_polar=True,
+    polar_tick_mode="theta",
     azimuth_offset=-np.pi / 2,
     offset_in_degrees=False,
     normalize_to_min=False,
     mark_min=False,
+    rasterize=True,
     # ───────── interpolation ────────
     grid_res_deg=2.0,
     interp_method="cubic",
@@ -1165,7 +1193,13 @@ def vis_threshold_mollweide_2d(
     angles_in_degrees : bool, optional
         Pass True if `phi`, `theta` are in degrees.
     flip_polar : bool, optional
-        Swap North/South: θ → π = θ.
+        Reverse the displayed poles via θ → π − θ. When
+        ``polar_tick_mode='theta'``, tick labels still report the original θ.
+    polar_tick_mode : {'theta', 'latitude'}, optional
+        Values shown on the vertical ticks. ``'theta'`` (default) reports the
+        original polar/co-latitude angle, where θ = 0° points along +z.
+        ``'latitude'`` reports the projected Mollweide latitude. Tick labels
+        are shown in degrees regardless of ``angles_in_degrees``.
     azimuth_offset : float, optional
         Rotate longitudes eastward by this amount.
     offset_in_degrees : bool, optional
@@ -1192,6 +1226,9 @@ def vis_threshold_mollweide_2d(
     phi = np.asarray(phi, dtype=float)
     theta = np.asarray(theta, dtype=float)
     thr = np.asarray(thr, dtype=float)
+
+    if polar_tick_mode not in {"theta", "latitude"}:
+        raise ValueError("polar_tick_mode must be 'theta' or 'latitude'")
 
     if angles_in_degrees:
         phi = np.deg2rad(phi)
@@ -1245,7 +1282,16 @@ def vis_threshold_mollweide_2d(
         fig = plt.figure(figsize=(8, 4.6))
         ax = fig.add_subplot(111, projection="mollweide")
 
-    im = ax.pcolormesh(Lon, Lat, Thr, shading="auto", cmap=cmap, vmin=vmin, vmax=vmax)
+    im = ax.pcolormesh(
+        Lon,
+        Lat,
+        Thr,
+        shading="auto",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        rasterized=rasterize,
+    )
     ax.grid(True, alpha=0.3)
 
     if mark_min:
@@ -1272,6 +1318,11 @@ def vis_threshold_mollweide_2d(
             offset_in_degrees=offset_in_degrees,
             every_deg=30,
         )
+    _set_mollweide_polar_ticks(
+        ax,
+        flip_polar=flip_polar,
+        mode=polar_tick_mode,
+    )
     return ax
 
 

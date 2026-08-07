@@ -1,6 +1,5 @@
 from typing import Optional, Tuple, Union
 
-import numpy as np
 import numpy.typing as npt
 import torch
 from torch import Tensor
@@ -85,26 +84,32 @@ class Thresholder:
         each population element. Must implement :meth:`is_active`, which returns
         a boolean tensor indicating activity for each element.
     space : Optional[Union[npt.NDArray, Tensor]], optional
-        Spatial extracellular potential distribution of the stimulus. An array of
-        shape ``(model.np, model.nc)`` that encodes the coupling between each population
-        element and the stimulus source(s). Used together with ``time`` when
-        ``bases`` is not provided.
+        Spatial extracellular potential distribution of the stimulus. It must
+        be broadcastable to ``model.shape == (*batch, model.np, model.nc)``.
+        Used together with ``time`` when ``bases`` is not provided.
     time : Optional[Waveform], optional
         Temporal waveform of the stimulus. When used with ``space``, the
-        effective extracellular potential passed to the model is
-        ``space * amp[:, None]``, where ``amp`` is the per-element amplitude
-        vector.
+        effective extracellular potential passed to the model is ``space * amp``,
+        with a final singleton compartment axis added to ``amp``. Thus one
+        independently searched amplitude is maintained for every entry of
+        ``model.shape[:-1]`` (all batch and population lanes).
     bases : Optional[Union[npt.NDArray, Tensor]], optional
-        Precomputed spatiotemporal bases for the extracellular potential.
-        Expected shape is ``(model.np, nt, model.nc)`` (or broadcastable
-        to this shape) and multiplied by the per-element amplitude vector.
+        Precomputed spatiotemporal bases for the extracellular potential. The
+        canonical layout is time-first, ``(nt, *model.shape)``; payload axes
+        after time may broadcast to ``model.shape``. The historical unbatched
+        layout ``(model.np, nt, model.nc)`` is accepted when the canonical
+        interpretation is not possible. Ambiguous layouts are rejected.
         When ``bases`` is provided, ``space`` and ``time`` are ignored and
         ``chunklength`` cannot be used.
     ub : optional
-        Initial upper bound(s) on threshold amplitudes. If ``None``, upper
+        Initial upper bound(s) on threshold amplitudes, broadcastable to
+        ``model.shape[:-1]``. If ``None``, upper
         bounds are initialised heuristically from ``model.diameters`` using
         ``0.2 / (diameter / 5)**2`` per element. Either ``ub`` must be
         provided or ``model.diameters`` must be set.
+    lb : optional
+        Initial lower bound(s) on threshold amplitudes, broadcastable to
+        ``model.shape[:-1]``. If ``None``, lower bounds are initialised to zero.
     fix_bound_up : float, optional
         Multiplicative factor used to increase the upper bound during the
         bound-fixing stage when a response is still clearly subthreshold,
@@ -212,6 +217,7 @@ class Thresholder:
         time: Optional[Waveform] = None,
         bases: Optional[Union[npt.NDArray, Tensor]] = None,
         ub=None,
+        lb=None,
         fix_bound_up=2.0,
         fix_bound_down=0.1,
         max_tries_bound_fix=10,
@@ -219,8 +225,24 @@ class Thresholder:
         atol=None,
         rtol=None,
         chunklength=None,
+        mode="arithmetic",
     ):
         self.model = model
+        self.model_shape = tuple(
+            int(size) for size in getattr(model, "shape", (model.np, model.nc))
+        )
+        if len(self.model_shape) < 2:
+            raise ValueError(
+                "model.shape must include population and compartment axes; "
+                f"got {self.model_shape}."
+            )
+        if self.model_shape[-2:] != (int(model.np), int(model.nc)):
+            raise ValueError(
+                "The final axes of model.shape must be (model.np, model.nc); "
+                f"got model.shape={self.model_shape}, model.np={model.np}, "
+                f"and model.nc={model.nc}."
+            )
+        self.lane_shape = self.model_shape[:-1]
         self.chunklength = chunklength
         self.bases = None
         self.functional = False
@@ -237,7 +259,12 @@ class Thresholder:
         self._space_no_nan = None
         self._bases_no_nan = None
 
-        if bases is None and (space is None and time is None):
+        valid_modes = ["arithmetic", "geometric"]
+        if mode not in valid_modes:
+            raise ValueError(f"Invalid mode '{mode}'. Valid options are {valid_modes}.")
+        self.mode = mode
+
+        if bases is None and (space is None or time is None):
             raise ValueError(
                 "At least one of bases or space and time must be provided."
             )
@@ -247,13 +274,13 @@ class Thresholder:
                 raise ValueError(
                     "Cannot use chunklength with bases. Supply space and time instead."
                 )
-            bases = torch.as_tensor(bases)
-            self.bases = bases.to(device=model.device(), dtype=model.dtype())
+            bases = torch.as_tensor(bases, device=model.device(), dtype=model.dtype())
+            self.bases = self._normalize_bases(bases)
             self.check_active = self._check_active_bases
             self.functional = False
         else:
-            self.space = torch.as_tensor(space).to(
-                device=model.device(), dtype=model.dtype()
+            self.space = self._normalize_space(
+                torch.as_tensor(space, device=model.device(), dtype=model.dtype())
             )
             self.time = time.to(device=model.device(), dtype=model.dtype())
             self.check_active = self._check_active_space_time
@@ -262,22 +289,12 @@ class Thresholder:
         diams = getattr(model, "diameters", None)
 
         if diams is not None:
-            if hasattr(diams, "__iter__"):
-                if self.bases is not None:
-                    assert len(diams) == self.bases.shape[1]
-                elif self.functional:
-                    assert len(diams) == self.space.shape[0]
-
-            elif isinstance(diams, float):
-                diams = np.atleast_1d(np.full(self.bases.shape[1], diams))
-
-            diams = torch.as_tensor(diams)
-            self.diams = diams.to(device=model.device(), dtype=model.dtype())
+            self.diams = self._normalize_lane_value(diams, "model.diameters")
 
         else:
             self.diams = None
 
-        if fix_bound_down >= 1 or fix_bound_up <= 0:
+        if fix_bound_down <= 0 or fix_bound_down >= 1:
             raise ValueError("fix_bound_down should be < 1 and > 0.")
 
         if fix_bound_up <= 1:
@@ -287,11 +304,7 @@ class Thresholder:
 
         with torch.no_grad():
             if ub is not None:
-                self.ub = torch.as_tensor(
-                    ub, device=model.device(), dtype=model.dtype()
-                ) * torch.ones(
-                    self.model.np, device=model.device(), dtype=model.dtype()
-                )
+                self.ub = self._normalize_lane_value(ub, "ub")
             else:
                 if self.diams is None:
                     raise ValueError(
@@ -299,7 +312,18 @@ class Thresholder:
                     )
                 self.ub = 0.2 * torch.ones_like(self.diams) / (self.diams / 5) ** 2
             self.ub_initial = self.ub.clone()
-            self.lb = torch.zeros_like(self.ub)
+            if lb is not None:
+                self.lb = self._normalize_lane_value(lb, "lb")
+            else:
+                self.lb = torch.zeros_like(self.ub)
+            self.lb_initial = self.lb.clone()
+
+        if self.mode == "geometric":
+            if torch.any(self.lb <= 0) or torch.any(self.ub <= 0):
+                raise ValueError(
+                    "geometric thresholding requires strictly positive lb and ub; "
+                    "provide a positive lower bound instead of the default zero."
+                )
 
         self.fix_bound_up = fix_bound_up
         self.fix_bound_down = fix_bound_down
@@ -310,41 +334,142 @@ class Thresholder:
         self.threshold = active.threshold
         self.rec = Recorder(["v"], max_only=True)
 
-    def set_partition(self, model_partition, active_partition=None):
-        assert sum(model_partition) == self.model.nc, (
-            "Sum of partition lengths must equal number of population compartment."
+    def _normalize_lane_value(self, value, name: str) -> Tensor:
+        """Broadcast one threshold value to ``model.shape[:-1]``.
+
+        Bounds use ordinary trailing PyTorch broadcasting. In particular, a
+        value shaped ``(model.np,)`` is shared by every explicit batch, while
+        per-batch values should include a final singleton population axis.
+        """
+        value = torch.as_tensor(
+            value, device=self.model.device(), dtype=self.model.dtype()
         )
+        try:
+            return torch.broadcast_to(value, self.lane_shape).clone()
+        except RuntimeError as exc:
+            raise ValueError(
+                f"{name} shape {tuple(value.shape)} is not broadcastable to "
+                f"model lane shape {self.lane_shape} (= model.shape[:-1]). "
+                "Use explicit singleton axes to distinguish batch and "
+                "population dimensions."
+            ) from exc
+
+    def _normalize_space(self, space: Tensor) -> Tensor:
+        """Broadcast a functional spatial field to the full model shape."""
+        try:
+            return torch.broadcast_to(space, self.model_shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"space shape {tuple(space.shape)} is not broadcastable to "
+                f"model shape {self.model_shape}. Use explicit singleton axes "
+                "to distinguish batch, population, and compartment dimensions."
+            ) from exc
+
+    def _time_first_bases_candidate(self, bases: Tensor) -> Optional[Tensor]:
+        """Return the canonical time-first broadcast view, if one exists."""
+        if bases.dim() < 1:
+            return None
+        payload_shape = tuple(bases.shape[1:])
+        if len(payload_shape) > len(self.model_shape):
+            return None
+        shaped = bases.reshape(
+            int(bases.shape[0]),
+            *(1,) * (len(self.model_shape) - len(payload_shape)),
+            *payload_shape,
+        )
+        try:
+            return torch.broadcast_to(shaped, (int(bases.shape[0]), *self.model_shape))
+        except RuntimeError:
+            return None
+
+    def _legacy_bases_candidate(self, bases: Tensor) -> Optional[Tensor]:
+        """Normalize historical ``(model.np, nt, model.nc)`` bases."""
+        if bases.dim() != 3:
+            return None
+        # The historical contract was explicit population-first, rather than
+        # population-broadcastable. Requiring the exact population length also
+        # keeps canonical one-step bases shaped ``(1, N, C)`` unambiguous.
+        if int(bases.shape[0]) != int(self.model.np):
+            return None
+        if int(bases.shape[-1]) not in (1, int(self.model.nc)):
+            return None
+        return self._time_first_bases_candidate(bases.movedim(1, 0))
+
+    def _normalize_bases(self, bases: Tensor) -> Tensor:
+        """Normalize bases to canonical ``(time, *model.shape)`` layout."""
+        if bases.dim() == 0:
+            raise ValueError(
+                "bases must have a leading time axis; got a scalar tensor."
+            )
+
+        canonical = self._time_first_bases_candidate(bases)
+        legacy = self._legacy_bases_candidate(bases)
+        if canonical is not None and legacy is not None:
+            raise ValueError(
+                f"bases shape {tuple(bases.shape)} is ambiguous: it is valid as "
+                "both canonical (time, *model.shape) and historical "
+                "(model.np, time, model.nc) layout. Supply canonical bases with "
+                "an explicit singleton batch axis, or choose a time length that "
+                "disambiguates the axes."
+            )
+        if canonical is not None:
+            return canonical
+        if legacy is not None:
+            return legacy
+        raise ValueError(
+            f"bases shape {tuple(bases.shape)} cannot be normalized to canonical "
+            f"shape (time, *model.shape) = (time, {', '.join(map(str, self.model_shape))}). "
+            "Payload axes after time use ordinary trailing broadcasting. The "
+            "historical unbatched (model.np, time, model.nc) layout is accepted "
+            "only when unambiguous."
+        )
+
+    def set_partition(self, model_partition, active_partition=None):
+        if self.model_partition is not None:
+            raise RuntimeError("A model partition has already been configured.")
+        model_partition = tuple(int(length) for length in model_partition)
+        if not model_partition or any(length <= 0 for length in model_partition):
+            raise ValueError("model_partition must contain positive lengths.")
+        if sum(model_partition) != self.model.nc:
+            raise ValueError(
+                "Sum of partition lengths must equal number of population compartments."
+            )
         if active_partition is not None:
-            assert len(model_partition) == len(active_partition), (
-                "Model and active partitions must have the same length."
-            )
-            assert all(m >= a for m, a in zip(model_partition, active_partition)), (
-                "Each model partition length must be at least as large as the corresponding active partition length."
-            )
+            active_partition = tuple(int(length) for length in active_partition)
+            if len(model_partition) != len(active_partition):
+                raise ValueError(
+                    "Model and active partitions must have the same length."
+                )
+            if any(length <= 0 for length in active_partition):
+                raise ValueError("active_partition must contain positive lengths.")
+            if not all(m >= a for m, a in zip(model_partition, active_partition)):
+                raise ValueError(
+                    "Each model partition length must be at least as large as "
+                    "the corresponding active partition length."
+                )
         else:
             active_partition = model_partition
         with torch.no_grad():
             self.model_partition = model_partition
             self.active_partition = active_partition
-            self.ub = (
-                self.ub[:, None].expand(-1, len(model_partition)).contiguous().clone()
-            )
-            self.lb = (
-                self.lb[:, None].expand(-1, len(model_partition)).contiguous().clone()
-            )
-            self.ub_initial = (
-                self.ub_initial[:, None]
-                .expand(-1, len(model_partition))
-                .contiguous()
-                .clone()
-            )
-            self.rec.set_partition(active_partition)
+            n_partitions = len(model_partition)
+
+            def expand_partition(value):
+                return value.unsqueeze(-1).expand(*value.shape, n_partitions).clone()
+
+            self.ub = expand_partition(self.ub)
+            self.lb = expand_partition(self.lb)
+            self.ub_initial = expand_partition(self.ub_initial)
+            self.lb_initial = expand_partition(self.lb_initial)
+            # Recorder observes the complete model, not the callback's selected
+            # nodes, so its partition is defined in model-compartment space.
+            self.rec.set_partition(model_partition)
 
     def reset_bounds(self):
         """Reset upper and lower bounds to initial values."""
         with torch.no_grad():
             self.ub = self.ub_initial.clone()
-            self.lb = torch.zeros_like(self.ub)
+            self.lb = self.lb_initial.clone()
             self.ignore = None
 
     def check_tolerance(
@@ -356,7 +481,8 @@ class Thresholder:
             rtol = self.rtol
 
         if atol is not None and rtol is not None:
-            return (awindow >= atol) & (rwindow >= rtol)
+            # Continue while either requested accuracy has not yet been met.
+            return (awindow >= atol) | (rwindow >= rtol)
         elif atol is not None:
             return awindow >= atol
         elif rtol is not None:
@@ -364,20 +490,65 @@ class Thresholder:
         else:
             raise ValueError("Either atol or rtol must be provided.")
 
+    def _relative_window(self, awindow: Tensor) -> Tensor:
+        """Return the documented relative interval width ``(ub - lb) / ub``."""
+        return awindow / self.ub
+
     def ve_from_s_t(self, ve_s, ve_t, device, multicontact=False):
-        ve_s = torch.as_tensor(ve_s, device=device)
-        ve_t = torch.as_tensor(ve_t, device=device)
+        ve_s = torch.as_tensor(ve_s, device=device, dtype=self.model.dtype())
+        ve_t = torch.as_tensor(ve_t, device=device, dtype=self.model.dtype())
 
-        if multicontact:
-            ve_s = ve_s.expand(-1, self.model.np, -1)
-            ve_t = ve_t.expand(-1, self.model.np, -1)
-            einsum = op_mc
-        else:
-            ve_s = ve_s.expand(self.model.np, -1)
-            ve_t = ve_t.expand(self.model.np, -1)
-            einsum = op_sc
+        if not multicontact:
+            ve_s = self._normalize_space(ve_s)
+            if ve_t.dim() == 0:
+                raise ValueError("ve_t must have a trailing time axis.")
+            time_shape = (*self.lane_shape, int(ve_t.shape[-1]))
+            try:
+                ve_t = torch.broadcast_to(ve_t, time_shape)
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"ve_t shape {tuple(ve_t.shape)} is not broadcastable to "
+                    f"(*model.shape[:-1], time) = {time_shape}."
+                ) from exc
+            return op_sc(ve_s, ve_t)
 
-        return einsum(ve_s, ve_t)
+        if ve_s.dim() < 1 or ve_t.dim() < 2:
+            raise ValueError(
+                "multicontact ve_s and ve_t need leading contact axes, and ve_t "
+                "also needs a trailing time axis."
+            )
+        n_contacts = int(ve_s.shape[0])
+        if int(ve_t.shape[0]) != n_contacts:
+            raise ValueError("ve_s and ve_t must have the same number of contacts.")
+
+        spatial_payload = tuple(ve_s.shape[1:])
+        if len(spatial_payload) > len(self.model_shape):
+            raise ValueError("multicontact ve_s has too many spatial axes.")
+        ve_s = ve_s.reshape(
+            n_contacts,
+            *(1,) * (len(self.model_shape) - len(spatial_payload)),
+            *spatial_payload,
+        )
+        temporal_payload = tuple(ve_t.shape[1:-1])
+        if len(temporal_payload) > len(self.lane_shape):
+            raise ValueError("multicontact ve_t has too many lane axes.")
+        ve_t = ve_t.reshape(
+            n_contacts,
+            *(1,) * (len(self.lane_shape) - len(temporal_payload)),
+            *temporal_payload,
+            int(ve_t.shape[-1]),
+        )
+        try:
+            ve_s = torch.broadcast_to(ve_s, (n_contacts, *self.model_shape))
+            ve_t = torch.broadcast_to(
+                ve_t, (n_contacts, *self.lane_shape, int(ve_t.shape[-1]))
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                "multicontact fields are not broadcastable to contact-first "
+                "model spatial and temporal shapes."
+            ) from exc
+        return op_mc(ve_s, ve_t)
 
     def float(self):
         self.fp32 = True
@@ -397,6 +568,7 @@ class Thresholder:
         self.ub = self.ub.float()
         self.ub_initial = self.ub_initial.float()
         self.lb = self.lb.float()
+        self.lb_initial = self.lb_initial.float()
         return self
 
     def double(self):
@@ -417,6 +589,7 @@ class Thresholder:
         self.ub = self.ub.double()
         self.ub_initial = self.ub_initial.double()
         self.lb = self.lb.double()
+        self.lb_initial = self.lb_initial.double()
         return self
 
     def _space_for_run(self) -> Tensor:
@@ -428,37 +601,32 @@ class Thresholder:
         return self._bases_no_nan if self._bases_no_nan is not None else self.bases
 
     def _scaled_bases_field(self, bound: Tensor) -> Tensor:
-        """Scale basis-mode fields by unpartitioned or partition-expanded bounds."""
-        bases = self._bases_for_run()
-        pop_dim = self._bases_population_dim(bases)
+        """Scale canonical bases while preserving time and every model axis."""
+        scale = self._bound_as_spatial(bound)
+        return self._bases_for_run() * scale.unsqueeze(0)
 
-        if pop_dim == 0:
-            if bound.dim() == 1:
-                scale = bound[:, None, None]
-            elif bound.dim() == 2 and bound.shape[1] == 1:
-                scale = bound[:, 0][:, None, None]
-            elif bound.dim() == 2:
-                scale = bound[:, None, :]
-            else:
-                raise ValueError("bound must be a 1D or 2D tensor.")
-        else:
-            if bound.dim() == 1:
-                scale = bound[None, :, None]
-            elif bound.dim() == 2 and bound.shape[1] == 1:
-                scale = bound[:, 0][None, :, None]
-            elif bound.dim() == 2:
-                scale = bound[None, :, :]
-            else:
-                raise ValueError("bound must be a 1D or 2D tensor.")
-
-        return bases * scale
+    def _bound_as_spatial(self, bound: Tensor) -> Tensor:
+        """Broadcast lane or compartment-expanded amplitudes to model shape."""
+        bound = torch.as_tensor(
+            bound, device=self.model.device(), dtype=self.model.dtype()
+        )
+        if tuple(bound.shape) == self.lane_shape:
+            bound = bound.unsqueeze(-1)
+        try:
+            return torch.broadcast_to(bound, self.model_shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"bound shape {tuple(bound.shape)} is not broadcastable to model "
+                f"shape {self.model_shape}. Expected lane bounds shaped "
+                f"{self.lane_shape}, or compartment-expanded bounds."
+            ) from exc
 
     def _field_nan_mask(self) -> Tensor:
         """Return a boolean ignore mask for field entries containing NaNs.
 
         The returned tensor has the same shape as ``self.ub``/``self.lb``:
-        ``(model.np,)`` for unpartitioned thresholding and
-        ``(model.np, n_partitions)`` when a model partition is active.
+        ``model.shape[:-1]`` for unpartitioned thresholding and
+        ``(*model.shape[:-1], n_partitions)`` when a partition is active.
         """
         if self.functional:
             return self._space_nan_mask()
@@ -469,7 +637,7 @@ class Thresholder:
         space_nan = self._spatial_nan_as_population_by_compartment(space_nan)
 
         if self.model_partition is None:
-            return space_nan.any(dim=1)
+            return space_nan.any(dim=-1)
 
         return self._partition_nan_mask(space_nan, self.model_partition)
 
@@ -482,13 +650,13 @@ class Thresholder:
         return self._reduce_bases_nan_by_partition(bases_nan, self.model_partition)
 
     def _spatial_nan_as_population_by_compartment(self, space_nan: Tensor) -> Tensor:
-        """Broadcast a spatial NaN mask to ``(model.np, model.nc)``."""
+        """Broadcast a spatial NaN mask to the full model shape."""
         try:
-            return torch.broadcast_to(space_nan, (self.model.np, self.model.nc))
+            return torch.broadcast_to(space_nan, self.model_shape)
         except RuntimeError as exc:
             raise ValueError(
-                "space must be broadcastable to shape "
-                f"({self.model.np}, {self.model.nc}) for partition-aware NaN checks."
+                f"space must be broadcastable to model shape {self.model_shape} "
+                "for partition-aware NaN checks."
             ) from exc
 
     def _partition_nan_mask(self, nan_by_compartment: Tensor, partition) -> Tensor:
@@ -496,92 +664,101 @@ class Thresholder:
         start = 0
         for length in partition:
             stop = start + length
-            if length == 0:
-                cols.append(
-                    torch.zeros(
-                        self.model.np,
-                        device=nan_by_compartment.device,
-                        dtype=torch.bool,
-                    )
-                )
-            else:
-                cols.append(nan_by_compartment[:, start:stop].any(dim=1))
+            cols.append(nan_by_compartment[..., start:stop].any(dim=-1))
             start = stop
-        return torch.stack(cols, dim=1)
-
-    def _bases_population_dim(self, bases: Tensor) -> Optional[int]:
-        """Infer the population dimension of a basis tensor.
-
-        ``_check_active_bases`` scales bases using ``bound[None, :, None]``, so
-        dimension 1 is preferred when it has population length. Dimension 0 is
-        also accepted to support the documented ``(model.np, nt, model.nc)``
-        layout.
-        """
-        if bases.dim() >= 2 and bases.shape[1] == self.model.np:
-            return 1
-        if bases.dim() >= 1 and bases.shape[0] == self.model.np:
-            return 0
-        for dim, size in enumerate(bases.shape[:-1]):
-            if size == self.model.np:
-                return dim
-        return None
-
-    @staticmethod
-    def _any_except(tensor: Tensor, keep_dim: int) -> Tensor:
-        for dim in reversed(range(tensor.dim())):
-            if dim != keep_dim:
-                tensor = tensor.any(dim=dim)
-        return tensor
+        return torch.stack(cols, dim=-1)
 
     def _reduce_bases_nan(self, bases_nan: Tensor) -> Tensor:
-        pop_dim = self._bases_population_dim(bases_nan)
-        if pop_dim is None:
-            return bases_nan.any().reshape(1).expand(self.model.np)
-        return self._any_except(bases_nan, pop_dim)
+        expected = (int(bases_nan.shape[0]), *self.model_shape)
+        if tuple(bases_nan.shape) != expected:
+            raise ValueError(
+                "bases NaN reduction requires canonical time-first bases shaped "
+                f"{expected}; got {tuple(bases_nan.shape)}."
+            )
+        return bases_nan.any(dim=0).any(dim=-1)
 
     def _reduce_bases_nan_by_partition(self, bases_nan: Tensor, partition) -> Tensor:
-        pop_dim = self._bases_population_dim(bases_nan)
-        comp_dim = bases_nan.dim() - 1
-
+        expected = (int(bases_nan.shape[0]), *self.model_shape)
+        if tuple(bases_nan.shape) != expected:
+            raise ValueError(
+                "partitioned bases NaN reduction requires canonical time-first "
+                f"bases shaped {expected}; got {tuple(bases_nan.shape)}."
+            )
         cols = []
         start = 0
         for length in partition:
             stop = start + length
-            if length == 0:
-                cols.append(
-                    torch.zeros(
-                        self.model.np, device=bases_nan.device, dtype=torch.bool
-                    )
-                )
-                start = stop
-                continue
-
-            index = [slice(None)] * bases_nan.dim()
-            index[comp_dim] = slice(start, stop)
-            part_nan = bases_nan[tuple(index)]
-
-            if pop_dim is None:
-                cols.append(part_nan.any().reshape(1).expand(self.model.np))
-            else:
-                cols.append(self._any_except(part_nan, pop_dim))
+            part_nan = bases_nan[..., start:stop]
+            cols.append(part_nan.any(dim=0).any(dim=-1))
             start = stop
+        return torch.stack(cols, dim=-1)
 
-        return torch.stack(cols, dim=1)
+    def _normalize_activity(self, activity: Tensor) -> Tensor:
+        """Validate the callback's one-result-per-search-lane contract."""
+        if activity is None:
+            raise TypeError(
+                "ThresholdCallback.is_active must return a boolean tensor, not None."
+            )
+        activity = torch.as_tensor(activity, device=self.ub.device)
+        if activity.dtype != torch.bool:
+            raise TypeError(
+                "ThresholdCallback.is_active must return a boolean tensor; "
+                f"got dtype {activity.dtype}."
+            )
+        expected = tuple(self.ub.shape)
+        if tuple(activity.shape) != expected:
+            partition_note = (
+                ""
+                if self.model_partition is None
+                else f" (including {len(self.model_partition)} partitions)"
+            )
+            raise ValueError(
+                "ThresholdCallback.is_active returned shape "
+                f"{tuple(activity.shape)}, but Thresholder requires {expected}"
+                f"{partition_note}. Callbacks must preserve every batch and "
+                "population axis; implicit broadcasting of activity is not allowed."
+            )
+        return activity
+
+    def _normalize_recorder_metric(self, recorded: Tensor) -> Tensor:
+        """Remove Recorder-only singleton axes without squeezing model lanes."""
+        recorded = torch.as_tensor(recorded, device=self.ub.device)
+        expected = tuple(self.ub.shape)
+        if tuple(recorded.shape) == expected:
+            return recorded
+        if self.model_partition is None and tuple(recorded.shape) == (*expected, 1):
+            return recorded.squeeze(-1)
+        raise ValueError(
+            f"Recorder block metric shape {tuple(recorded.shape)} cannot be "
+            f"mapped to threshold bound shape {expected}. Expected exactly "
+            f"{expected}"
+            + (
+                f" or {(*expected, 1)} from an unpartitioned Recorder."
+                if self.model_partition is None
+                else "."
+            )
+        )
 
     def _ignored_like(self, target: Tensor) -> Tensor:
         if self.ignore is None:
             return torch.zeros_like(target, dtype=torch.bool)
         if (
             self.model_partition is not None
-            and self.ignore.dim() == 2
-            and target.dim() == 2
-            and self.ignore.shape[1] == len(self.model_partition)
-            and target.shape[1] == self.model.nc
+            and tuple(self.ignore.shape)
+            == (*self.lane_shape, len(self.model_partition))
+            and tuple(target.shape) == self.model_shape
         ):
             return _scale_by_partition(self.ignore, self.model_partition)
-        return _agree_dims(self.ignore, target)
+        ignored = _agree_dims(self.ignore, target)
+        if tuple(ignored.shape) != tuple(target.shape):
+            raise ValueError(
+                f"ignore shape {tuple(self.ignore.shape)} cannot be mapped to "
+                f"target shape {tuple(target.shape)}."
+            )
+        return ignored
 
     def _set_ignore(self, ignore: Tensor):
+        ignore = self._normalize_activity(ignore)
         if self.ignore is None:
             self.ignore = ignore.clone()
         else:
@@ -641,7 +818,9 @@ class Thresholder:
                 dt=dt,
                 callbacks=[self.active],
             )
-        return self.active.is_active(partition=self.active_partition)
+        return self._normalize_activity(
+            self.active.is_active(partition=self.active_partition)
+        )
 
     def _check_active_space_time(self, tstop, dt, bound: Tensor):
         """Check whether stimulus amplitudes generates APs.
@@ -658,7 +837,7 @@ class Thresholder:
         """
         self.active.reset()
         with torch.no_grad():
-            ve = self._space_for_run() * bound
+            ve = self._space_for_run() * self._bound_as_spatial(bound)
             self.model.initialize()
             if self.chunklength is not None:
                 self.model.longrun(
@@ -675,7 +854,9 @@ class Thresholder:
                     dt=dt,
                     callbacks=[self.active],
                 )
-        return self.active.is_active(partition=self.active_partition)
+        return self._normalize_activity(
+            self.active.is_active(partition=self.active_partition)
+        )
 
     def check_active_with_rec(self, tstop, dt, bound: Tensor):
         self.active.reset()
@@ -691,7 +872,7 @@ class Thresholder:
                 )
             else:
                 if self.chunklength is not None:
-                    ve = self._space_for_run() * bound
+                    ve = self._space_for_run() * self._bound_as_spatial(bound)
                     self.model.longrun(
                         extra=(ve, self.time),
                         tstop=tstop,
@@ -700,51 +881,51 @@ class Thresholder:
                         chunklength=self.chunklength,
                     )
                 else:
-                    ve = self._space_for_run() * bound
+                    ve = self._space_for_run() * self._bound_as_spatial(bound)
                     self.model.run(
                         extra=(ve, self.time),
                         tstop=tstop,
                         dt=dt,
                         callbacks=[self.active, self.rec],
                     )
-        return self.active.is_active(partition=self.active_partition), self.rec.stack()
+        activity = self._normalize_activity(
+            self.active.is_active(partition=self.active_partition)
+        )
+        # ``stack("v")`` is time-first and avoids the additional state axis
+        # introduced by ``stack()``. Recorder already reduces compartments (or
+        # each compartment partition) per sample; reduce only the time axis here.
+        recorded = self.rec.stack("v").amax(dim=0)
+        return activity, self._normalize_recorder_metric(recorded)
 
     def _fix_bounds(self, tstop, dt, block_possible=True):
         """Make sure upper bound generates AP."""
 
         with torch.no_grad():
             tries = 0
-            ub = _scale_by_partition(self.ub, self.model_partition)
-            if block_possible:
-                mask, rec = self.check_active_with_rec(tstop, dt, ub)
-            else:
-                mask = self.check_active(tstop, dt, ub)
-            mask = mask | self._ignored_like(mask)
             print("Fixing bounds.", end="")
-            while torch.any(~mask):
-                print(".", end="")
+            while True:
                 ub = _scale_by_partition(self.ub, self.model_partition)
-                if tries >= self.max_tries_bound_fix:
-                    break
                 if block_possible:
                     mask, rec = self.check_active_with_rec(tstop, dt, ub)
+                    rec = self._normalize_recorder_metric(rec)
                 else:
                     mask = self.check_active(tstop, dt, ub)
+                mask = self._normalize_activity(mask)
                 mask = mask | self._ignored_like(mask)
+                if not torch.any(~mask):
+                    print("Done.")
+                    return
+                if tries >= self.max_tries_bound_fix:
+                    break
+
+                print(".", end="")
                 inactive = ~mask
                 if block_possible:
-                    self.ub[(rec.squeeze() < self.threshold) & inactive] *= (
-                        self.fix_bound_up
-                    )
-                    self.ub[(rec.squeeze() >= self.threshold) & inactive] *= (
-                        self.fix_bound_down
-                    )
+                    self.ub[(rec < self.threshold) & inactive] *= self.fix_bound_up
+                    self.ub[(rec >= self.threshold) & inactive] *= self.fix_bound_down
                 else:
                     self.ub[inactive] *= self.fix_bound_up
                 tries += 1
-            else:
-                print("Done.")
-                return
             print(
                 f"Unable to fix bounds within {self.max_tries_bound_fix}"
                 " iterations, ignoring some."
@@ -783,10 +964,18 @@ class Thresholder:
         Returns
         -------
         Tuple[Tensor, Tensor]
-            Upper and lower bound on thresholds.
+            Upper and lower threshold bounds on CPU. Each has shape
+            ``model.shape[:-1]`` without a model partition, or
+            ``(*model.shape[:-1], n_partitions)`` after :meth:`set_partition`.
         """
         if reset_bounds:
             self.reset_bounds()
+
+        # Resolve effective tolerances before running any simulations.
+        effective_atol = self.atol if atol is None else atol
+        effective_rtol = self.rtol if rtol is None else rtol
+        if effective_atol is None and effective_rtol is None:
+            raise ValueError("Either atol or rtol must be provided.")
 
         with torch.no_grad():
             self._apply_field_nan_ignore()
@@ -807,13 +996,13 @@ class Thresholder:
 
         with torch.no_grad():
             awindow = self.ub - self.lb
-            rwindow = awindow / self.ub
+            rwindow = self._relative_window(awindow)
             msk = self.check_tolerance(awindow, rwindow, atol=atol, rtol=rtol)
             msk = msk & ~self._ignored_like(msk)
             tries = 0
 
             while bool(torch.any(msk)) and (tries < self.max_tries_thresh):
-                stimamp = (self.ub + self.lb) / 2
+                stimamp = self.calc_stimamp()
                 mask = self.check_active(
                     tstop, dt, _scale_by_partition(stimamp, self.model_partition)
                 )
@@ -823,16 +1012,15 @@ class Thresholder:
                 self.ub[a_thr] = stimamp[a_thr]
                 self.lb[b_thr] = stimamp[b_thr]
                 awindow = self.ub - self.lb
-                rwindow = awindow / self.ub
+                rwindow = self._relative_window(awindow)
                 msk = self.check_tolerance(awindow, rwindow, atol=atol, rtol=rtol)
                 msk = msk & ~self._ignored_like(msk)
                 tries += 1
-            if tries >= self.max_tries_thresh:
-                print("hmm")
-                if self.ignore is not None:
-                    self.ub[self.ignore] = torch.nan
-                    self.lb[self.ignore] = torch.nan
-                return self.ub.cpu(), self.lb.cpu()
+
+            # Entries still outside tolerance exhausted their independent
+            # iteration budget and must not be reported as finite thresholds.
+            if torch.any(msk):
+                self._set_ignore(msk)
 
             if self.ignore is not None:
                 self.ub[self.ignore] = torch.nan
@@ -840,13 +1028,53 @@ class Thresholder:
 
             return self.ub.cpu(), self.lb.cpu()
 
+    def calc_stimamp(self):
+        if self.mode == "arithmetic":
+            return (self.ub + self.lb) / 2
+        elif self.mode == "geometric":
+            valid = ~self._ignored_like(self.lb)
+            if torch.any((self.lb <= 0) & valid) or torch.any((self.ub <= 0) & valid):
+                raise ValueError(
+                    "geometric thresholding requires strictly positive lower "
+                    "and upper bounds for every non-ignored lane."
+                )
+            return torch.sqrt(self.ub * self.lb)
+        else:
+            raise ValueError(f"Unknown mode '{self.mode}'.")
+
 
 def op_mc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("can,cat->tan", s, t).contiguous()
+    """Combine contact-first spatial and time-last temporal fields.
+
+    ``s`` has shape ``(contacts, *lanes, compartments)`` and ``t`` has
+    shape ``(contacts, *lanes, time)``. Leading lane axes use normal PyTorch
+    broadcasting and are preserved in the time-first result.
+    """
+    if s.dim() < 2 or t.dim() < 2:
+        raise ValueError("s and t must include contact and trailing feature axes.")
+    if s.shape[0] != t.shape[0]:
+        raise ValueError("s and t must have the same number of contacts.")
+    try:
+        lane_shape = torch.broadcast_shapes(s.shape[1:-1], t.shape[1:-1])
+        s = torch.broadcast_to(s, (s.shape[0], *lane_shape, s.shape[-1]))
+        t = torch.broadcast_to(t, (t.shape[0], *lane_shape, t.shape[-1]))
+    except RuntimeError as exc:
+        raise ValueError("s and t lane axes are not broadcastable.") from exc
+    combined = (s.unsqueeze(-2) * t.unsqueeze(-1)).sum(dim=0)
+    return combined.movedim(-2, 0).contiguous()
 
 
 def op_sc(s: Tensor, t: Tensor) -> Tensor:
-    return torch.einsum("an,at->tan", s, t).contiguous()
+    """Combine ``(*lanes, compartments)`` and ``(*lanes, time)`` fields."""
+    if s.dim() < 1 or t.dim() < 1:
+        raise ValueError("s and t must have trailing compartment/time axes.")
+    try:
+        lane_shape = torch.broadcast_shapes(s.shape[:-1], t.shape[:-1])
+        s = torch.broadcast_to(s, (*lane_shape, s.shape[-1]))
+        t = torch.broadcast_to(t, (*lane_shape, t.shape[-1]))
+    except RuntimeError as exc:
+        raise ValueError("s and t lane axes are not broadcastable.") from exc
+    return (s.unsqueeze(-2) * t.unsqueeze(-1)).movedim(-2, 0).contiguous()
 
 
 def _scale_by_partition(B: torch.Tensor, partition=None) -> torch.Tensor:
@@ -857,16 +1085,16 @@ def _scale_by_partition(B: torch.Tensor, partition=None) -> torch.Tensor:
     Parameters
     ----------
     B : torch.Tensor
-        Scaling tensor of shape (m, p). Each column provides the scaling
-        factor for the corresponding segment in ``partition``.
+        Scaling tensor of shape ``(*lanes, p)``. The final axis provides the
+        scaling factor for each segment in ``partition``.
     partition : sequence of int
         Segment lengths whose sum equals ``n``.
 
     Returns
     -------
     torch.Tensor
-        Tensor of shape (m, n) where each segment ``j`` is scaled by
-        ``B[:, j]``.
+        Tensor of shape ``(*lanes, n)`` where each segment ``j`` is scaled by
+        ``B[..., j]``. Without a partition, returns ``B[..., None]``.
 
     Raises
     ------
@@ -875,22 +1103,25 @@ def _scale_by_partition(B: torch.Tensor, partition=None) -> torch.Tensor:
     """
 
     if partition is None:
-        return B[:, None]
+        return B.unsqueeze(-1)
+
+    if B.dim() < 1:
+        raise ValueError("partitioned scaling requires a final partition axis.")
 
     lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
     if lengths.dim() != 1:
         raise ValueError("partition must be a 1D sequence of integers.")
-    if lengths.numel() != B.shape[1]:
+    if lengths.numel() != B.shape[-1]:
         raise ValueError(
-            "partition length must match the number of columns in B; "
-            f"got {lengths.numel()} and {B.shape[1]}."
+            "partition length must match the final dimension of B; "
+            f"got {lengths.numel()} and {B.shape[-1]}."
         )
     if lengths.numel() == 0:
         raise ValueError("partition must be non-empty.")
     if torch.any(lengths < 0):
         raise ValueError("partition values must be non-negative.")
 
-    weights = torch.repeat_interleave(B, lengths.to(device=B.device), dim=1)
+    weights = torch.repeat_interleave(B, lengths.to(device=B.device), dim=-1)
     return weights
 
 
@@ -901,7 +1132,8 @@ def _agree_dims(mask: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     Parameters
     ----------
     mask : torch.Tensor
-        Boolean mask tensor of shape (m,).
+        Boolean mask tensor with one fewer trailing axis than ``B``, or a
+        tensor already broadcastable to ``B``.
     B : torch.Tensor
         Target tensor of shape (m, n).
 
@@ -910,8 +1142,13 @@ def _agree_dims(mask: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     torch.Tensor
         Expanded boolean mask of shape (m, n).
     """
-    if mask.dim() == 1 and B.dim() == 2:
-        return mask[:, None].expand_as(B)
-    if B.dim() == 1 and mask.dim() == 2:
+    if tuple(mask.shape) == tuple(B.shape):
+        return mask
+    if tuple(mask.shape) == tuple(B.shape[:-1]):
+        return mask.unsqueeze(-1).expand_as(B)
+    if tuple(B.shape) == tuple(mask.shape[:-1]) and mask.shape[-1] == 1:
         return mask.squeeze(-1)
-    return mask
+    try:
+        return torch.broadcast_to(mask, B.shape)
+    except RuntimeError:
+        return mask

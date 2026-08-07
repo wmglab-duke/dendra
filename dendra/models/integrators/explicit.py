@@ -157,9 +157,11 @@ class _euler(Integrator):
             model.i_membrane = i_membrane
 
     def _step(self, v, ve, area, dt, temp, cm, intra):
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
         K1, i_ion = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
+        accepted_frame = self._capture_ion_current_frame()
         v_n = v + K1 * dt
+        self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = cm * (v_n - v) / dt
@@ -183,9 +185,11 @@ class _eulerv1(_euler):
     """
 
     def _step(self, v, ve, area, dt, temp, cm, intra=None):
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
         K1, i_ion = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
+        accepted_frame = self._capture_ion_current_frame()
         v_n = v + K1 * dt
+        self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = cm * (v_n - v) / dt
@@ -217,10 +221,12 @@ class _rk2(_euler):
     """
 
     def _step(self, v, ve, area, dt, temp, cm, intra=None):
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
         K1, _ = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
         K2, i2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra)
+        accepted_frame = self._capture_ion_current_frame()
         v_n = v + K2 * dt
+        self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = cm * (v_n - v) / dt
@@ -243,12 +249,21 @@ class _rk4(_euler):
     """
 
     def _step(self, v, ve, area, dt, temp, cm, intra=None):
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
         K1, i1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
+        frame1 = self._capture_ion_current_frame()
         K2, i2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra)
+        frame2 = self._capture_ion_current_frame()
         K3, i3 = self.FRK(v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra)
+        frame3 = self._capture_ion_current_frame()
         K4, i4 = self.FRK(v + K3 * dt, ve, area, self.cm_inv, self.ra_inv, intra)
+        frame4 = self._capture_ion_current_frame()
         v_n = v + (K1 + 2 * K2 + 2 * K3 + K4) * dt / 6.0
+        accepted_frame = self._combine_ion_current_frames(
+            (frame1, frame2, frame3, frame4),
+            (1.0 / 6.0, 2.0 / 6.0, 2.0 / 6.0, 1.0 / 6.0),
+        )
+        self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = cm * (v_n - v) / dt
@@ -436,21 +451,23 @@ class _dufort_frankel_homogeneous(Integrator):
         else:
             laplacian = ssd_df(v, v, ve) - v
 
-        self.mech.advance(v, dt, temp)
-        i_ion = self.mech.iexp(v) * area
+        self._advance_pre_current(v, dt, temp)
+        i_mem = self.mech.iexp(v)
+        accepted_frame = self._capture_ion_current_frame()
+        i_ion = i_mem * area
         i_drive = i_ion
         if intra is not None:
             i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
 
         # s1 and s2 contain 2*dt.  The starter advances exactly one dt.
         v_new = v + 0.5 * s2 * laplacian - 0.5 * s1 * i_drive
-        i_mem = self.mech.itot(v)
 
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
                 self.filter, v_new
             )
 
+        self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = 2.0 * (v_new - v) / s1
@@ -460,31 +477,36 @@ class _dufort_frankel_homogeneous(Integrator):
 
     def _step(
         self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra=None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if ve is None:
             d2v = s2 * ssd_df_no_ve(v, v_prev)
         else:
             d2v = s2 * ssd_df(v, v_prev, ve)
 
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
+        i_frame = self._capture_ion_current_frame()
+        g_frame = self._capture_ion_conductance_frame()
 
         i_drive = i_ion * area
         if intra is not None:
             i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
 
         v_new = (v_prev + d2v - s1 * i_drive) / (s4 + 0.5 * gtot * s3)
-
-        i_mem = self.mech.itot(v)
+        accepted_frame = self._linearize_ion_current_frame(
+            i_frame, g_frame, v_new, conductance_scale=0.5
+        )
+        i_mem = i_ion + 0.5 * gtot * v_new
 
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
                 self.filter, v_new
             )
 
+        self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
-            i_cap = (v_new - v_prev) / self.s1
+            i_cap = (v_new - v_prev) / s1
             i_membrane = i_cap + i_mem * area
 
         return v_new, v, i_membrane
@@ -502,28 +524,33 @@ class _dufort_frankel_homogeneous(Integrator):
         dt,
         temp,
         intra=None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         d2v = s2 * _conv_last(self.ssd, v, v_prev, ve)
 
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
+        i_frame = self._capture_ion_current_frame()
+        g_frame = self._capture_ion_conductance_frame()
 
         i_drive = i_ion * area
         if intra is not None:
             i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
 
         v_new = (v_prev + d2v - s1 * i_drive) / (s4 + 0.5 * gtot * s3)
-
-        i_mem = self.mech.itot(v)
+        accepted_frame = self._linearize_ion_current_frame(
+            i_frame, g_frame, v_new, conductance_scale=0.5
+        )
+        i_mem = i_ion + 0.5 * gtot * v_new
 
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
                 self.filter, v_new
             )
 
+        self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
-            i_cap = (v_new - v_prev) / self.s1
+            i_cap = (v_new - v_prev) / s1
             i_membrane = i_cap + i_mem * area
 
         return v_new, v, i_membrane
@@ -685,16 +712,17 @@ class _dufort_frankel(Integrator):
             delta_axial = delta_axial + 0.5 * c_left * (ve_padded[:, :-2] - ve_flat)
             delta_axial = delta_axial + 0.5 * c_right * (ve_padded[:, 2:] - ve_flat)
 
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
         area = _flatten_to_solve(self.area, K)
         s1 = _flatten_to_solve(self.s1, K)
-        i_ion_stim = _flatten_to_solve(self.mech.iexp(v), K) * area
+        i_mem = self.mech.iexp(v)
+        accepted_frame = self._capture_ion_current_frame()
+        i_ion_stim = _flatten_to_solve(i_mem, K) * area
         if intra is not None:
             i_ion_stim = i_ion_stim - _flatten_to_solve(intra, K, tuple(v.shape))
 
         v_new_flat = v_flat + delta_axial - 0.5 * s1 * i_ion_stim
         v_new = v_new_flat.reshape_as(v)
-        i_mem = self.mech.itot(v)
 
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
@@ -702,6 +730,7 @@ class _dufort_frankel(Integrator):
             )
             v_new_flat = _flatten_to_solve(v_new, K)
 
+        self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = 2.0 * (v_new_flat - v_flat) / s1
@@ -741,8 +770,10 @@ class _dufort_frankel(Integrator):
         else:
             num = num_v_prev + num_axial_v
 
-        self.mech.advance(v, dt, temp)
+        self._advance_pre_current(v, dt, temp)
         i_ion, gtot = self.mech.idf(v, v_prev)
+        i_frame = self._capture_ion_current_frame()
+        g_frame = self._capture_ion_conductance_frame()
         area = _flatten_to_solve(self.area, K)
         s1 = _flatten_to_solve(self.s1, K)
         s3 = _flatten_to_solve(self.s3, K)
@@ -754,14 +785,17 @@ class _dufort_frankel(Integrator):
         numerator = num + num_ion
         denominator = 1 + c_axial + (0.5 * s3 * _flatten_to_solve(gtot, K))
         v_new = (numerator / denominator).reshape_as(v)
-
-        i_mem = self.mech.itot(v)
+        accepted_frame = self._linearize_ion_current_frame(
+            i_frame, g_frame, v_new, conductance_scale=0.5
+        )
+        i_mem = i_ion + 0.5 * gtot * v_new
 
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
                 self.filter, v_new
             )
 
+        self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = (_flatten_to_solve(v_new, K) - v_prev_flat) / s1

@@ -6,8 +6,8 @@ The Slice contract
 :class:`dendra.models.slice.Slice` is Dendra's retained, logical selection of
 locations in a :class:`dendra.models.core.Population`.  It is the common
 interface for inspecting and changing selected state, labelling morphology
-regions, inserting mechanisms, applying intracellular stimulation, and
-specifying network endpoints.
+regions, inserting and deleting mechanisms, applying intracellular stimulation,
+and specifying network endpoints.
 
 A ``Slice`` is **not** a tensor and does not own simulation state.  Reading a
 field produces a non-aliasing tensor snapshot; an explicit Slice write changes
@@ -85,6 +85,14 @@ The following introspection has tensor-like meaning:
    The total number of selected entries, including repeated entries.  A scalar
    Slice has one element; an empty Slice has zero.
 
+``selection.flat_index``
+   A one-dimensional ``torch.long`` tensor containing the selected locations as
+   offsets into the flattened root population.  Its order and multiplicity
+   match ``selection``.  The returned tensor is an owned snapshot, so it can be
+   sampled or permuted without changing the retained Slice.  It reflects the
+   population layout at access time; reacquire it after batching or moving the
+   population, and unravel it against the shape from that same layout.
+
 Consequently, ``len(selection)`` and ``selection.numel()`` differ for a
 multidimensional selection:
 
@@ -94,6 +102,22 @@ multidimensional selection:
    assert region.shape == torch.Size([2, 3])
    assert len(region) == 2
    assert region.numel() == 6
+
+The flat numeric form makes arbitrary reordering and subsampling explicit.  To
+turn transformed flat indices back into a Slice, unravel them against the
+population shape:
+
+.. code-block:: python
+
+   flat = region.flat_index
+   order = torch.randperm(flat.numel(), device=flat.device)
+   shuffled_flat = flat[order]
+   shuffled = cells[torch.unravel_index(shuffled_flat, cells.shape)]
+
+   torch.testing.assert_close(
+       shuffled.v,
+       region.v.reshape(-1)[order],
+   )
 
 Reading state returns snapshots
 -------------------------------
@@ -179,7 +203,7 @@ For example, ``soma.batch`` and ``soma.initialize`` raise instead of
 transforming the whole population behind a region-looking expression.  Use
 ``soma.model.initialize()`` or ``soma.model.np`` only when whole-model access is
 intentional; Slice-scoped construction uses the explicit ``inject``, ``insert``,
-and ``parametrize`` methods below.
+``delete``, ``delete_all``, and ``parametrize`` methods below.
 
 Labels
 ------
@@ -328,7 +352,7 @@ operations:
    * - ``population.build()`` or ``initialize()``
      - Population-backed slices retain their selection.  A retained mechanism
        or other submodule Slice is rebound to the corresponding live submodule.
-   * - Forced rebuild after insertion/configuration changes
+   * - Forced rebuild after insertion/deletion/configuration changes
      - Submodule slices are rebound by their registered path.  If that path no
        longer exists or no longer supports the selection, use raises a clear
        stale-Slice error.
@@ -375,6 +399,26 @@ The following operations record the Slice's logical locations:
    union of their core cell/compartment locations.  If insertion changes an
    already-built model, call ``initialize()`` before running it again.
 
+``selection.delete(mechanism, strict=False)``
+   Remove the exact mechanism class from those physical compartments.  This is
+   a structural, set-valued operation: repeated Slice indices do not request
+   repeated deletion, and all copied or duplicate mechanism slots at a selected
+   compartment are removed.  By default, Dendra deletes the intersection of the
+   selected physical set and the mechanism's support; selected compartments
+   without that class are ignored.  Pass ``strict=True`` when every selected
+   compartment must support the exact class.  A strict mismatch fails
+   atomically without changing insertion or parameterization records.  On a
+   batched population, the Slice is projected onto the shared structural core,
+   so a deletion selected through any batch replica applies to that compartment
+   in every replica.  An empty Slice is a no-op.
+
+``selection.delete_all()``
+   Remove every mechanism class present on the selected physical compartments.
+   Support outside the Slice survives.  All affected classes and overrides are
+   planned as one transaction: if any required projection is unsafe, Dendra
+   changes none of them.  Batch projection, duplicate/copy removal, empty-Slice
+   behavior, and rebuild requirements are the same as for ``delete``.
+
 ``selection.parametrize(name, value, alias=None)``
    Register a spatial parameter override for the selected locations.  This is
    distinct from changing current mutable state with ``set``.  Batch replicas
@@ -393,6 +437,93 @@ Mechanism attribute access requires a built mechanism hierarchy.  It is valid
 to retain a population Slice before insertion, but access ``selection.mech``
 only after ``build()`` or ``initialize()`` has materialized the mechanisms.
 
+Deleting mechanisms and rebuilding safely
+------------------------------------------
+
+:meth:`~dendra.models.core.Population.delete` without an ``index`` removes the
+exact mechanism class from every place it is configured in the population:
+
+.. code-block:: python
+
+   from dendra.models.mod import hh, pas
+
+   cells.insert(pas)
+   cells.soma.insert(hh)
+
+   cells.dendrite.delete(pas)       # pas-support intersection
+   cells.soma.delete(pas, strict=True)
+   cells.delete(hh)                 # exact class everywhere
+   cells.delete_all()               # every remaining class everywhere
+
+The indexed ``Population.delete(mechanism, index=..., strict=False)`` and
+``Population.delete_all(index=...)`` forms address unbatched population-core
+coordinates directly.  With no ``index``, ``delete`` removes the named class
+everywhere and ``delete_all`` removes every mechanism class everywhere.  Prefer
+the Slice forms for restricted operations, especially after batching, because
+the Slice performs the structural projection explicitly.
+
+A restricted ``delete`` subtracts the mechanism-support intersection from every
+overlapping insertion alias.  ``strict=True`` first requires the entire
+selected physical set to be supported; otherwise it changes nothing.
+``delete_all`` takes the support intersection independently for every class
+present in the target.  It is transactional across classes: an unsafe
+transformation for one mechanism leaves every mechanism unchanged.
+
+Both operations crop persistent mechanism parameterizations that were
+registered through a Slice.  Scalar override values are retained.  Tensor-valued
+RANGE overrides are expanded over their old physical support and projected onto
+the surviving locations.  A spatial, module-valued override cannot be cropped
+safely: it may remain unchanged or be removed in full, but a partial overlap
+raises ``ValueError`` before any configuration is changed.  Likewise, a
+non-scalar BATCH override is rejected when any of its placement survives,
+because sparse deletion can change the compiled row grouping.  Replace such an
+override with a scalar or Tensor RANGE value, delete its complete support, or
+remove the whole mechanism instead.
+
+When the last supported compartment is deleted, Dendra removes the mechanism's
+configuration entirely, so the class is not instantiated by the next build.
+Every successful non-empty ``delete`` or ``delete_all`` invalidates
+initialization.  Call ``initialize()`` again before stepping or running:
+
+.. code-block:: python
+
+   cells.dendrite.delete(pas)
+   cells.initialize()
+
+A structural rebuild replaces compiled mechanism modules and may replace their
+registered ``torch.nn.Parameter`` objects.  If an optimizer was created before
+the deletion, create a new optimizer *after* reinitialization so it references
+the live Parameters:
+
+.. code-block:: python
+
+   cells.soma.delete(hh)
+   cells.initialize()
+   optimizer = torch.optim.Adam(cells.parameters(), lr=1e-3)
+
+The same replacement matters inside a :class:`~dendra.models.networks.Network`.
+Queued connection specifications hold their target synapse object, and any
+``SynapseSlots`` object also belongs to that compiled instance.  Before
+rebuilding a population that belongs to a network, clear the network's
+connections; after rebuilding, reacquire every target mechanism, recreate slot
+selections, reconnect, and initialize the network:
+
+.. code-block:: python
+
+   network.clear_synapses()
+   post.soma.delete(pas)
+   post.initialize()
+
+   live_synapse = post.mech.exp2syn
+   live_slots = post.soma.slots(live_synapse)
+   network.connect_to_slots(pre, live_slots, weight=0.05, delay=1.0)
+   network.initialize(dt=0.025)
+
+This is required even when the deleted mechanism is not itself the synaptic
+target: rebuilding the population replaces its complete compiled mechanism
+graph.  Dendra rejects stale target mechanisms and stale ``SynapseSlots``
+rather than silently wiring connections to detached state.
+
 Overlap, order, and multiplicity
 --------------------------------
 
@@ -406,6 +537,8 @@ Multiplicity has operation-specific meaning:
 * intracellular injections add repeated contributions;
 * distributed mechanism insertion and spatial parameterization operate on the
   unique physical region unless duplicate preservation is requested explicitly;
+* mechanism deletion treats the selection as a physical set and removes every
+  duplicate/copy slot at each selected compartment;
 * network connection rules apply their documented ``allow_multapses`` policy;
 * ``set`` and attribute assignment reject an ambiguous duplicate-bearing write
   when repeated occurrences request different values.
@@ -427,6 +560,10 @@ The Slice API fails early in cases that could otherwise change model meaning:
   or non-spatial tensor fields raise ``ValueError``;
 * incompatible write shapes report the selected and supplied shapes;
 * writes outside sparse mechanism support raise ``ValueError``;
+* a strict partial mechanism deletion that includes unsupported compartments
+  raises ``ValueError`` without changing the mechanism configuration;
+* an unprojectable spatial override makes ``delete`` or ``delete_all`` fail
+  without changing any affected mechanism configuration;
 * a submodule Slice that cannot be rebound after rebuild raises ``RuntimeError``;
 * cross-model Slice concatenation and foreign network endpoints are rejected;
 * ``len`` on a scalar Slice raises ``TypeError``.

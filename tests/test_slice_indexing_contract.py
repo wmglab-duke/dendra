@@ -134,6 +134,94 @@ def test_direct_slice_indexing_matches_torch(key):
 
 
 @pytest.mark.parametrize(
+    "key",
+    [
+        pytest.param((slice(1, None), slice(None, None, 2)), id="basic-slices"),
+        pytest.param((1, 2), id="scalar"),
+        pytest.param(
+            torch.tensor(
+                [
+                    [True, False, True, False, False],
+                    [False, True, False, True, False],
+                    [True, True, False, False, False],
+                ]
+            ),
+            id="boolean-mask",
+        ),
+        pytest.param(
+            (torch.tensor([2, 0, 2]), torch.tensor([4, 1, 4])),
+            id="ordered-repeats",
+        ),
+        pytest.param((None, Ellipsis), id="new-axis"),
+        pytest.param((slice(None), slice(0, 0)), id="empty"),
+    ],
+)
+def test_flat_index_is_canonical_population_flat_selection(key):
+    population = _population()
+    selection = population[key]
+    grid = torch.arange(
+        population.v.numel(), device=population.device(), dtype=torch.long
+    ).reshape(population.shape)
+
+    flat_index = selection.flat_index
+
+    assert flat_index.ndim == 1
+    assert flat_index.dtype == torch.long
+    assert flat_index.device == population.device()
+    assert torch.equal(flat_index, grid[key].reshape(-1))
+
+
+def test_flat_index_can_be_permuted_and_reused_as_a_population_selection():
+    population = _population()
+    selection = population[
+        torch.tensor([2, 0, 2]),
+        torch.tensor([4, 1, 3]),
+    ]
+    order = torch.tensor([2, 0, 1], device=population.device())
+
+    permuted_flat = selection.flat_index[order]
+    permuted = population[torch.unravel_index(permuted_flat, population.shape)]
+
+    assert torch.equal(permuted.v, selection.v.reshape(-1)[order])
+
+
+def test_flat_index_is_an_owned_snapshot():
+    population = _population()
+    selection = population[[2, 0], 1:4]
+    expected_values = selection.v.clone()
+    expected_index = selection.flat_index.clone()
+
+    selection.flat_index.fill_(0)
+
+    assert torch.equal(selection.v, expected_values)
+    assert torch.equal(selection.flat_index, expected_index)
+
+
+def test_nested_flat_index_tracks_the_current_batched_population_layout():
+    population = _population()
+    selection = population[:, 1:][[2, 0], ::2]
+    before_batch = selection.flat_index
+
+    population.batch(2)
+    grid = torch.arange(
+        population.v.numel(), device=population.device(), dtype=torch.long
+    ).reshape(population.shape)
+    expected = grid[:, :, 1:][:, [2, 0], ::2].reshape(-1)
+
+    assert torch.equal(selection.flat_index, expected)
+    assert before_batch.tolist() == [11, 13, 1, 3]
+
+    population.batch(3)
+    grid = torch.arange(
+        population.v.numel(), device=population.device(), dtype=torch.long
+    ).reshape(population.shape)
+    expected = grid[:, :, :, 1:][:, :, [2, 0], ::2].reshape(-1)
+
+    assert torch.equal(selection.flat_index, expected)
+    assert before_batch.tolist() == [11, 13, 1, 3]
+
+
+@pytest.mark.parametrize(
     ("first", "second"),
     [
         pytest.param(
@@ -373,6 +461,33 @@ def test_label_rejects_population_attribute_collisions_atomically(name):
         assert type(after_attribute) is type(before_attribute)
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "index_spec",
+        "flat_index",
+        "parent_slice",
+        "index",
+        "numel",
+        "get",
+        "set",
+        "label",
+        "inject",
+    ],
+)
+def test_top_level_label_rejects_slice_api_collisions_atomically(name):
+    population = _population()
+    selection = population[:, 0]
+    before_labels = dict(population._labels)
+    before_dict = dict(vars(population))
+
+    with pytest.raises(ValueError, match="Slice API"):
+        selection.label(name)
+
+    assert population._labels == before_labels
+    assert vars(population) == before_dict
+
+
 def test_label_rejects_an_existing_label_collision_atomically():
     population = _population()
     original = population[:, 0].label("region")
@@ -412,6 +527,7 @@ def test_label_rejects_an_existing_instance_attribute_atomically():
     [
         "model",
         "index_spec",
+        "flat_index",
         "base_shape",
         "parent_slice",
         "shape",

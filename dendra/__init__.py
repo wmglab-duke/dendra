@@ -99,7 +99,7 @@ from .models.integrators import (
 )
 from .models.mod import load_mechanisms
 from .models.stim.waveform import *
-from .stepping import step
+from .stepping import step, step_network, step_population
 
 __all__ = [
     "PI",
@@ -110,6 +110,8 @@ __all__ = [
     "ctx",
     "doctor",
     "step",
+    "step_population",
+    "step_network",
     "DEVICE",
     "DTYPE",
     "NATIVE_EXTENSION_POLICY",

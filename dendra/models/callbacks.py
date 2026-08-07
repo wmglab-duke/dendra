@@ -209,10 +209,11 @@ def _append_tensor_max(
     record : List[torch.Tensor]
         The list to which the maximum value will be appended.
     partition : sequence of int, optional
-        Segment lengths that partition ``tensor`` along dimension 1. The sum of
-        the sequence must equal ``tensor.shape[1]`` and all values must be
+        Segment lengths that partition ``tensor`` along its final dimension.
+        The sum of the sequence must equal ``tensor.shape[-1]`` and all values must be
         positive. If provided, the maximum is computed within each segment
-        along dimension 1 and stacked into a new dimension.
+        along the final dimension. All leading model and batch dimensions are
+        preserved, and the partition dimension is appended at the end.
     """
     if partition is None:
         record.append(torch.amax(tensor, -1, keepdim=True))
@@ -222,14 +223,14 @@ def _append_tensor_max(
         raise ValueError("partitioned max requires tensor with at least 2 dims.")
 
     total = int(partition.sum().item())
-    if total != tensor.shape[1]:
+    if total != tensor.shape[-1]:
         raise ValueError(
-            "sum(partition) must equal tensor.shape[1]; "
-            f"got {total} and {tensor.shape[1]}."
+            "sum(partition) must equal tensor.shape[-1]; "
+            f"got {total} and {tensor.shape[-1]}."
         )
 
-    segments = torch.split(tensor, partition.tolist(), dim=1)
-    record.append(torch.stack([torch.amax(seg, dim=1) for seg in segments], dim=1))
+    segments = torch.split(tensor, partition.tolist(), dim=-1)
+    record.append(torch.stack([torch.amax(seg, dim=-1) for seg in segments], dim=-1))
 
 
 def _append_tensor_indexed(
@@ -309,6 +310,35 @@ def _n(node_indices, model):
     return len(node_indices)
 
 
+def _model_population_shape(model) -> Tuple[int, ...]:
+    """Return all model axes except the final compartment axis.
+
+    Dendra models expose the membrane-voltage shape through ``model.shape``.
+    The voltage tensor fallback keeps callbacks compatible with lightweight
+    third-party models and older test doubles that predate that property.
+    """
+    try:
+        shape = tuple(model.shape)
+    except (AttributeError, TypeError):
+        try:
+            shape = tuple(model.v.shape)
+        except AttributeError as exc:
+            raise TypeError(
+                "threshold callbacks require model.shape or a model.v tensor."
+            ) from exc
+
+    if len(shape) < 2:
+        raise ValueError(
+            f"threshold callbacks require model shape (*batch, N, C); got {shape}."
+        )
+    return shape[:-1]
+
+
+def _threshold_record_shape(model, node_indices) -> Tuple[int, ...]:
+    """Return ``(*batch, N, K)`` for ``K`` checked compartments."""
+    return (*_model_population_shape(model), _n(node_indices, model))
+
+
 def _atleast_2d(x: torch.Tensor) -> torch.Tensor:
     dims = x.dim()
     if dims == 1:
@@ -379,8 +409,9 @@ class Recorder(Callback):
         List of state names to record. Can be model attributes (e.g., 'v') or
         mechanism states (e.g., 'hh.m').
     max_only : bool, optional
-        If True, only the maximum value across nodes is recorded for each state.
-        Default is False.
+        If True, only the maximum value across the final compartment axis is
+        recorded for each state. All leading batch and population axes are
+        preserved. Default is False.
     node_indices : list of int, optional
         Indices of specific nodes to record. If None, all nodes are recorded.
         Default is None.
@@ -390,6 +421,10 @@ class Recorder(Callback):
     sliding_window : int, optional
         Size of sliding window for temporal averaging of recorded data.
         Default is None (no averaging).
+    partition : sequence of int, optional
+        With ``max_only=True``, contiguous segment lengths along the final
+        compartment axis. One maximum per segment is appended as the final
+        output axis.
 
     Notes
     -----
@@ -734,7 +769,8 @@ class Recorder(Callback):
         ----------
         var : str, optional
             Name of the specific state to stack. If None, all states
-            are stacked and concatenated along dimension 2. Default is None.
+            are stacked on an axis immediately before the final recorded-node
+            or partition axis. Default is None.
 
         Returns
         -------
@@ -748,7 +784,7 @@ class Recorder(Callback):
             if self.sliding_window is not None:
                 vs = _sliding_window_average(vs, self.sliding_window)
             return vs
-        vs = torch.stack([torch.stack(self.rec[s]) for s in self.rec], dim=2)
+        vs = torch.stack([torch.stack(self.rec[s]) for s in self.rec], dim=-2)
         if self.sliding_window is not None:
             vs = _sliding_window_average(vs, self.sliding_window)
         if self.max_only:
@@ -1003,6 +1039,12 @@ class ThresholdCallback(Callback):
     monitoring when membrane potential crosses a specified threshold at selected nodes.
     It serves as a base class for specialized callbacks like APCount, Active, and Raster.
 
+    The final model dimension is always interpreted as compartments. For a
+    model shaped ``(*batch, N, C)``, callback state for ``K`` checked
+    compartments is shaped ``(*batch, N, K)``. Activity criteria reduce only
+    that final ``K`` axis and therefore return ``(*batch, N)`` (or
+    ``(*batch, N, P)`` for ``P`` checked-compartment partitions).
+
     Parameters
     ----------
     threshold : float, optional
@@ -1019,7 +1061,8 @@ class ThresholdCallback(Callback):
     Attributes
     ----------
     record : torch.Tensor
-        Records detection results (specific format depends on subclass).
+        Records detection results while preserving all model axes before the
+        final compartment axis (specific format depends on subclass).
     state_cache : torch.Tensor
         Cache of state to track threshold crossings between time steps.
     threshold : float
@@ -1056,18 +1099,26 @@ class ThresholdCallback(Callback):
 
     def pre_loop_hook(self, model):
         """
-        Normalize and move node indices to the model device.
+        Validate, normalize, and move node indices to the model device.
 
-        Converts ``node_check`` to a tensor on the model device and wraps any
-        negative indices so they reference from the end of the cable.
+        Negative indices use normal Python indexing semantics. Indices outside
+        ``[-model.nc, model.nc - 1]`` are rejected rather than silently wrapped.
         """
         self.node_check = torch.as_tensor(
             self.node_check, dtype=torch.long, device=model.device()
-        )
+        ).reshape(-1)
 
-        # convert negative to positive index
-        nc = model.nc
-        self.node_check = self.node_check.remainder(nc)
+        nc = int(model.nc)
+        invalid = (self.node_check < -nc) | (self.node_check >= nc)
+        if torch.any(invalid):
+            invalid_values = self.node_check[invalid].detach().cpu().tolist()
+            raise IndexError(
+                "node_check entries must be valid compartment indices in "
+                f"[-{nc}, {nc - 1}]; got {invalid_values}."
+            )
+        self.node_check = torch.where(
+            self.node_check < 0, self.node_check + nc, self.node_check
+        )
 
     @property
     def dt(self):
@@ -1158,7 +1209,7 @@ class APCount(ThresholdCallback):
     Attributes
     ----------
     record : torch.Tensor
-        Integer tensor of shape [n_axons, n_check_nodes] storing AP counts.
+        Tensor of shape ``(*batch, N, n_check_nodes)`` storing AP counts.
     state_cache : torch.Tensor
         Boolean tensor tracking membrane potential state relative to threshold.
     """
@@ -1167,24 +1218,22 @@ class APCount(ThresholdCallback):
         """
         Allocate per-axon spike counters and state cache.
 
-        ``record`` is created as a ``(n_axons, n_nodes_checked)`` float tensor
-        and ``state_cache`` starts as ``True`` so the first upward crossing is
-        counted. Negative indices in ``node_check`` have already been resolved
-        by :meth:`ThresholdCallback.pre_loop_hook`.
+        ``record`` is created as a ``(*batch, N, n_nodes_checked)`` float
+        tensor and ``state_cache`` starts as ``True`` so the first upward
+        crossing is counted. Negative indices in ``node_check`` have already
+        been resolved by :meth:`ThresholdCallback.pre_loop_hook`.
         """
         super().pre_loop_hook(model)
 
         if self.record is None:
             self.record = torch.zeros(
-                model.n(),
-                _n(self.node_check, model),
+                _threshold_record_shape(model, self.node_check),
                 dtype=torch.float,
                 device=model.device(),
             )
         if self.state_cache is None:
             self.state_cache = torch.ones(
-                model.n(),
-                _n(self.node_check, model),
+                _threshold_record_shape(model, self.node_check),
                 dtype=torch.bool,
                 device=model.device(),
             )
@@ -1262,7 +1311,7 @@ class ActiveAL(APCount):
     Attributes
     ----------
     record : torch.Tensor
-        Integer tensor of shape [n_axons, n_check_nodes] storing spike counts.
+        Tensor of shape ``(*batch, N, n_check_nodes)`` storing spike counts.
     state_cache : torch.Tensor
         Boolean tensor tracking membrane potential state relative to threshold.
     at_least : int
@@ -1287,30 +1336,31 @@ class ActiveAL(APCount):
         """
         Determine which axons are active based on spike counts.
 
-        By default, an axon is active if the number of nonzero entries in each
-        row of ``record`` is at least ``at_least``. When ``partition`` is
+        By default, a logical population entry is active if the number of
+        nonzero entries along the final axis of ``record`` is at least
+        ``at_least``. When ``partition`` is
         provided, the check is performed independently over contiguous segments
-        of each row, and a boolean mask is returned for each segment.
+        of the final axis, and a boolean mask is returned for each segment.
 
         Parameters
         ----------
         partition : sequence of int, optional
-            Segment lengths that partition ``record`` along dimension 1. The
-            sum of the sequence must equal ``record.shape[1]`` and every value
+            Segment lengths that partition ``record`` along its final axis. The
+            sum of the sequence must equal ``record.shape[-1]`` and every value
             must be at least ``at_least``. If None, the full row is used.
 
         Returns
         -------
         torch.Tensor
-            Boolean tensor of shape ``(n_axons,)`` when ``partition`` is None,
-            otherwise ``(n_axons, len(partition))``. If ``inv`` is True, the
-            result is inverted.
+            Boolean tensor of shape ``(*batch, N)`` when ``partition`` is None,
+            otherwise ``(*batch, N, len(partition))``. If ``inv`` is True,
+            the result is inverted.
 
         Raises
         ------
         ValueError
             If ``partition`` is empty, not 1D, does not sum to
-            ``record.shape[1]``, or any segment length is less than
+            ``record.shape[-1]``, or any segment length is less than
             ``at_least``.
         """
         if self.record is None:
@@ -1373,17 +1423,17 @@ class ActiveALCount(APCount):
         """
         Determine which axons are active based on total spike count.
 
-        An axon is active if the sum of counts across all monitored nodes in
-        ``record`` is at least ``at_least``. When ``partition`` is provided,
-        the check is performed independently over contiguous segments of each row,
-        and a boolean mask is returned for each segment.
+        A logical population entry is active if the sum of counts across the
+        final checked-node axis in ``record`` is at least ``at_least``. When
+        ``partition`` is provided, the check is performed independently over
+        contiguous segments of that final axis.
 
         Returns
         -------
         torch.Tensor
-            Boolean tensor of shape ``(n_axons,)`` when ``partition`` is None,
-            otherwise ``(n_axons, len(partition))``. If ``inv`` is True, the
-            result is inverted.
+            Boolean tensor of shape ``(*batch, N)`` when ``partition`` is None,
+            otherwise ``(*batch, N, len(partition))``. If ``inv`` is True,
+            the result is inverted.
         """
         if self.record is None:
             return self.record
@@ -1438,9 +1488,11 @@ class Active(ActiveAL):
     Attributes
     ----------
     record : torch.Tensor
-        Boolean tensor of shape [n_axons] indicating which axons fired at least once.
+        Boolean tensor of shape ``(*batch, N)`` indicating which logical
+        population entries fired at least once.
     state_cache : torch.Tensor
-        Boolean tensor tracking membrane potential state relative to threshold.
+        Boolean tensor of shape ``(*batch, N, K)`` tracking membrane potential
+        state at the ``K`` checked compartments.
     """
 
     def __init__(
@@ -1495,34 +1547,42 @@ class _Active(ThresholdCallback):
     Attributes
     ----------
     record : torch.Tensor
-        Boolean tensor of shape [n_axons] indicating which axons fired at least once.
+        Boolean tensor of shape ``(*batch, N)`` indicating which logical
+        population entries fired at least once.
     state_cache : torch.Tensor
-        Boolean tensor tracking membrane potential state relative to threshold.
+        Boolean tensor of shape ``(*batch, N, K)`` tracking membrane potential
+        state at the ``K`` checked compartments.
     """
 
     def __init__(
         self, threshold=0.0, t_start_check=0.0, node_check=[5, -5], dt=None, inv=False
     ):
-        super().__init__(threshold, t_start_check, node_check, dt)
+        super().__init__(
+            threshold=threshold,
+            t_start_check=t_start_check,
+            node_check=node_check,
+            dt=dt,
+        )
         self.inv = inv
 
     def pre_loop_hook(self, model):
         """
         Initialize boolean fire mask and cache for threshold detection.
 
-        Creates a ``record`` vector (one flag per axon) and a per-node
-        ``state_cache`` that tracks whether voltage was below threshold on the
-        previous step.
+        Creates a ``record`` tensor shaped ``(*batch, N)`` and a per-node
+        ``state_cache`` shaped ``(*batch, N, K)`` that tracks whether voltage
+        was below threshold on the previous step.
         """
         super().pre_loop_hook(model)
         if self.record is None:
             self.record = torch.zeros(
-                model.n(), dtype=torch.bool, device=model.device()
+                _model_population_shape(model),
+                dtype=torch.bool,
+                device=model.device(),
             )
         if self.state_cache is None:
             self.state_cache = torch.ones(
-                model.n(),
-                _n(self.node_check, model),
+                _threshold_record_shape(model, self.node_check),
                 dtype=torch.bool,
                 device=model.device(),
             )
@@ -1536,7 +1596,7 @@ class _Active(ThresholdCallback):
         axon, updates ``record`` when a rising edge occurs, and updates
         ``state_cache`` to reflect the new below-threshold mask.
         """
-        if self.i >= self.ind_start:
+        if self.i >= self.ind_start and self.i < self.ind_end:
             vm_new = model.v.index_select(-1, self.node_check)
             self.state_cache, self.record = _update_active(
                 self.state_cache, vm_new, self.record, self.threshold
@@ -1595,7 +1655,8 @@ class Raster(ThresholdCallback):
     Attributes
     ----------
     record : list of torch.Tensor
-        List of boolean tensors, one per time step, indicating which axons spiked.
+        List of boolean tensors shaped ``(*batch, N, K)``, one per time step,
+        indicating which checked compartments spiked.
     state_cache : torch.Tensor
         Boolean tensor tracking membrane potential state relative to threshold.
     """
@@ -1608,15 +1669,12 @@ class Raster(ThresholdCallback):
         that will hold per-step spike masks, and seeds ``state_cache`` so the
         first upward crossings are detected.
         """
-        self.node_check = torch.as_tensor(
-            self.node_check, dtype=torch.long, device=model.device()
-        )
+        super().pre_loop_hook(model)
         if self.record is None:
             self.record = []
         if self.state_cache is None:
             self.state_cache = torch.ones(
-                model.n(),
-                _n(self.node_check, model),
+                _threshold_record_shape(model, self.node_check),
                 dtype=torch.bool,
                 device=model.device(),
             )
@@ -1630,8 +1688,8 @@ class Raster(ThresholdCallback):
         computes rising-edge events with :func:`_increment_act`, updates
         ``state_cache``, and appends the resulting activity mask to ``record``.
         """
-        if self.i >= self.ind_start:
-            vm_new = _atleast_2d(model.v[:, self.node_check])
+        if self.i >= self.ind_start and self.i < self.ind_end:
+            vm_new = model.v.index_select(-1, self.node_check)
             vm = self.state_cache
             self.state_cache, la = _increment_act(vm, vm_new, self.threshold)
             self.record.append(la)
@@ -1691,7 +1749,14 @@ class Raster(ThresholdCallback):
             cmap = plt.cm.viridis
         if isinstance(cmap, str):
             cmap = plt.get_cmap(cmap)
-        binary_array = self.numpy()[:, axon_idx, node_idx].T
+        raster = self.numpy()
+        if raster.ndim != 3:
+            raise ValueError(
+                "Raster.plot supports unbatched records shaped (time, N, K); "
+                f"got {raster.shape}. Select a batch entry from Raster.numpy() "
+                "and plot it explicitly."
+            )
+        binary_array = raster[:, axon_idx, node_idx].T
         if ax is None:
             fig, ax = plt.subplots(dpi=300, figsize=(10, 6))
 
@@ -1747,13 +1812,13 @@ def _update_active(
     vm, vm_new, record, threshold: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # pragma: no cover
     ge = vm_new >= threshold
-    record = torch.logical_or(record, torch.any(torch.logical_and(ge, vm), dim=1))
+    record = torch.logical_or(record, torch.any(torch.logical_and(ge, vm), dim=-1))
     return ~ge, record
 
 
 def _is_active(record, at_least: int, partition=None) -> torch.Tensor:
     if partition is None:
-        return torch.count_nonzero(record, dim=1) >= at_least
+        return torch.count_nonzero(record, dim=-1) >= at_least
 
     lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
     if lengths.dim() != 1:
@@ -1762,10 +1827,10 @@ def _is_active(record, at_least: int, partition=None) -> torch.Tensor:
     lengths_list = lengths.tolist()
     if not lengths_list:
         raise ValueError("partition must be non-empty.")
-    if sum(lengths_list) != record.shape[1]:
+    if sum(lengths_list) != record.shape[-1]:
         raise ValueError(
-            "sum(partition) must equal record.shape[1]; "
-            f"got {sum(lengths_list)} and {record.shape[1]}."
+            "sum(partition) must equal record.shape[-1]; "
+            f"got {sum(lengths_list)} and {record.shape[-1]}."
         )
     if min(lengths_list) < at_least:
         raise ValueError(
@@ -1773,15 +1838,15 @@ def _is_active(record, at_least: int, partition=None) -> torch.Tensor:
             f"minimum was {min(lengths_list)}."
         )
 
-    segments = torch.split(record, lengths_list, dim=1)
+    segments = torch.split(record, lengths_list, dim=-1)
     return torch.stack(
-        [torch.count_nonzero(seg, dim=1) >= at_least for seg in segments], dim=1
+        [torch.count_nonzero(seg, dim=-1) >= at_least for seg in segments], dim=-1
     )
 
 
 def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
     if partition is None:
-        return record.sum(dim=1) >= at_least
+        return record.sum(dim=-1) >= at_least
 
     lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
     if lengths.dim() != 1:
@@ -1790,10 +1855,10 @@ def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
     lengths_list = lengths.tolist()
     if not lengths_list:
         raise ValueError("partition must be non-empty.")
-    if sum(lengths_list) != record.shape[1]:
+    if sum(lengths_list) != record.shape[-1]:
         raise ValueError(
-            "sum(partition) must equal record.shape[1]; "
-            f"got {sum(lengths_list)} and {record.shape[1]}."
+            "sum(partition) must equal record.shape[-1]; "
+            f"got {sum(lengths_list)} and {record.shape[-1]}."
         )
     if min(lengths_list) < at_least:
         raise ValueError(
@@ -1801,8 +1866,8 @@ def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
             f"minimum was {min(lengths_list)}."
         )
 
-    segments = torch.split(record, lengths_list, dim=1)
-    return torch.stack([seg.sum(dim=1) >= at_least for seg in segments], dim=1)
+    segments = torch.split(record, lengths_list, dim=-1)
+    return torch.stack([seg.sum(dim=-1) >= at_least for seg in segments], dim=-1)
 
 
 def _sliding_window_average(x, window_size: int):

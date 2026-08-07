@@ -176,7 +176,9 @@ def _oracle_step(state, dt, *, conductance=CONDUCTANCE):
 
     cmdt = 1.0e-3 * CM.to(v).reshape_as(v) / dt_t
     v_new = (cmdt * v + g * ek_new) / (cmdt + g)
-    voltage_current = g * (v - ek_new)
+    # The implicit solver evaluates once at ``v`` and commits the affine
+    # endpoint current that actually closes its linearized voltage balance.
+    voltage_current = g * (v_new - ek_new)
     return (v_new, ki_new, ko, ek_new), {
         "flux_current": flux_current,
         "voltage_current": voltage_current,

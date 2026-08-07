@@ -1,3 +1,4 @@
+from operator import index as integer_index
 from typing import List, Union
 
 import torch
@@ -8,6 +9,8 @@ from .spherical_cartesian import spherical_to_cartesian
 
 
 class Point(P):
+    """Base for elementwise point fields that preserve ``(*batch, N, C)``."""
+
     P.PARAMETER(x=0.0, y=0.0, z=0.0)
 
     def fn(self, x, y, z):
@@ -124,8 +127,21 @@ class parametric_efield(torch.nn.Module):
 
     The public :meth:`forward` path treats ``model.x``, ``model.y``, and
     ``model.z`` as coordinates in µm, accepts an E-field magnitude in V/m,
-    and returns extracellular quasipotentials in mV. The calculation is fully
-    vectorized over the sampled azimuthal and polar directions.
+    and returns extracellular quasipotentials in mV. Let ``D`` be
+    ``n_azimuthal * n_polar`` and ``Q`` be the product of every model coordinate
+    axis except the final compartment axis. Direction-to-model alignment is
+    explicit:
+
+    * ``D == Q`` pairs one direction with each flattened logical model lane and
+      restores the exact model coordinate shape.
+    * ``D == 1`` broadcasts the single direction over all ``Q`` lanes and
+      restores the exact model coordinate shape.
+    * ``Q == 1`` with ``D > 1`` is field-generation mode and returns ``(D, C)``.
+      Any singleton leading axes in a higher-rank model are intentionally
+      collapsed. When ``D == Q == 1``, the single-direction rule takes
+      precedence and preserves the exact coordinate shape.
+    * All other ``D``/``Q`` combinations raise :class:`ValueError`; they never
+      form an implicit Cartesian product.
 
     Parameters
     ----------
@@ -156,8 +172,8 @@ class parametric_efield(torch.nn.Module):
         relative_mag_change_per_mm: Union[float, List[float], torch.Tensor] = 0.0,
     ):
         super().__init__()
-        self.n_phi = n_azimuthal
-        self.n_theta = n_polar
+        self.n_phi = self._positive_integer("n_azimuthal", n_azimuthal)
+        self.n_theta = self._positive_integer("n_polar", n_polar)
 
         if isinstance(relative_mag_change_per_mm, (int, float)):
             mag_changes = [float(relative_mag_change_per_mm)]
@@ -185,6 +201,21 @@ class parametric_efield(torch.nn.Module):
         self.register_buffer("phi", phi)
         self.register_buffer("theta", theta)
 
+    @staticmethod
+    def _positive_integer(name: str, value: object) -> int:
+        """Return a strict, Python-int dimension without accepting floats/bools."""
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive integer; got {value!r}.")
+        try:
+            count = integer_index(value)
+        except TypeError as exc:
+            raise ValueError(
+                f"{name} must be a positive integer; got {value!r}."
+            ) from exc
+        if count < 1:
+            raise ValueError(f"{name} must be a positive integer; got {value!r}.")
+        return int(count)
+
     def __forward(
         self, model: object, e_field_strength_Vm: float = 1.0
     ) -> torch.Tensor:
@@ -207,8 +238,24 @@ class parametric_efield(torch.nn.Module):
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
 
+        if not (x.shape == y.shape == z.shape) or x.ndim < 2:
+            raise ValueError(
+                "model.x, model.y, and model.z must have identical shapes "
+                "(*batch, N, C)."
+            )
+        n_compartments = x.shape[-1]
+        n_lanes = x.numel() // n_compartments
+        if n_lanes != 1:
+            raise ValueError(
+                "The spatial-gradient parametric E-field path generates a new "
+                "direction/magnitude batch and therefore requires exactly one "
+                f"logical model lane; got Q={n_lanes} from shape {tuple(x.shape)}."
+            )
+
+        x = x.reshape(1, n_compartments)
+        y = y.reshape(1, n_compartments)
+        z = z.reshape(1, n_compartments)
         z_coords = z[0]
-        n_compartments = len(z_coords)
 
         # Reshape tensors for broadcasting to the final shape:
         # (n_phi, n_theta, n_mag_changes, n_compartments)
@@ -293,27 +340,51 @@ class parametric_efield(torch.nn.Module):
         Returns
         -------
         torch.Tensor
-            Quasipotentials in mV with shape
-            ``(n_azimuthal * n_polar, n_compartments)`` (plus any compatible
-            model batch dimensions).
+            Quasipotentials in mV. See the class-level direction-alignment
+            contract for the exact output shape.
         """
         self.to(device=model.device(), dtype=model.dtype())
         x, y, z = model.x, model.y, model.z
-        x = x / 1e6  # Convert from µm to m
-        y = y / 1e6  # Convert from µm to m
-        z = z / 1e6  # Convert from µm to m
-
-        phi = self.phi.view(-1, 1)
-        theta = self.theta.view(-1, 1)
-
-        ve = (
-            -e_field_strength_Vm
-            * (
-                x * torch.sin(theta) * torch.cos(phi)
-                + y * torch.sin(theta) * torch.sin(phi)
-                + z * torch.cos(theta)
+        if not (x.shape == y.shape == z.shape) or x.ndim < 2:
+            raise ValueError(
+                "model.x, model.y, and model.z must have identical shapes "
+                "(*batch, N, C)."
             )
-            * 1000.0
-        )  # Convert to mV
 
-        return ve
+        n_compartments = x.shape[-1]
+        n_lanes = x.numel() // n_compartments
+        coords_m = (
+            torch.stack((x, y, z), dim=-1).reshape(n_lanes, n_compartments, 3) / 1e6
+        )
+
+        sin_theta = torch.sin(self.theta)
+        directions = torch.stack(
+            (
+                sin_theta * torch.cos(self.phi),
+                sin_theta * torch.sin(self.phi),
+                torch.cos(self.theta),
+            ),
+            dim=-1,
+        )
+        n_directions = directions.shape[0]
+
+        # Shape preservation wins when both single-direction broadcasting and
+        # single-lane generation apply (D == Q == 1).
+        if n_directions == 1:
+            directions = directions.expand(n_lanes, -1)
+            output_shape = x.shape
+        elif n_lanes == 1:
+            coords_m = coords_m.expand(n_directions, -1, -1)
+            output_shape = (n_directions, n_compartments)
+        elif n_directions == n_lanes:
+            output_shape = x.shape
+        else:
+            raise ValueError(
+                "Parametric E-field directions must align with logical model "
+                "lanes: expected D == Q, D == 1, or Q == 1, where "
+                f"D={n_directions} and Q={n_lanes} for model shape "
+                f"{tuple(x.shape)}."
+            )
+
+        ve = -e_field_strength_Vm * torch.sum(coords_m * directions[:, None, :], dim=-1)
+        return (ve * 1000.0).reshape(output_shape)
