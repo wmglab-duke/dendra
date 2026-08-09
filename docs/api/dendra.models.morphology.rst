@@ -13,6 +13,11 @@ Native morphology declaration
 .. autoclass:: dendra.models.morphology.SectionLocation
    :members:
 
+Morphology composition
+----------------------
+
+.. autofunction:: dendra.models.morphology.connect_morphologies
+
 Canonical scalar compartment graph
 ----------------------------------
 

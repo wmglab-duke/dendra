@@ -560,6 +560,103 @@ declaration until a new root is authored. Previously compiled graphs and
 instantiated models are immutable snapshots and are not altered by deletion;
 compile or construct a new model to observe the revised morphology.
 
+Connect complete morphologies
+-----------------------------
+
+Use :func:`dendra.connect_morphologies` when the host cell and the arbor to
+attach are already complete Morphology declarations. The parent location may
+be anywhere on the host tree. The child location must be endpoint ``0`` or
+``1`` of the child tree's root Section; selecting any other Section would give
+the child tree two parents. Both sources must validate as complete, connected
+one-root trees before they can be composed.
+
+For example, a cell ending in a short dendritic stump can be extended with a
+separately authored full arbor. Here both declarations contain a Section named
+``"dendrite_root"``, so ``child_prefix`` gives every copied child Section a
+collision-free name:
+
+.. code-block:: python
+
+   host = dn.Morphology(rhoa=90.0, cm=1.0)
+   soma = host.section(
+       "soma",
+       points=[
+           (-10 * um, 0 * um, 0 * um, 20 * um),
+           (10 * um, 0 * um, 0 * um, 20 * um),
+       ],
+   )
+   stump = host.section(
+       "dendrite_root",
+       points=[
+           (10 * um, 0 * um, 0 * um, 2 * um),
+           (30 * um, 0 * um, 0 * um, 2 * um),
+       ],
+       labels="dendrite",
+   )
+   stump.connect(soma.at(1.0), child_end=0)
+
+   arbor = dn.Morphology(rhoa=80.0, cm=1.2)
+   arbor_root = arbor.section(
+       "dendrite_root",
+       points=[
+           (30 * um, 0 * um, 0 * um, 2 * um),
+           (80 * um, 0 * um, 0 * um, 1.4 * um),
+       ],
+       nseg=5,
+       labels="dendrite",
+   )
+   upper = arbor.section(
+       "upper",
+       points=[
+           (80 * um, 0 * um, 0 * um, 1.4 * um),
+           (130 * um, 40 * um, 0 * um, 0.8 * um),
+       ],
+       nseg=5,
+       labels="dendrite",
+   )
+   lower = arbor.section(
+       "lower",
+       points=[
+           (80 * um, 0 * um, 0 * um, 1.4 * um),
+           (130 * um, -40 * um, 0 * um, 0.8 * um),
+       ],
+       nseg=5,
+       labels="dendrite",
+   )
+   upper.connect(arbor_root.at(1.0), child_end=0)
+   lower.connect(arbor_root.at(1.0), child_end=0)
+
+   combined = dn.connect_morphologies(
+       stump.at(1.0),
+       arbor_root.at(0.0),
+       child_prefix="arbor_",
+   )
+
+   assert tuple(section.name for section in combined.sections) == (
+       "soma",
+       "dendrite_root",
+       "arbor_dendrite_root",
+       "arbor_upper",
+       "arbor_lower",
+   )
+   tree = dn.Tree.from_morphology(combined)
+
+Composition is pure: ``combined`` contains newly owned Section objects and
+neither ``host`` nor ``arbor`` is changed. Sections retain their authored
+geometry, discretization, electrical values, explicit structural labels, and
+imported SWC type provenance. The result uses the host Morphology's ``rhoa``
+and ``cm`` defaults for Sections declared later, and orders copied host
+Sections before copied child Sections. ``child_prefix`` changes copied child
+Section names, their automatic name labels, and the keys of their SWC
+provenance; omit it when the two declarations' names and reserved labels are
+already collision-free.
+
+The new electrical edge has the same endpoint and resistor semantics as a
+same-Morphology Section connection. Composition does not translate or rotate
+either declaration's coordinates. Supply already aligned pt3d coordinates
+when spatial continuity matters, particularly before SWC export or evaluation
+of extracellular fields.
+
 Connect sections
 ----------------
 
