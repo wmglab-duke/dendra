@@ -55,6 +55,16 @@ def _broadcast_to(value, target: torch.Tensor) -> torch.Tensor:
     return value.expand_as(target)
 
 
+def _broadcast_mask_to(value, target: torch.Tensor) -> torch.Tensor:
+    """Broadcast a structural boolean mask without adopting target dtype."""
+    value = torch.as_tensor(value, device=target.device, dtype=torch.bool)
+    if value.ndim == 0:
+        return value.expand(target.shape)
+    while value.ndim < target.ndim:
+        value = value.unsqueeze(0)
+    return value.expand(target.shape)
+
+
 def _flatten_last(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
     shape = tuple(x.shape)
     if x.ndim < 1:
@@ -231,13 +241,35 @@ class SpatialOperator1D(torch.nn.Module):
     the preselected solver.
     """
 
-    def __init__(self, *, solver: str = "auto", boundary: str = "sealed"):
+    def __init__(
+        self,
+        *,
+        solver: str = "auto",
+        boundary: str = "sealed",
+        interface_scheme: str = "arithmetic",
+    ):
         super().__init__()
         self.solver = _normalize_solver_name(solver)
         self.boundary = str(boundary or "sealed").lower()
         if self.boundary not in {"sealed", "no_flux", "noflux"}:
             raise NotImplementedError(
                 "SpatialOperator1D MVP supports only sealed/no-flux boundaries."
+            )
+        interface_scheme = str(interface_scheme or "arithmetic").lower()
+        interface_aliases = {
+            "mean": "arithmetic",
+            "legacy": "arithmetic",
+            "harmonic": "series",
+            "resistance": "series",
+            "resistive": "series",
+        }
+        self.interface_scheme = interface_aliases.get(
+            interface_scheme, interface_scheme
+        )
+        if self.interface_scheme not in {"arithmetic", "series"}:
+            raise ValueError(
+                "interface_scheme must be 'arithmetic' or 'series'; got "
+                f"{interface_scheme!r}."
             )
         self.configured = False
         self.solver_name = "unconfigured"
@@ -284,6 +316,7 @@ class SpatialOperator1D(torch.nn.Module):
         *,
         volume_fraction=1.0,
         area_fraction=1.0,
+        interface_scheme: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(volume, g_edge)`` for finite-volume diffusion."""
         volume, edge_area = self.finite_volume_geometry(
@@ -293,12 +326,47 @@ class SpatialOperator1D(torch.nn.Module):
             area_fraction=area_fraction,
         )
         dx_um = _broadcast_to(dx_um, diam_um)
-        edge_len = 0.5 * (dx_um[..., :-1] + dx_um[..., 1:])
-
         D_full = _broadcast_to(D_um2_per_ms, diam_um)
-        D_edge = 0.5 * (D_full[..., :-1] + D_full[..., 1:])
-        tiny = torch.finfo(edge_len.dtype).tiny
-        g_edge = D_edge * edge_area / edge_len.clamp_min(tiny)
+        scheme = str(interface_scheme or self.interface_scheme).lower()
+        scheme = {
+            "mean": "arithmetic",
+            "legacy": "arithmetic",
+            "harmonic": "series",
+            "resistance": "series",
+            "resistive": "series",
+        }.get(scheme, scheme)
+        if scheme == "arithmetic":
+            edge_len = 0.5 * (dx_um[..., :-1] + dx_um[..., 1:])
+            D_edge = 0.5 * (D_full[..., :-1] + D_full[..., 1:])
+            tiny = torch.finfo(edge_len.dtype).tiny
+            g_edge = D_edge * edge_area / edge_len.clamp_min(tiny)
+        elif scheme == "series":
+            if bool(torch.any(D_full < 0).item()):
+                raise ValueError(
+                    "series-interface diffusion requires non-negative diffusivity."
+                )
+            area = self.cylinder_cross_section_um2(diam_um)
+            capacity = D_full * area
+            tiny = torch.finfo(capacity.dtype).tiny
+            infinity = torch.full_like(capacity, torch.inf)
+            half_resistance = torch.where(
+                capacity > 0,
+                0.5 * dx_um / capacity.clamp_min(tiny),
+                infinity,
+            )
+            resistance = half_resistance[..., :-1] + half_resistance[..., 1:]
+            valid = torch.isfinite(resistance) & (resistance > 0)
+            g_edge = torch.where(
+                valid,
+                resistance.clamp_min(tiny).reciprocal(),
+                torch.zeros_like(resistance),
+            )
+            g_edge = g_edge * _broadcast_to(area_fraction, g_edge)
+        else:
+            raise ValueError(
+                "interface_scheme must be 'arithmetic' or 'series'; got "
+                f"{interface_scheme!r}."
+            )
         return volume, g_edge
 
     def configure_diffusion(
@@ -311,9 +379,18 @@ class SpatialOperator1D(torch.nn.Module):
         *,
         volume_fraction=1.0,
         area_fraction=1.0,
+        interface_scheme: str | None = None,
+        node_mask=None,
         solver: str | None = None,
     ) -> "SpatialOperator1D":
-        """Precompute geometry, solver choice, and timestep-scaled bands."""
+        """Precompute geometry, solver choice, and timestep-scaled bands.
+
+        ``node_mask`` selects the induced diffusion subgraph.  An interface is
+        active only when both of its endpoint compartments are selected, so
+        omitted compartments impose exact sealed boundaries.  The full field
+        shape is retained: disconnected selected regions therefore form
+        independent diagonal blocks in the same solve.
+        """
         if c_like.ndim < 1:
             raise ValueError("diffusion fields must have a final compartment dimension")
         if c_like.shape[-1] <= 0:
@@ -323,15 +400,28 @@ class SpatialOperator1D(torch.nn.Module):
         dt_t = _as_tensor_like(dt, c_ref)
         diam_um = _broadcast_to(diam_um, c_ref)
         dx_um = _broadcast_to(dx_um, c_ref)
+        if node_mask is None:
+            active = torch.ones_like(c_ref, dtype=torch.bool)
+            D_effective = D_um2_per_ms
+        else:
+            active = _broadcast_mask_to(node_mask, c_ref)
+            D_full = _broadcast_to(D_um2_per_ms, c_ref)
+            # Excluded values have no physical meaning in a regional process.
+            # Clear them before interface validation/geometry so a sentinel,
+            # NaN, or negative value outside support cannot affect the induced
+            # subgraph. Crossing edges are sealed below in all cases.
+            D_effective = torch.where(active, D_full, torch.zeros_like(D_full))
         volume, g_edge = self.edge_conductance(
-            D_um2_per_ms,
+            D_effective,
             diam_um,
             dx_um,
             volume_fraction=volume_fraction,
             area_fraction=area_fraction,
+            interface_scheme=interface_scheme,
         )
 
         vol2, base_shape = _flatten_last(volume)
+        active2, _ = _flatten_last(active)
         K = int(vol2.shape[-1])
         B = int(vol2.shape[0])
         self.B = B
@@ -344,6 +434,7 @@ class SpatialOperator1D(torch.nn.Module):
             # layout so the compiled hot path never repeats shape normalization.
             dt_t = _broadcast_to(dt_t, c_ref).reshape(B, K)
         self._set_buffer("dt", dt_t)
+        self._set_buffer("node_mask", active2.contiguous())
 
         if K == 1:
             self._set_buffer("volume", vol2)
@@ -353,28 +444,37 @@ class SpatialOperator1D(torch.nn.Module):
             self._set_buffer("g_edge", vol2.new_empty((B, 0)))
             self._set_buffer("lower", vol2.new_empty((B, 0)))
             self._set_buffer("upper", vol2.new_empty((B, 0)))
-            self._set_buffer("main", vol2)
+            solve_volume = torch.where(active2, vol2, torch.ones_like(vol2))
+            self._set_buffer("solve_volume", solve_volume.contiguous())
+            self._set_buffer("main", solve_volume.contiguous())
             self._solve = None
             self.solver_name = "trivial"
             self.configured = True
             return self
 
-        g2 = g_edge.reshape(B, K - 1).contiguous()
+        g2 = g_edge.reshape(B, K - 1)
+        edge_active = active2[:, :-1] & active2[:, 1:]
+        # Apply the regional boundary after endpoint diffusivities have been
+        # averaged.  Setting D=0 outside the region alone would leave a
+        # half-strength crossing edge under arithmetic endpoint averaging.
+        g2 = torch.where(edge_active, g2, torch.zeros_like(g2)).contiguous()
         zeros = vol2.new_zeros((B, 1))
         left_g = torch.cat((zeros, g2), dim=-1)
         right_g = torch.cat((g2, zeros), dim=-1)
 
+        solve_volume = torch.where(active2, vol2, torch.ones_like(vol2))
         if dt_t.ndim == 0:
             lower = -dt_t * g2
             upper = lower
-            main = vol2 + dt_t * (left_g + right_g)
+            main = solve_volume + dt_t * (left_g + right_g)
         else:
             dt_left = 0.5 * (dt_t[:, :-1] + dt_t[:, 1:])
             lower = -dt_left * g2
             upper = lower
-            main = vol2 + dt_t * (left_g + right_g)
+            main = solve_volume + dt_t * (left_g + right_g)
 
         self._set_buffer("volume", vol2.contiguous())
+        self._set_buffer("solve_volume", solve_volume.contiguous())
         self._set_buffer(
             "inv_volume",
             (1.0 / vol2.clamp_min(torch.finfo(vol2.dtype).tiny)).contiguous(),
@@ -407,7 +507,7 @@ class SpatialOperator1D(torch.nn.Module):
         if self.K <= 1:
             return c
         c2 = c.reshape(self.B, self.K).contiguous()
-        rhs = self._buffers["volume"] * c2
+        rhs = self._buffers["solve_volume"] * c2
         if self._solve is None:
             out = _dense_tridiagonal_solve(
                 self._buffers["lower"],
@@ -422,7 +522,9 @@ class SpatialOperator1D(torch.nn.Module):
                 self._buffers["upper"],
                 rhs,
             )
-        return out.reshape(self.base_shape)
+        out = out.reshape(self.base_shape)
+        active = self._buffers["node_mask"].reshape(self.base_shape)
+        return torch.where(active, out, c)
 
     def diffuse_explicit_configured(self, c: torch.Tensor) -> torch.Tensor:
         """Explicit sealed-boundary finite-volume update using precomputed geometry."""
@@ -435,7 +537,9 @@ class SpatialOperator1D(torch.nn.Module):
         net[:, :-1] = net[:, :-1] + edge_flux
         net[:, 1:] = net[:, 1:] - edge_flux
         dt_t = self._buffers["dt"]
-        return (c2 + dt_t * net * self._buffers["inv_volume"]).reshape(self.base_shape)
+        out = (c2 + dt_t * net * self._buffers["inv_volume"]).reshape(self.base_shape)
+        active = self._buffers["node_mask"].reshape(self.base_shape)
+        return torch.where(active, out, c)
 
     # ------------------------------------------------------------------
     # Backward-compatible convenience methods.  These recompute coefficients
@@ -451,6 +555,8 @@ class SpatialOperator1D(torch.nn.Module):
         *,
         volume_fraction=1.0,
         area_fraction=1.0,
+        interface_scheme: str | None = None,
+        node_mask=None,
         solver: str | None = None,
     ) -> torch.Tensor:
         self.configure_diffusion(
@@ -461,6 +567,8 @@ class SpatialOperator1D(torch.nn.Module):
             dx_um,
             volume_fraction=volume_fraction,
             area_fraction=area_fraction,
+            interface_scheme=interface_scheme,
+            node_mask=node_mask,
             solver=solver,
         )
         return self.diffuse_implicit_configured(c)
@@ -475,6 +583,8 @@ class SpatialOperator1D(torch.nn.Module):
         *,
         volume_fraction=1.0,
         area_fraction=1.0,
+        interface_scheme: str | None = None,
+        node_mask=None,
     ) -> torch.Tensor:
         self.configure_diffusion(
             c,
@@ -484,6 +594,8 @@ class SpatialOperator1D(torch.nn.Module):
             dx_um,
             volume_fraction=volume_fraction,
             area_fraction=area_fraction,
+            interface_scheme=interface_scheme,
+            node_mask=node_mask,
             solver=self.solver,
         )
         return self.diffuse_explicit_configured(c)
@@ -826,9 +938,17 @@ class SpatialOperatorTree(torch.nn.Module):
         model,
         *,
         domain: str | None = "intracellular",
+        node_mask=None,
         solver: str | None = None,
     ) -> "SpatialOperatorTree":
-        """Precompute DHS topology, mass term, diffusion couplings, and solver."""
+        """Precompute DHS topology, mass term, diffusion couplings, and solver.
+
+        ``node_mask`` selects an induced forest of the full morphology.  Parent-
+        child coupling is retained only when both endpoints are selected.  The
+        original Hines topology can then solve all selected connected components
+        as independent diagonal blocks without rebuilding or flattening the
+        morphology graph.
+        """
         if c_like.ndim < 1:
             raise ValueError("diffusion fields must have a final compartment dimension")
         K = int(c_like.shape[-1])
@@ -869,8 +989,15 @@ class SpatialOperatorTree(torch.nn.Module):
         self.K = K
         self.base_shape = base_shape
 
+        if node_mask is None:
+            active = torch.ones_like(c_like, dtype=torch.bool)
+        else:
+            active = _broadcast_mask_to(node_mask, c_like)
+        active2 = active.reshape(B, K)
+
         # Align volume and field-space quantities to solver/topological order.
         volume_s = volume2.index_select(-1, solver_order).contiguous()
+        active_s = active2.index_select(-1, solver_order).contiguous()
 
         D_full = _broadcast_to(D_um2_per_ms, c_like).reshape(B, K)
         D_s = D_full.index_select(-1, solver_order)
@@ -897,7 +1024,49 @@ class SpatialOperatorTree(torch.nn.Module):
                 f"diffusion graph batch has {diff_geom_s.shape[0]} rows, but material field has {B} solve rows."
             )
 
-        g_diff_s = (D_edge_s * diff_geom_s).contiguous()
+        edge_active_s = torch.zeros_like(active_s)
+        for child in range(K):
+            p = int(parent_idx[child].item())
+            if p >= 0:
+                edge_active_s[:, child] = active_s[:, child] & active_s[:, p]
+        g_diff_s = torch.where(
+            edge_active_s,
+            D_edge_s * diff_geom_s,
+            torch.zeros_like(D_edge_s),
+        ).contiguous()
+
+        # A zero-volume junction is a valid algebraic node when it is coupled
+        # to at least one positive-volume compartment.  An induced component
+        # made entirely of zero-volume nodes, however, has neither storage nor
+        # an anchoring mass term and leaves a singular pure-Laplacian block.
+        # Validate that every active component reaches positive material mass.
+        reachable_mass = active_s & (volume_s > 0)
+        conductive_edge_s = edge_active_s & (g_diff_s != 0)
+        # Solver order is topological (each parent precedes its children). One
+        # reverse sweep propagates mass anchors up to component roots, and one
+        # forward sweep propagates them back down: O(K), including large trees.
+        for child in range(K - 1, -1, -1):
+            p = int(parent_idx[child].item())
+            if p >= 0:
+                reachable_mass[:, p] |= (
+                    conductive_edge_s[:, child] & reachable_mass[:, child]
+                )
+        for child in range(K):
+            p = int(parent_idx[child].item())
+            if p >= 0:
+                reachable_mass[:, child] |= (
+                    conductive_edge_s[:, child] & reachable_mass[:, p]
+                )
+        unanchored = active_s & ~reachable_mass
+        if bool(torch.any(unanchored).item()):
+            first_row, first_slot = torch.nonzero(unanchored, as_tuple=False)[
+                0
+            ].tolist()
+            raise ValueError(
+                "Each active Tree diffusion component must contain positive "
+                "material volume; found a zero-volume component at solve row "
+                f"{first_row}, compartment slot {first_slot}."
+            )
 
         dt_t = _as_tensor_like(dt, c_like)
         if dt_t.ndim != 0:
@@ -911,10 +1080,17 @@ class SpatialOperatorTree(torch.nn.Module):
             dmem = volume_s / dt_t.clamp_min(tiny)
         else:
             dmem = volume_s / dt_t.clamp_min(tiny)
+        # An excluded zero-volume branchpoint would otherwise leave a singular
+        # all-zero row after its incident edges are masked.  A unit identity row
+        # is numerically benign and, together with the final where, makes every
+        # excluded compartment an exact no-op.
+        dmem = torch.where(active_s, dmem, torch.ones_like(dmem))
 
         self._set_buffer("volume", volume2.contiguous())
         self._set_buffer("volume_solver", volume_s.contiguous())
         self._set_buffer("inv_volume", (1.0 / volume2.clamp_min(tiny)).contiguous())
+        self._set_buffer("node_mask", active2.contiguous())
+        self._set_buffer("node_mask_solver", active_s.contiguous())
         self._set_buffer("dmem", dmem.contiguous())
         self._set_buffer("a_geom", g_diff_s.contiguous())
         self._set_buffer("solver_order", solver_order)
@@ -965,7 +1141,9 @@ class SpatialOperatorTree(torch.nn.Module):
             )
 
         out = out_s.index_select(-1, self._buffers["inv_solver_order"])
-        return out.reshape(self.base_shape)
+        out = out.reshape(self.base_shape)
+        active = self._buffers["node_mask"].reshape(self.base_shape)
+        return torch.where(active, out, c)
 
     def diffuse_explicit_configured(self, c: torch.Tensor) -> torch.Tensor:
         """Explicit tree diffusion update for debug use.
@@ -980,7 +1158,8 @@ class SpatialOperatorTree(torch.nn.Module):
         c2 = c.reshape(self.B, self.K).contiguous()
         c_s = c2.index_select(-1, self._buffers["solver_order"])
         volume_s = self._buffers["volume_solver"]
-        if torch.any(volume_s <= 0):
+        active_s = self._buffers["node_mask_solver"]
+        if torch.any((volume_s <= 0) & active_s):
             raise RuntimeError(
                 "Explicit tree diffusion is undefined for zero-volume nodes/branchpoints; use implicit diffusion."
             )
@@ -997,9 +1176,12 @@ class SpatialOperatorTree(torch.nn.Module):
             net[:, p] = net[:, p] - flux
 
         dt_t = self._buffers["dt"]
-        c_next_s = c_s + dt_t * net / volume_s
+        safe_volume_s = torch.where(active_s, volume_s, torch.ones_like(volume_s))
+        c_next_s = c_s + dt_t * net / safe_volume_s
         c_next = c_next_s.index_select(-1, self._buffers["inv_solver_order"])
-        return c_next.reshape(self.base_shape)
+        c_next = c_next.reshape(self.base_shape)
+        active = self._buffers["node_mask"].reshape(self.base_shape)
+        return torch.where(active, c_next, c)
 
     # Backward-compatible convenience wrappers.
     def diffuse_implicit(
@@ -1010,10 +1192,17 @@ class SpatialOperatorTree(torch.nn.Module):
         model,
         *,
         domain: str | None = "intracellular",
+        node_mask=None,
         solver: str | None = None,
     ) -> torch.Tensor:
         self.configure_diffusion(
-            c, dt, D_um2_per_ms, model, domain=domain, solver=solver
+            c,
+            dt,
+            D_um2_per_ms,
+            model,
+            domain=domain,
+            node_mask=node_mask,
+            solver=solver,
         )
         return self.diffuse_implicit_configured(c)
 
@@ -1025,8 +1214,15 @@ class SpatialOperatorTree(torch.nn.Module):
         model,
         *,
         domain: str | None = "intracellular",
+        node_mask=None,
     ) -> torch.Tensor:
         self.configure_diffusion(
-            c, dt, D_um2_per_ms, model, domain=domain, solver=self.solver
+            c,
+            dt,
+            D_um2_per_ms,
+            model,
+            domain=domain,
+            node_mask=node_mask,
+            solver=self.solver,
         )
         return self.diffuse_explicit_configured(c)

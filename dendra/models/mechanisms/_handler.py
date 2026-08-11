@@ -7,7 +7,7 @@ import torch._dynamo as dynamo
 import torch._inductor.config as inductor_config
 
 from ..rng import _validate_rng_checkpoint_payload
-from ._material_process import MaterialProcess
+from ._material_process import DiffusionProcess, MaterialProcess
 from ._materials import _canonical_material_name
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
 
@@ -355,6 +355,8 @@ class MechanismHandler(torch.nn.Module):
 
         for process in self.material_processes.values():
             process.bind_materials(self._get_material, population=population)
+
+        self._validate_diffusion_process_overlaps()
 
         self._material_process_order = self._ordered_material_process_names()
 
@@ -738,6 +740,37 @@ class MechanismHandler(torch.nn.Module):
             if name not in seen:
                 ordered.append(name)
         return tuple(ordered)
+
+    def _validate_diffusion_process_overlaps(self):
+        """Reject order-dependent overlapping spatial writes to one field."""
+        writers = {}
+        for process_name, process in self.material_processes.items():
+            if not isinstance(process, DiffusionProcess):
+                continue
+            phase = _canonical_material_phase(
+                getattr(type(process), "_material_process_phase", "transport")
+            )
+            support = process._buffers["_mp_node_mask"]
+            targets = {
+                (
+                    phase,
+                    _canonical_material_name(spec.material),
+                    str(spec.field),
+                )
+                for spec in type(process)._diffusion_specs
+            }
+            for target in targets:
+                for previous_name, previous_support in writers.get(target, ()):
+                    if bool(torch.any(support & previous_support).item()):
+                        _, material, field = target
+                        raise ValueError(
+                            "Overlapping DiffusionProcess instances "
+                            f"{previous_name!r} and {process_name!r} both write "
+                            f"{material}.{field}. Use one fused process or make "
+                            "their compartment supports disjoint."
+                        )
+                writers.setdefault(target, []).append((process_name, support))
+        return None
 
     def advance_material_processes(self, dt):
         for process_name in self._material_process_order:
