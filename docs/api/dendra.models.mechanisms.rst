@@ -37,6 +37,18 @@ Python expression. A nonlinear pointwise current can instead define an exact
 For a distributed mechanism that pair is ``(mA/cm², S/cm²)``; for a point
 process it is ``(nA, µS)`` before area normalization.
 
+The voltage passed to ``breakpoint`` and current methods is read-only. Dendra
+may gather it once and share that tensor across mechanisms with the exact same
+ordered compartment support; mechanism hooks must not modify it in place.
+
+This sharing is automatic and does not fuse or rewrite mechanism classes.
+Each current method and point-process area conversion still runs independently;
+adjacent contributions to the same current field are then reduced locally and
+scattered once. Selectors must match exactly, including fancy-index order.
+Duplicate-index supports retain separate scatters. As with other parallel
+reductions, the optimization may change the final floating-point association
+at overlapping supports by a few last bits.
+
 Dufort--Frankel requires the stronger *affine* property
 ``I(v) = g * v + b``, with ``g`` and ``b`` independent of ``v`` during that
 evaluation, to center a current exactly between its two stored voltage levels.

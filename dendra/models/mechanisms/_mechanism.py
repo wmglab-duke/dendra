@@ -268,6 +268,11 @@ class Mechanism(Parameterized):
     :meth:`initial` and :meth:`breakpoint` to populate buffers and assemble
     currents each step. ``ASSIGNED`` is retained as a deprecated alias for
     :meth:`BUFFER` for compatibility with older mechanism definitions.
+
+    The voltage passed to ``breakpoint`` and declared current methods is a
+    read-only input.  Dendra may reuse one gathered voltage tensor across
+    mechanisms that occupy the exact same ordered compartment support; hooks
+    must never mutate ``v`` in place.
     """
 
     _state = set()
@@ -1340,7 +1345,8 @@ class Mechanism(Parameterized):
         -----
         Override to compute mechanism-level :meth:`BUFFER` values and assemble
         currents (e.g., ``ina``, ``ik``, ``il``). Called each step before
-        current accumulation.
+        current accumulation. Treat ``v`` as read-only: its gathered tensor may
+        be shared with other mechanisms on the same ordered support.
         """
         return
 

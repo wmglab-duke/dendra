@@ -263,6 +263,91 @@ def make_scaler(mech, area):
     return _scaler
 
 
+def _same_current_support(left, right):
+    """Return whether two mechanisms have the same ordered physical support.
+
+    Current aggregation may share a gathered voltage only when the two local
+    tensors have exactly the same layout.  In particular, fancy indices are
+    compared in order and with duplicates intact; set-equivalent selectors are
+    not interchangeable because mechanism state and parameters follow local
+    selector order.
+    """
+
+    if (
+        left.base_ndim != right.base_ndim
+        or left.shape_f != right.shape_f
+        or left.is_composable != right.is_composable
+    ):
+        return False
+
+    left_key = left.key
+    right_key = right.key
+    if left_key is None or right_key is None:
+        return left_key is None and right_key is None
+
+    if left.is_composable:
+        if len(left_key) != len(right_key):
+            return False
+        for left_part, right_part in zip(left_key, right_key):
+            if isinstance(left_part, slice) and isinstance(right_part, slice):
+                if (
+                    left_part.start,
+                    left_part.stop,
+                    left_part.step,
+                ) != (
+                    right_part.start,
+                    right_part.stop,
+                    right_part.step,
+                ):
+                    return False
+            elif left_part != right_part:
+                return False
+        return True
+
+    # Meta tensors intentionally carry shape/device metadata but no index
+    # values, so ordered equality cannot be established.  Conservatively keep
+    # distinct fancy mechanisms in separate groups until they reach a device
+    # with materialized keys.
+    if left_key.device.type == "meta" or right_key.device.type == "meta":
+        return left is right
+
+    return (
+        left_key.shape == right_key.shape
+        and left_key.dtype == right_key.dtype
+        and left_key.device == right_key.device
+        and torch.equal(left_key, right_key)
+    )
+
+
+def _support_scatter_is_unambiguous(mech):
+    """Return whether local summation preserves this support's scatter order.
+
+    A fancy selector may deliberately contain duplicate physical indices (for
+    example, colocated point-process copies).  Sharing its voltage gather is
+    safe, but combining multiple mechanisms before ``scatter_add_`` changes the
+    reduction association across duplicate slots.  Keep those scatters
+    separate and aggregate only unique-index, slice, or global supports.
+    """
+
+    if mech.key is None or mech.is_composable:
+        return True
+    if mech.key.device.type == "meta":
+        return False
+    return torch.unique(mech.key).numel() == mech.key.numel()
+
+
+def _current_value_for_buffer(value, buffer):
+    """Match destination casting without touching already-compatible tensors."""
+
+    if (
+        torch.is_tensor(value)
+        and value.device == buffer.device
+        and value.dtype == buffer.dtype
+    ):
+        return value
+    return torch.as_tensor(value, device=buffer.device, dtype=buffer.dtype)
+
+
 class MechanismHandler(torch.nn.Module):
     """
     Base class for handling mechanisms in a model.
@@ -363,6 +448,23 @@ class MechanismHandler(torch.nn.Module):
         # --- flattened mapping (current-index, mechanism-obj, fn) ------------
         self._map = []
         self._map_exp = []
+        self._current_support_representatives = ()
+        self._current_breakpoint_plan = ()
+        self._map_grouped = ()
+        self._map_exp_grouped = ()
+        self._ion_support_representatives = ()
+        self._ion_source_breakpoint_plan = ()
+        self._map_exp_ion_reads_grouped = ()
+        self._total_support_representatives = ()
+        self._map_exp_total_grouped = ()
+
+        # Preserve breakpoint behavior for directly constructed handlers even
+        # before ``make_maps()`` or full Population initialization.
+        (
+            self._current_support_representatives,
+            self._current_breakpoint_plan,
+            _support_by_mechanism,
+        ) = self._partition_current_supports(self._current_evaluation_mechanisms)
 
         self.ion_to_buff_idx = {}
         self.i_g_buffers_initialized = False
@@ -370,6 +472,12 @@ class MechanismHandler(torch.nn.Module):
         self.update_ion_buf = {}
 
         self.shape = None
+
+        # Mechanism selector keys are persistent buffers.  A same-shaped
+        # checkpoint may therefore replace their ordered physical supports;
+        # rebuild derived gather/scatter plans after all child mechanisms have
+        # consumed the load.
+        self.register_load_state_dict_post_hook(self._refresh_maps_after_load)
 
         if self.write_ion_c:
             self.write_to_ions = dynamo.disable(self.write_to_ions)
@@ -391,6 +499,11 @@ class MechanismHandler(torch.nn.Module):
             inductor_config.cpp_wrapper = False
         else:
             inductor_config.cpp_wrapper = True
+
+    @staticmethod
+    def _refresh_maps_after_load(module, incompatible_keys):
+        del incompatible_keys
+        module.make_maps()
 
     def _apply(self, fn, recurse=True):
         """Move registered state plus current scratch and scaling closures."""
@@ -484,6 +597,141 @@ class MechanismHandler(torch.nn.Module):
         )
         self._current_evaluation_mechanisms = tuple(
             self.mechanisms[name] for name in self._pre_current_mechanism_names
+        )
+        self._make_grouped_current_plans()
+
+    @staticmethod
+    def _partition_current_supports(mechanisms):
+        """Build exact ordered-support groups for a mechanism sequence."""
+
+        representatives = []
+        mechanism_plan = []
+        support_by_mechanism = {}
+        for mech in mechanisms:
+            support_index = next(
+                (
+                    index
+                    for index, representative in enumerate(representatives)
+                    if _same_current_support(mech, representative)
+                ),
+                None,
+            )
+            if support_index is None:
+                support_index = len(representatives)
+                representatives.append(mech)
+            mechanism_plan.append((mech, support_index))
+            support_by_mechanism[id(mech)] = support_index
+        return (
+            tuple(representatives),
+            tuple(mechanism_plan),
+            support_by_mechanism,
+        )
+
+    @staticmethod
+    def _group_current_map(entries, representatives, support_by_mechanism):
+        """Fuse adjacent exact-support entries into local reduction runs.
+
+        Runs remain in the original current-map order.  Only entries with the
+        same destination current and exact support are combined, and duplicate
+        fancy selectors retain one scatter per entry.
+        """
+
+        runs = []
+        for entry in entries:
+            current_index, mech, *payload = entry
+            support_index = support_by_mechanism[id(mech)]
+            can_extend = (
+                bool(runs)
+                and runs[-1][0] == current_index
+                and runs[-1][1] == support_index
+                and _support_scatter_is_unambiguous(representatives[support_index])
+            )
+            current_entry = (mech, *payload)
+            if can_extend:
+                runs[-1][3].append(current_entry)
+            else:
+                runs.append(
+                    [
+                        current_index,
+                        support_index,
+                        representatives[support_index],
+                        [current_entry],
+                    ]
+                )
+        return tuple(
+            (current_index, support_index, representative, tuple(run_entries))
+            for current_index, support_index, representative, run_entries in runs
+        )
+
+    def _make_grouped_current_plans(self):
+        """Compile gather-once/scatter-once plans for every current API."""
+
+        current_mechanisms = list(self._current_evaluation_mechanisms)
+        current_ids = {id(mech) for mech in current_mechanisms}
+        for _, mech, *_ in self._map:
+            if id(mech) not in current_ids:
+                current_mechanisms.append(mech)
+                current_ids.add(id(mech))
+        (
+            self._current_support_representatives,
+            current_plan,
+            current_support_by_mechanism,
+        ) = self._partition_current_supports(current_mechanisms)
+        breakpoint_ids = {id(mech) for mech in self._current_evaluation_mechanisms}
+        self._current_breakpoint_plan = tuple(
+            (mech, support_index)
+            for mech, support_index in current_plan
+            if id(mech) in breakpoint_ids
+        )
+        self._map_grouped = self._group_current_map(
+            self._map,
+            self._current_support_representatives,
+            current_support_by_mechanism,
+        )
+        self._map_exp_grouped = self._group_current_map(
+            self._map_exp,
+            self._current_support_representatives,
+            current_support_by_mechanism,
+        )
+
+        ion_mechanisms = list(self._ion_current_sources)
+        ion_ids = {id(mech) for mech in ion_mechanisms}
+        for _, mech, *_ in self._map_exp_ion_reads:
+            if id(mech) not in ion_ids:
+                ion_mechanisms.append(mech)
+                ion_ids.add(id(mech))
+        (
+            self._ion_support_representatives,
+            ion_plan,
+            ion_support_by_mechanism,
+        ) = self._partition_current_supports(ion_mechanisms)
+        source_ids = {id(mech) for mech in self._ion_current_sources}
+        self._ion_source_breakpoint_plan = tuple(
+            (mech, support_index)
+            for mech, support_index in ion_plan
+            if id(mech) in source_ids
+        )
+        self._map_exp_ion_reads_grouped = self._group_current_map(
+            self._map_exp_ion_reads,
+            self._ion_support_representatives,
+            ion_support_by_mechanism,
+        )
+
+        total_mechanisms = []
+        total_ids = set()
+        for _, mech, *_ in self._map_exp:
+            if id(mech) not in total_ids:
+                total_mechanisms.append(mech)
+                total_ids.add(id(mech))
+        (
+            self._total_support_representatives,
+            _total_plan,
+            total_support_by_mechanism,
+        ) = self._partition_current_supports(total_mechanisms)
+        self._map_exp_total_grouped = self._group_current_map(
+            self._map_exp,
+            self._total_support_representatives,
+            total_support_by_mechanism,
         )
 
     def initialize(self, v, celsius, diameters, populate=True, random_generation=None):
@@ -859,15 +1107,31 @@ class MechanismHandler(torch.nn.Module):
         if not self._ion_current_reads:
             return
 
-        for source in self._ion_current_sources:
-            source.breakpoint(source.get(v))
+        local_voltages = tuple(
+            representative.get(v)
+            for representative in self._ion_support_representatives
+        )
+        for source, support_index in self._ion_source_breakpoint_plan:
+            source.breakpoint(local_voltages[support_index])
 
         for current_index in self._ion_current_indices:
             self._buf_i[current_index] = torch.zeros_like(self._buf_i[current_index])
 
-        for c_idx, mech, fn, scale_f in self._map_exp_ion_reads:
-            current = scale_f(getattr(mech, fn)(mech.get(v)))
-            mech.add_(self._buf_i[c_idx], current)
+        for (
+            c_idx,
+            support_index,
+            representative,
+            entries,
+        ) in self._map_exp_ion_reads_grouped:
+            local_current = None
+            local_voltage = local_voltages[support_index]
+            for mech, fn, scale_f in entries:
+                current = scale_f(getattr(mech, fn)(local_voltage))
+                current = _current_value_for_buffer(current, self._buf_i[c_idx])
+                local_current = (
+                    current if local_current is None else local_current + current
+                )
+            representative.add_(self._buf_i[c_idx], local_current)
 
         for ion, current_field, _ in self._ion_current_reads:
             if self.update_ion_buf.get(ion, False):
@@ -975,8 +1239,12 @@ class MechanismHandler(torch.nn.Module):
     # or current-reader fields. ``advance_post_current`` publishes the frame
     # selected by the solver.
     def i(self, v):
-        for mech in self._current_evaluation_mechanisms:
-            mech.breakpoint(mech.get(v))
+        local_voltages = tuple(
+            representative.get(v)
+            for representative in self._current_support_representatives
+        )
+        for mech, support_index in self._current_breakpoint_plan:
+            mech.breakpoint(local_voltages[support_index])
 
         if not self.currents:
             z = torch.zeros_like(v)
@@ -988,11 +1256,21 @@ class MechanismHandler(torch.nn.Module):
         for i, buf in enumerate(self._buf_g):
             self._buf_g[i] = torch.zeros_like(buf)
 
-        # core loop: minimal Python, pure aten ops inside
-        for c_idx, mech, fn, scale_f, _factorable in self._map:
-            i, g = scale_f(*getattr(mech, fn)(mech.get(v)))
-            mech.add_(self._buf_i[c_idx], i)
-            mech.add_(self._buf_g[c_idx], g)
+        # Evaluate every authored current in map order, but reduce adjacent
+        # exact-support contributions locally before touching full-sized
+        # population buffers.
+        for c_idx, support_index, representative, entries in self._map_grouped:
+            local_i = None
+            local_g = None
+            local_voltage = local_voltages[support_index]
+            for mech, fn, scale_f, _factorable in entries:
+                i, g = scale_f(*getattr(mech, fn)(local_voltage))
+                i = _current_value_for_buffer(i, self._buf_i[c_idx])
+                g = _current_value_for_buffer(g, self._buf_g[c_idx])
+                local_i = i if local_i is None else local_i + i
+                local_g = g if local_g is None else local_g + g
+            representative.add_(self._buf_i[c_idx], local_i)
+            representative.add_(self._buf_g[c_idx], local_g)
 
         # sum up currents and conductances
         tot_i = torch.stack(self._buf_i).sum(dim=0)
@@ -1001,8 +1279,12 @@ class MechanismHandler(torch.nn.Module):
         return tot_i, tot_g
 
     def iexp(self, v):
-        for mech in self._current_evaluation_mechanisms:
-            mech.breakpoint(mech.get(v))
+        local_voltages = tuple(
+            representative.get(v)
+            for representative in self._current_support_representatives
+        )
+        for mech, support_index in self._current_breakpoint_plan:
+            mech.breakpoint(local_voltages[support_index])
 
         if not self.currents:
             return torch.zeros_like(v)
@@ -1010,10 +1292,14 @@ class MechanismHandler(torch.nn.Module):
         for i, buf in enumerate(self._buf_i):
             self._buf_i[i] = torch.zeros_like(buf)
 
-        # core loop: minimal Python, pure aten ops inside
-        for c_idx, mech, fn, scale_f in self._map_exp:
-            i = scale_f(getattr(mech, fn)(mech.get(v)))
-            mech.add_(self._buf_i[c_idx], i)
+        for c_idx, support_index, representative, entries in self._map_exp_grouped:
+            local_i = None
+            local_voltage = local_voltages[support_index]
+            for mech, fn, scale_f in entries:
+                i = scale_f(getattr(mech, fn)(local_voltage))
+                i = _current_value_for_buffer(i, self._buf_i[c_idx])
+                local_i = i if local_i is None else local_i + i
+            representative.add_(self._buf_i[c_idx], local_i)
 
         # sum up currents and conductances
         tot_i = torch.stack(self._buf_i).sum(dim=0)
@@ -1021,14 +1307,22 @@ class MechanismHandler(torch.nn.Module):
         return tot_i
 
     def idf(self, v, v_prev):
-        for mech in self._current_evaluation_mechanisms:
-            mech.breakpoint(mech.get(v))
+        local_voltages = tuple(
+            representative.get(v)
+            for representative in self._current_support_representatives
+        )
+        for mech, support_index in self._current_breakpoint_plan:
+            mech.breakpoint(local_voltages[support_index])
 
         if not self.currents:
             z = torch.zeros_like(v)
             return z, z
 
         v_half = 0.5 * v_prev
+        local_half_voltages = tuple(
+            representative.get(v_half)
+            for representative in self._current_support_representatives
+        )
 
         # reset buffers
         for i, buf in enumerate(self._buf_i):
@@ -1036,20 +1330,27 @@ class MechanismHandler(torch.nn.Module):
         for i, buf in enumerate(self._buf_g):
             self._buf_g[i] = torch.zeros_like(buf)
 
-        for c_idx, mech, fn, scale_f, factorable in self._map:
-            if factorable:
-                v_in = v_half
-                i, g = scale_f(*getattr(mech, fn)(mech.get(v_in)))
-            else:
-                v_in = v
-                current_fn = fn.removesuffix("_with_g")
-                raw_i = getattr(mech, current_fn)(mech.get(v_in))
-                if current_fn in mech._save:
-                    setattr(mech, f"{current_fn}_", raw_i)
-                i = scale_f(raw_i)
-                g = torch.zeros_like(i) if torch.is_tensor(i) else 0.0
-            mech.add_(self._buf_i[c_idx], i)
-            mech.add_(self._buf_g[c_idx], g)
+        for c_idx, support_index, representative, entries in self._map_grouped:
+            local_i = None
+            local_g = None
+            for mech, fn, scale_f, factorable in entries:
+                if factorable:
+                    i, g = scale_f(
+                        *getattr(mech, fn)(local_half_voltages[support_index])
+                    )
+                else:
+                    current_fn = fn.removesuffix("_with_g")
+                    raw_i = getattr(mech, current_fn)(local_voltages[support_index])
+                    if current_fn in mech._save:
+                        setattr(mech, f"{current_fn}_", raw_i)
+                    i = scale_f(raw_i)
+                    g = torch.zeros_like(i) if torch.is_tensor(i) else 0.0
+                i = _current_value_for_buffer(i, self._buf_i[c_idx])
+                g = _current_value_for_buffer(g, self._buf_g[c_idx])
+                local_i = i if local_i is None else local_i + i
+                local_g = g if local_g is None else local_g + g
+            representative.add_(self._buf_i[c_idx], local_i)
+            representative.add_(self._buf_g[c_idx], local_g)
 
         # sum up currents and conductances
         tot_i = torch.stack(self._buf_i).sum(dim=0)
@@ -1064,9 +1365,23 @@ class MechanismHandler(torch.nn.Module):
         for i, buf in enumerate(self._buf_i):
             self._buf_i[i] = torch.zeros_like(buf)
 
-        for c_idx, mech, fn, scale_f in self._map_exp:
-            i = scale_f(getattr(mech, fn)(mech.get(v)))
-            mech.add_(self._buf_i[c_idx], i)
+        local_voltages = tuple(
+            representative.get(v)
+            for representative in self._total_support_representatives
+        )
+        for (
+            c_idx,
+            support_index,
+            representative,
+            entries,
+        ) in self._map_exp_total_grouped:
+            local_i = None
+            local_voltage = local_voltages[support_index]
+            for mech, fn, scale_f in entries:
+                i = scale_f(getattr(mech, fn)(local_voltage))
+                i = _current_value_for_buffer(i, self._buf_i[c_idx])
+                local_i = i if local_i is None else local_i + i
+            representative.add_(self._buf_i[c_idx], local_i)
 
         return torch.stack(self._buf_i).sum(dim=0)
 
