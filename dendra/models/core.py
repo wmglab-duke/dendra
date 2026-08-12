@@ -796,6 +796,10 @@ class Population(P, Sliceable):
         self._material_process_write = {}
         self._material_process_source = {}
         self._material_configs = {}
+        # Named finite-volume geometries for chemical/material transport.  The
+        # registry stores buffer names rather than tensor objects so ordinary
+        # Module dtype/device moves cannot leave stale Python references behind.
+        self._material_geometries = {}
 
         self._all_read = {}
         self._all_write = {}
@@ -973,6 +977,43 @@ class Population(P, Sliceable):
             reset_torch_compiler()
         return obj
 
+    def __deepcopy__(self, memo):
+        """Copy runtime state while deliberately severing live autograd graphs.
+
+        PyTorch supports deepcopy only for leaf tensors. Training-mode material
+        state and differentiable spatial-operator caches are valid non-leaf
+        buffers, so seed the copy memo with detached value copies. Parameters
+        remain independently copied leaves. Any spatial process whose cached
+        coefficients were detached is marked for a lazy rebuild from the
+        cloned Parameters before its next transport step.
+        """
+        import copy as _copy
+
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+
+        detached_runtime = False
+        for module in self.modules():
+            for value in module._buffers.values():
+                if torch.is_tensor(value) and not value.is_leaf:
+                    if id(value) not in memo:
+                        memo[id(value)] = value.detach().clone()
+                    detached_runtime = True
+
+        result = self.__class__.__new__(self.__class__)
+        memo[id(self)] = result
+        state = _copy.deepcopy(self.__getstate__(), memo)
+        result.__setstate__(state)
+
+        if detached_runtime and getattr(result, "is_built", False):
+            for process in getattr(
+                getattr(result, "mech", None), "material_processes", {}
+            ).values():
+                if hasattr(process, "_spatial_configured"):
+                    process._spatial_configured = False
+        return result
+
     def __getstate__(self):
         """Serialize without process-local compiled helpers.
 
@@ -990,6 +1031,7 @@ class Population(P, Sliceable):
         state.setdefault("_mech_exclusions", {})
         state.setdefault("_mech_data_ic", {})
         state.setdefault("_mech_data_base_kwargs", {})
+        state.setdefault("_material_geometries", {})
 
         # Sparse insertion records historically stored GLOBAL and indexed
         # parameters together. GLOBAL values now belong to the one compiled
@@ -1333,6 +1375,187 @@ class Population(P, Sliceable):
     def material_(self, name: str, *args, **kwargs):
         """In-place alias of :meth:`material`."""
         self.material(name, *args, **kwargs)
+
+    def register_material_geometry(
+        self,
+        name: str,
+        *,
+        domain: str,
+        volume,
+        edge_area=None,
+        edge_distance=None,
+        edge_factor=None,
+    ):
+        """Register named finite-volume geometry for material transport.
+
+        A named geometry describes a chemical storage/transport domain.  It is
+        deliberately independent of electrical extracellular parameters such as
+        ``xraxial``, ``xc``, and ``xg``.  Reference it from
+        :meth:`DiffusionProcess.DIFFUSE` with ``geometry=name``.
+
+        Parameters
+        ----------
+        name
+            Geometry identifier referenced by
+            ``DiffusionProcess.DIFFUSE(..., geometry=name)``.
+        domain
+            Chemical/material domain represented by this geometry, for example
+            ``"extracellular"`` or ``"intracellular"``.
+        volume
+            Scalar or node/control-volume tensor in ``um^3``, or the name of a
+            registered Population buffer/parameter containing it.  It must
+            broadcast to the material field; a non-scalar tensor normally has
+            final dimension ``C`` (the compartment count).
+        edge_area, edge_distance
+            Scalar or interface-aligned area in ``um^2`` and center-to-center
+            transport distance in ``um``.  Both must broadcast over the
+            population's interfaces. Non-scalar 1-D tensors normally have final
+            dimension ``C - 1``. A Tree uses compact edge dimension ``E`` in
+            the stable order exposed by
+            :attr:`~dendra.models.tree.Tree.material_edge_index`. Dendra forms
+            ``edge_factor = edge_area / edge_distance``.
+        edge_factor
+            Scalar or interface-aligned precomputed geometry factor in ``um``.
+            Specify this instead of ``edge_area`` and ``edge_distance``.
+            Diffusive edge conductance is ``D_edge * edge_factor`` in
+            ``um^3 / ms``.
+
+        Returns
+        -------
+        Population
+            ``self``, so registration may be chained.
+
+        Notes
+        -----
+        String-valued components must name registered buffers or parameters so
+        they participate in dtype/device moves and ``state_dict`` handling.
+        Direct ordinary tensor-like values are registered as Population
+        buffers by this method. A direct ``nn.Parameter`` is instead registered
+        as a Population parameter and is discoverable through
+        ``model.parameters()``. Differentiable sources preserve autograd.
+
+        A bound DiffusionProcess samples current source values whenever its
+        spatial operator is configured (normally on the first step after
+        initialization or after explicit timestep reconfiguration), rather
+        than reading them on every timestep.  Reconfigure after changing a
+        geometry source.
+
+        On the active process region, unbranched control volumes must be finite
+        and positive. Implicit Tree diffusion also permits finite zero-volume
+        algebraic junctions, provided every conductive component contains at
+        least one positive-volume node; explicit Tree diffusion requires every
+        active volume to be positive. Interface area/factor must be finite and
+        non-negative, and explicit edge distances finite and positive. A zero
+        edge factor seals that interface. Validation that depends on the
+        eventual process region is deferred until process binding/operator
+        configuration. Every field using this geometry must declare the same
+        effective chemical domain as ``domain``.
+
+        Named Tree geometry reuses the morphology's immutable parent-child
+        topology while replacing chemical storage volumes and edge weights. It
+        may seal existing edges but cannot add edges or define an independent
+        chemical transport graph.
+        """
+        name = str(name)
+        if not name or not name.replace("_", "").isalnum():
+            raise ValueError(
+                "Material geometry names must contain only letters, digits, "
+                "and underscores."
+            )
+        if name in self._material_geometries:
+            raise ValueError(f"Material geometry {name!r} is already registered.")
+        if edge_factor is None:
+            if edge_area is None or edge_distance is None:
+                raise ValueError(
+                    "Material geometry requires edge_factor or both edge_area "
+                    "and edge_distance."
+                )
+        elif edge_area is not None or edge_distance is not None:
+            raise ValueError(
+                "Specify edge_factor or edge_area/edge_distance, not both."
+            )
+
+        aliases = {
+            "i": "intracellular",
+            "inside": "intracellular",
+            "cytosol": "intracellular",
+            "cytoplasm": "intracellular",
+            "o": "extracellular",
+            "outside": "extracellular",
+            "extra": "extracellular",
+        }
+        domain = aliases.get(str(domain).lower(), str(domain).lower())
+
+        def register_component(component: str, value):
+            if isinstance(value, str):
+                registered = value in self._buffers or value in self._parameters
+                if not registered:
+                    raise AttributeError(
+                        f"Material geometry {name!r} requires {value!r} to be a "
+                        "registered Population buffer or parameter."
+                    )
+                if not torch.is_tensor(getattr(self, value)):
+                    raise TypeError(
+                        f"Material geometry component {value!r} must be a tensor."
+                    )
+                return value
+            registered_name = f"_material_geometry_{name}_{component}"
+            if isinstance(value, torch.nn.Parameter):
+                # Reuse an already registered source by identity so passing
+                # ``volume=model.volume_parameter`` does not create a second
+                # alias in the state dict. Direct Parameters otherwise become
+                # true Population parameters and are optimizer-discoverable.
+                for parameter_name, parameter in self._parameters.items():
+                    if parameter is value:
+                        return parameter_name
+                parameter = value
+                if (
+                    parameter.device != self.diam.device
+                    or parameter.dtype != self.diam.dtype
+                ):
+                    parameter = torch.nn.Parameter(
+                        parameter.detach().to(
+                            device=self.diam.device, dtype=self.diam.dtype
+                        ),
+                        requires_grad=bool(parameter.requires_grad),
+                    )
+                self.register_parameter(registered_name, parameter)
+                return registered_name
+
+            tensor = torch.as_tensor(
+                value, device=self.diam.device, dtype=self.diam.dtype
+            )
+            self.register_buffer(registered_name, tensor)
+            return registered_name
+
+        config = {
+            "name": name,
+            "domain": domain,
+            "volume": register_component("volume", volume),
+        }
+        if edge_factor is not None:
+            config["edge_factor"] = register_component("edge_factor", edge_factor)
+        else:
+            config["edge_area"] = register_component("edge_area", edge_area)
+            config["edge_distance"] = register_component("edge_distance", edge_distance)
+        self._material_geometries[name] = config
+        if self.is_built:
+            self._flag_rebuild = True
+        return self
+
+    def material_geometry(self, name: str):
+        """Return a copy of a named material-transport geometry configuration.
+
+        The returned mapping contains registered Population source names
+        (buffers or parameters) rather than detached tensor snapshots.
+        """
+        try:
+            return dict(self._material_geometries[str(name)])
+        except KeyError as exc:
+            raise KeyError(
+                f"Unknown material geometry {name!r}. Available geometries: "
+                f"{sorted(self._material_geometries)}."
+            ) from exc
 
     def _material_constructor_kwargs(self, name: str) -> Dict[str, object]:
         """Build Material constructor kwargs from population-local overrides."""

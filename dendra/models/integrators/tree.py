@@ -73,6 +73,33 @@ class _ScalarDHSGroup:
     a_geom: torch.Tensor
 
 
+def _compiled_tree_graph_view(model):
+    """Return the morphology snapshot used by Tree numerical solvers.
+
+    ``Tree.graph`` is retained as a mutable NetworkX interoperability view.
+    Factories also retain an immutable CompartmentGraph; prefer that compiled
+    snapshot so mutating the view cannot split electrical and material
+    topology. Low-level/legacy Tree subclasses without a snapshot keep the
+    historical graph/assemble_graphs fallback.
+    """
+    canonical = getattr(model, "compartment_graph", None)
+    if canonical is not None:
+        return canonical.to_networkx()
+    compiled = getattr(model, "_compiled_graph", None)
+    if compiled is not None:
+        return compiled
+    graph = model.graph
+    if graph is None:
+        try:
+            graph = model.assemble_graphs()
+        except Exception as err:
+            raise ValueError(
+                "Model must expose compiled compartment_graph, `graph`, or "
+                "implement `assemble_graphs()` returning morphology graphs."
+            ) from err
+    return graph
+
+
 def _scalar_group_planes(value, model, P, B, K, name, *, device):
     """Broadcast a scalar-group field to ``(P, B, K)`` without detaching it."""
     value = value.to(device=device, dtype=model.dtype())
@@ -105,15 +132,7 @@ def _scalar_dhs_group(model, P: int, device: torch.device) -> _ScalarDHSGroup:
     if isinstance(model, Tree):
         B = int(model.shape[-2])
         K = int(model.shape[-1])
-        graph = model.graph
-        if graph is None:
-            try:
-                graph = model.assemble_graphs()
-            except Exception as err:
-                raise ValueError(
-                    "A scalar Tree group must expose `graph` or implement "
-                    "`assemble_graphs()`."
-                ) from err
+        graph = _compiled_tree_graph_view(model)
         graphs = graph if isinstance(graph, list) else [graph]
         if len(graphs) not in (1, B):
             raise ValueError(
@@ -576,15 +595,7 @@ class _dhs(Integrator):
                 f"DHS integrator is not implemented for device type {device.type}."
             )
 
-        graph = model.graph
-        if graph is None:
-            try:
-                graph = model.assemble_graphs()
-            except Exception as err:
-                raise ValueError(
-                    "Model must have a `graph` attribute or implement "
-                    "`assemble_graphs()` method returning a list of graphs."
-                ) from err
+        graph = _compiled_tree_graph_view(model)
         if not isinstance(graph, list):
             graph = [graph]
 

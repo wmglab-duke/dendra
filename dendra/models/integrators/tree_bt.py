@@ -13,7 +13,11 @@ from .core import (
     _flatten_to_solve,
     _model_solve_shape,
 )
-from .tree import _validate_dhs_threads, _validate_tree_graph
+from .tree import (
+    _compiled_tree_graph_view,
+    _validate_dhs_threads,
+    _validate_tree_graph,
+)
 from .triton import dhs_bt_solve_cuda
 
 try:
@@ -151,8 +155,17 @@ class _dhs_bt(Integrator):
         else:
             raise NotImplementedError(f"Unsupported device type: {dev.type}")
 
-        # Topology
-        parent_idx, depth, node_order = _topo_parent_depth(model.graph)
+        # Topology and axial geometry come from the same immutable compiled
+        # morphology snapshot as scalar DHS and material transport. The public
+        # NetworkX graph is an interoperability view, not a recompilation API.
+        graph = _compiled_tree_graph_view(model)
+        if isinstance(graph, list):
+            if len(graph) != 1:
+                raise ValueError(
+                    "ExtCellTree block-DHS requires one shared compiled morphology."
+                )
+            graph = graph[0]
+        parent_idx, depth, node_order = _topo_parent_depth(graph)
         order, layer_ptr = _build_layers(depth.to(torch.int32), self.threads)
         self.solver_order.copy_(
             torch.as_tensor(node_order, dtype=torch.int64, device=dev)
@@ -205,7 +218,7 @@ class _dhs_bt(Integrator):
 
         # Intracellular axial (returned in SOLVER order)
         _, g_intra_solver, _ = graph_to_parent_and_axial(
-            model.graph, dtype_axial=dtyp
+            graph, dtype_axial=dtyp
         )  # (1,K) S for a single morphology
         g_intra_solver = g_intra_solver.squeeze(0).to(device=dev)
         # Map to MECHANISM order so it matches dx/area/xraxial layout

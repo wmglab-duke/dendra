@@ -95,3 +95,47 @@ def test_tree_from_graph_preserves_source_precision_until_requested_downcast(dty
     assert torch.equal(tree.diff_parent_index, torch.tensor([-1, 0]))
     assert torch.equal(tree.diff_edge_parent, torch.tensor([0]))
     assert torch.equal(tree.diff_edge_child, torch.tensor([1]))
+
+
+def test_tree_material_edges_define_stable_compact_topology_order():
+    graph = nx.DiGraph()
+    for node in range(3):
+        graph.add_node(
+            node,
+            name="soma.root" if node == 2 else f"dend.child{node}",
+            L=1.0,
+            diam=1.0,
+            Ra=100.0,
+            cm=1.0,
+            area=1.0,
+        )
+    # The root need not be storage slot zero. Compact material edges are
+    # nevertheless ordered by their child storage slot, not graph insertion or
+    # traversal order.
+    graph.add_edge(2, 1, diff_geom_um=2.0)
+    graph.add_edge(2, 0, diff_geom_um=1.0)
+
+    tree = dn.Tree.from_graph(graph, N=2, dtype=torch.float64)
+    expected = torch.tensor([[2, 2], [0, 1]], dtype=torch.long)
+    assert torch.equal(tree.material_edge_index, expected)
+    parent, child = tree.material_edges
+    assert torch.equal(parent, expected[0])
+    assert torch.equal(child, expected[1])
+
+    # Population batching does not replicate shared topology, and the derived
+    # API introduces no duplicate checkpoint state.
+    tree.batch(3)
+    assert tree.material_edge_index.shape == (2, 2)
+    assert torch.equal(tree.material_edge_index, expected)
+    state = tree.state_dict()
+    assert "material_edge_index" not in state
+    assert "diff_edge_parent" in state
+    assert "diff_edge_child" in state
+
+
+def test_tree_material_edges_follow_model_device():
+    tree = dn.Tree.from_graph(_precise_graph(), device="meta")
+    assert tree.material_edge_index.device.type == "meta"
+    parent, child = tree.material_edges
+    assert parent.device.type == "meta"
+    assert child.device.type == "meta"
