@@ -619,6 +619,11 @@ class Mechanism(Parameterized):
             # e.g., key shape [N] -> [B1, B2, ..., N]
             expanded_key = self.key.expand(*batch_shape, -1)
 
+            what = torch.as_tensor(
+                what,
+                device=tensor.device,
+                dtype=tensor.dtype,
+            )
             what = what.expand_as(expanded_key)
 
             # what should have shape [B1, B2, ..., N]
@@ -630,10 +635,15 @@ class Mechanism(Parameterized):
             batch_shape = tensor.shape[: -self.base_ndim]
             flat_tensor = tensor.reshape(*batch_shape, -1)
 
-            what = what.expand_as(self.key)
-
             # Expand key to match batch dimensions for scatter
             expanded_key = self.key.expand(*batch_shape, -1)
+
+            what = torch.as_tensor(
+                what,
+                device=tensor.device,
+                dtype=tensor.dtype,
+            )
+            what = what.expand_as(expanded_key)
 
             # what should have shape [B1, B2, ..., N]
             return flat_tensor.scatter_add(-1, expanded_key, what).reshape_as(tensor)
