@@ -37,8 +37,9 @@ consumed by :class:`~dendra.models.tree.Tree`, or by the tridiagonal
 :class:`~dendra.models.core.Cable` fast path when the graph is one unbranched
 material cable. See
 :doc:`dendra.models.morphology` for the declaration and canonical graph APIs,
-and :doc:`../basics/02a_native_morphologies` for the connection contract and a
-worked example.
+including :func:`dendra.connect_morphologies` for composing complete trees,
+and :doc:`../basics/02a_native_morphologies` for the connection contract and
+worked examples.
 
 
 Packed scalar populations

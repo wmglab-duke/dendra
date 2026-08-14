@@ -488,16 +488,18 @@ def test_multi_tree_step_writes_each_group_back_in_original_layout():
     assert torch.equal(model.populations["chain"].v, model.v[..., 8:].reshape(1, 3))
 
 
-def test_multi_tree_invalid_group_topology_fails_initialization_atomically():
+def test_multi_tree_mutable_graph_view_does_not_recompile_group_topology():
     model, mechanism, integrator = _make_multi()
     invalid = model.populations["chain"].graph.copy()
     invalid.add_edge(2, 0)
     model.populations["chain"]._graph = invalid
 
-    with pytest.raises(ValueError, match="acyclic|parents"):
-        integrator._initialize(model, 0.05)
-    assert integrator.initialized is False
-    assert integrator.dt is None
+    # Tree factories retain an immutable CompartmentGraph snapshot. The
+    # NetworkX graph is an interoperability view; mutating/replacing it does
+    # not change the compiled electrical (or material) topology.
+    integrator._initialize(model, 0.05)
+    assert integrator.initialized is True
+    assert integrator.dt == pytest.approx(0.05)
 
 
 @pytest.mark.cuda

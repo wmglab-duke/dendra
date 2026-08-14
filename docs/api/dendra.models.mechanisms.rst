@@ -37,6 +37,18 @@ Python expression. A nonlinear pointwise current can instead define an exact
 For a distributed mechanism that pair is ``(mA/cm², S/cm²)``; for a point
 process it is ``(nA, µS)`` before area normalization.
 
+The voltage passed to ``breakpoint`` and current methods is read-only. Dendra
+may gather it once and share that tensor across mechanisms with the exact same
+ordered compartment support; mechanism hooks must not modify it in place.
+
+This sharing is automatic and does not fuse or rewrite mechanism classes.
+Each current method and point-process area conversion still runs independently;
+adjacent contributions to the same current field are then reduced locally and
+scattered once. Selectors must match exactly, including fancy-index order.
+Duplicate-index supports retain separate scatters. As with other parallel
+reductions, the optimization may change the final floating-point association
+at overlapping supports by a few last bits.
+
 Dufort--Frankel requires the stronger *affine* property
 ``I(v) = g * v + b``, with ``g`` and ``b`` independent of ``v`` during that
 evaluation, to center a current exactly between its two stored voltage levels.
@@ -179,6 +191,79 @@ unchanged.
 .. autofunction:: dendra.models.mechanisms.register_material
 
 .. autoclass:: dendra.models.mechanisms.material_defaults
+
+Material processes
+------------------
+
+:class:`~dendra.models.mechanisms.MaterialProcess` objects update shared
+population-wide Material fields after local Mechanism writes and sources have
+been committed. Spatial transport normally runs in the ``transport`` phase;
+Material/Ion guards and derived-field updates run afterward.
+
+.. autoclass:: dendra.models.mechanisms.MaterialProcess
+   :members: METHOD, PHASE
+   :show-inheritance:
+
+.. autoclass:: dendra.models.mechanisms.DiffusionProcess
+   :members: DIFFUSE, RELAX, BATH
+   :show-inheritance:
+
+Regional DiffusionProcess insertion uses the induced compartment topology. An
+edge is active only when both endpoints belong to the process region. Crossing
+edges are sealed, disconnected selected components evolve independently, and
+excluded field values remain unchanged. Repeated insertion of the same class
+forms one union region.
+
+``DiffusionProcess.RELAX(..., where="all")`` means that no *additional*
+reservoir mask is applied. It never broadens or bypasses the process insertion
+region. Effective reservoir support is the intersection of the process region,
+the optional ``where`` mask, and compartments with nonzero ``rate``. ``BATH``
+is an exact alias for ``RELAX``. Relaxation is fused into the implicit diffusion
+matrix and is therefore not a separate operator-split update. It represents a
+fixed/infinite reservoir and does not conserve mass in the modeled field; use
+:class:`~dendra.models.mechanisms.ExchangeProcess` for a finite conservative
+reservoir.
+
+Named chemical geometry
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Intracellular, extracellular, periaxonal, or other chemical domains on an
+unbranched or Tree Population can use an explicitly registered finite-volume
+geometry:
+
+:meth:`~dendra.models.core.Population.register_material_geometry` accepts a
+node/control-volume tensor plus either interface area and distance or a
+precomputed edge factor.
+
+Geometry components may be scalar or broadcastable tensors. Non-scalar
+node/control-volume arrays normally end in ``C`` compartments. Unbranched edge
+arrays end in ``C - 1`` interfaces. Tree edge arrays end in compact dimension
+``E`` and follow :attr:`~dendra.models.tree.Tree.material_edge_index`, whose
+columns are stable ``(parent, child)`` pairs in model-storage coordinates.
+Named Tree geometry retains the morphology topology: a zero edge coefficient
+may seal an existing edge, but geometry cannot add a new connection. Geometry
+names refer to chemical storage and transport only; electrical
+extracellular-layer parameters do not imply a chemical volume or diffusion
+area.
+
+Implicit Tree diffusion permits zero-volume algebraic junctions when every
+conductive component is anchored by at least one positive-volume compartment.
+Explicit Tree diffusion requires positive volume at every active node. A
+regional Tree insertion is an exact induced forest, so an omitted junction is
+not added implicitly and can intentionally disconnect selected branches.
+
+Named sources must be registered Population buffers or parameters. They are
+sampled when the spatial operator is configured (normally on the first step
+after initialization or after explicit timestep reconfiguration), not read on
+every timestep. Differentiable sources preserve autograd; use ``nn.Parameter``
+for optimizer-discovered trainables. Direct ordinary tensors are registered as
+Population buffers, while direct ``nn.Parameter`` values are registered as
+Population parameters. Reconfigure after changing geometry, diffusivity, or
+RELAX coefficients.
+
+See :doc:`../advanced/A0_mechanisms_and_ions_materials` for regional,
+edge-diffusivity, extracellular, and bath-coupling examples and the full solver
+contract.
 
 Ion Management
 --------------

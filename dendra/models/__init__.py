@@ -12,6 +12,7 @@ from .morphology import (
     Morphology,
     Section,
     SectionLocation,
+    connect_morphologies,
 )
 from .multi import MultiPopulation, concat_models
 from .networks import *

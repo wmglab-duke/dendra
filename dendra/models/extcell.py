@@ -16,7 +16,16 @@ import torch
 
 from .core import Axon
 from .integrators import bwd_euler_bt, dhs_bt
-from .tree import Tree, gather_diffusion_edges, gather_membrane, gather_morphology
+from .morphology import CompartmentGraph
+from .tree import (
+    Tree,
+    _normalize_tree_graph,
+    _register_canonical_internal_nodes,
+    _register_compartment_graph_labels,
+    gather_diffusion_edges,
+    gather_membrane,
+    gather_morphology,
+)
 
 
 class ExtCellAxon(Axon):
@@ -212,7 +221,10 @@ class ExtCellTree(Tree):
                 value = value.to(device=self.device(), dtype=self.dtype())
             else:
                 value = value.clone().to(device=self.device())
-            self.register_buffer(key, value)
+            if key in self._buffers:
+                self._buffers[key] = value
+            else:
+                self.register_buffer(key, value)
 
     @classmethod
     def from_graph(cls, graph, N=1, n_layers=2, integrator=None, **kwargs):
@@ -236,6 +248,8 @@ class ExtCellTree(Tree):
         ExtCellTree
             Configured tree population with extracellular coupling.
         """
+        graph = _normalize_tree_graph(graph)
+        compartment_graph = CompartmentGraph.from_networkx(graph)
         C = len(graph.nodes)
         morphology = gather_morphology(graph)
         diffusion_edges = gather_diffusion_edges(graph)
@@ -250,6 +264,9 @@ class ExtCellTree(Tree):
         tree.slice("axon").label("axon")
         tree.slice("dend").label("dend")
         tree.slice("apic").label("apic")
+        tree._compartment_graph = compartment_graph
+        _register_canonical_internal_nodes(tree, compartment_graph)
+        _register_compartment_graph_labels(tree, compartment_graph)
         return tree
 
     @classmethod

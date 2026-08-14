@@ -281,6 +281,9 @@ def gather_diffusion_edges(graph):
     ``diff_parent_index`` and ``diff_geom_um`` buffers have length ``n_comp`` and
     are child-indexed: root entries have parent ``-1`` and zero geometry.
     Compact edge-list buffers are also returned for scatter/gather backends.
+    Their edge axis is ordered by increasing child storage index, with the root
+    omitted; :attr:`Tree.material_edge_index` exposes that ordering publicly for
+    edge-located material data.
     """
     n_comp = len(graph.nodes)
     parent_index = [-1 for _ in range(n_comp)]
@@ -364,10 +367,20 @@ class Tree(Population):
     def __init__(
         self, N, C, graph=None, integrator=None, principal_axis=None, **kwargs
     ):
+        if graph is not None:
+            graph = _normalize_tree_graph(graph)
+            if len(graph.nodes) != int(C):
+                raise ValueError(
+                    f"Tree graph has {len(graph.nodes)} compartments, but C={C}."
+                )
         if integrator is None:
             integrator = dhs()
         super().__init__(N, C, integrator=integrator, **kwargs)
         self._graph = graph
+        # A Tree is a compiled simulation object. Retain an independent graph
+        # snapshot even for the documented low-level constructor; the public
+        # NetworkX graph remains a mutable interoperability view only.
+        self._compiled_graph = None if graph is None else graph.copy()
         self._compartment_graph = None
         names = []
 
@@ -408,11 +421,29 @@ class Tree(Population):
             "base_azimuthal_rotation", self.azimuthal_rotations.clone()
         )
 
+        if graph is not None:
+            diffusion_edges = gather_diffusion_edges(graph)
+            for key, value in diffusion_edges.items():
+                if value.dtype.is_floating_point:
+                    if value.ndim == 2:
+                        value = value.expand(N, -1).clone()
+                    else:
+                        value = value.clone()
+                    value = value.to(device=self.device(), dtype=self.dtype())
+                else:
+                    value = value.clone().to(device=self.device())
+                self.register_buffer(key, value)
+
         self[:, self.find_not("branchpoint")].label("internal_nodes")
 
     @property
     def graph(self):
-        """networkx.DiGraph: Underlying morphology graph."""
+        """networkx.DiGraph: Mutable morphology interoperability view.
+
+        Simulation topology is the immutable compiled :attr:`compartment_graph`
+        (and its registered topology buffers). Mutating this NetworkX view does
+        not recompile the Tree; construct a new Tree to change morphology.
+        """
         return self._graph
 
     @property
@@ -424,6 +455,111 @@ class Tree(Population):
         topology, material domains, and provenance used at construction time.
         """
         return self._compartment_graph
+
+    @property
+    def material_edge_index(self) -> torch.LongTensor:
+        """Return the compact parent-child material edge index.
+
+        Returns
+        -------
+        torch.LongTensor
+            Tensor with shape ``(2, E)``. Row zero contains parent compartment
+            indices and row one contains the corresponding child compartment
+            indices. A connected Tree with ``C`` compartments has ``E = C - 1``
+            edges.
+
+        Notes
+        -----
+        Edges are oriented away from the morphology root and ordered by
+        increasing child storage index, with the root omitted. This edge axis
+        is the stable ordering for edge-located material geometry and
+        diffusivity. Topology is shared by every population instance and batch
+        replica, so this tensor has no population or batch axis. It is derived
+        from registered topology buffers, follows model device moves, and does
+        not add duplicate checkpoint state.
+        """
+        return torch.stack((self.diff_edge_parent, self.diff_edge_child), dim=0)
+
+    @property
+    def material_edges(self) -> tuple[torch.LongTensor, torch.LongTensor]:
+        """Return compact material edges as ``(parent, child)`` tensors.
+
+        This is the unpacking-oriented form of :attr:`material_edge_index`::
+
+            parent, child = tree.material_edges
+
+        Both tensors have shape ``(E,)`` and use the same stable compact edge
+        ordering documented by :attr:`material_edge_index`.
+        """
+        edge_index = self.material_edge_index
+        return edge_index[0], edge_index[1]
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Reject checkpoint topology that disagrees with this compiled Tree.
+
+        ``graph`` remains a mutable NetworkX interoperability view, whereas the
+        canonical ``CompartmentGraph`` and registered parent/edge buffers are
+        the compiled morphology contract. Loading same-shaped buffers from a
+        different Tree must not silently make chemical and electrical topology
+        disagree.
+        """
+        if self._compartment_graph is not None:
+            expected_parent = torch.as_tensor(
+                self._compartment_graph.topology.parent_index, dtype=torch.long
+            )
+        elif hasattr(self, "diff_parent_index"):
+            # Compatibility for specialized/legacy Tree factories without a
+            # canonical CompartmentGraph snapshot: the target's registered
+            # topology is still immutable during state restoration.
+            expected_parent = self.diff_parent_index.detach().cpu().to(torch.long)
+        else:
+            expected_parent = None
+
+        if expected_parent is not None:
+            expected_child = torch.nonzero(
+                expected_parent >= 0, as_tuple=False
+            ).flatten()
+            expected_edge_parent = expected_parent.index_select(0, expected_child)
+            expected = {
+                "diff_parent_index": expected_parent,
+                "diff_edge_parent": expected_edge_parent,
+                "diff_edge_child": expected_child,
+            }
+            for name, expected_value in expected.items():
+                key = f"{prefix}{name}"
+                incoming = state_dict.get(key)
+                # Let the ordinary strict/non-strict loader report a missing
+                # legacy key. When present, however, topology is immutable.
+                if incoming is None:
+                    continue
+                if (
+                    not torch.is_tensor(incoming)
+                    or incoming.dtype != torch.long
+                    or not torch.equal(incoming.detach().cpu(), expected_value)
+                ):
+                    raise RuntimeError(
+                        "Cannot load a Tree checkpoint with a different or "
+                        f"corrupt compiled material topology ({name!r})."
+                    )
+
+        return super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def material_volume(self, domain="intracellular"):
         """Return the volume/mass buffer appropriate for a material domain.
@@ -503,7 +639,10 @@ class Tree(Population):
                     value = value.clone().to(device=tree.device(), dtype=tree.dtype())
             else:
                 value = value.clone().to(device=tree.device())
-            tree.register_buffer(key, value)
+            if key in tree._buffers:
+                tree._buffers[key] = value
+            else:
+                tree.register_buffer(key, value)
         tree.slice("soma").label("soma")
         tree.slice("axon").label("axon")
         tree.slice("dend").label("dend")

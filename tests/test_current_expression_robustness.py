@@ -7,6 +7,7 @@ import inspect
 import pytest
 import torch
 
+import dendra as dn
 from dendra.models.mechanisms import (
     Mechanism,
     UnsafeAutomaticNumericalFallbackError,
@@ -38,6 +39,14 @@ class _DirectAffine(Mechanism):
 
     def i(self, v):
         return self.g * (v - self.e)
+
+
+class _VoltageIndependentCurrent(Mechanism):
+    Mechanism.RANGE(offset=0.125)
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    def i(self, v):
+        return self.offset
 
 
 class _LocalTemporariesAffine(Mechanism):
@@ -275,6 +284,29 @@ def test_ionic_current_uses_the_same_exact_symbolic_contract(dtype):
     _assert_close(conductance, _autograd_conductance(mechanism, "ina", voltage))
     assert mechanism._current_conductance_mode == {"ina": "symbolic"}
     assert mechanism._current_conductance_fallback_reason == {"ina": None}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_restricted_voltage_independent_current_broadcasts_zero_conductance(dtype):
+    model = dn.Population(2, 4, dtype=dtype)
+    model[:, [1, 3]].insert(_VoltageIndependentCurrent, offset=0.125)
+    model.initialize()
+
+    current, conductance = model.mech.i(model.v)
+    expected_current = torch.zeros_like(model.v)
+    expected_current[:, [1, 3]] = 0.125
+
+    torch.testing.assert_close(current, expected_current)
+    torch.testing.assert_close(conductance, torch.zeros_like(model.v))
+    mechanism = next(iter(model.mech.mechanisms.values()))
+    _assert_symbolic_path(mechanism, "i")
+    torch.testing.assert_close(
+        mechanism.add(torch.zeros_like(model.v), 0),
+        torch.zeros_like(model.v),
+    )
+
+    model.step(dt=0.001)
+    assert torch.isfinite(model.v).all()
 
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)

@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+import warnings
 from collections.abc import Mapping
 from typing import Any, Callable, ClassVar, Optional, TypeVar
 
@@ -50,9 +51,11 @@ class ctx(contextlib.ContextDecorator):
     - ``DEBUG`` (int/bool): increase logging verbosity for mechanism/state
       compilation (symbolic transforms, conductance differentiation).
     - ``DEVICE`` (str/torch.device/None): default device for newly constructed
-      Dendra modules that honor context placement.
-    - ``DTYPE`` (str/torch.dtype/None): optional default floating dtype for newly
-      constructed Dendra modules that honor context placement.
+      Dendra modules and eligible PyTorch factory calls without an explicit
+      ``device``.
+    - ``DTYPE`` (str/torch.dtype/None): default floating dtype for newly
+      constructed Dendra modules and, when supported as a default by the
+      installed PyTorch release, PyTorch factories that infer a floating dtype.
     - ``IMEM`` (int/bool): whether integrators compute/store ``i_membrane``
       in populations (required for LFP calculations).
     - ``USETABLES`` (int/bool): toggle lookup tables declared via ``TABLE`` on
@@ -81,21 +84,42 @@ class ctx(contextlib.ContextDecorator):
     -------
     >>> with ctx(DEBUG=1, JIT=0):
     ...     net.build(...)
+    >>> with ctx(DEVICE="cpu", DTYPE=torch.float64):
+    ...     values = torch.zeros(5)
+    >>> values.device, values.dtype
+    (device(type='cpu'), torch.float64)
 
     Parameters
     ----------
     **kwargs
         Mapping from ContextVar key to temporary value. Restored on exit.
+
+    Notes
+    -----
+    Explicit ``device=`` and ``dtype=`` factory arguments override these
+    defaults. Passing ``None`` or ``"default"`` selects Dendra's ordinary
+    ``cpu``/``float32`` construction default within that scope. Dendra's context
+    values and PyTorch's default floating dtype are process-global, while
+    PyTorch's device scope is not isolated between asynchronous tasks; overlapping
+    ``ctx`` scopes in different threads or tasks are unsupported. PyTorch 2.8
+    cannot use ``bfloat16`` as its default dtype; on affected releases Dendra
+    still uses the requested dtype, while implicit PyTorch factories retain their
+    prior default and emit a warning. Integer-inferred, ``*_like``, and
+    storage-sharing factories retain their normal PyTorch dtype/device behavior.
     """
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self._frames: list[tuple[dict[str, Any], contextlib.ExitStack]] = []
+
+    def _recreate_cm(self):
+        """Return a fresh context when this instance decorates a function."""
+        return type(self)(**self.kwargs)
 
     def __enter__(self):
-        self.old_context: dict[str, Any] = {
-            k: v.value for k, v in ContextVar._cache.items()
-        }
+        old_context: dict[str, Any] = {k: v.value for k, v in ContextVar._cache.items()}
         resolved = []
+        torch_defaults = {}
         for k, v in self.kwargs.items():
             key = CONTEXT_ALIASES.get(k, k)
             if key not in ContextVar._cache:
@@ -109,13 +133,51 @@ class ctx(contextlib.ContextDecorator):
                 v = normalize_runtime_contract_validation(v)
             elif key == "NATIVE_EXTENSION_POLICY":
                 v = normalize_native_extension_policy(v)
+            elif key == "DEVICE":
+                torch_defaults[key] = _normalize_device_value(
+                    v, default=torch.device("cpu")
+                )
+            elif key == "DTYPE":
+                torch_defaults[key] = _normalize_dtype_value(v, default=torch.float32)
             resolved.append((key, v))
+
+        torch_defaults_stack = contextlib.ExitStack()
+        try:
+            device = torch_defaults.get("DEVICE")
+            if device is not None:
+                torch_defaults_stack.enter_context(torch.device(device))
+
+            dtype = torch_defaults.get("DTYPE")
+            if dtype is not None:
+                old_dtype = torch.get_default_dtype()
+                torch_defaults_stack.callback(torch.set_default_dtype, old_dtype)
+                try:
+                    torch.set_default_dtype(dtype)
+                except TypeError:
+                    if dtype != torch.bfloat16:
+                        raise
+                    warnings.warn(
+                        f"PyTorch {torch.__version__} cannot use torch.bfloat16 "
+                        "as its default dtype. Dendra will use torch.bfloat16, "
+                        "but implicit PyTorch factory calls retain their prior "
+                        "default; pass dtype=torch.bfloat16 explicitly.",
+                        stacklevel=2,
+                    )
+        except BaseException:
+            torch_defaults_stack.close()
+            raise
+
         for key, v in resolved:
             ContextVar._cache[key].value = v
+        self._frames.append((old_context, torch_defaults_stack))
 
     def __exit__(self, *args):
-        for k, v in self.old_context.items():
-            ContextVar._cache[k].value = v
+        old_context, torch_defaults_stack = self._frames.pop()
+        try:
+            return torch_defaults_stack.__exit__(*args)
+        finally:
+            for k, v in old_context.items():
+                ContextVar._cache[k].value = v
 
 
 class ContextVar:

@@ -53,6 +53,108 @@ def test_contextvar_and_ctx():
     assert H.DEBUG.value == orig_debug
 
 
+def test_ctx_propagates_dtype_and_device_to_torch_factories():
+    original_dtype = torch.get_default_dtype()
+    original_device = torch.get_default_device()
+
+    with dn.ctx(DTYPE=torch.float64, DEVICE="meta"):
+        implicit = torch.zeros(5)
+        inferred = torch.tensor([1.25, 2.5])
+        explicit = torch.zeros(5, dtype=torch.float32, device="cpu")
+
+        assert implicit.dtype == inferred.dtype == torch.float64
+        assert implicit.device.type == inferred.device.type == "meta"
+        assert explicit.dtype == torch.float32
+        assert explicit.device.type == "cpu"
+        assert H.current_dtype() == torch.float64
+        assert H.current_device() == torch.device("meta")
+
+    assert torch.get_default_dtype() == original_dtype
+    assert torch.get_default_device() == original_device
+
+
+def test_ctx_torch_defaults_nest_and_restore_after_an_exception():
+    original_dtype = torch.get_default_dtype()
+    original_device = torch.get_default_device()
+
+    with pytest.raises(RuntimeError, match="leave outer context"):
+        with H.ctx(DTYPE=torch.float64, DEVICE="meta"):
+            assert torch.zeros(1).dtype == torch.float64
+            assert torch.zeros(1).device.type == "meta"
+
+            with H.ctx(DTYPE=torch.float32, DEVICE="cpu"):
+                inner = torch.zeros(1)
+                assert inner.dtype == torch.float32
+                assert inner.device.type == "cpu"
+
+            with H.ctx(DTYPE=None, DEVICE=None):
+                defaults = torch.zeros(1)
+                assert defaults.dtype == torch.float32
+                assert defaults.device.type == "cpu"
+
+            restored_outer = torch.zeros(1)
+            assert restored_outer.dtype == torch.float64
+            assert restored_outer.device.type == "meta"
+            raise RuntimeError("leave outer context")
+
+    assert torch.get_default_dtype() == original_dtype
+    assert torch.get_default_device() == original_device
+
+
+def test_invalid_torch_dtype_context_is_atomic():
+    original_debug = H.DEBUG.value
+    original_dtype = torch.get_default_dtype()
+    original_device = torch.get_default_device()
+
+    with pytest.raises(TypeError, match="floating-point"):
+        with H.ctx(DEBUG=1, DEVICE="meta", DTYPE=torch.int64):
+            pass
+
+    assert H.DEBUG.value == original_debug
+    assert torch.get_default_dtype() == original_dtype
+    assert torch.get_default_device() == original_device
+
+
+def test_ctx_preserves_bfloat16_when_torch_cannot_make_it_the_default(
+    monkeypatch,
+):
+    original_dtype = torch.get_default_dtype()
+    set_default_dtype = torch.set_default_dtype
+
+    def reject_bfloat16(dtype):
+        if dtype == torch.bfloat16:
+            raise TypeError("bfloat16 has no corresponding complex dtype")
+        set_default_dtype(dtype)
+
+    monkeypatch.setattr(torch, "set_default_dtype", reject_bfloat16)
+
+    with pytest.warns(UserWarning, match="cannot use torch.bfloat16"):
+        with H.ctx(DTYPE=torch.bfloat16):
+            assert H.current_dtype() == torch.bfloat16
+            assert torch.zeros(1).dtype == original_dtype
+
+    assert torch.get_default_dtype() == original_dtype
+
+
+def test_ctx_instance_can_be_nested_and_reused_as_a_decorator():
+    original_dtype = torch.get_default_dtype()
+    context = H.ctx(DTYPE=torch.float64)
+
+    with context:
+        assert torch.zeros(1).dtype == torch.float64
+        with context:
+            assert torch.zeros(1).dtype == torch.float64
+        assert torch.zeros(1).dtype == torch.float64
+
+    @context
+    def tensor_factory():
+        return torch.zeros(1)
+
+    assert tensor_factory().dtype == torch.float64
+    assert tensor_factory().dtype == torch.float64
+    assert torch.get_default_dtype() == original_dtype
+
+
 def test_runtime_contract_validation_context_is_normalized_and_atomic():
     original = H.RUNTIME_CONTRACT_VALIDATION.value
 

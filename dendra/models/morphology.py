@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
@@ -947,6 +948,35 @@ class Morphology:
             )
         return section
 
+    def _validate_connected_tree(self) -> str:
+        """Validate the authored Section topology and return its root name."""
+        if not self._sections:
+            raise ValueError("Cannot compile an empty Morphology.")
+        roots = [name for name in self._sections if name not in self._connections]
+        if len(roots) != 1:
+            raise ValueError(
+                "A scalar Morphology must have exactly one root section; "
+                f"found {len(roots)} ({roots!r})."
+            )
+        if len(self._connections) != len(self._sections) - 1:
+            raise ValueError("Every non-root section must have exactly one parent.")
+
+        root_name = roots[0]
+        section_children: dict[str, list[str]] = {name: [] for name in self._sections}
+        for connection in self._connections.values():
+            section_children[connection.parent_name].append(connection.child_name)
+        visited: set[str] = set()
+        stack = [root_name]
+        while stack:
+            name = stack.pop()
+            if name in visited:
+                raise ValueError("Section connections contain a cycle.")
+            visited.add(name)
+            stack.extend(reversed(section_children[name]))
+        if visited != set(self._sections):
+            raise ValueError("All sections must be reachable from the root section.")
+        return root_name
+
     def delete_section(
         self, section: str | Section, *, recursive: bool = False
     ) -> tuple[str, ...]:
@@ -1544,32 +1574,7 @@ class Morphology:
         ``diameter_um`` metadata is the arclength mean over the compartment,
         not a point sample used to reconstruct these exact integrals.
         """
-        if not self._sections:
-            raise ValueError("Cannot compile an empty Morphology.")
-        roots = [name for name in self._sections if name not in self._connections]
-        if len(roots) != 1:
-            raise ValueError(
-                "A scalar Morphology must have exactly one root section; "
-                f"found {len(roots)} ({roots!r})."
-            )
-        if len(self._connections) != len(self._sections) - 1:
-            raise ValueError("Every non-root section must have exactly one parent.")
-
-        root_name = roots[0]
-        section_children: dict[str, list[str]] = {name: [] for name in self._sections}
-        for connection in self._connections.values():
-            section_children[connection.parent_name].append(connection.child_name)
-        visited: set[str] = set()
-        stack = [root_name]
-        while stack:
-            name = stack.pop()
-            if name in visited:
-                raise ValueError("Section connections contain a cycle.")
-            visited.add(name)
-            stack.extend(reversed(section_children[name]))
-        if visited != set(self._sections):
-            raise ValueError("All sections must be reachable from the root section.")
-
+        root_name = self._validate_connected_tree()
         return _compile_morphology(self, root_name)
 
     @classmethod
@@ -2631,6 +2636,149 @@ class Morphology:
         return self._sections[key]
 
 
+def connect_morphologies(
+    parent: SectionLocation,
+    child: SectionLocation,
+    *,
+    child_prefix: str = "",
+) -> Morphology:
+    """Connect two complete Morphologies and return an independent declaration.
+
+    ``parent`` may select any location on its owning Morphology. ``child`` must
+    select endpoint 0 or 1 of the root Section in a different Morphology. The
+    parent Morphology is copied first, the complete child Morphology is copied
+    after it, and one new Section connection joins the two trees. Neither input
+    is mutated, and every Section in the result has fresh identity.
+
+    Section names remain exact by default. ``child_prefix`` is prepended to
+    every child-Morphology Section name when the two declarations would
+    otherwise collide. The corresponding automatic name label and imported SWC
+    type key are renamed with it; reusable structural labels are unchanged.
+    Any remaining Section-name or name-versus-label conflict is rejected.
+
+    Spatial coordinates are preserved exactly. As with :meth:`Morphology.connect`,
+    this operation establishes electrical topology but does not translate or
+    rotate the child geometry.
+
+    Parameters
+    ----------
+    parent : SectionLocation
+        Attachment location in the Morphology that will provide the result's
+        defaults and root tree.
+    child : SectionLocation
+        Endpoint of the other Morphology's unique root Section.
+    child_prefix : str, optional
+        Prefix for every Section name copied from the child Morphology. Default
+        is the empty string.
+
+    Returns
+    -------
+    Morphology
+        A fresh, connected Morphology containing independent copies of both
+        source declarations, in parent-then-child Section declaration order.
+    """
+    if not isinstance(parent, SectionLocation):
+        raise TypeError("parent must be a SectionLocation returned by Section.at().")
+    if not isinstance(child, SectionLocation):
+        raise TypeError("child must be a SectionLocation returned by Section.at().")
+    if child.x not in (0.0, 1.0):
+        raise ValueError("child must select root Section endpoint 0 or 1.")
+    if not isinstance(child_prefix, str):
+        raise TypeError("child_prefix must be a string.")
+
+    parent_morphology = parent.section._owner
+    child_morphology = child.section._owner
+    parent_section = parent_morphology._resolve_section(parent.section)
+    child_section = child_morphology._resolve_section(child.section)
+    if parent_morphology is child_morphology:
+        raise ValueError(
+            "parent and child must belong to different Morphologies; use "
+            "Morphology.connect for Sections in one Morphology."
+        )
+
+    parent_morphology._validate_connected_tree()
+    child_root_name = child_morphology._validate_connected_tree()
+    if child_section.name != child_root_name:
+        raise ValueError(
+            "child must select an endpoint on the child Morphology's root "
+            f"Section {child_root_name!r}."
+        )
+
+    child_names = {name: f"{child_prefix}{name}" for name in child_morphology._sections}
+    duplicate_names = sorted(
+        set(parent_morphology._sections).intersection(child_names.values())
+    )
+    if duplicate_names:
+        conflicts = ", ".join(repr(name) for name in duplicate_names)
+        raise ValueError(
+            "Cannot connect Morphologies because child Section name(s) conflict "
+            f"with the parent Morphology: {conflicts}. Pass child_prefix to "
+            "rename every child Section explicitly."
+        )
+
+    combined_names = set(parent_morphology._sections) | set(child_names.values())
+    final_labels: list[tuple[str, frozenset[str]]] = [
+        (section.name, section.labels) for section in parent_morphology.sections
+    ]
+    final_labels.extend(
+        (
+            child_names[section.name],
+            (section.labels - {section.name}) | {child_names[section.name]},
+        )
+        for section in child_morphology.sections
+    )
+    label_conflicts: list[tuple[str, str]] = []
+    for section_name, labels in final_labels:
+        label_conflicts.extend(
+            (section_name, conflict)
+            for conflict in sorted((labels & combined_names) - {section_name})
+        )
+    if label_conflicts:
+        details = ", ".join(
+            f"Section {section_name!r} uses reserved name {label!r} as a label"
+            for section_name, label in label_conflicts
+        )
+        raise ValueError(
+            "Cannot connect Morphologies because Section names are reserved in "
+            f"the combined declaration: {details}."
+        )
+
+    result = deepcopy(parent_morphology)
+    copied_child = deepcopy(child_morphology)
+    for old_name, section in copied_child._sections.items():
+        new_name = child_names[old_name]
+        object.__setattr__(section, "name", new_name)
+        object.__setattr__(
+            section,
+            "labels",
+            (section.labels - {old_name}) | {new_name},
+        )
+        object.__setattr__(section, "_owner", result)
+        result._sections[new_name] = section
+
+    for connection in copied_child._connections.values():
+        new_child_name = child_names[connection.child_name]
+        result._connections[new_child_name] = _Connection(
+            parent_name=child_names[connection.parent_name],
+            parent_x=connection.parent_x,
+            child_name=new_child_name,
+            child_end=connection.child_end,
+        )
+
+    for section_name, swc_type in copied_child._swc_section_types.items():
+        result._swc_section_types[child_names[section_name]] = swc_type
+
+    new_root_name = child_names[child_root_name]
+    result._connections[new_root_name] = _Connection(
+        parent_name=parent_section.name,
+        parent_x=parent.x,
+        child_name=new_root_name,
+        child_end=int(child.x),
+    )
+    result._validate_connected_tree()
+    return result
+
+
 def _normalize_points(
     points: Sequence[Sequence[float]], *, section_name: str
 ) -> tuple[tuple[float, float, float, float], ...]:
@@ -3387,4 +3535,5 @@ __all__ = [
     "Morphology",
     "Section",
     "SectionLocation",
+    "connect_morphologies",
 ]

@@ -23,6 +23,19 @@ class DiffusionSpec:
     field: str
     D: Any
     domain: str | None = None
+    geometry: str | None = None
+    D_location: str = "node"
+
+
+@dataclass(frozen=True)
+class DiffusionRelaxationSpec:
+    """Linear reservoir coupling fused into one diffused material field."""
+
+    material: str
+    field: str
+    rate: Any
+    target: Any = 0.0
+    where: Any = "all"
 
 
 @dataclass(frozen=True)
@@ -1245,25 +1258,65 @@ class ExchangeProcess(MaterialProcess):
 
 
 class DiffusionProcess(MaterialProcess):
-    """Finite-volume diffusion process for full population-wide material fields.
+    """Finite-volume diffusion over all or a selected subset of compartments.
 
-    MVP scope:
-      - analytic one-dimensional unbranched geometry along the final tensor
-        axis for specialized Axon models without a compartment graph
-      - canonical graph geometry using the DHS/Hines spatial operator for Tree
-        and native Cable models when material-geometry buffers are available
-      - sealed/no-flux boundaries
-      - intracellular/cytosolic domain
-      - explicit and implicit methods, with implicit as the default
+    Declare transported fields with :meth:`DIFFUSE`. Intracellular fields can
+    use an Axon's analytic cylindrical geometry or a Tree's native material
+    geometry. Intracellular, extracellular, periaxonal, and other chemical
+    domains on unbranched or Tree populations may instead use finite-volume
+    geometry registered by :meth:`Population.register_material_geometry`.
+    Boundaries are sealed.
 
-    Geometry/topology and timestep-scaled coefficients are configured from
-    ``set_dt(dt)`` so the per-timestep material phase only calls a preconfigured
-    spatial operator.
+    Inserting on a Slice restricts transport to the induced morphology
+    subgraph.  An edge is active only when both endpoints are selected;
+    crossing edges are sealed, disconnected selected components evolve as
+    independent matrix blocks, and excluded field values remain exactly
+    unchanged.  Repeated insertions of the same process class form one union
+    support, so separately inserted regions communicate if they touch.
+
+    :meth:`RELAX` (alias :meth:`BATH`) optionally fuses linear reservoir
+    coupling into the implicit diffusion solve.  With storage matrix ``M``,
+    diffusion Laplacian ``L``, non-negative rate ``Lambda``, reservoir value
+    ``c_bath``, and the field ``c_source`` after committed local material
+    sources, one step solves
+
+    ``(M + dt*L + dt*M*Lambda) c_new = M*c_source + dt*M*Lambda*c_bath``.
+
+    Consequently diffusion and bath coupling are not operator-split from one
+    another.  Local Mechanism material writes/sources run first; material
+    transport runs next; Ion/Material guards and derived values such as Nernst
+    reversals refresh afterward.  ``RELAX`` is currently implicit-only.
+
+    Analytic 1-D models support ``interface_scheme="arithmetic"`` (the legacy
+    default) and ``interface_scheme="series"`` (two half-compartment diffusion
+    resistances in series).  Tree models use their precomputed edge geometry
+    and do not accept the 1-D-only series option.  Named geometries already
+    provide an interface factor and currently use the arithmetic scheme; use
+    edge-located diffusivity for an explicitly computed interface coefficient.
+
+    Geometry/topology and timestep-scaled coefficients are configured before
+    stepping (or explicitly by ``set_dt(dt)``), so the per-timestep material
+    phase only calls a preconfigured spatial operator. Registered
+    named-geometry and Population coefficient buffers/parameters are sampled
+    during this configuration and remain differentiable; they are not read
+    anew on every timestep.
+
+    Notes
+    -----
+    One process class may declare multiple fields. If any DIFFUSE declaration
+    names geometry, every DIFFUSE declaration in that class must name that same
+    geometry; named and unnamed declarations cannot be mixed. Overlapping
+    assignments from repeated insertions must be unambiguous. Distinct
+    DiffusionProcess classes may be disjoint, but overlapping writers to the
+    same material field in the same phase are rejected because sequential
+    implicit solves are order-dependent.
     """
 
     _material_process_phase = "transport"
     _diffusion_specs: tuple[DiffusionSpec, ...] = tuple()
     _diffusion_declarations = []
+    _diffusion_relaxation_specs: tuple[DiffusionRelaxationSpec, ...] = tuple()
+    _diffusion_relaxation_declarations = []
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -1280,8 +1333,29 @@ class DiffusionProcess(MaterialProcess):
         )
         cls._diffusion_specs = tuple(specs)
 
+        relaxation_specs: list[DiffusionRelaxationSpec] = []
+        for base in reversed(cls.__mro__):
+            if "_diffusion_relaxation_specs" in base.__dict__:
+                relaxation_specs.extend(list(base._diffusion_relaxation_specs))
+        relaxation_specs.extend(
+            consume_class_values(
+                cls,
+                "diffusion_process.relaxation_specs",
+                DiffusionProcess._diffusion_relaxation_declarations,
+            )
+        )
+        cls._diffusion_relaxation_specs = tuple(relaxation_specs)
+
     @staticmethod
-    def DIFFUSE(material, *, field=None, D=None, domain=None):
+    def DIFFUSE(
+        material,
+        *,
+        field=None,
+        D=None,
+        domain=None,
+        geometry=None,
+        D_location="node",
+    ):
         """Declare a material field to diffuse.
 
         Parameters
@@ -1292,30 +1366,141 @@ class DiffusionProcess(MaterialProcess):
             Field name, e.g. ``"cai"`` or ``"ip3i"``.  If omitted, defaults to
             ``f"{material}i"``.
         D
-            Diffusivity in ``um^2 / ms`` by default.  May be a scalar or the name
-            of a process parameter, e.g. ``D="Dca"``.
+            Diffusivity in ``um^2 / ms``.  It may be a scalar, tensor, or the
+            name of a process parameter/buffer.  With ``D_location="edge"``, a
+            string may also name a registered Population edge buffer.
         domain
             Optional domain override.  If omitted, the material field spec's
             domain metadata is used.
+        geometry
+            Optional named material geometry registered on the Population with
+            :meth:`Population.register_material_geometry`. It is currently
+            required for extracellular diffusion. Every DIFFUSE declaration
+            in one process class must use the same named geometry (or none).
+        D_location
+            ``"node"`` (default) means ``D`` is scalar or node-aligned.  The
+            spatial backend derives interface coefficients from endpoint
+            values.  ``"edge"`` means ``D`` is scalar or interface-aligned
+            (final dimension ``C - 1`` for an unbranched population, or compact
+            Tree edge dimension ``E`` in
+            :attr:`~dendra.models.tree.Tree.material_edge_index` order). It
+            requires named geometry and is useful for barriers or junctions
+            that cannot be represented by endpoint averaging.
+
+        Notes
+        -----
+        With named geometry and ``D_location="node"``, interface diffusivity is
+        the arithmetic endpoint mean ``0.5 * (D_i + D_j)``. Named geometry
+        rejects ``interface_scheme="series"`` because an area/distance edge
+        factor does not contain both half-compartment resistances.
+
+        Edge location is supported with explicit named geometry on unbranched
+        and Tree populations; it is not available for analytic cylindrical 1-D
+        or native Tree geometry. A node-aligned RANGE declaration is not an edge
+        array. For spatially varying edge diffusivity, use a literal edge tensor
+        or a registered Population edge buffer/parameter. Process-local names
+        take precedence over Population names.
+
+        Named Tree geometry retains morphology adjacency. Compact edge entry
+        ``e`` describes ``parent[e] -> child[e]`` as exposed by
+        :attr:`~dendra.models.tree.Tree.material_edges`; zero geometry or
+        diffusivity may seal that edge, but named geometry cannot add a new one.
+
+        Coefficients are finite and non-negative on active interfaces. A zero
+        diffusivity seals an interface. Registered Population values are
+        sampled whenever the process spatial operator is configured, not on
+        every timestep; reconfigure after mutating one.
         """
         material = str(material)
         if field is None:
             field = f"{material}i"
         if D is None:
             D = "D"
+        D_location = str(D_location).lower()
+        if D_location not in {"node", "edge"}:
+            raise ValueError("D_location must be 'node' or 'edge'.")
         spec = DiffusionSpec(
-            str(material), str(field), D, None if domain is None else str(domain)
+            str(material),
+            str(field),
+            D,
+            None if domain is None else str(domain),
+            None if geometry is None else str(geometry),
+            D_location,
         )
         declare_class_value(
             "diffusion_process.specs", spec, DiffusionProcess._diffusion_declarations
         )
 
+    @staticmethod
+    def RELAX(material, *, field=None, rate=None, target=0.0, where="all"):
+        """Fuse linear reservoir relaxation into a diffused field's solve.
+
+        The implicit update contributes ``-rate * (c - target)`` to the same
+        linear system as diffusion.  This is useful for bulk-bath exchange,
+        clearance into a fixed reservoir, or other stiff linear coupling.
+
+        Parameters
+        ----------
+        material
+            Material containing the field.  It must match a :meth:`DIFFUSE`
+            declaration in the same process class.
+        field
+            Field to relax.  If omitted, defaults to ``f"{material}i"``.
+        rate
+            Non-negative relaxation rate in ``1 / ms``.  It may be a scalar,
+            node-aligned tensor, or process parameter/buffer name.  A spatially
+            varying zero rate is often the simplest coupling mask.
+        target
+            Reservoir concentration/value in the same units as ``field``.  It
+            may be scalar, node-aligned, or a parameter/buffer name.
+        where
+            An additional node mask.  ``"all"`` (the default) and ``None`` mean
+            *no additional mask*: they do not override the region where the
+            DiffusionProcess was inserted.  A boolean scalar/tensor, a
+            node-aligned process parameter/buffer name, or a registered
+            Population buffer/parameter name further restricts reservoir
+            coupling.
+
+        Notes
+        -----
+        Effective coupling support is the intersection of the process insertion
+        region and ``where``; compartments with ``rate == 0`` contribute no
+        relaxation.  Thus ``where="all"`` on a regional process still excludes
+        every compartment outside that process region.  Multiple RELAX
+        declarations for one field add their diagonal and right-hand-side
+        contributions.  RELAX requires ``METHOD("implicit")``.  For bath-only
+        dynamics, declare the field with ``DIFFUSE(..., D=0)`` and then RELAX it.
+
+        Only ``"all"`` and ``None`` are special mask values. Any other string is
+        resolved as a process-local or registered Population quantity name;
+        ClampProcess selector words such as ``"terminal"``, ``"root"``, and
+        ``"soma"`` have no special meaning here. Process-local names take
+        precedence over Population names.
+
+        Rate, target, and where values are sampled into the configured implicit
+        operator and are not hot-read every timestep. Reconfigure the spatial
+        operator after changing them. RELAX represents coupling to a fixed or
+        infinite reservoir and therefore does not conserve mass inside the
+        modeled field. Use ExchangeProcess for conservative exchange with a
+        finite modeled reservoir.
+
+        ``BATH`` is an exact declaration alias for ``RELAX``.
+        """
+        material = str(material)
+        if field is None:
+            field = f"{material}i"
+        if rate is None:
+            rate = "rate"
+        spec = DiffusionRelaxationSpec(material, str(field), rate, target, where)
+        declare_class_value(
+            "diffusion_process.relaxation_specs",
+            spec,
+            DiffusionProcess._diffusion_relaxation_declarations,
+        )
+
+    BATH = RELAX
+
     def configure_process(self, population=None):
-        if self.key is not None:
-            raise NotImplementedError(
-                "DiffusionProcess MVP must be inserted globally. Region-restricted "
-                "diffusion will require restricted spatial operators."
-            )
         if population is None:
             raise RuntimeError(
                 "DiffusionProcess requires population geometry during binding."
@@ -1344,6 +1529,21 @@ class DiffusionProcess(MaterialProcess):
         self._diffusion_boundary = str(kwargs.get("boundary", "sealed")).lower()
         self._diffusion_volume_fraction = kwargs.get("volume_fraction", 1.0)
         self._diffusion_area_fraction = kwargs.get("area_fraction", 1.0)
+        interface_scheme = str(
+            kwargs.get("interface_scheme", kwargs.get("interface", "arithmetic"))
+        ).lower()
+        self._diffusion_interface_scheme = {
+            "mean": "arithmetic",
+            "legacy": "arithmetic",
+            "harmonic": "series",
+            "resistance": "series",
+            "resistive": "series",
+        }.get(interface_scheme, interface_scheme)
+        if self._diffusion_interface_scheme not in {"arithmetic", "series"}:
+            raise ValueError(
+                "interface_scheme must be 'arithmetic' or 'series'; got "
+                f"{interface_scheme!r}."
+            )
         self._diffusion_domain = kwargs.get("domain", None)
         self._diffusion_threads = int(kwargs.get("threads", 16))
 
@@ -1358,7 +1558,30 @@ class DiffusionProcess(MaterialProcess):
             for i, spec in enumerate(type(self)._diffusion_specs)
         )
 
+        self._configure_region(population)
+        self._validate_overlapping_diffusivity_overrides()
+        self._configure_named_transport_geometry(population)
+
         self._diffusion_geometry_kind = self._select_geometry_kind(population)
+        if (
+            self._diffusion_geometry_name is not None
+            and self._diffusion_interface_scheme != "arithmetic"
+        ):
+            raise NotImplementedError(
+                "Named material geometry already supplies an interface edge "
+                "factor and currently supports only interface_scheme='arithmetic'. "
+                "Use D_location='edge' for an explicitly computed interface "
+                "diffusivity."
+            )
+        if (
+            self._diffusion_geometry_kind == "tree"
+            and self._diffusion_interface_scheme != "arithmetic"
+        ):
+            raise NotImplementedError(
+                "interface_scheme='series' is available only for analytic 1-D "
+                "DiffusionProcess geometry. Tree diffusion uses the morphology's "
+                "precomputed edge geometry."
+            )
         if self._diffusion_geometry_kind == "tree":
             self._configure_tree_geometry(population)
         else:
@@ -1368,6 +1591,287 @@ class DiffusionProcess(MaterialProcess):
 
         self._validate_diffusion_specs()
         self._spatial_configured = False
+        return None
+
+    def _configure_named_transport_geometry(self, population) -> None:
+        """Bind explicit chemical geometry and population edge coefficients."""
+        # Keep a non-module back-reference for live geometry/edge buffers. Using
+        # object.__setattr__ avoids registering the owning Population as a child
+        # module (which would create a torch.nn.Module cycle).
+        object.__setattr__(self, "_mp_population", population)
+        geometry_names = {spec.geometry for spec in type(self)._diffusion_specs}
+        named = {name for name in geometry_names if name is not None}
+        if len(named) > 1:
+            raise ValueError(
+                "One DiffusionProcess instance currently requires one shared "
+                f"transport geometry; received {sorted(named)}."
+            )
+        if named and None in geometry_names:
+            raise ValueError(
+                "All DIFFUSE declarations in one process must use the same named "
+                "transport geometry."
+            )
+
+        self._diffusion_geometry_name = next(iter(named), None)
+        self._diffusion_geometry_domain = None
+        if self._diffusion_geometry_name is not None:
+            try:
+                config = population.material_geometry(self._diffusion_geometry_name)
+            except AttributeError as exc:
+                raise NotImplementedError(
+                    "Named material transport geometry requires a Population "
+                    "implementing register_material_geometry(...)."
+                ) from exc
+            self._diffusion_geometry_domain = _canonical_domain(config["domain"])
+            self._diffusion_geometry_config = dict(config)
+        else:
+            self._diffusion_geometry_config = None
+
+        # Edge coefficients have a different shape from ordinary RANGE
+        # parameters. Permit an explicit Population buffer reference for them.
+        self._diffusion_population_quantities = {}
+
+        def register_population_quantity(source_name, destination_name, role):
+            registered = source_name in getattr(
+                population, "_buffers", {}
+            ) or source_name in getattr(population, "_parameters", {})
+            if not registered:
+                if hasattr(population, source_name):
+                    raise AttributeError(
+                        f"Population {role} {source_name!r} must be a registered "
+                        "buffer or parameter so it follows dtype/device and "
+                        "state-dict semantics."
+                    )
+                return False
+            value = getattr(population, source_name)
+            if not torch.is_tensor(value):
+                raise TypeError(f"Population {role} {source_name!r} must be a tensor.")
+            self._diffusion_population_quantities[source_name] = destination_name
+            return True
+
+        for spec in type(self)._diffusion_specs:
+            if spec.D_location != "edge" or not isinstance(spec.D, str):
+                continue
+            range_names = set()
+            for declaration in ("range", "range_p", "range_n"):
+                range_names.update(getattr(self, declaration, {}).keys())
+            if spec.D in range_names:
+                raise ValueError(
+                    f"Edge-located diffusivity {spec.D!r} cannot be a RANGE "
+                    "parameter because RANGE values are node-aligned. Use a "
+                    "scalar/GLOBAL value or a registered Population edge "
+                    "buffer/parameter."
+                )
+            if hasattr(self, spec.D) or spec.D in self._buffers:
+                continue
+            buffer_name = f"_mp_edge_quantity_{_safe_key(0, spec.D, 'edge')}"
+            if not register_population_quantity(
+                spec.D, buffer_name, "edge diffusivity"
+            ):
+                raise AttributeError(
+                    f"Edge diffusivity {spec.D!r} is neither a process parameter "
+                    "nor a registered Population tensor buffer."
+                )
+
+        # Reservoir masks/rates/targets may likewise reference an explicitly
+        # registered Population tensor. Ordinary RANGE/GLOBAL names continue
+        # to resolve from the process itself and therefore take precedence.
+        for relaxation in type(self)._diffusion_relaxation_specs:
+            for value in (relaxation.rate, relaxation.target, relaxation.where):
+                if not isinstance(value, str) or value.lower() == "all":
+                    continue
+                if hasattr(self, value) or value in self._buffers:
+                    continue
+                buffer_name = f"_mp_node_quantity_{_safe_key(0, value, 'node')}"
+                if not register_population_quantity(
+                    value, buffer_name, "relaxation quantity"
+                ):
+                    continue
+
+        self._refresh_named_transport_quantities()
+
+    def _refresh_named_transport_quantities(self) -> None:
+        """Refresh live Population geometry and coefficient buffers."""
+        population = getattr(self, "_mp_population", None)
+        if population is None:
+            return
+
+        config = getattr(self, "_diffusion_geometry_config", None)
+        if config is not None:
+
+            def component(name):
+                source_name = config[name]
+                value = getattr(population, source_name)
+                if not torch.is_tensor(value):
+                    raise TypeError(
+                        f"Material geometry component {source_name!r} must be a tensor."
+                    )
+                return value.clone()
+
+            volume = component("volume")
+            if "edge_factor" in config:
+                self._set_geometry_buffer(
+                    "_mp_transport_edge_factor", component("edge_factor")
+                )
+            else:
+                # Retain the primitive quantities until the spatial backend has
+                # applied its regional edge mask. This lets excluded/crossing
+                # Tree edges carry harmless sentinels and avoids inventing a
+                # dummy root-edge distance.
+                self._set_geometry_buffer(
+                    "_mp_transport_edge_area", component("edge_area")
+                )
+                self._set_geometry_buffer(
+                    "_mp_transport_edge_distance", component("edge_distance")
+                )
+            self._set_geometry_buffer("_mp_transport_volume", volume)
+
+        for source_name, destination_name in getattr(
+            self, "_diffusion_population_quantities", {}
+        ).items():
+            value = getattr(population, source_name)
+            self._set_geometry_buffer(destination_name, value.clone())
+
+    def _validate_overlapping_diffusivity_overrides(self) -> None:
+        """Reject contradictory RANGE D assignments on overlapping regions.
+
+        Repeated insertions of one process class compile into one union.  Equal
+        assignments on an overlap are harmless and deduplicate naturally;
+        different assignments would otherwise be resolved by insertion order,
+        making the diffusion graph configuration ambiguous.
+        """
+        range_names = set()
+        for declaration in ("range", "range_p", "range_n"):
+            range_names.update(getattr(self, declaration, {}).keys())
+
+        diffusivity_names = {
+            spec.D
+            for spec in type(self)._diffusion_specs
+            if isinstance(spec.D, str) and spec.D in range_names
+        }
+        for name in diffusivity_names:
+            entries = tuple(self.additional_parameters.get(name, ()))
+            keys = self.keys.get(name)
+            dynamic_parametrizations = tuple(
+                parametrization
+                for parametrization, _args in self.in_graph_parametrizations.get(
+                    name, ()
+                )
+                if hasattr(parametrization, "func")
+            )
+            if len(entries) + len(dynamic_parametrizations) < 2:
+                continue
+
+            # A module-valued RANGE override is represented as an in-graph
+            # Functional rather than an entry in ``additional_parameters``.
+            # Its future values cannot be compared at bind time, so any overlap
+            # with another explicit assignment is order-dependent and rejected.
+            static_support = (
+                set(keys.detach().cpu().reshape(-1).tolist())
+                if keys is not None
+                else set()
+            )
+            claimed_support = set(static_support)
+            for parametrization in dynamic_parametrizations:
+                dynamic_key = getattr(parametrization, "key", None)
+                if dynamic_key is None:
+                    dynamic_support = set(range(int(self.diam.numel())))
+                else:
+                    dynamic_support = set(
+                        dynamic_key.detach().cpu().reshape(-1).tolist()
+                    )
+                if dynamic_support & claimed_support:
+                    raise ValueError(
+                        "Overlapping DiffusionProcess regions use a dynamic "
+                        f"module-valued diffusivity override for parameter {name!r}; "
+                        "the resulting assignment would depend on insertion order."
+                    )
+                claimed_support.update(dynamic_support)
+
+            if len(entries) < 2 or keys is None:
+                continue
+
+            keys = keys.detach().cpu().reshape(-1)
+            cursor = 0
+            assigned: dict[int, tuple[torch.Tensor, bool, object]] = {}
+            for fill, parameter in entries:
+                values = fill(self.resolve(parameter)).reshape(-1)
+                if torch.is_tensor(parameter):
+                    trainable = bool(parameter.requires_grad)
+                elif isinstance(parameter, torch.nn.Module):
+                    trainable = any(p.requires_grad for p in parameter.parameters())
+                else:
+                    trainable = False
+                count = int(values.numel())
+                entry_keys = keys[cursor : cursor + count]
+                if entry_keys.numel() != count:
+                    raise RuntimeError(
+                        f"Could not align regional diffusion parameter {name!r} "
+                        "with its compartment support."
+                    )
+                cursor += count
+                for key, value in zip(entry_keys.tolist(), values):
+                    previous = assigned.get(int(key))
+                    if previous is not None:
+                        previous_value, previous_trainable, previous_source = previous
+                        if not torch.equal(
+                            previous_value.detach().cpu(), value.detach().cpu()
+                        ):
+                            raise ValueError(
+                                f"Overlapping DiffusionProcess regions assign "
+                                f"conflicting values to diffusivity parameter {name!r} "
+                                f"at compiled compartment slot {key}."
+                            )
+                        if (
+                            previous_trainable or trainable
+                        ) and previous_source is not parameter:
+                            raise ValueError(
+                                "Overlapping DiffusionProcess regions assign "
+                                f"independently trainable values to diffusivity "
+                                f"parameter {name!r} at compiled compartment slot "
+                                f"{key}."
+                            )
+                    assigned[int(key)] = (value, trainable, parameter)
+
+            if cursor != keys.numel():
+                raise RuntimeError(
+                    f"Could not align all regional diffusion parameter {name!r} "
+                    "overrides with their compartment support."
+                )
+
+    def _configure_region(self, population) -> None:
+        """Compile the process placement into a population-core node mask."""
+        if hasattr(population, "core_shape"):
+            core_shape = tuple(population.core_shape())
+        else:
+            population_shape = tuple(getattr(population, "shape", ()))
+            if len(population_shape) < 2:
+                raise RuntimeError(
+                    "DiffusionProcess requires a population shape with neuron "
+                    "and compartment dimensions."
+                )
+            core_shape = population_shape[-2:]
+
+        node_mask = torch.zeros(core_shape, dtype=torch.bool)
+        if self.key is None:
+            node_mask.fill_(True)
+        elif self.is_composable:
+            node_mask[self.key] = True
+        else:
+            key = torch.as_tensor(self.key, dtype=torch.long).detach().cpu().reshape(-1)
+            if torch.unique(key).numel() != key.numel():
+                raise ValueError(
+                    "DiffusionProcess support is set-valued; copies and preserved "
+                    "duplicate compartment indices are not supported."
+                )
+            node_mask.reshape(-1).index_fill_(0, key, True)
+
+        if not bool(torch.any(node_mask)):
+            raise ValueError("DiffusionProcess must select at least one compartment.")
+
+        self._diffusion_is_regional = self.key is not None
+        self._diffusion_core_shape = core_shape
+        self._set_geometry_buffer("_mp_node_mask", node_mask)
         return None
 
     def _new_spatial_operators(self) -> torch.nn.ModuleDict:
@@ -1383,6 +1887,7 @@ class DiffusionProcess(MaterialProcess):
             operator_kwargs = {
                 "solver": self._diffusion_solver,
                 "boundary": self._diffusion_boundary,
+                "interface_scheme": self._diffusion_interface_scheme,
             }
         operators = torch.nn.ModuleDict(
             {
@@ -1398,11 +1903,19 @@ class DiffusionProcess(MaterialProcess):
 
         Specialized Axon populations expose ``graph=None`` and use analytic 1D
         finite-volume geometry. Tree and native Cable populations expose a
-        graph; for those we require canonical material-geometry buffers so that
-        pt3d-aware volumes and edge diffusion geometry are used rather than
-        stylized ``diam*L`` approximations.
+        graph and use the Tree spatial backend. Unnamed Tree diffusion requires
+        canonical material-geometry buffers so pt3d-aware volumes and edge
+        diffusion geometry are used rather than stylized ``diam*L``
+        approximations; named geometry supplies those chemical coefficients
+        explicitly while retaining only the graph topology.
         """
         graph = getattr(population, "graph", None)
+        if self._diffusion_geometry_name is not None:
+            # A named geometry replaces chemical storage/edge coefficients, not
+            # adjacency. Graph-backed populations therefore retain the Tree
+            # solver and morphology topology without requiring native chemical
+            # volumes or diff_geom metadata.
+            return "tree" if graph is not None else "1d"
         if graph is None:
             return "1d"
 
@@ -1462,7 +1975,16 @@ class DiffusionProcess(MaterialProcess):
         # topology/metadata used during set_dt(...) precomputation only.
         object.__setattr__(self, "_mp_graph", getattr(population, "graph"))
 
-        for name in ("volume", "volume_um3", "volume_i", "volume_o", "diff_geom_um"):
+        for name in (
+            "volume",
+            "volume_um3",
+            "volume_i",
+            "volume_o",
+            "diff_geom_um",
+            "diff_parent_index",
+            "diff_edge_parent",
+            "diff_edge_child",
+        ):
             if hasattr(population, name):
                 value = getattr(population, name)
                 if torch.is_tensor(value):
@@ -1499,6 +2021,10 @@ class DiffusionProcess(MaterialProcess):
         raise NotImplementedError(f"Unsupported material diffusion domain: {domain!r}")
 
     def _validate_diffusion_specs(self):
+        diffused_targets = {
+            (_canonical_material_name(spec.material), spec.field)
+            for spec in type(self)._diffusion_specs
+        }
         for spec in type(self)._diffusion_specs:
             material = self._get_material(spec.material)
             if not material.has_field(spec.field):
@@ -1507,11 +2033,39 @@ class DiffusionProcess(MaterialProcess):
                     f"Available fields: {material.fields}."
                 )
             domain = self._effective_domain(material, spec)
-            if domain not in {"intracellular", None}:
+            if self._diffusion_geometry_name is not None:
+                if domain != self._diffusion_geometry_domain:
+                    raise ValueError(
+                        f"Diffused field {spec.material}.{spec.field} has domain "
+                        f"{domain!r}, but material geometry "
+                        f"{self._diffusion_geometry_name!r} represents "
+                        f"{self._diffusion_geometry_domain!r}."
+                    )
+            elif domain not in {"intracellular", None}:
                 raise NotImplementedError(
-                    "DiffusionProcess MVP only supports intracellular/cytosolic "
-                    f"fields; {spec.material}.{spec.field} has domain {domain!r}."
+                    "DiffusionProcess without a named geometry only supports "
+                    "intracellular fields. Extracellular fields require an explicit "
+                    "domain-specific material geometry; "
+                    f"{spec.material}.{spec.field} has domain {domain!r}."
                 )
+            if spec.D_location == "edge" and self._diffusion_geometry_name is None:
+                raise NotImplementedError(
+                    "Edge-located diffusivity requires an explicit named material "
+                    "transport geometry."
+                )
+
+        if type(self)._diffusion_relaxation_specs:
+            if self._diffusion_method != "implicit":
+                raise NotImplementedError(
+                    "DiffusionProcess.RELAX currently requires METHOD('implicit')."
+                )
+            for spec in type(self)._diffusion_relaxation_specs:
+                target = (_canonical_material_name(spec.material), spec.field)
+                if target not in diffused_targets:
+                    raise ValueError(
+                        "DiffusionProcess.RELAX must target a field declared by "
+                        f"DIFFUSE in the same class; missing {spec.material}.{spec.field}."
+                    )
 
     def _effective_domain(self, material, spec: DiffusionSpec) -> str | None:
         domain = spec.domain
@@ -1528,6 +2082,11 @@ class DiffusionProcess(MaterialProcess):
         if isinstance(value, str):
             if hasattr(self, value):
                 return getattr(self, value)
+            population_buffer = getattr(
+                self, "_diffusion_population_quantities", {}
+            ).get(value)
+            if population_buffer is not None:
+                return self._buffers[population_buffer]
             try:
                 return self._buffers[value]
             except KeyError as exc:
@@ -1538,6 +2097,61 @@ class DiffusionProcess(MaterialProcess):
         if torch.is_tensor(value):
             return value.to(device=like.device, dtype=like.dtype)
         return torch.as_tensor(value, device=like.device, dtype=like.dtype)
+
+    def _resolve_spatial_quantity(self, value, like: torch.Tensor):
+        """Resolve a diffusion quantity into full population field space.
+
+        RANGE parameters on a region-restricted process are compiled in local
+        union-slot order.  Scatter those values back to physical compartments;
+        scalar/GLOBAL values and literal full-field tensors retain their normal
+        broadcasting semantics.  Values outside the support are immaterial
+        because the induced-edge mask is applied after endpoint averaging.
+        """
+        resolved = self._resolve_quantity(value, like)
+        if self.key is None or resolved.ndim == 0 or not isinstance(value, str):
+            return resolved
+
+        range_names = set()
+        for declaration in ("range", "range_p", "range_n"):
+            range_names.update(getattr(self, declaration, {}).keys())
+        if value not in range_names:
+            return resolved
+
+        local_like = self.get(like)
+        try:
+            local = torch.broadcast_to(
+                resolved.to(device=like.device, dtype=like.dtype), local_like.shape
+            )
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Regional diffusion parameter {value!r} with shape "
+                f"{tuple(resolved.shape)} cannot broadcast to local support "
+                f"shape {tuple(local_like.shape)}."
+            ) from exc
+        return self.put(local, torch.zeros_like(like), like)
+
+    def _relaxations_for(self, diffusion_spec: DiffusionSpec):
+        material = _canonical_material_name(diffusion_spec.material)
+        return tuple(
+            spec
+            for spec in type(self)._diffusion_relaxation_specs
+            if _canonical_material_name(spec.material) == material
+            and spec.field == diffusion_spec.field
+        )
+
+    def _resolve_relaxation_where(self, value, like: torch.Tensor):
+        if value is None or (isinstance(value, str) and value.lower() == "all"):
+            return None
+        return self._resolve_spatial_quantity(value, like).to(
+            device=like.device, dtype=torch.bool
+        )
+
+    def _configure_relaxations(self, operator, diffusion_spec, c):
+        for relaxation in self._relaxations_for(diffusion_spec):
+            rate = self._resolve_spatial_quantity(relaxation.rate, c)
+            target = self._resolve_spatial_quantity(relaxation.target, c)
+            where = self._resolve_relaxation_where(relaxation.where, c)
+            operator.configure_relaxation(rate, target, where=where)
 
     def set_dt(self, dt):
         """Update dt and precompute diffusion operators for the current run."""
@@ -1552,26 +2166,73 @@ class DiffusionProcess(MaterialProcess):
         return None
 
     def configure_spatial_operators(self, dt):
+        # Recheck compatible overlap assignments at every operator rebuild so
+        # independently trainable regional parameters cannot silently diverge
+        # after their initial configuration.
+        self._refresh_named_transport_quantities()
+        self._validate_overlapping_diffusivity_overrides()
         if self._diffusion_geometry_kind == "tree":
             return self._configure_tree_spatial_operators(dt)
         return self._configure_1d_spatial_operators(dt)
 
     def _configure_1d_spatial_operators(self, dt):
         dx = self._buffers["_mp_dx"].to(device=self.diam.device, dtype=self.diam.dtype)
-        diam_base = self.diam
+        node_mask = (
+            self._buffers["_mp_node_mask"] if self._diffusion_is_regional else None
+        )
         resolved = []
         for key, spec in zip(
             self._diffusion_operator_keys, type(self)._diffusion_specs
         ):
             material = self._get_material(spec.material)
             c = material._buffers[spec.field]
-            D = self._resolve_quantity(spec.D, c)
-            resolved.append((key, c, D))
+            if spec.D_location == "edge":
+                D = self._resolve_quantity(spec.D, c)
+            else:
+                D = self._resolve_spatial_quantity(spec.D, c)
+            resolved.append((key, spec, c, D))
 
         staged_operators = self._new_spatial_operators()
-        for key, c, D in resolved:
-            diam = diam_base.to(device=c.device, dtype=c.dtype)
+        for key, spec, c, D in resolved:
+            if self._diffusion_geometry_name is not None:
+                # Explicit chemical geometry supplies all storage and edge
+                # factors; electrical/cylindrical diam and dx are unused.
+                diam = torch.ones_like(c)
+            elif self._diffusion_is_regional:
+                # ``self.diam`` is the differentiable local view compiled for
+                # the union support. Scatter it into full material-field space;
+                # values outside the support never participate because crossing
+                # edges and excluded volumes are masked. This avoids a detached
+                # geometry snapshot and preserves morphology gradients.
+                local_like = self.get(c)
+                local_diam = torch.broadcast_to(
+                    self.diam.to(device=c.device, dtype=c.dtype), local_like.shape
+                )
+                diam = self.put(local_diam, torch.zeros_like(c), c)
+            else:
+                # Preserve the original global path, where ``self.diam`` aliases
+                # the population geometry and carries any live autograd graph.
+                diam = self.diam.to(device=c.device, dtype=c.dtype)
             dx_c = dx.to(device=c.device, dtype=c.dtype)
+            volume = None
+            edge_factor = None
+            edge_area = None
+            edge_distance = None
+            if self._diffusion_geometry_name is not None:
+                volume = self._buffers["_mp_transport_volume"].to(
+                    device=c.device, dtype=c.dtype
+                )
+                if "_mp_transport_edge_factor" in self._buffers:
+                    edge_factor = self._buffers["_mp_transport_edge_factor"].to(
+                        device=c.device, dtype=c.dtype
+                    )
+                else:
+                    edge_area = self._buffers["_mp_transport_edge_area"].to(
+                        device=c.device, dtype=c.dtype
+                    )
+                    edge_distance = self._buffers["_mp_transport_edge_distance"].to(
+                        device=c.device, dtype=c.dtype
+                    )
             staged_operators[key].configure_diffusion(
                 c,
                 dt,
@@ -1580,33 +2241,98 @@ class DiffusionProcess(MaterialProcess):
                 dx_c,
                 volume_fraction=self._diffusion_volume_fraction,
                 area_fraction=self._diffusion_area_fraction,
+                node_mask=node_mask,
                 solver=self._diffusion_solver,
+                volume=volume,
+                edge_factor=edge_factor,
+                edge_area=edge_area,
+                edge_distance=edge_distance,
+                D_location=spec.D_location,
             )
+            self._configure_relaxations(staged_operators[key], spec, c)
         self._spatial_operators = staged_operators
         self._spatial_configured = True
         return None
 
     def _configure_tree_spatial_operators(self, dt):
+        node_mask = (
+            self._buffers["_mp_node_mask"] if self._diffusion_is_regional else None
+        )
         resolved = []
         for key, spec in zip(
             self._diffusion_operator_keys, type(self)._diffusion_specs
         ):
             material = self._get_material(spec.material)
             c = material._buffers[spec.field]
-            D = self._resolve_quantity(spec.D, c)
+            if spec.D_location == "edge":
+                D = self._resolve_quantity(spec.D, c)
+            else:
+                D = self._resolve_spatial_quantity(spec.D, c)
             domain = self._effective_domain(material, spec) or "intracellular"
-            resolved.append((key, c, D, domain))
+            resolved.append((key, spec, c, D, domain))
 
         staged_operators = self._new_spatial_operators()
-        for key, c, D, domain in resolved:
+        for key, spec, c, D, domain in resolved:
+            volume = None
+            edge_factor = None
+            edge_area = None
+            edge_distance = None
+            if self._diffusion_geometry_name is not None:
+                volume = self._buffers["_mp_transport_volume"].to(
+                    device=c.device, dtype=c.dtype
+                )
+                if "_mp_transport_edge_factor" in self._buffers:
+                    edge_factor = self._buffers["_mp_transport_edge_factor"].to(
+                        device=c.device, dtype=c.dtype
+                    )
+                else:
+                    edge_area = self._buffers["_mp_transport_edge_area"].to(
+                        device=c.device, dtype=c.dtype
+                    )
+                    edge_distance = self._buffers["_mp_transport_edge_distance"].to(
+                        device=c.device, dtype=c.dtype
+                    )
+            parent_index = None
+            material_edge_index = None
+            if "_mp_diff_parent_index" in self._buffers:
+                parent_index = self._buffers["_mp_diff_parent_index"]
+            if (
+                "_mp_diff_edge_parent" in self._buffers
+                and "_mp_diff_edge_child" in self._buffers
+            ):
+                material_edge_index = torch.stack(
+                    (
+                        self._buffers["_mp_diff_edge_parent"],
+                        self._buffers["_mp_diff_edge_child"],
+                    ),
+                    dim=0,
+                )
+            native_edge_factor = None
+            if (
+                self._diffusion_geometry_name is None
+                and "_mp_diff_geom_um" in self._buffers
+            ):
+                native_edge_factor = self._buffers["_mp_diff_geom_um"].to(
+                    device=c.device, dtype=c.dtype
+                )
             staged_operators[key].configure_diffusion(
                 c,
                 dt,
                 D,
                 self,
                 domain=domain,
+                node_mask=node_mask,
                 solver=self._diffusion_solver,
+                volume=volume,
+                edge_factor=edge_factor,
+                edge_area=edge_area,
+                edge_distance=edge_distance,
+                D_location=spec.D_location,
+                parent_index=parent_index,
+                material_edge_index=material_edge_index,
+                native_edge_factor=native_edge_factor,
             )
+            self._configure_relaxations(staged_operators[key], spec, c)
         self._spatial_operators = staged_operators
         self._spatial_configured = True
         return None
