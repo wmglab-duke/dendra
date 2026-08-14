@@ -1,3 +1,16 @@
+## v0.23.0 (2026-08-14)
+
+### Feat
+
+- **mechanisms**: handle voltage-independent currents returning 0 scalar conductance
+- **materials**: support regional intracellular/extracellular diffusion with named finite-volume geometry on unbranched and Tree populations, edge-local diffusivity, and implicit spatially varying reservoir coupling
+- **materials**: allow `DiffusionProcess` insertion on compartment subsets; selected compartments form an induced diffusion graph with sealed crossing edges and independent disconnected components
+- **morphology**: connect two morphologies
+
+### Refactor
+
+- **mechanisms**: detect mechanisms with identical ordered compartment support and gather voltage once per support
+
 ## v0.22.0 (2026-08-07)
 
 ### Feat
