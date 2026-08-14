@@ -248,6 +248,11 @@ def test_scalar_and_tensor_reduction_preserves_eager_autograd_and_compile_eager(
         eager_i.square().sum() + eager_g.square().sum(), eager_voltage
     )[0]
 
+    # Integrator initialization detaches ephemeral current scratch before a
+    # compiled run. Mirror that lifecycle here so Dynamo does not capture the
+    # completed eager autograd graph through the handler's reusable buffers.
+    handler.detach_i_g_bufs()
+
     compiled_i_g = torch.compile(handler.i, backend="eager", fullgraph=True)
     compiled_voltage = eager_voltage.detach().clone().requires_grad_()
     compiled_i, compiled_g = compiled_i_g(compiled_voltage)
