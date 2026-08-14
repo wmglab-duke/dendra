@@ -327,6 +327,7 @@ def _project_indexed_override(
     core_shape,
     *,
     context,
+    logical_shape=None,
 ):
     """Project an indexed override onto its surviving physical support."""
     old_core_indices = torch.as_tensor(
@@ -363,7 +364,13 @@ def _project_indexed_override(
 
     key = old_core_indices.to(device=tensor.device)
     try:
-        expand = create_param_expander(tensor, key, tuple(core_shape))
+        expand = create_param_expander(
+            tensor,
+            key,
+            tuple(core_shape),
+            logical_shape=logical_shape,
+            context=context,
+        )
         expanded = expand(tensor).reshape(-1)
     except (IndexError, RuntimeError, ValueError) as exc:
         raise ValueError(
@@ -3847,7 +3854,8 @@ class Population(P, Sliceable):
         planned_sparse_ic = self._mech_data_ic.get(mechanism)
         old_sparse_domain = self._sparse_mechanism_slot_domain(mechanism)
         indexed_names = _mechanism_spatial_parameter_names(mechanism)
-        for record_number, record in enumerate(self._mech_data.get(mechanism, ())):
+        sparse_records = tuple(self._mech_data.get(mechanism, ()))
+        for record_number, record in enumerate(sparse_records):
             alias, kwargs, key, preserve, copies = _unpack_mechanism_insertion_record(
                 record
             )
@@ -3861,6 +3869,16 @@ class Population(P, Sliceable):
                 value_domain = _sorted_unique_long(selected)
                 value_keep = ~torch.isin(value_domain, requested)
                 retained = value_domain[value_keep]
+
+            logical_shape = None
+            if preserve:
+                if value_domain.numel() % copies:
+                    raise RuntimeError(
+                        "Copied mechanism insertion has an inconsistent "
+                        f"stored layout: {value_domain.numel()} slots for "
+                        f"{copies} copies."
+                    )
+                logical_shape = (copies, value_domain.numel() // copies)
 
             if retained.numel() == 0:
                 continue
@@ -3887,6 +3905,7 @@ class Population(P, Sliceable):
                                 f"Mechanism {mechanism.__name__!r} insertion "
                                 f"record {record_number} parameter {name!r}"
                             ),
+                            logical_shape=logical_shape,
                         )
                         if name in indexed_names
                         else value
@@ -8685,7 +8704,8 @@ def compile_mechanism(
     preserve_duplicate_indices = [
         bool(p or c != 1) for p, c in zip(preserve_duplicate_indices, copies)
     ]
-    if any(preserve_duplicate_indices):
+    uses_multiset_layout = any(preserve_duplicate_indices)
+    if uses_multiset_layout:
         total_index, is_composable, shape, local_indices = compose_or_flatten_multiset(
             indices,
             model.core_shape(),
@@ -8750,12 +8770,33 @@ def compile_mechanism(
     # We can now use these local indices to compile the mechanism.
 
     additional_parameters = {}
+    spatial_parameter_names = _mechanism_spatial_parameter_names(mechanism)
 
-    for alias, kwargs, idx in zip(aliases, kwargs_list, local_indices):
+    for alias, kwargs, idx, n_copies, preserves_multiplicity in zip(
+        aliases,
+        kwargs_list,
+        local_indices,
+        copies,
+        preserve_duplicate_indices,
+    ):
         if hasattr(mechanism, "normalize_random_kwargs"):
             kwargs = mechanism.normalize_random_kwargs(kwargs)
+        logical_shape = None
+        if preserves_multiplicity:
+            n_record_slots = len(idx)
+            if n_record_slots % n_copies:
+                raise RuntimeError(
+                    "Copied mechanism insertion produced an inconsistent "
+                    f"record layout: {n_record_slots} slots for {n_copies} copies."
+                )
+            logical_shape = (n_copies, n_record_slots // n_copies)
         for k, v in kwargs.items():
-            additional_parameters.setdefault(k, []).append((alias, v, idx))
+            parameter_logical_shape = (
+                logical_shape if k in spatial_parameter_names else None
+            )
+            additional_parameters.setdefault(k, []).append(
+                (alias, v, idx, parameter_logical_shape)
+            )
 
     mechanism.check_kwargs(additional_parameters)
     if hasattr(mechanism, "normalize_random_kwargs"):

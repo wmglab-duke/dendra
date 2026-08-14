@@ -935,7 +935,13 @@ class Functional(torch.nn.Module):
 
 
 def build_parametrization(
-    module, output, key: torch.LongTensor, main_shape: tuple[int, int]
+    module,
+    output,
+    key: torch.LongTensor,
+    main_shape: tuple[int, ...],
+    *,
+    logical_shape: tuple[int, int] | None = None,
+    context: str | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Construct a parametrization callable for in-graph updates.
@@ -950,6 +956,11 @@ def build_parametrization(
         Flat indices where updates should be applied.
     main_shape : tuple of int
         Shape of the target parameter grid.
+    logical_shape : tuple of int, optional
+        Record-local ``(copies, selected_locations)`` layout used for copied
+        sparse mechanism insertions.
+    context : str, optional
+        Description included in parameter-shape validation errors.
 
     Returns
     -------
@@ -958,12 +969,23 @@ def build_parametrization(
     """
     if key is None:
         return Functional(module)
-    fill = create_param_expander(output, key, main_shape)
+    fill = create_param_expander(
+        output,
+        key,
+        main_shape,
+        logical_shape=logical_shape,
+        context=context,
+    )
     return Functional(module, fill=fill, key=key)
 
 
 def create_param_expander(
-    param: torch.Tensor, key: torch.LongTensor, main_shape: tuple[int, int]
+    param: torch.Tensor,
+    key: torch.LongTensor,
+    main_shape: tuple[int, ...],
+    *,
+    logical_shape: tuple[int, int] | None = None,
+    context: str | None = None,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     """
     Create a specialized function that expands parameters for indexed assignment.
@@ -975,7 +997,14 @@ def create_param_expander(
     key : torch.LongTensor
         Flat index tensor selecting assignment positions.
     main_shape : tuple of int
-        Height and width of the conceptual 2D grid addressed by ``key``.
+        Shape of the parameter grid addressed by ``key``.
+    logical_shape : tuple of int, optional
+        Record-local ``(copies, selected_locations)`` layout. When provided,
+        copied RANGE values may be scalar, ``(copies, 1)``,
+        ``(1, selected_locations)``, ``(copies, selected_locations)``, or an
+        exact-numel tensor, which is reshaped in row-major order.
+    context : str, optional
+        Description included in parameter-shape validation errors.
 
     Returns
     -------
@@ -989,10 +1018,83 @@ def create_param_expander(
 
     Notes
     -----
-    Supported patterns include scalar, pre-sized, row-broadcast, and column-broadcast
-    parameterizations.
+    Supported patterns include scalar, pre-sized, row-broadcast, and
+    column-broadcast parameterizations. Copied insertion layouts use the
+    explicit record-local rules described by ``logical_shape`` rather than
+    inferring an axis from a one-dimensional value.
     """
     num_keys = key.numel()
+
+    if logical_shape is not None:
+        try:
+            copies, selected_locations = (int(size) for size in logical_shape)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "logical_shape must contain exactly (copies, selected_locations)."
+            ) from exc
+        if copies < 1 or selected_locations < 1:
+            raise ValueError(
+                "logical_shape entries must be positive; got "
+                f"{(copies, selected_locations)}."
+            )
+
+        logical_numel = copies * selected_locations
+        if logical_numel != num_keys:
+            raise ValueError(
+                "Copied parameter layout is inconsistent with its indexed "
+                f"support: logical shape {(copies, selected_locations)} has "
+                f"{logical_numel} slots, but the key has {num_keys}."
+            )
+
+        prefix = f"{context}: " if context else ""
+        param_shape = tuple(param.shape)
+
+        if param.dim() == 0:
+
+            def expander(p: torch.Tensor) -> torch.Tensor:
+                return p.expand(logical_numel)
+
+            return expander
+
+        if param.numel() == logical_numel:
+
+            def expander(p: torch.Tensor) -> torch.Tensor:
+                return p.reshape(logical_numel)
+
+            return expander
+
+        if param_shape == (copies, 1):
+
+            def expander(p: torch.Tensor) -> torch.Tensor:
+                return p.expand(copies, selected_locations).reshape(logical_numel)
+
+            return expander
+
+        if param_shape == (1, selected_locations):
+
+            def expander(p: torch.Tensor) -> torch.Tensor:
+                return p.expand(copies, selected_locations).reshape(logical_numel)
+
+            return expander
+
+        expected = (
+            f"a scalar, ({copies}, 1), (1, {selected_locations}), "
+            f"({copies}, {selected_locations}), or any exact "
+            f"{logical_numel}-element tensor"
+        )
+        if param.dim() == 1:
+            raise ValueError(
+                f"{prefix}bare one-dimensional parameter shape {param_shape} "
+                "is ambiguous or incomplete for copied insertion logical "
+                f"shape {(copies, selected_locations)}; expected {expected}. "
+                "Use an explicit singleton axis to select per-copy or "
+                "per-location broadcasting."
+            )
+        raise ValueError(
+            f"{prefix}parameter shape {param_shape} cannot target copied "
+            f"insertion logical shape {(copies, selected_locations)}; "
+            f"expected {expected}."
+        )
 
     # --- Condition 1: Pre-Sized Parameter ---
     # The parameter is already the correct size, one value per key.
@@ -1010,6 +1112,15 @@ def create_param_expander(
             return p.expand(num_keys)
 
         return expander
+
+    if len(main_shape) != 2:
+        prefix = f"{context}: " if context else ""
+        raise ValueError(
+            f"{prefix}parameter shape {tuple(param.shape)} cannot be broadcast "
+            f"over indexed target shape {tuple(main_shape)}. Only a scalar or "
+            f"an exact {num_keys}-element value is supported for a "
+            "one-dimensional indexed target without an explicit logical shape."
+        )
 
     # --- For broadcast cases, we need to know the unique rows/cols in the key ---
     # This setup is done only once, making the returned expander fast.
@@ -1046,6 +1157,29 @@ def create_param_expander(
         f"  - For row-broadcast, expected shape: ({len(unique_rows)}, 1)\n"
         f"  - For column-broadcast, expected shape: (1, {len(unique_cols)})"
     )
+
+
+def _unpack_additional_parameter_record(record):
+    """Normalize legacy and layout-aware indexed parameter overrides."""
+    if len(record) == 3:
+        alias, value, key = record
+        logical_shape = None
+    elif len(record) == 4:
+        alias, value, key, logical_shape = record
+    else:
+        raise ValueError(
+            "Additional parameter records must contain either "
+            "(alias, value, key) or "
+            "(alias, value, key, logical_shape)."
+        )
+    if logical_shape is not None:
+        logical_shape = tuple(int(size) for size in logical_shape)
+        if len(logical_shape) != 2:
+            raise ValueError(
+                "Additional parameter logical_shape must contain exactly "
+                "(copies, selected_locations)."
+            )
+    return alias, value, key, logical_shape
 
 
 class staticproperty:
@@ -2903,8 +3037,10 @@ class Parameterized(SimpleParameterized):
         Parameters
         ----------
         additional_parameters : dict, optional
-            Mapping from parameter names to lists of ``(alias, value, key)`` tuples
-            describing indexed overrides.
+            Mapping from parameter names to lists of ``(alias, value, key)``
+            tuples describing indexed overrides. A fourth
+            ``(copies, selected_locations)`` item may provide the record-local
+            logical layout for a copied sparse RANGE insertion.
         """
         if additional_parameters is not None:
             for name, list_of_aliases_values_and_keys in additional_parameters.items():
@@ -2924,7 +3060,10 @@ class Parameterized(SimpleParameterized):
                         self._batch_main_shape() if is_batch else self.shape_p[-2:]
                     )
                     empty_shape = self._batch_shape() if is_batch else self.shape_p
-                    for alias, value, key in list_of_aliases_values_and_keys:
+                    for record in list_of_aliases_values_and_keys:
+                        alias, value, key, logical_shape = (
+                            _unpack_additional_parameter_record(record)
+                        )
                         if alias is not None:
                             p_name = f"{name}_{alias}"
                         else:
@@ -2933,6 +3072,10 @@ class Parameterized(SimpleParameterized):
                         key = torch.as_tensor(key, dtype=torch.long)
                         if is_batch:
                             key = self._collapse_batch_key(key)
+                        range_logical_shape = logical_shape if is_range else None
+                        context = f"parameter {name!r}"
+                        if alias is not None:
+                            context += f" for insertion alias {alias!r}"
                         parameter = to_param(
                             value,
                             positive=positive,
@@ -2952,7 +3095,12 @@ class Parameterized(SimpleParameterized):
                                 )
                             )
                             parametrization = build_parametrization(
-                                parameter, p, key, param_shape
+                                parameter,
+                                p,
+                                key,
+                                param_shape,
+                                logical_shape=range_logical_shape,
+                                context=context,
                             )
                             self.register_parametrization_in_graph(
                                 name, parametrization
@@ -2964,7 +3112,13 @@ class Parameterized(SimpleParameterized):
                                 p = parameter()
                             else:
                                 p = parameter
-                            fill = create_param_expander(p, key, param_shape)
+                            fill = create_param_expander(
+                                p,
+                                key,
+                                param_shape,
+                                logical_shape=range_logical_shape,
+                                context=context,
+                            )
                             self.additional_parameters.setdefault(name, []).append(
                                 (fill, getattr(self, p_name))
                             )
