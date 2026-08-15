@@ -4,6 +4,7 @@ from .backend import Backend
 from .core import Axon, Cable, Myelinated, Population, SingleCompartment, Unmyelinated
 from .distributions import *
 from .extcell import ExtCellAxon, ExtCellTree
+from .intrinsic import insert_intrinsic_activity, remove_intrinsic_activity
 from .morphology import (
     CompartmentGeometry,
     CompartmentGraph,

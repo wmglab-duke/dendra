@@ -385,6 +385,22 @@ Slice-scoped model construction
 
 The following operations record the Slice's logical locations:
 
+``dendra.insert_intrinsic_activity(selection, onsets, tau=0.1, gmax=0.1, e=0.0)``
+   Add a conductance-driven train of alpha events to the selected physical
+   compartments.  A scalar creates one event, a one-dimensional value is a
+   shared event train, and a two-dimensional value has explicit
+   ``(events, locations)`` layout.  Repeated calls add independent events.
+   Unlike ``selection.inject(waveform)``, this changes membrane current through
+   the voltage-dependent relation ``g * (v - e)`` rather than prescribing an
+   absolute current waveform.  This is a structural edit; call ``initialize()``
+   before running the model again.
+
+``dendra.remove_intrinsic_activity(selection)``
+   Remove all events created by ``insert_intrinsic_activity`` at the selected
+   physical compartments.  Activity outside the selection and ordinary
+   ``alphasynapse`` insertions are retained.  Removing absent activity and
+   removing from an empty Slice are no-ops.  Reinitialize before the next run.
+
 ``selection.inject(waveform)``
    Apply an intracellular waveform at those physical compartments.  Empty
    selections are a no-op.  Repeated physical indices contribute repeatedly

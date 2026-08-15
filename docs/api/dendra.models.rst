@@ -8,6 +8,14 @@ Core
    :inherited-members: Module, object
    :member-order: groupwise
 
+
+Intrinsic activity
+------------------
+
+.. autofunction:: dendra.models.intrinsic.insert_intrinsic_activity
+
+.. autofunction:: dendra.models.intrinsic.remove_intrinsic_activity
+
 `Population` subclasses
 -----------------------
 .. autoclass:: dendra.models.core.SingleCompartment
