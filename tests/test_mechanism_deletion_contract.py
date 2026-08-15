@@ -388,6 +388,30 @@ def test_delete_removes_all_copied_slots_at_selected_physical_locations():
     )
 
 
+def test_delete_projects_per_copy_range_broadcast_before_rebuild():
+    population = _population(c=3)
+    population[:, :2].insert(
+        _RangeProbe,
+        copies=3,
+        g=torch.tensor([[10.0], [20.0], [30.0]], dtype=DTYPE),
+    )
+    population.build()
+
+    torch.testing.assert_close(
+        _mechanism(population, _RangeProbe).g,
+        torch.tensor([10.0, 10.0, 20.0, 20.0, 30.0, 30.0], dtype=DTYPE),
+    )
+
+    population[:, 0].delete(_RangeProbe)
+    population.build()
+
+    assert _compiled_support(population, _RangeProbe).tolist() == [1, 1, 1]
+    torch.testing.assert_close(
+        _mechanism(population, _RangeProbe).g,
+        torch.tensor([10.0, 20.0, 30.0], dtype=DTYPE),
+    )
+
+
 def test_partial_delete_projects_persistent_slice_parametrization():
     population = _population(c=3)
     population.insert(_RangeProbe, g=1.0)

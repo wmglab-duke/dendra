@@ -161,6 +161,41 @@ def test_expander_invalid_raises():
         M.create_param_expander(bad, key, (H, W))
 
 
+def test_expander_copied_record_logical_broadcast_contract():
+    key = torch.arange(6, dtype=torch.long)
+    logical_shape = (3, 2)
+
+    per_copy = torch.tensor([[1.0], [2.0], [3.0]])
+    expand = M.create_param_expander(per_copy, key, (6,), logical_shape=logical_shape)
+    torch.testing.assert_close(
+        expand(per_copy), torch.tensor([1.0, 1.0, 2.0, 2.0, 3.0, 3.0])
+    )
+
+    per_location = torch.tensor([[4.0, 5.0]])
+    expand = M.create_param_expander(
+        per_location, key, (6,), logical_shape=logical_shape
+    )
+    torch.testing.assert_close(
+        expand(per_location), torch.tensor([4.0, 5.0, 4.0, 5.0, 4.0, 5.0])
+    )
+
+    exact_numel = torch.arange(6.0).reshape(2, 3)
+    expand = M.create_param_expander(
+        exact_numel, key, (6,), logical_shape=logical_shape
+    )
+    torch.testing.assert_close(expand(exact_numel), torch.arange(6.0))
+
+
+def test_expander_one_dimensional_targets_fail_with_value_error_not_index_error():
+    key = torch.arange(6, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="bare one-dimensional"):
+        M.create_param_expander(torch.arange(3.0), key, (6,), logical_shape=(3, 2))
+
+    with pytest.raises(ValueError, match="one-dimensional indexed target"):
+        M.create_param_expander(torch.arange(3.0), key, (6,))
+
+
 # ---- staticproperty / add_instance_property / Referency ---------------------------
 def test_staticproperty_and_add_instance_property():
     class A:

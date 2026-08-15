@@ -1,16 +1,17 @@
 Welcome to Dendra!
-===================
+==================
 
-``Dendra`` is a differentiable simulator for biophysical neuron fiber models in `PyTorch <https://github.com/pytorch/pytorch>`_, with an emphasis on effects of extracellular stimulation and event-based networks with synaptic delays. Its key features are:
+``Dendra`` is a biophysical neuron & network simulator written in `PyTorch <https://github.com/pytorch/pytorch>`_, with an emphasis on effects of extracellular stimulation and event-based networks with synaptic delays. Its key features are:
 
 - support for CPU and GPU
-- automatic differentiation, allowing gradient-based optimization of thousands of parameters
-- ``jit``-compilation, making it blazing fast while being (mostly) written in python
+- automatic differentiation, facilitating gradient-based optimization of large numbers of parameters
+- ``jit``-compilation (for speed and memory efficiency) via `torch.compile <https://pytorch.org/docs/stable/generated/torch.compile.html>`_
 - symbolic specification of ODE and kinetic schemes for easy implementation of new mechanisms
 - flexible extracellular stimulation with support for complex 3D fields
 - fully differentiable event-based and continuous network simulation with synaptic delays
 - a simple API, making it easy to use for beginners and experts alike
 - implementations of a range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more (via `Dendra Models <https://gitlab.oit.duke.edu/mah148/dendra-models>`_)
+- a ``Materials`` interface for generic chemical reaction-diffusion simulations, including support for diffusion in intracellular and extracellular space
 
 
 ``Dendra`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please let us know by opening an issue on our `GitLab repository <https://gitlab.oit.duke.edu/mah148/dendra>`_.
