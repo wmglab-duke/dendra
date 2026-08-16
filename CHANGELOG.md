@@ -1,3 +1,9 @@
+## v0.24.0 (2026-08-16)
+
+### Feat
+
+- **stimulation**: add functionality to insert / remove intrinsic activity
+
 ## v0.23.1 (2026-08-15)
 
 ### Fix
