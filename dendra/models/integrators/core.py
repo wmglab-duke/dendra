@@ -556,6 +556,13 @@ class Integrator(torch.nn.Module):
                         pass
                 raise
             self.initialized = True
+            complete_reinitialization = getattr(
+                model,
+                "_complete_integrator_reinitialization",
+                None,
+            )
+            if complete_reinitialization is not None:
+                complete_reinitialization()
 
     def init_v(self, model):
         model.v = _expanded_v_init(model).clone().detach().contiguous()

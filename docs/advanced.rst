@@ -12,3 +12,5 @@ Advanced
    advanced/A3_synapse_banks_and_slots.ipynb
    advanced/A4_multi_device_and_batching.ipynb
    advanced/A5_runtime_contracts.rst
+   advanced/A6_mechanism_support_layouts.rst
+   advanced/A7_model_initialization.rst

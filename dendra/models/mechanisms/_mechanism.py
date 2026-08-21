@@ -1,4 +1,5 @@
 import inspect
+import math
 import textwrap
 import warnings
 from types import MethodType
@@ -17,6 +18,7 @@ from dendra.models.parametric import Parameterized
 from ._ions import VALENCES
 from ._materials import _canonical_material_name
 from ._state import State
+from ._support import SupportMap, SupportSpec
 from ._symbolic import build_current_eq
 
 
@@ -276,6 +278,12 @@ class Mechanism(Parameterized):
     """
 
     _state = set()
+    # Experimental structured-support eligibility. Custom mechanisms whose
+    # tensor algebra assigns meaning to the legacy one-dimensional slot axis
+    # can opt out before a Population is built.
+    supports_population_axis_layout = True
+    supports_population_axis_multistream_delays = False
+
     _ion = set()
     _material = set()
     _save = set()
@@ -535,6 +543,9 @@ class Mechanism(Parameterized):
         shape_f,
         key=None,
         is_composable=False,
+        support_spec: SupportSpec | None = None,
+        preserves_multiplicity=False,
+        force_packed_support=False,
         additional_parameters=None,
         ic: dict = None,
         **kwargs,
@@ -558,6 +569,15 @@ class Mechanism(Parameterized):
             Index selector identifying the attached compartments.
         is_composable : bool, optional
             Whether ``key`` represents a tuple of slices instead of flat indices.
+        support_spec : SupportSpec, optional
+            Precomputed structural support metadata. Population compilation
+            supplies this so support identity remains available after device
+            moves without changing the legacy ``key`` storage ABI.
+        preserves_multiplicity : bool, optional
+            Whether local slots deliberately preserve repeated physical
+            locations, as for copied point processes.
+        force_packed_support : bool, optional
+            Keep an otherwise classifiable support in its packed one-axis ABI.
         additional_parameters : dict, optional
             Additional parameter declarations injected by the parent population.
         ic : dict, optional
@@ -604,72 +624,44 @@ class Mechanism(Parameterized):
             self.key = None
 
         self.is_composable = is_composable
+        self.preserves_multiplicity = bool(preserves_multiplicity)
+        self.force_packed_support = bool(force_packed_support)
 
-        def get_fancy(tensor):
-            if tensor.ndim == 0:
-                # If tensor is scalar, return it directly
-                return tensor
-            # Preserves batch dimensions by only flattening the base dimensions
-            batch_shape = tensor.shape[: -self.base_ndim]
-            flat_tensor = tensor.reshape(*batch_shape, -1)
-            # Select along the last dimension (the flattened base dimension)
-            return flat_tensor.index_select(-1, self.key)
-
-        def add_fancy_(tensor, what):
-            # Use scatter_add_ for batched index_add_
-            batch_shape = tensor.shape[: -self.base_ndim]
-            flat_tensor = tensor.reshape(*batch_shape, -1)
-
-            # Expand key to match batch dimensions for scatter
-            # e.g., key shape [N] -> [B1, B2, ..., N]
-            expanded_key = self.key.expand(*batch_shape, -1)
-
-            what = torch.as_tensor(
-                what,
-                device=tensor.device,
-                dtype=tensor.dtype,
-            )
-            what = what.expand_as(expanded_key)
-
-            # what should have shape [B1, B2, ..., N]
-            flat_tensor.scatter_add_(-1, expanded_key, what)
-            return tensor  # Return original tensor for chaining
-
-        def add_fancy(tensor, what):
-            # Use scatter_add for batched index_add
-            batch_shape = tensor.shape[: -self.base_ndim]
-            flat_tensor = tensor.reshape(*batch_shape, -1)
-
-            # Expand key to match batch dimensions for scatter
-            expanded_key = self.key.expand(*batch_shape, -1)
-
-            what = torch.as_tensor(
-                what,
-                device=tensor.device,
-                dtype=tensor.dtype,
-            )
-            what = what.expand_as(expanded_key)
-
-            # what should have shape [B1, B2, ..., N]
-            return flat_tensor.scatter_add(-1, expanded_key, what).reshape_as(tensor)
-
-        if self.key is None:
-            self.get = lambda tensor: tensor
-            self.add_ = lambda add_to, add_what: add_to.add_(add_what)
-            self.add = lambda add_to, add_what: add_to.add(add_what)
-            self.put = self.put_no_op
-        elif self.is_composable:
-            self.get = lambda tensor: (
-                tensor[..., *self.key] if tensor.ndim > 0 else tensor
-            )
-            self.add_ = lambda add_to, add_what: add_to[..., *self.key].add_(add_what)
-            self.add = lambda add_to, add_what: add_to[..., *self.key].add(add_what)
-            self.put = self.put_slice
-        else:
-            self.get = get_fancy
-            self.add_ = add_fancy_
-            self.add = add_fancy
-            self.put = self.put_fancy
+        if support_spec is None:
+            if torch.is_tensor(diameters) and diameters.ndim >= self.base_ndim:
+                source_core_shape = tuple(diameters.shape[-self.base_ndim :])
+            else:
+                # Bare Mechanism instances have historically accepted scalar or
+                # one-dimensional tensors. They do not carry enough information
+                # to distinguish population from compartment axes, so retain
+                # their one-axis ABI and describe it as one synthetic population.
+                source_core_shape = (1, math.prod(tuple(shape)))
+            try:
+                support_spec = SupportSpec.from_compiled(
+                    core_shape=source_core_shape,
+                    key=self.key,
+                    is_composable=self.is_composable,
+                    local_shape=shape,
+                    preserves_multiplicity=self.preserves_multiplicity,
+                    force_packed=self.force_packed_support,
+                )
+            except (TypeError, ValueError):
+                # Direct construction predates structural support metadata and
+                # permits combinations such as a full-field ``shape`` with a
+                # shorter ownership-only key. Compilation always supplies a
+                # validated SupportSpec; keep ambiguous direct instances on the
+                # legacy path instead of tightening their public contract.
+                support_spec = None
+        elif not isinstance(support_spec, SupportSpec):
+            raise TypeError("support_spec must be a SupportSpec instance.")
+        self.support_spec = support_spec
+        self.support_map = (
+            SupportMap(support_spec) if support_spec is not None else None
+        )
+        self._support_key_values_valid = not (
+            torch.is_tensor(self.key) and self.key.device.type == "meta"
+        )
+        self.register_load_state_dict_post_hook(self._refresh_support_after_load)
 
         self.read_ion = self._read_ion
         self.write_ion_c = self._write_ion_c
@@ -747,6 +739,148 @@ class Mechanism(Parameterized):
         for state in self.DE.values():
             state.instantiate_tables()
         self._install_monomorphic_advance()
+
+    @staticmethod
+    def _refresh_support_after_load(module, incompatible_keys):
+        del incompatible_keys
+        module.refresh_support_spec()
+
+    def _apply(self, fn, recurse=True):
+        """Track whether a packed selector still has materialized values."""
+
+        key_before = getattr(self, "key", None)
+        valid_before = getattr(self, "_support_key_values_valid", True)
+        result = super()._apply(fn, recurse=recurse)
+        key_after = getattr(self, "key", None)
+
+        if not torch.is_tensor(key_after):
+            self._support_key_values_valid = True
+        elif key_after.device.type == "meta" or (
+            torch.is_tensor(key_before) and key_before.device.type == "meta"
+        ):
+            # Meta storage has no values. A later ``to_empty`` allocation must
+            # not be mistaken for a restored structural selector.
+            self._support_key_values_valid = False
+        elif not valid_before:
+            self._support_key_values_valid = False
+        else:
+            try:
+                if self.support_spec is not None:
+                    self.support_spec.validate_runtime_key(
+                        key_after,
+                        context=f"Mechanism {self.name!r} support",
+                    )
+            except (TypeError, ValueError, RuntimeError):
+                self._support_key_values_valid = False
+            else:
+                self._support_key_values_valid = True
+        return result
+
+    def refresh_support_spec(self):
+        """Refresh metadata after a checkpoint replaces a fancy selector key."""
+
+        if self.support_spec is None:
+            return None
+        preserves_population_axis = self.support_spec.preserves_population_axis
+        key = self.key
+        if (
+            key is not None
+            and not self.is_composable
+            and torch.is_tensor(key)
+            and key.device.type == "meta"
+        ):
+            # Meta tensors contain no values. Keep the device-independent spec
+            # computed before the move rather than degrading its identity.
+            self._support_key_values_valid = False
+            return self.support_spec
+        self.support_spec = SupportSpec.from_compiled(
+            core_shape=self.support_spec.source_core_shape,
+            key=key,
+            is_composable=self.is_composable,
+            local_shape=self.support_spec.legacy_local_shape,
+            preserves_multiplicity=self.preserves_multiplicity,
+            force_packed=self.force_packed_support,
+        )
+        if preserves_population_axis:
+            self.support_spec = self.support_spec.with_population_axis()
+        self.support_map = SupportMap(self.support_spec)
+        self._support_key_values_valid = True
+        return self.support_spec
+
+    def get(self, tensor):
+        """Gather this mechanism's local view from a full population field."""
+
+        if self.support_map is not None:
+            return self.support_map.gather(tensor, self.key)
+        if tensor.ndim == 0 or self.key is None:
+            return tensor
+        if self.is_composable:
+            return tensor[..., *self.key]
+
+        batch_shape = tensor.shape[: -self.base_ndim]
+        flat_tensor = tensor.reshape(*batch_shape, -1)
+        return flat_tensor.index_select(-1, self.key)
+
+    def add_(self, add_to, add_what):
+        """Add local values to a full population field in place."""
+
+        if self.support_map is not None:
+            return self.support_map.scatter_add_(add_to, add_what, self.key)
+        if self.key is None:
+            return add_to.add_(add_what)
+        if self.is_composable:
+            return add_to[..., *self.key].add_(add_what)
+
+        batch_shape = add_to.shape[: -self.base_ndim]
+        flat_tensor = add_to.reshape(*batch_shape, -1)
+        expanded_key = self.key.expand(*batch_shape, -1)
+        values = torch.as_tensor(
+            add_what,
+            device=add_to.device,
+            dtype=add_to.dtype,
+        ).expand_as(expanded_key)
+        flat_tensor.scatter_add_(-1, expanded_key, values)
+        return add_to
+
+    def add(self, add_to, add_what):
+        """Return a full population field with local values added."""
+
+        if self.support_map is not None:
+            return self.support_map.scatter_add(add_to, add_what, self.key)
+        if self.key is None:
+            return add_to.add(add_what)
+        if self.is_composable:
+            # Preserve the historical direct-construction return contract for
+            # ambiguous slice-backed mechanisms: this path returns the selected
+            # local slice rather than a reconstructed full field.
+            return add_to[..., *self.key].add(add_what)
+
+        batch_shape = add_to.shape[: -self.base_ndim]
+        flat_tensor = add_to.reshape(*batch_shape, -1)
+        expanded_key = self.key.expand(*batch_shape, -1)
+        values = torch.as_tensor(
+            add_what,
+            device=add_to.device,
+            dtype=add_to.dtype,
+        ).expand_as(expanded_key)
+        return flat_tensor.scatter_add(-1, expanded_key, values).reshape_as(add_to)
+
+    def put(self, ion_conc_u, ion_conc_o, v, clone=True):
+        """Write local concentrations back to their full population field."""
+
+        if self.support_map is not None:
+            return self.support_map.scatter_set(
+                ion_conc_u,
+                ion_conc_o,
+                v,
+                self.key,
+                clone=clone,
+            )
+        if self.key is None:
+            return self.put_no_op(ion_conc_u, ion_conc_o, v, clone=clone)
+        if self.is_composable:
+            return self.put_slice(ion_conc_u, ion_conc_o, v, clone=clone)
+        return self.put_fancy(ion_conc_u, ion_conc_o, v, clone=clone)
 
     def set_dt(self, dt):
         """
@@ -1412,7 +1546,9 @@ class Mechanism(Parameterized):
         -----
         This generic fallback is normally replaced at instance construction by
         :meth:`_install_monomorphic_advance`, which installs a generated method
-        on the concrete mechanism/proxy class.
+        on the concrete mechanism/proxy class. Treat ``v`` as read-only: the
+        handler may share one gathered tensor across mechanisms with identical
+        ordered support.
         """
         states = self._gather_states()
         updates = {}
@@ -2092,6 +2228,17 @@ class Mechanism(Parameterized):
         models with several fixed pathway delays and avoids one delayed-state
         helper call per pathway.
         """
+        if (
+            self.support_spec is not None
+            and self.support_spec.preserves_population_axis
+            and not self.supports_population_axis_multistream_delays
+        ):
+            raise RuntimeError(
+                "Multi-stream delayed state requires an explicit population-axis "
+                "contract. Set supports_population_axis_multistream_delays=True "
+                "on the mechanism after auditing stream_axis semantics, or build "
+                "the Population with preserve_mechanism_population_axis=False."
+            )
         if mode is None:
             mode = "auto"
         mode = str(mode).lower()

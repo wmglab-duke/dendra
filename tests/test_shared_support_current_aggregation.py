@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 import dendra as dn  # noqa: F401 - configure Dendra before compiling mechanisms
-from dendra.models.mechanisms import Mechanism, PointProcess
+from dendra.models.mechanisms import Mechanism, PointProcess, State
 from dendra.models.mechanisms._handler import MechanismHandler
 
 FULL_SHAPE = (2, 4)
@@ -88,6 +89,17 @@ class _SavedNonlinear(Mechanism):
         return self.scale * v.square()
 
 
+class _RelaxState(State):
+    State.STATE("x")
+    State.RANGE(rate=0.1)
+    State.DERIVATIVE("x' = -rate * x")
+
+
+class _StateOnly(Mechanism):
+    Mechanism.STATE(_RelaxState)
+    Mechanism.INIT(x=-65.0)
+
+
 def _make_mechanism(
     cls,
     name,
@@ -168,6 +180,47 @@ def test_exact_ordered_fancy_supports_share_but_reordered_support_does_not():
     actual_i, actual_g = handler.i(voltage)
     torch.testing.assert_close(actual_i, expected_i)
     torch.testing.assert_close(actual_g, expected_g)
+
+
+def test_state_initialization_and_advance_gather_once_per_exact_support():
+    shared = torch.tensor([0, 3, 5, 7])
+    other = torch.tensor([1, 2, 4, 6])
+    mechanisms = {
+        "first": _make_mechanism(_StateOnly, "first", key=shared),
+        "second": _make_mechanism(_StateOnly, "second", key=shared.clone()),
+        "other": _make_mechanism(_StateOnly, "other", key=other),
+    }
+    field = torch.linspace(-72.0, -58.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    handler = MechanismHandler(
+        torch.full(FULL_SHAPE, 34.0, dtype=DTYPE),
+        torch.ones(FULL_SHAPE, dtype=DTYPE),
+        mechanisms,
+    )
+    handler.make_maps()
+
+    assert len(handler._state_support_representatives) == 2
+    assert [support for _, support in handler._state_advance_plan] == [0, 0, 1]
+
+    calls = [0, 0]
+    for support_index, representative in enumerate(
+        handler._state_support_representatives
+    ):
+        original_get = representative.get
+
+        def counted_get(tensor, *, _get=original_get, _index=support_index):
+            calls[_index] += 1
+            return _get(tensor)
+
+        representative.get = counted_get
+
+    handler.compute_initial_conditions(field)
+    assert calls == [1, 1]
+
+    calls[:] = [0, 0]
+    handler.advance(field, torch.tensor(0.025, dtype=DTYPE), 34.0)
+    assert calls == [1, 1]
+    for mechanism in mechanisms.values():
+        assert torch.isfinite(mechanism.x).all()
 
 
 def test_duplicate_fancy_support_shares_gather_but_keeps_separate_scatters():
@@ -303,7 +356,7 @@ def test_point_scaling_happens_before_local_reduction_and_maps_rebuild_on_dtype(
     torch.testing.assert_close(actual_float[1], expected_float[1])
 
 
-def test_group_plans_rebuild_when_loading_different_ordered_supports():
+def test_group_plans_reject_state_dict_for_different_ordered_supports():
     shared = torch.tensor([0, 1])
     target = _make_handler(
         {
@@ -325,8 +378,11 @@ def test_group_plans_rebuild_when_loading_different_ordered_supports():
     )
 
     assert len(target._current_support_representatives) == 1
-    target.load_state_dict(source.state_dict())
-    assert len(target._current_support_representatives) == 2
+    expected_key = target.second.key.clone()
+    with pytest.raises(ValueError, match="selector keys encode mechanism placement"):
+        target.load_state_dict(source.state_dict())
+    assert len(target._current_support_representatives) == 1
+    assert torch.equal(target.second.key, expected_key)
 
     voltage = torch.arange(8, dtype=DTYPE).reshape(FULL_SHAPE)
     expected = _scatter_oracle(target, voltage)

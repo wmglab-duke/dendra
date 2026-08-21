@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import warnings
 
 import pytest
@@ -48,6 +49,15 @@ class _DecayState(State):
 class _StatefulBuffer(Mechanism):
     Mechanism.STATE(_DecayState)
     Mechanism.BUFFER("scratch")
+
+
+class _RecoveryState(State):
+    State.STATE("y")
+    State.DERIVATIVE("y' = -y")
+
+
+class _MultiStatefulBuffer(Mechanism):
+    Mechanism.STATE(_DecayState, _RecoveryState)
 
 
 class _ConstantWaveform(torch.nn.Module):
@@ -512,6 +522,75 @@ def test_tensor_key_copy_preserves_device_dtype_and_independence_without_warning
     assert mech.key.data_ptr() != key.data_ptr()
     key[0] = 0
     assert mech.key.tolist() == [1, 4]
+
+
+@pytest.mark.parametrize("support_kind", ["packed", "slice"])
+@pytest.mark.parametrize("batch_shape", [(), (3,), (2, 3)])
+def test_handler_set_buffers_keeps_restricted_state_diameters_local(
+    support_kind, batch_shape
+):
+    source_shape = (2, 4)
+    celsius = torch.full(source_shape, 34.0, dtype=torch.float64)
+    initial_diameters = torch.arange(1, 9, dtype=torch.float64).reshape(source_shape)
+
+    if support_kind == "packed":
+        key = torch.tensor([1, 3, 4, 6], dtype=torch.long)
+        is_composable = False
+        local_shape = (4,)
+
+        def gather(values):
+            return values.reshape(*values.shape[:-2], -1).index_select(-1, key)
+
+    else:
+        key = (slice(None), slice(1, 3))
+        is_composable = True
+        local_shape = (2, 2)
+
+        def gather(values):
+            return values[..., *key]
+
+    mech = _MultiStatefulBuffer(
+        "restricted",
+        celsius,
+        initial_diameters,
+        local_shape,
+        local_shape,
+        key=key,
+        is_composable=is_composable,
+    )
+    handler = MechanismHandler(
+        celsius,
+        torch.ones(source_shape, dtype=torch.float64),
+        {"restricted": mech},
+    )
+
+    assert len(mech.DE) == 2
+    rebound_shape = (*batch_shape, *source_shape)
+    value_count = math.prod(rebound_shape)
+
+    for offset in (10.0, 100.0):
+        population_diameters = (
+            torch.arange(value_count, dtype=torch.float64).reshape(rebound_shape)
+            + offset
+        )
+        expected = gather(population_diameters).clone()
+        previous_diameters = mech.diam
+
+        handler.set_buffers(population_diameters)
+
+        assert mech.diam is not previous_diameters
+        assert mech._buffers["diam"] is mech.diam
+        assert tuple(mech.diam.shape) == (*batch_shape, *local_shape)
+        torch.testing.assert_close(mech.diam, expected)
+        for state in mech.DE.values():
+            assert state.diam is mech.diam
+            assert state._buffers["diam"] is mech.diam
+            torch.testing.assert_close(state.diam, expected)
+
+        # Rebinding owns its local geometry rather than aliasing the caller's
+        # population-wide tensor.
+        population_diameters.add_(1000.0)
+        torch.testing.assert_close(mech.diam, expected)
 
 
 def test_waveform_injections_respect_current_names_masks_scales_and_clear():

@@ -788,6 +788,10 @@ class Slice:
         return equal
 
     def _mapper_is_unique(self, mapper) -> bool:
+        support_map = getattr(mapper, "support_map", None)
+        if support_map is not None:
+            return support_map.is_injective(getattr(mapper, "key", None))
+
         cached = getattr(mapper, "_dendra_slice_mapping_is_unique", None)
         if cached is not None:
             return bool(cached)
@@ -1045,7 +1049,21 @@ class Slice:
                     f"Slice parameterization of {name!r} includes locations "
                     "outside that mechanism's insertion region."
                 )
-        return self._stable_unique_indices(logical[spec.index])
+        key = self._stable_unique_indices(logical[spec.index])
+        is_batch = (
+            name in getattr(model, "batch_t", {})
+            or name in getattr(model, "batch_p", {})
+            or name in getattr(model, "batch_n", {})
+        )
+        if is_batch:
+            # ``Parameterized.parametrize`` accepts coordinates in the RANGE
+            # grid and collapses its final compartment axis for BATCH fields.
+            # The logical projection above necessarily starts with already-
+            # collapsed storage indices, so lift them back into one canonical
+            # RANGE coordinate before handing them off. Without this step an
+            # (N, 1) BATCH buffer would be divided by K a second time.
+            key = key * int(model.shape_p[-1])
+        return key
 
     def _core_index_spec(self, *, preserve_multiplicity: bool = False) -> IndexSpec:
         """Project logical batch coordinates onto structural core coordinates."""

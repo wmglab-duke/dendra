@@ -2992,6 +2992,7 @@ class Network(RNGMixin):
             pop.detach()
             pop.initialized = True
             pop.initializing_from_state_cache = True
+            pop._integrator_reinit_pending = True
 
     def initialize_synapses_from_state_cache(
         self,

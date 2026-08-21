@@ -586,11 +586,14 @@ class State(Parameterized):
         Compute ASSIGNED/intermediate values for this state at the breakpoint.
 
         Override in subclasses; may return a dict mapping ASSIGNED names to
-        values. Called each step before derivatives are evaluated.
+        values. Called each step before derivatives are evaluated. Treat ``v``
+        as read-only; its gathered tensor may be shared by mechanisms on the
+        same ordered support.
         """
         return {}
 
     def advance(self, v, dt, states):
+        """Advance state while treating the shared local voltage as read-only."""
         if self.method == "euler_heun":
             return self.solve(v, dt, states)
         return self.solve(dt, **self.breakpoint(v, states), **states)

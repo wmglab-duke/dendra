@@ -48,6 +48,7 @@ from dendra.helpers import (
     current_compile_options,
     current_device,
     current_dtype,
+    current_preserve_mechanism_population_axis,
     current_runtime_contract_validation,
     op_mc,
     op_sc,
@@ -66,6 +67,13 @@ from dendra.models.mechanisms._materials import (
     material_specs,
     valid_materials,
 )
+from dendra.models.mechanisms._mechanism import (
+    ContinuousSynapse,
+    PointProcess,
+    Synapse,
+    VoltageProcess,
+)
+from dendra.models.mechanisms._support import SupportKind, SupportSpec
 from dendra.models.mechanisms.validate import validate
 from dendra.models.modular import matches_any_pattern
 from dendra.models.parametric import Parameterized as P
@@ -304,6 +312,24 @@ def _mechanism_batch_parameter_names(mechanism):
         for declaration in ("_batch", "_batch_p", "_batch_n"):
             names.update(getattr(owner, declaration, {}).keys())
     return names
+
+
+def _mechanism_has_batch_contract(mechanism):
+    """Return whether a mechanism or one of its states owns BATCH-shaped data."""
+
+    for owner in (mechanism, *tuple(getattr(mechanism, "_state", ()))):
+        if any(
+            bool(getattr(owner, declaration, {}))
+            for declaration in ("_batch", "_batch_p", "_batch_n")
+        ):
+            return True
+        for collection in ("_random_parameters", "_runtime_noises"):
+            if any(
+                getattr(spec, "scope", None) == "batch"
+                for spec in getattr(owner, collection, {}).values()
+            ):
+                return True
+    return False
 
 
 def _mechanism_global_parameter_names(mechanism):
@@ -653,6 +679,19 @@ def _time_grid_from_step_count(
 class Population(P, Sliceable):
     """
     Base class for a population of multicompartment neurons.
+
+    Parameters
+    ----------
+    N : int, default 1
+        Number of population rows (cells).
+    C : int, default 1
+        Number of compartments per row.
+    preserve_mechanism_population_axis : bool or None, default None
+        Experimentally store eligible shared-column distributed mechanisms as
+        ``(N, K)`` instead of one packed ``(N * K,)`` slot axis. Ineligible
+        supports retain their legacy representation. ``None`` resolves the
+        construction-time Dendra context/environment policy, then this model
+        family's default.
     """
 
     # ---------- repr knobs (safe defaults) ----------
@@ -667,6 +706,17 @@ class Population(P, Sliceable):
     _REPR_FLOAT_SIGFIGS: int = 6  # scalar + small tensor formatting
     _REPR_MAX_MECH_PARAM_ENTRIES: int = 200  # safety bound per mechanism
 
+    # Model families may opt into an audited structural layout while the base
+    # Population remains compatibility-first. A construction-scoped context or
+    # explicit constructor argument takes precedence over this default.
+    preserve_mechanism_population_axis_default: bool = False
+
+    @property
+    def preserve_mechanism_population_axis(self) -> bool:
+        """Return the immutable mechanism-layout policy resolved at construction."""
+
+        return self._preserve_mechanism_population_axis
+
     P.RANGEP(cm=1.0, rhoa=35.4)
     P.GLOBAL(celsius=37.0)
     P.GLOBALP(rhoa_scale=1.0, cm_scale=1.0, area_scale=1.0)
@@ -678,10 +728,32 @@ class Population(P, Sliceable):
         integrator=None,
         v_init=-65.0,
         *,
+        preserve_mechanism_population_axis: bool | None = None,
         device=None,
         dtype=None,
         **kwargs,
     ):
+        if preserve_mechanism_population_axis is not None and not isinstance(
+            preserve_mechanism_population_axis, bool
+        ):
+            raise TypeError(
+                "preserve_mechanism_population_axis must be a boolean or None."
+            )
+        if preserve_mechanism_population_axis is None:
+            preserve_mechanism_population_axis = (
+                current_preserve_mechanism_population_axis()
+            )
+        if preserve_mechanism_population_axis is None:
+            preserve_mechanism_population_axis = getattr(
+                type(self),
+                "preserve_mechanism_population_axis_default",
+                False,
+            )
+        if not isinstance(preserve_mechanism_population_axis, bool):
+            raise TypeError(
+                f"{type(self).__name__}.preserve_mechanism_population_axis_default "
+                "must be a boolean."
+            )
         init_device = (
             current_device(torch.device("cpu"))
             if device is None
@@ -697,6 +769,7 @@ class Population(P, Sliceable):
         self.np = N
         self.nc = C
         self.v_init = v_init
+        self._preserve_mechanism_population_axis = preserve_mechanism_population_axis
 
         self.is_built = False
         self._flag_rebuild = False
@@ -846,6 +919,7 @@ class Population(P, Sliceable):
         self.mech: MechanismHandler = None  # type: ignore
 
         self.initialized: bool = False
+        self._integrator_reinit_pending: bool = False
         self.eval()
 
     def force_integrator_reinit(self):
@@ -858,10 +932,15 @@ class Population(P, Sliceable):
             True if the integrator should be re-initialized, False otherwise.
             By default, this returns True during training to ensure that any
             changes to model parameters are reflected in the integrator state.
-            During evaluation, it returns False to allow the integrator to reuse
-            its existing state for efficiency.
+            During evaluation, it also returns True exactly once after a cached
+            state restore; subsequent steps reuse the rebuilt workspace.
         """
-        return self.training or self.initializing_from_state_cache
+        return self.training or self._integrator_reinit_pending
+
+    def _complete_integrator_reinitialization(self):
+        """Consume the one-shot workspace rebuild requested by state restore."""
+
+        self._integrator_reinit_pending = False
 
     def _runtime_workspace_rebuild_pending(self):
         """Whether direct execution will refresh all tracked workspace inputs."""
@@ -1039,6 +1118,36 @@ class Population(P, Sliceable):
         state.setdefault("_mech_data_ic", {})
         state.setdefault("_mech_data_base_kwargs", {})
         state.setdefault("_material_geometries", {})
+        state.setdefault("_integrator_reinit_pending", False)
+
+        # The layout is a construction-time structural snapshot.  Migrate the
+        # short-lived public-attribute representation, preserve older pickles
+        # that predate the option as legacy-flat, and reject corrupt values
+        # before a later build can change tensor ABI unexpectedly.
+        missing_layout = object()
+        legacy_layout = state.pop(
+            "preserve_mechanism_population_axis",
+            missing_layout,
+        )
+        resolved_layout = state.get(
+            "_preserve_mechanism_population_axis",
+            missing_layout,
+        )
+        if resolved_layout is missing_layout:
+            resolved_layout = (
+                False if legacy_layout is missing_layout else legacy_layout
+            )
+        elif legacy_layout is not missing_layout and legacy_layout != resolved_layout:
+            raise ValueError(
+                "Serialized Population contains conflicting mechanism "
+                "population-axis layout values."
+            )
+        if not isinstance(resolved_layout, bool):
+            raise TypeError(
+                "Serialized Population mechanism population-axis layout must "
+                "be a boolean."
+            )
+        state["_preserve_mechanism_population_axis"] = resolved_layout
 
         # Sparse insertion records historically stored GLOBAL and indexed
         # parameters together. GLOBAL values now belong to the one compiled
@@ -1772,8 +1881,16 @@ class Population(P, Sliceable):
         fn : Callable
             Callback invoked with the population instance just prior to
             mechanism initialization.
+
+        Notes
+        -----
+        Pre-initialization hooks affect the state from which a steady-state
+        cache is derived. Registering one therefore invalidates any existing
+        steady-state snapshot.
         """
         self.pre_initialize_hooks.append(fn)
+        if hasattr(self, "_caches"):
+            self.clear_steady_state()
 
     def device(self):
         """
@@ -1891,6 +2008,7 @@ class Population(P, Sliceable):
         except Exception:
             self.v_init = old_v_init
             raise
+        self.clear_steady_state()
         return self
 
     def prep_intra(self, intra, n, dt):
@@ -3045,6 +3163,7 @@ class Population(P, Sliceable):
             self._clear_duration_remainder()
             self.initialized = True
             self.initializing_from_state_cache = True
+            self._integrator_reinit_pending = True
             return True
         return False
 
@@ -3072,25 +3191,31 @@ class Population(P, Sliceable):
         # instead of stepping a partially reset model advertised as initialized.
         self.initialized = False
         self.initializing_from_state_cache = False
+        self._integrator_reinit_pending = False
         self._clear_duration_remainder()
         existing_integrator = getattr(self, "integrator", None)
         if existing_integrator is not None:
             existing_integrator.initialized = False
 
         self.build(force_rebuild)
-        random_generation = object() if populate_parameter_buffers else None
         if (
             populate_parameter_buffers
             and "_steady_state" in self._caches
             and self._has_random_parameters_resampled_on_initialize()
         ):
             self.clear_steady_state()
+        self.intra = self.build_intra()
+        # A steady-state snapshot is already a complete initialized state.  Its
+        # restore path is intentionally distinct from fresh initialization: do
+        # not reset voltage, repopulate parameters, advance RNG streams, or run
+        # pre-initialization hooks/Mechanism INITIAL blocks before restoring it.
+        if self._restore_steady_state():
+            return self
+
+        random_generation = object() if populate_parameter_buffers else None
         if populate_parameter_buffers:
             self.populate_parameter_buffers(random_generation=random_generation)
         self._refresh_parameter_views_for_initialization()
-        self.intra = self.build_intra()
-        if self._restore_steady_state():
-            return self
         self.integrator.init_v(self)
         self.pre_initialize()
         self.integrator.mech.initialize(
@@ -3101,13 +3226,6 @@ class Population(P, Sliceable):
             random_generation=random_generation,
         )
         self.post_initialize()
-        self.integrator.mech.initialize(
-            self.v,
-            self.celsius,
-            self.diam,
-            populate=populate_parameter_buffers,
-            random_generation=random_generation,
-        )
         self.t = torch.zeros_like(self.t).detach()
         self._clear_duration_remainder()
         self.initialized = True
@@ -3785,6 +3903,41 @@ class Population(P, Sliceable):
         planned_exclusions = self._mech_exclusions.get(mechanism)
         batch_names = _mechanism_batch_parameter_names(mechanism)
 
+        def plan_sparse_layout(records, sparse_ic):
+            """Use the compiler's pure support phase for mutation validation."""
+
+            if not records:
+                return None
+            kwargs_list = []
+            keys = []
+            preserves = []
+            copies_list = []
+            for record in records:
+                _, kwargs, key, preserve, copies = _unpack_mechanism_insertion_record(
+                    record
+                )
+                kwargs_list.append(kwargs)
+                keys.append(key)
+                preserves.append(bool(preserve or int(copies) != 1))
+                copies_list.append(int(copies))
+            return _plan_mechanism_support(
+                self,
+                mechanism,
+                keys,
+                kwargs_list=kwargs_list,
+                preserve_duplicate_indices=preserves,
+                copies=copies_list,
+                ic=sparse_ic,
+                base_kwargs=self._mech_data_base_kwargs.get(mechanism),
+            )
+
+        current_support_plan = None
+        if planned_everywhere is None:
+            current_support_plan = plan_sparse_layout(
+                tuple(self._mech_data.get(mechanism, ())),
+                self._mech_data_ic.get(mechanism),
+            )
+
         if planned_everywhere is not None:
             configured_name, configured_ic, configured_kwargs = planned_everywhere
             excluded = torch.as_tensor(
@@ -3983,6 +4136,29 @@ class Population(P, Sliceable):
             projected["core_indices"] = old_indices[keep].clone()
             projected["mechanism_class"] = mechanism
             planned_parametrizations.append(projected)
+
+        if (
+            current_support_plan is not None
+            and current_support_plan.support_spec.preserves_population_axis
+            and _mechanism_has_batch_contract(mechanism)
+        ):
+            future_support_plan = plan_sparse_layout(
+                planned_records,
+                planned_sparse_ic,
+            )
+            if (
+                future_support_plan is not None
+                and len(future_support_plan.local_shape) < 2
+            ):
+                raise ValueError(
+                    f"Cannot partially delete mechanism {mechanism.__name__!r}: "
+                    "the remaining support would change grouped (N, K) storage "
+                    "to packed one-axis storage, but the mechanism declares "
+                    "BATCH-scoped state. Packed storage cannot preserve "
+                    "per-population BATCH association. Delete the whole "
+                    "mechanism or reconfigure the final placement explicitly. "
+                    "No changes were made."
+                )
 
         # Commit only after support and every affected value have been validated.
         if planned_everywhere is None:
@@ -4899,7 +5075,12 @@ class Population(P, Sliceable):
 
     def set_value(self, name: str, value: torch.Tensor):
         """
-        Set a parameter or state variable by name.
+        Set an initialization input or state variable by name.
+
+        The value is applied after voltage reset and before mechanism
+        initialization, so dependency-driving values such as ``v`` and
+        ``celsius`` participate in gate initialization and Q10 caches. Adding
+        an override invalidates any cached steady state.
 
         Parameters
         ----------
@@ -4917,7 +5098,7 @@ class Population(P, Sliceable):
             else:
                 raise AttributeError(f"Model has no attribute '{name}' to set.")
 
-        self.register_post_initialize_hook(_set_value)
+        self.register_pre_initialize_hook(_set_value)
 
     # -- batching stuff --
     def is_batched(self):
@@ -4993,6 +5174,19 @@ class Population(P, Sliceable):
         if n <= 0:
             raise ValueError("Batch size n must be positive.")
 
+        # A compiled mechanism records both its explicit batch prefix and its
+        # two-axis population support.  Batching the owning Population changes
+        # the former, so the compiled hierarchy cannot remain authoritative.
+        # Keep the existing modules available until the normal lazy build
+        # boundary, but require that boundary before they can execute again.
+        rebuild_mechanisms = self.is_built
+        if rebuild_mechanisms:
+            self._flag_rebuild = True
+            self.initialized = False
+            integrator = getattr(self, "integrator", None)
+            if integrator is not None:
+                integrator.initialized = False
+
         def _batch_tensor_attr(name: str):
             if not hasattr(self, name):
                 return
@@ -5036,6 +5230,18 @@ class Population(P, Sliceable):
         if hasattr(self, "i_membrane") and self.i_membrane is not None:
             _batch_tensor_attr("i_membrane")
 
+        # A mechanism rebuild also constructs a fresh Integrator, whose
+        # constructor may replace population-owned history buffers (for
+        # example Dufort--Frankel's scalar validity/time markers). Preserve the
+        # values after they have acquired the new batch axis and restore them
+        # onto the fresh integrator below.
+        rebuilt_runtime_state = {}
+        if rebuild_mechanisms:
+            for name in state_vars | {"i_membrane"}:
+                value = getattr(self, name, None)
+                if torch.is_tensor(value):
+                    rebuilt_runtime_state[name] = value
+
         self.reshape(self._calc_shape_p(), self.shape)
         for population_slice in self._labels.values():
             population_slice._batch()
@@ -5043,6 +5249,14 @@ class Population(P, Sliceable):
         self.x = self.x.unsqueeze(0).expand(n, *self.x.shape).clone()
         self.y = self.y.unsqueeze(0).expand(n, *self.y.shape).clone()
         self.z = self.z.unsqueeze(0).expand(n, *self.z.shape).clone()
+        if rebuild_mechanisms:
+            # ``batch`` is a public materialization boundary: callers may
+            # inspect or use the compiled hierarchy as soon as it returns.
+            # Rebuild now instead of exposing stale mechanism ``shape_p`` /
+            # ``shape_f`` metadata until a later initialize call.
+            self.build()
+            for name, value in rebuilt_runtime_state.items():
+                setattr(self, name, value)
         return self
 
     def batch_(self, n):
@@ -8643,6 +8857,254 @@ def compose_or_flatten_union(
         return result_indices, False, final_shape, local_indices
 
 
+_POPULATION_AXIS_EXCLUDED_MECHANISMS = (
+    MaterialProcess,
+    PointProcess,
+    Synapse,
+    ContinuousSynapse,
+    VoltageProcess,
+)
+
+
+def _broadcasts_to_shape(value, shape) -> bool:
+    """Return whether a static parameter value has an unambiguous layout."""
+
+    if isinstance(value, torch.nn.Module):
+        return False
+    try:
+        value = torch.as_tensor(value)
+    except (TypeError, ValueError, RuntimeError):
+        return False
+    if value.ndim == 0:
+        return True
+    try:
+        torch.broadcast_to(value, tuple(shape))
+    except RuntimeError:
+        return False
+    return True
+
+
+def _population_axis_parameter_layout_is_safe(
+    mechanism,
+    support_spec,
+    *,
+    base_kwargs,
+    kwargs_list,
+    ic,
+) -> bool:
+    """Reject flat-only values before changing a mechanism's storage ABI."""
+
+    natural_shape = support_spec.local_core_shape
+    batch_shape = natural_shape[:-1] + (1,)
+    range_names = _mechanism_spatial_parameter_names(mechanism)
+    batch_names = _mechanism_batch_parameter_names(mechanism)
+
+    for owner in (mechanism, *tuple(getattr(mechanism, "_state", ()))):
+        for declaration in ("_range", "_range_p", "_range_n"):
+            if not all(
+                _broadcasts_to_shape(value, natural_shape)
+                for value in getattr(owner, declaration, {}).values()
+            ):
+                return False
+        for declaration in ("_batch", "_batch_p", "_batch_n"):
+            if not all(
+                _broadcasts_to_shape(value, batch_shape)
+                for value in getattr(owner, declaration, {}).values()
+            ):
+                return False
+
+    for name, value in dict(base_kwargs or {}).items():
+        if name in range_names and not _broadcasts_to_shape(value, natural_shape):
+            return False
+        if name in batch_names and not _broadcasts_to_shape(value, batch_shape):
+            return False
+    if ic is not None and not all(
+        _broadcasts_to_shape(value, natural_shape) for value in ic.values()
+    ):
+        return False
+    if not all(
+        _broadcasts_to_shape(value, natural_shape)
+        for value in getattr(mechanism, "_init", {}).values()
+    ):
+        return False
+
+    # RANGE overrides already carry exact flattened record-local keys, so their
+    # values retain row-major meaning when the destination buffer becomes
+    # (N, K). BATCH overrides collapse those keys by the new population axis;
+    # keep non-scalar BATCH values on the legacy path until that migration has
+    # its own explicit value-shape contract.
+    for kwargs in kwargs_list:
+        for name, value in kwargs.items():
+            if name in batch_names and not _broadcasts_to_shape(value, ()):
+                return False
+    return True
+
+
+def _preserve_compiled_population_axis(
+    model,
+    mechanism,
+    support_spec,
+    *,
+    base_kwargs,
+    kwargs_list,
+    ic,
+) -> bool:
+    """Apply the initial fail-closed eligibility policy for ``(N, K)`` storage."""
+
+    if not getattr(model, "preserve_mechanism_population_axis", False):
+        return False
+    if (
+        support_spec.kind is not SupportKind.SHARED_COLUMNS
+        or not support_spec.all_populations
+        or support_spec.source_core_shape[0] <= 1
+    ):
+        return False
+    if issubclass(mechanism, _POPULATION_AXIS_EXCLUDED_MECHANISMS):
+        return False
+    if not bool(getattr(mechanism, "supports_population_axis_layout", True)):
+        return False
+    return _population_axis_parameter_layout_is_safe(
+        mechanism,
+        support_spec,
+        base_kwargs=base_kwargs,
+        kwargs_list=kwargs_list,
+        ic=ic,
+    )
+
+
+@dataclass(frozen=True)
+class _MechanismSupportPlan:
+    """Pure structural result shared by compilation and mutation validation."""
+
+    total_index: Any
+    is_composable: bool
+    local_shape: tuple[int, ...]
+    local_indices: tuple[tuple[int, ...], ...]
+    support_spec: SupportSpec
+    preserves_multiplicity: bool
+    force_packed: bool
+    preserve_duplicate_indices: tuple[bool, ...]
+    copies: tuple[int, ...]
+
+
+def _plan_mechanism_support(
+    model,
+    mechanism,
+    indices,
+    kwargs_list,
+    preserve_duplicate_indices=None,
+    copies=None,
+    *,
+    ic=None,
+    base_kwargs=None,
+    force_flat=False,
+) -> _MechanismSupportPlan:
+    """Plan support and its runtime shape without instantiating a mechanism."""
+
+    if preserve_duplicate_indices is None:
+        preserve_duplicate_indices = [False] * len(indices)
+    if copies is None:
+        copies = [1] * len(indices)
+    preserve_duplicate_indices = tuple(
+        bool(value) for value in preserve_duplicate_indices
+    )
+    copies = tuple(int(value) for value in copies)
+    if len(preserve_duplicate_indices) != len(indices) or len(copies) != len(indices):
+        raise ValueError(
+            "Mechanism support options must have one entry per insertion region."
+        )
+    preserve_duplicate_indices = tuple(
+        bool(preserve or n_copies != 1)
+        for preserve, n_copies in zip(preserve_duplicate_indices, copies)
+    )
+    uses_multiset_layout = any(preserve_duplicate_indices)
+    if uses_multiset_layout:
+        total_index, is_composable, local_shape, local_indices = (
+            compose_or_flatten_multiset(
+                indices,
+                model.core_shape(),
+                preserve_duplicate_indices,
+                copies,
+            )
+        )
+    else:
+        total_index, is_composable, local_shape, local_indices = (
+            compose_or_flatten_union(indices, model.core_shape())
+        )
+
+    base_kwargs = dict(base_kwargs or {})
+
+    def cannot_target_composed_shape(value):
+        if isinstance(value, torch.nn.Module):
+            return False
+        try:
+            value = torch.as_tensor(value)
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        if value.ndim == 0:
+            return False
+        try:
+            torch.broadcast_to(value, local_shape)
+        except RuntimeError:
+            return value.numel() == math.prod(local_shape)
+        return False
+
+    indexed_base_names = _mechanism_spatial_parameter_names(mechanism)
+    shape_sensitive_values = [
+        value for key, value in base_kwargs.items() if key in indexed_base_names
+    ]
+    if ic is not None:
+        shape_sensitive_values.extend(ic.values())
+    force_flat = bool(
+        force_flat
+        or (
+            is_composable
+            and any(
+                cannot_target_composed_shape(value) for value in shape_sensitive_values
+            )
+        )
+    )
+    if force_flat and is_composable:
+        core_grid = np.arange(math.prod(model.core_shape())).reshape(model.core_shape())
+        total_index = np.asarray(core_grid[total_index]).reshape(-1).tolist()
+        local_shape = (len(total_index),)
+        is_composable = False
+
+    force_packed = bool(force_flat or uses_multiset_layout)
+    support_spec = SupportSpec.from_compiled(
+        core_shape=model.core_shape(),
+        key=total_index,
+        is_composable=is_composable,
+        local_shape=local_shape,
+        preserves_multiplicity=uses_multiset_layout,
+        force_packed=force_packed,
+    )
+    if _preserve_compiled_population_axis(
+        model,
+        mechanism,
+        support_spec,
+        base_kwargs=base_kwargs,
+        kwargs_list=kwargs_list,
+        ic=ic,
+    ):
+        support_spec = support_spec.with_population_axis()
+        local_shape = support_spec.runtime_local_shape
+
+    return _MechanismSupportPlan(
+        total_index=total_index,
+        is_composable=is_composable,
+        local_shape=tuple(local_shape),
+        local_indices=tuple(
+            tuple(int(index) for index in values) for values in local_indices
+        ),
+        support_spec=support_spec,
+        preserves_multiplicity=uses_multiset_layout,
+        force_packed=force_packed,
+        preserve_duplicate_indices=preserve_duplicate_indices,
+        copies=copies,
+    )
+
+
 def compile_mechanism(
     model,
     mechanism,
@@ -8695,63 +9157,26 @@ def compile_mechanism(
         Tuple ``(mechanism_instance, parameter_shape, total_index)`` ready for
         registration via :meth:`Population._register_mech`.
     """
-    if preserve_duplicate_indices is None:
-        preserve_duplicate_indices = [False] * len(indices)
-    if copies is None:
-        copies = [1] * len(indices)
-    preserve_duplicate_indices = [bool(v) for v in preserve_duplicate_indices]
-    copies = [int(c) for c in copies]
-    preserve_duplicate_indices = [
-        bool(p or c != 1) for p, c in zip(preserve_duplicate_indices, copies)
-    ]
-    uses_multiset_layout = any(preserve_duplicate_indices)
-    if uses_multiset_layout:
-        total_index, is_composable, shape, local_indices = compose_or_flatten_multiset(
-            indices,
-            model.core_shape(),
-            preserve_duplicate_indices,
-            copies,
-        )
-    else:
-        total_index, is_composable, shape, local_indices = compose_or_flatten_union(
-            indices, model.core_shape()
-        )
-
     base_kwargs = dict(base_kwargs or {})
-
-    def cannot_target_composed_shape(value):
-        if isinstance(value, torch.nn.Module):
-            return False
-        try:
-            value = torch.as_tensor(value)
-        except (TypeError, ValueError):
-            return False
-        if value.ndim == 0:
-            return False
-        try:
-            torch.broadcast_to(value, shape)
-        except RuntimeError:
-            return value.numel() == math.prod(shape)
-        return False
-
-    indexed_base_names = _mechanism_spatial_parameter_names(mechanism)
-    shape_sensitive_values = [
-        value for key, value in base_kwargs.items() if key in indexed_base_names
-    ]
-    if ic is not None:
-        shape_sensitive_values.extend(ic.values())
-    force_flat = bool(
-        force_flat
-        or (
-            is_composable
-            and any(cannot_target_composed_shape(v) for v in shape_sensitive_values)
-        )
+    plan = _plan_mechanism_support(
+        model,
+        mechanism,
+        indices,
+        kwargs_list,
+        preserve_duplicate_indices=preserve_duplicate_indices,
+        copies=copies,
+        ic=ic,
+        base_kwargs=base_kwargs,
+        force_flat=force_flat,
     )
-    if force_flat and is_composable:
-        core_grid = np.arange(math.prod(model.core_shape())).reshape(model.core_shape())
-        total_index = np.asarray(core_grid[total_index]).reshape(-1).tolist()
-        shape = (len(total_index),)
-        is_composable = False
+    total_index = plan.total_index
+    is_composable = plan.is_composable
+    shape = plan.local_shape
+    local_indices = plan.local_indices
+    support_spec = plan.support_spec
+    preserve_duplicate_indices = plan.preserve_duplicate_indices
+    copies = plan.copies
+    uses_multiset_layout = plan.preserves_multiplicity
 
     shape_p = shape
     shape_f = shape
@@ -8811,6 +9236,9 @@ def compile_mechanism(
         shape_f,
         key=total_index,
         is_composable=is_composable,
+        support_spec=support_spec,
+        preserves_multiplicity=uses_multiset_layout,
+        force_packed_support=plan.force_packed,
         additional_parameters=additional_parameters,
         ic=ic,
         **base_kwargs,

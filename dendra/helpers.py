@@ -58,6 +58,11 @@ class ctx(contextlib.ContextDecorator):
       installed PyTorch release, PyTorch factories that infer a floating dtype.
     - ``IMEM`` (int/bool): whether integrators compute/store ``i_membrane``
       in populations (required for LFP calculations).
+    - ``PRESERVE_MECHANISM_POPULATION_AXIS`` (bool/int/None): construction-time
+      policy for population-axis-preserving mechanism storage. ``True``/``1``
+      enables it, ``False``/``0`` disables it, and ``None`` or ``"default"``
+      defers to the model-family default. Existing models are not changed when
+      this value changes; it is consumed only while a model is constructed.
     - ``USETABLES`` (int/bool): toggle lookup tables declared via ``TABLE`` on
       State/Mechanism.
     - ``RUNTIME_CONTRACT_VALIDATION`` (str): runtime validation policy for
@@ -133,6 +138,8 @@ class ctx(contextlib.ContextDecorator):
                 v = normalize_runtime_contract_validation(v)
             elif key == "NATIVE_EXTENSION_POLICY":
                 v = normalize_native_extension_policy(v)
+            elif key == "PRESERVE_MECHANISM_POPULATION_AXIS":
+                v = normalize_preserve_mechanism_population_axis(v)
             elif key == "DEVICE":
                 torch_defaults[key] = _normalize_device_value(
                     v, default=torch.device("cpu")
@@ -383,6 +390,39 @@ def current_native_extension_policy() -> str:
     return normalize_native_extension_policy(NATIVE_EXTENSION_POLICY.value)
 
 
+def normalize_preserve_mechanism_population_axis(value) -> bool | None:
+    """Normalize the construction-time mechanism population-axis policy.
+
+    ``True`` and ``1`` enable population-axis-preserving mechanism storage;
+    ``False`` and ``0`` disable it. ``None``, an empty string, and
+    ``"default"`` defer to the model-family default. String forms are limited
+    to ``"0"`` and ``"1"`` so misspelled environment values fail loudly.
+    """
+    if value is None:
+        return None
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        policy = value.strip().lower()
+        if policy in ("", "default"):
+            return None
+        if policy in ("0", "1"):
+            return policy == "1"
+    raise ValueError(
+        "PRESERVE_MECHANISM_POPULATION_AXIS must be True, False, 1, 0, "
+        f"None, or 'default'; got {value!r}."
+    )
+
+
+def current_preserve_mechanism_population_axis() -> bool | None:
+    """Return the active construction-time mechanism layout policy."""
+    return normalize_preserve_mechanism_population_axis(
+        PRESERVE_MECHANISM_POPULATION_AXIS.value
+    )
+
+
 # Backward-compatible context-key aliases. The exported variable
 # ``JIT_IN_NETWORK`` below points at ``JIT_NETWORK_SOLVES`` as well, but ctx()
 # needs a key-level alias so ``with dendra.ctx(JIT_IN_NETWORK=0): ...`` keeps
@@ -402,6 +442,16 @@ PADE = ContextVar("PADE", -1)
 REQUIRE_GRAD = ContextVar("REQUIRE_GRAD", 0)
 USETABLES = ContextVar("USETABLES", 1)
 RUNTIME_CONTRACT_VALIDATION = ContextVar("RUNTIME_CONTRACT_VALIDATION", "versioned")
+
+# Unlike older binary ContextVars, this construction policy is intentionally
+# tri-state. ContextVar's environment loader needs a concrete casting type, so
+# it first reads a string and is then normalized to True, False, or None.
+PRESERVE_MECHANISM_POPULATION_AXIS = ContextVar(
+    "PRESERVE_MECHANISM_POPULATION_AXIS", ""
+)
+PRESERVE_MECHANISM_POPULATION_AXIS.value = normalize_preserve_mechanism_population_axis(
+    PRESERVE_MECHANISM_POPULATION_AXIS.value
+)
 
 NATIVE_EXTENSION_POLICY = ContextVar("NATIVE_EXTENSION_POLICY", "fallback")
 BACKEND = ContextVar("BACKEND", "inductor")
