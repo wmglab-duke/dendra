@@ -87,10 +87,19 @@ class ExtCellAxon(Axon):
     def _x(self):
         """Compute compartment midpoints centered along the axon."""
         dtype = self.dx.dtype
-        node_l = torch.atleast_2d(self.dx.squeeze().to(torch.double))
+        device = self.dx.device
+        if device.type == "mps":
+            # MPS does not implement binary64 tensors. Geometry setup is a
+            # one-time operation, so retain the established binary64 arithmetic
+            # on CPU and transfer only the final model-dtype coordinates.
+            node_l = torch.atleast_2d(
+                self.dx.squeeze().to(device="cpu").to(dtype=torch.double)
+            )
+        else:
+            node_l = torch.atleast_2d(self.dx.squeeze().to(torch.double))
         x = node_l.cumsum(dim=1) - node_l / 2
         x = x - torch.sum(node_l, dim=1, keepdim=True) / 2
-        return x.to(dtype)
+        return x.to(device=device, dtype=dtype)
 
     def assemble_graphs(self):
         """Export the axon morphology and parameters as a graph.

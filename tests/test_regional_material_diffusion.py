@@ -356,3 +356,58 @@ def test_1d_diffusion_preserves_live_diameter_gradients(regional):
     assert model.diam.grad is not None
     assert torch.isfinite(model.diam.grad).all()
     assert torch.any(model.diam.grad != 0)
+
+
+@pytest.mark.skipif(
+    not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+    reason="MPS is not available",
+)
+def test_mps_regional_implicit_diffusion_uses_parallel_pcr_at_realistic_size():
+    """A TJS-sized regional field must not materialize a dense 1101² matrix."""
+    compartments = 1101
+    initial = torch.zeros((2, compartments), device="mps", dtype=torch.float32)
+    initial[:, compartments // 2] = torch.tensor(
+        [1.0, 2.0], device="mps", dtype=torch.float32
+    )
+    # Give the excluded terminal compartments recognizable values so this also
+    # exercises the regional identity rows around the induced diffusion graph.
+    initial[:, 0] = 7.0
+    initial[:, -1] = 11.0
+
+    model = dn.Population(
+        N=2,
+        C=compartments,
+        v_init=-65.0,
+        device="mps",
+        dtype=torch.float32,
+    )
+    model.diam.fill_(2.0)
+    model.dx.fill_(1.0)
+    model.material(
+        "tracer",
+        fields={"c": initial},
+        min_values={"c": 0.0},
+        domain="intracellular",
+    )
+    model[:, 1:-1].insert(_RegionalAutoImplicitDiffusion, D=1.0)
+    model.eval()
+    model.initialize()
+
+    before = _concentration(model).clone()
+    model.step(dt=0.005)
+    after = _concentration(model)
+
+    process = next(iter(model.mech.material_processes.values()))
+    operator = next(iter(process._spatial_operators.values()))
+    assert operator.K == compartments
+    assert operator.solver_name == "pcr_mps"
+    assert after.device.type == "mps"
+    assert torch.isfinite(after).all()
+    assert torch.equal(after[:, [0, -1]], before[:, [0, -1]])
+    assert not torch.equal(after[:, 1:-1], before[:, 1:-1])
+    torch.testing.assert_close(
+        after[:, 1:-1].sum(dim=-1),
+        before[:, 1:-1].sum(dim=-1),
+        rtol=2e-5,
+        atol=2e-5,
+    )

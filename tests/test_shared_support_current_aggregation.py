@@ -6,8 +6,9 @@ import pytest
 import torch
 
 import dendra as dn  # noqa: F401 - configure Dendra before compiling mechanisms
-from dendra.models.mechanisms import Mechanism, PointProcess, State
+from dendra.models.mechanisms import Mechanism, PointProcess, State, VoltageProcess
 from dendra.models.mechanisms._handler import MechanismHandler
+from dendra.models.mechanisms._support_registry import SupportEntry
 
 FULL_SHAPE = (2, 4)
 DTYPE = torch.float64
@@ -100,6 +101,13 @@ class _StateOnly(Mechanism):
     Mechanism.INIT(x=-65.0)
 
 
+class _OffsetVoltage(VoltageProcess):
+    VoltageProcess.RANGE(offset=2.0)
+
+    def update_v(self, v):
+        return v + self.offset
+
+
 def _make_mechanism(
     cls,
     name,
@@ -154,6 +162,26 @@ def _scatter_oracle(handler, voltage):
     return expected_i, expected_g
 
 
+def test_direct_handler_itot_before_map_construction_keeps_safe_defaults():
+    mechanism = _make_mechanism(
+        _TensorAffine,
+        "direct",
+        key=torch.tensor([0, 3, 5, 7]),
+        g=0.25,
+        bias=-1.0,
+    )
+    handler = MechanismHandler(
+        torch.full(FULL_SHAPE, 34.0, dtype=DTYPE),
+        torch.ones(FULL_SHAPE, dtype=DTYPE),
+        {"direct": mechanism},
+        currents={"nonspecific": {"direct": ["i"]}},
+    )
+    voltage = torch.zeros(FULL_SHAPE, dtype=DTYPE)
+    handler.init_i_g_bufs(voltage)
+
+    torch.testing.assert_close(handler.itot(voltage), torch.zeros_like(voltage))
+
+
 def test_exact_ordered_fancy_supports_share_but_reordered_support_does_not():
     shared = torch.tensor([0, 3, 5, 7])
     reordered = torch.tensor([7, 5, 3, 0])
@@ -173,7 +201,9 @@ def test_exact_ordered_fancy_supports_share_but_reordered_support_does_not():
 
     assert len(handler._current_support_representatives) == 2
     assert [len(entries) for *_, entries in handler._map_grouped] == [2, 1]
-    assert [support for _, support in handler._current_breakpoint_plan] == [0, 0, 1]
+    # IDs are authored mechanism ordinals, so the distinct third mechanism
+    # retains ID 2 even though the first two mechanisms share ID 0.
+    assert [support for _, support in handler._current_breakpoint_plan] == [0, 0, 2]
 
     voltage = torch.linspace(-3.0, 4.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
     expected_i, expected_g = _scatter_oracle(handler, voltage)
@@ -182,7 +212,93 @@ def test_exact_ordered_fancy_supports_share_but_reordered_support_does_not():
     torch.testing.assert_close(actual_g, expected_g)
 
 
-def test_state_initialization_and_advance_gather_once_per_exact_support():
+def test_equal_supports_separated_in_authored_order_remain_distinct_runs():
+    shared = torch.tensor([0, 3, 5, 7])
+    intervening = torch.tensor([1, 2, 4, 6])
+    handler = _make_handler(
+        {
+            "first": _make_mechanism(_TensorAffine, "first", key=shared, g=0.25),
+            "middle": _make_mechanism(_TensorAffine, "middle", key=intervening, g=-0.5),
+            "last": _make_mechanism(_TensorAffine, "last", key=shared.clone(), g=0.75),
+        }
+    )
+
+    assert [support for _, support in handler._current_breakpoint_plan] == [0, 1, 0]
+    assert [len(entries) for *_, entries in handler._map_grouped] == [1, 1, 1]
+
+    voltage = torch.linspace(-3.0, 4.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    expected = _scatter_oracle(handler, voltage)
+    actual = handler.i(voltage)
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+
+
+def test_handler_current_paths_use_support_entries_not_mechanism_mappers(monkeypatch):
+    support = torch.tensor([0, 3, 5, 7])
+    handler = _make_handler(
+        {
+            "first": _make_mechanism(
+                _TensorAffine, "first", key=support, g=0.25, bias=-1.0
+            ),
+            "second": _make_mechanism(
+                _TensorAffine,
+                "second",
+                key=support.clone(),
+                g=-0.5,
+                bias=2.0,
+            ),
+        }
+    )
+    voltage = torch.linspace(-3.0, 4.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    previous = voltage - 5.0
+    expected_i = handler.i(voltage)
+    expected_iexp = handler.iexp(voltage)
+    expected_idf = handler.idf(voltage, previous)
+    expected_itot = handler.itot(voltage)
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("handler execution re-entered a Mechanism mapper")
+
+    for mechanism in handler.mechanisms.values():
+        for name in ("get", "add_", "add", "put"):
+            monkeypatch.setattr(mechanism, name, forbidden)
+
+    actual_i = handler.i(voltage)
+    actual_iexp = handler.iexp(voltage)
+    actual_idf = handler.idf(voltage, previous)
+    actual_itot = handler.itot(voltage)
+    for actual, expected in ((actual_i, expected_i), (actual_idf, expected_idf)):
+        for actual_field, expected_field in zip(actual, expected):
+            torch.testing.assert_close(actual_field, expected_field)
+    torch.testing.assert_close(actual_iexp, expected_iexp)
+    torch.testing.assert_close(actual_itot, expected_itot)
+
+
+def test_restricted_voltage_process_uses_canonical_support_access(monkeypatch):
+    support = torch.tensor([0, 3, 5, 7])
+    process = _make_mechanism(_OffsetVoltage, "offset", key=support, offset=2.5)
+    handler = MechanismHandler(
+        torch.full(FULL_SHAPE, 34.0, dtype=DTYPE),
+        torch.ones(FULL_SHAPE, dtype=DTYPE),
+        {"offset": process},
+    )
+    handler.make_maps()
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("handler execution re-entered a Mechanism mapper")
+
+    monkeypatch.setattr(process, "get", forbidden)
+    monkeypatch.setattr(process, "put", forbidden)
+    voltage = torch.arange(8, dtype=DTYPE).reshape(FULL_SHAPE)
+    expected = voltage.clone()
+    expected.reshape(-1)[support] += 2.5
+
+    torch.testing.assert_close(handler.update_v(voltage), expected)
+
+
+def test_state_initialization_and_advance_gather_once_per_exact_support(monkeypatch):
     shared = torch.tensor([0, 3, 5, 7])
     other = torch.tensor([1, 2, 4, 6])
     mechanisms = {
@@ -199,19 +315,20 @@ def test_state_initialization_and_advance_gather_once_per_exact_support():
     handler.make_maps()
 
     assert len(handler._state_support_representatives) == 2
-    assert [support for _, support in handler._state_advance_plan] == [0, 0, 1]
+    assert [support for _, support in handler._state_advance_plan] == [0, 0, 2]
 
     calls = [0, 0]
-    for support_index, representative in enumerate(
-        handler._state_support_representatives
-    ):
-        original_get = representative.get
+    support_positions = {
+        entry.support_id: index
+        for index, entry in enumerate(handler._state_support_entries)
+    }
+    original_gather = SupportEntry.gather
 
-        def counted_get(tensor, *, _get=original_get, _index=support_index):
-            calls[_index] += 1
-            return _get(tensor)
+    def counted_gather(entry, tensor):
+        calls[support_positions[entry.support_id]] += 1
+        return original_gather(entry, tensor)
 
-        representative.get = counted_get
+    monkeypatch.setattr(SupportEntry, "gather", counted_gather)
 
     handler.compute_initial_conditions(field)
     assert calls == [1, 1]
@@ -223,7 +340,9 @@ def test_state_initialization_and_advance_gather_once_per_exact_support():
         assert torch.isfinite(mechanism.x).all()
 
 
-def test_duplicate_fancy_support_shares_gather_but_keeps_separate_scatters():
+def test_duplicate_fancy_support_shares_gather_but_keeps_separate_scatters(
+    monkeypatch,
+):
     duplicate_support = torch.tensor([1, 1, 6])
     handler = _make_handler(
         {
@@ -246,7 +365,19 @@ def test_duplicate_fancy_support_shares_gather_but_keeps_separate_scatters():
 
     voltage = torch.linspace(-2.0, 5.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
     expected = _scatter_oracle(handler, voltage)
+    scatter_calls = 0
+    original_scatter_add = SupportEntry.scatter_add_
+
+    def counted_scatter_add(entry, destination, local):
+        nonlocal scatter_calls
+        scatter_calls += 1
+        return original_scatter_add(entry, destination, local)
+
+    monkeypatch.setattr(SupportEntry, "scatter_add_", counted_scatter_add)
     actual = handler.i(voltage)
+    # Two mechanisms remain separate runs, each scattering current and
+    # conductance independently.
+    assert scatter_calls == 4
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1])
 

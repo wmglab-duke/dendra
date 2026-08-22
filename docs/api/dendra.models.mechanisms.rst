@@ -224,6 +224,13 @@ fixed/infinite reservoir and does not conserve mass in the modeled field; use
 :class:`~dendra.models.mechanisms.ExchangeProcess` for a finite conservative
 reservoir.
 
+On Apple MPS, one-dimensional implicit diffusion with ``solver="auto"``,
+``"thomas"``, or ``"pcr"`` uses a vectorized parallel-cyclic-reduction solve.
+It takes logarithmically many reduction rounds, accepts non-power-of-two region
+lengths, and does not construct a dense compartment-by-compartment matrix.
+``solver="spd"`` emits a warning and selects the same MPS path. CPU and CUDA
+retain their existing device-specific solver policies.
+
 Named chemical geometry
 ~~~~~~~~~~~~~~~~~~~~~~~
 

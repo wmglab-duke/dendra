@@ -44,6 +44,7 @@ from dendra.helpers import (
     JIT_NETWORK_OPS,
     JIT_NETWORK_SOLVES,
     _normalize_dtype_value,
+    compile_options_for_device,
     compile_options_key,
     current_compile_options,
     current_device,
@@ -671,7 +672,23 @@ def _time_grid_from_step_count(
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    """Construct an exact-length float64 time grid from integer offsets."""
+    """Construct an exact-length time grid from binary64 integer offsets.
+
+    MPS does not support binary64 tensors. Preserve the established binary64
+    timestamp calculation there by staging it on CPU, then cast once to the
+    caller's supported dtype while transferring the finished grid.
+    """
+    device = torch.device(device)
+    if device.type == "mps":
+        if n_steps == 0:
+            return torch.empty(0, device=device, dtype=start.dtype)
+        offsets = torch.arange(n_steps, device="cpu", dtype=torch.double)
+        # MPS attempts the dtype conversion before the device transfer when
+        # both are requested in one `.to(...)`, which still asks MPS to perform
+        # unsupported binary64 work. Move first, then widen on CPU.
+        grid = start.to(device="cpu").to(dtype=torch.double) + offsets * dt
+        return grid.to(device=device, dtype=start.dtype)
+
     offsets = torch.arange(n_steps, device=device, dtype=torch.double)
     return start.to(device=device, dtype=torch.double) + offsets * dt
 
@@ -797,10 +814,12 @@ class Population(P, Sliceable):
         # not yet sufficient to form a complete fixed step.  Keep this separate
         # from model time: explicit step() and array-driven run(ve=...) advance
         # state without consuming the duration budget.
-        self.register_buffer(
-            "_duration_remainder",
-            torch.zeros((), device=init_device, dtype=torch.float64),
-        )
+        # Duration budgeting is host-side control-plane work: every read is
+        # converted to a Python float before any simulation kernel runs. Keep
+        # it outside the registered model buffers so their device/dtype
+        # invariant remains intact, while _save/_load_from_state_dict below retain
+        # the historical `_duration_remainder` serialization key.
+        self._duration_remainder = torch.zeros((), device="cpu", dtype=torch.float64)
 
         # compiler stuff
         self.backend = BACKEND.value
@@ -964,14 +983,26 @@ class Population(P, Sliceable):
         self.compile_mode = COMPILE_MODE.value
         self.compile_options = current_compile_options()
         self.compile_options_key = compile_options_key(self.compile_options)
+        effective_compile_options = compile_options_for_device(
+            self.compile_options,
+            backend=self.backend,
+            device=self.device(),
+            mode=self.compile_mode,
+            dynamic=self.dynamic,
+        )
+        effective_compile_mode = (
+            self.compile_mode if effective_compile_options is None else None
+        )
+        compile_device_type = self.device().type
 
         make_intra_config = (
             self.jit,
             self.backend,
             self.fullgraph,
             self.dynamic,
-            self.compile_mode,
-            self.compile_options_key,
+            effective_compile_mode,
+            compile_options_key(effective_compile_options),
+            compile_device_type,
         )
         if getattr(self, "_make_intra_config", None) != make_intra_config:
             if self.jit:
@@ -980,10 +1011,10 @@ class Population(P, Sliceable):
                     fullgraph=self.fullgraph,
                     dynamic=self.dynamic,
                 )
-                if self.compile_mode is not None:
-                    kwargs["mode"] = self.compile_mode
-                if self.compile_options is not None:
-                    kwargs["options"] = dict(self.compile_options)
+                if effective_compile_mode is not None:
+                    kwargs["mode"] = effective_compile_mode
+                if effective_compile_options is not None:
+                    kwargs["options"] = dict(effective_compile_options)
                 with torch_compiler_warning_context():
                     self.make_intra = torch.compile(make_intra, **kwargs)
             else:
@@ -1113,12 +1144,53 @@ class Population(P, Sliceable):
         return state
 
     def __setstate__(self, state):
-        """Restore populations serialized before mechanism deletion support."""
+        """Restore populations across supported serialized layout revisions."""
         state.setdefault("_mech_exclusions", {})
         state.setdefault("_mech_data_ic", {})
         state.setdefault("_mech_data_base_kwargs", {})
         state.setdefault("_material_geometries", {})
         state.setdefault("_integrator_reinit_pending", False)
+
+        # Duration carry was originally a registered model-device buffer. Move
+        # legacy pickles to precise host metadata before Module.__setstate__ can
+        # re-register it and make a later `.to("mps")` attempt binary64 on MPS.
+        buffers = state.get("_buffers")
+        legacy_remainder = None
+        if isinstance(buffers, dict):
+            legacy_remainder = buffers.pop("_duration_remainder", None)
+        current_remainder = state.get("_duration_remainder")
+        if current_remainder is not None and legacy_remainder is not None:
+            current_value = (
+                torch.as_tensor(current_remainder)
+                .detach()
+                .to(device="cpu")
+                .to(dtype=torch.float64)
+            )
+            legacy_value = (
+                torch.as_tensor(legacy_remainder)
+                .detach()
+                .to(device="cpu")
+                .to(dtype=torch.float64)
+            )
+            if current_value.shape != legacy_value.shape or not torch.equal(
+                current_value, legacy_value
+            ):
+                raise ValueError(
+                    "Serialized Population contains conflicting duration "
+                    "remainder metadata."
+                )
+        remainder = (
+            current_remainder if current_remainder is not None else legacy_remainder
+        )
+        if remainder is None:
+            remainder = torch.zeros((), dtype=torch.float64)
+        if not torch.is_tensor(remainder) or tuple(remainder.shape) != ():
+            raise TypeError(
+                "Serialized Population duration remainder must be a scalar tensor."
+            )
+        state["_duration_remainder"] = (
+            remainder.detach().to(device="cpu").to(dtype=torch.float64).clone()
+        )
 
         # The layout is a construction-time structural snapshot.  Migrate the
         # short-lived public-attribute representation, preserve older pickles
@@ -1309,6 +1381,69 @@ class Population(P, Sliceable):
                 # closures, so direct Population execution can rebuild lazily.
                 integrator.initialized = False
         return result
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        """Serialize precise host duration metadata under its stable key."""
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        remainder = self._duration_remainder
+        destination[f"{prefix}_duration_remainder"] = (
+            remainder if keep_vars else remainder.detach()
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Restore precise host duration metadata without making it a buffer."""
+        key = f"{prefix}_duration_remainder"
+        has_remainder = key in state_dict
+        incoming = state_dict.pop(key, None)
+        try:
+            super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+        finally:
+            if has_remainder:
+                state_dict[key] = incoming
+
+        if not has_remainder:
+            if strict:
+                missing_keys.append(key)
+            return
+        if not torch.is_tensor(incoming):
+            error_msgs.append(
+                f'While copying the parameter named "{key}", expected a tensor '
+                f"but received {type(incoming).__name__}."
+            )
+            return
+        if tuple(incoming.shape) != ():
+            error_msgs.append(
+                f"size mismatch for {key}: copying a param with shape "
+                f"{tuple(incoming.shape)} from checkpoint, the shape in current "
+                "model is ()."
+            )
+            return
+        try:
+            self._duration_remainder = (
+                incoming.to(device="cpu").to(dtype=torch.float64).detach().clone()
+            )
+        except Exception as error:
+            error_msgs.append(
+                f'While copying the parameter named "{key}", an exception '
+                f"occurred: {error}."
+            )
 
     def numel(self, include_batch_dimensions=True):
         """
@@ -2443,15 +2578,13 @@ class Population(P, Sliceable):
         """Commit retained physical time without mutating checkpoint aliases."""
         self._duration_remainder = torch.tensor(
             value,
-            device=self._duration_remainder.device,
+            device="cpu",
             dtype=torch.float64,
         )
 
     def _clear_duration_remainder(self) -> None:
         """Start a fresh duration budget for a new simulation episode."""
-        self._duration_remainder = torch.zeros(
-            (), device=self._duration_remainder.device, dtype=torch.float64
-        )
+        self._duration_remainder = torch.zeros((), device="cpu", dtype=torch.float64)
 
     def step(
         self,
@@ -3267,7 +3400,12 @@ class Population(P, Sliceable):
         """
         if isinstance(state_dict, (str, os.PathLike)):
             state_dict = torch.load(
-                state_dict, map_location=self.device(), weights_only=True
+                # Load on the host, then let load_state_dict copy each tensor to
+                # its owning buffer. This preserves CPU-resident control metadata
+                # and avoids materializing checkpoint float64 tensors on MPS.
+                state_dict,
+                map_location="cpu",
+                weights_only=True,
             )
         has_duration_remainder = (
             isinstance(state_dict, Mapping) and "_duration_remainder" in state_dict
@@ -5466,9 +5604,7 @@ class Population(P, Sliceable):
         # Runtime checkpoints created before fractional-duration carry support
         # have no entry; restoring them starts with no pending physical time.
         if "duration_remainder" not in state_dict:
-            duration_remainder = torch.zeros(
-                (), device=self._duration_remainder.device, dtype=torch.float64
-            )
+            duration_remainder = torch.zeros((), device="cpu", dtype=torch.float64)
         else:
             duration_remainder = state_dict["duration_remainder"]
             if not torch.is_tensor(duration_remainder):
@@ -5483,9 +5619,9 @@ class Population(P, Sliceable):
                 raise TypeError(
                     "Population checkpoint duration_remainder must have floating dtype."
                 )
-            duration_remainder = duration_remainder.to(
-                device=self._duration_remainder.device, dtype=torch.float64
-            ).clone()
+            duration_remainder = (
+                duration_remainder.to(device="cpu").to(dtype=torch.float64).clone()
+            )
             duration_value = float(duration_remainder.detach().cpu().item())
             if not math.isfinite(duration_value) or duration_value < 0.0:
                 raise ValueError(
@@ -8481,6 +8617,19 @@ class Myelinated(Axon):
 
     def _x(self) -> torch.Tensor:  # x in um
         length = (self.n_comp - 1) * self.deltax(self.diameters).unsqueeze(1)
+        if length.device.type == "mps":
+            # Preserve the binary64 interpolation used by the CPU/CUDA path,
+            # then transfer only the model-dtype result to MPS.
+            length_work = length.to(device="cpu").to(dtype=torch.double)
+            start = -length_work / 2
+            end = length_work / 2
+            t = torch.linspace(
+                0, 1, self.n_comp, device="cpu", dtype=torch.double
+            ).unsqueeze(0)
+            return ((1 - t) * start + t * end).to(
+                device=length.device, dtype=self.dtype()
+            )
+
         start = -length / 2
         end = length / 2
         steps = self.n_comp

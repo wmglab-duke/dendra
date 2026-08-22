@@ -70,6 +70,54 @@ def _duration_remainder(pop):
     return value.item()
 
 
+def test_duration_remainder_is_pinned_to_host_binary64_across_transforms():
+    pop = _population()
+    _advance(pop, "run", 0.04)
+
+    assert "_duration_remainder" not in dict(pop.named_buffers())
+    torch.testing.assert_close(
+        pop.state_dict()["_duration_remainder"], pop._duration_remainder
+    )
+
+    pop.float()
+    assert pop._duration_remainder.device.type == "cpu"
+    assert pop._duration_remainder.dtype == torch.float64
+    assert pop._duration_remainder.item() == pytest.approx(0.04)
+
+    # If the pending 0.04 ms were cast to float32 with the model, its rounded
+    # value plus 0.06 would miss this exact decimal boundary.
+    _advance(pop, "run", 0.06)
+    assert pop.t.item() == pytest.approx(DT)
+    assert pop._duration_remainder.item() == 0.0
+
+    pop.double()
+    assert pop._duration_remainder.device.type == "cpu"
+    assert pop._duration_remainder.dtype == torch.float64
+    assert pop._duration_remainder.item() == 0.0
+
+
+def test_legacy_pickled_duration_buffer_migrates_to_host_metadata():
+    source = _population()
+    _advance(source, "run", 0.04)
+    legacy_state = source.__getstate__()
+    legacy_state["_buffers"] = dict(legacy_state["_buffers"])
+    legacy_state["_buffers"]["_duration_remainder"] = legacy_state.pop(
+        "_duration_remainder"
+    )
+
+    restored = source.__class__.__new__(source.__class__)
+    restored.__setstate__(legacy_state)
+
+    assert "_duration_remainder" not in dict(restored.named_buffers())
+    assert restored._duration_remainder.device.type == "cpu"
+    assert restored._duration_remainder.dtype == torch.float64
+    assert restored._duration_remainder.item() == pytest.approx(0.04)
+
+    restored.float()
+    _advance(restored, "run", 0.06)
+    assert restored.t.item() == pytest.approx(DT)
+
+
 @pytest.mark.parametrize("variant", RUN_VARIANTS)
 def test_fractional_partition_matches_complete_run_for_each_variant(variant):
     whole = _population()

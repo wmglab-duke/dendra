@@ -14,6 +14,7 @@ from dendra.helpers import (
     DYNAMIC,
     FULLGRAPH,
     IMEM,
+    compile_options_for_device,
     compile_options_key,
     current_compile_options,
     detach_vars,
@@ -330,14 +331,43 @@ class Integrator(torch.nn.Module):
         owner_compile_options = getattr(model, "compile_options", None)
         if owner_compile_options is None:
             owner_compile_options = current_compile_options()
-        compile_options = normalize_compile_options(owner_compile_options)
+        requested_compile_options = normalize_compile_options(owner_compile_options)
+        model_device = model.device()
+        compile_device_type = torch.device(model_device).type
+        backend = getattr(model, "backend", _cfg_value(BACKEND))
+        dynamic = bool(getattr(model, "dynamic", bool(DYNAMIC)))
+        requested_compile_mode = getattr(
+            model, "compile_mode", _cfg_value(COMPILE_MODE)
+        )
+        mechanism_handler = getattr(model, "mech", None)
+        if mechanism_handler is None:
+            # During Population.build(), the handler is passed to the
+            # integrator before Population.mech is assigned.
+            mechanism_handler = self.mech
+        requires_inductor_python_wrapper = bool(
+            getattr(
+                mechanism_handler,
+                "requires_inductor_python_wrapper",
+                False,
+            )
+        )
+        compile_options = compile_options_for_device(
+            requested_compile_options,
+            backend=backend,
+            device=model_device,
+            mode=requested_compile_mode,
+            dynamic=dynamic,
+            requires_inductor_python_wrapper=requires_inductor_python_wrapper,
+        )
+        compile_mode = requested_compile_mode if compile_options is None else None
         new_config = (
             bool(jit_enabled_for_scope(scope, model)),
-            getattr(model, "backend", _cfg_value(BACKEND)),
+            backend,
             bool(getattr(model, "fullgraph", bool(FULLGRAPH))),
-            bool(getattr(model, "dynamic", bool(DYNAMIC))),
-            getattr(model, "compile_mode", _cfg_value(COMPILE_MODE)),
+            dynamic,
+            compile_mode,
             compile_options_key(compile_options),
+            compile_device_type,
             scope,
         )
         old_config = (
@@ -347,6 +377,7 @@ class Integrator(torch.nn.Module):
             getattr(self, "dynamic", None),
             getattr(self, "compile_mode", None),
             getattr(self, "compile_options_key", None),
+            getattr(self, "compile_device_type", None),
             getattr(self, "compile_scope", None),
         )
         (
@@ -356,8 +387,11 @@ class Integrator(torch.nn.Module):
             self.dynamic,
             self.compile_mode,
             self.compile_options_key,
+            self.compile_device_type,
             self.compile_scope,
         ) = new_config
+        self.requested_compile_mode = requested_compile_mode
+        self.requested_compile_options = requested_compile_options
         self.compile_options = compile_options
         if new_config != old_config:
             self._compiled_kernels.clear()
@@ -445,6 +479,7 @@ class Integrator(torch.nn.Module):
             self.dynamic,
             self.compile_mode,
             self.compile_options_key,
+            self.compile_device_type,
         )
         with torch_compiler_warning_context():
             compiled = self._compiled_kernels.get(key)

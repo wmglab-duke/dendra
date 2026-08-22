@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import MethodType
 
 import torch
+import torch._inductor.config as inductor_config
 
 import dendra  # noqa: F401  (configure Dendra before constructing mechanisms)
 from dendra.models.mechanisms import Mechanism
@@ -17,6 +18,26 @@ SHAPE = (1, 2)
 VOLTAGE = torch.tensor([[-65.0, -55.0]], dtype=DTYPE)
 CELSIUS = torch.full(SHAPE, 34.0, dtype=DTYPE)
 DIAMETERS = torch.ones(SHAPE, dtype=DTYPE)
+
+
+def test_handler_construction_does_not_mutate_global_compiler_configuration():
+    """Handler composition must not select process-global compiler policy."""
+
+    for configured_value in (False, True):
+        with inductor_config.patch({"cpp_wrapper": configured_value}):
+            simple = MechanismHandler(CELSIUS, torch.ones_like(CELSIUS), {})
+            assert inductor_config.cpp_wrapper is configured_value
+            assert not simple.requires_inductor_python_wrapper
+
+            synchronized = MechanismHandler(
+                CELSIUS,
+                torch.ones_like(CELSIUS),
+                {},
+                read_ion={"na": {}},
+                read_material={"pool": {}},
+            )
+            assert inductor_config.cpp_wrapper is configured_value
+            assert synchronized.requires_inductor_python_wrapper
 
 
 class _CountingMaterial(Material):
@@ -181,7 +202,9 @@ def test_replacement_write_is_guarded_without_a_trailing_overwrite():
     )
 
 
-def test_final_current_frame_uses_post_commit_nernst_state_without_reinitializing():
+def test_final_current_frame_uses_post_commit_nernst_state_without_reinitializing(
+    monkeypatch,
+):
     sodium = Ion("na", SHAPE, einit=1, eadvance=1).to(DTYPE)
     writer = _mechanism(_SodiumConcentrationWriter, "writer")
     channel = _mechanism(_NernstSodiumCurrent, "channel")
@@ -203,6 +226,14 @@ def test_final_current_frame_uses_post_commit_nernst_state_without_reinitializin
         },
         currents={"ina": {"channel": ["ina"]}},
     ).to(DTYPE)
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("handler execution re-entered a Mechanism mapper")
+
+    for mechanism in handler.mechanisms.values():
+        for name in ("get", "add_", "add", "put"):
+            monkeypatch.setattr(mechanism, name, forbidden)
 
     handler.initialize(VOLTAGE, CELSIUS, DIAMETERS)
 

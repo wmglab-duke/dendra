@@ -154,17 +154,47 @@ mechanism class declares
 Support-group scheduling
 ------------------------
 
-At build time the handler groups mechanisms only when their ordered physical
-support *and* local tensor layout are exactly equal. The schedule then reuses a
-gathered local voltage for current breakpoints, initialization, and state
-advancement while preserving authored mechanism order; geometry binding
-similarly gathers diameter once per support. Ion, Material, and accepted
-ionic-current reads are gathered once per ``(field, support)`` group; a
-Material reader that also writes the same field still receives its own clone.
-During current assembly, adjacent contributions to the same current
-destination and exact support are summed locally and scattered once when the
-selector has unambiguous scatter semantics. Duplicate-slot supports retain
-separate scatters.
+Each handler owns one runtime-only support registry. During construction, and
+again whenever runtime maps are rebuilt after loading or device conversion,
+the registry visits mechanisms in authored order and groups them only when
+their ordered physical support *and* local tensor layout are exactly equal.
+All initialization, state, field-read, breakpoint, and current plans refer to
+the same handler-wide support IDs rather than independently renumbering a
+support in each phase.
+
+Support IDs are the authored ordinal of the first mechanism in a group and may
+therefore be sparse. If mechanisms 0 and 1 share a support while mechanism 2
+uses another support, their IDs are ``0, 0, 2``. This keeps the later ID stable
+if an earlier packed-key group must conservatively split after a metadata-only
+device transition. IDs are derived execution metadata, not a model parameter
+or checkpoint identity; applications should not assign scientific meaning to
+their numeric values.
+
+The schedule reuses a gathered local voltage for current breakpoints,
+initialization, and state advancement while preserving authored mechanism
+order; geometry binding similarly gathers diameter once per support. Ion,
+Material, and accepted ionic-current reads are gathered once per
+``(field, support)`` group; a Material reader that also writes the same field
+still receives its own clone. During current assembly, adjacent contributions
+to the same current destination and exact support are summed locally and
+scattered once when the selector has unambiguous scatter semantics.
+Duplicate-slot supports retain separate scatters.
+
+Here *adjacent* means consecutive in the authored flattened current schedule,
+not neighboring physical compartments. An intervening contribution ends the
+local reduction run even if a later mechanism has the same support. This keeps
+callback order and floating-point reduction association unchanged.
+
+Every handler-owned regional read or write is routed through the support's
+runtime ``SupportEntry``. The entry executes its canonical immutable
+``SupportMap`` and obtains the representative mechanism's compatibility key at
+the instant of the operation; it never caches a key tensor that a device move
+or state load could replace. Mechanisms continue to own their parameters,
+state, and compatibility ``key`` buffers, and their public ``get``/``put``
+interface remains available to Slice and other inspection APIs. Regional
+``VoltageProcess`` updates use the same gather/update/replacement path.
+``MaterialProcess`` execution remains under its dedicated material scheduler
+and will join support-centric execution during the later bundle rollout.
 
 For the overall initialization lifecycle, see :ref:`model-initialization`.
 
@@ -205,9 +235,12 @@ For compatibility, ``mechanism.key`` currently remains the complete ordered
 flat physical key even when the structured mapper operates on only ``K``
 column indices. It is structural, immutable runtime data: do not modify it in
 place or load it from a differently placed model. Change placement through
-``Population.insert`` / ``delete`` and rebuild. This rollout establishes the
-canonical support abstraction and the ``(N, K)`` tensor contract; removing or
-interning the redundant flat key is a later serialization migration.
+``Population.insert`` / ``delete`` and rebuild. Equal-support mechanisms now
+share one immutable runtime mapper and support specification, but every
+mechanism retains its own registered compatibility key. The registry owns no
+selector tensors and contributes no ``state_dict`` entries, so ordinary and
+runtime checkpoint formats are unchanged. Removing or interning the redundant
+registered keys remains a later serialization migration.
 
 Inspection and benchmarking
 ---------------------------
@@ -218,8 +251,21 @@ currently one of ``dense``, ``rectangular``, ``shared_columns``, or
 ``preserves_population_axis`` reports the selected storage layout and
 ``runtime_local_shape`` reports the unbatched mechanism-visible shape.
 
+An initialized Population exposes its handler at ``population.mech``. The
+handler's ``support_registry`` can be inspected when profiling scheduler
+layout. ``active_ids`` lists active handler-wide IDs and ``accounting`` reports
+the number of mechanisms, unique supports, compatibility selector indices,
+unique flattened indices, and the compact structured target. These counts are
+diagnostic targets: ``compatibility_indices`` still describes the actual
+per-mechanism compatibility representation used by current checkpoints.
+
 ``scripts/benchmark_mechanism_support.py`` compares separate and grouped
 flat/axis current assembly plus separate, shared, and clone-isolated field
-reads in eager or compiled execution. Its output labels the ``K``-index form
-as ``target-compact``: that is the representation after the compatibility key
-is removed, not current serialized ``state_dict`` size.
+reads in eager or compiled execution. It also compares the former repeated
+per-phase support partitioning with one registry rebuild followed by phase
+lookups. ``--distinct-supports`` distributes channels into contiguous authored
+clusters across multiple exact supports, matching the scheduler's adjacent-run
+current aggregation. The report distinguishes unchanged serialized/runtime
+key bytes, a unique flattened target, and the compact interned target; the
+latter two describe raw integer-selector payload for later storage migrations,
+not current ``state_dict`` size or total checkpoint size.

@@ -25,6 +25,7 @@ from .core import (
     ensure_model_buffer,
 )
 from .tridiag import pcr_solve_t
+from .tridiag.block import block_pcr_solve_t
 from .triton import (
     pcr_solve_cuda_t,
     solve_bt_spd_cuda_consume_unchecked,
@@ -483,8 +484,9 @@ class _bwd_euler_bt(Integrator):
     def __init__(self, model, mech, imem=None, method="inv", **kwargs):
         if not DENDRA_SOLVERS_AVAILABLE:
             logging.warning(
-                "Only CUDA-based solvers available, using triton Thomas solver. "
-                "CPU models will not work. Install dendra_solvers for CPU support."
+                "Native CPU block solvers are unavailable. CUDA will use Triton "
+                "and MPS will use pure-PyTorch block PCR; install dendra_solvers "
+                "for CPU support."
             )
         super().__init__(model, mech, imem)
 
@@ -552,7 +554,14 @@ class _bwd_euler_bt(Integrator):
         self.mech.detach()
 
     def _select_solver(self, model):
-        dev = model.device().type  # "cpu" or "cuda"
+        dev = model.device().type
+
+        # Apple MPS cannot load either the CPU extension or CUDA/Triton kernels.
+        # Use a vectorized, differentiable pure-Torch solver for both public
+        # methods. The method still controls CPU/CUDA dispatch exactly as before.
+        if dev == "mps":
+            self._solve = block_pcr_solve_t
+            return
 
         if self.method == "spd":
             if dev == "cuda":

@@ -144,5 +144,21 @@ invalidates derived solver coefficients. Direct ``Population`` and
 owned by an already-built ``Network`` requires ``Network.initialize(dt)`` so
 the owner can refresh the complete runtime state.
 
+Apple MPS supports float32 model tensors but not float64 tensors. Dendra keeps
+the fractional duration carried between ``run`` calls as host-side float64
+control metadata, so moving or constructing a Population on MPS does not try to
+materialize that value on the accelerator. It remains part of state dictionaries
+and runtime checkpoints. Time-grid and one-time geometry calculations that need
+binary64 precision are likewise staged on CPU before their model-dtype results
+are transferred to MPS. This does not make float64 simulation state available
+on MPS; construct the model with ``dtype=torch.float32``.
+
+For JIT execution, Dendra applies MPS compiler compatibility as per-model
+``torch.compile`` options rather than changing process-global Inductor state.
+It disables the unsupported non-AOT C++ MPS wrapper and limits fusion to 30
+unique input/output buffers, below Metal's 31 constant-buffer ceiling. An
+explicitly smaller ``max_fusion_unique_io_buffers`` value is respected. These
+effective options participate in Dendra's compiled-kernel cache identity.
+
 For the native morphology invariants that motivate these checks, see
 :doc:`../basics/02a_native_morphologies`.

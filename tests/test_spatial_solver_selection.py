@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from dendra.models.integrators.tridiag import pcr_solve_parallel_t
 from dendra.models.mechanisms import _spatial as spatial
 
 
@@ -25,14 +26,18 @@ def test_dense_tridiagonal_aliases_never_require_an_accelerated_solver(name):
 def test_explicit_pcr_selection_is_device_specific(monkeypatch):
     cpu = _solver("cpu")
     cuda = _solver("cuda")
+    mps = _solver("mps")
     monkeypatch.setattr(spatial, "pcr_solve_t", cpu)
     monkeypatch.setattr(spatial, "pcr_solve_cuda_t", cuda)
+    monkeypatch.setattr(spatial, "pcr_solve_parallel_t", mps)
 
     assert spatial.select_tridiagonal_solver("pcr", torch.device("cpu")) == (
         cpu,
         "pcr_cpu",
     )
     assert spatial.select_tridiagonal_solver("pcr", "cuda") == (cuda, "pcr_cuda")
+    assert spatial.select_tridiagonal_solver("pcr", "mps") == (mps, "pcr_mps")
+    assert spatial.select_tridiagonal_solver("pcr", "mps:0") == (mps, "pcr_mps")
 
     monkeypatch.setattr(spatial, "pcr_solve_t", None)
     with pytest.raises(ImportError, match="integrators.tridiag.pcr_solve_t"):
@@ -40,6 +45,10 @@ def test_explicit_pcr_selection_is_device_specific(monkeypatch):
     monkeypatch.setattr(spatial, "pcr_solve_cuda_t", None)
     with pytest.raises(ImportError, match="integrators.triton.pcr_solve_cuda_t"):
         spatial.select_tridiagonal_solver("pcr", "cuda")
+    monkeypatch.setattr(spatial, "pcr_solve_parallel_t", None)
+    with pytest.raises(ImportError, match="tridiag.pcr_solve_parallel_t"):
+        spatial.select_tridiagonal_solver("pcr", "mps")
+    assert spatial.select_tridiagonal_solver("auto", "mps") == (None, "dense")
 
 
 def test_spd_uses_cpu_extension_and_warns_before_cuda_fallback(monkeypatch):
@@ -59,6 +68,14 @@ def test_spd_uses_cpu_extension_and_warns_before_cuda_fallback(monkeypatch):
         assert spatial.select_tridiagonal_solver("spd", "cuda") == (
             thomas,
             "thomas_cuda",
+        )
+
+    mps = _solver("mps")
+    monkeypatch.setattr(spatial, "pcr_solve_parallel_t", mps)
+    with pytest.warns(UserWarning, match="not implemented on MPS"):
+        assert spatial.select_tridiagonal_solver("spd", "mps") == (
+            mps,
+            "pcr_mps",
         )
 
 
@@ -128,15 +145,93 @@ def test_cpu_thomas_policy_covers_extension_fallback_and_dense(monkeypatch):
     assert spatial.select_tridiagonal_solver("auto", "cpu") == (None, "dense")
 
 
-def test_unknown_tridiagonal_solver_warns_and_other_devices_use_dense(monkeypatch):
+def test_unknown_tridiagonal_solver_warns_and_mps_auto_uses_parallel_pcr(monkeypatch):
     monkeypatch.setattr(spatial, "DENDRA_SOLVERS_AVAILABLE", False)
     monkeypatch.setattr(spatial, "pcr_solve_t", None)
+    mps = _solver("mps")
+    monkeypatch.setattr(spatial, "pcr_solve_parallel_t", mps)
     with pytest.warns(UserWarning, match="Unknown material tridiagonal solver"):
         assert spatial.select_tridiagonal_solver("surprise", "cpu") == (
             None,
             "dense",
         )
-    assert spatial.select_tridiagonal_solver("auto", "mps") == (None, "dense")
+    assert spatial.select_tridiagonal_solver("auto", "mps") == (mps, "pcr_mps")
+    assert spatial.select_tridiagonal_solver("thomas", "mps") == (mps, "pcr_mps")
+
+
+def _dense_tridiagonal(a, b, c):
+    matrix = torch.diag_embed(b)
+    rows = torch.arange(b.shape[-1] - 1, device=b.device)
+    matrix[..., rows + 1, rows] = a
+    matrix[..., rows, rows + 1] = c
+    return matrix
+
+
+@pytest.mark.parametrize("length", [1, 2, 3, 5, 11, 17, 32, 33, 101])
+def test_parallel_pcr_matches_dense_for_arbitrary_diffusion_system_sizes(length):
+    """Cover singleton, prime, and adjacent power-of-two chain lengths."""
+    generator = torch.Generator().manual_seed(1000 + length)
+    leading_shape = (2, 3)
+    edge = torch.rand(
+        leading_shape + (max(length - 1, 0),),
+        generator=generator,
+        dtype=torch.float64,
+    )
+    mass = 0.25 + torch.rand(
+        leading_shape + (length,), generator=generator, dtype=torch.float64
+    )
+    boundary = torch.zeros(leading_shape + (1,), dtype=torch.float64)
+    a = -edge
+    c = -edge
+    b = mass + torch.cat((boundary, edge), dim=-1) + torch.cat((edge, boundary), dim=-1)
+    rhs = torch.randn(
+        leading_shape + (length,), generator=generator, dtype=torch.float64
+    )
+
+    expected = torch.linalg.solve(
+        _dense_tridiagonal(a, b, c), rhs.unsqueeze(-1)
+    ).squeeze(-1)
+    actual = pcr_solve_parallel_t(a, b, c, rhs)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-12, atol=2e-12)
+
+
+def test_parallel_pcr_is_autograd_safe_for_all_bands_and_rhs():
+    a = torch.tensor([[-0.2, 0.1, -0.3, 0.2]], dtype=torch.float64, requires_grad=True)
+    b = torch.tensor(
+        [[2.0, 2.5, 3.0, 2.25, 1.75]], dtype=torch.float64, requires_grad=True
+    )
+    c = torch.tensor([[0.3, -0.1, 0.15, -0.2]], dtype=torch.float64, requires_grad=True)
+    rhs = torch.tensor(
+        [[1.0, -2.0, 0.5, 1.25, -0.75]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+
+    assert torch.autograd.gradcheck(
+        pcr_solve_parallel_t,
+        (a, b, c, rhs),
+        eps=1e-6,
+        atol=1e-5,
+        rtol=1e-4,
+    )
+
+
+def test_parallel_pcr_preserves_constant_field_for_tjs_sized_diffusion_system():
+    length = 1101
+    generator = torch.Generator().manual_seed(20260821)
+    edge = torch.rand((5, length - 1), generator=generator, dtype=torch.float32)
+    mass = 0.5 + torch.rand((5, length), generator=generator, dtype=torch.float32)
+    boundary = torch.zeros((5, 1), dtype=torch.float32)
+    a = -edge
+    c = -edge
+    b = mass + torch.cat((boundary, edge), dim=-1) + torch.cat((edge, boundary), dim=-1)
+    expected = torch.arange(1, 6, dtype=torch.float32).unsqueeze(-1).expand(-1, length)
+    rhs = mass * expected
+
+    actual = pcr_solve_parallel_t(a, b, c, rhs)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.parametrize(

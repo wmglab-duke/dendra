@@ -256,6 +256,7 @@ def _normalize_dtype_value(value, default=None):
 
 
 _COMPILE_OPTIONS_NONE_SENTINELS = {"", "none", "null", "default", "{}"}
+_MPS_MAX_FUSION_UNIQUE_IO_BUFFERS = 30
 
 
 def _freeze_compile_option_value(value):
@@ -334,6 +335,89 @@ def current_compile_options(default=None):
     if options is None:
         return default
     return options
+
+
+def compile_options_for_device(
+    options=None,
+    *,
+    backend="inductor",
+    device=None,
+    mode=None,
+    dynamic=False,
+    requires_inductor_python_wrapper=False,
+):
+    """Return effective per-call compiler options for an execution device.
+
+    PyTorch's non-AOT MPS Inductor path cannot currently use the C++ wrapper.
+    Selecting it fails during wrapper generation before a kernel can run.  Keep
+    that compatibility rule local to each ``torch.compile`` call instead of
+    mutating process-global Inductor configuration.  On other devices, preserve
+    Dendra's existing C++-wrapper default while respecting an explicit user
+    choice. Other compiler backends receive the requested options unchanged.
+
+    PyTorch does not permit passing ``mode=`` and ``options=`` together. For
+    Inductor, the selected mode is therefore expanded into its equivalent
+    option entries before device policy and explicitly requested options are
+    applied. An explicit ``cpp_wrapper=True`` request is overridden on MPS, or
+    when a compiled region contains synchronization phases that require the
+    Python wrapper. MPS fusion is also capped below Metal's 31 constant-buffer
+    limit; a stricter user cap is retained. The input mapping is never mutated.
+
+    Parameters
+    ----------
+    options : Mapping, JSON str, or None
+        User-requested backend options.
+    backend : str or callable
+        Compiler backend passed to ``torch.compile``.
+    device : torch.device, str, Tensor, or None
+        Device on which the compiled callable will execute.  Tensor inputs are
+        accepted for convenience.
+    mode : str or None
+        Optional Inductor mode whose options should be retained when a device
+        policy requires an explicit ``options=`` mapping.
+    dynamic : bool
+        Dynamic-shape setting used when resolving Inductor mode options.
+    requires_inductor_python_wrapper : bool
+        Force the Python wrapper for a compiled region containing operations
+        incompatible with Inductor's C++ wrapper.
+
+    Returns
+    -------
+    dict or None
+        Effective options suitable for ``torch.compile(options=...)``.
+    """
+    normalized = normalize_compile_options(options)
+    if not (isinstance(backend, str) and backend.lower() == "inductor"):
+        return normalized
+    if device is None:
+        return normalized
+    if torch.is_tensor(device):
+        device = device.device
+    try:
+        device_type = torch.device(device).type
+    except (TypeError, RuntimeError):
+        return normalized
+    effective = {}
+    if mode is not None:
+        effective.update(torch._inductor.list_mode_options(mode, dynamic=dynamic))
+    if normalized is not None:
+        effective.update(normalized)
+    if device_type == "mps" or requires_inductor_python_wrapper:
+        effective["cpp_wrapper"] = False
+    else:
+        effective.setdefault("cpp_wrapper", True)
+    if device_type == "mps":
+        fusion_cap = effective.get("max_fusion_unique_io_buffers")
+        if fusion_cap is None:
+            effective["max_fusion_unique_io_buffers"] = (
+                _MPS_MAX_FUSION_UNIQUE_IO_BUFFERS
+            )
+        elif isinstance(fusion_cap, int):
+            effective["max_fusion_unique_io_buffers"] = min(
+                fusion_cap,
+                _MPS_MAX_FUSION_UNIQUE_IO_BUFFERS,
+            )
+    return effective
 
 
 def current_device(default=None):

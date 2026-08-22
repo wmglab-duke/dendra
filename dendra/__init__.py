@@ -244,7 +244,3 @@ _cache_cpu_isa_list()
 
 # setup environment
 allow_tf32(bool(TF32))
-
-import torch._inductor.config as inductor_config
-
-inductor_config.cpp_wrapper = True
