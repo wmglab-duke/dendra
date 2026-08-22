@@ -569,6 +569,11 @@ class _bwd_euler_bt(Integrator):
                 # unchecked consuming path to avoid duplicate per-step validation.
                 self._solve = solve_bt_spd_cuda_consume_unchecked
             elif dev == "cpu":
+                if not DENDRA_SOLVERS_AVAILABLE:
+                    raise ImportError(
+                        "_bwd_euler_bt(method='spd') requires dendra_solvers for CPU execution. "
+                        "Use CUDA or install dendra_solvers."
+                    )
                 try:
                     from dendra_solvers import solve_bt_spd_consume_unchecked
                 except ImportError as err:

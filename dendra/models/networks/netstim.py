@@ -217,6 +217,33 @@ class NetStim(DNModule, Sliceable):
         self.sched_time_ms = torch.empty(0, device=init_device, dtype=init_dtype)
         self.sched_weight = torch.empty(0, device=init_device, dtype=init_dtype)
 
+    def __deepcopy__(self, memo):
+        """Clone configuration/runtime values without retaining a live BPTT graph.
+
+        PyTorch's default module deepcopy rejects non-leaf tensors. NetStim can
+        legitimately own those after differentiable stochastic or scheduled
+        execution, both in registered buffers and in ordinary tensor
+        attributes such as ``spike_gate``. Seed the deepcopy memo with detached
+        value copies, matching Population's structural-clone contract.
+        """
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+
+        for module in self.modules():
+            for value in module._buffers.values():
+                if torch.is_tensor(value) and not value.is_leaf:
+                    memo.setdefault(id(value), value.detach().clone())
+            for value in vars(module).values():
+                if torch.is_tensor(value) and not value.is_leaf:
+                    memo.setdefault(id(value), value.detach().clone())
+
+        result = self.__class__.__new__(self.__class__)
+        memo[id(self)] = result
+        state = copy.deepcopy(self.__getstate__(), memo)
+        result.__setstate__(state)
+        return result
+
     # ───────────────────────── shape helpers ─────────────────────────
     @staticmethod
     def _flat_numel_from_shape(shape: tuple[int, ...]) -> int:

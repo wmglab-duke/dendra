@@ -7,6 +7,7 @@ import torch
 
 import dendra as dn
 import dendra.models.integrators.implicit as implicit
+from dendra._bootstrap import torch_compiler_warning_context
 from dendra.models.integrators.implicit import _bwd_euler_bt
 from dendra.models.integrators.tridiag.block import block_pcr_solve_t
 from dendra.models.mod import pas
@@ -175,7 +176,10 @@ def test_block_pcr_mps_is_inductor_fullgraph_compatible():
     inputs = _well_conditioned_case(13, device="mps")
     expected = block_pcr_solve_t(*inputs)
     # PyTorch's non-AOT MPS wrapper currently requires cpp_wrapper=False.
-    with inductor_config.patch({"cpp_wrapper": False}):
+    with (
+        torch_compiler_warning_context(),
+        inductor_config.patch({"cpp_wrapper": False}),
+    ):
         compiled = torch.compile(
             block_pcr_solve_t,
             backend="inductor",

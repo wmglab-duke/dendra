@@ -148,7 +148,7 @@ python -m pytest tests -W error -m "cpu or (neuron and not cuda)" --cov=dendra -
 
 The `TOTAL` row is the overall coverage result. Open `htmlcov/index.html` to inspect coverage by module and identify untested lines and branches. The required lane installs and exercises NEURON; accelerator execution remains outside this measurement, while CPU-testable CUDA/Triton interfaces remain covered. Results can still vary when optional CPU solvers are unavailable.
 
-GitLab CI runs this same non-CUDA branch-coverage measurement for every pipeline, enforces a ratcheted global minimum, and retains JSON, browsable HTML, and Cobertura reports. Critical modules also have individual floors configured in `pyproject.toml`; validate them locally after generating `coverage.json` with:
+GitLab CI runs this same non-CUDA branch-coverage measurement for every pipeline, enforces a ratcheted 84% global minimum, and retains JSON, browsable HTML, and Cobertura reports. Critical modules also have individual floors configured in `coverage-floors.toml`; validate them locally after generating `coverage.json` with:
 
 ```bash
 python scripts/check_coverage_floors.py coverage.json

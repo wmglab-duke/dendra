@@ -4,6 +4,7 @@ import pytest
 import torch
 
 import dendra as dn
+from dendra._bootstrap import torch_compiler_warning_context
 from dendra.helpers import compile_options_for_device
 from dendra.models.core import _time_grid_from_step_count
 from dendra.models.mod import pas
@@ -141,13 +142,14 @@ def test_mps_compile_policy_splits_kernels_above_metal_buffer_limit():
     def add_all(*values):
         return sum(values)
 
-    compiled = torch.compile(
-        add_all,
-        backend="inductor",
-        fullgraph=True,
-        options=options,
-    )
-    values = [torch.full((8,), value, device="mps") for value in range(40)]
-    actual = compiled(*values)
+    with torch_compiler_warning_context():
+        compiled = torch.compile(
+            add_all,
+            backend="inductor",
+            fullgraph=True,
+            options=options,
+        )
+        values = [torch.full((8,), value, device="mps") for value in range(40)]
+        actual = compiled(*values)
 
     torch.testing.assert_close(actual, torch.full_like(actual, 780.0))

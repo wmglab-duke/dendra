@@ -4,11 +4,13 @@ import configparser
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "check_coverage_floors.py"
 ROOT = Path(__file__).parents[1]
 CPU_COVERAGE_CONFIG = ROOT / ".coveragerc.cpu"
+COVERAGE_FLOORS_CONFIG = ROOT / "coverage-floors.toml"
 CPU_KERNEL_OMISSIONS = {
     "dendra/models/integrators/triton/bt_kernel.py",
     "dendra/models/integrators/triton/bt_spd_kernel.py",
@@ -22,9 +24,9 @@ CPU_KERNEL_OMISSIONS = {
 
 def _write_policy_fixture(tmp_path, *, actual=None, floor=80.0, include=True):
     module = "dendra/example.py"
-    config = tmp_path / "pyproject.toml"
+    config = tmp_path / "coverage-floors.toml"
     config.write_text(
-        f'[tool.dendra.coverage-floors]\n"{module}" = {floor}\n',
+        f'[coverage-floors]\n"{module}" = {floor}\n',
         encoding="utf-8",
     )
     files = {}
@@ -64,14 +66,24 @@ def test_coverage_policy_rejects_low_or_missing_modules(tmp_path):
 
 
 def test_coverage_policy_reports_invalid_configuration(tmp_path):
-    config = tmp_path / "pyproject.toml"
-    config.write_text("[tool.dendra]\n", encoding="utf-8")
+    config = tmp_path / "coverage-floors.toml"
+    config.write_text("[coverage]\n", encoding="utf-8")
     report = tmp_path / "coverage.json"
     report.write_text(json.dumps({"files": {}}), encoding="utf-8")
 
     result = _run_policy(config, report)
     assert result.returncode == 2
     assert "configuration error" in result.stderr
+
+
+def test_coverage_floors_live_in_dedicated_configuration():
+    with COVERAGE_FLOORS_CONFIG.open("rb") as stream:
+        floors = tomllib.load(stream)["coverage-floors"]
+    with (ROOT / "pyproject.toml").open("rb") as stream:
+        project = tomllib.load(stream)
+
+    assert floors
+    assert "coverage-floors" not in project.get("tool", {}).get("dendra", {})
 
 
 def test_cpu_coverage_omits_only_accelerator_kernel_bodies():
@@ -96,3 +108,4 @@ def test_required_coverage_commands_use_cpu_scope():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "--cov-config=.coveragerc.cpu" in ci
     assert "--cov-config=.coveragerc.cpu" in readme
+    assert "--cov-fail-under=84" in ci

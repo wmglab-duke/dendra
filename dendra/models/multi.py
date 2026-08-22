@@ -218,6 +218,23 @@ def _check_celsius(celsius, populations):
         )
 
 
+def _validate_component_device_and_dtype(populations):
+    """Fail with component-specific diagnostics before tensor concatenation."""
+    devices = {population.device() for population in populations.values()}
+    if len(devices) > 1:
+        details = ", ".join(
+            f"{name}={population.device()}" for name, population in populations.items()
+        )
+        raise ValueError(f"All populations must be on the same device; got {details}.")
+
+    dtypes = {population.dtype() for population in populations.values()}
+    if len(dtypes) > 1:
+        details = ", ".join(
+            f"{name}={population.dtype()}" for name, population in populations.items()
+        )
+        raise ValueError(f"All populations must be of the same dtype; got {details}.")
+
+
 def concat_models(
     populations: dict[str, Population],
     threads=16,
@@ -276,6 +293,7 @@ def concat_models(
     integrator = _assess_type_and_make_integrator(
         populations, threads=threads, write_back=write_back
     )
+    _validate_component_device_and_dtype(populations)
     # concatenate x, y, z
     x = torch.cat([pop.x.flatten() for pop in populations.values()])
     y = torch.cat([pop.y.flatten() for pop in populations.values()])
@@ -294,9 +312,12 @@ def concat_models(
 
 def offsets(populations):
     """Compute flattened offsets for each population in the concatenation."""
-    sizes = [math.prod(p.shape) for p in populations.values()]
-    off = [0] + list(torch.cumsum(torch.tensor(sizes), dim=0).numpy().astype(int))[:-1]
-    return off
+    result = []
+    total = 0
+    for population in populations.values():
+        result.append(total)
+        total += math.prod(population.shape)
+    return result
 
 
 def indices(populations):
@@ -304,7 +325,7 @@ def indices(populations):
     off = offsets(populations)
     sizes = [math.prod(p.shape) for p in populations.values()]
     indices = [
-        torch.arange(s).reshape(p.shape) + off[idx]
+        torch.arange(s, device=p.device(), dtype=torch.long).reshape(p.shape) + off[idx]
         for idx, (s, p) in enumerate(zip(sizes, populations.values()))
     ]
     return indices
@@ -529,12 +550,9 @@ class MultiPopulation(Population):
 
         # Check all populations are on the same device/dtype before composing
         # tensor-valued v_init values from them.
+        _validate_component_device_and_dtype(populations)
         devices = {pop.device() for pop in populations.values()}
         dtypes = {pop.dtype() for pop in populations.values()}
-        if len(devices) > 1:
-            raise ValueError("All populations must be on the same device.")
-        if len(dtypes) > 1:
-            raise ValueError("All populations must be of the same dtype.")
 
         if integrator is None:
             integrator = _assess_type_and_make_integrator(populations)

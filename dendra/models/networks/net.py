@@ -1,5 +1,6 @@
 import copy
 import gc
+import keyword
 import math
 import os
 from collections.abc import Mapping
@@ -32,7 +33,7 @@ from ..core import (
     _validate_time_scalar,
     make_intra,
 )
-from ..multi import concat_models, indices
+from ..multi import concat_models, offsets
 from ..parametric import is_parametric, to_param
 from ..rng import RNGMixin
 from ..slice import SynapseSlots
@@ -220,6 +221,103 @@ def get_local_index(population, mech, index):
         ),
     )
     return indices.index_select(0, index)
+
+
+def _mechanism_slot_flat_indices(model, mechanism):
+    """Materialize population-flat mechanism slots in exact local order."""
+    support_spec = getattr(mechanism, "support_spec", None)
+    if support_spec is not None:
+        return support_spec.materialized_flat_indices(
+            getattr(mechanism, "key", None), device="cpu"
+        )
+    return (
+        to_flat_idx_mech(model.shape, mechanism, model.device())
+        .to(dtype=torch.long)
+        .detach()
+        .cpu()
+    )
+
+
+def _packed_synapse_local_index_map(
+    component,
+    component_synapse,
+    packed,
+    packed_synapse,
+    component_offset,
+):
+    """Map one component's synapse-local slots into a packed mechanism.
+
+    Mechanism compilation can reorder slots when placements with different
+    multiplicity policies are combined. In particular, a copied point process
+    switches the merged mechanism to record-ordered multiset storage even when
+    another component used a sorted union. Match physical compartments and
+    stable duplicate occurrence ranks instead of assuming one prefix offset.
+    """
+    component_slot_flat = _mechanism_slot_flat_indices(component, component_synapse)
+    packed_slot_flat = _mechanism_slot_flat_indices(packed, packed_synapse)
+
+    component_size = component.v.numel()
+    component_stop = component_offset + component_size
+    packed_component_local = torch.nonzero(
+        (packed_slot_flat >= component_offset) & (packed_slot_flat < component_stop),
+        as_tuple=False,
+    ).flatten()
+    packed_component_relative = (
+        packed_slot_flat.index_select(0, packed_component_local) - component_offset
+    )
+
+    if component_slot_flat.numel() != packed_component_relative.numel():
+        raise RuntimeError(
+            "Concatenation changed the local slot count for mechanism "
+            f"{component_synapse.name!r} in population {component.name!r}: "
+            f"expected {component_slot_flat.numel()}, got "
+            f"{packed_component_relative.numel()}. Connection targets cannot be "
+            "remapped safely."
+        )
+
+    if torch.equal(component_slot_flat, packed_component_relative):
+        return packed_component_local
+
+    component_order = torch.argsort(component_slot_flat, stable=True)
+    packed_order = torch.argsort(packed_component_relative, stable=True)
+    if not torch.equal(
+        component_slot_flat.index_select(0, component_order),
+        packed_component_relative.index_select(0, packed_order),
+    ):
+        raise RuntimeError(
+            "Concatenation changed the physical slot placement for mechanism "
+            f"{component_synapse.name!r} in population {component.name!r}. "
+            "Connection targets cannot be remapped safely."
+        )
+
+    mapping = torch.empty_like(component_order)
+    mapping[component_order] = packed_component_local.index_select(0, packed_order)
+    return mapping
+
+
+def _rebind_cloned_population_clocks(populations):
+    """Point dynamic mechanism clocks at cloned owners after deepcopy."""
+    visited = set()
+
+    def rebind(population):
+        if id(population) in visited:
+            return
+        visited.add(id(population))
+
+        mechanism_handler = getattr(population, "mech", None)
+        if mechanism_handler is not None:
+            for mechanism in mechanism_handler.mechanisms.values():
+                mechanism.setreference("t", lambda population=population: population.t)
+            for process in getattr(
+                mechanism_handler, "material_processes", {}
+            ).values():
+                process.setreference("t", lambda population=population: population.t)
+
+        for component in getattr(population, "populations", {}).values():
+            rebind(component)
+
+    for population in populations.values():
+        rebind(population)
 
 
 def _last_celsius(populations):
@@ -3625,8 +3723,8 @@ class Network(RNGMixin):
                     new_target_idx,
                     synapse,
                     threshold,
-                    _evaluate(weight),
-                    _evaluate(delay),
+                    weight,
+                    delay,
                     pre_var=pre_var,
                 )
         for k, v in _continuous_synapse_spec.items():
@@ -3660,8 +3758,8 @@ class Network(RNGMixin):
                     target_pop,
                     new_target_idx,
                     synapse,
-                    weight=_evaluate(weight),
-                    delay=_evaluate(delay),
+                    weight=weight,
+                    delay=delay,
                     pre_var=pre_var,
                     input=input_name,
                     reduce=reduce,
@@ -3676,18 +3774,101 @@ class Network(RNGMixin):
         """In-place variant of :meth:`batch` that returns ``None``."""
         self.batch(n, include_netstim=include_netstim)
 
-    def concat(self, **kwargs):
+    def _normalize_concat_population_names(self, pops_to_concatenate):
+        """Return one validated, deterministic population-name list."""
+        if pops_to_concatenate is None:
+            names = list(self.populations)
+        else:
+            if isinstance(pops_to_concatenate, str):
+                raise TypeError(
+                    "Populations to concatenate must be an ordered iterable of "
+                    "population names, not a single string."
+                )
+            if isinstance(pops_to_concatenate, (Mapping, set, frozenset)):
+                raise TypeError(
+                    "Populations to concatenate must be an ordered iterable of "
+                    "population names."
+                )
+            try:
+                names = list(pops_to_concatenate)
+            except TypeError as exc:
+                raise TypeError(
+                    "Populations to concatenate must be an ordered iterable of "
+                    "population names."
+                ) from exc
+
+        if not names:
+            raise ValueError("At least one population must be selected to concatenate.")
+        if any(not isinstance(population_name, str) for population_name in names):
+            raise TypeError("Population names to concatenate must all be strings.")
+
+        seen_names = set()
+        duplicate_names = []
+        for population_name in names:
+            if population_name in seen_names and population_name not in duplicate_names:
+                duplicate_names.append(population_name)
+            seen_names.add(population_name)
+        if duplicate_names:
+            formatted = ", ".join(repr(item) for item in duplicate_names)
+            raise ValueError(
+                f"Population names may only be selected once; duplicates: {formatted}."
+            )
+
+        missing_names = [name for name in names if name not in self.populations]
+        if missing_names:
+            formatted = ", ".join(repr(item) for item in missing_names)
+            raise KeyError(
+                f"Unknown population(s) selected for concatenation: {formatted}."
+            )
+        return names
+
+    def _validate_concat_output_name(self, name, selected_names):
+        """Reject group names that cannot safely become Network attributes."""
+        if (
+            not name
+            or not name.isidentifier()
+            or keyword.iskeyword(name)
+            or name.startswith("_")
+        ):
+            raise ValueError(
+                "Concatenated population names must be public Python identifiers."
+            )
+        if name == "netstim":
+            raise ValueError(
+                "'netstim' is reserved and cannot name a population group."
+            )
+
+        reserved_instance_names = (
+            set(vars(self))
+            | set(self._modules)
+            | set(self._parameters)
+            | set(self._buffers)
+        ) - set(self.populations)
+        if hasattr(type(self), name) or name in reserved_instance_names:
+            raise ValueError(
+                f"Population name {name!r} is reserved by Network and cannot name "
+                "a concatenated group."
+            )
+        if name in self.populations and name not in selected_names:
+            raise ValueError(f"Population '{name}' is already in use.")
+
+    def concat(self, *, threads=16, **kwargs):
         """
         Concatenates populations to solve with fewer kernel launches.
         All connections are preserved.
 
         Parameters
         ----------
+        threads : int, optional
+            DHS solver lane count for groups containing Tree or Cable models.
+            Must divide 32. Default is 16.
         **kwargs : dict
             Populations to concatenate, where keys are the new population names
             and values are lists of population names to concatenate. If no
             populations are specified, all populations will be concatenated into
-            'all_populations'.
+            'all_populations'. A group may reuse the name of one of the
+            populations it replaces, but may not collide with an unselected
+            population or a Network attribute.
 
         Returns
         -------
@@ -3708,48 +3889,109 @@ class Network(RNGMixin):
         >>> net2 = net.concat(exc=['exc1', 'exc2'])
         >>> print(list(net2.populations.keys()))
         ['exc', 'inh']
+
+        Notes
+        -----
+        This is a preprocessing transform rather than a live simulation-state
+        continuation. The returned Network owns cloned population and NetStim
+        objects, so a subsequent :meth:`batch` cannot mutate the source
+        Network. Wiring weight, delay, and transform modules retain their
+        identity, so existing optimizer references to those connection modules
+        remain valid. Population parameter modules are cloned; create an
+        optimizer after this transform when optimizing population parameters.
+        Apply concatenation before initialization when pending event queues and
+        the exact runtime clock matter.
         """
         if not kwargs:
-            return self._concat("all_populations")
+            return self._concat("all_populations", threads=threads)
+
+        normalized_groups = {}
+        selected_by_group = {}
+        for name, selection in kwargs.items():
+            if selection is None:
+                raise TypeError(
+                    "Named concatenation groups require an ordered iterable of "
+                    "population names. Use net.concat() to concatenate all populations."
+                )
+            selected = self._normalize_concat_population_names(selection)
+            self._validate_concat_output_name(name, selected)
+            for population_name in selected:
+                previous = selected_by_group.get(population_name)
+                if previous is not None:
+                    raise ValueError(
+                        f"Population {population_name!r} is selected by both "
+                        f"concatenation groups {previous!r} and {name!r}. Groups "
+                        "must be disjoint."
+                    )
+                selected_by_group[population_name] = name
+            normalized_groups[name] = selected
+
         net = self
-        for name, pops_to_concatenate in kwargs.items():
-            net = net._concat(name, pops_to_concatenate)
+        clone_inputs = True
+        for name, pops_to_concatenate in normalized_groups.items():
+            net = net._concat(
+                name,
+                pops_to_concatenate,
+                threads=threads,
+                clone_inputs=clone_inputs,
+            )
+            clone_inputs = False
         return net
 
-    def _concat(self, name, pops_to_concatenate=None, threads=16):
-        if pops_to_concatenate is None:
-            pops_to_concatenate = []
-        already_used = [
-            n for n in self.populations.keys() if n not in pops_to_concatenate
-        ]
-        if name in already_used:
-            raise ValueError(f"Population '{name}' is already in use.")
+    def _concat(
+        self,
+        name,
+        pops_to_concatenate=None,
+        threads=16,
+        *,
+        clone_inputs=True,
+    ):
         if self.is_batched:
             raise ValueError("Cannot concatenate populations in a batched network.")
-        if not pops_to_concatenate:
-            pops_to_concatenate = list(self.populations.keys())
 
-        concat_pops = {n: self.populations[n] for n in pops_to_concatenate}
-        p_type = type(self.populations[pops_to_concatenate[0]])
-        assert all(type(self.populations[n]) is p_type for n in pops_to_concatenate), (
-            "All populations must be of the same type."
+        pops_to_concatenate = self._normalize_concat_population_names(
+            pops_to_concatenate
         )
+        self._validate_concat_output_name(name, pops_to_concatenate)
+
+        # A concatenated network owns its structural state.  In particular,
+        # batching a MultiPopulation also batches all of its component models;
+        # retaining the input objects here would therefore corrupt the source
+        # Network while leaving its ``is_batched`` flag stale.  Clone all
+        # populations together so intentional sharing inside the model graph is
+        # retained, while connection parameter modules remain shared exactly as
+        # they were before this ownership fix.
+        if clone_inputs:
+            clone_memo = {}
+            cloned_populations = copy.deepcopy(dict(self.populations), clone_memo)
+            cloned_netstim = copy.deepcopy(self.netstim, clone_memo)
+            _rebind_cloned_population_clocks(cloned_populations)
+        else:
+            cloned_populations = dict(self.populations)
+            cloned_netstim = self.netstim
+
+        concat_pops = {n: cloned_populations[n] for n in pops_to_concatenate}
+        component_offsets = dict(zip(pops_to_concatenate, offsets(concat_pops)))
         celsius = _last_celsius(concat_pops).item()
         concatenated = concat_models(concat_pops, threads=threads, celsius=celsius)
-        new_populations = {
-            n: p for n, p in self.populations.items() if n not in pops_to_concatenate
-        }
-        new_populations[name] = concatenated
+        new_populations = {}
+        inserted = False
+        for population_name, population in cloned_populations.items():
+            if population_name in concat_pops:
+                if not inserted:
+                    new_populations[name] = concatenated
+                    inserted = True
+                continue
+            new_populations[population_name] = population
         new_net = Network(
             new_populations,
-            netstim=self.netstim,
+            netstim=cloned_netstim,
+            seed=self._base_seed,
             track_netcon_events=self.track_netcon_events,
             netcon_delay_backend=self.netcon_delay_backend,
             netcon_train_backend=self.netcon_train_backend,
         )
-
-        all_indices = indices(concat_pops)
-        all_indices = {n: i.flatten() for n, i in zip(pops_to_concatenate, all_indices)}
+        target_slot_mappings = {}
 
         def remapped_endpoint(population_name):
             if population_name in pops_to_concatenate:
@@ -3763,24 +4005,56 @@ class Network(RNGMixin):
                 return new_net.netstim
             return new_net.populations[population_name]
 
+        def remapped_target_index(population_name, original_synapse, target_idx):
+            if population_name not in concat_pops:
+                return target_idx
+
+            component = cloned_populations[population_name]
+            component_synapse = getattr(component.mech, original_synapse.name)
+            self._require_live_target_synapse(component, component_synapse)
+            packed_synapse = getattr(concatenated.mech, original_synapse.name)
+            mapping_key = (population_name, original_synapse.name)
+            mapping = target_slot_mappings.get(mapping_key)
+            if mapping is None:
+                mapping = _packed_synapse_local_index_map(
+                    component,
+                    component_synapse,
+                    concatenated,
+                    packed_synapse,
+                    component_offsets[population_name],
+                )
+                target_slot_mappings[mapping_key] = mapping
+
+            target_idx = target_idx.to(dtype=torch.long)
+            invalid = (target_idx < 0) | (target_idx >= mapping.numel())
+            if torch.any(invalid):
+                bad = target_idx[invalid][:10].detach().cpu().tolist()
+                raise IndexError(
+                    f"Stored target slot indices for mechanism "
+                    f"{original_synapse.name!r} in population "
+                    f"{population_name!r} are out of range: {bad}."
+                )
+            return mapping.to(device=target_idx.device).index_select(0, target_idx)
+
         # now reapply connections
         for k, v in self.synapse_spec.items():
-            source_name, target_name, synapse, pre_var = k
+            source_name, target_name, original_synapse, pre_var = k
             source_pop = remapped_endpoint(source_name)
             target_pop = remapped_endpoint(target_name)
-            synapse = getattr(target_pop.mech, synapse.name)
+            synapse = getattr(target_pop.mech, original_synapse.name)
 
             for data in v:
                 source_idx, target_idx = data[0], data[1]
                 threshold, weight, delay = data[2], data[4], data[6]
 
                 if source_name in pops_to_concatenate:
-                    source_idx = all_indices[source_name][source_idx]
+                    source_idx = source_idx + component_offsets[source_name]
 
                 # target_idx is local to the target synapse, not population-flat.
-                # Reinserted component synapses preserve their own local ordering
-                # inside the concatenated population, so it must not be offset by
-                # the owning population's compartment position.
+                # Rebuilds may merge and reorder slots from several components.
+                target_idx = remapped_target_index(
+                    target_name, original_synapse, target_idx
+                )
 
                 new_net._connect(
                     source_pop,
@@ -3798,7 +4072,7 @@ class Network(RNGMixin):
             (
                 source_name,
                 target_name,
-                synapse,
+                original_synapse,
                 pre_var,
                 input_name,
                 reduce,
@@ -3806,13 +4080,16 @@ class Network(RNGMixin):
             ) = k
             source_pop = remapped_endpoint(source_name)
             target_pop = remapped_endpoint(target_name)
-            synapse = getattr(target_pop.mech, synapse.name)
+            synapse = getattr(target_pop.mech, original_synapse.name)
 
             for data in v:
                 source_idx, target_idx = data[0], data[1]
                 weight, delay = data[2], data[4]
                 if source_name in pops_to_concatenate:
-                    source_idx = all_indices[source_name][source_idx]
+                    source_idx = source_idx + component_offsets[source_name]
+                target_idx = remapped_target_index(
+                    target_name, original_synapse, target_idx
+                )
 
                 new_net._connect_continuous(
                     source_pop,
@@ -3828,6 +4105,8 @@ class Network(RNGMixin):
                     transform=transform,
                 )
 
+        new_net.set_rng_state(self.rng_state())
+        new_net.train(self.training)
         return new_net
 
     def _enable_synapse_state_cache_recording(self):
