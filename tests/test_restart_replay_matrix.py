@@ -5,7 +5,7 @@ import copy
 import pytest
 import torch
 
-import dendra as dn  # configure Dendra before importing torch
+import dendra as dn
 from dendra.models.mechanisms import Mechanism
 from dendra.models.mod import pas
 

@@ -69,6 +69,28 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 
 - Library of models: install the companion package [`dendra-models`](https://gitlab.oit.duke.edu/mah148/dendra-models) for additional pre-defined neuron & network models.
 
+### Optional TorchInductor cache isolation
+
+Importing Dendra leaves TorchInductor's cache behavior at PyTorch's defaults.
+Dendra's cache-directory, precompiled-header, compile-thread, and CPU ISA cache
+overrides are all opt-in. To enable them with per-process cache isolation, set
+the following environment variable before starting Python:
+
+```sh
+export DENDRA_CONFIGURE_TORCHINDUCTOR_CACHE=1
+python your_simulation.py
+```
+
+With this option enabled, the default cache policy is `process`. Set
+`DENDRA_INDUCTOR_CACHE_POLICY=shared` to retain a shared cache, or `off` to
+disable configuration even when the import gate is enabled. Dendra must be
+imported before PyTorch so the cache settings take effect reliably:
+
+```python
+import dendra as dn
+import torch
+```
+
 (interactive-jupyter)=
 ### Interactive Jupyter figures
 

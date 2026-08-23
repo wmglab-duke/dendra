@@ -4,7 +4,7 @@ import math
 import pytest
 import torch
 
-import dendra as dn  # noqa: F401 - configure Torch before importing it directly
+import dendra as dn  # noqa: F401 - initialize Dendra before integrator imports
 from dendra.models.integrators.core import (
     Integrator,
     _broadcast_to_shape,

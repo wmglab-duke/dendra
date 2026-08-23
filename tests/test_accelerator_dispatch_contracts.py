@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import dendra  # noqa: F401  # configure TorchInductor before importing torch
+import dendra  # noqa: F401 - initialize Dendra before loading integrator modules
 from dendra.models.integrators.triton import (
     TRITON_AVAILABLE,
     dhs_bt_solve_cuda,

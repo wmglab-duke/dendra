@@ -9,9 +9,15 @@ os.environ.setdefault("MKL_DYNAMIC", "FALSE")
 os.environ["OMP_PROC_BIND"] = "true"
 os.environ["OMP_PLACES"] = "cores"
 
-from ._bootstrap import configure_torchinductor_cache_for_dendra
+from ._bootstrap import (
+    _should_cache_cpu_isa_for_dendra,
+    _should_configure_torchinductor_cache_on_import,
+    configure_torchinductor_cache_for_dendra,
+)
 
-configure_torchinductor_cache_for_dendra()
+_torchinductor_cache_opt_in = _should_configure_torchinductor_cache_on_import()
+if _torchinductor_cache_opt_in:
+    configure_torchinductor_cache_for_dendra()
 
 import pickle
 import time
@@ -240,7 +246,8 @@ def _cache_cpu_isa_list():
         return
 
 
-_cache_cpu_isa_list()
+if _torchinductor_cache_opt_in and _should_cache_cpu_isa_for_dendra():
+    _cache_cpu_isa_list()
 
 # setup environment
 allow_tf32(bool(TF32))

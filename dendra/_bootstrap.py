@@ -13,6 +13,22 @@ import warnings
 from contextlib import contextmanager
 from pathlib import Path
 
+_DISABLED_INDUCTOR_CACHE_POLICIES = {
+    "0",
+    "false",
+    "none",
+    "off",
+    "disable",
+    "disabled",
+}
+_PROCESS_INDUCTOR_CACHE_POLICIES = {
+    "process",
+    "isolated",
+    "per_process",
+    "per-process",
+}
+_SHARED_INDUCTOR_CACHE_POLICIES = {"shared", "global"}
+
 
 @contextmanager
 def torch_compiler_warning_context():
@@ -59,6 +75,19 @@ def _truthy(x: str | None) -> bool:
     return str(x).lower() in {"1", "true", "yes", "on"}
 
 
+def _should_configure_torchinductor_cache_on_import() -> bool:
+    """Return whether importing Dendra should configure TorchInductor's cache."""
+    return _truthy(os.environ.get("DENDRA_CONFIGURE_TORCHINDUCTOR_CACHE", "0"))
+
+
+def _should_cache_cpu_isa_for_dendra() -> bool:
+    """Return whether the selected policy enables Dendra's CPU ISA cache."""
+    policy = os.environ.get("DENDRA_INDUCTOR_CACHE_POLICY", "process").lower()
+    return policy in (
+        _PROCESS_INDUCTOR_CACHE_POLICIES | _SHARED_INDUCTOR_CACHE_POLICIES
+    )
+
+
 def _get_notebook_or_process_id() -> str:
     """
     Stable-enough process identifier for interactive notebooks and scripts.
@@ -81,6 +110,11 @@ def configure_torchinductor_cache_for_dendra() -> None:
 
     Environment variables
     ---------------------
+    DENDRA_CONFIGURE_TORCHINDUCTOR_CACHE:
+        "1" opts ``import dendra`` into Dendra-managed TorchInductor cache
+        behavior, including this function and the CPU ISA cache. Default: "0".
+        The flag does not affect explicit calls to this function.
+
     DENDRA_INDUCTOR_CACHE_POLICY:
         "process"  -> per-process cache directory, safest for notebooks
         "shared"   -> leave TORCHINDUCTOR_CACHE_DIR alone unless user set it
@@ -101,7 +135,7 @@ def configure_torchinductor_cache_for_dendra() -> None:
     """
     policy = os.environ.get("DENDRA_INDUCTOR_CACHE_POLICY", "process").lower()
 
-    if policy in {"0", "false", "none", "off", "disable", "disabled"}:
+    if policy in _DISABLED_INDUCTOR_CACHE_POLICIES:
         return
 
     # This is the important limitation. If torch is already imported, some
@@ -117,7 +151,7 @@ def configure_torchinductor_cache_for_dendra() -> None:
         )
         return
 
-    if policy in {"process", "isolated", "per_process", "per-process"}:
+    if policy in _PROCESS_INDUCTOR_CACHE_POLICIES:
         root = Path(
             os.environ.get(
                 "DENDRA_INDUCTOR_CACHE_ROOT",
@@ -155,7 +189,7 @@ def configure_torchinductor_cache_for_dendra() -> None:
 
             atexit.register(_cleanup_cache_dir)
 
-    elif policy in {"shared", "global"}:
+    elif policy in _SHARED_INDUCTOR_CACHE_POLICIES:
         # Respect user's chosen shared cache. Do not clean it automatically.
         if _truthy(os.environ.get("DENDRA_INDUCTOR_DISABLE_PCH", "1")):
             os.environ.setdefault("TORCHINDUCTOR_CPP_CACHE_PRECOMPILE_HEADERS", "0")

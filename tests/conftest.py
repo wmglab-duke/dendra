@@ -6,9 +6,8 @@ from pathlib import PurePosixPath
 
 import pytest
 
-# Dendra configures TorchInductor during package import. Import it before test
-# modules have a chance to import torch so collection itself exercises the
-# supported initialization order and warnings can be treated as errors.
+# Import Dendra once before test-module collection so process-wide runtime
+# initialization is deterministic. TorchInductor cache configuration is opt-in.
 import dendra  # noqa: F401
 
 _NEURON_MODULES = {

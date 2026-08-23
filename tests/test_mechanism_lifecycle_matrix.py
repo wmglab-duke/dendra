@@ -7,7 +7,7 @@ import warnings
 import pytest
 import torch
 
-import dendra  # noqa: F401  (configure Dendra before importing torch)
+import dendra  # noqa: F401 - initialize Dendra before mechanism imports
 from dendra.models.mechanisms import Mechanism, PointProcess, State
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion

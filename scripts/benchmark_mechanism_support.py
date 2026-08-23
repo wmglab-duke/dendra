@@ -32,7 +32,7 @@ from collections.abc import Sequence
 import torch
 from torch.utils.benchmark import Compare, Timer
 
-import dendra as dn  # noqa: F401 - configure TorchInductor before importing Torch
+import dendra as dn  # noqa: F401 - initialize Dendra before mechanism imports
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._support import SupportMap, SupportSpec
 from dendra.models.mechanisms._support_registry import SupportRegistry

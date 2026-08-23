@@ -8,7 +8,7 @@ import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-import dendra as dn  # configure Dendra before importing torch
+import dendra as dn
 from dendra.models.mechanisms import Mechanism
 from dendra.models.mod import pas
 
