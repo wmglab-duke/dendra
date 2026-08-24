@@ -11,6 +11,79 @@ _INDEX_DTYPES = (torch.int32, torch.int64)
 _WARP_SIZE = 32
 
 
+def flatten_vmap_solver_batch(info, in_dims, *tensors):
+    """Merge a vmap dimension into a solver's existing leading batch.
+
+    Triton solver kernels already process an explicit ``B`` dimension.  A
+    transform adds another logical batch dimension, ``V``.  Moving ``V`` to
+    the front, broadcasting any unbatched operands across it, and reshaping
+    ``(V, B, ...)`` to ``(V * B, ...)`` lets the existing kernels process the
+    transform without a per-example fallback loop.
+    """
+    transform_batch = info.batch_size
+    prepared = []
+    solver_batch = None
+
+    for tensor, in_dim in zip(tensors, in_dims, strict=True):
+        if in_dim is None:
+            value = tensor.unsqueeze(0).expand(transform_batch, *tensor.shape)
+        else:
+            value = tensor.movedim(in_dim, 0)
+
+        current_batch = value.shape[1]
+        if solver_batch is None:
+            solver_batch = current_batch
+        elif current_batch != solver_batch:
+            raise ValueError("all solver operands must have the same batch size")
+        prepared.append(value)
+
+    if solver_batch is None:
+        raise ValueError("at least one solver operand is required")
+
+    flattened = tuple(
+        value.reshape(transform_batch * solver_batch, *value.shape[2:])
+        for value in prepared
+    )
+    return flattened, solver_batch
+
+
+def restore_vmap_solver_batch(tensor, transform_batch, solver_batch):
+    """Restore a flattened solver result to ``(V, B, ...)`` layout."""
+    return tensor.reshape(transform_batch, solver_batch, *tensor.shape[1:])
+
+
+def is_vmap_batched_tensor(tensor):
+    """Return whether ``tensor`` carries a hidden functorch batch dimension."""
+    # These private Functorch predicates are eager-only Python builtins that
+    # Dynamo cannot trace. During ordinary compiled training, the cotangent is
+    # not transform-wrapped and the existing raw-kernel branch is the correct
+    # path; avoid even presenting the predicates to the tracer. Compiling a
+    # vmap-of-VJP transform around these old-style autograd Functions is not a
+    # supported contract; apply this eager transform outside the compiled
+    # region instead.
+    if torch.compiler.is_compiling():
+        return False
+    functorch = torch._C._functorch
+    return functorch.is_batchedtensor(tensor) or functorch.is_legacy_batchedtensor(
+        tensor
+    )
+
+
+def reject_nested_vmap(operator_name, *tensors):
+    """Fail clearly before a hidden outer batch reaches a raw Triton launch.
+
+    The tree adjoint rules own mutable elimination workspaces and therefore
+    launch their kernels directly after flattening one transform level.  A
+    nested transform would leave another hidden batch level on those tensors,
+    which raw Triton pointer arithmetic cannot interpret safely.
+    """
+    if any(is_vmap_batched_tensor(tensor) for tensor in tensors):
+        raise RuntimeError(
+            f"{operator_name} does not support nested vmap; flatten the "
+            "cotangent batch dimensions before applying torch.vmap"
+        )
+
+
 def _require_tensors(named_tensors: Iterable[tuple[str, object]]) -> None:
     for name, tensor in named_tensors:
         if not isinstance(tensor, torch.Tensor):

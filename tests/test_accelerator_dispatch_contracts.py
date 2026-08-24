@@ -14,6 +14,7 @@ from dendra.models.integrators.triton import (
 from dendra.models.integrators.triton._contracts import (
     adjoint_main_blocks,
     copy_rhs_workspace,
+    is_vmap_batched_tensor,
     validate_block_tridiagonal,
     validate_threads,
     validate_tree,
@@ -183,6 +184,17 @@ def test_block_adjoint_transposes_main_blocks_and_rhs_workspace_is_independent()
     assert workspace.data_ptr() != rhs.data_ptr()
     workspace.zero_()
     assert torch.count_nonzero(rhs) > 0
+
+
+def test_vmap_batch_detection_is_dynamo_fullgraph_safe():
+    def branch_on_transform(tensor):
+        if is_vmap_batched_tensor(tensor):
+            return tensor + 1
+        return tensor - 1
+
+    compiled = torch.compile(branch_on_transform, backend="eager", fullgraph=True)
+    value = torch.tensor([2.0])
+    torch.testing.assert_close(compiled(value), value - 1)
 
 
 def test_pack_structure_rejects_wrong_word_width_and_mixed_devices():

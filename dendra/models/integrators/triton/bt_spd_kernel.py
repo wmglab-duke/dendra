@@ -463,6 +463,11 @@ def thomas_bt3_spd_solve_with_chol_kernel(
 import torch  # noqa: E402
 from torch.library import triton_op, wrap_triton  # noqa: E402
 
+from ._contracts import (  # noqa: E402
+    flatten_vmap_solver_batch,
+    restore_vmap_solver_batch,
+)
+
 
 def _check_bt_spd_cuda_shapes(
     lower: torch.Tensor,
@@ -642,6 +647,18 @@ def solve_bt_spd_solve_with_chol_impl(
 @solve_bt_spd_solve_with_chol_impl.register_fake
 def _(lower, upper, chol, rhs):
     return rhs.new_empty(rhs.shape)
+
+
+@solve_bt_spd_solve_with_chol_impl.register_vmap
+def _solve_bt_spd_with_chol_vmap(info, in_dims, lower, upper, chol, rhs):
+    flattened, solver_batch = flatten_vmap_solver_batch(
+        info, in_dims, lower, upper, chol, rhs
+    )
+    if info.batch_size == 0:
+        x = flattened[-1].new_empty(flattened[-1].shape)
+    else:
+        x = solve_bt_spd_solve_with_chol_impl(*flattened)
+    return restore_vmap_solver_batch(x, info.batch_size, solver_batch), 0
 
 
 class _SolveBTSPDCudaConsumeUnchecked(torch.autograd.Function):
