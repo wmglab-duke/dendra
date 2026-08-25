@@ -14,3 +14,4 @@ Advanced
    advanced/A5_runtime_contracts.rst
    advanced/A6_mechanism_support_layouts.rst
    advanced/A7_model_initialization.rst
+   advanced/A8_functional_populations.rst

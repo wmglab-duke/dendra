@@ -153,5 +153,6 @@ frontend/node_modules/
 dendra/models/heterogeneous/*.cpp
 
 .codex/
+/codex-docs/
 experiments/
 results/

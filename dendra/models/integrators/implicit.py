@@ -448,6 +448,94 @@ class _bwd_euler_ub(Integrator):
 
         return v_new, i_membrane
 
+    def _functional_step_reference(
+        self,
+        v,
+        dt,
+        temp,
+        ve=None,
+        intra=None,
+        *,
+        solver=None,
+    ):
+        """Return one UB transition without mutating integrator scratch.
+
+        This parallel reference path leaves the performance-critical imperative
+        ``_step`` implementation unchanged. Registered mechanism state may be
+        rebound while it runs, so callers must provide an isolated functional
+        module context. Handler current aggregation and ``_last_bands`` are
+        fully call-local, which makes this path safe for ``vmap`` lanes.
+        """
+        dt_s = dt * 1e-3
+
+        v = self.mech.update_v(v)
+        self._advance_pre_current(v, dt, temp)
+
+        (
+            itot,
+            gtot,
+            ion_current_frame,
+            ion_conductance_frame,
+        ) = self.mech._functional_i_reference(v)
+
+        v_flat = _flatten_to_solve(v, self.K, self.base_shape)
+        itot = _flatten_to_solve(itot, self.K, self.base_shape)
+        gtot = _flatten_to_solve(gtot, self.K, self.base_shape)
+
+        f_n = (gtot * v_flat - itot) * self.scale
+
+        if ve is not None:
+            ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
+            delta_ve = ve_flat[..., 1:] - ve_flat[..., :-1]
+            extracellular = torch.zeros_like(ve_flat)
+            extracellular[..., :-1] += self.g_edge_Cinv * delta_ve
+            extracellular[..., 1:] -= self.g_edge_Cinv_right * delta_ve
+            f_n = f_n + extracellular
+
+        if intra is not None:
+            f_n = f_n + (
+                _flatten_to_solve(intra, self.K, self.base_shape) * self.cm_inv
+            )
+
+        rhs = v_flat + dt_s * f_n
+        main = 1.0 - dt_s * (self.diag_base - gtot * self.scale)
+
+        if self.K == 1:
+            v_np1 = rhs / main
+        else:
+            solve = self._solve if solver is None else solver
+            if self.use_gc_variant:
+                v_np1 = solve(
+                    self.lower,
+                    main,
+                    self.upper,
+                    rhs,
+                    self.clip_scale,
+                )
+            else:
+                v_np1 = solve(self.lower, main, self.upper, rhs)
+
+        i_membrane = None
+        if self.imem:
+            area = self.scale / self.cm_inv
+            capacitance = 1.0 / self.cm_inv
+            capacitive_conductance = capacitance / dt_s
+            ionic_conductance = gtot * area
+            ionic_current = itot * area
+            membrane_conductance = capacitive_conductance + ionic_conductance
+            i_membrane = (
+                membrane_conductance * (v_np1 - v_flat) + ionic_current
+            ).reshape(self.base_shape)
+
+        v_new = v_np1.reshape(self.base_shape)
+        accepted_frame = self._linearize_ion_current_frame(
+            ion_current_frame,
+            ion_conductance_frame,
+            v_new - v,
+        )
+        self._advance_post_current(v, dt, temp, accepted_frame)
+        return v_new, i_membrane
+
 
 class _bwd_euler_bt(Integrator):
     r"""

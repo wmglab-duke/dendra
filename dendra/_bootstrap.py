@@ -42,6 +42,20 @@ def torch_compiler_warning_context():
         )
         warnings.filterwarnings(
             "ignore",
+            message=r".*torch\.jit\.script.*deprecated.*",
+            category=DeprecationWarning,
+            module=r"torch\.jit\._script",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=(
+                r".*The \.grad attribute of a Tensor that is not a leaf Tensor "
+                r"is being accessed.*"
+            ),
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
             message=(
                 r".*torch\.autograd\.function\.Function.*should not be "
                 r"instantiated\..*Methods on autograd functions.*"

@@ -17,7 +17,7 @@ from dendra.models.parametric import Parameterized
 
 from ._ions import VALENCES
 from ._materials import _canonical_material_name
-from ._state import State
+from ._state import State, _materialize_derived_buffers
 from ._support import SupportMap, SupportSpec
 from ._symbolic import build_current_eq
 
@@ -288,6 +288,7 @@ class Mechanism(Parameterized):
     _material = set()
     _save = set()
     _assigned = set()
+    _derived_buffers = set()
     _explicit = set()
     _numerical = set()
     _affine = set()
@@ -298,6 +299,7 @@ class Mechanism(Parameterized):
     _material_declarations = []
     _save_declarations = []
     _assigned_declarations = []
+    _derived_buffer_declarations = []
     _explicit_declarations = []
     _numerical_declarations = []
     _affine_declarations = []
@@ -348,6 +350,7 @@ class Mechanism(Parameterized):
         new_material = set()
         new_save = set()
         new_assigned = set()
+        new_derived_buffers = set()
         new_explicit = set()
         new_numerical = set()
         new_affine = set()
@@ -377,6 +380,8 @@ class Mechanism(Parameterized):
                 new_save.update(base._save)
             if "_assigned" in base.__dict__:
                 new_assigned.update(base._assigned)
+            if "_derived_buffers" in base.__dict__:
+                new_derived_buffers.update(base._derived_buffers)
             if "_read_ion" in base.__dict__:
                 new_read_ion.update(base._read_ion)
             if "_write_ion" in base.__dict__:
@@ -434,6 +439,13 @@ class Mechanism(Parameterized):
             cls, "mechanism.assigned", Mechanism._assigned_declarations
         ):
             new_assigned.update(a_list)
+        for b_list in consume_class_values(
+            cls,
+            "mechanism.derived_buffers",
+            Mechanism._derived_buffer_declarations,
+        ):
+            new_derived_buffers.update(b_list)
+        new_assigned.update(new_derived_buffers)
         for r_dict in consume_class_values(
             cls, "mechanism.read_ion", Mechanism._read_ion_declarations
         ):
@@ -521,6 +533,7 @@ class Mechanism(Parameterized):
         cls._save = new_save
         cls._currents = new_currents
         cls._assigned = new_assigned
+        cls._derived_buffers = new_derived_buffers
         cls._read_ion = new_read_ion
         cls._write_ion = new_write_ion
         cls._write_ion_c = new_write_ion_c
@@ -1149,29 +1162,43 @@ class Mechanism(Parameterized):
             self._set_local_material_buffer(local_name, torch.zeros_like(local))
 
     def _init_buffers_s(self, v_init):
-        for state_module in self.DE.values():
-            state_names = state_module._state
-            for state_name in state_names:
-                if state_name in self._init_params:
-                    buffer_tensor = (
-                        torch.as_tensor(
-                            self._init_params[state_name],
-                            device=v_init.device,
-                            dtype=v_init.dtype,
+        states = tuple(self.DE.values())
+        try:
+            # Static workspaces are initialization inputs, so both the
+            # Mechanism and every nested State must see them before State.inf,
+            # explicit INIT assignment, or either authored initial hook runs.
+            _materialize_derived_buffers(self)
+            for state_module in states:
+                state_module._prepare_derived_buffers_for_initialize()
+
+            for state_module in states:
+                state_names = state_module._state
+                for state_name in state_names:
+                    if state_name in self._init_params:
+                        buffer_tensor = (
+                            torch.as_tensor(
+                                self._init_params[state_name],
+                                device=v_init.device,
+                                dtype=v_init.dtype,
+                            )
+                            .expand_as(v_init)
+                            .clone()
                         )
-                        .expand_as(v_init)
-                        .clone()
-                    )
-                    setattr(self, state_name, buffer_tensor.detach())
-                else:
-                    if inf := state_module.inf(v_init):
-                        buffer_tensor = inf[state_name]
                         setattr(self, state_name, buffer_tensor.detach())
+                    else:
+                        if inf := state_module.inf(v_init):
+                            buffer_tensor = inf[state_name]
+                            setattr(self, state_name, buffer_tensor.detach())
 
-        self.initial(v_init)
+            self.initial(v_init)
 
-        for _, s in self.DE.items():
-            s.initialize(v_init)
+            for state_module in states:
+                state_module.initialize(v_init)
+        finally:
+            # An external State.initialize override may not call super(). Do
+            # not let its one-shot marker leak into a direct later initialize.
+            for state_module in states:
+                state_module._clear_derived_buffers_for_initialize()
 
         return
 
@@ -1206,6 +1233,31 @@ class Mechanism(Parameterized):
         """
         declare_class_value(
             "mechanism.assigned", args, Mechanism._assigned_declarations
+        )
+
+    @staticmethod
+    def DERIVED_BUFFER(*args):
+        """Declare initialization-static buffers built by ``derive_buffers``.
+
+        A derived buffer is also an ordinary :meth:`BUFFER`, retaining existing
+        registration and checkpoint compatibility. The framework refreshes it
+        after effective parameters, temperature, and local geometry have been
+        populated, before State initial-value inference and authored
+        :meth:`initial` hooks.
+
+        ``derive_buffers()`` must return a mapping containing exactly the
+        declared names. It must not mutate module tensors and must not depend on
+        voltage, dynamic state, ions/materials, randomness, or timestep.
+
+        Parameters
+        ----------
+        *args : str
+            Names of derived buffers to allocate and materialize.
+        """
+        declare_class_value(
+            "mechanism.derived_buffers",
+            args,
+            Mechanism._derived_buffer_declarations,
         )
 
     @staticmethod
@@ -1641,6 +1693,10 @@ class Mechanism(Parameterized):
         cached conductances) or perform any one-time setup before stepping.
         """
         return
+
+    def derive_buffers(self):
+        """Return initialization-static buffers declared by DERIVED_BUFFER."""
+        return {}
 
     @classmethod
     def rename(cls, new_name=None, suffix=None):

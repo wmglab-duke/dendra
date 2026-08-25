@@ -100,6 +100,35 @@ establishing its contract. An analytic pair supplies only a local conductance;
 it does not make a genuinely coupled current safe. Nonlocal voltage coupling
 must be represented outside the local mechanism-current assembly.
 
+Initialization-derived buffers
+------------------------------
+
+Use ``Mechanism.DERIVED_BUFFER(...)`` or ``State.DERIVED_BUFFER(...)`` for a
+workspace that is completely determined by populated parameters, temperature,
+and local geometry and then remains fixed between initializations. Implement
+``derive_buffers()`` as a pure function returning exactly the declared names:
+
+.. code-block:: python
+
+   class TemperatureScale(Mechanism):
+       Mechanism.GLOBAL(reference=1.0, q10=2.0)
+       Mechanism.DERIVED_BUFFER("scale")
+
+       def derive_buffers(self):
+           return {
+               "scale": self.reference * self.q10 ** ((self.celsius - 22.0) / 10.0)
+           }
+
+Dendra refreshes these tensors before State initial-value inference and the
+authored ``initial()`` hooks. They retain normal buffer and checkpoint behavior.
+The builder must not
+mutate module tensors or depend on voltage, evolving state, Ion/Material state,
+randomness, or timestep. Continue to use ``BUFFER`` for values written by
+``breakpoint()``, values that accumulate across steps, and recorder-visible
+outputs such as a current intermediate. Custom timestep-dependent workspaces
+should remain in ``set_dt()``; the experimental functional-Population API does
+not yet lower those workspaces.
+
 .. autoclass:: dendra.models.mechanisms.State
    :members:
    :inherited-members: Module, object

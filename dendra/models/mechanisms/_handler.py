@@ -8,6 +8,7 @@ from ..rng import _validate_rng_checkpoint_payload
 from ._material_process import DiffusionProcess, MaterialProcess
 from ._materials import _canonical_material_name
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
+from ._support import SupportKind
 from ._support_registry import SupportRegistry
 
 _MATERIAL_PHASE_ALIASES = {
@@ -1821,6 +1822,95 @@ class MechanismHandler(torch.nn.Module):
 
         return tot_i, tot_g
 
+    def _functional_i_reference(self, v):
+        """Evaluate currents with call-local aggregation scratch.
+
+        This is the transform-safe counterpart to :meth:`i`.  It deliberately
+        does not read, replace, or mutate ``_buf_i`` / ``_buf_g``; those lists
+        are imperative execution scratch whose unbatched tensors cannot be
+        shared across ``vmap`` lanes.  The returned ion frames let a functional
+        integrator carry the same solver-selected current semantics without
+        publishing an intermediate frame through handler state.
+
+        Mechanism breakpoint effects are still ordinary module rebindings. A
+        caller must therefore isolate registered mechanism state (for example
+        with ``torch.func.functional_call``) or lower those effects explicitly.
+        """
+        local_voltages = self._gather_support_fields(
+            v,
+            self._current_support_entries,
+        )
+        for mech, support_index in self._current_breakpoint_plan:
+            mech.breakpoint(local_voltages[support_index])
+
+        if not self.currents:
+            z = torch.zeros_like(v)
+            empty_frame = tuple(
+                torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+                for ion in self._ion_current_frame_ions
+            )
+            return z, z, empty_frame, empty_frame
+
+        buf_i = [None for _ in self._buf_i]
+        buf_g = [None for _ in self._buf_g]
+
+        for c_idx, support_index, support_entry, entries in self._map_grouped:
+            local_i = None
+            local_g = None
+            local_voltage = local_voltages[support_index]
+            for mech, fn, scale_f, _factorable in entries:
+                current, conductance = scale_f(*getattr(mech, fn)(local_voltage))
+                current = _current_value_for_buffer(current, v)
+                conductance = _current_value_for_buffer(conductance, v)
+                # Exact affine currents may have a voltage-independent scalar
+                # conductance.  Imperative aggregation expands that value when
+                # it scatters into full-sized scratch buffers; this functional
+                # path has no destination buffer, so materialize the same dense
+                # shape explicitly.  ``broadcast_to`` remains vmap-safe because
+                # hidden batch dimensions are handled by the transform.
+                current = torch.broadcast_to(current, local_voltage.shape)
+                conductance = torch.broadcast_to(conductance, local_voltage.shape)
+                local_i = current if local_i is None else local_i + current
+                local_g = conductance if local_g is None else local_g + conductance
+            if support_entry.spec.kind is not SupportKind.DENSE:
+                raise RuntimeError(
+                    "functional current aggregation currently requires dense support"
+                )
+            buf_i[c_idx] = local_i if buf_i[c_idx] is None else buf_i[c_idx] + local_i
+            buf_g[c_idx] = local_g if buf_g[c_idx] is None else buf_g[c_idx] + local_g
+
+        buf_i = [torch.zeros_like(v) if value is None else value for value in buf_i]
+        buf_g = [torch.zeros_like(v) if value is None else value for value in buf_g]
+
+        current_frame = tuple(
+            (
+                buf_i[current_index]
+                if current_index >= 0
+                else torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+            )
+            for ion, current_index in zip(
+                self._ion_current_frame_ions,
+                self._ion_current_frame_indices,
+            )
+        )
+        conductance_frame = tuple(
+            (
+                buf_g[current_index]
+                if current_index >= 0
+                else torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+            )
+            for ion, current_index in zip(
+                self._ion_current_frame_ions,
+                self._ion_current_frame_indices,
+            )
+        )
+        return (
+            torch.stack(buf_i).sum(dim=0),
+            torch.stack(buf_g).sum(dim=0),
+            current_frame,
+            conductance_frame,
+        )
+
     def iexp(self, v):
         local_voltages = self._gather_support_fields(
             v,
@@ -2035,6 +2125,10 @@ class MechanismHandler(torch.nn.Module):
             for state_key, state in mech.DE.items():
                 for state_name in sorted(state._state):
                     states[f"{mech_name}.{state_name}"] = getattr(mech, state_name)
+                for buffer_name in sorted(state._state_buffers):
+                    states[f"{mech_name}.DE.{state_key}.{buffer_name}"] = (
+                        state._buffers[buffer_name]
+                    )
                 _capture_stochastic_state(states, f"{mech_name}.DE.{state_key}", state)
             for buffer_name in sorted(mech._assigned):
                 states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
@@ -2061,6 +2155,10 @@ class MechanismHandler(torch.nn.Module):
                 for state_name in sorted(state._state):
                     states[f"{process_name}.{state_name}"] = getattr(
                         process, state_name
+                    )
+                for buffer_name in sorted(state._state_buffers):
+                    states[f"{process_name}.DE.{state_key}.{buffer_name}"] = (
+                        state._buffers[buffer_name]
                     )
                 _capture_stochastic_state(
                     states, f"{process_name}.DE.{state_key}", state
@@ -2197,6 +2295,7 @@ class MechanismHandler(torch.nn.Module):
         self._validate_support_identity_payload(state_dict)
 
         assignment_map = {}
+        assignment_keys = {}
         tensor_memo = {}
         rng_assignments = []
         delay_assignments = []
@@ -2253,6 +2352,7 @@ class MechanismHandler(torch.nn.Module):
                     f"Mutable field {name!r} received conflicting snapshot entries."
                 )
             assignment_map[target] = (owner, name, prepared)
+            assignment_keys.setdefault(target, key)
 
         def add_stochastic(module, prefix, legacy_prefixes):
             for rng_name in _stochastic_rng_names(module):
@@ -2390,6 +2490,13 @@ class MechanismHandler(torch.nn.Module):
                 state_names = tuple(sorted(state._state))
                 for state_name in state_names:
                     add_tensor(module, state_name, f"{prefix}.{state_name}")
+                for buffer_name in sorted(state._state_buffers):
+                    add_tensor(
+                        state,
+                        buffer_name,
+                        f"{prefix}.DE.{state_key}.{buffer_name}",
+                        optional=True,
+                    )
                 add_stochastic(
                     state,
                     f"{prefix}.DE.{state_key}",
@@ -2457,9 +2564,25 @@ class MechanismHandler(torch.nn.Module):
 
         return {
             "assignments": list(assignment_map.values()),
+            "assignment_keys": assignment_keys,
             "rng_assignments": rng_assignments,
             "delay_assignments": delay_assignments,
         }
+
+    def _mutable_state_bindings(self):
+        """Return checkpoint-key bindings from the canonical state inventory.
+
+        This private manifest is shared by checkpoint restoration and the
+        experimental functional Population lowering.  Building it through the
+        normal snapshot preflight keeps one authority for aliases, shapes, and
+        dynamically registered boundary state.
+        """
+        plan = self._preflight_mutable_state_dict(self.mutable_state_dict())
+        keys = plan["assignment_keys"]
+        return tuple(
+            (keys[(id(owner), name)], owner, name)
+            for owner, name, _value in plan["assignments"]
+        )
 
     def _validate_support_identity_payload(self, state_dict):
         """Reject checkpoints whose local slots address another support.

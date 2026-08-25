@@ -26,6 +26,7 @@ from pathlib import Path
 
 import torch
 
+import dendra.func as func
 import dendra.models.callbacks as callbacks
 import dendra.models.mod as mod
 
@@ -145,6 +146,7 @@ __all__ = [
     "set_jit_network_ops_enabled",
     "set_jit_in_network_enabled",
     "callbacks",
+    "func",
     "mod",
     "load_mechanisms",
     "DistributionSpec",

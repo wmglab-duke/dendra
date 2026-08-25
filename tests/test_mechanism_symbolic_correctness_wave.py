@@ -417,6 +417,7 @@ def test_aborted_mechanism_and_state_declarations_do_not_leak():
             Mechanism.PARAMETER(flat_ghost=1.0)
             Mechanism.RANGE(range_ghost=2.0)
             Mechanism.BUFFER("buffer_ghost")
+            Mechanism.DERIVED_BUFFER("derived_ghost")
             Mechanism.NONSPECIFIC_CURRENT("current_ghost")
             Mechanism.AFFINE("affine_ghost")
             raise RuntimeError("abort mechanism")
@@ -427,6 +428,8 @@ def test_aborted_mechanism_and_state_declarations_do_not_leak():
     assert "flat_ghost" not in _CleanMechanism._params
     assert "range_ghost" not in _CleanMechanism._range
     assert "buffer_ghost" not in _CleanMechanism._assigned
+    assert "derived_ghost" not in _CleanMechanism._assigned
+    assert "derived_ghost" not in _CleanMechanism._derived_buffers
     assert "current_ghost" not in _CleanMechanism._currents.get("nonspecific", ())
     assert "affine_ghost" not in _CleanMechanism._affine
 
@@ -435,6 +438,7 @@ def test_aborted_mechanism_and_state_declarations_do_not_leak():
         class _AbortedState(State):
             State.RANGE(rate_ghost=3.0)
             State.STATE("state_ghost")
+            State.DERIVED_BUFFER("derived_state_ghost")
             State.DERIVATIVE("state_ghost' = -rate_ghost * state_ghost")
             State.METHOD("derivimplicit")
             raise RuntimeError("abort state")
@@ -444,6 +448,8 @@ def test_aborted_mechanism_and_state_declarations_do_not_leak():
 
     assert "rate_ghost" not in _CleanState._range
     assert "state_ghost" not in _CleanState._state
+    assert "derived_state_ghost" not in _CleanState._state_buffers
+    assert "derived_state_ghost" not in _CleanState._derived_buffers
     assert not _CleanState._derivative
     assert _CleanState.method == "cnexp"
 
@@ -462,6 +468,41 @@ def test_class_body_declarations_override_legacy_preclass_queue_order():
         State.METHOD("cnexp")
 
     assert _StateClassBodyWins.method == "cnexp"
+
+
+def test_derived_buffer_declarations_inherit_and_survive_mechanism_rename():
+    class DerivedBaseState(State):
+        State.STATE("x")
+        State.DERIVED_BUFFER("base_state_workspace")
+
+    class DerivedChildState(DerivedBaseState):
+        State.DERIVED_BUFFER("child_state_workspace")
+
+    class DerivedBaseMechanism(Mechanism):
+        Mechanism.BUFFER("ordinary_carry")
+        Mechanism.DERIVED_BUFFER("base_workspace")
+
+    class DerivedChildMechanism(DerivedBaseMechanism):
+        Mechanism.STATE(DerivedChildState)
+        Mechanism.DERIVED_BUFFER("child_workspace")
+
+    assert DerivedChildState._derived_buffers == {
+        "base_state_workspace",
+        "child_state_workspace",
+    }
+    assert DerivedChildState._derived_buffers <= DerivedChildState._state_buffers
+    assert DerivedChildMechanism._derived_buffers == {
+        "base_workspace",
+        "child_workspace",
+    }
+    assert DerivedChildMechanism._derived_buffers <= DerivedChildMechanism._assigned
+    assert "ordinary_carry" not in DerivedChildMechanism._derived_buffers
+
+    renamed = DerivedChildMechanism.rename("derived_buffer_rename_oracle")
+    assert renamed._derived_buffers == DerivedChildMechanism._derived_buffers
+    assert renamed._derived_buffers is not DerivedChildMechanism._derived_buffers
+    assert renamed._assigned == DerivedChildMechanism._assigned
+    assert renamed._assigned is not DerivedChildMechanism._assigned
 
 
 @pytest.mark.parametrize(

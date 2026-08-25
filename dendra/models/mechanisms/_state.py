@@ -1,5 +1,6 @@
 import inspect
 import textwrap
+from collections.abc import Mapping
 from types import MethodType
 
 import torch
@@ -20,6 +21,166 @@ from ._kinetic import kinetic_to_derivatives
 from ._linearimplicit import build_linearimplicit
 from ._mechanism import classproperty
 from ._rosenbrock import build_rosenbrock1
+
+
+def _registered_tensor_items(module):
+    """Yield canonical registered tensor slots, including nested modules."""
+
+    for module_path, owner in module.named_modules(remove_duplicate=False):
+        for collection_name in ("_parameters", "_buffers"):
+            collection = getattr(owner, collection_name)
+            for name, value in collection.items():
+                if value is None:
+                    continue
+                yield (module_path, collection_name, name), value
+
+
+def _registered_tensor_snapshot(module):
+    """Snapshot enough registered state to reject mutations by a pure builder."""
+
+    snapshot = {}
+    for key, value in _registered_tensor_items(module):
+        try:
+            version = value._version
+        except RuntimeError:
+            # Tensors created in inference_mode deliberately have no version
+            # counter. Preserve a value copy only for that uncommon lifecycle;
+            # ordinary initialization keeps the cheap identity/version path.
+            version = None
+            fallback = value.detach().clone(memory_format=torch.preserve_format)
+        else:
+            fallback = None
+        snapshot[key] = (
+            id(value),
+            version,
+            tuple(value.shape),
+            tuple(value.stride()),
+            value.storage_offset(),
+            value.dtype,
+            value.device,
+            value.requires_grad,
+            fallback,
+        )
+    return snapshot
+
+
+def _registered_tensors_unchanged(module, snapshot):
+    """Return whether registered identities, metadata, and values are unchanged."""
+
+    current = dict(_registered_tensor_items(module))
+    if set(current) != set(snapshot):
+        return False
+    for key, value in current.items():
+        (
+            identity,
+            version,
+            shape,
+            stride,
+            storage_offset,
+            dtype,
+            device,
+            requires_grad,
+            fallback,
+        ) = snapshot[key]
+        if (
+            id(value) != identity
+            or tuple(value.shape) != shape
+            or tuple(value.stride()) != stride
+            or value.storage_offset() != storage_offset
+            or value.dtype != dtype
+            or value.device != device
+            or value.requires_grad != requires_grad
+        ):
+            return False
+        if version is not None:
+            try:
+                if value._version != version:
+                    return False
+            except RuntimeError:
+                return False
+        else:
+            # Compare logical values bit-for-bit. torch.equal reports matching
+            # NaNs as unequal, while a zero-tolerance allclose would miss a
+            # +0.0/-0.0 mutation that can affect reciprocal expressions.
+            value_bytes = value.detach().contiguous().reshape(-1).view(torch.uint8)
+            fallback_bytes = (
+                fallback.detach().contiguous().reshape(-1).view(torch.uint8)
+            )
+            if not torch.equal(value_bytes, fallback_bytes):
+                return False
+    return True
+
+
+def _materialize_derived_buffers(module):
+    """Validate and install one module's initialization-static workspaces."""
+
+    expected = set(module._derived_buffers)
+    if not expected:
+        return
+
+    before = _registered_tensor_snapshot(module)
+    values = module.derive_buffers()
+    if not _registered_tensors_unchanged(module, before):
+        raise RuntimeError(
+            f"{type(module).__name__}.derive_buffers() must not mutate registered "
+            "parameters or buffers; return the derived tensors instead."
+        )
+
+    if not isinstance(values, Mapping):
+        raise TypeError(
+            f"{type(module).__name__}.derive_buffers() must return a mapping."
+        )
+    actual = set(values)
+    if actual != expected:
+        missing = sorted(map(str, expected - actual))
+        unexpected = sorted(map(str, actual - expected))
+        raise ValueError(
+            f"{type(module).__name__}.derive_buffers() keys do not match "
+            f"DERIVED_BUFFER declarations; missing={missing}, "
+            f"unexpected={unexpected}."
+        )
+
+    reference = module.diam
+    local_shape = tuple(reference.shape)
+    staged = {}
+    for name in sorted(expected):
+        value = values[name]
+        if not torch.is_tensor(value):
+            raise TypeError(
+                f"{type(module).__name__}.derive_buffers()[{name!r}] must be a Tensor."
+            )
+        if value.device != reference.device or value.dtype != reference.dtype:
+            raise ValueError(
+                f"{type(module).__name__}.derive_buffers()[{name!r}] must use "
+                f"{reference.device}/{reference.dtype}; got "
+                f"{value.device}/{value.dtype}."
+            )
+        try:
+            broadcast_shape = torch.broadcast_shapes(tuple(value.shape), local_shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"{type(module).__name__}.derive_buffers()[{name!r}] with shape "
+                f"{tuple(value.shape)} is not broadcastable to local shape "
+                f"{local_shape}."
+            ) from exc
+        if tuple(broadcast_shape) != local_shape:
+            raise ValueError(
+                f"{type(module).__name__}.derive_buffers()[{name!r}] with shape "
+                f"{tuple(value.shape)} is not broadcastable to local shape "
+                f"{local_shape}."
+            )
+        # A registered buffer must remain independently writable by ordinary
+        # state_dict/checkpoint restoration. Builders may naturally return a
+        # view (for example scalar.expand_as(diam)); clone it so overlapping
+        # strides or dependency aliases do not turn the installed buffer into
+        # an unwritable checkpoint destination. clone() retains autograd.
+        staged[name] = value.clone(memory_format=torch.preserve_format)
+
+    # Install only after the whole mapping has passed validation. Assignment is
+    # deliberately out of place so gradients through the builder are retained.
+    for name, value in staged.items():
+        setattr(module, name, value)
+
 
 # Integration-method registry -------------------------------------------------
 #
@@ -252,6 +413,9 @@ class State(Parameterized):
     _assigned = set()
     _assigned_declarations = []
 
+    _derived_buffers = set()
+    _derived_buffer_declarations = []
+
     has_q10 = False
 
     # Backward-compatible public class attribute.  Existing definitions such as
@@ -278,6 +442,7 @@ class State(Parameterized):
         new_buffers = set()
         new_derivative = set()
         new_assigned = set()
+        new_derived_buffers = set()
         new_kinetic = set()
         new_diffusion = set()
         new_method = "cnexp"
@@ -297,6 +462,8 @@ class State(Parameterized):
                 new_diffusion.update(base._diffusion)
             if "_assigned" in base.__dict__:
                 new_assigned.update(base._assigned)
+            if "_derived_buffers" in base.__dict__:
+                new_derived_buffers.update(base._derived_buffers)
 
             if "_method" in base.__dict__:
                 new_method, new_method_kwargs = _merge_method_config(
@@ -337,6 +504,13 @@ class State(Parameterized):
             cls, "state.assigned", State._assigned_declarations
         ):
             new_assigned.update(a_list)
+        for b_list in consume_class_values(
+            cls,
+            "state.derived_buffers",
+            State._derived_buffer_declarations,
+        ):
+            new_derived_buffers.update(b_list)
+        new_buffers.update(new_derived_buffers)
         for method_name, method_kwargs in consume_class_values(
             cls, "state.method", State._method_declarations
         ):
@@ -358,6 +532,7 @@ class State(Parameterized):
         cls._kinetic = new_kinetic
         cls._diffusion = new_diffusion
         cls._assigned = list(new_assigned)
+        cls._derived_buffers = new_derived_buffers
         cls._method = new_method
         cls._method_kwargs = dict(new_method_kwargs)
 
@@ -458,7 +633,18 @@ class State(Parameterized):
         """
         return tensor.view(*self.shape)
 
+    def _prepare_derived_buffers_for_initialize(self):
+        """Materialize once before inf/INIT and mark the value for initialize()."""
+        _materialize_derived_buffers(self)
+        self._derived_buffers_prepared_for_initialize = True
+
+    def _clear_derived_buffers_for_initialize(self):
+        self._derived_buffers_prepared_for_initialize = False
+
     def initialize(self, v):
+        if not getattr(self, "_derived_buffers_prepared_for_initialize", False):
+            _materialize_derived_buffers(self)
+        self._clear_derived_buffers_for_initialize()
         self.initial(v)
         return
 
@@ -496,6 +682,31 @@ class State(Parameterized):
             Buffer names to allocate.
         """
         declare_class_value("state.buffers", args, State._state_buffers_declarations)
+
+    @staticmethod
+    def DERIVED_BUFFER(*args):
+        """Declare initialization-static buffers built by ``derive_buffers``.
+
+        Derived buffers retain ordinary :meth:`BUFFER` registration and
+        checkpoint behavior, but additionally declare that their accepted value
+        is a pure function of populated parameters, temperature, and local
+        geometry. They are refreshed before State initial-value inference and
+        authored :meth:`initial` hooks.
+
+        ``derive_buffers()`` must return a mapping containing exactly the
+        declared names. It must not mutate module tensors and must not depend on
+        voltage, dynamic state, ions/materials, randomness, or timestep.
+
+        Parameters
+        ----------
+        *args : str
+            Names of derived buffers to allocate and materialize.
+        """
+        declare_class_value(
+            "state.derived_buffers",
+            args,
+            State._derived_buffer_declarations,
+        )
 
     @staticmethod
     def DERIVATIVE(*args):
@@ -629,6 +840,10 @@ class State(Parameterized):
         state initialization (may depend on morphology such as ``self.diam``).
         """
         pass
+
+    def derive_buffers(self):
+        """Return initialization-static buffers declared by DERIVED_BUFFER."""
+        return {}
 
     def inf(self, v):
         """

@@ -60,6 +60,55 @@ class _MultiStatefulBuffer(Mechanism):
     Mechanism.STATE(_DecayState, _RecoveryState)
 
 
+class _DerivedLifecycleState(State):
+    State.STATE("x")
+    State.DERIVATIVE("x' = -x")
+    State.DERIVED_BUFFER("state_scale")
+    State.BUFFER("initial_seen")
+
+    def derive_buffers(self):
+        return {"state_scale": self.celsius - self.diam}
+
+    def initial(self, v):
+        self.initial_seen = self.state_scale + v
+
+
+class _DerivedLifecycleMechanism(Mechanism):
+    Mechanism.STATE(_DerivedLifecycleState)
+    Mechanism.DERIVED_BUFFER("gain")
+    Mechanism.BUFFER("initial_seen")
+
+    def derive_buffers(self):
+        return {"gain": 2.0 * self.celsius + self.diam}
+
+    def initial(self, v):
+        self.initial_seen = self.gain + v
+
+
+class _DerivedInfState(State):
+    State.STATE("x")
+    State.DERIVATIVE("x' = -x")
+    State.DERIVED_BUFFER("drive")
+    State.BUFFER("initial_seen")
+
+    def derive_buffers(self):
+        return {"drive": 3.0 * self.diam}
+
+    def inf(self, v):
+        return {"x": self.drive}
+
+    def initial(self, v):
+        self.initial_seen = self.drive + v
+
+
+class _DerivedInfMechanism(Mechanism):
+    Mechanism.STATE(_DerivedInfState)
+    Mechanism.BUFFER("state_drive_seen")
+
+    def initial(self, v):
+        self.state_drive_seen = self.DE._DerivedInfState.drive
+
+
 class _ConstantWaveform(torch.nn.Module):
     def __init__(self, value):
         super().__init__()
@@ -95,6 +144,31 @@ def _base_mechanism(shape=(2, 3), *, key=None):
     )
 
 
+def _derived_lifecycle_mechanism():
+    shape = (2, 3)
+    celsius = torch.full(
+        shape,
+        34.0,
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    diam = torch.linspace(
+        1.0,
+        2.0,
+        math.prod(shape),
+        dtype=torch.float64,
+        requires_grad=True,
+    ).reshape(shape)
+    mechanism = _DerivedLifecycleMechanism(
+        "derived",
+        celsius,
+        diam,
+        shape,
+        shape,
+    )
+    return mechanism, celsius, diam
+
+
 def _population_with_registered_injection(*, accepted=False):
     population = dendra.Population(N=1, C=1, dtype=torch.float64)
     waveform = dendra.constant(value=1.0)
@@ -125,6 +199,257 @@ def _run_single(mech, values, *, mode=None, delay_steps=None):
                 ).clone()
             )
     return outputs
+
+
+def test_derived_buffers_refresh_before_authored_initial_and_retain_gradients():
+    mechanism, celsius, diam = _derived_lifecycle_mechanism()
+    voltage = torch.linspace(
+        -70.0,
+        -60.0,
+        mechanism.diam.numel(),
+        dtype=mechanism.diam.dtype,
+    ).reshape_as(mechanism.diam)
+
+    mechanism._init_buffers_s(voltage)
+    state = mechanism.DE["_DerivedLifecycleState"]
+
+    expected_gain = 2.0 * celsius + diam
+    expected_state_scale = celsius - diam
+    torch.testing.assert_close(mechanism.gain, expected_gain)
+    torch.testing.assert_close(mechanism.initial_seen, expected_gain + voltage)
+    torch.testing.assert_close(state.state_scale, expected_state_scale)
+    torch.testing.assert_close(state.initial_seen, expected_state_scale + voltage)
+
+    celsius_gradient, diameter_gradient = torch.autograd.grad(
+        mechanism.gain.sum() + 2.0 * state.state_scale.sum(),
+        (celsius, diam),
+    )
+    torch.testing.assert_close(
+        celsius_gradient,
+        torch.full_like(celsius_gradient, 4.0),
+    )
+    torch.testing.assert_close(
+        diameter_gradient,
+        torch.full_like(diameter_gradient, -1.0),
+    )
+
+    assert "gain" in mechanism._assigned
+    assert "gain" in mechanism.state_dict()
+    assert "state_scale" in state._state_buffers
+    assert "DE._DerivedLifecycleState.state_scale" in mechanism.state_dict()
+
+    handler = MechanismHandler(
+        celsius,
+        torch.ones_like(diam),
+        {"derived": mechanism},
+    )
+    checkpoint = handler.mutable_state_dict()
+    torch.testing.assert_close(checkpoint["derived.gain"], mechanism.gain)
+    torch.testing.assert_close(
+        checkpoint["derived.DE._DerivedLifecycleState.state_scale"],
+        state.state_scale,
+    )
+
+
+def test_state_derived_buffers_are_ready_for_inf_and_mechanism_initial():
+    shape = (2, 3)
+    diam = torch.arange(1, 7, dtype=torch.float64).reshape(shape)
+    voltage = torch.full(shape, -65.0, dtype=torch.float64)
+    mechanism = _DerivedInfMechanism(
+        "derived_inf",
+        torch.tensor(34.0, dtype=torch.float64),
+        diam,
+        shape,
+        shape,
+    )
+
+    mechanism._init_buffers_s(voltage)
+    state = mechanism.DE._DerivedInfState
+    expected_drive = 3.0 * diam
+    torch.testing.assert_close(mechanism.x, expected_drive, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        mechanism.state_drive_seen,
+        expected_drive,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        state.initial_seen,
+        expected_drive + voltage,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("builder", "error", "message"),
+    [
+        (lambda self: None, TypeError, "must return a mapping"),
+        (lambda self: {}, ValueError, "keys do not match"),
+        (
+            lambda self: {
+                "workspace": self.diam,
+                "unexpected": self.diam,
+            },
+            ValueError,
+            "unexpected=.*unexpected",
+        ),
+        (
+            lambda self: {"workspace": 1.0},
+            TypeError,
+            "must be a Tensor",
+        ),
+        (
+            lambda self: {"workspace": self.diam.float()},
+            ValueError,
+            "must use.*float64",
+        ),
+        (
+            lambda self: {"workspace": self.diam.new_zeros(2, 2)},
+            ValueError,
+            "not broadcastable",
+        ),
+    ],
+)
+def test_derived_buffer_builder_contract_fails_before_authored_initial(
+    builder,
+    error,
+    message,
+):
+    class InvalidDerivedBuffer(Mechanism):
+        Mechanism.DERIVED_BUFFER("workspace")
+        Mechanism.BUFFER("initial_seen")
+
+        def derive_buffers(self):
+            return builder(self)
+
+        def initial(self, v):
+            self.initial_seen = torch.ones_like(v)
+
+    shape = (2, 3)
+    mechanism = InvalidDerivedBuffer(
+        "invalid",
+        torch.full(shape, 34.0, dtype=torch.float64),
+        torch.ones(shape, dtype=torch.float64),
+        shape,
+        shape,
+    )
+    with pytest.raises(error, match=message):
+        mechanism._init_buffers_s(torch.zeros(shape, dtype=torch.float64))
+    assert torch.count_nonzero(mechanism.initial_seen) == 0
+
+
+def test_derived_buffer_builder_rejects_registered_tensor_mutation():
+    class MutatingDerivedBuffer(Mechanism):
+        Mechanism.DERIVED_BUFFER("workspace")
+
+        def derive_buffers(self):
+            self.workspace.add_(1.0)
+            return {"workspace": self.diam}
+
+    shape = (2, 3)
+    mechanism = MutatingDerivedBuffer(
+        "mutating",
+        torch.full(shape, 34.0, dtype=torch.float64),
+        torch.ones(shape, dtype=torch.float64),
+        shape,
+        shape,
+    )
+    with pytest.raises(RuntimeError, match="must not mutate registered"):
+        mechanism._init_buffers_s(torch.zeros(shape, dtype=torch.float64))
+
+
+def test_derived_buffer_builder_supports_and_guards_inference_tensors():
+    class InferenceDerivedBuffer(Mechanism):
+        Mechanism.DERIVED_BUFFER("workspace")
+
+        def derive_buffers(self):
+            return {"workspace": 2.0 * self.diam}
+
+    class MutatingInferenceDerivedBuffer(Mechanism):
+        Mechanism.DERIVED_BUFFER("workspace")
+
+        def derive_buffers(self):
+            self.workspace.add_(1.0)
+            return {"workspace": 2.0 * self.diam}
+
+    class NaNInferenceDerivedBuffer(Mechanism):
+        Mechanism.DERIVED_BUFFER("workspace")
+
+        def derive_buffers(self):
+            return {"workspace": torch.full_like(self.diam, torch.nan)}
+
+    shape = (2, 3)
+    voltage = torch.zeros(shape, dtype=torch.float64)
+    with torch.inference_mode():
+        mechanism = InferenceDerivedBuffer(
+            "inference",
+            torch.tensor(34.0, dtype=torch.float64),
+            torch.ones(shape, dtype=torch.float64),
+            shape,
+            shape,
+        )
+        mechanism._init_buffers_s(voltage)
+        mechanism._init_buffers_s(voltage)
+        torch.testing.assert_close(
+            mechanism.workspace,
+            torch.full(shape, 2.0, dtype=torch.float64),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+        mutating = MutatingInferenceDerivedBuffer(
+            "mutating_inference",
+            torch.tensor(34.0, dtype=torch.float64),
+            torch.ones(shape, dtype=torch.float64),
+            shape,
+            shape,
+        )
+        with pytest.raises(RuntimeError, match="must not mutate registered"):
+            mutating._init_buffers_s(voltage)
+
+        nan_workspace = NaNInferenceDerivedBuffer(
+            "nan_inference",
+            torch.tensor(34.0, dtype=torch.float64),
+            torch.ones(shape, dtype=torch.float64),
+            shape,
+            shape,
+        )
+        nan_workspace._init_buffers_s(voltage)
+        nan_workspace._init_buffers_s(voltage)
+        assert torch.isnan(nan_workspace.workspace).all()
+
+
+def test_derived_buffer_expanded_views_are_independent_checkpoint_destinations():
+    class ExpandedDerivedBuffer(Mechanism):
+        Mechanism.DERIVED_BUFFER("workspace")
+
+        def derive_buffers(self):
+            return {"workspace": self.celsius.expand_as(self.diam)}
+
+    shape = (2, 3)
+
+    def make_mechanism():
+        mechanism = ExpandedDerivedBuffer(
+            "expanded",
+            torch.tensor(34.0, dtype=torch.float64),
+            torch.ones(shape, dtype=torch.float64),
+            shape,
+            shape,
+        )
+        mechanism._init_buffers_s(torch.zeros(shape, dtype=torch.float64))
+        return mechanism
+
+    source = make_mechanism()
+    target = make_mechanism()
+    assert source.workspace.stride() != (0, 0)
+    assert (
+        source.workspace.untyped_storage().data_ptr()
+        != source.celsius.untyped_storage().data_ptr()
+    )
+
+    target.load_state_dict(source.state_dict())
+    torch.testing.assert_close(target.workspace, source.workspace, rtol=0.0, atol=0.0)
 
 
 @pytest.mark.parametrize("delay", [0, 1, 3])
