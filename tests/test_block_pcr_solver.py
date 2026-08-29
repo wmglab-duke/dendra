@@ -138,7 +138,7 @@ def test_block_integrator_selects_portable_solver_for_mps_without_allocating_mps
     integrator = _bwd_euler_bt(model, torch.nn.Module(), method=method)
     model.reported_device = torch.device("mps")
 
-    integrator._select_solver(model)
+    integrator._select_solver(model.device())
 
     assert integrator._solve is block_pcr_solve_t
 
@@ -150,7 +150,7 @@ def test_block_integrator_preserves_cpu_extension_requirement(monkeypatch, metho
     integrator = _bwd_euler_bt(model, torch.nn.Module(), method=method)
 
     with pytest.raises(ImportError, match="requires dendra_solvers for CPU"):
-        integrator._select_solver(model)
+        integrator._select_solver(model.device())
 
 
 @pytest.mark.skipif(not MPS_AVAILABLE, reason="MPS is not available")

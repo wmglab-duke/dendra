@@ -20,7 +20,7 @@ CORE_SHAPE = (2, 4)
 
 
 class _SupportState(Mechanism):
-    Mechanism.BUFFER("scratch")
+    Mechanism.CARRY("scratch")
 
 
 class _StatelessSupport(Mechanism):

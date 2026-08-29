@@ -14,7 +14,9 @@ from dendra.models.integrators.triton import (
 from dendra.models.integrators.triton._contracts import (
     adjoint_main_blocks,
     copy_rhs_workspace,
+    flatten_vmap_solver_batch,
     is_vmap_batched_tensor,
+    restore_vmap_solver_batch,
     validate_block_tridiagonal,
     validate_threads,
     validate_tree,
@@ -195,6 +197,44 @@ def test_vmap_batch_detection_is_dynamo_fullgraph_safe():
     compiled = torch.compile(branch_on_transform, backend="eager", fullgraph=True)
     value = torch.tensor([2.0])
     torch.testing.assert_close(compiled(value), value - 1)
+
+
+def test_vmap_solver_batch_helpers_flatten_broadcast_and_restore_without_cuda():
+    info = SimpleNamespace(batch_size=3)
+    shared = torch.arange(10, dtype=torch.float64).reshape(2, 5)
+    mapped = torch.arange(30, dtype=torch.float64).reshape(2, 5, 3)
+
+    (flat_shared, flat_mapped), solver_batch = flatten_vmap_solver_batch(
+        info,
+        (None, 2),
+        shared,
+        mapped,
+    )
+
+    assert solver_batch == 2
+    assert flat_shared.shape == (6, 5)
+    assert flat_mapped.shape == (6, 5)
+    torch.testing.assert_close(
+        flat_shared,
+        shared.unsqueeze(0).expand(3, 2, 5).reshape(6, 5),
+    )
+    torch.testing.assert_close(
+        flat_mapped,
+        mapped.movedim(2, 0).reshape(6, 5),
+    )
+    restored = restore_vmap_solver_batch(flat_mapped, 3, solver_batch)
+    torch.testing.assert_close(restored, mapped.movedim(2, 0))
+
+
+def test_vmap_solver_batch_helpers_reject_missing_or_mismatched_solver_batches():
+    info = SimpleNamespace(batch_size=3)
+    with pytest.raises(ValueError, match="at least one solver operand"):
+        flatten_vmap_solver_batch(info, ())
+
+    shared = torch.zeros((2, 5))
+    mapped = torch.zeros((3, 4, 5))
+    with pytest.raises(ValueError, match="same batch size"):
+        flatten_vmap_solver_batch(info, (None, 0), shared, mapped)
 
 
 def test_pack_structure_rejects_wrong_word_width_and_mixed_devices():

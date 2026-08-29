@@ -7,6 +7,59 @@ import torch
 from .core import _as_solve_matrix, _model_solve_shape
 
 
+def _cylindrical_membrane_area(
+    diameter_um: torch.Tensor,
+    length_um: torch.Tensor,
+) -> torch.Tensor:
+    """Return lateral cylindrical membrane area in square centimetres."""
+    return diameter_um * 1.0e-4 * torch.pi * length_um * 1.0e-4
+
+
+def _cylindrical_edge_conductance(
+    diameter_um: torch.Tensor,
+    length_um: torch.Tensor,
+    axial_resistivity_ohm_cm: torch.Tensor,
+) -> torch.Tensor:
+    """Return centre-to-centre conductance for adjoining cylinders."""
+    radius_cm = 1.0e-4 * diameter_um / 2.0
+    length_cm = 1.0e-4 * length_um
+    segment_resistance = (
+        axial_resistivity_ohm_cm * length_cm / (torch.pi * radius_cm.square())
+    )
+    return 2.0 / (segment_resistance[..., :-1] + segment_resistance[..., 1:])
+
+
+def _layered_edge_conductance(
+    axial_resistance_mohm_per_cm: torch.Tensor,
+    length_um: torch.Tensor,
+) -> torch.Tensor:
+    """Return centre-to-centre conductance for extracellular cable layers.
+
+    ``axial_resistance_mohm_per_cm`` has one final axis per extracellular
+    layer.  Each compartment contributes half of its longitudinal resistance
+    to either adjoining edge, matching the intracellular cylindrical adapter
+    and NEURON's ``xraxial`` convention.
+    """
+    length_cm = length_um * 1.0e-4
+    segment_resistance = axial_resistance_mohm_per_cm * length_cm.unsqueeze(-1) * 1.0e6
+    return 2.0 / (segment_resistance[..., :-1, :] + segment_resistance[..., 1:, :])
+
+
+def _canonical_edge_conductance(
+    resistance_ohm: torch.Tensor,
+    rhoa_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Return exact path conductance from child-indexed edge resistance.
+
+    Native ``Cable`` resistance stores a zero placeholder at the root and the
+    complete centre-to-centre resistance at every subsequent child.  The
+    compiled resistance already incorporates the source morphology's axial
+    resistivity, so only the supported spatially uniform runtime scale remains
+    to be applied here.
+    """
+    return (resistance_ohm[..., 1:] * rhoa_scale).reciprocal()
+
+
 def unbranched_edge_conductance(model) -> torch.Tensor:
     """Return path-edge conductance in siemens as a ``(B, K - 1)`` tensor.
 
@@ -42,17 +95,14 @@ def unbranched_edge_conductance(model) -> torch.Tensor:
                 "within each cable. Exact edge totals cannot recover distinct "
                 "left/right half-path scaling."
             )
-        return (resistance[:, 1:] * reference).reciprocal()
+        return _canonical_edge_conductance(resistance, reference)
 
     diam = _as_solve_matrix(model.diam, model)
     dx = _as_solve_matrix(model.dx, model)
     rhoa = _as_solve_matrix(model.rhoa, model) * _as_solve_matrix(
         model.rhoa_scale, model
     )
-    radius_cm = 1e-4 * diam / 2.0
-    dx_cm = 1e-4 * dx
-    segment_resistance = rhoa * dx_cm / (torch.pi * radius_cm.square())
-    return 2.0 / (segment_resistance[:, :-1] + segment_resistance[:, 1:])
+    return _cylindrical_edge_conductance(diam, dx, rhoa)
 
 
 __all__ = ["unbranched_edge_conductance"]

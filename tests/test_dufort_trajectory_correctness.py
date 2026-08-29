@@ -59,7 +59,7 @@ class _AnalyticNonlinearCurrent(Mechanism):
 
 
 class _SavedNumericalNonlinearCurrent(_NumericalNonlinearCurrent):
-    Mechanism.SAVE("i")
+    Mechanism.SAVE_CURRENT("i")
 
 
 class _ScalarExplicitCurrent(Mechanism):

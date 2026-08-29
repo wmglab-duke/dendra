@@ -92,11 +92,12 @@ class ExtCellAxon(Axon):
             # MPS does not implement binary64 tensors. Geometry setup is a
             # one-time operation, so retain the established binary64 arithmetic
             # on CPU and transfer only the final model-dtype coordinates.
-            node_l = torch.atleast_2d(
-                self.dx.squeeze().to(device="cpu").to(dtype=torch.double)
+            node_l = self.dx.to(device="cpu", dtype=torch.double).reshape(
+                self.n_ax,
+                self.n_comp,
             )
         else:
-            node_l = torch.atleast_2d(self.dx.squeeze().to(torch.double))
+            node_l = self.dx.to(torch.double).reshape(self.n_ax, self.n_comp)
         x = node_l.cumsum(dim=1) - node_l / 2
         x = x - torch.sum(node_l, dim=1, keepdim=True) / 2
         return x.to(device=device, dtype=dtype)

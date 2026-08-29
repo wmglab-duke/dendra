@@ -1253,14 +1253,14 @@ def interp1d(
     P = v["xnew"].shape[1]
     shape_ynew = (D_eff, P)
 
-    # Prepare output buffer
+    # Preserve the explicit mutating ``out=`` API, but keep the ordinary path
+    # allocation-only so it composes with torch.func transforms.
+    ybuf = None
     if out is not None:
         if out.numel() != D_eff * P:
             out = None
         else:
             ybuf = out.reshape(shape_ynew)
-    if out is None:
-        ybuf = torch.empty(*shape_ynew, device=device, dtype=v["x"].dtype)
 
     # Broadcast xnew rows if needed
     if v["xnew"].shape[0] == 1 and D_eff > 1:
@@ -1271,7 +1271,10 @@ def interp1d(
             return t.contiguous().view(-1)[ind]
         return torch.gather(t, 1, ind)
 
-    enable_grad = require_grad["x"] or require_grad["y"] or require_grad["xnew"]
+    # Never re-enable reverse-mode recording inside an ambient no-grad context.
+    enable_grad = torch.is_grad_enabled() and (
+        require_grad["x"] or require_grad["y"] or require_grad["xnew"]
+    )
     grad_ctx = torch.enable_grad() if enable_grad else torch.no_grad()
 
     with grad_ctx:
@@ -1309,8 +1312,7 @@ def interp1d(
                 else v["xnew"]
             )
             u = (x_used - x_min) * inv_dx0
-            ind = u.to(torch.long)
-            ind.clamp_(0, v["x"].shape[1] - 2)
+            ind = u.to(torch.long).clamp(0, v["x"].shape[1] - 2)
             t = u - ind.to(u.dtype)
             if outside == "clamp":
                 t = torch.clamp(t, 0.0, 1.0)
@@ -1334,12 +1336,13 @@ def interp1d(
 
         else:
             # Original searchsorted path
-            ind = torch.empty(shape_ynew, device=device, dtype=torch.long)
-            torch.searchsorted(
-                v["x"].contiguous().squeeze(), v["xnew"].contiguous(), out=ind
-            )
-            ind -= 1
-            ind.clamp_(0, v["x"].shape[1] - 2)
+            # Materialize query values at any hidden vmap levels carried by
+            # ``x``. Merely calling contiguous() on an unbatched query leaves
+            # the batching rule with a stride-zero broadcast and emits a
+            # performance warning.
+            search_values = (v["xnew"] + torch.zeros_like(v["x"][:, :1])).contiguous()
+            ind = torch.searchsorted(v["x"].contiguous().squeeze(), search_values)
+            ind = (ind - 1).clamp(0, v["x"].shape[1] - 2)
 
             dx = v["x"][:, 1:] - v["x"][:, :-1]
             safe_dx = torch.where(
@@ -1364,15 +1367,21 @@ def interp1d(
                 outside_mask = (v["xnew"] < x_min) | (v["xnew"] > x_max)
                 ynew = ynew.masked_fill(outside_mask, 0.0)
 
-    ybuf.copy_(ynew)
+    if ybuf is not None:
+        ybuf.copy_(ynew)
+        result = ybuf
+    else:
+        # The historical allocation path used an x-typed output buffer and
+        # therefore cast promoted interpolation results back to x.dtype.
+        result = ynew.to(dtype=v["x"].dtype)
 
     if reshaped_xnew:
-        ybuf = ybuf.view(original_xnew_shape)
+        result = result.view(original_xnew_shape)
 
     if x.ndim == 1 and y.ndim == 1 and xnew.ndim == 1:
-        return ybuf.view(-1)
+        return result.view(-1)
 
-    return ybuf
+    return result
 
 
 def interp1d_uniform(x, y, xnew, out=None, *, outside: str = "zero"):

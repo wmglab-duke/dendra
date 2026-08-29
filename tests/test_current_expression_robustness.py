@@ -84,7 +84,7 @@ class _ExpandedAffine(Mechanism):
 
 class _SavedMultiCurrent(Mechanism):
     Mechanism.RANGE(gl=0.125, el=-54.0, gna=0.75, ena=42.0, gate=0.5)
-    Mechanism.SAVE("ina")
+    Mechanism.SAVE_CURRENT("ina")
     Mechanism.NONSPECIFIC_CURRENT("il", "ina")
 
     def il(self, v):

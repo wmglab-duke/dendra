@@ -45,7 +45,7 @@ def _material(name, values, *, domain="i"):
 
 
 def _bind(process, materials, population=None):
-    return process.bind_materials(materials.__getitem__, population=population)
+    return process._bind_materials(materials.__getitem__, population=population)
 
 
 def _snapshot_material_state(materials):

@@ -11,7 +11,6 @@ from .core import (
     _core_key_from_flat,
     _global_configuration_values_equal,
     _mechanism_global_parameter_names,
-    _mechanism_initial_defaults,
     _unpack_mechanism_insertion_record,
 )
 from .integrators import bwd_euler_sc_multi, dhs_multi
@@ -980,8 +979,7 @@ class MultiPopulation(Population):
                     for parameter_name, value in kwargs.items()
                     if parameter_name not in global_names
                 }
-                effective_ic = _mechanism_initial_defaults(m_class)
-                effective_ic.update(ic or {})
+                effective_ic = dict(ic or {})
                 local_flat = torch.arange(math.prod(pop.core_shape()), dtype=torch.long)
                 excluded = torch.as_tensor(
                     pop._mech_exclusions.get(m_class, []), dtype=torch.long
@@ -1001,8 +999,7 @@ class MultiPopulation(Population):
             for m_class, list_of_aliases_kwargs_keys in pop._mech_data.items():
                 idx = 0
                 global_names = _mechanism_global_parameter_names(m_class)
-                effective_ic = _mechanism_initial_defaults(m_class)
-                effective_ic.update(pop._mech_data_ic.get(m_class) or {})
+                effective_ic = dict(pop._mech_data_ic.get(m_class) or {})
                 for record in list_of_aliases_kwargs_keys:
                     (
                         alias,

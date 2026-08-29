@@ -9,10 +9,25 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 import dendra.utils as U
+from dendra.utils.tensor_ops import _logical_tensor_bytes
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_logical_tensor_bytes_materializes_singleton_expanded_layout(dtype):
+    value = torch.tensor(2.0, dtype=dtype).expand(1, 1)
+    assert value.stride() == (0, 0)
+
+    actual = _logical_tensor_bytes(value)
+    expected = torch.tensor(2.0, dtype=dtype).reshape(-1).view(torch.uint8)
+
+    assert actual.device.type == "cpu"
+    assert actual.dtype == torch.uint8
+    assert actual.stride() == (1,)
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
 def _as_1d(t: torch.Tensor) -> torch.Tensor:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 import dendra as dn
@@ -20,6 +21,10 @@ class _DerivedState(State):
     State.DERIVED_BUFFER("drive")
     State.DERIVATIVE("x' = drive")
 
+    def state_defaults(self, v, values):
+        del values
+        return {"x": torch.zeros_like(v)}
+
     def derive_buffers(self):
         return {
             "drive": self.state_scale
@@ -29,11 +34,10 @@ class _DerivedState(State):
 
 
 class _DerivedWorkspaceMechanism(Mechanism):
-    Mechanism.STATE(_DerivedState)
-    Mechanism.INIT(x=0.0)
+    Mechanism.STATE_BUNDLE(_DerivedState)
     Mechanism.GLOBAL(mechanism_scale=1.0e-7, e=-55.0)
     Mechanism.DERIVED_BUFFER("conductance")
-    Mechanism.BUFFER("trace")
+    Mechanism.CARRY("trace")
     Mechanism.NONSPECIFIC_CURRENT("i")
     Mechanism.AFFINE("i")
 
@@ -44,11 +48,13 @@ class _DerivedWorkspaceMechanism(Mechanism):
             * (1.0 + 0.05 * self.diam)
         }
 
-    def initial(self, v):
-        self.trace = torch.zeros_like(v)
+    def initial_values(self, v, values):
+        del values
+        return {"trace": torch.zeros_like(v)}
 
-    def breakpoint(self, v):
-        self.trace = self.conductance + self.x
+    def advance(self, v, dt, values):
+        del v, dt
+        return {"trace": values["conductance"] + values["x"]}
 
     def i(self, v):
         return self.conductance * (v - self.e)
@@ -57,20 +63,52 @@ class _DerivedWorkspaceMechanism(Mechanism):
 class _MutatingDerivedWorkspace(Mechanism):
     Mechanism.GLOBAL(base=1.0e-8, e=-60.0)
     Mechanism.DERIVED_BUFFER("workspace")
+    Mechanism.ASSIGNED("probe")
     Mechanism.NONSPECIFIC_CURRENT("i")
     Mechanism.AFFINE("i")
 
     def derive_buffers(self):
         return {"workspace": self.base * torch.ones_like(self.diam)}
 
-    def breakpoint(self, v):
+    def assigned_values(self, v, values):
         # Deliberately invalid authored behavior: functional execution must at
         # least contain the mutation to its private transition workspace.
+        del values
         if self.training:
             self.workspace.add_(self.base)
+        return {"probe": torch.zeros_like(v)}
 
     def i(self, v):
         return self.workspace * (v - self.e)
+
+
+class _RebindingDerivedWorkspace(_MutatingDerivedWorkspace):
+    def assigned_values(self, v, values):
+        del values
+        if self.training:
+            self.workspace = self.workspace + self.base
+        return {"probe": torch.zeros_like(v)}
+
+
+class _DeferredLayoutMechanism(Mechanism):
+    Mechanism.CARRY("history", shape="deferred")
+    Mechanism.DERIVED_BUFFER("routing", dtype=torch.long, shape="deferred")
+    Mechanism.NONSPECIFIC_CURRENT("i")
+    Mechanism.AFFINE("i")
+
+    def derive_buffers(self):
+        return {"routing": torch.arange(2, device=self.diam.device)}
+
+    def initial_values(self, v, values):
+        del values
+        return {"history": torch.stack((v, v), dim=-1)}
+
+    def advance(self, v, dt, values):
+        del v
+        return {"history": values["history"] + dt}
+
+    def i(self, v):
+        return 0.0 * v
 
 
 def _model(mechanism=_DerivedWorkspaceMechanism):
@@ -84,10 +122,27 @@ def _model(mechanism=_DerivedWorkspaceMechanism):
             integrator=dn.bwd_euler_ub(method="pcr", imem=False),
         )
         model.insert(mechanism)
-        if mechanism is _MutatingDerivedWorkspace:
-            # Initialization evaluates BREAKPOINT once. Keep the deliberately
+        if issubclass(mechanism, _MutatingDerivedWorkspace):
+            # Initialization evaluates assigned_values once. Keep the deliberately
             # invalid mutation specific to the subsequent transition under test.
             model.eval()
+        model.initialize()
+        model.train()
+    return model
+
+
+def _deferred_model():
+    with dn.ctx(JIT=0, REQUIRE_GRAD=1):
+        model = dn.Unmyelinated(
+            [1.0],
+            L=4.0,
+            dx=1.0,
+            v_init=-65.0,
+            dtype=torch.float64,
+            integrator=dn.bwd_euler_ub(method="pcr", imem=False),
+        )
+        model.insert(_DeferredLayoutMechanism)
+        model.batch(2)
         model.initialize()
         model.train()
     return model
@@ -148,6 +203,33 @@ def test_derived_workspaces_are_prepared_static_tensors_not_explicit_carry():
     torch.testing.assert_close(
         prepared_values[state_path], expected_drive, rtol=0.0, atol=0.0
     )
+
+
+def test_deferred_layouts_are_frozen_and_preserved_by_functional_step():
+    model = _deferred_model()
+    mechanism = model.mech._DeferredLayoutMechanism
+    expected_shape = (*model.shape, 2)
+
+    assert mechanism.history.shape == expected_shape
+    assert mechanism.routing.shape == (2,)
+    assert mechanism._carry_resolved_shapes == {"history": expected_shape}
+    assert mechanism._derived_resolved_shapes == {"routing": (2,)}
+
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    prepared = functional.prepare(tensors.parameters, tensors.constants)
+    history = tensors.state["mechanism_buffers"]["_DeferredLayoutMechanism"]["history"]
+    next_state, _auxiliary = functional.step(
+        tensors.parameters,
+        prepared,
+        tensors.state,
+    )
+    next_history = next_state["mechanism_buffers"]["_DeferredLayoutMechanism"][
+        "history"
+    ]
+
+    assert history.shape == expected_shape
+    assert next_history.shape == expected_shape
+    torch.testing.assert_close(next_history, history + DT)
 
 
 def test_parameter_temperature_and_geometry_substitutions_have_exact_gradients():
@@ -349,25 +431,76 @@ def test_chained_fused_and_imperative_execution_match_every_carry_leaf():
     _assert_every_leaf_close(chained, expected)
 
 
-def test_inplace_derived_workspace_mutation_is_call_local():
-    model = _model(_MutatingDerivedWorkspace)
-    functional, tensors = dn.func.make_functional(model, dt=DT)
-    prepared = functional.prepare(tensors.parameters, tensors.constants)
-    prepared_path = "integrator.mech.mechanisms._MutatingDerivedWorkspace.workspace"
-    workspace = prepared.values["mechanisms"][prepared_path]
-    original_prepared = workspace.clone()
-    original_source = model.mech._MutatingDerivedWorkspace.workspace.clone()
-    prepared_version = workspace._version
+@pytest.mark.parametrize(
+    "mechanism_type",
+    [_MutatingDerivedWorkspace, _RebindingDerivedWorkspace],
+)
+def test_authored_derived_workspace_writes_fail_during_lowering(mechanism_type):
+    model = _model(mechanism_type)
+    source = getattr(model.mech, mechanism_type.__name__)
+    original_source = source.workspace.clone()
+    source_version = source.workspace._version
 
-    first, _aux = functional.step(tensors.parameters, prepared, tensors.state)
-    second, _aux = functional.step(tensors.parameters, prepared, tensors.state)
+    with pytest.raises(
+        dn.func.FunctionalizationError,
+        match="lowering.*mutation or rebinding.*read-only.*workspace",
+    ):
+        dn.func.make_functional(model, dt=DT)
 
-    assert workspace._version == prepared_version
-    torch.testing.assert_close(workspace, original_prepared, rtol=0.0, atol=0.0)
+    assert source.workspace._version == source_version
     torch.testing.assert_close(
-        model.mech._MutatingDerivedWorkspace.workspace,
+        source.workspace,
         original_source,
         rtol=0.0,
         atol=0.0,
     )
-    _assert_every_leaf_close(first, second, rtol=0.0, atol=0.0)
+
+
+def test_runtime_checkpoint_omits_reconstructible_derived_workspaces():
+    model = _model()
+    mechanism = model.mech._DerivedWorkspaceMechanism
+    state = mechanism.DE._DerivedState
+    dt = torch.as_tensor(DT, dtype=model.dtype(), device=model.device())
+    model.integrator._initialize(model, dt, force=True, compile_scope="population")
+    checkpoint = model.state_dict_for_checkpoint()
+
+    assert "_DerivedWorkspaceMechanism.conductance" not in checkpoint["mech"]
+    assert "_DerivedWorkspaceMechanism.DE._DerivedState.drive" not in checkpoint["mech"]
+    assert "_DerivedWorkspaceMechanism.trace" in checkpoint["mech"]
+    assert "_DerivedWorkspaceMechanism.x" in checkpoint["mech"]
+
+    old_conductance = mechanism.conductance.clone()
+    old_drive = state.drive.clone()
+    with torch.no_grad():
+        mechanism.mechanism_scale_param.mul_(2.0)
+        state.state_scale_param.add_(0.5)
+    model.initialize()
+    model.integrator._initialize(model, dt, force=True, compile_scope="population")
+    current_conductance = mechanism.conductance.clone()
+    current_drive = state.drive.clone()
+    assert not torch.equal(current_conductance, old_conductance)
+    assert not torch.equal(current_drive, old_drive)
+
+    model.restore_dict_from_checkpoint(checkpoint)
+    torch.testing.assert_close(
+        mechanism.conductance,
+        current_conductance,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(state.drive, current_drive, rtol=0.0, atol=0.0)
+
+
+def test_derived_builder_hook_identity_is_part_of_source_structure(monkeypatch):
+    model = _model()
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+
+    def replacement(self):
+        return {"conductance": 2.0 * self.mechanism_scale * self.diam}
+
+    monkeypatch.setattr(_DerivedWorkspaceMechanism, "derive_buffers", replacement)
+    with pytest.raises(
+        dn.func.FunctionalizationError,
+        match="structure changed|lower it again",
+    ):
+        functional.prepare(tensors.parameters, tensors.constants)

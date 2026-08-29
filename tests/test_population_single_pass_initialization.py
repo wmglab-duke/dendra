@@ -25,11 +25,12 @@ def test_population_calls_handler_once_and_post_hook_does_not_reinitialize(
     events = []
 
     class InitialVoltageProbe(Mechanism):
-        Mechanism.BUFFER("initial_voltage")
+        Mechanism.CARRY("initial_voltage")
 
-        def initial(self, v):
+        def initial_values(self, v, values):
+            del values
             events.append("initial")
-            self.initial_voltage = v.clone()
+            return {"initial_voltage": v.clone()}
 
     model = dn.Population(N=1, C=2, v_init=-65.0, dtype=DTYPE)
     model.insert(InitialVoltageProbe)
@@ -69,15 +70,20 @@ def test_population_calls_handler_once_and_post_hook_does_not_reinitialize(
     torch.testing.assert_close(model.v, torch.full_like(model.v, -40.0))
 
 
-def test_set_value_is_a_pre_initial_condition_override_and_invalidates_steady_cache():
+def test_pre_transform_overrides_initial_condition_and_invalidates_steady_cache():
     initial_calls = []
 
     class InitialVoltageProbe(Mechanism):
-        Mechanism.BUFFER("initial_voltage")
+        Mechanism.CARRY("initial_voltage")
 
-        def initial(self, v):
+        def initial_values(self, v, values):
+            del values
             initial_calls.append(v.detach().clone())
-            self.initial_voltage = v.clone()
+            return {"initial_voltage": v.clone()}
+
+    class ReplaceVoltage(torch.nn.Module):
+        def forward(self, value):
+            return (value,)
 
     model = dn.Population(N=1, C=2, v_init=-65.0, dtype=DTYPE)
     model.insert(InitialVoltageProbe)
@@ -86,7 +92,12 @@ def test_set_value_is_a_pre_initial_condition_override_and_invalidates_steady_ca
     assert "_steady_state" in model._caches
 
     override = torch.tensor([[-51.0, -49.0]], dtype=DTYPE)
-    model.set_value("v", override)
+    model.register_pre_initialize_transform(
+        "replace_voltage",
+        ReplaceVoltage(),
+        writes=("state.integrator.v",),
+        inputs={"value": override},
+    )
     assert "_steady_state" not in model._caches
 
     model.initialize()
@@ -116,9 +127,10 @@ def test_steady_restore_skips_fresh_initialization_work(monkeypatch):
     events = []
 
     class InitialProbe(Mechanism):
-        def initial(self, v):
-            del v
+        def initial_values(self, v, values):
+            del v, values
             events.append("initial")
+            return {}
 
     model = dn.Population(N=1, C=2, dtype=DTYPE)
     model.insert(InitialProbe)
@@ -196,10 +208,11 @@ def test_failed_post_hook_is_fail_closed_without_a_hidden_second_initialization(
     initial_calls = 0
 
     class InitialCountProbe(Mechanism):
-        def initial(self, v):
+        def initial_values(self, v, values):
             nonlocal initial_calls
-            del v
+            del v, values
             initial_calls += 1
+            return {}
 
     model = dn.Population(N=1, C=1, dtype=DTYPE)
     model.insert(InitialCountProbe)

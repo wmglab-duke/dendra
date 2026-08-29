@@ -16,20 +16,27 @@ class apcount(M):
     """
 
     M.RANGE(threshold=0.0)  # Threshold for spike detection
-    M.BUFFER("n", "active")
+    M.CARRY("n", dtype=torch.float32)
+    M.CARRY("active", dtype=torch.bool)
 
-    def initial(self, v):
+    def initial_values(self, v, values):
         # Keep the hard counter at least float32 even for low-precision voltage
         # simulations.  float16 stops representing consecutive integers at
         # 2048 (bfloat16 at 256), which can silently drop later spikes.
-        self.n = torch.zeros_like(v, dtype=torch.float32)
         # Starting above threshold is not an upward crossing.  Initialize the
-        # hard latch from voltage so the first breakpoint cannot count a
+        # hard latch from voltage so the first accepted transition cannot count a
         # spurious event, matching apcount_d and spikedetect semantics.
-        self.active = v > self.threshold
+        return {
+            "n": torch.zeros_like(v, dtype=torch.float32),
+            "active": v > self.threshold,
+        }
 
-    def breakpoint(self, v):
+    def advance(self, v, dt, values):
+        del dt
         above_threshold = v > self.threshold
-        spikes = above_threshold & ~self.active
-        self.n += spikes.to(dtype=self.n.dtype, device=self.n.device)
-        self.active = above_threshold
+        spikes = above_threshold & ~values["active"]
+        return {
+            "n": values["n"]
+            + spikes.to(dtype=values["n"].dtype, device=values["n"].device),
+            "active": above_threshold,
+        }

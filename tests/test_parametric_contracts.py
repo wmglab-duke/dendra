@@ -82,6 +82,36 @@ def test_softplus_inverse_honors_low_linear_threshold():
 
 
 @pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: M.PositiveParam(1.0),
+        lambda: M.Bounded(1.0, max_val=2.0, cap_mode="softcap"),
+        lambda: M.Bounded(
+            1.0,
+            min_val=0.0,
+            max_val=2.0,
+            cap_mode="hard-ste",
+        ),
+    ],
+    ids=("lower-softplus", "upper-softcap", "bounded-hard-cap"),
+)
+def test_scalar_softplus_parameters_accept_empty_functional_vmap(factory):
+    parameter = factory()
+    raw = parameter.rho.detach().clone()
+
+    def resolve_lane(rho):
+        return torch.func.functional_call(parameter, {"rho": rho}, ())
+
+    lanes = raw + raw.new_tensor((-0.2, 0.0, 0.3))
+    actual = torch.vmap(resolve_lane)(lanes)
+    expected = torch.stack(tuple(resolve_lane(lane) for lane in lanes))
+    torch.testing.assert_close(actual, expected)
+
+    empty = torch.vmap(resolve_lane)(raw.new_empty((0,)))
+    assert empty.shape == (0,)
+
+
+@pytest.mark.parametrize(
     "value,constraint,expected_type",
     [
         (1.0, "positive", M.PositiveParam),
@@ -571,6 +601,142 @@ def test_batch_and_range_parameter_overrides_have_known_scatter_semantics():
         model.parametrize("global_value", 1.0)
 
 
+def test_constructor_additional_parameters_remain_functional_tensor_slots():
+    M.Parameterized.RANGE(rate=1.0)
+
+    class Model(M.Parameterized):
+        def forward(self):
+            return self._derive_parameter_buffers()["rate"]
+
+    model = Model(
+        shape=(2, 3),
+        shape_f=(2, 3),
+        dtype=torch.float64,
+        additional_parameters={
+            "rate": [
+                ("left", 2.0, torch.tensor([0, 3])),
+                (
+                    "rows",
+                    torch.tensor([[3.0], [5.0]], dtype=torch.float64),
+                    torch.tensor([1, 2, 4, 5]),
+                ),
+            ]
+        },
+    )
+
+    assert tuple(
+        parameter_name for _fill, parameter_name in model.additional_parameters["rate"]
+    ) == ("rate_left", "rate_rows")
+    assert {"rate_left", "rate_rows"} <= set(dict(model.named_parameters()))
+
+    left = torch.tensor(7.0, dtype=torch.float64, requires_grad=True)
+    rows = torch.tensor([[11.0], [13.0]], dtype=torch.float64, requires_grad=True)
+    actual = torch.func.functional_call(
+        model,
+        {"rate_left": left, "rate_rows": rows},
+        (),
+        tie_weights=False,
+    )
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([[7.0, 11.0, 11.0], [7.0, 13.0, 13.0]], dtype=torch.float64),
+    )
+    left_gradient, rows_gradient = torch.autograd.grad(actual.sum(), (left, rows))
+    torch.testing.assert_close(left_gradient, torch.tensor(2.0, dtype=torch.float64))
+    torch.testing.assert_close(
+        rows_gradient,
+        torch.tensor([[2.0], [2.0]], dtype=torch.float64),
+    )
+    torch.testing.assert_close(model.rate_left, torch.tensor(2.0, dtype=torch.float64))
+    torch.testing.assert_close(
+        model.rate_rows,
+        torch.tensor([[3.0], [5.0]], dtype=torch.float64),
+    )
+
+
+def test_dynamic_additional_parameter_remains_a_functional_tensor_slot():
+    M.Parameterized.RANGE(rate=1.0)
+
+    class Model(M.Parameterized):
+        def forward(self):
+            return self._derive_parameter_buffers()["rate"]
+
+    model = Model(shape=(1, 3), shape_f=(1, 3), dtype=torch.float64)
+    model.parametrize("rate", 2.0, key=torch.tensor([0, 2]), alias="ends")
+
+    assert model.additional_parameters["rate"][0][1] == "rate_ends"
+    replacement = torch.tensor(7.0, dtype=torch.float64, requires_grad=True)
+    actual = torch.func.functional_call(
+        model,
+        {"rate_ends": replacement},
+        (),
+        tie_weights=False,
+    )
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([[7.0, 1.0, 7.0]], dtype=torch.float64),
+    )
+    (gradient,) = torch.autograd.grad(actual.sum(), (replacement,))
+    torch.testing.assert_close(gradient, torch.tensor(2.0, dtype=torch.float64))
+
+
+def test_additional_parameter_slots_survive_copy_conversion_and_state_dict():
+    M.Parameterized.RANGE(rate=1.0)
+
+    class Model(M.Parameterized):
+        pass
+
+    def make(left, rows):
+        return Model(
+            shape=(2, 3),
+            shape_f=(2, 3),
+            dtype=torch.float32,
+            additional_parameters={
+                "rate": [
+                    ("left", left, torch.tensor([0, 3])),
+                    ("rows", rows, torch.tensor([1, 2, 4, 5])),
+                ]
+            },
+        )
+
+    source = make(2.0, torch.tensor([[3.0], [5.0]]))
+    source.populate_parameter_buffers()
+    clone = copy.deepcopy(source).double()
+
+    assert tuple(
+        source_name for _fill, source_name in clone.additional_parameters["rate"]
+    ) == ("rate_left", "rate_rows")
+    assert clone.rate_left.dtype == torch.float64
+    assert clone.rate_rows.dtype == torch.float64
+    with torch.no_grad():
+        clone.rate_left.fill_(7.0)
+        clone.rate_rows.copy_(torch.tensor([[11.0], [13.0]], dtype=torch.float64))
+    torch.testing.assert_close(
+        clone._derive_parameter_buffers()["rate"],
+        torch.tensor([[7.0, 11.0, 11.0], [7.0, 13.0, 13.0]], dtype=torch.float64),
+    )
+    torch.testing.assert_close(
+        source._derive_parameter_buffers()["rate"],
+        torch.tensor([[2.0, 3.0, 3.0], [2.0, 5.0, 5.0]]),
+    )
+
+    meta = copy.deepcopy(source).to(device="meta")
+    meta_rate = meta._derive_parameter_buffers()["rate"]
+    assert meta_rate.device.type == "meta"
+    assert meta_rate.shape == source.rate.shape
+
+    target = make(17.0, torch.tensor([[19.0], [23.0]]))
+    result = target.load_state_dict(source.state_dict(), strict=True)
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+    torch.testing.assert_close(
+        target._derive_parameter_buffers()["rate"],
+        source._derive_parameter_buffers()["rate"],
+    )
+
+
 def test_constrained_parametrize_wraps_raw_parameters_and_preserves_trainability():
     M.Parameterized.RANGEP(rate=2.0)
 
@@ -625,6 +791,162 @@ def test_constructor_module_only_additional_parameters_do_not_require_scatter_ke
     model.populate_parameter_buffers()
 
     torch.testing.assert_close(model.rate, torch.tensor([[3.0, 3.0, 2.0]]))
+
+
+def test_module_override_keeps_public_parameter_name_and_strict_round_trip():
+    M.Parameterized.RANGE(rate=2.0)
+
+    class Affine(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.theta = torch.nn.Parameter(torch.tensor(value))
+
+        def forward(self, _buffer):
+            return self.theta
+
+    class Model(M.Parameterized):
+        pass
+
+    def make(value):
+        model = Model(shape=(1, 2), shape_f=(1, 2))
+        model.parametrize(
+            "rate",
+            Affine(value),
+            key=torch.tensor([0]),
+            alias="left",
+        )
+        return model
+
+    source = make(3.0)
+    parameter_names = tuple(dict(source.named_parameters()))
+    assert "rate_left.theta" in parameter_names
+    assert not any(
+        name.startswith("_in_graph_parametrization") for name in parameter_names
+    )
+
+    aliases = dict(source.named_parameters(remove_duplicate=False))
+    private_name = "_in_graph_parametrization_rate_0.func.theta"
+    assert aliases["rate_left.theta"] is aliases[private_name]
+
+    target = make(9.0)
+    result = target.load_state_dict(source.state_dict(), strict=True)
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+    target.populate_parameter_buffers()
+    torch.testing.assert_close(target.rate, torch.tensor([[3.0, 2.0]]))
+
+
+def test_module_override_strict_load_accepts_pre_registration_checkpoint():
+    M.Parameterized.RANGE(rate=2.0)
+
+    class Affine(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.theta = torch.nn.Parameter(torch.tensor(value))
+
+        def forward(self, _buffer):
+            return self.theta
+
+    class Model(M.Parameterized):
+        pass
+
+    def make(value):
+        model = Model(shape=(1, 2), shape_f=(1, 2))
+        model.parametrize("rate", Affine(value), key=torch.tensor([0]), alias="left")
+        return model
+
+    source = make(3.0)
+    old_layout = {
+        name: value
+        for name, value in source.state_dict().items()
+        if not name.startswith("_in_graph_parametrization_rate_0.")
+    }
+    target = make(9.0)
+
+    result = target.load_state_dict(old_layout, strict=True)
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+    target.populate_parameter_buffers()
+    torch.testing.assert_close(target.rate, torch.tensor([[3.0, 2.0]]))
+
+
+def test_module_override_consumes_and_validates_legacy_persistent_structural_key():
+    M.Parameterized.RANGE(rate=2.0)
+
+    class Affine(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.theta = torch.nn.Parameter(torch.tensor(value))
+
+        def forward(self, _buffer):
+            return self.theta
+
+    class Model(M.Parameterized):
+        pass
+
+    def make():
+        model = Model(shape=(1, 2), shape_f=(1, 2))
+        model.parametrize("rate", Affine(3.0), key=torch.tensor([0]), alias="left")
+        return model
+
+    source = make()
+    key_name = "_in_graph_parametrization_rate_0.key"
+    legacy = dict(source.state_dict())
+    legacy[key_name] = getattr(source, "_in_graph_parametrization_rate_0").key.clone()
+
+    result = make().load_state_dict(legacy, strict=True)
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+
+    legacy[key_name] = torch.tensor([1])
+    with pytest.raises(RuntimeError, match="Structural parametrization key mismatch"):
+        make().load_state_dict(legacy, strict=True)
+
+
+def test_parameter_materializer_adopts_effective_buffer_dtype_from_module_source():
+    M.Parameterized.RANGE(rate=2.0)
+
+    class Source(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.theta = torch.nn.Parameter(torch.tensor(3.0, dtype=torch.float32))
+
+        def forward(self):
+            return self.theta
+
+    class Model(M.Parameterized):
+        pass
+
+    model = Model(shape=(2, 3), shape_f=(2, 3), dtype=torch.float64, rate=Source())
+    model.populate_parameter_buffers()
+
+    assert model.rate.dtype == torch.float64
+    torch.testing.assert_close(model.rate, torch.full((2, 3), 3.0, dtype=torch.float64))
+    model.rate.sum().backward()
+    torch.testing.assert_close(model.rate_param.theta.grad, torch.tensor(6.0))
+
+
+def test_in_place_transform_receives_writable_copy_without_mutating_raw_source():
+    M.Parameterized.RANGE(rate=2.0)
+
+    class Twice(torch.nn.Module):
+        def forward(self, value):
+            return value.mul_(2.0)
+
+    class Model(M.Parameterized):
+        pass
+
+    model = Model(shape=(2, 3), shape_f=(2, 3))
+    model.register_parametrization_in_graph("rate", Twice())
+    raw_before = model.rate_param.detach().clone()
+
+    derived = model._derive_parameter_buffers()
+    torch.testing.assert_close(derived["rate"], torch.full((2, 3), 4.0))
+    torch.testing.assert_close(model.rate_param, raw_before)
+
+    model.populate_parameter_buffers()
+    torch.testing.assert_close(model.rate, torch.full((2, 3), 4.0))
+    torch.testing.assert_close(model.rate_param, raw_before)
 
 
 def test_dynamic_parametrize_moves_stale_keys_before_committing_new_override():

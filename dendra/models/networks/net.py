@@ -4253,6 +4253,44 @@ class Network(RNGMixin):
             )
 
     # load utilities
+    def _rebuild_loaded_population_workspaces(self, readiness):
+        """Refresh derived child workspaces after a successful public load.
+
+        ``Population._load_from_state_dict`` deliberately invalidates its
+        integrator because ordinary state dictionaries contain derived solver
+        buffers.  An already initialized Network can refresh every child
+        coherently at its authoritative timestep, preserving the historical
+        ``network.load(...); network.step()`` contract without permitting an
+        individual population to rebuild lazily during network execution.
+        """
+        if self.dt is None:
+            return
+
+        try:
+            for name, population in self.populations.items():
+                integrator = population.integrator
+                if integrator is None or not readiness.get(name, False):
+                    continue
+                dt_pop = torch.tensor(
+                    float(self.dt),
+                    device=population.device(),
+                    dtype=population.dtype(),
+                )
+                integrator._initialize(
+                    population,
+                    dt_pop,
+                    force=True,
+                    compile_scope="network_population",
+                )
+        except Exception:
+            # A Network must never expose a mixture of refreshed and stale
+            # population workspaces after a late rebuild failure.
+            for population in self.populations.values():
+                integrator = population.integrator
+                if integrator is not None:
+                    integrator.initialized = False
+            raise
+
     def load(self, state_dict):
         """
         Load model weights from a state dictionary.
@@ -4280,8 +4318,23 @@ class Network(RNGMixin):
             state_dict = torch.load(
                 state_dict, map_location=self.device(), weights_only=True
             )
+        workspace_readiness = {
+            name: bool(
+                population.integrator is not None and population.integrator.initialized
+            )
+            for name, population in self.populations.items()
+        }
         has_duration_remainder = "_duration_remainder" in state_dict
-        _load_compatible_state_dict_transactionally(self, state_dict)
+        try:
+            _load_compatible_state_dict_transactionally(self, state_dict)
+        except Exception:
+            for name, population in self.populations.items():
+                integrator = population.integrator
+                if integrator is not None:
+                    # The transactional loader has restored the exact workspace
+                    # buffers that backed the previous validity flag.
+                    integrator.initialized = workspace_readiness.get(name, False)
+            raise
         if not has_duration_remainder:
             self._clear_duration_remainder()
         else:
@@ -4289,6 +4342,7 @@ class Network(RNGMixin):
                 float(self._duration_remainder.detach().cpu().item())
             )
         self._reanchor_runtime_clock_from_time()
+        self._rebuild_loaded_population_workspaces(workspace_readiness)
         return self
 
     # utilities

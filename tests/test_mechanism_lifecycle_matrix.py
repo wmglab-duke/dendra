@@ -47,8 +47,8 @@ class _DecayState(State):
 
 
 class _StatefulBuffer(Mechanism):
-    Mechanism.STATE(_DecayState)
-    Mechanism.BUFFER("scratch")
+    Mechanism.STATE_BUNDLE(_DecayState)
+    Mechanism.CARRY("scratch")
 
 
 class _RecoveryState(State):
@@ -57,56 +57,164 @@ class _RecoveryState(State):
 
 
 class _MultiStatefulBuffer(Mechanism):
-    Mechanism.STATE(_DecayState, _RecoveryState)
+    Mechanism.STATE_BUNDLE(_DecayState, _RecoveryState)
+
+
+class _CountingDefaultsState(State):
+    State.STATE("x", "y")
+    State.DERIVATIVE("x' = 0.0 * x", "y' = 0.0 * y")
+
+    def state_defaults(self, v, values):
+        del values
+        return {"x": torch.ones_like(v), "y": -torch.ones_like(v)}
+
+
+class _CountingDefaultsMechanism(Mechanism):
+    Mechanism.STATE_BUNDLE(_CountingDefaultsState)
+
+
+class _PurePhaseMechanism(Mechanism):
+    Mechanism.CARRY("steps", dtype=torch.long, shape=())
+    Mechanism.CARRY("memory")
+    Mechanism.ASSIGNED("drive")
+
+    def initial_values(self, v, values):
+        del values
+        return {
+            "steps": torch.zeros((), dtype=torch.long, device=v.device),
+            "memory": torch.zeros_like(v),
+        }
+
+    def assigned_values(self, v, values):
+        del values
+        return {"drive": 2.0 * v}
+
+    def advance(self, v, dt, values):
+        del v, dt
+        return {
+            "steps": values["steps"] + 1,
+            "memory": values["drive"],
+        }
+
+
+class _DeferredLayoutMechanism(Mechanism):
+    Mechanism.CARRY("history", shape="deferred")
+    Mechanism.CARRY("cursor", dtype=torch.long, shape="deferred")
+    Mechanism.DERIVED_BUFFER("routing", dtype=torch.long, shape="deferred")
+
+    def derive_buffers(self):
+        width = self.shape_f[-1] // 2
+        return {
+            "routing": torch.arange(width, device=self.diam.device),
+        }
+
+    def initial_values(self, v, values):
+        del values
+        width = v.shape[-1] // 2
+        return {
+            "history": v[..., :width].clone(),
+            "cursor": torch.zeros(v.shape[:-1], device=v.device, dtype=torch.long),
+        }
+
+    def advance(self, v, dt, values):
+        del v, dt
+        return {
+            "history": values["history"] + 1.0,
+            "cursor": values["cursor"] + 1,
+        }
+
+
+class _CurrentOnlyAssignedMechanism(Mechanism):
+    Mechanism.ASSIGNED("conductance")
+    Mechanism.NONSPECIFIC_CURRENT("i")
+
+    def assigned_values(self, v, values):
+        del values
+        return {"conductance": torch.ones_like(v)}
+
+    def i(self, v):
+        return self.conductance * v
+
+
+class _DeferredNestedState(State):
+    State.STATE("x")
+    State.CARRY("history", shape="deferred")
+    State.DERIVED_BUFFER("routing", dtype=torch.long, shape="deferred")
+    State.DERIVATIVE("x' = 0.0 * x")
+
+    def derive_buffers(self):
+        return {
+            "routing": torch.arange(
+                self.shape_f[-1] // 2,
+                device=self.diam.device,
+            )
+        }
+
+    def state_defaults(self, v, values):
+        del values
+        return {"x": torch.zeros_like(v)}
+
+    def initial_values(self, v, values):
+        del values
+        return {"history": v[..., ::2].clone()}
+
+
+class _DeferredNestedMechanism(Mechanism):
+    Mechanism.STATE_BUNDLE(_DeferredNestedState)
 
 
 class _DerivedLifecycleState(State):
     State.STATE("x")
     State.DERIVATIVE("x' = -x")
     State.DERIVED_BUFFER("state_scale")
-    State.BUFFER("initial_seen")
+    State.CARRY("initial_seen")
 
     def derive_buffers(self):
         return {"state_scale": self.celsius - self.diam}
 
-    def initial(self, v):
-        self.initial_seen = self.state_scale + v
+    def initial_values(self, v, values):
+        del values
+        return {"initial_seen": self.state_scale + v}
 
 
 class _DerivedLifecycleMechanism(Mechanism):
-    Mechanism.STATE(_DerivedLifecycleState)
+    Mechanism.STATE_BUNDLE(_DerivedLifecycleState)
     Mechanism.DERIVED_BUFFER("gain")
-    Mechanism.BUFFER("initial_seen")
+    Mechanism.CARRY("initial_seen")
 
     def derive_buffers(self):
         return {"gain": 2.0 * self.celsius + self.diam}
 
-    def initial(self, v):
-        self.initial_seen = self.gain + v
+    def initial_values(self, v, values):
+        del values
+        return {"initial_seen": self.gain + v}
 
 
 class _DerivedInfState(State):
     State.STATE("x")
     State.DERIVATIVE("x' = -x")
     State.DERIVED_BUFFER("drive")
-    State.BUFFER("initial_seen")
+    State.CARRY("initial_seen")
 
     def derive_buffers(self):
         return {"drive": 3.0 * self.diam}
 
-    def inf(self, v):
+    def state_defaults(self, v, values):
+        del v, values
         return {"x": self.drive}
 
-    def initial(self, v):
-        self.initial_seen = self.drive + v
+    def initial_values(self, v, values):
+        del values
+        return {"initial_seen": self.drive + v}
 
 
 class _DerivedInfMechanism(Mechanism):
-    Mechanism.STATE(_DerivedInfState)
-    Mechanism.BUFFER("state_drive_seen")
+    Mechanism.STATE_BUNDLE(_DerivedInfState)
+    Mechanism.CARRY("state_drive_seen")
 
-    def initial(self, v):
-        self.state_drive_seen = self.DE._DerivedInfState.drive
+    def initial_values(self, v, values):
+        del values
+        return {"state_drive_seen": self.DE._DerivedInfState.drive + 0.0 * v}
 
 
 class _ConstantWaveform(torch.nn.Module):
@@ -201,6 +309,196 @@ def _run_single(mech, values, *, mode=None, delay_steps=None):
     return outputs
 
 
+def test_mechanism_state_bundle_names_and_flattened_state_names_are_unique():
+    class _SameBundleName(State):
+        State.STATE("left")
+
+    first_bundle = _SameBundleName
+
+    class _SameBundleName(State):
+        State.STATE("right")
+
+    second_bundle = _SameBundleName
+
+    with pytest.raises(ValueError, match="unique class names.*_SameBundleName"):
+
+        class _DuplicateBundleNames(Mechanism):
+            Mechanism.STATE_BUNDLE(first_bundle, second_bundle)
+
+    class _FirstStateBundle(State):
+        State.STATE("shared")
+
+    class _SecondStateBundle(State):
+        State.STATE("shared")
+
+    with pytest.raises(ValueError, match=r"disjoint State\.STATE names.*shared"):
+
+        class _DuplicateFlattenedStateNames(Mechanism):
+            Mechanism.STATE_BUNDLE(_FirstStateBundle, _SecondStateBundle)
+
+
+def test_state_bundle_registration_has_an_unambiguous_declaration_name():
+    class _RegisteredStateBundle(State):
+        State.STATE("x")
+
+    class _RegisteredMechanism(Mechanism):
+        Mechanism.STATE_BUNDLE(_RegisteredStateBundle)
+
+    assert not hasattr(Mechanism, "STATE")
+    assert _RegisteredMechanism._state == (_RegisteredStateBundle,)
+
+
+def test_mechanism_flat_storage_roles_cannot_reuse_owned_slots():
+    class _NestedState(State):
+        State.STATE("x")
+
+    with pytest.raises(ValueError, match="CARRY names conflict.*gain"):
+
+        class _ParameterCarryCollision(Mechanism):
+            Mechanism.GLOBAL(gain=1.0)
+            Mechanism.CARRY("gain")
+
+    with pytest.raises(ValueError, match="ASSIGNED names conflict.*drive"):
+
+        class _ParameterAssignedCollision(Mechanism):
+            Mechanism.RANGE(drive=1.0)
+            Mechanism.ASSIGNED("drive")
+
+    with pytest.raises(ValueError, match="CARRY names conflict.*diam"):
+
+        class _ReservedCarryCollision(Mechanism):
+            Mechanism.CARRY("diam")
+
+    with pytest.raises(ValueError, match="ASSIGNED names conflict.*advance"):
+
+        class _MethodAssignedCollision(Mechanism):
+            Mechanism.ASSIGNED("advance")
+
+    with pytest.raises(ValueError, match="CARRY names conflict.*x"):
+
+        class _StateCarryCollision(Mechanism):
+            Mechanism.STATE_BUNDLE(_NestedState)
+            Mechanism.CARRY("x")
+
+    with pytest.raises(ValueError, match="ASSIGNED names conflict.*x"):
+
+        class _StateAssignedCollision(Mechanism):
+            Mechanism.STATE_BUNDLE(_NestedState)
+            Mechanism.ASSIGNED("x")
+
+
+def test_save_current_mirror_cannot_be_reused_by_any_flat_user_role():
+    class _SavedMirrorState(State):
+        State.STATE("i_")
+
+    with pytest.raises(ValueError, match="CARRY names conflict.*i_"):
+
+        class _SavedCarryCollision(Mechanism):
+            Mechanism.NONSPECIFIC_CURRENT("i")
+            Mechanism.SAVE_CURRENT("i")
+            Mechanism.CARRY("i_")
+
+    with pytest.raises(ValueError, match="ASSIGNED names conflict.*i_"):
+
+        class _SavedAssignedCollision(Mechanism):
+            Mechanism.NONSPECIFIC_CURRENT("i")
+            Mechanism.SAVE_CURRENT("i")
+            Mechanism.ASSIGNED("i_")
+
+    with pytest.raises(ValueError, match="SAVE_CURRENT mirrors conflict.*i_"):
+
+        class _SavedStateCollision(Mechanism):
+            Mechanism.NONSPECIFIC_CURRENT("i")
+            Mechanism.SAVE_CURRENT("i")
+            Mechanism.STATE_BUNDLE(_SavedMirrorState)
+
+    with pytest.raises(ValueError, match="SAVE_CURRENT mirrors conflict.*i_"):
+
+        class _SavedParameterCollision(Mechanism):
+            Mechanism.GLOBAL(i_=0.0)
+            Mechanism.NONSPECIFIC_CURRENT("i")
+            Mechanism.SAVE_CURRENT("i")
+
+
+def test_save_current_requires_a_current_and_owns_its_zero_initialized_mirror():
+    assert not hasattr(Mechanism, "SAVE")
+
+    with pytest.raises(ValueError, match="SAVE_CURRENT.*invalid names.*missing"):
+
+        class _UndeclaredSavedCurrent(Mechanism):
+            Mechanism.SAVE_CURRENT("missing")
+
+    with pytest.raises(ValueError, match="SAVE_CURRENT.*invalid names.*nai"):
+
+        class _ConcentrationIsNotCurrent(Mechanism):
+            Mechanism.USEION("na", write=["nai"])
+            Mechanism.SAVE_CURRENT("nai")
+
+    class _SavedNonspecificCurrent(Mechanism):
+        Mechanism.SAVE_CURRENT("i")
+        Mechanism.NONSPECIFIC_CURRENT("i")
+
+        def i(self, v):
+            return 2.0 * v
+
+    class _SavedIonicCurrent(Mechanism):
+        Mechanism.SAVE_CURRENT("ina")
+        Mechanism.USEION("na", write=["ina"])
+
+        def ina(self, v):
+            return 3.0 * v
+
+    shape = (2, 3)
+    diam = torch.ones(shape, dtype=torch.float64)
+    for mechanism_type, mirror_name in (
+        (_SavedNonspecificCurrent, "i_"),
+        (_SavedIonicCurrent, "ina_"),
+    ):
+        mechanism = mechanism_type(
+            "saved",
+            torch.tensor(37.0, dtype=torch.float64),
+            diam,
+            (1, 3),
+            shape,
+        )
+        mirror = getattr(mechanism, mirror_name)
+        assert mirror.shape == shape
+        torch.testing.assert_close(mirror, torch.zeros_like(mirror))
+
+    class _IllegalSavedCurrentInitializer(_SavedNonspecificCurrent):
+        def initial_values(self, v, values):
+            assert "i_" not in values
+            return {"i_": torch.ones_like(v)}
+
+    mechanism = _IllegalSavedCurrentInitializer(
+        "saved",
+        torch.tensor(37.0, dtype=torch.float64),
+        diam,
+        shape,
+        shape,
+    )
+    with pytest.raises(KeyError, match="undeclared outputs.*i_"):
+        mechanism._init_buffers_s(torch.zeros_like(diam))
+
+    class _IllegalSavedCurrentAdvance(_SavedNonspecificCurrent):
+        def advance(self, v, dt, values):
+            del dt, values
+            return {"i_": torch.ones_like(v)}
+
+    mechanism = _IllegalSavedCurrentAdvance(
+        "saved",
+        torch.tensor(37.0, dtype=torch.float64),
+        diam,
+        shape,
+        shape,
+    )
+    with pytest.raises(KeyError, match="undeclared outputs.*i_"):
+        mechanism._advance_states(
+            torch.zeros_like(diam),
+            torch.tensor(0.025, dtype=torch.float64),
+        )
+
+
 def test_derived_buffers_refresh_before_authored_initial_and_retain_gradients():
     mechanism, celsius, diam = _derived_lifecycle_mechanism()
     voltage = torch.linspace(
@@ -233,9 +531,9 @@ def test_derived_buffers_refresh_before_authored_initial_and_retain_gradients():
         torch.full_like(diameter_gradient, -1.0),
     )
 
-    assert "gain" in mechanism._assigned
+    assert "gain" in mechanism._derived_buffers
     assert "gain" in mechanism.state_dict()
-    assert "state_scale" in state._state_buffers
+    assert "state_scale" in state._derived_buffers
     assert "DE._DerivedLifecycleState.state_scale" in mechanism.state_dict()
 
     handler = MechanismHandler(
@@ -244,14 +542,21 @@ def test_derived_buffers_refresh_before_authored_initial_and_retain_gradients():
         {"derived": mechanism},
     )
     checkpoint = handler.mutable_state_dict()
-    torch.testing.assert_close(checkpoint["derived.gain"], mechanism.gain)
+    # Runtime activation checkpoints carry evolving state and ordinary mutable
+    # buffers, but not reproducible preparation workspaces.  DERIVED_BUFFER
+    # values are rebuilt from parameters at the next configuration boundary.
+    assert "derived.gain" not in checkpoint
+    assert "derived.DE._DerivedLifecycleState.state_scale" not in checkpoint
     torch.testing.assert_close(
-        checkpoint["derived.DE._DerivedLifecycleState.state_scale"],
-        state.state_scale,
+        checkpoint["derived.initial_seen"], mechanism.initial_seen
+    )
+    torch.testing.assert_close(
+        checkpoint["derived.DE._DerivedLifecycleState.initial_seen"],
+        state.initial_seen,
     )
 
 
-def test_state_derived_buffers_are_ready_for_inf_and_mechanism_initial():
+def test_state_derived_buffers_are_ready_for_defaults_and_mechanism_initial_values():
     shape = (2, 3)
     diam = torch.arange(1, 7, dtype=torch.float64).reshape(shape)
     voltage = torch.full(shape, -65.0, dtype=torch.float64)
@@ -279,6 +584,166 @@ def test_state_derived_buffers_are_ready_for_inf_and_mechanism_initial():
         rtol=0.0,
         atol=0.0,
     )
+
+
+def test_state_defaults_is_evaluated_once_for_all_declared_state_values():
+    shape = (2, 3)
+    mechanism = _CountingDefaultsMechanism(
+        "counting_defaults",
+        torch.tensor(34.0, dtype=torch.float64),
+        torch.ones(shape, dtype=torch.float64),
+        shape,
+        shape,
+    )
+    voltage = torch.zeros(shape, dtype=torch.float64)
+
+    state_type = type(mechanism.DE._CountingDefaultsState)
+    original_defaults = state_type.state_defaults
+    calls = 0
+
+    def counted_defaults(self, v, values):
+        nonlocal calls
+        calls += 1
+        return original_defaults(self, v, values)
+
+    state_type.state_defaults = counted_defaults
+    try:
+        mechanism._init_buffers_s(voltage)
+    finally:
+        state_type.state_defaults = original_defaults
+
+    assert calls == 1
+    torch.testing.assert_close(mechanism.x, torch.ones_like(voltage))
+    torch.testing.assert_close(mechanism.y, -torch.ones_like(voltage))
+
+
+def test_mechanism_assigned_is_repeatable_and_advance_commits_carry_once():
+    shape = (2, 3)
+    voltage = torch.arange(6, dtype=torch.float64).reshape(shape)
+    mechanism = _PurePhaseMechanism(
+        "pure_phase",
+        torch.tensor(34.0, dtype=torch.float64),
+        torch.ones(shape, dtype=torch.float64),
+        shape,
+        shape,
+    )
+    mechanism._init_buffers_s(voltage)
+
+    assert mechanism.steps.shape == ()
+    assert mechanism.steps.dtype == torch.long
+    assert mechanism.memory.dtype == torch.float64
+    assert "drive" not in mechanism.state_dict()
+
+    mechanism._evaluate_assigned(voltage)
+    first = mechanism.drive
+    mechanism._evaluate_assigned(voltage)
+    torch.testing.assert_close(mechanism.drive, first)
+    assert mechanism.steps.item() == 0
+    torch.testing.assert_close(mechanism.memory, torch.zeros_like(voltage))
+
+    mechanism._advance_states(voltage, voltage.new_tensor(0.1))
+    assert mechanism.steps.item() == 1
+    torch.testing.assert_close(mechanism.memory, 2.0 * voltage)
+
+    checkpoint = MechanismHandler(
+        torch.full(shape, 34.0, dtype=torch.float64),
+        torch.ones(shape, dtype=torch.float64),
+        {"pure_phase": mechanism},
+    ).mutable_state_dict()
+    assert "pure_phase.steps" in checkpoint
+    assert "pure_phase.memory" in checkpoint
+    assert "pure_phase.drive" not in checkpoint
+
+
+def test_deferred_layouts_resolve_once_and_strict_load_into_fresh_instance():
+    shape_p = (1, 6)
+    shape_f = (3, 1, 6)
+    voltage = torch.arange(math.prod(shape_f), dtype=torch.float64).reshape(shape_f)
+
+    def fresh():
+        return _DeferredLayoutMechanism(
+            "deferred",
+            torch.tensor(34.0, dtype=torch.float64),
+            torch.ones(shape_p, dtype=torch.float64),
+            shape_p,
+            shape_f,
+        )
+
+    source = fresh()
+    assert source._carry_resolved_shapes == {"history": None, "cursor": None}
+    assert source._derived_resolved_shapes == {"routing": None}
+    source._init_buffers_s(voltage)
+
+    assert source.history.shape == (3, 1, 3)
+    assert source.cursor.shape == (3, 1)
+    assert source.cursor.dtype is torch.long
+    assert source.routing.shape == (3,)
+    assert source.routing.dtype is torch.long
+    assert source._carry_resolved_shapes == {
+        "history": (3, 1, 3),
+        "cursor": (3, 1),
+    }
+    assert source._derived_resolved_shapes == {"routing": (3,)}
+
+    target = fresh()
+    target.load_state_dict(source.state_dict(), strict=True)
+    assert target._carry_resolved_shapes == source._carry_resolved_shapes
+    assert target._derived_resolved_shapes == source._derived_resolved_shapes
+    torch.testing.assert_close(target.history, source.history)
+    torch.testing.assert_close(target.cursor, source.cursor)
+    torch.testing.assert_close(target.routing, source.routing)
+
+    target._advance_states(voltage, voltage.new_tensor(0.1))
+    torch.testing.assert_close(target.history, source.history + 1.0)
+    torch.testing.assert_close(target.cursor, source.cursor + 1)
+
+
+def test_current_only_assigned_is_not_repeated_by_accepted_transition():
+    shape = (2, 3)
+    voltage = torch.arange(6, dtype=torch.float64).reshape(shape)
+    mechanism = _CurrentOnlyAssignedMechanism(
+        "current_only",
+        torch.tensor(34.0, dtype=torch.float64),
+        torch.ones(shape, dtype=torch.float64),
+        shape,
+        shape,
+    )
+    calls = 0
+    original = mechanism.assigned_values
+
+    def counted(v, values):
+        nonlocal calls
+        calls += 1
+        return original(v, values)
+
+    mechanism.assigned_values = counted
+    mechanism._evaluate_assigned(voltage)
+    mechanism._evaluate_assigned(voltage)
+    assert calls == 2
+
+    mechanism._advance_states(voltage, voltage.new_tensor(0.1))
+    assert calls == 2
+
+
+def test_nested_state_deferred_layout_uses_runtime_batch_shape():
+    shape_p = (1, 6)
+    shape_f = (2, 3, 1, 6)
+    voltage = torch.arange(math.prod(shape_f), dtype=torch.float64).reshape(shape_f)
+    mechanism = _DeferredNestedMechanism(
+        "nested_deferred",
+        torch.tensor(34.0, dtype=torch.float64),
+        torch.ones(shape_p, dtype=torch.float64),
+        shape_p,
+        shape_f,
+    )
+
+    mechanism._init_buffers_s(voltage)
+    state = mechanism.DE["_DeferredNestedState"]
+
+    assert state.history.shape == (2, 3, 1, 3)
+    assert state.routing.shape == (3,)
+    assert state._carry_resolved_shapes == {"history": (2, 3, 1, 3)}
+    assert state._derived_resolved_shapes == {"routing": (3,)}
 
 
 @pytest.mark.parametrize(
@@ -318,13 +783,14 @@ def test_derived_buffer_builder_contract_fails_before_authored_initial(
 ):
     class InvalidDerivedBuffer(Mechanism):
         Mechanism.DERIVED_BUFFER("workspace")
-        Mechanism.BUFFER("initial_seen")
+        Mechanism.CARRY("initial_seen")
 
         def derive_buffers(self):
             return builder(self)
 
-        def initial(self, v):
-            self.initial_seen = torch.ones_like(v)
+        def initial_values(self, v, values):
+            del values
+            return {"initial_seen": torch.ones_like(v)}
 
     shape = (2, 3)
     mechanism = InvalidDerivedBuffer(
@@ -1112,6 +1578,44 @@ def test_handler_current_apis_match_exact_density_and_point_aggregation():
     df_i, df_g = handler.idf(v, v_prev)
     torch.testing.assert_close(df_i, expected_df_i)
     torch.testing.assert_close(df_g, expected_df_g)
+
+
+def test_call_local_current_frame_matches_imperative_without_touching_scratch():
+    handler = _make_current_handler(with_ion=True)
+    v = torch.tensor([[-70.0, -60.0, -50.0]], dtype=torch.float64)
+
+    expected_i, expected_g = handler.i(v)
+    expected_current_frame = handler.capture_ion_current_frame()
+    expected_conductance_frame = handler.capture_ion_conductance_frame()
+    scratch = tuple(handler._buf_i) + tuple(handler._buf_g)
+    scratch_ids = tuple(id(value) for value in scratch)
+    scratch_versions = tuple(value._version for value in scratch)
+    scratch_values = tuple(value.clone() for value in scratch)
+
+    actual_i, actual_g, current_frame, conductance_frame = (
+        handler._evaluate_current_frame(v)
+    )
+
+    torch.testing.assert_close(actual_i, expected_i)
+    torch.testing.assert_close(actual_g, expected_g)
+    for actual, expected in zip(
+        current_frame,
+        expected_current_frame,
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected)
+    for actual, expected in zip(
+        conductance_frame,
+        expected_conductance_frame,
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected)
+
+    after = tuple(handler._buf_i) + tuple(handler._buf_g)
+    assert tuple(id(value) for value in after) == scratch_ids
+    assert tuple(value._version for value in after) == scratch_versions
+    for actual, expected in zip(after, scratch_values, strict=True):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_handler_noncurrent_ion_is_safe_across_current_apis():

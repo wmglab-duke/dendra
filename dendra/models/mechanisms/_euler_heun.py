@@ -84,18 +84,18 @@ def build_euler_heun(
         )
 
     assigned_list_sorted = sorted(assigned)
-    lines = ["def solve(self, v, dt, states):"]
+    lines = ["def solve(self, v, dt, values):"]
     lines.append("    __dt_ref = None")
     for state in states:
-        lines.append(f"    __old_{state} = states[{state!r}]")
+        lines.append(f"    __old_{state} = values[{state!r}]")
         lines.append(f"    if __dt_ref is None: __dt_ref = __old_{state}")
     lines.append(
         "    __dt = torch.as_tensor(dt, dtype=__dt_ref.dtype, device=__dt_ref.device)"
     )
     lines.append("    __sqrt_dt = torch.sqrt(__dt)")
-    lines.append("    __bp_old = self.breakpoint(v, states)")
+    lines.append("    __assigned_old = self._derive_assigned_values(v, values)")
     for name in assigned_list_sorted:
-        lines.append(f"    __old_assigned_{name} = __bp_old[{name!r}]")
+        lines.append(f"    __old_assigned_{name} = __assigned_old[{name!r}]")
 
     returns = []
     for state in states:
@@ -141,16 +141,16 @@ def build_euler_heun(
             f"__diff_old_{state} * __dW_{state}"
         )
 
-    lines.append("    __pred_states = {")
+    lines.append("    __pred_values = {**values,")
     for state in states:
         if state in eliminate:
             lines.append(f"        {state!r}: _{state},")
         else:
             lines.append(f"        {state!r}: __pred_{state},")
     lines.append("    }")
-    lines.append("    __bp_pred = self.breakpoint(v, __pred_states)")
+    lines.append("    __assigned_pred = self._derive_assigned_values(v, __pred_values)")
     for name in assigned_list_sorted:
-        lines.append(f"    __pred_assigned_{name} = __bp_pred[{name!r}]")
+        lines.append(f"    __pred_assigned_{name} = __assigned_pred[{name!r}]")
 
     for state in states:
         if state in eliminate:

@@ -12,6 +12,7 @@ from dendra.models.integrators.tree import (
 from dendra.models.integrators.tree_bt import (
     _dhs_bt,
     _topo_parent_depth,
+    _tree_layered_edge_conductance,
     assemble_rhs,
 )
 
@@ -448,7 +449,113 @@ def test_block_rhs_matches_manual_radial_balance_and_outer_drive():
         drive,
         e_ext,
     )
-    assert torch.equal(assemble_rhs(previous, capacitance, drive, xg, e_ext), expected)
+    assert torch.equal(
+        assemble_rhs(previous, capacitance, drive, xg[..., -1], e_ext), expected
+    )
+
+
+def test_block_tree_workspace_is_shared_pure_and_transformable():
+    graph = _graph([(2, 0), (2, 1), (0, 3)], nodes=[3, 1, 0, 2])
+    model = BlockTreeModel(graph, shape=(2, 4))
+    integrator = _dhs_bt(model, LinearMechanism(), threads=2)
+    dt = torch.tensor(0.045, dtype=DTYPE, requires_grad=True)
+    integrator._initialize(model, dt.detach())
+
+    child = integrator.edge_child_orig
+    parent = integrator.edge_parent_orig
+    g_mechanism = integrator.g_to_parent.index_select(1, integrator.inv_solver_order)
+    intracellular_edge = g_mechanism[..., 0].index_select(1, child)
+    extracellular_edge = _tree_layered_edge_conductance(
+        model.xraxial,
+        model.dx,
+        child,
+        parent,
+    )
+    torch.testing.assert_close(
+        g_mechanism[..., 1:].index_select(1, child),
+        extracellular_edge,
+    )
+
+    physical = {
+        "cm": model.cm.detach().clone().requires_grad_(),
+        "area": model.area.detach().clone().requires_grad_(),
+        "intracellular_edge_conductance": intracellular_edge.detach()
+        .clone()
+        .requires_grad_(),
+        "extracellular_edge_conductance": extracellular_edge.detach()
+        .clone()
+        .requires_grad_(),
+        "xc": model.xc.detach().clone().requires_grad_(),
+        "xg": model.xg.detach().clone().requires_grad_(),
+    }
+    snapshots = {name: value.detach().clone() for name, value in physical.items()}
+    workspace = integrator._derive_prepared_workspace(
+        dt,
+        **physical,
+        edge_child_orig=child,
+        solver_order=integrator.solver_order,
+    )
+    assert tuple(integrator._PREPARED_WORKSPACE_SCHEMA) == (
+        ("area", "node"),
+        ("cm_dt", "node"),
+        ("xc_dt", "shell_node"),
+        ("c_rad", "block_node"),
+        ("xg", "shell_node"),
+        ("main_blocks", "block_matrix"),
+        ("g_to_parent", "block_node"),
+    )
+    for name, expected in snapshots.items():
+        torch.testing.assert_close(physical[name], expected)
+    assert workspace["area"].data_ptr() != physical["area"].data_ptr()
+    for name in workspace:
+        torch.testing.assert_close(workspace[name], getattr(integrator, name))
+
+    def prepared(dt_value, cm, area, g_intra, g_extra, xc, xg):
+        values = integrator._prepare_workspace(
+            dt_value,
+            cm=cm,
+            area=area,
+            intracellular_edge_conductance=g_intra,
+            extracellular_edge_conductance=g_extra,
+            xc=xc,
+            xg=xg,
+            edge_child_orig=child,
+            solver_order=integrator.solver_order,
+        )
+        return values["main_blocks"], values["g_to_parent"], values["c_rad"]
+
+    dynamic = (
+        dt,
+        physical["cm"],
+        physical["area"],
+        physical["intracellular_edge_conductance"],
+        physical["extracellular_edge_conductance"],
+        physical["xc"],
+        physical["xg"],
+    )
+    assert torch.autograd.gradcheck(prepared, dynamic, fast_mode=True)
+
+    lanes = 3
+    lane_scale = torch.linspace(0.9, 1.1, lanes, dtype=DTYPE)
+    batched = tuple(
+        value.unsqueeze(0) * lane_scale.reshape((lanes,) + (1,) * value.ndim)
+        for value in dynamic
+    )
+    vmapped = torch.vmap(prepared)(*batched)
+    expected = tuple(
+        torch.stack(
+            [prepared(*(value[i] for value in batched))[j] for i in range(lanes)]
+        )
+        for j in range(len(vmapped))
+    )
+    for actual, wanted in zip(vmapped, expected):
+        torch.testing.assert_close(actual, wanted)
+
+    empty = tuple(value.new_empty((0, *value.shape)) for value in dynamic)
+    empty_output = torch.vmap(prepared)(*empty)
+    assert empty_output[0].shape == (0, 2, 4, 3, 3)
+    assert empty_output[1].shape == (0, 2, 4, 3)
+    assert empty_output[2].shape == (0, 2, 4, 3)
 
 
 @pytest.mark.parametrize("graph", TOPOLOGIES)
@@ -466,7 +573,7 @@ def test_block_tree_step_matches_dense_reference(graph):
     intra = torch.linspace(0.01, 0.04, compartments, dtype=DTYPE)
     external = torch.linspace(-3.0, 5.0, compartments, dtype=DTYPE)
 
-    actual_vc, actual_v = integrator._step(
+    actual_vc, actual_v, i_membrane = integrator._step(
         vc, voltage, 0.03, model.celsius, ve=external, intra=intra
     )
     expected_vc = _block_dense_reference(
@@ -474,6 +581,7 @@ def test_block_tree_step_matches_dense_reference(graph):
     )
     assert torch.allclose(actual_vc, expected_vc, rtol=2e-10, atol=5e-10)
     assert torch.allclose(actual_v, expected_vc[..., 0] - expected_vc[..., 1])
+    assert i_membrane is None
 
 
 def test_block_tree_supports_batched_inputs_and_dense_gradients():
@@ -491,7 +599,7 @@ def test_block_tree_supports_batched_inputs_and_dense_gradients():
     intra = torch.tensor([0.02, -0.01, 0.04, 0.03], dtype=DTYPE).requires_grad_()
     external = torch.tensor([-3.0, 1.0, 4.0, -2.0], dtype=DTYPE).requires_grad_()
 
-    actual, _ = integrator._step(
+    actual, _, _ = integrator._step(
         vc.reshape(-1, integrator.K, 3),
         voltage,
         0.045,

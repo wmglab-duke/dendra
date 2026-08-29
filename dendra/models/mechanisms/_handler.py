@@ -71,6 +71,16 @@ _SUPPORT_ENTRY_PLAN_ATTRS = (
 )
 
 
+def _runtime_state_buffer_names(state):
+    """Return State buffers that are true mutable runtime carry."""
+    return tuple(getattr(state, "_carry", ()))
+
+
+def _runtime_mechanism_carry_names(module):
+    """Return declared persistent Mechanism carry names."""
+    return tuple(getattr(module, "_carry", ()))
+
+
 def _support_spec(module):
     """Return the structural support description owned by ``module``."""
 
@@ -324,28 +334,12 @@ def make_scaler(mech, area, support_entry=None):
     multiple inputs.
     """
     if isinstance(mech, PointProcess):
-        # Calculate the scaling factor once. This is a closure.
-        # The 'arr' variable will be remembered by the _scaler function.
         gather = mech.get if support_entry is None else support_entry.gather
-        arr = 1e6 * gather(area)
-
-        # Add a check to prevent division by zero.
-        if torch.any(arr == 0):
-            raise ValueError(
-                "Calculated area factor is zero, perhaps you inserted a PointProcess at a branchpoint?"
-            )
-
-        def _scaler(*args):
-            # Scale all incoming arguments
-            scaled_values = tuple(a / arr for a in args)
-
-            # If only one argument was passed, return the single scaled value.
-            if len(scaled_values) == 1:
-                return scaled_values[0]
-            # Otherwise, return the tuple of scaled values.
-            return scaled_values
-
-        return _scaler
+        # Precompute exactly once per map build, as before, but keep the factor
+        # in a registered non-persistent buffer rather than a closed-over Tensor.
+        # Besides making dtype/device relocation ordinary Module behavior, this
+        # gives functional_call an explicit slot that preparation can rebind.
+        return PointProcess._bind_area_factor(mech, 1e6 * gather(area))
 
     def _scaler(*args):
         # If only one argument was passed, return it directly.
@@ -553,7 +547,7 @@ class MechanismHandler(torch.nn.Module):
         )
 
         for process in self.material_processes.values():
-            process.bind_materials(self._get_material, population=population)
+            process._bind_materials(self._get_material, population=population)
 
         self._validate_diffusion_process_overlaps()
 
@@ -565,13 +559,13 @@ class MechanismHandler(torch.nn.Module):
         self._current_support_entries = ()
         self._current_support_representatives = ()
         self._current_support_ids = ()
-        self._current_breakpoint_plan = ()
+        self._current_assigned_plan = ()
         self._map_grouped = ()
         self._map_exp_grouped = ()
         self._ion_support_entries = ()
         self._ion_support_representatives = ()
         self._ion_support_ids = ()
-        self._ion_source_breakpoint_plan = ()
+        self._ion_source_assigned_plan = ()
         self._map_exp_ion_reads_grouped = ()
         self._total_support_entries = ()
         self._total_support_representatives = ()
@@ -584,12 +578,12 @@ class MechanismHandler(torch.nn.Module):
         # handler.  The registry owns no tensors and never enters state_dict.
         self._support_registry = SupportRegistry(self.mechanisms.values())
 
-        # Preserve breakpoint behavior for directly constructed handlers even
-        # before ``make_maps()`` or full Population initialization.
+        # Build the assigned-value schedule even for directly constructed
+        # handlers before ``make_maps()`` or full Population initialization.
         (
             self._current_support_entries,
             self._current_support_ids,
-            self._current_breakpoint_plan,
+            self._current_assigned_plan,
             _support_by_mechanism,
         ) = self._registered_support_plan(self._current_evaluation_mechanisms)
         self._current_support_representatives = tuple(
@@ -736,9 +730,7 @@ class MechanismHandler(torch.nn.Module):
             self._buf_i = [fn(buffer) for buffer in self._buf_i]
             self._buf_g = [fn(buffer) for buffer in self._buf_g]
 
-        # Point-process density scalers close over an area-derived tensor.
-        # Rebuild the maps after area/mechanism conversion so no callable keeps
-        # a source-device or source-dtype tensor alive.
+        # Rebuild support plans and point-process area factors after conversion.
         if hasattr(self, "_map"):
             self.make_maps()
         return result
@@ -944,7 +936,7 @@ class MechanismHandler(torch.nn.Module):
         self._post_state_support_representatives = tuple(
             entry.representative for entry in self._post_state_support_entries
         )
-        self._state_reader_breakpoint_plan = tuple(
+        self._state_reader_assigned_plan = tuple(
             (mech, state_support_by_mechanism[id(mech)]) for mech in current_readers
         )
         self._make_field_read_plans()
@@ -1080,6 +1072,37 @@ class MechanismHandler(torch.nn.Module):
             for field, local_name in field_map.items()
         )
 
+        # Fresh initialization treats absolute write locals as explicit seed
+        # sources when they are also declared ODE states. Source locals remain
+        # writable carry but begin at the canonical zero installed by
+        # ``_reset_shared_local_buffers``. Cache ownership once; this is an
+        # initialization plan, never a timestep scan.
+        shared_initial_names = {}
+        absolute_seed_names = {}
+        for _shared, field, mechanism, _support in (
+            *self._ion_write_support_plan,
+            *self._material_write_support_plan,
+        ):
+            shared_initial_names.setdefault(id(mechanism), set()).add(field)
+            if any(field in state._state for state in mechanism.DE.values()):
+                absolute_seed_names.setdefault(id(mechanism), set()).add(field)
+        for (
+            _material,
+            _field,
+            local_name,
+            mechanism,
+            _support,
+        ) in self._material_source_support_plan:
+            shared_initial_names.setdefault(id(mechanism), set()).add(local_name)
+        self._shared_initial_value_names = {
+            identity: frozenset(names)
+            for identity, names in shared_initial_names.items()
+        }
+        self._absolute_state_seed_names = {
+            identity: frozenset(names)
+            for identity, names in absolute_seed_names.items()
+        }
+
     @staticmethod
     def _bind_mechanism_field(mechanism, field, value):
         """Bind one local shared field to a mechanism and all nested States."""
@@ -1141,11 +1164,15 @@ class MechanismHandler(torch.nn.Module):
         self._current_support_representatives = tuple(
             entry.representative for entry in self._current_support_entries
         )
-        breakpoint_ids = {id(mech) for mech in self._current_evaluation_mechanisms}
-        self._current_breakpoint_plan = tuple(
+        assigned_ids = {
+            id(mech)
+            for mech in self._current_evaluation_mechanisms
+            if mech._assigned or mech._has_authored_assigned_values
+        }
+        self._current_assigned_plan = tuple(
             (mech, support_index)
             for mech, support_index in current_plan
-            if id(mech) in breakpoint_ids
+            if id(mech) in assigned_ids
         )
         self._map_grouped = self._group_current_map(
             self._map,
@@ -1171,8 +1198,12 @@ class MechanismHandler(torch.nn.Module):
         self._ion_support_representatives = tuple(
             entry.representative for entry in self._ion_support_entries
         )
-        source_ids = {id(mech) for mech in self._ion_current_sources}
-        self._ion_source_breakpoint_plan = tuple(
+        source_ids = {
+            id(mech)
+            for mech in self._ion_current_sources
+            if mech._assigned or mech._has_authored_assigned_values
+        }
+        self._ion_source_assigned_plan = tuple(
             (mech, support_index)
             for mech, support_index in ion_plan
             if id(mech) in source_ids
@@ -1206,7 +1237,7 @@ class MechanismHandler(torch.nn.Module):
         """Initialize shared fields and mechanisms as one ordered transaction.
 
         Ionic-current readers require a provisional current frame before their
-        ``INITIAL`` blocks can run.  That frame is only a dependency input: the
+        initial-value hooks can run. That frame is only a dependency input: the
         accepted frame is recomputed after replacement writes, concentration
         guards, reversal-potential updates, and shared-field reads are coherent.
 
@@ -1219,38 +1250,78 @@ class MechanismHandler(torch.nn.Module):
         self.init_rng()
         if populate:
             self.populate(random_generation=random_generation)
-        self.ion_init(celsius)
-        self.material_init(celsius)
-        self.set_buffers(diameters)
-        self.init_i_g_bufs(v)
+        self._initialize_tensor_transaction(
+            v,
+            celsius,
+            diameters=diameters,
+            initialize_current_scratch=True,
+            dispatch_shared_hooks=True,
+        )
+
+    def _initialize_tensor_transaction(
+        self,
+        v,
+        celsius,
+        *,
+        diameters=None,
+        initialize_current_scratch=False,
+        state_overrides=None,
+        call_local_currents=False,
+        dispatch_shared_hooks=False,
+    ):
+        """Run the deterministic tensor portion of handler initialization.
+
+        Imperative initialization supplies geometry and uses reusable current
+        scratch. Functional initialization supplies explicit State overrides,
+        relies on already-prepared geometry, and evaluates currents call-locally.
+        Both adapters share the same ordered shared-field transaction.
+        """
+        self._reset_shared_initial_fields(
+            celsius,
+            dispatch_hooks=dispatch_shared_hooks,
+        )
+        if diameters is None:
+            self._reset_shared_local_buffers(bind_state_aliases=False)
+        else:
+            self.set_buffers(diameters)
+        if initialize_current_scratch:
+            self.init_i_g_bufs(v)
         self.read_from_ions()
         self.read_from_materials()
         if self._ion_current_reads:
-            local_voltages = self._gather_support_fields(
+            self._initialize_state_plan(
                 v,
                 self._pre_state_support_entries,
+                self._pre_state_advance_plan,
+                state_overrides=state_overrides,
             )
-            for mech, support_index in self._pre_state_advance_plan:
-                mech._init_buffers_s(local_voltages[support_index])
-            self.i(v)
-            initial_frame = self.capture_ion_current_frame()
+            initial_frame = self._initialization_current_frame(
+                v,
+                call_local=call_local_currents,
+            )
             self._publish_ion_current_frame(initial_frame)
-            local_voltages = self._gather_support_fields(
+            self._initialize_state_plan(
                 v,
                 self._post_state_support_entries,
+                self._post_state_advance_plan,
+                state_overrides=state_overrides,
             )
-            for mech, support_index in self._post_state_advance_plan:
-                local_v = local_voltages[support_index]
-                mech._init_buffers_s(local_v)
-                mech.breakpoint(local_v)
         else:
-            self.compute_initial_conditions(v)
+            self._initialize_state_plan(
+                v,
+                self._state_support_entries,
+                self._state_advance_plan,
+                state_overrides=state_overrides,
+            )
             if self.write_ion_c or self.write_material:
-                # A BREAKPOINT block may prepare an absolute concentration or
-                # material write.  Preserve that initialization contract before
+                # Assigned algebra may prepare an absolute concentration or
+                # material write. Preserve that initialization contract before
                 # committing replacements; the final evaluation below then
                 # refreshes currents from the post-commit shared state.
-                self.i(v)
+                self._initialization_current_frame(
+                    v,
+                    call_local=call_local_currents,
+                )
 
         # Commit absolute mechanism-owned values exactly once.  Additive
         # sources are per-step increments and must not alter the t=0 state.
@@ -1260,10 +1331,10 @@ class MechanismHandler(torch.nn.Module):
         # Enforce guards and update derived fields (for example Nernst
         # potentials) after the only replacement commit.  There are no writes
         # after this phase that could undo those constraints.
-        for ion in self.ions.values():
-            ion.advance(celsius)
-        for material in self.materials.values():
-            material.advance(celsius)
+        self._advance_shared_fields(
+            celsius,
+            dispatch_hooks=dispatch_shared_hooks,
+        )
 
         self.read_from_ions()
         self.read_from_materials()
@@ -1272,14 +1343,95 @@ class MechanismHandler(torch.nn.Module):
         # pre-commit concentrations or reversal potentials.  Re-evaluate once
         # from the coherent shared state and publish only this final frame as
         # the accepted t=0 ionic current.
-        self.i(v)
-        self._publish_ion_current_frame(self.capture_ion_current_frame())
+        self._publish_ion_current_frame(
+            self._initialization_current_frame(
+                v,
+                call_local=call_local_currents,
+            )
+        )
 
-        # BREAKPOINT is allowed to prepare local write buffers.  Rebind shared
-        # fields after the final evaluation so those provisional next-step
-        # values cannot leave read/write mechanisms out of sync at t=0.
+        # Rebind shared fields after the final evaluation so provisional
+        # next-step values cannot leave read/write mechanisms out of sync at
+        # t=0.
         self.read_from_ions()
         self.read_from_materials()
+
+    def _reset_shared_initial_fields(self, celsius, *, dispatch_hooks):
+        """Reset shared fields under the selected imperative or pure policy."""
+        if dispatch_hooks:
+            self.ion_init(celsius)
+            self.material_init(celsius)
+            return
+        for ion in self.ions.values():
+            values = ion._derive_initial_field_values(celsius)
+            ion._install_field_values(values)
+        for material in self.materials.values():
+            values = material._derive_initial_field_values()
+            values.update(material._derive_advanced_field_updates(values, celsius))
+            material._install_field_values(values)
+
+    def _advance_shared_fields(self, celsius, *, dispatch_hooks):
+        """Apply guards and derived-field updates to the committed frame."""
+        if dispatch_hooks:
+            for ion in self.ions.values():
+                ion.advance(celsius)
+            for material in self.materials.values():
+                material.advance(celsius)
+            return
+        for ion in self.ions.values():
+            ion._install_field_updates(
+                ion._derive_advanced_field_updates(ion._buffers, celsius)
+            )
+        for material in self.materials.values():
+            material._install_field_updates(
+                material._derive_advanced_field_updates(material._buffers, celsius)
+            )
+
+    def _initialize_state_plan(
+        self,
+        v,
+        support_entries,
+        advance_plan,
+        *,
+        state_overrides,
+    ):
+        """Initialize one ordered mechanism-state plan at support-local voltage."""
+        local_voltages = self._gather_support_fields(v, support_entries)
+        for mechanism, support_index in advance_plan:
+            local_v = local_voltages[support_index]
+            shared_value_names = self._shared_initial_value_names.get(id(mechanism), ())
+            seeds = {
+                name: getattr(mechanism, name)
+                for name in self._absolute_state_seed_names.get(id(mechanism), ())
+            }
+            if state_overrides is None:
+                mechanism._init_buffers_s(
+                    local_v,
+                    seeds=seeds,
+                    shared_value_names=shared_value_names,
+                )
+            else:
+                mechanism._initialize_declared_values(
+                    local_v,
+                    overrides=state_overrides.get(mechanism.name, {}),
+                    seeds=seeds,
+                    shared_value_names=shared_value_names,
+                    require_complete=True,
+                    isolate_values=False,
+                    detach_inferred=False,
+                    detach_values=False,
+                    materialize_workspaces=False,
+                )
+
+    def _initialization_current_frame(self, v, *, call_local):
+        """Evaluate one initialization current frame under either policy."""
+        if call_local:
+            _itot, _gtot, current_frame, _conductance_frame = (
+                self._evaluate_current_frame(v)
+            )
+            return current_frame
+        self.i(v)
+        return self.capture_ion_current_frame()
 
     def _sync_celsius(self, celsius):
         """Rebind every local temperature view before parameter population.
@@ -1313,10 +1465,54 @@ class MechanismHandler(torch.nn.Module):
         solvers can precompute timestep-dependent quantities once per run/dt,
         rather than inside every MaterialProcess.advance_materials(...) call.
         """
-        for mech in self.mechanisms.values():
-            mech.set_dt(dt)
+        # Stage every ordinary Mechanism tree through the framework-owned base
+        # implementation.  Authored virtual dispatch is deliberately absent:
+        # TIMESTEP_BUFFER/derive_timestep_buffers is the sole extension point.
+        canonical = [
+            (
+                module,
+                Mechanism._stage_timestep_configuration(module, dt),
+            )
+            for module in self.mechanisms.values()
+        ]
+
+        # MaterialProcess owns a separate family-specific lifecycle.  In
+        # particular, DiffusionProcess uses this hook to rebuild spatial
+        # operators.  Complete those hooks before publishing any staged
+        # ordinary-Mechanism update.
         for process in self.material_processes.values():
             process.set_dt(dt)
+        for module, configuration in canonical:
+            Mechanism._commit_timestep_configuration(module, configuration)
+
+    def _reset_initialization_timestep(self):
+        """Restore the construction-fresh zero-dt initialization view.
+
+        Public ``Population.initialize()`` may be called after a simulation has
+        configured the handler for a nonzero timestep. State defaults and
+        initial values are defined before runtime timestep preparation, so
+        clear the framework-owned scalar and declared TIMESTEP_BUFFER values
+        without dispatching authored timestep builders.
+        """
+
+        modules = (*self.mechanisms.values(), *self.material_processes.values())
+        for module in modules:
+            dt = module._buffers.get("dt")
+            if torch.is_tensor(dt):
+                module._buffers["dt"] = torch.zeros_like(dt).detach()
+            for owner in (module, *module.DE.values()):
+                for name in owner._timestep_buffers:
+                    value = owner._buffers.get(name)
+                    if torch.is_tensor(value):
+                        owner._buffers[name] = torch.zeros_like(value).detach()
+
+        # MaterialProcess families may own additional timestep-derived module
+        # trees outside the declared buffer contract. In particular, diffusion
+        # operators can retain both the previous dt and a live training graph.
+        # Invoke their private family lifecycle only after the canonical tensor
+        # state above has been restored to its construction-fresh zero view.
+        for process in self.material_processes.values():
+            process._reset_initialization_timestep()
 
     def update_v(self, v):
         for process, support_entry in self._voltage_process_support_plan:
@@ -1478,9 +1674,10 @@ class MechanismHandler(torch.nn.Module):
         ) in self._material_source_support_plan:
             material_h = self._get_material(material)
             source_u = mech._buffers[local_name]
-            zeros = torch.zeros_like(material_h._buffers[field])
-            source_u = support_entry.scatter_set(source_u, zeros, v)
-            material_h._buffers[field] = material_h._buffers[field] + source_u
+            material_h._buffers[field] = support_entry.scatter_add(
+                material_h._buffers[field],
+                source_u,
+            )
 
     def write_to_materials(self, v):
         """Commit material replacements followed by additive step sources."""
@@ -1503,22 +1700,15 @@ class MechanismHandler(torch.nn.Module):
 
     def _ordered_material_process_names(self):
         items = tuple(self.material_processes.items())
-        ordered = []
-        seen = set()
-        for phase in _MATERIAL_PHASE_ORDER:
-            for name, process in items:
-                process_phase = _canonical_material_phase(
-                    getattr(type(process), "_material_process_phase", "post_local")
-                )
-                if process_phase == phase:
-                    ordered.append(name)
-                    seen.add(name)
-        # Preserve insertion order for custom/unrecognized phases.  This keeps
-        # PHASE extensible without silently dropping a process from the scheduler.
-        for name, _process in items:
-            if name not in seen:
-                ordered.append(name)
-        return tuple(ordered)
+        return tuple(
+            name
+            for phase in _MATERIAL_PHASE_ORDER
+            for name, process in items
+            if _canonical_material_phase(
+                getattr(type(process), "_material_process_phase", "post_local")
+            )
+            == phase
+        )
 
     def _validate_diffusion_process_overlaps(self):
         """Reject order-dependent overlapping spatial writes to one field."""
@@ -1651,8 +1841,8 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._ion_support_entries,
         )
-        for source, support_index in self._ion_source_breakpoint_plan:
-            source.breakpoint(local_voltages[support_index])
+        for source, support_index in self._ion_source_assigned_plan:
+            source._evaluate_assigned(local_voltages[support_index])
 
         for current_index in self._ion_current_indices:
             self._buf_i[current_index] = torch.zeros_like(self._buf_i[current_index])
@@ -1710,7 +1900,7 @@ class MechanismHandler(torch.nn.Module):
             self._pre_state_support_entries,
         )
         for mech, support_index in self._pre_state_advance_plan:
-            mech._advance(local_voltages[support_index], dt)
+            mech._advance_states(local_voltages[support_index], dt)
 
     def advance_post_current(self, v, dt, temp, current_frame):
         """Publish the accepted current, advance its readers, and commit state.
@@ -1733,8 +1923,7 @@ class MechanismHandler(torch.nn.Module):
         )
         for mech, support_index in self._post_state_advance_plan:
             local_v = local_voltages[support_index]
-            mech.breakpoint(local_v)
-            mech._advance(local_v, dt)
+            mech._advance_states(local_v, dt)
 
         self._finish_advance(v, dt, temp)
 
@@ -1751,11 +1940,8 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._state_support_entries,
         )
-        for mech, support_index in self._state_reader_breakpoint_plan:
-            mech.breakpoint(local_voltages[support_index])
-
         for mech, support_index in self._state_advance_plan:
-            mech._advance(local_voltages[support_index], dt)
+            mech._advance_states(local_voltages[support_index], dt)
 
         self._finish_advance(v, dt, temp)
 
@@ -1779,69 +1965,49 @@ class MechanismHandler(torch.nn.Module):
         self.detach_i_g_bufs()
 
     # Current evaluators fill ephemeral scratch and preserve the normal
-    # breakpoint/SAVE side effects, but do not overwrite committed shared Ion
+    # assigned-value/SAVE_CURRENT effects, but do not overwrite committed shared Ion
     # or current-reader fields. ``advance_post_current`` publishes the frame
     # selected by the solver.
     def i(self, v):
-        local_voltages = self._gather_support_fields(
-            v,
-            self._current_support_entries,
-        )
-        for mech, support_index in self._current_breakpoint_plan:
-            mech.breakpoint(local_voltages[support_index])
-
+        """Evaluate affine currents using the handler's imperative scratch."""
         if not self.currents:
-            z = torch.zeros_like(v)
-            return z, z
+            itot, gtot, _current_frame, _conductance_frame = (
+                self._evaluate_current_frame(v)
+            )
+            return itot, gtot
 
-        # reset buffers
-        for i, buf in enumerate(self._buf_i):
-            self._buf_i[i] = torch.zeros_like(buf)
-        for i, buf in enumerate(self._buf_g):
-            self._buf_g[i] = torch.zeros_like(buf)
+        # Rebind rather than clear in place. Captured frames from an earlier
+        # solver stage must retain both their values and their autograd graphs.
+        for index, buffer in enumerate(self._buf_i):
+            self._buf_i[index] = torch.zeros_like(buffer)
+        for index, buffer in enumerate(self._buf_g):
+            self._buf_g[index] = torch.zeros_like(buffer)
 
-        # Evaluate every authored current in map order, but reduce adjacent
-        # exact-support contributions locally before touching full-sized
-        # population buffers.
-        for c_idx, support_index, support_entry, entries in self._map_grouped:
-            local_i = None
-            local_g = None
-            local_voltage = local_voltages[support_index]
-            for mech, fn, scale_f, _factorable in entries:
-                i, g = scale_f(*getattr(mech, fn)(local_voltage))
-                i = _current_value_for_buffer(i, self._buf_i[c_idx])
-                g = _current_value_for_buffer(g, self._buf_g[c_idx])
-                local_i = i if local_i is None else local_i + i
-                local_g = g if local_g is None else local_g + g
-            support_entry.scatter_add_(self._buf_i[c_idx], local_i)
-            support_entry.scatter_add_(self._buf_g[c_idx], local_g)
+        itot, gtot, _current_frame, _conductance_frame = self._evaluate_current_frame(
+            v,
+            scratch=(self._buf_i, self._buf_g),
+        )
+        return itot, gtot
 
-        # sum up currents and conductances
-        tot_i = torch.stack(self._buf_i).sum(dim=0)
-        tot_g = torch.stack(self._buf_g).sum(dim=0)
+    def _evaluate_current_frame(self, v, *, scratch=None):
+        """Evaluate affine currents and return totals plus aligned Ion frames.
 
-        return tot_i, tot_g
+        ``scratch=None`` is the call-local, transform-safe execution policy.
+        Supplying ``(current_buffers, conductance_buffers)`` retains the
+        allocation-efficient imperative reduction used by :meth:`i`. Both
+        policies share the exact authored-current traversal, assigned-value order,
+        scaling, grouping, total reduction, and Ion-frame construction.
 
-    def _functional_i_reference(self, v):
-        """Evaluate currents with call-local aggregation scratch.
-
-        This is the transform-safe counterpart to :meth:`i`.  It deliberately
-        does not read, replace, or mutate ``_buf_i`` / ``_buf_g``; those lists
-        are imperative execution scratch whose unbatched tensors cannot be
-        shared across ``vmap`` lanes.  The returned ion frames let a functional
-        integrator carry the same solver-selected current semantics without
-        publishing an intermediate frame through handler state.
-
-        Mechanism breakpoint effects are still ordinary module rebindings. A
-        caller must therefore isolate registered mechanism state (for example
-        with ``torch.func.functional_call``) or lower those effects explicitly.
+        ASSIGNED products are ordinary non-persistent module rebindings. A
+        functional caller must isolate registered mechanism state (for example
+        with :func:`torch.func.functional_call`) or lower them explicitly.
         """
         local_voltages = self._gather_support_fields(
             v,
             self._current_support_entries,
         )
-        for mech, support_index in self._current_breakpoint_plan:
-            mech.breakpoint(local_voltages[support_index])
+        for mech, support_index in self._current_assigned_plan:
+            mech._evaluate_assigned(local_voltages[support_index])
 
         if not self.currents:
             z = torch.zeros_like(v)
@@ -1851,36 +2017,83 @@ class MechanismHandler(torch.nn.Module):
             )
             return z, z, empty_frame, empty_frame
 
-        buf_i = [None for _ in self._buf_i]
-        buf_g = [None for _ in self._buf_g]
+        call_local = scratch is None
+        if call_local:
+            buf_i = [None for _ in self._buf_i]
+            buf_g = [None for _ in self._buf_g]
+            # A zero-storage expanded view is a read-only seed for the first
+            # pure regional scatter in each current category. The scatter
+            # allocates its result, so there is no need to allocate and clear a
+            # full temporary field before that first contribution.
+            zero_field = v.new_zeros(()).expand(v.shape)
+        else:
+            try:
+                buf_i, buf_g = scratch
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    "current scratch must be a (current_buffers, "
+                    "conductance_buffers) pair"
+                ) from error
+            if len(buf_i) != len(self._buf_i) or len(buf_g) != len(self._buf_g):
+                raise ValueError(
+                    "current scratch does not match the handler current layout"
+                )
 
+        # Evaluate every authored current in map order, but reduce adjacent
+        # exact-support contributions locally before touching full-sized
+        # population buffers.
         for c_idx, support_index, support_entry, entries in self._map_grouped:
             local_i = None
             local_g = None
             local_voltage = local_voltages[support_index]
             for mech, fn, scale_f, _factorable in entries:
                 current, conductance = scale_f(*getattr(mech, fn)(local_voltage))
-                current = _current_value_for_buffer(current, v)
-                conductance = _current_value_for_buffer(conductance, v)
-                # Exact affine currents may have a voltage-independent scalar
-                # conductance.  Imperative aggregation expands that value when
-                # it scatters into full-sized scratch buffers; this functional
-                # path has no destination buffer, so materialize the same dense
-                # shape explicitly.  ``broadcast_to`` remains vmap-safe because
-                # hidden batch dimensions are handled by the transform.
-                current = torch.broadcast_to(current, local_voltage.shape)
-                conductance = torch.broadcast_to(conductance, local_voltage.shape)
+                reference_i = v if call_local else buf_i[c_idx]
+                reference_g = v if call_local else buf_g[c_idx]
+                current = _current_value_for_buffer(current, reference_i)
+                conductance = _current_value_for_buffer(conductance, reference_g)
+                if call_local:
+                    # Expand each term before authored-support reduction. If a
+                    # transformed parameter produces a hidden-lane scalar,
+                    # adding it first to a shared spatial tensor can otherwise
+                    # select lane zero and fail for an empty vmap.
+                    current = torch.broadcast_to(current, local_voltage.shape)
+                    conductance = torch.broadcast_to(
+                        conductance,
+                        local_voltage.shape,
+                    )
                 local_i = current if local_i is None else local_i + current
                 local_g = conductance if local_g is None else local_g + conductance
-            if support_entry.spec.kind is not SupportKind.DENSE:
-                raise RuntimeError(
-                    "functional current aggregation currently requires dense support"
-                )
-            buf_i[c_idx] = local_i if buf_i[c_idx] is None else buf_i[c_idx] + local_i
-            buf_g[c_idx] = local_g if buf_g[c_idx] is None else buf_g[c_idx] + local_g
 
-        buf_i = [torch.zeros_like(v) if value is None else value for value in buf_i]
-        buf_g = [torch.zeros_like(v) if value is None else value for value in buf_g]
+            if call_local:
+                if support_entry.spec.kind is SupportKind.DENSE:
+                    buf_i[c_idx] = (
+                        local_i if buf_i[c_idx] is None else buf_i[c_idx] + local_i
+                    )
+                    buf_g[c_idx] = (
+                        local_g if buf_g[c_idx] is None else buf_g[c_idx] + local_g
+                    )
+                else:
+                    # A genuinely out-of-place scatter is essential here. In a
+                    # parameter-only vmap, ``v`` (and therefore zeros_like(v))
+                    # is shared while a local current carries an implicit lane.
+                    # SupportMap.scatter_add propagates that lane without
+                    # mutating shared state and preserves duplicate semantics.
+                    destination_i = zero_field if buf_i[c_idx] is None else buf_i[c_idx]
+                    destination_g = zero_field if buf_g[c_idx] is None else buf_g[c_idx]
+                    # Scatter directly into the accumulated category value.
+                    # For duplicate supports this retains the imperative
+                    # destination/source association instead of reducing into
+                    # a separate full tensor and adding it afterward.
+                    buf_i[c_idx] = support_entry.scatter_add(destination_i, local_i)
+                    buf_g[c_idx] = support_entry.scatter_add(destination_g, local_g)
+            else:
+                support_entry.scatter_add_(buf_i[c_idx], local_i)
+                support_entry.scatter_add_(buf_g[c_idx], local_g)
+
+        if call_local:
+            buf_i = [torch.zeros_like(v) if value is None else value for value in buf_i]
+            buf_g = [torch.zeros_like(v) if value is None else value for value in buf_g]
 
         current_frame = tuple(
             (
@@ -1916,8 +2129,8 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._current_support_entries,
         )
-        for mech, support_index in self._current_breakpoint_plan:
-            mech.breakpoint(local_voltages[support_index])
+        for mech, support_index in self._current_assigned_plan:
+            mech._evaluate_assigned(local_voltages[support_index])
 
         if not self.currents:
             return torch.zeros_like(v)
@@ -1944,8 +2157,8 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._current_support_entries,
         )
-        for mech, support_index in self._current_breakpoint_plan:
-            mech.breakpoint(local_voltages[support_index])
+        for mech, support_index in self._current_assigned_plan:
+            mech._evaluate_assigned(local_voltages[support_index])
 
         if not self.currents:
             z = torch.zeros_like(v)
@@ -2019,6 +2232,11 @@ class MechanismHandler(torch.nn.Module):
         return torch.stack(self._buf_i).sum(dim=0)
 
     def set_buffers(self, diameters):
+        self._bind_state_geometry(diameters)
+        self._reset_shared_local_buffers()
+
+    def _bind_state_geometry(self, diameters):
+        """Bind support-local geometry for Mechanism and nested State trees."""
         local_geometry = self._gather_support_fields(
             diameters,
             self._state_support_entries,
@@ -2033,11 +2251,14 @@ class MechanismHandler(torch.nn.Module):
             for state in m.DE.values():
                 state.diam = local_diameters
 
+    def _reset_shared_local_buffers(self, *, bind_state_aliases=True):
+        """Seed absolute-write locals and clear per-step material sources."""
         for ion, quantity, mechanism, support_entry in self._ion_write_support_plan:
             q = support_entry.gather(getattr(self.ions[ion], quantity))
             setattr(mechanism, quantity, q.clone())
-            for state in mechanism.DE.values():
-                setattr(state, quantity, getattr(mechanism, quantity))
+            if bind_state_aliases:
+                for state in mechanism.DE.values():
+                    setattr(state, quantity, getattr(mechanism, quantity))
 
         for (
             material,
@@ -2048,8 +2269,9 @@ class MechanismHandler(torch.nn.Module):
             material_h = self._get_material(material)
             q = support_entry.gather(material_h._buffers[field])
             setattr(mechanism, field, q.clone())
-            for state in mechanism.DE.values():
-                setattr(state, field, getattr(mechanism, field))
+            if bind_state_aliases:
+                for state in mechanism.DE.values():
+                    setattr(state, field, getattr(mechanism, field))
 
         for (
             material,
@@ -2061,8 +2283,9 @@ class MechanismHandler(torch.nn.Module):
             material_h = self._get_material(material)
             q = support_entry.gather(material_h._buffers[field])
             setattr(mechanism, local_name, torch.zeros_like(q))
-            for state in mechanism.DE.values():
-                setattr(state, local_name, getattr(mechanism, local_name))
+            if bind_state_aliases:
+                for state in mechanism.DE.values():
+                    setattr(state, local_name, getattr(mechanism, local_name))
 
     def compute_initial_conditions(self, v):
         local_voltages = self._gather_support_fields(
@@ -2125,12 +2348,12 @@ class MechanismHandler(torch.nn.Module):
             for state_key, state in mech.DE.items():
                 for state_name in sorted(state._state):
                     states[f"{mech_name}.{state_name}"] = getattr(mech, state_name)
-                for buffer_name in sorted(state._state_buffers):
+                for buffer_name in sorted(_runtime_state_buffer_names(state)):
                     states[f"{mech_name}.DE.{state_key}.{buffer_name}"] = (
                         state._buffers[buffer_name]
                     )
                 _capture_stochastic_state(states, f"{mech_name}.DE.{state_key}", state)
-            for buffer_name in sorted(mech._assigned):
+            for buffer_name in _runtime_mechanism_carry_names(mech):
                 states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
             for saved_name in sorted(mech._save):
                 buffer_name = f"{saved_name}_"
@@ -2156,14 +2379,14 @@ class MechanismHandler(torch.nn.Module):
                     states[f"{process_name}.{state_name}"] = getattr(
                         process, state_name
                     )
-                for buffer_name in sorted(state._state_buffers):
+                for buffer_name in sorted(_runtime_state_buffer_names(state)):
                     states[f"{process_name}.DE.{state_key}.{buffer_name}"] = (
                         state._buffers[buffer_name]
                     )
                 _capture_stochastic_state(
                     states, f"{process_name}.DE.{state_key}", state
                 )
-            for buffer_name in sorted(process._assigned):
+            for buffer_name in _runtime_mechanism_carry_names(process):
                 states[f"{process_name}.{buffer_name}"] = process._buffers[buffer_name]
             for saved_name in sorted(process._save):
                 buffer_name = f"{saved_name}_"
@@ -2490,7 +2713,7 @@ class MechanismHandler(torch.nn.Module):
                 state_names = tuple(sorted(state._state))
                 for state_name in state_names:
                     add_tensor(module, state_name, f"{prefix}.{state_name}")
-                for buffer_name in sorted(state._state_buffers):
+                for buffer_name in sorted(_runtime_state_buffer_names(state)):
                     add_tensor(
                         state,
                         buffer_name,
@@ -2502,7 +2725,7 @@ class MechanismHandler(torch.nn.Module):
                     f"{prefix}.DE.{state_key}",
                     tuple(f"{prefix}.{name}" for name in state_names),
                 )
-            for buffer_name in sorted(module._assigned):
+            for buffer_name in _runtime_mechanism_carry_names(module):
                 add_tensor(module, buffer_name, f"{prefix}.{buffer_name}")
             for saved_name in sorted(module._save):
                 buffer_name = f"{saved_name}_"

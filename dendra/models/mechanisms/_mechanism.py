@@ -1,7 +1,7 @@
 import inspect
 import math
 import textwrap
-import warnings
+from collections.abc import Mapping
 from types import MethodType
 from typing import Dict
 
@@ -12,12 +12,32 @@ from dendra.models._class_declarations import (
     _DECLARATIONS_KEY,
     consume_class_values,
     declare_class_value,
+    merge_buffer_schemas,
+    merge_timestep_buffer_shapes,
+    normalize_buffer_schema,
+    normalize_timestep_buffer_shape,
 )
 from dendra.models.parametric import Parameterized
 
 from ._ions import VALENCES
 from ._materials import _canonical_material_name
-from ._state import State, _materialize_derived_buffers
+from ._state import (
+    State,
+    _canonical_timestep_buffer_shape,
+    _evaluate_registered_builder,
+    _install_declared_buffer_value,
+    _install_timestep_buffers,
+    _materialize_derived_buffers,
+    _normalize_initial_values,
+    _parameterized_workspace_slots,
+    _reset_runtime_output_validation,
+    _resolve_deferred_buffers_from_state_dict,
+    _stage_timestep_buffers,
+    _support_visible_value,
+    _timestep_buffer_schema,
+    _unresolved_deferred_buffer_names,
+    _validate_runtime_outputs,
+)
 from ._support import SupportMap, SupportSpec
 from ._symbolic import build_current_eq
 
@@ -34,6 +54,15 @@ def _merge_nested_dict(dst, src):
     for key, values in src.items():
         dst.setdefault(key, {})
         dst[key].update(values)
+
+
+def _extend_unique(target, values):
+    """Append values once while preserving declaration/MRO order."""
+    seen = set(target)
+    for value in values:
+        if value not in seen:
+            target.append(value)
+            seen.add(value)
 
 
 def _as_name_list(values):
@@ -99,30 +128,40 @@ def _mechanism_advance_signature(mech) -> tuple:
     """Static layout signature for a generated mechanism advance fast path."""
     state_layout = []
     for state_name, state_module in mech.DE.items():
+        state_carry = tuple(state_module._carry)
         state_layout.append(
             (
                 state_name,
                 tuple(state_module._state),
+                state_carry,
                 getattr(type(state_module), "advance", None) is State.advance,
-                getattr(type(state_module), "breakpoint", None) is State.breakpoint,
+                getattr(type(state_module), "assigned_values", None)
+                is State.assigned_values,
                 getattr(state_module, "method", None),
             )
         )
-    return (tuple(state_layout), tuple(mech._all_states))
+    return (
+        tuple(state_layout),
+        tuple(mech._transition_input_names),
+        tuple(mech._carry),
+        tuple(mech._advance_output_names()),
+        bool(mech._has_authored_assigned_values),
+        bool(mech._has_authored_advance),
+    )
 
 
 def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
-    """Compile a per-mechanism/per-proxy `_advance` implementation.
+    """Compile a per-mechanism/per-proxy `_advance_states` implementation.
 
     The generated function deliberately avoids the shared base-class loop over
     ``self.DE.values()`` and uses literal state-module names / buffer keys.  This
     gives TorchDynamo a distinct code object for each generated mechanism proxy,
-    avoiding cache churn from one polymorphic ``Mechanism._advance`` frame being
-    called with many unrelated ``self`` types.
+    avoiding cache churn from one polymorphic framework transition being called
+    with many unrelated ``self`` types.
 
     State-module updates are evaluated from a single snapshot of mechanism
     buffers taken at the start of the timestep.  The returned locals are committed
-    only after every state module has evaluated its breakpoint/solve call.  This
+    only after every state module has evaluated its assigned/advance call. This
     avoids order-dependent Gauss-Seidel semantics across ``mech.DE`` entries and
     matches the usual ODE interpretation that all state bundles advance from
     time-n values to time-(n+1) values together.
@@ -130,78 +169,100 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
     cls = mech.__class__
     cls_name = _safe_generated_identifier(cls.__name__)
     mech_name = _safe_generated_identifier(getattr(mech, "name", cls.__name__))
-    func_name = f"_advance_{cls_name}_{mech_name}_{id(cls):x}"
+    func_name = f"_advance_states_{cls_name}_{mech_name}_{id(cls):x}"
 
     lines = [
         f"def {func_name}(self, v, dt):",
         "    __buffers = self._buffers",
     ]
 
-    if not mech.DE:
-        lines.append("    return None")
+    if mech.DE or mech._has_authored_advance:
+        lines.append("    self._evaluate_assigned(v)")
+    transition_names = tuple(mech._transition_input_names)
+    if transition_names:
+        lines.append("    __values = {")
+        for name in transition_names:
+            lines.append(f"        {name!r}: getattr(self, {name!r}),")
+        lines.append("    }")
     else:
-        lines.append("    __DE = self.DE")
-        all_state_names = tuple(mech._all_states)
+        lines.append("    __values = {}")
+    lines.append("    __values['celsius'] = self.celsius")
+    lines.append("    __values['diam'] = self.diam")
+    lines.append("    __DE = self.DE")
 
-        if all_state_names:
+    commit_lines = []
+    for idx, (state_key, state_module) in enumerate(mech.DE.items()):
+        state_var_names = tuple(state_module._state)
+        state_carry_names = tuple(state_module._carry)
+        uses_default_advance = (
+            getattr(type(state_module), "advance", None) is State.advance
+            and getattr(state_module, "method", None) != "euler_heun"
+        )
+        uses_default_assigned = (
+            getattr(type(state_module), "assigned_values", None)
+            is State.assigned_values
+        )
+        lines.extend(
+            [
+                f"    # State bundle {idx}: {state_key}",
+                f"    __state_module_{idx} = __DE[{state_key!r}]",
+                f"    __state_values_{idx} = __values.copy()",
+            ]
+        )
+        for carry_name in state_carry_names:
             lines.append(
-                "    # Snapshot all mechanism states/assigned buffers before solving any bundle."
-            )
-            lines.append("    __states = {")
-            for state_name in all_state_names:
-                lines.append(f"        {state_name!r}: __buffers[{state_name!r}],")
-            lines.append("    }")
-        else:
-            lines.append("    __states = {}")
-
-        commit_lines = []
-        for idx, (state_key, state_module) in enumerate(mech.DE.items()):
-            state_var_names = tuple(state_module._state)
-            uses_default_advance = (
-                getattr(type(state_module), "advance", None) is State.advance
-                and getattr(state_module, "method", None) != "euler_heun"
-            )
-            uses_default_breakpoint = (
-                getattr(type(state_module), "breakpoint", None) is State.breakpoint
+                f"    __state_values_{idx}[{carry_name!r}] = "
+                f"__state_module_{idx}._buffers[{carry_name!r}]"
             )
 
-            lines.extend(
-                [
-                    f"    # State bundle {idx}: {state_key}",
-                    f"    __state_module_{idx} = __DE[{state_key!r}]",
-                ]
-            )
-
-            if uses_default_advance:
-                if uses_default_breakpoint:
-                    lines.append(f"    __breakpoint_{idx} = {{}}")
-                else:
-                    lines.append(
-                        f"    __breakpoint_{idx} = __state_module_{idx}.breakpoint(v, __states)"
-                    )
-                lines.append(
-                    f"    __local_{idx} = __state_module_{idx}.solve(dt, **__breakpoint_{idx}, **__states)"
-                )
-                for state_var_name in state_var_names:
-                    commit_lines.append(
-                        f"    __buffers[{state_var_name!r}] = __local_{idx}[{state_var_name!r}]"
-                    )
+        if uses_default_advance:
+            if not state_module._assigned and uses_default_assigned:
+                lines.append(f"    __assigned_{idx} = {{}}")
             else:
-                # Preserve custom State.advance call semantics, but delay
-                # committing its returned updates until all bundles have read the
-                # start-of-step snapshot.  Any internal side effects performed by
-                # a custom advance method remain that method's responsibility.
                 lines.append(
-                    f"    __local_{idx} = __state_module_{idx}.advance(v, dt, __states)"
+                    f"    __assigned_{idx} = "
+                    f"__state_module_{idx}._derive_assigned_values("
+                    f"v, __state_values_{idx})"
                 )
-                commit_lines.append(f"    __buffers.update(__local_{idx})")
-
-        if commit_lines:
+            lines.append(f"    __solver_values_{idx} = __state_values_{idx}.copy()")
+            lines.append(f"    __solver_values_{idx}.update(__assigned_{idx})")
             lines.append(
-                "    # Commit all returned updates after every bundle has evaluated."
+                f"    __local_{idx} = __state_module_{idx}._solve("
+                f"dt, **__solver_values_{idx})"
             )
-            lines.extend(commit_lines)
-        lines.append("    return None")
+        else:
+            # Preserve custom State.advance call semantics, but delay
+            # committing its returned updates until all bundles have read the
+            # start-of-step snapshot.  Any internal side effects performed by
+            # a custom advance method remain that method's responsibility.
+            lines.append(
+                f"    __local_{idx} = __state_module_{idx}._derive_advance_values("
+                f"v, dt, __state_values_{idx})"
+            )
+        for state_var_name in state_var_names:
+            commit_lines.append(
+                f"    __buffers[{state_var_name!r}] = __local_{idx}[{state_var_name!r}]"
+            )
+        for carry_name in state_carry_names:
+            commit_lines.append(f"    if {carry_name!r} in __local_{idx}:")
+            commit_lines.append(
+                f"        __state_module_{idx}._buffers[{carry_name!r}] = "
+                f"__local_{idx}[{carry_name!r}]"
+            )
+
+    lines.append(
+        "    __mechanism_updates = self._derive_advance_values(v, dt, __values)"
+    )
+    if commit_lines:
+        lines.append(
+            "    # Commit returned updates after every bundle and the mechanism "
+            "transition have evaluated."
+        )
+        lines.extend(commit_lines)
+    for name in mech._advance_output_names():
+        lines.append(f"    if {name!r} in __mechanism_updates:")
+        lines.append(f"        setattr(self, {name!r}, __mechanism_updates[{name!r}])")
+    lines.append("    return None")
 
     source = "\n".join(lines) + "\n"
     filename = (
@@ -210,13 +271,16 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
     namespace = {}
     exec(compile(source, filename, "exec"), {}, namespace)
     fn = namespace[func_name]
-    fn.__name__ = "_advance"
-    fn.__qualname__ = f"{cls.__qualname__}._advance"
+    fn.__name__ = "_advance_states"
+    fn.__qualname__ = f"{cls.__qualname__}._advance_states"
     fn.__module__ = cls.__module__
     fn.__doc__ = (
         "Generated monomorphic mechanism state-advance fast path.  The source "
         "is stored on the owning class as `_dendra_monomorphic_advance_source`."
     )
+    fn._dendra_monomorphic_advance_states = True
+    # Transitional marker retained for functional-lowering code written
+    # against the previous private method name.
     fn._dendra_monomorphic_advance = True
     fn._dendra_monomorphic_advance_signature = signature
     fn._dendra_monomorphic_advance_source = source
@@ -232,22 +296,23 @@ class Mechanism(Parameterized):
     :class:`dendra.models.parametric.Parameterized` to leverage the shared
     parameter declaration and population infrastructure.
 
-    Use uppercase classmethods (``STATE``, ``GLOBAL``, ``RANGE``, ``BUFFER``,
-    ``USEION``, ``NONSPECIFIC_CURRENT``, etc.) at class definition time to
-    declare structure. Override lowercase hooks (``initial``, ``breakpoint``,
+    Use uppercase classmethods (``STATE_BUNDLE``, ``GLOBAL``, ``RANGE``,
+    ``CARRY``, ``USEION``, ``NONSPECIFIC_CURRENT``, etc.) at class definition time to
+    declare structure. Override pure lowercase hooks (``initial_values``,
+    ``assigned_values``, ``advance``,
     current methods) to implement behavior.
 
-    - ``STATE(StateSubclass, ...)``: register one or more State bundles. Each
+    - ``STATE_BUNDLE(StateSubclass, ...)``: register one or more State bundles. Each
       State subclass manages its own state variables and derivatives. These are
       accessible via the ``mechanism.DE`` ModuleDict.
     - ``GLOBAL/RANGE``: shared vs per-compartment parameters.
-    - ``BUFFER``: mechanism-level buffers (analogous to State ``BUFFER``),
-      typically set in ``initial``/``breakpoint``.
-      ``ASSIGNED`` remains as a legacy alias for this declaration.
+    - ``CARRY``: persistent non-ODE simulation state.
+    - ``ASSIGNED``: repeatable ephemeral algebra.
     - ``USEION``: ionic read/write dependencies.
     - ``NONSPECIFIC_CURRENT`` / current methods: contribute to membrane balance.
-    - ``initial(self, v)``: one-time setup; set mechanism buffers, etc.
-    - ``breakpoint(self, v)``: per-step computation of currents/buffer values.
+    - ``initial_values(self, v, values)``: pure initialization overlay.
+    - ``assigned_values(self, v, values)``: pure repeatable algebra.
+    - ``advance(self, v, dt, values)``: accepted-timestep transition.
 
     Notes
     -----
@@ -264,20 +329,16 @@ class Mechanism(Parameterized):
     :mod:`dendra.units` are plain scalars for documented public base units; do
     not form density units with expressions such as ``S / cm**2``.
 
-    Subclasses declare state, mechanism-buffer, and ionic variables using the
-    :meth:`STATE`, :meth:`BUFFER`, :meth:`SAVE`, :meth:`USEION`, and
-    :meth:`NONSPECIFIC_CURRENT` helpers during class definition. Override
-    :meth:`initial` and :meth:`breakpoint` to populate buffers and assemble
-    currents each step. ``ASSIGNED`` is retained as a deprecated alias for
-    :meth:`BUFFER` for compatibility with older mechanism definitions.
-
-    The voltage passed to ``breakpoint`` and declared current methods is a
-    read-only input.  Dendra may reuse one gathered voltage tensor across
-    mechanisms that occupy the exact same ordered compartment support; hooks
-    must never mutate ``v`` in place.
+    Subclasses declare nested state, persistent :meth:`CARRY`, ephemeral
+    :meth:`ASSIGNED`, and ionic/material dependencies during class definition.
+    ``initial_values`` and ``advance`` define persistent initialization and one
+    accepted-timestep transition; ``assigned_values`` defines repeatable
+    current-stage algebra. All hook inputs are read-only. Dendra may reuse one
+    gathered voltage tensor across mechanisms that occupy the same ordered
+    support, and may evaluate assigned/current algebra more than once per step.
     """
 
-    _state = set()
+    _state = ()
     # Experimental structured-support eligibility. Custom mechanisms whose
     # tensor algebra assigns meaning to the legacy one-dimensional slot axis
     # can opt out before a Population is built.
@@ -287,26 +348,32 @@ class Mechanism(Parameterized):
     _ion = set()
     _material = set()
     _save = set()
-    _assigned = set()
+    _carry = ()
+    _carry_specs = {}
+    _assigned = ()
     _derived_buffers = set()
+    _derived_buffer_specs = {}
+    _timestep_buffers = set()
+    _timestep_buffer_shapes = {}
     _explicit = set()
     _numerical = set()
     _affine = set()
     _affine_method_owners = {}
 
-    _state_declarations = []
+    _state_bundle_declarations = []
     _ion_declarations = []
     _material_declarations = []
-    _save_declarations = []
+    _save_current_declarations = []
+    _carry_declarations = []
     _assigned_declarations = []
     _derived_buffer_declarations = []
+    _timestep_buffer_declarations = []
     _explicit_declarations = []
     _numerical_declarations = []
     _affine_declarations = []
 
     _conductances = {}
     _currents = {}
-    _init = {}
 
     _read_ion = {}
     _write_ion = {}
@@ -318,8 +385,6 @@ class Mechanism(Parameterized):
 
     _conductances_declarations = []
     _currents_declarations = []
-    _init_declarations = []
-
     _read_ion_declarations = []
     _write_ion_declarations = []
     _write_ion_c_declarations = []
@@ -330,11 +395,38 @@ class Mechanism(Parameterized):
 
     _renamed_aliases = {}
 
+    # MaterialProcess owns a distinct timestep lifecycle (for example,
+    # DiffusionProcess rebuilds spatial operators).  Ordinary distributed
+    # Mechanisms instead use the framework-owned TIMESTEP_BUFFER protocol and
+    # may not add a user-dispatched ``set_dt`` hook.
+    _material_process_set_dt_lifecycle = False
+
     def __init_subclass__(cls, **kwargs):
         """
         This special method is called automatically whenever a class
         inherits from Parameterized.
         """
+        forbidden_hooks = {
+            "breakpoint": "assigned_values",
+            "initial": "initial_values",
+            "initial_outputs": "initial_values",
+            "_advance": "advance",
+        }
+        authored_forbidden = {
+            name: replacement
+            for name, replacement in forbidden_hooks.items()
+            if name in cls.__dict__
+        }
+        if authored_forbidden:
+            details = ", ".join(
+                f"{name} -> {replacement}"
+                for name, replacement in sorted(authored_forbidden.items())
+            )
+            raise TypeError(
+                f"Mechanism {cls.__qualname__} defines removed lifecycle hooks: "
+                f"{details}."
+            )
+
         # Call the parent's __init_subclass__ WITHOUT our custom kwargs,
         # as the base 'object' class does not accept them.
         super().__init_subclass__(**kwargs)
@@ -345,12 +437,17 @@ class Mechanism(Parameterized):
         cls._renamed_aliases = {}
 
         # Start with a fresh dictionary for the new class's parameters.
-        new_state = set()
+        new_state = []
         new_ion = set()
         new_material = set()
         new_save = set()
-        new_assigned = set()
+        new_carry = []
+        new_carry_specs = {}
+        new_assigned = []
         new_derived_buffers = set()
+        new_derived_buffer_specs = {}
+        new_timestep_buffers = set()
+        new_timestep_buffer_shapes = {}
         new_explicit = set()
         new_numerical = set()
         new_affine = set()
@@ -365,23 +462,61 @@ class Mechanism(Parameterized):
         new_source_material = {}
 
         new_currents = {}
-        new_init = {}
 
         # Walk MRO in reverse to build up params from parent to child
         for base in reversed(cls.__mro__):
             # We look for a _params attribute defined directly on the base
             if "_state" in base.__dict__:
-                new_state.update(base._state)
+                _extend_unique(new_state, base._state)
             if "_ion" in base.__dict__:
                 new_ion.update(base._ion)
             if "_material" in base.__dict__:
                 new_material.update(base._material)
             if "_save" in base.__dict__:
                 new_save.update(base._save)
+            if "_carry" in base.__dict__:
+                _extend_unique(new_carry, base._carry)
+                inherited_specs = {
+                    name: base.__dict__.get("_carry_specs", {}).get(
+                        name, (None, "local")
+                    )
+                    for name in base._carry
+                }
+                merge_buffer_schemas(
+                    new_carry_specs,
+                    inherited_specs,
+                    owner=cls,
+                    declaration="CARRY",
+                )
             if "_assigned" in base.__dict__:
-                new_assigned.update(base._assigned)
+                _extend_unique(new_assigned, base._assigned)
             if "_derived_buffers" in base.__dict__:
                 new_derived_buffers.update(base._derived_buffers)
+                inherited_specs = {
+                    name: base.__dict__.get("_derived_buffer_specs", {}).get(
+                        name, (None, "local")
+                    )
+                    for name in base._derived_buffers
+                }
+                merge_buffer_schemas(
+                    new_derived_buffer_specs,
+                    inherited_specs,
+                    owner=cls,
+                    declaration="DERIVED_BUFFER",
+                )
+            if "_timestep_buffers" in base.__dict__:
+                new_timestep_buffers.update(base._timestep_buffers)
+                inherited_shapes = {
+                    name: base.__dict__.get("_timestep_buffer_shapes", {}).get(
+                        name, "local"
+                    )
+                    for name in base._timestep_buffers
+                }
+                merge_timestep_buffer_shapes(
+                    new_timestep_buffer_shapes,
+                    inherited_shapes,
+                    owner=cls,
+                )
             if "_read_ion" in base.__dict__:
                 new_read_ion.update(base._read_ion)
             if "_write_ion" in base.__dict__:
@@ -401,8 +536,6 @@ class Mechanism(Parameterized):
                 new_currents.update(
                     {name: list(currents) for name, currents in base._currents.items()}
                 )
-            if "_init" in base.__dict__:
-                new_init.update(base._init)
             if "_explicit" in base.__dict__:
                 new_explicit.update(base._explicit)
             if "_numerical" in base.__dict__:
@@ -420,9 +553,35 @@ class Mechanism(Parameterized):
                 inherited_affine_method_owners.setdefault(current, set()).add(owner)
 
         for s_list in consume_class_values(
-            cls, "mechanism.state", Mechanism._state_declarations
+            cls, "mechanism.state_bundle", Mechanism._state_bundle_declarations
         ):
-            new_state.update(s_list)
+            _extend_unique(new_state, s_list)
+        state_class_names = {}
+        duplicate_state_classes = set()
+        flattened_state_names = {}
+        duplicate_state_names = set()
+        for state_type in new_state:
+            state_class_name = state_type.__name__
+            if state_class_name in state_class_names:
+                duplicate_state_classes.add(state_class_name)
+            else:
+                state_class_names[state_class_name] = state_type
+            for state_name in getattr(state_type, "_state", ()):
+                if state_name in flattened_state_names:
+                    duplicate_state_names.add(state_name)
+                else:
+                    flattened_state_names[state_name] = state_type
+        if duplicate_state_classes:
+            raise ValueError(
+                "Mechanism STATE_BUNDLE entries must have unique class names; "
+                f"duplicates: {sorted(duplicate_state_classes)}"
+            )
+        if duplicate_state_names:
+            raise ValueError(
+                "Mechanism STATE_BUNDLE entries must declare disjoint State.STATE "
+                "names; "
+                f"duplicates: {sorted(duplicate_state_names)}"
+            )
         for i_list in consume_class_values(
             cls, "mechanism.ion", Mechanism._ion_declarations
         ):
@@ -432,20 +591,154 @@ class Mechanism(Parameterized):
         ):
             new_material.update(m_list)
         for s_list in consume_class_values(
-            cls, "mechanism.save", Mechanism._save_declarations
+            cls,
+            "mechanism.save_current",
+            Mechanism._save_current_declarations,
         ):
             new_save.update(s_list)
+        for declaration in consume_class_values(
+            cls, "mechanism.carry", Mechanism._carry_declarations
+        ):
+            merge_buffer_schemas(
+                new_carry_specs,
+                declaration,
+                owner=cls,
+                declaration="CARRY",
+            )
+            _extend_unique(new_carry, declaration)
         for a_list in consume_class_values(
             cls, "mechanism.assigned", Mechanism._assigned_declarations
         ):
-            new_assigned.update(a_list)
-        for b_list in consume_class_values(
+            _extend_unique(new_assigned, a_list)
+        for declaration in consume_class_values(
             cls,
             "mechanism.derived_buffers",
             Mechanism._derived_buffer_declarations,
         ):
-            new_derived_buffers.update(b_list)
-        new_assigned.update(new_derived_buffers)
+            if isinstance(declaration, dict):
+                specs = declaration
+            else:
+                specs = {name: (None, "local") for name in declaration}
+            merge_buffer_schemas(
+                new_derived_buffer_specs,
+                specs,
+                owner=cls,
+                declaration="DERIVED_BUFFER",
+            )
+            new_derived_buffers.update(specs)
+        for declaration in consume_class_values(
+            cls,
+            "mechanism.timestep_buffers",
+            Mechanism._timestep_buffer_declarations,
+        ):
+            # Tuple-only values can exist in the historical out-of-class queue
+            # if a declaration straddles a live-code reload. Treat those as the
+            # legacy local layout; all new declarations are name->shape maps.
+            if isinstance(declaration, dict):
+                shapes = declaration
+            else:
+                shapes = {name: "local" for name in declaration}
+            merge_timestep_buffer_shapes(
+                new_timestep_buffer_shapes,
+                shapes,
+                owner=cls,
+            )
+            new_timestep_buffers.update(shapes)
+        overlap = new_derived_buffers & new_timestep_buffers
+        if overlap:
+            raise ValueError(
+                "Mechanism buffers cannot be both DERIVED_BUFFER and "
+                f"TIMESTEP_BUFFER: {sorted(overlap)}"
+            )
+        workspace_buffers = new_derived_buffers | new_timestep_buffers
+        overlap = set(new_carry) & workspace_buffers
+        if overlap:
+            raise ValueError(
+                "Mechanism DERIVED_BUFFER/TIMESTEP_BUFFER already declares an "
+                "persistent carry; do not also declare it with CARRY: "
+                f"{sorted(overlap)}"
+            )
+        overlap = set(new_assigned) & (set(new_carry) | workspace_buffers)
+        if overlap:
+            raise ValueError(
+                "Mechanism ASSIGNED values are ephemeral and cannot also be "
+                "CARRY/DERIVED_BUFFER/TIMESTEP_BUFFER values: "
+                f"{sorted(overlap)}"
+            )
+
+        # Derived and timestep workspaces are installed into registered buffer
+        # slots.  Fail
+        # at class definition, rather than much later during instance
+        # construction, when a declaration would overwrite a parameter,
+        # mirrored State variable, or an execution-owned slot.
+        state_names = {
+            name
+            for state_type in new_state
+            for name in getattr(state_type, "_state", ())
+        }
+        reserved_execution_slots = _parameterized_workspace_slots(cls) | {
+            "DE",
+            "_all_states",
+            "_current_conductance_fallback_reason",
+            "_current_conductance_mode",
+            "_current_factorable",
+            "_delayed_state_specs",
+            "_init_params",
+            "_injection_specs",
+            "_name",
+            "_support_key_values_valid",
+            "base_ndim",
+            "celsius",
+            "diam",
+            "dt",
+            "factorable",
+            "force_packed_support",
+            "injected_waveforms",
+            "is_composable",
+            "key",
+            "name",
+            "preserves_multiplicity",
+            "read_ion",
+            "read_material",
+            "source_material",
+            "support_map",
+            "support_spec",
+            "write_ion",
+            "write_ion_c",
+            "write_material",
+        }
+        saved_current_buffer_names = {f"{name}_" for name in new_save}
+        execution_slots = reserved_execution_slots | saved_current_buffer_names
+        workspace_class_slots = {
+            name
+            for name in workspace_buffers
+            if any(name in base.__dict__ for base in cls.__mro__)
+        }
+        overlap = workspace_buffers & (
+            state_names | execution_slots | workspace_class_slots
+        )
+        if overlap:
+            raise ValueError(
+                "Mechanism DERIVED_BUFFER/TIMESTEP_BUFFER names conflict with "
+                "parameters, State variables, methods, or reserved execution slots: "
+                f"{sorted(overlap)}"
+            )
+        for role, names in (
+            ("CARRY", set(new_carry)),
+            ("ASSIGNED", set(new_assigned)),
+        ):
+            role_class_slots = {
+                name
+                for name in names
+                if any(name in base.__dict__ for base in cls.__mro__)
+            }
+            overlap = names & (state_names | execution_slots | role_class_slots)
+            if overlap:
+                raise ValueError(
+                    f"Mechanism {role} names conflict with parameters, State "
+                    "variables, methods, saved-current mirrors, or reserved "
+                    f"execution slots: {sorted(overlap)}"
+                )
         for r_dict in consume_class_values(
             cls, "mechanism.read_ion", Mechanism._read_ion_declarations
         ):
@@ -480,10 +773,18 @@ class Mechanism(Parameterized):
             cls, "mechanism.currents", Mechanism._currents_declarations
         ):
             new_currents.setdefault("nonspecific", []).extend(c_list)
-        for i_dict in consume_class_values(
-            cls, "mechanism.init", Mechanism._init_declarations
-        ):
-            new_init.update(i_dict)
+        declared_nonspecific_currents = set(new_currents.get("nonspecific", ()))
+        declared_ionic_currents = {
+            f"i{ion}" for ion, fields in new_write_ion.items() if f"i{ion}" in fields
+        }
+        invalid_saved_currents = new_save - (
+            declared_nonspecific_currents | declared_ionic_currents
+        )
+        if invalid_saved_currents:
+            raise ValueError(
+                "SAVE_CURRENT names must be declared nonspecific or ionic "
+                f"currents; invalid names: {sorted(invalid_saved_currents)}"
+            )
         for v_list in consume_class_values(
             cls, "mechanism.explicit", Mechanism._explicit_declarations
         ):
@@ -525,27 +826,104 @@ class Mechanism(Parameterized):
             new_affine.add(current)
             new_affine_method_owners[current] = owner
 
+        runtime_local_slots = set()
+        for usage in (new_read_ion, new_write_ion, new_write_ion_c):
+            for names in usage.values():
+                runtime_local_slots.update(names)
+        for usage in (new_read_material, new_write_material):
+            for names in usage.values():
+                runtime_local_slots.update(names)
+        for source_fields in new_source_material.values():
+            runtime_local_slots.update(source_fields.values())
+        nested_workspace_buffers = {
+            name
+            for state_type in new_state
+            for name in (
+                *getattr(state_type, "_derived_buffers", ()),
+                *getattr(state_type, "_timestep_buffers", ()),
+            )
+        }
+        current_runtime_slots = {
+            f"{current}_with_g"
+            for currents in (*new_currents.values(), *new_write_ion.values())
+            for current in currents
+        }
+        overlap = (workspace_buffers | nested_workspace_buffers) & runtime_local_slots
+        overlap.update(workspace_buffers & current_runtime_slots)
+        if overlap:
+            raise ValueError(
+                "Mechanism or State DERIVED_BUFFER/TIMESTEP_BUFFER names conflict "
+                f"with installed current/ion/material runtime slots: {sorted(overlap)}"
+            )
+
+        # SAVE_CURRENT mirrors are framework-owned flat Mechanism state. Reject
+        # every authored flat role that could replace, re-register, or rebind a
+        # ``<current>_`` mirror. Nested State buffers other than STATE remain
+        # namespaced below ``DE`` and therefore do not share this flat storage.
+        declared_current_names = {
+            current
+            for currents in (*new_currents.values(), *new_write_ion.values())
+            for current in currents
+        }
+        saved_class_slots = {
+            name
+            for name in saved_current_buffer_names
+            if any(name in base.__dict__ for base in cls.__mro__)
+        }
+        overlap = saved_current_buffer_names & (
+            state_names
+            | set(new_carry)
+            | set(new_assigned)
+            | workspace_buffers
+            | reserved_execution_slots
+            | runtime_local_slots
+            | declared_current_names
+            | current_runtime_slots
+            | saved_class_slots
+        )
+        if overlap:
+            raise ValueError(
+                "Mechanism SAVE_CURRENT mirrors conflict with user-declared "
+                "parameters, State variables, CARRY/ASSIGNED values, "
+                "workspaces, currents, shared fields, methods, or reserved "
+                f"execution slots: {sorted(overlap)}"
+            )
+
         cls.state_classes = {s.__name__: s for s in new_state}
 
-        cls._state = new_state
+        cls._state = tuple(new_state)
         cls._ion = new_ion
         cls._material = new_material
         cls._save = new_save
         cls._currents = new_currents
-        cls._assigned = new_assigned
+        cls._carry = tuple(new_carry)
+        cls._carry_specs = new_carry_specs
+        cls._assigned = tuple(new_assigned)
         cls._derived_buffers = new_derived_buffers
+        cls._derived_buffer_specs = new_derived_buffer_specs
+        cls._timestep_buffers = new_timestep_buffers
+        cls._timestep_buffer_shapes = new_timestep_buffer_shapes
         cls._read_ion = new_read_ion
         cls._write_ion = new_write_ion
         cls._write_ion_c = new_write_ion_c
         cls._read_material = new_read_material
         cls._write_material = new_write_material
         cls._source_material = new_source_material
-        cls._init = new_init
         cls._explicit = new_explicit
         cls._numerical = new_numerical
         cls._affine = new_affine
         cls._affine_method_owners = new_affine_method_owners
         cls._name = None
+
+        set_dt_owner = _mro_attribute_owner(cls, "set_dt")
+        if set_dt_owner is not None and not getattr(
+            cls, "_material_process_set_dt_lifecycle", False
+        ):
+            raise TypeError(
+                "Mechanism.set_dt is not a supported lifecycle hook; declare "
+                "TIMESTEP_BUFFER values and implement "
+                "derive_timestep_buffers(dt) instead."
+            )
 
     def __init__(
         self,
@@ -699,9 +1077,9 @@ class Mechanism(Parameterized):
             {state._name: state for state in states}
         )
 
-        self._init_params: Dict[str, float] = {k: v for k, v in self._init.items()}
-        if ic is not None:
-            self._init_params.update(ic)
+        # Insertion-time ``ic`` is the sole high-priority state override.
+        # State.state_defaults owns reusable class-level defaults.
+        self._init_params: Dict[str, float] = dict(ic or {})
 
         self.register_buffer("diam", self.get(diameters))
         for state in self.DE.values():
@@ -709,18 +1087,106 @@ class Mechanism(Parameterized):
                 self.register_buffer(state_name, torch.zeros(shape))
                 # getattr(self, state_name).requires_grad_(True)
 
-        for r in self._save:
-            self.register_buffer(f"{r}_", torch.zeros(shape))
+        for current in sorted(self._save):
+            self.register_buffer(f"{current}_", self.diam.new_zeros(shape_f))
 
-        for a in self._assigned:
-            self.register_buffer(a, torch.zeros(shape))
+        self._carry_resolved_shapes = {}
+        self._derived_resolved_shapes = {}
+        for name in self._carry:
+            dtype, carry_shape = self._carry_specs[name]
+            canonical_shape = (
+                shape_f
+                if carry_shape == "local"
+                else (() if carry_shape == "deferred" else carry_shape)
+            )
+            self.register_buffer(
+                name,
+                self.diam.new_zeros(
+                    canonical_shape,
+                    dtype=self.diam.dtype if dtype is None else dtype,
+                ),
+            )
+            self._carry_resolved_shapes[name] = (
+                None if carry_shape == "deferred" else tuple(canonical_shape)
+            )
+
+        # ASSIGNED values are repeatable algebraic work products, not mutable
+        # simulation carry. Keep non-persistent slots so ordinary Module
+        # conversion remains safe while excluding them from state_dict and the
+        # functional/checkpoint carry schema.
+        for name in self._assigned:
+            self.register_buffer(
+                name,
+                self.diam.new_zeros(shape_f),
+                persistent=False,
+            )
+
+        for name in self._derived_buffers:
+            dtype, derived_shape = self._derived_buffer_specs.get(name, (None, "local"))
+            canonical_shape = (
+                shape_f
+                if derived_shape == "local"
+                else (() if derived_shape == "deferred" else derived_shape)
+            )
+            self.register_buffer(
+                name,
+                self.diam.new_zeros(
+                    canonical_shape,
+                    dtype=self.diam.dtype if dtype is None else dtype,
+                ),
+            )
+            self._derived_resolved_shapes[name] = (
+                None if derived_shape == "deferred" else tuple(canonical_shape)
+            )
+
+        for name in self._timestep_buffers:
+            self.register_buffer(
+                name,
+                self.diam.new_zeros(_canonical_timestep_buffer_shape(self, name)),
+            )
+
+        # Canonical immutable initialization plans keep declaration discovery
+        # outside compiled functional execution.
+        self._initial_state_names = tuple(
+            name for state in self.DE.values() for name in state._state
+        )
+        self._initial_carry_names = tuple(self._carry)
+        self._saved_current_buffer_names = tuple(
+            sorted(f"{name}_" for name in self._save)
+        )
+        self._has_authored_initial_values = (
+            type(self).initial_values is not Mechanism.initial_values
+        )
+        self._has_authored_assigned_values = (
+            type(self).assigned_values is not Mechanism.assigned_values
+        )
+        self._has_authored_advance = type(self).advance is not Mechanism.advance
+        self._assigned_schema_validated = False
+        self._advance_schema_validated = False
+        self._advance_return_names = ()
+
+        self._timestep_buffer_schema = _timestep_buffer_schema(self)
 
         self._all_states = []
         for state_module in self.DE.values():
             for state_name in state_module._state:
                 self._all_states.append(state_name)
 
-        self._all_states += [a for a in self._assigned]
+        # `_all_states` remains the public persistent-state inventory used by
+        # initialization transforms. Solver input additionally includes
+        # prepared and ephemeral algebraic values, but those are not carry.
+        self._all_states += list(self._carry)
+        self._transition_input_names = tuple(
+            dict.fromkeys(
+                (
+                    *self._all_states,
+                    *self._assigned,
+                    *sorted(self._derived_buffers),
+                    *sorted(self._timestep_buffers),
+                    *self._runtime_shared_local_names(),
+                )
+            )
+        )
 
         # factorize current equations
         self._current_factorable = {}
@@ -764,6 +1230,18 @@ class Mechanism(Parameterized):
         key_before = getattr(self, "key", None)
         valid_before = getattr(self, "_support_key_values_valid", True)
         result = super()._apply(fn, recurse=recurse)
+        # `Module.to(dtype=...)` converts every floating buffer. Explicitly
+        # typed carry is part of the simulation schema, so restore its declared
+        # dtype while retaining the device/layout selected by `fn`.
+        buffer_specs = {
+            **self._carry_specs,
+            **self._derived_buffer_specs,
+        }
+        for name, (dtype, _shape) in buffer_specs.items():
+            if dtype is not None and name in self._buffers:
+                value = self._buffers[name]
+                if value.dtype != dtype:
+                    self._buffers[name] = value.to(dtype=dtype)
         key_after = getattr(self, "key", None)
 
         if not torch.is_tensor(key_after):
@@ -787,7 +1265,31 @@ class Mechanism(Parameterized):
                 self._support_key_values_valid = False
             else:
                 self._support_key_values_valid = True
+        _reset_runtime_output_validation(self)
         return result
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Resolve fresh deferred layouts once from incoming checkpoint tensors."""
+
+        _resolve_deferred_buffers_from_state_dict(self, state_dict, prefix)
+        return super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def refresh_support_spec(self):
         """Refresh metadata after a checkpoint replaces a fancy selector key."""
@@ -895,16 +1397,36 @@ class Mechanism(Parameterized):
             return self.put_slice(ion_conc_u, ion_conc_o, v, clone=clone)
         return self.put_fancy(ion_conc_u, ion_conc_o, v, clone=clone)
 
-    def set_dt(self, dt):
-        """
-        Update the per-mechanism time-step buffer.
+    def _configure_timestep(self, dt):
+        """Apply the canonical framework-owned timestep configuration."""
 
-        Parameters
-        ----------
-        dt : float or Tensor
-            New integration step size in milliseconds.
-        """
-        self.dt = self.dt.fill_(dt).detach()
+        configuration = Mechanism._stage_timestep_configuration(self, dt)
+        Mechanism._commit_timestep_configuration(self, configuration)
+
+    def _stage_timestep_configuration(self, dt):
+        """Build one canonical timestep update without mutating this tree."""
+
+        dt_tensor = torch.as_tensor(dt, device=self.dt.device, dtype=self.dt.dtype)
+        if dt_tensor.ndim != 0:
+            raise ValueError("mechanism timestep must be a scalar")
+
+        # Derive and validate every nested workspace before changing ``dt`` or
+        # installing any value.  A late State failure therefore leaves the
+        # complete Mechanism at its previous coherent timestep.
+        staged = [(self, _stage_timestep_buffers(self, dt_tensor))]
+        staged.extend(
+            (state_module, _stage_timestep_buffers(state_module, dt_tensor))
+            for state_module in self.DE.values()
+        )
+        return dt_tensor.detach().clone(), tuple(staged)
+
+    def _commit_timestep_configuration(self, configuration):
+        """Install a canonical update returned by timestep staging."""
+
+        dt_tensor, staged = configuration
+        self._buffers["dt"] = dt_tensor
+        for module, values in staged:
+            _install_timestep_buffers(module, values)
 
     def put_no_op(self, ion_conc_u, ion_conc_o, v, clone=True):
         """
@@ -1161,89 +1683,460 @@ class Mechanism(Parameterized):
             local = self._material_local_view(material, field)
             self._set_local_material_buffer(local_name, torch.zeros_like(local))
 
-    def _init_buffers_s(self, v_init):
+    def _init_buffers_s(
+        self,
+        v_init,
+        *,
+        seeds=None,
+        shared_value_names=(),
+    ):
+        """Imperative adapter for the canonical declared initialization path."""
+
+        return self._initialize_declared_values(
+            v_init,
+            overrides=None,
+            seeds=seeds,
+            shared_value_names=shared_value_names,
+            require_complete=False,
+            isolate_values=True,
+            detach_inferred=True,
+            detach_values=False,
+            materialize_workspaces=True,
+        )
+
+    def _initialize_declared_values(
+        self,
+        v_init,
+        *,
+        overrides,
+        seeds,
+        shared_value_names,
+        require_complete,
+        isolate_values,
+        detach_inferred,
+        detach_values,
+        materialize_workspaces,
+    ):
+        """Initialize declared State and carry through one ordered transaction.
+
+        The same declaration-driven routine underlies imperative and functional
+        initialization. Its precedence is shared-field seed,
+        ``State.state_defaults``, insertion-time ``ic``, Mechanism
+        ``initial_values``, then ordered State ``initial_values``.
+        """
+
         states = tuple(self.DE.values())
-        try:
-            # Static workspaces are initialization inputs, so both the
-            # Mechanism and every nested State must see them before State.inf,
-            # explicit INIT assignment, or either authored initial hook runs.
+        seeds = {} if seeds is None else seeds
+        shared_value_names = tuple(shared_value_names)
+        # Static workspaces are initialization inputs, so both the
+        # Mechanism and every nested State must see them before defaults,
+        # insertion-time overrides, or either authored initial hook runs.
+        state_value_names = []
+        if materialize_workspaces:
             _materialize_derived_buffers(self)
             for state_module in states:
-                state_module._prepare_derived_buffers_for_initialize()
+                _materialize_derived_buffers(state_module)
 
-            for state_module in states:
-                state_names = state_module._state
-                for state_name in state_names:
-                    if state_name in self._init_params:
-                        buffer_tensor = (
-                            torch.as_tensor(
-                                self._init_params[state_name],
-                                device=v_init.device,
-                                dtype=v_init.dtype,
-                            )
-                            .expand_as(v_init)
-                            .clone()
-                        )
-                        setattr(self, state_name, buffer_tensor.detach())
-                    else:
-                        if inf := state_module.inf(v_init):
-                            buffer_tensor = inf[state_name]
-                            setattr(self, state_name, buffer_tensor.detach())
+        # Ordinary carry has a deterministic fresh default. Shared write
+        # and source locals were seeded immediately before this call and
+        # must retain those canonical values.
+        ordinary_mechanism = tuple(
+            name for name in self._initial_carry_names if name not in shared_value_names
+        )
+        for name in ordinary_mechanism:
+            setattr(self, name, torch.zeros_like(getattr(self, name)))
+        for name in self._saved_current_buffer_names:
+            setattr(self, name, torch.zeros_like(getattr(self, name)))
+        for state_module in states:
+            ordinary_state = tuple(
+                name
+                for name in state_module._initial_carry_names
+                if name not in shared_value_names
+            )
+            for name in ordinary_state:
+                setattr(
+                    state_module,
+                    name,
+                    torch.zeros_like(getattr(state_module, name)),
+                )
 
-            self.initial(v_init)
+        initialized, seeded_only = self._derive_initial_state_values(
+            v_init,
+            overrides=overrides,
+            seeds=seeds,
+            require_complete=False,
+            return_seeded=True,
+        )
+        for state_name, buffer_tensor in initialized.items():
+            # A seed is already the handler-installed writable local. Do
+            # not rebind it in imperative mode: historically this preserves
+            # the Ion/Material initial-source graph until the commit phase.
+            if state_name in seeded_only:
+                continue
+            setattr(
+                self,
+                state_name,
+                buffer_tensor.detach() if detach_inferred else buffer_tensor,
+            )
 
-            for state_module in states:
-                state_module.initialize(v_init)
-        finally:
-            # An external State.initialize override may not call super(). Do
-            # not let its one-shot marker leak into a direct later initialize.
-            for state_module in states:
-                state_module._clear_derived_buffers_for_initialize()
+        values = self._initial_value_frame(v_init, shared_value_names)
+        mechanism_values = self._derive_initial_values(
+            v_init,
+            values,
+            shared_value_names=shared_value_names,
+            isolate=isolate_values,
+        )
+        self._install_initial_values(
+            mechanism_values,
+            detach=detach_values,
+        )
+
+        for state_module in states:
+            # Install support-local shared inputs first so declaration-owned
+            # STATE/CARRY values win when a writable shared seed has the
+            # same name as a State variable after ``ic`` precedence.
+            state_values = {
+                name: getattr(state_module, name)
+                for name in self._runtime_shared_local_names()
+                if hasattr(state_module, name)
+            }
+            state_values.update(
+                {
+                    name: getattr(self, name)
+                    for name in state_module._state
+                    if hasattr(self, name)
+                }
+            )
+            state_values.update(
+                {
+                    name: getattr(state_module, name)
+                    for name in state_module._initial_carry_names
+                }
+            )
+            # State initialization is a pure returned-value phase, but it
+            # may depend on the support-local Ion/Material frame that the
+            # handler has already installed for this mechanism. Expose
+            # those aliases explicitly rather than requiring hidden reads
+            # through ``self``. This includes ionic-current inputs for the
+            # ordered post-current initialization plan, concentration and
+            # material reads, and writable/source seeds.
+            state_values["celsius"] = _support_visible_value(
+                state_module.celsius, v_init
+            )
+            state_values["diam"] = state_module.diam
+            state_values_out = state_module._derive_initial_values(
+                v_init,
+                state_values,
+                isolate=isolate_values,
+            )
+            state_value_names.extend(state_values_out)
+            for name, value in state_values_out.items():
+                installed = value.detach() if detach_values else value
+                if name in state_module._state:
+                    setattr(self, name, installed)
+                else:
+                    _install_declared_buffer_value(state_module, name, installed)
+
+        unresolved_layouts = []
+        for owner in (self, *states):
+            unresolved_layouts.extend(
+                f"{type(owner).__qualname__}.{name}"
+                for name in _unresolved_deferred_buffer_names(owner)
+            )
+        if unresolved_layouts:
+            raise RuntimeError(
+                "Deferred buffer layouts must be resolved during pure "
+                "initialization: " + ", ".join(unresolved_layouts)
+            )
+
+        if require_complete:
+            provided = (
+                *tuple(initialized),
+                *tuple(mechanism_values),
+                *tuple(state_value_names),
+            )
+            unresolved = sorted(
+                name
+                for state_module in states
+                for name in state_module._state
+                if name not in provided
+            )
+            if unresolved:
+                raise KeyError(
+                    f"{type(self).__qualname__} initialization did not "
+                    f"produce declared states {unresolved}"
+                )
 
         return
 
+    def _initial_value_frame(self, v_init, shared_value_names):
+        """Return explicit local inputs visible to Mechanism.initial_values."""
+
+        frame = {
+            name: getattr(self, name)
+            for state_module in self.DE.values()
+            for name in state_module._state
+            if hasattr(self, name)
+        }
+        carry_names = (
+            *self._initial_carry_names,
+            *tuple(shared_value_names),
+        )
+        frame.update(
+            {name: getattr(self, name) for name in carry_names if hasattr(self, name)}
+        )
+        frame.update(
+            {
+                name: getattr(self, name)
+                for name in self._runtime_shared_local_names()
+                if hasattr(self, name)
+            }
+        )
+        frame["celsius"] = _support_visible_value(self.celsius, v_init)
+        frame["diam"] = self.diam
+        return frame
+
+    def _derive_initial_values(
+        self,
+        v_init,
+        values,
+        *,
+        shared_value_names,
+        isolate,
+    ):
+        """Evaluate this Mechanism's pure authored initialization overlay."""
+
+        authored = self._has_authored_initial_values
+        if not torch.compiler.is_compiling():
+            authored = (
+                "initial_values" in self.__dict__
+                or type(self).initial_values is not Mechanism.initial_values
+            )
+        if not authored:
+            return {}
+
+        valid_names = (
+            *self._initial_state_names,
+            *self._initial_carry_names,
+            *tuple(shared_value_names),
+        )
+        references = {
+            name: getattr(self, name) for name in valid_names if hasattr(self, name)
+        }
+        outputs = (
+            _evaluate_registered_builder(self, "initial_values", v_init, values)
+            if isolate
+            else self.initial_values(v_init, values)
+        )
+        return _normalize_initial_values(
+            self,
+            outputs,
+            references,
+            method_name="initial_values",
+        )
+
+    def _install_initial_values(self, values, *, detach):
+        for name, value in values.items():
+            _install_declared_buffer_value(
+                self,
+                name,
+                value.detach() if detach else value,
+            )
+
+    def _runtime_shared_local_names(self):
+        """Return ordered Ion/Material locals visible to pure transitions."""
+        names = []
+        for usage in (self._read_ion, self._write_ion_c):
+            for fields in usage.values():
+                _extend_unique(names, fields)
+        for usage in (self._read_material, self._write_material):
+            for fields in usage.values():
+                _extend_unique(names, fields)
+        for fields in self._source_material.values():
+            _extend_unique(names, fields.values())
+        return tuple(names)
+
+    def _advance_output_names(self):
+        """Return ordered persistent/shared names authored advance may update."""
+        names = list(self._carry)
+        for fields in self._write_ion_c.values():
+            _extend_unique(names, fields)
+        for fields in self._write_material.values():
+            _extend_unique(names, fields)
+        for fields in self._source_material.values():
+            _extend_unique(names, fields.values())
+        return tuple(names)
+
+    def _runtime_value_frame(self):
+        values = {
+            name: getattr(self, name)
+            for name in self._transition_input_names
+            if hasattr(self, name)
+        }
+        values["celsius"] = self.celsius
+        values["diam"] = self.diam
+        return values
+
+    def _derive_assigned_values(self, v, values):
+        """Evaluate repeatable algebra; validate its fixed schema once."""
+        outputs = self.assigned_values(v, values)
+        if not self._assigned_schema_validated and not torch.compiler.is_compiling():
+            _validate_runtime_outputs(
+                self,
+                "assigned_values",
+                outputs,
+                {name: getattr(self, name) for name in self._assigned},
+                required=self._assigned,
+            )
+            self._assigned_schema_validated = True
+        return outputs
+
+    def _evaluate_assigned(self, v):
+        """Install pure repeatable ASSIGNED algebra."""
+        if self._has_authored_assigned_values:
+            outputs = self._derive_assigned_values(v, self._runtime_value_frame())
+            for name in self._assigned:
+                setattr(self, name, outputs[name])
+            return outputs
+
+        return {}
+
+    def _derive_advance_values(self, v, dt, values):
+        """Evaluate and validate the authored accepted-step transition."""
+        if not self._has_authored_advance:
+            return {}
+        outputs = self.advance(v, dt, values)
+        if not self._advance_schema_validated and not torch.compiler.is_compiling():
+            references = {
+                name: getattr(self, name)
+                for name in self._advance_output_names()
+                if hasattr(self, name)
+            }
+            _validate_runtime_outputs(
+                self,
+                "advance",
+                outputs,
+                references,
+            )
+            self._advance_return_names = tuple(outputs)
+            self._advance_schema_validated = True
+        return outputs
+
+    def _derive_initial_state_values(
+        self,
+        v_init,
+        *,
+        overrides=None,
+        seeds=None,
+        require_complete=False,
+        return_seeded=False,
+    ):
+        """Purely derive declared state values at support-local voltage.
+
+        The imperative adapter supplies insertion-time ``ic`` values.
+        Functional callers provide those same values as explicit tensors,
+        avoiding hidden Python-side initial conditions while sharing the exact
+        precedence and inference routine.
+        """
+
+        overrides = self._init_params if overrides is None else overrides
+        seeds = {} if seeds is None else seeds
+        if not isinstance(overrides, Mapping):
+            raise TypeError("mechanism initial state overrides must be a mapping")
+        if not isinstance(seeds, Mapping):
+            raise TypeError("mechanism initial state seeds must be a mapping")
+
+        declared = {
+            name for state_module in self.DE.values() for name in state_module._state
+        }
+        relevant = {
+            name: value for name, value in overrides.items() if name in declared
+        }
+        unknown_seeds = set(seeds) - declared
+        if unknown_seeds:
+            raise KeyError(
+                f"mechanism initial state seeds contain unknown states "
+                f"{sorted(unknown_seeds)}"
+            )
+        values = {}
+        seeded_only = set()
+        for state_module in self.DE.values():
+            local_overrides = {
+                name: relevant[name] for name in state_module._state if name in relevant
+            }
+            inferred, local_seeded = state_module._derive_initial_state_values(
+                v_init,
+                overrides=local_overrides,
+                seeds={
+                    name: seeds[name] for name in state_module._state if name in seeds
+                },
+                require_complete=require_complete,
+                return_seeded=True,
+            )
+            overlap = set(values) & set(inferred)
+            if overlap:  # pragma: no cover - construction rejects duplicate buffers
+                raise RuntimeError(
+                    f"Mechanism {type(self).__qualname__} has duplicate declared "
+                    f"state names {sorted(overlap)}"
+                )
+            values.update(inferred)
+            seeded_only.update(local_seeded)
+        if return_seeded:
+            return values, frozenset(seeded_only)
+        return values
+
     # Classmethod declarations
     @staticmethod
-    def STATE(*args):
+    def STATE_BUNDLE(*args):
         """
-        Declare state variables for the mechanism class body.
+        Register State bundle classes for the mechanism class body.
 
         Parameters
         ----------
         *args : type
-            State module classes registered to ``Mechanism._state``.
+            State subclasses whose solver tensors are owned by the mechanism.
         """
-        declare_class_value("mechanism.state", args, Mechanism._state_declarations)
+        declare_class_value(
+            "mechanism.state_bundle", args, Mechanism._state_bundle_declarations
+        )
 
     @staticmethod
-    def BUFFER(*args):
-        """
-        Declare mechanism-level buffers.
+    def CARRY(*args, dtype=None, shape="local"):
+        """Declare persistent mutable mechanism carry.
 
-        These buffers are allocated per mechanism instance and are typically
-        populated in :meth:`initial` or :meth:`breakpoint`. They are analogous
-        to :meth:`State.BUFFER` rather than :meth:`State.ASSIGNED`: unlike a
-        State ASSIGNED variable, a mechanism buffer does not have to be
-        computed and returned from a state ``breakpoint`` function.
+        Carry crosses accepted timesteps and is therefore part of imperative
+        checkpoints and functional state. Authors initialize it through
+        :meth:`initial_values` and update it through :meth:`advance`; current-
+        stage algebra belongs in :meth:`ASSIGNED` instead.
 
         Parameters
         ----------
         *args : str
-            Names of mechanism buffers to allocate per instance.
+            Names of persistent carry tensors.
+        dtype : torch.dtype, optional
+            Fixed carry dtype. ``None`` follows the mechanism dtype.
+        shape : {"local", "deferred", tuple of int}, optional
+            ``"local"`` follows the mechanism runtime shape, including
+            explicit Population batch axes. ``"deferred"`` lets the first
+            pure initialization output establish a custom shape, which is then
+            frozen for this mechanism instance. A tuple declares structural
+            storage independent of Population batching.
         """
+        schema = normalize_buffer_schema(dtype, shape, declaration="CARRY")
         declare_class_value(
-            "mechanism.assigned", args, Mechanism._assigned_declarations
+            "mechanism.carry",
+            {name: schema for name in args},
+            Mechanism._carry_declarations,
         )
 
     @staticmethod
-    def DERIVED_BUFFER(*args):
+    def DERIVED_BUFFER(*args, dtype=None, shape="local"):
         """Declare initialization-static buffers built by ``derive_buffers``.
 
-        A derived buffer is also an ordinary :meth:`BUFFER`, retaining existing
-        registration and checkpoint compatibility. The framework refreshes it
-        after effective parameters, temperature, and local geometry have been
-        populated, before State initial-value inference and authored
-        :meth:`initial` hooks.
+        A derived buffer retains registered-buffer and ``state_dict``
+        registration. The framework refreshes it after effective parameters,
+        temperature, and local geometry have been populated, before State
+        defaults and authored :meth:`initial_values` hooks.
 
         ``derive_buffers()`` must return a mapping containing exactly the
         declared names. It must not mutate module tensors and must not depend on
@@ -1253,42 +2146,79 @@ class Mechanism(Parameterized):
         ----------
         *args : str
             Names of derived buffers to allocate and materialize.
+        dtype : torch.dtype, optional
+            Fixed workspace dtype. ``None`` follows the mechanism dtype.
+        shape : {"local", "deferred", tuple of int}, optional
+            ``"local"`` follows the mechanism runtime shape, including
+            explicit Population batch axes.
+            ``"deferred"`` lets the first pure builder result establish a
+            custom shape, which is then frozen for this instance. A tuple is a
+            fixed structural shape.
         """
+        schema = normalize_buffer_schema(dtype, shape, declaration="DERIVED_BUFFER")
         declare_class_value(
             "mechanism.derived_buffers",
-            args,
+            {name: schema for name in args},
             Mechanism._derived_buffer_declarations,
         )
 
     @staticmethod
-    def ASSIGNED(*args):
-        """
-        Deprecated alias for :meth:`BUFFER`.
+    def TIMESTEP_BUFFER(*args, shape="local"):
+        """Declare buffers built by ``derive_timestep_buffers(dt)``.
 
-        Mechanism-level ``ASSIGNED`` historically declared mutable buffers.
-        New code should use ``Mechanism.BUFFER(...)`` to avoid confusion with
-        ``State.ASSIGNED(...)``, whose names must be computed by a State
-        ``breakpoint`` function.
-        """
-        warnings.warn(
-            "Mechanism.ASSIGNED(...) is deprecated; use Mechanism.BUFFER(...) "
-            "for mechanism-level buffers. State.ASSIGNED(...) is unchanged.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        Mechanism.BUFFER(*args)
-
-    @staticmethod
-    def SAVE(*args):
-        """
-        Declare state variables that must be saved each time step.
+        Dendra rebuilds a timestep buffer whenever the owning integrator
+        configures a timestep, after effective parameters and
+        initialization-static derived buffers are available. The builder must
+        be pure and use its explicit scalar ``dt`` argument instead of mutating
+        module state. Do not repeat the same name in a :meth:`CARRY`,
+        :meth:`DERIVED_BUFFER`, or :meth:`ASSIGNED` declaration.
 
         Parameters
         ----------
         *args : str
-            Names of buffers mirrored with a trailing underscore.
+            Names of timestep-derived buffers to materialize.
+        shape : {"local", tuple of int}, optional
+            Canonical registered-buffer shape. ``"local"`` (the default)
+            follows the owning mechanism's runtime shape. An explicit tuple,
+            including ``()`` for a scalar, is structural and remains independent
+            of Population batching.
         """
-        declare_class_value("mechanism.save", args, Mechanism._save_declarations)
+        shape = normalize_timestep_buffer_shape(shape)
+        declare_class_value(
+            "mechanism.timestep_buffers",
+            {name: shape for name in args},
+            Mechanism._timestep_buffer_declarations,
+        )
+
+    @staticmethod
+    def ASSIGNED(*args):
+        """Declare repeatable ephemeral algebra returned by assigned_values."""
+        declare_class_value(
+            "mechanism.assigned",
+            args,
+            Mechanism._assigned_declarations,
+        )
+
+    @staticmethod
+    def SAVE_CURRENT(*args):
+        """Declare currents whose latest evaluated values should be retained.
+
+        Every name must also be declared by :meth:`NONSPECIFIC_CURRENT` or as
+        an ionic-current write through :meth:`USEION`. Dendra owns the
+        checkpointed ``<current>_`` mirror, initializes it to zero, and updates
+        it whenever that current is evaluated. Authored ``initial_values`` and
+        ``advance`` hooks must not write the mirror directly.
+
+        Parameters
+        ----------
+        *args : str
+            Declared current names to mirror with a trailing underscore.
+        """
+        declare_class_value(
+            "mechanism.save_current",
+            args,
+            Mechanism._save_current_declarations,
+        )
 
     @staticmethod
     def USEION(ion, read=None, write=None):
@@ -1442,18 +2372,6 @@ class Mechanism(Parameterized):
         )
 
     @staticmethod
-    def INIT(**kwargs):
-        """
-        Declare initial buffer values for state variables.
-
-        Parameters
-        ----------
-        **kwargs
-            Mapping from state names to scalar initial conditions.
-        """
-        declare_class_value("mechanism.init", kwargs, Mechanism._init_declarations)
-
-    @staticmethod
     def EXPLICIT(*args):
         """
         Mark currents as voltage independent when assembling the RHS.
@@ -1518,24 +2436,6 @@ class Mechanism(Parameterized):
             "mechanism.numerical", args, Mechanism._numerical_declarations
         )
 
-    def breakpoint(self, v):
-        """
-        Evaluate mechanism currents at the breakpoint stage.
-
-        Parameters
-        ----------
-        v : Tensor
-            Membrane potential values for the local compartments.
-
-        Notes
-        -----
-        Override to compute mechanism-level :meth:`BUFFER` values and assemble
-        currents (e.g., ``ina``, ``ik``, ``il``). Called each step before
-        current accumulation. Treat ``v`` as read-only: its gathered tensor may
-        be shared with other mechanisms on the same ordered support.
-        """
-        return
-
     def detach(self):
         """
         Detach mechanism buffers and nested state modules from autograd.
@@ -1545,9 +2445,9 @@ class Mechanism(Parameterized):
             state_module.detach()
 
     def _install_monomorphic_advance(self):
-        """Install a generated per-proxy `_advance` fast path when safe.
+        """Install a generated per-proxy `_advance_states` fast path when safe.
 
-        The base `_advance` method is intentionally generic and polymorphic.  It
+        The base `_advance_states` method is intentionally generic and polymorphic. It
         is convenient for eager execution, but TorchDynamo specializes it on
         ``type(self)``.  In models with many generated mechanism proxy classes,
         that shared code object can recompile once per mechanism.  This installer
@@ -1555,19 +2455,17 @@ class Mechanism(Parameterized):
         class with a generated method whose code object is unique to that class
         and whose state-module names / buffer keys are static literals.
 
-        Subclasses that define their own `_advance` are left untouched.
         """
         cls = self.__class__
         if cls is Mechanism:
             return
 
-        existing = cls.__dict__.get("_advance", None)
-        base_advance = Mechanism.__dict__.get("_advance")
-
+        existing = cls.__dict__.get("_advance_states", None)
+        base_advance = Mechanism.__dict__.get("_advance_states")
         if (
             existing is not None
             and existing is not base_advance
-            and not getattr(existing, "_dendra_monomorphic_advance", False)
+            and not getattr(existing, "_dendra_monomorphic_advance_states", False)
         ):
             return
 
@@ -1579,13 +2477,12 @@ class Mechanism(Parameterized):
             return
 
         advance_fn, source = _compile_monomorphic_mechanism_advance(self, signature)
-        setattr(cls, "_advance", advance_fn)
+        setattr(cls, "_advance_states", advance_fn)
         cls._dendra_monomorphic_advance_signature = signature
         cls._dendra_monomorphic_advance_source = source
 
-    def _advance(self, v, dt):
-        """
-        Advance nested state modules by one time step.
+    def _advance_states(self, v, dt):
+        """Advance nested State and Mechanism carry from one shared snapshot.
 
         Parameters
         ----------
@@ -1602,18 +2499,34 @@ class Mechanism(Parameterized):
         handler may share one gathered tensor across mechanisms with identical
         ordered support.
         """
-        states = self._gather_states()
-        updates = {}
+        if self.DE or self._has_authored_advance:
+            self._evaluate_assigned(v)
+        values = self._runtime_value_frame()
+        state_updates = []
         for state_module in self.DE.values():
-            local = state_module.advance(v, dt, states)
-            updates.update(local)
-        self._buffers.update(updates)
+            local_values = dict(values)
+            for name in state_module._carry:
+                local_values[name] = state_module._buffers[name]
+            state_updates.append(
+                (
+                    state_module,
+                    state_module._derive_advance_values(v, dt, local_values),
+                )
+            )
+
+        mechanism_updates = self._derive_advance_values(v, dt, values)
+        for state_module, updates in state_updates:
+            for name in state_module._state:
+                self._buffers[name] = updates[name]
+            for name in state_module._carry:
+                if name in updates:
+                    state_module._buffers[name] = updates[name]
+        for name in self._advance_output_names():
+            if name in mechanism_updates:
+                setattr(self, name, mechanism_updates[name])
 
     def _gather_states(self):
-        states = {
-            state_name: self._buffers[state_name] for state_name in self._all_states
-        }
-        return states
+        return self._runtime_value_frame()
 
     def populate(self, random_generation=None):
         """
@@ -1678,24 +2591,29 @@ class Mechanism(Parameterized):
         self.sample_runtime_noises_(*names, dt=dt, phase=phase, force=True)
         return self
 
-    def initial(self, v):
-        """
-        Hook for subclasses to initialize buffers from membrane potential.
+    def initial_values(self, v, values):
+        """Return a pure partial overlay for declared initial values.
 
-        Parameters
-        ----------
-        v : Tensor
-            Membrane potential values used for initialization.
-
-        Notes
-        -----
-        Use this to populate mechanism-level :meth:`BUFFER` values (e.g.,
-        cached conductances) or perform any one-time setup before stepping.
+        ``values`` includes initialized STATE/CARRY values, support-visible
+        ``celsius`` and ``diam``, and the support-local Ion/Material/current
+        aliases installed for this ordered initialization phase.
         """
-        return
+        return {}
+
+    def assigned_values(self, v, values):
+        """Return every ephemeral value declared with :meth:`ASSIGNED`."""
+        return {}
+
+    def advance(self, v, dt, values):
+        """Return a partial accepted-step CARRY/shared-field update mapping."""
+        return {}
 
     def derive_buffers(self):
         """Return initialization-static buffers declared by DERIVED_BUFFER."""
+        return {}
+
+    def derive_timestep_buffers(self, dt):
+        """Return timestep workspaces declared by TIMESTEP_BUFFER."""
         return {}
 
     @classmethod
@@ -1997,21 +2915,6 @@ class Mechanism(Parameterized):
             raise RuntimeError(f"Cannot locate module for {cls.__qualname__}")
         return inspect.getsource(mod)  # whole file
 
-    def states_dict(self):
-        """
-        Map state names to their underlying buffers.
-
-        Returns
-        -------
-        dict
-            Dictionary from raw state names to tensors.
-        """
-        dct = {}
-        for state_module in self.DE.values():
-            for state_name in state_module._state:
-                dct[state_name] = self._buffers[state_name]
-        return dct
-
     # -- rng --
     def init_rng(self):
         for state_module in self.DE.values():
@@ -2127,8 +3030,8 @@ class Mechanism(Parameterized):
             Backend selection policy.
         buffer_name : str, optional
             Name of the registered buffer. Defaults to
-            ``f"{name}_delay_buffer"``. Existing mechanism ``BUFFER`` variables can be
-            reused by passing their name here.
+            ``f"{name}_delay_buffer"``. Existing mechanism ``CARRY`` storage
+            can be reused by passing its declared name here.
         pointer_name : str, optional
             Name of the circular-buffer write pointer.
         insert_axis : int, default -1
@@ -2863,7 +3766,9 @@ class Mechanism(Parameterized):
         )
 
         # Expose the current variable immediately for introspection, even before
-        # the first timestep.  Subclasses may also declare it with BUFFER.
+        # the first timestep. Subclasses normally declare repeatable injected
+        # current algebra with ASSIGNED; this fallback supports older custom
+        # injection owners that do not predeclare the slot.
         if not hasattr(self, current_name):
             self.register_buffer(
                 current_name, torch.zeros_like(local_mask, dtype=dtype)
@@ -3078,7 +3983,35 @@ class PointProcess(Mechanism):
     coordinate, use ``50 * dendra.units.nS / dendra.units.uS``.
     """
 
-    pass
+    # Framework-owned, support-local conversion workspace.  The value is the
+    # divisor ``1e6 * area_cm2`` used to convert authored nA/µS values into
+    # distributed membrane densities.  It is derived from morphology, so it is
+    # deliberately non-persistent and rebuilt by MechanismHandler.make_maps().
+    _AREA_FACTOR_BUFFER = "_point_area_factor"
+
+    def _bind_area_factor(self, value: torch.Tensor):
+        """Install a live point-to-density divisor and return its scaler."""
+
+        if not torch.is_tensor(value):
+            raise TypeError("PointProcess area factor must be a Tensor.")
+        if torch.any(value == 0):
+            raise ValueError(
+                "Calculated area factor is zero, perhaps you inserted a "
+                "PointProcess at a branchpoint?"
+            )
+        name = PointProcess._AREA_FACTOR_BUFFER
+        if name in self._buffers:
+            self._buffers[name] = value
+        else:
+            self.register_buffer(name, value, persistent=False)
+        return PointProcess._scale_to_density.__get__(self, type(self))
+
+    def _scale_to_density(self, *values):
+        """Convert one or more authored point values using the live divisor."""
+
+        factor = self._buffers[PointProcess._AREA_FACTOR_BUFFER]
+        scaled = tuple(value / factor for value in values)
+        return scaled[0] if len(scaled) == 1 else scaled
 
 
 class Synapse(Mechanism):
@@ -3229,7 +4162,7 @@ class ContinuousSynapse(Mechanism):
         assigned = list(names)
         if keep_old:
             assigned.extend(f"{name}_old" for name in names)
-        Mechanism.BUFFER(*assigned)
+        Mechanism.CARRY(*assigned)
         declare_class_value(
             "continuous_synapse.inputs",
             (names, bool(keep_old)),
@@ -3377,8 +4310,12 @@ def rename(mechanism, new_name=None):
     # be used alongside the source class; sharing the same generated `_advance`
     # code object would reintroduce cross-class Dynamo guard churn.  The first
     # instance of the renamed class will generate its own fast path.
-    if getattr(class_dict.get("_advance"), "_dendra_monomorphic_advance", False):
-        class_dict.pop("_advance", None)
+    if getattr(
+        class_dict.get("_advance_states"),
+        "_dendra_monomorphic_advance_states",
+        False,
+    ):
+        class_dict.pop("_advance_states", None)
     class_dict.pop("_dendra_monomorphic_advance_signature", None)
     class_dict.pop("_dendra_monomorphic_advance_source", None)
 

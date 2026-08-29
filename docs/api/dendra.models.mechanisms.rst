@@ -37,7 +37,7 @@ Python expression. A nonlinear pointwise current can instead define an exact
 For a distributed mechanism that pair is ``(mA/cm², S/cm²)``; for a point
 process it is ``(nA, µS)`` before area normalization.
 
-The voltage passed to ``breakpoint`` and current methods is read-only. Dendra
+The voltage passed to ``assigned_values`` and current methods is read-only. Dendra
 may gather it once and share that tensor across mechanisms with the exact same
 ordered compartment support; mechanism hooks must not modify it in place.
 
@@ -100,8 +100,55 @@ establishing its contract. An analytic pair supplies only a local conductance;
 it does not make a genuinely coupled current safe. Nonlocal voltage coupling
 must be represented outside the local mechanism-current assembly.
 
-Initialization-derived buffers
-------------------------------
+Mechanism and State value roles
+-------------------------------
+
+``State.STATE("x")`` declares a solver-evolved tensor named ``x``.
+``Mechanism.STATE_BUNDLE(Gates)`` has a different, structural purpose: it registers a
+``State`` subclass and exposes that bundle's declared solver tensors on the
+owning Mechanism. State-bundle class names and their flattened solver-tensor
+names must therefore be unique within one Mechanism.
+
+The remaining declarations describe the same lifetimes at either scope:
+
+* ``CARRY`` is persistent, checkpointed state that is not advanced by a
+  declared State equation. Use ``dtype=...`` for boolean or integer carry and
+  ``shape=...`` for structural storage that is independent of morphology.
+* ``ASSIGNED`` is ephemeral algebra returned by ``assigned_values(v, values)``.
+  It is recomputed whenever an integrator needs it and is neither checkpointed
+  nor part of functional carry.
+* ``DERIVED_BUFFER`` is a prepared workspace determined by parameters,
+  temperature, and geometry.
+* ``TIMESTEP_BUFFER`` is a prepared workspace that additionally depends on
+  ``dt``.
+
+``Mechanism.SAVE_CURRENT("i")`` is intentionally narrower than ``CARRY``. The
+name must also be declared as a nonspecific or ionic current. Dendra owns the
+checkpointed ``i_`` mirror, initializes it to zero, and refreshes it when that
+current participates in Dendra's current assembly. A direct call to
+``mechanism.i(v)`` does not refresh it. The mirror is the raw support-local
+current before scatter/reduction and, for a PointProcess, before area
+normalization. Thus it uses mA/cm² for a distributed mechanism and nA for a
+PointProcess. Authored ``initial_values`` and ``advance`` hooks cannot write the
+mirror. In functional state it is available as
+``state["mechanism_buffers"][mechanism_name]["i_"]``. Use ``CARRY`` for
+counters, latches, histories, or any other user-authored persistent state.
+
+``assigned_values`` must be pure because an integrator may evaluate it more
+than once at different stage voltages. It returns exactly the declared
+``ASSIGNED`` names. Counters, latches, and other persistent updates belong in
+``advance(v, dt, values)``, which runs once per accepted timestep. A custom
+State ``advance`` returns every declared solver tensor and may also update that
+State's ``CARRY``. A Mechanism ``advance`` returns a partial update of its own
+``CARRY`` and writable or additive Ion/Material locals. Every runtime output
+must be a Tensor with the declared shape, dtype, and device. A State's default
+``advance`` is the generated transition for its declared equations.
+
+Authors migrating custom mechanisms from Dendra 0.24 or earlier should follow
+:doc:`Custom-mechanism migration <../upgrading>`.
+
+Derived workspaces
+------------------
 
 Use ``Mechanism.DERIVED_BUFFER(...)`` or ``State.DERIVED_BUFFER(...)`` for a
 workspace that is completely determined by populated parameters, temperature,
@@ -119,15 +166,100 @@ and local geometry and then remains fixed between initializations. Implement
                "scale": self.reference * self.q10 ** ((self.celsius - 22.0) / 10.0)
            }
 
-Dendra refreshes these tensors before State initial-value inference and the
-authored ``initial()`` hooks. They retain normal buffer and checkpoint behavior.
-The builder must not
+Dendra refreshes these tensors before State initial-value inference and
+``initial_values(...)`` hooks. The builder must not
 mutate module tensors or depend on voltage, evolving state, Ion/Material state,
-randomness, or timestep. Continue to use ``BUFFER`` for values written by
-``breakpoint()``, values that accumulate across steps, and recorder-visible
-outputs such as a current intermediate. Custom timestep-dependent workspaces
-should remain in ``set_dt()``; the experimental functional-Population API does
-not yet lower those workspaces.
+randomness, or timestep.
+
+Pure initialization
+-------------------
+
+Use ``State.state_defaults(v, values)`` for fallback State values. Explicit
+insertion-time ``ic`` values take precedence over those defaults. Later
+Mechanism and State ``initial_values(v, values)`` overlays may intentionally
+replace either value; use them for pure declaration-owned initialization of
+state or carry:
+
+.. code-block:: python
+
+   class Gate(State):
+       State.STATE("x")
+       State.CARRY("drive")
+       State.DERIVATIVE("x' = 0.0 * x")
+
+       def state_defaults(self, v, values):
+           return {"x": torch.sigmoid(0.05 * v)}
+
+       def initial_values(self, v, values):
+           drive = torch.sigmoid(0.05 * v + 0.01 * values["celsius"])
+           return {"drive": 2.0 * drive}
+
+For fresh functional initialization, every declared State value must be resolved
+by a shared-field seed, ``state_defaults``, an explicit ``ic``, or an
+``initial_values`` overlay. Mechanism overlays run before ordered State overlays.
+A State overlay may return only its own ``STATE`` and ``CARRY`` names; a
+Mechanism overlay may additionally return its writable Ion/Material locals.
+
+Every State bundle registered on one Mechanism must have a unique class name,
+and their flattened ``STATE`` names must be disjoint. This keeps module lookup,
+solver scheduling, checkpoints, and functional state schemas unambiguous. A
+subclass that replaces a bundle should inherit directly from the intended
+Mechanism base and redeclare the complete replacement bundle rather than
+adding a second State with the same output names.
+
+The hook must return Tensors, remain deterministic, and avoid all mutation and
+implicit RNG. ``values["celsius"]`` is already padded to local voltage rank for
+transform-safe broadcasting; ``values["diam"]`` supplies local geometry.
+
+Use ``Mechanism.TIMESTEP_BUFFER(...)`` or ``State.TIMESTEP_BUFFER(...)`` when a
+workspace also depends on the simulation timestep. Implement
+``derive_timestep_buffers(dt)`` as a pure function returning exactly the
+declared names. ``dt`` is a scalar Tensor in milliseconds on the model's device
+and with its dtype:
+
+.. code-block:: python
+
+   class ExponentialDecay(Mechanism):
+       Mechanism.GLOBAL(tau=2.0)
+       Mechanism.TIMESTEP_BUFFER("decay")
+
+       def derive_timestep_buffers(self, dt):
+           return {"decay": (-dt / self.tau).exp()}
+
+Dendra builds timestep workspaces once when an integrator configures or changes
+its timestep, after effective parameters and initialization-static derived
+workspaces are available. By default, each output may be scalar or
+otherwise broadcastable to the owner's ``shape_p``; Dendra stores it in that
+canonical local shape so serialization remains stable before and after timestep
+configuration.
+
+For a population-independent structural workspace, declare an exact shape. The
+empty tuple declares a scalar, while any other tuple consists of non-negative
+Python integers:
+
+.. code-block:: python
+
+   Mechanism.TIMESTEP_BUFFER("scalar_factor", shape=())
+   Mechanism.TIMESTEP_BUFFER("stage_table", shape=(1, 11, 1))
+
+The builder output must be broadcastable to the declared shape and Dendra
+materializes an independent tensor with exactly that shape. Structural shapes
+do not acquire axes from ``Population.batch()``; include intentional singleton
+axes in the declaration when the mechanism's tensor algebra needs them. An
+inherited timestep-buffer name must retain the same shape declaration
+throughout its class hierarchy.
+
+``TIMESTEP_BUFFER`` already declares the registered buffer, so do not repeat the
+same name with ``CARRY`` or ``ASSIGNED``. The builder must not read evolving
+state, mutate registered tensors, use randomness, or depend on another installed
+timestep workspace.
+
+Both workspace families are registered buffers and participate in
+``state_dict`` serialization. Runtime simulation checkpoints do not treat them
+as mutable carry: initialized live workspaces remain tied to the current
+parameters, geometry, temperature, and integrator timestep. In the
+functional-Population API both families are read-only prepared values, not
+evolving state.
 
 .. autoclass:: dendra.models.mechanisms.State
    :members:
@@ -152,7 +284,7 @@ not yet lower those workspaces.
    :members:
    :inherited-members: Module, object
    :member-order: groupwise
-   :exclude-members: set_dt, put_no_op, put_slice, put_fancy, register_ion, detach,
+   :exclude-members: put_no_op, put_slice, put_fancy, register_ion, detach,
     populate, initialize, batch, states, apply_parameterizations,
     apply_parametrizations,
     check_kwargs,
@@ -229,8 +361,27 @@ population-wide Material fields after local Mechanism writes and sources have
 been committed. Spatial transport normally runs in the ``transport`` phase;
 Material/Ion guards and derived-field updates run afterward.
 
+Material processes have a deliberately separate authoring contract from local
+Mechanisms. Declare process parameters with ``GLOBAL``, ``RANGE``, or ``BATCH``
+and material dependencies with the concrete family declaration (for example,
+``DIFFUSE``, ``CLEAR``, ``CLAMP``, or ``EXCHANGE``). Ordinary Mechanism state,
+current, ion/material-use, and workspace declarations are rejected with an
+error because the material scheduler does not run those phases.
+
+After insertion, Dendra binds the shared fields and calls
+``configure_process(population)``. Binding or execution-map reconstruction may
+call it again, so implementations must be idempotent. Dendra calls
+``set_dt(dt)`` when timestep configuration changes, then
+``advance_materials(dt)`` once per accepted step in ``post_local``,
+``transport``, or ``post_transport`` phase order. Ordinary local Mechanism
+roles and hooks are not part of this scheduler contract and fail explicitly.
+Process-family implementations access bound Material fields through their
+private framework adapter rather than a second public field read/write API.
+Authors of new process families implement these hooks over complete Material
+fields; users of the built-in families normally only need their declarations.
+
 .. autoclass:: dendra.models.mechanisms.MaterialProcess
-   :members: METHOD, PHASE
+   :members: METHOD, PHASE, configure_process, set_dt, advance_materials
    :show-inheritance:
 
 .. autoclass:: dendra.models.mechanisms.DiffusionProcess

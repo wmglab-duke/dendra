@@ -36,7 +36,7 @@ def _clearance_process(shape):
 
 def _advance_clearance(material):
     process = _clearance_process(tuple(material.c.shape))
-    process.bind_materials({"pool": material}.__getitem__)
+    process._bind_materials({"pool": material}.__getitem__)
     process.advance_materials(DT)
     return material.c.sum()
 

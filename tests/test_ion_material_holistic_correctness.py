@@ -72,9 +72,11 @@ class _PotassiumFlux(Mechanism):
     # k.ki/k.ko/k.ek state used by USEION above.
     Mechanism.USEMATERIAL("k", read=["ki", "ko", "ek"], write=["ki"])
 
-    def _advance(self, v, dt):
-        outward_current = self.ik(v)
-        self.ki = self.ki - dt * self.current_to_concentration * outward_current
+    def advance(self, v, dt, values):
+        outward_current = self.g * (v - values["ek"])
+        return {
+            "ki": values["ki"] - dt * self.current_to_concentration * outward_current
+        }
 
     def ik(self, v):
         return self.g * (v - self.ek)

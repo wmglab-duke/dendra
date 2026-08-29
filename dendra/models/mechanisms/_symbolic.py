@@ -185,9 +185,9 @@ def build_current_eq(mechanism, k, assign=False):
                 factorable,
             )
 
-        # SAVE currents must still update their mirrored ``<current>_`` buffer.
+        # SAVE_CURRENT mirrors must still receive the evaluated current.
         # Wrap the exact pair rather than returning it directly so analytic and
-        # generated current paths share the same SAVE contract.
+        # generated current paths share the same saved-current contract.
         code = build_analytic_equation(k, assign=True)
         if DEBUG > 0:
             logger.info(f"Generated code for {k}:\n{code}")

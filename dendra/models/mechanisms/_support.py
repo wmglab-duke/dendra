@@ -509,7 +509,8 @@ class SupportMap:
 
         key = self._flat_runtime_key(runtime_key)
         batch_shape = tuple(tensor.shape[:-2]) if tensor.ndim >= 2 else ()
-        return tensor.reshape(batch_shape + (-1,)).index_select(-1, key)
+        flat_size = math.prod(self.spec.source_core_shape)
+        return tensor.reshape(batch_shape + (flat_size,)).index_select(-1, key)
 
     def scatter_add_(
         self,
@@ -543,7 +544,8 @@ class SupportMap:
 
         key = self._flat_runtime_key(runtime_key)
         batch_shape = tuple(destination.shape[:-2]) if destination.ndim >= 2 else ()
-        flat_destination = destination.reshape(batch_shape + (-1,))
+        flat_size = math.prod(self.spec.source_core_shape)
+        flat_destination = destination.reshape(batch_shape + (flat_size,))
         expanded_key = key.expand(batch_shape + (key.numel(),))
         values = torch.as_tensor(
             local,
@@ -559,10 +561,67 @@ class SupportMap:
         local,
         runtime_key=None,
     ) -> torch.Tensor:
-        """Return a full field with local values added."""
+        """Return a full field with local values added, without mutation.
 
-        result = destination.clone()
-        return self.scatter_add_(result, local, runtime_key)
+        This is deliberately not implemented as ``clone`` followed by
+        :meth:`scatter_add_`.  During a parameter-only ``vmap`` the destination
+        can be shared while ``local`` carries an implicit batch dimension;
+        in-place scatter cannot add that batched source to an unbatched target.
+        The out-of-place operators below let PyTorch propagate and broadcast
+        those transform dimensions naturally.
+        """
+
+        values = torch.as_tensor(
+            local,
+            device=destination.device,
+            dtype=destination.dtype,
+        )
+        if self.spec.kind is SupportKind.DENSE:
+            values = torch.broadcast_to(values, destination.shape)
+            return destination + values
+
+        if self.spec.kind is SupportKind.RECTANGULAR:
+            row_slice, column_slice = self.spec.normalized_slices
+            rows = destination[..., slice(*row_slice), :]
+            selected = rows[..., :, slice(*column_slice)]
+            values = torch.broadcast_to(values, selected.shape)
+            rows = torch.slice_scatter(
+                rows,
+                selected + values,
+                dim=-1,
+                start=column_slice[0],
+                end=column_slice[1],
+                step=column_slice[2],
+            )
+            return torch.slice_scatter(
+                destination,
+                rows,
+                dim=-2,
+                start=row_slice[0],
+                end=row_slice[1],
+                step=row_slice[2],
+            )
+
+        if self._uses_compact_shared_columns(destination):
+            columns = self._shared_columns(runtime_key, device=destination.device)
+            population = self.spec.source_core_shape[0]
+            column_count = len(self.spec.column_indices)
+            batch_shape = tuple(destination.shape[:-2])
+            structured_shape = batch_shape + (population, column_count)
+            values = values.expand(batch_shape + self.spec.runtime_local_shape)
+            values = values.reshape(structured_shape)
+            indices = columns.expand(structured_shape)
+            return torch.scatter_add(destination, -1, indices, values)
+
+        key = self._flat_runtime_key(runtime_key)
+        batch_shape = tuple(destination.shape[:-2]) if destination.ndim >= 2 else ()
+        flat_size = math.prod(self.spec.source_core_shape)
+        flat_destination = destination.reshape(batch_shape + (flat_size,))
+        expanded_key = key.expand(batch_shape + (self.spec.slot_count,))
+        values = values.expand(batch_shape + self.spec.runtime_local_shape)
+        values = values.reshape(batch_shape + (self.spec.slot_count,))
+        result = torch.scatter_add(flat_destination, -1, expanded_key, values)
+        return result.reshape(destination.shape)
 
     def scatter_set(
         self,
@@ -579,12 +638,64 @@ class SupportMap:
             return local
 
         destination = destination.expand_as(reference)
+        values = torch.as_tensor(
+            local,
+            device=destination.device,
+            dtype=destination.dtype,
+        )
+
         if clone:
-            destination = destination.clone()
+            # Keep the ordinary public/default path genuinely out of place.
+            # As with scatter_add(), a local value may carry an implicit vmap
+            # lane while the canonical destination is shared across lanes.
+            if self.spec.kind is SupportKind.RECTANGULAR:
+                row_slice, column_slice = self.spec.normalized_slices
+                rows = destination[..., slice(*row_slice), :]
+                selected = rows[..., :, slice(*column_slice)]
+                values = torch.broadcast_to(values, selected.shape)
+                rows = torch.slice_scatter(
+                    rows,
+                    values,
+                    dim=-1,
+                    start=column_slice[0],
+                    end=column_slice[1],
+                    step=column_slice[2],
+                )
+                return torch.slice_scatter(
+                    destination,
+                    rows,
+                    dim=-2,
+                    start=row_slice[0],
+                    end=row_slice[1],
+                    step=row_slice[2],
+                )
+            if self._uses_compact_shared_columns(destination):
+                columns = self._shared_columns(
+                    runtime_key,
+                    device=destination.device,
+                )
+                population = self.spec.source_core_shape[0]
+                column_count = len(self.spec.column_indices)
+                batch_shape = tuple(destination.shape[:-2])
+                structured_shape = batch_shape + (population, column_count)
+                values = values.expand(batch_shape + self.spec.runtime_local_shape)
+                values = values.reshape(structured_shape)
+                indices = columns.expand(structured_shape)
+                return torch.scatter(destination, -1, indices, values)
+
+            key = self._flat_runtime_key(runtime_key)
+            batch_shape = tuple(destination.shape[:-2]) if destination.ndim >= 2 else ()
+            flat_size = math.prod(self.spec.source_core_shape)
+            flat_destination = destination.reshape(batch_shape + (flat_size,))
+            expanded_key = key.expand(batch_shape + (self.spec.slot_count,))
+            values = values.expand(batch_shape + self.spec.runtime_local_shape)
+            values = values.reshape(batch_shape + (self.spec.slot_count,))
+            result = torch.scatter(flat_destination, -1, expanded_key, values)
+            return result.reshape(destination.shape)
 
         if self.spec.kind is SupportKind.RECTANGULAR:
             selectors = tuple(slice(*item) for item in self.spec.normalized_slices)
-            destination[..., *selectors] = local
+            destination[..., *selectors] = values
             return destination
         if self._uses_compact_shared_columns(destination):
             columns = self._shared_columns(runtime_key, device=destination.device)
@@ -592,20 +703,19 @@ class SupportMap:
             column_count = len(self.spec.column_indices)
             batch_shape = tuple(destination.shape[:-2])
             structured_shape = batch_shape + (population, column_count)
-            values = torch.as_tensor(
-                local,
-                device=destination.device,
-                dtype=destination.dtype,
-            ).expand(batch_shape + self.spec.runtime_local_shape)
+            values = values.expand(batch_shape + self.spec.runtime_local_shape)
             values = values.reshape(structured_shape)
             destination.scatter_(-1, columns.expand(structured_shape), values)
             return destination
 
         key = self._flat_runtime_key(runtime_key)
         batch_shape = tuple(destination.shape[:-2]) if destination.ndim >= 2 else ()
-        flat_destination = destination.reshape(batch_shape + (-1,))
-        expanded_key = key.expand(batch_shape + (key.numel(),))
-        flat_destination.scatter_(-1, expanded_key, local)
+        flat_size = math.prod(self.spec.source_core_shape)
+        flat_destination = destination.reshape(batch_shape + (flat_size,))
+        expanded_key = key.expand(batch_shape + (self.spec.slot_count,))
+        values = values.expand(batch_shape + self.spec.runtime_local_shape)
+        values = values.reshape(batch_shape + (self.spec.slot_count,))
+        flat_destination.scatter_(-1, expanded_key, values)
         return destination
 
     def same_ordered_support(

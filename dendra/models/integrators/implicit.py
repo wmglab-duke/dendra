@@ -3,17 +3,20 @@ import warnings
 from typing import Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 try:
-    import dendra_solvers  # noqa: F401
+    import dendra_solvers
 
     DENDRA_SOLVERS_AVAILABLE = True
 except ImportError:
+    dendra_solvers = None
     DENDRA_SOLVERS_AVAILABLE = False
 
-from .cable import unbranched_edge_conductance
+from .cable import (
+    _layered_edge_conductance,
+    unbranched_edge_conductance,
+)
 from .core import (
     Integrator,
     MultiIntegrator,
@@ -54,62 +57,84 @@ class _bwd_euler_sc(Integrator):
         If truthy, accumulate membrane currents each step. Default None.
     """
 
+    # Integrator-owned tensor workspace contract. Topology adapters provide
+    # effective physical tensors in their natural broadcast layouts; the
+    # single-compartment solver deliberately retains those layouts rather than
+    # expanding them to the full voltage shape.
+    _PREPARED_WORKSPACE_SCHEMA = (
+        ("cmdt", "parameter"),
+        ("area", "geometry"),
+    )
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_point"
+    _FUNCTIONAL_CRITICAL_METHODS = ()
+
     def __init__(self, model, mech, imem=None):
         super().__init__(model, mech, imem)
         self.register_buffer("cmdt", torch.tensor(0.0))
         self.register_buffer("area", torch.tensor(0.0))
 
+    @staticmethod
+    def _prepare_workspace(dt, *, cm, area):
+        """Purely derive the single-compartment implicit-Euler workspace.
+
+        ``cm`` is effective specific capacitance in uF/cm^2 and ``area`` is
+        effective membrane area in cm^2. Both inputs retain their natural
+        broadcast layouts. The returned tensors own independent storage while
+        preserving autograd edges to every explicit input.
+        """
+        if torch.is_tensor(dt):
+            # Retain a logical singleton axis until the scalar is combined
+            # with parameter tensors. This preserves hidden vmap lanes,
+            # including a zero-sized lane batch.
+            dt_s = dt.reshape(1) * 1.0e-3
+        else:
+            dt_s = dt * 1.0e-3
+
+        return {
+            "cmdt": (1.0e-6 * cm) / dt_s,
+            "area": area.clone(memory_format=torch.preserve_format),
+        }
+
     def initialize(self, model, dt):
-        # model.cm: uF/cm²
-        # dt: ms
-        self.cmdt = (1e-6 * model.cm * model.cm_scale) / (1e-3 * dt)
-        self.area = model.area * model.area_scale
+        workspace = self._derive_prepared_workspace(
+            dt,
+            cm=model.cm * model.cm_scale,
+            area=model.area * model.area_scale,
+        )
+        self._install_prepared_workspace(workspace)
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._call_kernel(
-            "_solve", model.v, dt, model.celsius, intra
+            "_step", model.v, dt, model.celsius, ve, intra
         )
         model.v = v_new
         if self.imem:
             model.i_membrane = i_membrane
 
-    def _solve(self, v, dt, temp, intra=None):
-        # apply voltage processes
-        v = self.mech.update_v(v)
-        self._advance_pre_current(v, dt, temp)
-        itot, gtot = self.mech.i(v)
-        ion_current_frame = self._capture_ion_current_frame()
-        ion_conductance_frame = self._capture_ion_conductance_frame()
+    def _voltage_update(
+        self,
+        v,
+        dt,
+        itot,
+        gtot,
+        ve=None,
+        intra=None,
+        *,
+        solver=None,
+    ):
+        """Return the shared closed-form single-compartment voltage update."""
+        del dt, ve, solver
 
         denom = self.cmdt + gtot
-
-        v_new = v
-
-        # Adjust for the ionic current part
-        ionic_update = itot / denom
-        v_new = v_new - ionic_update
-
-        # Adjust for the external injected current, if any
+        v_new = v - itot / denom
         if intra is not None:
-            # We can fuse the division with the area into the update.
-            external_update = (intra / self.area) / denom
-            v_new = v_new + external_update
+            v_new = v_new + (intra / self.area) / denom
 
         i_membrane = None
         if self.imem:
-            # capacitance term (mA/cm^2) using cmdt = Cm/dt_s per area
-            i_cap = self.cmdt * (v_new - v)  # mA/cm^2
-            i_ion = itot + gtot * (v_new - v)  # mA/cm^2
-            i_mem_dens = i_cap + i_ion
-            i_membrane = i_mem_dens * self.area  # mA
-
-        accepted_frame = self._linearize_ion_current_frame(
-            ion_current_frame,
-            ion_conductance_frame,
-            v_new - v,
-        )
-        self._advance_post_current(v, dt, temp, accepted_frame)
-
+            i_cap = self.cmdt * (v_new - v)
+            i_ion = itot + gtot * (v_new - v)
+            i_membrane = (i_cap + i_ion) * self.area
         return v_new, i_membrane
 
 
@@ -145,13 +170,14 @@ class _bwd_euler_sc_skip(Integrator):
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._call_kernel(
-            "_solve", model.v, dt, model.celsius, intra
+            "_step", model.v, dt, model.celsius, ve, intra
         )
         model.v = v_new
         if self.imem:
             model.i_membrane = i_membrane
 
-    def _solve(self, v, dt, temp, intra=None):
+    def _step(self, v, dt, temp, ve=None, intra=None):
+        del ve
         # apply voltage processes
         # Keep the pre-process voltage independent from the returned tensor.
         # VoltageProcess implementations are documented as out-of-place, but
@@ -174,12 +200,24 @@ class _bwd_euler_sc_skip(Integrator):
 
 
 class _bwd_euler_sc_multi(MultiIntegrator, _bwd_euler_sc):
+    """Packed independent-compartment variant of implicit Euler.
+
+    The numerical workspace and tensor transition are intentionally inherited
+    from :class:`_bwd_euler_sc`: concatenation changes ownership/writeback, not
+    the per-compartment equation.  A distinct operator kind lets functional
+    lowering admit the packed runtime without mistaking it for an ordinary
+    :class:`SingleCompartment` topology.
+    """
+
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_multi_point"
+    _FUNCTIONAL_CRITICAL_METHODS = ()
+
     def __init__(self, model, mech, imem=None, write_back=True):
         super().__init__(model, mech, imem, write_back)
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._call_kernel(
-            "_solve", model.v, dt, model.celsius, intra
+            "_step", model.v, dt, model.celsius, ve, intra
         )
         model.v = v_new
         if self.imem:
@@ -208,6 +246,21 @@ class _bwd_euler_ub(Integrator):
     """
 
     supports_unbranched_cable = True
+    # Integrator-owned tensor workspace contract. Topology adapters provide
+    # effective physical tensors in solve layout; this schema describes only
+    # the numerical state derived from them. ``node`` and ``edge`` are static
+    # shape roles consumed by functional lowering, not public API names.
+    _PREPARED_WORKSPACE_SCHEMA = (
+        ("diag_base", "node"),
+        ("lower", "edge"),
+        ("upper", "edge"),
+        ("g_edge_Cinv", "edge"),
+        ("g_edge_Cinv_right", "edge"),
+        ("cm_inv", "node"),
+        ("scale", "node"),
+    )
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_path"
+    _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver",)
 
     def __init__(
         self, model, mech, method: str = "inv", clip_scale_backward=None, **kw
@@ -229,7 +282,6 @@ class _bwd_euler_ub(Integrator):
                 self.register_buffer("clip_scale", torch.tensor(clip_scale_backward))
                 self.use_gc_variant = True
 
-        self._last_bands: Tuple[Tensor, Tensor, Tensor] = None
         B, K = _model_solve_shape(model)
         self.B = B
         self.K = K
@@ -245,8 +297,8 @@ class _bwd_euler_ub(Integrator):
         self.register_buffer("g_edge_Cinv", torch.zeros(B, K - 1))
         self.register_buffer("g_edge_Cinv_right", torch.zeros(B, K - 1))
 
-    def _select_solver(self, model):
-        dev = model.device().type  # "cpu" or "cuda"
+    def _select_solver(self, device):
+        dev = torch.device(device).type
 
         # -------- explicit PCR --------
         if self.method == "pcr":
@@ -306,18 +358,85 @@ class _bwd_euler_ub(Integrator):
                 )
                 self._solve = pcr_solve_t
 
+    def _functional_solver(self):
+        """Return the transform-compatible facade for the selected UB solver."""
+        solver = self._solve
+        solver_name = getattr(solver, "__name__", None)
+        solver_module = getattr(solver, "__module__", None)
+
+        if solver_module == "torch._ops.dendra_solvers":
+            facade = (
+                None
+                if dendra_solvers is None
+                else getattr(dendra_solvers, solver_name, None)
+            )
+            if callable(facade) and solver_name in {"thomas_solve_t", "pcr_solve_t"}:
+                return facade
+            raise RuntimeError(
+                "The selected native CPU solver requires a dendra-solvers build "
+                "that exports torch.func-compatible tridiagonal facades."
+            )
+
+        if solver_name == "pcr_solve_t" and solver_module == (
+            "dendra.models.integrators.tridiag.pcr"
+        ):
+            return solver
+
+        raise RuntimeError(
+            "The selected bwd_euler_ub solver is not yet transform-compatible. "
+            "Use method='thomas' with current dendra-solvers or method='pcr'."
+        )
+
+    @staticmethod
+    def _prepare_workspace(dt, *, cm, area, edge_conductance):
+        """Purely derive the unbranched implicit-Euler tensor workspace.
+
+        Parameters are already normalized to the solver's ``(B, K)`` layout:
+        ``cm`` is effective specific capacitance in uF/cm^2, ``area`` is
+        effective membrane area in cm^2, and ``edge_conductance`` is the
+        centre-to-centre axial conductance in siemens. The method neither reads
+        nor mutates module state, so imperative and functional execution can
+        share the exact same numerical preparation.
+        """
+        if torch.is_tensor(dt):
+            # Retain a logical singleton axis until the scalar is combined
+            # with spatial tensors. This preserves hidden vmap lanes,
+            # including a zero-sized lane batch.
+            dt_s = dt.reshape(1) * 1.0e-3
+        else:
+            dt_s = dt * 1.0e-3
+
+        capacitance = 1.0e-6 * cm * area
+        cm_inv = capacitance.reciprocal()
+
+        g_left = edge_conductance / capacitance[..., :-1]
+        g_right = edge_conductance / capacitance[..., 1:]
+        zeros = torch.zeros_like(capacitance[..., :1])
+        diag_base = torch.cat((-g_left, zeros), dim=-1) + torch.cat(
+            (zeros, -g_right),
+            dim=-1,
+        )
+
+        return {
+            "diag_base": diag_base,
+            "lower": -dt_s * g_right,
+            "upper": -dt_s * g_left,
+            "g_edge_Cinv": g_left,
+            "g_edge_Cinv_right": g_right,
+            "cm_inv": cm_inv,
+            "scale": area * cm_inv,
+        }
+
     def initialize(self, model, dt):
         """
         Compute geometry-dependent coefficients and select tridiagonal solver
         based on `self.method` and device.
         """
         # Select solver first (depends on device and method)
-        self._select_solver(model)
+        self._select_solver(model.device())
 
         B, K = _model_solve_shape(model)
         self.B, self.K = B, K
-        dt_s = dt * 1e-3  # s
-
         cm = _as_solve_matrix(model.cm, model) * _as_solve_matrix(model.cm_scale, model)
 
         # ── geometry (all element-wise) ──────────────────────────────
@@ -325,38 +444,20 @@ class _bwd_euler_ub(Integrator):
             model.area_scale, model
         )
 
-        Cm = 1e-6 * cm * area_cm2  # F   (B,K)
-        Cm_inv = 1.0 / Cm  # 1/F
-
         # ── edge axial conductance between centres i ↔ i+1 ──────────
         # Native Cable uses exact compiled edge resistance; conventional Axon
         # models retain the established half-cylinder reconstruction.
         g_edge = unbranched_edge_conductance(model)
 
-        # convert to   g / C    (1/s)   for each adjoining cell
-        g_left = g_edge / Cm[:, :-1]  # affects row i     (B,K-1)
-        g_right = g_edge / Cm[:, 1:]  # affects row i+1   (B,K-1)
-
-        self.g_edge_Cinv = g_left
-        self.g_edge_Cinv_right = g_right
-
-        # ── fill solver buffers ─────────────────────────────────────
-        # diagonal of the diffusive operator (base part, no ion channels yet)
-        diag = torch.zeros(B, K, device=model.device(), dtype=model.dtype())
-        diag[:, :-1] -= g_left
-        diag[:, 1:] -= g_right
-        self.diag_base = diag
-
-        # time-scaled banded matrix (Thomas / SPD will overwrite main diag later)
-        # For edge i <-> i+1, the upper entry belongs to row i and is
-        # normalized by C_i; the lower entry belongs to row i+1 and is
-        # normalized by C_{i+1}.
-        self.lower = -dt_s * g_right  # (B,K-1)  subdiag
-        self.upper = -dt_s * g_left  # (B,K-1)  superdiag
-
-        # misc pre-computed factors used elsewhere
-        self.cm_inv = Cm_inv  # (B,K)
-        self.scale = area_cm2 * Cm_inv  # 1 / c_m (inverse specific capacitance, cm^2/F)
+        # Build every value before committing any of them. The pure builder is
+        # also the functional backend's preparation primitive.
+        workspace = self._derive_prepared_workspace(
+            dt,
+            cm=cm,
+            area=area_cm2,
+            edge_conductance=g_edge,
+        )
+        self._install_prepared_workspace(workspace)
 
         self.base_shape = tuple(model.shape)
 
@@ -368,115 +469,25 @@ class _bwd_euler_ub(Integrator):
         if self.imem:
             model.i_membrane = i_membrane
 
-    def _step(self, v, dt, temp, ve=None, intra=None) -> Tensor:
-        dt_s = dt * 1e-3
-
-        v = self.mech.update_v(v)  # apply voltage processes
-        self._advance_pre_current(v, dt, temp)
-
-        itot, gtot = self.mech.i(v)  # public voltage shape
-        ion_current_frame = self._capture_ion_current_frame()
-        ion_conductance_frame = self._capture_ion_conductance_frame()
-
-        v_flat = _flatten_to_solve(v, self.K)
-        itot = _flatten_to_solve(itot, self.K)
-        gtot = _flatten_to_solve(gtot, self.K)
-
-        # f_n = (irev - i_res) * self.scale
-        f_n = (gtot * v_flat - itot) * self.scale  # (B,K)
-
-        if ve is not None:
-            # diffusive extracellular coupling
-            ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
-            delta_ve = ve_flat[..., 1:] - ve_flat[..., :-1]
-            S = torch.zeros_like(ve_flat)  # (B, K)
-            # A varying extracellular field enters through A @ ve.  Each side
-            # of an edge must use the capacitance of its own compartment.
-            S[..., :-1] += self.g_edge_Cinv * delta_ve
-            S[..., 1:] -= self.g_edge_Cinv_right * delta_ve
-            f_n = f_n + S
-
-        if intra is not None:
-            f_n = f_n + _flatten_to_solve(intra, self.K, self.base_shape) * self.cm_inv
-
-        RHS = v_flat + dt_s * f_n
-
-        # build tridiagonal system M v_{n+1} = RHS
-        A_diag = self.diag_base - gtot * self.scale
-        main = 1.0 - dt_s * A_diag  # (B,K)
-
-        # diagonals
-        a_s = self.lower  # (B,K-1)
-        c_s = self.upper  # (B,K-1)
-        b_s = main  # (B,K)
-
-        if not self.jit:
-            self._last_bands = (a_s, b_s, c_s)
-
-        d_s = RHS
-
-        # solve tridiagonal system
-        if self.K == 1:
-            # Tridiagonal extension kernels require at least one off-diagonal.
-            # A one-compartment Cable is the same scalar implicit system and
-            # has the exact closed-form solution below.
-            v_np1 = d_s / b_s
-        elif self.use_gc_variant:
-            # GC variant only valid for Thomas solver
-            v_np1 = self._solve(a_s, b_s, c_s, d_s, self.clip_scale)
-        else:
-            v_np1 = self._solve(a_s, b_s, c_s, d_s)
-
-        i_membrane = None
-
-        if self.imem:
-            area = self.scale / self.cm_inv  # cm^2 (segment area)
-            Cm = 1.0 / self.cm_inv  # F (segment capacitance)
-            Cdt = Cm / dt_s  # A/V (capacitive 'conductance')
-            g_abs = gtot * area  # S (ionic conductance per segment)
-            i_abs = itot * area  # mA (ionic current per segment)
-            dmem = Cdt + g_abs  # A/V
-            i_membrane = (dmem * (v_np1 - v_flat) + i_abs).reshape(self.base_shape)
-
-        v_new = v_np1.reshape(self.base_shape)
-        accepted_frame = self._linearize_ion_current_frame(
-            ion_current_frame,
-            ion_conductance_frame,
-            v_new - v,
-        )
-        self._advance_post_current(v, dt, temp, accepted_frame)
-
-        return v_new, i_membrane
-
-    def _functional_step_reference(
+    def _voltage_update(
         self,
         v,
         dt,
-        temp,
+        itot,
+        gtot,
         ve=None,
         intra=None,
         *,
         solver=None,
     ):
-        """Return one UB transition without mutating integrator scratch.
-
-        This parallel reference path leaves the performance-critical imperative
-        ``_step`` implementation unchanged. Registered mechanism state may be
-        rebound while it runs, so callers must provide an isolated functional
-        module context. Handler current aggregation and ``_last_bands`` are
-        fully call-local, which makes this path safe for ``vmap`` lanes.
-        """
-        dt_s = dt * 1e-3
-
-        v = self.mech.update_v(v)
-        self._advance_pre_current(v, dt, temp)
-
-        (
-            itot,
-            gtot,
-            ion_current_frame,
-            ion_conductance_frame,
-        ) = self.mech._functional_i_reference(v)
+        """Return the shared unbranched implicit voltage update."""
+        # Retain a logical singleton axis until dt is combined with spatial
+        # tensors. Scalar-only binary batching otherwise selects lane zero for
+        # an empty outer vmap.
+        if torch.is_tensor(dt):
+            dt_s = dt.reshape(1) * 1.0e-3
+        else:
+            dt_s = dt * 1.0e-3
 
         v_flat = _flatten_to_solve(v, self.K, self.base_shape)
         itot = _flatten_to_solve(itot, self.K, self.base_shape)
@@ -487,10 +498,20 @@ class _bwd_euler_ub(Integrator):
         if ve is not None:
             ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
             delta_ve = ve_flat[..., 1:] - ve_flat[..., :-1]
-            extracellular = torch.zeros_like(ve_flat)
-            extracellular[..., :-1] += self.g_edge_Cinv * delta_ve
-            extracellular[..., 1:] -= self.g_edge_Cinv_right * delta_ve
-            f_n = f_n + extracellular
+            if self.K > 1:
+                left = self.g_edge_Cinv * delta_ve
+                right = self.g_edge_Cinv_right * delta_ve
+                # Prepared conductances may carry vmap lanes that ``ve`` does
+                # not. Assemble out of place so those lanes can broadcast.
+                extracellular = torch.cat(
+                    (
+                        left[..., :1],
+                        left[..., 1:] - right[..., :-1],
+                        -right[..., -1:],
+                    ),
+                    dim=-1,
+                )
+                f_n = f_n + extracellular
 
         if intra is not None:
             f_n = f_n + (
@@ -527,14 +548,7 @@ class _bwd_euler_ub(Integrator):
                 membrane_conductance * (v_np1 - v_flat) + ionic_current
             ).reshape(self.base_shape)
 
-        v_new = v_np1.reshape(self.base_shape)
-        accepted_frame = self._linearize_ion_current_frame(
-            ion_current_frame,
-            ion_conductance_frame,
-            v_new - v,
-        )
-        self._advance_post_current(v, dt, temp, accepted_frame)
-        return v_new, i_membrane
+        return v_np1.reshape(self.base_shape), i_membrane
 
 
 class _bwd_euler_bt(Integrator):
@@ -568,6 +582,18 @@ class _bwd_euler_bt(Integrator):
     """
 
     v_vars = ["v", "vc"]
+    _PREPARED_WORKSPACE_SCHEMA = (
+        ("lower", "block_edge"),
+        ("upper", "block_edge"),
+        ("maind", "block_matrix"),
+        ("area", "node"),
+        ("cm_dt", "node"),
+        ("xc_dt", "shell_node"),
+        ("c_rad", "block_node"),
+        ("xg", "shell_node"),
+    )
+    _FUNCTIONAL_OPERATOR_KIND = "block_path"
+    _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver",)
 
     def __init__(self, model, mech, imem=None, method="inv", **kwargs):
         if not DENDRA_SOLVERS_AVAILABLE:
@@ -619,6 +645,104 @@ class _bwd_euler_bt(Integrator):
         self.initialized = False
         self.dt = None
 
+    def _functional_solver(self):
+        """Return a transform-compatible block solver facade.
+
+        Current dendra-solvers releases expose the native block-Thomas kernel
+        through a ``torch.func``-aware Python facade. Older installations retain
+        correctness through the portable pure-Torch PCR implementation.
+        """
+        native = (
+            None
+            if dendra_solvers is None
+            else getattr(dendra_solvers, "solve_bt", None)
+        )
+        if callable(native):
+            return native
+        return block_pcr_solve_t
+
+    @staticmethod
+    def _prepare_workspace(
+        dt,
+        *,
+        cm,
+        area,
+        intracellular_edge_conductance,
+        extracellular_edge_conductance,
+        xc,
+        xg,
+    ):
+        """Purely derive the two-layer block implicit-Euler workspace.
+
+        All tensors arrive in flattened solve layout. ``cm``/``xc`` are in
+        microfarads per square centimetre, ``xg`` is in siemens per square
+        centimetre, ``area`` is in square centimetres, and both edge inputs are
+        conductances in siemens.
+        """
+        if torch.is_tensor(dt):
+            dt_s = dt.reshape(1) * 1.0e-3
+        else:
+            dt_s = dt * 1.0e-3
+
+        cm_dt = cm * 1.0e-6 * area / dt_s
+        xc_dt = xc * 1.0e-6 * area.unsqueeze(-1) / dt_s
+        radial_g = xg * area.unsqueeze(-1)
+
+        zero_node = torch.zeros_like(cm_dt[..., :1])
+        gi_left = torch.cat((zero_node, intracellular_edge_conductance), dim=-1)
+        gi_right = torch.cat((intracellular_edge_conductance, zero_node), dim=-1)
+
+        # Derive the sealed-end row from a node-shaped tensor. For K == 1 the
+        # edge tensor is empty, so slicing its first edge would incorrectly
+        # retain a zero-length compartment axis.
+        zero_shell = torch.zeros_like(xc_dt[..., :1, :])
+        gx_left = torch.cat(
+            (zero_shell, extracellular_edge_conductance),
+            dim=-2,
+        )
+        gx_right = torch.cat(
+            (extracellular_edge_conductance, zero_shell),
+            dim=-2,
+        )
+
+        shell_0 = xc_dt[..., 0] + radial_g[..., 0]
+        diagonal_0 = cm_dt + gi_left + gi_right
+        diagonal_1 = cm_dt + shell_0 + gx_left[..., 0] + gx_right[..., 0]
+        diagonal_2 = (
+            shell_0
+            + xc_dt[..., 1]
+            + radial_g[..., 1]
+            + gx_left[..., 1]
+            + gx_right[..., 1]
+        )
+        zero = torch.zeros_like(cm_dt)
+        main = torch.stack(
+            (
+                torch.stack((diagonal_0, -cm_dt, zero), dim=-1),
+                torch.stack((-cm_dt, diagonal_1, -shell_0), dim=-1),
+                torch.stack((zero, -shell_0, diagonal_2), dim=-1),
+            ),
+            dim=-2,
+        )
+        off_diagonal = -torch.cat(
+            (
+                intracellular_edge_conductance.unsqueeze(-1),
+                extracellular_edge_conductance,
+            ),
+            dim=-1,
+        )
+
+        return {
+            "lower": off_diagonal.clone(memory_format=torch.preserve_format),
+            "upper": off_diagonal.clone(memory_format=torch.preserve_format),
+            "maind": main,
+            "area": area.clone(memory_format=torch.preserve_format),
+            "cm_dt": cm_dt,
+            "xc_dt": xc_dt,
+            "c_rad": torch.cat((cm_dt.unsqueeze(-1), xc_dt), dim=-1),
+            "xg": radial_g,
+        }
+
     @classmethod
     def shape(cls, np, nc):
         return (np, nc)
@@ -641,8 +765,8 @@ class _bwd_euler_bt(Integrator):
             model.i_membrane = model.i_membrane.detach()
         self.mech.detach()
 
-    def _select_solver(self, model):
-        dev = model.device().type
+    def _select_solver(self, device):
+        dev = torch.device(device).type
 
         # Apple MPS cannot load either the CPU extension or CUDA/Triton kernels.
         # Use a vectorized, differentiable pure-Torch solver for both public
@@ -696,7 +820,7 @@ class _bwd_euler_bt(Integrator):
 
         The outermost (Dirichlet) bath is *not* part of the unknowns.
         """
-        self._select_solver(model)
+        self._select_solver(model.device())
         self._refresh_solver_shape(model, block_dim=self.M)
         if tuple(model.vc.shape) != tuple(model.shape) + (self.M,):
             vc_new = torch.zeros(
@@ -708,131 +832,30 @@ class _bwd_euler_bt(Integrator):
             new[:n].copy_(old[:n].to(device=model.device(), dtype=model.dtype()))
             model.vc = vc_new
 
-        # ------------------------------------------------------------------
-        # Geometry-dependent scalars
-        # ------------------------------------------------------------------
-        dt = dt * 1e-3  # ms → s
-        B, K, M = self.B, self.K, self.M
-        dev, dtyp = model.device(), model.dtype()
-
-        L = _as_solve_matrix(model.dx, model) * 1e-4  # μm → cm
-        diam = _as_solve_matrix(model.diam, model) * 1e-4  # μm → cm
-        radius = 0.5 * diam  # cm
-        area = torch.pi * diam * L  # cm² for each segment
-
-        # ------------------------------------------------------------------
-        # Axial conductances (left/right padding → K+1)
-        # ------------------------------------------------------------------
-        ri = _as_solve_matrix(model.rhoa, model) * L / (torch.pi * radius**2)  # Ω
-        ri = 0.5 * (ri[:, :-1] + ri[:, 1:])  # (B,K-1)
-        gi = 1.0 / ri  # S
-        gi = F.pad(gi, (1, 1))  # (B,K+1)
-
-        raxial = (
-            _as_solve_block(model.xraxial, model, (M - 1,)) * L.unsqueeze(-1) * 1e6
-        )  # Ω
-        raxial = 0.5 * (raxial[:, :-1, :] + raxial[:, 1:, :])
-        self.register_buffer("raxial", raxial[..., 0])
-        gaxial = 1.0 / raxial  # S, (B,K-1,M-1)
-        zeros_G = torch.zeros((B, 1, M - 1), device=dev, dtype=dtyp)
-        gaxial = torch.cat([zeros_G, gaxial, zeros_G], dim=1)  # (B,K+1,M-1)
-
-        # convenience slices for later
-        gi_L = gi[:, :-1]  # (B,K)
-        gi_R = gi[:, 1:]
-        gx_L = gaxial[:, :-1, :]  # (B,K,M-1)
-        gx_R = gaxial[:, 1:, :]
-
-        # ------------------------------------------------------------------
-        # Radial (membrane + shell) elements
-        # ------------------------------------------------------------------
-        area_cm2 = area  # cm²
-        cm_dt = _as_solve_matrix(model.cm, model) * 1e-6 * area_cm2 / dt
-
-        xc_dt = (
-            _as_solve_block(model.xc, model, (M - 1,))
-            * 1e-6
-            * area_cm2.unsqueeze(-1)
-            / dt
-        )  # F/s, (B,K,M-1)
-        xg = _as_solve_block(model.xg, model, (M - 1,)) * area_cm2.unsqueeze(-1)
-
-        # ------------------------------------------------------------------
-        # Allocate blocks
-        # ------------------------------------------------------------------
-        main = torch.zeros((B, K, M, M), device=dev, dtype=dtyp)
-        lower = torch.zeros((B, K - 1, M), device=dev, dtype=dtyp)
-        upper = torch.zeros((B, K - 1, M), device=dev, dtype=dtyp)
-
-        zeros_B = torch.zeros(B, device=dev, dtype=dtyp)  # utility vector
-
-        # ------------------------------------------------------------------
-        # Build each compartment block
-        # ------------------------------------------------------------------
-        for i in range(K):
-            # axial conductances to neighbours (0 at sealed ends)
-            ga_L = gi_L[:, i] if i > 0 else zeros_B
-            ga_R = gi_R[:, i] if i < K - 1 else zeros_B
-
-            for s in range(M):  # row/col in M×M block
-                # ---------- diagonal element -----------------------------------
-                if s == 0:  # vi
-                    diag = cm_dt[:, i] + ga_L + ga_R
-                elif s == 1:  # ve[0]  (membrane + first shell)
-                    xc_out = xc_dt[:, i, 0]
-                    xg_out = xg[:, i, 0]
-                    gs_L = gx_L[:, i, 0] if i > 0 else zeros_B
-                    gs_R = gx_R[:, i, 0] if i < K - 1 else zeros_B
-                    diag = cm_dt[:, i] + xc_out + xg_out + gs_L + gs_R
-                else:  # ve[s-1],  s ≥ 2
-                    # inward coupling is index (s-2), outward is index (s-1)
-                    xc_in = xc_dt[:, i, s - 2]
-                    xg_in = xg[:, i, s - 2]
-                    xc_out = xc_dt[:, i, s - 1]
-                    xg_out = xg[:, i, s - 1]
-                    gs_L = gx_L[:, i, s - 1] if i > 0 else zeros_B
-                    gs_R = gx_R[:, i, s - 1] if i < K - 1 else zeros_B
-                    diag = xc_in + xc_out + xg_in + xg_out + gs_L + gs_R
-
-                main[:, i, s, s] = diag
-
-                # ---------- radial off-diagonal (coupling to s+1) ---------------
-                if s < M - 1:
-                    if s == 0:
-                        coup = -cm_dt[:, i]  # vi ↔ ve0
-                    else:
-                        coup = -(
-                            xc_dt[:, i, s - 1] + xg[:, i, s - 1]
-                        )  # ve[s-1] ↔ ve[s]
-                    main[:, i, s, s + 1] = coup
-                    main[:, i, s + 1, s] = coup  # symmetry
-
-                # ---------- axial off-diagonal blocks ---------------------------
-                if i > 0:
-                    if s == 0:
-                        lower[:, i - 1, 0] = -ga_L
-                    else:
-                        lower[:, i - 1, s] = -gx_L[:, i, s - 1]
-                if i < K - 1:
-                    if s == 0:
-                        upper[:, i, 0] = -ga_R
-                    else:
-                        upper[:, i, s] = -gx_R[:, i, s - 1]
-
-        # ------------------------------------------------------------------
-        # Store for use in the time-stepping routine
-        # ------------------------------------------------------------------
-        self.area = area
-        self.cm_dt = cm_dt
-        self.xc_dt = xc_dt
-        self.xg = xg
-        self.c_rad = torch.cat([cm_dt.unsqueeze(-1), xc_dt], dim=-1)
-
-        self.maind = main
-        self.lower = lower
-        self.upper = upper
-
-        self.base_shape = tuple(list(model.shape) + [self.M])
+        cm = _as_solve_matrix(model.cm, model) * _as_solve_matrix(
+            model.cm_scale,
+            model,
+        )
+        area = _as_solve_matrix(model.area, model) * _as_solve_matrix(
+            model.area_scale,
+            model,
+        )
+        dx = _as_solve_matrix(model.dx, model)
+        extracellular_edge_conductance = _layered_edge_conductance(
+            _as_solve_block(model.xraxial, model, (self.M - 1,)),
+            dx,
+        )
+        workspace = self._derive_prepared_workspace(
+            dt,
+            cm=cm,
+            area=area,
+            intracellular_edge_conductance=unbranched_edge_conductance(model),
+            extracellular_edge_conductance=extracellular_edge_conductance,
+            xc=_as_solve_block(model.xc, model, (self.M - 1,)),
+            xg=_as_solve_block(model.xg, model, (self.M - 1,)),
+        )
+        self._install_prepared_workspace(workspace)
+        self.base_shape = tuple(model.shape) + (self.M,)
 
     def step(self, model, dt, ve=None, intra=None):
         vc_new, v_new, i_membrane = self._call_kernel(
@@ -849,7 +872,18 @@ class _bwd_euler_bt(Integrator):
         if self.imem:
             model.i_membrane = i_membrane
 
-    def _step(self, vc, v, dt, temp, ve=None, intra=None) -> Tuple[Tensor, Tensor]:
+    def _step(
+        self,
+        vc,
+        v,
+        dt,
+        temp,
+        ve=None,
+        intra=None,
+        *,
+        solver=None,
+        call_local_currents=False,
+    ) -> Tuple[Tensor, Tensor]:
         xg = self.xg[..., -1]
 
         # apply voltage processes
@@ -858,29 +892,49 @@ class _bwd_euler_bt(Integrator):
         # advance gating
         self._advance_pre_current(v_state, dt, temp)
 
-        itot, gtot = self.mech.i(v_state)
-        ion_current_frame = self._capture_ion_current_frame()
-        ion_conductance_frame = self._capture_ion_conductance_frame()
+        if call_local_currents:
+            evaluate = getattr(self.mech, "_evaluate_current_frame", None)
+            if evaluate is None:
+                raise RuntimeError(
+                    "call-local current evaluation requires a MechanismHandler "
+                    "with _evaluate_current_frame()"
+                )
+            (
+                itot,
+                gtot,
+                ion_current_frame,
+                ion_conductance_frame,
+            ) = evaluate(v_state)
+        else:
+            itot, gtot = self.mech.i(v_state)
+            ion_current_frame = self._capture_ion_current_frame()
+            ion_conductance_frame = self._capture_ion_conductance_frame()
 
         # linearized ionic conductances & reversal
-        v_flat = _flatten_to_solve(v_state, self.K)
-        gtot = _flatten_to_solve(gtot, self.K) * self.area
+        public_voltage_shape = self.base_shape[:-1]
+        v_flat = _flatten_to_solve(v_state, self.K, public_voltage_shape)
+        gtot = _flatten_to_solve(gtot, self.K, public_voltage_shape) * self.area
 
-        itot = _flatten_to_solve(itot, self.K) * self.area  # (B, K)
+        itot = _flatten_to_solve(itot, self.K, public_voltage_shape) * self.area
 
         d = gtot * v_flat - itot
 
         if intra is not None:
             d = d + _flatten_to_solve(intra, self.K, self.base_shape[:-1])
 
-        # Disposable solver workspaces. The SPD consuming solvers may overwrite
-        # both buffers during factorization/elimination; neither is read after
-        # the solve.
-        B_work = self.maind.clone()  # (B, K, M, M)
-        B_work[..., 0, 0] += gtot
-        B_work[..., 1, 1] += gtot
-        B_work[..., 0, 1] -= gtot
-        B_work[..., 1, 0] -= gtot
+        # Assemble out of place so hidden torch.func lanes on current parameters
+        # can broadcast over the shared prepared block matrix. The result is a
+        # disposable workspace for consuming native SPD solvers as well.
+        zero = torch.zeros_like(gtot)
+        ionic_blocks = torch.stack(
+            (
+                torch.stack((gtot, -gtot, zero), dim=-1),
+                torch.stack((-gtot, gtot, zero), dim=-1),
+                torch.stack((zero, zero, zero), dim=-1),
+            ),
+            dim=-2,
+        )
+        B_work = self.maind + ionic_blocks
 
         ve_flat = (
             _flatten_to_solve(ve, self.K, self.base_shape[:-1])
@@ -890,7 +944,8 @@ class _bwd_euler_bt(Integrator):
         D_work = assemble_rhs(vc, self.c_rad, d, xg, ve_flat)
 
         # solve block-tridiagonal system
-        vc_new = self._solve(self.lower, B_work, self.upper, D_work).reshape(
+        solve = self._solve if solver is None else solver
+        vc_new = solve(self.lower, B_work, self.upper, D_work).reshape(
             self.base_shape
         )  # (model.shape)
         v_new = vc_new[..., 0] - vc_new[..., 1]  # v = vi - ve0
@@ -899,7 +954,11 @@ class _bwd_euler_bt(Integrator):
 
         if self.imem:
             vprev_mem = vc[..., 0] - vc[..., 1]
-            delta_v = _flatten_to_solve(v_new, self.K) - vprev_mem.reshape(-1, self.K)
+            delta_v = _flatten_to_solve(
+                v_new,
+                self.K,
+                public_voltage_shape,
+            ) - vprev_mem.reshape(-1, self.K)
             i_membrane = (self.cm_dt + gtot) * delta_v + itot
             # ``i_membrane`` follows NEURON's extracellular convention exactly:
             # area * (Cm * (v_new - v_old) / dt + I_ion(v_new)), using Dendra's
@@ -920,22 +979,22 @@ class _bwd_euler_bt(Integrator):
 
 
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):
-    rhs = torch.zeros_like(v_prev)
-
     v_c = c_rad[..., :-1] * (v_prev[..., :-1] - v_prev[..., 1:])
-
-    rhs[..., :-1] += v_c
-    rhs[..., 1:] -= v_c
-
-    rhs[..., 0] += d
-    rhs[..., 1] -= d
-
+    radial = torch.cat(
+        (
+            v_c[..., :1],
+            v_c[..., 1:] - v_c[..., :-1],
+            -v_c[..., -1:],
+        ),
+        dim=-1,
+    )
+    zero = torch.zeros_like(d)
+    membrane = torch.stack((d, -d, zero), dim=-1)
+    boundary = c_rad[..., -1] * v_prev[..., -1]
     if e_ext is not None:
-        rhs[..., -1] += xg * e_ext + c_rad[..., -1] * v_prev[..., -1]
-    else:
-        rhs[..., -1] += c_rad[..., -1] * v_prev[..., -1]
-
-    return rhs
+        boundary = boundary + xg * e_ext
+    bath = torch.stack((zero, zero, boundary), dim=-1)
+    return radial + membrane + bath
 
 
 def assemble_rhs_into(

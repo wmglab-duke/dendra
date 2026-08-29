@@ -392,10 +392,6 @@ class _dufort_frankel_homogeneous(Integrator):
         self.s4 = 1 + self.s2
         self.f64 = model.dtype() == torch.float64
         self.ve_zero = torch.zeros_like(model.v)
-        if self.conv:
-            self.method = self._step_conv
-        else:
-            self.method = self._step
 
         # Forced coefficient rebuilds in training do not invalidate a same-dt
         # history. A genuine timestep change does, including after restoring a

@@ -45,7 +45,7 @@ def _initialized_exp2syn(tau1, tau2, *, dtype=torch.float64):
 )
 def test_exp2syn_effective_ratio_and_peak_normalization(tau1, tau2, expected_ratio):
     mechanism = _initialized_exp2syn(tau1, tau2)
-    effective_tau1 = float(mechanism.DE["A"].tau1.item())
+    effective_tau1 = float(mechanism.tau1_effective.item())
     effective_tau2 = float(mechanism.DE["B"].tau2.item())
     ratio = effective_tau1 / effective_tau2
 
@@ -80,7 +80,7 @@ def test_exp2syn_effective_ratio_and_peak_normalization(tau1, tau2, expected_rat
 )
 def test_exp2syn_equal_taus_stay_finite_at_supported_floating_precisions(dtype):
     mechanism = _initialized_exp2syn(2.0, 2.0, dtype=dtype)
-    ratio = mechanism.DE["A"].tau1 / mechanism.DE["B"].tau2
+    ratio = mechanism.tau1_effective / mechanism.DE["B"].tau2
 
     assert torch.all(ratio > 0)
     assert torch.all(ratio < 1)
@@ -138,10 +138,14 @@ def test_exp2syn_effective_tau_drives_a_kinetics_and_preserves_parameter_gradien
     state_a = mechanism.DE["A"]
     state_b = mechanism.DE["B"]
 
-    states = {"A": torch.ones_like(mechanism.A), "B": torch.zeros_like(mechanism.B)}
+    states = {
+        "A": torch.ones_like(mechanism.A),
+        "B": torch.zeros_like(mechanism.B),
+        "tau1_effective": mechanism.tau1_effective,
+    }
     dt = torch.tensor(0.1, dtype=population.dtype())
     updated = state_a.advance(population.v, dt, states)["A"]
-    expected = torch.exp(-dt / state_a.tau1)
+    expected = torch.exp(-dt / mechanism.tau1_effective)
     torch.testing.assert_close(updated, expected)
 
     (updated.sum() + mechanism.factor.sum()).backward()
@@ -156,10 +160,15 @@ def test_exp2syn_effective_tau_drives_a_kinetics_and_preserves_parameter_gradien
         state_a.tau1_param.fill_(2.0)
         state_b.tau2_param.fill_(2.0)
     population.initialize()
-    assert float(state_a.tau1.item()) == pytest.approx(1.9998)
+    assert float(state_a.tau1.item()) == pytest.approx(2.0)
+    assert float(mechanism.tau1_effective.item()) == pytest.approx(1.9998)
     assert torch.isfinite(mechanism.factor).all()
+    states["tau1_effective"] = mechanism.tau1_effective
     clamped_update = state_a.advance(population.v, dt, states)["A"]
-    torch.testing.assert_close(clamped_update, torch.exp(-dt / state_a.tau1))
+    torch.testing.assert_close(
+        clamped_update,
+        torch.exp(-dt / mechanism.tau1_effective),
+    )
 
 
 @pytest.mark.parametrize(

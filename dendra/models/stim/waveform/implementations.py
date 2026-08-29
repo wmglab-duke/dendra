@@ -396,6 +396,8 @@ class sin(Waveform):
     >>> values = waveform(t)  # [4, T], 4 batched multitone waveforms
     """
 
+    FUNCTIONAL_PURE = True
+
     Waveform.PARAMETER(
         amp=1.0,
         freq=1.0,
@@ -496,6 +498,8 @@ class cos(Waveform):
     >>> values = waveform(t)  # [4, T], 4 batched multitone waveforms
     """
 
+    FUNCTIONAL_PURE = True
+
     Waveform.PARAMETER(
         amp=1.0,
         freq=1.0,
@@ -559,6 +563,8 @@ class mono_rect(Waveform):
     >>> values = waveform(t)
     """
 
+    FUNCTIONAL_PURE = True
+
     Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0, tau=0.1)
 
     def fn(self, t):
@@ -616,6 +622,8 @@ class bi_rect(Waveform):
     >>> t = torch.linspace(0, 3, 100)
     >>> values = waveform(t)
     """
+
+    FUNCTIONAL_PURE = True
 
     Waveform.PARAMETER(
         amp1=-1.0,
@@ -696,6 +704,8 @@ class bi_rect_balanced(Waveform):
     >>> values = waveform(t)
     """
 
+    FUNCTIONAL_PURE = True
+
     Waveform.PARAMETER(amp=1.0, delay=0.0, pw1=1.0, pw2=1.0, interval=0.0, tau=0.1)
 
     def fn(self, t):
@@ -764,6 +774,8 @@ class bi_rect_symm(Waveform):
     >>> values = waveform(t)
     """
 
+    FUNCTIONAL_PURE = True
+
     Waveform.PARAMETER(amp=1.0, delay=0.0, pw=1.0, interval=0.0, tau=0.1)
 
     def fn(self, t):
@@ -815,13 +827,30 @@ class arbitrary(Waveform):
     >>> values = waveform(t)
     """
 
+    FUNCTIONAL_PURE = True
+
     Waveform.PARAMETER(values=[0.0, 0.0], tpoints=[0.0, 1.0])
 
     def fn(self, t):
         if self.values.ndim > 1:
             t = t.unsqueeze(0)
             t = t.expand(self.values.shape[0], -1)
-        return interp1d(self.tpoints, self.values, t)
+        # The uniform-grid shortcut treats spacing as structural, so its
+        # derivative with respect to trainable tpoints is not the derivative of
+        # general interpolation. Retain that fast path only for ordinary eager
+        # evaluation in which no tpoint derivative can be recorded.
+        transformed = (
+            torch.compiler.is_compiling() or torch._C._are_functorch_transforms_active()
+        )
+        if transformed:
+            differentiate_tpoints = True
+        else:
+            tangent = torch.autograd.forward_ad.unpack_dual(self.tpoints).tangent
+            differentiate_tpoints = (
+                torch.is_grad_enabled() and self.tpoints.requires_grad
+            ) or tangent is not None
+        uniform = "never" if differentiate_tpoints else "auto"
+        return interp1d(self.tpoints, self.values, t, uniform=uniform)
 
 
 class constant(Waveform):
@@ -850,6 +879,8 @@ class constant(Waveform):
     >>> t = torch.linspace(0, 1, 100)
     >>> values = waveform(t)
     """
+
+    FUNCTIONAL_PURE = True
 
     Waveform.PARAMETER(value=0.0)
 

@@ -57,9 +57,8 @@ class fire_r_d(VoltageProcess):
         tau_gate=0.5,
         ste_scale=1.0,
     )
-    VoltageProcess.BUFFER(
-        "is_refractory", "time_refractory", "spike_gate", "reset_gate"
-    )
+    VoltageProcess.CARRY("is_refractory", dtype=torch.bool)
+    VoltageProcess.CARRY("time_refractory", "spike_gate", "reset_gate")
 
     @staticmethod
     def _tensor_like(x, ref):
@@ -67,11 +66,13 @@ class fire_r_d(VoltageProcess):
             return x.to(dtype=ref.dtype, device=ref.device)
         return torch.tensor(x, dtype=ref.dtype, device=ref.device)
 
-    def initial(self, v):
-        self.is_refractory = torch.zeros_like(v, dtype=torch.bool)
-        self.time_refractory = torch.zeros_like(v, dtype=v.dtype)
-        self.spike_gate = torch.zeros_like(v, dtype=v.dtype)
-        self.reset_gate = torch.zeros_like(v, dtype=v.dtype)
+    def initial_values(self, v, values):
+        return {
+            "is_refractory": torch.zeros_like(v, dtype=torch.bool),
+            "time_refractory": torch.zeros_like(v),
+            "spike_gate": torch.zeros_like(v),
+            "reset_gate": torch.zeros_like(v),
+        }
 
     def update_v(self, v):
         threshold = self._tensor_like(self.threshold, v)

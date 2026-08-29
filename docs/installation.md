@@ -11,7 +11,7 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
 ## Prerequisites
 
 - Python 3.11 or newer
-- PyTorch 2.8+
+- PyTorch 2.12+
 - Git
 
 ## Quick start
@@ -34,11 +34,11 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
    ```
 
    ```sh
-   # e.g., GPU build (Pytorch 2.8.0, CUDA 12.9) - adjust the version and CUDA version as needed
-   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129
+   # e.g., GPU build (PyTorch 2.12.0, CUDA 12.9) - adjust the version and CUDA version as needed
+   pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu129
 
    # CPU-only build
-   # pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+   # pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
    ```
 
 3. (Windows without WSL2) Install NEURON using the precompiled installer from https://neuron.yale.edu/neuron/download.

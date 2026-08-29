@@ -13,7 +13,7 @@ DT = 0.025
 
 
 class _ThreeIonCurrent(Mechanism):
-    Mechanism.BUFFER("evaluation_calls")
+    Mechanism.ASSIGNED("stage_marker")
     Mechanism.RANGE(
         gna=0.01,
         gk=0.02,
@@ -28,12 +28,9 @@ class _ThreeIonCurrent(Mechanism):
     Mechanism.USEION("k", write=["ik"])
     Mechanism.USEION("ca", write=["ica"])
 
-    def initial(self, v):
-        self.evaluation_calls = torch.zeros_like(v)
-
-    def breakpoint(self, v):
-        del v
-        self.evaluation_calls = self.evaluation_calls + 1
+    def assigned_values(self, v, values):
+        del values
+        return {"stage_marker": torch.zeros_like(v)}
 
     def ina(self, v):
         return (
@@ -62,27 +59,20 @@ class _CurrentSnapshot(State):
     State.STATE("seen")
     State.DERIVATIVE("seen' = 0 * seen")
 
-    def advance(self, v, dt, states):
-        del v, dt, states
-        return {"seen": self.ina + self.ik + self.ica}
+    def state_defaults(self, v, values):
+        del values
+        return {"seen": torch.zeros_like(v)}
+
+    def advance(self, v, dt, values):
+        del v, dt
+        return {"seen": values["ina"] + values["ik"] + values["ica"]}
 
 
 class _ThreeIonCurrentReader(Mechanism):
-    Mechanism.BUFFER("breakpoint_calls", "breakpoint_seen")
-    Mechanism.STATE(_CurrentSnapshot)
-    Mechanism.INIT(seen=0.0)
+    Mechanism.STATE_BUNDLE(_CurrentSnapshot)
     Mechanism.USEION("na", read=["ina"])
     Mechanism.USEION("k", read=["ik"])
     Mechanism.USEION("ca", read=["ica"])
-
-    def initial(self, v):
-        self.breakpoint_calls = torch.zeros_like(v)
-        self.breakpoint_seen = torch.zeros_like(v)
-
-    def breakpoint(self, v):
-        del v
-        self.breakpoint_calls = self.breakpoint_calls + 1
-        self.breakpoint_seen = self.ina + self.ik + self.ica
 
 
 class _CurrentReaderWriterCycle(Mechanism):
@@ -97,14 +87,16 @@ class _CurrentReaderWriterCycle(Mechanism):
         return self.ik(v), self.gk
 
 
-class _BreakpointProbe(Mechanism):
-    Mechanism.BUFFER("calls")
+class _AcceptedStepProbe(Mechanism):
+    Mechanism.CARRY("steps")
 
-    def initial(self, v):
-        self.calls = torch.zeros_like(v)
+    def initial_values(self, v, values):
+        del values
+        return {"steps": torch.zeros_like(v)}
 
-    def breakpoint(self, v):
-        self.calls = self.calls + 1
+    def advance(self, v, dt, values):
+        del v, dt
+        return {"steps": values["steps"] + 1}
 
 
 def _model(*, with_breakpoint_probe=False, gna=None, integrator=None):
@@ -121,7 +113,7 @@ def _model(*, with_breakpoint_probe=False, gna=None, integrator=None):
         # A non-contiguous insertion exercises mechanism-local indexed views.
         model[:, 1::2].insert(_ThreeIonCurrentReader)
         if with_breakpoint_probe:
-            model.insert(_BreakpointProbe)
+            model.insert(_AcceptedStepProbe)
         if gna is not None:
             model.train(True)
         model.initialize()
@@ -206,7 +198,14 @@ def _explicit_oracle(model, integrator_name):
 
 def _reset_evaluation_count(model):
     channel = _mechanism(model, _ThreeIonCurrent)
-    channel.evaluation_calls = torch.zeros_like(channel.evaluation_calls)
+    channel._test_evaluation_calls = 0
+    evaluate_assigned = channel._evaluate_assigned
+
+    def counted_evaluation(*args, **kwargs):
+        channel._test_evaluation_calls += 1
+        return evaluate_assigned(*args, **kwargs)
+
+    channel._evaluate_assigned = counted_evaluation
     return channel
 
 
@@ -232,16 +231,6 @@ def test_initialize_commits_coherent_full_and_indexed_ion_currents():
 
     expected = _full_currents(model, model.v)
     _assert_committed_currents(model, expected, assert_seen=False)
-    reader = _mechanism(model, _ThreeIonCurrentReader)
-    torch.testing.assert_close(
-        reader.breakpoint_calls,
-        torch.ones_like(reader.breakpoint_calls),
-    )
-    torch.testing.assert_close(
-        reader.breakpoint_seen,
-        sum(reader.get(current) for current in expected.values()),
-    )
-    assert torch.all(_mechanism(model, _ThreeIonCurrent).evaluation_calls > 0)
 
 
 @pytest.mark.parametrize(
@@ -262,10 +251,7 @@ def test_solver_step_evaluates_each_current_source_once_per_required_stage(
 
     model.step(dt=DT)
 
-    torch.testing.assert_close(
-        channel.evaluation_calls,
-        torch.full_like(channel.evaluation_calls, expected_evaluations),
-    )
+    assert channel._test_evaluation_calls == expected_evaluations
 
 
 @pytest.mark.parametrize(
@@ -285,10 +271,7 @@ def test_explicit_solver_commits_the_runge_kutta_weighted_ionic_flux(
 
     torch.testing.assert_close(model.v, expected_v, rtol=2.0e-12, atol=2.0e-12)
     _assert_committed_currents(model, accepted)
-    torch.testing.assert_close(
-        channel.evaluation_calls,
-        torch.full_like(channel.evaluation_calls, expected_evaluations),
-    )
+    assert channel._test_evaluation_calls == expected_evaluations
 
     # With uniform voltage there is no axial current, so the accepted per-ion
     # quadrature must be exactly the flux that changed membrane voltage.
@@ -338,10 +321,7 @@ def test_implicit_solver_commits_the_linearized_endpoint_ionic_flux():
     # by the one evaluated current/conductance pair. This distinguishes correct
     # endpoint linearization from a hidden second current evaluation at v_new.
     assert not torch.allclose(_full_currents(model, expected_v)["ina"], accepted["ina"])
-    torch.testing.assert_close(
-        channel.evaluation_calls,
-        torch.ones_like(channel.evaluation_calls),
-    )
+    assert channel._test_evaluation_calls == 1
     torch.testing.assert_close(
         sum(accepted.values()),
         -cmdt * (model.v - v0),
@@ -382,10 +362,7 @@ def test_dufort_regular_step_reuses_its_centered_ionic_frame(
             accepted[current_name] = getattr(channel, current_name)(v)
 
     _assert_committed_currents(model, accepted)
-    torch.testing.assert_close(
-        channel.evaluation_calls,
-        torch.ones_like(channel.evaluation_calls),
-    )
+    assert channel._test_evaluation_calls == 1
     expected_imem = (model.v - v_prev) / model.integrator.s1 + sum(
         accepted.values()
     ) * model.integrator.area
@@ -436,13 +413,13 @@ def test_current_reads_use_step_voltage_not_last_current_evaluation():
     model = _model(with_breakpoint_probe=True)
     handler = model.mech
     reader = _mechanism(model, _ThreeIonCurrentReader)
-    breakpoint_probe = _mechanism(model, _BreakpointProbe)
+    step_probe = _mechanism(model, _AcceptedStepProbe)
     state = next(iter(reader.DE.values()))
 
     accepted_v = torch.tensor([[-80.0, -70.0, -60.0, -50.0]], dtype=DTYPE)
     distractor_v = torch.tensor([[20.0, 25.0, 30.0, 35.0]], dtype=DTYPE)
     handler.iexp(distractor_v)
-    breakpoint_calls = breakpoint_probe.calls.clone()
+    accepted_steps = step_probe.steps.clone()
     distractor = sum(
         reader.get(handler.ions[ion]._buffers[f"i{ion}"]) for ion in ("na", "k", "ca")
     )
@@ -450,7 +427,7 @@ def test_current_reads_use_step_voltage_not_last_current_evaluation():
     assert not torch.allclose(distractor, expected_total)
 
     handler.advance(accepted_v, torch.as_tensor(DT, dtype=DTYPE), model.celsius)
-    torch.testing.assert_close(breakpoint_probe.calls, breakpoint_calls)
+    torch.testing.assert_close(step_probe.steps, accepted_steps + 1)
 
     torch.testing.assert_close(reader.seen, expected_total)
     for current_name, expected in expected_currents.items():

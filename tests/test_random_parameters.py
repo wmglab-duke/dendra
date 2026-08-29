@@ -182,11 +182,15 @@ def test_state_rangerand_works_in_nested_state():
         State.RANGERAND("gate_noise", distribution="normal", mu=1.0, sigma=1e-8)
         State.DERIVATIVE("m' = (minf - m) / tau")
 
-        def breakpoint(self, v, states=None):
-            return {"minf": torch.sigmoid(v * 0.0), "tau": self.gate_noise}
+        def assigned_values(self, v, values):
+            del values
+            return {
+                "minf": torch.sigmoid(v * 0.0),
+                "tau": self.gate_noise.expand_as(v),
+            }
 
     class WithState(Mechanism):
-        Mechanism.STATE(Gate)
+        Mechanism.STATE_BUNDLE(Gate)
 
         def i(self, v):
             return torch.zeros_like(v)

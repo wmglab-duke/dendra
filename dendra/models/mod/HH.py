@@ -5,20 +5,20 @@ from ..mechanisms.ops import exp, vtrap
 
 
 class mhn(S):
-    has_q10 = True
-
     S.STATE("m", "h", "n")
     S.DERIVATIVE(
         "m' = (minf - m) / mtau", "h' = (hinf - h) / htau", "n' = (ninf - n) / ntau"
     )
     S.ASSIGNED("minf", "mtau", "hinf", "htau", "ninf", "ntau")
+    S.DERIVED_BUFFER("q10")
     S.GLOBAL(am1=0.1, am2=4.0, ah1=0.07, ah2=1.0, an1=0.01, an2=0.125)
 
-    def calc_q10(self):
-        return 3.0 ** ((self.celsius - 6.3) / 10.0)
+    def derive_buffers(self):
+        return {"q10": 3.0 ** ((self.celsius - 6.3) / 10.0)}
 
-    def breakpoint(self, v, states):
-        q10 = self.q10()
+    def assigned_values(self, v, values):
+        del values
+        q10 = self.q10
         alpha_m = self.am1 * vtrap(-(v + 40), 10)
         beta_m = self.am2 * exp(-(v + 65) / 18)
         tot = alpha_m + beta_m
@@ -35,16 +35,16 @@ class mhn(S):
         ntau = 1 / (q10 * tot)
         ninf = alpha_n / tot
         return {
-            "mtau": mtau,
             "minf": minf,
-            "htau": htau,
+            "mtau": mtau,
             "hinf": hinf,
-            "ntau": ntau,
+            "htau": htau,
             "ninf": ninf,
+            "ntau": ntau,
         }
 
-    def inf(self, v):
-        states = self.breakpoint(v, None)
+    def state_defaults(self, v, values):
+        states = self.assigned_values(v, values)
         return {"m": states["minf"], "h": states["hinf"], "n": states["ninf"]}
 
 
@@ -79,7 +79,7 @@ class hh(M):
     S/cm².
     """
 
-    M.STATE(mhn)
+    M.STATE_BUNDLE(mhn)
     M.GLOBAL(gnabar=0.12, gkbar=0.036, gl=0.0003, ena=50.0, ek=-77.0, el=-54.3)
 
     M.NONSPECIFIC_CURRENT("il", "ina", "ik")

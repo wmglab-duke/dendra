@@ -31,11 +31,11 @@ class _CoupledCurrent(Mechanism):
 
 
 class _SavedPointwiseNonlinearNumerical(_PointwiseNonlinearNumerical):
-    Mechanism.SAVE("i")
+    Mechanism.SAVE_CURRENT("i")
 
 
 class _StatefulCurrent(Mechanism):
-    Mechanism.BUFFER("calls")
+    Mechanism.CARRY("calls")
     Mechanism.NONSPECIFIC_CURRENT("i")
 
     def i(self, v):
@@ -59,7 +59,7 @@ class _DeclaredCoupledCurrent(Mechanism):
 
 
 class _DeclaredStatefulCurrent(Mechanism):
-    Mechanism.BUFFER("calls")
+    Mechanism.CARRY("calls")
     Mechanism.NONSPECIFIC_CURRENT("i")
     Mechanism.NUMERICAL("i")
 
@@ -93,7 +93,7 @@ class _DeclaredBadDtypeCurrent(Mechanism):
 
 
 class _DeclaredMutatingRandomCurrent(Mechanism):
-    Mechanism.BUFFER("calls")
+    Mechanism.CARRY("calls")
     Mechanism.NONSPECIFIC_CURRENT("i")
     Mechanism.NUMERICAL("i")
 
@@ -121,7 +121,7 @@ class _DeclaredZeroingVoltageCurrent(Mechanism):
 
 
 class _DeclaredResizingStateCurrent(Mechanism):
-    Mechanism.BUFFER("scratch")
+    Mechanism.CARRY("scratch")
     Mechanism.NONSPECIFIC_CURRENT("i")
     Mechanism.NUMERICAL("i")
 

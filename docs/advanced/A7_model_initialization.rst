@@ -12,16 +12,17 @@ Fresh initialization
 
 For a fresh initialization, Dendra performs one ordered transaction:
 
-#. Build the model if necessary and populate its parameters, including values
-   that are resampled on initialization.
-#. Reset voltage and run pre-initialize hooks.
-#. Initialize mechanism state once and synchronize shared Ion and Material
-   fields.
+#. Build the model if necessary, populate Population- and integrator-owned
+   parameters (including values resampled on initialization), and reset
+   voltage.
+#. Run pre-initialize hooks.
+#. Populate Mechanism- and State-owned parameters inside the mechanism handler,
+   initialize their state once, and synchronize shared Ion and Material fields.
 #. Apply initial absolute writes, concentration guards, reversal potentials,
    and the accepted membrane-current state.
 #. Run post-initialize hooks and mark the model ready to execute.
 
-Every mechanism ``INITIAL`` path therefore runs once. If any phase fails, the
+Every declared initialization path therefore runs once. If any phase fails, the
 model remains uninitialized and cannot be stepped until initialization
 succeeds.
 
@@ -39,17 +40,60 @@ Use the earliest hook that matches the value's role:
 
 * ``set_v_init(...)`` changes the voltage used by the next fresh
   initialization.
-* ``set_value(...)`` applies an override after voltage reset but before
-  mechanism initial conditions.
-* A pre-initialize hook is appropriate for custom setup that mechanism initial
-  conditions, temperature scaling, or derived fields must observe.
+* ``State.state_defaults(...)`` supplies fallback solver-state values below an
+  explicit insertion-time ``ic``.
+* ``Mechanism.initial_values(...)`` or ``State.initial_values(...)`` is
+  appropriate for pure, declaration-owned state and carry initialization that
+  should work through both imperative and functional execution.
+* A pre-initialize transform is appropriate for declared tensor-only setup that
+  should remain available through ``dn.func``.
+* A pre-initialize hook is appropriate for custom setup that must be visible to
+  mechanism initial conditions, temperature scaling, or derived fields.
 * A post-initialize hook observes or adjusts the completed state. No automatic
   recomputation follows it, so it should not be used for values that initial
   conditions depend on.
 
-Registering a pre-initialize hook, calling ``set_value(...)``, or changing
-``v_init`` invalidates an existing steady-state cache. This prevents an older
-snapshot from silently hiding the new initial condition.
+Registering a pre-initialize hook or transform, or changing ``v_init``,
+invalidates an existing steady-state cache. This prevents an older snapshot
+from silently hiding the new initial condition.
+
+Pure mechanism initialization values
+------------------------------------
+
+Mechanism authors can implement ``initial_values(v, values)`` on a
+``Mechanism`` or nested ``State``. A Mechanism may return flattened solver
+state, direct ``CARRY``, and owned writable Ion/Material locals. A State may
+return only its own ``STATE`` and ``CARRY`` names. ``values`` contains the current
+ordered initialization frame, including support-visible ``celsius``, local
+``diam``, and the Ion/Material/current aliases declared by the owning
+Mechanism. The ordering is shared-field seed, ``state_defaults``, insertion
+``ic``, Mechanism values, then State values. Thus ``ic`` overrides
+``state_defaults``, while a later authored ``initial_values`` overlay may
+intentionally replace either.
+
+These returned-value hooks must be deterministic and read-only, so imperative
+and functional initialization execute the same authored computation.
+
+Pure initialization transforms
+------------------------------
+
+Use ``register_pre_initialize_transform`` or
+``register_post_initialize_transform`` when setup logic should also be
+available through ``dn.func``. A transform is a stateless
+``torch.nn.Module``: its tensor reads, writes, and additional inputs are
+declared at registration, it returns one tuple entry per write, and actions run
+in registration order. Canonical paths address raw parameters as
+``parameters.<name>`` and initialized carry as ``state.<path>``. Extra inputs
+become replaceable leaves in ``PopulationTensors.initialization.transforms``.
+Post transforms can observe temporary clock/control writes from earlier post
+transforms, but the normal final initialization reset still returns simulation
+time and the duration remainder to zero.
+
+Ordinary pre/post hooks remain the permissive imperative extension point and
+still receive the Population object. Dendra deliberately does not infer a pure
+functional program from those arbitrary callbacks. Use ``set_v_init(...)`` for
+the configured initial voltage and an explicit transform for other declared
+initialization-time tensor updates.
 
 Steady-state restoration
 ------------------------
@@ -57,7 +101,8 @@ Steady-state restoration
 A cached steady state is already a complete initialized snapshot, so restoring
 it follows a shorter path. Dendra restores the state transactionally and skips
 voltage reset, parameter resampling, pre-initialize hooks, and mechanism
-``INITIAL``. Post-initialize hooks still run once against the restored state.
+initial-value evaluation. Post-initialize hooks still run once against the
+restored state.
 
 The cached stochastic state is restored without consuming another random
 sample. The solver workspace is rebuilt once on the first subsequent execution

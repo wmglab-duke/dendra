@@ -113,6 +113,24 @@ CASES = (
         (6,),
         has_duplicates=True,
     ),
+    _Case(
+        "empty_rectangular",
+        (slice(None), slice(2, 2)),
+        True,
+        (3, 0),
+        SupportKind.RECTANGULAR,
+        (),
+        (3, 0),
+    ),
+    _Case(
+        "empty_packed",
+        torch.tensor([], dtype=torch.long),
+        False,
+        (0,),
+        SupportKind.PACKED_FLAT,
+        (),
+        (0,),
+    ),
 )
 
 
@@ -192,6 +210,344 @@ def test_structural_support_matches_legacy_batched_gather_and_scatter_add(case):
     actual_scatter = torch.zeros_like(field)
     mechanism.add_(actual_scatter, local)
     assert torch.equal(actual_scatter, expected_scatter)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_out_of_place_scatter_add_is_pure_and_differentiable(case):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    indices = _materialized(support_map.spec, mechanism.key)
+    local_shape = support_map.spec.runtime_local_shape
+
+    destination = (
+        torch.linspace(-1.0, 2.0, 18, dtype=DTYPE).reshape(CORE_SHAPE).requires_grad_()
+    )
+    local = (
+        torch.linspace(0.25, 1.75, support_map.spec.slot_count, dtype=DTYPE)
+        .reshape(local_shape)
+        .requires_grad_()
+    )
+    original = destination.detach().clone()
+    original_version = destination._version
+
+    actual = support_map.scatter_add(destination, local, mechanism.key)
+    actual_gradients = torch.autograd.grad(actual.square().sum(), (destination, local))
+
+    reference_destination = original.clone().requires_grad_()
+    reference_local = local.detach().clone().requires_grad_()
+    expected = torch.scatter_add(
+        reference_destination.reshape(-1),
+        0,
+        indices,
+        reference_local.reshape(-1),
+    ).reshape(CORE_SHAPE)
+    expected_gradients = torch.autograd.grad(
+        expected.square().sum(),
+        (reference_destination, reference_local),
+    )
+
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_gradients, expected_gradients)
+    torch.testing.assert_close(destination, original)
+    assert destination._version == original_version
+    assert actual is not destination
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+@pytest.mark.parametrize("lane_count", (3, 0), ids=("nonempty", "empty"))
+def test_out_of_place_scatter_add_supports_parameter_only_vmap(case, lane_count):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    destination = torch.linspace(-1.0, 2.0, 18, dtype=DTYPE).reshape(CORE_SHAPE)
+    local = torch.randn(
+        (lane_count,) + support_map.spec.runtime_local_shape,
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+
+    def scatter(one_local):
+        return support_map.scatter_add(destination, one_local, mechanism.key)
+
+    actual = torch.vmap(scatter)(local)
+    if lane_count:
+        expected = torch.stack([scatter(one_local) for one_local in local])
+        torch.testing.assert_close(actual, expected)
+    else:
+        assert actual.shape == (0,) + CORE_SHAPE
+
+    gradient = torch.autograd.grad(actual.square().sum(), local)[0]
+    assert gradient.shape == local.shape
+    assert torch.isfinite(gradient).all()
+
+
+@pytest.mark.parametrize(
+    "case",
+    tuple(
+        case
+        for case in CASES
+        if case.expected_kind in {SupportKind.DENSE, SupportKind.RECTANGULAR}
+        and case.expected_flat
+    ),
+    ids=lambda case: case.name,
+)
+@pytest.mark.parametrize("lane_count", (3, 0), ids=("nonempty", "empty"))
+def test_out_of_place_scatter_add_broadcasts_a_vmapped_scalar(case, lane_count):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    destination = torch.linspace(-1.0, 2.0, 18, dtype=DTYPE).reshape(CORE_SHAPE)
+    local = torch.randn(lane_count, dtype=DTYPE, requires_grad=True)
+
+    vmapped = torch.vmap(
+        lambda scalar: support_map.scatter_add(
+            destination,
+            scalar,
+            mechanism.key,
+        )
+    )
+    expected = vmapped(local)
+    torch.compiler.reset()
+    compiled = torch.compile(vmapped, backend="eager", fullgraph=True)
+    actual = compiled(local)
+
+    assert actual.shape == (lane_count,) + CORE_SHAPE
+    torch.testing.assert_close(actual, expected)
+    gradient = torch.autograd.grad(expected.square().sum(), local)[0]
+    assert gradient.shape == local.shape
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+@pytest.mark.parametrize("lane_count", (3, 0), ids=("nonempty", "empty"))
+def test_gather_and_out_of_place_scatter_support_state_vmap(case, lane_count):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    voltages = torch.randn(
+        (lane_count,) + CORE_SHAPE,
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+
+    def round_trip(voltage):
+        local = support_map.gather(voltage, mechanism.key)
+        return support_map.scatter_add(voltage, local.square(), mechanism.key)
+
+    actual = torch.vmap(round_trip)(voltages)
+    assert actual.shape == voltages.shape
+    if lane_count:
+        expected = torch.stack([round_trip(voltage) for voltage in voltages])
+        torch.testing.assert_close(actual, expected)
+
+    gradient = torch.autograd.grad(actual.square().sum(), voltages)[0]
+    assert gradient.shape == voltages.shape
+    assert torch.isfinite(gradient).all()
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_compiled_vmapped_out_of_place_scatter_add_is_fullgraph(case):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    destination = torch.linspace(-1.0, 2.0, 18, dtype=DTYPE).reshape(CORE_SHAPE)
+    local = torch.randn(
+        (2,) + support_map.spec.runtime_local_shape,
+        dtype=DTYPE,
+    )
+
+    vmapped = torch.vmap(
+        lambda one_local: support_map.scatter_add(
+            destination,
+            one_local,
+            mechanism.key,
+        )
+    )
+    torch.compiler.reset()
+    compiled = torch.compile(vmapped, backend="eager", fullgraph=True)
+
+    torch.testing.assert_close(compiled(local), vmapped(local))
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_out_of_place_scatter_add_supports_reverse_and_forward_mode(case):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    destination = torch.linspace(-1.0, 2.0, 18, dtype=DTYPE).reshape(CORE_SHAPE)
+    local = torch.randn(support_map.spec.runtime_local_shape, dtype=DTYPE)
+
+    def scatter(one_local):
+        return support_map.scatter_add(destination, one_local, mechanism.key)
+
+    reverse = torch.func.jacrev(scatter)(local)
+    forward = torch.func.jacfwd(scatter)(local)
+
+    assert reverse.shape == CORE_SHAPE + support_map.spec.runtime_local_shape
+    torch.testing.assert_close(reverse, forward)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_support_map_handles_an_explicit_empty_batch_axis(case):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    destination = torch.empty((0,) + CORE_SHAPE, dtype=DTYPE, requires_grad=True)
+
+    local = support_map.gather(destination, mechanism.key)
+    actual = support_map.scatter_add(destination, local, mechanism.key)
+
+    assert local.shape == (0,) + support_map.spec.runtime_local_shape
+    assert actual.shape == destination.shape
+    gradient = torch.autograd.grad(actual.sum(), destination)[0]
+    assert gradient.shape == destination.shape
+
+
+@pytest.mark.parametrize(
+    "case",
+    tuple(case for case in CASES if not case.has_duplicates),
+    ids=lambda case: case.name,
+)
+def test_out_of_place_scatter_set_is_pure_and_differentiable(case):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    indices = _materialized(support_map.spec, mechanism.key)
+    destination = (
+        torch.linspace(-1.0, 2.0, 18, dtype=DTYPE).reshape(CORE_SHAPE).requires_grad_()
+    )
+    local = torch.randn(
+        support_map.spec.runtime_local_shape,
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+    original = destination.detach().clone()
+    original_version = destination._version
+
+    actual = support_map.scatter_set(
+        local,
+        destination,
+        destination,
+        mechanism.key,
+    )
+    actual_gradients = torch.autograd.grad(
+        actual.square().sum(),
+        (destination, local),
+        allow_unused=True,
+    )
+
+    reference_destination = original.clone().requires_grad_()
+    reference_local = local.detach().clone().requires_grad_()
+    expected = torch.scatter(
+        reference_destination.reshape(-1),
+        0,
+        indices,
+        reference_local.reshape(-1),
+    ).reshape(CORE_SHAPE)
+    expected_gradients = torch.autograd.grad(
+        expected.square().sum(),
+        (reference_destination, reference_local),
+        allow_unused=True,
+    )
+
+    actual_destination_gradient = (
+        torch.zeros_like(destination)
+        if actual_gradients[0] is None
+        else actual_gradients[0]
+    )
+    expected_destination_gradient = (
+        torch.zeros_like(reference_destination)
+        if expected_gradients[0] is None
+        else expected_gradients[0]
+    )
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        actual_destination_gradient,
+        expected_destination_gradient,
+    )
+    torch.testing.assert_close(actual_gradients[1], expected_gradients[1])
+    torch.testing.assert_close(destination, original)
+    assert destination._version == original_version
+
+
+@pytest.mark.parametrize(
+    "case",
+    tuple(case for case in CASES if not case.has_duplicates),
+    ids=lambda case: case.name,
+)
+@pytest.mark.parametrize("lane_count", (3, 0), ids=("nonempty", "empty"))
+def test_out_of_place_scatter_set_supports_parameter_only_vmap(case, lane_count):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    destination = torch.linspace(-1.0, 2.0, 18, dtype=DTYPE).reshape(CORE_SHAPE)
+    local = torch.randn(
+        (lane_count,) + support_map.spec.runtime_local_shape,
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+
+    def replace(one_local):
+        return support_map.scatter_set(
+            one_local,
+            destination,
+            destination,
+            mechanism.key,
+        )
+
+    actual = torch.vmap(replace)(local)
+    assert actual.shape == (lane_count,) + CORE_SHAPE
+    gradient = torch.autograd.grad(actual.square().sum(), local)[0]
+    assert gradient.shape == local.shape
+    assert torch.isfinite(gradient).all()
+
+
+@pytest.mark.parametrize("lane_count", (3, 0), ids=("nonempty", "empty"))
+def test_rectangular_out_of_place_scatter_set_broadcasts_a_vmapped_scalar(
+    lane_count,
+):
+    case = next(case for case in CASES if case.name == "rectangular")
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    destination = torch.linspace(-1.0, 2.0, 18, dtype=DTYPE).reshape(CORE_SHAPE)
+    local = torch.randn(lane_count, dtype=DTYPE, requires_grad=True)
+
+    vmapped = torch.vmap(
+        lambda scalar: support_map.scatter_set(
+            scalar,
+            destination,
+            destination,
+            mechanism.key,
+        )
+    )
+    expected = vmapped(local)
+    torch.compiler.reset()
+    compiled = torch.compile(vmapped, backend="eager", fullgraph=True)
+    actual = compiled(local)
+
+    assert actual.shape == (lane_count,) + CORE_SHAPE
+    torch.testing.assert_close(actual, expected)
+    gradient = torch.autograd.grad(expected.square().sum(), local)[0]
+    assert gradient.shape == local.shape
+
+
+@pytest.mark.parametrize(
+    "case",
+    tuple(case for case in CASES if not case.has_duplicates),
+    ids=lambda case: case.name,
+)
+def test_compiled_vmapped_out_of_place_scatter_set_is_fullgraph(case):
+    mechanism = _probe(case)
+    support_map = mechanism.support_map
+    destination = torch.linspace(-1.0, 2.0, 18, dtype=DTYPE).reshape(CORE_SHAPE)
+    local = torch.randn(
+        (2,) + support_map.spec.runtime_local_shape,
+        dtype=DTYPE,
+    )
+
+    vmapped = torch.vmap(
+        lambda one_local: support_map.scatter_set(
+            one_local,
+            destination,
+            destination,
+            mechanism.key,
+        )
+    )
+    torch.compiler.reset()
+    compiled = torch.compile(vmapped, backend="eager", fullgraph=True)
+
+    torch.testing.assert_close(compiled(local), vmapped(local))
 
 
 @pytest.mark.parametrize(

@@ -31,9 +31,13 @@ class _FirstMaterialWriter(Mechanism):
         source={"amount": "delta"},
     )
 
-    def _advance(self, v, dt):
-        self.amount = self.amount + dt * self.rate
-        self.delta = dt * self.source_scale * self.amount
+    def advance(self, v, dt, values):
+        del v
+        amount = values["amount"] + dt * self.rate
+        return {
+            "amount": amount,
+            "delta": dt * self.source_scale * amount,
+        }
 
 
 class _LastMaterialWriter(Mechanism):
@@ -55,10 +59,13 @@ class _LastMaterialWriter(Mechanism):
     Mechanism.NONSPECIFIC_CURRENT("i")
     Mechanism.AFFINE("i")
 
-    def _advance(self, v, dt):
-        amount = self.amount
-        self.amount = self.retain * amount + dt * self.rate
-        self.delta = dt * self.source_scale * amount
+    def advance(self, v, dt, values):
+        del v
+        amount = values["amount"]
+        return {
+            "amount": self.retain * amount + dt * self.rate,
+            "delta": dt * self.source_scale * amount,
+        }
 
     def i(self, v):
         conductance = self.g * self.amount

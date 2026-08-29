@@ -8,11 +8,17 @@ from ..mechanisms.ops import exp, log
 
 class A(S):
     S.STATE("A")
+    S.ASSIGNED("tau1_effective")
     S.RANGE(tau1=0.1)
-    S.DERIVATIVE("A' = -A / tau1")
+    S.DERIVATIVE("A' = -A / tau1_effective")
 
-    def inf(self, v):
+    def state_defaults(self, v, values):
+        del values
         return {"A": torch.zeros_like(v)}
+
+    def assigned_values(self, v, values):
+        del v
+        return {"tau1_effective": values["tau1_effective"]}
 
 
 class B(S):
@@ -20,7 +26,8 @@ class B(S):
     S.RANGE(tau2=10.0)
     S.DERIVATIVE("B' = -B / tau2")
 
-    def inf(self, v):
+    def state_defaults(self, v, values):
+        del values
         return {"B": torch.zeros_like(v)}
 
 
@@ -80,14 +87,14 @@ class exp2syn(PP, Syn):
     values strictly between zero and one.
     """
 
-    PP.STATE(A, B)
+    PP.STATE_BUNDLE(A, B)
     PP.RANGE(e=0.0)
-    PP.BUFFER("factor")
+    PP.DERIVED_BUFFER("factor", "tau1_effective")
 
     PP.NONSPECIFIC_CURRENT("i")
     PP.AFFINE("i")
 
-    def initial(self, v):
+    def derive_buffers(self):
         state_a = self.DE["A"]
         tau1 = state_a.tau1
         tau2 = self.DE["B"].tau2
@@ -106,15 +113,16 @@ class exp2syn(PP, Syn):
         )
         ratio = torch.minimum(torch.maximum(ratio, lower), upper)
 
-        # NEURON adjusts tau1 itself, so the A-state kinetics must use the same
-        # effective value as the normalization factor.
-        state_a.tau1 = ratio * tau2
+        tau1_effective = ratio * tau2
 
         # At the peak, exp(-tp/tau1) is exactly ratio times
         # exp(-tp/tau2). This log-domain form is algebraically equivalent to
         # NEURON's tp expression but stays finite as ratio approaches one.
         log_denominator = torch.log1p(-ratio) + ratio / (1 - ratio) * log(ratio)
-        self.factor = exp(-log_denominator)
+        return {
+            "factor": exp(-log_denominator),
+            "tau1_effective": tau1_effective,
+        }
 
     def i(self, v):
         return (self.B - self.A) * (v - self.e)

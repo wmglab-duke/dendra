@@ -75,7 +75,8 @@ class apcount_d(M):
     """
 
     M.RANGE(threshold=0.0, tau_gate=0.5, ste_scale=1.0)
-    M.BUFFER("n", "spikes", "active", "h_prev")
+    M.CARRY("n", "spikes", "h_prev")
+    M.CARRY("active", dtype=torch.bool)
 
     @staticmethod
     def _tensor_like(x, ref):
@@ -88,20 +89,22 @@ class apcount_d(M):
         tau = self._tensor_like(self.tau_gate, v).clamp_min(1.0e-3)
         return torch.sigmoid((v - threshold) / tau)
 
-    def initial(self, v):
+    def initial_values(self, v, values):
         threshold = self._tensor_like(self.threshold, v)
         gate0 = self._gate(v)
-
-        self.n = torch.zeros_like(v, dtype=v.dtype)
-        self.spikes = torch.zeros_like(v, dtype=v.dtype)
 
         # Initialize to the current hard state so starting above threshold does
         # not create a spurious first-step crossing. This matches spikedetect's
         # upward-crossing semantics.
-        self.active = v > threshold
-        self.h_prev = gate0
+        return {
+            "n": torch.zeros_like(v),
+            "spikes": torch.zeros_like(v),
+            "active": v > threshold,
+            "h_prev": gate0,
+        }
 
-    def breakpoint(self, v):
+    def advance(self, v, dt, values):
+        del dt
         threshold = self._tensor_like(self.threshold, v)
         ste = self._tensor_like(self.ste_scale, v)
 
@@ -109,18 +112,21 @@ class apcount_d(M):
         above_threshold = v > threshold
 
         # Hard upward crossing used for the forward value.
-        hard_spikes = above_threshold & ~self.active
+        hard_spikes = above_threshold & ~values["active"]
         hard_spikes = hard_spikes.to(dtype=v.dtype)
 
         # Smooth positive gate change used only for the backward value.
-        soft_spikes = torch.relu(gate - self.h_prev)
+        soft_spikes = torch.relu(gate - values["h_prev"])
 
         # Straight-through estimator: forward == hard_spikes, backward ==
         # ste_scale * d soft_spikes / d inputs.
-        self.spikes = hard_spikes + ste * (soft_spikes - soft_spikes.detach())
-        self.n = self.n + self.spikes
+        spikes = hard_spikes + ste * (soft_spikes - soft_spikes.detach())
 
         # Update memories after computing the event.
-        self.active = above_threshold
-        self.h_prev = gate
+        return {
+            "n": values["n"] + spikes,
+            "spikes": spikes,
+            "active": above_threshold,
+            "h_prev": gate,
+        }
         # If truncated BPTT is desired, use: self.h_prev = gate.detach()

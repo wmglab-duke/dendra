@@ -49,11 +49,14 @@ class _FrozenState(State):
     State.STATE("x")
     State.DERIVATIVE("x' = 0 * x")
 
+    def state_defaults(self, v, values):
+        del values
+        return {"x": torch.ones_like(v)}
+
 
 class _StatefulProbe(Mechanism):
     Mechanism.RANGE(g=1.0)
-    Mechanism.STATE(_FrozenState)
-    Mechanism.INIT(x=1.0)
+    Mechanism.STATE_BUNDLE(_FrozenState)
     Mechanism.NONSPECIFIC_CURRENT("i")
 
     def i(self, v):

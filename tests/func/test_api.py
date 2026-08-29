@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import dendra as dn
-from dendra.models.mechanisms import Mechanism, PointProcess, State
+from dendra.models.mechanisms import Mechanism, State
 from dendra.models.mechanisms._material_process import DiffusionProcess
 from dendra.models.mod import hh, pas
 
@@ -15,19 +15,13 @@ class _DiameterState(State):
     State.STATE("x")
     State.DERIVATIVE("x' = diam")
 
+    def state_defaults(self, v, values):
+        del values
+        return {"x": torch.zeros_like(v)}
+
 
 class _DiameterMechanism(Mechanism):
-    Mechanism.STATE(_DiameterState)
-    Mechanism.INIT(x=0.0)
-
-
-class _DensePointCurrent(PointProcess):
-    PointProcess.GLOBAL(g=1.0e-8, e=-60.0)
-    PointProcess.NONSPECIFIC_CURRENT("i")
-    PointProcess.AFFINE("i")
-
-    def i(self, v):
-        return self.g * (v - self.e)
+    Mechanism.STATE_BUNDLE(_DiameterState)
 
 
 class _TableMechanism(Mechanism):
@@ -55,15 +49,17 @@ class _FlagMechanism(Mechanism):
 
 
 class _InplaceBufferMechanism(Mechanism):
-    Mechanism.BUFFER("gain")
+    Mechanism.CARRY("gain")
     Mechanism.NONSPECIFIC_CURRENT("i")
     Mechanism.AFFINE("i")
 
-    def initial(self, v):
-        self.gain.fill_(1.0)
+    def initial_values(self, v, values):
+        del values
+        return {"gain": torch.ones_like(v)}
 
-    def breakpoint(self, v):
-        self.gain.add_(1.0)
+    def advance(self, v, dt, values):
+        del v, dt
+        return {"gain": values["gain"] + 1.0}
 
     def i(self, v):
         return self.gain * v
@@ -72,14 +68,26 @@ class _InplaceBufferMechanism(Mechanism):
         return self.i(v), self.gain.expand_as(v)
 
 
+class _SavedCurrentMechanism(Mechanism):
+    Mechanism.GLOBAL(g=1.0e-4)
+    Mechanism.NONSPECIFIC_CURRENT("i")
+    Mechanism.SAVE_CURRENT("i")
+    Mechanism.AFFINE("i")
+
+    def i(self, v):
+        return self.g * v
+
+
 class _WriteOnlySodium(Mechanism):
     Mechanism.USEION("na", write=["nai"])
 
-    def initial(self, v):
-        self.nai = torch.full_like(v, 3.0)
+    def initial_values(self, v, values):
+        del values
+        return {"nai": torch.full_like(v, 3.0)}
 
-    def _advance(self, v, dt):
-        self.nai = self.nai + 1.0
+    def advance(self, v, dt, values):
+        del v, dt
+        return {"nai": values["nai"] + 1.0}
 
 
 class _WriteOnlyMaterialLocals(Mechanism):
@@ -89,21 +97,19 @@ class _WriteOnlyMaterialLocals(Mechanism):
         source={"amount": "delta"},
     )
 
-    def initial(self, v):
-        self.amount = torch.full_like(v, 3.0)
-        self.delta = torch.full_like(v, 0.25)
+    def initial_values(self, v, values):
+        del values
+        return {
+            "amount": torch.full_like(v, 3.0),
+            "delta": torch.full_like(v, 0.25),
+        }
 
-    def _advance(self, v, dt):
-        self.amount = self.amount + 1.0
-        self.delta = self.delta + 0.5
-
-
-class _CustomTimestepWorkspace(Mechanism):
-    Mechanism.BUFFER("gain")
-
-    def set_dt(self, dt):
-        super().set_dt(dt)
-        self.gain = torch.ones_like(self.diam) * dt
+    def advance(self, v, dt, values):
+        del v, dt
+        return {
+            "amount": values["amount"] + 1.0,
+            "delta": values["delta"] + 0.5,
+        }
 
 
 def _model(*, dtype=torch.float64, method="pcr", jit=0):
@@ -125,27 +131,51 @@ def _model(*, dtype=torch.float64, method="pcr", jit=0):
 def test_func_namespace_exports_the_functional_population_api():
     assert "func" in dn.__all__
     assert set(dn.func.__all__) == {
+        "APCount",
+        "CompiledPopulationChunk",
+        "AnomalyDetector",
+        "FunctionalCallback",
+        "FunctionalCallbackResults",
+        "FunctionalCallbackState",
+        "FunctionalCallbacks",
+        "FunctionalExtra",
+        "FunctionalIntra",
         "FunctionalPopulation",
         "FunctionalizationError",
+        "InitializationInput",
         "PopulationTensors",
+        "Raster",
+        "Recorder",
         "RolloutInput",
         "StepInput",
+        "StimulusTensors",
+        "longrun",
+        "longrun_checkpointed",
         "make_functional",
+        "run",
     }
 
 
 def test_make_functional_extracts_the_minimal_hh_carry_without_aliasing():
     model = _model()
     functional, tensors = dn.func.make_functional(model, dt=DT)
+    prepared = functional.prepare(tensors.parameters, tensors.constants)
 
     assert functional.shape == model.shape
+    assert "local_geometry" not in prepared.values
     assert set(tensors.state) == {"clock", "control", "integrator", "mechanisms"}
     assert set(tensors.state["integrator"]) == {"v"}
     assert set(tensors.state["mechanisms"]) == {"hh"}
     assert set(tensors.state["mechanisms"]["hh"]) == {"m", "h", "n"}
     assert set(tensors.state["clock"]) == {"t"}
     assert set(tensors.state["control"]) == {"duration_remainder"}
-    assert set(tensors.constants) == {"diam", "dx"}
+    assert set(tensors.constants) == {"diam", "dx", "dt"}
+    torch.testing.assert_close(
+        tensors.constants["dt"],
+        torch.as_tensor(DT, dtype=model.dtype(), device=model.device()),
+        rtol=0.0,
+        atol=0.0,
+    )
     assert tuple(tensors.parameters) == tuple(dict(model.named_parameters()))
 
     source = {
@@ -173,18 +203,91 @@ def test_make_functional_extracts_the_minimal_hh_carry_without_aliasing():
         )
 
 
-def test_make_functional_fails_closed_and_reports_all_unsupported_features():
-    model = dn.SingleCompartment(N=1, C=1, dtype=torch.float64)
-    model.insert(pas)
-    model.initialize()
+def test_make_functional_accepts_exact_single_compartment_and_batch_layouts():
+    with dn.ctx(JIT=0, REQUIRE_GRAD=1):
+        model = dn.SingleCompartment(
+            N=2,
+            C=1,
+            dtype=torch.float64,
+            integrator=dn.bwd_euler_sc(imem=False),
+        )
+        model.insert(pas)
+        model.batch(3)
+        model.initialize()
 
-    with pytest.raises(dn.func.FunctionalizationError) as error:
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    prepared = functional.prepare(tensors.parameters, tensors.constants)
+
+    assert functional.shape == (3, 2, 1)
+    assert prepared.values["integrator"]["cmdt"].shape == (1, 2, 1)
+    assert prepared.values["integrator"]["area"].shape == (2, 1)
+
+
+@pytest.mark.parametrize(
+    ("model_factory", "message"),
+    [
+        (
+            lambda: dn.SingleCompartment(
+                N=1,
+                C=1,
+                dtype=torch.float64,
+                integrator=dn.bwd_euler_ub(method="pcr", imem=False),
+            ),
+            "SingleCompartment functionalization requires exactly bwd_euler_sc",
+        ),
+        (
+            lambda: dn.Unmyelinated(
+                [2.0],
+                L=4.0,
+                dx=1.0,
+                dtype=torch.float64,
+                integrator=dn.bwd_euler_sc(imem=False),
+            ),
+            "Unmyelinated functionalization requires bwd_euler_ub",
+        ),
+    ],
+)
+def test_make_functional_rejects_mismatched_topology_integrator_pairs(
+    model_factory,
+    message,
+):
+    with dn.ctx(JIT=0):
+        model = model_factory()
+        model.insert(pas)
+        model.initialize()
+
+    with pytest.raises(dn.func.FunctionalizationError, match=message):
         dn.func.make_functional(model, dt=DT)
 
-    message = str(error.value)
-    assert "Unmyelinated" in message
-    assert "bwd_euler_ub" in message
-    assert "required Unmyelinated parameters" in message
+
+def test_make_functional_rejects_single_compartment_imem_recording():
+    with dn.ctx(JIT=0):
+        model = dn.SingleCompartment(N=1, C=1, dtype=torch.float64)
+        model.imem = True
+        model.insert(pas)
+        model.initialize()
+
+    with pytest.raises(
+        dn.func.FunctionalizationError,
+        match="i_membrane recording is not supported yet",
+    ):
+        dn.func.make_functional(model, dt=DT)
+
+
+def test_make_functional_rejects_single_compartment_subclasses():
+    class CustomSingleCompartment(dn.SingleCompartment):
+        pass
+
+    with dn.ctx(JIT=0):
+        model = CustomSingleCompartment(N=1, C=1, dtype=torch.float64)
+        model.insert(pas)
+        model.initialize()
+
+    with pytest.raises(
+        dn.func.FunctionalizationError,
+        match="exact SingleCompartment",
+    ):
+        dn.func.make_functional(model, dt=DT)
 
 
 def test_make_functional_rejects_uninitialized_population():
@@ -235,14 +338,7 @@ def test_make_functional_rejects_unlowered_material_process_workspaces():
         dn.func.make_functional(model, dt=DT)
 
 
-@pytest.mark.parametrize(
-    ("mechanism", "message"),
-    [
-        (_DensePointCurrent, "PointProcesses.*area-dependent"),
-        (_TableMechanism, "TABLE lookup workspaces"),
-    ],
-)
-def test_make_functional_rejects_unlowered_mechanism_workspaces(mechanism, message):
+def test_make_functional_rejects_unlowered_table_workspaces():
     with dn.ctx(JIT=0, REQUIRE_GRAD=1):
         model = dn.Unmyelinated(
             [1.0],
@@ -251,33 +347,19 @@ def test_make_functional_rejects_unlowered_mechanism_workspaces(mechanism, messa
             dtype=torch.float64,
             integrator=dn.bwd_euler_ub(method="pcr", imem=False),
         )
-        model.insert(mechanism)
-        model.initialize()
-        model.train()
-
-    with pytest.raises(dn.func.FunctionalizationError, match=message):
-        dn.func.make_functional(model, dt=DT)
-
-
-def test_make_functional_rejects_custom_timestep_workspaces():
-    with dn.ctx(JIT=0, REQUIRE_GRAD=1):
-        model = dn.Unmyelinated(
-            [1.0],
-            L=4.0,
-            dx=1.0,
-            dtype=torch.float64,
-            integrator=dn.bwd_euler_ub(method="pcr", imem=False),
-        )
-        model.insert(pas)
-        model.insert(_CustomTimestepWorkspace)
+        model.insert(_TableMechanism)
         model.initialize()
         model.train()
 
     with pytest.raises(
         dn.func.FunctionalizationError,
-        match="overrides set_dt.*workspace",
+        match="TABLE lookup workspaces",
     ):
         dn.func.make_functional(model, dt=DT)
+
+
+def test_mechanism_timestep_configuration_is_not_a_public_author_hook():
+    assert not hasattr(Mechanism, "set_dt")
 
 
 def test_runtime_morphology_reads_follow_extracted_geometry_and_are_differentiable():
@@ -348,7 +430,7 @@ def test_runtime_morphology_reads_follow_extracted_geometry_and_are_differentiab
     torch.testing.assert_close(jacobian, expected, rtol=0.0, atol=0.0)
 
 
-def test_inplace_authored_buffer_updates_are_isolated_and_differentiable():
+def test_authored_carry_updates_are_isolated_and_differentiable():
     with dn.ctx(JIT=0, REQUIRE_GRAD=1):
         model = dn.Unmyelinated(
             [1.0],
@@ -396,6 +478,37 @@ def test_inplace_authored_buffer_updates_are_isolated_and_differentiable():
     jacobian = torch.func.jacrev(next_voltage)(gain)
     assert torch.isfinite(jacobian).all()
     assert torch.count_nonzero(jacobian) > 0
+
+
+def test_saved_current_mirror_is_framework_owned_functional_checkpoint_state():
+    with dn.ctx(JIT=0, REQUIRE_GRAD=1):
+        model = dn.Unmyelinated(
+            [1.0],
+            L=4.0,
+            dx=1.0,
+            dtype=torch.float64,
+            integrator=dn.bwd_euler_ub(method="pcr", imem=False),
+        )
+        model.insert(_SavedCurrentMechanism)
+        model.build()
+        mechanism = model.mech._SavedCurrentMechanism
+        torch.testing.assert_close(mechanism.i_, torch.zeros_like(mechanism.i_))
+        model.initialize()
+        model.train()
+
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    mirror = tensors.state["mechanism_buffers"]["_SavedCurrentMechanism"]["i_"]
+    torch.testing.assert_close(mirror, mechanism.i_)
+    checkpoint = model.mech.mutable_state_dict()
+    torch.testing.assert_close(checkpoint["_SavedCurrentMechanism.i_"], mirror)
+
+    prepared = functional.prepare(tensors.parameters, tensors.constants)
+    next_state, _aux = functional.step(
+        tensors.parameters,
+        prepared,
+        tensors.state,
+    )
+    assert "i_" in next_state["mechanism_buffers"]["_SavedCurrentMechanism"]
 
 
 @pytest.mark.parametrize("kind", ["ion", "material"])
@@ -457,6 +570,37 @@ def test_write_only_shared_field_locals_are_complete_differentiable_carry(kind):
         prepared,
         tensors.state,
         steps=2,
+    )
+
+    def atomic(state):
+        return functional.prepare_and_rollout(
+            tensors.parameters,
+            tensors.constants,
+            state,
+            steps=5,
+        )[0]
+
+    assert functional.prewarm_structured_rollout()
+    structured_expected = atomic(tensors.state)
+    graphs = []
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    compiled = torch.compile(atomic, backend=backend, fullgraph=True)
+    with torch.no_grad():
+        structured_actual = compiled(tensors.state)
+    for actual_leaf, expected_leaf in zip(
+        torch.utils._pytree.tree_leaves(structured_actual),
+        torch.utils._pytree.tree_leaves(structured_expected),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual_leaf, expected_leaf, rtol=0.0, atol=0.0)
+    assert len(graphs) == 1
+    assert any(
+        node.op == "call_function" and node.target is torch.ops.higher_order.while_loop
+        for node in graphs[0].graph.nodes
     )
 
     dt = torch.as_tensor(DT, dtype=imperative.dtype())

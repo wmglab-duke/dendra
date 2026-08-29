@@ -13,10 +13,8 @@ contract.
 .. autoclass:: dendra.models.mod.alphasynapse_d
 .. autoclass:: dendra.models.mod.apcount
    :members:
-   :exclude-members: initial, breakpoint
 .. autoclass:: dendra.models.mod.apcount_d
    :members:
-   :exclude-members: initial, breakpoint
 .. autoclass:: dendra.models.mod.exp2syn
 .. autoclass:: dendra.models.mod.expsyn
 .. autoclass:: dendra.models.mod.fire_r
@@ -39,6 +37,6 @@ Graded / continuous synapses
 
 .. automodule:: dendra.models.mod.GRADED_SYNAPSE
    :members: sigmoid_release, graded_release_gate, graded_syn
-   :exclude-members: __init__, initial, breakpoint, inf, forward
+   :exclude-members: __init__, forward
    :show-inheritance:
    :no-inherited-members:

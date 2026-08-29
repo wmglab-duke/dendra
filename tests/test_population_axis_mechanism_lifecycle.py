@@ -24,22 +24,27 @@ class _LifecycleState(State):
     State.RANGE(rate=0.1)
     State.DERIVATIVE("x' = -rate * x")
 
+    def state_defaults(self, v, values):
+        del values
+        return {"x": torch.full_like(v, 0.4)}
+
 
 class _LifecycleProbe(Mechanism):
     Mechanism.RANGE(g=2.0e-4, e=-52.0)
     Mechanism.BATCH(scale=1.0)
-    Mechanism.STATE(_LifecycleState)
-    Mechanism.INIT(x=0.4)
-    Mechanism.BUFFER("scratch")
+    Mechanism.STATE_BUNDLE(_LifecycleState)
+    Mechanism.CARRY("scratch")
     Mechanism.NONSPECIFIC_CURRENT("i")
-    Mechanism.SAVE("i")
+    Mechanism.SAVE_CURRENT("i")
     Mechanism.AFFINE("i")
 
-    def initial(self, v):
-        self.scratch = torch.zeros_like(v)
+    def initial_values(self, v, values):
+        del values
+        return {"scratch": torch.zeros_like(v)}
 
-    def breakpoint(self, v):
-        self.scratch = 0.25 * v
+    def advance(self, v, dt, values):
+        del dt, values
+        return {"scratch": 0.25 * v}
 
     def i(self, v):
         return self.scale * self.g * self.x * (v - self.e)
@@ -380,11 +385,11 @@ def test_postbuild_batch_refreshes_structured_mechanism_shape_metadata_and_runti
         mechanism.g,
         mechanism.e,
         mechanism.x,
-        mechanism.i_,
-        mechanism.scratch,
         state.rate,
     ):
         assert tuple(value.shape) == expected_shape_p
+    assert tuple(mechanism.i_.shape) == expected_shape_f
+    assert tuple(mechanism.scratch.shape) == expected_shape_f
     assert tuple(mechanism.scale.shape) == (1, N_POPULATIONS, 1)
     assert tuple(mechanism.get(population.v).shape) == expected_shape_f
 

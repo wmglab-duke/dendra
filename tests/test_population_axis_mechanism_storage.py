@@ -36,22 +36,27 @@ class _AxisState(State):
     State.BATCH(state_scale=1.0)
     State.DERIVATIVE("x' = -state_scale * rate * x")
 
+    def state_defaults(self, v, values):
+        del values
+        return {"x": torch.full_like(v, 0.4)}
+
 
 class _AxisDensity(Mechanism):
     Mechanism.RANGE(g=2.0e-4, e=-52.0)
     Mechanism.BATCH(scale=1.0)
-    Mechanism.STATE(_AxisState)
-    Mechanism.INIT(x=0.4)
-    Mechanism.BUFFER("scratch")
+    Mechanism.STATE_BUNDLE(_AxisState)
+    Mechanism.CARRY("scratch")
     Mechanism.NONSPECIFIC_CURRENT("i")
-    Mechanism.SAVE("i")
+    Mechanism.SAVE_CURRENT("i")
     Mechanism.AFFINE("i")
 
-    def initial(self, v):
-        self.scratch = torch.zeros_like(v)
+    def initial_values(self, v, values):
+        del values
+        return {"scratch": torch.zeros_like(v)}
 
-    def breakpoint(self, v):
-        self.scratch = 0.5 * v
+    def advance(self, v, dt, values):
+        del dt, values
+        return {"scratch": 0.5 * v}
 
     def i(self, v):
         return self.scale * self.g * self.x * (v - self.e)
@@ -94,8 +99,18 @@ class _FlatDefaultDensity(Mechanism):
     Mechanism.RANGE(value=torch.arange(6, dtype=DTYPE))
 
 
+class _FlatInitState(State):
+    State.STATE("x")
+    State.RANGE(x0=torch.arange(6, dtype=DTYPE))
+    State.DERIVATIVE("x' = 0 * x")
+
+    def state_defaults(self, v, values):
+        del v, values
+        return {"x": self.x0}
+
+
 class _FlatInitDensity(Mechanism):
-    Mechanism.INIT(x=torch.arange(6, dtype=DTYPE))
+    Mechanism.STATE_BUNDLE(_FlatInitState)
 
 
 class _NoBatchDensity(Mechanism):
@@ -111,10 +126,13 @@ class _NestedBatchState(State):
     State.BATCH(scale=1.0)
     State.DERIVATIVE("x' = -scale * x")
 
+    def state_defaults(self, v, values):
+        del values
+        return {"x": torch.ones_like(v)}
+
 
 class _NestedBatchOnly(Mechanism):
-    Mechanism.STATE(_NestedBatchState)
-    Mechanism.INIT(x=1.0)
+    Mechanism.STATE_BUNDLE(_NestedBatchState)
 
 
 class _BatchRandOnly(Mechanism):
@@ -176,18 +194,21 @@ def test_opt_in_shared_columns_preserve_all_mechanism_storage_axes(
     assert mechanism.shape_p == expected_parameter_shape
     assert mechanism.shape_f == expected_full_shape
 
-    # RANGE parameters, state storage, SAVE mirrors, and mechanism BUFFERs all
-    # use shape_p at construction.  Explicit runtime batches stay broadcastable
-    # rather than being redundantly materialized in parameter storage.
+    # RANGE parameters and State storage use shape_p at construction. Explicit
+    # runtime batches stay broadcastable rather than being redundantly
+    # materialized in parameter storage.
     for value in (
         mechanism.g,
         mechanism.e,
         mechanism.x,
-        mechanism.i_,
-        mechanism.scratch,
         state.rate,
     ):
         assert tuple(value.shape) == expected_parameter_shape
+    # Persistent CARRY is execution state and therefore owns every runtime
+    # batch lane from construction onward. Framework-owned saved-current
+    # mirrors follow that same runtime-state layout.
+    assert tuple(mechanism.scratch.shape) == expected_full_shape
+    assert tuple(mechanism.i_.shape) == expected_full_shape
 
     # BATCH means every structural axis except the final compartment axis.
     # Preserving N therefore changes (1,) into (N, 1), with explicit batch
@@ -205,7 +226,7 @@ def test_opt_in_shared_columns_preserve_all_mechanism_storage_axes(
 
     # Initialization materializes dynamic state over explicit runtime batches;
     # parameter buffers keep their singleton broadcast prefix.  A real step
-    # then exercises both SAVE and user BUFFER rebinding at shape_f.
+    # then exercises both SAVE_CURRENT and user CARRY rebinding at shape_f.
     population.initialize()
     assert tuple(mechanism.x.shape) == expected_full_shape
     assert tuple(mechanism.scratch.shape) == expected_full_shape

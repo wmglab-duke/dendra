@@ -5,6 +5,7 @@ import hashlib
 import itertools
 import math
 import os
+import random
 import re
 import sys
 import textwrap
@@ -57,6 +58,10 @@ from dendra.helpers import (
 from dendra.models.backend import Backend as A
 from dendra.models.callbacks import Callback, CallbackList
 from dendra.models.graph import get_area_from_graph
+from dendra.models.initialization import (
+    _InitializationTransformAction,
+    _InitializationTransformHook,
+)
 from dendra.models.integrators import bwd_euler_sc, bwd_euler_ub
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
@@ -340,11 +345,6 @@ def _mechanism_global_parameter_names(mechanism):
         for declaration in ("_global", "_global_p", "_global_n"):
             names.update(getattr(owner, declaration, {}).keys())
     return names
-
-
-def _mechanism_initial_defaults(mechanism):
-    """Return class-declared mechanism state initial values."""
-    return dict(getattr(mechanism, "_init", {}))
 
 
 def _project_indexed_override(
@@ -911,6 +911,7 @@ class Population(P, Sliceable):
 
         self.pre_initialize_hooks: List[Callable] = []
         self.post_initialize_hooks: List[Callable] = []
+        self._initialization_transforms = torch.nn.ModuleDict()
 
         reset_torch_compiler(prefer_public=False)
 
@@ -1117,10 +1118,35 @@ class Population(P, Sliceable):
                     if id(value) not in memo:
                         memo[id(value)] = value.detach().clone()
                     detached_runtime = True
+        handler = getattr(self, "mech", None)
+        if handler is not None:
+            # MechanismHandler keeps current/conductance aggregation planes in
+            # plain Python lists for the imperative hot path. They can carry a
+            # live training graph even though they are not registered buffers.
+            for scratch_name in ("_buf_i", "_buf_g"):
+                values = getattr(handler, scratch_name, ())
+                for value in values:
+                    if torch.is_tensor(value) and not value.is_leaf:
+                        memo.setdefault(id(value), value.detach().clone())
+                        detached_runtime = True
 
         result = self.__class__.__new__(self.__class__)
         memo[id(self)] = result
-        state = _copy.deepcopy(self.__getstate__(), memo)
+        if self.__class__.__module__ == "torch.nn.utils.parametrize":
+            # torch.nn parametrization installs a dynamic wrapper class whose
+            # __getstate__ deliberately rejects pickle serialization. A Dendra
+            # runtime deepcopy is not serialization: locate the first authored
+            # Dendra state hook below that wrapper so functional lowering and
+            # other private execution clones retain normal Population cleanup.
+            getstate = next(
+                owner.__dict__["__getstate__"]
+                for owner in self.__class__.__mro__[1:]
+                if "__getstate__" in owner.__dict__
+            )
+            source_state = getstate(self)
+        else:
+            source_state = self.__getstate__()
+        state = _copy.deepcopy(source_state, memo)
         result.__setstate__(state)
 
         if detached_runtime and getattr(result, "is_built", False):
@@ -1417,6 +1443,18 @@ class Population(P, Sliceable):
         finally:
             if has_remainder:
                 state_dict[key] = incoming
+
+        # Registered timestep workspaces and solver buffers remain part of the
+        # ordinary state-dict schema for compatibility, but they are derived
+        # from the next execution's parameters, geometry, and dt.  Any load—
+        # including direct ``load_state_dict``—must therefore force a coherent
+        # rebuild before those restored values can be consumed. This also applies
+        # to nested loading through a Network: Network execution cannot lazily
+        # rebuild one child, so its runtime contract must fail closed and require
+        # Network.initialize(dt) before the next step.
+        integrator = getattr(self, "integrator", None)
+        if integrator is not None:
+            integrator.initialized = False
 
         if not has_remainder:
             if strict:
@@ -2007,6 +2045,35 @@ class Population(P, Sliceable):
         """
         self.post_initialize_hooks.append(fn)
 
+    def register_post_initialize_transform(
+        self,
+        name: str,
+        module: torch.nn.Module,
+        reads=(),
+        writes=(),
+        inputs=None,
+    ):
+        """Register a pure tensor transform after mechanism initialization.
+
+        Parameters are canonical tensor references. ``inputs`` is an ordered
+        mapping of explicit tensor inputs owned by the registered action. The
+        stateless module receives ``(*reads, *inputs)`` and must return one
+        tuple entry per declared write.
+
+        Returns
+        -------
+        _InitializationTransformAction
+            The registered private action, including its explicit input buffers.
+        """
+        return self._register_initialize_transform(
+            "post",
+            name,
+            module,
+            reads=reads,
+            writes=writes,
+            inputs=inputs,
+        )
+
     def register_pre_initialize_hook(self, fn: Callable):
         """
         Register a hook executed before model initialization.
@@ -2026,6 +2093,443 @@ class Population(P, Sliceable):
         self.pre_initialize_hooks.append(fn)
         if hasattr(self, "_caches"):
             self.clear_steady_state()
+
+    def register_pre_initialize_transform(
+        self,
+        name: str,
+        module: torch.nn.Module,
+        reads=(),
+        writes=(),
+        inputs=None,
+    ):
+        """Register a pure tensor transform before mechanism initialization.
+
+        Parameters are canonical tensor references. ``inputs`` is an ordered
+        mapping of explicit tensor inputs owned by the registered action. The
+        stateless module receives ``(*reads, *inputs)`` and must return one
+        tuple entry per declared write.
+
+        Returns
+        -------
+        _InitializationTransformAction
+            The registered private action, including its explicit input buffers.
+        """
+        return self._register_initialize_transform(
+            "pre",
+            name,
+            module,
+            reads=reads,
+            writes=writes,
+            inputs=inputs,
+        )
+
+    def _register_initialize_transform(
+        self,
+        phase,
+        name,
+        module,
+        *,
+        reads,
+        writes,
+        inputs,
+    ):
+        shared_state_references = tuple(
+            reference
+            for reference in (*reads, *writes)
+            if reference.startswith(("state.ions.", "state.materials."))
+        )
+        if phase != "post" and shared_state_references:
+            raise ValueError(
+                "Ion/Material state is only coherent after the initialization "
+                "transaction and may only be read by post transforms: "
+                f"{shared_state_references!r}."
+            )
+        shared_state_writes = tuple(
+            reference
+            for reference in writes
+            if reference.startswith(("state.ions.", "state.materials."))
+        )
+        if shared_state_writes:
+            raise ValueError(
+                "Post-initialization Ion/Material references are read-only; "
+                "writing them would require another guard, equilibrium, current, "
+                f"and local-synchronization transaction: {shared_state_writes!r}."
+            )
+        if name in self._initialization_transforms:
+            raise ValueError(
+                f"Initialization transform name {name!r} is already registered. "
+                "Names must be unique across both phases."
+            )
+        action = _InitializationTransformAction(
+            name,
+            phase,
+            module,
+            reads=reads,
+            writes=writes,
+            inputs=inputs,
+        )
+        self._initialization_transforms[name] = action
+        hook = _InitializationTransformHook(name, phase)
+        hooks = (
+            self.pre_initialize_hooks if phase == "pre" else self.post_initialize_hooks
+        )
+        hooks.append(hook)
+        if phase == "pre" and hasattr(self, "_caches"):
+            self.clear_steady_state()
+        return action
+
+    def _resolve_initialization_transform_reference(self, reference):
+        if reference.startswith("parameters."):
+            name = reference.removeprefix("parameters.")
+            parameters = dict(self.named_parameters())
+            try:
+                return parameters[name]
+            except KeyError as exc:
+                raise KeyError(
+                    f"Initialization transform references unknown parameter "
+                    f"{name!r}. Available canonical parameters are "
+                    f"{tuple(parameters)!r}."
+                ) from exc
+
+        if reference == "state.integrator.v":
+            target = self.v
+        elif reference == "state.clock.t":
+            target = self.t
+        elif reference == "state.control.duration_remainder":
+            target = self._duration_remainder
+        elif reference.startswith("state.mechanisms."):
+            path = reference.removeprefix("state.mechanisms.")
+            mechanism_name, state_name = path.rsplit(".", 1)
+            handler = getattr(self, "mech", None)
+            mechanisms = getattr(handler, "mechanisms", {})
+            if mechanism_name not in mechanisms:
+                raise KeyError(
+                    f"Initialization transform references unknown mechanism "
+                    f"{mechanism_name!r}. Available mechanisms are "
+                    f"{tuple(mechanisms)!r}."
+                )
+            mechanism = mechanisms[mechanism_name]
+            declared_states = set(getattr(mechanism, "_all_states", ()))
+            if (
+                state_name not in declared_states
+                or state_name not in mechanism._buffers
+            ):
+                raise KeyError(
+                    f"Initialization transform references undeclared state "
+                    f"{state_name!r} on mechanism {mechanism_name!r}. Available "
+                    f"states are {tuple(sorted(declared_states))!r}."
+                )
+            target = mechanism._buffers[state_name]
+        elif reference.startswith("state.ions."):
+            path = reference.removeprefix("state.ions.")
+            ion_name, field_name = path.rsplit(".", 1)
+            handler = getattr(self, "mech", None)
+            ions = getattr(handler, "ions", {})
+            if ion_name not in ions:
+                raise KeyError(
+                    f"Initialization transform references unknown Ion "
+                    f"{ion_name!r}. Available Ions are {tuple(ions)!r}."
+                )
+            ion = ions[ion_name]
+            if field_name not in ion.fields or field_name not in ion._buffers:
+                raise KeyError(
+                    f"Initialization transform references unknown Ion field "
+                    f"{ion_name}.{field_name}. Available fields are "
+                    f"{tuple(ion.fields)!r}."
+                )
+            target = ion._buffers[field_name]
+        elif reference.startswith("state.materials."):
+            path = reference.removeprefix("state.materials.")
+            material_name, field_name = path.rsplit(".", 1)
+            handler = getattr(self, "mech", None)
+            materials = getattr(handler, "materials", {})
+            if material_name not in materials:
+                raise KeyError(
+                    f"Initialization transform references unknown Material "
+                    f"{material_name!r}. Available Materials are "
+                    f"{tuple(materials)!r}."
+                )
+            material = materials[material_name]
+            if field_name not in material.fields or field_name not in material._buffers:
+                raise KeyError(
+                    f"Initialization transform references unknown Material field "
+                    f"{material_name}.{field_name}. Available fields are "
+                    f"{tuple(material.fields)!r}."
+                )
+            target = material._buffers[field_name]
+        else:  # validated when the action was constructed
+            raise RuntimeError(
+                f"Unsupported initialization transform reference {reference!r}."
+            )
+
+        if not torch.is_tensor(target):
+            raise TypeError(
+                f"Initialization transform reference {reference!r} is not Tensor-valued."
+            )
+        return target
+
+    @staticmethod
+    def _initialization_transform_argument(value):
+        return value.detach().clone(memory_format=torch.preserve_format)
+
+    @staticmethod
+    def _initialization_transform_numpy_rng_equal(left, right):
+        return all(
+            (
+                np.array_equal(left_item, right_item)
+                if isinstance(left_item, np.ndarray)
+                else left_item == right_item
+            )
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+
+    def _evaluate_initialization_transform(self, action, values):
+        arguments = tuple(
+            self._initialization_transform_argument(value) for value in values
+        )
+        # Inference tensors intentionally do not expose version counters. The
+        # arguments are private clones, so skipping this diagnostic in inference
+        # mode cannot let an authored in-place write escape into model state.
+        versions = (
+            None
+            if torch.is_inference_mode_enabled()
+            else tuple(argument._version for argument in arguments)
+        )
+        torch_rng = torch.random.get_rng_state()
+        python_rng = random.getstate()
+        numpy_rng = np.random.get_state()
+        device_rng = None
+        device = self.device()
+        if device.type == "cuda":  # pragma: no cover - CUDA test slice
+            device_rng = torch.cuda.get_rng_state(device)
+        elif device.type == "mps" and hasattr(torch.mps, "get_rng_state"):
+            device_rng = torch.mps.get_rng_state()
+
+        try:
+            result = action(*arguments)
+            changed_arguments = (
+                ()
+                if versions is None
+                else tuple(
+                    index
+                    for index, (argument, version) in enumerate(
+                        zip(arguments, versions, strict=True)
+                    )
+                    if argument._version != version
+                )
+            )
+            consumed_rng = (
+                not torch.equal(torch.random.get_rng_state(), torch_rng)
+                or random.getstate() != python_rng
+                or not self._initialization_transform_numpy_rng_equal(
+                    np.random.get_state(), numpy_rng
+                )
+            )
+            if device_rng is not None:
+                if device.type == "cuda":  # pragma: no cover - CUDA test slice
+                    consumed_rng = consumed_rng or not torch.equal(
+                        torch.cuda.get_rng_state(device), device_rng
+                    )
+                else:
+                    consumed_rng = consumed_rng or not torch.equal(
+                        torch.mps.get_rng_state(), device_rng
+                    )
+        finally:
+            torch.random.set_rng_state(torch_rng)
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+            if device_rng is not None:
+                if device.type == "cuda":  # pragma: no cover - CUDA test slice
+                    torch.cuda.set_rng_state(device_rng, device)
+                else:
+                    torch.mps.set_rng_state(device_rng)
+
+        if changed_arguments:
+            raise RuntimeError(
+                f"Initialization transform {action.name!r} mutated tensor arguments "
+                f"{changed_arguments!r}; transforms must return new values."
+            )
+        if consumed_rng:
+            raise RuntimeError(
+                f"Initialization transform {action.name!r} consumed implicit RNG "
+                "state; randomness must be supplied as an explicit input."
+            )
+        return result
+
+    @staticmethod
+    def _normalize_initialization_transform_output(action, reference, value, target):
+        if not torch.is_tensor(value):
+            raise TypeError(
+                f"Initialization transform {action.name!r} output for {reference!r} "
+                "must be a Tensor."
+            )
+        value = value.to(device=target.device, dtype=target.dtype)
+        try:
+            value = torch.broadcast_to(value, tuple(target.shape))
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Initialization transform {action.name!r} output for {reference!r} "
+                f"has shape {tuple(value.shape)}, which is not broadcastable to "
+                f"target shape {tuple(target.shape)}."
+            ) from exc
+        return value.clone(memory_format=torch.preserve_format)
+
+    @staticmethod
+    def _preserved_stochastic_parameter_buffers(owner):
+        names = tuple(getattr(owner, "random_parameters", ())) + tuple(
+            getattr(owner, "runtime_noises", ())
+        )
+        return {
+            name: getattr(owner, name)
+            .detach()
+            .clone(memory_format=torch.preserve_format)
+            for name in names
+            if torch.is_tensor(getattr(owner, name, None))
+        }
+
+    @classmethod
+    def _rematerialize_parameter_owner(cls, owner):
+        derive = getattr(owner, "_derive_parameter_buffers", None)
+        install = getattr(owner, "_install_parameter_buffers", None)
+        if not callable(derive) or not callable(install):
+            return
+        preserved = cls._preserved_stochastic_parameter_buffers(owner)
+        values = derive()
+        for name, value in preserved.items():
+            if name in values:
+                values[name] = value
+        install(values)
+        make_contiguous = getattr(owner, "make_contiguous", None)
+        if callable(make_contiguous):
+            make_contiguous()
+
+    def _deterministically_rematerialize_initialization_parameters(self):
+        # Parameter wrappers may cache resolved raw leaves in eval mode. A raw
+        # output is a new generation even though initialization itself remains
+        # an imperative no-grad transaction.
+        for module in self.modules():
+            clear_cache = getattr(module, "clear_cache", None)
+            if callable(clear_cache):
+                clear_cache()
+
+        self._rematerialize_parameter_owner(self)
+        self._refresh_parameter_views_for_initialization()
+
+        handler = getattr(self, "mech", None)
+        if handler is None:
+            return
+        sync_celsius = getattr(handler, "_sync_celsius", None)
+        if callable(sync_celsius):
+            sync_celsius(self.celsius)
+        make_maps = getattr(handler, "make_maps", None)
+        if callable(make_maps):
+            make_maps()
+        set_buffers = getattr(handler, "set_buffers", None)
+        if callable(set_buffers):
+            set_buffers(self.diam)
+
+        mechanisms = tuple(getattr(handler, "mechanisms", {}).values())
+        processes = tuple(getattr(handler, "material_processes", {}).values())
+        owners = (*mechanisms, *processes)
+        for owner in owners:
+            self._rematerialize_parameter_owner(owner)
+            for state in getattr(owner, "DE", {}).values():
+                self._rematerialize_parameter_owner(state)
+
+        from dendra.models.mechanisms._state import _materialize_derived_buffers
+
+        for owner in owners:
+            _materialize_derived_buffers(owner)
+            for state in getattr(owner, "DE", {}).values():
+                _materialize_derived_buffers(state)
+
+    def _invalidate_integrator_after_initialization_transform(self):
+        integrator = getattr(self, "integrator", None)
+        if integrator is None:
+            return
+        integrator.initialized = False
+        compiled = getattr(integrator, "_compiled_kernels", None)
+        if hasattr(compiled, "clear"):
+            compiled.clear()
+
+    def _execute_initialization_transform(self, action_name, *, phase):
+        try:
+            action = self._initialization_transforms[action_name]
+        except KeyError as exc:
+            raise KeyError(
+                f"Initialization transform {action_name!r} is not registered."
+            ) from exc
+        if action.phase != phase:
+            raise RuntimeError(
+                f"Initialization transform {action_name!r} is registered for "
+                f"phase {action.phase!r}, not {phase!r}."
+            )
+
+        reads = tuple(
+            self._resolve_initialization_transform_reference(reference)
+            for reference in action.reads
+        )
+        targets = tuple(
+            self._resolve_initialization_transform_reference(reference)
+            for reference in action.writes
+        )
+        if len({id(target) for target in targets}) != len(targets):
+            raise ValueError(
+                f"Initialization transform {action.name!r} writes aliased targets."
+            )
+        result = self._evaluate_initialization_transform(
+            action,
+            (*reads, *action.input_values()),
+        )
+        if type(result) is not tuple:
+            raise TypeError(
+                f"Initialization transform {action.name!r} must return an exact "
+                "tuple with one entry per declared write."
+            )
+        if len(result) != len(action.writes):
+            raise ValueError(
+                f"Initialization transform {action.name!r} returned {len(result)} "
+                f"outputs for {len(action.writes)} declared writes."
+            )
+        staged = tuple(
+            self._normalize_initialization_transform_output(
+                action,
+                reference,
+                value,
+                target,
+            )
+            for reference, value, target in zip(
+                action.writes,
+                result,
+                targets,
+                strict=True,
+            )
+        )
+
+        snapshots = tuple(target.detach().clone() for target in targets)
+        writes_parameters = any(
+            reference.startswith("parameters.") for reference in action.writes
+        )
+        try:
+            for target, value in zip(targets, staged, strict=True):
+                target.copy_(value)
+            if writes_parameters:
+                self._deterministically_rematerialize_initialization_parameters()
+        except Exception:
+            for target, snapshot in zip(targets, snapshots, strict=True):
+                target.copy_(snapshot)
+            if writes_parameters:
+                try:
+                    self._deterministically_rematerialize_initialization_parameters()
+                except Exception:
+                    # Preserve the primary transform failure. The population and
+                    # integrator remain fail-closed; initialize() must be retried.
+                    pass
+            raise
+        finally:
+            self._invalidate_integrator_after_initialization_transform()
+
+        return tuple(targets)
 
     def device(self):
         """
@@ -3344,6 +3848,20 @@ class Population(P, Sliceable):
         # pre-initialization hooks/Mechanism INITIAL blocks before restoring it.
         if self._restore_steady_state():
             return self
+
+        # Fresh initialization starts with a zero population clock and a
+        # construction-fresh handler timestep view. Establish those explicit
+        # hook inputs before any authored population/mechanism/state hook. The
+        # integrator's cached Python metadata was invalidated above and must not
+        # be interpreted as a prepared runtime configuration.
+        self.t = torch.zeros_like(self.t).detach()
+        reset_initialization_timestep = getattr(
+            self.mech,
+            "_reset_initialization_timestep",
+            None,
+        )
+        if callable(reset_initialization_timestep):
+            reset_initialization_timestep()
 
         random_generation = object() if populate_parameter_buffers else None
         if populate_parameter_buffers:
@@ -5211,33 +5729,6 @@ class Population(P, Sliceable):
         """
         return self.v.shape[-2]
 
-    def set_value(self, name: str, value: torch.Tensor):
-        """
-        Set an initialization input or state variable by name.
-
-        The value is applied after voltage reset and before mechanism
-        initialization, so dependency-driving values such as ``v`` and
-        ``celsius`` participate in gate initialization and Q10 caches. Adding
-        an override invalidates any cached steady state.
-
-        Parameters
-        ----------
-        name : str
-            The name of the parameter or state variable to set.
-        value : torch.Tensor
-            The value to set for the specified parameter or state variable.
-        """
-
-        def _set_value(model):
-            if hasattr(model, name):
-                getattr(model, name).copy_(
-                    value.to(device=model.device(), dtype=model.dtype())
-                )
-            else:
-                raise AttributeError(f"Model has no attribute '{name}' to set.")
-
-        self.register_pre_initialize_hook(_set_value)
-
     # -- batching stuff --
     def is_batched(self):
         """
@@ -5691,6 +6182,8 @@ class Population(P, Sliceable):
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
         r"""
         Run a long simulation in chunks using activation checkpointing.
@@ -5725,20 +6218,32 @@ class Population(P, Sliceable):
             of checkpoint inputs. This is safer but may incur a memory overhead.
             Default is False.
         restore_state_after_backward : bool, optional
-            If True, restore model state to the end of the forward pass after
-            backward. This is useful when further simulation or evaluation is
-            needed after backpropagation. Default is True.
+            If True, isolate checkpoint replay from the live model so backward,
+            ``autograd.grad``, and higher-order derivatives do not leave its
+            buffers at an internal chunk boundary. This is useful when further
+            simulation or evaluation is needed after differentiation. Default
+            is True.
         return_final_state : bool, optional
             If True, return a tuple (loss, final_state) where final_state is a
             checkpoint state dictionary suitable for restore_dict_from_checkpoint.
             Default is False.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Native pure callback plan made from a FunctionalPopulation bound to
+            this exact source model. It runs beside, and does not replace, the
+            imperative hooks in ``callbacks``.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Explicit carry returned by a previous native callback execution.
+            Requires ``functional_callbacks`` and resumes without reinitializing.
 
         Returns
         -------
-        torch.Tensor or None, or (torch.Tensor or None, dict)
+        torch.Tensor or None or tuple
             If return_final_state is False (default): returns the total loss contribution
             from callbacks, or None if no hook returned a non-None value.
             If return_final_state is True: returns (loss_or_none, final_state_dict).
+            When ``functional_callbacks`` is supplied, its result is appended:
+            ``(loss_or_none, callback_results)`` or
+            ``(loss_or_none, final_state_dict, callback_results)``.
 
 
         Notes
@@ -5772,6 +6277,24 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        if functional_callbacks is None:
+            if functional_callback_state is not None:
+                raise ValueError(
+                    "functional_callback_state requires functional_callbacks"
+                )
+            functional_callback_binding = None
+        else:
+            from dendra.func._callbacks import (
+                FunctionalCallbackResults,
+                FunctionalCallbacks,
+            )
+
+            if not isinstance(functional_callbacks, FunctionalCallbacks):
+                raise TypeError(
+                    "functional_callbacks must be a FunctionalCallbacks plan "
+                    "created by functional.make_callbacks(...)"
+                )
+            functional_callback_binding = functional_callbacks._bind_imperative(self)
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
         )
@@ -5782,6 +6305,8 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
+        if functional_callback_binding is not None:
+            functional_callbacks._validate_runtime_dt(dt_f)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
@@ -5831,8 +6356,8 @@ class Population(P, Sliceable):
 
         def _copy_state_containers(sd: Dict[str, Any]) -> Dict[str, Any]:
             """
-            Copy only nested containers (not tensors). Useful to protect the
-            backward-restore hook from accidental user mutation of the returned dict.
+            Copy only nested containers (not tensors) so checkpoint replay can
+            restore the captured live bindings after mutating the module.
             """
 
             def _copy(value):
@@ -5846,6 +6371,59 @@ class Population(P, Sliceable):
 
             return _copy(sd)
 
+        class _PreserveModelStateDuringRecompute:
+            """Reusable context for first- and higher-order checkpoint replay."""
+
+            def __init__(context_self):
+                context_self._previous = []
+
+            def __enter__(context_self):
+                context_self._previous.append(
+                    _copy_state_containers(self.state_dict_for_checkpoint())
+                )
+                return None
+
+            def __exit__(context_self, exc_type, exc_value, traceback):
+                previous = context_self._previous.pop()
+                self.restore_dict_from_checkpoint(previous)
+                return False
+
+        def _checkpoint_contexts():
+            return nullcontext(), _PreserveModelStateDuringRecompute()
+
+        def _prepare_functional_callback_state():
+            """Establish explicit native carry and the optional initial sample."""
+
+            if functional_callback_binding is None:
+                return None, []
+            if functional_callback_state is None:
+                native_state, initial_emission = functional_callbacks._initialize(
+                    functional_callback_binding.state()
+                )
+                initial_part = functional_callbacks._stack([initial_emission])
+                parts = (
+                    [initial_part]
+                    if functional_callbacks._has_emissions(initial_part)
+                    else []
+                )
+                return native_state, parts
+            return functional_callbacks._validate_state(functional_callback_state), []
+
+        def _finalize_functional_callback_results(native_state, parts):
+            """Finalize one imperative execution segment without hiding carry."""
+
+            stacked = functional_callbacks._concatenate(parts)
+            native_state = functional_callbacks._capture_emission_schemas(
+                native_state,
+                stacked,
+            )
+            outputs = functional_callbacks._finalize(native_state, stacked)
+            native_state = functional_callbacks._materialize_state(native_state)
+            return FunctionalCallbackResults(
+                state=native_state,
+                outputs=outputs,
+            )
+
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
                 # --------------------------------------------------------------
@@ -5857,9 +6435,22 @@ class Population(P, Sliceable):
 
                 if t.numel() == 0:
                     self._set_duration_remainder(duration_remainder)
+                    if functional_callback_binding is None:
+                        if return_final_state:
+                            return None, self.state_dict_for_checkpoint()
+                        return None
+                    native_state, callback_parts = _prepare_functional_callback_state()
+                    functional_results = _finalize_functional_callback_results(
+                        native_state,
+                        callback_parts,
+                    )
                     if return_final_state:
-                        return None, self.state_dict_for_checkpoint()
-                    return None
+                        return (
+                            None,
+                            self.state_dict_for_checkpoint(),
+                            functional_results,
+                        )
+                    return None, functional_results
 
                 n_chunks = math.ceil(len(t) / chunklength)
                 t_chunks = torch.tensor_split(t, n_chunks)
@@ -5881,6 +6472,8 @@ class Population(P, Sliceable):
                     compile_scope="population",
                 )
 
+                native_state, callback_parts = _prepare_functional_callback_state()
+
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
@@ -5896,6 +6489,12 @@ class Population(P, Sliceable):
 
                 # Local alias for speed
                 _checkpoint = torch.utils.checkpoint.checkpoint
+                checkpoint_options = {
+                    "use_reentrant": False,
+                    "determinism_check": "none",
+                }
+                if restore_state_after_backward:
+                    checkpoint_options["context_fn"] = _checkpoint_contexts
 
                 # --------------------------------------------------------------
                 # Main chunk loop (checkpointed)
@@ -5988,9 +6587,145 @@ class Population(P, Sliceable):
 
                         return state_out, chunk_loss, saw_loss_flag
 
-                    state, chunk_loss, saw_loss_flag = _checkpoint(
-                        _run_chunk, state, use_reentrant=False, determinism_check="none"
-                    )
+                    if functional_callback_binding is None:
+                        state, chunk_loss, saw_loss_flag = _checkpoint(
+                            _run_chunk,
+                            state,
+                            **checkpoint_options,
+                        )
+                    else:
+
+                        def _run_chunk_functional(
+                            state_in,
+                            native_state_in,
+                            t_chunk_local=t_chunk_local,
+                            chunk_idx=chunk_idx,
+                        ):
+                            # Functional callback carry is an explicit checkpoint
+                            # input/output. The model boundary follows the same
+                            # mutation-safety policy as the ordinary path.
+                            state_local = (
+                                state_in
+                                if not safe_checkpoint
+                                else _clone_checkpoint_state_dict(state_in)
+                            )
+                            self.restore_dict_from_checkpoint(state_local)
+
+                            if with_intra:
+                                stims, indices = intra.init(t_chunk_local)
+                                stims = [s.unbind(-1) for s in stims]
+                            else:
+                                stims, indices = None, None
+
+                            if with_extra:
+                                ve_list = self._compute_extra_chunk(
+                                    extra_cfg,
+                                    chunk_idx,
+                                    t_chunk_local,
+                                )
+                            else:
+                                ve_list = None
+
+                            pre_chunk_hook(callbacks, self, t_chunk_local)
+
+                            chunk_loss = None
+                            saw_loss_local = False
+                            native_state_local = native_state_in
+                            emissions = []
+
+                            for j in range(len(t_chunk_local)):
+                                ve_c = ve_list[j] if ve_list is not None else None
+
+                                if with_intra:
+                                    s = [st[j] for st in stims]
+                                    intra_c = self._call_make_intra(
+                                        intra,
+                                        s,
+                                        indices,
+                                    )
+                                else:
+                                    intra_c = None
+
+                                self._step(
+                                    self.integrator,
+                                    self,
+                                    dt_tensor,
+                                    ve_c,
+                                    intra_c,
+                                )
+                                self.t = self.t + dt_tensor
+
+                                model_state = functional_callback_binding.state()
+                                native_state_local, emitted = (
+                                    functional_callbacks._update(
+                                        native_state_local,
+                                        model_state,
+                                        {"v": model_state["integrator"]["v"]},
+                                    )
+                                )
+                                if emitted is not None:
+                                    emissions.append(emitted)
+
+                                if callbacks:
+                                    for c in callbacks:
+                                        hook = getattr(c, "post_step_hook", None)
+                                        if hook is None:
+                                            continue
+                                        chunk_loss, saw = _add_loss(
+                                            chunk_loss,
+                                            hook(self),
+                                        )
+                                        saw_loss_local = saw_loss_local or saw
+
+                            if callbacks:
+                                for c in callbacks:
+                                    hook = getattr(c, "post_chunk_hook", None)
+                                    if hook is None:
+                                        continue
+                                    chunk_loss, saw = _add_loss(
+                                        chunk_loss,
+                                        hook(self, t_chunk_local),
+                                    )
+                                    saw_loss_local = saw_loss_local or saw
+
+                            state_out = self.state_dict_for_checkpoint()
+                            emitted_part = functional_callbacks._stack(emissions)
+
+                            if chunk_loss is None:
+                                chunk_loss = torch.zeros(
+                                    (),
+                                    device=self.device(),
+                                    dtype=self.dtype(),
+                                )
+
+                            saw_loss_flag = torch.tensor(
+                                1 if saw_loss_local else 0,
+                                device=self.device(),
+                                dtype=torch.int32,
+                            )
+
+                            return (
+                                state_out,
+                                native_state_local,
+                                emitted_part,
+                                chunk_loss,
+                                saw_loss_flag,
+                            )
+
+                        (
+                            state,
+                            native_state,
+                            emitted_part,
+                            chunk_loss,
+                            saw_loss_flag,
+                        ) = _checkpoint(
+                            _run_chunk_functional,
+                            state,
+                            native_state,
+                            **checkpoint_options,
+                        )
+                        if functional_callbacks._has_emissions(emitted_part):
+                            callback_parts.append(emitted_part)
 
                     total_loss, _ = _add_loss(total_loss, chunk_loss)
                     saw_any_loss = saw_any_loss or bool(int(saw_loss_flag.item()))
@@ -6011,43 +6746,28 @@ class Population(P, Sliceable):
                 if progressbar:
                     progressbar.close()
 
-        if not saw_any_loss:
-            if return_final_state:
-                return None, self.state_dict_for_checkpoint()
-            return None
+                functional_results = None
+                if functional_callback_binding is not None:
+                    functional_results = _finalize_functional_callback_results(
+                        native_state,
+                        callback_parts,
+                    )
 
-        # ------------------------------------------------------------------
-        # IMPORTANT: preserve forward-final model state across backward.
-        #
-        # With checkpointing, backward re-runs chunk forwards and therefore
-        # re-mutates self.t / buffers. Without intervention, the module state
-        # after loss.backward() will typically reflect the last recomputed
-        # chunk, not the true forward-final state.
-        #
-        # We snapshot the final state and schedule a restoration callback at
-        # the *end* of backward.
-        # ------------------------------------------------------------------
+        if not saw_any_loss:
+            total_loss = None
+            if functional_callback_binding is None:
+                if return_final_state:
+                    return None, self.state_dict_for_checkpoint()
+                return None
+
         final_state = None
-        if restore_state_after_backward or return_final_state:
+        if return_final_state:
             final_state = self.state_dict_for_checkpoint()
 
-        if restore_state_after_backward:
-            # Protect hook state from accidental external mutation of the dict structure.
-            final_state_for_hook = _copy_state_containers(final_state)
-
-            def _queue_restore(grad, fs=final_state_for_hook):
-                # Must be called during backward; this schedules restore after
-                # the autograd engine finishes the backward pass.
-                torch.autograd.Variable._execution_engine.queue_callback(
-                    lambda: self.restore_dict_from_checkpoint(fs)
-                )
-                return grad
-
-            # Only meaningful if backward will actually run through this tensor.
-            # (register_hook requires requires_grad=True)
-            if isinstance(total_loss, torch.Tensor) and total_loss.requires_grad:
-                total_loss.register_hook(_queue_restore)
-
+        if functional_callback_binding is not None:
+            if return_final_state:
+                return total_loss, final_state, functional_results
+            return total_loss, functional_results
         if return_final_state:
             return total_loss, final_state
         return total_loss
@@ -8532,10 +9252,17 @@ class Myelinated(Axon):
                 Scaled axial resistivity values.
             """
             diameters = diameters.unsqueeze(1) if diameters.ndim == 1 else diameters
-            axon_d = self.axond1 * diameters**2 + self.axond2 * diameters + self.axond3
-            deltax = (
-                self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
-            )
+            # Retain one logical singleton axis for scalar coefficients. This
+            # preserves an empty hidden vmap lane instead of selecting lane
+            # zero during scalar-by-spatial broadcasting.
+            axond1 = self.axond1.reshape(1)
+            axond2 = self.axond2.reshape(1)
+            axond3 = self.axond3.reshape(1)
+            deltax1 = self.deltax1.reshape(1)
+            deltax2 = self.deltax2.reshape(1)
+            deltax3 = self.deltax3.reshape(1)
+            axon_d = axond1 * diameters**2 + axond2 * diameters + axond3
+            deltax = deltax1 * diameters**2 + deltax2 * diameters + deltax3
             deltax = deltax / dx
             scale = 1 / ((axon_d / diam) ** 2)
             rhoa = rhoa * scale * deltax
@@ -8564,7 +9291,12 @@ class Myelinated(Axon):
             Tensor
                 Node diameters in μm.
             """
-            node_d = self.noded1 * diam**2 + self.noded2 * diam + self.noded3
+            # See ``myelinated_rhoa.forward``: the singleton keeps scalar
+            # coefficients well-defined for zero-sized outer vmap lanes.
+            noded1 = self.noded1.reshape(1)
+            noded2 = self.noded2.reshape(1)
+            noded3 = self.noded3.reshape(1)
+            node_d = noded1 * diam**2 + noded2 * diam + noded3
             return node_d
 
     def __init__(
@@ -9071,12 +9803,6 @@ def _population_axis_parameter_layout_is_safe(
         _broadcasts_to_shape(value, natural_shape) for value in ic.values()
     ):
         return False
-    if not all(
-        _broadcasts_to_shape(value, natural_shape)
-        for value in getattr(mechanism, "_init", {}).values()
-    ):
-        return False
-
     # RANGE overrides already carry exact flattened record-local keys, so their
     # values retain row-major meaning when the destination buffer becomes
     # (N, K). BATCH overrides collapse those keys by the new population axis;

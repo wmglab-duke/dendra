@@ -328,7 +328,13 @@ def _run_dendra(case, dt):
     model = case.build_dendra()
     mechanism = model.mech.hh
     expected_q10 = 3.0 ** ((float(model.celsius) - 6.3) / 10.0)
-    assert float(mechanism.DE["mhn"].q10()) == pytest.approx(expected_q10, rel=2.0e-15)
+    q10 = mechanism.DE["mhn"].q10
+    torch.testing.assert_close(
+        q10,
+        torch.full_like(q10, expected_q10),
+        rtol=2.0e-15,
+        atol=0.0,
+    )
     nodes = torch.as_tensor(case.record_nodes, dtype=torch.long)
     recorder = dn.callbacks.RecorderLambda(
         {

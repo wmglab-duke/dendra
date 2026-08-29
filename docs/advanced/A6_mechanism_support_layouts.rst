@@ -5,7 +5,8 @@ Mechanism support layouts
 
 A mechanism's *support* is the ordered set of physical compartments where it
 is installed. Dendra represents that placement independently from the tensors
-holding RANGE values, state, saved currents, and scratch buffers. This lets the
+holding RANGE values, state, saved-current mirrors, and declared workspaces.
+This lets the
 runtime share voltage gathers between mechanisms on the same region and, when
 their current destinations and scatter semantics also agree, reduce several
 local current contributions before one scatter. Mechanism equations do not
@@ -45,11 +46,14 @@ the example above, ``shape_p`` is ``(1, 32, 3)`` and ``shape_f`` is
 ``(8, 32, 3)``.
 
 The population axis changes the meaning of BATCH storage in the intended way.
-RANGE, state, SAVE, and BUFFER fields use ``(..., N, K)``. A BATCH field uses
-``(..., N, 1)``: one value per cell, shared over that mechanism's local
-compartment columns. Under the legacy flat layout the same sparse mechanism
-has only ``(..., 1)`` BATCH storage and therefore shares one value across all
-cells.
+RANGE parameters, solver tensors declared by nested ``State.STATE``, direct
+Mechanism or State ``CARRY``/``ASSIGNED`` values, and ``SAVE_CURRENT`` mirrors
+retain the ``(N, K)`` support axes. A BATCH field uses ``(N, 1)``: one value per
+cell, shared over that mechanism's local compartment columns. Explicit leading
+batch axes remain singleton for parameter storage and are materialized for
+runtime state, carry, assigned values, and saved-current mirrors. Under the
+flat layout the same sparse mechanism has only ``(..., 1)`` BATCH storage and
+therefore shares one value across all cells.
 
 Construction policy and precedence
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -113,7 +117,7 @@ decision.
 Eligibility and fallback
 ------------------------
 
-The initial rollout is fail-closed. Dendra uses population-shaped storage only
+The option is fail-closed. Dendra uses population-shaped storage only
 when all of the following are true:
 
 * the option is enabled on the Population;
@@ -158,8 +162,8 @@ Each handler owns one runtime-only support registry. During construction, and
 again whenever runtime maps are rebuilt after loading or device conversion,
 the registry visits mechanisms in authored order and groups them only when
 their ordered physical support *and* local tensor layout are exactly equal.
-All initialization, state, field-read, breakpoint, and current plans refer to
-the same handler-wide support IDs rather than independently renumbering a
+All initialization, state, field-read, assigned-value, and current plans refer
+to the same handler-wide support IDs rather than independently renumbering a
 support in each phase.
 
 Support IDs are the authored ordinal of the first mechanism in a group and may
@@ -170,10 +174,10 @@ device transition. IDs are derived execution metadata, not a model parameter
 or checkpoint identity; applications should not assign scientific meaning to
 their numeric values.
 
-The schedule reuses a gathered local voltage for current breakpoints,
-initialization, and state advancement while preserving authored mechanism
-order; geometry binding similarly gathers diameter once per support. Ion,
-Material, and accepted ionic-current reads are gathered once per
+The schedule reuses a gathered local voltage for assigned-value evaluation,
+initialization, state advancement, and current assembly while preserving
+authored mechanism order; geometry binding similarly gathers diameter once per
+support. Ion, Material, and accepted ionic-current reads are gathered once per
 ``(field, support)`` group; a Material reader that also writes the same field
 still receives its own clone. During current assembly, adjacent contributions
 to the same current destination and exact support are summed locally and
@@ -193,8 +197,7 @@ or state load could replace. Mechanisms continue to own their parameters,
 state, and compatibility ``key`` buffers, and their public ``get``/``put``
 interface remains available to Slice and other inspection APIs. Regional
 ``VoltageProcess`` updates use the same gather/update/replacement path.
-``MaterialProcess`` execution remains under its dedicated material scheduler
-and will join support-centric execution during the later bundle rollout.
+``MaterialProcess`` execution remains under its dedicated material scheduler.
 
 For the overall initialization lifecycle, see :ref:`model-initialization`.
 
@@ -205,9 +208,10 @@ READ+WRITE binding remains isolated because its local value is intentionally
 mutable before the ordered write-back phase.
 
 This is scheduling reuse, not mechanism fusion. Every mechanism keeps its own
-parameters, state solver, breakpoint, RNG streams, and write semantics.
-Mechanism and State hooks must treat their voltage argument as read-only
-because equal-support mechanisms can receive the same gathered tensor.
+parameters, state solver, assigned-value evaluation, RNG streams, and write
+semantics. Mechanism and State hooks must treat their voltage argument as
+read-only because equal-support mechanisms can receive the same gathered
+tensor.
 
 Structural edits are planned through the same support compiler used by
 ``build()``. If a partial deletion would turn opt-in ``(N, K)`` storage into a
@@ -239,8 +243,7 @@ place or load it from a differently placed model. Change placement through
 share one immutable runtime mapper and support specification, but every
 mechanism retains its own registered compatibility key. The registry owns no
 selector tensors and contributes no ``state_dict`` entries, so ordinary and
-runtime checkpoint formats are unchanged. Removing or interning the redundant
-registered keys remains a later serialization migration.
+runtime checkpoint formats are unchanged.
 
 Inspection and benchmarking
 ---------------------------

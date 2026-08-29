@@ -51,64 +51,56 @@ class _CountingMaterial(Material):
 
 
 class _StepSource(Mechanism):
-    Mechanism.BUFFER("delta")
+    Mechanism.CARRY("delta")
     Mechanism.USEMATERIAL("pool", read=["amount"], source={"amount": "delta"})
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.populate_calls = 0
-        self.initial_calls = 0
 
     def populate(self, *args, **kwargs):
         self.populate_calls = getattr(self, "populate_calls", 0) + 1
         return super().populate(*args, **kwargs)
 
-    def initial(self, v):
-        self.initial_calls += 1
-        self.delta = torch.full_like(v, 0.25)
+    def initial_values(self, v, values):
+        del values
+        return {"delta": torch.full_like(v, 0.25)}
 
 
 class _GuardedWriter(Mechanism):
-    Mechanism.BUFFER("breakpoint_calls")
+    Mechanism.CARRY("advance_calls")
     Mechanism.USEMATERIAL("pool", read=["amount"], write=["amount"])
 
-    def initial(self, v):
-        self.amount = torch.full_like(v, -2.0)
-        self.breakpoint_calls = torch.zeros_like(v)
+    def initial_values(self, v, values):
+        del values
+        return {
+            "amount": torch.full_like(v, -2.0),
+            "advance_calls": torch.zeros_like(v),
+        }
 
-    def breakpoint(self, v):
-        self.breakpoint_calls = self.breakpoint_calls + 1
-        self.amount = torch.full_like(v, -3.0)
+    def advance(self, v, dt, values):
+        del dt
+        return {
+            "amount": torch.full_like(v, -3.0),
+            "advance_calls": values["advance_calls"] + 1,
+        }
 
 
 class _SodiumConcentrationWriter(Mechanism):
     Mechanism.USEION("na", write=["nai"])
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.initial_calls = 0
-
-    def initial(self, v):
-        self.initial_calls += 1
-        self.nai = torch.full_like(v, 5.0)
+    def initial_values(self, v, values):
+        del values
+        return {"nai": torch.full_like(v, 5.0)}
 
 
 class _NernstSodiumCurrent(Mechanism):
-    Mechanism.BUFFER("breakpoint_calls")
     Mechanism.RANGE(g=0.01)
     Mechanism.USEION("na", read=["ena"], write=["ina"])
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.initial_calls = 0
-
-    def initial(self, v):
-        self.initial_calls += 1
-        self.breakpoint_calls = torch.zeros_like(v)
-
-    def breakpoint(self, v):
-        del v
-        self.breakpoint_calls = self.breakpoint_calls + 1
+    def initial_values(self, v, values):
+        del v, values
+        return {}
 
     def ina(self, v):
         return self.g * (v - self.ena)
@@ -118,17 +110,12 @@ class _NernstSodiumCurrent(Mechanism):
 
 
 class _SodiumCurrentReader(Mechanism):
-    Mechanism.BUFFER("initial_seen")
+    Mechanism.CARRY("initial_seen")
     Mechanism.USEION("na", read=["ina"])
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.initial_calls = 0
-
-    def initial(self, v):
+    def initial_values(self, v, values):
         del v
-        self.initial_calls += 1
-        self.initial_seen = self.ina.clone()
+        return {"initial_seen": values["ina"].clone()}
 
 
 def _mechanism(cls, name):
@@ -163,14 +150,12 @@ def test_initialization_excludes_step_sources_and_material_process_phase():
     assert process_calls == 0
     assert material.initialize_calls == 1
     assert source.populate_calls == 1
-    assert source.initial_calls == 1
 
     handler.advance(VOLTAGE, torch.as_tensor(0.025, dtype=DTYPE), CELSIUS)
 
     torch.testing.assert_close(material.amount, torch.full(SHAPE, 1.25, dtype=DTYPE))
     assert process_calls == 1
     assert source.populate_calls == 1
-    assert source.initial_calls == 1
 
 
 def test_replacement_write_is_guarded_without_a_trailing_overwrite():
@@ -197,8 +182,8 @@ def test_replacement_write_is_guarded_without_a_trailing_overwrite():
     torch.testing.assert_close(material.amount, expected)
     torch.testing.assert_close(writer.amount, expected)
     torch.testing.assert_close(
-        writer.breakpoint_calls,
-        torch.full_like(writer.breakpoint_calls, 2.0),
+        writer.advance_calls,
+        torch.zeros_like(writer.advance_calls),
     )
 
 
@@ -244,10 +229,3 @@ def test_final_current_frame_uses_post_commit_nernst_state_without_reinitializin
     torch.testing.assert_close(reader.ina, expected_current)
     torch.testing.assert_close(handler.capture_ion_current_frame()[0], expected_current)
     assert not torch.allclose(reader.initial_seen, expected_current)
-    assert writer.initial_calls == 1
-    assert channel.initial_calls == 1
-    assert reader.initial_calls == 1
-    torch.testing.assert_close(
-        channel.breakpoint_calls,
-        torch.full_like(channel.breakpoint_calls, 2.0),
-    )

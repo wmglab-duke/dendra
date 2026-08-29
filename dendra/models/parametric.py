@@ -209,6 +209,45 @@ def softplus_inv(y, beta: float = 1.0, threshold: float = 20.0, eps: float = 1e-
     return result.to(dtype=original_dtype)
 
 
+def _softplus_transform(
+    value: torch.Tensor,
+    *,
+    beta: float,
+    threshold: float,
+    offset: float = 0.0,
+) -> torch.Tensor:
+    """Apply softplus without selecting from a hidden empty vmap lane.
+
+    ``functional_call`` may bind a logically scalar parameter to a BatchedTensor
+    whose hidden vmap axis has length zero. PyTorch's scalar softplus batching
+    path currently tries to select the first physical lane. Retaining one
+    logical singleton axis across the operation preserves ordinary values while
+    making that empty-lane result well-defined.
+    """
+    scalar = value.ndim == 0
+    work = value.reshape(1) if scalar else value
+    result = offset + F.softplus(work, beta=beta, threshold=threshold)
+    return result.squeeze(0) if scalar else result
+
+
+def _softcap_transform(
+    value: torch.Tensor,
+    *,
+    maximum: float,
+    beta: float,
+    threshold: float,
+) -> torch.Tensor:
+    """Apply a reflected softplus while retaining a logical scalar axis."""
+    scalar = value.ndim == 0
+    work = value.reshape(1) if scalar else value
+    result = maximum - F.softplus(
+        maximum - work,
+        beta=beta,
+        threshold=threshold,
+    )
+    return result.squeeze(0) if scalar else result
+
+
 def resolve(parameter):
     """Resolve a parameter-like object to a tensor value."""
     if isinstance(parameter, torch.nn.Parameter):
@@ -384,21 +423,45 @@ def ste_clamp(y, *, lo=None, hi=None, alpha_lo: float = 1.0, alpha_hi: float = 1
     torch.Tensor
         Tensor that is clamped in the forward pass but keeps surrogate gradients.
     """
-    y_sur = y
-    if lo is not None:
-        y_sur = torch.where(y < lo, lo + alpha_lo * (y - lo), y_sur)
-    if hi is not None:
-        y_sur = torch.where(y > hi, hi + alpha_hi * (y - hi), y_sur)
+    # A logically scalar BatchedTensor may have a hidden vmap axis of length
+    # zero. Scalar comparison/arithmetic batching rules currently try to select
+    # the first physical lane in that case. Keep one logical singleton axis for
+    # the complete transform, as the softplus helpers above do.
+    scalar = y.ndim == 0
+    work = y.reshape(1) if scalar else y
 
-    y_fwd = y
-    if lo is not None:
-        lo_t = torch.as_tensor(lo, device=y.device, dtype=y.dtype)
+    def retain_scalar_axis(bound):
+        if scalar and torch.is_tensor(bound) and bound.ndim == 0:
+            return bound.reshape(1)
+        return bound
+
+    lo_work = retain_scalar_axis(lo)
+    hi_work = retain_scalar_axis(hi)
+
+    y_sur = work
+    if lo_work is not None:
+        y_sur = torch.where(
+            work < lo_work,
+            lo_work + alpha_lo * (work - lo_work),
+            y_sur,
+        )
+    if hi_work is not None:
+        y_sur = torch.where(
+            work > hi_work,
+            hi_work + alpha_hi * (work - hi_work),
+            y_sur,
+        )
+
+    y_fwd = work
+    if lo_work is not None:
+        lo_t = torch.as_tensor(lo_work, device=y.device, dtype=y.dtype)
         y_fwd = torch.maximum(y_fwd, lo_t)
-    if hi is not None:
-        hi_t = torch.as_tensor(hi, device=y.device, dtype=y.dtype)
+    if hi_work is not None:
+        hi_t = torch.as_tensor(hi_work, device=y.device, dtype=y.dtype)
         y_fwd = torch.minimum(y_fwd, hi_t)
 
-    return y_sur + (y_fwd - y_sur).detach()
+    result = y_sur + (y_fwd - y_sur).detach()
+    return result.squeeze(0) if scalar else result
 
 
 # --- modules ---
@@ -607,8 +670,11 @@ class Bounded(cacheable):
         if mode == "hard-ste":
             return ste_clamp(y, hi=self.max_val)
         if mode == "softcap":
-            return self.max_val - F.softplus(
-                self.max_val - y, beta=self.cap_beta, threshold=self.threshold
+            return _softcap_transform(
+                y,
+                maximum=self.max_val,
+                beta=self.cap_beta,
+                threshold=self.threshold,
             )
         # sigmoid mode handled in both-bounds path
         return y
@@ -621,8 +687,11 @@ class Bounded(cacheable):
         # Lower-only
         if self.min_val is not None and self.max_val is None:
             if self.lower_mode == "softplus":
-                return self.min_val + F.softplus(
-                    self.rho, beta=self.beta, threshold=self.threshold
+                return _softplus_transform(
+                    self.rho,
+                    beta=self.beta,
+                    threshold=self.threshold,
+                    offset=self.min_val,
                 )
             elif self.lower_mode in {"hard-ste", "leaky-ste"}:
                 alpha = 1.0 if self.lower_mode == "hard-ste" else self.lower_alpha
@@ -639,8 +708,11 @@ class Bounded(cacheable):
             # Inclusive [min,max]. Preserve the configured lower transform
             # while applying a straight-through upper cap.
             if self.lower_mode == "softplus":
-                lower_bounded = self.min_val + F.softplus(
-                    self.rho, beta=self.beta, threshold=self.threshold
+                lower_bounded = _softplus_transform(
+                    self.rho,
+                    beta=self.beta,
+                    threshold=self.threshold,
+                    offset=self.min_val,
                 )
                 return ste_clamp(lower_bounded, hi=self.max_val)
             alpha_lo = 1.0 if self.lower_mode == "hard-ste" else self.lower_alpha
@@ -908,9 +980,57 @@ class Functional(torch.nn.Module):
         self.func = func
         self.fill = fill
         if key is not None:
-            self.register_buffer("key", torch.as_tensor(key, dtype=torch.long))
+            # ``key`` describes the model's authored regional layout. It is
+            # reconstructed by the model constructor rather than learned or
+            # advanced at runtime, so it is structural state rather than
+            # checkpoint state.
+            self.register_buffer(
+                "key", torch.as_tensor(key, dtype=torch.long), persistent=False
+            )
         else:
             self.key = None
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Accept checkpoints from the brief persistent-key layout."""
+        key_name = f"{prefix}key"
+        incoming = state_dict.pop(key_name, None)
+        try:
+            result = super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+        finally:
+            if incoming is not None:
+                state_dict[key_name] = incoming
+
+        if incoming is not None and self.key is not None:
+            incoming_key = torch.as_tensor(
+                incoming, device=self.key.device, dtype=self.key.dtype
+            )
+            if incoming_key.shape != self.key.shape or not torch.equal(
+                incoming_key, self.key
+            ):
+                error_msgs.append(
+                    f"Structural parametrization key mismatch for {key_name}: "
+                    f"checkpoint has shape {tuple(incoming_key.shape)} but the "
+                    f"constructed model expects shape {tuple(self.key.shape)} "
+                    "and identical indices."
+                )
+        return result
 
     def forward(self, buffer):
         """
@@ -2609,7 +2729,7 @@ class Parameterized(SimpleParameterized):
         This does not require any modification of the State / Mechanism
         implementation (beyond the TABLE declaration); internally, Dendra will
         check the flag and use the table when enabled  whenever the State /
-        Mechanism calls `func` (within, e.g., `breakpoint`).
+        Mechanism calls ``func`` (within, e.g., ``assigned_values``).
 
         In practice, this can speed up repeated evaluations of expensive
         functions, but for simple functions the overhead of the table lookup
@@ -3008,6 +3128,52 @@ class Parameterized(SimpleParameterized):
             if isinstance(rng_module, RNGModule):
                 rng_module.reset()
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Load checkpoints across registrations of shared tensor aliases."""
+        # Registering an authored transform can expose a second state-dict path
+        # to a parameter or persistent buffer that already has a stable public
+        # path. Older checkpoints store that tensor only once. Materialize
+        # missing aliases from the canonical entry while preserving any alias
+        # value explicitly present in the checkpoint. This belongs at the
+        # Parameterized layer so standalone models and nested mechanisms get
+        # the same compatibility as Population.
+        for canonical_items, alias_items in (
+            (
+                self.named_parameters(),
+                self.named_parameters(remove_duplicate=False),
+            ),
+            (
+                self.named_buffers(),
+                self.named_buffers(remove_duplicate=False),
+            ),
+        ):
+            canonical_by_identity = {id(value): name for name, value in canonical_items}
+            for alias, value in alias_items:
+                canonical = canonical_by_identity[id(value)]
+                alias_key = f"{prefix}{alias}"
+                canonical_key = f"{prefix}{canonical}"
+                if alias_key not in state_dict and canonical_key in state_dict:
+                    state_dict[alias_key] = state_dict[canonical_key]
+
+        return super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def register_parametrization_in_graph(self, name: str, param: Callable, args=None):
         """
         Register a parametrization to be applied during buffer population.
@@ -3028,6 +3194,14 @@ class Parameterized(SimpleParameterized):
             param = Functional(param)
         if args is None:
             args = []
+        if not any(module is param for module in self.modules()):
+            base_name = f"_in_graph_parametrization_{name.replace('.', '_')}"
+            module_name = f"{base_name}_{len(self.in_graph_parametrizations[name])}"
+            suffix = len(self.in_graph_parametrizations[name])
+            while hasattr(self, module_name):
+                suffix += 1
+                module_name = f"{base_name}_{suffix}"
+            self.add_module(module_name, param)
         self.in_graph_parametrizations[name].append((param, args))
 
     def instantiate_additional_parameters(self, additional_parameters=None):
@@ -3102,10 +3276,16 @@ class Parameterized(SimpleParameterized):
                                 logical_shape=range_logical_shape,
                                 context=context,
                             )
+                            # Register the authored parameter under its stable,
+                            # ergonomic public name before the transform wrapper
+                            # becomes another module path to the same object.
+                            # named_parameters() therefore keeps the historical
+                            # canonical name while remove_duplicate=False still
+                            # exposes every alias needed by functional_call.
+                            setattr(self, p_name, parameter)
                             self.register_parametrization_in_graph(
                                 name, parametrization
                             )
-                            setattr(self, p_name, parameter)
                         else:
                             setattr(self, p_name, parameter)
                             if bounded:
@@ -3120,7 +3300,12 @@ class Parameterized(SimpleParameterized):
                                 context=context,
                             )
                             self.additional_parameters.setdefault(name, []).append(
-                                (fill, getattr(self, p_name))
+                                # Retain the stable registered slot rather than
+                                # the current Tensor object. Functional calls
+                                # temporarily rebind module parameters; a
+                                # captured object would bypass that explicit
+                                # input and silently freeze the override.
+                                (fill, p_name)
                             )
                             keys.append(key)
                     if keys:
@@ -3227,15 +3412,15 @@ class Parameterized(SimpleParameterized):
                     torch.empty(empty_shape, device=target.device, dtype=target.dtype)
                 )
                 parametrization = build_parametrization(parameter, p, key, main_shape)
-                self.register_parametrization_in_graph(name, parametrization)
                 setattr(self, p_name, parameter)
+                self.register_parametrization_in_graph(name, parametrization)
             else:
                 p = parameter() if (positive or negative) else parameter
                 fill = create_param_expander(p, key, main_shape)
                 setattr(self, p_name, parameter)
                 if name not in self.additional_parameters:
                     self.additional_parameters[name] = []
-                self.additional_parameters[name].append((fill, getattr(self, p_name)))
+                self.additional_parameters[name].append((fill, p_name))
                 self.keys[name] = combined_key
             return alias
 
@@ -3243,32 +3428,185 @@ class Parameterized(SimpleParameterized):
         """
         Reset parameter buffers to defaults, then apply overrides and parametrizations.
         """
-        keys_to_process = itertools.chain(
-            self.__class__._global.keys(),
-            self.__class__._range.keys(),
-            self.__class__._batch.keys(),
-            self.__class__._global_p.keys(),
-            self.__class__._range_p.keys(),
-            self.__class__._batch_p.keys(),
-            self.__class__._global_n.keys(),
-            self.__class__._range_n.keys(),
-            self.__class__._batch_n.keys(),
-        )
-        for name in keys_to_process:
-            if not torch.is_tensor(getattr(self, name)):
-                continue
-            if hasattr(self, "parametrizations"):
-                if name in self.parametrizations:
-                    # If the parameter has parametrizations, we skip it
-                    continue
-            p_name = f"{name}_param"
-            setattr(self, name, getattr(self, name).detach())
-            getattr(self, name).copy_(self.evaluate(p_name))
-        self.load_additional_parameters()
-        self.apply_parametrizations()
+        self._install_parameter_buffers(self._derive_parameter_buffers())
         self._sample_random_parameters(random_generation=random_generation)
         self.sample_runtime_noises_(force=True, phase=None, dt=1.0)
         self.make_contiguous()
+
+    def _derive_parameter_buffers(self):
+        """Purely materialize declared default parameter buffers.
+
+        This is the shared raw-to-effective boundary for ordinary population
+        and functional preparation. It preserves the established deterministic
+        order: declared defaults, regional overrides, then authored in-graph
+        transforms. Stochastic parameter and noise sampling remain later
+        imperative-only phases.
+        """
+        categories = (
+            self.__class__._global,
+            self.__class__._range,
+            self.__class__._batch,
+            self.__class__._global_p,
+            self.__class__._range_p,
+            self.__class__._batch_p,
+            self.__class__._global_n,
+            self.__class__._range_n,
+            self.__class__._batch_n,
+        )
+        values = {}
+        for category in categories:
+            for name in category:
+                if name in values:
+                    continue
+                target = getattr(self, name)
+                if not torch.is_tensor(target):
+                    continue
+                if hasattr(self, "parametrizations") and name in self.parametrizations:
+                    # torch.nn parametrizations own this effective value.
+                    continue
+
+                parameter_name = f"{name}_param"
+                parameter = getattr(self, parameter_name)
+                if isinstance(parameter, torch.nn.Parameter):
+                    value = parameter
+                elif isinstance(parameter, cacheable):
+                    # Bypass the inference cache: preparation must always be a
+                    # pure function of the explicit raw tensor leaves.
+                    value = parameter._compute()
+                elif isinstance(parameter, torch.nn.Module):
+                    value = parameter()
+                elif torch.is_tensor(parameter):
+                    value = parameter
+                else:
+                    raise TypeError(
+                        f"Parameter source {parameter_name!r} is not tensor-valued."
+                    )
+
+                if not torch.is_tensor(value):
+                    raise TypeError(
+                        f"Parameter source {parameter_name!r} is not tensor-valued."
+                    )
+                # Historical ``buffer.copy_(source)`` semantics adopted the
+                # effective buffer's device and dtype. Keep that behavior in
+                # the pure materializer with a differentiable conversion.
+                value = value.to(device=target.device, dtype=target.dtype)
+
+                try:
+                    value = torch.broadcast_to(value, tuple(target.shape))
+                except RuntimeError as exc:
+                    raise ValueError(
+                        f"Parameter source {parameter_name!r} with shape "
+                        f"{tuple(value.shape)} is not broadcastable to effective "
+                        f"buffer {name!r} with shape {tuple(target.shape)}."
+                    ) from exc
+                # Keep the pure derivation allocation-free for the common
+                # broadcast-only path. The imperative installer performs the
+                # one historical copy into writable buffer storage; regional
+                # index_copy and authored transforms below allocate only when
+                # their semantics require it.
+                values[name] = value
+
+        if hasattr(self, "parametrizations"):
+            for name in self.parametrizations:
+                value = getattr(self, name)
+                if not torch.is_tensor(value):
+                    raise TypeError(
+                        f"torch parametrization target {name!r} is not tensor-valued."
+                    )
+                values[name] = value
+
+        for name, parameters in self.additional_parameters.items():
+            value = values[name] if name in values else getattr(self, name)
+            additional_values = []
+            for fill, parameter in parameters:
+                source = (
+                    getattr(self, parameter)
+                    if isinstance(parameter, str)
+                    else parameter
+                )
+                # As with ordinary ``*_param`` sources above, preparation is
+                # a pure function of explicit leaves. An eval-mode cache must
+                # not hide a functional_call replacement of a bounded regional
+                # parameter's raw tensor.
+                source_value = (
+                    source._compute()
+                    if isinstance(source, cacheable)
+                    else resolve(source)
+                )
+                additional_values.append(fill(source_value))
+            additional = torch.cat(additional_values).to(
+                device=value.device,
+                dtype=value.dtype,
+            )
+            key = self.keys[name].to(device=value.device)
+            values[name] = (
+                value.reshape(-1).index_copy(0, key, additional).reshape(value.shape)
+            )
+
+        for name, parametrizations in self.in_graph_parametrizations.items():
+            value = values[name] if name in values else getattr(self, name)
+            # Authored transforms historically receive writable dense storage
+            # and may operate in place. Clone only transformed targets: this
+            # protects raw sources and avoids writing through zero-stride
+            # broadcast views without restoring the common-path double copy.
+            value = value.clone(memory_format=torch.preserve_format)
+            for parametrization, args in parametrizations:
+                value = parametrization(
+                    value,
+                    *[
+                        values[arg] if arg in values else getattr(self, arg)
+                        for arg in args
+                    ],
+                )
+            values[name] = value
+        return values
+
+    def _install_parameter_buffers(self, values):
+        """Validate and commit one deterministic effective-buffer generation."""
+        if not isinstance(values, dict):
+            raise TypeError("parameter buffer values must be a dictionary")
+
+        staged = []
+        for name, value in values.items():
+            if not torch.is_tensor(value):
+                raise TypeError(
+                    f"Effective parameter buffer {name!r} must be a Tensor."
+                )
+            target = getattr(self, name)
+            if not torch.is_tensor(target):
+                raise TypeError(
+                    f"Effective parameter target {name!r} must be a Tensor."
+                )
+            if value.shape != target.shape:
+                raise ValueError(
+                    f"Effective parameter buffer {name!r} has shape "
+                    f"{tuple(value.shape)}; expected {tuple(target.shape)}."
+                )
+            if value.device != target.device or value.dtype != target.dtype:
+                raise ValueError(
+                    f"Effective parameter buffer {name!r} must use "
+                    f"{target.device}/{target.dtype}."
+                )
+            staged.append((name, value))
+
+        transformed = set(self.in_graph_parametrizations)
+        torch_parametrized = (
+            set(self.parametrizations) if hasattr(self, "parametrizations") else set()
+        )
+        for name, value in staged:
+            if name in torch_parametrized:
+                # The registered parametrization computes this property from
+                # its original tensor; there is no effective buffer to commit.
+                continue
+            if name in transformed:
+                # Preserve the historical graph-carrying rebind performed by
+                # apply_parametrizations().
+                setattr(self, name, value)
+            else:
+                target = getattr(self, name)
+                setattr(self, name, target.detach())
+                getattr(self, name).copy_(value)
+        return values
 
     def _sample_random_parameters(
         self, names=None, *, force: bool = False, random_generation=None

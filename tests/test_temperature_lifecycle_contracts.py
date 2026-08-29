@@ -17,6 +17,11 @@ DT = 0.01
 MODEL_KINDS = ("single_compartment", "tree", "unmyelinated", "myelinated")
 
 
+class _ReplaceParameter(torch.nn.Module):
+    def forward(self, value):
+        return (value,)
+
+
 def _tree_graph():
     graph = nx.DiGraph()
     for node in range(3):
@@ -79,7 +84,7 @@ def _runtime_state(model):
         "m": mechanism.m,
         "h": mechanism.h,
         "n": mechanism.n,
-        "q10": state.q10_cache,
+        "q10": state.q10,
         "celsius": model.celsius,
         "state_celsius": state.celsius,
         "t": model.t,
@@ -98,7 +103,8 @@ def _assert_temperature_views_are_current(model, expected):
     assert state.celsius is model.celsius
     torch.testing.assert_close(model.celsius, torch.as_tensor(expected, dtype=DTYPE))
     torch.testing.assert_close(
-        state.q10_cache, torch.as_tensor(_expected_q10(expected), dtype=DTYPE)
+        state.q10,
+        torch.full_like(state.q10, _expected_q10(expected)),
     )
 
 
@@ -135,35 +141,38 @@ def test_celsius_parameter_update_reinitializes_q10_and_matches_fresh_model(
 
 
 @pytest.mark.parametrize("kind", MODEL_KINDS)
-def test_set_value_temperature_hook_refreshes_q10_and_persists(kind):
-    hooked = _new_model(kind, LOW_CELSIUS, initialize=False)
-    hooked.set_value("celsius", torch.tensor(HIGH_CELSIUS, dtype=DTYPE))
-    hooked.initialize()
+def test_pre_transform_updates_temperature_q10_and_persists(kind):
+    transformed = _new_model(kind, LOW_CELSIUS, initialize=False)
+    transformed.register_pre_initialize_transform(
+        "replace_temperature",
+        _ReplaceParameter(),
+        writes=("parameters.celsius_param",),
+        inputs={"value": torch.tensor(HIGH_CELSIUS, dtype=DTYPE)},
+    )
+    transformed.initialize()
 
-    # set_value is a persistent effective-value override; it deliberately does
-    # not rewrite the underlying GLOBAL source.
-    assert hooked.celsius_param.item() == pytest.approx(LOW_CELSIUS)
-    _assert_temperature_views_are_current(hooked, HIGH_CELSIUS)
-    hooked.initialize()
-    _assert_temperature_views_are_current(hooked, HIGH_CELSIUS)
+    assert transformed.celsius_param.item() == pytest.approx(HIGH_CELSIUS)
+    _assert_temperature_views_are_current(transformed, HIGH_CELSIUS)
+    transformed.initialize()
+    _assert_temperature_views_are_current(transformed, HIGH_CELSIUS)
 
     fresh = _new_model(kind, HIGH_CELSIUS)
-    _assert_runtime_equal(_runtime_state(hooked), _runtime_state(fresh))
-    _advance(hooked)
+    _assert_runtime_equal(_runtime_state(transformed), _runtime_state(fresh))
+    _advance(transformed)
     _advance(fresh)
-    _assert_runtime_equal(_runtime_state(hooked), _runtime_state(fresh))
+    _assert_runtime_equal(_runtime_state(transformed), _runtime_state(fresh))
 
 
 def test_direct_celsius_buffer_mutation_and_rebinding_are_not_source_updates():
     model = _new_model("single_compartment", LOW_CELSIUS)
     _, state = _hh_parts(model)
-    initial_q10 = state.q10_cache.clone()
+    initial_q10 = state.q10.clone()
 
     with torch.no_grad():
         model.celsius.fill_(HIGH_CELSIUS)
     assert model.celsius.item() == pytest.approx(HIGH_CELSIUS)
     assert model.celsius_param.item() == pytest.approx(LOW_CELSIUS)
-    torch.testing.assert_close(state.q10_cache, initial_q10)
+    torch.testing.assert_close(state.q10, initial_q10)
 
     # initialize() rematerializes the unchanged source and rebuilds Q10.
     model.initialize()
@@ -173,7 +182,7 @@ def test_direct_celsius_buffer_mutation_and_rebinding_are_not_source_updates():
     model.celsius = torch.tensor(HIGH_CELSIUS, dtype=DTYPE)
     assert state.celsius is old_state_temperature
     assert state.celsius is not model.celsius
-    torch.testing.assert_close(state.q10_cache, initial_q10)
+    torch.testing.assert_close(state.q10, initial_q10)
     model.initialize()
     _assert_temperature_views_are_current(model, LOW_CELSIUS)
 

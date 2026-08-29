@@ -339,6 +339,43 @@ def test_overlapping_dynamic_diffusivity_overrides_are_rejected():
         model.initialize()
 
 
+def test_overlapping_trainable_diffusivity_resolves_stable_parameter_slots():
+    shared_parameter = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+    with dn.ctx(DTYPE="float32"):
+        shared = _chain([1.0, 0.0, 0.0, 0.0])
+        shared[:, [0, 1, 2]].insert(
+            _RegionalImplicitDiffusion,
+            alias="left",
+            D=shared_parameter,
+        )
+        shared[:, [2, 3]].insert(
+            _RegionalImplicitDiffusion,
+            alias="right",
+            D=shared_parameter,
+        )
+        _initialize(shared)
+
+    process = next(iter(shared.mech.material_processes.values()))
+    assert process.D_left is process.D_right
+    assert tuple(
+        source_name for _fill, source_name in process.additional_parameters["D"]
+    ) == ("D_left", "D_right")
+
+    independent = _chain([1.0, 0.0, 0.0, 0.0])
+    independent[:, [0, 1, 2]].insert(
+        _RegionalImplicitDiffusion,
+        alias="left",
+        D=torch.nn.Parameter(torch.tensor(1.0, dtype=DTYPE)),
+    )
+    independent[:, [2, 3]].insert(
+        _RegionalImplicitDiffusion,
+        alias="right",
+        D=torch.nn.Parameter(torch.tensor(1.0, dtype=DTYPE)),
+    )
+    with pytest.raises(ValueError, match="independently trainable.*diffusivity"):
+        independent.initialize()
+
+
 @pytest.mark.parametrize("regional", [False, True])
 def test_1d_diffusion_preserves_live_diameter_gradients(regional):
     model = _chain([1.0, 0.0, 0.0], diam=[1.4, 2.0, 2.6])
@@ -356,6 +393,50 @@ def test_1d_diffusion_preserves_live_diameter_gradients(regional):
     assert model.diam.grad is not None
     assert torch.isfinite(model.diam.grad).all()
     assert torch.any(model.diam.grad != 0)
+
+
+def test_reinitialize_discards_diffusion_timestep_workspace():
+    model = _chain([1.0, 0.0, 0.0])
+    model.diam.requires_grad_(True)
+    model.insert(_RegionalExplicitDiffusion, D=1.0)
+    model.train()
+    model.initialize()
+
+    model.step(dt=0.125)
+    process = next(iter(model.mech.material_processes.values()))
+    old_operators = process._spatial_operators
+    old_operator = next(iter(old_operators.values()))
+
+    assert process._spatial_configured is True
+    assert old_operator.configured is True
+    torch.testing.assert_close(old_operator.dt, old_operator.dt.new_tensor(0.125))
+    assert any(
+        value.grad_fn is not None
+        for value in old_operator.buffers()
+        if value.is_floating_point()
+    )
+
+    model.initialize()
+
+    reset_operators = process._spatial_operators
+    reset_operator = next(iter(reset_operators.values()))
+    assert process.dt.item() == 0.0
+    assert process._spatial_configured is False
+    assert reset_operators is not old_operators
+    assert reset_operator.configured is False
+    assert reset_operator.solver_name == "unconfigured"
+    assert tuple(reset_operator.buffers()) == ()
+
+    process.advance_materials(0.25)
+
+    configured_operator = next(iter(process._spatial_operators.values()))
+    assert configured_operator is not reset_operator
+    assert process._spatial_configured is True
+    assert configured_operator.configured is True
+    torch.testing.assert_close(
+        configured_operator.dt,
+        configured_operator.dt.new_tensor(0.25),
+    )
 
 
 @pytest.mark.skipif(

@@ -7,6 +7,7 @@ import torch
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
+from dendra.func import _population as functional_population_module
 from dendra.models.mod import hh
 
 DT = 0.01
@@ -80,6 +81,36 @@ def _assert_state_matches_model(state, model, *, rtol=0.0, atol=0.0):
     torch.testing.assert_close(state["clock"]["t"], model.t, rtol=0.0, atol=0.0)
 
 
+def _assert_every_state_leaf_close(actual, expected, *, rtol=0.0, atol=0.0):
+    actual_with_paths, actual_spec = torch.utils._pytree.tree_flatten_with_path(actual)
+    expected_with_paths, expected_spec = torch.utils._pytree.tree_flatten_with_path(
+        expected
+    )
+    assert actual_spec == expected_spec
+    for (actual_path, actual_leaf), (expected_path, expected_leaf) in zip(
+        actual_with_paths,
+        expected_with_paths,
+        strict=True,
+    ):
+        assert actual_path == expected_path
+        torch.testing.assert_close(
+            actual_leaf,
+            expected_leaf,
+            rtol=rtol,
+            atol=atol,
+            msg=lambda message: f"state leaf {actual_path}: {message}",
+        )
+
+
+def _while_loop_nodes(graph_module):
+    return [
+        node
+        for node in graph_module.graph.nodes
+        if node.op == "call_function"
+        and node.target is torch.ops.higher_order.while_loop
+    ]
+
+
 def _tensor_snapshot(tensor):
     return (
         id(tensor),
@@ -105,7 +136,6 @@ def _source_snapshot(model):
         "buf_i": tuple(_tensor_snapshot(value) for value in handler._buf_i),
         "buf_g_list": id(handler._buf_g),
         "buf_g": tuple(_tensor_snapshot(value) for value in handler._buf_g),
-        "last_bands": copy.copy(getattr(integrator, "_last_bands", None)),
         "workspace": {
             name: _tensor_snapshot(getattr(integrator, name))
             for name in (
@@ -149,7 +179,6 @@ def _assert_source_unchanged(model, snapshot):
         _assert_tensor_snapshot(value, expected)
     for value, expected in zip(model.mech._buf_g, snapshot["buf_g"], strict=True):
         _assert_tensor_snapshot(value, expected)
-    assert getattr(model.integrator, "_last_bands", None) is snapshot["last_bands"]
     for name, expected in snapshot["workspace"].items():
         _assert_tensor_snapshot(getattr(model.integrator, name), expected)
     assert model.integrator.initialized == snapshot["integrator_initialized"]
@@ -373,6 +402,9 @@ def test_vmap_over_parameters_with_shared_state_matches_explicit_lanes():
     actual = torch.vmap(run_lane)(lanes)
     expected = torch.stack(tuple(run_lane(value) for value in lanes))
     torch.testing.assert_close(actual, expected, rtol=2.0e-10, atol=2.0e-11)
+
+    empty = torch.vmap(run_lane)(base.new_empty((0, *base.shape)))
+    assert empty.shape == (0, *model.v.shape)
 
 
 def test_raw_parameter_gradients_and_hessian_are_finite_and_nonzero():
@@ -674,6 +706,449 @@ def test_multistep_fullgraph_is_reused_for_stable_shapes():
     torch.testing.assert_close(first, voltage(tensors.state, ve, intra))
     torch.testing.assert_close(second, voltage(tensors.state, ve + 0.1, intra))
     assert compile_count == 1
+
+
+def test_structured_step_capture_is_lazy_and_signature_specific(monkeypatch):
+    make_fx_calls = []
+    original_make_fx = functional_population_module.make_fx
+
+    def counting_make_fx(*args, **kwargs):
+        make_fx_calls.append(None)
+        return original_make_fx(*args, **kwargs)
+
+    monkeypatch.setattr(functional_population_module, "make_fx", counting_make_fx)
+    functional, _tensors = dn.func.make_functional(_model(method="pcr"), dt=DT)
+
+    assert make_fx_calls == []
+    assert functional._structured_step_graphs == {}
+    assert functional.prewarm_structured_rollout(ve=True, intra=False)
+    assert len(make_fx_calls) == 1
+    assert set(functional._structured_step_graphs) == {(True, False)}
+
+    # Reusing one signature is free; requesting another captures only that one.
+    assert functional.prewarm_structured_rollout(ve=True, intra=False)
+    assert len(make_fx_calls) == 1
+    assert functional.prewarm_structured_rollout(ve=False, intra=True)
+    assert len(make_fx_calls) == 2
+    assert set(functional._structured_step_graphs) == {
+        (True, False),
+        (False, True),
+    }
+
+
+def test_structured_capture_failure_is_cached_per_signature(monkeypatch):
+    original_make_fx = functional_population_module.make_fx
+    make_fx_calls = 0
+
+    def fail_first_make_fx(*args, **kwargs):
+        nonlocal make_fx_calls
+        make_fx_calls += 1
+        if make_fx_calls == 1:
+            raise RuntimeError("authored step is not traceable")
+        return original_make_fx(*args, **kwargs)
+
+    monkeypatch.setattr(functional_population_module, "make_fx", fail_first_make_fx)
+    functional, _tensors = dn.func.make_functional(_model(method="pcr"), dt=DT)
+
+    assert not functional.prewarm_structured_rollout(ve=False, intra=False)
+    assert not functional.prewarm_structured_rollout(ve=False, intra=False)
+    assert make_fx_calls == 1
+    assert (False, False) in functional._structured_capture_errors
+
+    assert functional.prewarm_structured_rollout(ve=True, intra=True)
+    assert make_fx_calls == 2
+    assert set(functional._structured_step_graphs) == {(True, True)}
+
+
+def test_no_grad_fullgraph_without_prewarm_uses_correct_unrolled_fallback():
+    model = _model(method="pcr")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    ve, intra = _drives(model, 5)
+    graphs = []
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    def atomic(state, ve_values, intra_values):
+        return functional.prepare_and_rollout(
+            tensors.parameters,
+            tensors.constants,
+            state,
+            dn.func.RolloutInput(ve=ve_values, intra=intra_values),
+        )[0]
+
+    expected = atomic(tensors.state, ve, intra)
+    compiled = torch.compile(atomic, backend=backend, fullgraph=True)
+    with torch.no_grad(), torch_compiler_warning_context():
+        actual = compiled(tensors.state, ve, intra)
+
+    _assert_every_state_leaf_close(actual, expected)
+    assert functional._structured_step_graphs == {}
+    assert len(graphs) == 1
+    assert not _while_loop_nodes(graphs[0])
+
+
+@pytest.mark.parametrize("drive_kind", ["none", "ve", "intra", "both"])
+def test_no_grad_compiled_rollout_uses_structured_loop_for_optional_drives(
+    drive_kind,
+):
+    model = _model(method="pcr")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    ve, intra = _drives(model, 5)
+    selected_ve = ve if drive_kind in {"ve", "both"} else None
+    selected_intra = intra if drive_kind in {"intra", "both"} else None
+    signature = (selected_ve is not None, selected_intra is not None)
+    assert not functional._structured_step_graphs
+    assert functional.prewarm_structured_rollout(
+        ve=signature[0],
+        intra=signature[1],
+    )
+    assert set(functional._structured_step_graphs) == {signature}
+    graphs = []
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    def atomic(state, ve_values, intra_values):
+        return functional.prepare_and_rollout(
+            tensors.parameters,
+            tensors.constants,
+            state,
+            dn.func.RolloutInput(ve=ve_values, intra=intra_values),
+            steps=5,
+        )[0]
+
+    expected = atomic(tensors.state, selected_ve, selected_intra)
+    compiled = torch.compile(atomic, backend=backend, fullgraph=True)
+    with torch.no_grad(), torch_compiler_warning_context():
+        actual = compiled(tensors.state, selected_ve, selected_intra)
+
+    _assert_every_state_leaf_close(actual, expected)
+    assert len(graphs) == 1
+    assert len(_while_loop_nodes(graphs[0])) == 1
+
+
+@pytest.mark.parametrize("state_kind", ["noncontiguous", "reversed"])
+def test_no_grad_structured_rollout_canonicalizes_state_carry(state_kind):
+    model = _model(method="pcr")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    assert functional.prewarm_structured_rollout(ve=True, intra=True)
+    ve, intra = _drives(model, 5)
+    if state_kind == "noncontiguous":
+        state = torch.utils._pytree.tree_map(
+            lambda value: (
+                value.transpose(0, 1).contiguous().transpose(0, 1)
+                if value.ndim == 2
+                else value.clone()
+            ),
+            tensors.state,
+        )
+        assert any(
+            not value.is_contiguous()
+            for value in torch.utils._pytree.tree_leaves(state)
+        )
+    else:
+
+        def reverse_mapping_order(value):
+            if isinstance(value, dict):
+                return {
+                    key: reverse_mapping_order(item)
+                    for key, item in reversed(value.items())
+                }
+            return value.clone()
+
+        state = reverse_mapping_order(tensors.state)
+        assert tuple(state) == tuple(reversed(tensors.state))
+    graphs = []
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    def atomic(current, ve_values, intra_values):
+        return functional.prepare_and_rollout(
+            tensors.parameters,
+            tensors.constants,
+            current,
+            dn.func.RolloutInput(ve=ve_values, intra=intra_values),
+        )[0]
+
+    expected = atomic(state, ve, intra)
+    compiled = torch.compile(atomic, backend=backend, fullgraph=True)
+    with torch.no_grad(), torch_compiler_warning_context():
+        actual = compiled(state, ve, intra)
+
+    _assert_every_state_leaf_close(actual, expected)
+    assert len(graphs) == 1
+    assert len(_while_loop_nodes(graphs[0])) == 1
+
+
+def test_structured_rollout_graph_size_is_bounded_by_block_not_step_count():
+    model = _model(method="pcr")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    assert functional.prewarm_structured_rollout(ve=True, intra=True)
+    graphs = []
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    def atomic(state, ve_values, intra_values):
+        return functional.prepare_and_rollout(
+            tensors.parameters,
+            tensors.constants,
+            state,
+            dn.func.RolloutInput(ve=ve_values, intra=intra_values),
+        )[0]
+
+    compiled = torch.compile(
+        atomic,
+        backend=backend,
+        fullgraph=True,
+        dynamic=False,
+    )
+    cases = tuple((steps, *_drives(model, steps)) for steps in (8, 68))
+    with torch.no_grad(), torch_compiler_warning_context():
+        for _repeat in range(2):
+            for _steps, ve, intra in cases:
+                actual = compiled(tensors.state, ve, intra)
+                expected = atomic(tensors.state, ve, intra)
+                _assert_every_state_leaf_close(actual, expected)
+
+    # Each time-axis shape needs one specialized graph, but repeated calls do
+    # not recompile and neither graph contains a timestep-sized unrolled body.
+    assert len(graphs) == len(cases)
+    assert all(len(_while_loop_nodes(graph)) == 1 for graph in graphs)
+    recursive_sizes = [
+        tuple(
+            (name, len(tuple(module.graph.nodes)))
+            for name, module in graph.named_modules()
+            if isinstance(module, torch.fx.GraphModule)
+        )
+        for graph in graphs
+    ]
+    assert recursive_sizes[0] == recursive_sizes[1]
+
+
+def test_no_grad_compiled_zero_step_rollout_preserves_every_state_leaf():
+    model = _model(method="pcr")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    empty_ve, empty_intra = _drives(model, 0)
+
+    def without_drives(state):
+        return functional.prepare_and_rollout(
+            tensors.parameters,
+            tensors.constants,
+            state,
+            steps=0,
+        )[0]
+
+    def with_empty_drives(state, ve_values, intra_values):
+        return functional.prepare_and_rollout(
+            tensors.parameters,
+            tensors.constants,
+            state,
+            dn.func.RolloutInput(ve=ve_values, intra=intra_values),
+        )[0]
+
+    compiled_without_drives = torch.compile(
+        without_drives,
+        backend="eager",
+        fullgraph=True,
+    )
+    compiled_with_empty_drives = torch.compile(
+        with_empty_drives,
+        backend="eager",
+        fullgraph=True,
+    )
+    with torch.no_grad(), torch_compiler_warning_context():
+        without = compiled_without_drives(tensors.state)
+        with_empty = compiled_with_empty_drives(
+            tensors.state,
+            empty_ve,
+            empty_intra,
+        )
+
+    _assert_every_state_leaf_close(without, tensors.state)
+    _assert_every_state_leaf_close(with_empty, tensors.state)
+
+
+def test_no_grad_compiled_vmap_retains_unrolled_transform_fallback():
+    model = _model(method="pcr")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    ve, _intra = _drives(model, 3)
+    offsets = model.v.new_tensor((-0.25, 0.125))
+    states = torch.utils._pytree.tree_map(
+        lambda value: torch.stack((value, value)),
+        tensors.state,
+    )
+    states["integrator"]["v"] = states["integrator"]["v"] + offsets.reshape(
+        2, *([1] * model.v.ndim)
+    )
+    lane_ve = torch.stack((ve, ve + 0.2))
+    graphs = []
+
+    def run_lane(state, ve_values):
+        return functional.prepare_and_rollout(
+            tensors.parameters,
+            tensors.constants,
+            state,
+            dn.func.RolloutInput(ve=ve_values),
+        )[0]
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    vmapped = torch.vmap(run_lane)
+    compiled = torch.compile(vmapped, backend=backend, fullgraph=True)
+    with torch.no_grad(), torch_compiler_warning_context():
+        actual = compiled(states, lane_ve)
+        expected = torch.utils._pytree.tree_map(
+            lambda *values: torch.stack(values),
+            *(
+                run_lane(
+                    torch.utils._pytree.tree_map(
+                        lambda value: value[index],
+                        states,
+                    ),
+                    lane_ve[index],
+                )
+                for index in range(2)
+            ),
+        )
+
+    _assert_every_state_leaf_close(actual, expected, rtol=2.0e-10, atol=2.0e-11)
+    assert graphs
+    assert all(not _while_loop_nodes(graph) for graph in graphs)
+
+    empty_states = torch.utils._pytree.tree_map(
+        lambda value: value.new_empty((0, *value.shape)),
+        tensors.state,
+    )
+    empty_ve = ve.new_empty((0, *ve.shape))
+    with torch.no_grad():
+        empty_result = vmapped(empty_states, empty_ve)
+    for result_leaf, state_leaf in zip(
+        torch.utils._pytree.tree_leaves(empty_result),
+        torch.utils._pytree.tree_leaves(tensors.state),
+        strict=True,
+    ):
+        assert result_leaf.shape == (0, *state_leaf.shape)
+
+
+def test_grad_enabled_compile_retains_differentiable_unrolled_rollout():
+    model = _model(method="pcr")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    parameter_name = "integrator.mech.mechanisms.hh.gnabar_param"
+    graphs = []
+
+    def loss(gnabar):
+        parameters = dict(tensors.parameters)
+        parameters[parameter_name] = gnabar
+        state, _aux = functional.prepare_and_rollout(
+            parameters,
+            tensors.constants,
+            tensors.state,
+            steps=5,
+        )
+        return state["integrator"]["v"].square().mean()
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    gnabar = tensors.parameters[parameter_name]
+    expected = torch.autograd.grad(loss(gnabar), gnabar)[0]
+    compiled = torch.compile(loss, backend=backend, fullgraph=True)
+    with torch_compiler_warning_context():
+        compiled_loss = compiled(gnabar)
+    actual = torch.autograd.grad(compiled_loss, gnabar)[0]
+
+    torch.testing.assert_close(actual, expected, rtol=2.0e-9, atol=2.0e-10)
+    assert graphs
+    assert all(not _while_loop_nodes(graph) for graph in graphs)
+
+
+def test_no_grad_direct_forward_ad_retains_differentiable_unrolled_rollout():
+    model = _model(method="pcr")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    parameter_name = "integrator.mech.mechanisms.hh.gnabar_param"
+    graphs = []
+
+    def final_voltage(gnabar):
+        parameters = dict(tensors.parameters)
+        parameters[parameter_name] = gnabar
+        state, _aux = functional.prepare_and_rollout(
+            parameters,
+            tensors.constants,
+            tensors.state,
+            steps=5,
+        )
+        return state["integrator"]["v"]
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    primal = tensors.parameters[parameter_name].detach()
+    tangent = torch.full_like(primal, 0.125)
+    compiled = torch.compile(final_voltage, backend=backend, fullgraph=True)
+    with (
+        torch.no_grad(),
+        torch.autograd.forward_ad.dual_level(),
+        torch_compiler_warning_context(),
+    ):
+        gnabar = torch.autograd.forward_ad.make_dual(primal, tangent)
+        expected = torch.autograd.forward_ad.unpack_dual(final_voltage(gnabar))
+        actual = torch.autograd.forward_ad.unpack_dual(compiled(gnabar))
+
+    torch.testing.assert_close(actual.primal, expected.primal, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        actual.tangent,
+        expected.tangent,
+        rtol=2.0e-9,
+        atol=2.0e-10,
+    )
+    assert graphs
+    assert all(not _while_loop_nodes(graph) for graph in graphs)
+
+
+def test_no_grad_structured_rollout_supports_native_thomas_solver():
+    try:
+        from dendra_solvers import thomas_solve_t
+    except ImportError:
+        pytest.skip("transform-compatible dendra-solvers facade is unavailable")
+
+    model = _model(method="thomas")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    assert functional._transition.solver is thomas_solve_t
+    assert functional.prewarm_structured_rollout(ve=True, intra=True)
+    ve, intra = _drives(model, 5)
+    graphs = []
+
+    def backend(graph_module, _example_inputs):
+        graphs.append(graph_module)
+        return graph_module.forward
+
+    def atomic(state, ve_values, intra_values):
+        return functional.prepare_and_rollout(
+            tensors.parameters,
+            tensors.constants,
+            state,
+            dn.func.RolloutInput(ve=ve_values, intra=intra_values),
+        )[0]
+
+    expected = atomic(tensors.state, ve, intra)
+    compiled = torch.compile(atomic, backend=backend, fullgraph=True)
+    with torch.no_grad(), torch_compiler_warning_context():
+        actual = compiled(tensors.state, ve, intra)
+
+    _assert_every_state_leaf_close(actual, expected, rtol=2.0e-10, atol=2.0e-11)
+    assert len(graphs) == 1
+    assert len(_while_loop_nodes(graphs[0])) == 1
 
 
 @pytest.mark.parametrize("training", [False, True])

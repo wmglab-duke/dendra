@@ -13,6 +13,11 @@ from dendra.models.stim.waveform import constant
 DTYPE = torch.float64
 
 
+class _Replace(torch.nn.Module):
+    def forward(self, value):
+        return (value,)
+
+
 def _population(*, N=2, C=3, v_init=-65.0, initialize=True):
     pop = dn.Population(N=N, C=C, v_init=v_init, dtype=DTYPE)
     pop.insert(pas, g=0.001, e=-70.0)
@@ -32,6 +37,26 @@ def _clone_nested(value):
     if isinstance(value, list):
         return [_clone_nested(item) for item in value]
     return value
+
+
+def _assert_nested_equal(actual, expected):
+    if torch.is_tensor(actual) or torch.is_tensor(expected):
+        assert torch.is_tensor(actual) and torch.is_tensor(expected)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+        return
+    if isinstance(actual, dict) or isinstance(expected, dict):
+        assert isinstance(actual, dict) and isinstance(expected, dict)
+        assert tuple(actual) == tuple(expected)
+        for key in actual:
+            _assert_nested_equal(actual[key], expected[key])
+        return
+    if isinstance(actual, (tuple, list)) or isinstance(expected, (tuple, list)):
+        assert type(actual) is type(expected)
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected, strict=True):
+            _assert_nested_equal(actual_item, expected_item)
+        return
+    assert actual == expected
 
 
 @pytest.mark.parametrize(
@@ -110,13 +135,18 @@ def test_population_checkpoint_restores_integrator_mechanism_and_time_state():
     assert torch.equal(pop.t, expected_t)
 
 
-def test_initialization_hooks_and_set_value_execute_in_order():
+def test_initialization_hooks_and_transform_execute_in_order():
     pop = dn.Population(N=1, C=2, v_init=-65.0, dtype=DTYPE)
     pop.insert(pas, g=0.001, e=-70.0)
     calls = []
     pop.register_pre_initialize_hook(lambda model: calls.append(("pre", model)))
     pop.register_post_initialize_hook(lambda model: calls.append(("post", model)))
-    pop.set_value("v", torch.tensor([[-55.0, -56.0]], dtype=DTYPE))
+    pop.register_pre_initialize_transform(
+        "replace_voltage",
+        _Replace(),
+        writes=("state.integrator.v",),
+        inputs={"value": torch.tensor([[-55.0, -56.0]], dtype=DTYPE)},
+    )
 
     assert pop.initialize() is pop
     assert [name for name, _ in calls] == ["pre", "post"]
@@ -125,11 +155,16 @@ def test_initialization_hooks_and_set_value_execute_in_order():
     assert pop.initialize_() is None
 
 
-def test_set_value_reports_unknown_state_during_initialization():
+def test_initialization_transform_reports_unknown_state_during_initialization():
     pop = dn.Population(N=1, C=1, dtype=DTYPE)
     pop.insert(pas, g=0.001, e=-70.0)
-    pop.set_value("not_a_state", torch.tensor(1.0))
-    with pytest.raises(AttributeError, match="not_a_state"):
+    pop.register_pre_initialize_transform(
+        "unknown_state",
+        _Replace(),
+        writes=("state.mechanisms.missing.value",),
+        inputs={"value": torch.tensor(1.0)},
+    )
+    with pytest.raises(KeyError, match="missing"):
         pop.initialize()
 
 
@@ -311,6 +346,29 @@ def test_checkpointed_longrun_callback_loss_backpropagates_and_restores_final_st
     assert pop.mech.pas.g_param.grad is not None
     assert torch.isfinite(pop.mech.pas.g_param.grad)
     assert torch.equal(pop.t, expected_t)
+
+
+def test_checkpointed_live_voltage_loss_restores_state_without_callback_loss():
+    with dn.ctx(REQUIRE_GRAD=1):
+        pop = _population(N=1, C=2)
+    pop.train()
+    returned = pop.longrun_checkpointed(
+        tstop=0.03,
+        chunklength=2,
+        dt=0.01,
+        safe_checkpoint=True,
+        restore_state_after_backward=True,
+    )
+    forward_final = _clone_nested(pop.state_dict_for_checkpoint())
+    loss = pop.v.square().mean()
+
+    assert returned is None
+    assert loss.requires_grad
+    loss.backward()
+
+    _assert_nested_equal(pop.state_dict_for_checkpoint(), forward_final)
+    assert pop.mech.pas.g_param.grad is not None
+    assert torch.isfinite(pop.mech.pas.g_param.grad)
 
 
 def test_checkpointed_longrun_validates_chunk_length_and_empty_run_contract():

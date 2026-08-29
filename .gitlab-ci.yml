@@ -29,7 +29,7 @@ before_script:
   - python -m pip install numpy
 
   # 1) Install PyTorch first
-  - python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+  - python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
 
   # 2) Clone and install dendra-solvers AFTER torch (still no-build-isolation)
   - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/dendra-solvers.git"
@@ -41,7 +41,10 @@ before_script:
 
   # 4) Clone and install dendra-models AFTER dendra and torch
   - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/dendra-models.git"
-  - cd dendra-models && python -m pip install --build-constraint "$CI_PROJECT_DIR/constraints.txt" . && cd "$CI_PROJECT_DIR"
+  # Dendra itself is the source checkout under test. Avoid asking pip to
+  # resolve dendra-models' released Dendra floor before Commitizen has bumped
+  # this checkout at the end of the successful pipeline.
+  - cd dendra-models && python -m pip install --no-deps --build-constraint "$CI_PROJECT_DIR/constraints.txt" . && cd "$CI_PROJECT_DIR"
 
   # Optional: verify in logs
   - python -c "import numpy as np; print('NumPy:', np.__version__)"

@@ -168,6 +168,22 @@ class _MaterialFieldTransaction:
             material._buffers[field] = value
 
 
+def _unsupported_local_declaration(name: str):
+    """Build a declaration that fails before Mechanism validation can obscure it."""
+
+    def declaration(*args, **kwargs):
+        del args, kwargs
+        raise TypeError(
+            f"MaterialProcess authoring does not support: {name}. "
+            "Use GLOBAL/RANGE/BATCH for process parameters, METHOD/PHASE and "
+            "the concrete process family's declarations for configuration, "
+            "and update full Material fields in advance_materials(dt)."
+        )
+
+    declaration.__name__ = name
+    return staticmethod(declaration)
+
+
 class MaterialProcess(Mechanism):
     """Base class for full-field processes over shared Material objects.
 
@@ -178,12 +194,96 @@ class MaterialProcess(Mechanism):
     _material_process_phase = "post_local"
     _material_process_method = "none"
     _material_process_method_kwargs: dict[str, Any] = {}
+    _material_process_set_dt_lifecycle = True
 
     _phase_declarations = []
     _method_declarations = []
 
+    _SUPPORTED_PHASES = ("post_local", "transport", "post_transport")
+
+    # Material processes are full-field scheduler operators. Override the
+    # ordinary local-Mechanism declarations so misspellings in a process class
+    # fail at the declaration site, before Mechanism's unrelated validations
+    # can produce a misleading error. The post-class checks below also catch a
+    # declaration deliberately made through ``Mechanism.<name>``.
+    STATE_BUNDLE = _unsupported_local_declaration("STATE_BUNDLE")
+    CARRY = _unsupported_local_declaration("CARRY")
+    ASSIGNED = _unsupported_local_declaration("ASSIGNED")
+    DERIVED_BUFFER = _unsupported_local_declaration("DERIVED_BUFFER")
+    TIMESTEP_BUFFER = _unsupported_local_declaration("TIMESTEP_BUFFER")
+    SAVE_CURRENT = _unsupported_local_declaration("SAVE_CURRENT")
+    USEION = _unsupported_local_declaration("USEION")
+    USEMATERIAL = _unsupported_local_declaration("USEMATERIAL")
+    NONSPECIFIC_CURRENT = _unsupported_local_declaration("NONSPECIFIC_CURRENT")
+    EXPLICIT = _unsupported_local_declaration("EXPLICIT")
+    AFFINE = _unsupported_local_declaration("AFFINE")
+    NUMERICAL = _unsupported_local_declaration("NUMERICAL")
+
+    _UNSUPPORTED_HOOKS = {
+        "initial_values": "MaterialProcess has no voltage-local initialization phase",
+        "assigned_values": "MaterialProcess has no voltage/current-stage algebra phase",
+        "advance": "implement advance_materials(dt) instead",
+        "derive_buffers": "prepare process caches in configure_process(population)",
+        "derive_timestep_buffers": "prepare timestep caches in set_dt(dt)",
+    }
+
     def __init_subclass__(cls, **kwargs):
+        authored_hooks = {
+            name: guidance
+            for name, guidance in MaterialProcess._UNSUPPORTED_HOOKS.items()
+            if name in cls.__dict__
+        }
+        if authored_hooks:
+            details = ", ".join(
+                f"{name}: {guidance}"
+                for name, guidance in sorted(authored_hooks.items())
+            )
+            raise TypeError(
+                f"MaterialProcess {cls.__qualname__} defines ordinary Mechanism "
+                f"lifecycle hooks that the material scheduler does not call ({details})."
+            )
+
         super().__init_subclass__(**kwargs)
+
+        unsupported_declarations = []
+        declaration_checks = (
+            ("STATE_BUNDLE", cls._state),
+            ("CARRY", cls._carry),
+            ("ASSIGNED", cls._assigned),
+            ("DERIVED_BUFFER", cls._derived_buffers),
+            ("TIMESTEP_BUFFER", cls._timestep_buffers),
+            ("SAVE_CURRENT", cls._save),
+            ("USEION", (cls._ion, cls._read_ion, cls._write_ion, cls._write_ion_c)),
+            (
+                "USEMATERIAL",
+                (
+                    cls._material,
+                    cls._read_material,
+                    cls._write_material,
+                    cls._source_material,
+                ),
+            ),
+            ("NONSPECIFIC_CURRENT", cls._currents),
+            ("EXPLICIT", cls._explicit),
+            ("AFFINE", cls._affine),
+            ("NUMERICAL", cls._numerical),
+        )
+        for declaration, values in declaration_checks:
+            if isinstance(values, tuple):
+                present = any(bool(value) for value in values)
+            else:
+                present = bool(values)
+            if present:
+                unsupported_declarations.append(declaration)
+        if unsupported_declarations:
+            names = ", ".join(unsupported_declarations)
+            raise TypeError(
+                f"MaterialProcess {cls.__qualname__} uses ordinary Mechanism "
+                f"declarations that the material scheduler does not support: {names}. "
+                "Use GLOBAL/RANGE/BATCH for process parameters, METHOD/PHASE and "
+                "the concrete process family's declarations for configuration, "
+                "and update full Material fields in advance_materials(dt)."
+            )
 
         phase = "post_local"
         method = "none"
@@ -207,7 +307,16 @@ class MaterialProcess(Mechanism):
         if method_declarations:
             method, method_kwargs = method_declarations[-1]
 
-        cls._material_process_phase = str(phase)
+        phase = str(phase)
+        if phase not in MaterialProcess._SUPPORTED_PHASES:
+            valid = ", ".join(
+                repr(value) for value in MaterialProcess._SUPPORTED_PHASES
+            )
+            raise ValueError(
+                f"MaterialProcess phase must be one of {valid}; got {phase!r}."
+            )
+
+        cls._material_process_phase = phase
         cls._material_process_method = str(method).lower()
         cls._material_process_method_kwargs = dict(method_kwargs)
 
@@ -222,20 +331,93 @@ class MaterialProcess(Mechanism):
 
     @staticmethod
     def PHASE(phase="post_local"):
-        """Declare the material scheduler phase for this process."""
+        """Declare one of ``post_local``, ``transport``, or ``post_transport``."""
+        phase = str(phase)
+        if phase not in MaterialProcess._SUPPORTED_PHASES:
+            valid = ", ".join(
+                repr(value) for value in MaterialProcess._SUPPORTED_PHASES
+            )
+            raise ValueError(
+                f"MaterialProcess phase must be one of {valid}; got {phase!r}."
+            )
         declare_class_value(
-            "material_process.phase", str(phase), MaterialProcess._phase_declarations
+            "material_process.phase", phase, MaterialProcess._phase_declarations
         )
 
-    def bind_materials(self, material_resolver, *, population=None):
-        """Bind process to the Material registry and population geometry."""
+    def _bind_materials(self, material_resolver, *, population=None):
+        """Framework adapter binding the Material registry and population geometry."""
         self._material_resolver = material_resolver
         self._population_shape = None if population is None else tuple(population.shape)
         self.configure_process(population)
         return self
 
     def configure_process(self, population=None):
-        """Hook called once after full Material/Population binding."""
+        """Configure this process after Material/Population binding.
+
+        Dendra may invoke this hook again when it rebuilds execution maps or
+        rebinds the process. Implementations must therefore be idempotent:
+        replace derived configuration instead of accumulating it.
+        """
+        return None
+
+    @staticmethod
+    def _reject_ordinary_lifecycle(hook: str, replacement: str):
+        raise RuntimeError(
+            f"MaterialProcess does not participate in Mechanism.{hook}(). {replacement}"
+        )
+
+    def initial_values(self, v, values):
+        del v, values
+        self._reject_ordinary_lifecycle(
+            "initial_values",
+            "Initialize or cache full-field process data in the idempotent "
+            "configure_process(population) hook.",
+        )
+
+    def assigned_values(self, v, values):
+        del v, values
+        self._reject_ordinary_lifecycle(
+            "assigned_values",
+            "Compute full-field process updates in advance_materials(dt).",
+        )
+
+    def advance(self, v, dt, values):
+        del v, dt, values
+        self._reject_ordinary_lifecycle(
+            "advance",
+            "Implement and call advance_materials(dt) instead.",
+        )
+
+    def derive_buffers(self):
+        self._reject_ordinary_lifecycle(
+            "derive_buffers",
+            "Prepare process caches in the idempotent "
+            "configure_process(population) hook.",
+        )
+
+    def derive_timestep_buffers(self, dt):
+        del dt
+        self._reject_ordinary_lifecycle(
+            "derive_timestep_buffers",
+            "Prepare timestep-dependent process data in set_dt(dt).",
+        )
+
+    def set_dt(self, dt):
+        """Apply this MaterialProcess family's timestep configuration."""
+
+        Mechanism._configure_timestep(self, dt)
+        return None
+
+    def _reset_initialization_timestep(self):
+        """Discard family-specific timestep state before fresh initialization.
+
+        ``MechanismHandler`` clears the framework-owned ``dt`` and declared
+        ``TIMESTEP_BUFFER`` tensors before calling this hook.  Most material
+        processes have no additional timestep-derived state; families with
+        cached solver workspaces may override it to restore their
+        construction-fresh, unconfigured representation.
+        """
+
         return None
 
     def _get_material(self, name: str):
@@ -253,14 +435,6 @@ class MaterialProcess(Mechanism):
             if canonical != requested:
                 return resolver(requested)
             raise
-
-    def material_field(self, material: str, field: str) -> torch.Tensor:
-        return self._get_material(material)._buffers[str(field)]
-
-    def set_material_field(
-        self, material: str, field: str, value: torch.Tensor
-    ) -> None:
-        self._get_material(material)._buffers[str(field)] = value
 
     def _resolve_quantity(self, value, like: torch.Tensor, *, what: str = "quantity"):
         """Resolve a scalar/tensor/process parameter into a tensor like ``like``.
@@ -1795,11 +1969,16 @@ class DiffusionProcess(MaterialProcess):
             cursor = 0
             assigned: dict[int, tuple[torch.Tensor, bool, object]] = {}
             for fill, parameter in entries:
+                source = (
+                    getattr(self, parameter)
+                    if isinstance(parameter, str)
+                    else parameter
+                )
                 values = fill(self.resolve(parameter)).reshape(-1)
-                if torch.is_tensor(parameter):
-                    trainable = bool(parameter.requires_grad)
-                elif isinstance(parameter, torch.nn.Module):
-                    trainable = any(p.requires_grad for p in parameter.parameters())
+                if torch.is_tensor(source):
+                    trainable = bool(source.requires_grad)
+                elif isinstance(source, torch.nn.Module):
+                    trainable = any(p.requires_grad for p in source.parameters())
                 else:
                     trainable = False
                 count = int(values.numel())
@@ -1824,14 +2003,14 @@ class DiffusionProcess(MaterialProcess):
                             )
                         if (
                             previous_trainable or trainable
-                        ) and previous_source is not parameter:
+                        ) and previous_source is not source:
                             raise ValueError(
                                 "Overlapping DiffusionProcess regions assign "
                                 f"independently trainable values to diffusivity "
                                 f"parameter {name!r} at compiled compartment slot "
                                 f"{key}."
                             )
-                    assigned[int(key)] = (value, trainable, parameter)
+                    assigned[int(key)] = (value, trainable, source)
 
             if cursor != keys.numel():
                 raise RuntimeError(
@@ -1897,6 +2076,13 @@ class DiffusionProcess(MaterialProcess):
         )
         operators.train(self.training)
         return operators
+
+    def _reset_initialization_timestep(self):
+        """Release configured diffusion operators and their autograd graphs."""
+
+        self._spatial_operators = self._new_spatial_operators()
+        self._spatial_configured = False
+        return None
 
     def _select_geometry_kind(self, population) -> str:
         """Select the spatial backend for this population.
