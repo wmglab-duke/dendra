@@ -406,22 +406,55 @@ def test_extcell_tree_one_compartment_zero_edge_parity_and_transforms():
     reverse = torch.func.jacrev(circuit_voltage, argnums=(0, 1, 2))(*arguments)
     with torch_compiler_warning_context():
         forward = torch.func.jacfwd(circuit_voltage, argnums=(0, 1, 2))(*arguments)
-    for index, (actual_jacobian, expected_jacobian) in enumerate(
-        zip(reverse, forward, strict=True)
+
+    for jacobian in (*reverse, *forward):
+        assert torch.isfinite(jacobian).all()
+
+    area_reverse, resistance_reverse, xg_reverse = reverse
+    area_forward, resistance_forward, xg_forward = forward
+    area_reverse_active = area_reverse[..., 0, :, :]
+    area_forward_active = area_forward[..., 0, :, :]
+    torch.testing.assert_close(
+        area_reverse_active,
+        area_forward_active,
+        rtol=2.0e-10,
+        atol=2.0e-11,
+    )
+
+    # With one compartment and no edges, area scales every shell circuit term
+    # together, so the shell voltages are analytically area-invariant. Reverse
+    # and forward AD cancel the O(1e4-1e5) active sensitivity in different
+    # orders; bound each zero residual relative to that meaningful scale rather
+    # than comparing the two cancellation residues to each other.
+    area_scale = max(
+        area_reverse_active.abs().amax().item(),
+        area_forward_active.abs().amax().item(),
+    )
+    assert area_scale > 0.0
+    area_shell_atol = 1.0e-11 * area_scale
+    for area_jacobian in (area_reverse, area_forward):
+        shell_jacobian = area_jacobian[..., 1:, :, :]
+        torch.testing.assert_close(
+            shell_jacobian,
+            torch.zeros_like(shell_jacobian),
+            rtol=0.0,
+            atol=area_shell_atol,
+        )
+
+    for actual_jacobian, expected_jacobian in zip(
+        (resistance_reverse, xg_reverse),
+        (resistance_forward, xg_forward),
+        strict=True,
     ):
-        assert torch.isfinite(actual_jacobian).all()
         torch.testing.assert_close(
             actual_jacobian,
             expected_jacobian,
             rtol=2.0e-10,
-            # Area is expressed in cm², so its Jacobian is O(1e4-1e5).
-            # Reverse/forward cross terms near zero accumulate correspondingly
-            # larger absolute roundoff while retaining ~1e-12 relative error.
-            atol=2.0e-7 if index == 0 else 2.0e-11,
+            atol=2.0e-11,
         )
-    assert torch.count_nonzero(reverse[0])
-    assert torch.count_nonzero(reverse[1]) == 0
-    assert torch.count_nonzero(reverse[2])
+    assert torch.count_nonzero(area_reverse_active)
+    assert torch.count_nonzero(resistance_reverse) == 0
+    assert torch.count_nonzero(xg_reverse)
 
     def membrane_voltage_from_xg(xg):
         constants = {**tensors.constants, "xg": xg}
