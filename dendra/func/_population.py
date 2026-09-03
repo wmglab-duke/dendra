@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import copy
 import dis
 import hashlib
@@ -13,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
+from functools import cache
 
 import numpy as np
 import torch
@@ -41,9 +43,13 @@ from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion
 from dendra.models.mechanisms._materials import Material
 from dendra.models.mechanisms._mechanism import Mechanism, PointProcess
+from dendra.models.mechanisms._numerical import (
+    validate_declared_numerical_current as _validate_declared_numerical_current,
+)
 from dendra.models.mechanisms._state import State
 from dendra.models.mechanisms._support import SupportKind
 from dendra.models.mechanisms._support_registry import SupportEntry
+from dendra.models.mechanisms._symbolic import build_numerical_equation
 from dendra.models.multi import MultiPopulation
 from dendra.models.parametric import Functional as ParameterFunctional
 from dendra.models.parametric import Parameterized, cacheable, staticproperty
@@ -186,6 +192,25 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
     }
     for implementation in (_bwd_euler_sc, _bwd_euler_ub)
 }
+
+
+def _functional_initialization_profile(population):
+    """Return the audited scalar initializer family for ``population``.
+
+    SingleCompartment lowering remains exact-type because general subclasses are
+    not admitted by the transition contract. Unmyelinated subclasses may add
+    mechanisms and construction-time parameterization while retaining the same
+    scalar-path voltage and lifecycle semantics; their inherited hooks are
+    checked against the canonical base separately.
+    """
+
+    if type(population) is SingleCompartment:
+        return SingleCompartment, "scalar_point", _bwd_euler_sc
+    if isinstance(population, Unmyelinated):
+        return Unmyelinated, "scalar_path", _bwd_euler_ub
+    return None
+
+
 _STANDARD_MYELINATED_RHOA_FORWARD = inspect.getattr_static(
     Myelinated.myelinated_rhoa,
     "forward",
@@ -3202,6 +3227,37 @@ def _unsafe_initialization_operations(
     return tuple(sorted(unsafe))
 
 
+@cache
+def _canonical_numerical_current_adapter(
+    current_name: str,
+    assign: bool,
+) -> tuple[str, str, tuple]:
+    """Return the exact framework-generated numerical-current provenance."""
+
+    source = build_numerical_equation(current_name, assign)
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+    filename = f"<dendra.mechanisms.numerical:{digest}>"
+    module_code = compile(source, filename, "exec", dont_inherit=True)
+    function_codes = tuple(
+        value
+        for value in module_code.co_consts
+        if inspect.iscode(value) and value.co_name == current_name
+    )
+    if len(function_codes) != 1:  # pragma: no cover - fixed framework template
+        raise RuntimeError(
+            "Dendra's numerical-current template did not produce exactly one "
+            f"function named {current_name!r}"
+        )
+    return (
+        source,
+        filename,
+        _transform_code_structure_signature(
+            function_codes[0],
+            label=f"canonical numerical current {current_name}.__code__",
+        ),
+    )
+
+
 def _initialization_callable_dependency_signature(
     value,
     *,
@@ -3218,6 +3274,77 @@ def _initialization_callable_dependency_signature(
         value = value.__func__
     bound_receiver = value.__self__ if inspect.ismethod(value) else None
     target = getattr(value, "__func__", value)
+
+    generated_filename = getattr(target, "__generated_filename__", None)
+    conductance_mode = getattr(target, "_dendra_conductance_mode", None)
+    if (
+        bound_receiver is owner
+        and target.__module__ == "dendra.models.mechanisms._symbolic"
+        and isinstance(generated_filename, str)
+        and generated_filename.startswith("<dendra.mechanisms.numerical:")
+        and conductance_mode == "numerical-declared"
+        and getattr(target, "_dendra_conductance_fallback_reason", None) is None
+    ):
+        current_name = target.__name__
+        wrapper = getattr(owner, f"{current_name}_with_g", None)
+        authored_current = getattr(owner, current_name, None)
+        if (
+            getattr(wrapper, "__func__", wrapper) is target
+            and callable(authored_current)
+            and getattr(authored_current, "__func__", authored_current) is not target
+        ):
+            expected_source, expected_filename, expected_code = (
+                _canonical_numerical_current_adapter(
+                    current_name,
+                    current_name in owner._save,
+                )
+            )
+            actual_code = _transform_code_structure_signature(
+                target.__code__,
+                label=f"{label}.__code__",
+            )
+            globals_are_canonical = (
+                target.__globals__.get("torch") is torch
+                and target.__globals__.get("validate_declared_numerical_current")
+                is _validate_declared_numerical_current
+                and target.__globals__.get("__builtins__") is builtins.__dict__
+            )
+            if (
+                getattr(target, "__source__", None) != expected_source
+                or generated_filename != expected_filename
+                or actual_code != expected_code
+                or not globals_are_canonical
+            ):
+                return _unsupported_initialization_dependency(
+                    target,
+                    label=label,
+                    reason=(
+                        "a generated numerical-current adapter whose source, "
+                        "code, or framework validator bindings are no longer "
+                        "canonical"
+                    ),
+                    strict=strict,
+                )
+            # The generated adapter's context branch controls only Dendra's
+            # eager numerical-current validator; its tensor result is the fixed
+            # centred-difference expression captured in the generated code.
+            # Fingerprint that code and recursively audit the authored current
+            # rather than treating framework-owned ``is_compiling``/``type``
+            # diagnostics as authored transform-dependent behavior.
+            return (
+                "dendra-generated-numerical-current",
+                generated_filename,
+                actual_code,
+                expected_source,
+                _initialization_callable_dependency_signature(
+                    authored_current,
+                    label=f"{label}.authored_current",
+                    owner=owner,
+                    strict=strict,
+                    seen=seen,
+                    forbidden_receiver_attributes=forbidden_receiver_attributes,
+                ),
+            )
     forbidden_name = _forbidden_initialization_callable_name(target)
     if forbidden_name is not None:
         return _unsupported_initialization_dependency(
@@ -3833,10 +3960,9 @@ def _initialization_structure_signature(population: Population) -> tuple:
             for name, material in population.mech.materials.items()
         ),
     )
-    inspect_final_frame = type(population) in {
-        SingleCompartment,
-        Unmyelinated,
-    } and not any(
+    inspect_final_frame = _functional_initialization_profile(
+        population
+    ) is not None and not any(
         bool(collection)
         for collection in (
             population.mech.material_processes,
@@ -3864,25 +3990,25 @@ def _functional_initialization_failures(population: Population) -> list[str]:
 
     Functional transition admission is intentionally broader. This initializer
     supports declared State plus canonical Ion/Material tensor transactions on
-    the exact single-compartment and unmyelinated implicit-Euler topologies.
+    the exact single-compartment and structurally canonical unmyelinated
+    implicit-Euler topologies.
     Authored shared-field hooks and process initialization remain imperative and
     fail closed until their outputs have an explicit pure contract.
     """
 
     failures = []
-    if type(population) is SingleCompartment:
-        operator_kind = "scalar_point"
-        implementation = _bwd_euler_sc
-    elif type(population) is Unmyelinated:
-        operator_kind = "scalar_path"
-        implementation = _bwd_euler_ub
-    else:
+    profile = _functional_initialization_profile(population)
+    if profile is None:
         failures.append(
-            "functional initialization currently supports exactly "
-            "SingleCompartment and Unmyelinated Populations"
+            "functional initialization currently supports exact "
+            "SingleCompartment and structurally canonical Unmyelinated "
+            "Populations"
         )
+        population_family = None
         operator_kind = None
         implementation = None
+    else:
+        population_family, operator_kind, implementation = profile
 
     if operator_kind is not None:
         spec = _resolve_functional_integrator_spec(
@@ -3896,7 +4022,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             )
 
     population_standards = _STANDARD_POPULATION_FRESH_INITIALIZATION.get(
-        type(population)
+        population_family
     )
     if population_standards is not None:
         replaced_population_hooks = [
@@ -4033,7 +4159,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             )
 
     if (
-        type(population) in {SingleCompartment, Unmyelinated}
+        profile is not None
         and not handler.material_processes
         and not handler.voltage_processes
     ):

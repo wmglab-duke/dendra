@@ -1188,12 +1188,14 @@ Arbitrary callbacks registered with ``register_pre_initialize_hook`` or
 guessed or traced by the functional initializer.
 
 Fresh functional initialization supports exact ``SingleCompartment`` models
-using ``bwd_euler_sc`` and exact ``Unmyelinated`` models using
-``bwd_euler_ub``. It accepts multiple stateful or stateless mechanisms over
-dense or regional support when every declared State value is supplied by an
-insertion-time ``ic``, a canonical shared write seed, ``state_defaults``, or
-``initial_values``. Dendra resets ``CARRY`` to zero before
-the pure initialization overlays run.
+using ``bwd_euler_sc`` and structurally canonical ``Unmyelinated`` models using
+``bwd_euler_ub``. An ``Unmyelinated`` subclass may define its mechanisms,
+parameterization, and registered pure initialization transforms while retaining
+the standard geometry and lifecycle methods. It accepts multiple stateful or
+stateless mechanisms over dense or regional support when every declared State
+value is supplied by an insertion-time ``ic``, a canonical shared write seed,
+``state_defaults``, or ``initial_values``. Dendra resets ``CARRY`` to zero
+before the pure initialization overlays run.
 
 Initialization hooks must be deterministic, tensor-native, and free of
 mutation and implicit RNG. Their ``values`` mapping provides support-visible

@@ -11,6 +11,11 @@ from dendra.models.mechanisms import Mechanism
 DTYPE = torch.float64
 
 
+class _Add(torch.nn.Module):
+    def forward(self, value, increment):
+        return (value + increment,)
+
+
 def _only_mechanism(model, mechanism_type):
     return next(
         mechanism
@@ -188,6 +193,57 @@ def test_steady_restore_skips_fresh_initialization_work(monkeypatch):
     assert integrator_initializes == 1
     assert model.initializing_from_state_cache
     assert not model._integrator_reinit_pending
+
+
+def test_steady_restore_preserves_structured_post_transform_outputs_exactly():
+    observed = []
+    model = dn.Population(N=1, C=2, v_init=-65.0, dtype=DTYPE)
+    model.register_post_initialize_transform(
+        "raise_voltage",
+        _Add(),
+        reads=("state.integrator.v",),
+        writes=("state.integrator.v",),
+        inputs={"increment": torch.tensor(5.0, dtype=DTYPE)},
+    )
+    model.register_post_initialize_hook(
+        lambda population: observed.append(population.v.detach().clone())
+    )
+    model.initialize()
+    expected = model.v.detach().clone()
+    model.cache("_steady_state")
+    model.v.fill_(20.0)
+
+    model.initialize()
+
+    assert model.initializing_from_state_cache
+    torch.testing.assert_close(model.v, expected, rtol=0.0, atol=0.0)
+    assert len(observed) == 2
+    for value in observed:
+        torch.testing.assert_close(value, expected, rtol=0.0, atol=0.0)
+
+
+def test_registering_post_transform_invalidates_steady_cache():
+    model = dn.Population(N=1, C=2, v_init=-65.0, dtype=DTYPE)
+    model.initialize()
+    model.cache("_steady_state")
+
+    model.register_post_initialize_transform(
+        "raise_voltage",
+        _Add(),
+        reads=("state.integrator.v",),
+        writes=("state.integrator.v",),
+        inputs={"increment": torch.tensor(5.0, dtype=DTYPE)},
+    )
+
+    assert "_steady_state" not in model._caches
+    model.initialize()
+    assert not model.initializing_from_state_cache
+    torch.testing.assert_close(
+        model.v,
+        torch.full_like(model.v, -60.0),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def test_set_v_init_invalidates_steady_cache_before_the_next_initialize():

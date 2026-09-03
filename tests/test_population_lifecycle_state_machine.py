@@ -157,6 +157,7 @@ def test_failed_cached_initialize_post_hook_remains_fail_closed_and_retryable():
 
     assert not pop.initialized
     assert not pop.initializing_from_state_cache
+    assert not pop._restoring_steady_state
     assert not pop.integrator.initialized
     with pytest.raises(ValueError, match="initialized"):
         pop.step(dt=0.01)

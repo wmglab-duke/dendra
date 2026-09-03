@@ -836,6 +836,7 @@ class Population(P, Sliceable):
         self.compile_options = current_compile_options()
         self.compile_options_key = compile_options_key(self.compile_options)
         self.initializing_from_state_cache = False
+        self._restoring_steady_state = False
 
         if self.imem:
             self.register_buffer(
@@ -2174,7 +2175,10 @@ class Population(P, Sliceable):
             self.pre_initialize_hooks if phase == "pre" else self.post_initialize_hooks
         )
         hooks.append(hook)
-        if phase == "pre" and hasattr(self, "_caches"):
+        # Both phases contribute persistent writes to a complete initialized
+        # snapshot. A transform registered after steady-state caching must run
+        # through a fresh transaction rather than being hidden by that cache.
+        if hasattr(self, "_caches"):
             self.clear_steady_state()
         return action
 
@@ -3703,6 +3707,11 @@ class Population(P, Sliceable):
         """
         with torch.no_grad():
             for h in self.post_initialize_hooks:
+                if self._restoring_steady_state and isinstance(
+                    h,
+                    _InitializationTransformHook,
+                ):
+                    continue
                 h(self)
 
     def pre_initialize(self):
@@ -3792,10 +3801,16 @@ class Population(P, Sliceable):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
             # ``restore`` marks ordinary named-cache restores usable. A
-            # steady-state initialization still has a post-initialize phase,
-            # so keep this transition fail-closed until every hook succeeds.
+            # steady-state initialization still replays permissive legacy post
+            # hooks, so keep this transition fail-closed until every hook
+            # succeeds. Structured transforms are fresh-initialization work:
+            # every declared write is already present in the restored snapshot.
             self.initialized = False
-            self.post_initialize()
+            self._restoring_steady_state = True
+            try:
+                self.post_initialize()
+            finally:
+                self._restoring_steady_state = False
             self.t = torch.zeros_like(self.t).detach()
             self._clear_duration_remainder()
             self.initialized = True

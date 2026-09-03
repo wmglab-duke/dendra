@@ -508,6 +508,36 @@ class _AnalyticFrameMechanism(Mechanism):
         return 0.0 * v, 0.0 * v
 
 
+_NUMERICAL_VALIDATOR_CALLS = []
+
+
+class _NumericalFrameState(State):
+    State.STATE("value")
+    State.DERIVATIVE("value' = 0.0 * value")
+
+    def state_defaults(self, v, values):
+        return {"value": torch.zeros_like(v)}
+
+
+class _NumericalFrameMechanism(Mechanism):
+    Mechanism.STATE_BUNDLE(_NumericalFrameState)
+    Mechanism.GLOBAL(g=0.01)
+    Mechanism.NONSPECIFIC_CURRENT("i")
+    Mechanism.NUMERICAL("i")
+
+    def i(self, v):
+        return self.g * v
+
+
+class _CanonicalUnmyelinatedSubclass(dn.Unmyelinated):
+    pass
+
+
+class _AuthoredLifecycleUnmyelinated(dn.Unmyelinated):
+    def pre_initialize(self):
+        return super().pre_initialize()
+
+
 def _insert_mechanism(model, layout, mechanism=_DeclaredInitializationMechanism):
     kwargs = {
         "ic": {
@@ -589,6 +619,25 @@ def _model_with_defaults(mechanism):
         finally:
             if partial_defaults is not None:
                 _PartialDefaultsState.state_defaults = partial_defaults
+    return model
+
+
+def _unmyelinated_subclass_model(population_type, *, v_init=-63.0):
+    with dn.ctx(JIT=0, REQUIRE_GRAD=1):
+        model = population_type(
+            [1.5, 2.25],
+            L=4.0,
+            dx=1.0,
+            v_init=v_init,
+            dtype=torch.float64,
+            integrator=dn.bwd_euler_ub(method="pcr", imem=False),
+        )
+        model.insert(
+            _DeclaredInitializationMechanism,
+            ic={"declared_value": -0.25, "insertion_value": 0.75},
+        )
+        model.initialize()
+        model.train()
     return model
 
 
@@ -705,6 +754,71 @@ def test_declared_state_initialization_matches_imperative_for_every_support(
         rtol=0.0,
         atol=0.0,
     )
+
+
+def test_canonical_unmyelinated_subclass_initializes_purely_and_differentiates():
+    source = _unmyelinated_subclass_model(_CanonicalUnmyelinatedSubclass)
+    functional, tensors = dn.func.make_functional(source, dt=DT)
+    v_init = _new_initial_voltage(source)
+    initialized = functional.initialize(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization._replace(v_init=v_init),
+    )
+
+    reference = _unmyelinated_subclass_model(
+        _CanonicalUnmyelinatedSubclass,
+        v_init=v_init,
+    )
+    _assert_tree_close(initialized.state, functional.extract(reference).state)
+
+    gain_name = _parameter_name(tensors.parameters, "initial_gain_param")
+
+    def activation(voltage, raw_gain):
+        parameters = dict(tensors.parameters)
+        parameters[gain_name] = raw_gain
+        result = functional.initialize(
+            parameters,
+            tensors.constants,
+            tensors.initialization._replace(v_init=voltage),
+        )
+        return result.state["mechanisms"][MECHANISM_NAME]["activation"]
+
+    arguments = (v_init, tensors.parameters[gain_name])
+    reverse = torch.func.jacrev(activation, argnums=(0, 1))(*arguments)
+    forward = torch.func.jacfwd(activation, argnums=(0, 1))(*arguments)
+    for reverse_jacobian, forward_jacobian in zip(reverse, forward, strict=True):
+        assert torch.isfinite(reverse_jacobian).all()
+        assert torch.count_nonzero(reverse_jacobian) > 0
+        torch.testing.assert_close(
+            reverse_jacobian,
+            forward_jacobian,
+            rtol=2.0e-10,
+            atol=2.0e-11,
+        )
+
+
+def test_unmyelinated_subclass_with_authored_lifecycle_remains_fail_closed():
+    model = _unmyelinated_subclass_model(_AuthoredLifecycleUnmyelinated)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+
+    with pytest.raises(
+        dn.func.FunctionalizationError,
+        match=r"Population replaces canonical fresh-initialization hooks.*pre_initialize",
+    ):
+        functional.initialize(
+            tensors.parameters,
+            tensors.constants,
+            tensors.initialization,
+        )
+
+    prepared = functional.prepare(tensors.parameters, tensors.constants)
+    next_state, _auxiliary = functional.step(
+        tensors.parameters,
+        prepared,
+        tensors.state,
+    )
+    assert set(next_state) == set(tensors.state)
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
@@ -1364,6 +1478,37 @@ def test_exact_analytic_final_current_dependencies_are_checked_without_execution
             tensors.initialization,
         )
     assert _ANALYTIC_FRAME_CALLS == []
+
+
+def test_generated_numerical_validator_rebinding_invalidates_without_execution(
+    monkeypatch,
+):
+    model = _model_with_defaults(_NumericalFrameMechanism)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    mechanism = model.mech.mechanisms["_NumericalFrameMechanism"]
+    generated = mechanism.i_with_g.__func__
+
+    def effectful_validator(*args, **kwargs):
+        del args, kwargs
+        _NUMERICAL_VALIDATOR_CALLS.append("called")
+
+    _NUMERICAL_VALIDATOR_CALLS.clear()
+    monkeypatch.setitem(
+        generated.__globals__,
+        "validate_declared_numerical_current",
+        effectful_validator,
+    )
+
+    with pytest.raises(
+        dn.func.FunctionalizationError,
+        match=r"generated numerical|initialization structure|lower it again|validator",
+    ):
+        functional.initialize(
+            tensors.parameters,
+            tensors.constants,
+            tensors.initialization,
+        )
+    assert _NUMERICAL_VALIDATOR_CALLS == []
 
 
 def test_tensor_native_receiver_method_in_state_defaults_remains_admitted():

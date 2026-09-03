@@ -53,9 +53,9 @@ Use the earliest hook that matches the value's role:
   recomputation follows it, so it should not be used for values that initial
   conditions depend on.
 
-Registering a pre-initialize hook or transform, or changing ``v_init``,
-invalidates an existing steady-state cache. This prevents an older snapshot
-from silently hiding the new initial condition.
+Registering a pre-initialize hook or either structured transform, or changing
+``v_init``, invalidates an existing steady-state cache. This prevents an older
+snapshot from silently hiding the new initialization transaction.
 
 Pure mechanism initialization values
 ------------------------------------
@@ -101,8 +101,11 @@ Steady-state restoration
 A cached steady state is already a complete initialized snapshot, so restoring
 it follows a shorter path. Dendra restores the state transactionally and skips
 voltage reset, parameter resampling, pre-initialize hooks, and mechanism
-initial-value evaluation. Post-initialize hooks still run once against the
-restored state.
+initial-value evaluation. Structured pre- and post-initialize transforms do not
+run again: all of their declared writes are already represented in the cached
+snapshot. Permissive post-initialize hooks still run once against the restored
+state, which preserves their use for imperative observation or external-state
+repair.
 
 The cached stochastic state is restored without consuming another random
 sample. The solver workspace is rebuilt once on the first subsequent execution

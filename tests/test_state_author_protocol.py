@@ -95,6 +95,28 @@ def test_explicit_state_carry_dtype_survives_module_conversion():
     assert state.carry_flags.dtype is torch.bool
 
 
+@pytest.mark.parametrize(
+    ("dtype", "shape", "error", "message"),
+    [
+        ("float64", "local", TypeError, "CARRY dtype"),
+        (None, "structural", ValueError, "CARRY shape"),
+        (None, [1], TypeError, "CARRY shape"),
+        (None, (True,), TypeError, "CARRY shape dimensions"),
+        (None, (-1,), ValueError, "CARRY shape dimensions"),
+    ],
+)
+def test_state_carry_rejects_ambiguous_storage_schemas(
+    dtype,
+    shape,
+    error,
+    message,
+):
+    with pytest.raises(error, match=message):
+
+        class _InvalidCarrySchema(State):
+            State.CARRY("carry", dtype=dtype, shape=shape)
+
+
 def test_state_defaults_receive_explicit_temperature_and_geometry():
     state = _state(_OrderedBase)
     voltage = torch.full((3,), -65.0, dtype=torch.float64)

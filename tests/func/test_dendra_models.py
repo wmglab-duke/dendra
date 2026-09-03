@@ -62,15 +62,61 @@ MODEL_CASES = (
     ),
 )
 
+INITIALIZATION_MODEL_CASES = (
+    *MODEL_CASES,
+    _ModelCase(
+        "Schild1997",
+        {"diameters": [1.0], "L": 4.0, "dx": 1.0},
+        {},
+    ),
+)
+
+BALANCED_INITIALIZATION_MODEL_CASES = (
+    _ModelCase(
+        "Tigerholm2014",
+        {"diameters": [1.0], "L": 4.0, "dx": 1.0},
+        {},
+    ),
+    _ModelCase(
+        "ThioAutonomic2024",
+        {"diameters": [1.0], "L": 4.0, "dx": 1.0},
+        {},
+    ),
+    _ModelCase(
+        "ThioCutaneous2024",
+        {"diameters": [1.0], "L": 4.0, "dx": 1.0},
+        {},
+    ),
+    _ModelCase(
+        "ThioCutaneousAugmented2024",
+        {"diameters": [1.0], "L": 4.0, "dx": 1.0},
+        {},
+    ),
+)
+
+TIGERHOLM_BALANCE_PARAMETERS = (
+    "integrator.mech.mechanisms.leak.gnaleak_param",
+    "integrator.mech.mechanisms.extrapump.pumpina_param",
+    "integrator.mech.mechanisms.leak.gkleak_param",
+    "integrator.mech.mechanisms.extrapump.pumpik_param",
+)
+THIO_BALANCE_PARAMETERS = (
+    *TIGERHOLM_BALANCE_PARAMETERS,
+    "integrator.mech.mechanisms.leak.gcaleak_param",
+    "integrator.mech.mechanisms.extrapump.pumpica_param",
+)
+
 
 def _case_id(case):
     return case.name
 
 
-def _model(case: _ModelCase, *, method: str | None):
+def _model(case: _ModelCase, *, method: str | None, v_init=None):
     kwargs = dict(case.kwargs)
     if method is not None:
         kwargs["integrator"] = dn.bwd_euler_ub(method=method, imem=False)
+    if v_init is not None:
+        kwargs["v_init"] = v_init
     constructor = getattr(peripheral, case.name)
     with dn.ctx(JIT=0, REQUIRE_GRAD=1):
         model = constructor(**kwargs).double()
@@ -226,6 +272,265 @@ def _assert_discovered_schema(state, case):
     assert set(state["ions"]) == {"k", "na"}
     assert set(state["ions"]["k"]) == {"ik", "ek", "ki", "ko"}
     assert set(state["ions"]["na"]) == {"ina", "ena", "nai", "nao"}
+
+
+@pytest.mark.parametrize("case", INITIALIZATION_MODEL_CASES, ids=_case_id)
+def test_real_unmyelinated_subclass_fresh_initialization_parity_and_grad(case):
+    source = _model(case, method="pcr")
+    functional, tensors = dn.func.make_functional(source, dt=DT)
+    v_init = torch.linspace(
+        -72.0,
+        -54.0,
+        source.v.numel(),
+        dtype=source.dtype(),
+        device=source.device(),
+    ).reshape(source.shape)
+    initialized = functional.initialize(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization._replace(v_init=v_init),
+    )
+
+    reference = _model(case, method="pcr", v_init=v_init)
+    expected = functional.extract(reference)
+    _assert_every_leaf_close(initialized.state, expected.state, rtol=0.0, atol=0.0)
+    for name in tensors.parameters:
+        torch.testing.assert_close(
+            initialized.parameters[name],
+            expected.parameters[name],
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def state_loss(voltage):
+        state = functional.initialize(
+            tensors.parameters,
+            tensors.constants,
+            tensors.initialization._replace(v_init=voltage),
+        ).state
+        loss = state["integrator"]["v"].square().mean()
+        for mechanism_state in state["mechanisms"].values():
+            for value in mechanism_state.values():
+                loss = loss + value.square().mean()
+        return loss
+
+    gradient = torch.func.grad(state_loss)(v_init)
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    BALANCED_INITIALIZATION_MODEL_CASES,
+    ids=_case_id,
+)
+def test_cfiber_balance_initialization_matches_imperative_and_composes_with_step(
+    case,
+):
+    source = _model(case, method="pcr")
+    functional, tensors = dn.func.make_functional(source, dt=TIGERHOLM_DT)
+    v_init = torch.linspace(
+        -64.0,
+        -54.0,
+        source.v.numel(),
+        dtype=source.dtype(),
+        device=source.device(),
+    ).reshape(source.shape)
+    initialized = functional.initialize(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization._replace(v_init=v_init),
+    )
+
+    reference = _model(case, method="pcr", v_init=v_init)
+    expected = functional.extract(reference)
+    _assert_every_leaf_close(initialized.state, expected.state, rtol=0.0, atol=0.0)
+    _assert_every_leaf_close(
+        initialized.parameters,
+        expected.parameters,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    balance_parameters = (
+        TIGERHOLM_BALANCE_PARAMETERS
+        if case.name == "Tigerholm2014"
+        else THIO_BALANCE_PARAMETERS
+    )
+    assert any(
+        torch.count_nonzero(initialized.parameters[name]) > 0
+        for name in balance_parameters
+    )
+    assert any(
+        not torch.equal(initialized.parameters[name], tensors.parameters[name])
+        for name in balance_parameters
+    )
+
+    actual, _auxiliary = functional.prepare_and_step(
+        initialized.parameters,
+        initialized.constants,
+        initialized.state,
+    )
+    stale, _stale_auxiliary = functional.prepare_and_step(
+        tensors.parameters,
+        initialized.constants,
+        initialized.state,
+    )
+    assert not torch.equal(
+        actual["integrator"]["v"],
+        stale["integrator"]["v"],
+    )
+    dt = _initialize_imperative_integrator(reference, TIGERHOLM_DT)
+    reference.integrator.step(reference, dt)
+    reference.t = reference.t + dt
+    _assert_every_leaf_close(actual, functional.extract(reference).state)
+
+
+@pytest.mark.parametrize(
+    ("case", "raw_parameter", "balance_parameters", "state_path"),
+    (
+        pytest.param(
+            BALANCED_INITIALIZATION_MODEL_CASES[0],
+            "integrator.mech.mechanisms.ks.gbar_param.rho",
+            TIGERHOLM_BALANCE_PARAMETERS,
+            ("ks", "f"),
+            id="Tigerholm2014",
+        ),
+        pytest.param(
+            BALANCED_INITIALIZATION_MODEL_CASES[2],
+            "integrator.mech.mechanisms.nav7.gbar_param.rho",
+            THIO_BALANCE_PARAMETERS,
+            ("bk", "m"),
+            id="ThioCutaneous2024",
+        ),
+    ),
+)
+def test_cfiber_balance_initialization_has_reverse_and_forward_derivatives(
+    case,
+    raw_parameter,
+    balance_parameters,
+    state_path,
+):
+    source = _model(case, method="pcr")
+    functional, tensors = dn.func.make_functional(source, dt=TIGERHOLM_DT)
+    v_init = tensors.initialization.v_init
+
+    def initialized_values(voltage, raw_value):
+        parameters = dict(tensors.parameters)
+        parameters[raw_parameter] = raw_value
+        initialized = functional.initialize(
+            parameters,
+            tensors.constants,
+            tensors.initialization._replace(v_init=voltage),
+        )
+        mechanism_name, state_name = state_path
+        return torch.cat(
+            (
+                *(
+                    initialized.parameters[name].reshape(-1)
+                    for name in balance_parameters
+                ),
+                initialized.state["mechanisms"][mechanism_name][state_name].reshape(-1),
+            )
+        )
+
+    arguments = (v_init, tensors.parameters[raw_parameter])
+    reverse = torch.func.jacrev(initialized_values, argnums=(0, 1))(*arguments)
+    with torch_compiler_warning_context():
+        forward = torch.func.jacfwd(initialized_values, argnums=(0, 1))(*arguments)
+    for reverse_jacobian, forward_jacobian in zip(reverse, forward, strict=True):
+        assert torch.isfinite(reverse_jacobian).all()
+        assert torch.count_nonzero(reverse_jacobian) > 0
+        torch.testing.assert_close(
+            reverse_jacobian,
+            forward_jacobian,
+            rtol=2.0e-10,
+            atol=2.0e-11,
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "balance_parameter", "state_path"),
+    (
+        pytest.param(
+            BALANCED_INITIALIZATION_MODEL_CASES[0],
+            TIGERHOLM_BALANCE_PARAMETERS[0],
+            ("ks", "f"),
+            id="Tigerholm2014",
+        ),
+        pytest.param(
+            BALANCED_INITIALIZATION_MODEL_CASES[2],
+            THIO_BALANCE_PARAMETERS[1],
+            ("bk", "m"),
+            id="ThioCutaneous2024",
+        ),
+    ),
+)
+def test_cfiber_balance_initialization_vmap_including_empty_lanes(
+    case,
+    balance_parameter,
+    state_path,
+):
+    source = _model(case, method="pcr")
+    functional, tensors = dn.func.make_functional(source, dt=TIGERHOLM_DT)
+    mechanism_name, state_name = state_path
+
+    def lane(voltage):
+        initialized = functional.initialize(
+            tensors.parameters,
+            tensors.constants,
+            tensors.initialization._replace(v_init=voltage),
+        )
+        return (
+            initialized.state["integrator"]["v"],
+            initialized.parameters[balance_parameter],
+            initialized.state["mechanisms"][mechanism_name][state_name],
+        )
+
+    base = tensors.initialization.v_init
+    voltage_lanes = torch.stack((base - 2.0, base + 1.0))
+    actual = torch.vmap(lane)(voltage_lanes)
+    expected = torch.utils._pytree.tree_map(
+        lambda *values: torch.stack(values),
+        *(lane(voltage) for voltage in voltage_lanes),
+    )
+    _assert_every_leaf_close(actual, expected, rtol=0.0, atol=0.0)
+
+    empty = torch.vmap(lane)(voltage_lanes[:0])
+    for value in torch.utils._pytree.tree_leaves(empty):
+        assert value.shape[0] == 0
+
+
+def test_thio_balance_initialization_compile_of_jacrev_matches_eager():
+    case = BALANCED_INITIALIZATION_MODEL_CASES[2]
+    source = _model(case, method="pcr")
+    functional, tensors = dn.func.make_functional(source, dt=TIGERHOLM_DT)
+    v_init = tensors.initialization.v_init
+
+    def initialized_values(voltage):
+        initialized = functional.initialize(
+            tensors.parameters,
+            tensors.constants,
+            tensors.initialization._replace(v_init=voltage),
+        )
+        return torch.cat(
+            (
+                initialized.parameters[THIO_BALANCE_PARAMETERS[1]].reshape(-1),
+                initialized.state["mechanisms"]["bk"]["m"].reshape(-1),
+            )
+        )
+
+    transformed = torch.func.jacrev(initialized_values)
+    expected = transformed(v_init)
+    with torch_compiler_warning_context():
+        compiled = torch.compile(
+            transformed,
+            backend="eager",
+            fullgraph=True,
+            dynamic=False,
+        )
+        actual = compiled(v_init)
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
 def test_regional_cortical_ih_fresh_initialization_matches_local_state_defaults_and_grad():
