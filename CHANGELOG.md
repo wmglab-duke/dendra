@@ -1,3 +1,25 @@
+## v0.25.0 (2026-09-04)
+
+### BREAKING CHANGE
+
+- new canonical Mechanism and State declaration protocol
+
+### Feat
+
+- **func**: add composable functional population execution
+- **functional**: implement DERIVED_BUFFER
+- **solvers**: add vmap functionality to custom solvers
+- **runtime**: add MPS support and canonical support registry
+
+### Fix
+
+- **networks**: network conat functional across scalar neuron types
+
+### Refactor
+
+- **torchinductor**: make dendra torchinductor patches opt-in
+- **mechanisms**: preserve population axis
+
 ## v0.24.0 (2026-08-16)
 
 ### Feat
