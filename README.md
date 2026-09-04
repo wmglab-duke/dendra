@@ -12,8 +12,8 @@
 Fast, scalable, versatile, and differentiable neural simulator with support for extracellular fields. Useful to implement and train high-throughput GPU-compatible models.
 
 ## Documentation
-Full documentation is available at [https://mah148.pages.oit.duke.edu/dendra](https://mah148.pages.oit.duke.edu/dendra).
-See the [unit conventions](https://mah148.pages.oit.duke.edu/dendra/units.html)
+Full documentation is available at [Dendra documentation](https://dendra-dev.pages.oit.duke.edu/dendra/).
+See the [unit conventions](https://dendra-dev.pages.oit.duke.edu/dendra/units.html).
 for the distinct distributed-mechanism, point-process, stimulation, and material
 contracts.
 

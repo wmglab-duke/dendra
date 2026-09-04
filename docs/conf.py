@@ -20,7 +20,7 @@ from pathlib import Path
 # -- Project information -----------------------------------------------------
 
 project = "Dendra"
-copyright = "2025, WMG Lab (Duke University)"
+copyright = "2026, WMG Lab (Duke University)"
 author = "Minhaj Hussain"
 
 
@@ -98,7 +98,7 @@ html_theme_options = {
     "light_logo": "_static/logo-light.png",
     "dark_logo": "_static/logo-dark.png",
     "accent_color": "cyan",
-    "gitlab_url": "https://gitlab.oit.duke.edu/mah148/dendra",
+    "gitlab_url": "https://gitlab.oit.duke.edu/dendra-dev/dendra",
 }
 
 html_css_files = ["custom.css"]
