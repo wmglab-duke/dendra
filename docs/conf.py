@@ -76,6 +76,8 @@ myst_enable_extensions = [
 ]
 nb_execution_timeout = 600
 nb_execution_mode = "cache"
+# Include the underlying exception in CI logs, not only a report-file path.
+nb_execution_show_tb = True
 _here = Path(__file__).resolve().parent
 _root = _here.parent
 myst_substitutions = {
