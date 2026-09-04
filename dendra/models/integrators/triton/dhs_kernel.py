@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._contracts import validate_tree
+from ._contracts import is_vmap_batched_tensor, reject_nested_vmap, validate_tree
 
 # ==============================================================================
 # 1. The Triton Kernel
@@ -220,6 +220,183 @@ def _single_dhs_kernel_packed(
 # ==============================================================================
 
 
+def _launch_stable_adjoint(
+    d_work, a_geom, rhs_work, parent_idx, order, layer_ptr, threads
+):  # pragma: no cover
+    batch, size = d_work.shape
+    result = torch.empty_like(rhs_work)
+    _single_dhs_kernel[(batch,)](
+        d_work,
+        a_geom.contiguous(),
+        rhs_work,
+        result,
+        parent_idx,
+        order,
+        layer_ptr,
+        K=size,
+        L=layer_ptr.numel() - 1,
+        K_THREADS=threads,
+    )
+    return result
+
+
+@torch.library.custom_op("dendra_triton::dhs_stable_adjoint", mutates_args=())
+def _dhs_stable_adjoint(
+    d_mem: torch.Tensor,
+    a_geom: torch.Tensor,
+    rhs: torch.Tensor,
+    parent_idx: torch.Tensor,
+    order: torch.Tensor,
+    layer_ptr: torch.Tensor,
+    threads: int,
+) -> torch.Tensor:
+    return _launch_stable_adjoint(
+        d_mem.clone(memory_format=torch.contiguous_format),
+        a_geom.contiguous(),
+        rhs.clone(memory_format=torch.contiguous_format),
+        parent_idx,
+        order,
+        layer_ptr,
+        threads,
+    )
+
+
+@_dhs_stable_adjoint.register_fake
+def _(d_mem, a_geom, rhs, parent_idx, order, layer_ptr, threads):
+    return rhs.new_empty(rhs.shape)
+
+
+@_dhs_stable_adjoint.register_vmap
+def _(info, in_dims, *args):  # pragma: no cover
+    d_mem, a_geom, rhs, parent_idx, order, layer_ptr, threads = args
+    d_dim, a_dim, rhs_dim, parent_dim, order_dim, layer_dim, _ = in_dims
+    if any(dim is not None for dim in (parent_dim, order_dim, layer_dim)):
+        raise RuntimeError(
+            "stable DHS adjoint vmap requires parent_idx, order, and "
+            "layer_ptr to be shared across the transform batch"
+        )
+    reject_nested_vmap(
+        "stable DHS adjoint",
+        d_mem,
+        a_geom,
+        rhs,
+        parent_idx,
+        order,
+        layer_ptr,
+    )
+    transform_batch = info.batch_size
+    d_work, solver_batch = _merge_workspace_batch(d_mem, d_dim, transform_batch)
+    a_merged, a_batch = _merge_solver_batch(a_geom, a_dim, transform_batch)
+    rhs_work, rhs_batch = _merge_workspace_batch(rhs, rhs_dim, transform_batch)
+    if a_batch != solver_batch or rhs_batch != solver_batch:
+        raise ValueError("all stable DHS operands must have the same solver batch")
+    if transform_batch == 0:
+        result = rhs_work.new_empty(rhs_work.shape)
+        return result.reshape(0, solver_batch, *result.shape[1:]), 0
+    result = _launch_stable_adjoint(
+        d_work,
+        a_merged,
+        rhs_work,
+        parent_idx,
+        order,
+        layer_ptr,
+        threads,
+    )
+    return result.reshape(transform_batch, solver_batch, *result.shape[1:]), 0
+
+
+def _launch_packed_adjoint(
+    d_work, a_geom, rhs_work, parent_idx, order, layer_ptr, threads
+):  # pragma: no cover
+    batch, size = d_work.shape
+    layers = layer_ptr.numel() - 1
+    neurons_per_warp = 32 // threads
+    grid_x = math.ceil(batch / neurons_per_warp)
+    result = torch.empty_like(rhs_work)
+    _single_dhs_kernel_packed[(grid_x,)](
+        d_work,
+        a_geom,
+        rhs_work,
+        result,
+        parent_idx,
+        order,
+        layer_ptr,
+        B_total=batch,
+        K=size,
+        L=layers,
+        K_THREADS=threads,
+        WARP_SIZE=32,
+        num_warps=1,
+        num_stages=4,
+    )
+    return result
+
+
+@torch.library.custom_op("dendra_triton::dhs_packed_adjoint", mutates_args=())
+def _dhs_packed_adjoint(
+    d_mem: torch.Tensor,
+    a_geom: torch.Tensor,
+    rhs: torch.Tensor,
+    parent_idx: torch.Tensor,
+    order: torch.Tensor,
+    layer_ptr: torch.Tensor,
+    threads: int,
+) -> torch.Tensor:
+    return _launch_packed_adjoint(
+        d_mem.clone(memory_format=torch.contiguous_format),
+        a_geom.contiguous(),
+        rhs.clone(memory_format=torch.contiguous_format),
+        parent_idx,
+        order,
+        layer_ptr,
+        threads,
+    )
+
+
+@_dhs_packed_adjoint.register_fake
+def _(d_mem, a_geom, rhs, parent_idx, order, layer_ptr, threads):
+    return rhs.new_empty(rhs.shape)
+
+
+@_dhs_packed_adjoint.register_vmap
+def _(info, in_dims, *args):  # pragma: no cover
+    d_mem, a_geom, rhs, parent_idx, order, layer_ptr, threads = args
+    d_dim, a_dim, rhs_dim, parent_dim, order_dim, layer_dim, _ = in_dims
+    if any(dim is not None for dim in (parent_dim, order_dim, layer_dim)):
+        raise RuntimeError(
+            "DHS adjoint vmap requires parent_idx, order, and layer_ptr to "
+            "be shared across the transform batch"
+        )
+    reject_nested_vmap(
+        "packed DHS adjoint",
+        d_mem,
+        a_geom,
+        rhs,
+        parent_idx,
+        order,
+        layer_ptr,
+    )
+    transform_batch = info.batch_size
+    d_work, solver_batch = _merge_workspace_batch(d_mem, d_dim, transform_batch)
+    a_merged, a_batch = _merge_solver_batch(a_geom, a_dim, transform_batch)
+    rhs_work, rhs_batch = _merge_workspace_batch(rhs, rhs_dim, transform_batch)
+    if a_batch != solver_batch or rhs_batch != solver_batch:
+        raise ValueError("all DHS operands must have the same solver batch")
+    if transform_batch == 0:
+        result = rhs_work.new_empty(rhs_work.shape)
+        return result.reshape(0, solver_batch, *result.shape[1:]), 0
+    result = _launch_packed_adjoint(
+        d_work,
+        a_merged,
+        rhs_work,
+        parent_idx,
+        order,
+        layer_ptr,
+        threads,
+    )
+    return result.reshape(transform_batch, solver_batch, *result.shape[1:]), 0
+
+
 class DHSSolveStable(torch.autograd.Function):
     """
     Differentiable wrapper for the DHS solver kernel.
@@ -271,19 +448,30 @@ class DHSSolveStable(torch.autograd.Function):
         # The matrix for the adjoint system must be identical to the one in the
         # forward pass. We achieve this by calling the same kernel with the
         # same physical inputs (`d_mem`, `a_geom`).
-        g = torch.empty_like(grad_out)
-        _single_dhs_kernel[(B,)](
-            d_mem.clone(),
-            a_geom,
-            grad_out.clone(),
-            g,
-            parent_idx,
-            order,
-            layer_ptr,
-            K=K,
-            L=L,
-            K_THREADS=threads,
-        )
+        if is_vmap_batched_tensor(grad_out):
+            g = _dhs_stable_adjoint(
+                d_mem,
+                a_geom,
+                grad_out,
+                parent_idx,
+                order,
+                layer_ptr,
+                threads,
+            )
+        else:
+            g = torch.empty_like(grad_out)
+            _single_dhs_kernel[(B,)](
+                d_mem.clone(),
+                a_geom,
+                grad_out.clone(),
+                g,
+                parent_idx,
+                order,
+                layer_ptr,
+                K=K,
+                L=L,
+                K_THREADS=threads,
+            )
 
         # --- 2. Compute Gradients for Original Inputs ---
         grad_b = g
@@ -307,7 +495,16 @@ class DHSSolveStable(torch.autograd.Function):
 
 class DHSSolvePacked(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, d_mem, a_geom, b, parent_idx, order, layer_ptr, threads: int):
+    def forward(
+        ctx,
+        d_mem,
+        a_geom,
+        b,
+        parent_idx,
+        order,
+        layer_ptr,
+        threads: int,
+    ):
         """
         Parameters
         ----------
@@ -354,27 +551,37 @@ class DHSSolvePacked(torch.autograd.Function):
         threads = ctx.threads
         B, K = d_mem.shape
         L = layer_ptr.numel() - 1
-
         NEURONS_PER_WARP = 32 // threads
         grid_x = math.ceil(B / NEURONS_PER_WARP)
 
-        g = torch.empty_like(grad_out)
-        _single_dhs_kernel_packed[(grid_x,)](
-            d_mem.clone(),  # rebuild identical matrix
-            a_geom,
-            grad_out.clone(),  # RHS = upstream grad
-            g,
-            parent_idx,
-            order,
-            layer_ptr,
-            B_total=B,
-            K=K,
-            L=L,
-            K_THREADS=threads,
-            WARP_SIZE=32,
-            num_warps=1,
-            num_stages=4,
-        )
+        if is_vmap_batched_tensor(grad_out):
+            g = _dhs_packed_adjoint(
+                d_mem,
+                a_geom,
+                grad_out,
+                parent_idx,
+                order,
+                layer_ptr,
+                threads,
+            )
+        else:
+            g = torch.empty_like(grad_out)
+            _single_dhs_kernel_packed[(grid_x,)](
+                d_mem.clone(),
+                a_geom,
+                grad_out.clone(),
+                g,
+                parent_idx,
+                order,
+                layer_ptr,
+                B_total=B,
+                K=K,
+                L=L,
+                K_THREADS=threads,
+                WARP_SIZE=32,
+                num_warps=1,
+                num_stages=4,
+            )
 
         # Gradients wrt original inputs
         grad_b = g
@@ -392,6 +599,34 @@ class DHSSolvePacked(torch.autograd.Function):
         grad_a_geom = torch.where(root_mask, root_grad, nonroot_grad)
 
         return grad_d_mem, grad_a_geom, grad_b, None, None, None, None
+
+
+def _merge_solver_batch(tensor, batch_dim, transform_batch):
+    """Move a vmap dimension first and fuse it with the solver batch."""
+    if batch_dim is None:
+        tensor = tensor.unsqueeze(0).expand(transform_batch, *tensor.shape)
+    else:
+        tensor = tensor.movedim(batch_dim, 0)
+    solver_batch = tensor.shape[1]
+    merged = tensor.reshape(
+        transform_batch * solver_batch, *tensor.shape[2:]
+    ).contiguous()
+    return merged, solver_batch
+
+
+def _merge_workspace_batch(tensor, batch_dim, transform_batch):
+    """Fuse batches while making one independent in-kernel workspace copy."""
+    if batch_dim is None:
+        repeats = (transform_batch,) + (1,) * (tensor.ndim - 1)
+        merged = tensor.repeat(repeats)
+        solver_batch = tensor.shape[0]
+    else:
+        tensor = tensor.movedim(batch_dim, 0)
+        solver_batch = tensor.shape[1]
+        merged = tensor.reshape(
+            transform_batch * solver_batch, *tensor.shape[2:]
+        ).clone(memory_format=torch.contiguous_format)
+    return merged, solver_batch
 
 
 # ==============================================================================

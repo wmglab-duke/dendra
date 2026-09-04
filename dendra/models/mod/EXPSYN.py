@@ -11,7 +11,8 @@ class g(S):
     S.RANGE(tau=0.1)
     S.DERIVATIVE("g' = -g / tau")
 
-    def inf(self, v):
+    def state_defaults(self, v, values):
+        del values
         return {"g": torch.zeros_like(v)}
 
 
@@ -48,7 +49,7 @@ class expsyn(PP, Syn):
     where :math:`g_0` is the conductance immediately after synaptic activation.
     """
 
-    PP.STATE(g)
+    PP.STATE_BUNDLE(g)
     PP.RANGE(e=0.0)
     PP.NONSPECIFIC_CURRENT("i")
 

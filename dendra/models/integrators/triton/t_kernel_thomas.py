@@ -2,7 +2,12 @@ import torch
 import triton
 import triton.language as tl
 
-from ._contracts import validate_tridiagonal
+from ._contracts import (
+    flatten_vmap_solver_batch,
+    is_vmap_batched_tensor,
+    restore_vmap_solver_batch,
+    validate_tridiagonal,
+)
 
 
 @triton.jit
@@ -157,7 +162,14 @@ class ThomasSolve(torch.autograd.Function):
 
         # The core of the backward pass is solving A^T * y = grad_x
         # The matrix A^T has diagonals (c, b, a)
-        y = ThomasSolve._solve(a=c, b=b, c=a, d=grad_x)
+        if is_vmap_batched_tensor(grad_x):
+            # The dispatcher gives modern vmap its fused rule below and lets
+            # legacy ``is_grads_batched`` use PyTorch's correctness fallback.
+            y = _thomas_solve_cuda_t_adjoint(c, b, a, grad_x)
+        else:
+            # Preserve the original direct-kernel path and its launch overhead
+            # for the overwhelmingly common single-VJP case.
+            y = ThomasSolve._solve(a=c, b=b, c=a, d=grad_x)
 
         # Compute gradients based on the formulas derived
         if needs_grad[3]:  # Gradient for d
@@ -175,6 +187,32 @@ class ThomasSolve(torch.autograd.Function):
 
         # Return gradients in the same order as forward inputs
         return grad_a, grad_b, grad_c, grad_d
+
+
+@torch.library.custom_op("dendra_triton::thomas_solve_cuda_t_adjoint", mutates_args=())
+def _thomas_solve_cuda_t_adjoint(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    d: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch boundary for transformed adjoint solves."""
+    return ThomasSolve._solve(a, b, c, d)
+
+
+@_thomas_solve_cuda_t_adjoint.register_fake
+def _(a, b, c, d):
+    return d.new_empty(d.shape)
+
+
+@_thomas_solve_cuda_t_adjoint.register_vmap
+def _thomas_adjoint_vmap(info, in_dims, a, b, c, d):
+    flattened, solver_batch = flatten_vmap_solver_batch(info, in_dims, a, b, c, d)
+    if info.batch_size == 0:
+        x = flattened[-1].new_empty(flattened[-1].shape)
+    else:
+        x = _thomas_solve_cuda_t_adjoint(*flattened)
+    return restore_vmap_solver_batch(x, info.batch_size, solver_batch), 0
 
 
 def thomas_solve_cuda_t(a, b, c, d):

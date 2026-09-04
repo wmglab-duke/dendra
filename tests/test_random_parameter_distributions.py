@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-import dendra as dn  # noqa: F401 - ensure Dendra configures Torch before torch import
+import dendra as dn  # noqa: F401 - initialize Dendra before declaring parameters
 from dendra.models.parametric import Parameterized
 from dendra.models.random_parameters import (
     available_random_distributions,

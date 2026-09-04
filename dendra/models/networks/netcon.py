@@ -6,6 +6,7 @@ from typing import Any, Dict, Literal
 import torch
 
 from ...helpers import current_native_extension_policy
+from ...utils.tensor_ops import _logical_tensor_bytes
 from ..parametric import Referency
 from .netstim import NetStim, _causal_step_index
 from .spiking import update_active, update_active_diff
@@ -437,10 +438,10 @@ def _topology_tensor_digest(*tensors: torch.Tensor) -> str:
     """Return a stable digest for small/static connection-topology tensors."""
     digest = hashlib.sha256()
     for tensor in tensors:
-        value = tensor.detach().cpu().contiguous()
+        value = tensor.detach()
         digest.update(str(value.dtype).encode("ascii"))
         digest.update(str(tuple(value.shape)).encode("ascii"))
-        digest.update(value.view(torch.uint8).numpy().tobytes())
+        digest.update(_logical_tensor_bytes(value).numpy().tobytes())
     return digest.hexdigest()
 
 

@@ -322,20 +322,72 @@ class Material(torch.nn.Module):
 
     def initialize(self, *args, **kwargs) -> None:
         """Reset material fields from their registered initial-value sources."""
+        values = self._derive_initial_field_values()
+        self._install_field_values(values)
+        # Preserve Material's imperative extension point. Canonical Material
+        # delegates back to the pure helper below; authored subclasses may
+        # continue to override advance() without adopting functional lowering.
+        self.advance(*args, **kwargs)
+        if not self.training:
+            self.detach()
+
+    def _derive_initial_field_values(self) -> dict[str, torch.Tensor]:
+        """Purely derive canonical fields from registered initial sources."""
+        values = {}
         for field in self._material_fields:
             current = self._buffers[field]
             if self._material_has_initial_sources:
                 source = self.initial_source(field)
             else:
                 source = self._buffers[f"_initial_{field}"]
-            self._buffers[field] = _make_into_shape(
+            values[field] = _make_into_shape(
                 current.shape,
                 source,
                 like=current,
             )
-        self.advance(*args, **kwargs)
-        if not self.training:
-            self.detach()
+        return values
+
+    def _derive_advanced_field_updates(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *args,
+        **kwargs,
+    ) -> dict[str, torch.Tensor]:
+        """Purely derive the sparse generic updates for one material frame."""
+        updates = {}
+        for field in self._material_min_fields:
+            value = values[field]
+            min_value = self._buffers[f"_min_{field}"].to(
+                device=value.device,
+                dtype=value.dtype,
+            )
+            updates[field] = torch.where(value <= min_value, min_value, value)
+        return updates
+
+    def _install_field_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+    ) -> None:
+        """Install one complete material frame without changing graph ownership."""
+        expected = set(self._material_fields)
+        actual = set(values)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            unknown = sorted(actual - expected)
+            raise KeyError(
+                f"Material {self.name!r} field frame mismatch: "
+                f"missing={missing}, unknown={unknown}."
+            )
+        for field in self._material_fields:
+            self._buffers[field] = values[field]
+
+    def _install_field_updates(
+        self,
+        updates: Mapping[str, torch.Tensor],
+    ) -> None:
+        """Install a sparse set of material-field updates."""
+        for field, value in updates.items():
+            self._buffers[field] = value
 
     def detach(self):
         for field in self._material_fields:
@@ -348,9 +400,8 @@ class Material(torch.nn.Module):
         Generic materials only enforce minimum values.  Subclasses such as Ion
         override this to update derived fields like reversal potentials.
         """
-        for field in self._material_min_fields:
-            value = self._buffers[field]
-            min_value = self._buffers[f"_min_{field}"].to(
-                device=value.device, dtype=value.dtype
-            )
-            self._buffers[field] = torch.where(value <= min_value, min_value, value)
+        if not self._material_min_fields:
+            return
+        self._install_field_updates(
+            self._derive_advanced_field_updates(self._buffers, *args, **kwargs)
+        )

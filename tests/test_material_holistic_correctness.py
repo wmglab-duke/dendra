@@ -49,10 +49,11 @@ class _MaterialWritingCurrent(Mechanism):
     Mechanism.USEMATERIAL("solute", read=["c"], write=["c"])
     Mechanism.NONSPECIFIC_CURRENT("i")
 
-    def _advance(self, v, dt):
+    def advance(self, v, dt, values):
+        del v
         # This is a local reaction/write. The handler must publish it before
         # clearance/exchange/transport and then resynchronize the final field.
-        self.c = self.c + dt * self.production
+        return {"c": values["c"] + dt * self.production}
 
     def i(self, v):
         conductance = self.g * self.c

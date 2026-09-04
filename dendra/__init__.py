@@ -9,9 +9,15 @@ os.environ.setdefault("MKL_DYNAMIC", "FALSE")
 os.environ["OMP_PROC_BIND"] = "true"
 os.environ["OMP_PLACES"] = "cores"
 
-from ._bootstrap import configure_torchinductor_cache_for_dendra
+from ._bootstrap import (
+    _should_cache_cpu_isa_for_dendra,
+    _should_configure_torchinductor_cache_on_import,
+    configure_torchinductor_cache_for_dendra,
+)
 
-configure_torchinductor_cache_for_dendra()
+_torchinductor_cache_opt_in = _should_configure_torchinductor_cache_on_import()
+if _torchinductor_cache_opt_in:
+    configure_torchinductor_cache_for_dendra()
 
 import pickle
 import time
@@ -20,6 +26,7 @@ from pathlib import Path
 
 import torch
 
+import dendra.func as func
 import dendra.models.callbacks as callbacks
 import dendra.models.mod as mod
 
@@ -30,6 +37,7 @@ from .helpers import (
     DEVICE,
     DTYPE,
     NATIVE_EXTENSION_POLICY,
+    PRESERVE_MECHANISM_POPULATION_AXIS,
     RUNTIME_CONTRACT_VALIDATION,
     TF32,
     allow_tf32,
@@ -38,8 +46,10 @@ from .helpers import (
     current_device,
     current_dtype,
     current_native_extension_policy,
+    current_preserve_mechanism_population_axis,
     current_runtime_contract_validation,
     normalize_native_extension_policy,
+    normalize_preserve_mechanism_population_axis,
     normalize_runtime_contract_validation,
     set_compile_options,
     set_jit_enabled,
@@ -118,21 +128,25 @@ __all__ = [
     "DEVICE",
     "DTYPE",
     "NATIVE_EXTENSION_POLICY",
+    "PRESERVE_MECHANISM_POPULATION_AXIS",
     "RUNTIME_CONTRACT_VALIDATION",
     "COMPILE_OPTIONS",
     "current_compile_options",
     "current_device",
     "current_dtype",
     "current_native_extension_policy",
+    "current_preserve_mechanism_population_axis",
     "current_runtime_contract_validation",
     "normalize_runtime_contract_validation",
     "normalize_native_extension_policy",
+    "normalize_preserve_mechanism_population_axis",
     "set_compile_options",
     "set_jit_enabled",
     "set_jit_network_solves_enabled",
     "set_jit_network_ops_enabled",
     "set_jit_in_network_enabled",
     "callbacks",
+    "func",
     "mod",
     "load_mechanisms",
     "DistributionSpec",
@@ -234,11 +248,8 @@ def _cache_cpu_isa_list():
         return
 
 
-_cache_cpu_isa_list()
+if _torchinductor_cache_opt_in and _should_cache_cpu_isa_for_dendra():
+    _cache_cpu_isa_list()
 
 # setup environment
 allow_tf32(bool(TF32))
-
-import torch._inductor.config as inductor_config
-
-inductor_config.cpp_wrapper = True

@@ -3,6 +3,17 @@
 ### Feat
 
 - **stimulation**: add functionality to insert / remove intrinsic activity
+- **mechanisms**: add opt-in population-shaped storage for distributed mechanisms on shared compartment columns
+- **mechanisms**: expose the population-axis layout as a construction-scoped `dendra.ctx` / environment policy with explicit constructor overrides and audited model-family defaults
+
+### Fix
+
+- **mechanisms**: make support-aware copying, batching, device moves, deletion, and checkpoint validation fail closed
+- **initialization**: replace the hidden double mechanism initialization with one ordered transaction; run `INITIAL` once, keep per-step material sources and transport out of `t=0`, retain post-guard values, publish final ionic currents after concentration and Nernst synchronization, invalidate steady snapshots when `v_init` changes, and consume post-restore solver rebuilds only once
+
+### Perf
+
+- **mechanisms**: reuse exact-support gathers across initialization, state advancement, geometry and field synchronization, and reduce compatible current contributions before scattering
 
 ## v0.23.1 (2026-08-15)
 

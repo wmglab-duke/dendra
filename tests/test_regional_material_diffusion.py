@@ -339,6 +339,43 @@ def test_overlapping_dynamic_diffusivity_overrides_are_rejected():
         model.initialize()
 
 
+def test_overlapping_trainable_diffusivity_resolves_stable_parameter_slots():
+    shared_parameter = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+    with dn.ctx(DTYPE="float32"):
+        shared = _chain([1.0, 0.0, 0.0, 0.0])
+        shared[:, [0, 1, 2]].insert(
+            _RegionalImplicitDiffusion,
+            alias="left",
+            D=shared_parameter,
+        )
+        shared[:, [2, 3]].insert(
+            _RegionalImplicitDiffusion,
+            alias="right",
+            D=shared_parameter,
+        )
+        _initialize(shared)
+
+    process = next(iter(shared.mech.material_processes.values()))
+    assert process.D_left is process.D_right
+    assert tuple(
+        source_name for _fill, source_name in process.additional_parameters["D"]
+    ) == ("D_left", "D_right")
+
+    independent = _chain([1.0, 0.0, 0.0, 0.0])
+    independent[:, [0, 1, 2]].insert(
+        _RegionalImplicitDiffusion,
+        alias="left",
+        D=torch.nn.Parameter(torch.tensor(1.0, dtype=DTYPE)),
+    )
+    independent[:, [2, 3]].insert(
+        _RegionalImplicitDiffusion,
+        alias="right",
+        D=torch.nn.Parameter(torch.tensor(1.0, dtype=DTYPE)),
+    )
+    with pytest.raises(ValueError, match="independently trainable.*diffusivity"):
+        independent.initialize()
+
+
 @pytest.mark.parametrize("regional", [False, True])
 def test_1d_diffusion_preserves_live_diameter_gradients(regional):
     model = _chain([1.0, 0.0, 0.0], diam=[1.4, 2.0, 2.6])
@@ -356,3 +393,102 @@ def test_1d_diffusion_preserves_live_diameter_gradients(regional):
     assert model.diam.grad is not None
     assert torch.isfinite(model.diam.grad).all()
     assert torch.any(model.diam.grad != 0)
+
+
+def test_reinitialize_discards_diffusion_timestep_workspace():
+    model = _chain([1.0, 0.0, 0.0])
+    model.diam.requires_grad_(True)
+    model.insert(_RegionalExplicitDiffusion, D=1.0)
+    model.train()
+    model.initialize()
+
+    model.step(dt=0.125)
+    process = next(iter(model.mech.material_processes.values()))
+    old_operators = process._spatial_operators
+    old_operator = next(iter(old_operators.values()))
+
+    assert process._spatial_configured is True
+    assert old_operator.configured is True
+    torch.testing.assert_close(old_operator.dt, old_operator.dt.new_tensor(0.125))
+    assert any(
+        value.grad_fn is not None
+        for value in old_operator.buffers()
+        if value.is_floating_point()
+    )
+
+    model.initialize()
+
+    reset_operators = process._spatial_operators
+    reset_operator = next(iter(reset_operators.values()))
+    assert process.dt.item() == 0.0
+    assert process._spatial_configured is False
+    assert reset_operators is not old_operators
+    assert reset_operator.configured is False
+    assert reset_operator.solver_name == "unconfigured"
+    assert tuple(reset_operator.buffers()) == ()
+
+    process.advance_materials(0.25)
+
+    configured_operator = next(iter(process._spatial_operators.values()))
+    assert configured_operator is not reset_operator
+    assert process._spatial_configured is True
+    assert configured_operator.configured is True
+    torch.testing.assert_close(
+        configured_operator.dt,
+        configured_operator.dt.new_tensor(0.25),
+    )
+
+
+@pytest.mark.skipif(
+    not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+    reason="MPS is not available",
+)
+def test_mps_regional_implicit_diffusion_uses_parallel_pcr_at_realistic_size():
+    """A TJS-sized regional field must not materialize a dense 1101² matrix."""
+    compartments = 1101
+    initial = torch.zeros((2, compartments), device="mps", dtype=torch.float32)
+    initial[:, compartments // 2] = torch.tensor(
+        [1.0, 2.0], device="mps", dtype=torch.float32
+    )
+    # Give the excluded terminal compartments recognizable values so this also
+    # exercises the regional identity rows around the induced diffusion graph.
+    initial[:, 0] = 7.0
+    initial[:, -1] = 11.0
+
+    model = dn.Population(
+        N=2,
+        C=compartments,
+        v_init=-65.0,
+        device="mps",
+        dtype=torch.float32,
+    )
+    model.diam.fill_(2.0)
+    model.dx.fill_(1.0)
+    model.material(
+        "tracer",
+        fields={"c": initial},
+        min_values={"c": 0.0},
+        domain="intracellular",
+    )
+    model[:, 1:-1].insert(_RegionalAutoImplicitDiffusion, D=1.0)
+    model.eval()
+    model.initialize()
+
+    before = _concentration(model).clone()
+    model.step(dt=0.005)
+    after = _concentration(model)
+
+    process = next(iter(model.mech.material_processes.values()))
+    operator = next(iter(process._spatial_operators.values()))
+    assert operator.K == compartments
+    assert operator.solver_name == "pcr_mps"
+    assert after.device.type == "mps"
+    assert torch.isfinite(after).all()
+    assert torch.equal(after[:, [0, -1]], before[:, [0, -1]])
+    assert not torch.equal(after[:, 1:-1], before[:, 1:-1])
+    torch.testing.assert_close(
+        after[:, 1:-1].sum(dim=-1),
+        before[:, 1:-1].sum(dim=-1),
+        rtol=2e-5,
+        atol=2e-5,
+    )

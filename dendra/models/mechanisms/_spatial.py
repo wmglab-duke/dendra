@@ -24,8 +24,12 @@ except ImportError:  # pragma: no cover - depends on local installation
     DENDRA_SOLVERS_AVAILABLE = False
 
 try:
-    from dendra.models.integrators.tridiag import pcr_solve_t
+    from dendra.models.integrators.tridiag import (
+        pcr_solve_parallel_t,
+        pcr_solve_t,
+    )
 except Exception:  # pragma: no cover - import robustness for partial installs
+    pcr_solve_parallel_t = None
     pcr_solve_t = None
 
 try:
@@ -154,15 +158,17 @@ def select_tridiagonal_solver(solver: str | None, device: torch.device | str):
 
     The policy mirrors the unbranched voltage integrator:
 
-    - ``solver='pcr'`` explicitly requests PCR/Torch fallback.
+    - ``solver='pcr'`` explicitly requests PCR: Triton on CUDA, vectorized
+      pure PyTorch on MPS, and the historical pure-PyTorch Thomas fallback on
+      CPU.
     - ``solver='spd'`` uses the CPU SPD tridiagonal solver when available and
       falls back to Thomas-style solvers otherwise.
     - ``solver='thomas'``/``'auto'`` uses Triton Thomas on CUDA, Dendra's CPU
-      extension on CPU when available, and the pure-PyTorch PCR/Thomas fallback
-      when needed.
+      extension on CPU when available, vectorized pure-PyTorch PCR on MPS, and
+      the pure-PyTorch Thomas fallback on CPU when needed.
     """
     mode = _normalize_solver_name(solver)
-    dev_type = torch.device(device).type if not isinstance(device, str) else device
+    dev_type = torch.device(device).type
 
     if mode in {"dense", "debug"}:
         return None, "dense"
@@ -174,6 +180,13 @@ def select_tridiagonal_solver(solver: str | None, device: torch.device | str):
                     "solver='pcr' on CUDA requires dendra.models.integrators.triton.pcr_solve_cuda_t."
                 )
             return pcr_solve_cuda_t, "pcr_cuda"
+        if dev_type == "mps":
+            if pcr_solve_parallel_t is None:
+                raise ImportError(
+                    "solver='pcr' on MPS requires "
+                    "dendra.models.integrators.tridiag.pcr_solve_parallel_t."
+                )
+            return pcr_solve_parallel_t, "pcr_mps"
         if pcr_solve_t is None:
             raise ImportError(
                 "solver='pcr' requires dendra.models.integrators.tridiag.pcr_solve_t."
@@ -184,6 +197,12 @@ def select_tridiagonal_solver(solver: str | None, device: torch.device | str):
         if dev_type == "cuda":
             warnings.warn(
                 "Material diffusion solver='spd' is not implemented on CUDA; falling back to Thomas."
+            )
+            mode = "thomas"
+        elif dev_type == "mps":
+            warnings.warn(
+                "Material diffusion solver='spd' is not implemented on MPS; "
+                "falling back to parallel cyclic reduction."
             )
             mode = "thomas"
         else:
@@ -216,6 +235,11 @@ def select_tridiagonal_solver(solver: str | None, device: torch.device | str):
             raise ImportError(
                 "solver='thomas' on CUDA requires dendra.models.integrators.triton.thomas_solve_cuda_t."
             )
+        return None, "dense"
+
+    if dev_type == "mps":
+        if pcr_solve_parallel_t is not None:
+            return pcr_solve_parallel_t, "pcr_mps"
         return None, "dense"
 
     if dev_type == "cpu":

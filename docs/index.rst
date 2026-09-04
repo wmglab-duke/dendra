@@ -57,7 +57,7 @@ Getting started
 Installation
 ------------
 
-Dendra targets Python 3.11+ and PyTorch 2.8+ (CUDA 12.9+ wheels recommended for GPU use). A typical setup is:
+Dendra targets Python 3.11+ and PyTorch 2.12+ (CUDA 12.9+ wheels recommended for GPU use). A typical setup is:
 
 1. Create and activate an isolated environment (optional): ``conda create -n dendra python=3.12 && conda activate dendra``.
 2. Install PyTorch (choose GPU or CPU wheels): ``python -m pip install torch --index-url https://download.pytorch.org/whl/cu129``.
@@ -113,6 +113,7 @@ If you use `Dendra`, consider citing the `corresponding paper <https://www.natur
    :caption: Getting started
 
    installation
+   upgrading
    units
 
 .. toctree::

@@ -17,6 +17,30 @@ ArrayLike1D = Union[
 ]
 
 
+def _logical_tensor_bytes(value: torch.Tensor) -> torch.Tensor:
+    """Materialize a tensor's logical value as dense CPU bytes.
+
+    PyTorch may regard a size-one expanded tensor as contiguous even when its
+    final stride is zero. Calling ``contiguous()`` is then a no-op, and viewing
+    the result as bytes fails because dtype-changing views require a final
+    stride of one. An explicit destination allocation guarantees a genuinely
+    dense layout for audit fingerprints and bitwise comparisons.
+    """
+
+    detached = value.detach()
+    if detached.layout != torch.strided:
+        detached = detached.to_dense()
+    if detached.numel() == 0:
+        return torch.empty(0, device="cpu", dtype=torch.uint8)
+    dense = torch.empty(
+        tuple(detached.shape),
+        device="cpu",
+        dtype=detached.dtype,
+    )
+    dense.copy_(detached)
+    return dense.reshape(-1).view(torch.uint8)
+
+
 def cartesian_product(
     *seqs: ArrayLike1D,
     dtype: Optional[torch.dtype] = None,

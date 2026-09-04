@@ -21,10 +21,9 @@ def exprelr(x, y):
 
         f(x, y) = x / expm1(q) = (q y) / expm1(q)
                  = y / (1 + q/2 + q^2/6 + ...)
-                 ≈ y - x/2 + O(q^2).
+                 ≈ y (1 - q/2 + q^2/12).
 
-    The implementation switches to the first-order approximation y - x/2
-    when |q| < 1e-6.
+    The implementation switches to this second-order series when |q| < 1e-6.
 
     Parameters
     ----------
@@ -52,9 +51,18 @@ def exprelr(x, y):
     tensor(1.)
     """
     q = x / y
-    val = x / torch.expm1(q)
-    approx = y - (x / 2)
-    return torch.where(q.abs() < 1e-6, approx, val)
+    small = q.abs() < 1e-6
+    # ``torch.where`` evaluates both branches. Feeding the exact singular
+    # expression ``0 / expm1(0)`` to the inactive branch gives a finite primal
+    # but a NaN derivative (the masked backward still encounters 0 * NaN).
+    # Make that branch finite before selecting the series approximation.
+    q_safe = torch.where(small, torch.ones_like(q), q)
+    val = x / torch.expm1(q_safe)
+    # ``addcmul`` retains the exact Hessian at the removable singularity while
+    # fusing the only extra product needed beyond the historical first-order
+    # branch. This helper is used in hot mechanism assigned-value paths.
+    approx = torch.addcmul(y - x / 2, x, q, value=1 / 12)
+    return torch.where(small, approx, val)
 
 
 vtrap = exprelr
@@ -70,8 +78,7 @@ def expinv(x):
 
         x / expm1(x) = 1 - x/2 + x^2/12 - x^4/720 + ... .
 
-    The implementation switches to the first-order approximation 1 - x/2
-    when |x| < 1e-6.
+    The implementation switches to a second-order series when |x| < 1e-6.
 
     Parameters
     ----------
@@ -87,7 +94,7 @@ def expinv(x):
     Notes
     -----
     - Stable around x = 0 to avoid loss of precision due to cancellation.
-    - Series terms beyond first order are omitted for speed.
+    - The small-input branch retains terms through second order.
 
     Examples
     --------
@@ -95,9 +102,11 @@ def expinv(x):
     >>> expinv(torch.tensor(1e-12))
     tensor(1.)
     """
-    val = x / torch.expm1(x)
-    approx = 1 - 0.5 * x
-    return torch.where(x.abs() < 1e-6, approx, val)
+    small = x.abs() < 1e-6
+    x_safe = torch.where(small, torch.ones_like(x), x)
+    val = x / torch.expm1(x_safe)
+    approx = torch.addcmul(1 - 0.5 * x, x, x, value=1 / 12)
+    return torch.where(small, approx, val)
 
 
 def safe_exp(x):

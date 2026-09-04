@@ -199,7 +199,7 @@ def _run_dendra(
     )
     model.run(tstop=tstop, dt=dt, callbacks=[recorder])
     traces = {name: recorder.numpy(name).reshape(n_steps + 1) for name in TRACE_NAMES}
-    q10 = float(mechanism.DE["mhn"].q10())
+    q10 = float(mechanism.DE["mhn"].q10)
     return traces, q10
 
 

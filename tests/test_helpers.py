@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -187,6 +191,98 @@ def test_native_extension_policy_context_is_normalized_and_atomic():
         with H.ctx(NATIVE_EXTENSION_POLICY="silent"):
             pass
     assert H.NATIVE_EXTENSION_POLICY.value == original
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        ("1", True),
+        ("0", False),
+        (None, None),
+        ("", None),
+        (" default ", None),
+    ],
+)
+def test_preserve_mechanism_population_axis_normalization(value, expected):
+    assert H.normalize_preserve_mechanism_population_axis(value) is expected
+
+
+def test_preserve_mechanism_population_axis_context_nests_and_restores():
+    original = H.PRESERVE_MECHANISM_POPULATION_AXIS.value
+
+    with dn.ctx(PRESERVE_MECHANISM_POPULATION_AXIS=1):
+        assert H.current_preserve_mechanism_population_axis() is True
+        assert (
+            dn.PRESERVE_MECHANISM_POPULATION_AXIS
+            is H.PRESERVE_MECHANISM_POPULATION_AXIS
+        )
+
+        with dn.ctx(PRESERVE_MECHANISM_POPULATION_AXIS="default"):
+            assert H.current_preserve_mechanism_population_axis() is None
+
+        assert H.current_preserve_mechanism_population_axis() is True
+
+        with pytest.raises(RuntimeError, match="leave layout context"):
+            with dn.ctx(PRESERVE_MECHANISM_POPULATION_AXIS=False):
+                assert H.current_preserve_mechanism_population_axis() is False
+                raise RuntimeError("leave layout context")
+
+        assert H.current_preserve_mechanism_population_axis() is True
+
+    assert H.PRESERVE_MECHANISM_POPULATION_AXIS.value is original
+
+
+@pytest.mark.parametrize("invalid", [2, -1, 1.0, "true", "yes", object()])
+def test_invalid_preserve_mechanism_population_axis_context_is_atomic(invalid):
+    original_debug = H.DEBUG.value
+    original_policy = H.PRESERVE_MECHANISM_POPULATION_AXIS.value
+
+    with pytest.raises(ValueError, match="PRESERVE_MECHANISM_POPULATION_AXIS"):
+        with dn.ctx(DEBUG=1, PRESERVE_MECHANISM_POPULATION_AXIS=invalid):
+            pass
+
+    assert H.DEBUG.value == original_debug
+    assert H.PRESERVE_MECHANISM_POPULATION_AXIS.value is original_policy
+
+
+def test_preserve_mechanism_population_axis_environment_seeds_import():
+    environment = os.environ.copy()
+    environment["PRESERVE_MECHANISM_POPULATION_AXIS"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import dendra; "
+            "assert dendra.current_preserve_mechanism_population_axis() is True; "
+            "assert dendra.Population(N=1, C=1)."
+            "preserve_mechanism_population_axis is True",
+        ],
+        cwd=os.fspath(Path(__file__).parents[1]),
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_invalid_preserve_mechanism_population_axis_environment_rejects_import():
+    environment = os.environ.copy()
+    environment["PRESERVE_MECHANISM_POPULATION_AXIS"] = "true"
+    result = subprocess.run(
+        [sys.executable, "-c", "import dendra"],
+        cwd=os.fspath(Path(__file__).parents[1]),
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "PRESERVE_MECHANISM_POPULATION_AXIS" in result.stderr
 
 
 def test_explicit_model_dtype_overrides_context_default():

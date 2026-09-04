@@ -212,6 +212,7 @@ class SliceLifecycleStateMachine(RuleBasedStateMachine):
     @rule(size=st.integers(min_value=1, max_value=3))
     def add_leading_batch_axis(self, size: int):
         old_numel = self.oracle.numel()
+        was_built = self.population.is_built
         self.population.batch(size)
         self.oracle = self.oracle.unsqueeze(0).expand(size, *self.oracle.shape).clone()
 
@@ -225,7 +226,13 @@ class SliceLifecycleStateMachine(RuleBasedStateMachine):
                 record.coordinate_ids + batch * old_numel for batch in range(size)
             ]
             record.coordinate_ids = torch.stack(replicas, dim=0)
-        if self.g_oracle is not None:
+        if was_built:
+            # Batching a built Population rebuilds its compiled mechanism tree
+            # so support metadata acquires the new leading axis.  Mutable
+            # Slice.set writes belong to that disposable instance; only
+            # authored insertion values and persistent parametrizations replay.
+            self._record_built_mechanism()
+        elif self.g_oracle is not None:
             self.g_oracle = (
                 self.g_oracle.unsqueeze(0).expand(size, *self.g_oracle.shape).clone()
             )
@@ -410,3 +417,20 @@ TestSliceLifecycleStateMachine.settings = settings(
     deadline=None,
     suppress_health_check=(HealthCheck.too_slow,),
 )
+
+
+def test_postbuild_batch_rebinds_mechanism_slice_to_authored_configuration():
+    population = dn.Population(N=1, C=1, dtype=DTYPE)
+    population.insert(pas, g=0.125, e=-65.0)
+    population.build()
+
+    retained = population[...].mech.pas
+    old_mechanism = retained.model
+    retained.set("g", torch.tensor(0.001, dtype=DTYPE))
+    assert torch.equal(retained.g, torch.tensor([[0.001]], dtype=DTYPE))
+
+    population.batch(1)
+
+    assert retained.model is population.mech.pas
+    assert retained.model is not old_mechanism
+    assert torch.equal(retained.g, torch.tensor([[[0.125]]], dtype=DTYPE))

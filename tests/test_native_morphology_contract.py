@@ -482,6 +482,29 @@ def test_native_tree_population_and_explicit_batch_run_share_canonical_template(
     torch.testing.assert_close(model.v, model.v[0].expand_as(model.v))
 
 
+def test_tree_electrical_geometry_uses_immutable_compartment_snapshot():
+    morphology = dn.Morphology(rhoa=87.0, cm=1.1)
+    root = morphology.section("root", L=18.0, diam=5.0, nseg=1)
+    child = morphology.section("child", L=30.0, diam=1.5, nseg=2)
+    child.connect(root.at(1.0), child_end=0)
+    model = dn.Tree.from_morphology(morphology, N=2, dtype=torch.float64)
+
+    area = model.area.clone()
+    resistance = model.edge_resistance_ohm.clone()
+    for node in model.graph.nodes:
+        model.graph.nodes[node]["area"] = 1.0e20
+    for parent, child_node in model.graph.edges:
+        model.graph.edges[parent, child_node]["R_ohm"] = 1.0
+
+    torch.testing.assert_close(model.area, area, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        model.edge_resistance_ohm,
+        resistance,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
 def test_custom_graph_subclasses_must_explicitly_adapt_canonical_morphology():
     morphology = dn.Morphology()
     morphology.section("cable", L=10.0, diam=2.0)

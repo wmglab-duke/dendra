@@ -198,8 +198,32 @@ def _dense_block_reference(model, mechanism, vc, voltage, dt, intra, extracellul
     graph = model.graph
     batch = math.prod(model.shape[:-1])
     compartments = model.shape[-1]
-    area = model.area.reshape(batch, compartments)
-    cm = model.cm.reshape(batch, compartments)
+    area_scale = torch.broadcast_to(
+        torch.as_tensor(
+            model.area_scale,
+            dtype=model.area.dtype,
+            device=model.area.device,
+        ),
+        model.shape,
+    ).reshape(batch, compartments)
+    cm_scale = torch.broadcast_to(
+        torch.as_tensor(
+            model.cm_scale,
+            dtype=model.cm.dtype,
+            device=model.cm.device,
+        ),
+        model.shape,
+    ).reshape(batch, compartments)
+    rhoa_scale = torch.broadcast_to(
+        torch.as_tensor(
+            model.rhoa_scale,
+            dtype=model.area.dtype,
+            device=model.area.device,
+        ),
+        model.shape,
+    ).reshape(batch, compartments)
+    area = model.area.reshape(batch, compartments) * area_scale
+    cm = model.cm.reshape(batch, compartments) * cm_scale
     dx_cm = 1e-4 * model.dx.reshape(batch, compartments)
     xraxial = model.xraxial.reshape(batch, compartments, 2)
     xc = model.xc.reshape(batch, compartments, 2)
@@ -249,7 +273,12 @@ def _dense_block_reference(model, mechanism, vc, voltage, dt, intra, extracellul
                 + xg[node, 1] * extracellular[row, node]
             )
 
-        _add_edge_laplacian(matrix, graph, channel=0)
+        _add_edge_laplacian(
+            matrix,
+            graph,
+            channel=0,
+            rhoa_scale=rhoa_scale[row],
+        )
         for shell in range(2):
             shell_g = torch.zeros(compartments, dtype=vc.dtype)
             for parent, child in graph.edges():
@@ -354,7 +383,7 @@ def test_block_tree_matches_independent_dense_system_and_input_gradients():
         [-3.0, 1.0, 5.0, -2.0, 4.0], dtype=DTYPE, requires_grad=True
     )
 
-    actual, _ = integrator._step(
+    actual, _, _ = integrator._step(
         vc.reshape(-1, 5, 3),
         voltage,
         dt,
@@ -380,6 +409,66 @@ def test_block_tree_matches_independent_dense_system_and_input_gradients():
         torch.testing.assert_close(got, want, rtol=3e-9, atol=3e-8)
 
 
+def test_block_tree_applies_population_scales_and_preserves_their_gradients():
+    graph = _graph(
+        EDGES,
+        [8_000_000.123, 12_000_000.456, 16_000_000.789, 22_000_000.321],
+        node_order=[4, 1, 3, 0, 2],
+    )
+    model = _BlockTreeModel(graph)
+    model.area_scale = torch.tensor(
+        [[0.85, 1.10, 1.35, 0.95, 1.20], [1.25, 0.90, 1.05, 1.40, 0.80]],
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+    model.cm_scale = torch.tensor(
+        [[1.15, 0.90, 1.25, 0.80, 1.05], [0.75, 1.30, 0.95, 1.10, 1.20]],
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+    model.rhoa_scale = torch.tensor(
+        [[0.70, 1.10, 1.60, 0.85, 1.35], [1.40, 0.75, 1.20, 1.80, 0.95]],
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+    mechanism = _LinearMechanism(conductance=2.4e-4, reversal=-49.0)
+    integrator = _dhs_bt(model, mechanism, threads=2)
+    dt = 0.07
+    integrator._initialize(model, dt)
+    vc = torch.empty(model.shape + (3,), dtype=DTYPE)
+    vc[..., 0] = model.v
+    vc[..., 1] = torch.tensor([-1.0, 0.5, 2.0, -0.75, 1.25], dtype=DTYPE)
+    vc[..., 2] = torch.tensor([0.4, -0.6, 0.9, 1.1, -0.3], dtype=DTYPE)
+    voltage = vc[..., 0] - vc[..., 1]
+    intra = torch.tensor([0.011, -0.007, 0.019, 0.003, -0.013], dtype=DTYPE)
+    extracellular = torch.tensor([-3.0, 1.0, 5.0, -2.0, 4.0], dtype=DTYPE)
+
+    actual, _, _ = integrator._step(
+        vc.reshape(-1, 5, 3),
+        voltage,
+        dt,
+        model.celsius,
+        intra=intra,
+        ve=extracellular,
+    )
+    expected = _dense_block_reference(
+        model,
+        mechanism,
+        vc,
+        voltage,
+        dt,
+        intra,
+        extracellular,
+    )
+    torch.testing.assert_close(actual, expected, rtol=3e-10, atol=8e-10)
+
+    scales = (model.area_scale, model.cm_scale, model.rhoa_scale)
+    actual_grad = torch.autograd.grad(actual.square().sum(), scales, retain_graph=True)
+    expected_grad = torch.autograd.grad(expected.square().sum(), scales)
+    for got, want in zip(actual_grad, expected_grad):
+        torch.testing.assert_close(got, want, rtol=3e-9, atol=3e-8)
+
+
 def test_block_tree_common_mode_equal_to_bath_is_invariant():
     graph = _graph(
         EDGES,
@@ -395,11 +484,12 @@ def test_block_tree_common_mode_equal_to_bath_is_invariant():
     voltage = torch.zeros(model.shape, dtype=DTYPE)
     bath = torch.full(model.shape, common_mode, dtype=DTYPE)
 
-    actual, membrane = integrator._step(
+    actual, membrane, i_membrane = integrator._step(
         vc.reshape(-1, 5, 3), voltage, dt, model.celsius, ve=bath
     )
     torch.testing.assert_close(actual, vc, rtol=0.0, atol=1e-10)
     torch.testing.assert_close(membrane, voltage, rtol=0.0, atol=1e-10)
+    assert i_membrane is None
 
 
 def test_block_tree_imem_reports_discrete_membrane_balance():

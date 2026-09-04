@@ -265,45 +265,52 @@ class Ion(Material):
         # Ion initialization should use e_init/i_init/o_init so that explicit
         # equilibria()/concentrations() values, including trainable parameter
         # declarations handled by to_param, remain the source of truth.
-        name = self.name
-        i_buf = self._buffers[f"i{name}"]
-        self._buffers[f"i{name}"] = torch.zeros_like(i_buf)
-        self._buffers[f"e{name}"] = self._expand_init_like(
-            self.e_init, self._buffers[f"e{name}"]
-        )
-        self._buffers[f"{name}i"] = self._expand_init_like(
-            self.i_init, self._buffers[f"{name}i"]
-        )
-        self._buffers[f"{name}o"] = self._expand_init_like(
-            self.o_init, self._buffers[f"{name}o"]
-        )
-        self.einit(celsius)
+        self._install_field_values(self._derive_initial_field_values(celsius))
         if not self.training:
             self.detach()
 
-    def detach(self):
-        super().detach()
-        return self
-
-    def einit(self, celsius) -> None:
+    def _derive_initial_field_values(self, celsius) -> dict[str, torch.Tensor]:
+        """Purely derive the canonical t=0 Ion frame."""
+        name = self.name
+        i_buf = self._buffers[f"i{name}"]
+        values = {field: self._buffers[field] for field in self._material_fields}
+        values[f"i{name}"] = torch.zeros_like(i_buf)
+        values[f"e{name}"] = self._expand_init_like(
+            self.e_init, self._buffers[f"e{name}"]
+        )
+        values[f"{name}i"] = self._expand_init_like(
+            self.i_init, self._buffers[f"{name}i"]
+        )
+        values[f"{name}o"] = self._expand_init_like(
+            self.o_init, self._buffers[f"{name}o"]
+        )
         if self.init_e_reversal:
-            name = self.name
-            iono = self._buffers[f"{name}o"]
-            ioni = self._buffers[f"{name}i"]
-            self._buffers[f"e{name}"] = (
-                torch.log(iono / ioni) * self.rzf * (273.15 + celsius)
+            values[f"e{name}"] = self._nernst(values, celsius)
+        return values
+
+    def _nernst(self, values, celsius, updates=None):
+        name = self.name
+        updates = {} if updates is None else updates
+        iono = updates.get(f"{name}o", values[f"{name}o"])
+        ioni = updates.get(f"{name}i", values[f"{name}i"])
+        return torch.log(iono / ioni) * self.rzf * (273.15 + celsius)
+
+    def _derive_advanced_field_updates(
+        self,
+        values,
+        celsius,
+    ) -> dict[str, torch.Tensor]:
+        """Purely derive concentration guards and reversal updates."""
+        updates = super()._derive_advanced_field_updates(values, celsius)
+        if self.advance_e:
+            updates[f"e{self.name}"] = self._nernst(
+                values,
+                celsius,
+                updates=updates,
             )
+        return updates
 
     def advance(self, celsius) -> None:
-        # Clamp intracellular/extracellular concentrations through Material.advance.
-        super().advance(celsius)
-
-        if not self.advance_e:
-            return
-
-        name = self.name
-        iono = self._buffers[f"{name}o"]
-        ioni = self._buffers[f"{name}i"]
-        self._buffers[f"e{name}"] = (
-            torch.log(iono / ioni) * self.rzf * (273.15 + celsius)
+        self._install_field_updates(
+            self._derive_advanced_field_updates(self._buffers, celsius)
         )

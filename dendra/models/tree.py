@@ -457,6 +457,46 @@ class Tree(Population):
         return self._compartment_graph
 
     @property
+    def area(self):
+        """Exact compiled membrane area in square centimetres.
+
+        A Tree is a compiled simulation object.  Its public NetworkX ``graph``
+        remains mutable for interoperability, but changing that view must not
+        change the numerical model piecemeal.  Read membrane area from the same
+        immutable :class:`CompartmentGraph` snapshot that owns electrical
+        topology and axial resistance.
+        """
+        graph = self.compartment_graph
+        if graph is None:
+            return super().area
+        area = torch.as_tensor(
+            graph.geometry.area_um2,
+            device=self.device(),
+            dtype=self.dtype(),
+        ).reshape(1, -1)
+        return (area * 1.0e-8).expand(self.np, -1)
+
+    @property
+    def edge_resistance_ohm(self):
+        """Exact child-indexed compiled axial resistance in ohms.
+
+        The root entry is zero; every other entry is the complete resistance
+        between that compartment and its parent.  Values are shared across the
+        population axis and retain the model's current dtype and device.
+        """
+        graph = self.compartment_graph
+        if graph is None:
+            raise AttributeError(
+                "Tree has no compiled CompartmentGraph electrical geometry"
+            )
+        resistance = torch.as_tensor(
+            graph.geometry.edge_resistance_ohm,
+            device=self.device(),
+            dtype=self.dtype(),
+        ).reshape(1, -1)
+        return resistance.expand(self.np, -1)
+
+    @property
     def material_edge_index(self) -> torch.LongTensor:
         """Return the compact parent-child material edge index.
 

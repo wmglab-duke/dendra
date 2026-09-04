@@ -4,7 +4,12 @@ import torch
 import triton
 import triton.language as tl
 
-from ._contracts import adjoint_main_blocks, validate_tree_block
+from ._contracts import (
+    adjoint_main_blocks,
+    is_vmap_batched_tensor,
+    reject_nested_vmap,
+    validate_tree_block,
+)
 
 
 # ============================================================
@@ -234,6 +239,99 @@ def _dhs_bt3_kernel(
         tl.store(X_ch + 2, x2, mask=m)
 
 
+def _launch_bt3_solve(
+    main_work, edge, rhs_work, parent_idx, order, layer_ptr, threads
+):  # pragma: no cover
+    batch, size, _, _ = main_work.shape
+    result = torch.empty_like(rhs_work)
+    minv = torch.empty(batch, size, 9, device=rhs_work.device, dtype=rhs_work.dtype)
+    neurons_per_warp = 32 // threads
+    grid_x = math.ceil(batch / neurons_per_warp)
+    _dhs_bt3_kernel[(grid_x,)](
+        main_work.reshape(batch, -1),
+        edge.reshape(batch, -1),
+        rhs_work.reshape(batch, -1),
+        result.reshape(batch, -1),
+        minv.reshape(batch, -1),
+        parent_idx,
+        order,
+        layer_ptr,
+        B_total=batch,
+        K=size,
+        L=layer_ptr.numel() - 1,
+        K_THREADS=threads,
+        WARP_SIZE=32,
+        num_warps=1,
+        num_stages=4,
+    )
+    return result
+
+
+@torch.library.custom_op("dendra_triton::dhs_bt3_adjoint", mutates_args=())
+def _dhs_bt3_adjoint(
+    main: torch.Tensor,
+    edge: torch.Tensor,
+    rhs: torch.Tensor,
+    parent_idx: torch.Tensor,
+    order: torch.Tensor,
+    layer_ptr: torch.Tensor,
+    threads: int,
+) -> torch.Tensor:
+    return _launch_bt3_solve(
+        adjoint_main_blocks(main),
+        edge.contiguous(),
+        rhs.clone(memory_format=torch.contiguous_format),
+        parent_idx,
+        order,
+        layer_ptr,
+        threads,
+    )
+
+
+@_dhs_bt3_adjoint.register_fake
+def _(main, edge, rhs, parent_idx, order, layer_ptr, threads):
+    return rhs.new_empty(rhs.shape)
+
+
+@_dhs_bt3_adjoint.register_vmap
+def _(info, in_dims, *args):  # pragma: no cover
+    main, edge, rhs, parent_idx, order, layer_ptr, threads = args
+    main_dim, edge_dim, rhs_dim, parent_dim, order_dim, layer_dim, _ = in_dims
+    if any(dim is not None for dim in (parent_dim, order_dim, layer_dim)):
+        raise RuntimeError(
+            "block DHS adjoint vmap requires parent_idx, order, and layer_ptr "
+            "to be shared across the transform batch"
+        )
+    reject_nested_vmap(
+        "block DHS adjoint",
+        main,
+        edge,
+        rhs,
+        parent_idx,
+        order,
+        layer_ptr,
+    )
+    transform_batch = info.batch_size
+    main_work, solver_batch = _merge_adjoint_main_batch(main, main_dim, transform_batch)
+    edge_merged, edge_batch = _merge_solver_batch(edge, edge_dim, transform_batch)
+    rhs_work, rhs_batch = _merge_workspace_batch(rhs, rhs_dim, transform_batch)
+    if edge_batch != solver_batch or rhs_batch != solver_batch:
+        raise ValueError("all block DHS operands must have the same solver batch")
+    if transform_batch == 0:
+        result = rhs_work.new_empty(rhs_work.shape)
+        return result.reshape(0, solver_batch, *result.shape[1:]), 0
+    result = _launch_bt3_solve(
+        main_work,
+        edge_merged,
+        rhs_work,
+        parent_idx,
+        order,
+        layer_ptr,
+        threads,
+    )
+    return result.reshape(transform_batch, solver_batch, *result.shape[1:]), 0
+
+
 class DHSBTSolve3(torch.autograd.Function):
     @staticmethod
     def forward(ctx, D_blocks, G_vec, b, parent_idx, order, layer_ptr, threads: int):
@@ -274,32 +372,40 @@ class DHSBTSolve3(torch.autograd.Function):
     def backward(ctx, grad_out):
         D_blocks, G_vec, X, parent_idx, order, layer_ptr = ctx.saved_tensors
         threads = ctx.threads
-        B, K, _, _ = D_blocks.shape
 
-        g = torch.empty_like(grad_out)
-        MINV = torch.empty(B, K, 9, device=g.device, dtype=g.dtype)
-
-        NEURONS_PER_WARP = 32 // threads
-        grid_x = math.ceil(B / NEURONS_PER_WARP)
-
-        # Solve A^T g = grad_out by reusing the same kernel
-        _dhs_bt3_kernel[(grid_x,)](
-            adjoint_main_blocks(D_blocks).reshape(B, -1).clone(),
-            G_vec.reshape(B, -1),
-            grad_out.reshape(B, -1).clone(),
-            g.reshape(B, -1),
-            MINV.reshape(B, -1),
-            parent_idx,
-            order,
-            layer_ptr,
-            B_total=B,
-            K=K,
-            L=layer_ptr.numel() - 1,
-            K_THREADS=threads,
-            WARP_SIZE=32,
-            num_warps=1,
-            num_stages=4,
-        )
+        if is_vmap_batched_tensor(grad_out):
+            g = _dhs_bt3_adjoint(
+                D_blocks,
+                G_vec,
+                grad_out,
+                parent_idx,
+                order,
+                layer_ptr,
+                threads,
+            )
+        else:
+            B, K, _, _ = D_blocks.shape
+            g = torch.empty_like(grad_out)
+            MINV = torch.empty(B, K, 9, device=g.device, dtype=g.dtype)
+            NEURONS_PER_WARP = 32 // threads
+            grid_x = math.ceil(B / NEURONS_PER_WARP)
+            _dhs_bt3_kernel[(grid_x,)](
+                adjoint_main_blocks(D_blocks).reshape(B, -1).clone(),
+                G_vec.reshape(B, -1),
+                grad_out.reshape(B, -1).clone(),
+                g.reshape(B, -1),
+                MINV.reshape(B, -1),
+                parent_idx,
+                order,
+                layer_ptr,
+                B_total=B,
+                K=K,
+                L=layer_ptr.numel() - 1,
+                K_THREADS=threads,
+                WARP_SIZE=32,
+                num_warps=1,
+                num_stages=4,
+            )
 
         grad_b = g
         grad_D = -(g.unsqueeze(-1) * X.unsqueeze(-2))  # per-node 3×3
@@ -318,9 +424,48 @@ class DHSBTSolve3(torch.autograd.Function):
         return grad_D, grad_G, grad_b, None, None, None, None
 
 
+def _merge_solver_batch(tensor, batch_dim, transform_batch):
+    if batch_dim is None:
+        tensor = tensor.unsqueeze(0).expand(transform_batch, *tensor.shape)
+    else:
+        tensor = tensor.movedim(batch_dim, 0)
+    solver_batch = tensor.shape[1]
+    merged = tensor.reshape(
+        transform_batch * solver_batch, *tensor.shape[2:]
+    ).contiguous()
+    return merged, solver_batch
+
+
+def _merge_workspace_batch(tensor, batch_dim, transform_batch):
+    if batch_dim is None:
+        repeats = (transform_batch,) + (1,) * (tensor.ndim - 1)
+        merged = tensor.repeat(repeats)
+        solver_batch = tensor.shape[0]
+    else:
+        tensor = tensor.movedim(batch_dim, 0)
+        solver_batch = tensor.shape[1]
+        merged = tensor.reshape(
+            transform_batch * solver_batch, *tensor.shape[2:]
+        ).clone(memory_format=torch.contiguous_format)
+    return merged, solver_batch
+
+
+def _merge_adjoint_main_batch(main, batch_dim, transform_batch):
+    if batch_dim is None:
+        main = main.unsqueeze(0).expand(transform_batch, *main.shape)
+    else:
+        main = main.movedim(batch_dim, 0)
+    solver_batch = main.shape[1]
+    work = main.transpose(-1, -2).reshape(
+        transform_batch * solver_batch, *main.shape[2:]
+    )
+    return work.contiguous(), solver_batch
+
+
 def dhs_bt_solve_cuda(D_blocks, G_vec, b, parent_idx, order, layer_ptr, threads=16):
     """Solve A x = b on a tree for 3-component unknowns (vi, ve0, ve1).
-    Inputs are expected in *solver order* (use solver_order / inv_solver_order around this call).
+    Inputs are expected in *solver order* (use solver_order / inv_solver_order
+    around this call).
     """
     validate_tree_block(D_blocks, G_vec, b, parent_idx, order, layer_ptr, threads)
     return DHSBTSolve3.apply(

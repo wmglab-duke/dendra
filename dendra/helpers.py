@@ -58,6 +58,11 @@ class ctx(contextlib.ContextDecorator):
       installed PyTorch release, PyTorch factories that infer a floating dtype.
     - ``IMEM`` (int/bool): whether integrators compute/store ``i_membrane``
       in populations (required for LFP calculations).
+    - ``PRESERVE_MECHANISM_POPULATION_AXIS`` (bool/int/None): construction-time
+      policy for population-axis-preserving mechanism storage. ``True``/``1``
+      enables it, ``False``/``0`` disables it, and ``None`` or ``"default"``
+      defers to the model-family default. Existing models are not changed when
+      this value changes; it is consumed only while a model is constructed.
     - ``USETABLES`` (int/bool): toggle lookup tables declared via ``TABLE`` on
       State/Mechanism.
     - ``RUNTIME_CONTRACT_VALIDATION`` (str): runtime validation policy for
@@ -133,6 +138,8 @@ class ctx(contextlib.ContextDecorator):
                 v = normalize_runtime_contract_validation(v)
             elif key == "NATIVE_EXTENSION_POLICY":
                 v = normalize_native_extension_policy(v)
+            elif key == "PRESERVE_MECHANISM_POPULATION_AXIS":
+                v = normalize_preserve_mechanism_population_axis(v)
             elif key == "DEVICE":
                 torch_defaults[key] = _normalize_device_value(
                     v, default=torch.device("cpu")
@@ -249,6 +256,7 @@ def _normalize_dtype_value(value, default=None):
 
 
 _COMPILE_OPTIONS_NONE_SENTINELS = {"", "none", "null", "default", "{}"}
+_MPS_MAX_FUSION_UNIQUE_IO_BUFFERS = 30
 
 
 def _freeze_compile_option_value(value):
@@ -329,6 +337,89 @@ def current_compile_options(default=None):
     return options
 
 
+def compile_options_for_device(
+    options=None,
+    *,
+    backend="inductor",
+    device=None,
+    mode=None,
+    dynamic=False,
+    requires_inductor_python_wrapper=False,
+):
+    """Return effective per-call compiler options for an execution device.
+
+    PyTorch's non-AOT MPS Inductor path cannot currently use the C++ wrapper.
+    Selecting it fails during wrapper generation before a kernel can run.  Keep
+    that compatibility rule local to each ``torch.compile`` call instead of
+    mutating process-global Inductor configuration.  On other devices, preserve
+    Dendra's existing C++-wrapper default while respecting an explicit user
+    choice. Other compiler backends receive the requested options unchanged.
+
+    PyTorch does not permit passing ``mode=`` and ``options=`` together. For
+    Inductor, the selected mode is therefore expanded into its equivalent
+    option entries before device policy and explicitly requested options are
+    applied. An explicit ``cpp_wrapper=True`` request is overridden on MPS, or
+    when a compiled region contains synchronization phases that require the
+    Python wrapper. MPS fusion is also capped below Metal's 31 constant-buffer
+    limit; a stricter user cap is retained. The input mapping is never mutated.
+
+    Parameters
+    ----------
+    options : Mapping, JSON str, or None
+        User-requested backend options.
+    backend : str or callable
+        Compiler backend passed to ``torch.compile``.
+    device : torch.device, str, Tensor, or None
+        Device on which the compiled callable will execute.  Tensor inputs are
+        accepted for convenience.
+    mode : str or None
+        Optional Inductor mode whose options should be retained when a device
+        policy requires an explicit ``options=`` mapping.
+    dynamic : bool
+        Dynamic-shape setting used when resolving Inductor mode options.
+    requires_inductor_python_wrapper : bool
+        Force the Python wrapper for a compiled region containing operations
+        incompatible with Inductor's C++ wrapper.
+
+    Returns
+    -------
+    dict or None
+        Effective options suitable for ``torch.compile(options=...)``.
+    """
+    normalized = normalize_compile_options(options)
+    if not (isinstance(backend, str) and backend.lower() == "inductor"):
+        return normalized
+    if device is None:
+        return normalized
+    if torch.is_tensor(device):
+        device = device.device
+    try:
+        device_type = torch.device(device).type
+    except (TypeError, RuntimeError):
+        return normalized
+    effective = {}
+    if mode is not None:
+        effective.update(torch._inductor.list_mode_options(mode, dynamic=dynamic))
+    if normalized is not None:
+        effective.update(normalized)
+    if device_type == "mps" or requires_inductor_python_wrapper:
+        effective["cpp_wrapper"] = False
+    else:
+        effective.setdefault("cpp_wrapper", True)
+    if device_type == "mps":
+        fusion_cap = effective.get("max_fusion_unique_io_buffers")
+        if fusion_cap is None:
+            effective["max_fusion_unique_io_buffers"] = (
+                _MPS_MAX_FUSION_UNIQUE_IO_BUFFERS
+            )
+        elif isinstance(fusion_cap, int):
+            effective["max_fusion_unique_io_buffers"] = min(
+                fusion_cap,
+                _MPS_MAX_FUSION_UNIQUE_IO_BUFFERS,
+            )
+    return effective
+
+
 def current_device(default=None):
     """Return the active Dendra default device, or ``default`` when unset."""
     return _normalize_device_value(DEVICE.value, default=default)
@@ -383,6 +474,39 @@ def current_native_extension_policy() -> str:
     return normalize_native_extension_policy(NATIVE_EXTENSION_POLICY.value)
 
 
+def normalize_preserve_mechanism_population_axis(value) -> bool | None:
+    """Normalize the construction-time mechanism population-axis policy.
+
+    ``True`` and ``1`` enable population-axis-preserving mechanism storage;
+    ``False`` and ``0`` disable it. ``None``, an empty string, and
+    ``"default"`` defer to the model-family default. String forms are limited
+    to ``"0"`` and ``"1"`` so misspelled environment values fail loudly.
+    """
+    if value is None:
+        return None
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        policy = value.strip().lower()
+        if policy in ("", "default"):
+            return None
+        if policy in ("0", "1"):
+            return policy == "1"
+    raise ValueError(
+        "PRESERVE_MECHANISM_POPULATION_AXIS must be True, False, 1, 0, "
+        f"None, or 'default'; got {value!r}."
+    )
+
+
+def current_preserve_mechanism_population_axis() -> bool | None:
+    """Return the active construction-time mechanism layout policy."""
+    return normalize_preserve_mechanism_population_axis(
+        PRESERVE_MECHANISM_POPULATION_AXIS.value
+    )
+
+
 # Backward-compatible context-key aliases. The exported variable
 # ``JIT_IN_NETWORK`` below points at ``JIT_NETWORK_SOLVES`` as well, but ctx()
 # needs a key-level alias so ``with dendra.ctx(JIT_IN_NETWORK=0): ...`` keeps
@@ -402,6 +526,16 @@ PADE = ContextVar("PADE", -1)
 REQUIRE_GRAD = ContextVar("REQUIRE_GRAD", 0)
 USETABLES = ContextVar("USETABLES", 1)
 RUNTIME_CONTRACT_VALIDATION = ContextVar("RUNTIME_CONTRACT_VALIDATION", "versioned")
+
+# Unlike older binary ContextVars, this construction policy is intentionally
+# tri-state. ContextVar's environment loader needs a concrete casting type, so
+# it first reads a string and is then normalized to True, False, or None.
+PRESERVE_MECHANISM_POPULATION_AXIS = ContextVar(
+    "PRESERVE_MECHANISM_POPULATION_AXIS", ""
+)
+PRESERVE_MECHANISM_POPULATION_AXIS.value = normalize_preserve_mechanism_population_axis(
+    PRESERVE_MECHANISM_POPULATION_AXIS.value
+)
 
 NATIVE_EXTENSION_POLICY = ContextVar("NATIVE_EXTENSION_POLICY", "fallback")
 BACKEND = ContextVar("BACKEND", "inductor")

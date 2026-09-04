@@ -54,7 +54,7 @@ class fire_d(VoltageProcess):
     """
 
     VoltageProcess.RANGE(threshold=-50.0, rest=-65.0, tau_gate=0.5, ste_scale=1.0)
-    VoltageProcess.BUFFER("reset_gate")
+    VoltageProcess.CARRY("reset_gate")
 
     @staticmethod
     def _tensor_like(x, ref):
@@ -62,8 +62,8 @@ class fire_d(VoltageProcess):
             return x.to(dtype=ref.dtype, device=ref.device)
         return torch.tensor(x, dtype=ref.dtype, device=ref.device)
 
-    def initial(self, v):
-        self.reset_gate = torch.zeros_like(v, dtype=v.dtype)
+    def initial_values(self, v, values):
+        return {"reset_gate": torch.zeros_like(v)}
 
     def update_v(self, v):
         threshold = self._tensor_like(self.threshold, v)

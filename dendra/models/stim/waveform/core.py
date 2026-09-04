@@ -32,6 +32,14 @@ class Waveform(SimpleParameterized):
         1. Define parameters using the PARAMETER class method
         2. Implement the fn(t) method to define the waveform's behavior
 
+    Custom subclasses used by :mod:`dendra.func` must additionally declare
+    ``FUNCTIONAL_PURE = True`` on each concrete class.  This is a promise that
+    evaluating the waveform is deterministic and does not mutate registered
+    tensors, Python instance state, or random-number-generator state. Functional
+    lowering audits the declaration and fails closed when it cannot establish a
+    safe contract. The default is ``False`` so purity is never inherited by
+    accident when a subclass changes behavior.
+
     Examples
     --------
     Creating a custom triangular wave:
@@ -41,6 +49,7 @@ class Waveform(SimpleParameterized):
     >>>
     >>> class triangle(Waveform):
     ...     '''Triangular waveform generator'''
+    ...     FUNCTIONAL_PURE = True
     ...     Waveform.PARAMETER(amp=1.0, freq=1.0, delay=0.0)
     ...
     ...     def fn(self, t):
@@ -68,6 +77,8 @@ class Waveform(SimpleParameterized):
     Arithmetic operations supported include addition (+), subtraction (-), multiplication (*), and division (/).
 
     """
+
+    FUNCTIONAL_PURE = False
 
     def __init__(self, **kwargs):
         self.check_kwargs(kwargs)
@@ -160,15 +171,15 @@ class Waveform(SimpleParameterized):
         _poisson
             A waveform that follows a Poisson distribution according to the specified parameters.
         """
-        return _poisson(
+        poisson_type = _randomized_poisson if randomize_every_call else _poisson
+        return poisson_type(
             self,
             interval,
             n,
             start,
             noise,
             off,
-            randomize_every_call,
-            generator,
+            generator=generator,
             **kwargs,
         )
 
@@ -242,6 +253,8 @@ class Waveform(SimpleParameterized):
 
 
 class Constant(Waveform):
+    FUNCTIONAL_PURE = True
+
     def __init__(self, c: float):
         super().__init__()
         self.c = float(c)
@@ -257,6 +270,8 @@ class Constant(Waveform):
 
 class Reciprocal(Waveform):
     """Represents 1 / wf."""
+
+    FUNCTIONAL_PURE = True
 
     def __init__(self, wf: Waveform, eps: float = 1e-12):
         super().__init__()
@@ -293,6 +308,8 @@ def _repeat_broadcast_param(x, t: torch.Tensor) -> torch.Tensor:
 
 
 class _repeat(Waveform):
+    FUNCTIONAL_PURE = True
+
     Waveform.PARAMETER(freq=1.0, delay=0.0, off=torch.inf)
 
     def __init__(
@@ -319,6 +336,8 @@ class _repeat(Waveform):
 
 
 class Sum(Waveform):
+    FUNCTIONAL_PURE = True
+
     def __init__(self, *waveforms, scale=None):
         super().__init__()
 
@@ -378,6 +397,8 @@ class Product(Waveform):
     - Auto-flattens nested Product.
     - Scalars are absorbed into `gain`.
     """
+
+    FUNCTIONAL_PURE = True
 
     def __init__(self, *waveforms, gain: float = 1.0):
         super().__init__()
@@ -455,14 +476,25 @@ class _poisson(Waveform):
             Δt = (1-noise)*interval + noise*Exp(...)
     off : float
         Do not schedule spikes at or beyond this time [ms].
-    randomize_every_call : bool
-        If True, generate a new Poisson schedule on each call to fn(t).
-        Otherwise, the schedule is generated once at init time and
-        re-used on every call.
     generator : Optional[torch.Generator]
         A PyTorch random number generator for reproducibility.
         If None, the default generator is used.
     """
+
+    FUNCTIONAL_PURE = True
+
+    @property
+    def randomize_every_call(self) -> bool:
+        """Whether evaluation regenerates the schedule before every call."""
+
+        return isinstance(self, _randomized_poisson)
+
+    @randomize_every_call.setter
+    def randomize_every_call(self, enabled: bool) -> None:
+        # Preserve the historical mutable option without allowing a concrete
+        # instance's behavior to disagree with its purity declaration.
+        target_type = _randomized_poisson if bool(enabled) else _poisson
+        self.__class__ = target_type
 
     def __init__(
         self,
@@ -496,7 +528,7 @@ class _poisson(Waveform):
             raise ValueError("Poisson off must not be NaN.")
         if not math.isfinite(self.noise) or not 0.0 <= self.noise <= 1.0:
             raise ValueError("Poisson noise must be between 0 and 1 inclusive.")
-        self.randomize_every_call = bool(randomize_every_call)
+        self.randomize_every_call = False
         self.generator = generator or torch.default_generator
         self._spike_time_trailing_dims = 0
         if np.isinf(self.off) and self.n is None:
@@ -505,6 +537,12 @@ class _poisson(Waveform):
                 "(number of spikes) to terminate."
             )
         self.register_buffer("_spike_times", self._make_schedule(self.generator))
+        if bool(randomize_every_call):
+            # Retain compatibility for callers of this private historical
+            # constructor while ensuring the resulting concrete class carries
+            # the honest stateful purity marker and forward implementation.
+            self.randomize_every_call = True
+            self.__class__ = _randomized_poisson
 
     def reshape_for_intra(self):
         already_reshaped = getattr(self, "_reshaped_for_intra", False)
@@ -553,14 +591,24 @@ class _poisson(Waveform):
             )
         self._spike_times = schedule
 
+    def __setstate__(self, state):
+        """Restore old randomized pickles into the stateful concrete type."""
+
+        state = dict(state)
+        legacy_randomized = bool(state.pop("randomize_every_call", False))
+        super().__setstate__(state)
+        if legacy_randomized:
+            # Before the fixed/randomized implementation split, both modes
+            # were serialized as ``_poisson``. Preserve those objects' call
+            # semantics while keeping newly constructed fixed schedules pure.
+            self.__class__ = _randomized_poisson
+
     # ---------- core -----------------------------------------------------
     def fn(self, t: torch.Tensor) -> torch.Tensor:
         """
         Sum a copy of `waveform` at every scheduled spike time.
         Assumes the wrapped waveform returns 0 for t<0 or t>duration.
         """
-        if self.randomize_every_call:
-            self.regenerate_schedule_()
         # Evaluate each onset independently so the spike axis can never alias a
         # population, compartment, oscillator-component, or other leading axis
         # of the wrapped waveform merely because their lengths happen to match.
@@ -572,3 +620,26 @@ class _poisson(Waveform):
 
     def __repr__(self):
         return f"Poisson({self.waveform}, interval={self.interval}, noise={self.noise})"
+
+
+class _randomized_poisson(_poisson):
+    """Legacy stateful Poisson mode that regenerates its schedule per call."""
+
+    FUNCTIONAL_PURE = False
+
+    def __init__(
+        self,
+        waveform: Waveform,
+        interval: float,
+        n: Optional[int] = None,
+        start: float = 0.0,
+        noise: float = 1.0,
+        off: float = torch.inf,
+        generator: Optional[torch.Generator] = None,
+    ):
+        super().__init__(waveform, interval, n, start, noise, off, generator=generator)
+        self.randomize_every_call = True
+
+    def fn(self, t: torch.Tensor) -> torch.Tensor:
+        self.regenerate_schedule_()
+        return super().fn(t)

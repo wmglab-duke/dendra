@@ -20,7 +20,7 @@ class _DuplicateGlobalState(State):
 
 
 class _DuplicateGlobalMechanism(Mechanism):
-    Mechanism.STATE(_DuplicateGlobalState)
+    Mechanism.STATE_BUNDLE(_DuplicateGlobalState)
     Mechanism.GLOBAL(scale=1.0)
     Mechanism.NONSPECIFIC_CURRENT("i")
 

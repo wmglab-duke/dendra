@@ -83,7 +83,7 @@ class spikedetect(M):
     - `spikes` is differentiable w.r.t. `v` through the surrogate term.
     - The state `h_prev` stores the previous gate. If you do not want the autograd
       graph to backpropagate through time across many steps, you can optionally
-      detach the memory update (see commented line in `breakpoint`).
+      detach the memory update in ``advance``.
 
     **Efficient usage in a Network**
 
@@ -111,7 +111,7 @@ class spikedetect(M):
     Why this is efficient:
 
     - The threshold crossing computation is performed **once** for each presynaptic
-      compartment (in `breakpoint(v)`).
+      compartment in the accepted-step transition.
     - All outgoing synapses from that presynaptic population can read the already-
       computed `spikes` tensor, avoiding redundant per-synapse threshold checks.
 
@@ -120,9 +120,9 @@ class spikedetect(M):
     """
 
     M.RANGE(threshold=0.0, tau_gate=0.5, ste_scale=1.0)
-    M.BUFFER("spikes", "h_prev")
+    M.CARRY("spikes", "h_prev")
 
-    def initial(self, v):
+    def initial_values(self, v, values):
         # Initialize the gate memory to the current gate so we do NOT emit a spike at t=0
         # if v starts above threshold.
         thr = torch.as_tensor(self.threshold, dtype=v.dtype, device=v.device)
@@ -131,17 +131,17 @@ class spikedetect(M):
         )
 
         gate0 = torch.sigmoid((v - thr) / tau)
-        self.h_prev = gate0
-        self.spikes = torch.zeros_like(v, dtype=v.dtype)
+        return {"h_prev": gate0, "spikes": torch.zeros_like(v)}
 
-    def breakpoint(self, v):
+    def advance(self, v, dt, values):
+        del dt
         thr = self.threshold
         tau = self.tau_gate.clamp_min(1e-3)
         ste = self.ste_scale
 
         # Smooth gate in [0,1], with gate==0.5 at v==threshold
         gate = torch.sigmoid((v - thr) / tau)
-        old_h = self.h_prev  # IMPORTANT: use old gate
+        old_h = values["h_prev"]
 
         # Hard upward crossing: from <=0.5 to >0.5 (equivalent to crossing threshold from below)
         rising = (gate > 0.5) & (old_h <= 0.5)
@@ -152,9 +152,9 @@ class spikedetect(M):
         # Straight-through estimator:
         #   forward: spikes == rising (0/1)
         #   backward: gradients come from rise_soft
-        self.spikes = rising.to(v.dtype) + ste * (rise_soft - rise_soft.detach())
+        spikes = rising.to(v.dtype) + ste * (rise_soft - rise_soft.detach())
 
         # Update memory AFTER computing rising/rise_soft
-        self.h_prev = gate
+        return {"spikes": spikes, "h_prev": gate}
         # If want to prevent building a long autograd graph through time, use:
         # self.h_prev = gate.detach(), but we don't do that here.

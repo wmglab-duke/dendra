@@ -4,7 +4,7 @@ import math
 import pytest
 import torch
 
-import dendra as dn  # noqa: F401 - configure Torch before importing it directly
+import dendra as dn  # noqa: F401 - initialize Dendra before integrator imports
 from dendra.models.integrators.core import (
     Integrator,
     _broadcast_to_shape,
@@ -23,6 +23,7 @@ from dendra.models.integrators.tridiag.pcr import (
     _batched_thomas_inplace,
     pcr_solve_t,
 )
+from dendra.models.mechanisms import Mechanism
 from dendra.models.rng import (
     RNGModule,
     _device_seed,
@@ -107,6 +108,13 @@ class _LinearMechanism(torch.nn.Module):
 
     def detach(self):
         self.detached = True
+
+
+class _FallbackCanonicalMechanism(Mechanism):
+    Mechanism.TIMESTEP_BUFFER("coefficient")
+
+    def derive_timestep_buffers(self, dt):
+        return {"coefficient": torch.ones_like(self.diam) * dt}
 
 
 def _physical_cable_terms(model):
@@ -449,7 +457,14 @@ def test_integrator_shape_views_force_reinit_and_handler_dt_fallback():
     class Handler(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.mechanisms = {"a": Leaf(), "b": Leaf()}
+            canonical = _FallbackCanonicalMechanism(
+                "canonical",
+                torch.full_like(model.diam, 36.0),
+                model.diam,
+                model.shape,
+                model.shape,
+            )
+            self.mechanisms = {"a": Leaf(), "b": Leaf(), "canonical": canonical}
 
         def detach(self):
             pass
@@ -457,7 +472,13 @@ def test_integrator_shape_views_force_reinit_and_handler_dt_fallback():
     handler = Handler()
     integrator = _LifecycleIntegrator(model, handler)
     integrator._initialize(model, 0.01, force=True)
-    assert [leaf.dt for leaf in handler.mechanisms.values()] == [0.01, 0.01]
+    assert [handler.mechanisms[name].dt for name in ("a", "b")] == [0.01, 0.01]
+    canonical = handler.mechanisms["canonical"]
+    assert float(canonical.dt) == pytest.approx(0.01)
+    torch.testing.assert_close(
+        canonical.coefficient,
+        torch.full_like(canonical.coefficient, 0.01),
+    )
     assert integrator.needs_to_be_initialized(model, 0.01) is False
     assert integrator.needs_to_be_initialized(model, 0.01, force=True) is True
 

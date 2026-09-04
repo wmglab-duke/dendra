@@ -3,7 +3,12 @@ import triton
 import triton.language as tl
 from torch.library import triton_op, wrap_triton
 
-from ._contracts import copy_rhs_workspace, validate_block_tridiagonal
+from ._contracts import (
+    copy_rhs_workspace,
+    flatten_vmap_solver_batch,
+    restore_vmap_solver_batch,
+    validate_block_tridiagonal,
+)
 
 
 # ---------------------------------------------------------------------
@@ -235,6 +240,18 @@ def thomas_bt3_solve(
 @thomas_bt3_solve.register_fake
 def _(lower, main, upper, rhs):
     return rhs.new_empty(rhs.shape)
+
+
+@thomas_bt3_solve.register_vmap
+def _thomas_bt3_solve_vmap(info, in_dims, lower, main, upper, rhs):
+    flattened, solver_batch = flatten_vmap_solver_batch(
+        info, in_dims, lower, main, upper, rhs
+    )
+    if info.batch_size == 0:
+        x = flattened[-1].new_empty(flattened[-1].shape)
+    else:
+        x = thomas_bt3_solve(*flattened)
+    return restore_vmap_solver_batch(x, info.batch_size, solver_batch), 0
 
 
 # ---------------------------------------------------------------------

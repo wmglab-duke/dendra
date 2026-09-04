@@ -86,3 +86,11 @@ def test_mechanism_scalers_implement_documented_density_and_point_contracts():
     # raw nA/µS divided by 1e6 * area_cm2 -> mA/cm² / S/cm²
     torch.testing.assert_close(scaled_i, torch.tensor([[2.0, 2.0]]))
     torch.testing.assert_close(scaled_g, torch.tensor([[3.0, 3.0]]))
+
+    factor_name = PointProcess._AREA_FACTOR_BUFFER
+    assert factor_name in point._buffers
+    assert factor_name not in point.state_dict()
+    point._buffers[factor_name] = 2.0 * point._buffers[factor_name]
+    rebound_i, rebound_g = point_scale(current_na, conductance_us)
+    torch.testing.assert_close(rebound_i, 0.5 * scaled_i)
+    torch.testing.assert_close(rebound_g, 0.5 * scaled_g)

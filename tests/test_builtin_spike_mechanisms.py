@@ -35,6 +35,10 @@ def _instance(cls, v_init, *, tensor_dtype=DTYPE, **parameters):
     return mechanism
 
 
+def _advance(mechanism, voltage):
+    mechanism._advance_states(voltage, voltage.new_tensor(1.0))
+
+
 def test_fire_uses_strict_threshold_and_differentiable_forward_is_exact():
     voltage = torch.tensor([[-51.0, -50.0, -49.0]], dtype=DTYPE)
     hard = _instance(fire, voltage, threshold=-50.0, rest=-65.0)
@@ -93,8 +97,8 @@ def test_refractory_fire_hard_and_surrogate_forward_lifecycle_match():
         tau_gate=0.5,
         ste_scale=1.0,
     )
-    hard.set_dt(1.0)
-    differentiable.set_dt(1.0)
+    hard._configure_timestep(1.0)
+    differentiable._configure_timestep(1.0)
 
     sequence = (
         initial,
@@ -130,7 +134,7 @@ def test_fire_r_d_gradients_exist_only_when_available_to_spike():
         refractory=2.0,
         tau_gate=0.5,
     )
-    mechanism.set_dt(1.0)
+    mechanism._configure_timestep(1.0)
 
     crossing = torch.tensor([[-49.0]], dtype=DTYPE, requires_grad=True)
     output = mechanism.update_v(crossing)
@@ -161,8 +165,8 @@ def test_apcount_variants_count_only_upward_crossings():
 
     assert hard.n.dtype == torch.float32
     assert differentiable.n.dtype == DTYPE
-    hard.breakpoint(initial)
-    differentiable.breakpoint(initial)
+    _advance(hard, initial)
+    _advance(differentiable, initial)
     torch.testing.assert_close(hard.n, torch.zeros_like(initial, dtype=torch.float32))
     torch.testing.assert_close(differentiable.n, torch.zeros_like(initial))
 
@@ -181,8 +185,8 @@ def test_apcount_variants_count_only_upward_crossings():
         ),
         expected_counts,
     ):
-        hard.breakpoint(voltage)
-        differentiable.breakpoint(voltage)
+        _advance(hard, voltage)
+        _advance(differentiable, voltage)
         torch.testing.assert_close(hard.n, expected.to(torch.float32))
         torch.testing.assert_close(differentiable.n, expected)
 
@@ -198,10 +202,19 @@ def test_hard_apcount_does_not_saturate_with_low_precision_voltage(
     counter = _instance(apcount, initial, tensor_dtype=dtype, threshold=0.0)
     counter.n.fill_(last_exact_integer)
 
-    counter.breakpoint(torch.tensor([[1.0]], dtype=dtype))
+    _advance(counter, torch.tensor([[1.0]], dtype=dtype))
 
     assert counter.n.dtype == torch.float32
     assert counter.n.item() == last_exact_integer + 1
+
+
+def test_explicit_carry_dtype_survives_module_dtype_conversion():
+    counter = _instance(apcount, torch.tensor([[-1.0]]), threshold=0.0)
+
+    counter.to(dtype=torch.float16)
+
+    assert counter.n.dtype == torch.float32
+    assert counter.active.dtype == torch.bool
 
 
 def test_apcount_d_and_spikedetect_emit_hard_events_with_surrogate_gradients():
@@ -211,8 +224,8 @@ def test_apcount_d_and_spikedetect_emit_hard_events_with_surrogate_gradients():
 
     counter_voltage = torch.tensor([[0.1]], dtype=DTYPE, requires_grad=True)
     detector_voltage = torch.tensor([[0.1]], dtype=DTYPE, requires_grad=True)
-    counter.breakpoint(counter_voltage)
-    detector.breakpoint(detector_voltage)
+    _advance(counter, counter_voltage)
+    _advance(detector, detector_voltage)
 
     assert counter.spikes.item() == detector.spikes.item() == 1.0
     assert counter.n.item() == 1.0
@@ -223,8 +236,8 @@ def test_apcount_d_and_spikedetect_emit_hard_events_with_surrogate_gradients():
     assert torch.isfinite(counter_voltage.grad).all()
     assert torch.isfinite(detector_voltage.grad).all()
 
-    counter.breakpoint(torch.tensor([[0.2]], dtype=DTYPE))
-    detector.breakpoint(torch.tensor([[0.2]], dtype=DTYPE))
+    _advance(counter, torch.tensor([[0.2]], dtype=DTYPE))
+    _advance(detector, torch.tensor([[0.2]], dtype=DTYPE))
     assert counter.spikes.item() == detector.spikes.item() == 0.0
     assert counter.n.item() == 1.0
 
@@ -233,8 +246,8 @@ def test_spikedetect_initialization_above_threshold_does_not_emit_event():
     initial = torch.tensor([[1.0, 0.0]], dtype=DTYPE)
     detector = _instance(spikedetect, initial, threshold=0.0, tau_gate=0.5)
 
-    detector.breakpoint(initial)
+    _advance(detector, initial)
     torch.testing.assert_close(detector.spikes, torch.zeros_like(initial))
-    detector.breakpoint(torch.tensor([[-1.0, -1.0]], dtype=DTYPE))
-    detector.breakpoint(torch.tensor([[1.0, 1.0]], dtype=DTYPE))
+    _advance(detector, torch.tensor([[-1.0, -1.0]], dtype=DTYPE))
+    _advance(detector, torch.tensor([[1.0, 1.0]], dtype=DTYPE))
     torch.testing.assert_close(detector.spikes, torch.ones_like(initial))

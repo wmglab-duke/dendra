@@ -247,7 +247,7 @@ def _run_dendra(synapse_kind):
     network.initialize(DT)
     if synapse_kind.startswith("exp2syn"):
         tau1, tau2 = _exp2_taus(synapse_kind)
-        effective_tau1 = float(synapse.DE["A"].tau1.item())
+        effective_tau1 = float(synapse.tau1_effective.item())
         assert effective_tau1 == pytest.approx(
             _effective_exp2_tau1(tau1, tau2), rel=2.0e-7
         )

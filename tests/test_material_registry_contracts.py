@@ -261,9 +261,12 @@ def test_late_registered_alias_binds_mechanism_read_write_and_source_end_to_end(
             source={"c": "c_increment"},
         )
 
-        def _advance(self, v, dt):
-            self.c = self.c + dt
-            self.c_increment = torch.full_like(self.c_increment, 2.0 * dt)
+        def advance(self, v, dt, values):
+            del v
+            return {
+                "c": values["c"] + dt,
+                "c_increment": torch.full_like(values["c_increment"], 2.0 * dt),
+            }
 
     # The alias deliberately does not exist while the class body is evaluated.
     register_material("solute", fields={"c": 1.0}, aliases="late_pool")

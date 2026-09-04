@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 import dendra as dn  # noqa: F401 - configure Dendra before compiling mechanisms
-from dendra.models.mechanisms import Mechanism, PointProcess
+from dendra.models.mechanisms import Mechanism, PointProcess, State, VoltageProcess
 from dendra.models.mechanisms._handler import MechanismHandler
+from dendra.models.mechanisms._support_registry import SupportEntry
 
 FULL_SHAPE = (2, 4)
 DTYPE = torch.float64
@@ -35,6 +37,20 @@ class _ScalarConstant(Mechanism):
     def i_with_conductance(self, v):
         del v
         return 1.25, 0.0
+
+
+class _ReducedConstant(Mechanism):
+    Mechanism.RANGE(scale=0.5)
+    Mechanism.NONSPECIFIC_CURRENT("i")
+    Mechanism.AFFINE("i")
+
+    def i(self, v):
+        del v
+        return self.scale.sum()
+
+    def i_with_conductance(self, v):
+        value = self.scale.sum()
+        return value, torch.zeros_like(v)
 
 
 class _PointAffine(PointProcess):
@@ -68,7 +84,7 @@ class _HalfOne(_HalfLarge):
 class _SavedAffine(Mechanism):
     Mechanism.RANGE(g=0.5, bias=-0.75)
     Mechanism.NONSPECIFIC_CURRENT("i")
-    Mechanism.SAVE("i")
+    Mechanism.SAVE_CURRENT("i")
     Mechanism.AFFINE("i")
 
     def i(self, v):
@@ -81,11 +97,46 @@ class _SavedAffine(Mechanism):
 class _SavedNonlinear(Mechanism):
     Mechanism.RANGE(scale=0.1)
     Mechanism.NONSPECIFIC_CURRENT("i")
-    Mechanism.SAVE("i")
+    Mechanism.SAVE_CURRENT("i")
     Mechanism.NUMERICAL("i")
 
     def i(self, v):
         return self.scale * v.square()
+
+
+class _RelaxState(State):
+    State.STATE("x")
+    State.RANGE(rate=0.1)
+    State.DERIVATIVE("x' = -rate * x")
+
+    def state_defaults(self, v, values):
+        del values
+        return {"x": torch.full_like(v, -65.0)}
+
+
+class _StateOnly(Mechanism):
+    Mechanism.STATE_BUNDLE(_RelaxState)
+
+
+class _OffsetVoltage(VoltageProcess):
+    VoltageProcess.RANGE(offset=2.0)
+
+    def update_v(self, v):
+        return v + self.offset
+
+
+class _CallLocalCurrent(torch.nn.Module):
+    """Expose the handler's pure current frame through ``forward`` for transforms."""
+
+    def __init__(self, handler):
+        super().__init__()
+        self.handler = handler
+
+    def forward(self, voltage):
+        current, conductance, _current_frame, _conductance_frame = (
+            self.handler._evaluate_current_frame(voltage)
+        )
+        return current, conductance
 
 
 def _make_mechanism(
@@ -142,6 +193,267 @@ def _scatter_oracle(handler, voltage):
     return expected_i, expected_g
 
 
+REGIONAL_CURRENT_CASES = (
+    pytest.param(None, False, id="dense"),
+    pytest.param((slice(None), slice(1, 3)), True, id="rectangular"),
+    pytest.param(torch.tensor([1, 3, 5, 7]), False, id="shared_columns"),
+    pytest.param(torch.tensor([0, 3, 5]), False, id="packed"),
+    pytest.param(torch.tensor([1, 1, 6]), False, id="duplicate_packed"),
+)
+
+
+@pytest.mark.parametrize("key,is_composable", REGIONAL_CURRENT_CASES)
+def test_call_local_current_frame_matches_imperative_for_every_support(
+    key,
+    is_composable,
+):
+    handler = _make_handler(
+        {
+            "probe": _make_mechanism(
+                _TensorAffine,
+                "probe",
+                key=key,
+                is_composable=is_composable,
+                g=0.375,
+                bias=-0.25,
+            )
+        }
+    )
+    voltage = torch.linspace(-2.0, 5.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    expected = handler.i(voltage)
+    scratch_before = tuple(
+        buffer.clone()
+        for buffers in (handler._buf_i, handler._buf_g)
+        for buffer in buffers
+    )
+
+    actual = handler._evaluate_current_frame(voltage)[:2]
+
+    torch.testing.assert_close(actual, expected)
+    scratch_after = tuple(
+        buffer for buffers in (handler._buf_i, handler._buf_g) for buffer in buffers
+    )
+    for before, after in zip(scratch_before, scratch_after):
+        torch.testing.assert_close(after, before)
+
+
+@pytest.mark.parametrize("key,is_composable", REGIONAL_CURRENT_CASES)
+@pytest.mark.parametrize("lane_count", (3, 0), ids=("nonempty", "empty"))
+def test_call_local_regional_current_supports_parameter_only_vmap(
+    key,
+    is_composable,
+    lane_count,
+):
+    handler = _make_handler(
+        {
+            "probe": _make_mechanism(
+                _TensorAffine,
+                "probe",
+                key=key,
+                is_composable=is_composable,
+                g=0.375,
+                bias=-0.25,
+            )
+        }
+    )
+    module = _CallLocalCurrent(handler)
+    voltage = torch.linspace(-2.0, 5.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    conductance_name, base_conductance = next(
+        (name, buffer)
+        for name, buffer in module.named_buffers()
+        if name.endswith("mechanisms.probe.g")
+    )
+    conductances = torch.randn(
+        (lane_count,) + tuple(base_conductance.shape),
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+
+    def evaluate(conductance):
+        return torch.func.functional_call(
+            module,
+            {conductance_name: conductance},
+            (voltage,),
+            strict=False,
+        )
+
+    current, conductance = torch.vmap(evaluate)(conductances)
+    assert current.shape == conductance.shape == (lane_count,) + FULL_SHAPE
+    gradient = torch.autograd.grad(
+        current.square().sum() + conductance.square().sum(),
+        conductances,
+    )[0]
+    assert gradient.shape == conductances.shape
+    assert torch.isfinite(gradient).all()
+
+
+@pytest.mark.parametrize("key,is_composable", REGIONAL_CURRENT_CASES)
+@pytest.mark.parametrize("lane_count", (3, 0), ids=("nonempty", "empty"))
+def test_call_local_regional_current_supports_voltage_vmap(
+    key,
+    is_composable,
+    lane_count,
+):
+    handler = _make_handler(
+        {
+            "probe": _make_mechanism(
+                _TensorAffine,
+                "probe",
+                key=key,
+                is_composable=is_composable,
+                g=0.375,
+                bias=-0.25,
+            )
+        }
+    )
+    module = _CallLocalCurrent(handler)
+    voltages = torch.randn(
+        (lane_count,) + FULL_SHAPE,
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+
+    current, conductance = torch.vmap(module)(voltages)
+    assert current.shape == conductance.shape == voltages.shape
+    gradient = torch.autograd.grad(
+        current.square().sum() + conductance.square().sum(),
+        voltages,
+    )[0]
+    assert gradient.shape == voltages.shape
+    assert torch.isfinite(gradient).all()
+
+
+@pytest.mark.parametrize(
+    "key,is_composable",
+    REGIONAL_CURRENT_CASES[1:4],
+)
+@pytest.mark.parametrize("lane_count", (3, 0), ids=("nonempty", "empty"))
+def test_call_local_group_broadcasts_each_transformed_scalar_before_reduction(
+    key,
+    is_composable,
+    lane_count,
+):
+    handler = _make_handler(
+        {
+            "reduced": _make_mechanism(
+                _ReducedConstant,
+                "reduced",
+                key=key,
+                is_composable=is_composable,
+            ),
+            "spatial": _make_mechanism(
+                _TensorAffine,
+                "spatial",
+                key=key,
+                is_composable=is_composable,
+                g=0.375,
+                bias=-0.25,
+            ),
+        }
+    )
+    assert [len(entries) for *_, entries in handler._map_grouped] == [2]
+    module = _CallLocalCurrent(handler)
+    voltage = torch.linspace(-2.0, 5.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    scale_name, base_scale = next(
+        (name, buffer)
+        for name, buffer in module.named_buffers()
+        if name.endswith("mechanisms.reduced.scale")
+    )
+    scales = torch.randn(
+        (lane_count,) + tuple(base_scale.shape),
+        dtype=DTYPE,
+        requires_grad=True,
+    )
+
+    def evaluate(scale):
+        return torch.func.functional_call(
+            module,
+            {scale_name: scale},
+            (voltage,),
+            strict=False,
+        )
+
+    vmapped = torch.vmap(evaluate)
+    expected = vmapped(scales)
+    torch.compiler.reset()
+    compiled = torch.compile(vmapped, backend="eager", fullgraph=True)
+    actual = compiled(scales)
+
+    assert actual[0].shape == actual[1].shape == (lane_count,) + FULL_SHAPE
+    torch.testing.assert_close(actual, expected)
+    gradient = torch.autograd.grad(
+        expected[0].square().sum() + expected[1].square().sum(),
+        scales,
+    )[0]
+    assert gradient.shape == scales.shape
+
+
+@pytest.mark.parametrize("key,is_composable", REGIONAL_CURRENT_CASES)
+def test_compiled_vmapped_call_local_regional_current_is_fullgraph(
+    key,
+    is_composable,
+):
+    handler = _make_handler(
+        {
+            "probe": _make_mechanism(
+                _TensorAffine,
+                "probe",
+                key=key,
+                is_composable=is_composable,
+                g=0.375,
+                bias=-0.25,
+            )
+        }
+    )
+    module = _CallLocalCurrent(handler)
+    voltage = torch.linspace(-2.0, 5.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    conductance_name, base_conductance = next(
+        (name, buffer)
+        for name, buffer in module.named_buffers()
+        if name.endswith("mechanisms.probe.g")
+    )
+    conductances = torch.randn(
+        (2,) + tuple(base_conductance.shape),
+        dtype=DTYPE,
+    )
+
+    def evaluate(conductance):
+        return torch.func.functional_call(
+            module,
+            {conductance_name: conductance},
+            (voltage,),
+            strict=False,
+        )
+
+    vmapped = torch.vmap(evaluate)
+    torch.compiler.reset()
+    compiled = torch.compile(vmapped, backend="eager", fullgraph=True)
+    expected = vmapped(conductances)
+    actual = compiled(conductances)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_direct_handler_itot_before_map_construction_keeps_safe_defaults():
+    mechanism = _make_mechanism(
+        _TensorAffine,
+        "direct",
+        key=torch.tensor([0, 3, 5, 7]),
+        g=0.25,
+        bias=-1.0,
+    )
+    handler = MechanismHandler(
+        torch.full(FULL_SHAPE, 34.0, dtype=DTYPE),
+        torch.ones(FULL_SHAPE, dtype=DTYPE),
+        {"direct": mechanism},
+        currents={"nonspecific": {"direct": ["i"]}},
+    )
+    voltage = torch.zeros(FULL_SHAPE, dtype=DTYPE)
+    handler.init_i_g_bufs(voltage)
+
+    torch.testing.assert_close(handler.itot(voltage), torch.zeros_like(voltage))
+
+
 def test_exact_ordered_fancy_supports_share_but_reordered_support_does_not():
     shared = torch.tensor([0, 3, 5, 7])
     reordered = torch.tensor([7, 5, 3, 0])
@@ -161,7 +473,9 @@ def test_exact_ordered_fancy_supports_share_but_reordered_support_does_not():
 
     assert len(handler._current_support_representatives) == 2
     assert [len(entries) for *_, entries in handler._map_grouped] == [2, 1]
-    assert [support for _, support in handler._current_breakpoint_plan] == [0, 0, 1]
+    # IDs are authored mechanism ordinals, so the distinct third mechanism
+    # retains ID 2 even though the first two mechanisms share ID 0.
+    assert handler._current_assigned_plan == ()
 
     voltage = torch.linspace(-3.0, 4.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
     expected_i, expected_g = _scatter_oracle(handler, voltage)
@@ -170,7 +484,137 @@ def test_exact_ordered_fancy_supports_share_but_reordered_support_does_not():
     torch.testing.assert_close(actual_g, expected_g)
 
 
-def test_duplicate_fancy_support_shares_gather_but_keeps_separate_scatters():
+def test_equal_supports_separated_in_authored_order_remain_distinct_runs():
+    shared = torch.tensor([0, 3, 5, 7])
+    intervening = torch.tensor([1, 2, 4, 6])
+    handler = _make_handler(
+        {
+            "first": _make_mechanism(_TensorAffine, "first", key=shared, g=0.25),
+            "middle": _make_mechanism(_TensorAffine, "middle", key=intervening, g=-0.5),
+            "last": _make_mechanism(_TensorAffine, "last", key=shared.clone(), g=0.75),
+        }
+    )
+
+    assert handler._current_assigned_plan == ()
+    assert [len(entries) for *_, entries in handler._map_grouped] == [1, 1, 1]
+
+    voltage = torch.linspace(-3.0, 4.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    expected = _scatter_oracle(handler, voltage)
+    actual = handler.i(voltage)
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+
+
+def test_handler_current_paths_use_support_entries_not_mechanism_mappers(monkeypatch):
+    support = torch.tensor([0, 3, 5, 7])
+    handler = _make_handler(
+        {
+            "first": _make_mechanism(
+                _TensorAffine, "first", key=support, g=0.25, bias=-1.0
+            ),
+            "second": _make_mechanism(
+                _TensorAffine,
+                "second",
+                key=support.clone(),
+                g=-0.5,
+                bias=2.0,
+            ),
+        }
+    )
+    voltage = torch.linspace(-3.0, 4.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    previous = voltage - 5.0
+    expected_i = handler.i(voltage)
+    expected_iexp = handler.iexp(voltage)
+    expected_idf = handler.idf(voltage, previous)
+    expected_itot = handler.itot(voltage)
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("handler execution re-entered a Mechanism mapper")
+
+    for mechanism in handler.mechanisms.values():
+        for name in ("get", "add_", "add", "put"):
+            monkeypatch.setattr(mechanism, name, forbidden)
+
+    actual_i = handler.i(voltage)
+    actual_iexp = handler.iexp(voltage)
+    actual_idf = handler.idf(voltage, previous)
+    actual_itot = handler.itot(voltage)
+    for actual, expected in ((actual_i, expected_i), (actual_idf, expected_idf)):
+        for actual_field, expected_field in zip(actual, expected):
+            torch.testing.assert_close(actual_field, expected_field)
+    torch.testing.assert_close(actual_iexp, expected_iexp)
+    torch.testing.assert_close(actual_itot, expected_itot)
+
+
+def test_restricted_voltage_process_uses_canonical_support_access(monkeypatch):
+    support = torch.tensor([0, 3, 5, 7])
+    process = _make_mechanism(_OffsetVoltage, "offset", key=support, offset=2.5)
+    handler = MechanismHandler(
+        torch.full(FULL_SHAPE, 34.0, dtype=DTYPE),
+        torch.ones(FULL_SHAPE, dtype=DTYPE),
+        {"offset": process},
+    )
+    handler.make_maps()
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("handler execution re-entered a Mechanism mapper")
+
+    monkeypatch.setattr(process, "get", forbidden)
+    monkeypatch.setattr(process, "put", forbidden)
+    voltage = torch.arange(8, dtype=DTYPE).reshape(FULL_SHAPE)
+    expected = voltage.clone()
+    expected.reshape(-1)[support] += 2.5
+
+    torch.testing.assert_close(handler.update_v(voltage), expected)
+
+
+def test_state_initialization_and_advance_gather_once_per_exact_support(monkeypatch):
+    shared = torch.tensor([0, 3, 5, 7])
+    other = torch.tensor([1, 2, 4, 6])
+    mechanisms = {
+        "first": _make_mechanism(_StateOnly, "first", key=shared),
+        "second": _make_mechanism(_StateOnly, "second", key=shared.clone()),
+        "other": _make_mechanism(_StateOnly, "other", key=other),
+    }
+    field = torch.linspace(-72.0, -58.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
+    handler = MechanismHandler(
+        torch.full(FULL_SHAPE, 34.0, dtype=DTYPE),
+        torch.ones(FULL_SHAPE, dtype=DTYPE),
+        mechanisms,
+    )
+    handler.make_maps()
+
+    assert len(handler._state_support_representatives) == 2
+    assert [support for _, support in handler._state_advance_plan] == [0, 0, 2]
+
+    calls = [0, 0]
+    support_positions = {
+        entry.support_id: index
+        for index, entry in enumerate(handler._state_support_entries)
+    }
+    original_gather = SupportEntry.gather
+
+    def counted_gather(entry, tensor):
+        calls[support_positions[entry.support_id]] += 1
+        return original_gather(entry, tensor)
+
+    monkeypatch.setattr(SupportEntry, "gather", counted_gather)
+
+    handler.compute_initial_conditions(field)
+    assert calls == [1, 1]
+
+    calls[:] = [0, 0]
+    handler.advance(field, torch.tensor(0.025, dtype=DTYPE), 34.0)
+    assert calls == [1, 1]
+    for mechanism in mechanisms.values():
+        assert torch.isfinite(mechanism.x).all()
+
+
+def test_duplicate_fancy_support_shares_gather_but_keeps_separate_scatters(
+    monkeypatch,
+):
     duplicate_support = torch.tensor([1, 1, 6])
     handler = _make_handler(
         {
@@ -193,9 +637,54 @@ def test_duplicate_fancy_support_shares_gather_but_keeps_separate_scatters():
 
     voltage = torch.linspace(-2.0, 5.0, 8, dtype=DTYPE).reshape(FULL_SHAPE)
     expected = _scatter_oracle(handler, voltage)
+    scatter_calls = 0
+    original_scatter_add = SupportEntry.scatter_add_
+
+    def counted_scatter_add(entry, destination, local):
+        nonlocal scatter_calls
+        scatter_calls += 1
+        return original_scatter_add(entry, destination, local)
+
+    monkeypatch.setattr(SupportEntry, "scatter_add_", counted_scatter_add)
     actual = handler.i(voltage)
+    # Two mechanisms remain separate runs, each scattering current and
+    # conductance independently.
+    assert scatter_calls == 4
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1])
+
+
+def test_call_local_duplicate_scatter_preserves_authored_float_association():
+    support = torch.tensor([0, 0])
+    handler = _make_handler(
+        {
+            "large_then_small": _make_mechanism(
+                _TensorAffine,
+                "large_then_small",
+                key=support,
+                dtype=torch.float32,
+                g=torch.zeros(2, dtype=torch.float32),
+                bias=torch.tensor([1.0e20, 1.0], dtype=torch.float32),
+            ),
+            "cancel_then_small": _make_mechanism(
+                _TensorAffine,
+                "cancel_then_small",
+                key=support.clone(),
+                dtype=torch.float32,
+                g=torch.zeros(2, dtype=torch.float32),
+                bias=torch.tensor([-1.0e20, 1.0], dtype=torch.float32),
+            ),
+        },
+        dtype=torch.float32,
+    )
+    voltage = torch.zeros(FULL_SHAPE, dtype=torch.float32)
+
+    expected = handler.i(voltage)
+    actual = handler._evaluate_current_frame(voltage)[:2]
+
+    assert expected[0][0, 0].item() == 1.0
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
 
 
 def test_identical_composable_slices_share_one_gather_and_scatter():
@@ -303,7 +792,7 @@ def test_point_scaling_happens_before_local_reduction_and_maps_rebuild_on_dtype(
     torch.testing.assert_close(actual_float[1], expected_float[1])
 
 
-def test_group_plans_rebuild_when_loading_different_ordered_supports():
+def test_group_plans_reject_state_dict_for_different_ordered_supports():
     shared = torch.tensor([0, 1])
     target = _make_handler(
         {
@@ -325,8 +814,11 @@ def test_group_plans_rebuild_when_loading_different_ordered_supports():
     )
 
     assert len(target._current_support_representatives) == 1
-    target.load_state_dict(source.state_dict())
-    assert len(target._current_support_representatives) == 2
+    expected_key = target.second.key.clone()
+    with pytest.raises(ValueError, match="selector keys encode mechanism placement"):
+        target.load_state_dict(source.state_dict())
+    assert len(target._current_support_representatives) == 1
+    assert torch.equal(target.second.key, expected_key)
 
     voltage = torch.arange(8, dtype=DTYPE).reshape(FULL_SHAPE)
     expected = _scatter_oracle(target, voltage)

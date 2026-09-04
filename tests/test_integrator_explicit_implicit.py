@@ -650,7 +650,7 @@ def test_backward_euler_single_compartment_gradient_matches_closed_form():
     integrator.area = torch.tensor(2.0, dtype=DTYPE)
     v = torch.tensor([[1.0, -2.0, 4.0]], dtype=DTYPE, requires_grad=True)
     intra = torch.tensor([[0.2, 0.4, -0.1]], dtype=DTYPE, requires_grad=True)
-    result, _ = integrator._solve(v, 0.1, 37.0, intra)
+    result, _ = integrator._step(v, 0.1, 37.0, intra=intra)
     result.sum().backward()
     assert torch.allclose(v.grad, torch.full_like(v, 0.75))
     assert torch.allclose(intra.grad, torch.full_like(intra, 0.5))
@@ -724,6 +724,13 @@ def test_backward_euler_multi_commits_and_honors_write_back_switch():
     mech = LinearMechanism(g=0.2, e=-3.0)
     integrator = _bwd_euler_sc_multi(model, mech, write_back=False)
     integrator._initialize(model, 0.1)
+    functional_spec = integrator._functional_spec()
+    assert functional_spec.operator_kind == "scalar_multi_point"
+    assert functional_spec.implementation is _bwd_euler_sc_multi
+    assert functional_spec.workspace_schema == (
+        ("cmdt", "parameter"),
+        ("area", "geometry"),
+    )
     integrator.step(model, 0.1)
     assert model.v.shape == model.shape
     assert not torch.equal(model.v, torch.full_like(model.v, -2.0))
@@ -811,7 +818,6 @@ def test_unbranched_implicit_step_matches_dense_linear_system_and_gradients():
     assert imem.shape == model.shape and torch.isfinite(imem).all()
     actual.sum().backward()
     assert v.grad is not None and torch.isfinite(v.grad).all()
-    assert integrator._last_bands is not None
 
 
 def test_unbranched_implicit_preserves_uniform_intracellular_potential_with_ve():
@@ -846,7 +852,7 @@ def test_unbranched_solver_selection_alias_fallbacks_and_clip_configuration():
     assert inv.method == "thomas"
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        inv._select_solver(model)
+        inv._select_solver(model.device())
     if not DENDRA_SOLVERS_AVAILABLE:
         assert inv._solve is pcr_solve_t
         assert any("Falling back to PCR" in str(item.message) for item in caught)
@@ -859,7 +865,7 @@ def test_unbranched_solver_selection_alias_fallbacks_and_clip_configuration():
 
     unknown = _bwd_euler_ub(model, LinearMechanism(), method="not-a-solver")
     with pytest.warns(UserWarning, match="Unknown or unsupported"):
-        unknown._select_solver(model)
+        unknown._select_solver(model.device())
     assert unknown.method == "thomas"
 
 
@@ -867,11 +873,11 @@ def test_unbranched_spd_selection_uses_solver_or_warns_and_falls_back():
     model = CableModel(shape=(1, 3))
     integrator = _bwd_euler_ub(model, LinearMechanism(), method="spd")
     if DENDRA_SOLVERS_AVAILABLE:
-        integrator._select_solver(model)
+        integrator._select_solver(model.device())
         assert callable(integrator._solve)
     else:
         with pytest.warns(UserWarning, match="not available"):
-            integrator._select_solver(model)
+            integrator._select_solver(model.device())
         assert integrator._solve is pcr_solve_t
 
 

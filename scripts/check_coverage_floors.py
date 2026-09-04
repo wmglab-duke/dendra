@@ -14,11 +14,9 @@ def load_floors(config_path: Path) -> dict[str, float]:
     with config_path.open("rb") as stream:
         config = tomllib.load(stream)
     try:
-        raw_floors = config["tool"]["dendra"]["coverage-floors"]
+        raw_floors = config["coverage-floors"]
     except KeyError as exc:
-        raise ValueError(
-            f"{config_path} has no [tool.dendra.coverage-floors] table"
-        ) from exc
+        raise ValueError(f"{config_path} has no [coverage-floors] table") from exc
 
     floors = {str(module): float(value) for module, value in raw_floors.items()}
     invalid = {
@@ -64,9 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--config",
-        default=Path("pyproject.toml"),
+        default=Path("coverage-floors.toml"),
         type=Path,
-        help="TOML file containing [tool.dendra.coverage-floors]",
+        help="TOML file containing [coverage-floors]; defaults to coverage-floors.toml",
     )
     args = parser.parse_args(argv)
 

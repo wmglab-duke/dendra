@@ -163,7 +163,7 @@ def test_ion_field_metadata_and_exchange_geometry_follow_physical_domains():
         diameters=torch.ones(shape),
         shape=shape,
         shape_f=shape,
-    ).bind_materials({"na": ion}.__getitem__, population=population)
+    )._bind_materials({"na": ion}.__getitem__, population=population)
 
     ion.nai.copy_(torch.tensor([[10.0, 20.0]]))
     ion.nao.copy_(torch.tensor([[100.0, 200.0]]))

@@ -5,6 +5,7 @@ import hashlib
 import itertools
 import math
 import os
+import random
 import re
 import sys
 import textwrap
@@ -44,10 +45,12 @@ from dendra.helpers import (
     JIT_NETWORK_OPS,
     JIT_NETWORK_SOLVES,
     _normalize_dtype_value,
+    compile_options_for_device,
     compile_options_key,
     current_compile_options,
     current_device,
     current_dtype,
+    current_preserve_mechanism_population_axis,
     current_runtime_contract_validation,
     op_mc,
     op_sc,
@@ -55,6 +58,10 @@ from dendra.helpers import (
 from dendra.models.backend import Backend as A
 from dendra.models.callbacks import Callback, CallbackList
 from dendra.models.graph import get_area_from_graph
+from dendra.models.initialization import (
+    _InitializationTransformAction,
+    _InitializationTransformHook,
+)
 from dendra.models.integrators import bwd_euler_sc, bwd_euler_ub
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
@@ -66,6 +73,13 @@ from dendra.models.mechanisms._materials import (
     material_specs,
     valid_materials,
 )
+from dendra.models.mechanisms._mechanism import (
+    ContinuousSynapse,
+    PointProcess,
+    Synapse,
+    VoltageProcess,
+)
+from dendra.models.mechanisms._support import SupportKind, SupportSpec
 from dendra.models.mechanisms.validate import validate
 from dendra.models.modular import matches_any_pattern
 from dendra.models.parametric import Parameterized as P
@@ -306,6 +320,24 @@ def _mechanism_batch_parameter_names(mechanism):
     return names
 
 
+def _mechanism_has_batch_contract(mechanism):
+    """Return whether a mechanism or one of its states owns BATCH-shaped data."""
+
+    for owner in (mechanism, *tuple(getattr(mechanism, "_state", ()))):
+        if any(
+            bool(getattr(owner, declaration, {}))
+            for declaration in ("_batch", "_batch_p", "_batch_n")
+        ):
+            return True
+        for collection in ("_random_parameters", "_runtime_noises"):
+            if any(
+                getattr(spec, "scope", None) == "batch"
+                for spec in getattr(owner, collection, {}).values()
+            ):
+                return True
+    return False
+
+
 def _mechanism_global_parameter_names(mechanism):
     """Collect GLOBAL parameter names declared by a mechanism and its states."""
     names = set()
@@ -313,11 +345,6 @@ def _mechanism_global_parameter_names(mechanism):
         for declaration in ("_global", "_global_p", "_global_n"):
             names.update(getattr(owner, declaration, {}).keys())
     return names
-
-
-def _mechanism_initial_defaults(mechanism):
-    """Return class-declared mechanism state initial values."""
-    return dict(getattr(mechanism, "_init", {}))
 
 
 def _project_indexed_override(
@@ -645,7 +672,23 @@ def _time_grid_from_step_count(
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    """Construct an exact-length float64 time grid from integer offsets."""
+    """Construct an exact-length time grid from binary64 integer offsets.
+
+    MPS does not support binary64 tensors. Preserve the established binary64
+    timestamp calculation there by staging it on CPU, then cast once to the
+    caller's supported dtype while transferring the finished grid.
+    """
+    device = torch.device(device)
+    if device.type == "mps":
+        if n_steps == 0:
+            return torch.empty(0, device=device, dtype=start.dtype)
+        offsets = torch.arange(n_steps, device="cpu", dtype=torch.double)
+        # MPS attempts the dtype conversion before the device transfer when
+        # both are requested in one `.to(...)`, which still asks MPS to perform
+        # unsupported binary64 work. Move first, then widen on CPU.
+        grid = start.to(device="cpu").to(dtype=torch.double) + offsets * dt
+        return grid.to(device=device, dtype=start.dtype)
+
     offsets = torch.arange(n_steps, device=device, dtype=torch.double)
     return start.to(device=device, dtype=torch.double) + offsets * dt
 
@@ -653,6 +696,19 @@ def _time_grid_from_step_count(
 class Population(P, Sliceable):
     """
     Base class for a population of multicompartment neurons.
+
+    Parameters
+    ----------
+    N : int, default 1
+        Number of population rows (cells).
+    C : int, default 1
+        Number of compartments per row.
+    preserve_mechanism_population_axis : bool or None, default None
+        Experimentally store eligible shared-column distributed mechanisms as
+        ``(N, K)`` instead of one packed ``(N * K,)`` slot axis. Ineligible
+        supports retain their legacy representation. ``None`` resolves the
+        construction-time Dendra context/environment policy, then this model
+        family's default.
     """
 
     # ---------- repr knobs (safe defaults) ----------
@@ -667,6 +723,17 @@ class Population(P, Sliceable):
     _REPR_FLOAT_SIGFIGS: int = 6  # scalar + small tensor formatting
     _REPR_MAX_MECH_PARAM_ENTRIES: int = 200  # safety bound per mechanism
 
+    # Model families may opt into an audited structural layout while the base
+    # Population remains compatibility-first. A construction-scoped context or
+    # explicit constructor argument takes precedence over this default.
+    preserve_mechanism_population_axis_default: bool = False
+
+    @property
+    def preserve_mechanism_population_axis(self) -> bool:
+        """Return the immutable mechanism-layout policy resolved at construction."""
+
+        return self._preserve_mechanism_population_axis
+
     P.RANGEP(cm=1.0, rhoa=35.4)
     P.GLOBAL(celsius=37.0)
     P.GLOBALP(rhoa_scale=1.0, cm_scale=1.0, area_scale=1.0)
@@ -678,10 +745,32 @@ class Population(P, Sliceable):
         integrator=None,
         v_init=-65.0,
         *,
+        preserve_mechanism_population_axis: bool | None = None,
         device=None,
         dtype=None,
         **kwargs,
     ):
+        if preserve_mechanism_population_axis is not None and not isinstance(
+            preserve_mechanism_population_axis, bool
+        ):
+            raise TypeError(
+                "preserve_mechanism_population_axis must be a boolean or None."
+            )
+        if preserve_mechanism_population_axis is None:
+            preserve_mechanism_population_axis = (
+                current_preserve_mechanism_population_axis()
+            )
+        if preserve_mechanism_population_axis is None:
+            preserve_mechanism_population_axis = getattr(
+                type(self),
+                "preserve_mechanism_population_axis_default",
+                False,
+            )
+        if not isinstance(preserve_mechanism_population_axis, bool):
+            raise TypeError(
+                f"{type(self).__name__}.preserve_mechanism_population_axis_default "
+                "must be a boolean."
+            )
         init_device = (
             current_device(torch.device("cpu"))
             if device is None
@@ -697,6 +786,7 @@ class Population(P, Sliceable):
         self.np = N
         self.nc = C
         self.v_init = v_init
+        self._preserve_mechanism_population_axis = preserve_mechanism_population_axis
 
         self.is_built = False
         self._flag_rebuild = False
@@ -724,10 +814,12 @@ class Population(P, Sliceable):
         # not yet sufficient to form a complete fixed step.  Keep this separate
         # from model time: explicit step() and array-driven run(ve=...) advance
         # state without consuming the duration budget.
-        self.register_buffer(
-            "_duration_remainder",
-            torch.zeros((), device=init_device, dtype=torch.float64),
-        )
+        # Duration budgeting is host-side control-plane work: every read is
+        # converted to a Python float before any simulation kernel runs. Keep
+        # it outside the registered model buffers so their device/dtype
+        # invariant remains intact, while _save/_load_from_state_dict below retain
+        # the historical `_duration_remainder` serialization key.
+        self._duration_remainder = torch.zeros((), device="cpu", dtype=torch.float64)
 
         # compiler stuff
         self.backend = BACKEND.value
@@ -744,6 +836,7 @@ class Population(P, Sliceable):
         self.compile_options = current_compile_options()
         self.compile_options_key = compile_options_key(self.compile_options)
         self.initializing_from_state_cache = False
+        self._restoring_steady_state = False
 
         if self.imem:
             self.register_buffer(
@@ -819,6 +912,7 @@ class Population(P, Sliceable):
 
         self.pre_initialize_hooks: List[Callable] = []
         self.post_initialize_hooks: List[Callable] = []
+        self._initialization_transforms = torch.nn.ModuleDict()
 
         reset_torch_compiler(prefer_public=False)
 
@@ -846,6 +940,7 @@ class Population(P, Sliceable):
         self.mech: MechanismHandler = None  # type: ignore
 
         self.initialized: bool = False
+        self._integrator_reinit_pending: bool = False
         self.eval()
 
     def force_integrator_reinit(self):
@@ -858,10 +953,15 @@ class Population(P, Sliceable):
             True if the integrator should be re-initialized, False otherwise.
             By default, this returns True during training to ensure that any
             changes to model parameters are reflected in the integrator state.
-            During evaluation, it returns False to allow the integrator to reuse
-            its existing state for efficiency.
+            During evaluation, it also returns True exactly once after a cached
+            state restore; subsequent steps reuse the rebuilt workspace.
         """
-        return self.training or self.initializing_from_state_cache
+        return self.training or self._integrator_reinit_pending
+
+    def _complete_integrator_reinitialization(self):
+        """Consume the one-shot workspace rebuild requested by state restore."""
+
+        self._integrator_reinit_pending = False
 
     def _runtime_workspace_rebuild_pending(self):
         """Whether direct execution will refresh all tracked workspace inputs."""
@@ -885,14 +985,26 @@ class Population(P, Sliceable):
         self.compile_mode = COMPILE_MODE.value
         self.compile_options = current_compile_options()
         self.compile_options_key = compile_options_key(self.compile_options)
+        effective_compile_options = compile_options_for_device(
+            self.compile_options,
+            backend=self.backend,
+            device=self.device(),
+            mode=self.compile_mode,
+            dynamic=self.dynamic,
+        )
+        effective_compile_mode = (
+            self.compile_mode if effective_compile_options is None else None
+        )
+        compile_device_type = self.device().type
 
         make_intra_config = (
             self.jit,
             self.backend,
             self.fullgraph,
             self.dynamic,
-            self.compile_mode,
-            self.compile_options_key,
+            effective_compile_mode,
+            compile_options_key(effective_compile_options),
+            compile_device_type,
         )
         if getattr(self, "_make_intra_config", None) != make_intra_config:
             if self.jit:
@@ -901,10 +1013,10 @@ class Population(P, Sliceable):
                     fullgraph=self.fullgraph,
                     dynamic=self.dynamic,
                 )
-                if self.compile_mode is not None:
-                    kwargs["mode"] = self.compile_mode
-                if self.compile_options is not None:
-                    kwargs["options"] = dict(self.compile_options)
+                if effective_compile_mode is not None:
+                    kwargs["mode"] = effective_compile_mode
+                if effective_compile_options is not None:
+                    kwargs["options"] = dict(effective_compile_options)
                 with torch_compiler_warning_context():
                     self.make_intra = torch.compile(make_intra, **kwargs)
             else:
@@ -1007,10 +1119,35 @@ class Population(P, Sliceable):
                     if id(value) not in memo:
                         memo[id(value)] = value.detach().clone()
                     detached_runtime = True
+        handler = getattr(self, "mech", None)
+        if handler is not None:
+            # MechanismHandler keeps current/conductance aggregation planes in
+            # plain Python lists for the imperative hot path. They can carry a
+            # live training graph even though they are not registered buffers.
+            for scratch_name in ("_buf_i", "_buf_g"):
+                values = getattr(handler, scratch_name, ())
+                for value in values:
+                    if torch.is_tensor(value) and not value.is_leaf:
+                        memo.setdefault(id(value), value.detach().clone())
+                        detached_runtime = True
 
         result = self.__class__.__new__(self.__class__)
         memo[id(self)] = result
-        state = _copy.deepcopy(self.__getstate__(), memo)
+        if self.__class__.__module__ == "torch.nn.utils.parametrize":
+            # torch.nn parametrization installs a dynamic wrapper class whose
+            # __getstate__ deliberately rejects pickle serialization. A Dendra
+            # runtime deepcopy is not serialization: locate the first authored
+            # Dendra state hook below that wrapper so functional lowering and
+            # other private execution clones retain normal Population cleanup.
+            getstate = next(
+                owner.__dict__["__getstate__"]
+                for owner in self.__class__.__mro__[1:]
+                if "__getstate__" in owner.__dict__
+            )
+            source_state = getstate(self)
+        else:
+            source_state = self.__getstate__()
+        state = _copy.deepcopy(source_state, memo)
         result.__setstate__(state)
 
         if detached_runtime and getattr(result, "is_built", False):
@@ -1034,11 +1171,82 @@ class Population(P, Sliceable):
         return state
 
     def __setstate__(self, state):
-        """Restore populations serialized before mechanism deletion support."""
+        """Restore populations across supported serialized layout revisions."""
         state.setdefault("_mech_exclusions", {})
         state.setdefault("_mech_data_ic", {})
         state.setdefault("_mech_data_base_kwargs", {})
         state.setdefault("_material_geometries", {})
+        state.setdefault("_integrator_reinit_pending", False)
+
+        # Duration carry was originally a registered model-device buffer. Move
+        # legacy pickles to precise host metadata before Module.__setstate__ can
+        # re-register it and make a later `.to("mps")` attempt binary64 on MPS.
+        buffers = state.get("_buffers")
+        legacy_remainder = None
+        if isinstance(buffers, dict):
+            legacy_remainder = buffers.pop("_duration_remainder", None)
+        current_remainder = state.get("_duration_remainder")
+        if current_remainder is not None and legacy_remainder is not None:
+            current_value = (
+                torch.as_tensor(current_remainder)
+                .detach()
+                .to(device="cpu")
+                .to(dtype=torch.float64)
+            )
+            legacy_value = (
+                torch.as_tensor(legacy_remainder)
+                .detach()
+                .to(device="cpu")
+                .to(dtype=torch.float64)
+            )
+            if current_value.shape != legacy_value.shape or not torch.equal(
+                current_value, legacy_value
+            ):
+                raise ValueError(
+                    "Serialized Population contains conflicting duration "
+                    "remainder metadata."
+                )
+        remainder = (
+            current_remainder if current_remainder is not None else legacy_remainder
+        )
+        if remainder is None:
+            remainder = torch.zeros((), dtype=torch.float64)
+        if not torch.is_tensor(remainder) or tuple(remainder.shape) != ():
+            raise TypeError(
+                "Serialized Population duration remainder must be a scalar tensor."
+            )
+        state["_duration_remainder"] = (
+            remainder.detach().to(device="cpu").to(dtype=torch.float64).clone()
+        )
+
+        # The layout is a construction-time structural snapshot.  Migrate the
+        # short-lived public-attribute representation, preserve older pickles
+        # that predate the option as legacy-flat, and reject corrupt values
+        # before a later build can change tensor ABI unexpectedly.
+        missing_layout = object()
+        legacy_layout = state.pop(
+            "preserve_mechanism_population_axis",
+            missing_layout,
+        )
+        resolved_layout = state.get(
+            "_preserve_mechanism_population_axis",
+            missing_layout,
+        )
+        if resolved_layout is missing_layout:
+            resolved_layout = (
+                False if legacy_layout is missing_layout else legacy_layout
+            )
+        elif legacy_layout is not missing_layout and legacy_layout != resolved_layout:
+            raise ValueError(
+                "Serialized Population contains conflicting mechanism "
+                "population-axis layout values."
+            )
+        if not isinstance(resolved_layout, bool):
+            raise TypeError(
+                "Serialized Population mechanism population-axis layout must "
+                "be a boolean."
+            )
+        state["_preserve_mechanism_population_axis"] = resolved_layout
 
         # Sparse insertion records historically stored GLOBAL and indexed
         # parameters together. GLOBAL values now belong to the one compiled
@@ -1200,6 +1408,81 @@ class Population(P, Sliceable):
                 # closures, so direct Population execution can rebuild lazily.
                 integrator.initialized = False
         return result
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        """Serialize precise host duration metadata under its stable key."""
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        remainder = self._duration_remainder
+        destination[f"{prefix}_duration_remainder"] = (
+            remainder if keep_vars else remainder.detach()
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Restore precise host duration metadata without making it a buffer."""
+        key = f"{prefix}_duration_remainder"
+        has_remainder = key in state_dict
+        incoming = state_dict.pop(key, None)
+        try:
+            super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+        finally:
+            if has_remainder:
+                state_dict[key] = incoming
+
+        # Registered timestep workspaces and solver buffers remain part of the
+        # ordinary state-dict schema for compatibility, but they are derived
+        # from the next execution's parameters, geometry, and dt.  Any load—
+        # including direct ``load_state_dict``—must therefore force a coherent
+        # rebuild before those restored values can be consumed. This also applies
+        # to nested loading through a Network: Network execution cannot lazily
+        # rebuild one child, so its runtime contract must fail closed and require
+        # Network.initialize(dt) before the next step.
+        integrator = getattr(self, "integrator", None)
+        if integrator is not None:
+            integrator.initialized = False
+
+        if not has_remainder:
+            if strict:
+                missing_keys.append(key)
+            return
+        if not torch.is_tensor(incoming):
+            error_msgs.append(
+                f'While copying the parameter named "{key}", expected a tensor '
+                f"but received {type(incoming).__name__}."
+            )
+            return
+        if tuple(incoming.shape) != ():
+            error_msgs.append(
+                f"size mismatch for {key}: copying a param with shape "
+                f"{tuple(incoming.shape)} from checkpoint, the shape in current "
+                "model is ()."
+            )
+            return
+        try:
+            self._duration_remainder = (
+                incoming.to(device="cpu").to(dtype=torch.float64).detach().clone()
+            )
+        except Exception as error:
+            error_msgs.append(
+                f'While copying the parameter named "{key}", an exception '
+                f"occurred: {error}."
+            )
 
     def numel(self, include_batch_dimensions=True):
         """
@@ -1763,6 +2046,35 @@ class Population(P, Sliceable):
         """
         self.post_initialize_hooks.append(fn)
 
+    def register_post_initialize_transform(
+        self,
+        name: str,
+        module: torch.nn.Module,
+        reads=(),
+        writes=(),
+        inputs=None,
+    ):
+        """Register a pure tensor transform after mechanism initialization.
+
+        Parameters are canonical tensor references. ``inputs`` is an ordered
+        mapping of explicit tensor inputs owned by the registered action. The
+        stateless module receives ``(*reads, *inputs)`` and must return one
+        tuple entry per declared write.
+
+        Returns
+        -------
+        _InitializationTransformAction
+            The registered private action, including its explicit input buffers.
+        """
+        return self._register_initialize_transform(
+            "post",
+            name,
+            module,
+            reads=reads,
+            writes=writes,
+            inputs=inputs,
+        )
+
     def register_pre_initialize_hook(self, fn: Callable):
         """
         Register a hook executed before model initialization.
@@ -1772,8 +2084,456 @@ class Population(P, Sliceable):
         fn : Callable
             Callback invoked with the population instance just prior to
             mechanism initialization.
+
+        Notes
+        -----
+        Pre-initialization hooks affect the state from which a steady-state
+        cache is derived. Registering one therefore invalidates any existing
+        steady-state snapshot.
         """
         self.pre_initialize_hooks.append(fn)
+        if hasattr(self, "_caches"):
+            self.clear_steady_state()
+
+    def register_pre_initialize_transform(
+        self,
+        name: str,
+        module: torch.nn.Module,
+        reads=(),
+        writes=(),
+        inputs=None,
+    ):
+        """Register a pure tensor transform before mechanism initialization.
+
+        Parameters are canonical tensor references. ``inputs`` is an ordered
+        mapping of explicit tensor inputs owned by the registered action. The
+        stateless module receives ``(*reads, *inputs)`` and must return one
+        tuple entry per declared write.
+
+        Returns
+        -------
+        _InitializationTransformAction
+            The registered private action, including its explicit input buffers.
+        """
+        return self._register_initialize_transform(
+            "pre",
+            name,
+            module,
+            reads=reads,
+            writes=writes,
+            inputs=inputs,
+        )
+
+    def _register_initialize_transform(
+        self,
+        phase,
+        name,
+        module,
+        *,
+        reads,
+        writes,
+        inputs,
+    ):
+        shared_state_references = tuple(
+            reference
+            for reference in (*reads, *writes)
+            if reference.startswith(("state.ions.", "state.materials."))
+        )
+        if phase != "post" and shared_state_references:
+            raise ValueError(
+                "Ion/Material state is only coherent after the initialization "
+                "transaction and may only be read by post transforms: "
+                f"{shared_state_references!r}."
+            )
+        shared_state_writes = tuple(
+            reference
+            for reference in writes
+            if reference.startswith(("state.ions.", "state.materials."))
+        )
+        if shared_state_writes:
+            raise ValueError(
+                "Post-initialization Ion/Material references are read-only; "
+                "writing them would require another guard, equilibrium, current, "
+                f"and local-synchronization transaction: {shared_state_writes!r}."
+            )
+        if name in self._initialization_transforms:
+            raise ValueError(
+                f"Initialization transform name {name!r} is already registered. "
+                "Names must be unique across both phases."
+            )
+        action = _InitializationTransformAction(
+            name,
+            phase,
+            module,
+            reads=reads,
+            writes=writes,
+            inputs=inputs,
+        )
+        self._initialization_transforms[name] = action
+        hook = _InitializationTransformHook(name, phase)
+        hooks = (
+            self.pre_initialize_hooks if phase == "pre" else self.post_initialize_hooks
+        )
+        hooks.append(hook)
+        # Both phases contribute persistent writes to a complete initialized
+        # snapshot. A transform registered after steady-state caching must run
+        # through a fresh transaction rather than being hidden by that cache.
+        if hasattr(self, "_caches"):
+            self.clear_steady_state()
+        return action
+
+    def _resolve_initialization_transform_reference(self, reference):
+        if reference.startswith("parameters."):
+            name = reference.removeprefix("parameters.")
+            parameters = dict(self.named_parameters())
+            try:
+                return parameters[name]
+            except KeyError as exc:
+                raise KeyError(
+                    f"Initialization transform references unknown parameter "
+                    f"{name!r}. Available canonical parameters are "
+                    f"{tuple(parameters)!r}."
+                ) from exc
+
+        if reference == "state.integrator.v":
+            target = self.v
+        elif reference == "state.clock.t":
+            target = self.t
+        elif reference == "state.control.duration_remainder":
+            target = self._duration_remainder
+        elif reference.startswith("state.mechanisms."):
+            path = reference.removeprefix("state.mechanisms.")
+            mechanism_name, state_name = path.rsplit(".", 1)
+            handler = getattr(self, "mech", None)
+            mechanisms = getattr(handler, "mechanisms", {})
+            if mechanism_name not in mechanisms:
+                raise KeyError(
+                    f"Initialization transform references unknown mechanism "
+                    f"{mechanism_name!r}. Available mechanisms are "
+                    f"{tuple(mechanisms)!r}."
+                )
+            mechanism = mechanisms[mechanism_name]
+            declared_states = set(getattr(mechanism, "_all_states", ()))
+            if (
+                state_name not in declared_states
+                or state_name not in mechanism._buffers
+            ):
+                raise KeyError(
+                    f"Initialization transform references undeclared state "
+                    f"{state_name!r} on mechanism {mechanism_name!r}. Available "
+                    f"states are {tuple(sorted(declared_states))!r}."
+                )
+            target = mechanism._buffers[state_name]
+        elif reference.startswith("state.ions."):
+            path = reference.removeprefix("state.ions.")
+            ion_name, field_name = path.rsplit(".", 1)
+            handler = getattr(self, "mech", None)
+            ions = getattr(handler, "ions", {})
+            if ion_name not in ions:
+                raise KeyError(
+                    f"Initialization transform references unknown Ion "
+                    f"{ion_name!r}. Available Ions are {tuple(ions)!r}."
+                )
+            ion = ions[ion_name]
+            if field_name not in ion.fields or field_name not in ion._buffers:
+                raise KeyError(
+                    f"Initialization transform references unknown Ion field "
+                    f"{ion_name}.{field_name}. Available fields are "
+                    f"{tuple(ion.fields)!r}."
+                )
+            target = ion._buffers[field_name]
+        elif reference.startswith("state.materials."):
+            path = reference.removeprefix("state.materials.")
+            material_name, field_name = path.rsplit(".", 1)
+            handler = getattr(self, "mech", None)
+            materials = getattr(handler, "materials", {})
+            if material_name not in materials:
+                raise KeyError(
+                    f"Initialization transform references unknown Material "
+                    f"{material_name!r}. Available Materials are "
+                    f"{tuple(materials)!r}."
+                )
+            material = materials[material_name]
+            if field_name not in material.fields or field_name not in material._buffers:
+                raise KeyError(
+                    f"Initialization transform references unknown Material field "
+                    f"{material_name}.{field_name}. Available fields are "
+                    f"{tuple(material.fields)!r}."
+                )
+            target = material._buffers[field_name]
+        else:  # validated when the action was constructed
+            raise RuntimeError(
+                f"Unsupported initialization transform reference {reference!r}."
+            )
+
+        if not torch.is_tensor(target):
+            raise TypeError(
+                f"Initialization transform reference {reference!r} is not Tensor-valued."
+            )
+        return target
+
+    @staticmethod
+    def _initialization_transform_argument(value):
+        return value.detach().clone(memory_format=torch.preserve_format)
+
+    @staticmethod
+    def _initialization_transform_numpy_rng_equal(left, right):
+        return all(
+            (
+                np.array_equal(left_item, right_item)
+                if isinstance(left_item, np.ndarray)
+                else left_item == right_item
+            )
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+
+    def _evaluate_initialization_transform(self, action, values):
+        arguments = tuple(
+            self._initialization_transform_argument(value) for value in values
+        )
+        # Inference tensors intentionally do not expose version counters. The
+        # arguments are private clones, so skipping this diagnostic in inference
+        # mode cannot let an authored in-place write escape into model state.
+        versions = (
+            None
+            if torch.is_inference_mode_enabled()
+            else tuple(argument._version for argument in arguments)
+        )
+        torch_rng = torch.random.get_rng_state()
+        python_rng = random.getstate()
+        numpy_rng = np.random.get_state()
+        device_rng = None
+        device = self.device()
+        if device.type == "cuda":  # pragma: no cover - CUDA test slice
+            device_rng = torch.cuda.get_rng_state(device)
+        elif device.type == "mps" and hasattr(torch.mps, "get_rng_state"):
+            device_rng = torch.mps.get_rng_state()
+
+        try:
+            result = action(*arguments)
+            changed_arguments = (
+                ()
+                if versions is None
+                else tuple(
+                    index
+                    for index, (argument, version) in enumerate(
+                        zip(arguments, versions, strict=True)
+                    )
+                    if argument._version != version
+                )
+            )
+            consumed_rng = (
+                not torch.equal(torch.random.get_rng_state(), torch_rng)
+                or random.getstate() != python_rng
+                or not self._initialization_transform_numpy_rng_equal(
+                    np.random.get_state(), numpy_rng
+                )
+            )
+            if device_rng is not None:
+                if device.type == "cuda":  # pragma: no cover - CUDA test slice
+                    consumed_rng = consumed_rng or not torch.equal(
+                        torch.cuda.get_rng_state(device), device_rng
+                    )
+                else:
+                    consumed_rng = consumed_rng or not torch.equal(
+                        torch.mps.get_rng_state(), device_rng
+                    )
+        finally:
+            torch.random.set_rng_state(torch_rng)
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+            if device_rng is not None:
+                if device.type == "cuda":  # pragma: no cover - CUDA test slice
+                    torch.cuda.set_rng_state(device_rng, device)
+                else:
+                    torch.mps.set_rng_state(device_rng)
+
+        if changed_arguments:
+            raise RuntimeError(
+                f"Initialization transform {action.name!r} mutated tensor arguments "
+                f"{changed_arguments!r}; transforms must return new values."
+            )
+        if consumed_rng:
+            raise RuntimeError(
+                f"Initialization transform {action.name!r} consumed implicit RNG "
+                "state; randomness must be supplied as an explicit input."
+            )
+        return result
+
+    @staticmethod
+    def _normalize_initialization_transform_output(action, reference, value, target):
+        if not torch.is_tensor(value):
+            raise TypeError(
+                f"Initialization transform {action.name!r} output for {reference!r} "
+                "must be a Tensor."
+            )
+        value = value.to(device=target.device, dtype=target.dtype)
+        try:
+            value = torch.broadcast_to(value, tuple(target.shape))
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Initialization transform {action.name!r} output for {reference!r} "
+                f"has shape {tuple(value.shape)}, which is not broadcastable to "
+                f"target shape {tuple(target.shape)}."
+            ) from exc
+        return value.clone(memory_format=torch.preserve_format)
+
+    @staticmethod
+    def _preserved_stochastic_parameter_buffers(owner):
+        names = tuple(getattr(owner, "random_parameters", ())) + tuple(
+            getattr(owner, "runtime_noises", ())
+        )
+        return {
+            name: getattr(owner, name)
+            .detach()
+            .clone(memory_format=torch.preserve_format)
+            for name in names
+            if torch.is_tensor(getattr(owner, name, None))
+        }
+
+    @classmethod
+    def _rematerialize_parameter_owner(cls, owner):
+        derive = getattr(owner, "_derive_parameter_buffers", None)
+        install = getattr(owner, "_install_parameter_buffers", None)
+        if not callable(derive) or not callable(install):
+            return
+        preserved = cls._preserved_stochastic_parameter_buffers(owner)
+        values = derive()
+        for name, value in preserved.items():
+            if name in values:
+                values[name] = value
+        install(values)
+        make_contiguous = getattr(owner, "make_contiguous", None)
+        if callable(make_contiguous):
+            make_contiguous()
+
+    def _deterministically_rematerialize_initialization_parameters(self):
+        # Parameter wrappers may cache resolved raw leaves in eval mode. A raw
+        # output is a new generation even though initialization itself remains
+        # an imperative no-grad transaction.
+        for module in self.modules():
+            clear_cache = getattr(module, "clear_cache", None)
+            if callable(clear_cache):
+                clear_cache()
+
+        self._rematerialize_parameter_owner(self)
+        self._refresh_parameter_views_for_initialization()
+
+        handler = getattr(self, "mech", None)
+        if handler is None:
+            return
+        sync_celsius = getattr(handler, "_sync_celsius", None)
+        if callable(sync_celsius):
+            sync_celsius(self.celsius)
+        make_maps = getattr(handler, "make_maps", None)
+        if callable(make_maps):
+            make_maps()
+        set_buffers = getattr(handler, "set_buffers", None)
+        if callable(set_buffers):
+            set_buffers(self.diam)
+
+        mechanisms = tuple(getattr(handler, "mechanisms", {}).values())
+        processes = tuple(getattr(handler, "material_processes", {}).values())
+        owners = (*mechanisms, *processes)
+        for owner in owners:
+            self._rematerialize_parameter_owner(owner)
+            for state in getattr(owner, "DE", {}).values():
+                self._rematerialize_parameter_owner(state)
+
+        from dendra.models.mechanisms._state import _materialize_derived_buffers
+
+        for owner in owners:
+            _materialize_derived_buffers(owner)
+            for state in getattr(owner, "DE", {}).values():
+                _materialize_derived_buffers(state)
+
+    def _invalidate_integrator_after_initialization_transform(self):
+        integrator = getattr(self, "integrator", None)
+        if integrator is None:
+            return
+        integrator.initialized = False
+        compiled = getattr(integrator, "_compiled_kernels", None)
+        if hasattr(compiled, "clear"):
+            compiled.clear()
+
+    def _execute_initialization_transform(self, action_name, *, phase):
+        try:
+            action = self._initialization_transforms[action_name]
+        except KeyError as exc:
+            raise KeyError(
+                f"Initialization transform {action_name!r} is not registered."
+            ) from exc
+        if action.phase != phase:
+            raise RuntimeError(
+                f"Initialization transform {action_name!r} is registered for "
+                f"phase {action.phase!r}, not {phase!r}."
+            )
+
+        reads = tuple(
+            self._resolve_initialization_transform_reference(reference)
+            for reference in action.reads
+        )
+        targets = tuple(
+            self._resolve_initialization_transform_reference(reference)
+            for reference in action.writes
+        )
+        if len({id(target) for target in targets}) != len(targets):
+            raise ValueError(
+                f"Initialization transform {action.name!r} writes aliased targets."
+            )
+        result = self._evaluate_initialization_transform(
+            action,
+            (*reads, *action.input_values()),
+        )
+        if type(result) is not tuple:
+            raise TypeError(
+                f"Initialization transform {action.name!r} must return an exact "
+                "tuple with one entry per declared write."
+            )
+        if len(result) != len(action.writes):
+            raise ValueError(
+                f"Initialization transform {action.name!r} returned {len(result)} "
+                f"outputs for {len(action.writes)} declared writes."
+            )
+        staged = tuple(
+            self._normalize_initialization_transform_output(
+                action,
+                reference,
+                value,
+                target,
+            )
+            for reference, value, target in zip(
+                action.writes,
+                result,
+                targets,
+                strict=True,
+            )
+        )
+
+        snapshots = tuple(target.detach().clone() for target in targets)
+        writes_parameters = any(
+            reference.startswith("parameters.") for reference in action.writes
+        )
+        try:
+            for target, value in zip(targets, staged, strict=True):
+                target.copy_(value)
+            if writes_parameters:
+                self._deterministically_rematerialize_initialization_parameters()
+        except Exception:
+            for target, snapshot in zip(targets, snapshots, strict=True):
+                target.copy_(snapshot)
+            if writes_parameters:
+                try:
+                    self._deterministically_rematerialize_initialization_parameters()
+                except Exception:
+                    # Preserve the primary transform failure. The population and
+                    # integrator remain fail-closed; initialize() must be retried.
+                    pass
+            raise
+        finally:
+            self._invalidate_integrator_after_initialization_transform()
+
+        return tuple(targets)
 
     def device(self):
         """
@@ -1891,6 +2651,7 @@ class Population(P, Sliceable):
         except Exception:
             self.v_init = old_v_init
             raise
+        self.clear_steady_state()
         return self
 
     def prep_intra(self, intra, n, dt):
@@ -2325,15 +3086,13 @@ class Population(P, Sliceable):
         """Commit retained physical time without mutating checkpoint aliases."""
         self._duration_remainder = torch.tensor(
             value,
-            device=self._duration_remainder.device,
+            device="cpu",
             dtype=torch.float64,
         )
 
     def _clear_duration_remainder(self) -> None:
         """Start a fresh duration budget for a new simulation episode."""
-        self._duration_remainder = torch.zeros(
-            (), device=self._duration_remainder.device, dtype=torch.float64
-        )
+        self._duration_remainder = torch.zeros((), device="cpu", dtype=torch.float64)
 
     def step(
         self,
@@ -2948,6 +3707,11 @@ class Population(P, Sliceable):
         """
         with torch.no_grad():
             for h in self.post_initialize_hooks:
+                if self._restoring_steady_state and isinstance(
+                    h,
+                    _InitializationTransformHook,
+                ):
+                    continue
                 h(self)
 
     def pre_initialize(self):
@@ -3037,14 +3801,21 @@ class Population(P, Sliceable):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
             # ``restore`` marks ordinary named-cache restores usable. A
-            # steady-state initialization still has a post-initialize phase,
-            # so keep this transition fail-closed until every hook succeeds.
+            # steady-state initialization still replays permissive legacy post
+            # hooks, so keep this transition fail-closed until every hook
+            # succeeds. Structured transforms are fresh-initialization work:
+            # every declared write is already present in the restored snapshot.
             self.initialized = False
-            self.post_initialize()
+            self._restoring_steady_state = True
+            try:
+                self.post_initialize()
+            finally:
+                self._restoring_steady_state = False
             self.t = torch.zeros_like(self.t).detach()
             self._clear_duration_remainder()
             self.initialized = True
             self.initializing_from_state_cache = True
+            self._integrator_reinit_pending = True
             return True
         return False
 
@@ -3072,25 +3843,45 @@ class Population(P, Sliceable):
         # instead of stepping a partially reset model advertised as initialized.
         self.initialized = False
         self.initializing_from_state_cache = False
+        self._integrator_reinit_pending = False
         self._clear_duration_remainder()
         existing_integrator = getattr(self, "integrator", None)
         if existing_integrator is not None:
             existing_integrator.initialized = False
 
         self.build(force_rebuild)
-        random_generation = object() if populate_parameter_buffers else None
         if (
             populate_parameter_buffers
             and "_steady_state" in self._caches
             and self._has_random_parameters_resampled_on_initialize()
         ):
             self.clear_steady_state()
+        self.intra = self.build_intra()
+        # A steady-state snapshot is already a complete initialized state.  Its
+        # restore path is intentionally distinct from fresh initialization: do
+        # not reset voltage, repopulate parameters, advance RNG streams, or run
+        # pre-initialization hooks/Mechanism INITIAL blocks before restoring it.
+        if self._restore_steady_state():
+            return self
+
+        # Fresh initialization starts with a zero population clock and a
+        # construction-fresh handler timestep view. Establish those explicit
+        # hook inputs before any authored population/mechanism/state hook. The
+        # integrator's cached Python metadata was invalidated above and must not
+        # be interpreted as a prepared runtime configuration.
+        self.t = torch.zeros_like(self.t).detach()
+        reset_initialization_timestep = getattr(
+            self.mech,
+            "_reset_initialization_timestep",
+            None,
+        )
+        if callable(reset_initialization_timestep):
+            reset_initialization_timestep()
+
+        random_generation = object() if populate_parameter_buffers else None
         if populate_parameter_buffers:
             self.populate_parameter_buffers(random_generation=random_generation)
         self._refresh_parameter_views_for_initialization()
-        self.intra = self.build_intra()
-        if self._restore_steady_state():
-            return self
         self.integrator.init_v(self)
         self.pre_initialize()
         self.integrator.mech.initialize(
@@ -3101,13 +3892,6 @@ class Population(P, Sliceable):
             random_generation=random_generation,
         )
         self.post_initialize()
-        self.integrator.mech.initialize(
-            self.v,
-            self.celsius,
-            self.diam,
-            populate=populate_parameter_buffers,
-            random_generation=random_generation,
-        )
         self.t = torch.zeros_like(self.t).detach()
         self._clear_duration_remainder()
         self.initialized = True
@@ -3149,7 +3933,12 @@ class Population(P, Sliceable):
         """
         if isinstance(state_dict, (str, os.PathLike)):
             state_dict = torch.load(
-                state_dict, map_location=self.device(), weights_only=True
+                # Load on the host, then let load_state_dict copy each tensor to
+                # its owning buffer. This preserves CPU-resident control metadata
+                # and avoids materializing checkpoint float64 tensors on MPS.
+                state_dict,
+                map_location="cpu",
+                weights_only=True,
             )
         has_duration_remainder = (
             isinstance(state_dict, Mapping) and "_duration_remainder" in state_dict
@@ -3785,6 +4574,41 @@ class Population(P, Sliceable):
         planned_exclusions = self._mech_exclusions.get(mechanism)
         batch_names = _mechanism_batch_parameter_names(mechanism)
 
+        def plan_sparse_layout(records, sparse_ic):
+            """Use the compiler's pure support phase for mutation validation."""
+
+            if not records:
+                return None
+            kwargs_list = []
+            keys = []
+            preserves = []
+            copies_list = []
+            for record in records:
+                _, kwargs, key, preserve, copies = _unpack_mechanism_insertion_record(
+                    record
+                )
+                kwargs_list.append(kwargs)
+                keys.append(key)
+                preserves.append(bool(preserve or int(copies) != 1))
+                copies_list.append(int(copies))
+            return _plan_mechanism_support(
+                self,
+                mechanism,
+                keys,
+                kwargs_list=kwargs_list,
+                preserve_duplicate_indices=preserves,
+                copies=copies_list,
+                ic=sparse_ic,
+                base_kwargs=self._mech_data_base_kwargs.get(mechanism),
+            )
+
+        current_support_plan = None
+        if planned_everywhere is None:
+            current_support_plan = plan_sparse_layout(
+                tuple(self._mech_data.get(mechanism, ())),
+                self._mech_data_ic.get(mechanism),
+            )
+
         if planned_everywhere is not None:
             configured_name, configured_ic, configured_kwargs = planned_everywhere
             excluded = torch.as_tensor(
@@ -3983,6 +4807,29 @@ class Population(P, Sliceable):
             projected["core_indices"] = old_indices[keep].clone()
             projected["mechanism_class"] = mechanism
             planned_parametrizations.append(projected)
+
+        if (
+            current_support_plan is not None
+            and current_support_plan.support_spec.preserves_population_axis
+            and _mechanism_has_batch_contract(mechanism)
+        ):
+            future_support_plan = plan_sparse_layout(
+                planned_records,
+                planned_sparse_ic,
+            )
+            if (
+                future_support_plan is not None
+                and len(future_support_plan.local_shape) < 2
+            ):
+                raise ValueError(
+                    f"Cannot partially delete mechanism {mechanism.__name__!r}: "
+                    "the remaining support would change grouped (N, K) storage "
+                    "to packed one-axis storage, but the mechanism declares "
+                    "BATCH-scoped state. Packed storage cannot preserve "
+                    "per-population BATCH association. Delete the whole "
+                    "mechanism or reconfigure the final placement explicitly. "
+                    "No changes were made."
+                )
 
         # Commit only after support and every affected value have been validated.
         if planned_everywhere is None:
@@ -4897,28 +5744,6 @@ class Population(P, Sliceable):
         """
         return self.v.shape[-2]
 
-    def set_value(self, name: str, value: torch.Tensor):
-        """
-        Set a parameter or state variable by name.
-
-        Parameters
-        ----------
-        name : str
-            The name of the parameter or state variable to set.
-        value : torch.Tensor
-            The value to set for the specified parameter or state variable.
-        """
-
-        def _set_value(model):
-            if hasattr(model, name):
-                getattr(model, name).copy_(
-                    value.to(device=model.device(), dtype=model.dtype())
-                )
-            else:
-                raise AttributeError(f"Model has no attribute '{name}' to set.")
-
-        self.register_post_initialize_hook(_set_value)
-
     # -- batching stuff --
     def is_batched(self):
         """
@@ -4993,6 +5818,19 @@ class Population(P, Sliceable):
         if n <= 0:
             raise ValueError("Batch size n must be positive.")
 
+        # A compiled mechanism records both its explicit batch prefix and its
+        # two-axis population support.  Batching the owning Population changes
+        # the former, so the compiled hierarchy cannot remain authoritative.
+        # Keep the existing modules available until the normal lazy build
+        # boundary, but require that boundary before they can execute again.
+        rebuild_mechanisms = self.is_built
+        if rebuild_mechanisms:
+            self._flag_rebuild = True
+            self.initialized = False
+            integrator = getattr(self, "integrator", None)
+            if integrator is not None:
+                integrator.initialized = False
+
         def _batch_tensor_attr(name: str):
             if not hasattr(self, name):
                 return
@@ -5036,6 +5874,18 @@ class Population(P, Sliceable):
         if hasattr(self, "i_membrane") and self.i_membrane is not None:
             _batch_tensor_attr("i_membrane")
 
+        # A mechanism rebuild also constructs a fresh Integrator, whose
+        # constructor may replace population-owned history buffers (for
+        # example Dufort--Frankel's scalar validity/time markers). Preserve the
+        # values after they have acquired the new batch axis and restore them
+        # onto the fresh integrator below.
+        rebuilt_runtime_state = {}
+        if rebuild_mechanisms:
+            for name in state_vars | {"i_membrane"}:
+                value = getattr(self, name, None)
+                if torch.is_tensor(value):
+                    rebuilt_runtime_state[name] = value
+
         self.reshape(self._calc_shape_p(), self.shape)
         for population_slice in self._labels.values():
             population_slice._batch()
@@ -5043,6 +5893,14 @@ class Population(P, Sliceable):
         self.x = self.x.unsqueeze(0).expand(n, *self.x.shape).clone()
         self.y = self.y.unsqueeze(0).expand(n, *self.y.shape).clone()
         self.z = self.z.unsqueeze(0).expand(n, *self.z.shape).clone()
+        if rebuild_mechanisms:
+            # ``batch`` is a public materialization boundary: callers may
+            # inspect or use the compiled hierarchy as soon as it returns.
+            # Rebuild now instead of exposing stale mechanism ``shape_p`` /
+            # ``shape_f`` metadata until a later initialize call.
+            self.build()
+            for name, value in rebuilt_runtime_state.items():
+                setattr(self, name, value)
         return self
 
     def batch_(self, n):
@@ -5252,9 +6110,7 @@ class Population(P, Sliceable):
         # Runtime checkpoints created before fractional-duration carry support
         # have no entry; restoring them starts with no pending physical time.
         if "duration_remainder" not in state_dict:
-            duration_remainder = torch.zeros(
-                (), device=self._duration_remainder.device, dtype=torch.float64
-            )
+            duration_remainder = torch.zeros((), device="cpu", dtype=torch.float64)
         else:
             duration_remainder = state_dict["duration_remainder"]
             if not torch.is_tensor(duration_remainder):
@@ -5269,9 +6125,9 @@ class Population(P, Sliceable):
                 raise TypeError(
                     "Population checkpoint duration_remainder must have floating dtype."
                 )
-            duration_remainder = duration_remainder.to(
-                device=self._duration_remainder.device, dtype=torch.float64
-            ).clone()
+            duration_remainder = (
+                duration_remainder.to(device="cpu").to(dtype=torch.float64).clone()
+            )
             duration_value = float(duration_remainder.detach().cpu().item())
             if not math.isfinite(duration_value) or duration_value < 0.0:
                 raise ValueError(
@@ -5341,6 +6197,8 @@ class Population(P, Sliceable):
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
         r"""
         Run a long simulation in chunks using activation checkpointing.
@@ -5375,20 +6233,32 @@ class Population(P, Sliceable):
             of checkpoint inputs. This is safer but may incur a memory overhead.
             Default is False.
         restore_state_after_backward : bool, optional
-            If True, restore model state to the end of the forward pass after
-            backward. This is useful when further simulation or evaluation is
-            needed after backpropagation. Default is True.
+            If True, isolate checkpoint replay from the live model so backward,
+            ``autograd.grad``, and higher-order derivatives do not leave its
+            buffers at an internal chunk boundary. This is useful when further
+            simulation or evaluation is needed after differentiation. Default
+            is True.
         return_final_state : bool, optional
             If True, return a tuple (loss, final_state) where final_state is a
             checkpoint state dictionary suitable for restore_dict_from_checkpoint.
             Default is False.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Native pure callback plan made from a FunctionalPopulation bound to
+            this exact source model. It runs beside, and does not replace, the
+            imperative hooks in ``callbacks``.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Explicit carry returned by a previous native callback execution.
+            Requires ``functional_callbacks`` and resumes without reinitializing.
 
         Returns
         -------
-        torch.Tensor or None, or (torch.Tensor or None, dict)
+        torch.Tensor or None or tuple
             If return_final_state is False (default): returns the total loss contribution
             from callbacks, or None if no hook returned a non-None value.
             If return_final_state is True: returns (loss_or_none, final_state_dict).
+            When ``functional_callbacks`` is supplied, its result is appended:
+            ``(loss_or_none, callback_results)`` or
+            ``(loss_or_none, final_state_dict, callback_results)``.
 
 
         Notes
@@ -5422,6 +6292,24 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        if functional_callbacks is None:
+            if functional_callback_state is not None:
+                raise ValueError(
+                    "functional_callback_state requires functional_callbacks"
+                )
+            functional_callback_binding = None
+        else:
+            from dendra.func._callbacks import (
+                FunctionalCallbackResults,
+                FunctionalCallbacks,
+            )
+
+            if not isinstance(functional_callbacks, FunctionalCallbacks):
+                raise TypeError(
+                    "functional_callbacks must be a FunctionalCallbacks plan "
+                    "created by functional.make_callbacks(...)"
+                )
+            functional_callback_binding = functional_callbacks._bind_imperative(self)
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
         )
@@ -5432,6 +6320,8 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
+        if functional_callback_binding is not None:
+            functional_callbacks._validate_runtime_dt(dt_f)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
@@ -5481,8 +6371,8 @@ class Population(P, Sliceable):
 
         def _copy_state_containers(sd: Dict[str, Any]) -> Dict[str, Any]:
             """
-            Copy only nested containers (not tensors). Useful to protect the
-            backward-restore hook from accidental user mutation of the returned dict.
+            Copy only nested containers (not tensors) so checkpoint replay can
+            restore the captured live bindings after mutating the module.
             """
 
             def _copy(value):
@@ -5496,6 +6386,59 @@ class Population(P, Sliceable):
 
             return _copy(sd)
 
+        class _PreserveModelStateDuringRecompute:
+            """Reusable context for first- and higher-order checkpoint replay."""
+
+            def __init__(context_self):
+                context_self._previous = []
+
+            def __enter__(context_self):
+                context_self._previous.append(
+                    _copy_state_containers(self.state_dict_for_checkpoint())
+                )
+                return None
+
+            def __exit__(context_self, exc_type, exc_value, traceback):
+                previous = context_self._previous.pop()
+                self.restore_dict_from_checkpoint(previous)
+                return False
+
+        def _checkpoint_contexts():
+            return nullcontext(), _PreserveModelStateDuringRecompute()
+
+        def _prepare_functional_callback_state():
+            """Establish explicit native carry and the optional initial sample."""
+
+            if functional_callback_binding is None:
+                return None, []
+            if functional_callback_state is None:
+                native_state, initial_emission = functional_callbacks._initialize(
+                    functional_callback_binding.state()
+                )
+                initial_part = functional_callbacks._stack([initial_emission])
+                parts = (
+                    [initial_part]
+                    if functional_callbacks._has_emissions(initial_part)
+                    else []
+                )
+                return native_state, parts
+            return functional_callbacks._validate_state(functional_callback_state), []
+
+        def _finalize_functional_callback_results(native_state, parts):
+            """Finalize one imperative execution segment without hiding carry."""
+
+            stacked = functional_callbacks._concatenate(parts)
+            native_state = functional_callbacks._capture_emission_schemas(
+                native_state,
+                stacked,
+            )
+            outputs = functional_callbacks._finalize(native_state, stacked)
+            native_state = functional_callbacks._materialize_state(native_state)
+            return FunctionalCallbackResults(
+                state=native_state,
+                outputs=outputs,
+            )
+
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
                 # --------------------------------------------------------------
@@ -5507,9 +6450,22 @@ class Population(P, Sliceable):
 
                 if t.numel() == 0:
                     self._set_duration_remainder(duration_remainder)
+                    if functional_callback_binding is None:
+                        if return_final_state:
+                            return None, self.state_dict_for_checkpoint()
+                        return None
+                    native_state, callback_parts = _prepare_functional_callback_state()
+                    functional_results = _finalize_functional_callback_results(
+                        native_state,
+                        callback_parts,
+                    )
                     if return_final_state:
-                        return None, self.state_dict_for_checkpoint()
-                    return None
+                        return (
+                            None,
+                            self.state_dict_for_checkpoint(),
+                            functional_results,
+                        )
+                    return None, functional_results
 
                 n_chunks = math.ceil(len(t) / chunklength)
                 t_chunks = torch.tensor_split(t, n_chunks)
@@ -5531,6 +6487,8 @@ class Population(P, Sliceable):
                     compile_scope="population",
                 )
 
+                native_state, callback_parts = _prepare_functional_callback_state()
+
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
 
@@ -5546,6 +6504,12 @@ class Population(P, Sliceable):
 
                 # Local alias for speed
                 _checkpoint = torch.utils.checkpoint.checkpoint
+                checkpoint_options = {
+                    "use_reentrant": False,
+                    "determinism_check": "none",
+                }
+                if restore_state_after_backward:
+                    checkpoint_options["context_fn"] = _checkpoint_contexts
 
                 # --------------------------------------------------------------
                 # Main chunk loop (checkpointed)
@@ -5638,9 +6602,145 @@ class Population(P, Sliceable):
 
                         return state_out, chunk_loss, saw_loss_flag
 
-                    state, chunk_loss, saw_loss_flag = _checkpoint(
-                        _run_chunk, state, use_reentrant=False, determinism_check="none"
-                    )
+                    if functional_callback_binding is None:
+                        state, chunk_loss, saw_loss_flag = _checkpoint(
+                            _run_chunk,
+                            state,
+                            **checkpoint_options,
+                        )
+                    else:
+
+                        def _run_chunk_functional(
+                            state_in,
+                            native_state_in,
+                            t_chunk_local=t_chunk_local,
+                            chunk_idx=chunk_idx,
+                        ):
+                            # Functional callback carry is an explicit checkpoint
+                            # input/output. The model boundary follows the same
+                            # mutation-safety policy as the ordinary path.
+                            state_local = (
+                                state_in
+                                if not safe_checkpoint
+                                else _clone_checkpoint_state_dict(state_in)
+                            )
+                            self.restore_dict_from_checkpoint(state_local)
+
+                            if with_intra:
+                                stims, indices = intra.init(t_chunk_local)
+                                stims = [s.unbind(-1) for s in stims]
+                            else:
+                                stims, indices = None, None
+
+                            if with_extra:
+                                ve_list = self._compute_extra_chunk(
+                                    extra_cfg,
+                                    chunk_idx,
+                                    t_chunk_local,
+                                )
+                            else:
+                                ve_list = None
+
+                            pre_chunk_hook(callbacks, self, t_chunk_local)
+
+                            chunk_loss = None
+                            saw_loss_local = False
+                            native_state_local = native_state_in
+                            emissions = []
+
+                            for j in range(len(t_chunk_local)):
+                                ve_c = ve_list[j] if ve_list is not None else None
+
+                                if with_intra:
+                                    s = [st[j] for st in stims]
+                                    intra_c = self._call_make_intra(
+                                        intra,
+                                        s,
+                                        indices,
+                                    )
+                                else:
+                                    intra_c = None
+
+                                self._step(
+                                    self.integrator,
+                                    self,
+                                    dt_tensor,
+                                    ve_c,
+                                    intra_c,
+                                )
+                                self.t = self.t + dt_tensor
+
+                                model_state = functional_callback_binding.state()
+                                native_state_local, emitted = (
+                                    functional_callbacks._update(
+                                        native_state_local,
+                                        model_state,
+                                        {"v": model_state["integrator"]["v"]},
+                                    )
+                                )
+                                if emitted is not None:
+                                    emissions.append(emitted)
+
+                                if callbacks:
+                                    for c in callbacks:
+                                        hook = getattr(c, "post_step_hook", None)
+                                        if hook is None:
+                                            continue
+                                        chunk_loss, saw = _add_loss(
+                                            chunk_loss,
+                                            hook(self),
+                                        )
+                                        saw_loss_local = saw_loss_local or saw
+
+                            if callbacks:
+                                for c in callbacks:
+                                    hook = getattr(c, "post_chunk_hook", None)
+                                    if hook is None:
+                                        continue
+                                    chunk_loss, saw = _add_loss(
+                                        chunk_loss,
+                                        hook(self, t_chunk_local),
+                                    )
+                                    saw_loss_local = saw_loss_local or saw
+
+                            state_out = self.state_dict_for_checkpoint()
+                            emitted_part = functional_callbacks._stack(emissions)
+
+                            if chunk_loss is None:
+                                chunk_loss = torch.zeros(
+                                    (),
+                                    device=self.device(),
+                                    dtype=self.dtype(),
+                                )
+
+                            saw_loss_flag = torch.tensor(
+                                1 if saw_loss_local else 0,
+                                device=self.device(),
+                                dtype=torch.int32,
+                            )
+
+                            return (
+                                state_out,
+                                native_state_local,
+                                emitted_part,
+                                chunk_loss,
+                                saw_loss_flag,
+                            )
+
+                        (
+                            state,
+                            native_state,
+                            emitted_part,
+                            chunk_loss,
+                            saw_loss_flag,
+                        ) = _checkpoint(
+                            _run_chunk_functional,
+                            state,
+                            native_state,
+                            **checkpoint_options,
+                        )
+                        if functional_callbacks._has_emissions(emitted_part):
+                            callback_parts.append(emitted_part)
 
                     total_loss, _ = _add_loss(total_loss, chunk_loss)
                     saw_any_loss = saw_any_loss or bool(int(saw_loss_flag.item()))
@@ -5661,43 +6761,28 @@ class Population(P, Sliceable):
                 if progressbar:
                     progressbar.close()
 
-        if not saw_any_loss:
-            if return_final_state:
-                return None, self.state_dict_for_checkpoint()
-            return None
+                functional_results = None
+                if functional_callback_binding is not None:
+                    functional_results = _finalize_functional_callback_results(
+                        native_state,
+                        callback_parts,
+                    )
 
-        # ------------------------------------------------------------------
-        # IMPORTANT: preserve forward-final model state across backward.
-        #
-        # With checkpointing, backward re-runs chunk forwards and therefore
-        # re-mutates self.t / buffers. Without intervention, the module state
-        # after loss.backward() will typically reflect the last recomputed
-        # chunk, not the true forward-final state.
-        #
-        # We snapshot the final state and schedule a restoration callback at
-        # the *end* of backward.
-        # ------------------------------------------------------------------
+        if not saw_any_loss:
+            total_loss = None
+            if functional_callback_binding is None:
+                if return_final_state:
+                    return None, self.state_dict_for_checkpoint()
+                return None
+
         final_state = None
-        if restore_state_after_backward or return_final_state:
+        if return_final_state:
             final_state = self.state_dict_for_checkpoint()
 
-        if restore_state_after_backward:
-            # Protect hook state from accidental external mutation of the dict structure.
-            final_state_for_hook = _copy_state_containers(final_state)
-
-            def _queue_restore(grad, fs=final_state_for_hook):
-                # Must be called during backward; this schedules restore after
-                # the autograd engine finishes the backward pass.
-                torch.autograd.Variable._execution_engine.queue_callback(
-                    lambda: self.restore_dict_from_checkpoint(fs)
-                )
-                return grad
-
-            # Only meaningful if backward will actually run through this tensor.
-            # (register_hook requires requires_grad=True)
-            if isinstance(total_loss, torch.Tensor) and total_loss.requires_grad:
-                total_loss.register_hook(_queue_restore)
-
+        if functional_callback_binding is not None:
+            if return_final_state:
+                return total_loss, final_state, functional_results
+            return total_loss, functional_results
         if return_final_state:
             return total_loss, final_state
         return total_loss
@@ -8182,10 +9267,17 @@ class Myelinated(Axon):
                 Scaled axial resistivity values.
             """
             diameters = diameters.unsqueeze(1) if diameters.ndim == 1 else diameters
-            axon_d = self.axond1 * diameters**2 + self.axond2 * diameters + self.axond3
-            deltax = (
-                self.deltax1 * diameters**2 + self.deltax2 * diameters + self.deltax3
-            )
+            # Retain one logical singleton axis for scalar coefficients. This
+            # preserves an empty hidden vmap lane instead of selecting lane
+            # zero during scalar-by-spatial broadcasting.
+            axond1 = self.axond1.reshape(1)
+            axond2 = self.axond2.reshape(1)
+            axond3 = self.axond3.reshape(1)
+            deltax1 = self.deltax1.reshape(1)
+            deltax2 = self.deltax2.reshape(1)
+            deltax3 = self.deltax3.reshape(1)
+            axon_d = axond1 * diameters**2 + axond2 * diameters + axond3
+            deltax = deltax1 * diameters**2 + deltax2 * diameters + deltax3
             deltax = deltax / dx
             scale = 1 / ((axon_d / diam) ** 2)
             rhoa = rhoa * scale * deltax
@@ -8214,7 +9306,12 @@ class Myelinated(Axon):
             Tensor
                 Node diameters in μm.
             """
-            node_d = self.noded1 * diam**2 + self.noded2 * diam + self.noded3
+            # See ``myelinated_rhoa.forward``: the singleton keeps scalar
+            # coefficients well-defined for zero-sized outer vmap lanes.
+            noded1 = self.noded1.reshape(1)
+            noded2 = self.noded2.reshape(1)
+            noded3 = self.noded3.reshape(1)
+            node_d = noded1 * diam**2 + noded2 * diam + noded3
             return node_d
 
     def __init__(
@@ -8267,6 +9364,19 @@ class Myelinated(Axon):
 
     def _x(self) -> torch.Tensor:  # x in um
         length = (self.n_comp - 1) * self.deltax(self.diameters).unsqueeze(1)
+        if length.device.type == "mps":
+            # Preserve the binary64 interpolation used by the CPU/CUDA path,
+            # then transfer only the model-dtype result to MPS.
+            length_work = length.to(device="cpu").to(dtype=torch.double)
+            start = -length_work / 2
+            end = length_work / 2
+            t = torch.linspace(
+                0, 1, self.n_comp, device="cpu", dtype=torch.double
+            ).unsqueeze(0)
+            return ((1 - t) * start + t * end).to(
+                device=length.device, dtype=self.dtype()
+            )
+
         start = -length / 2
         end = length / 2
         steps = self.n_comp
@@ -8643,6 +9753,248 @@ def compose_or_flatten_union(
         return result_indices, False, final_shape, local_indices
 
 
+_POPULATION_AXIS_EXCLUDED_MECHANISMS = (
+    MaterialProcess,
+    PointProcess,
+    Synapse,
+    ContinuousSynapse,
+    VoltageProcess,
+)
+
+
+def _broadcasts_to_shape(value, shape) -> bool:
+    """Return whether a static parameter value has an unambiguous layout."""
+
+    if isinstance(value, torch.nn.Module):
+        return False
+    try:
+        value = torch.as_tensor(value)
+    except (TypeError, ValueError, RuntimeError):
+        return False
+    if value.ndim == 0:
+        return True
+    try:
+        torch.broadcast_to(value, tuple(shape))
+    except RuntimeError:
+        return False
+    return True
+
+
+def _population_axis_parameter_layout_is_safe(
+    mechanism,
+    support_spec,
+    *,
+    base_kwargs,
+    kwargs_list,
+    ic,
+) -> bool:
+    """Reject flat-only values before changing a mechanism's storage ABI."""
+
+    natural_shape = support_spec.local_core_shape
+    batch_shape = natural_shape[:-1] + (1,)
+    range_names = _mechanism_spatial_parameter_names(mechanism)
+    batch_names = _mechanism_batch_parameter_names(mechanism)
+
+    for owner in (mechanism, *tuple(getattr(mechanism, "_state", ()))):
+        for declaration in ("_range", "_range_p", "_range_n"):
+            if not all(
+                _broadcasts_to_shape(value, natural_shape)
+                for value in getattr(owner, declaration, {}).values()
+            ):
+                return False
+        for declaration in ("_batch", "_batch_p", "_batch_n"):
+            if not all(
+                _broadcasts_to_shape(value, batch_shape)
+                for value in getattr(owner, declaration, {}).values()
+            ):
+                return False
+
+    for name, value in dict(base_kwargs or {}).items():
+        if name in range_names and not _broadcasts_to_shape(value, natural_shape):
+            return False
+        if name in batch_names and not _broadcasts_to_shape(value, batch_shape):
+            return False
+    if ic is not None and not all(
+        _broadcasts_to_shape(value, natural_shape) for value in ic.values()
+    ):
+        return False
+    # RANGE overrides already carry exact flattened record-local keys, so their
+    # values retain row-major meaning when the destination buffer becomes
+    # (N, K). BATCH overrides collapse those keys by the new population axis;
+    # keep non-scalar BATCH values on the legacy path until that migration has
+    # its own explicit value-shape contract.
+    for kwargs in kwargs_list:
+        for name, value in kwargs.items():
+            if name in batch_names and not _broadcasts_to_shape(value, ()):
+                return False
+    return True
+
+
+def _preserve_compiled_population_axis(
+    model,
+    mechanism,
+    support_spec,
+    *,
+    base_kwargs,
+    kwargs_list,
+    ic,
+) -> bool:
+    """Apply the initial fail-closed eligibility policy for ``(N, K)`` storage."""
+
+    if not getattr(model, "preserve_mechanism_population_axis", False):
+        return False
+    if (
+        support_spec.kind is not SupportKind.SHARED_COLUMNS
+        or not support_spec.all_populations
+        or support_spec.source_core_shape[0] <= 1
+    ):
+        return False
+    if issubclass(mechanism, _POPULATION_AXIS_EXCLUDED_MECHANISMS):
+        return False
+    if not bool(getattr(mechanism, "supports_population_axis_layout", True)):
+        return False
+    return _population_axis_parameter_layout_is_safe(
+        mechanism,
+        support_spec,
+        base_kwargs=base_kwargs,
+        kwargs_list=kwargs_list,
+        ic=ic,
+    )
+
+
+@dataclass(frozen=True)
+class _MechanismSupportPlan:
+    """Pure structural result shared by compilation and mutation validation."""
+
+    total_index: Any
+    is_composable: bool
+    local_shape: tuple[int, ...]
+    local_indices: tuple[tuple[int, ...], ...]
+    support_spec: SupportSpec
+    preserves_multiplicity: bool
+    force_packed: bool
+    preserve_duplicate_indices: tuple[bool, ...]
+    copies: tuple[int, ...]
+
+
+def _plan_mechanism_support(
+    model,
+    mechanism,
+    indices,
+    kwargs_list,
+    preserve_duplicate_indices=None,
+    copies=None,
+    *,
+    ic=None,
+    base_kwargs=None,
+    force_flat=False,
+) -> _MechanismSupportPlan:
+    """Plan support and its runtime shape without instantiating a mechanism."""
+
+    if preserve_duplicate_indices is None:
+        preserve_duplicate_indices = [False] * len(indices)
+    if copies is None:
+        copies = [1] * len(indices)
+    preserve_duplicate_indices = tuple(
+        bool(value) for value in preserve_duplicate_indices
+    )
+    copies = tuple(int(value) for value in copies)
+    if len(preserve_duplicate_indices) != len(indices) or len(copies) != len(indices):
+        raise ValueError(
+            "Mechanism support options must have one entry per insertion region."
+        )
+    preserve_duplicate_indices = tuple(
+        bool(preserve or n_copies != 1)
+        for preserve, n_copies in zip(preserve_duplicate_indices, copies)
+    )
+    uses_multiset_layout = any(preserve_duplicate_indices)
+    if uses_multiset_layout:
+        total_index, is_composable, local_shape, local_indices = (
+            compose_or_flatten_multiset(
+                indices,
+                model.core_shape(),
+                preserve_duplicate_indices,
+                copies,
+            )
+        )
+    else:
+        total_index, is_composable, local_shape, local_indices = (
+            compose_or_flatten_union(indices, model.core_shape())
+        )
+
+    base_kwargs = dict(base_kwargs or {})
+
+    def cannot_target_composed_shape(value):
+        if isinstance(value, torch.nn.Module):
+            return False
+        try:
+            value = torch.as_tensor(value)
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        if value.ndim == 0:
+            return False
+        try:
+            torch.broadcast_to(value, local_shape)
+        except RuntimeError:
+            return value.numel() == math.prod(local_shape)
+        return False
+
+    indexed_base_names = _mechanism_spatial_parameter_names(mechanism)
+    shape_sensitive_values = [
+        value for key, value in base_kwargs.items() if key in indexed_base_names
+    ]
+    if ic is not None:
+        shape_sensitive_values.extend(ic.values())
+    force_flat = bool(
+        force_flat
+        or (
+            is_composable
+            and any(
+                cannot_target_composed_shape(value) for value in shape_sensitive_values
+            )
+        )
+    )
+    if force_flat and is_composable:
+        core_grid = np.arange(math.prod(model.core_shape())).reshape(model.core_shape())
+        total_index = np.asarray(core_grid[total_index]).reshape(-1).tolist()
+        local_shape = (len(total_index),)
+        is_composable = False
+
+    force_packed = bool(force_flat or uses_multiset_layout)
+    support_spec = SupportSpec.from_compiled(
+        core_shape=model.core_shape(),
+        key=total_index,
+        is_composable=is_composable,
+        local_shape=local_shape,
+        preserves_multiplicity=uses_multiset_layout,
+        force_packed=force_packed,
+    )
+    if _preserve_compiled_population_axis(
+        model,
+        mechanism,
+        support_spec,
+        base_kwargs=base_kwargs,
+        kwargs_list=kwargs_list,
+        ic=ic,
+    ):
+        support_spec = support_spec.with_population_axis()
+        local_shape = support_spec.runtime_local_shape
+
+    return _MechanismSupportPlan(
+        total_index=total_index,
+        is_composable=is_composable,
+        local_shape=tuple(local_shape),
+        local_indices=tuple(
+            tuple(int(index) for index in values) for values in local_indices
+        ),
+        support_spec=support_spec,
+        preserves_multiplicity=uses_multiset_layout,
+        force_packed=force_packed,
+        preserve_duplicate_indices=preserve_duplicate_indices,
+        copies=copies,
+    )
+
+
 def compile_mechanism(
     model,
     mechanism,
@@ -8695,63 +10047,26 @@ def compile_mechanism(
         Tuple ``(mechanism_instance, parameter_shape, total_index)`` ready for
         registration via :meth:`Population._register_mech`.
     """
-    if preserve_duplicate_indices is None:
-        preserve_duplicate_indices = [False] * len(indices)
-    if copies is None:
-        copies = [1] * len(indices)
-    preserve_duplicate_indices = [bool(v) for v in preserve_duplicate_indices]
-    copies = [int(c) for c in copies]
-    preserve_duplicate_indices = [
-        bool(p or c != 1) for p, c in zip(preserve_duplicate_indices, copies)
-    ]
-    uses_multiset_layout = any(preserve_duplicate_indices)
-    if uses_multiset_layout:
-        total_index, is_composable, shape, local_indices = compose_or_flatten_multiset(
-            indices,
-            model.core_shape(),
-            preserve_duplicate_indices,
-            copies,
-        )
-    else:
-        total_index, is_composable, shape, local_indices = compose_or_flatten_union(
-            indices, model.core_shape()
-        )
-
     base_kwargs = dict(base_kwargs or {})
-
-    def cannot_target_composed_shape(value):
-        if isinstance(value, torch.nn.Module):
-            return False
-        try:
-            value = torch.as_tensor(value)
-        except (TypeError, ValueError):
-            return False
-        if value.ndim == 0:
-            return False
-        try:
-            torch.broadcast_to(value, shape)
-        except RuntimeError:
-            return value.numel() == math.prod(shape)
-        return False
-
-    indexed_base_names = _mechanism_spatial_parameter_names(mechanism)
-    shape_sensitive_values = [
-        value for key, value in base_kwargs.items() if key in indexed_base_names
-    ]
-    if ic is not None:
-        shape_sensitive_values.extend(ic.values())
-    force_flat = bool(
-        force_flat
-        or (
-            is_composable
-            and any(cannot_target_composed_shape(v) for v in shape_sensitive_values)
-        )
+    plan = _plan_mechanism_support(
+        model,
+        mechanism,
+        indices,
+        kwargs_list,
+        preserve_duplicate_indices=preserve_duplicate_indices,
+        copies=copies,
+        ic=ic,
+        base_kwargs=base_kwargs,
+        force_flat=force_flat,
     )
-    if force_flat and is_composable:
-        core_grid = np.arange(math.prod(model.core_shape())).reshape(model.core_shape())
-        total_index = np.asarray(core_grid[total_index]).reshape(-1).tolist()
-        shape = (len(total_index),)
-        is_composable = False
+    total_index = plan.total_index
+    is_composable = plan.is_composable
+    shape = plan.local_shape
+    local_indices = plan.local_indices
+    support_spec = plan.support_spec
+    preserve_duplicate_indices = plan.preserve_duplicate_indices
+    copies = plan.copies
+    uses_multiset_layout = plan.preserves_multiplicity
 
     shape_p = shape
     shape_f = shape
@@ -8811,6 +10126,9 @@ def compile_mechanism(
         shape_f,
         key=total_index,
         is_composable=is_composable,
+        support_spec=support_spec,
+        preserves_multiplicity=uses_multiset_layout,
+        force_packed_support=plan.force_packed,
         additional_parameters=additional_parameters,
         ic=ic,
         **base_kwargs,

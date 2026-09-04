@@ -219,8 +219,26 @@ def test_public_load_preserves_coherent_clock_anchor_bit_for_bit():
     restored.load(state)
 
     assert torch.equal(restored._clock_origin, expected_origin)
+    assert restored.cell.integrator.initialized
     restored.step()
     assert torch.equal(restored.t, expected_next_time)
+
+
+def test_public_load_failure_preserves_initialized_network_usability():
+    net = _network()
+    net.initialize(DT)
+    state = _clone_nested(net.state_dict())
+    corrupt = _clone_nested(state)
+    corrupt["t"].add_(9.0)
+    corrupt["_extra_state"]["rng_state"]["cpu"] = torch.zeros(1, dtype=torch.uint8)
+
+    with pytest.raises(RuntimeError):
+        net.load(corrupt)
+
+    assert torch.equal(net.t, state["t"])
+    assert net.cell.integrator.initialized
+    net.step()
+    assert net.t.item() == pytest.approx(DT)
 
 
 def test_restore_accepts_legacy_flat_event_netcon_checkpoint():

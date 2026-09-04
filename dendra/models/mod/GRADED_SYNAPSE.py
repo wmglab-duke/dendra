@@ -232,15 +232,16 @@ class graded_release_state(S):
         sigma = self.sigma.clamp_min(1.0e-6)
         return torch.sigmoid((v - self.theta) / sigma)
 
-    def breakpoint(self, v, states):
+    def assigned_values(self, v, values):
+        del values
         T = self._release(v)
         denom = (self.alpha * T + self.beta).clamp_min(1.0e-12)
         sinf = (self.alpha * T) / denom
         tau = 1.0 / denom
         return {"T": T, "sinf": sinf, "tau": tau}
 
-    def inf(self, v):
-        bp = self.breakpoint(v, None)
+    def state_defaults(self, v, values):
+        bp = self.assigned_values(v, values)
         return {"s": bp["sinf"]}
 
 
@@ -307,7 +308,7 @@ class graded_release_gate(M):
         )
     """
 
-    M.STATE(graded_release_state)
+    M.STATE_BUNDLE(graded_release_state)
 
 
 class graded_syn(CS):

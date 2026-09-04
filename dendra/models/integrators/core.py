@@ -1,5 +1,7 @@
 import inspect
 import math
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -14,6 +16,7 @@ from dendra.helpers import (
     DYNAMIC,
     FULLGRAPH,
     IMEM,
+    compile_options_for_device,
     compile_options_key,
     current_compile_options,
     detach_vars,
@@ -237,6 +240,16 @@ def _expanded_v_init(model):
     )
 
 
+@dataclass(frozen=True)
+class _FunctionalIntegratorSpec:
+    """Private capability record consumed by ``dendra.func`` lowering."""
+
+    operator_kind: str
+    implementation: type
+    workspace_schema: tuple[tuple[str, str], ...]
+    critical_methods: tuple[str, ...]
+
+
 class Integrator(torch.nn.Module):
     r"""Base class for all integrators.
 
@@ -253,6 +266,9 @@ class Integrator(torch.nn.Module):
 
     __constants__ = {"imem"}
     v_vars = ["v"]
+    _PREPARED_WORKSPACE_SCHEMA = ()
+    _FUNCTIONAL_OPERATOR_KIND = None
+    _FUNCTIONAL_CRITICAL_METHODS = ()
 
     def __init__(self, model, mech, imem=None):
         super().__init__()
@@ -295,6 +311,204 @@ class Integrator(torch.nn.Module):
         capture = getattr(self.mech, "capture_ion_conductance_frame", None)
         return () if capture is None else capture()
 
+    def _prepared_workspace_schema(self):
+        """Return the validated private tensor-workspace contract.
+
+        Concrete integrators declare ``(buffer_name, shape_role)`` entries and
+        implement a pure ``_prepare_workspace(dt, **physical_inputs)`` builder.
+        The functional backend interprets shape roles; the base Integrator owns
+        structural validation so imperative and functional preparation cannot
+        silently disagree about names or tensor ownership.
+        """
+        schema = tuple(self._PREPARED_WORKSPACE_SCHEMA)
+        names = []
+        for entry in schema:
+            if (
+                not isinstance(entry, tuple)
+                or len(entry) != 2
+                or not all(isinstance(value, str) and value for value in entry)
+            ):
+                raise TypeError(
+                    f"{type(self).__qualname__}._PREPARED_WORKSPACE_SCHEMA must "
+                    "contain non-empty (buffer_name, shape_role) string pairs."
+                )
+            names.append(entry[0])
+        if len(names) != len(set(names)):
+            raise ValueError(
+                f"{type(self).__qualname__}._PREPARED_WORKSPACE_SCHEMA contains "
+                "duplicate buffer names."
+            )
+        if "dt" in names:
+            raise ValueError(
+                f"{type(self).__qualname__}._PREPARED_WORKSPACE_SCHEMA cannot "
+                "declare reserved entry 'dt'."
+            )
+        return schema
+
+    def _derive_prepared_workspace(self, dt, **physical_inputs):
+        """Build and validate a pure tensor workspace for one timestep.
+
+        Topology adapters remain responsible for producing effective physical
+        inputs in the integrator's documented layout. This method is the shared
+        numerical-preparation boundary used by both ordinary initialization and
+        ``dendra.func`` lowering.
+        """
+        builder = getattr(self, "_prepare_workspace", None)
+        if not callable(builder):
+            raise NotImplementedError(
+                f"{type(self).__qualname__} does not define a pure "
+                "_prepare_workspace() builder."
+            )
+        schema = self._prepared_workspace_schema()
+        workspace = builder(dt, **physical_inputs)
+        if not isinstance(workspace, Mapping):
+            raise TypeError(
+                f"{type(self).__qualname__}._prepare_workspace() must return a mapping."
+            )
+
+        # Resolve and validate the complete generation before returning it. In
+        # particular, a missing late entry cannot expose a partially installed
+        # workspace to the imperative model.
+        staged = tuple((name, workspace[name]) for name, _role in schema)
+        expected = {name for name, _role in schema}
+        unexpected = set(workspace) - expected
+        if unexpected:
+            raise KeyError(
+                f"{type(self).__qualname__}._prepare_workspace() returned "
+                f"unexpected entries {sorted(unexpected)}."
+            )
+        non_tensors = [name for name, value in staged if not torch.is_tensor(value)]
+        if non_tensors:
+            raise TypeError(
+                f"{type(self).__qualname__}._prepare_workspace() returned "
+                f"non-Tensor entries {non_tensors}."
+            )
+        return dict(staged)
+
+    def _install_prepared_workspace(self, workspace):
+        """Atomically install one already validated workspace generation."""
+        schema = self._prepared_workspace_schema()
+        staged = tuple((name, workspace[name]) for name, _role in schema)
+        missing_buffers = [name for name, _value in staged if name not in self._buffers]
+        if missing_buffers:
+            raise RuntimeError(
+                f"{type(self).__qualname__} workspace entries must be registered "
+                f"buffers before installation; missing {missing_buffers}."
+            )
+        for name, value in staged:
+            setattr(self, name, value)
+        return workspace
+
+    def _functional_spec(self):
+        """Describe this integrator's private functional capability, if any."""
+        implementation = None
+        operator_kind = None
+        for owner in type(self).__mro__:
+            declared = owner.__dict__.get("_FUNCTIONAL_OPERATOR_KIND")
+            if declared is not None:
+                implementation = owner
+                operator_kind = declared
+                break
+        if implementation is None:
+            return None
+
+        common_methods = (
+            "_functional_spec",
+            "_functional_solver",
+            "_step",
+            "_voltage_update",
+            "_prepare_workspace",
+            "_prepared_workspace_schema",
+            "_derive_prepared_workspace",
+            "_install_prepared_workspace",
+            "initialize",
+            "step",
+        )
+        critical_methods = tuple(
+            dict.fromkeys((*common_methods, *self._FUNCTIONAL_CRITICAL_METHODS))
+        )
+        return _FunctionalIntegratorSpec(
+            operator_kind=str(operator_kind),
+            implementation=implementation,
+            workspace_schema=self._prepared_workspace_schema(),
+            critical_methods=critical_methods,
+        )
+
+    def _functional_solver(self):
+        """Return a transform-compatible solver facade, if one is needed."""
+        return None
+
+    def _step(
+        self,
+        v,
+        dt,
+        temp,
+        ve=None,
+        intra=None,
+        *,
+        solver=None,
+        call_local_currents=False,
+    ):
+        """Run one linearized implicit transition.
+
+        Single-compartment and unbranched-cable implicit Euler share this
+        lifecycle exactly; concrete integrators own only their numerical
+        :meth:`_voltage_update`. Ordinary execution uses handler-owned scratch.
+        Functional execution selects call-local current frames and must isolate
+        registered mechanism state around this method.
+        """
+        v_state = self.mech.update_v(v)
+        self._advance_pre_current(v_state, dt, temp)
+        if call_local_currents:
+            evaluate = getattr(self.mech, "_evaluate_current_frame", None)
+            if evaluate is None:
+                raise RuntimeError(
+                    "call-local current evaluation requires a MechanismHandler "
+                    "with _evaluate_current_frame()"
+                )
+            (
+                itot,
+                gtot,
+                ion_current_frame,
+                ion_conductance_frame,
+            ) = evaluate(v_state)
+        else:
+            itot, gtot = self.mech.i(v_state)
+            ion_current_frame = self._capture_ion_current_frame()
+            ion_conductance_frame = self._capture_ion_conductance_frame()
+        v_new, i_membrane = self._voltage_update(
+            v_state,
+            dt,
+            itot,
+            gtot,
+            ve,
+            intra,
+            solver=solver,
+        )
+        accepted_frame = self._linearize_ion_current_frame(
+            ion_current_frame,
+            ion_conductance_frame,
+            v_new - v_state,
+        )
+        self._advance_post_current(v_state, dt, temp, accepted_frame)
+        return v_new, i_membrane
+
+    def _voltage_update(
+        self,
+        v,
+        dt,
+        itot,
+        gtot,
+        ve=None,
+        intra=None,
+        *,
+        solver=None,
+    ):
+        """Return the pure numerical voltage update shared by both frontends."""
+        raise NotImplementedError(
+            f"{type(self).__qualname__} does not define _voltage_update()."
+        )
+
     @staticmethod
     def _combine_ion_current_frames(frames, weights):
         """Combine solver-stage frames without detaching their autograd graphs."""
@@ -330,14 +544,43 @@ class Integrator(torch.nn.Module):
         owner_compile_options = getattr(model, "compile_options", None)
         if owner_compile_options is None:
             owner_compile_options = current_compile_options()
-        compile_options = normalize_compile_options(owner_compile_options)
+        requested_compile_options = normalize_compile_options(owner_compile_options)
+        model_device = model.device()
+        compile_device_type = torch.device(model_device).type
+        backend = getattr(model, "backend", _cfg_value(BACKEND))
+        dynamic = bool(getattr(model, "dynamic", bool(DYNAMIC)))
+        requested_compile_mode = getattr(
+            model, "compile_mode", _cfg_value(COMPILE_MODE)
+        )
+        mechanism_handler = getattr(model, "mech", None)
+        if mechanism_handler is None:
+            # During Population.build(), the handler is passed to the
+            # integrator before Population.mech is assigned.
+            mechanism_handler = self.mech
+        requires_inductor_python_wrapper = bool(
+            getattr(
+                mechanism_handler,
+                "requires_inductor_python_wrapper",
+                False,
+            )
+        )
+        compile_options = compile_options_for_device(
+            requested_compile_options,
+            backend=backend,
+            device=model_device,
+            mode=requested_compile_mode,
+            dynamic=dynamic,
+            requires_inductor_python_wrapper=requires_inductor_python_wrapper,
+        )
+        compile_mode = requested_compile_mode if compile_options is None else None
         new_config = (
             bool(jit_enabled_for_scope(scope, model)),
-            getattr(model, "backend", _cfg_value(BACKEND)),
+            backend,
             bool(getattr(model, "fullgraph", bool(FULLGRAPH))),
-            bool(getattr(model, "dynamic", bool(DYNAMIC))),
-            getattr(model, "compile_mode", _cfg_value(COMPILE_MODE)),
+            dynamic,
+            compile_mode,
             compile_options_key(compile_options),
+            compile_device_type,
             scope,
         )
         old_config = (
@@ -347,6 +590,7 @@ class Integrator(torch.nn.Module):
             getattr(self, "dynamic", None),
             getattr(self, "compile_mode", None),
             getattr(self, "compile_options_key", None),
+            getattr(self, "compile_device_type", None),
             getattr(self, "compile_scope", None),
         )
         (
@@ -356,8 +600,11 @@ class Integrator(torch.nn.Module):
             self.dynamic,
             self.compile_mode,
             self.compile_options_key,
+            self.compile_device_type,
             self.compile_scope,
         ) = new_config
+        self.requested_compile_mode = requested_compile_mode
+        self.requested_compile_options = requested_compile_options
         self.compile_options = compile_options
         if new_config != old_config:
             self._compiled_kernels.clear()
@@ -445,6 +692,7 @@ class Integrator(torch.nn.Module):
             self.dynamic,
             self.compile_mode,
             self.compile_options_key,
+            self.compile_device_type,
         )
         with torch_compiler_warning_context():
             compiled = self._compiled_kernels.get(key)
@@ -505,6 +753,47 @@ class Integrator(torch.nn.Module):
             return True
         return not self.initialized or self.dt != float(dt) or self.shape != model.shape
 
+    def _configure_mechanism_timestep(self, dt):
+        """Configure handler or fallback mechanism timestep state safely."""
+
+        handler_set_dt = getattr(self.mech, "set_dt", None)
+        if callable(handler_set_dt):
+            handler_set_dt(dt)
+            return
+
+        # Lightweight downstream/test handlers may expose only a ``mechanisms``
+        # collection. Ordinary Dendra Mechanisms no longer have a public
+        # ``set_dt`` hook, so stage them through the framework-owned base
+        # implementation while preserving the legacy protocol for non-Dendra
+        # leaves and the separate MaterialProcess family lifecycle.
+        from dendra.models.mechanisms._mechanism import Mechanism
+
+        canonical = []
+        family_or_legacy = []
+        for mechanism in self.mech.mechanisms.values():
+            if isinstance(mechanism, Mechanism) and not getattr(
+                type(mechanism), "_material_process_set_dt_lifecycle", False
+            ):
+                canonical.append(
+                    (
+                        mechanism,
+                        Mechanism._stage_timestep_configuration(mechanism, dt),
+                    )
+                )
+            else:
+                setter = getattr(mechanism, "set_dt", None)
+                if not callable(setter):
+                    raise TypeError(
+                        "Fallback mechanism handlers require each non-Dendra "
+                        "leaf to provide a callable set_dt(dt) method."
+                    )
+                family_or_legacy.append(setter)
+
+        for setter in family_or_legacy:
+            setter(dt)
+        for mechanism, configuration in canonical:
+            Mechanism._commit_timestep_configuration(mechanism, configuration)
+
     def _initialize(self, model, dt, force=False, *, compile_scope: str = "population"):
         needs_initialize = self.needs_to_be_initialized(model, dt, force)
         if needs_initialize:
@@ -525,11 +814,7 @@ class Integrator(torch.nn.Module):
             self.shape = model.shape
             self._compiled_kernels.clear()
             try:
-                if hasattr(self.mech, "set_dt"):
-                    self.mech.set_dt(dt)
-                else:
-                    for mech in self.mech.mechanisms.values():
-                        mech.set_dt(dt)
+                self._configure_mechanism_timestep(dt)
                 self.initialize(model, dt)
                 record = getattr(model, "_record_integrator_workspace_contracts", None)
                 if record is not None:
@@ -544,11 +829,7 @@ class Integrator(torch.nn.Module):
                 self._compiled_kernels.clear()
                 if previous_initialized and previous_dt is not None:
                     try:
-                        if hasattr(self.mech, "set_dt"):
-                            self.mech.set_dt(previous_dt)
-                        else:
-                            for mech in self.mech.mechanisms.values():
-                                mech.set_dt(previous_dt)
+                        self._configure_mechanism_timestep(previous_dt)
                     except Exception:
                         # The integrator remains explicitly invalid. A later
                         # initialize call must rebuild all timestep-dependent
@@ -556,6 +837,13 @@ class Integrator(torch.nn.Module):
                         pass
                 raise
             self.initialized = True
+            complete_reinitialization = getattr(
+                model,
+                "_complete_integrator_reinitialization",
+                None,
+            )
+            if complete_reinitialization is not None:
+                complete_reinitialization()
 
     def init_v(self, model):
         model.v = _expanded_v_init(model).clone().detach().contiguous()

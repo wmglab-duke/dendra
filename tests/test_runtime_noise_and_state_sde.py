@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import dendra as dn  # noqa: F401 - ensure top-level API exports are available
-from dendra.models.mechanisms import MaterialProcess, Mechanism
+from dendra.models.mechanisms import Mechanism
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._state import State, valid_integration_methods
 from dendra.models.parametric import Parameterized
@@ -67,11 +67,12 @@ def test_state_euler_maruyama_is_registered_and_runs():
         State.DIFFUSION("x = diff_sigma")
         State.METHOD("euler_maruyama")
 
-        def breakpoint(self, v, states):
+        def assigned_values(self, v, values):
+            del values
             return {
-                "drift_mu": self.mu,
-                "drift_tau": self.tau,
-                "diff_sigma": self.sigma,
+                "drift_mu": self.mu.expand_as(v),
+                "drift_tau": self.tau.expand_as(v),
+                "diff_sigma": self.sigma.expand_as(v),
             }
 
     state = OU(
@@ -151,14 +152,15 @@ def test_state_euler_heun_is_registered_and_recomputes_diffusion_at_predictor():
 
     class Geometric(State):
         State.STATE("x")
+        State.CARRY("scale")
         State.RANGE(sigma=2.0)
         State.ASSIGNED("diff_sigma")
         State.DERIVATIVE("x' = 0.0")
         State.DIFFUSION("x = diff_sigma * x")
         State.METHOD("euler_heun")
 
-        def breakpoint(self, v, states):
-            return {"diff_sigma": self.sigma}
+        def assigned_values(self, v, values):
+            return {"diff_sigma": self.sigma * values["scale"]}
 
     state = Geometric(
         torch.tensor(36.0),
@@ -176,7 +178,11 @@ def test_state_euler_heun_is_registered_and_recomputes_diffusion_at_predictor():
     state.x_dW_rng.randn = one_like
     x0 = torch.ones(1, 1)
     dt = torch.tensor(0.25)
-    out = state.advance(torch.zeros(1, 1), dt, {"x": x0})["x"]
+    out = state.advance(
+        torch.zeros(1, 1),
+        dt,
+        {"x": x0, "scale": torch.ones_like(x0)},
+    )["x"]
 
     dW = torch.sqrt(dt)
     diff_old = 2.0 * x0
@@ -266,7 +272,7 @@ def test_handler_checkpoint_replays_nested_state_sde_rng():
         State.METHOD("euler_maruyama")
 
     class DiffusiveMechanism(Mechanism):
-        Mechanism.STATE(DiffusiveState)
+        Mechanism.STATE_BUNDLE(DiffusiveState)
 
     shape = (1, 4)
     mech = DiffusiveMechanism(
@@ -304,7 +310,7 @@ def test_handler_checkpoint_replays_nested_state_sde_rng():
 
 def test_handler_checkpoint_restore_is_atomic_on_corrupt_rng_state():
     class ScratchMechanism(Mechanism):
-        Mechanism.BUFFER("scratch")
+        Mechanism.CARRY("scratch")
 
     class NoiseMechanism(Mechanism):
         Mechanism.RANGENOISE("eta", distribution="normal", mu=0.0, sigma=1.0, seed=789)
@@ -368,7 +374,7 @@ def _delayed_handler(*, batched=False):
 
 def test_handler_restore_preflights_shape_and_casts_to_live_dtype():
     class ScratchMechanism(Mechanism):
-        Mechanism.BUFFER("scratch")
+        Mechanism.CARRY("scratch")
 
     shape = (1, 3)
     celsius = torch.full(shape, 36.0, dtype=torch.float64)
@@ -488,7 +494,7 @@ def test_nested_state_rng_uses_canonical_key_and_restores_legacy_fallback(
         State.RNG(stream=123)
 
     class RandomMechanism(Mechanism):
-        Mechanism.STATE(RandomState)
+        Mechanism.STATE_BUNDLE(RandomState)
 
     shape = (1, 4)
     celsius = torch.full(shape, 36.0)
@@ -512,24 +518,3 @@ def test_nested_state_rng_uses_canonical_key_and_restores_legacy_fallback(
     actual = state.stream.rand((5,))
 
     torch.testing.assert_close(actual, expected)
-
-
-def test_material_process_restore_has_the_same_atomic_shape_contract():
-    class ScratchProcess(MaterialProcess):
-        MaterialProcess.BUFFER("scratch")
-
-    shape = (1, 3)
-    celsius = torch.full(shape, 36.0)
-    process = ScratchProcess("process", celsius, torch.ones(shape), shape, shape)
-    handler = MechanismHandler(celsius, torch.ones(shape), {"process": process})
-    process.scratch = torch.tensor([[2.0, 3.0, 5.0]])
-    snapshot = handler.mutable_state_dict()
-    before_ref = process.scratch
-    before_value = process.scratch.clone()
-    snapshot["process.scratch"] = torch.zeros(3)
-
-    with pytest.raises(ValueError, match="shape"):
-        handler.restore_mutable_state_dict(snapshot)
-
-    assert process.scratch is before_ref
-    torch.testing.assert_close(process.scratch, before_value)

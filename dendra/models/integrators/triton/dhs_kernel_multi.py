@@ -6,7 +6,11 @@ import torch
 import triton
 import triton.language as tl
 
-from ._contracts import validate_tree_multi
+from ._contracts import (
+    is_vmap_batched_tensor,
+    reject_nested_vmap,
+    validate_tree_multi,
+)
 
 
 @triton.jit
@@ -203,6 +207,426 @@ def _multi_dhs_grad_a_kernel(
         tl.store(dA + idx, grad, mask=m)
 
 
+def _launch_multi_solve(
+    d_work,
+    a_geom,
+    rhs_work,
+    P_cat,
+    ORDER_cat,
+    LAYER_PTR_cat,
+    WARP_P_OFF,
+    WARP_ORDER_OFF,
+    WARP_LPTR_OFF,
+    WARP_L,
+    WARP_ROW_BASE,
+    WARP_ROW_COUNT,
+    K_stride,
+    L_max,
+    threads,
+    grid_x,
+):  # pragma: no cover
+    result = torch.empty_like(rhs_work)
+    _multi_dhs_kernel_warp_hom[(grid_x,)](
+        d_work,
+        a_geom.contiguous(),
+        rhs_work,
+        result,
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+        K_STRIDE=K_stride,
+        L_MAX=L_max,
+        K_THREADS=threads,
+        WARP_SIZE=32,
+        num_warps=1,
+        num_stages=4,
+    )
+    return result
+
+
+def _launch_multi_grad_a(
+    voltage,
+    adjoint,
+    P_cat,
+    ORDER_cat,
+    LAYER_PTR_cat,
+    WARP_P_OFF,
+    WARP_ORDER_OFF,
+    WARP_LPTR_OFF,
+    WARP_L,
+    WARP_ROW_BASE,
+    WARP_ROW_COUNT,
+    K_stride,
+    L_max,
+    threads,
+    grid_x,
+):  # pragma: no cover
+    result = torch.zeros_like(voltage)
+    _multi_dhs_grad_a_kernel[(grid_x,)](
+        voltage,
+        adjoint,
+        result,
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+        K_STRIDE=K_stride,
+        L_MAX=L_max,
+        K_THREADS=threads,
+        WARP_SIZE=32,
+        num_warps=1,
+        num_stages=2,
+    )
+    return result
+
+
+@torch.library.custom_op("dendra_triton::dhs_multi_adjoint", mutates_args=())
+def _dhs_multi_adjoint(
+    d_mem: torch.Tensor,
+    a_geom: torch.Tensor,
+    rhs: torch.Tensor,
+    P_cat: torch.Tensor,
+    ORDER_cat: torch.Tensor,
+    LAYER_PTR_cat: torch.Tensor,
+    WARP_P_OFF: torch.Tensor,
+    WARP_ORDER_OFF: torch.Tensor,
+    WARP_LPTR_OFF: torch.Tensor,
+    WARP_L: torch.Tensor,
+    WARP_ROW_BASE: torch.Tensor,
+    WARP_ROW_COUNT: torch.Tensor,
+    K_stride: int,
+    L_max: int,
+    threads: int,
+    grid_x: int,
+) -> torch.Tensor:
+    return _launch_multi_solve(
+        d_mem.clone(memory_format=torch.contiguous_format),
+        a_geom.contiguous(),
+        rhs.clone(memory_format=torch.contiguous_format),
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+        K_stride,
+        L_max,
+        threads,
+        grid_x,
+    )
+
+
+@_dhs_multi_adjoint.register_fake
+def _(
+    d_mem,
+    a_geom,
+    rhs,
+    P_cat,
+    ORDER_cat,
+    LAYER_PTR_cat,
+    WARP_P_OFF,
+    WARP_ORDER_OFF,
+    WARP_LPTR_OFF,
+    WARP_L,
+    WARP_ROW_BASE,
+    WARP_ROW_COUNT,
+    K_stride,
+    L_max,
+    threads,
+    grid_x,
+):
+    return rhs.new_empty(rhs.shape)
+
+
+@torch.library.custom_op("dendra_triton::dhs_multi_grad_a", mutates_args=())
+def _dhs_multi_grad_a(
+    voltage: torch.Tensor,
+    adjoint: torch.Tensor,
+    P_cat: torch.Tensor,
+    ORDER_cat: torch.Tensor,
+    LAYER_PTR_cat: torch.Tensor,
+    WARP_P_OFF: torch.Tensor,
+    WARP_ORDER_OFF: torch.Tensor,
+    WARP_LPTR_OFF: torch.Tensor,
+    WARP_L: torch.Tensor,
+    WARP_ROW_BASE: torch.Tensor,
+    WARP_ROW_COUNT: torch.Tensor,
+    K_stride: int,
+    L_max: int,
+    threads: int,
+    grid_x: int,
+) -> torch.Tensor:
+    return _launch_multi_grad_a(
+        voltage.contiguous(),
+        adjoint.contiguous(),
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+        K_stride,
+        L_max,
+        threads,
+        grid_x,
+    )
+
+
+@_dhs_multi_grad_a.register_fake
+def _(
+    voltage,
+    adjoint,
+    P_cat,
+    ORDER_cat,
+    LAYER_PTR_cat,
+    WARP_P_OFF,
+    WARP_ORDER_OFF,
+    WARP_LPTR_OFF,
+    WARP_L,
+    WARP_ROW_BASE,
+    WARP_ROW_COUNT,
+    K_stride,
+    L_max,
+    threads,
+    grid_x,
+):
+    return voltage.new_empty(voltage.shape)
+
+
+def _merge_solver_batch(tensor, batch_dim, transform_batch):
+    if batch_dim is None:
+        tensor = tensor.unsqueeze(0).expand(transform_batch, *tensor.shape)
+    else:
+        tensor = tensor.movedim(batch_dim, 0)
+    solver_batch = tensor.shape[1]
+    return (
+        tensor.reshape(transform_batch * solver_batch, *tensor.shape[2:]).contiguous(),
+        solver_batch,
+    )
+
+
+def _merge_workspace_batch(tensor, batch_dim, transform_batch):
+    if batch_dim is None:
+        repeats = (transform_batch,) + (1,) * (tensor.ndim - 1)
+        return tensor.repeat(repeats), tensor.shape[0]
+    tensor = tensor.movedim(batch_dim, 0)
+    solver_batch = tensor.shape[1]
+    return (
+        tensor.reshape(transform_batch * solver_batch, *tensor.shape[2:]).clone(
+            memory_format=torch.contiguous_format
+        ),
+        solver_batch,
+    )
+
+
+def _repeat_warp_plan(
+    transform_batch,
+    solver_batch,
+    WARP_P_OFF,
+    WARP_ORDER_OFF,
+    WARP_LPTR_OFF,
+    WARP_L,
+    WARP_ROW_BASE,
+    WARP_ROW_COUNT,
+):
+    row_offsets = (
+        torch.arange(
+            transform_batch,
+            device=WARP_ROW_BASE.device,
+            dtype=WARP_ROW_BASE.dtype,
+        )
+        * solver_batch
+    )
+    repeated_row_base = (WARP_ROW_BASE.unsqueeze(0) + row_offsets.unsqueeze(1)).reshape(
+        -1
+    )
+    return (
+        WARP_P_OFF.repeat(transform_batch),
+        WARP_ORDER_OFF.repeat(transform_batch),
+        WARP_LPTR_OFF.repeat(transform_batch),
+        WARP_L.repeat(transform_batch),
+        repeated_row_base,
+        WARP_ROW_COUNT.repeat(transform_batch),
+    )
+
+
+def _reject_batched_multi_plan(in_dims):
+    if any(dim is not None for dim in in_dims[3:12]):
+        raise RuntimeError(
+            "multi-morphology DHS vmap requires topology catalogs and the "
+            "warp plan to be shared across the transform batch"
+        )
+
+
+@_dhs_multi_adjoint.register_vmap
+def _(info, in_dims, *args):  # pragma: no cover
+    _reject_batched_multi_plan(in_dims)
+    (
+        d_mem,
+        a_geom,
+        rhs,
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+        K_stride,
+        L_max,
+        threads,
+        grid_x,
+    ) = args
+    if grid_x != WARP_ROW_BASE.numel():
+        raise ValueError("grid_x must equal the multi-DHS plan warp count")
+    reject_nested_vmap(
+        "multi-morphology DHS adjoint",
+        d_mem,
+        a_geom,
+        rhs,
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+    )
+    transform_batch = info.batch_size
+    d_work, solver_batch = _merge_workspace_batch(d_mem, in_dims[0], transform_batch)
+    a_merged, a_batch = _merge_solver_batch(a_geom, in_dims[1], transform_batch)
+    rhs_work, rhs_batch = _merge_workspace_batch(rhs, in_dims[2], transform_batch)
+    if a_batch != solver_batch or rhs_batch != solver_batch:
+        raise ValueError("all multi-DHS operands must have the same solver batch")
+    if transform_batch == 0:
+        result = rhs_work.new_empty(rhs_work.shape)
+        return result.reshape(0, solver_batch, *result.shape[1:]), 0
+    repeated_plan = _repeat_warp_plan(
+        transform_batch,
+        solver_batch,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+    )
+    result = _launch_multi_solve(
+        d_work,
+        a_merged,
+        rhs_work,
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        *repeated_plan,
+        K_stride,
+        L_max,
+        threads,
+        grid_x * transform_batch,
+    )
+    return result.reshape(transform_batch, solver_batch, *result.shape[1:]), 0
+
+
+@_dhs_multi_grad_a.register_vmap
+def _(info, in_dims, *args):  # pragma: no cover
+    # This op has two data operands, followed by the same nine topology/plan
+    # tensors used by the solve.
+    if any(dim is not None for dim in in_dims[2:11]):
+        raise RuntimeError(
+            "multi-morphology DHS grad-a vmap requires topology catalogs and "
+            "the warp plan to be shared across the transform batch"
+        )
+    (
+        voltage,
+        adjoint,
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+        K_stride,
+        L_max,
+        threads,
+        grid_x,
+    ) = args
+    if grid_x != WARP_ROW_BASE.numel():
+        raise ValueError("grid_x must equal the multi-DHS plan warp count")
+    reject_nested_vmap(
+        "multi-morphology DHS grad-a",
+        voltage,
+        adjoint,
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+    )
+    transform_batch = info.batch_size
+    voltage_merged, solver_batch = _merge_solver_batch(
+        voltage, in_dims[0], transform_batch
+    )
+    adjoint_merged, adjoint_batch = _merge_solver_batch(
+        adjoint, in_dims[1], transform_batch
+    )
+    if adjoint_batch != solver_batch:
+        raise ValueError("multi-DHS voltage and adjoint batches must match")
+    if transform_batch == 0:
+        result = voltage_merged.new_empty(voltage_merged.shape)
+        return result.reshape(0, solver_batch, *result.shape[1:]), 0
+    repeated_plan = _repeat_warp_plan(
+        transform_batch,
+        solver_batch,
+        WARP_P_OFF,
+        WARP_ORDER_OFF,
+        WARP_LPTR_OFF,
+        WARP_L,
+        WARP_ROW_BASE,
+        WARP_ROW_COUNT,
+    )
+    result = _launch_multi_grad_a(
+        voltage_merged,
+        adjoint_merged,
+        P_cat,
+        ORDER_cat,
+        LAYER_PTR_cat,
+        *repeated_plan,
+        K_stride,
+        L_max,
+        threads,
+        grid_x * transform_batch,
+    )
+    return result.reshape(transform_batch, solver_batch, *result.shape[1:]), 0
+
+
 class DHSSolveMultiPacked(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -295,54 +719,94 @@ class DHSSolveMultiPacked(torch.autograd.Function):
         )
 
         # 1) adjoint solve: g = A^{-1} * grad_out   (solver order, row-padded)
-        g = torch.empty_like(grad_out)
-        _multi_dhs_kernel_warp_hom[(grid_x,)](
-            d_mem.clone(),
-            a_geom,
-            grad_out.clone(),
-            g,
-            P_cat,
-            ORDER_cat,
-            LAYER_PTR_cat,
-            WARP_P_OFF,
-            WARP_ORDER_OFF,
-            WARP_LPTR_OFF,
-            WARP_L,
-            WARP_ROW_BASE,
-            WARP_ROW_COUNT,
-            K_STRIDE=K_stride,
-            L_MAX=L_max,
-            K_THREADS=threads,
-            WARP_SIZE=32,
-            num_warps=1,
-            num_stages=4,
-        )
+        transformed = is_vmap_batched_tensor(grad_out)
+        if transformed:
+            g = _dhs_multi_adjoint(
+                d_mem,
+                a_geom,
+                grad_out,
+                P_cat,
+                ORDER_cat,
+                LAYER_PTR_cat,
+                WARP_P_OFF,
+                WARP_ORDER_OFF,
+                WARP_LPTR_OFF,
+                WARP_L,
+                WARP_ROW_BASE,
+                WARP_ROW_COUNT,
+                K_stride,
+                L_max,
+                threads,
+                grid_x,
+            )
+        else:
+            g = torch.empty_like(grad_out)
+            _multi_dhs_kernel_warp_hom[(grid_x,)](
+                d_mem.clone(),
+                a_geom,
+                grad_out.clone(),
+                g,
+                P_cat,
+                ORDER_cat,
+                LAYER_PTR_cat,
+                WARP_P_OFF,
+                WARP_ORDER_OFF,
+                WARP_LPTR_OFF,
+                WARP_L,
+                WARP_ROW_BASE,
+                WARP_ROW_COUNT,
+                K_STRIDE=K_stride,
+                L_MAX=L_max,
+                K_THREADS=threads,
+                WARP_SIZE=32,
+                num_warps=1,
+                num_stages=4,
+            )
 
         # 2) grads wrt inputs (all in solver order)
         grad_b = g
         grad_d = -(g * V_out)
 
-        grad_a = torch.zeros_like(a_geom)
-        _multi_dhs_grad_a_kernel[(grid_x,)](
-            V_out,
-            g,
-            grad_a,
-            P_cat,
-            ORDER_cat,
-            LAYER_PTR_cat,
-            WARP_P_OFF,
-            WARP_ORDER_OFF,
-            WARP_LPTR_OFF,
-            WARP_L,
-            WARP_ROW_BASE,
-            WARP_ROW_COUNT,
-            K_STRIDE=K_stride,
-            L_MAX=L_max,
-            K_THREADS=threads,
-            WARP_SIZE=32,
-            num_warps=1,
-            num_stages=2,
-        )
+        if transformed:
+            grad_a = _dhs_multi_grad_a(
+                V_out,
+                g,
+                P_cat,
+                ORDER_cat,
+                LAYER_PTR_cat,
+                WARP_P_OFF,
+                WARP_ORDER_OFF,
+                WARP_LPTR_OFF,
+                WARP_L,
+                WARP_ROW_BASE,
+                WARP_ROW_COUNT,
+                K_stride,
+                L_max,
+                threads,
+                grid_x,
+            )
+        else:
+            grad_a = torch.zeros_like(a_geom)
+            _multi_dhs_grad_a_kernel[(grid_x,)](
+                V_out,
+                g,
+                grad_a,
+                P_cat,
+                ORDER_cat,
+                LAYER_PTR_cat,
+                WARP_P_OFF,
+                WARP_ORDER_OFF,
+                WARP_LPTR_OFF,
+                WARP_L,
+                WARP_ROW_BASE,
+                WARP_ROW_COUNT,
+                K_STRIDE=K_stride,
+                L_MAX=L_max,
+                K_THREADS=threads,
+                WARP_SIZE=32,
+                num_warps=1,
+                num_stages=2,
+            )
 
         # Return grads for each forward input (tensors only)
         return (
@@ -384,7 +848,8 @@ def dhs_solve_multi_cuda(
     grid_x: int = None,
 ):
     """
-    Public entry for multi-morph DHS. Matches the signature used by `_dhs_multi.step(...)`.
+    Public entry for multi-morph DHS. Matches the signature used by
+    `_dhs_multi.step(...)`.
     """
     validate_tree_multi(
         d_mem,

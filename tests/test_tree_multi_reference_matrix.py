@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import dendra as dn
+from dendra._bootstrap import torch_compiler_warning_context
 from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE, _dhs_multi
 from dendra.models.integrators.triton import dhs_solve_multi_cuda
 
@@ -39,6 +40,10 @@ class LinearMechanism(torch.nn.Module):
         conductance = self.conductance.to(voltage).expand_as(voltage)
         reversal = self.reversal.to(voltage).expand_as(voltage)
         return conductance * (voltage - reversal), conductance
+
+    def _evaluate_current_frame(self, voltage):
+        current, conductance = self.i(voltage)
+        return current, conductance, (), ()
 
     def set_dt(self, dt):
         self.dt = float(dt)
@@ -434,6 +439,138 @@ def test_multi_tree_multistep_gradients_match_dense_reference():
         assert torch.allclose(got, want, rtol=8e-10, atol=8e-10)
 
 
+def test_multi_tree_functional_transition_matches_dense_bptt_reference():
+    """The pure branch keeps the packed launch and never reuses scratch."""
+
+    model, mechanism, integrator = _make_multi(batch=2)
+    dt = 0.041
+    integrator._initialize(model, dt)
+    solver = integrator._functional_solver()
+
+    voltage, intra, ve = _sample_inputs(model)
+    voltage.requires_grad_()
+    intra.requires_grad_()
+    ve.requires_grad_()
+    mechanism.conductance.requires_grad_()
+    mechanism.reversal.requires_grad_()
+
+    actual_1, _ = integrator._step(
+        voltage,
+        dt,
+        model.celsius,
+        ve=ve,
+        intra=intra,
+        solver=solver,
+        call_local_currents=True,
+    )
+    actual_2, _ = integrator._step(
+        actual_1,
+        dt,
+        model.celsius,
+        ve=ve,
+        intra=intra,
+        solver=solver,
+        call_local_currents=True,
+    )
+
+    expected_1 = _dense_reference(model, mechanism, voltage, dt, ve=ve, intra=intra)
+    expected_2 = _dense_reference(model, mechanism, expected_1, dt, ve=ve, intra=intra)
+    assert torch.allclose(actual_2, expected_2, rtol=5e-12, atol=5e-12)
+
+    weights = torch.linspace(0.4, 1.3, actual_2.numel(), dtype=DTYPE).reshape_as(
+        actual_2
+    )
+    differentiable_inputs = (
+        voltage,
+        intra,
+        ve,
+        mechanism.conductance,
+        mechanism.reversal,
+    )
+    actual_grad = torch.autograd.grad(
+        (actual_2.square() * weights).sum(),
+        differentiable_inputs,
+        retain_graph=True,
+    )
+    expected_grad = torch.autograd.grad(
+        (expected_2.square() * weights).sum(), differentiable_inputs
+    )
+    for got, want in zip(actual_grad, expected_grad):
+        assert torch.allclose(got, want, rtol=8e-10, atol=8e-10)
+
+
+def test_multi_tree_functional_transition_supports_jacobians_and_vmap():
+    model, _mechanism, integrator = _make_multi()
+    dt = 0.043
+    integrator._initialize(model, dt)
+    solver = integrator._functional_solver()
+    voltage, _intra, _ve = _sample_inputs(model)
+
+    def transition(value):
+        return integrator._step(
+            value,
+            dt,
+            model.celsius,
+            solver=solver,
+            call_local_currents=True,
+        )[0]
+
+    reverse = torch.func.jacrev(transition)(voltage)
+    with torch_compiler_warning_context():
+        forward = torch.func.jacfwd(transition)(voltage)
+    assert torch.allclose(reverse, forward, rtol=2e-10, atol=2e-10)
+
+    lanes = torch.stack((voltage, voltage + 2.0, voltage - 3.0))
+    actual = torch.vmap(transition)(lanes)
+    expected = torch.stack(tuple(transition(lane) for lane in lanes))
+    assert torch.allclose(actual, expected, rtol=3e-12, atol=3e-12)
+
+    empty = torch.vmap(transition)(lanes[:0])
+    assert empty.shape == lanes[:0].shape
+
+
+def test_multi_tree_pure_workspace_matches_initialized_workspace():
+    model, _mechanism, integrator = _make_multi(batch=2)
+    dt = 0.047
+    integrator._initialize(model, dt)
+
+    area = integrator.SCALE_MECH.detach().clone().requires_grad_()
+    cm = (
+        integrator.CMDT_MECH.detach() * (dt * 1.0e-3) / (1.0e-6 * area.detach())
+    ).requires_grad_()
+    axial = integrator.a_geom_flat.detach().clone().requires_grad_()
+    edges = integrator.EDGE_GAX_FLAT.detach().clone().requires_grad_()
+    workspace = integrator._derive_prepared_workspace(
+        torch.as_tensor(dt, dtype=DTYPE),
+        a_geom_flat=axial,
+        cm=cm,
+        area=area,
+        edge_conductance=edges,
+    )
+
+    assert tuple(workspace) == (
+        "a_geom_flat",
+        "CMDT_MECH",
+        "SCALE_MECH",
+        "EDGE_GAX_FLAT",
+    )
+    source_inputs = {
+        "a_geom_flat": axial,
+        "CMDT_MECH": cm,
+        "SCALE_MECH": area,
+        "EDGE_GAX_FLAT": edges,
+    }
+    for name, value in workspace.items():
+        assert value is not source_inputs[name]
+        assert torch.allclose(value, getattr(integrator, name))
+
+    gradients = torch.autograd.grad(
+        sum(value.square().sum() for value in workspace.values()),
+        (axial, cm, area, edges),
+    )
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
 def test_multi_tree_common_mode_and_uniform_extracellular_gauge_are_invariant():
     model, mechanism, integrator = _make_multi()
     mechanism.conductance.zero_()
@@ -514,7 +651,7 @@ def test_multi_tree_cpu_cuda_value_and_gradient_parity(threads):
 
     cpu_integrator._initialize(cpu_model, dt)
     gpu_integrator._initialize(gpu_model, dt)
-    assert gpu_integrator.solve.func is dhs_solve_multi_cuda
+    assert gpu_integrator._solve.func is dhs_solve_multi_cuda
 
     cpu_voltage, cpu_intra, cpu_ve = _sample_inputs(cpu_model)
     cpu_voltage.requires_grad_()
