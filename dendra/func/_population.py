@@ -52,7 +52,12 @@ from dendra.models.mechanisms._support_registry import SupportEntry
 from dendra.models.mechanisms._symbolic import build_numerical_equation
 from dendra.models.multi import MultiPopulation
 from dendra.models.parametric import Functional as ParameterFunctional
-from dendra.models.parametric import Parameterized, cacheable, staticproperty
+from dendra.models.parametric import (
+    Parameterized,
+    _ReplicaRangeExpander,
+    cacheable,
+    staticproperty,
+)
 from dendra.models.tree import Tree
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
@@ -5167,7 +5172,13 @@ def _additional_parameter_layout_signature(population) -> tuple:
                             f"Regional parameter source {source_name!r} on "
                             f"{type(owner).__qualname__} is not tensor-valued."
                         )
-                    count = int(fill(value).numel())
+                    # Replica overrides share physical keys across their
+                    # leading value axes; only the final slot axis consumes
+                    # keys. Retain that distinction in the layout fingerprint.
+                    replica_value = isinstance(fill, _ReplicaRangeExpander)
+                    count = (
+                        fill.slot_count if replica_value else int(fill(value).numel())
+                    )
                     record_key = key[cursor : cursor + count]
                     if record_key.numel() != count:
                         raise FunctionalizationError(
@@ -5179,6 +5190,7 @@ def _additional_parameter_layout_signature(population) -> tuple:
                             source_name,
                             _shape_tuple(value),
                             count,
+                            replica_value,
                             _audit_tensor_digest(record_key),
                         )
                     )
@@ -8085,10 +8097,10 @@ class FunctionalPopulation:
     def make_callbacks(self, callbacks):
         """Bind named native functional callbacks into an immutable plan.
 
-        Callback execution remains in the eager host runners; it is not added
-        to the Population transition or its compiled one-step kernel. Values
-        must implement :class:`dendra.func.FunctionalCallback`; built-ins such
-        as :class:`dendra.func.Recorder` provide familiar common behavior.
+        Callbacks execute in functional rollouts and host runners. A bound
+        compiled chunk fuses each callback update with its model transition.
+        Values must implement :class:`dendra.func.FunctionalCallback`; built-ins
+        such as :class:`dendra.func.Recorder` provide familiar common behavior.
         """
         from ._callbacks import FunctionalCallbacks
 
@@ -11192,13 +11204,33 @@ class FunctionalPopulation:
             extra=extra,
         )
 
-    def compile_rollout_chunk(self, steps: int, **compile_options):
+    def bind(self, parameters, prepared):
+        """Bind one eager step to explicit parameters and reusable preparation.
+
+        The binding snapshots the parameter mapping, retains its tensor leaves,
+        and carries this functional plan into the host runners. Prepare and bind
+        again for each new forward/backward graph when training.
+        """
+        from ._binding import BoundPopulation
+
+        return BoundPopulation(self, parameters, prepared)
+
+    def compile_rollout_chunk(
+        self, steps: int, *, execution: str = "default", **compile_options
+    ):
         """Create a freshness-checked fixed-length compiled rollout.
 
         Preparation remains outside the compiled boundary and can therefore be
         reused across calls. Grad-enabled calls compose through ordinary
         autograd, allowing a Python loop over this callable to build exact BPTT
         without statically compiling the complete time horizon.
+
+        ``execution="scan"`` opts into a horizon-independent loop graph on
+        supported PyTorch 2.14 installations. Dendra installs a narrowly scoped
+        process-local compatibility fix when this mode is selected. Ordinary
+        backward is supported; ``create_graph=True`` raises explicitly. Calls
+        inside ``torch.func`` or forward AD use the ordinary eager recurrence.
+        The default preserves the existing compiled execution strategy.
         """
         from ._compiled import CompiledPopulationChunk
 
@@ -11206,6 +11238,7 @@ class FunctionalPopulation:
             self,
             steps=steps,
             compile_options=compile_options,
+            execution=execution,
         )
 
     def commit_state_(self, population: Population, state) -> Population:

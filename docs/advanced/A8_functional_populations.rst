@@ -14,9 +14,11 @@ Supported models
 
 The topology list below describes functional *transition* support from an
 initialized tensor state. Fresh functional initialization is a narrower
-capability: it currently supports only exact ``SingleCompartment`` and
-``Unmyelinated`` models with their standard implicit integrators. Other
-admitted models can still start from the extracted ``tensors.state``.
+capability: it currently supports exact ``SingleCompartment`` and structurally
+canonical ``Unmyelinated`` models, including compatible subclasses, with their
+standard implicit integrators. This includes the Tigerholm/Thio models with
+registered pure resting-balance transforms. Other admitted models can still
+start from the extracted ``tensors.state``.
 
 The current transition API supports initialized models with all of the
 following properties:
@@ -561,63 +563,102 @@ their explicit parameter namespaces cannot silently diverge.
 Host-side simulation
 --------------------
 
-``dn.func.run``, ``dn.func.longrun``, and
-``dn.func.longrun_checkpointed`` advance explicit state with a user-supplied
-one-step callable. Bind parameters and one prepared workspace outside the
-runner so preparation is shared by the complete simulation:
+Use ``dn.func.run`` to advance an explicit state through a binding. Bindings
+carry the functional model, parameters, preparation, and number of timesteps
+per call. Prepare once for a forward/backward graph and bind an eager step:
 
 .. code-block:: python
 
-   from functools import partial
-
-   eager_step = partial(
-       fmodel.step,
-       tensors.parameters,
-       prepared,
-   )
-
+   prepared = fmodel.prepare(tensors.parameters, tensors.constants)
+   eager_step = fmodel.bind(tensors.parameters, prepared)
    drives = dn.func.RolloutInput(
        ve=ve_over_time,
        intra=intra_over_time,
    )
    final_state, auxiliary = dn.func.run(
-       fmodel,
-       eager_step,
-       tensors.state,
-       drives,
+       eager_step, tensors.state, inputs=drives,
    )
 
-The callable must accept ``(state, StepInput)`` and return exactly
-``(next_state, auxiliary)``. It must represent exactly one transition from the
-same ``fmodel`` passed to the runner. Dendra verifies ownership for its public
-bound methods and compiled chunks; a custom wrapper is responsible for
-preserving this contract. The
-callable may invoke an eager transition, as above, or an already compiled
-one-step transition:
+The returned ``BoundPopulation`` is also callable directly as
+``eager_step(state, StepInput(...))``. Its parameter mapping is a read-only
+snapshot of the keys and tensor references: replacing a leaf in the original
+mapping does not change an existing binding. Create a new binding after
+parameter replacement. The tensors themselves remain differentiable, and
+in-place edits to preparation inputs trigger the usual freshness checks.
+
+For compiled execution, bind a reusable fixed-width kernel:
 
 .. code-block:: python
 
-   compiled_one = fmodel.compile_rollout_chunk(1)
-   compiled_step = partial(
-       compiled_one,
-       tensors.parameters,
-       prepared,
-   )
-
-   duration = ve_over_time.shape[0] * fmodel.dt
-   final_state, auxiliary = dn.func.longrun(
-       fmodel,
-       compiled_step,
+   compiled_chunk = fmodel.compile_rollout_chunk(8)
+   bound_chunk = compiled_chunk.bind(tensors.parameters, prepared)
+   final_state, auxiliary = dn.func.run(
+       bound_chunk,
        tensors.state,
-       duration,
-       chunklength=32,
        inputs=drives,
+       checkpoint_every=32,
    )
 
-For the two exact ``partial`` forms above, Dendra performs source, state,
-parameter, and prepared-workspace checks at runner/chunk boundaries and uses
-the owned tensor transition inside the timestep loop. Custom wrappers remain
-fully checked on every public call.
+Here each compiled call consumes eight timesteps, and each checkpoint spans
+32 timesteps. To group execution without checkpointing, use
+``host_span_steps=32`` instead. These two options are mutually exclusive;
+omitting both uses one host span covering the resolved horizon. The runner
+fills each span with full compiled calls and a shorter cached tail. For example,
+a four-step kernel and a ten-step span execute as ``4 + 4 + 2`` steps. A span
+shorter than the kernel uses a shorter specialization. Neither setting
+truncates gradients.
+
+Keep ``compiled_chunk`` across optimization iterations. Prepare and bind again
+for each forward/backward graph; kernels cache shorter specializations but do
+not retain bindings or differentiable preparation. A direct
+``bound_chunk(state, RolloutInput(...))`` call consumes exactly
+``bound_chunk.steps`` timesteps.
+
+The existing ``run(fmodel, step, state, ...)``, ``longrun`` and
+``longrun_checkpointed`` forms remain supported, including their original
+``tstop`` and ``chunklength`` conventions. They accept explicit bindings and
+existing ``functools.partial`` forms. A general callable in those legacy forms
+must accept ``(state, StepInput)`` and return exactly
+``(next_state, auxiliary)`` for one transition from the same model.
+
+On supported PyTorch 2.14.0 installations, ``execution="scan"`` offers an
+experimental alternative for first-order training over longer horizons:
+
+.. code-block:: python
+
+   compiled_chunk = fmodel.compile_rollout_chunk(
+       ve_over_time.shape[0], execution="scan"
+   )
+   bound_chunk = compiled_chunk.bind(tensors.parameters, prepared)
+   final_state, auxiliary = dn.func.run(
+       bound_chunk, tensors.state, inputs=drives,
+   )
+
+Scan compiles a loop whose graph size does not grow with the number of
+timesteps. Setting the chunk width to the run's horizon executes all its
+timesteps in one compiled call, including callback updates. Preparation and
+runner validation remain outside that call. Shorter chunks and checkpointed
+runners use the same scheduling described above. Speed and memory use depend
+on the model and recording requirements; scan does not guarantee an improvement
+over the default compiled chunks.
+
+Scan uses a Dendra-maintained compatibility fix without modifying installed
+PyTorch files. Unsupported PyTorch builds raise ``FunctionalizationError``;
+omit ``execution="scan"`` to use the default compiled chunks on those builds.
+
+Scan supports ordinary first-order ``backward()`` and ``autograd.grad``.
+``create_graph=True`` raises explicitly; use the ordinary functional
+``rollout`` for higher derivatives. Calls under ``torch.func`` transforms or
+direct forward AD use the existing eager recurrence, so those compositions
+remain available but do not gain scan compilation. Integer callback counters
+can keep their integer dtype.
+
+For explicit bindings and the supported exact ``functools.partial`` forms,
+Dendra verifies ownership, source structure, state, parameters, and
+prepared-workspace freshness at runner/chunk boundaries, then calls the owned
+tensor kernel. Custom wrappers remain fully checked on every public call and
+must still advance exactly one timestep. Wrapping a multi-step compiled chunk
+in another callable does not opt it into chunk scheduling.
 
 Functional callbacks
 ~~~~~~~~~~~~~~~~~~~~
@@ -638,12 +679,11 @@ arguments of the ordinary recorder:
            "spike_count": dn.func.APCount(node_check=[0, -1]),
        }
    )
-   final_state, auxiliary = dn.func.longrun(
-       fmodel,
+   final_state, auxiliary = dn.func.run(
        eager_step,
        tensors.state,
-       tstop=5.0,
-       chunklength=100,
+       duration=5.0,
+       host_span_steps=100,
        callbacks=callbacks,
    )
    voltage = auxiliary["callbacks"]["trace"]["v"]
@@ -669,10 +709,13 @@ For a fresh run, ``Recorder`` returns the initial value followed by one value
 after every step. This includes one initial sample for a zero-step run. Its
 recording remains connected to autograd. ``AnomalyDetector`` instead emits no
 trajectory: it keeps and returns a cumulative Boolean mask using constant
-callback memory. Callback objects are immutable configuration, and the
-no-callback runner path is unchanged. Functional callbacks work with eager or
-compiled one-step callables and with ``longrun_checkpointed``; checkpoint
-replay recomputes each pure chunk without mutating external storage.
+callback memory. Callback objects are immutable configuration. Functional
+callbacks work with eager callables, bound compiled chunks, and
+``longrun_checkpointed``. With a bound compiled chunk, the runner compiles
+the simulation steps and callback updates together. Callbacks still observe
+every timestep: increasing the compiled chunk size does not subsample a
+recording or skip reducer updates. Checkpoint replay recomputes each pure host
+span without mutating external storage.
 
 ``Raster`` and ``APCount`` use the same upward-crossing rule as their imperative
 counterparts: a selected voltage at or above ``threshold`` fires only when its
@@ -757,6 +800,12 @@ Carry and individual emissions must also preserve each leaf's shape, dtype,
 and device; a finalized recording may vary only along its leading sample axis.
 Results from callbacks that emit no samples must preserve their complete leaf
 shapes.
+
+Use integer tensors for discrete sample indices and counts, and Boolean
+tensors for masks. These leaves do not need gradients. Keep accumulated losses
+as floating-point tensors connected to model state, and use tensor indexing
+rather than converting an index with ``.item()``.
+
 If a callback emits only from ``update``, its ``finalize`` method receives
 ``None`` for a zero-sample segment and should return the same result structure
 with an explicitly shaped empty tensor where appropriate.
@@ -851,38 +900,52 @@ recomputation for activation memory.
 
 The default example keeps the objective eager so
 ``torch.func.grad_and_value`` can transform it. For first-order optimization,
-``--compiled-step`` compiles one transition and uses ordinary autograd in the
-Python runner; this is the performance-oriented comparison with the imperative
-tutorial's JIT-enabled step. Compilation has a one-time cost and should be
-amortized across optimization iterations. The streaming scalar reducer is a
-memory demonstration, not an expected speedup over one vectorized MSE on a
-recorded trace.
+use ``--compiled-chunk-steps`` to compile several simulation steps and their
+loss updates together, with ordinary autograd:
 
-The runners have the following duration and input rules:
+.. code-block:: bash
 
-* If ``run`` receives ``ve`` or ``intra``, that time axis determines the number
-  of steps. ``tstop`` is ignored and the retained fractional-duration remainder
-  in state is unchanged.
-* Without explicit drives, ``run`` requires ``tstop``. ``longrun`` and
-  ``longrun_checkpointed`` always require it. ``tstop`` is a duration to
-  advance, and incomplete fixed timesteps are retained in
-  ``state["control"]["duration_remainder"]`` for the next duration-based call.
-* Drives passed to either long-run function must have exactly the number of
-  timesteps resolved from ``tstop`` and the retained remainder.
-* The runners use ``fmodel.dt`` for host duration scheduling by default. Pass
-  ``dt=...`` to use another timestep, and build the supplied prepared step from
-  ``tensors.constants["dt"]`` containing that same value. After every host
-  chunk, the runner verifies that the model clock advanced by that timestep and
-  raises instead of silently accepting a mismatched prepared step.
-* Long runs use fixed ordinary-Python groups of ``chunklength`` steps followed
-  by a shorter tail. ``chunklength`` controls host/checkpoint boundaries; it
-  does not compile the outer simulation horizon.
+   python examples/functional_gradient_descent.py --compiled-chunk-steps 4
+
+Add ``--checkpointed --chunklength 100`` to save a checkpoint every 100 steps
+while still executing four steps per compiled call. Each loss update uses the
+voltage at its original timestep. Keep the compiled chunk across optimization
+iterations to reuse its compilation; the example does this automatically.
+Larger chunks can take longer to compile, so short fits may be faster with
+smaller chunks. ``--compiled-step`` (also spelled ``--compile-step``) is equivalent to
+``--compiled-chunk-steps 1``.
+
+The binding form ``run(bound, state, ...)`` has explicit horizon rules:
+
+* With inputs alone, their time axis determines the number of steps. Alternatively,
+  pass ``steps=N`` to execute exactly N steps, including with no explicit drives.
+  Either form preserves the state's retained fractional-duration remainder.
+* ``duration=...`` advances by a physical duration, including any remainder from
+  a previous duration call. Incomplete timesteps are retained in
+  ``state["control"]["duration_remainder"]``. Duration is an amount to advance,
+  not an absolute stopping time.
+* ``steps`` and ``duration`` are mutually exclusive. If either is supplied along
+  with drives, their time axis must match the resolved number of steps exactly.
+* The default timestep comes from the bound preparation. The model's nominal
+  timestep is retained when it rounds to that same prepared value. An explicit
+  ``dt=...`` must agree with the preparation. Clock advance is checked after
+  every host span.
+
+For compatibility, the legacy ``run(fmodel, step, state, ...)`` still gives
+explicit drives precedence over ``tstop``. Without drives it requires ``tstop``.
+The two legacy long-run forms always interpret ``tstop`` as a duration and
+validate drives against it. All legacy forms default to ``fmodel.dt``. In the two long-run forms,
+``chunklength`` controls host/checkpoint spacing. Use the binding form
+for the explicit ``steps``, ``duration``, and span options.
 
 Time-first ``RolloutInput`` tensors remain available for already assembled
-drives. Registered intracellular waveforms are handled automatically, while a
-raw ``extra`` specification is lowered once and evaluated at each host chunk.
-Tensor-valued extracellular waveforms use the corresponding global time slice,
-so changing ``chunklength`` does not change stimulus timing.
+drives. Registered intracellular and bound extracellular Waveforms are evaluated
+at each accepted state clock, preserving the one-step runner's sampling even
+at sharp pulse boundaries. Changing the compiled kernel's timestep count does
+not change this sampling. A raw ``extra`` specification is lowered once and
+evaluated at each host chunk. Tensor-valued extracellular waveforms use the
+corresponding global time slice, so changing host/checkpoint spacing does not
+change stimulus timing.
 
 The outer host scheduler must remain eager: do not pass ``run``, ``longrun``,
 or ``longrun_checkpointed`` through ``torch.compile`` or a ``torch.func``
@@ -890,21 +953,26 @@ transform. Compile or transform the supplied tensor transition instead. The
 runners inherit the caller's gradient mode and never detach state between
 steps.
 
-For activation-checkpointed BPTT, use the same pure, deterministic, and
-side-effect-free step callable:
+Use ``checkpoint_every`` when the intermediate tensors saved for backward
+use too much memory. It recomputes parts of the simulation during backward,
+trading additional computation for lower storage. Supply the same pure,
+deterministic, and side-effect-free step callable:
 
 .. code-block:: python
 
-   final_state, auxiliary = dn.func.longrun_checkpointed(
-       fmodel,
-       compiled_step,
+   final_state, auxiliary = dn.func.run(
+       bound_chunk,
        tensors.state,
-       duration,
-       chunklength=32,
        inputs=drives,
+       checkpoint_every=32,
    )
    loss = final_state["integrator"]["v"].square().mean()
    loss.backward()
+
+``checkpoint_every`` sets the number of timesteps between checkpoints. Shorter
+chunks retain more boundary states; longer chunks can need more temporary
+memory during backward. Adjust this separately from the compiled chunk size
+to fit your simulation's memory budget. Gradients still span the full run.
 
 Checkpoint replay reuses the prepared workspace and reevaluates functional
 waveforms for the replayed chunk without mutating the source Population. This
@@ -1043,11 +1111,14 @@ first call an inference workload inside the same no-gradient context. A
 different time-axis length may create another PyTorch specialization, but each
 prewarmed structured graph retains the bounded loop body.
 
-For first-order BPTT, bind a one-step compiled chunk to one of the host runners
-shown above. ``compile_rollout_chunk`` already owns a compiled tensor boundary;
-call it directly rather than compiling its Python validation wrapper. Larger
-fixed compiled chunks can also be composed manually when reducing per-call
-overhead matters.
+For first-order BPTT, bind a fixed compiled chunk to one of the host runners
+shown above. The runner schedules full chunks and cached tails while retaining
+the autograd graph across every call. Choose the compiled timestep count to
+balance compilation cost against per-call overhead; use ``checkpoint_every`` to
+choose checkpoint spacing independently. Neither setting truncates the
+gradient. ``compile_rollout_chunk`` already owns a compiled tensor boundary;
+call it directly rather than compiling its Python validation wrapper. Manual
+composition of fixed chunks remains available for custom schedules.
 
 Compiled chunks currently target first-order BPTT. PyTorch's default
 Inductor/AOTAutograd path does not support double backward through these
@@ -1058,6 +1129,86 @@ then compile it, as shown above. When a compiled chunk is called inside
 transition eagerly because Dynamo/AOTAutograd cannot be nested inside an active
 ``torch.func`` transform; the result remains transform-compatible, but that
 inner chunk does not receive compiled acceleration.
+
+Inspecting execution
+~~~~~~~~~~~~~~~~~~~~
+
+A compiled kernel exposes its execution contract and the path selected by its
+most recent successful call:
+
+.. code-block:: python
+
+   print(compiled_chunk.capabilities.functional_transforms)  # "eager_fallback"
+   report = compiled_chunk.execution_report()
+   if report is not None:
+       print(report.strategy, report.steps, report.callbacks)
+
+Strategies distinguish compiled unrolling, a captured inference ``while_loop``,
+compiled scan, and eager fallback under function transforms or forward AD.
+``reason`` explains applicable restrictions, such as a chunk too short to use
+the inference loop. ``backend`` identifies the requested compiler backend;
+compiled dispatch alone does not imply native code generation or a speedup.
+
+The report is ``None`` before the first successful call. It covers the latest
+kernel invocation, including a shorter tail or callback specialization, rather
+than a complete host run. Checkpoint replay can update it during backward.
+Failed calls and zero-step runs leave the previous report unchanged. Capability
+fields describe Dendra's execution choices; actual compilation still depends
+on the selected PyTorch backend supporting the model's tensor operations.
+
+Runnable execution examples
+---------------------------
+
+``examples/functional_execution_modes.py`` exercises the execution options on
+the same small HH model. It demonstrates explicit state threading, no-gradient
+inference, compiled training, recordings, checkpointing, and function transforms:
+
+.. code-block:: bash
+
+   python examples/functional_execution_modes.py --mode all
+
+The default ``aot_eager`` backend exercises compilation and differentiation
+without native code generation. Select ``--backend inductor`` for optimized
+native kernels. The compiled-transform examples are verified with the default
+AOT eager backend; backend support can differ by transform. Choose one mode
+to focus on its API:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 72
+
+   * - Mode
+     - Demonstration
+   * - ``eager``
+     - Prepare once, advance one step, continue with rollout, and differentiate.
+   * - ``inference``
+     - Compile a no-gradient chunk, or prewarm and compile atomic preparation plus rollout.
+   * - ``atomic-compile``
+     - Compile preparation and a fixed rollout together with first-order backward.
+   * - ``chunks``
+     - Bind a compiled three-step kernel, group ``run`` into host spans, and compare legacy calls.
+   * - ``checkpointed``
+     - Reuse that kernel with five-step checkpoint spans and complete run gradients.
+   * - ``scan`` / ``scan-checkpointed``
+     - Use a full-horizon scan kernel, with optional checkpoint subdivision.
+   * - ``transforms``
+     - Evaluate a gradient, Jacobian, Hessian, JVP and batched simulations eagerly.
+   * - ``compiled-transforms``
+     - Apply those transforms first, then compile the resulting functions.
+   * - ``fallback``
+     - Show that transforming an already compiled chunk uses its eager fallback.
+
+For example:
+
+.. code-block:: bash
+
+   python examples/functional_execution_modes.py --mode checkpointed --backend inductor
+   python examples/functional_execution_modes.py --mode scan --backend inductor
+
+Scan modes require the supported PyTorch 2.14.0 implementation. ``all`` skips
+them on other versions; requesting one explicitly reports the capability error.
+The examples hold the extracted initial state fixed. For differentiation through
+initialization as well, see ``examples/functional_gradient_descent.py`` above.
 
 Solver availability
 -------------------

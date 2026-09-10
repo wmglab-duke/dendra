@@ -110,6 +110,32 @@ def test_extcell_axon_constructs_directly_on_mps():
     )
 
 
+def test_extcell_axon_nonuniform_midpoints_match_cpu_binary64_geometry():
+    lengths = torch.tensor(
+        [[0.1, 2.3, 0.7, 9.0, 1.0], [11.0, 0.2, 3.7, 0.3, 4.1]],
+        dtype=torch.float32,
+    )
+    axon = dn.ExtCellAxon(
+        diameters=[6.0, 8.0],
+        n_comp=5,
+        device="mps",
+        dtype=torch.float32,
+    )
+    axon.dx.copy_(lengths.to("mps"))
+
+    actual = axon._x()
+    lengths64 = lengths.to(torch.float64)
+    edges = torch.cat(
+        (torch.zeros((2, 1), dtype=torch.float64), lengths64.cumsum(dim=1)), dim=1
+    )
+    expected = ((edges[:, :-1] + edges[:, 1:] - edges[:, -1:]) / 2).float()
+
+    assert actual.device.type == "mps"
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(axon.dx.cpu(), lengths, rtol=0.0, atol=0.0)
+
+
 def test_mps_population_jit_uses_non_cpp_inductor_wrapper():
     # Keep JIT active through run(): Population refreshes compiler policy from
     # the active Dendra context at each public execution boundary.

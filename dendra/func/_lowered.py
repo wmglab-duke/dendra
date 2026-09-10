@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from ._types import RolloutInput
+from ._callbacks import _stack_callback_emissions, _update_callback_values
+from ._types import RolloutInput, StepInput
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -44,14 +45,21 @@ class _LoweredPopulationChunk:
     remain implementation details during the functional campaign.
     """
 
-    __slots__ = ("_functional", "_steps")
+    __slots__ = ("_functional", "_steps", "_stepwise_stimulation")
 
-    def __init__(self, functional: FunctionalPopulation, *, steps: int):
+    def __init__(
+        self,
+        functional: FunctionalPopulation,
+        *,
+        steps: int,
+        stepwise_stimulation: bool = False,
+    ):
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError("steps must be a positive integer")
         functional._validate_source()
         self._functional = functional
         self._steps = steps
+        self._stepwise_stimulation = stepwise_stimulation
 
     @property
     def steps(self) -> int:
@@ -84,6 +92,22 @@ class _LoweredPopulationChunk:
 
     def __call__(self, parameters, prepared, state, ve, intra):
         """Execute the pure tensor transition for exactly ``steps`` steps."""
+        if self._stepwise_stimulation:
+            # A host step samples bound Waveforms at its accepted clock. A
+            # vector start + arange * dt can round differently from repeated
+            # clock additions and miss narrow pulses. Preserve that recurrence
+            # inside the fixed compiled chunk; compiler size is bounded by C.
+            for index in range(self._steps):
+                state, auxiliary = self._functional._step_values(
+                    parameters,
+                    prepared,
+                    state,
+                    StepInput(
+                        ve=None if ve is None else ve[index],
+                        intra=None if intra is None else intra[index],
+                    ),
+                )
+            return state, auxiliary
         return self._functional._execute_rollout_values(
             parameters,
             prepared,
@@ -91,6 +115,48 @@ class _LoweredPopulationChunk:
             ve,
             intra,
             self._steps,
+        )
+
+
+class _LoweredCallbackPopulationChunk:
+    """A fixed tensor recurrence including every per-step callback update.
+
+    Keep only the callback plans, not their collection: the compiled wrapper
+    caches these kernels with weak collection keys. No initialized carry or
+    differentiable preparation belongs to this static callable.
+    """
+
+    __slots__ = ("_functional", "_steps", "_plans")
+
+    def __init__(self, functional, *, steps, plans):
+        self._functional = functional
+        self._steps = steps
+        self._plans = plans
+
+    def __call__(self, parameters, prepared, state, ve, intra, carries):
+        emissions = []
+        for index in range(self._steps):
+            # Sample bound waveforms at the accepted clock each time, matching
+            # the host recurrence even at floating-point pulse boundaries.
+            state, auxiliary = self._functional._step_values(
+                parameters,
+                prepared,
+                state,
+                StepInput(
+                    ve=None if ve is None else ve[index],
+                    intra=None if intra is None else intra[index],
+                ),
+            )
+            carries, emitted = _update_callback_values(
+                self._plans, carries, state, auxiliary
+            )
+            if emitted is not None:
+                emissions.append(emitted)
+        return (
+            state,
+            auxiliary,
+            carries,
+            _stack_callback_emissions(self._plans, emissions),
         )
 
 

@@ -150,8 +150,10 @@ control metadata, so moving or constructing a Population on MPS does not try to
 materialize that value on the accelerator. It remains part of state dictionaries
 and runtime checkpoints. Time-grid and one-time geometry calculations that need
 binary64 precision are likewise staged on CPU before their model-dtype results
-are transferred to MPS. This does not make float64 simulation state available
-on MPS; construct the model with ``dtype=torch.float32``.
+are transferred to MPS. This includes the compartment coordinates of an
+``ExtCellAxon`` constructed directly on MPS, including nonuniform compartment
+lengths. This does not make float64 simulation state available on MPS;
+construct the model with ``dtype=torch.float32``.
 
 For JIT execution, Dendra applies MPS compiler compatibility as per-model
 ``torch.compile`` options rather than changing process-global Inductor state.

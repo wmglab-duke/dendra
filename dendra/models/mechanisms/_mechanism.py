@@ -1980,7 +1980,7 @@ class Mechanism(Parameterized):
     def _derive_assigned_values(self, v, values):
         """Evaluate repeatable algebra; validate its fixed schema once."""
         outputs = self.assigned_values(v, values)
-        if not self._assigned_schema_validated and not torch.compiler.is_compiling():
+        if not torch.compiler.is_compiling() and not self._assigned_schema_validated:
             _validate_runtime_outputs(
                 self,
                 "assigned_values",
@@ -2006,7 +2006,7 @@ class Mechanism(Parameterized):
         if not self._has_authored_advance:
             return {}
         outputs = self.advance(v, dt, values)
-        if not self._advance_schema_validated and not torch.compiler.is_compiling():
+        if not torch.compiler.is_compiling() and not self._advance_schema_validated:
             references = {
                 name: getattr(self, name)
                 for name in self._advance_output_names()

@@ -7,11 +7,12 @@ workload. A custom pure callback accumulates voltage mean-squared error without
 retaining the candidate trace. By default, derivatives are produced by
 ``torch.func.grad_and_value`` over the eager functional rollout.
 ``--iterations`` and ``--tstop`` make shorter smoke runs convenient.
-``--compiled-step`` (also spelled ``--compile-step``) and ``--checkpointed``
-retain the classic autograd alternatives because host runners and activation
-checkpointing are intentionally outside ``torch.func`` transforms. Compiling
-the numerical step is the comparable mode when the imperative tutorial enables
-Dendra JIT; the scalar reducer mainly reduces callback output memory.
+``--compiled-chunk-steps 4`` compiles four simulation steps and their loss
+updates together, using ordinary autograd. Combine it with ``--checkpointed``
+to recompute activations during backward; ``--chunklength`` independently sets
+the number of steps between checkpoints. ``--compiled-step`` (also spelled
+``--compile-step``) remains available for one-step compilation. The scalar
+reducer reduces callback output memory in each mode.
 
 Each simulation reconstructs its initial voltage and HH gates through the pure
 functional initializer. The objective therefore includes initialization in its
@@ -117,17 +118,25 @@ def simulate_callbacks(
     *,
     steps: int,
     chunklength: int,
+    compiled_chunk=None,
     compiled_one_step=None,
     checkpointed: bool = False,
     host_runner: bool = False,
 ):
-    """Initialize purely, simulate, and return finalized callback results."""
+    """Initialize purely, simulate, and return finalized callback results.
+
+    ``compiled_one_step`` is retained as an alias for older example callers.
+    """
+    if compiled_one_step is not None:
+        if compiled_chunk is not None:
+            raise ValueError("pass only one compiled chunk")
+        compiled_chunk = compiled_one_step
     initialized = functional.initialize(
         parameters,
         tensors.constants,
         tensors.initialization,
     )
-    if not host_runner and compiled_one_step is None and not checkpointed:
+    if not host_runner and compiled_chunk is None and not checkpointed:
         _final_state, auxiliary = functional.prepare_and_rollout(
             initialized.parameters,
             initialized.constants,
@@ -142,7 +151,7 @@ def simulate_callbacks(
         initialized.constants,
     )
     step = partial(
-        functional.step if compiled_one_step is None else compiled_one_step,
+        functional.step if compiled_chunk is None else compiled_chunk,
         initialized.parameters,
         prepared,
     )
@@ -163,15 +172,26 @@ def parse_args():
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--tstop", type=float, default=5.0)
     parser.add_argument("--dt", type=float, default=0.005)
-    parser.add_argument("--chunklength", type=int, default=100)
+    parser.add_argument(
+        "--chunklength",
+        type=int,
+        default=100,
+        help="steps per host span, or steps between checkpoints with --checkpointed",
+    )
     parser.add_argument("--learning-rate", type=float, default=5e-3)
     parser.add_argument("--report-every", type=int, default=50)
-    parser.add_argument(
+    compilation = parser.add_mutually_exclusive_group()
+    compilation.add_argument(
         "--compiled-step",
         "--compile-step",
         dest="compiled_step",
         action="store_true",
-        help="compile one numerical step (recommended for first-order speed)",
+        help="compile one simulation step and its callback updates",
+    )
+    compilation.add_argument(
+        "--compiled-chunk-steps",
+        type=int,
+        help="compile this many simulation steps and callback updates together",
     )
     parser.add_argument("--checkpointed", action="store_true")
     parser.add_argument("--plot", action="store_true")
@@ -185,6 +205,8 @@ def validate_args(args):
         raise ValueError("tstop and dt must be positive")
     if args.chunklength <= 0:
         raise ValueError("chunklength must be positive")
+    if args.compiled_chunk_steps is not None and args.compiled_chunk_steps <= 0:
+        raise ValueError("compiled-chunk-steps must be positive")
     if args.learning_rate <= 0:
         raise ValueError("learning-rate must be positive")
     if args.report_every <= 0:
@@ -246,10 +268,15 @@ def main():
         name: value for name, value in parameters.items() if name not in trainable
     }
     optimizer = torch.optim.Adam(trainable.values(), lr=args.learning_rate)
-    compiled_one_step = (
-        functional.compile_rollout_chunk(1) if args.compiled_step else None
+    compiled_steps = args.compiled_chunk_steps
+    if args.compiled_step:
+        compiled_steps = 1
+    compiled_chunk = (
+        functional.compile_rollout_chunk(compiled_steps)
+        if compiled_steps is not None
+        else None
     )
-    use_torch_func = compiled_one_step is None and not args.checkpointed
+    use_torch_func = compiled_chunk is None and not args.checkpointed
 
     def objective(selected_parameters):
         local_parameters = {**fixed_parameters, **selected_parameters}
@@ -276,9 +303,9 @@ def main():
                 trace_callbacks,
                 steps=steps,
                 chunklength=args.chunklength,
-                compiled_one_step=compiled_one_step,
+                compiled_chunk=compiled_chunk,
                 checkpointed=args.checkpointed,
-                host_runner=compiled_one_step is not None or args.checkpointed,
+                host_runner=compiled_chunk is not None or args.checkpointed,
             )["voltage"]["v"]
 
     for iteration in range(args.iterations):
@@ -295,7 +322,7 @@ def main():
                 loss_callbacks,
                 steps=steps,
                 chunklength=args.chunklength,
-                compiled_one_step=compiled_one_step,
+                compiled_chunk=compiled_chunk,
                 checkpointed=args.checkpointed,
                 host_runner=True,
             )["mse"]
@@ -315,9 +342,9 @@ def main():
             loss_callbacks,
             steps=steps,
             chunklength=args.chunklength,
-            compiled_one_step=compiled_one_step,
+            compiled_chunk=compiled_chunk,
             checkpointed=args.checkpointed,
-            host_runner=compiled_one_step is not None or args.checkpointed,
+            host_runner=compiled_chunk is not None or args.checkpointed,
         )["mse"]
         final_trace = None
         if args.plot:
@@ -328,9 +355,9 @@ def main():
                 trace_callbacks,
                 steps=steps,
                 chunklength=args.chunklength,
-                compiled_one_step=compiled_one_step,
+                compiled_chunk=compiled_chunk,
                 checkpointed=args.checkpointed,
-                host_runner=compiled_one_step is not None or args.checkpointed,
+                host_runner=compiled_chunk is not None or args.checkpointed,
             )["voltage"]["v"]
 
     print(f"Final loss: {final_loss.item():.8g}")

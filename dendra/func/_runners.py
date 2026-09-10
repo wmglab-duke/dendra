@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
@@ -13,12 +13,14 @@ from torch.utils.checkpoint import checkpoint
 
 from dendra.models.core import _duration_step_budget, _validate_time_scalar
 
+from ._binding import BoundPopulation
 from ._callbacks import FunctionalCallbackResults, FunctionalCallbacks
 from ._population import FunctionalPopulation
 from ._stimuli import FunctionalExtra, StimulusTensors
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
 _StepCallable = Callable[[Mapping[str, object], StepInput], tuple[object, object]]
+_MISSING = object()
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,7 @@ class _StepExecution:
     public_step: _StepCallable
     binding: _OwnedStepBinding | None = None
     prepared_values: Mapping[str, object] | None = None
+    compiled_chunks: Mapping[int, object] | None = None
 
     def __call__(self, state, inputs: StepInput):
         if self.binding is None:
@@ -49,7 +52,10 @@ class _StepExecution:
                 state,
                 inputs,
             )
-        return self.binding.compiled_chunk._step_values(
+        compiled_chunk = self.binding.compiled_chunk
+        if self.compiled_chunks is not None:
+            compiled_chunk = self.compiled_chunks[1]
+        return compiled_chunk._step_values(
             self.binding.parameters,
             self.prepared_values,
             state,
@@ -62,11 +68,17 @@ def _owned_step_binding(functional, step) -> _OwnedStepBinding | None:
 
     Wrapped callables and partial subclasses remain generic: bypassing an
     adapter whose invocation semantics we do not own would be unsafe. Exact
-    one-step :class:`CompiledPopulationChunk` instances are also owned and
+    :class:`CompiledPopulationChunk` instances are also owned and
     expose the same private tensor-only boundary. An explicit ``extra=None``
     is equivalent to the functional-step default; non-empty functional
     ``extra`` remains on the public path so its validation is unchanged.
     """
+    if type(step) is BoundPopulation:
+        if step.functional is not functional:
+            return None
+        return _OwnedStepBinding(
+            functional, step._parameters, step.prepared, step.compiled_chunk
+        )
     if type(step) is not partial:
         return None
     candidate = step.func
@@ -89,7 +101,6 @@ def _owned_step_binding(functional, step) -> _OwnedStepBinding | None:
         not keywords
         and type(candidate) is CompiledPopulationChunk
         and candidate._functional is functional
-        and candidate.steps == 1
     ):
         return _OwnedStepBinding(
             functional,
@@ -113,6 +124,39 @@ def _prepare_step_execution(functional, step) -> _StepExecution:
     return _StepExecution(step, binding, prepared_values)
 
 
+def _prepare_compiled_schedule(execution, steps, chunklength, *, callbacks):
+    """Construct needed kernel specializations outside execution and replay.
+
+    Host/checkpoint boundaries remain authoritative. Within each such span,
+    consume full compiled chunks and at most one shorter tail. Callback kernels
+    include every per-step update and return explicit carry and stacked samples.
+    Empty schedules do not construct any new kernels.
+    """
+    binding = execution.binding
+    if steps == 0 or binding is None or binding.compiled_chunk is None:
+        return execution
+    chunk = binding.compiled_chunk
+    if chunk.steps == 1 and callbacks is None:
+        return execution
+    spans = {min(steps, chunklength)}
+    if steps % chunklength:
+        spans.add(steps % chunklength)
+    sizes = set()
+    for span in spans:
+        sizes.add(min(chunk.steps, span))
+        if span % chunk.steps:
+            sizes.add(span % chunk.steps)
+    kernels = {
+        size: (
+            chunk._runner_chunk(size)
+            if callbacks is None
+            else chunk._runner_callback_chunk(callbacks, size)
+        )
+        for size in sorted(sizes)
+    }
+    return replace(execution, compiled_chunks=kernels)
+
+
 def _refresh_checkpoint_execution(execution: _StepExecution, state) -> _StepExecution:
     """Revalidate captured bindings once for each checkpoint invocation.
 
@@ -132,11 +176,13 @@ def _refresh_checkpoint_execution(execution: _StepExecution, state) -> _StepExec
         binding.prepared,
         binding.parameters,
     )
-    return _StepExecution(execution.public_step, binding, prepared_values)
+    return replace(execution, prepared_values=prepared_values)
 
 
 def _inspect_step_callable(step):
     """Unwrap public callable adapters while retaining bound positional args."""
+    from ._compiled import CompiledPopulationChunk
+
     candidate = step
     bound_args = ()
     seen = set()
@@ -149,8 +195,23 @@ def _inspect_step_callable(step):
             candidate = candidate.func
             continue
         original = getattr(candidate, "_torchdynamo_orig_callable", None)
+        if original is None:
+            original = getattr(candidate, "__wrapped__", None)
         if original is not None:
             candidate = original
+            continue
+        owner = getattr(candidate, "__self__", None)
+        if (
+            isinstance(owner, BoundPopulation)
+            and getattr(candidate, "__func__", None) is BoundPopulation.__call__
+        ):
+            candidate = owner
+            continue
+        if (
+            isinstance(owner, CompiledPopulationChunk)
+            and getattr(candidate, "__func__", None) is CompiledPopulationChunk.__call__
+        ):
+            candidate = owner
             continue
         break
     return candidate, bound_args
@@ -169,15 +230,26 @@ def _validate_step_plan(functional, step) -> None:
     # Import lazily to preserve the existing population/compiled module split.
     from ._compiled import CompiledPopulationChunk
 
+    if isinstance(candidate, BoundPopulation):
+        if candidate.functional is not functional:
+            raise FunctionalizationError(
+                "step belongs to a different FunctionalPopulation plan"
+            )
+        if candidate.steps != 1 and _owned_step_binding(functional, step) is None:
+            raise FunctionalizationError(
+                "multi-step compiled chunks require the exact binding returned "
+                "by chunk.bind(); other adapters must expose a one-step callable"
+            )
     if isinstance(candidate, CompiledPopulationChunk):
         if candidate._functional is not functional:
             raise FunctionalizationError(
                 "step belongs to a different FunctionalPopulation plan"
             )
-        if candidate.steps != 1:
+        if candidate.steps != 1 and _owned_step_binding(functional, step) is None:
             raise FunctionalizationError(
-                "host schedulers require a one-step callable; bind a "
-                "CompiledPopulationChunk with steps=1"
+                "multi-step compiled chunks require the exact binding "
+                "functools.partial(chunk, parameters, prepared); other adapters "
+                "must expose a one-step callable"
             )
 
 
@@ -195,7 +267,9 @@ def _validate_visible_step_dt(
     # Import lazily to preserve the existing population/compiled module split.
     from ._compiled import CompiledPopulationChunk
 
-    if (
+    if isinstance(candidate, BoundPopulation) and candidate.functional is functional:
+        parameters, prepared = candidate._parameters, candidate.prepared
+    elif (
         owner is functional
         and getattr(candidate, "__func__", None) is FunctionalPopulation.step
         and len(bound_args) >= 2
@@ -204,7 +278,6 @@ def _validate_visible_step_dt(
     elif (
         isinstance(candidate, CompiledPopulationChunk)
         and candidate._functional is functional
-        and candidate.steps == 1
         and len(bound_args) >= 2
     ):
         parameters, prepared = bound_args[:2]
@@ -380,8 +453,8 @@ def _replace_duration_remainder(state, value: float):
     return updated
 
 
-def _stage_duration(state, tstop, dt: float):
-    duration = _validate_time_scalar(tstop, name="tstop", positive=False)
+def _stage_duration(state, tstop, dt: float, *, name="tstop"):
+    duration = _validate_time_scalar(tstop, name=name, positive=False)
     remainder = _duration_remainder(state)
     pending = float(remainder.detach().item())
     steps, next_remainder = _duration_step_budget(duration, dt, pending)
@@ -471,6 +544,19 @@ def _validate_zero_step_extra(functional, plan, tensors, state, dt: float) -> No
 
 def _execute_steps(step, state, inputs: RolloutInput, steps: int):
     auxiliary = None
+    if isinstance(step, _StepExecution) and step.compiled_chunks is not None:
+        binding = step.binding
+        width = binding.compiled_chunk.steps
+        for start in range(0, steps, width):
+            stop = min(start + width, steps)
+            kernel = step.compiled_chunks[stop - start]
+            state, auxiliary = kernel._rollout_values(
+                binding.parameters,
+                step.prepared_values,
+                state,
+                _slice_inputs(inputs, start, stop),
+            )
+        return state, auxiliary
     for index in range(steps):
         result = step(
             state,
@@ -495,11 +581,31 @@ def _execute_steps_with_callbacks(
 ):
     """Advance one chunk while threading pure callback carry.
 
-    Emissions are accumulated in an ordinary host list and stacked once.  The
-    callback reducer itself is side-effect-free, so this complete function is
-    safe to replay inside non-reentrant activation checkpointing.
+    Compiled bindings execute joint model/callback chunks and concatenate their
+    emissions. Eager callables update carry per step and stack emissions once.
+    Both paths replay safely inside non-reentrant activation checkpointing.
     """
     auxiliary = None
+    if isinstance(step, _StepExecution) and step.compiled_chunks is not None:
+        binding = step.binding
+        width = binding.compiled_chunk.steps
+        parts = []
+        for start in range(0, steps, width):
+            stop = min(start + width, steps)
+            kernel = step.compiled_chunks[stop - start]
+            state, auxiliary, carries, emitted = kernel._rollout_values(
+                binding.parameters,
+                step.prepared_values,
+                state,
+                _slice_inputs(inputs, start, stop),
+                callback_state.carries,
+            )
+            callback_state = callbacks._wrap_compiled_update(
+                callback_state, carries, emitted
+            )
+            if callbacks._has_emissions(emitted):
+                parts.append(emitted)
+        return state, auxiliary, callback_state, callbacks._concatenate(parts)
     emissions = []
     for index in range(steps):
         result = step(
@@ -723,331 +829,22 @@ def _execute_chunks_with_callbacks(
     return state, auxiliary
 
 
-def run(
-    functional: FunctionalPopulation,
-    step: _StepCallable,
+def _execute_checkpointed_chunks(
+    functional,
+    execution,
     state,
-    inputs: RolloutInput | None = None,
-    *,
-    tstop: float | None = None,
-    dt: float | None = None,
-    extra=None,
-    callbacks: FunctionalCallbacks | None = None,
-    callback_state=None,
+    inputs,
+    steps,
+    chunklength,
+    expected_remainder,
+    dt,
+    callbacks,
+    callback_state,
+    callback_parts,
+    extra_plan,
+    extra_tensors,
 ):
-    """Run a bound functional step in an ordinary Python loop.
-
-    A present ``ve`` or ``intra`` time axis is authoritative, matching the
-    direct-input behavior of :meth:`Population.run`; ``tstop`` is then ignored
-    and the retained duration remainder is unchanged. With no explicit drive,
-    ``tstop`` is required and represents a duration to advance.
-
-    ``step`` has the canonical signature ``step(state, StepInput)`` and must be
-    one transition from this exact functional plan. Bind raw parameters and one
-    prepared workspace outside this function so preparation is shared across
-    the complete forward/backward graph. ``dt`` controls host duration
-    scheduling and runtime ``extra`` waveform sampling. It defaults to the
-    functional plan's nominal timestep. The supplied ``step`` is not rebuilt;
-    prepare it from constants containing the same ``dt`` when the transition
-    or bound stimulation depends on timestep. The runner validates the
-    resulting model-clock advance after each host chunk.
-
-    ``callbacks`` must be an immutable plan from
-    :meth:`FunctionalPopulation.make_callbacks`. Named recordings are returned
-    under ``auxiliary["callbacks"]``. Pass that result's explicit ``state`` as
-    ``callback_state`` to continue without repeating the boundary sample.
-    """
-    expected_remainder = _validate_execution(functional, step, state)
-    execution = _prepare_step_execution(functional, step)
-    dt = _validate_runner_dt(functional, dt)
-    _validate_visible_step_dt(
-        functional,
-        step,
-        dt,
-        prepared_values=execution.prepared_values,
-    )
-    inputs = _validate_rollout_input_container(inputs)
-    extra_plan, extra_tensors = _prepare_extra(functional, extra, inputs)
-    has_drives = inputs.ve is not None or inputs.intra is not None
-
-    if not has_drives:
-        if tstop is None:
-            raise ValueError("tstop must be provided when inputs contain no drives")
-        state, steps = _stage_duration(state, tstop, dt)
-        expected_remainder = _validate_duration_remainder(state)
-        inputs, _resolved_steps = _resolve_inputs(functional, inputs, steps)
-    else:
-        # Validate the functional control schema even though a direct input does
-        # not consume or alter its retained physical duration.
-        inputs, steps = _resolve_inputs(functional, inputs, None)
-
-    callbacks, callback_state, callback_parts = _prepare_callback_collection(
-        functional,
-        callbacks,
-        callback_state,
-        state,
-        dt,
-    )
-
-    if steps == 0:
-        _validate_zero_step_extra(
-            functional,
-            extra_plan,
-            extra_tensors,
-            state,
-            dt,
-        )
-        state = functional._clone_state_tree(state)
-        return state, _attach_callback_results(
-            None,
-            callbacks,
-            callback_state,
-            callback_parts,
-        )
-    if callbacks is not None:
-        return _execute_chunks_with_callbacks(
-            functional,
-            execution,
-            state,
-            inputs,
-            steps,
-            steps,
-            expected_remainder,
-            dt,
-            callbacks,
-            callback_state,
-            callback_parts,
-            extra_plan,
-            extra_tensors,
-        )
-    return _execute_chunks(
-        functional,
-        execution,
-        state,
-        inputs,
-        steps,
-        steps,
-        expected_remainder,
-        dt,
-        extra_plan,
-        extra_tensors,
-    )
-
-
-def longrun(
-    functional: FunctionalPopulation,
-    step: _StepCallable,
-    state,
-    tstop: float,
-    chunklength: int,
-    inputs: RolloutInput | None = None,
-    *,
-    dt: float | None = None,
-    extra=None,
-    callbacks: FunctionalCallbacks | None = None,
-    callback_state=None,
-):
-    """Run a bound functional step in fixed host-side chunks.
-
-    The scheduler is deliberately not compiled. It groups the Python loop into
-    ``chunklength``-step blocks while preserving the exact duration remainder
-    in explicit state. Supplied time-first drives must cover the resolved
-    duration exactly.
-
-    ``dt`` defaults to the functional plan's nominal timestep and controls
-    host duration scheduling and runtime ``extra`` waveform sampling. The
-    supplied ``step`` remains responsible for using a matching prepared
-    timestep, including for bound stimulation; its clock advance is validated
-    after every host chunk.
-
-    Functional callback plans and carry follow the same contract as
-    :func:`run`; emitted tensors are stacked per chunk and concatenated once.
-    """
-    _validate_execution(functional, step, state)
-    execution = _prepare_step_execution(functional, step)
-    dt = _validate_runner_dt(functional, dt)
-    _validate_visible_step_dt(
-        functional,
-        step,
-        dt,
-        prepared_values=execution.prepared_values,
-    )
-    chunklength = _validate_chunklength(chunklength)
-    inputs = _validate_rollout_input_container(inputs)
-    extra_plan, extra_tensors = _prepare_extra(functional, extra, inputs)
-    state, steps = _stage_duration(state, tstop, dt)
-    expected_remainder = _validate_duration_remainder(state)
-    inputs, _resolved_steps = _resolve_inputs(functional, inputs, steps)
-
-    callbacks, callback_state, callback_parts = _prepare_callback_collection(
-        functional,
-        callbacks,
-        callback_state,
-        state,
-        dt,
-    )
-
-    if steps == 0:
-        _validate_zero_step_extra(
-            functional,
-            extra_plan,
-            extra_tensors,
-            state,
-            dt,
-        )
-        state = functional._clone_state_tree(state)
-        return state, _attach_callback_results(
-            None,
-            callbacks,
-            callback_state,
-            callback_parts,
-        )
-    if callbacks is not None:
-        return _execute_chunks_with_callbacks(
-            functional,
-            execution,
-            state,
-            inputs,
-            steps,
-            chunklength,
-            expected_remainder,
-            dt,
-            callbacks,
-            callback_state,
-            callback_parts,
-            extra_plan,
-            extra_tensors,
-        )
-    return _execute_chunks(
-        functional,
-        execution,
-        state,
-        inputs,
-        steps,
-        chunklength,
-        expected_remainder,
-        dt,
-        extra_plan,
-        extra_tensors,
-    )
-
-
-def longrun_checkpointed(
-    functional: FunctionalPopulation,
-    step: _StepCallable,
-    state,
-    tstop: float,
-    chunklength: int,
-    inputs: RolloutInput | None = None,
-    *,
-    dt: float | None = None,
-    extra=None,
-    callbacks: FunctionalCallbacks | None = None,
-    callback_state=None,
-):
-    """Run fixed Python chunks with non-reentrant activation checkpointing.
-
-    ``step`` must be pure, deterministic, and replay-safe. The returned state
-    is explicit, so imperative checkpoint options for module restoration are
-    unnecessary. When gradients are disabled this delegates to the ordinary
-    chunk engine because recomputation cannot reduce an autograd graph.
-
-    ``dt`` has the same host-scheduling contract as :func:`longrun`; prepare
-    the supplied ``step`` with the same timestep because checkpoint replay does
-    not rebuild its prepared workspace. Clock validation remains outside the
-    replayed checkpoint region.
-
-    Functional callbacks use pure carry and return each chunk's emissions
-    through the checkpoint boundary, preserving gradients without replay-time
-    mutation or duplicate samples.
-    """
-    _validate_execution(functional, step, state)
-    execution = _prepare_step_execution(functional, step)
-    dt = _validate_runner_dt(functional, dt)
-    _validate_visible_step_dt(
-        functional,
-        step,
-        dt,
-        prepared_values=execution.prepared_values,
-    )
-    chunklength = _validate_chunklength(chunklength)
-    inputs = _validate_rollout_input_container(inputs)
-    extra_plan, extra_tensors = _prepare_extra(functional, extra, inputs)
-    state, steps = _stage_duration(state, tstop, dt)
-    expected_remainder = _validate_duration_remainder(state)
-    inputs, _resolved_steps = _resolve_inputs(functional, inputs, steps)
-
-    if steps == 0:
-        callbacks, callback_state, callback_parts = _prepare_callback_collection(
-            functional,
-            callbacks,
-            callback_state,
-            state,
-            dt,
-        )
-        _validate_zero_step_extra(
-            functional,
-            extra_plan,
-            extra_tensors,
-            state,
-            dt,
-        )
-        state = functional._clone_state_tree(state)
-        return state, _attach_callback_results(
-            None,
-            callbacks,
-            callback_state,
-            callback_parts,
-        )
-    if not torch.is_grad_enabled():
-        callbacks, callback_state, callback_parts = _prepare_callback_collection(
-            functional,
-            callbacks,
-            callback_state,
-            state,
-            dt,
-        )
-        if callbacks is not None:
-            return _execute_chunks_with_callbacks(
-                functional,
-                execution,
-                state,
-                inputs,
-                steps,
-                chunklength,
-                expected_remainder,
-                dt,
-                callbacks,
-                callback_state,
-                callback_parts,
-                extra_plan,
-                extra_tensors,
-            )
-        return _execute_chunks(
-            functional,
-            execution,
-            state,
-            inputs,
-            steps,
-            chunklength,
-            expected_remainder,
-            dt,
-            extra_plan,
-            extra_tensors,
-        )
-
-    # Checkpoint cannot save inference tensors for backward. Such state and
-    # drive values are constants by construction, so materialize ordinary
-    # versioned clones without changing differentiable inputs.
-    state = _materialize_checkpoint_tree(state)
-    callbacks, callback_state, callback_parts = _prepare_callback_collection(
-        functional,
-        callbacks,
-        callback_state,
-        state,
-        dt,
-    )
-
+    """Execute a resolved host schedule with replay-time binding validation."""
     auxiliary: Any = None
     for start in range(0, steps, chunklength):
         stop = min(start + chunklength, steps)
@@ -1152,6 +949,309 @@ def longrun_checkpointed(
         callback_parts,
     )
     return state, auxiliary
+
+
+def _bound_runner_dt(functional, prepared_values):
+    """Infer the prepared timestep while preserving nominal float32 durations."""
+    primal, _tangent = torch.autograd.forward_ad.unpack_dual(
+        prepared_values["integrator"]["dt"]
+    )
+    value = float(primal.detach().to(device="cpu", dtype=torch.float64).item())
+    nominal = functional.dt
+    # Callback sample windows and physical durations use the authored Python
+    # value. Retain it when it represents exactly the same prepared timestep.
+    if float(torch.tensor(nominal, dtype=primal.dtype).item()) == value:
+        return nominal
+    return value
+
+
+def _run_schedule(
+    functional,
+    step,
+    state,
+    inputs,
+    *,
+    duration=_MISSING,
+    steps=None,
+    span=None,
+    checkpointed=False,
+    dt=None,
+    infer_bound_dt=False,
+    legacy_input_horizon=False,
+    duration_name="duration",
+    extra=None,
+    callbacks=None,
+    callback_state=None,
+):
+    """Resolve one horizon and use the shared eager/checkpoint execution engine."""
+    expected_remainder = _validate_execution(functional, step, state)
+    execution = _prepare_step_execution(functional, step)
+    if infer_bound_dt and dt is None:
+        dt = _bound_runner_dt(functional, execution.prepared_values)
+    dt = _validate_runner_dt(functional, dt)
+    _validate_visible_step_dt(
+        functional, step, dt, prepared_values=execution.prepared_values
+    )
+    if span is not None:
+        span = _validate_chunklength(span)
+    inputs = _validate_rollout_input_container(inputs)
+    extra_plan, extra_tensors = _prepare_extra(functional, extra, inputs)
+    has_drives = inputs.ve is not None or inputs.intra is not None
+    if legacy_input_horizon:
+        if has_drives:
+            duration = _MISSING
+        elif duration is None:
+            raise ValueError("tstop must be provided when inputs contain no drives")
+    if duration is not _MISSING:
+        state, steps = _stage_duration(state, duration, dt, name=duration_name)
+        expected_remainder = _validate_duration_remainder(state)
+    inputs, steps = _resolve_inputs(functional, inputs, steps)
+    chunklength = max(steps, 1) if span is None else span
+    use_checkpoint = checkpointed and torch.is_grad_enabled() and steps > 0
+    if use_checkpoint:
+        # Checkpoint cannot save inference tensors for backward. Preserve all
+        # differentiable leaves while materializing these constant values.
+        state = _materialize_checkpoint_tree(state)
+    callbacks, callback_state, callback_parts = _prepare_callback_collection(
+        functional, callbacks, callback_state, state, dt
+    )
+    execution = _prepare_compiled_schedule(
+        execution, steps, chunklength, callbacks=callbacks
+    )
+    if steps == 0:
+        _validate_zero_step_extra(functional, extra_plan, extra_tensors, state, dt)
+        state = functional._clone_state_tree(state)
+        return state, _attach_callback_results(
+            None, callbacks, callback_state, callback_parts
+        )
+    if use_checkpoint:
+        return _execute_checkpointed_chunks(
+            functional,
+            execution,
+            state,
+            inputs,
+            steps,
+            chunklength,
+            expected_remainder,
+            dt,
+            callbacks,
+            callback_state,
+            callback_parts,
+            extra_plan,
+            extra_tensors,
+        )
+    if callbacks is not None:
+        return _execute_chunks_with_callbacks(
+            functional,
+            execution,
+            state,
+            inputs,
+            steps,
+            chunklength,
+            expected_remainder,
+            dt,
+            callbacks,
+            callback_state,
+            callback_parts,
+            extra_plan,
+            extra_tensors,
+        )
+    return _execute_chunks(
+        functional,
+        execution,
+        state,
+        inputs,
+        steps,
+        chunklength,
+        expected_remainder,
+        dt,
+        extra_plan,
+        extra_tensors,
+    )
+
+
+def run(
+    functional: FunctionalPopulation | BoundPopulation,
+    step=_MISSING,
+    state=_MISSING,
+    inputs: RolloutInput | None = None,
+    *,
+    steps: int | None = None,
+    duration: float | None = None,
+    checkpoint_every: int | None = None,
+    host_span_steps: int | None = None,
+    tstop: float | None = None,
+    dt: float | None = None,
+    extra=None,
+    callbacks: FunctionalCallbacks | None = None,
+    callback_state=None,
+):
+    """Schedule explicit functional execution, optionally with checkpointing.
+
+    Preferred form: ``run(bound, state, inputs=..., steps=N)`` or
+    ``run(bound, state, duration=..., checkpoint_every=H)``. Create ``bound``
+    with ``fmodel.bind(parameters, prepared)`` or ``kernel.bind(...)``. Inputs
+    alone infer the horizon; an explicit step count or duration must match
+    their time axis. ``steps`` and ``duration`` are mutually exclusive.
+
+    ``duration`` is an amount to advance, including the state's retained
+    fractional remainder. Explicit or input-inferred steps leave that remainder
+    unchanged. The default timestep comes from the validated preparation.
+    ``checkpoint_every`` sets the number of steps between activation checkpoints;
+    ``host_span_steps`` instead groups an ordinary run. These mutually exclusive
+    options are independent of the compiled kernel width. Shorter kernel tails
+    are cached, and gradients span the complete run.
+
+    The legacy form ``run(functional, step, state, inputs, tstop=...)`` remains
+    supported. Its explicit drive horizon takes precedence over ``tstop`` and
+    its default timestep is the functional plan's nominal timestep. New horizon
+    and span options require the preferred binding form. Legacy steps may be
+    generic one-step callables, explicit bindings, or exact partial bindings.
+
+    Callbacks observe every accepted state, including within compiled chunks.
+    Results are returned under ``auxiliary["callbacks"]``; pass their explicit
+    ``state`` as ``callback_state`` when resuming to avoid duplicate frames.
+    This host scheduler stays outside torch.compile and torch.func boundaries.
+    """
+    if isinstance(functional, BoundPopulation):
+        if type(functional) is not BoundPopulation:
+            raise TypeError("run requires an exact BoundPopulation binding")
+        bound = functional
+        if step is not _MISSING:
+            if state is _MISSING:
+                state = step
+            elif inputs is None and (isinstance(state, RolloutInput) or state is None):
+                inputs, state = state, step
+            else:
+                raise TypeError("state was supplied more than once")
+        if state is _MISSING:
+            raise TypeError("run requires state")
+        if tstop is not None:
+            raise ValueError("use duration instead of tstop with a BoundPopulation")
+        if steps is not None and duration is not None:
+            raise ValueError("steps and duration are mutually exclusive")
+        if checkpoint_every is not None and host_span_steps is not None:
+            raise ValueError(
+                "checkpoint_every and host_span_steps are mutually exclusive"
+            )
+        for name, value in (
+            ("checkpoint_every", checkpoint_every),
+            ("host_span_steps", host_span_steps),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+        return _run_schedule(
+            bound.functional,
+            bound,
+            state,
+            inputs,
+            duration=_MISSING if duration is None else duration,
+            steps=steps,
+            span=checkpoint_every if checkpoint_every is not None else host_span_steps,
+            checkpointed=checkpoint_every is not None,
+            dt=dt,
+            infer_bound_dt=True,
+            extra=extra,
+            callbacks=callbacks,
+            callback_state=callback_state,
+        )
+    if any(
+        value is not None
+        for value in (steps, duration, checkpoint_every, host_span_steps)
+    ):
+        raise ValueError(
+            "steps, duration and span options require run(bound, state, ...)"
+        )
+    if step is _MISSING or state is _MISSING:
+        raise TypeError("legacy run requires functional, step and state")
+    return _run_schedule(
+        functional,
+        step,
+        state,
+        inputs,
+        duration=tstop,
+        dt=dt,
+        legacy_input_horizon=True,
+        duration_name="tstop",
+        extra=extra,
+        callbacks=callbacks,
+        callback_state=callback_state,
+    )
+
+
+def longrun(
+    functional: FunctionalPopulation,
+    step: _StepCallable,
+    state,
+    tstop: float,
+    chunklength: int,
+    inputs: RolloutInput | None = None,
+    *,
+    dt: float | None = None,
+    extra=None,
+    callbacks: FunctionalCallbacks | None = None,
+    callback_state=None,
+):
+    """Run a duration in host spans, preserving the legacy calling convention.
+
+    ``tstop`` is a duration to advance; supplied drives must match the resolved
+    number of steps. ``chunklength`` sets host grouping independently of compiled
+    kernel width. Exact bindings from ``bind`` and existing partial forms are
+    accepted. The default timestep is the functional plan's nominal timestep.
+    New code can use ``run(bound, state, duration=..., host_span_steps=...)``.
+    """
+    return _run_schedule(
+        functional,
+        step,
+        state,
+        inputs,
+        duration=tstop,
+        span=_validate_chunklength(chunklength),
+        dt=dt,
+        duration_name="tstop",
+        extra=extra,
+        callbacks=callbacks,
+        callback_state=callback_state,
+    )
+
+
+def longrun_checkpointed(
+    functional: FunctionalPopulation,
+    step: _StepCallable,
+    state,
+    tstop: float,
+    chunklength: int,
+    inputs: RolloutInput | None = None,
+    *,
+    dt: float | None = None,
+    extra=None,
+    callbacks: FunctionalCallbacks | None = None,
+    callback_state=None,
+):
+    """Run a duration with non-reentrant activation checkpointing.
+
+    This preserves the legacy horizon, timestep and chunklength conventions.
+    New code can use ``run(bound, state, duration=..., checkpoint_every=...)``.
+    Steps and callbacks must be pure, deterministic and replay-safe. Gradients
+    span the full simulation; replay reuses and revalidates prepared inputs.
+    With gradients disabled, ordinary execution uses the same host spans.
+    """
+    return _run_schedule(
+        functional,
+        step,
+        state,
+        inputs,
+        duration=tstop,
+        span=_validate_chunklength(chunklength),
+        checkpointed=True,
+        dt=dt,
+        duration_name="tstop",
+        extra=extra,
+        callbacks=callbacks,
+        callback_state=callback_state,
+    )
 
 
 __all__ = ["longrun", "longrun_checkpointed", "run"]
