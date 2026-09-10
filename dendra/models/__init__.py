@@ -1,7 +1,15 @@
 from .backend import Backend
 
 # from ._core import Axon
-from .core import Axon, Cable, Myelinated, Population, SingleCompartment, Unmyelinated
+from .core import (
+    Axon,
+    Cable,
+    Myelinated,
+    Population,
+    SingleCompartment,
+    Unmyelinated,
+    passive_end_nodes_,
+)
 from .distributions import *
 from .extcell import ExtCellAxon, ExtCellTree
 from .intrinsic import insert_intrinsic_activity, remove_intrinsic_activity

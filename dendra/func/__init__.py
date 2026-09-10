@@ -1,5 +1,6 @@
 """Functional transforms for explicit-state Dendra Population execution."""
 
+from ._binding import BoundPopulation
 from ._callbacks import (
     AnomalyDetector,
     APCount,
@@ -11,6 +12,7 @@ from ._callbacks import (
     Recorder,
 )
 from ._compiled import CompiledPopulationChunk
+from ._execution import ExecutionCapabilities, ExecutionReport
 from ._population import FunctionalPopulation, make_functional
 from ._runners import longrun, longrun_checkpointed, run
 from ._stimuli import FunctionalExtra, FunctionalIntra, StimulusTensors
@@ -25,7 +27,10 @@ from ._types import (
 __all__ = [
     "APCount",
     "AnomalyDetector",
+    "BoundPopulation",
     "CompiledPopulationChunk",
+    "ExecutionCapabilities",
+    "ExecutionReport",
     "FunctionalCallback",
     "FunctionalCallbackResults",
     "FunctionalCallbackState",

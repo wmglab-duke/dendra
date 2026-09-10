@@ -2,6 +2,7 @@
 
 import itertools
 import math
+from dataclasses import dataclass
 from numbers import Integral
 from types import MethodType
 from typing import Callable, Union
@@ -33,6 +34,29 @@ from .random_parameters import (
 from .rng import RNGModule
 
 _valid_param_type = Union[float, torch.Tensor, torch.nn.Parameter, torch.nn.Module]
+
+
+@dataclass(frozen=True)
+class _ReplicaRangeValue:
+    """Explicit replica axes followed by one value per selected RANGE slot."""
+
+    value: torch.Tensor
+
+    def __post_init__(self):
+        if not torch.is_tensor(self.value) or self.value.ndim < 1:
+            raise TypeError("replica RANGE values must be tensors with a slot axis")
+
+
+@dataclass(frozen=True)
+class _ReplicaRangeExpander:
+    slot_count: int
+
+    def __call__(self, value, replica_shape):
+        if value.shape[-1] != self.slot_count:
+            raise ValueError("replica RANGE value does not match its selected slots")
+        return torch.broadcast_to(value, (*replica_shape, self.slot_count)).reshape(
+            -1, self.slot_count
+        )
 
 
 def to_param(
@@ -2838,6 +2862,7 @@ class Parameterized(SimpleParameterized):
 
         self.keys = {}
         self.additional_parameters = {}
+        self._replica_range_fields = set()
         self.instantiate_global(**self.globals)
         self.instantiate_global(positive=True, **self.globals_p)
         self.instantiate_global(negative=True, **self.global_n)
@@ -2851,6 +2876,11 @@ class Parameterized(SimpleParameterized):
         self.instantiate_random_parameters(**self.random_parameters)
         self.instantiate_runtime_noises(**self.runtime_noises)
         self.instantiate_additional_parameters(additional_parameters)
+
+    def __setstate__(self, state):
+        """Keep historical shared RANGE fields shared after deserialization."""
+        state.setdefault("_replica_range_fields", set())
+        super().__setstate__(state)
 
     def reshape(self, shape_p, shape_f):
         """
@@ -2871,6 +2901,8 @@ class Parameterized(SimpleParameterized):
         self.instantiate_batch(**self.batch_t)
         self.instantiate_batch(positive=True, **self.batch_p)
         self.instantiate_batch(negative=True, **self.batch_n)
+        for name in self._replica_range_fields:
+            setattr(self, name, getattr(self, name).expand(self.shape_f).clone())
         self.instantiate_random_parameters(**self.random_parameters)
         self.instantiate_runtime_noises(**self.runtime_noises)
 
@@ -3227,6 +3259,26 @@ class Parameterized(SimpleParameterized):
                 is_batch = (
                     name in self.batch_t or name in self.batch_p or name in self.batch_n
                 )
+                if any(
+                    isinstance(record[1], _ReplicaRangeValue)
+                    for record in list_of_aliases_values_and_keys
+                ):
+                    if not is_range or bounded:
+                        raise ValueError(
+                            "replica overrides require an unbounded RANGE parameter"
+                        )
+                    if any(
+                        isinstance(record[1], torch.nn.Module)
+                        for record in list_of_aliases_values_and_keys
+                    ):
+                        raise ValueError(
+                            "replica RANGE overrides cannot be combined with "
+                            "module-valued regional overrides"
+                        )
+                    self._replica_range_fields.add(name)
+                    setattr(
+                        self, name, getattr(self, name).expand(self.shape_f).clone()
+                    )
                 if is_range or is_batch:
                     count = 0
                     keys = []
@@ -3250,6 +3302,17 @@ class Parameterized(SimpleParameterized):
                         context = f"parameter {name!r}"
                         if alias is not None:
                             context += f" for insertion alias {alias!r}"
+                        replica_value = isinstance(value, _ReplicaRangeValue)
+                        if replica_value:
+                            value = value.value
+                            if logical_shape is not None:
+                                raise ValueError(
+                                    "replica RANGE overrides do not support copied slots"
+                                )
+                            if key.numel() == 0 or value.shape[-1] != key.numel():
+                                raise ValueError(
+                                    "replica RANGE value does not match its selected slots"
+                                )
                         parameter = to_param(
                             value,
                             positive=positive,
@@ -3292,12 +3355,16 @@ class Parameterized(SimpleParameterized):
                                 p = parameter()
                             else:
                                 p = parameter
-                            fill = create_param_expander(
-                                p,
-                                key,
-                                param_shape,
-                                logical_shape=range_logical_shape,
-                                context=context,
+                            fill = (
+                                _ReplicaRangeExpander(key.numel())
+                                if replica_value
+                                else create_param_expander(
+                                    p,
+                                    key,
+                                    param_shape,
+                                    logical_shape=range_logical_shape,
+                                    context=context,
+                                )
                             )
                             self.additional_parameters.setdefault(name, []).append(
                                 # Retain the stable registered slot rather than
@@ -3311,12 +3378,50 @@ class Parameterized(SimpleParameterized):
                     if keys:
                         self.keys[name] = torch.cat(keys).to(torch.long)
 
+    def _replica_range_layout(self):
+        """Return current replica axes and the shared spatial slot count."""
+        support = getattr(self, "support_spec", None)
+        if support is None:
+            raise ValueError(
+                "replica RANGE overrides require mechanism support metadata"
+            )
+        local_shape = tuple(support.runtime_local_shape)
+        if tuple(self.shape_f[-len(local_shape) :]) != local_shape:
+            raise ValueError("replica RANGE support does not match the mechanism shape")
+        return tuple(self.shape_f[: -len(local_shape)]), math.prod(local_shape)
+
+    def _scatter_replica_range_values(self, name, value, sources):
+        replica_shape, spatial_slots = self._replica_range_layout()
+        rows = math.prod(replica_shape)
+        additions = []
+        for (fill, _parameter), source in zip(
+            self.additional_parameters[name], sources, strict=True
+        ):
+            if isinstance(fill, _ReplicaRangeExpander):
+                addition = fill(source, replica_shape)
+            else:
+                addition = fill(source).reshape(1, -1).expand(rows, -1)
+            additions.append(addition)
+        additional = torch.cat(additions, dim=1).to(
+            device=value.device, dtype=value.dtype
+        )
+        key = self.keys[name].to(device=value.device)
+        return (
+            value.reshape(rows, spatial_slots)
+            .index_copy(1, key, additional)
+            .reshape(value.shape)
+        )
+
     def load_additional_parameters(self):
         """
         Scatter alias-specific parameter overrides into their buffers.
         """
         for name, list_of_parameters in self.additional_parameters.items():
             buffer = getattr(self, name)
+            if name in self._replica_range_fields:
+                sources = [self.resolve(p) for _fill, p in list_of_parameters]
+                buffer.copy_(self._scatter_replica_range_values(name, buffer, sources))
+                continue
             additional_params = torch.cat(
                 [fill(self.resolve(p)) for fill, p in list_of_parameters]
             ).to(device=buffer.device, dtype=buffer.dtype)
@@ -3366,6 +3471,10 @@ class Parameterized(SimpleParameterized):
             return self.parametrize(
                 name, value, key=torch.arange(math.prod(self.shape_p)), alias=alias
             )
+        if name in self._replica_range_fields and isinstance(value, torch.nn.Module):
+            raise ValueError(
+                "replica RANGE fields do not support module-valued regional overrides"
+            )
         is_range = name in self.range or name in self.range_p or name in self.range_n
         is_batch = name in self.batch_t or name in self.batch_p or name in self.batch_n
         if not (is_range or is_batch):
@@ -3387,6 +3496,15 @@ class Parameterized(SimpleParameterized):
                     f"Parameter override '{p_name}' already exists. Choose a different alias."
                 )
             key = torch.as_tensor(key, dtype=torch.long)
+            if name in self._replica_range_fields:
+                _replica_shape, spatial_slots = self._replica_range_layout()
+                target_slots = getattr(self, name).numel()
+                if torch.any(key < 0) or torch.any(key >= target_slots):
+                    raise IndexError("replica RANGE override key is out of bounds")
+                # Slice parameter keys may include replica offsets; ordinary
+                # regional overrides keep their shared physical-support rule.
+                physical = torch.remainder(key, spatial_slots).detach().cpu().tolist()
+                key = torch.tensor(list(dict.fromkeys(physical)), dtype=torch.long)
             main_shape = self._batch_main_shape() if is_batch else self.shape_p[-2:]
             empty_shape = self._batch_shape() if is_batch else self.shape_p
             if is_batch:
@@ -3533,7 +3651,16 @@ class Parameterized(SimpleParameterized):
                     if isinstance(source, cacheable)
                     else resolve(source)
                 )
-                additional_values.append(fill(source_value))
+                additional_values.append(
+                    source_value
+                    if name in self._replica_range_fields
+                    else fill(source_value)
+                )
+            if name in self._replica_range_fields:
+                values[name] = self._scatter_replica_range_values(
+                    name, value, additional_values
+                )
+                continue
             additional = torch.cat(additional_values).to(
                 device=value.device,
                 dtype=value.dtype,

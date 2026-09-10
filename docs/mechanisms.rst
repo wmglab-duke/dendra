@@ -55,6 +55,40 @@ support.  The inverse operations are:
 For example, an active region can be converted to a passive-only region with
 ``region.delete_all()`` followed by ``region.insert(pas, ...)``.
 
+To make the ends of a Cable passive, use ``dn.passive_end_nodes_(cable, n=2)``.
+It replaces every mechanism on the first and last two compartments with ``pas``
+at ``g=1e-4`` S/cm². Omitting ``n`` selects one compartment at each end.
+The reversal defaults to each compartment's initial voltage; supply ``e`` to
+choose another value in mV. The helper also sets ``rhoa=1e10`` ohm cm and
+``cm=1.0`` µF/cm² by default. Supply other values, or pass ``None`` to preserve
+either material property. A Slice selects its own local ends:
+
+.. code-block:: python
+
+   dn.passive_end_nodes_(cable[..., 10:40], n=2, e=-65.0)
+   cable.initialize()
+
+``e`` follows PyTorch broadcasting against the **root Cable's** voltage shape
+``(*batch, N, C)``, including when passing a Slice. A scalar applies everywhere;
+``(N, 1)`` varies by cell, ``(C,)`` varies by compartment, and
+``(*batch, 1, 1)`` varies by batch replica. Only the selected ends are changed.
+For example, starting with an unbatched cable:
+
+.. code-block:: python
+
+   cable.batch_(2)
+   reversals = torch.tensor([-70.0, -65.0])[:, None, None]
+   dn.passive_end_nodes_(cable, e=reversals)
+   cable.initialize()
+
+``e=None`` uses ``v_init``, including any differences between replicas.
+Mechanism placement is shared across replicas even if the input Slice selects
+only one replica; the full ``e`` field supplies each replica's reversal.
+Overlapping end regions are configured once; ``n=0`` and empty regions do
+nothing. For a native morphology-compiled Cable, pass ``rhoa=None``: its
+resistivity is fixed by the source morphology and must be changed there before
+constructing a new Cable.
+
 By default, restricted ``delete`` removes the physical intersection with the
 exact class's current support.  Pass ``strict=True`` to require every selected
 compartment to host that class; a mismatch then fails atomically.  Deletion

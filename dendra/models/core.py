@@ -83,7 +83,7 @@ from dendra.models.mechanisms._support import SupportKind, SupportSpec
 from dendra.models.mechanisms.validate import validate
 from dendra.models.modular import matches_any_pattern
 from dendra.models.parametric import Parameterized as P
-from dendra.models.parametric import create_param_expander
+from dendra.models.parametric import _ReplicaRangeValue, create_param_expander
 from dendra.models.rng import _validate_rng_checkpoint_payload
 from dendra.models.stim.intra import Intra
 from dendra.models.stim.waveform import Waveform
@@ -367,6 +367,13 @@ def _project_indexed_override(
         )
     if bool(torch.all(keep_mask)):
         return value
+
+    if isinstance(value, _ReplicaRangeValue):
+        if value.value.shape[-1] != old_core_indices.numel():
+            raise ValueError(f"{context}: replica parameter and support disagree.")
+        return _ReplicaRangeValue(
+            value.value[..., keep_mask.to(value.value.device)].clone()
+        )
 
     if isinstance(value, torch.nn.Module):
         raise ValueError(
@@ -10135,3 +10142,108 @@ def compile_mechanism(
     )
 
     return m, shape_p, total_index
+
+
+def passive_end_nodes_(
+    model: Cable | Slice, n: int = 1, rhoa=1e10, cm=1.0, *, e=None
+) -> None:
+    """Replace both ends of a cable region with passive membrane mechanisms.
+
+    Select the first and last ``n`` entries of the target's final axis. For a
+    Slice these are its local ends, in its selected order. Overlapping ends and
+    repeated physical compartments are configured only once; ``n=0`` and empty
+    targets are no-ops. A scalar Slice selects its single compartment.
+
+    Every mechanism on the selected support is removed and replaced by ``pas``
+    with ``g=1e-4`` S/cm². ``e=None`` uses each compartment's initial voltage;
+    otherwise ``e`` is a reversal in mV broadcastable to the root Cable's full
+    voltage shape ``(*batch, N, C)``. Values always use root coordinates, even
+    for a Slice. Use ``(N, 1)`` for per-cell values or ``(*batch, 1, 1)`` for
+    per-replica values. Only selected compartments receive the override.
+
+    ``rhoa`` (ohm cm) and ``cm`` (µF/cm²) overrides default to ``1e10`` and ``1``;
+    pass ``None`` to leave either property unchanged. Native morphology-compiled
+    Cables require ``rhoa=None`` because their compiled resistivity is immutable.
+
+    Mechanism placement is shared by all batch replicas, including when the
+    Slice selects one replica; reversal values may differ across replicas.
+    Call ``model.initialize()`` (or ``slice.model.initialize()``) before running
+    the modified population. The target's initial voltage and current state
+    are not reset by this helper.
+    """
+    from dendra.models.mod import pas
+
+    if not isinstance(model, (Cable, Slice)):
+        raise TypeError("model must be a Cable or a Slice of a Cable")
+    root = model.model if isinstance(model, Slice) else model
+    if not isinstance(root, Cable):
+        raise TypeError("model must be a Cable or a Slice of a Cable")
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise TypeError("n must be a non-negative integer")
+    if n < 0:
+        raise ValueError("n must be a non-negative integer")
+    region = model if isinstance(model, Slice) else model[...]
+    if n == 0 or region.is_empty:
+        return
+    if region.is_scalar:
+        ends = region
+    else:
+        count = region.shape[-1]
+        positions = torch.arange(count, device=root.device())
+        ends = region[..., (positions < n) | (positions >= count - n)]
+
+    # Sparse insertion compiles a sorted physical union. Canonicalize the
+    # selection too, so each reversal stays paired with its compartment even
+    # when the input Slice is reordered or repeats locations.
+    core_shape = tuple(root.core_shape())
+    core_indices = _sorted_unique_long(
+        _core_flat_indices(ends._core_index_spec(), core_shape)
+    )
+    core_key = _core_key_from_flat(core_indices, core_shape)
+    ends = root[(Ellipsis, *core_key)]
+    source = torch.as_tensor(
+        root.v_init if e is None else e, device=root.device(), dtype=root.dtype()
+    )
+    if e is None:
+        field = root.expanded_v_init()
+    else:
+        try:
+            field = torch.broadcast_to(source, tuple(root.shape))
+        except RuntimeError as error:
+            raise ValueError(
+                f"e with shape {tuple(source.shape)} must be broadcastable to "
+                f"the root Cable voltage shape {tuple(root.shape)}. Use "
+                "(N, 1) for per-cell or (*batch, 1, 1) for per-replica values."
+            ) from error
+    selected = field[(Ellipsis, *core_key)]
+    source_shape = (1,) * (len(root.shape) - source.ndim) + tuple(source.shape)
+    # Preserve authored replica axes even when their initial values coincide:
+    # these become independent registered parameter entries during preparation.
+    if any(size > 1 for size in source_shape[:-2]):
+        reversal = _ReplicaRangeValue(selected)
+    else:
+        reversal = selected.reshape(-1, core_indices.numel())[0]
+    if rhoa is not None and root._compartment_graph is not None:
+        raise ValueError(
+            "Native Cable resistivity is immutable; pass rhoa=None to preserve "
+            "it, or edit the Morphology and construct a new Cable"
+        )
+
+    ends.delete_all()
+    if pas in root._mech_everywhere:
+        # Partial deletion keeps an everywhere record with exclusions. Convert
+        # the surviving passive support to an equivalent sparse record before
+        # adding the new ends; mixed everywhere/sparse insertion is disallowed.
+        remaining = root._mechanism_support_flat(pas)
+        _, initial_conditions, parameters = root._mech_everywhere.pop(pas)
+        root._mech_exclusions.pop(pas, None)
+        root._mech_data[pas] = [
+            (None, parameters, _core_key_from_flat(remaining, core_shape), False, 1)
+        ]
+        if initial_conditions is not None:
+            root._mech_data_ic[pas] = initial_conditions
+    ends.insert(pas, g=1e-4, e=reversal)
+    if rhoa is not None:
+        ends.parametrize("rhoa", rhoa)
+    if cm is not None:
+        ends.parametrize("cm", cm)

@@ -7,6 +7,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ._execution import (
+    ExecutionCapabilities,
+    ExecutionReport,
+    _backend_name,
+    _capabilities,
+    _ExecutionReportState,
+)
 from ._lowered import (
     _LoweredCallbackPopulationChunk,
     _LoweredPopulationChunk,
@@ -38,8 +45,17 @@ class CompiledPopulationChunk:
         *,
         steps: int,
         compile_options: dict,
+        execution: str = "default",
         _stepwise_stimulation: bool = False,
+        _report_state: _ExecutionReportState | None = None,
     ):
+        if execution not in ("default", "scan"):
+            raise ValueError("execution must be 'default' or 'scan'")
+        self._execution = execution
+        self._capabilities = _capabilities(execution)
+        self._report_state = (
+            _ExecutionReportState() if _report_state is None else _report_state
+        )
         self._lowered = _LoweredPopulationChunk(
             functional,
             steps=steps,
@@ -65,12 +81,43 @@ class CompiledPopulationChunk:
         # the weak key, so dropping that collection also releases its kernels.
         self._callback_chunks = weakref.WeakKeyDictionary()
 
-        self._compiled = torch.compile(self._lowered, **options)
+        if execution == "scan":
+            from ._scan import _CompiledScanPopulationChunk
+
+            self._compiled = _CompiledScanPopulationChunk(
+                functional,
+                steps=steps,
+                compile_options=options,
+                stepwise_stimulation=_stepwise_stimulation,
+            )
+        else:
+            self._compiled = torch.compile(self._lowered, **options)
 
     @property
     def steps(self) -> int:
         """The exact number of timesteps consumed by each invocation."""
         return self._steps
+
+    @property
+    def capabilities(self) -> ExecutionCapabilities:
+        """The immutable execution and differentiation contract for this kernel."""
+        return self._capabilities
+
+    def execution_report(self) -> ExecutionReport | None:
+        """Return the last successful dispatch, including tails and replay.
+
+        Returns ``None`` before any call completes. The report covers one kernel
+        invocation, not an entire run; checkpoint backward can replace it.
+        """
+        return self._report_state.report
+
+    def bind(self, parameters, prepared):
+        """Bind live parameters and preparation to this reusable kernel."""
+        from ._binding import BoundPopulation
+
+        return BoundPopulation(
+            self._functional, parameters, prepared, compiled_chunk=self
+        )
 
     def _runner_chunk(self, steps: int) -> CompiledPopulationChunk:
         """Reuse a host-compatible specialization with these compile options."""
@@ -88,7 +135,9 @@ class CompiledPopulationChunk:
                 self._functional,
                 steps=steps,
                 compile_options=self._compile_options,
+                execution=self._execution,
                 _stepwise_stimulation=stepwise_stimulation,
+                _report_state=self._report_state,
             )
         return self._runner_chunks[steps]
 
@@ -100,18 +149,76 @@ class CompiledPopulationChunk:
         # tensor-only transition is already transform-safe in eager mode, so
         # preserve vmap/jacrev/jacfwd and dual-tensor semantics without
         # attempting nested compilation.
+        transform_active = torch._C._are_functorch_transforms_active()
+        forward_ad_active = torch.autograd.forward_ad._current_level >= 0
+        grad_enabled = torch.is_grad_enabled()
+        if transform_active or forward_ad_active:
+            result = self._lowered(*operands)
+            strategy = (
+                "eager_transform_fallback"
+                if transform_active
+                else "eager_forward_ad_fallback"
+            )
+            self._record_execution(strategy, grad_enabled=grad_enabled)
+            return result
         if (
-            torch._C._are_functorch_transforms_active()
-            or torch.autograd.forward_ad._current_level >= 0
+            self._execution == "default"
+            and prewarm_structured
+            and not torch.is_grad_enabled()
         ):
-            return self._lowered(*operands)
-        if prewarm_structured and not torch.is_grad_enabled():
             functional = self._functional
             functional._ensure_structured_step_graph(
                 operands.ve is not None or functional.extra.enabled,
                 operands.intra is not None or functional.intra.enabled,
             )
-        return self._compiled(*operands)
+        strategy, reason = self._compiled_strategy(operands, grad_enabled)
+        result = self._compiled(*operands)
+        self._record_execution(strategy, grad_enabled=grad_enabled, reason=reason)
+        return result
+
+    def _compiled_strategy(self, operands, grad_enabled):
+        """Mirror the lowered inference dispatch without inspecting live graphs."""
+        if self._compile_options.get("disable", False):
+            return "eager_disabled", "Compilation was explicitly disabled."
+        if self._execution == "scan":
+            return "compiled_scan", None
+        if grad_enabled:
+            return (
+                "compiled_unrolled",
+                "Gradient recording uses the unrolled recurrence.",
+            )
+        if self._lowered._stepwise_stimulation:
+            return (
+                "compiled_unrolled",
+                "Bound waveforms are sampled at each accepted timestep.",
+            )
+        # Keep the threshold identical to the actual loop body. A prewarmed
+        # one-/two-/three-step call executes only the unrolled tail.
+        from ._population import _STRUCTURED_ROLLOUT_CHUNK
+
+        if self._steps < _STRUCTURED_ROLLOUT_CHUNK:
+            return (
+                "compiled_unrolled",
+                "The chunk is shorter than one inference loop block.",
+            )
+        signature = (
+            operands.ve is not None or self._functional.extra.enabled,
+            operands.intra is not None or self._functional.intra.enabled,
+        )
+        if signature in self._functional._structured_step_graphs:
+            return "compiled_while_loop", None
+        return "compiled_unrolled", "No captured inference step graph is available."
+
+    def _record_execution(self, strategy, *, grad_enabled, reason=None):
+        self._report_state.report = ExecutionReport(
+            requested_execution=self._execution,
+            strategy=strategy,
+            steps=self._steps,
+            callbacks=False,
+            grad_enabled=grad_enabled,
+            backend=_backend_name(self._compile_options),
+            reason=reason,
+        )
 
     def _runner_callback_chunk(self, callbacks, steps: int):
         """Cache a joint transition/reducer kernel for one plan and width."""
@@ -124,6 +231,8 @@ class CompiledPopulationChunk:
                 steps=steps,
                 plans=callbacks._plans,
                 compile_options=self._compile_options,
+                execution=self._execution,
+                report_state=self._report_state,
             )
         return kernels[steps]
 
@@ -218,20 +327,68 @@ class CompiledPopulationChunk:
 class _CompiledCallbackPopulationChunk:
     """Runner-owned tensor boundary for a joint model/callback recurrence."""
 
-    def __init__(self, functional, *, steps, plans, compile_options):
+    def __init__(
+        self,
+        functional,
+        *,
+        steps,
+        plans,
+        compile_options,
+        execution="default",
+        report_state,
+    ):
+        self._execution = execution
+        self._steps = steps
+        self._compile_options = compile_options
+        self._report_state = report_state
         self._lowered = _LoweredCallbackPopulationChunk(
             functional, steps=steps, plans=plans
         )
-        self._compiled = torch.compile(self._lowered, **compile_options)
+        if execution == "scan":
+            from ._scan import _CompiledScanPopulationChunk
+
+            self._compiled = _CompiledScanPopulationChunk(
+                functional,
+                steps=steps,
+                plans=plans,
+                compile_options=compile_options,
+            )
+        else:
+            self._compiled = torch.compile(self._lowered, **compile_options)
 
     def _rollout_values(self, parameters, prepared, state, inputs, carries):
         operands = (parameters, prepared, state, inputs.ve, inputs.intra, carries)
-        if (
-            torch._C._are_functorch_transforms_active()
-            or torch.autograd.forward_ad._current_level >= 0
-        ):
-            return self._lowered(*operands)
-        return self._compiled(*operands)
+        transform_active = torch._C._are_functorch_transforms_active()
+        forward_ad_active = torch.autograd.forward_ad._current_level >= 0
+        grad_enabled = torch.is_grad_enabled()
+        reason = None
+        if transform_active or forward_ad_active:
+            result = self._lowered(*operands)
+            strategy = (
+                "eager_transform_fallback"
+                if transform_active
+                else "eager_forward_ad_fallback"
+            )
+        else:
+            result = self._compiled(*operands)
+            if self._compile_options.get("disable", False):
+                strategy = "eager_disabled"
+                reason = "Compilation was explicitly disabled."
+            elif self._execution == "scan":
+                strategy = "compiled_scan"
+            else:
+                strategy = "compiled_unrolled"
+                reason = "Callback updates use the unrolled recurrence."
+        self._report_state.report = ExecutionReport(
+            requested_execution=self._execution,
+            strategy=strategy,
+            steps=self._steps,
+            callbacks=True,
+            grad_enabled=grad_enabled,
+            backend=_backend_name(self._compile_options),
+            reason=reason,
+        )
+        return result
 
 
 __all__ = ["CompiledPopulationChunk"]

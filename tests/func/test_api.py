@@ -132,8 +132,11 @@ def test_func_namespace_exports_the_functional_population_api():
     assert "func" in dn.__all__
     assert set(dn.func.__all__) == {
         "APCount",
+        "BoundPopulation",
         "CompiledPopulationChunk",
         "AnomalyDetector",
+        "ExecutionCapabilities",
+        "ExecutionReport",
         "FunctionalCallback",
         "FunctionalCallbackResults",
         "FunctionalCallbackState",
