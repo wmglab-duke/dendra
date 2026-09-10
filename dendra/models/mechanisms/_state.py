@@ -2297,7 +2297,7 @@ class State(Parameterized):
         if not self._assigned and not self._has_authored_assigned_values:
             return {}
         outputs = self.assigned_values(v, values)
-        if not self._assigned_schema_validated and not torch.compiler.is_compiling():
+        if not torch.compiler.is_compiling() and not self._assigned_schema_validated:
             _validate_runtime_outputs(
                 self,
                 "assigned_values",
@@ -2322,9 +2322,9 @@ class State(Parameterized):
         """Evaluate State advance and validate custom output structure once."""
         outputs = self.advance(v, dt, values)
         if (
-            self._has_authored_advance
+            not torch.compiler.is_compiling()
+            and self._has_authored_advance
             and not self._advance_schema_validated
-            and not torch.compiler.is_compiling()
         ):
             references = {name: values[name] for name in self._state}
             references.update({name: getattr(self, name) for name in self._carry})

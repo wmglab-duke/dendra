@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from ._lowered import _LoweredPopulationChunk, _PopulationChunkOperands
+from ._lowered import (
+    _LoweredCallbackPopulationChunk,
+    _LoweredPopulationChunk,
+    _PopulationChunkOperands,
+)
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
 if TYPE_CHECKING:
@@ -34,8 +38,13 @@ class CompiledPopulationChunk:
         *,
         steps: int,
         compile_options: dict,
+        _stepwise_stimulation: bool = False,
     ):
-        self._lowered = _LoweredPopulationChunk(functional, steps=steps)
+        self._lowered = _LoweredPopulationChunk(
+            functional,
+            steps=steps,
+            stepwise_stimulation=_stepwise_stimulation,
+        )
         self._functional = functional
         self._steps = self._lowered.steps
         # A preparation can own an autograd graph derived from parameters and
@@ -47,6 +56,14 @@ class CompiledPopulationChunk:
         options.setdefault("fullgraph", True)
         options.setdefault("dynamic", False)
         self._compile_options = options
+        # Host schedules may end at a shorter tail. Cache only kernels here,
+        # never bound parameters or preparation, so optimization graphs retain
+        # their ordinary lifetime.
+        self._runner_chunks: dict[int, CompiledPopulationChunk] = {}
+        # A transient callback plan may own a large immutable target trace.
+        # Lowerers retain its static entries, never the collection used here as
+        # the weak key, so dropping that collection also releases its kernels.
+        self._callback_chunks = weakref.WeakKeyDictionary()
 
         self._compiled = torch.compile(self._lowered, **options)
 
@@ -54,6 +71,26 @@ class CompiledPopulationChunk:
     def steps(self) -> int:
         """The exact number of timesteps consumed by each invocation."""
         return self._steps
+
+    def _runner_chunk(self, steps: int) -> CompiledPopulationChunk:
+        """Reuse a host-compatible specialization with these compile options."""
+        stepwise_stimulation = steps > 1 and (
+            self._functional.intra.enabled or self._functional.extra.enabled
+        )
+        if steps == self._steps and (
+            not stepwise_stimulation or self._lowered._stepwise_stimulation
+        ):
+            return self
+        if not 1 <= steps <= self._steps:
+            raise ValueError("runner chunk steps must be between 1 and chunk.steps")
+        if steps not in self._runner_chunks:
+            self._runner_chunks[steps] = CompiledPopulationChunk(
+                self._functional,
+                steps=steps,
+                compile_options=self._compile_options,
+                _stepwise_stimulation=stepwise_stimulation,
+            )
+        return self._runner_chunks[steps]
 
     def _execute_operands(self, operands, *, prewarm_structured: bool):
         """Execute validated tensor operands through the owned kernel."""
@@ -76,11 +113,25 @@ class CompiledPopulationChunk:
             )
         return self._compiled(*operands)
 
+    def _runner_callback_chunk(self, callbacks, steps: int):
+        """Cache a joint transition/reducer kernel for one plan and width."""
+        if not 1 <= steps <= self._steps:
+            raise ValueError("runner chunk steps must be between 1 and chunk.steps")
+        kernels = self._callback_chunks.setdefault(callbacks, {})
+        if steps not in kernels:
+            kernels[steps] = _CompiledCallbackPopulationChunk(
+                self._functional,
+                steps=steps,
+                plans=callbacks._plans,
+                compile_options=self._compile_options,
+            )
+        return kernels[steps]
+
     def _step_values(self, parameters, prepared, state, inputs: StepInput):
         """Execute one runner-validated frame without public Python checks."""
-        if self._steps != 1:  # Defensive: runner recognition also enforces this.
+        if self._steps != 1:
             raise FunctionalizationError(
-                "host schedulers require a one-step CompiledPopulationChunk"
+                "one-step execution requires a CompiledPopulationChunk with steps=1"
             )
         operands = _PopulationChunkOperands(
             parameters,
@@ -92,6 +143,20 @@ class CompiledPopulationChunk:
         # A one-step kernel has no large rollout graph to bound, so the
         # inference-only structured prewarm is unnecessary in this hot path.
         return self._execute_operands(operands, prewarm_structured=False)
+
+    def _rollout_values(self, parameters, prepared, state, inputs: RolloutInput):
+        """Execute one runner-validated fixed chunk without public tree checks."""
+        operands = _PopulationChunkOperands(
+            parameters,
+            prepared,
+            state,
+            inputs.ve,
+            inputs.intra,
+        )
+        return self._execute_operands(
+            operands,
+            prewarm_structured=self._steps > 1,
+        )
 
     def __call__(
         self,
@@ -148,6 +213,25 @@ class CompiledPopulationChunk:
             intra,
         )
         return self._execute_operands(operands, prewarm_structured=True)
+
+
+class _CompiledCallbackPopulationChunk:
+    """Runner-owned tensor boundary for a joint model/callback recurrence."""
+
+    def __init__(self, functional, *, steps, plans, compile_options):
+        self._lowered = _LoweredCallbackPopulationChunk(
+            functional, steps=steps, plans=plans
+        )
+        self._compiled = torch.compile(self._lowered, **compile_options)
+
+    def _rollout_values(self, parameters, prepared, state, inputs, carries):
+        operands = (parameters, prepared, state, inputs.ve, inputs.intra, carries)
+        if (
+            torch._C._are_functorch_transforms_active()
+            or torch.autograd.forward_ad._current_level >= 0
+        ):
+            return self._lowered(*operands)
+        return self._compiled(*operands)
 
 
 __all__ = ["CompiledPopulationChunk"]

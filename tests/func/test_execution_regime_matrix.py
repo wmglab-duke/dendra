@@ -6,7 +6,7 @@ public execution policies which must continue to compose across every admitted
 operator family:
 
 * eager fixed-step rollout under ``torch.func`` transformations; and
-* a one-step compiled kernel inside an eager host loop using ordinary autograd.
+* fixed compiled chunks inside an eager host loop using ordinary autograd.
 """
 
 from __future__ import annotations
@@ -316,7 +316,9 @@ def test_eager_rollout_supports_torch_func_grad_and_hessian(case):
     assert torch.count_nonzero(hessian) > 0
 
 
-def _ordinary_gradient_run(functional, tensors, inputs, parameter_name, *, compiled):
+def _ordinary_gradient_run(
+    functional, tensors, inputs, parameter_name, *, compiled, compiled_steps=1
+):
     parameters: Mapping[str, torch.Tensor] = {
         name: value.detach().clone() for name, value in tensors.parameters.items()
     }
@@ -326,7 +328,7 @@ def _ordinary_gradient_run(functional, tensors, inputs, parameter_name, *, compi
     intra = inputs.intra.detach().clone().requires_grad_()
     prepared = functional.prepare(parameters, tensors.constants)
     if compiled:
-        kernel = functional.compile_rollout_chunk(1, backend="aot_eager")
+        kernel = functional.compile_rollout_chunk(compiled_steps, backend="aot_eager")
         step = partial(kernel, parameters, prepared)
     else:
         step = partial(functional.step, parameters, prepared)
@@ -348,7 +350,10 @@ def _ordinary_gradient_run(functional, tensors, inputs, parameter_name, *, compi
 
 
 @pytest.mark.parametrize("case", CASES)
-def test_compiled_one_step_host_loop_matches_eager_ordinary_bptt(case):
+@pytest.mark.parametrize("compiled_steps", [1, 2], ids=["width-1", "width-2"])
+def test_compiled_fixed_chunks_host_loop_matches_eager_ordinary_bptt(
+    case, compiled_steps
+):
     model = case.build()
     functional, tensors = dn.func.make_functional(model, dt=DT)
     inputs = _drives(model)
@@ -366,6 +371,7 @@ def test_compiled_one_step_host_loop_matches_eager_ordinary_bptt(case):
             inputs,
             case.parameter,
             compiled=True,
+            compiled_steps=compiled_steps,
         )
 
     _assert_tree_close(actual[0], expected[0])

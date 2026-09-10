@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
@@ -38,6 +38,7 @@ class _StepExecution:
     public_step: _StepCallable
     binding: _OwnedStepBinding | None = None
     prepared_values: Mapping[str, object] | None = None
+    compiled_chunks: Mapping[int, object] | None = None
 
     def __call__(self, state, inputs: StepInput):
         if self.binding is None:
@@ -49,7 +50,10 @@ class _StepExecution:
                 state,
                 inputs,
             )
-        return self.binding.compiled_chunk._step_values(
+        compiled_chunk = self.binding.compiled_chunk
+        if self.compiled_chunks is not None:
+            compiled_chunk = self.compiled_chunks[1]
+        return compiled_chunk._step_values(
             self.binding.parameters,
             self.prepared_values,
             state,
@@ -62,7 +66,7 @@ def _owned_step_binding(functional, step) -> _OwnedStepBinding | None:
 
     Wrapped callables and partial subclasses remain generic: bypassing an
     adapter whose invocation semantics we do not own would be unsafe. Exact
-    one-step :class:`CompiledPopulationChunk` instances are also owned and
+    :class:`CompiledPopulationChunk` instances are also owned and
     expose the same private tensor-only boundary. An explicit ``extra=None``
     is equivalent to the functional-step default; non-empty functional
     ``extra`` remains on the public path so its validation is unchanged.
@@ -89,7 +93,6 @@ def _owned_step_binding(functional, step) -> _OwnedStepBinding | None:
         not keywords
         and type(candidate) is CompiledPopulationChunk
         and candidate._functional is functional
-        and candidate.steps == 1
     ):
         return _OwnedStepBinding(
             functional,
@@ -113,6 +116,39 @@ def _prepare_step_execution(functional, step) -> _StepExecution:
     return _StepExecution(step, binding, prepared_values)
 
 
+def _prepare_compiled_schedule(execution, steps, chunklength, *, callbacks):
+    """Construct needed kernel specializations outside execution and replay.
+
+    Host/checkpoint boundaries remain authoritative. Within each such span,
+    consume full compiled chunks and at most one shorter tail. Callback kernels
+    include every per-step update and return explicit carry and stacked samples.
+    Empty schedules do not construct any new kernels.
+    """
+    binding = execution.binding
+    if steps == 0 or binding is None or binding.compiled_chunk is None:
+        return execution
+    chunk = binding.compiled_chunk
+    if chunk.steps == 1 and callbacks is None:
+        return execution
+    spans = {min(steps, chunklength)}
+    if steps % chunklength:
+        spans.add(steps % chunklength)
+    sizes = set()
+    for span in spans:
+        sizes.add(min(chunk.steps, span))
+        if span % chunk.steps:
+            sizes.add(span % chunk.steps)
+    kernels = {
+        size: (
+            chunk._runner_chunk(size)
+            if callbacks is None
+            else chunk._runner_callback_chunk(callbacks, size)
+        )
+        for size in sorted(sizes)
+    }
+    return replace(execution, compiled_chunks=kernels)
+
+
 def _refresh_checkpoint_execution(execution: _StepExecution, state) -> _StepExecution:
     """Revalidate captured bindings once for each checkpoint invocation.
 
@@ -132,11 +168,13 @@ def _refresh_checkpoint_execution(execution: _StepExecution, state) -> _StepExec
         binding.prepared,
         binding.parameters,
     )
-    return _StepExecution(execution.public_step, binding, prepared_values)
+    return replace(execution, prepared_values=prepared_values)
 
 
 def _inspect_step_callable(step):
     """Unwrap public callable adapters while retaining bound positional args."""
+    from ._compiled import CompiledPopulationChunk
+
     candidate = step
     bound_args = ()
     seen = set()
@@ -149,8 +187,17 @@ def _inspect_step_callable(step):
             candidate = candidate.func
             continue
         original = getattr(candidate, "_torchdynamo_orig_callable", None)
+        if original is None:
+            original = getattr(candidate, "__wrapped__", None)
         if original is not None:
             candidate = original
+            continue
+        owner = getattr(candidate, "__self__", None)
+        if (
+            isinstance(owner, CompiledPopulationChunk)
+            and getattr(candidate, "__func__", None) is CompiledPopulationChunk.__call__
+        ):
+            candidate = owner
             continue
         break
     return candidate, bound_args
@@ -174,10 +221,11 @@ def _validate_step_plan(functional, step) -> None:
             raise FunctionalizationError(
                 "step belongs to a different FunctionalPopulation plan"
             )
-        if candidate.steps != 1:
+        if candidate.steps != 1 and _owned_step_binding(functional, step) is None:
             raise FunctionalizationError(
-                "host schedulers require a one-step callable; bind a "
-                "CompiledPopulationChunk with steps=1"
+                "multi-step compiled chunks require the exact binding "
+                "functools.partial(chunk, parameters, prepared); other adapters "
+                "must expose a one-step callable"
             )
 
 
@@ -204,7 +252,6 @@ def _validate_visible_step_dt(
     elif (
         isinstance(candidate, CompiledPopulationChunk)
         and candidate._functional is functional
-        and candidate.steps == 1
         and len(bound_args) >= 2
     ):
         parameters, prepared = bound_args[:2]
@@ -471,6 +518,19 @@ def _validate_zero_step_extra(functional, plan, tensors, state, dt: float) -> No
 
 def _execute_steps(step, state, inputs: RolloutInput, steps: int):
     auxiliary = None
+    if isinstance(step, _StepExecution) and step.compiled_chunks is not None:
+        binding = step.binding
+        width = binding.compiled_chunk.steps
+        for start in range(0, steps, width):
+            stop = min(start + width, steps)
+            kernel = step.compiled_chunks[stop - start]
+            state, auxiliary = kernel._rollout_values(
+                binding.parameters,
+                step.prepared_values,
+                state,
+                _slice_inputs(inputs, start, stop),
+            )
+        return state, auxiliary
     for index in range(steps):
         result = step(
             state,
@@ -495,11 +555,31 @@ def _execute_steps_with_callbacks(
 ):
     """Advance one chunk while threading pure callback carry.
 
-    Emissions are accumulated in an ordinary host list and stacked once.  The
-    callback reducer itself is side-effect-free, so this complete function is
-    safe to replay inside non-reentrant activation checkpointing.
+    Compiled bindings execute joint model/callback chunks and concatenate their
+    emissions. Eager callables update carry per step and stack emissions once.
+    Both paths replay safely inside non-reentrant activation checkpointing.
     """
     auxiliary = None
+    if isinstance(step, _StepExecution) and step.compiled_chunks is not None:
+        binding = step.binding
+        width = binding.compiled_chunk.steps
+        parts = []
+        for start in range(0, steps, width):
+            stop = min(start + width, steps)
+            kernel = step.compiled_chunks[stop - start]
+            state, auxiliary, carries, emitted = kernel._rollout_values(
+                binding.parameters,
+                step.prepared_values,
+                state,
+                _slice_inputs(inputs, start, stop),
+                callback_state.carries,
+            )
+            callback_state = callbacks._wrap_compiled_update(
+                callback_state, carries, emitted
+            )
+            if callbacks._has_emissions(emitted):
+                parts.append(emitted)
+        return state, auxiliary, callback_state, callbacks._concatenate(parts)
     emissions = []
     for index in range(steps):
         result = step(
@@ -743,7 +823,10 @@ def run(
     ``tstop`` is required and represents a duration to advance.
 
     ``step`` has the canonical signature ``step(state, StepInput)`` and must be
-    one transition from this exact functional plan. Bind raw parameters and one
+    one transition from this exact functional plan, or an exact
+    ``partial(compiled_chunk, parameters, prepared)`` binding. Multi-step
+    compiled chunks consume contiguous input slices and reuse a shorter
+    compiled specialization for the tail. Bind raw parameters and one
     prepared workspace outside this function so preparation is shared across
     the complete forward/backward graph. ``dt`` controls host duration
     scheduling and runtime ``extra`` waveform sampling. It defaults to the
@@ -756,6 +839,8 @@ def run(
     :meth:`FunctionalPopulation.make_callbacks`. Named recordings are returned
     under ``auxiliary["callbacks"]``. Pass that result's explicit ``state`` as
     ``callback_state`` to continue without repeating the boundary sample.
+    With callbacks, a multi-step compiled binding uses a cached joint
+    model/callback specialization so reducers observe every accepted timestep.
     """
     expected_remainder = _validate_execution(functional, step, state)
     execution = _prepare_step_execution(functional, step)
@@ -787,6 +872,9 @@ def run(
         callback_state,
         state,
         dt,
+    )
+    execution = _prepare_compiled_schedule(
+        execution, steps, max(steps, 1), callbacks=callbacks
     )
 
     if steps == 0:
@@ -862,6 +950,10 @@ def longrun(
 
     Functional callback plans and carry follow the same contract as
     :func:`run`; emitted tensors are stacked per chunk and concatenated once.
+    Exact bound compiled chunks may contain multiple steps. Each host span
+    consumes full compiled chunks and a cached shorter tail; ``chunklength``
+    does not change the compiled kernel width. Callback updates are compiled
+    with the model and still observe every accepted state.
     """
     _validate_execution(functional, step, state)
     execution = _prepare_step_execution(functional, step)
@@ -885,6 +977,9 @@ def longrun(
         callback_state,
         state,
         dt,
+    )
+    execution = _prepare_compiled_schedule(
+        execution, steps, chunklength, callbacks=callbacks
     )
 
     if steps == 0:
@@ -960,6 +1055,11 @@ def longrun_checkpointed(
     Functional callbacks use pure carry and return each chunk's emissions
     through the checkpoint boundary, preserving gradients without replay-time
     mutation or duplicate samples.
+
+    An exact bound multi-step compiled chunk follows :func:`longrun`'s full
+    chunk/tail schedule inside each checkpoint span. All needed specializations
+    are constructed before execution and reused during backward. Callback
+    updates are compiled with each model chunk and replayed with explicit carry.
     """
     _validate_execution(functional, step, state)
     execution = _prepare_step_execution(functional, step)
@@ -1007,6 +1107,9 @@ def longrun_checkpointed(
             state,
             dt,
         )
+        execution = _prepare_compiled_schedule(
+            execution, steps, chunklength, callbacks=callbacks
+        )
         if callbacks is not None:
             return _execute_chunks_with_callbacks(
                 functional,
@@ -1046,6 +1149,9 @@ def longrun_checkpointed(
         callback_state,
         state,
         dt,
+    )
+    execution = _prepare_compiled_schedule(
+        execution, steps, chunklength, callbacks=callbacks
     )
 
     auxiliary: Any = None

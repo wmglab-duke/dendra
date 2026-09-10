@@ -2,8 +2,8 @@
 
 Functional callbacks are a parallel API to Dendra's mutable callback classes.
 They own explicit tensor carry, return optional tensor emissions, and finalize a
-public tensor result. The model transition remains unaware of callbacks, so
-ordinary and compiled one-step execution keep the same ABI and performance.
+public tensor result. Host runners can compile callback updates together with
+fixed-length model chunks while keeping the model-only transition API unchanged.
 """
 
 from __future__ import annotations
@@ -844,6 +844,54 @@ class _CallbackPlan:
     validate_updates: bool
 
 
+def _update_callback_values(plans, carries, state, auxiliary, emission_schemas=None):
+    """Advance explicit tensor carry without the host's plan-token envelope."""
+    updated = {}
+    emissions = {}
+    for index, plan in enumerate(plans):
+        carry, emission = FunctionalCallbacks._pair(
+            plan.callback.update(carries[plan.name], state, auxiliary),
+            label=f"functional callback {plan.name!r}.update()",
+        )
+        schema = (
+            plan.emission_schema
+            if emission_schemas is None
+            else emission_schemas[index]
+        )
+        if plan.validate_updates:
+            _validate_tree(
+                carry,
+                plan.carry_schema,
+                label=f"functional callback {plan.name!r} carry",
+            )
+            if emission is not None and schema is not None:
+                _validate_tree(
+                    emission,
+                    schema,
+                    label=f"functional callback {plan.name!r} emission",
+                )
+        updated[plan.name] = carry
+        if emission is not None:
+            emissions[plan.name] = emission
+    return updated, emissions or None
+
+
+def _stack_callback_emissions(plans, emissions):
+    """Stack each callback's per-step tensor emissions inside a fixed chunk."""
+    return {
+        plan.name: _stack_emissions(
+            [
+                emission[plan.name]
+                for emission in emissions
+                if emission is not None and plan.name in emission
+            ],
+            plan.emission_schema,
+            label=f"functional callback {plan.name!r} emission",
+        )
+        for plan in plans
+    }
+
+
 @dataclass(frozen=True)
 class _ImperativeCallbackBinding:
     callbacks: FunctionalCallbacks
@@ -1102,53 +1150,61 @@ class FunctionalCallbacks:
         return state
 
     def _update(self, callback_state, state, auxiliary):
-        carries = {}
-        emissions = {}
-        for index, plan in enumerate(self._plans):
-            carry, emission = self._pair(
-                plan.callback.update(
-                    callback_state[plan.name],
-                    state,
-                    auxiliary,
-                ),
-                label=f"functional callback {plan.name!r}.update()",
-            )
-            runtime_emission_schema = callback_state.emission_schemas[index]
-            if plan.validate_updates:
-                _validate_tree(
-                    carry,
-                    plan.carry_schema,
-                    label=f"functional callback {plan.name!r} carry",
-                )
-                if emission is not None and runtime_emission_schema is not None:
-                    _validate_tree(
-                        emission,
-                        runtime_emission_schema,
-                        label=f"functional callback {plan.name!r} emission",
-                    )
-            carries[plan.name] = carry
-            if emission is not None:
-                emissions[plan.name] = emission
+        carries, emissions = _update_callback_values(
+            self._plans,
+            callback_state.carries,
+            state,
+            auxiliary,
+            callback_state.emission_schemas,
+        )
         next_state = FunctionalCallbackState(
             carries=carries,
             _token=self._state_token,
             _emission_schemas=callback_state.emission_schemas,
         )
-        return next_state, emissions or None
+        return next_state, emissions
 
     def _stack(self, emissions):
-        return {
-            plan.name: _stack_emissions(
-                [
-                    emission[plan.name]
-                    for emission in emissions
-                    if emission is not None and plan.name in emission
-                ],
-                plan.emission_schema,
-                label=f"functional callback {plan.name!r} emission",
-            )
-            for plan in self._plans
-        }
+        return _stack_callback_emissions(self._plans, emissions)
+
+    def _wrap_compiled_update(self, previous, carries, emissions):
+        """Restore host metadata and validate schemas discovered on earlier runs.
+
+        Compiled kernels consume plain tensor carry, so discovering the first
+        post-step emission does not change their input metadata on resume.
+        Per-step carry/bound emission checks and within-chunk emission checks
+        remain in the lowered transition. Previously discovered emission
+        schemas are checked here before accepting a compiled chunk's output.
+        """
+        state = FunctionalCallbackState(
+            carries=carries,
+            _token=self._state_token,
+            _emission_schemas=previous.emission_schemas,
+        )
+        self._validate_state(state)
+        for plan, schema in zip(self._plans, previous.emission_schemas, strict=True):
+            part = emissions[plan.name]
+            if schema is None or part is None:
+                continue
+            leaves, spec = torch.utils._pytree.tree_flatten(part)
+            if spec != schema.spec:
+                raise FunctionalizationError(
+                    f"functional callback {plan.name!r} emission changed its "
+                    "tensor PyTree structure"
+                )
+            for leaf, expected in zip(leaves, schema.leaves, strict=True):
+                if (
+                    not torch.is_tensor(leaf)
+                    or leaf.ndim != len(expected.shape) + 1
+                    or tuple(leaf.shape[1:]) != expected.shape
+                    or leaf.dtype != expected.dtype
+                    or leaf.device != expected.device
+                ):
+                    raise FunctionalizationError(
+                        f"functional callback {plan.name!r} emission changed a "
+                        "leaf's shape, dtype, or device"
+                    )
+        return state
 
     def _concatenate(self, parts):
         return {
