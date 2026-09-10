@@ -1,3 +1,10 @@
+## v0.26.0 (2026-09-10)
+
+### Feat
+
+- **models**: passive_end_nodes_
+- **func**: chunked compilation
+
 ## v0.25.0 (2026-09-04)
 
 ### BREAKING CHANGE
