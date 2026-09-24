@@ -1,3 +1,9 @@
+## v0.26.1 (2026-09-24)
+
+### Fix
+
+- **passive_end_nodes**: optionally adjust diam in passive_end_nodes_
+
 ## v0.26.0 (2026-09-10)
 
 ### Feat
