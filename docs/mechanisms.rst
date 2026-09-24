@@ -68,6 +68,20 @@ either material property. A Slice selects its own local ends:
    dn.passive_end_nodes_(cable[..., 10:40], n=2, e=-65.0)
    cable.initialize()
 
+Supply ``diam`` to set the selected ends to a fixed diameter in µm. It must be
+a finite positive scalar; ``diam=None`` (the default) leaves diameters unchanged:
+
+.. code-block:: python
+
+   dn.passive_end_nodes_(cable, n=2, diam=100.0)
+   cable.initialize()
+
+For ``Myelinated``, this sets the **effective node diameter**, after the usual
+fiber-to-node diameter calculation. The other nodes keep their diameter
+parametrization, including when its parameters change. Diameter overrides apply
+to all batch replicas of the selected physical compartments. Repeated calls
+replace the diameter on any overlapping ends with the latest supplied value.
+
 ``e`` follows PyTorch broadcasting against the **root Cable's** voltage shape
 ``(*batch, N, C)``, including when passing a Slice. A scalar applies everywhere;
 ``(N, 1)`` varies by cell, ``(C,)`` varies by compartment, and
@@ -85,9 +99,9 @@ For example, starting with an unbatched cable:
 Mechanism placement is shared across replicas even if the input Slice selects
 only one replica; the full ``e`` field supplies each replica's reversal.
 Overlapping end regions are configured once; ``n=0`` and empty regions do
-nothing. For a native morphology-compiled Cable, pass ``rhoa=None``: its
-resistivity is fixed by the source morphology and must be changed there before
-constructing a new Cable.
+nothing. For a native morphology-compiled Cable, use ``rhoa=None`` and leave
+``diam=None``: its resistivity and geometry are fixed by the source morphology
+and must be changed there before constructing a new Cable.
 
 By default, restricted ``delete`` removes the physical intersection with the
 exact class's current support.  Pass ``strict=True`` to require every selected

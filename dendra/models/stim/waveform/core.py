@@ -7,6 +7,8 @@ import torch
 
 from dendra.models.parametric import SimpleParameterized
 
+from ._gates import _rect_gate
+
 
 class Waveform(SimpleParameterized):
     """
@@ -117,7 +119,9 @@ class Waveform(SimpleParameterized):
     def forward(self, t):
         return self.fn(torch.as_tensor(t))
 
-    def repeat(self, freq: float, delay: float = 0.0, off: float = torch.inf):
+    def repeat(
+        self, freq: float, delay: float = 0.0, off: float = torch.inf, *, tau=0.01
+    ):
         """Return a periodically repeating copy of *this* waveform.
 
         Parameters
@@ -128,13 +132,19 @@ class Waveform(SimpleParameterized):
             Delay before the first repetition in ms. Default is 0.0.
         off : float, optional
             Time after which the waveform stops repeating in ms. Default is infinity.
+            Initialize to a finite value to optimize the stop time.
+        tau : float or torch.Tensor, optional
+            Sigmoid temperature in ms for surrogate gradients of the outer
+            delay/off gate. Default is 0.01 ms. Forward values retain abrupt
+            edges; gradients use a smooth approximation around each edge.
+            This is independent of any edge temperature on the repeated waveform.
 
         Returns
         -------
         _repeat
             A waveform that repeats periodically according to the specified parameters.
         """
-        return _repeat(self, freq, delay, off)
+        return _repeat(self, freq, delay, off, tau=tau)
 
     def poisson(
         self,
@@ -309,27 +319,80 @@ def _repeat_broadcast_param(x, t: torch.Tensor) -> torch.Tensor:
 
 class _repeat(Waveform):
     FUNCTIONAL_PURE = True
+    _version = 2
 
-    Waveform.PARAMETER(freq=1.0, delay=0.0, off=torch.inf)
+    Waveform.PARAMETER(freq=1.0, delay=0.0, off=torch.inf, tau=0.01)
 
     def __init__(
-        self, waveform, freq: float, delay: float = 0.0, off: float = torch.inf
+        self,
+        waveform,
+        freq: float,
+        delay: float = 0.0,
+        off: float = torch.inf,
+        *,
+        tau=0.01,
     ):
         freq_value = torch.as_tensor(freq).detach()
         if not torch.isfinite(freq_value).all() or torch.any(freq_value <= 0):
             raise ValueError("Repeat frequency must be finite and positive.")
-        super(_repeat, self).__init__(freq=freq, delay=delay, off=off)
+        super(_repeat, self).__init__(freq=freq, delay=delay, off=off, tau=tau)
         self.waveform = waveform
+
+    def __setstate__(self, state):
+        """Give historical pickles the newly introduced outer edge parameter."""
+        super().__setstate__(state)
+        if not hasattr(self, "tau"):
+            self.tau = torch.nn.Parameter(
+                self.freq.detach().new_tensor(0.01),
+                requires_grad=self.freq.requires_grad,
+            )
+            self.params.setdefault("tau", 0.01)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Supply the outer edge default only for explicitly older checkpoints."""
+        version = local_metadata.get("version")
+        tau_key = f"{prefix}tau"
+        if version is not None and version < 2 and tau_key not in state_dict:
+            reference = state_dict.get(f"{prefix}freq", self.freq)
+            state_dict[tau_key] = reference.new_full(self.tau.shape, 0.01)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def fn(self, t):
         freq = _repeat_broadcast_param(self.freq, t)
         delay = _repeat_broadcast_param(self.delay, t)
         off = _repeat_broadcast_param(self.off, t)
+        tau = _repeat_broadcast_param(self.tau, t)
 
         t_adjusted = t - delay
         mask = (t >= delay) & (t < off)
         t_periodic = torch.fmod(t_adjusted, 1.0 / freq)
-        return torch.where(mask, self.waveform.fn(t_periodic), 0.0)
+        values = self.waveform.fn(t_periodic)
+        out = torch.where(mask, values, 0.0)
+        gate = _rect_gate(t, delay, off, tau)
+        # Keep the existing hard mask, including its handling of nonfinite
+        # child values outside the active interval. Finite child values on
+        # either side of an edge supply its surrogate derivative. Retain their
+        # graph so mixed higher derivatives include the child's parameters.
+        finite_values = torch.where(torch.isfinite(values), values, 0.0)
+        correction = (gate - gate.detach()) * finite_values
+        return out + correction.to(out.dtype)
 
     def __repr__(self):
         return f"Repeat({self.waveform}, freq={self.freq}, delay={self.delay})"
