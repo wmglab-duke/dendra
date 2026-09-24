@@ -2,6 +2,58 @@
 
 Network implementation examples in ./net/
 
+[`fit_sinusoid_voltage.py`](fit_sinusoid_voltage.py) fits an injected sine's
+frequency, delay, and duration from simulated voltage recordings, optionally
+with observation noise, using ordinary `model.run()` and autograd. Try a
+passive membrane with 0.1 mV noise, or active Hodgkin–Huxley channels with
+0.5 mV noise:
+
+```bash
+python examples/fit_sinusoid_voltage.py --noise-std-mv 0.1 --noise-seed 0 --output-dir voltage-fit
+python examples/fit_sinusoid_voltage.py --membrane hh --noise-std-mv 0.5 --noise-seed 0 --output-dir voltage-hh
+```
+
+Noise defaults to zero. Gaussian noise is added independently at each recorded
+time and compartment, once; that recording is reused for every iteration and
+starting guess. The loss uses observed voltage MSE, normalized by the
+observed response energy. The best iteration and start are selected using
+that loss alone; clean-reference RMSE is calculated afterward for evaluation.
+
+The reference and fitted simulations use the same known cable, membrane
+parameters, initial voltage (-65 mV), current amplitude, and phase
+(0.4 radians). The five-compartment cable is 250 µm long and 2 µm in diameter;
+compartments 0, 2, and 3 are recorded by default. The passive defaults are
+0.05 nA, `dt=0.125` ms, and `tau=0.25` ms. `--membrane hh` uses fixed sodium,
+potassium, and leak channels at 6.3°C, with 0.2 nA, `dt=0.0625` ms, and
+`tau=0.5` ms; its reference trace includes an action potential. Change the
+known amplitude with `--amplitude-na`; it is not fitted. JIT is enabled by
+default; `--no-jit` disables it for debugging.
+
+The default run uses 180 optimization steps for each of two initial cutoff
+guesses. Use `--cutoff off` to fit an absolute cutoff instead of `off_after`,
+and `--initial-stop-ms 10.25 12.0` to specify initial absolute stop times in ms,
+including when fitting `off_after`; one or more values are accepted.
+`--initial-frequency-hz` and `--initial-delay-ms` set the other starting values.
+`--iterations`, `--dt`, `--tau`, and `--record-nodes` control optimization
+length, time resolution, surrogate width, and observed compartments.
+Updates keep frequency between 0.001 Hz and the sampling Nyquist limit,
+and stimulation within the 16 ms recording window for at least one time step.
+
+Keep `tau` wide enough relative to `dt` for nearby samples to receive timing
+gradients; the applied current's edges stay abrupt. Cutoffs within the same
+sampling interval can produce identical voltage traces, so interpret the fitted
+cutoff at that resolution. Multiple starts and a wider surrogate, such as
+`--tau 0.5` for the passive case, can help explore other intervals. Optimization
+can still settle in a local minimum, and these synthetic fits do not guarantee
+parameter recovery from noisy recordings or a different membrane model.
+Compare with `--noise-std-mv 0` before attributing parameter error to noise: a
+noiseless fit can also retain parameter error.
+
+`--output-dir` saves `summary.json`, `traces.npz`, `voltage_fit.png`, and
+`parameter_fit.png`. The arrays include clean reference, observed, initial,
+and fitted voltages, plus observed-minus-fitted residuals. The plots show those
+traces, residuals, and parameter trajectories for comparing the starts.
+
 [`functional_gradient_descent.py`](functional_gradient_descent.py) is the
 explicit-state functional counterpart to the
 [`04_gradient_descent` tutorial](../docs/basics/04_gradient_descent.ipynb).

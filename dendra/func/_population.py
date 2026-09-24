@@ -27,6 +27,7 @@ from dendra.models.core import (
     Population,
     SingleCompartment,
     Unmyelinated,
+    _PassiveEndDiameter,
 )
 from dendra.models.extcell import ExtCellAxon, ExtCellTree
 from dendra.models.initialization import _InitializationTransformHook
@@ -222,6 +223,10 @@ _STANDARD_MYELINATED_RHOA_FORWARD = inspect.getattr_static(
 )
 _STANDARD_MYELINATED_DIAMETER_FORWARD = inspect.getattr_static(
     Myelinated.myelinated_node_d,
+    "forward",
+)
+_STANDARD_PASSIVE_END_DIAMETER_FORWARD = inspect.getattr_static(
+    _PassiveEndDiameter,
     "forward",
 )
 _STANDARD_MECHANISM_INITIALIZATION = {
@@ -4843,16 +4848,49 @@ def _uses_standard_myelinated_parametrizations(population) -> bool:
     if parametrizations is None or set(parametrizations) != {"diam"}:
         return False
     diameter_transforms = parametrizations["diam"]
-    if len(diameter_transforms) != 1:
+    if not len(diameter_transforms):
         return False
     diameter_transform = diameter_transforms[0]
-    return (
+    if not (
         type(diameter_transform) is Myelinated.myelinated_node_d
         and "forward" not in diameter_transform.__dict__
         and inspect.getattr_static(type(diameter_transform), "forward")
         is _STANDARD_MYELINATED_DIAMETER_FORWARD
         and not _module_autograd_hook_signature(diameter_transforms)
         and not _module_autograd_hook_signature(diameter_transform)
+    ):
+        return False
+    return all(
+        _uses_passive_end_diameter_override(transform, population)
+        for index, transform in enumerate(diameter_transforms)
+        if index > 0
+    )
+
+
+def _uses_passive_end_diameter_override(transform, population) -> bool:
+    """Admit only the framework's fixed sparse geometry override."""
+    if (
+        type(transform) is not _PassiveEndDiameter
+        or "forward" in transform.__dict__
+        or inspect.getattr_static(type(transform), "forward")
+        is not _STANDARD_PASSIVE_END_DIAMETER_FORWARD
+        or _module_autograd_hook_signature(transform)
+        or transform._parameters
+        or transform._modules
+        or set(transform._buffers) != {"mask", "value"}
+    ):
+        return False
+    mask = transform._buffers["mask"]
+    value = transform._buffers["value"]
+    return (
+        torch.is_tensor(mask)
+        and mask.dtype == torch.bool
+        and _shape_tuple(mask) == tuple(population.core_shape())
+        and mask.device == population.device()
+        and torch.is_tensor(value)
+        and _shape_tuple(value) == ()
+        and value.dtype == population.dtype()
+        and value.device == population.device()
     )
 
 
@@ -5350,6 +5388,17 @@ def _parametrization_constant_layout_for_owners(
         record(value, aliases)
 
     for owner in owners:
+        # Myelinated geometry may append framework-owned passive-end overrides
+        # to its standard torch parametrization. Their mask/value buffers must
+        # remain explicit inputs, just like authored in-graph dependencies.
+        parametrizations = getattr(owner, "parametrizations", None)
+        if isinstance(owner, Myelinated) and parametrizations is not None:
+            for index, transform in enumerate(parametrizations["diam"]):
+                if index == 0 or type(transform) is not _PassiveEndDiameter:
+                    continue
+                transform_path = module_paths[id(transform)]
+                for buffer_name, value in transform.named_buffers(recurse=False):
+                    record(value, (f"{transform_path}.{buffer_name}",))
         available_names = _parameter_materialization_output_names(owner)
         available_names.update({"diam", "diameters", "dx", "celsius"})
         for target_name, transforms in owner.in_graph_parametrizations.items():

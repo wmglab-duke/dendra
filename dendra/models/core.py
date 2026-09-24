@@ -10144,8 +10144,26 @@ def compile_mechanism(
     return m, shape_p, total_index
 
 
+class _PassiveEndDiameter(torch.nn.Module):
+    """Keep selected node diameters fixed after an authored geometry transform."""
+
+    def __init__(self, mask, value):
+        super().__init__()
+        self.register_buffer("mask", mask.detach().clone())
+        self.register_buffer("value", value.detach().clone())
+
+    def forward(self, diam):
+        return torch.where(self.mask, self.value, diam)
+
+
 def passive_end_nodes_(
-    model: Cable | Slice, n: int = 1, rhoa=1e10, cm=1.0, *, e=None
+    model: Cable | Slice,
+    n: int = 1,
+    rhoa=1e10,
+    cm=1.0,
+    *,
+    e=None,
+    diam=None,
 ) -> None:
     """Replace both ends of a cable region with passive membrane mechanisms.
 
@@ -10164,6 +10182,14 @@ def passive_end_nodes_(
     ``rhoa`` (ohm cm) and ``cm`` (µF/cm²) overrides default to ``1e10`` and ``1``;
     pass ``None`` to leave either property unchanged. Native morphology-compiled
     Cables require ``rhoa=None`` because their compiled resistivity is immutable.
+
+    ``diam`` optionally sets a finite positive scalar diameter in µm at the
+    selected ends; ``None`` preserves their diameters. For parametrized geometry
+    such as Myelinated, the override applies after the diameter transform, so
+    it specifies the effective node diameter while other nodes retain their
+    original parametrization. Diameters are shared across batch replicas.
+    Native morphology-compiled Cables require ``diam=None``; edit the source
+    Morphology and construct a new Cable to change their geometry.
 
     Mechanism placement is shared by all batch replicas, including when the
     Slice selects one replica; reversal values may differ across replicas.
@@ -10229,6 +10255,26 @@ def passive_end_nodes_(
             "it, or edit the Morphology and construct a new Cable"
         )
 
+    diameter_override = None
+    if diam is not None:
+        if root._compartment_graph is not None:
+            raise ValueError(
+                "Native Cable diameter is immutable; pass diam=None to preserve "
+                "it, or edit the Morphology and construct a new Cable"
+            )
+        if "diam" in root.in_graph_parametrizations:
+            raise ValueError(
+                "passive_end_nodes_ cannot override an in-graph diameter "
+                "transform; configure that transform directly"
+            )
+        diam = torch.as_tensor(diam, device=root.device(), dtype=root.dtype())
+        if diam.ndim != 0 or not torch.isfinite(diam) or diam <= 0:
+            raise ValueError("diam must be a finite positive scalar in micrometers")
+        if torch.nn.utils.parametrize.is_parametrized(root, "diam"):
+            mask = torch.zeros(core_shape, device=root.device(), dtype=torch.bool)
+            mask[core_key] = True
+            diameter_override = _PassiveEndDiameter(mask, diam)
+
     ends.delete_all()
     if pas in root._mech_everywhere:
         # Partial deletion keeps an everywhere record with exclusions. Convert
@@ -10247,3 +10293,7 @@ def passive_end_nodes_(
         ends.parametrize("rhoa", rhoa)
     if cm is not None:
         ends.parametrize("cm", cm)
+    if diameter_override is not None:
+        root.register_parametrization("diam", diameter_override)
+    elif diam is not None:
+        ends.diam = diam

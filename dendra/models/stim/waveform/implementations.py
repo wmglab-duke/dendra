@@ -2,6 +2,7 @@ import torch
 
 from dendra.utils import interp1d
 
+from ._gates import _as_tensor_like, _rect_gate, _time_broadcast_param
 from .core import Waveform
 
 __all__ = [
@@ -14,58 +15,6 @@ __all__ = [
     "arbitrary",
     "constant",
 ]
-
-
-def _as_tensor_like(x, ref: torch.Tensor) -> torch.Tensor:
-    """
-    Convert python/numpy scalars to a tensor on ref.device/ref.dtype.
-    Leave torch.Tensors (incl. nn.Parameter) untouched to preserve grads.
-    """
-    if torch.is_tensor(x):
-        return x
-    return ref.new_tensor(x)
-
-
-def _time_broadcast_param(x, t: torch.Tensor) -> torch.Tensor:
-    """
-    Ensure x broadcasts against t (shape [T]) with time as the LAST dim.
-
-    Rules:
-      - scalars (0-dim) are fine as-is
-      - scalar-time evaluation preserves the parameter shape
-      - if the last dim is already 1, keep that explicit broadcast axis
-      - otherwise append a trailing singleton time dim, e.g. [B] -> [B,1]
-        and [B,C] -> [B,C,1]
-
-    Parameter axes are never inferred to be time merely because their length
-    happens to equal the number of evaluation points. The old heuristic made
-    output rank depend on ``T`` and silently confused population/compartment
-    axes with time.
-    """
-    x = _as_tensor_like(x, t)
-    if x.ndim == 0 or t.ndim == 0:
-        return x
-    if x.shape[-1] == 1:
-        return x
-    return x.unsqueeze(-1)
-
-
-def _rect_gate(t, start, stop, tau, inclusive_stop=False):
-    # Canonicalize to broadcast across time
-    start = _time_broadcast_param(start, t)
-    stop = _time_broadcast_param(stop, t)
-    tau = _time_broadcast_param(tau, t)
-
-    tau = torch.clamp(tau, min=1e-6)
-    soft = torch.sigmoid((t - start) / tau) * torch.sigmoid((stop - t) / tau)
-
-    if inclusive_stop:
-        hard = ((t >= start) & (t <= stop)).to(soft.dtype)
-    else:
-        hard = ((t >= start) & (t < stop)).to(soft.dtype)
-
-    # Straight-through gate: hard in forward, soft for gradients.
-    return hard + (soft - soft.detach())
 
 
 def _oscillator_broadcast_param(x, t: torch.Tensor) -> torch.Tensor:
@@ -363,6 +312,17 @@ class sin(Waveform):
       axis is the dimension immediately before time, and the output shape is
       ``[..., T]``.
 
+    Timing parameters use surrogate gradients while the forward waveform keeps
+    abrupt edges. ``delay`` moves both the onset gate and the carrier phase;
+    when ``off_after`` determines the stop, ``delay`` moves that edge too.
+    Only the earlier of ``off`` and ``delay + off_after`` receives the stop
+    gradient; equal finite cutoffs split it equally. Initialize a cutoff to a
+    finite value to optimize it. An infinite cutoff has zero gradient.
+    Enable gradients on the waveform parameters to be optimized, for example
+    ``waveform.delay.requires_grad_(True)``. Samples near an edge supply its
+    gradient, so a ``tau`` much smaller than the sampling interval can make
+    edge contributions numerically negligible.
+
     Scalars and singleton dimensions broadcast over components and batches.
     For example, ``delay`` with shape ``[B, 1]`` gives one delay per batch,
     shared by all components in that batch.
@@ -464,6 +424,17 @@ class cos(Waveform):
     - ``[..., K, T]`` or ``[..., K, 1]``: explicit time axis; the component
       axis is the dimension immediately before time, and the output shape is
       ``[..., T]``.
+
+    Timing parameters use surrogate gradients while the forward waveform keeps
+    abrupt edges. ``delay`` moves both the onset gate and the carrier phase;
+    when ``off_after`` determines the stop, ``delay`` moves that edge too.
+    Only the earlier of ``off`` and ``delay + off_after`` receives the stop
+    gradient; equal finite cutoffs split it equally. Initialize a cutoff to a
+    finite value to optimize it. An infinite cutoff has zero gradient.
+    Enable gradients on the waveform parameters to be optimized, for example
+    ``waveform.delay.requires_grad_(True)``. Samples near an edge supply its
+    gradient, so a ``tau`` much smaller than the sampling interval can make
+    edge contributions numerically negligible.
 
     Scalars and singleton dimensions broadcast over components and batches.
     For example, ``delay`` with shape ``[B, 1]`` gives one delay per batch,
