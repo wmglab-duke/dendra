@@ -5,7 +5,6 @@ setup(
         "numpy",
         "sympy >= 1.2",
         "torch>=2.12.0",
-        "dendra-solvers>=0.3.1",
         "scipy",
         "h5py",
         "tqdm",
@@ -18,6 +17,9 @@ setup(
         "ninja",
     ],
     extras_require={
+        "solvers": [
+            "dendra-solvers>=0.3.1",
+        ],
         "jupyter": [
             "ipympl >= 0.9.5",
         ],

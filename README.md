@@ -40,22 +40,23 @@ See the [unit conventions](https://dendra-dev.pages.oit.duke.edu/dendra/units.ht
 > git clone https://gitlab.oit.duke.edu/mah148/dendra.git
 ```
 
-3. Install.
+3. Install with the recommended CPU solvers.
 
 ```bash
 > cd dendra
-> pip install .
+> pip install ".[solvers]"
 ```
 
-This also installs [`dendra-solvers`](https://pypi.org/project/dendra-solvers/)
-from PyPI, enabling CPU implicit methods by default. On supported platforms,
-pip downloads a prebuilt solver wheel, so installing the CPU solvers does not
-require a C++ compiler. See the [installation guide](docs/installation.md#cpu-implicit-solvers)
-for supported platforms and source-build options. GPU solvers remain included
+This includes [`dendra-solvers`](https://pypi.org/project/dendra-solvers/).
+If that package cannot be installed, retry with `pip install .` to install
+Dendra without it. CPU unbranched cables can then use the built-in PyTorch
+solver; CPU block and tree methods require the optional solver package.
+See the [installation guide](docs/installation.md#cpu-implicit-solvers) for
+wheel-only installation and supported platforms. GPU solvers remain included
 with Dendra.
 
 - If you want to build and run the documentation locally:
-    - `pip install ".[doc]"`
+    - `pip install ".[doc,solvers]"` (includes CPU solvers used by the examples)
 
 - If you want interactive Matplotlib figures inside Jupyter:
     - `pip install ".[jupyter]"`
@@ -65,9 +66,11 @@ with Dendra.
       in both; see the [interactive Jupyter setup](docs/installation.md#interactive-jupyter-figures).
 
 ### ⚙️ Installing for development
-- Install `--editable` with dev dependencies & install `pre-commit`:
-    - `pip install --editable ".[dev]"`
+- Install `--editable` with development dependencies and CPU solvers for the full test suite:
+    - `pip install --editable ".[dev,solvers]"`
     - `pre-commit install`
+
+Use `pip install --editable ".[dev]"` for development without native CPU solvers.
 
 ### GPU deployment diagnostics
 
@@ -107,7 +110,7 @@ CUDA path is attempted; CPU and dense-backend execution are unaffected.
 
 ## ✅ Testing and code coverage
 
-The development dependencies include `pytest` and `pytest-cov`. Run the complete test suite from the repository root with:
+Install `.[dev,solvers]` for the full CPU test suite and coverage checks; the development dependencies include `pytest` and `pytest-cov`. Run the complete test suite from the repository root with:
 
 ```bash
 python -m pytest tests
