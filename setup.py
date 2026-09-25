@@ -5,6 +5,7 @@ setup(
         "numpy",
         "sympy >= 1.2",
         "torch>=2.12.0",
+        "dendra-solvers>=0.3.1",
         "scipy",
         "h5py",
         "tqdm",

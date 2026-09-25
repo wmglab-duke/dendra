@@ -51,12 +51,29 @@ On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best c
    pip install .
    ```
 
+## CPU implicit solvers
+
+Installing Dendra also installs [`dendra-solvers`](https://pypi.org/project/dendra-solvers/)
+from PyPI. CPU implicit methods are available after the normal installation;
+there is no separate solver-install step. GPU solvers are included with Dendra.
+
+Prebuilt solver wheels are available for:
+
+- Linux x86-64 and ARM64 on glibc-based distributions.
+- Windows x86-64.
+- macOS 14 or newer on Apple Silicon.
+
+When a matching wheel is available, pip selects it automatically, so installing
+the CPU solvers does not require a C++ compiler. For other platforms or
+custom PyTorch builds, see the source-build instructions on the
+[`dendra-solvers` package page](https://pypi.org/project/dendra-solvers/).
+Windows solver wheels support CPU simulations; the GPU limitation above still
+applies.
+
 ## Optional extras
 
 - Interactive Jupyter plots: `pip install ".[jupyter]"`. See the
   {ref}`interactive Jupyter setup <interactive-jupyter>` below.
-
-- CPU implicit solvers: install the companion package [`dendra-solvers`](https://gitlab.oit.duke.edu/mah148/dendra-solvers) (required only for CPU implicit methods; GPU solvers are included by default). Also required to build the documentation.
 
 - Documentation build dependencies: `pip install ".[doc]"` then `cd docs && make html`
 
@@ -146,8 +163,13 @@ the server-side installation before restarting.
 
 ```sh
 python - <<'PY'
+from importlib.metadata import version
+
 import dendra as dn
+import dendra_solvers._ext as solver_ext
 
 print("Dendra import succeeded")
+print("dendra-solvers:", version("dendra-solvers"))
+print("CPU solver extension:", solver_ext.__file__)
 PY
 ```

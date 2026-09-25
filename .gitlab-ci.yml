@@ -31,27 +31,36 @@ before_script:
   # 1) Install PyTorch first
   - python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
 
-  # 2) Clone and install dendra-solvers AFTER torch (still no-build-isolation)
-  - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/dendra-solvers.git"
-  - cd dendra-solvers && python -m pip install --no-build-isolation . && cd "$CI_PROJECT_DIR"
-
-  # 3) Install your main package with [doc] extra
+  # 2) Install Dendra with its published solver wheel and [doc] extra.
+  # Require the solver wheel so CI exercises the same artifact users install.
   # Use build-constraint ONLY here (no --no-build-isolation on this command)
-  - python -m pip install --build-constraint "$CI_PROJECT_DIR/constraints.txt" ".[doc]"
+  - python -m pip install --only-binary=dendra-solvers --build-constraint "$CI_PROJECT_DIR/constraints.txt" ".[doc]"
 
-  # 4) Clone and install dendra-models AFTER dendra and torch
+  # 3) Clone and install dendra-models AFTER dendra and torch
   - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/dendra-models.git"
   # Dendra itself is the source checkout under test. Avoid asking pip to
   # resolve dendra-models' released Dendra floor before Commitizen has bumped
   # this checkout at the end of the successful pipeline.
   - cd dendra-models && python -m pip install --no-deps --build-constraint "$CI_PROJECT_DIR/constraints.txt" . && cd "$CI_PROJECT_DIR"
 
-  # Optional: verify in logs
-  - python -c "import numpy as np; print('NumPy:', np.__version__)"
-  - python -c "import torch; print('PyTorch:', torch.__version__)"
-  - python -c "import neuron; print('NEURON:', neuron.__version__)"
-  - python -c "import dendra; print('Dendra:', dendra.__version__)"
-  - python -c "import dendra_models; print('Dendra-Models:', dendra_models.__version__)"
+  # Verify the installed versions and load the solver's native extension early.
+  - |
+    python - <<'PY'
+    from importlib.metadata import version
+    import numpy as np
+    import torch
+    import neuron
+    import dendra_solvers._ext as solvers_ext
+    import dendra
+    import dendra_models
+
+    print('NumPy:', np.__version__)
+    print('PyTorch:', torch.__version__)
+    print('NEURON:', neuron.__version__)
+    print('Dendra-Solvers:', version('dendra-solvers'), solvers_ext.__file__)
+    print('Dendra:', dendra.__version__)
+    print('Dendra-Models:', dendra_models.__version__)
+    PY
 
 test:
   stage: test

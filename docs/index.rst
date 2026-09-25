@@ -63,9 +63,11 @@ Dendra targets Python 3.11+ and PyTorch 2.12+ (CUDA 12.9+ wheels recommended for
 2. Install PyTorch (choose GPU or CPU wheels): ``python -m pip install torch --index-url https://download.pytorch.org/whl/cu129``.
 3. Clone the repo and install: ``git clone https://gitlab.oit.duke.edu/mah148/dendra.git && cd dendra && python -m pip install .``.
 
+Installing Dendra also installs ``dendra-solvers`` from PyPI for CPU implicit methods. Prebuilt solver wheels are available for Linux x86-64/ARM64, Windows x86-64, and Apple Silicon macOS; see :ref:`installation` for platform requirements. GPU solvers are included with Dendra.
+
 To build these docs locally, install the extras (``python -m pip install '.[doc]'``) and run ``make html`` inside ``docs``.
 
-See :ref:`installation` for detailed guidance and optional extras (Jupyter, development tooling, and CPU implicit solver support via ``dendra-solvers``).
+See :ref:`installation` for detailed guidance and optional extras (Jupyter and development tooling).
 
 
 Feedback and Contributions
