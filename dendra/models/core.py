@@ -3708,26 +3708,47 @@ class Population(P, Sliceable):
         if "_steady_state" in self._caches:
             self._caches.pop("_steady_state")
 
-    def post_initialize(self):
-        """
-        Run registered post-initialization hooks with gradients disabled.
-        """
+    def _run_initialization_hooks(self, hooks, *, skip_transforms_on_restore=False):
+        wrote_parameters = False
         with torch.no_grad():
-            for h in self.post_initialize_hooks:
-                if self._restoring_steady_state and isinstance(
-                    h,
-                    _InitializationTransformHook,
+            for hook in hooks:
+                if (
+                    skip_transforms_on_restore
+                    and self._restoring_steady_state
+                    and isinstance(hook, _InitializationTransformHook)
                 ):
                     continue
-                h(self)
+                if isinstance(hook, _InitializationTransformHook):
+                    action = self._initialization_transforms[hook.action_name]
+                    writes_parameters = any(
+                        reference.startswith("parameters.")
+                        for reference in action.writes
+                    )
+                else:
+                    writes_parameters = False
+                hook(self)
+                wrote_parameters |= writes_parameters
+
+        # A parameter-writing transform rematerializes every effective buffer
+        # inside the no-grad transaction. Recreate their parameter graphs after
+        # the hooks finish, while keeping the balance transaction itself detached.
+        if (
+            wrote_parameters
+            and torch.is_grad_enabled()
+            and not torch.is_inference_mode_enabled()
+            and any(parameter.requires_grad for parameter in self.parameters())
+        ):
+            self._deterministically_rematerialize_initialization_parameters()
+
+    def post_initialize(self):
+        """Run registered post-initialization hooks with gradients disabled."""
+        self._run_initialization_hooks(
+            self.post_initialize_hooks, skip_transforms_on_restore=True
+        )
 
     def pre_initialize(self):
-        """
-        Run registered pre-initialization hooks with gradients disabled.
-        """
-        with torch.no_grad():
-            for h in self.pre_initialize_hooks:
-                h(self)
+        """Run registered pre-initialization hooks with gradients disabled."""
+        self._run_initialization_hooks(self.pre_initialize_hooks)
 
     def populate(self, random_generation=None):
         """
