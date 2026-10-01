@@ -149,7 +149,7 @@ def test_block_integrator_preserves_cpu_extension_requirement(monkeypatch, metho
     model = _SelectorModel()
     integrator = _bwd_euler_bt(model, torch.nn.Module(), method=method)
 
-    with pytest.raises(ImportError, match="requires dendra_solvers for CPU"):
+    with pytest.raises(ImportError, match="requires the dendra-solvers package"):
         integrator._select_solver(model.device())
 
 

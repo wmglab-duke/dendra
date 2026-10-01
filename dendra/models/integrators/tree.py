@@ -612,9 +612,10 @@ class _dhs(Integrator):
         elif device.type == "cpu":
             if not DENDRA_SOLVERS_AVAILABLE:
                 raise ImportError(
-                    "DHS integrator requires dendra_solvers package for CPU "
-                    "execution. Please install it with `pip install "
-                    "dendra_solvers`."
+                    "DHS integrator requires the dendra-solvers package for CPU "
+                    "execution. Install it with "
+                    "`python -m pip install --upgrade "
+                    '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
                 )
             self._solve = torch.ops.dendra_solvers.dhs_solve
         else:
@@ -643,7 +644,9 @@ class _dhs(Integrator):
                 return facade
             raise RuntimeError(
                 "The selected native CPU solver requires a dendra-solvers build "
-                "that exports the torch.func-compatible dhs_solve facade."
+                "that exports the torch.func-compatible dhs_solve facade. Upgrade "
+                "it with `python -m pip install --upgrade "
+                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
             )
         raise RuntimeError(
             "The selected DHS solver is not yet transform-compatible. "
@@ -1046,9 +1049,10 @@ class _dhs_multi(MultiIntegrator):
         elif device.type == "cpu":
             if not DENDRA_SOLVERS_AVAILABLE:
                 raise ImportError(
-                    "DHS integrator requires dendra_solvers package for CPU "
-                    "execution. Please install it with `pip install "
-                    "dendra_solvers`."
+                    "DHS integrator requires the dendra-solvers package for CPU "
+                    "execution. Install it with "
+                    "`python -m pip install --upgrade "
+                    '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
                 )
             self._solve = _dhs_multi_solve_cpu
         else:
@@ -1075,7 +1079,9 @@ class _dhs_multi(MultiIntegrator):
                 return facade
             raise RuntimeError(
                 "The selected native CPU solver requires a dendra-solvers build "
-                "that exports the torch.func-compatible dhs_multi_solve facade."
+                "that exports the torch.func-compatible dhs_multi_solve facade. "
+                "Upgrade it with `python -m pip install --upgrade "
+                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
             )
         raise RuntimeError(
             "The selected packed DHS solver is not yet transform-compatible. "

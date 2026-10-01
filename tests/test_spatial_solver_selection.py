@@ -92,8 +92,10 @@ def test_missing_cpu_spd_extension_falls_back_through_cpu_policy(monkeypatch):
     assert [str(item.message) for item in recorded] == [
         "Material diffusion solver='spd' requested on CPU but "
         "dendra_solvers.solve_tri_spd is unavailable; falling back to Thomas/PCR.",
-        "Using material diffusion on CPU without dendra_solvers installed; "
-        "falling back to PCR/Thomas torch solver.",
+        "Using material diffusion on CPU without dendra-solvers installed; "
+        "falling back to the PyTorch PCR/Thomas solver. Install the native "
+        "package with `python -m pip install --upgrade "
+        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.',
     ]
 
 
@@ -135,7 +137,7 @@ def test_cpu_thomas_policy_covers_extension_fallback_and_dense(monkeypatch):
     fallback = _solver("fallback")
     monkeypatch.setattr(spatial, "DENDRA_SOLVERS_AVAILABLE", False)
     monkeypatch.setattr(spatial, "pcr_solve_t", fallback)
-    with pytest.warns(UserWarning, match="without dendra_solvers"):
+    with pytest.warns(UserWarning, match="without dendra-solvers"):
         assert spatial.select_tridiagonal_solver("thomas", "cpu") == (
             fallback,
             "pcr_cpu",
@@ -242,7 +244,7 @@ def test_tree_solver_aliases_follow_dense_or_auto_policy(monkeypatch, name):
     if name in {"dense", "debug", "torch", "linalg"}:
         assert spatial._select_dhs_solver(name, "cpu", threads=64) == (None, "dense")
     else:
-        with pytest.warns(UserWarning, match="without dendra_solvers"):
+        with pytest.warns(UserWarning, match="without dendra-solvers"):
             assert spatial._select_dhs_solver(name, "cpu", threads=64) == (
                 None,
                 "dense",
@@ -280,7 +282,7 @@ def test_tree_cpu_policy_covers_extension_explicit_failure_and_fallback(monkeypa
     assert name == "dhs_cpu"
 
     monkeypatch.setattr(spatial, "DENDRA_SOLVERS_AVAILABLE", False)
-    with pytest.raises(ImportError, match="requires dendra_solvers.dhs_solve"):
+    with pytest.raises(ImportError, match="requires the dendra-solvers package"):
         spatial._select_dhs_solver("thomas", "cpu", threads=32)
     with pytest.warns(UserWarning, match="falling back to dense"):
         assert spatial._select_dhs_solver("auto", "cpu", threads=32) == (

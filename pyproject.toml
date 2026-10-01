@@ -1,13 +1,20 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dendra"
+description = "Differentiable neuronal simulation and macroscopic descriptor optimization"
 requires-python = ">=3.11"
 readme = "README.md"
+license = "LicenseRef-Duke-Research-NonCommercial"
+license-files = ["LICENSE.md"]
 
 dynamic = ["version", "dependencies"]
+
+[project.urls]
+Documentation = "https://wmglab-duke.github.io/dendra/"
+Repository = "https://github.com/wmglab-duke/dendra"
 
 [project.optional-dependencies]
 solvers = [

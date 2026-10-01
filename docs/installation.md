@@ -5,93 +5,129 @@
 > Dendra targets Python 3.11+; the examples below use Python 3.12.
 
 ```{important}
-On Windows, we recommend using the Windows Subsystem for Linux (WSL2) for best compatibility and performance. 'Native' Windows is currently not supported for GPU simulations.
+On Windows, use the Windows Subsystem for Linux (WSL2) and follow the Linux
+commands below. Dendra's required NEURON dependency does not publish native
+Windows wheels on PyPI, so the standard Dendra PyPI installation is not
+supported in native PowerShell or Command Prompt.
 ```
 
-## Prerequisites
+## Requirements
 
 - Python 3.11 or newer
-- PyTorch 2.12+
-- Git
+- Pip
 
-## Quick start
+Dendra requires PyTorch 2.12 or newer and NEURON. Both are declared package
+dependencies and are installed automatically. Git is needed only for source
+and development installations.
+
+## Install from a source checkout
+
+Until the first Dendra release is published on PyPI, install from your source
+checkout. From the repository root, run:
+
+```sh
+python -m pip install --upgrade pip
+python -m pip install ".[solvers]"
+```
+
+Use `python -m pip install .` if the optional native solvers are unavailable.
+For development, use an editable installation as described in the repository's
+`CONTRIBUTING.md` file.
+
+## Install from PyPI
+
+The commands in this section apply once the Dendra distribution has been
+published on PyPI.
 
 1. Create and activate an environment (optional but recommended):
 
    ```sh
-   conda create -n dendra python=3.12
-   conda activate dendra
+   python -m venv .venv
+   source .venv/bin/activate
    ```
 
-2. (Optional) Install your preferred version of PyTorch:
+   Conda users can instead run
+   `conda create -n dendra python=3.12 && conda activate dendra`.
 
-   ```{important}
-   If installing on Windows without WSL2, please follow PyTorch installation instructions [here](https://docs.pytorch.org/tutorials/unstable/inductor_windows.html) to ensure proper setup of the PyTorch Inductor backend (used when Dendra JIT compilation is enabled).
-   ```
-
-   ```{tip}
-   We recommend installing the most recent stable version of PyTorch that supports your CUDA version. If you have an older GPU that is not compatible with the latest CUDA, you may need to install an older version of PyTorch that supports your CUDA version. See the [PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/) for more details.
-   ```
+2. Install Dendra with the recommended native CPU solvers:
 
    ```sh
-   # e.g., GPU build (PyTorch 2.12.0, CUDA 12.9) - adjust the version and CUDA version as needed
-   pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu129
-
-   # CPU-only build
-   # pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu
+   python -m pip install --upgrade pip
+   python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
    ```
 
-3. (Windows without WSL2) Install NEURON using the precompiled installer from https://neuron.yale.edu/neuron/download.
+   The `solvers` extra installs
+   [`dendra-solvers`](https://pypi.org/project/dendra-solvers/), which provides
+   native CPU solvers for block and tree models.
 
-4. Clone the repository and install Dendra with the recommended CPU solvers:
+3. If no compatible `dendra-solvers` distribution is available for your
+   platform, install the base package instead:
 
    ```sh
-   git clone https://gitlab.oit.duke.edu/mah148/dendra.git
-   cd dendra
-   pip install ".[solvers]"
+   python -m pip install dendra
    ```
 
-   If installation fails because `dendra-solvers` has no suitable distribution
-   or its local build fails, install Dendra without that optional package:
+   The base package retains Dendra's PyTorch CPU solver for unbranched cables
+   and all GPU solvers. CPU block and tree methods require `dendra-solvers`.
 
-   ```sh
-   pip install .
-   ```
+## Choose a PyTorch build
+
+Pip installs a compatible PyTorch release automatically. If you need a
+particular CPU, CUDA, or ROCm build, install it before Dendra using the command
+from the [PyTorch installation selector](https://pytorch.org/get-started/locally/).
+Dendra requires PyTorch 2.12 or newer.
+
+For example, a CPU-only installation on Linux or WSL2 uses PyTorch's CPU wheel
+index:
+
+```sh
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+
+After installing the selected build, install Dendra without carrying the
+PyTorch index into that command:
+
+```sh
+python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
+```
+
+On Windows hosts, run this inside WSL2.
 
 ## CPU implicit solvers
 
 The quick start includes [`dendra-solvers`](https://pypi.org/project/dendra-solvers/)
 through the optional `solvers` extra.
-The base installation (`pip install .`) does not download or build it, so an
-unavailable solver wheel or failed solver build does not prevent you from
-installing Dendra.
+The base installation (`python -m pip install dendra`) does not download or
+build it, so an unavailable solver wheel or failed solver build does not
+prevent you from installing Dendra.
 
 Without this package, CPU unbranched cable integration falls back to Dendra's
 PyTorch parallel cyclic reduction (PCR) solver. CPU block and tree methods
 require `dendra-solvers`. GPU solvers are included with Dendra and do not
 depend on this package.
 
-To enable the native CPU solvers, install the extra from the repository root:
+To add a prebuilt native CPU solver to an existing installation:
 
 ```sh
-pip install ".[solvers]"
+python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
 ```
 
 Or add the package to an existing Dendra installation, allowing only prebuilt
 wheels:
 
 ```sh
-pip install --only-binary=dendra-solvers "dendra-solvers>=0.3.1"
+python -m pip install --only-binary=dendra-solvers "dendra-solvers>=0.3.1"
 ```
 
 The wheel-only command fails if there is no compatible wheel, leaving your
-existing Dendra installation usable. The `solvers` extra allows a local source
-build when a wheel is unavailable; explicitly requesting this extra can fail
-if the solver cannot be installed. Use the base installation in that case.
+existing Dendra installation usable. To attempt a local source build when a
+wheel is unavailable, omit `--only-binary=dendra-solvers`; this requires a
+working C++ build environment and can still fail. Use the base installation in
+that case.
 
 Prebuilt solver wheels are available for:
 
-- Linux x86-64 and ARM64 on glibc-based distributions.
+- Linux x86-64 and ARM64 on glibc 2.24 or newer.
 - Windows x86-64.
 - macOS 14 or newer on Apple Silicon.
 
@@ -99,27 +135,30 @@ When a matching wheel is available, pip selects it automatically, so installing
 the CPU solvers does not require a C++ compiler. For other platforms or
 custom PyTorch builds, see the source-build instructions on the
 [`dendra-solvers` package page](https://pypi.org/project/dendra-solvers/).
-Windows solver wheels support CPU simulations; the GPU limitation above still
-applies.
+The standalone Windows solver wheel supports CPU kernels, but it does not
+remove Dendra's WSL2 requirement because NEURON remains a required dependency
+of the full Dendra package.
 
 ## Optional extras
 
-- Interactive Jupyter plots: `pip install ".[jupyter]"`. See the
+- Interactive Jupyter plots: `python -m pip install "dendra[jupyter]"`. See the
   {ref}`interactive Jupyter setup <interactive-jupyter>` below.
 
-- Documentation and the CPU solvers used by its examples:
-  `pip install ".[doc,solvers]"` then `cd docs && make html`
+- To build the documentation from a source checkout without executing its
+  notebooks, install the documentation dependencies with
+  `python -m pip install ".[doc]"`, then run
+  `sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html`.
 
-- Development setup (editable install, lint/test tooling, and CPU solvers for the full test suite):
+- For an editable development installation with lint, test, and CPU-solver
+  dependencies, follow the repository's `CONTRIBUTING.md` file.
 
-  ```sh
-  pip install --editable ".[dev,solvers]"
-  pre-commit install
-  ```
+## Upgrade
 
-  Use `pip install --editable ".[dev]"` for development without native CPU solvers.
+Upgrade Dendra while retaining the recommended solver extra with:
 
-- Library of models: install the companion package [`dendra-models`](https://gitlab.oit.duke.edu/mah148/dendra-models) for additional pre-defined neuron & network models.
+```sh
+python -m pip install --upgrade --only-binary=dendra-solvers "dendra[solvers]"
+```
 
 ### Optional TorchInductor cache isolation
 
@@ -155,7 +194,7 @@ When the server and kernel use the same environment:
 1. Install the extra in that environment:
 
    ```sh
-   pip install ".[jupyter]"
+   python -m pip install "dendra[jupyter]"
    ```
 
 2. Save your notebooks and stop the **entire Jupyter server**. Restarting only
@@ -196,11 +235,27 @@ the server-side installation before restarting.
 
 ## Verify the install
 
+First ask pip to check the complete dependency set and run Dendra's deployment
+diagnostics:
+
+```sh
+python -m pip check
+python -m dendra doctor
+```
+
+The doctor command reports the PyTorch device, CUDA readiness, compiler and
+toolkit discovery, and Dendra's optional NetCon CUDA extension. For a GPU
+deployment that must provide CUDA, run
+`python -m dendra doctor --require-cuda`.
+
+You can also verify the import and published version directly:
+
 ```sh
 python - <<'PY'
+from importlib.metadata import version
 import dendra as dn
 
-print("Dendra import succeeded")
+print("Dendra:", version("dendra"), dn.__file__)
 PY
 ```
 

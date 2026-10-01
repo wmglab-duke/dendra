@@ -10,11 +10,11 @@ Welcome to Dendra!
 - flexible extracellular stimulation with support for complex 3D fields
 - fully differentiable event-based and continuous network simulation with synaptic delays
 - a simple API, making it easy to use for beginners and experts alike
-- implementations of a range of popular biophysical models, including Hodgkin-Huxley, Tigerholm, MRG, and more (via `Dendra Models <https://gitlab.oit.duke.edu/mah148/dendra-models>`_)
+- built-in Hodgkin--Huxley and passive membrane mechanisms, plus symbolic APIs for implementing additional models
 - a ``Materials`` interface for generic chemical reaction-diffusion simulations, including support for diffusion in intracellular and extracellular space
 
 
-``Dendra`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please let us know by opening an issue on our `GitLab repository <https://gitlab.oit.duke.edu/mah148/dendra>`_.
+``Dendra`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please use the issue tracker on the repository host available to you.
 
 Getting started
 ---------------
@@ -23,49 +23,60 @@ Getting started
 
 .. code-block:: python
 
-   import torch
    import matplotlib.pyplot as plt
+   import numpy as np
 
    import dendra as dn
-   from dendra_models.models import smolMRG
-   from dendra.units import kHz, mA, ms, um
+   from dendra.models.mod import hh
+   from dendra.units import ms, nA
 
-   # single 2.0 µm MRG model with extracellular stimulation
-   model = smolMRG([2.0 * um], n_node=201)
-
-   # Analytic point-source field in mV/mA, 200 µm from the axon.
-   ve_s = dn.isotropic_point(z=200.0 * um)(model)
-
-   dt, tstop = 0.001 * ms, 100 * ms
-   f, amp = 5 * kHz, 0.5 * mA
-   i_t = dn.sin(amp=amp, freq=f)
-
-   # run simulation
-   rec = dn.callbacks.Recorder(['v'], node_indices=model.c(0.9))
-   model.steady_state()
-   model.longrun(
-      tstop=tstop, dt=dt, extra=(ve_s, i_t),
-      chunklength=1000, callbacks=[rec], progressbar=True
+   # Stimulate one built-in Hodgkin--Huxley compartment.
+   model = dn.SingleCompartment(
+       N=1, C=1, celsius=6.3, cm=1.0, v_init=-65.0
+   )
+   model.diam.fill_(20.0)
+   model.dx.fill_(20.0)
+   model.insert(hh)
+   model[..., 0].inject(
+       dn.mono_rect(amp=0.1 * nA, delay=1.0 * ms, pw=1.0 * ms)
    )
 
-   # visualize
-   v = rec.numpy('v')
-   plt.plot(v[:, 0, 0]-v[0, 0, 0])
+   recorder = dn.callbacks.Recorder(["v"], node_indices=[0])
+   dt = 0.01 * ms
+   model.initialize()
+   model.run(
+       tstop=10.0 * ms,
+       dt=dt,
+       callbacks=[recorder],
+       progressbar=False,
+   )
+
+   voltage = recorder.numpy("v")[:, 0, 0]
+   time = dt * np.arange(len(voltage))
+   plt.plot(time, voltage)
+   plt.xlabel("Time (ms)")
+   plt.ylabel("Membrane potential (mV)")
    plt.show()
 
 
 Installation
 ------------
 
-Dendra targets Python 3.11+ and PyTorch 2.12+ (CUDA 12.9+ wheels recommended for GPU use). A typical setup is:
+Dendra targets Python 3.11 or newer and PyTorch 2.12 or newer.
+
+On Windows, run these commands inside WSL2 because the required NEURON package does not publish native Windows wheels on PyPI.
+
+Until the first Dendra release is published on PyPI, install from a source checkout. From the repository root, run ``python -m pip install '.[solvers]'``. Use ``python -m pip install .`` if the optional native solvers are unavailable.
+
+Once the distribution is published, a typical PyPI setup is:
 
 1. Create and activate an isolated environment (optional): ``conda create -n dendra python=3.12 && conda activate dendra``.
-2. Install PyTorch (choose GPU or CPU wheels): ``python -m pip install torch --index-url https://download.pytorch.org/whl/cu129``.
-3. Clone the repo and install with the recommended CPU solvers: ``git clone https://gitlab.oit.duke.edu/mah148/dendra.git && cd dendra && python -m pip install '.[solvers]'``.
+2. If you need a particular CPU, CUDA, or ROCm build, install PyTorch first using its `installation selector <https://pytorch.org/get-started/locally/>`_.
+3. Install Dendra with the recommended native CPU solvers: ``python -m pip install --only-binary=dendra-solvers 'dendra[solvers]'``.
 
-If ``dendra-solvers`` cannot be installed, retry with ``python -m pip install .`` to install Dendra without it. CPU unbranched cables can then use Dendra's built-in PyTorch solver; CPU block and tree methods require the optional package. GPU solvers are included with Dendra. See :ref:`installation` for wheel-only installation and supported platforms.
+If ``dendra-solvers`` cannot be installed, retry with ``python -m pip install dendra``. CPU unbranched cables can then use Dendra's built-in PyTorch solver; CPU block and tree methods require the optional package. GPU solvers are included with Dendra. See :ref:`installation` for wheel-only installation and supported platforms.
 
-To build these docs locally, install the documentation extras and CPU solvers used by the examples (``python -m pip install '.[doc,solvers]'``) and run ``make html`` inside ``docs``.
+To build these docs locally without executing the notebooks, clone the source repository, install the documentation extras from its root (``python -m pip install '.[doc]'``), and run ``sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html``.
 
 See :ref:`installation` for detailed guidance and optional extras (Jupyter and development tooling).
 
@@ -73,13 +84,13 @@ See :ref:`installation` for detailed guidance and optional extras (Jupyter and d
 Feedback and Contributions
 --------------------------
 
-We welcome issues and pull requests on GitLab. When reporting a bug, include your OS, Python/PyTorch versions, install method, and a minimal reproducible script. For feature requests, please describe the workflow you are trying to support.
+We welcome issues and merge or pull requests on the repository host available to you. External contributions will use GitHub when the public repository opens. When reporting a bug, include your OS, Python/PyTorch versions, install method, and a minimal reproducible script. For feature requests, please describe the workflow you are trying to support. The repository's ``CONTRIBUTING.md`` file describes setup, testing, and submission.
 
 Contribution tips:
 
 - Use a fresh branch and keep changes focused.
 - Install development extras and CPU solvers (``python -m pip install --editable '.[dev,solvers]'``) for the full CPU test suite and coverage checks. Use ``.[dev]`` for development without native CPU solvers.
-- Follow the existing style conventions; ``pre-commit`` hooks are configured for you (``python -m pre-commit install``).
+- Follow the existing style conventions; install both hook stages with ``pre-commit install`` and ``pre-commit install --hook-type commit-msg``.
 - Documentation updates are appreciated—adding docstrings or short narrative sections to accompany new code is ideal.
 
 
