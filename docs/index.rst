@@ -76,7 +76,7 @@ Once the distribution is published, a typical PyPI setup is:
 
 If ``dendra-solvers`` cannot be installed, retry with ``python -m pip install dendra``. CPU unbranched cables can then use Dendra's built-in PyTorch solver; CPU block and tree methods require the optional package. GPU solvers are included with Dendra. See :ref:`installation` for wheel-only installation and supported platforms.
 
-To build these docs locally without executing the notebooks, clone the source repository, install the documentation extras from its root (``python -m pip install '.[doc]'``), and run ``sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html``.
+For a fast prose-only preview, clone the source repository, install the documentation extras from its root (``python -m pip install '.[doc]'``), and run ``sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html``. The repository's ``docs/README.md`` gives the full CI-equivalent workflow, which executes every notebook.
 
 See :ref:`installation` for detailed guidance and optional extras (Jupyter and development tooling).
 

@@ -114,12 +114,25 @@ python -m pytest tests -W error -m cuda
 ```
 
 For documentation changes, install the documentation dependencies and require
-a warning-free build:
+a warning-free build that executes every notebook. The notebooks use models
+from the companion `dendra-models` repository. Install the revision recorded
+for the documentation into the same environment:
 
 ```sh
-python -m pip install --editable ".[doc]"
-sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html
+python -m pip install --editable ".[doc,solvers]"
+DENDRA_MODELS_REVISION="$(cat docs/dendra-models-revision.txt)"
+python -m pip install --no-deps \
+  "dendra-models @ git+https://github.com/wmglab-duke/dendra-models.git@${DENDRA_MODELS_REVISION}"
+sphinx-build -E -W --keep-going \
+  -D nb_execution_mode=force \
+  -D nb_execution_allow_errors=0 \
+  -D nb_execution_raise_on_error=1 \
+  -b html docs docs/_build/html
 ```
+
+Full notebook execution also requires the `ffmpeg` executable on `PATH` for
+the multicontact animation tutorial. Install it with your operating system's
+package manager before running the build.
 
 The [testing section of the README](README.md#-testing-and-code-coverage)
 explains the test markers, coverage checks, and CUDA sanitizer lane in more

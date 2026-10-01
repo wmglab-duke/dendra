@@ -81,7 +81,11 @@ myst_enable_extensions = [
     "substitution",
 ]
 nb_execution_timeout = 600
+# Cache unchanged notebooks for ordinary local builds. CI overrides this with
+# ``force`` so every documentation run validates every executable notebook.
 nb_execution_mode = "cache"
+nb_execution_allow_errors = False
+nb_execution_raise_on_error = True
 # Include the underlying exception in CI logs, not only a report-file path.
 nb_execution_show_tb = True
 _here = Path(__file__).resolve().parent

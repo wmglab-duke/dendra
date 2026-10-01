@@ -25,6 +25,12 @@ on:
 permissions:
   contents: read
 
+env:
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MPLBACKEND: Agg
+
 concurrency:
   group: documentation-${{ github.ref }}
   cancel-in-progress: true
@@ -32,7 +38,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     permissions:
       contents: read
       pages: read
@@ -43,28 +49,36 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install documentation system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
       - name: Install documentation dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install ".[doc]"
-      - name: Build documentation without executing notebooks
+          python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --only-binary=dendra-solvers ".[doc,solvers]"
+          dendra_models_revision="$(cat docs/dendra-models-revision.txt)"
+          python -m pip install --no-deps \
+            "dendra-models @ git+https://github.com/wmglab-duke/dendra-models.git@${dendra_models_revision}"
+      - name: Build documentation and execute notebooks
         env:
           DENDRA_DOCS_DISABLE_INTERSPHINX: "1"
         run: >-
-          sphinx-build -W --keep-going -D nb_execution_mode=off
+          sphinx-build -E -W --keep-going -D nb_execution_mode=force
+          -D nb_execution_allow_errors=0 -D nb_execution_raise_on_error=1
           -b html docs docs/_build/html
       - name: Configure GitHub Pages
-        if: github.repository == 'wmglab-duke/dendra' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.repository == 'wmglab-duke/dendra' && github.event.repository.private == false && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/configure-pages@v5
       - name: Upload GitHub Pages artifact
-        if: github.repository == 'wmglab-duke/dendra' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.repository == 'wmglab-duke/dendra' && github.event.repository.private == false && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v4
         with:
           path: docs/_build/html
 
   deploy:
-    if: github.repository == 'wmglab-duke/dendra' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.repository == 'wmglab-duke/dendra' && github.event.repository.private == false && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
