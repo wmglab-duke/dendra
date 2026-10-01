@@ -38,7 +38,7 @@ before_script:
 
   # 3) Clone and install dendra-models AFTER dendra and torch
   - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/dendra-dev/dendra-models.git"
-  - git -C dendra-models checkout --detach "$(cat "$CI_PROJECT_DIR/docs/dendra-models-revision.txt")"
+  - git -C dendra-models checkout --detach "$(cat "$CI_PROJECT_DIR/docs/dendra-models-gitlab-revision.txt")"
   # Dendra itself is the source checkout under test. Avoid asking pip to
   # resolve dendra-models' released Dendra floor before Commitizen has bumped
   # this checkout at the end of the successful pipeline.
@@ -63,7 +63,32 @@ before_script:
     print('Dendra-Models:', dendra_models.__version__)
     PY
 
+# Keep prose-only branch pipelines focused on the executable documentation build.
+# Runtime, packaging, test, CI, and internal model-revision changes still run
+# both test lanes. Set RUN_FULL_TESTS=1 as a CI/CD variable to override the
+# changed-path filter for a branch pipeline.
+.full_test_rules:
+  rules:
+    - if: '$RUN_FULL_TESTS == "1" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+      changes:
+        paths:
+          - dendra/**/*
+          - tests/**/*
+          - scripts/**/*
+          - examples/**/*
+          - pyproject.toml
+          - setup.py
+          - .coveragerc.cpu
+          - coverage-floors.toml
+          - .gitlab-ci.yml
+          - .gitmodules
+          - docs/dendra-models-gitlab-revision.txt
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event" && $CI_PIPELINE_SOURCE != "external_pull_request_event"'
+
 test_base_install:
+  extends: .full_test_rules
   stage: test
   # Override the full test setup: this lane must never install native solvers.
   before_script:
@@ -107,6 +132,7 @@ test_base_install:
       PY
 
 test:
+  extends: .full_test_rules
   stage: test
   script:
     - python -m pip install pytest pytest-cov hypothesis neuron
@@ -141,7 +167,15 @@ build_docs:
 release_bump:
   stage: release
   image: python:3.12-slim
-  needs: ["build_docs"]
+  needs:
+    - job: test_base_install
+      optional: true
+      artifacts: false
+    - job: test
+      optional: true
+      artifacts: false
+    - job: build_docs
+      artifacts: false
   variables:
     GIT_DEPTH: "0"
   before_script:
