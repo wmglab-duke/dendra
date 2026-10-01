@@ -105,7 +105,7 @@ def test_cpu_coverage_omits_only_accelerator_kernel_bodies():
 
 def test_required_coverage_commands_use_cpu_scope():
     ci = (ROOT / ".gitlab-ci.yml").read_text(encoding="utf-8")
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    testing_guide = (ROOT / "docs" / "testing.md").read_text(encoding="utf-8")
     assert "--cov-config=.coveragerc.cpu" in ci
-    assert "--cov-config=.coveragerc.cpu" in readme
+    assert "--cov-config=.coveragerc.cpu" in testing_guide
     assert "--cov-fail-under=84" in ci

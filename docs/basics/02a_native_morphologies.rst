@@ -917,12 +917,12 @@ To use hover in Jupyter, follow :ref:`interactive-jupyter`. The setup matters
 because ``ipympl`` has a Python backend in the kernel and a JavaScript frontend
 in the Jupyter server. If those use separate environments, install compatible
 ipympl components in both; after a first installation, restart the complete
-server rather than only its kernel. From a Dendra checkout, the shared-
-environment installation is:
+server rather than only its kernel. For a shared server and kernel environment,
+install the Jupyter extra:
 
 .. code-block:: bash
 
-   python -m pip install --editable ".[jupyter]"
+   python -m pip install "dendra[jupyter]"
 
 An existing notebook may use ``%pip install ipympl`` for its kernel side, but
 that does not install into a separately managed server environment. After the

@@ -14,7 +14,7 @@ Welcome to Dendra!
 - a ``Materials`` interface for generic chemical reaction-diffusion simulations, including support for diffusion in intracellular and extracellular space
 
 
-``Dendra`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please use the issue tracker on the repository host available to you.
+``Dendra`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please use the `public issue tracker <https://github.com/wmglab-duke/dendra/issues>`_.
 
 Getting started
 ---------------
@@ -66,25 +66,24 @@ Dendra targets Python 3.11 or newer and PyTorch 2.12 or newer.
 
 On Windows, run these commands inside WSL2 because the required NEURON package does not publish native Windows wheels on PyPI.
 
-Until the first Dendra release is published on PyPI, install from a source checkout. From the repository root, run ``python -m pip install '.[solvers]'``. Use ``python -m pip install .`` if the optional native solvers are unavailable.
-
-Once the distribution is published, a typical PyPI setup is:
+A typical PyPI setup is:
 
 1. Create and activate an isolated environment (optional): ``conda create -n dendra python=3.12 && conda activate dendra``.
 2. If you need a particular CPU, CUDA, or ROCm build, install PyTorch first using its `installation selector <https://pytorch.org/get-started/locally/>`_.
 3. Install Dendra with the recommended native CPU solvers: ``python -m pip install --only-binary=dendra-solvers 'dendra[solvers]'``.
 
-If ``dendra-solvers`` cannot be installed, retry with ``python -m pip install dendra``. CPU unbranched cables can then use Dendra's built-in PyTorch solver; CPU block and tree methods require the optional package. GPU solvers are included with Dendra. See :ref:`installation` for wheel-only installation and supported platforms.
+If ``dendra-solvers`` cannot be installed, retry with ``python -m pip install dendra``. CPU unbranched cables can then use Dendra's built-in PyTorch solver; CPU block and tree methods require the optional package. GPU solvers are included with Dendra.
 
-For a fast prose-only preview, clone the source repository, install the documentation extras from its root (``python -m pip install '.[doc]'``), and run ``sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html``. The repository's ``docs/README.md`` gives the full CI-equivalent workflow, which executes every notebook.
-
-See :ref:`installation` for detailed guidance and optional extras (Jupyter and development tooling).
+See :ref:`installation` for source installations, supported solver wheels,
+verification, and optional extras. The :ref:`GPU deployment guide
+<gpu-deployment>` covers CUDA diagnostics and the optional native-extension
+probe.
 
 
 Feedback and Contributions
 --------------------------
 
-We welcome issues and merge or pull requests on the repository host available to you. External contributions will use GitHub when the public repository opens. When reporting a bug, include your OS, Python/PyTorch versions, install method, and a minimal reproducible script. For feature requests, please describe the workflow you are trying to support. The repository's ``CONTRIBUTING.md`` file describes setup, testing, and submission.
+We welcome issues and pull requests through `wmglab-duke/dendra <https://github.com/wmglab-duke/dendra>`_. When reporting a bug, include your OS, Python/PyTorch versions, install method, and a minimal reproducible script. For feature requests, please describe the workflow you are trying to support. The repository's `contribution guide <https://github.com/wmglab-duke/dendra/blob/main/CONTRIBUTING.md>`_ describes setup, testing, and submission. Internal contributors continue to use GitLab merge requests.
 
 Contribution tips:
 
@@ -126,6 +125,7 @@ If you use `Dendra`, consider citing the `corresponding paper <https://www.natur
    :caption: Getting started
 
    installation
+   gpu-deployment
    upgrading
    units
 
@@ -151,5 +151,6 @@ If you use `Dendra`, consider citing the `corresponding paper <https://www.natur
 
    mechanisms
    slices
+   testing
    dendra
    license

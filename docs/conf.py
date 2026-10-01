@@ -110,14 +110,14 @@ html_theme_options = {
     "accent_color": "cyan",
 }
 
-# Link to GitHub only in a GitHub-hosted documentation build. During internal
-# GitLab development the mirror may still be private, so a hard-coded URL would
-# make the source link unusable.
-if github_repository := os.environ.get("GITHUB_REPOSITORY"):
-    github_server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-    html_theme_options["github_url"] = f"{github_server}/{github_repository}"
-elif gitlab_project_url := os.environ.get("CI_PROJECT_URL"):
+# Public and local builds link to the public GitHub source. Internal GitLab CI
+# keeps its source link on the canonical development repository.
+if gitlab_project_url := os.environ.get("CI_PROJECT_URL"):
     html_theme_options["gitlab_url"] = gitlab_project_url
+else:
+    github_server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    github_repository = os.environ.get("GITHUB_REPOSITORY", "wmglab-duke/dendra")
+    html_theme_options["github_url"] = f"{github_server}/{github_repository}"
 
 html_css_files = ["custom.css"]
 
