@@ -353,8 +353,10 @@ class _bwd_euler_ub(Integrator):
                     self._solve = torch.ops.dendra_solvers.thomas_solve_t
             else:
                 warnings.warn(
-                    "Using `bwd_euler_ub` on CPU without dendra_solvers installed. "
-                    "Falling back to PCR solver."
+                    "Using `bwd_euler_ub` on CPU without dendra-solvers installed. "
+                    "Falling back to PCR solver. Install the native package with "
+                    "`python -m pip install --upgrade "
+                    '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
                 )
                 self._solve = pcr_solve_t
 
@@ -374,7 +376,9 @@ class _bwd_euler_ub(Integrator):
                 return facade
             raise RuntimeError(
                 "The selected native CPU solver requires a dendra-solvers build "
-                "that exports torch.func-compatible tridiagonal facades."
+                "that exports torch.func-compatible tridiagonal facades. Upgrade "
+                "it with `python -m pip install --upgrade "
+                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
             )
 
         if solver_name == "pcr_solve_t" and solver_module == (
@@ -599,8 +603,9 @@ class _bwd_euler_bt(Integrator):
         if not DENDRA_SOLVERS_AVAILABLE:
             logging.warning(
                 "Native CPU block solvers are unavailable. CUDA will use Triton "
-                "and MPS will use pure-PyTorch block PCR; install dendra_solvers "
-                "for CPU support."
+                "and MPS will use pure-PyTorch block PCR; install dendra-solvers "
+                "for CPU support with `python -m pip install --upgrade "
+                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
             )
         super().__init__(model, mech, imem)
 
@@ -783,15 +788,19 @@ class _bwd_euler_bt(Integrator):
             elif dev == "cpu":
                 if not DENDRA_SOLVERS_AVAILABLE:
                     raise ImportError(
-                        "_bwd_euler_bt(method='spd') requires dendra_solvers for CPU execution. "
-                        "Use CUDA or install dendra_solvers."
+                        "_bwd_euler_bt(method='spd') requires the dendra-solvers "
+                        "package for CPU execution. Use CUDA or run "
+                        "`python -m pip install --upgrade "
+                        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
                     )
                 try:
                     from dendra_solvers import solve_bt_spd_consume_unchecked
                 except ImportError as err:
                     raise ImportError(
-                        "_bwd_euler_bt(method='spd') requires dendra_solvers for CPU execution. "
-                        "Use CUDA or install dendra_solvers."
+                        "_bwd_euler_bt(method='spd') requires the dendra-solvers "
+                        "package for CPU execution. Use CUDA or run "
+                        "`python -m pip install --upgrade "
+                        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
                     ) from err
                 else:
                     # _step constructs fresh B_work/D_work buffers, so use the
@@ -805,8 +814,10 @@ class _bwd_euler_bt(Integrator):
                     self._solve = torch.ops.dendra_solvers.solve_bt
                 else:
                     raise ImportError(
-                        "_bwd_euler_bt(method='thomas') requires dendra_solvers for CPU execution. "
-                        "Use CUDA or install dendra_solvers."
+                        "_bwd_euler_bt(method='thomas') requires the dendra-solvers "
+                        "package for CPU execution. Use CUDA or run "
+                        "`python -m pip install --upgrade "
+                        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
                     )
 
     def initialize(self, model, dt):

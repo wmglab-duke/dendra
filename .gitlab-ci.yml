@@ -37,7 +37,7 @@ before_script:
   - python -m pip install --only-binary=dendra-solvers --build-constraint "$CI_PROJECT_DIR/constraints.txt" ".[doc,solvers]"
 
   # 3) Clone and install dendra-models AFTER dendra and torch
-  - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/dendra-models.git"
+  - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/dendra-dev/dendra-models.git"
   # Dendra itself is the source checkout under test. Avoid asking pip to
   # resolve dendra-models' released Dendra floor before Commitizen has bumped
   # this checkout at the end of the successful pipeline.
@@ -126,7 +126,9 @@ test:
 build_docs:
   stage: build
   script:
-    - sphinx-build -W --keep-going -b html docs docs/_build/html
+    # Validate Dendra's documentation strictly without depending on remote
+    # intersphinx inventories or rerunning the notebooks stored in the source.
+    - DENDRA_DOCS_DISABLE_INTERSPHINX=1 sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html
     - mkdir -p public
     - cp -r docs/_build/html/* public/
   artifacts:

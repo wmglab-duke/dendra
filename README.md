@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/_static/logo-light.png">
+  <img src="docs/_static/logo-light.png" alt="Dendra">
 </div>
 
 ***
@@ -7,70 +7,114 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style-plastic&logo=PyTorch&logoColor=white)](https://pytorch.com)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Coverage](https://gitlab.oit.duke.edu/mah148/dendra/badges/main/coverage.svg?job=test)](https://gitlab.oit.duke.edu/mah148/dendra/-/pipelines?ref=main)
 
 Fast, scalable, versatile, and differentiable neural simulator with support for extracellular fields. Useful to implement and train high-throughput GPU-compatible models.
 
 ## Documentation
-Full documentation is available at [Dendra documentation](https://dendra-dev.pages.oit.duke.edu/dendra/).
-See the [unit conventions](https://dendra-dev.pages.oit.duke.edu/dendra/units.html) for the distinct distributed-mechanism, point-process, stimulation, and material contracts.
+
+During internal development, the full documentation is available through
+[GitLab Pages](https://dendra-dev.pages.oit.duke.edu/dendra/). Its
+[source](docs/index.rst) is maintained with the repository and remains readable
+on either host. See the [unit conventions](docs/units.rst) for the distinct
+distributed-mechanism, point-process, stimulation, and material contracts.
 
 ## Requirements
 
 ### OS requirements
+
 `dendra` has been tested on Windows 11 under WSL2 (Ubuntu 22.04), Linux (AlmaLinux v9.3, binary-compatible with Red Hat Enterprise Linux), and macOS (Tahoe 26.3).
 
 ### Python dependencies
-`dendra` requires Python 3.11+, PyTorch 2.12+, and NEURON. For GPU support, CUDA 12.9+ is required for best performance. **We recommend installing the most recent stable version of PyTorch that supports your CUDA version**. If you have an older GPU that is not compatible with the latest CUDA, choose an older supported PyTorch release (2.12 or newer) that supports your CUDA version. See the [PyTorch previous versions page](https://pytorch.org/get-started/previous-versions/) for more details.
+
+`dendra` requires Python 3.11 or newer and PyTorch 2.12 or newer. PyTorch and
+NEURON are installed as package dependencies. GPU use requires a CUDA-capable
+PyTorch build compatible with the host driver.
+On Windows, install inside WSL2 because the required NEURON dependency does not
+publish native Windows wheels on PyPI.
 
 ## 🖥️ Installation
 
-> [!TIP]
-> We recommend using `conda` to manage your python environment. If you have `conda` installed, you may wish to set up a new environment: `conda create -n dendra python=3.12`. Be sure to activate your new environment (`conda activate dendra`) before following the installation instructions or running code.
+### From a source checkout
 
-1. (Optional) Install your preferred version of PyTorch. If you do not have a GPU or do not need GPU support, we recommend you install the CPU-only version of PyTorch to avoid installing unnecessary CUDA dependencies. e.g., for PyTorch 2.12.0:
+Until the first Dendra release is published on PyPI, install from your source
+checkout. From the repository root, install the package with the recommended
+native CPU solvers:
+
 ```bash
-> pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cu129  # GPU version, CUDA 12.9 specified - adjust the version and CUDA version as needed
-> pip install torch==2.12.0 --index-url https://download.pytorch.org/whl/cpu    # CPU-only version
+python -m pip install --upgrade pip
+python -m pip install ".[solvers]"
 ```
 
-2. Clone this repository.
+Use `python -m pip install .` if no compatible `dendra-solvers` distribution is
+available. The development section below describes editable installations.
+
+### From PyPI
+
+Once the Dendra distribution is published, create and activate an isolated
+Python environment, then install it with the recommended native CPU solvers:
 
 ```bash
-> git clone https://gitlab.oit.duke.edu/mah148/dendra.git
-```
-
-3. Install with the recommended CPU solvers.
-
-```bash
-> cd dendra
-> pip install ".[solvers]"
+python -m pip install --upgrade pip
+python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
 ```
 
 This includes [`dendra-solvers`](https://pypi.org/project/dendra-solvers/).
-If that package cannot be installed, retry with `pip install .` to install
-Dendra without it. CPU unbranched cables can then use the built-in PyTorch
-solver; CPU block and tree methods require the optional solver package.
-See the [installation guide](docs/installation.md#cpu-implicit-solvers) for
-wheel-only installation and supported platforms. GPU solvers remain included
-with Dendra.
+If no compatible solver distribution is available, install the base package:
 
-- If you want to build and run the documentation locally:
-    - `pip install ".[doc,solvers]"` (includes CPU solvers used by the examples)
+```bash
+python -m pip install dendra
+```
 
-- If you want interactive Matplotlib figures inside Jupyter:
-    - `pip install ".[jupyter]"`
-    - Restart the entire Jupyter server—not only the kernel—then select
-      `%matplotlib widget` before plotting.
-    - Separate server/kernel environments need compatible ipympl installations
-      in both; see the [interactive Jupyter setup](docs/installation.md#interactive-jupyter-figures).
+The base package retains Dendra's PyTorch CPU solver for unbranched cables and
+all GPU solvers. CPU block and tree methods require `dendra-solvers`.
+
+`pip` installs a compatible PyTorch release automatically. To select a specific
+CPU, CUDA, or ROCm build, install PyTorch first using its
+[installation selector](https://pytorch.org/get-started/locally/), then install
+Dendra. See the [installation guide](docs/installation.md)
+for virtual-environment, solver-wheel, source-installation, and verification
+instructions.
+
+For interactive Matplotlib figures in Jupyter, install:
+
+```bash
+python -m pip install "dendra[jupyter]"
+```
+
+Restart the entire Jupyter server, select `%matplotlib widget`, and see the
+[interactive Jupyter setup](docs/installation.md#interactive-jupyter-figures)
+when the server and kernel use different environments.
+
+Check the installed dependencies and inspect the PyTorch/CUDA deployment
+environment with:
+
+```bash
+python -m pip check
+python -m dendra doctor
+```
+
+If you installed the recommended CPU solvers, verify their compiled extension
+separately:
+
+```bash
+python -c "import dendra_solvers._ext as ext; print(ext.__file__)"
+```
 
 ### ⚙️ Installing for development
-- Install `--editable` with development dependencies and CPU solvers for the full test suite:
-    - `pip install --editable ".[dev,solvers]"`
-    - `pre-commit install`
 
-Use `pip install --editable ".[dev]"` for development without native CPU solvers.
+For development, use the repository checkout on the host available to you and
+follow the contribution guide. From the repository root, install Dendra in
+editable mode and enable the commit hooks:
+
+```bash
+python -m pip install --editable ".[dev,solvers]"
+pre-commit install
+pre-commit install --hook-type commit-msg
+```
+
+Use `python -m pip install --editable ".[dev]"` for development without native CPU solvers.
+See the [contribution guide](CONTRIBUTING.md)
+for the development and pull-request workflow.
 
 ### GPU deployment diagnostics
 
@@ -110,7 +154,7 @@ CUDA path is attempted; CPU and dense-backend execution are unaffected.
 
 ## ✅ Testing and code coverage
 
-Install `.[dev,solvers]` for the full CPU test suite and coverage checks; the development dependencies include `pytest` and `pytest-cov`. Run the complete test suite from the repository root with:
+Install `.[dev,solvers]` from a source checkout for the full CPU test suite and coverage checks; the development dependencies include `pytest` and `pytest-cov`. Run the complete test suite from the repository root with:
 
 ```bash
 python -m pytest tests
@@ -162,17 +206,6 @@ GitLab CI runs this same non-CUDA branch-coverage measurement for every pipeline
 python scripts/check_coverage_floors.py coverage.json
 ```
 
-
-🥳 You're all set!
-
-> [!NOTE]
-> Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive space.
-
-## 🗄️ Pre-implemented models
-
-Cell & network models are available at https://gitlab.oit.duke.edu/mah148/dendra-models.
-
-
 ## 🔍 Citation
 
 If you use Dendra, please cite...(paper forthcoming).
@@ -193,6 +226,7 @@ Minhaj A. Hussain, Warren M. Grill, Nicole A. Pelot. "Highly efficient modeling 
 
 
 ## 📜 License
+
 The copyrights of this software are owned by Duke University. As such, it is offered under a custom license (see LICENSE.md) whereby:
 
 1. DUKE grants YOU a royalty-free, non-transferable, non-exclusive, worldwide license under its copyright to use, reproduce, modify, publicly display, and perform the PROGRAM solely for non-commercial research and/or academic testing purposes.

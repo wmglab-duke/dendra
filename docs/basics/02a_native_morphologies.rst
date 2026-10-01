@@ -922,7 +922,7 @@ environment installation is:
 
 .. code-block:: bash
 
-   pip install --editable ".[jupyter]"
+   python -m pip install --editable ".[jupyter]"
 
 An existing notebook may use ``%pip install ipympl`` for its kernel side, but
 that does not install into a separately managed server environment. After the

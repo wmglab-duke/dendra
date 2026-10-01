@@ -1,11 +1,14 @@
 # Documentation
 
-To build the sphinx documentation and run locally:
+From the repository root, build the documentation without executing
+notebooks and serve it locally with:
 
+```sh
+python -m pip install ".[doc]"
+sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html
+python -m http.server --directory docs/_build/html
 ```
-python -m pip install '.[doc,solvers]'  # from the repo root; examples use CPU solvers
-cd docs
-make html
-cd _build/html
-python -m http.server
-```
+
+This uses the notebooks' stored outputs and matches the documentation CI build.
+Refresh notebook caches only in an environment that also contains
+their model and solver dependencies.

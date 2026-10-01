@@ -1,0 +1,198 @@
+name: Build and Publish Distributions
+
+# GitLab owns development, version bumps and tags. Promote selected releases
+# to GitHub; syncing main validates source without uploading to an index.
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish_target:
+        description: "Upload destination (PyPI requires a selected version tag)"
+        type: choice
+        options: [none, testpypi, pypi]
+        default: none
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.event_name != 'workflow_dispatch' }}
+
+env:
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MPLBACKEND: Agg
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate production release selection
+        env:
+          PUBLISH_TARGET: ${{ inputs.publish_target }}
+        run: |
+          if [[ "$PUBLISH_TARGET" == "pypi" && "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "Select a version tag when requesting a production upload."
+            exit 1
+          fi
+      - name: Install packaging tools
+        run: python -m pip install --upgrade build twine
+      - name: Test publication safeguards
+        run: python -m unittest discover -s tests -p test_distribution_checks.py
+      - name: Build wheel from source distribution
+        run: python -m build
+      - name: Check metadata and archive contents
+        run: |
+          python -m twine check --strict dist/*
+          python scripts/check_distribution.py dist --ref "$GITHUB_REF"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-dists
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  test_install:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: "3.11"
+            torch: "torch==2.12.0"
+            distribution: wheel
+            solvers: absent
+          - os: ubuntu-24.04
+            python: "3.13"
+            torch: "torch==2.12.0"
+            distribution: wheel
+            solvers: present
+          - os: ubuntu-24.04
+            python: "3.14"
+            torch: "torch>=2.12,<3"
+            distribution: wheel
+            solvers: absent
+          - os: macos-14
+            python: "3.12"
+            torch: "torch==2.12.0"
+            distribution: wheel
+            solvers: absent
+          - os: ubuntu-24.04
+            python: "3.12"
+            torch: "torch==2.12.0"
+            distribution: sdist
+            solvers: absent
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-dists
+          path: dist
+      - name: Install CPU PyTorch on Linux
+        if: runner.os == 'Linux'
+        env:
+          TORCH_SPEC: ${{ matrix.torch }}
+        run: python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
+      - name: Install PyTorch on macOS
+        if: runner.os == 'macOS'
+        env:
+          TORCH_SPEC: ${{ matrix.torch }}
+        run: python -m pip install "$TORCH_SPEC"
+      - name: Install the built artifact
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+          SOLVERS: ${{ matrix.solvers }}
+        run: |
+          if [[ "$DISTRIBUTION" == "wheel" ]]; then
+            artifacts=(dist/*.whl)
+          else
+            artifacts=(dist/*.tar.gz)
+          fi
+          if [[ "$SOLVERS" == "present" ]]; then
+            python -m pip install --only-binary=dendra-solvers "${artifacts[0]}[solvers]"
+          else
+            python -m pip install "${artifacts[0]}"
+          fi
+          python -m pip check
+      - name: Exercise installed simulation and analysis outside the checkout
+        env:
+          SOLVERS: ${{ matrix.solvers }}
+        run: |
+          cd "$RUNNER_TEMP"
+          python -I "$GITHUB_WORKSPACE/scripts/distribution_smoke.py" --expect-solvers "$SOLVERS"
+
+  check_dist:
+    needs: [build, test_install]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-dists
+          path: dist
+      - name: Recheck the distributions selected for upload
+        run: python scripts/check_distribution.py dist --ref "$GITHUB_REF"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checked-dists
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish_testpypi:
+    needs: check_dist
+    if: github.repository == 'wmglab-duke/dendra' && github.event_name == 'workflow_dispatch' && inputs.publish_target == 'testpypi'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: checked-dists
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish_pypi:
+    needs: check_dist
+    if: github.repository == 'wmglab-duke/dendra' && startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_target == 'pypi'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: checked-dists
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

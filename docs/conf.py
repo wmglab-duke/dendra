@@ -15,6 +15,7 @@
 # sys.path.insert(0, os.path.abspath('.'))
 
 import inspect
+import os
 from pathlib import Path
 
 # -- Project information -----------------------------------------------------
@@ -37,11 +38,16 @@ extensions = [
     "myst_nb",
 ]
 
-intersphinx_mapping = {
-    "python": ("https://docs.python.org/3", None),
-    "numpy": ("https://numpy.org/doc/stable", None),
-    "pytorch": ("https://pytorch.org/docs/stable", None),
-}
+if os.environ.get("DENDRA_DOCS_DISABLE_INTERSPHINX") == "1":
+    # Strict CI validation should fail for warnings in Dendra's documentation,
+    # not because an external documentation inventory is temporarily offline.
+    intersphinx_mapping = {}
+else:
+    intersphinx_mapping = {
+        "python": ("https://docs.python.org/3", None),
+        "numpy": ("https://numpy.org/doc/stable", None),
+        "pytorch": ("https://docs.pytorch.org/docs/stable", None),
+    }
 
 source_suffix = {
     ".rst": "restructuredtext",
@@ -98,8 +104,16 @@ html_theme_options = {
     "light_logo": "_static/logo-light.png",
     "dark_logo": "_static/logo-dark.png",
     "accent_color": "cyan",
-    "gitlab_url": "https://gitlab.oit.duke.edu/dendra-dev/dendra",
 }
+
+# Link to GitHub only in a GitHub-hosted documentation build. During internal
+# GitLab development the mirror may still be private, so a hard-coded URL would
+# make the source link unusable.
+if github_repository := os.environ.get("GITHUB_REPOSITORY"):
+    github_server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    html_theme_options["github_url"] = f"{github_server}/{github_repository}"
+elif gitlab_project_url := os.environ.get("CI_PROJECT_URL"):
+    html_theme_options["gitlab_url"] = gitlab_project_url
 
 html_css_files = ["custom.css"]
 

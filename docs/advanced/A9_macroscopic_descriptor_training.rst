@@ -134,7 +134,7 @@ Run it from the repository root:
 
    python examples/macroscopic_descriptor_training.py
 
-A short smoke run is available for checking an installation:
+A short source-checkout smoke run is available:
 
 .. code-block:: console
 
@@ -142,7 +142,7 @@ A short smoke run is available for checking an installation:
        --updates 1 --tstop-ms 60 --objective-start-ms 20 \
        --skip-holdout --no-jit
 
-The short command is the installation smoke check and normally finishes in a
+The short command checks the example environment and normally finishes in a
 few seconds. The full default run performs nine differentiable updates plus
 hard backtracking and a 400-ms holdout evaluation; it took about two minutes
 on one CPU thread in our test.
