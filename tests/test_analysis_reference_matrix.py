@@ -328,6 +328,142 @@ def test_hard_ads_recovers_latency_velocity_and_dropped_distal_spikes():
     assert single["p_success"].shape == (2, 1)
 
 
+def test_ads_dimensioned_stabilizers_are_independent_and_eps_is_compatible():
+    voltage, pulse_times = _train_trace()
+    voltage = voltage[:175, :1]
+    common = dict(
+        lengths_um=100.0,
+        response_window_ms=(0.1, 1.5),
+        dv_th=100.0,
+        baseline_n_pulses=2,
+        tail_n_pulses=2,
+        reference_latency_ms=0.4,
+        reference_velocity_m_per_s=0.4,
+    )
+
+    legacy = hard_activity_dependent_slowing(
+        voltage,
+        pulse_times,
+        DT_MS,
+        eps=1e-4,
+        **common,
+    )
+    explicit_legacy = hard_activity_dependent_slowing(
+        voltage,
+        pulse_times,
+        DT_MS,
+        eps=1e-4,
+        eps_time_ms2=1e-4,
+        eps_latency_ms=1e-4,
+        eps_velocity_m_per_s=1e-4,
+        **common,
+    )
+    for key in (
+        "v_m_per_s",
+        "ads_percent",
+        "instantaneous_frequency_hz",
+        "velocity_change_percent",
+    ):
+        torch.testing.assert_close(legacy[key], explicit_legacy[key])
+
+    soft_common = dict(
+        lengths_um=100.0,
+        response_window_ms=(0.1, 1.5),
+        reference_latency_ms=0.4,
+        reference_velocity_m_per_s=0.4,
+        **_soft_detection_kwargs(),
+    )
+    soft_legacy = activity_dependent_slowing(
+        voltage,
+        pulse_times,
+        DT_MS,
+        eps=1e-4,
+        **soft_common,
+    )
+    soft_explicit_legacy = activity_dependent_slowing(
+        voltage,
+        pulse_times,
+        DT_MS,
+        eps=1e-4,
+        eps_time_ms2=1e-4,
+        eps_latency_ms=1e-4,
+        eps_velocity_m_per_s=1e-4,
+        **soft_common,
+    )
+    for key in (
+        "v_m_per_s",
+        "ads_percent",
+        "instantaneous_frequency_hz",
+        "velocity_change_percent",
+    ):
+        torch.testing.assert_close(soft_legacy[key], soft_explicit_legacy[key])
+
+    baseline = hard_activity_dependent_slowing(
+        voltage,
+        pulse_times,
+        DT_MS,
+        eps=1e-12,
+        **common,
+    )
+    time_regularized = hard_activity_dependent_slowing(
+        voltage,
+        pulse_times,
+        DT_MS,
+        eps=1e-12,
+        eps_time_ms2=0.005,
+        **common,
+    )
+    latency_regularized = hard_activity_dependent_slowing(
+        voltage,
+        pulse_times,
+        DT_MS,
+        eps=1e-12,
+        eps_latency_ms=0.2,
+        **common,
+    )
+    velocity_regularized = hard_activity_dependent_slowing(
+        voltage,
+        pulse_times,
+        DT_MS,
+        eps=1e-12,
+        eps_velocity_m_per_s=0.2,
+        **common,
+    )
+
+    assert not torch.equal(time_regularized["v_m_per_s"], baseline["v_m_per_s"])
+    torch.testing.assert_close(time_regularized["ads_percent"], baseline["ads_percent"])
+    torch.testing.assert_close(latency_regularized["v_m_per_s"], baseline["v_m_per_s"])
+    assert not torch.equal(latency_regularized["ads_percent"], baseline["ads_percent"])
+    assert not torch.equal(
+        latency_regularized["instantaneous_frequency_hz"],
+        baseline["instantaneous_frequency_hz"],
+    )
+    torch.testing.assert_close(velocity_regularized["v_m_per_s"], baseline["v_m_per_s"])
+    torch.testing.assert_close(
+        velocity_regularized["ads_percent"], baseline["ads_percent"]
+    )
+    assert not torch.equal(
+        velocity_regularized["velocity_change_percent"],
+        baseline["velocity_change_percent"],
+    )
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    [activity_dependent_slowing, hard_activity_dependent_slowing],
+)
+@pytest.mark.parametrize(
+    "stabilizer", ["eps", "eps_time_ms2", "eps_latency_ms", "eps_velocity_m_per_s"]
+)
+@pytest.mark.parametrize("invalid", [-1e-6, float("nan"), float("inf")])
+def test_ads_rejects_invalid_stabilizers(descriptor, stabilizer, invalid):
+    voltage = torch.zeros((2, 1, 1), dtype=DTYPE)
+    pulse_times = torch.zeros(1, dtype=DTYPE)
+
+    with pytest.raises(ValueError, match=stabilizer):
+        descriptor(voltage, pulse_times, DT_MS, **{stabilizer: invalid})
+
+
 def test_hard_ads_excludes_spikes_in_gather_padding_outside_response_window():
     voltage = _resting_trace(50, 3, 1)
     # Crossing times are 2.47 (inside), 2.87 (after), and 2.07 ms (before).

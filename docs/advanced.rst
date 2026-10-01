@@ -15,3 +15,6 @@ Advanced
    advanced/A6_mechanism_support_layouts.rst
    advanced/A7_model_initialization.rst
    advanced/A8_functional_populations.rst
+   advanced/A9_macroscopic_descriptor_training.rst
+   advanced/A10_hard_transition_scans.rst
+   advanced/A11_event_margin_training.rst

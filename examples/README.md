@@ -77,3 +77,56 @@ For a longer optimization, amortize compilation with:
 ```bash
 python examples/functional_gradient_descent.py --compiled-step
 ```
+
+## Train a macroscopic descriptor
+
+[`macroscopic_descriptor_training.py`](macroscopic_descriptor_training.py)
+trains repeated firing without a target voltage trace. It differentiates the
+span firing frequency with respect to two Hodgkin--Huxley rate coordinates,
+takes normalized optimizer steps, and accepts a step only after a complete
+simulation confirms that the hard descriptor did not regress.
+
+Run a short smoke example from the repository root:
+
+```bash
+python examples/macroscopic_descriptor_training.py \
+    --updates 1 \
+    --tstop-ms 60 \
+    --objective-start-ms 20 \
+    --skip-holdout \
+    --no-jit
+```
+
+The full default run uses a longer observation window and evaluates the final
+parameters in a separate holdout window:
+
+```bash
+python examples/macroscopic_descriptor_training.py
+```
+
+See the
+[macroscopic descriptor training guide](../docs/advanced/A9_macroscopic_descriptor_training.rst)
+for the common optimization pattern and the other analysis interfaces.
+
+## Differentiate threshold and chronaxie
+
+[`threshold_descriptor_gradients.py`](threshold_descriptor_gradients.py)
+uses Dendra's built-in myelinated HH model to show the complete workflow for a
+threshold-derived descriptor. It runs hard `Thresholder` searches at four
+pulse widths, constructs voltage/amplitude tangents from one batched replay,
+and differentiates both the individual thresholds and the fitted chronaxie
+with respect to log sodium conductance. Fresh hard searches at perturbed
+conductances independently check every reported slope.
+
+Run the example from the repository root:
+
+```bash
+python examples/threshold_descriptor_gradients.py
+```
+
+The script checks exact hard-forward value parity and fails if a trace-derived
+slope differs from its hard finite difference by more than 2%. Its default CPU
+run normally finishes in about 15 seconds. The
+[threshold-derived descriptor guide](../docs/advanced/A9_macroscopic_descriptor_training.rst#threshold-derived-descriptors)
+explains the amplitude JVP, stateful replay ordering, probe checks, and
+chronaxie composition used by the script.

@@ -80,11 +80,13 @@ test_base_install:
 
       import torch
       import dendra as dn
+      import dendra.models.analysis as analysis
       from dendra.models.integrators.tridiag import pcr_solve_t
       from dendra.models.mod import pas
 
       assert find_spec("dendra_solvers") is None
       assert not Path(dn.__file__).resolve().is_relative_to(Path.cwd().resolve())
+      assert not Path(analysis.__file__).resolve().is_relative_to(Path.cwd().resolve())
       with dn.ctx(JIT=0, REQUIRE_GRAD=0, DEVICE="cpu"):
           morphology = dn.Morphology()
           morphology.section("path", L=50.0, diam=2.0, nseg=5)
