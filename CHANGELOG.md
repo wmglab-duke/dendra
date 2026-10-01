@@ -1,3 +1,14 @@
+## v0.27.0 (2026-10-01)
+
+### Feat
+
+- **packaging**: add GitHub trusted publishing
+- **analysis**: add hard-forward, branch-conditioned trace descriptors and validated threshold-derived objectives for model training. package the analysis API into focused modules, document complete training workflows, and add end-to-end examples and gradient checks
+
+### Fix
+
+- **initialization**: rematerialize effective parameter buffers after parameter-writing initialization transforms for repeated initialized simulations remain connected to trainable raw parameters
+
 ## v0.26.1 (2026-09-24)
 
 ### Fix
