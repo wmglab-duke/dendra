@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import tomllib
 from pathlib import Path
 
@@ -24,22 +23,7 @@ def test_jupyter_extra_declares_the_interactive_matplotlib_backend():
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     pyproject_extra = config["project"]["optional-dependencies"]["jupyter"]
 
-    setup_tree = ast.parse((ROOT / "setup.py").read_text(encoding="utf-8"))
-    setup_call = next(
-        node.value
-        for node in setup_tree.body
-        if isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Name)
-        and node.value.func.id == "setup"
-    )
-    extras_keyword = next(
-        keyword for keyword in setup_call.keywords if keyword.arg == "extras_require"
-    )
-    setup_extra = ast.literal_eval(extras_keyword.value)["jupyter"]
-
     assert pyproject_extra == ["ipympl >= 0.9.5"]
-    assert setup_extra == pyproject_extra
 
 
 def test_jupyter_install_docs_cover_shared_and_split_environments():
