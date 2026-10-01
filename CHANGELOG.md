@@ -1,3 +1,9 @@
+## v0.27.1 (2026-10-01)
+
+### Fix
+
+- **docs**: execute notebooks in documentation CI
+
 ## v0.27.0 (2026-10-01)
 
 ### Feat
