@@ -153,6 +153,16 @@ def test_hard_spike_arrival_times_detects_first_crossing_and_windows():
     assert not empty["has_crossing"].any()
     assert torch.isnan(empty["t_cross_ms"]).all()
 
+    boundary = _resting_trace(10, 1, 1)
+    boundary[7, 0, 0] = 0.0
+    aligned = hard_spike_arrival_times(
+        boundary,
+        0.01,
+        time_window_ms=(0.07, 0.075),
+    )
+    assert aligned["has_crossing"].item()
+    assert aligned["t_cross_ms"].item() == pytest.approx(0.07)
+
 
 def test_hard_spike_arrival_times_validates_shape_and_window_selection():
     V = _resting_trace(4, 1, 1)
@@ -228,6 +238,10 @@ def test_hard_firing_rate_refractory_window_and_validation():
         hard_firing_rate(V, DT_MS, time_window=(2, 3))
     with pytest.raises(ValueError, match="only one"):
         hard_firing_rate(V, DT_MS, time_window=(0, 3), time_window_ms=(0.0, 0.3))
+    with pytest.raises(ValueError, match="end > start"):
+        hard_firing_rate(V, DT_MS, time_window_ms=(0.3, 0.3))
+    with pytest.raises(ValueError, match="finite"):
+        hard_firing_rate(V, DT_MS, time_window_ms=(0.0, float("nan")))
 
 
 @pytest.mark.parametrize(
@@ -285,6 +299,81 @@ def test_hard_action_potential_width_validates_mode_and_mask():
         hard_action_potential_width(V, DT_MS, mode="bad")
     with pytest.raises(ValueError, match="node_mask"):
         hard_action_potential_width(V, DT_MS, node_mask=torch.ones(3))
+
+
+def _one_and_two_spike_width_traces():
+    first = _resting_trace(140, 1, 1)
+    spike = torch.tensor(
+        [-67.0, -61.0, -40.0, 0.0, 30.0, 25.0, 10.0, -20.0, -45.0, -58.0, -65.0, -70.0],
+        dtype=first.dtype,
+    )
+    first[30:42, 0, 0] = spike
+    second = first.clone()
+    second[80:92, 0, 0] = spike
+    return first, second
+
+
+def test_full_width_excludes_later_spike_within_postspike_window():
+    first, two_spikes = _one_and_two_spike_width_traces()
+    hard_options = dict(baseline_margin_mV=10.0, full_width_post_ms=8.0)
+    # Fix the first event's localization to isolate the width readout.
+    soft_options = dict(
+        **hard_options,
+        t_hat_ms=torch.tensor([[3.3]], dtype=first.dtype),
+        p_spike=torch.ones((1, 1), dtype=first.dtype),
+    )
+
+    hard_first = hard_action_potential_width(first, DT_MS, **hard_options)
+    hard_two = hard_action_potential_width(two_spikes, DT_MS, **hard_options)
+    soft_first = action_potential_width(first, DT_MS, **soft_options)
+    soft_two = action_potential_width(two_spikes, DT_MS, **soft_options)
+
+    assert hard_first["full_width_ms"].item() == pytest.approx(0.7984, abs=1e-4)
+    assert torch.equal(hard_first["full_width_ms"], hard_two["full_width_ms"])
+    assert soft_two["full_width_ms"].item() == pytest.approx(
+        soft_first["full_width_ms"].item(), abs=0.04
+    )
+    assert soft_two["full_width_ms"].item() == pytest.approx(
+        hard_two["full_width_ms"].item(), abs=0.12
+    )
+
+
+def test_full_width_first_return_remains_differentiable():
+    _, two_spikes = _one_and_two_spike_width_traces()
+    V = two_spikes.requires_grad_()
+    options = dict(
+        baseline_margin_mV=10.0,
+        full_width_post_ms=8.0,
+        t_hat_ms=torch.tensor([[3.3]], dtype=V.dtype),
+        p_spike=torch.ones((1, 1), dtype=V.dtype),
+    )
+
+    def width(voltage):
+        return action_potential_width(voltage, DT_MS, **options)["full_width_ms"].sum()
+
+    grad = torch.autograd.grad(width(V), V)[0]
+    direction = torch.zeros_like(V)
+    direction[38:41, 0, 0] = torch.tensor([0.25, 1.0, 0.25], dtype=V.dtype)
+    autodiff_slope = (grad * direction).sum().item()
+
+    def centered_slope(step_mV):
+        return (
+            (
+                width(V.detach() + step_mV * direction)
+                - width(V.detach() - step_mV * direction)
+            )
+            / (2 * step_mV)
+        ).item()
+
+    one_mV_slope = centered_slope(1.0)
+    fine_slope = centered_slope(0.1)
+
+    assert torch.isfinite(grad).all()
+    assert grad[29:42].abs().max().item() > 1e-4
+    assert abs(autodiff_slope) > 1e-4
+    assert one_mV_slope == pytest.approx(autodiff_slope, rel=0.1)
+    assert fine_slope == pytest.approx(autodiff_slope, rel=0.01)
+    assert abs(fine_slope - autodiff_slope) < abs(one_mV_slope - autodiff_slope)
 
 
 def test_soft_conduction_velocity_is_differentiable_and_honors_weights():

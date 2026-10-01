@@ -31,27 +31,79 @@ before_script:
   # 1) Install PyTorch first
   - python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
 
-  # 2) Clone and install dendra-solvers AFTER torch (still no-build-isolation)
-  - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/dendra-solvers.git"
-  - cd dendra-solvers && python -m pip install --no-build-isolation . && cd "$CI_PROJECT_DIR"
-
-  # 3) Install your main package with [doc] extra
+  # 2) Include optional native solvers for the full test and documentation lanes.
+  # Require the published wheel so CI exercises the distributed artifact.
   # Use build-constraint ONLY here (no --no-build-isolation on this command)
-  - python -m pip install --build-constraint "$CI_PROJECT_DIR/constraints.txt" ".[doc]"
+  - python -m pip install --only-binary=dendra-solvers --build-constraint "$CI_PROJECT_DIR/constraints.txt" ".[doc,solvers]"
 
-  # 4) Clone and install dendra-models AFTER dendra and torch
+  # 3) Clone and install dendra-models AFTER dendra and torch
   - git clone "https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.oit.duke.edu/mah148/dendra-models.git"
   # Dendra itself is the source checkout under test. Avoid asking pip to
   # resolve dendra-models' released Dendra floor before Commitizen has bumped
   # this checkout at the end of the successful pipeline.
   - cd dendra-models && python -m pip install --no-deps --build-constraint "$CI_PROJECT_DIR/constraints.txt" . && cd "$CI_PROJECT_DIR"
 
-  # Optional: verify in logs
-  - python -c "import numpy as np; print('NumPy:', np.__version__)"
-  - python -c "import torch; print('PyTorch:', torch.__version__)"
-  - python -c "import neuron; print('NEURON:', neuron.__version__)"
-  - python -c "import dendra; print('Dendra:', dendra.__version__)"
-  - python -c "import dendra_models; print('Dendra-Models:', dendra_models.__version__)"
+  # Verify the installed versions and load the solver's native extension early.
+  - |
+    python - <<'PY'
+    from importlib.metadata import version
+    import numpy as np
+    import torch
+    import neuron
+    import dendra_solvers._ext as solvers_ext
+    import dendra
+    import dendra_models
+
+    print('NumPy:', np.__version__)
+    print('PyTorch:', torch.__version__)
+    print('NEURON:', neuron.__version__)
+    print('Dendra-Solvers:', version('dendra-solvers'), solvers_ext.__file__)
+    print('Dendra:', dendra.__version__)
+    print('Dendra-Models:', dendra_models.__version__)
+    PY
+
+test_base_install:
+  stage: test
+  # Override the full test setup: this lane must never install native solvers.
+  before_script:
+    - python -m pip install --upgrade pip
+    - python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
+    - printf "numpy<2\ndendra-solvers==0\n" > "$CI_PROJECT_DIR/base-constraints.txt"
+    - python -m pip install --constraint "$CI_PROJECT_DIR/base-constraints.txt" .
+  script:
+    # Isolated mode imports the installed distribution, not the source checkout.
+    - |
+      python -I - <<'PY'
+      from importlib.util import find_spec
+      from pathlib import Path
+      import warnings
+
+      import torch
+      import dendra as dn
+      import dendra.models.analysis as analysis
+      from dendra.models.integrators.tridiag import pcr_solve_t
+      from dendra.models.mod import pas
+
+      assert find_spec("dendra_solvers") is None
+      assert not Path(dn.__file__).resolve().is_relative_to(Path.cwd().resolve())
+      assert not Path(analysis.__file__).resolve().is_relative_to(Path.cwd().resolve())
+      with dn.ctx(JIT=0, REQUIRE_GRAD=0, DEVICE="cpu"):
+          morphology = dn.Morphology()
+          morphology.section("path", L=50.0, diam=2.0, nseg=5)
+          cable = dn.Cable.from_morphology(
+              morphology, N=1, v_init=-65.0, dtype=torch.float64
+          )
+          cable.insert(pas, g=0.001, e=-70.0)
+          with warnings.catch_warnings(record=True) as caught:
+              warnings.simplefilter("always")
+              cable.initialize()
+              cable.run(tstop=0.1, dt=0.025)
+          assert any("Falling back to PCR" in str(item.message) for item in caught)
+          assert cable.integrator._solve is pcr_solve_t
+          assert torch.isfinite(cable.v).all()
+          assert (cable.v < -65.0).all()
+      print("Base installation and CPU cable fallback succeeded without native solvers.")
+      PY
 
 test:
   stage: test

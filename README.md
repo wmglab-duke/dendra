@@ -5,7 +5,7 @@
 ***
 
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style-plastic&logo=PyTorch&logoColor=white)](https://pytorch.com)
-[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![Coverage](https://gitlab.oit.duke.edu/mah148/dendra/badges/main/coverage.svg?job=test)](https://gitlab.oit.duke.edu/mah148/dendra/-/pipelines?ref=main)
 
@@ -40,15 +40,23 @@ See the [unit conventions](https://dendra-dev.pages.oit.duke.edu/dendra/units.ht
 > git clone https://gitlab.oit.duke.edu/mah148/dendra.git
 ```
 
-3. Install.
+3. Install with the recommended CPU solvers.
 
 ```bash
 > cd dendra
-> pip install .
+> pip install ".[solvers]"
 ```
 
+This includes [`dendra-solvers`](https://pypi.org/project/dendra-solvers/).
+If that package cannot be installed, retry with `pip install .` to install
+Dendra without it. CPU unbranched cables can then use the built-in PyTorch
+solver; CPU block and tree methods require the optional solver package.
+See the [installation guide](docs/installation.md#cpu-implicit-solvers) for
+wheel-only installation and supported platforms. GPU solvers remain included
+with Dendra.
+
 - If you want to build and run the documentation locally:
-    - `pip install ".[doc]"`
+    - `pip install ".[doc,solvers]"` (includes CPU solvers used by the examples)
 
 - If you want interactive Matplotlib figures inside Jupyter:
     - `pip install ".[jupyter]"`
@@ -58,9 +66,11 @@ See the [unit conventions](https://dendra-dev.pages.oit.duke.edu/dendra/units.ht
       in both; see the [interactive Jupyter setup](docs/installation.md#interactive-jupyter-figures).
 
 ### ⚙️ Installing for development
-- Install `--editable` with dev dependencies & install `pre-commit`:
-    - `pip install --editable ".[dev]"`
+- Install `--editable` with development dependencies and CPU solvers for the full test suite:
+    - `pip install --editable ".[dev,solvers]"`
     - `pre-commit install`
+
+Use `pip install --editable ".[dev]"` for development without native CPU solvers.
 
 ### GPU deployment diagnostics
 
@@ -100,7 +110,7 @@ CUDA path is attempted; CPU and dense-backend execution are unaffected.
 
 ## ✅ Testing and code coverage
 
-The development dependencies include `pytest` and `pytest-cov`. Run the complete test suite from the repository root with:
+Install `.[dev,solvers]` for the full CPU test suite and coverage checks; the development dependencies include `pytest` and `pytest-cov`. Run the complete test suite from the repository root with:
 
 ```bash
 python -m pytest tests
@@ -144,7 +154,7 @@ To measure both statement and branch coverage, print uncovered line numbers in t
 python -m pytest tests -W error -m "cpu or (neuron and not cuda)" --cov=dendra --cov-branch --cov-config=.coveragerc.cpu --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=html
 ```
 
-The `TOTAL` row is the overall coverage result. Open `htmlcov/index.html` to inspect coverage by module and identify untested lines and branches. The required lane installs and exercises NEURON; accelerator execution remains outside this measurement, while CPU-testable CUDA/Triton interfaces remain covered. Results can still vary when optional CPU solvers are unavailable.
+The `TOTAL` row is the overall coverage result. Open `htmlcov/index.html` to inspect coverage by module and identify untested lines and branches. The required lane installs and exercises NEURON and the CPU solvers; accelerator execution remains outside this measurement, while CPU-testable CUDA/Triton interfaces remain covered.
 
 GitLab CI runs this same non-CUDA branch-coverage measurement for every pipeline, enforces a ratcheted 84% global minimum, and retains JSON, browsable HTML, and Cobertura reports. Critical modules also have individual floors configured in `coverage-floors.toml`; validate them locally after generating `coverage.json` with:
 
@@ -157,9 +167,6 @@ python scripts/check_coverage_floors.py coverage.json
 
 > [!NOTE]
 > Installation of all dependencies should not take more time than a couple of minutes, depending on your internet speed. All dependencies (mainly PyTorch + CUDA libraries) require ~2GB of hard drive space.
-
-> [!IMPORTANT]
-> To enable implicit methods for solving $V_m$ **on CPU**, install [dendra-solvers](https://gitlab.oit.duke.edu/mah148/dendra-solvers). GPU implementations of all solvers are available by default.
 
 ## 🗄️ Pre-implemented models
 

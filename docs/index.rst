@@ -61,11 +61,13 @@ Dendra targets Python 3.11+ and PyTorch 2.12+ (CUDA 12.9+ wheels recommended for
 
 1. Create and activate an isolated environment (optional): ``conda create -n dendra python=3.12 && conda activate dendra``.
 2. Install PyTorch (choose GPU or CPU wheels): ``python -m pip install torch --index-url https://download.pytorch.org/whl/cu129``.
-3. Clone the repo and install: ``git clone https://gitlab.oit.duke.edu/mah148/dendra.git && cd dendra && python -m pip install .``.
+3. Clone the repo and install with the recommended CPU solvers: ``git clone https://gitlab.oit.duke.edu/mah148/dendra.git && cd dendra && python -m pip install '.[solvers]'``.
 
-To build these docs locally, install the extras (``python -m pip install '.[doc]'``) and run ``make html`` inside ``docs``.
+If ``dendra-solvers`` cannot be installed, retry with ``python -m pip install .`` to install Dendra without it. CPU unbranched cables can then use Dendra's built-in PyTorch solver; CPU block and tree methods require the optional package. GPU solvers are included with Dendra. See :ref:`installation` for wheel-only installation and supported platforms.
 
-See :ref:`installation` for detailed guidance and optional extras (Jupyter, development tooling, and CPU implicit solver support via ``dendra-solvers``).
+To build these docs locally, install the documentation extras and CPU solvers used by the examples (``python -m pip install '.[doc,solvers]'``) and run ``make html`` inside ``docs``.
+
+See :ref:`installation` for detailed guidance and optional extras (Jupyter and development tooling).
 
 
 Feedback and Contributions
@@ -76,7 +78,7 @@ We welcome issues and pull requests on GitLab. When reporting a bug, include you
 Contribution tips:
 
 - Use a fresh branch and keep changes focused.
-- Install development extras (``python -m pip install --editable '.[dev]'``) and run tests where applicable.
+- Install development extras and CPU solvers (``python -m pip install --editable '.[dev,solvers]'``) for the full CPU test suite and coverage checks. Use ``.[dev]`` for development without native CPU solvers.
 - Follow the existing style conventions; ``pre-commit`` hooks are configured for you (``python -m pre-commit install``).
 - Documentation updates are appreciated—adding docstrings or short narrative sections to accompany new code is ideal.
 

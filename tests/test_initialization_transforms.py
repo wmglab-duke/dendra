@@ -267,3 +267,37 @@ def test_raw_parameter_outputs_rematerialize_effective_q10_and_derived_buffers()
         torch.full_like(state.state_workspace, 22.3),
     )
     assert not model.integrator.initialized
+
+
+@pytest.mark.parametrize("phase", ("pre", "post"))
+def test_parameter_transform_preserves_unrelated_trainable_parameter_graph(phase):
+    model = dn.Population(N=1, C=3, dtype=DTYPE)
+    model.build()
+    model.train()
+    model.unfreeze("rhoa_param")
+    getattr(model, f"register_{phase}_initialize_transform")(
+        "keep_celsius",
+        _Identity(),
+        reads=("parameters.celsius_param",),
+        writes=("parameters.celsius_param",),
+    )
+
+    raw_rhoa = model.rhoa_param.rho
+    for _ in range(2):
+        model.initialize()
+        assert model.rhoa.requires_grad
+        gradient = torch.autograd.grad(model.rhoa.sum(), raw_rhoa)[0]
+        assert torch.isfinite(gradient).all()
+        assert torch.count_nonzero(gradient)
+
+    with torch.no_grad():
+        model.initialize()
+    assert not model.rhoa.requires_grad
+
+    with torch.inference_mode():
+        model.initialize()
+    assert not model.rhoa.requires_grad
+
+    model.initialize()
+    assert model.rhoa.requires_grad
+    assert torch.count_nonzero(torch.autograd.grad(model.rhoa.sum(), raw_rhoa)[0])

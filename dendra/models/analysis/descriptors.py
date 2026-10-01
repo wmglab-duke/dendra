@@ -453,7 +453,7 @@ def action_potential_width(
     width_pre_ms: float = 1.0,
     width_post_ms: float = 3.0,
     gate_t_scale_ms: float = 0.05,
-    # Full-width / return-to-baseline metric
+    # Full-width threshold excursion connected to the localized peak
     full_width_pre_ms: float | None = None,
     full_width_post_ms: float = 8.0,
     baseline_margin_mV: float = 1.0,
@@ -488,14 +488,14 @@ def action_potential_width(
       2) constructing a differentiable half-amplitude level,
       3) integrating a soft indicator of V > V_half over time.
 
-    Also returns a differentiable baseline-relative full-width metric:
+    Also returns a differentiable baseline-relative full-width metric for
+    the threshold excursion connected to the localized spike peak. The
+    connectivity envelope stops after the first return below
+    ``V_base + baseline_margin_mV``, so a later spike in the window does not
+    contribute to this spike's width.
 
-        full_width_ms ~= time spent above V_base + baseline_margin_mV
-
-    within a spike-centered window.
-
-    The extra return-to-baseline diagnostic penalizes / measures whether the
-    trace is still above baseline near the end of the allowed post-spike window.
+    The extra return diagnostic measures whether the trace is still above the
+    baseline-plus-margin level near the end of the post-spike search window.
 
     Assumes these are available in the outer scope:
 
@@ -650,7 +650,7 @@ def action_potential_width(
     width_ms_comp = (g_width * q_half).sum(dim=0) * dt_ms  # (F, C)
 
     # ---------------------------------------------------------------------
-    # 5. Full-width = soft time spent above baseline + margin
+    # 5. Full-width = soft threshold excursion connected to the peak
     # ---------------------------------------------------------------------
     baseline_margin_t = torch.as_tensor(
         baseline_margin_mV,
@@ -675,9 +675,38 @@ def action_potential_width(
         gate_t_scale_ms,
     )
 
-    q_full = torch.sigmoid((V - V_full[None, :, :]) / V_full_width_scale_t)
+    log_q_full = F.logsigmoid((V - V_full[None, :, :]) / V_full_width_scale_t)
+    q_full = log_q_full.exp()
 
-    full_width_ms_comp = (g_full_width * q_full).sum(dim=0) * dt_ms  # (F, C)
+    # Integrating q_full alone counts every later spike in the 8-ms search
+    # window. Instead, accumulate only decreases in log(q_full) while moving
+    # away from the selected peak. For a monotone crossing the exponential of
+    # this cumulative drop equals q_full (up to its near-unity peak value).
+    # Once the trace has returned below threshold, a later rise cannot undo
+    # the accumulated drop, so it cannot add another spike's duration.
+    t_mid = 0.5 * (t_ms[:-1] + t_ms[1:])[:, None, None]
+    post_peak = torch.sigmoid((t_mid - t_peak_ms[None, :, :]) / gate_t_scale_ms)
+    pre_peak = torch.sigmoid((t_peak_ms[None, :, :] - t_mid) / gate_t_scale_ms)
+    right_drop = F.relu(log_q_full[:-1] - log_q_full[1:]) * post_peak
+    left_drop = F.relu(log_q_full[1:] - log_q_full[:-1]) * pre_peak
+    right_cumulative_drop = torch.cat(
+        (torch.zeros_like(log_q_full[:1]), torch.cumsum(right_drop, dim=0)), dim=0
+    )
+    left_cumulative_drop = torch.cat(
+        (
+            torch.flip(
+                torch.cumsum(torch.flip(left_drop, dims=(0,)), dim=0), dims=(0,)
+            ),
+            torch.zeros_like(log_q_full[:1]),
+        ),
+        dim=0,
+    )
+    peak_left = torch.sigmoid((t_peak_ms[None, :, :] - t) / gate_t_scale_ms)
+    q_full_connected = peak_left * torch.exp(-left_cumulative_drop) + (
+        1.0 - peak_left
+    ) * torch.exp(-right_cumulative_drop)
+
+    full_width_ms_comp = (g_full_width * q_full_connected).sum(dim=0) * dt_ms
 
     # ---------------------------------------------------------------------
     # 6. Return-to-baseline tail diagnostics
@@ -795,6 +824,7 @@ def action_potential_width(
             {
                 "q_half": q_half,  # (T, F, C)
                 "q_full": q_full,  # (T, F, C)
+                "q_full_connected": q_full_connected,  # (T, F, C)
                 "g_width": g_width,  # (T, F, C)
                 "g_full_width": g_full_width,  # (T, F, C)
                 "g_return_tail": g_return_tail,  # (T, F, C)
@@ -3435,6 +3465,53 @@ def _coerce_positive_scalar(
     return out
 
 
+def _coerce_nonnegative_float(value: Any, *, name: str) -> float:
+    """Return a finite, nonnegative scalar as a Python float."""
+    try:
+        out = torch.as_tensor(value)
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise ValueError(f"{name} must be a finite nonnegative scalar.") from error
+    if out.ndim != 0:
+        raise ValueError(f"{name} must be a finite nonnegative scalar.")
+    try:
+        scalar = float(out.detach().cpu().item())
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must be a finite nonnegative scalar.") from error
+    if not np.isfinite(scalar) or scalar < 0.0:
+        raise ValueError(f"{name} must be a finite nonnegative scalar.")
+    return scalar
+
+
+def _resolve_ads_stabilizers(
+    eps: float,
+    eps_time_ms2: float | None,
+    eps_latency_ms: float | None,
+    eps_velocity_m_per_s: float | None,
+) -> tuple[float, float, float, float, bool]:
+    """Validate ADS stabilizers and apply the legacy ``eps`` fallbacks."""
+    legacy_velocity_eps = eps_velocity_m_per_s is None
+    eps = _coerce_nonnegative_float(eps, name="eps")
+    eps_time_ms2 = _coerce_nonnegative_float(
+        eps if eps_time_ms2 is None else eps_time_ms2,
+        name="eps_time_ms2",
+    )
+    eps_latency_ms = _coerce_nonnegative_float(
+        eps if eps_latency_ms is None else eps_latency_ms,
+        name="eps_latency_ms",
+    )
+    eps_velocity_m_per_s = _coerce_nonnegative_float(
+        eps if eps_velocity_m_per_s is None else eps_velocity_m_per_s,
+        name="eps_velocity_m_per_s",
+    )
+    return (
+        eps,
+        eps_time_ms2,
+        eps_latency_ms,
+        eps_velocity_m_per_s,
+        legacy_velocity_eps,
+    )
+
+
 def _coerce_pulse_times_ms(
     pulse_times_ms: torch.Tensor | Sequence[float],
     *,
@@ -3682,6 +3759,9 @@ def activity_dependent_slowing(
     reg_var_weight: float = 0.0,
     reg_success_weight: float = 0.0,
     eps: float = 1e-8,
+    eps_time_ms2: float | None = None,
+    eps_latency_ms: float | None = None,
+    eps_velocity_m_per_s: float | None = None,
     return_time_traces: bool = False,
 ) -> Dict[str, Any]:
     r"""
@@ -3793,6 +3873,13 @@ def activity_dependent_slowing(
       ``lambda_early`` to bias toward the first pulse-evoked spike.
     - ``return_time_traces=True`` no longer stores dense pulse-by-time gates; the function returns
       a note because storing those gates would defeat the optimization.
+    - ``eps_time_ms2`` regularizes the arrival-time variance in the velocity
+      regression, ``eps_latency_ms`` regularizes latency and interstimulus-time
+      denominators, and ``eps_velocity_m_per_s`` regularizes percentage velocity
+      changes. If any is omitted, the legacy ``eps`` value is used for that
+      quantity, preserving the behavior of existing calls. When an explicit
+      velocity epsilon is supplied, its square regularizes the smooth speed
+      magnitude so the units remain ``(m/s)^2`` under the square root.
     """
     if V.ndim != 3:
         raise ValueError("V must have shape (T, F, C).")
@@ -3807,6 +3894,23 @@ def activity_dependent_slowing(
         raise ValueError("tail_n_pulses must be >= 1.")
     if chunk_pulses is not None and chunk_pulses < 1:
         raise ValueError("chunk_pulses must be None or a positive integer.")
+
+    # ``eps`` historically regularized several denominators with different
+    # physical units. Keep it as the compatibility fallback while allowing
+    # callers to specify dimensionally meaningful values independently.
+    (
+        eps,
+        eps_time_ms2,
+        eps_latency_ms,
+        eps_velocity_m_per_s,
+        legacy_velocity_eps,
+    ) = _resolve_ads_stabilizers(
+        eps,
+        eps_time_ms2,
+        eps_latency_ms,
+        eps_velocity_m_per_s,
+    )
+    eps_speed_m2_per_s2 = eps if legacy_velocity_eps else eps_velocity_m_per_s**2
 
     device, dtype = V.device, V.dtype
     dt_ms = _coerce_positive_scalar(dt_ms, device=device, dtype=dtype, name="dt_ms")
@@ -3994,9 +4098,9 @@ def activity_dependent_slowing(
             ]
             dxc = x_um[:, None, :] - x_bar
             cov = (latency_weights * dtc * dxc).sum(dim=-1) / Wc
-            v_um_per_ms = cov / (var_t + eps)
+            v_um_per_ms = cov / (var_t + eps_time_ms2)
             v_m_per_s = 1e-3 * v_um_per_ms
-            speed_m_per_s = torch.sqrt(v_m_per_s * v_m_per_s + eps)
+            speed_m_per_s = torch.sqrt(v_m_per_s * v_m_per_s + eps_speed_m2_per_s2)
             valid_velocity_readout = has_readout[:, None]
             v_um_per_ms = torch.where(
                 valid_velocity_readout,
@@ -4074,14 +4178,16 @@ def activity_dependent_slowing(
         )
 
     latency_shift_ms = latency_ms - baseline_latency_ms[:, None]
-    ads_percent = 100.0 * latency_shift_ms / (baseline_latency_ms[:, None] + eps)
+    ads_percent = (
+        100.0 * latency_shift_ms / (baseline_latency_ms[:, None] + eps_latency_ms)
+    )
     arrival_time_ms = pulse_times + latency_ms
 
     if N >= 2:
         input_isi_ms = pulse_times[:, 1:] - pulse_times[:, :-1]
         output_isi_ms = arrival_time_ms[:, 1:] - arrival_time_ms[:, :-1]
         isi_error_ms = output_isi_ms - input_isi_ms
-        instantaneous_frequency_hz = 1000.0 / (input_isi_ms + eps)
+        instantaneous_frequency_hz = 1000.0 / (input_isi_ms + eps_latency_ms)
     else:
         input_isi_ms = V.new_empty((Fibs, 0))
         output_isi_ms = V.new_empty((Fibs, 0))
@@ -4127,7 +4233,7 @@ def activity_dependent_slowing(
         velocity_change_percent = (
             100.0
             * (v_m_per_s - baseline_velocity_m_per_s[:, None])
-            / (baseline_velocity_m_per_s[:, None] + eps)
+            / (baseline_velocity_m_per_s[:, None] + eps_velocity_m_per_s)
         )
         velocity_slowing_percent = -velocity_change_percent
         final_velocity_slowing_percent = velocity_slowing_percent[:, -1]
@@ -4662,6 +4768,14 @@ def frequency_following(
     r"""
     Differentiably estimate frequency following, entrainment, and conduction failure.
 
+    .. warning::
+
+       This descriptor is experimental as an optimization objective. Its
+       voltage gradient has not been established as a useful direction for
+       the complete ``hard_frequency_following`` protocol. Use the smooth
+       outputs as diagnostics unless the direction has been validated for the
+       declared model, stimulus, recording sites, and response windows.
+
     This metric is intended for pulse-train simulations in which the same axon/fiber is driven
     at one or more stimulation frequencies and the model should be scored by how reliably
     pulse-evoked spikes propagate to a readout region. It reuses the optimized local-window
@@ -4739,6 +4853,10 @@ def frequency_following(
       are experiment-design constants.
     - ``p_success`` is a smooth confidence, not a calibrated probability unless externally
       calibrated.
+    - Optimization with this smooth score is experimental: its gradient has not been validated
+      as a descent direction for the complete ``hard_frequency_following`` protocol. Separate
+      hard-forward event and expected-hard prototypes are also experimental and estimate
+      different training targets.
     - For high-frequency trains, choose ``response_window_ms`` so one pulse's readout window does
       not include the next pulse's response.
     - Use ``initiation_node_mask`` plus distal ``node_mask`` when you specifically need conduction
@@ -4756,7 +4874,7 @@ def frequency_following(
     ...     initiation_node_mask=stim_region_mask,
     ...     response_window_ms=(0.5, 20.0),
     ... )
-    >>> loss = (1.0 - out["tail_follow_fraction"]).mean() + out["reg"]
+    >>> diagnostic = out["tail_follow_fraction"]
     """
     if V.ndim != 3:
         raise ValueError("V must have shape (T, F, C).")
@@ -5019,6 +5137,7 @@ def hard_spike_arrival_times(
     This hard reference descriptor is intended for comparisons against smooth
     surrogates. It uses boolean threshold crossings and therefore does not provide useful
     gradients. Crossings are detected independently for every fiber and compartment.
+    A millisecond window includes interpolated crossing times on either boundary.
 
     Returns ``t_cross_ms`` and ``has_crossing`` with shape ``(F, C)``.
     """
@@ -5041,8 +5160,11 @@ def hard_spike_arrival_times(
             raise ValueError(
                 "time_window_ms must contain finite values with end > start."
             )
-        start = max(0, int(np.floor(window_start_float / float(dt.item()))))
-        end = min(T, int(np.ceil(window_end_float / float(dt.item()))) + 1)
+        # Include a conservative neighboring pair at each bound, then filter
+        # by candidate_time below. This avoids losing aligned events when
+        # decimal bounds and dt divide just above an integer in binary.
+        start = max(0, int(np.floor(window_start_float / float(dt.item()))) - 1)
+        end = min(T, int(np.floor(window_end_float / float(dt.item()))) + 2)
     elif time_window is not None:
         start, end = int(time_window[0]), int(time_window[1])
         start = max(0, start)
@@ -5066,9 +5188,13 @@ def hard_spike_arrival_times(
         crossings = crossings & (dV >= dv_th)
 
     if interpolate:
+        difference = v1_all - v0_all
+        safe_difference = torch.where(
+            difference != 0, difference, torch.ones_like(difference)
+        )
         frac_all = (
             (torch.as_tensor(V_th, device=device, dtype=dtype) - v0_all)
-            / (v1_all - v0_all + 1e-12)
+            / safe_difference
         ).clamp(0.0, 1.0)
     else:
         frac_all = torch.ones_like(v0_all)
@@ -5167,6 +5293,8 @@ def hard_firing_rate(
     This is non-differentiable and intended as an experimental reference for validating the
     smooth ``firing_rate`` surrogate. By default, per-fiber counts are averaged across selected
     compartments, matching the surrogate's mean-over-compartments convention.
+    A millisecond window includes interpolated crossing times on either boundary;
+    ``window_ms`` is the requested interval clipped to the recorded duration.
     """
     if V.ndim != 3:
         raise ValueError("V must have shape (T, F, C).")
@@ -5177,14 +5305,45 @@ def hard_firing_rate(
     if time_window is not None and time_window_ms is not None:
         raise ValueError("Pass only one of time_window or time_window_ms.")
     if time_window_ms is not None:
-        start = max(0, int(np.floor(float(time_window_ms[0]) / float(dt.item()))))
-        end = min(T, int(np.ceil(float(time_window_ms[1]) / float(dt.item()))) + 1)
+        window_start_float = float(time_window_ms[0])
+        window_end_float = float(time_window_ms[1])
+        if (
+            not np.isfinite(window_start_float)
+            or not np.isfinite(window_end_float)
+            or window_end_float <= window_start_float
+        ):
+            raise ValueError(
+                "time_window_ms must contain finite values with end > start."
+            )
+        start = max(0, int(np.floor(window_start_float / float(dt.item()))) - 1)
+        end = min(T, int(np.floor(window_end_float / float(dt.item()))) + 2)
+        recorded_end_ms = (T - 1) * float(dt.item())
+        analyzed_window_ms = min(window_end_float, recorded_end_ms) - max(
+            window_start_float, 0.0
+        )
+        duration_tolerance = (
+            8
+            * torch.finfo(dtype).eps
+            * max(
+                1.0,
+                abs(window_start_float),
+                abs(window_end_float),
+                abs(recorded_end_ms),
+            )
+        )
+        if analyzed_window_ms <= duration_tolerance:
+            raise ValueError(
+                "Selected millisecond window must overlap the recording "
+                "with positive duration."
+            )
     elif time_window is not None:
         start, end = int(time_window[0]), int(time_window[1])
         start = max(0, start)
         end = min(T, end)
+        analyzed_window_ms = (end - start - 1) * float(dt.item())
     else:
         start, end = 0, T
+        analyzed_window_ms = (end - start - 1) * float(dt.item())
     if end - start < 2:
         raise ValueError("Selected time window must contain at least 2 samples.")
 
@@ -5193,6 +5352,23 @@ def hard_firing_rate(
     if use_dv_gate:
         dV = (Vw[1:] - Vw[:-1]) / dt
         crossings = crossings & (dV >= dv_spk)
+    if time_window_ms is not None:
+        v0_all = Vw[:-1]
+        v1_all = Vw[1:]
+        difference = v1_all - v0_all
+        safe_difference = torch.where(
+            difference != 0, difference, torch.ones_like(difference)
+        )
+        fraction = (V_spk - v0_all) / safe_difference
+        pair_index = torch.arange(end - start - 1, device=device, dtype=dtype)[
+            :, None, None
+        ]
+        candidate_time = (start + pair_index + fraction) * dt
+        crossings = (
+            crossings
+            & (candidate_time >= window_start_float)
+            & (candidate_time <= window_end_float)
+        )
 
     if refractory_ms > 0.0:
         refractory_steps = max(1, int(round(refractory_ms / float(dt.item()))))
@@ -5233,7 +5409,7 @@ def hard_firing_rate(
     else:
         raise ValueError("aggregate must be one of {'mean', 'max', 'sum'}.")
 
-    window_ms = (end - start - 1) * dt
+    window_ms = dt.new_tensor(analyzed_window_ms)
     rate_hz_comp = 1000.0 * count_comp / window_ms
     rate_hz = 1000.0 * count / window_ms
     return {
@@ -5383,6 +5559,55 @@ def _hard_width_crossings_around_peak(
     return down_time - up_time, up_time, down_time
 
 
+def _piecewise_linear_window_mean(
+    trace: torch.Tensor,
+    dt: torch.Tensor,
+    start_ms: torch.Tensor,
+    end_ms: torch.Tensor,
+) -> torch.Tensor | None:
+    """Exact time mean of the sampled trace's piecewise-linear interpolant.
+
+    The requested window is clipped to the recorded time span. Its value and
+    boundary derivative remain continuous when either endpoint crosses a
+    sample time; only the local interpolation segment changes. ``None`` means
+    the clipped interval has zero duration. This helper intentionally leaves
+    its Torch graph intact for branch-conditioned timing derivatives.
+    """
+    if trace.ndim != 1 or trace.numel() < 2:
+        return None
+    last = (trace.numel() - 1) * dt
+    start = torch.clamp(start_ms, min=0.0, max=last)
+    end = torch.clamp(end_ms, min=0.0, max=last)
+    if bool((end.detach() <= start.detach()).item()):
+        return None
+    final_segment = trace.numel() - 2
+    first_index = min(
+        max(int(torch.floor(start.detach() / dt.detach()).item()), 0), final_segment
+    )
+    last_index = min(
+        max(int(torch.floor(end.detach() / dt.detach()).item()), 0), final_segment
+    )
+
+    def interpolate(time: torch.Tensor, index: int) -> torch.Tensor:
+        fraction = (time - index * dt) / dt
+        return trace[index] + (trace[index + 1] - trace[index]) * fraction
+
+    first_value = interpolate(start, first_index)
+    last_value = interpolate(end, last_index)
+    if first_index == last_index:
+        return 0.5 * (first_value + last_value)
+
+    first_end = (first_index + 1) * dt
+    integral = 0.5 * (first_value + trace[first_index + 1]) * (first_end - start)
+    if last_index > first_index + 1:
+        left = trace[first_index + 1 : last_index]
+        right = trace[first_index + 2 : last_index + 1]
+        integral = integral + 0.5 * (left + right).sum() * dt
+    last_start = last_index * dt
+    integral = integral + 0.5 * (trace[last_index] + last_value) * (end - last_start)
+    return integral / (end - start)
+
+
 @torch.no_grad()
 def hard_action_potential_width(
     V: torch.Tensor,  # (T, F, C)
@@ -5394,6 +5619,7 @@ def hard_action_potential_width(
     mode: Literal["half_height", "half_peak_to_peak"] = "half_height",
     baseline_pre_ms: float = 1.0,
     baseline_guard_ms: float = 0.15,
+    baseline_mean_mode: Literal["sampled", "continuous_time"] = "sampled",
     peak_pre_ms: float = 0.2,
     peak_post_ms: float = 1.5,
     trough_pre_ms: float = 0.3,
@@ -5409,15 +5635,31 @@ def hard_action_potential_width(
     """
     Hard AP half-width and baseline-relative full-width descriptors.
 
-    This is the non-differentiable reference analogue of ``action_potential_width``. It detects
-    the first hard threshold crossing, estimates baseline/peak/trough from hard windows, and
-    computes APD-style widths from threshold crossing times around the peak.
+    This is the non-differentiable reference analogue of ``action_potential_width``. At each
+    site it uses the first upward ``V_spk`` crossing to define a pre-spike baseline and
+    local peak. Full width is the interval between the last upward crossing of
+    ``V_base + baseline_margin_mV`` before that peak and the first downward crossing
+    afterward, with linear interpolation between samples. ``full_width_post_ms`` bounds
+    the search for that first return; it is not accumulated above-threshold time.
+    If the trace is still above the level at the search boundary, that boundary
+    is used as a censored endpoint.
+
+    ``baseline_mean_mode="sampled"`` preserves the historical mean over the
+    floor/ceil-selected sample slice. ``"continuous_time"`` integrates the
+    piecewise-linear voltage trace over the exact pre-spike time window, with
+    endpoints clipped to the recording. It avoids jumps solely from a baseline
+    window endpoint crossing a sample boundary; peak and crossing event
+    selections remain discrete.
     """
     if V.ndim != 3:
         raise ValueError("V must have shape (T, F, C).")
     T, Fibs, C = V.shape
     device, dtype = V.device, V.dtype
     dt = torch.as_tensor(dt_ms, device=device, dtype=dtype)
+    if baseline_mean_mode not in ("sampled", "continuous_time"):
+        raise ValueError("baseline_mean_mode must be 'sampled' or 'continuous_time'.")
+    if baseline_mean_mode == "continuous_time" and baseline_pre_ms <= baseline_guard_ms:
+        raise ValueError("baseline_pre_ms must exceed baseline_guard_ms.")
     if full_width_pre_ms is None:
         full_width_pre_ms = width_pre_ms
 
@@ -5441,9 +5683,19 @@ def hard_action_potential_width(
             tc = float(t_cross[f, c].item())
             base0 = max(0, int(np.floor((tc - baseline_pre_ms) / float(dt.item()))))
             base1 = max(0, int(np.ceil((tc - baseline_guard_ms) / float(dt.item()))))
-            if base1 <= base0:
-                continue
-            Vb = V[base0:base1, f, c].mean()
+            if baseline_mean_mode == "sampled":
+                if base1 <= base0:
+                    continue
+                Vb = V[base0:base1, f, c].mean()
+            else:
+                Vb = _piecewise_linear_window_mean(
+                    V[:, f, c],
+                    dt,
+                    t_cross[f, c] - baseline_pre_ms,
+                    t_cross[f, c] - baseline_guard_ms,
+                )
+                if Vb is None:
+                    continue
             V_base[f, c] = Vb
 
             peak0 = max(0, int(np.floor((tc - peak_pre_ms) / float(dt.item()))))
@@ -6002,6 +6254,9 @@ def hard_activity_dependent_slowing(
     tail_n_pulses: int = 10,
     interpolate: bool = True,
     eps: float = 1e-12,
+    eps_time_ms2: float | None = None,
+    eps_latency_ms: float | None = None,
+    eps_velocity_m_per_s: float | None = None,
     window_margin_ms: float | None = None,
 ) -> Dict[str, torch.Tensor]:
     """
@@ -6014,6 +6269,10 @@ def hard_activity_dependent_slowing(
     hard per-compartment crossing times.
 
     It is intended for hard-vs-surrogate comparisons, not gradient-based fitting.
+    ``eps_time_ms2``, ``eps_latency_ms``, and ``eps_velocity_m_per_s``
+    regularize the time-variance, latency/time, and velocity denominators in
+    their stated units. An omitted value falls back to the legacy ``eps``
+    argument, so existing calls retain their numerical behavior.
     """
     if V.ndim != 3:
         raise ValueError("V must have shape (T, F, C).")
@@ -6026,6 +6285,18 @@ def hard_activity_dependent_slowing(
         raise ValueError("baseline_n_pulses must be >= 1.")
     if tail_n_pulses < 1:
         raise ValueError("tail_n_pulses must be >= 1.")
+    (
+        eps,
+        eps_time_ms2,
+        eps_latency_ms,
+        eps_velocity_m_per_s,
+        _,
+    ) = _resolve_ads_stabilizers(
+        eps,
+        eps_time_ms2,
+        eps_latency_ms,
+        eps_velocity_m_per_s,
+    )
     device, dtype = V.device, V.dtype
     dt = _coerce_positive_scalar(dt_ms, device=device, dtype=dtype, name="dt_ms")
     dt_float = float(dt.detach().cpu().item())
@@ -6160,8 +6431,8 @@ def hard_activity_dependent_slowing(
         dxc = x - x_bar
         var_t = (w * dtc * dtc).sum(dim=-1) / torch.clamp(W, min=1.0)
         cov = (w * dtc * dxc).sum(dim=-1) / torch.clamp(W, min=1.0)
-        vel_um = cov / (var_t + eps)
-        valid_vel = (W >= 2.0) & (var_t > eps)
+        vel_um = cov / (var_t + eps_time_ms2)
+        valid_vel = (W >= 2.0) & (var_t > eps_time_ms2)
         v_m_per_s = torch.where(
             valid_vel, 1e-3 * vel_um, torch.full_like(vel_um, float("nan"))
         )
@@ -6180,13 +6451,15 @@ def hard_activity_dependent_slowing(
         baseline_latency = ref_latency
 
     latency_shift_ms = latency_ms - baseline_latency[:, None]
-    ads_percent = 100.0 * latency_shift_ms / (baseline_latency[:, None] + eps)
+    ads_percent = (
+        100.0 * latency_shift_ms / (baseline_latency[:, None] + eps_latency_ms)
+    )
 
     if N >= 2:
         input_isi_ms = pulse_times[:, 1:] - pulse_times[:, :-1]
         output_isi_ms = arrival_time_ms[:, 1:] - arrival_time_ms[:, :-1]
         isi_error_ms = output_isi_ms - input_isi_ms
-        instantaneous_frequency_hz = 1000.0 / (input_isi_ms + eps)
+        instantaneous_frequency_hz = 1000.0 / (input_isi_ms + eps_latency_ms)
     else:
         input_isi_ms = torch.empty((Fibs, 0), device=device, dtype=dtype)
         output_isi_ms = torch.empty((Fibs, 0), device=device, dtype=dtype)
@@ -6218,7 +6491,7 @@ def hard_activity_dependent_slowing(
         velocity_change_percent = (
             100.0
             * (v_m_per_s - baseline_velocity[:, None])
-            / (baseline_velocity[:, None] + eps)
+            / (baseline_velocity[:, None] + eps_velocity_m_per_s)
         )
         velocity_slowing_percent = -velocity_change_percent
         final_velocity_slowing_percent = velocity_slowing_percent[:, -1]

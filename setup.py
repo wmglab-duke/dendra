@@ -17,6 +17,9 @@ setup(
         "ninja",
     ],
     extras_require={
+        "solvers": [
+            "dendra-solvers>=0.3.1",
+        ],
         "jupyter": [
             "ipympl >= 0.9.5",
         ],

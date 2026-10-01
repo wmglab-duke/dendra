@@ -2,7 +2,14 @@
 "dendra/data/h5.py" = 98
 "dendra/helpers.py" = 79
 "dendra/models/_class_declarations.py" = 98
-"dendra/models/analysis.py" = 79
+"dendra/models/analysis/__init__.py" = 98
+"dendra/models/analysis/branch_conditioned_metrics.py" = 88
+"dendra/models/analysis/descriptors.py" = 79
+"dendra/models/analysis/firing_rate_trajectory.py" = 83
+"dendra/models/analysis/spike_timing.py" = 83
+"dendra/models/analysis/threshold_trace_probe.py" = 75
+"dendra/models/analysis/threshold_trace_tangent.py" = 73
+"dendra/models/analysis/threshold_transition_metrics.py" = 86
 "dendra/models/callbacks.py" = 84
 "dendra/models/core.py" = 66
 "dendra/models/extcell.py" = 91
