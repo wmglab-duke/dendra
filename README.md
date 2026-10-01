@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/_static/logo-light.png" alt="Dendra">
+  <img src="https://raw.githubusercontent.com/wmglab-duke/dendra/main/docs/_static/logo-light.png" alt="Dendra">
 </div>
 
 ***
