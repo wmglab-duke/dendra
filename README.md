@@ -4,11 +4,13 @@
 
 ***
 
-[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style-plastic&logo=PyTorch&logoColor=white)](https://pytorch.com)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style-plastic&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Code style: Ruff](https://img.shields.io/badge/code%20style-Ruff-D7FF64.svg?logo=ruff&logoColor=261230)](https://docs.astral.sh/ruff/)
 
-Fast, scalable, versatile, and differentiable neural simulator with support for extracellular fields. Useful to implement and train high-throughput GPU-compatible models.
+Dendra is a differentiable biophysical neuron and network simulator built on
+PyTorch. It supports CPU and GPU execution, extracellular fields, event-based
+networks, and macroscopic descriptors for gradient-based model training.
 
 ## Documentation
 
@@ -208,7 +210,8 @@ python scripts/check_coverage_floors.py coverage.json
 
 ## 🔍 Citation
 
-If you use Dendra, please cite...(paper forthcoming).
+A citation for Dendra and its accompanying manuscript will be added when it is
+available.
 
 Please also consider citing the work where geometric / topological surrogates and gradient-based design of selective neurostimulation are discussed in detail:
 
@@ -227,10 +230,9 @@ Minhaj A. Hussain, Warren M. Grill, Nicole A. Pelot. "Highly efficient modeling 
 
 ## 📜 License
 
-The copyrights of this software are owned by Duke University. As such, it is offered under a custom license (see LICENSE.md) whereby:
-
-1. DUKE grants YOU a royalty-free, non-transferable, non-exclusive, worldwide license under its copyright to use, reproduce, modify, publicly display, and perform the PROGRAM solely for non-commercial research and/or academic testing purposes.
-
-2. In order to obtain any further license rights, including the right to use the PROGRAM, any modifications or derivatives made by YOU, and/or PATENT RIGHTS for commercial purposes, (including using modifications as part of an industrially sponsored research project), YOU must contact DUKE’s Office for Translation and Commercialization (Digital Innovations Team) about additional commercial license agreements.
-
-Please note that this software is distributed AS IS, WITHOUT ANY WARRANTY; and without the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+Dendra is distributed under Duke University's custom license for non-commercial
+research and academic testing. Commercial use, including industrially
+sponsored research, requires a separate agreement with Duke's Office for
+Translation and Commercialization. The complete terms in
+[LICENSE.md](LICENSE.md) govern all use; downloading, cloning, or forking the
+software constitutes acceptance of those terms.

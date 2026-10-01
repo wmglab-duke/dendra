@@ -144,10 +144,11 @@ of the full Dendra package.
 - Interactive Jupyter plots: `python -m pip install "dendra[jupyter]"`. See the
   {ref}`interactive Jupyter setup <interactive-jupyter>` below.
 
-- To build the documentation from a source checkout without executing its
-  notebooks, install the documentation dependencies with
+- For a fast prose-only documentation preview, install the documentation dependencies with
   `python -m pip install ".[doc]"`, then run
   `sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html`.
+  The repository's `docs/README.md` gives the full CI-equivalent workflow,
+  which installs the companion models and executes every notebook.
 
 - For an editable development installation with lint, test, and CPU-solver
   dependencies, follow the repository's `CONTRIBUTING.md` file.
