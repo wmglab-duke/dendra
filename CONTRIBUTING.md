@@ -5,12 +5,12 @@ documentation, tests, and code changes are all useful contributions.
 
 ## Before you start
 
-Dendra is developed internally on GitLab. After the external repository opens,
-users can report issues and submit pull requests through
-[`wmglab-duke/dendra`](https://github.com/wmglab-duke/dendra) without GitLab
-access. Until then, internal contributors should continue to use their GitLab
-checkout and submit merge requests there. The environment, testing,
-documentation, and commit guidance below applies on both hosts.
+Dendra is developed internally on GitLab and published through
+[`wmglab-duke/dendra`](https://github.com/wmglab-duke/dendra). Users can report
+issues and submit pull requests on GitHub without GitLab access. Internal
+contributors continue to use their GitLab checkout and submit merge requests
+there. The environment, testing, documentation, and commit guidance below
+applies on both hosts.
 
 For a bug report, include:
 
@@ -25,10 +25,9 @@ confirm the design and scope before you invest substantial time.
 
 ## Set up a development environment
 
-Internal contributors can use their existing GitLab checkout. After the GitHub
-repository opens, external contributors should fork `wmglab-duke/dendra`, then
-clone their fork. Replace `YOUR-ACCOUNT` with your GitHub username or
-organization:
+Internal contributors can use their existing GitLab checkout. External
+contributors should fork `wmglab-duke/dendra`, then clone their fork. Replace
+`YOUR-ACCOUNT` with your GitHub username or organization:
 
 ```sh
 git clone https://github.com/YOUR-ACCOUNT/dendra.git
@@ -134,9 +133,8 @@ Full notebook execution also requires the `ffmpeg` executable on `PATH` for
 the multicontact animation tutorial. Install it with your operating system's
 package manager before running the build.
 
-The [testing section of the README](README.md#-testing-and-code-coverage)
-explains the test markers, coverage checks, and CUDA sanitizer lane in more
-detail.
+The [testing and code coverage guide](docs/testing.md) explains the test
+markers, coverage checks, and CUDA sanitizer lane in more detail.
 
 ## Submit the change
 
@@ -147,9 +145,8 @@ request into `develop`:
 git push --set-upstream origin fix/short-description
 ```
 
-After the GitHub repository opens, external contributors should push their
-branch to their fork and open a pull request against `wmglab-duke/dendra`'s
-`main` branch:
+External contributors should push their branch to their fork and open a pull
+request against `wmglab-duke/dendra`'s `main` branch:
 
 ```sh
 git push --set-upstream origin fix/short-description

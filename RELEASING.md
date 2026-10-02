@@ -12,6 +12,19 @@ GitLab CI updates the version, changelog, and version tag after the required
 checks pass on `main`. GitHub validates promoted source and publishes selected
 releases; it does not bump versions or edit the changelog.
 
+## GitLab validation scope
+
+On an existing branch, pushes that change only documentation, repository prose,
+or templates skip the independent base-install and coverage test jobs. The
+strict documentation job still installs Dendra and its pinned model package,
+executes every notebook, treats warnings and cell errors as failures, and gates
+Pages and the release job. Runtime, tests, scripts, examples, packaging,
+GitLab CI, and the internal `dendra-models` revision are treated as
+test-impacting and run both test lanes. New-branch, scheduled, tagged, and
+project-level manual pipelines also run the full suite. The release job waits
+for every test lane selected for that pipeline. Set the `RUN_FULL_TESTS=1`
+CI/CD variable to override the changed-path filter for a branch pipeline.
+
 Keep the GitHub workflows in canonical GitLab history so every promoted
 revision carries the configuration that GitHub executes. Public releases are
 selected by promoting immutable GitLab tags; uploads remain restricted to an
@@ -76,8 +89,10 @@ index. The explicit `--no-follow-tags` prevents a personal Git configuration
 from sending annotated release tags. Keep development branches and internal
 version tags on GitLab unless you deliberately select them for promotion.
 Avoid `--tags`, `--follow-tags`, and `--mirror` when pushing to GitHub.
-If the promoted revision changes `docs/dendra-models-revision.txt`, first make
-sure that exact commit exists in the public `wmglab-duke/dendra-models` mirror.
+When the companion model revision changes, record the internal source commit in
+`docs/dendra-models-gitlab-revision.txt` and its filtered public counterpart in
+`docs/dendra-models-revision.txt`. Make sure the latter commit exists in the
+public `wmglab-duke/dendra-models` mirror before promoting Dendra.
 
 ## Rehearse a selected release on TestPyPI
 

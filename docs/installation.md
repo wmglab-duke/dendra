@@ -20,24 +20,7 @@ Dendra requires PyTorch 2.12 or newer and NEURON. Both are declared package
 dependencies and are installed automatically. Git is needed only for source
 and development installations.
 
-## Install from a source checkout
-
-Until the first Dendra release is published on PyPI, install from your source
-checkout. From the repository root, run:
-
-```sh
-python -m pip install --upgrade pip
-python -m pip install ".[solvers]"
-```
-
-Use `python -m pip install .` if the optional native solvers are unavailable.
-For development, use an editable installation as described in the repository's
-`CONTRIBUTING.md` file.
-
 ## Install from PyPI
-
-The commands in this section apply once the Dendra distribution has been
-published on PyPI.
 
 1. Create and activate an environment (optional but recommended):
 
@@ -70,6 +53,7 @@ published on PyPI.
    The base package retains Dendra's PyTorch CPU solver for unbranched cables
    and all GPU solvers. CPU block and tree methods require `dendra-solvers`.
 
+(choose-pytorch-build)=
 ## Choose a PyTorch build
 
 Pip installs a compatible PyTorch release automatically. If you need a
@@ -138,6 +122,22 @@ custom PyTorch builds, see the source-build instructions on the
 The standalone Windows solver wheel supports CPU kernels, but it does not
 remove Dendra's WSL2 requirement because NEURON remains a required dependency
 of the full Dendra package.
+
+## Install from a source checkout
+
+To install an unreleased revision, clone the public repository and install from
+its root:
+
+```sh
+git clone https://github.com/wmglab-duke/dendra.git
+cd dendra
+python -m pip install --upgrade pip
+python -m pip install ".[solvers]"
+```
+
+Use `python -m pip install .` if the optional native solvers are unavailable.
+For an editable development environment, follow the
+[contribution guide](https://github.com/wmglab-duke/dendra/blob/main/CONTRIBUTING.md).
 
 ## Optional extras
 
@@ -247,7 +247,9 @@ python -m dendra doctor
 The doctor command reports the PyTorch device, CUDA readiness, compiler and
 toolkit discovery, and Dendra's optional NetCon CUDA extension. For a GPU
 deployment that must provide CUDA, run
-`python -m dendra doctor --require-cuda`.
+`python -m dendra doctor --require-cuda`. The {ref}`GPU deployment guide
+<gpu-deployment>` explains the complete native-extension probe and fallback
+policies.
 
 You can also verify the import and published version directly:
 
