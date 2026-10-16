@@ -679,14 +679,24 @@ class _dhs(Integrator):
             )
 
     def _functional_solver(self):
-        """Return the transform-compatible native CPU DHS facade.
+        """Return the transform-compatible facade for the selected DHS kernel.
 
         Imperative execution intentionally retains the raw dispatcher operator;
         its Python facade owns the forward-mode and nested ``torch.func``
-        contracts needed by functional Population lowering. CUDA remains
-        fail-closed for this CPU functional milestone.
+        contracts needed by functional Population lowering. CUDA uses a
+        separate split-context facade over its existing Triton solve kernel.
         """
         solver = self._solve
+        if (
+            isinstance(solver, partial)
+            and dhs_solve_cuda is not None
+            and solver.func is dhs_solve_cuda
+            and not solver.args
+            and solver.keywords == {"threads": self.threads}
+        ):
+            from ._cuda_functional import dhs_solve
+
+            return partial(dhs_solve, threads=self.threads)
         if DENDRA_SOLVERS_AVAILABLE and solver is torch.ops.dendra_solvers.dhs_solve:
             if callable(getattr(dendra_solvers, "DHSPlan", None)):
                 # Functional lowering owns immutable topology independently of
@@ -912,6 +922,9 @@ class _dhs(Integrator):
     def step(self, model, dt, ve=None, intra=None):
         if self._cpu_plan_available:
             self._refresh_cpu_topology_plan()
+        binding = self._tensor_step_binding
+        if binding is not None and binding.try_step(model, dt, ve, intra):
+            return
         v_new, i_membrane = self._call_kernel(
             "_step", model.v, dt, model.celsius, ve, intra
         )
@@ -1170,13 +1183,30 @@ class _dhs_multi(MultiIntegrator):
             )
 
     def _functional_solver(self):
-        """Return the transform-compatible native packed CPU facade.
+        """Return the transform-compatible facade for the packed DHS kernel.
 
         The imperative path deliberately keeps ``_dhs_multi_solve_cpu`` (or
         the CUDA launcher) and its existing call signature.  The public facade
         owns the forward-mode and nested ``torch.func`` contracts and accepts
         the twelve tensor operands of the native operator directly.
         """
+        solver = self._solve
+        if (
+            isinstance(solver, partial)
+            and dhs_solve_multi_cuda is not None
+            and solver.func is dhs_solve_multi_cuda
+            and not solver.args
+            and solver.keywords == {"threads": self.threads}
+        ):
+            from ._cuda_functional import dhs_multi_solve
+
+            return partial(
+                dhs_multi_solve,
+                K_stride=self.K_stride,
+                L_max=self.L_max,
+                threads=self.threads,
+                grid_x=self._tiled_grid_x,
+            )
         if self._solve is _dhs_multi_solve_cpu:
             constructor = getattr(dendra_solvers, "DHSMultiPlan", None)
             facade = getattr(dendra_solvers, "dhs_multi_solve_plan", None)

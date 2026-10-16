@@ -374,6 +374,14 @@ class _bwd_euler_ub(Integrator):
     def _functional_solver(self):
         """Return the transform-compatible facade for the selected UB solver."""
         solver = self._solve
+        if solver is not None and solver is thomas_solve_cuda_t:
+            from ._cuda_functional import thomas_solve
+
+            return thomas_solve
+        if solver is not None and solver is pcr_solve_cuda_t:
+            from ._cuda_functional import pcr_solve
+
+            return pcr_solve
         solver_name = getattr(solver, "__name__", None)
         solver_module = getattr(solver, "__module__", None)
 
@@ -675,14 +683,22 @@ class _bwd_euler_bt(Integrator):
         through a ``torch.func``-aware Python facade. Older installations retain
         correctness through the portable pure-Torch PCR implementation.
         """
-        native = (
-            None
-            if dendra_solvers is None
-            else getattr(dendra_solvers, "solve_bt", None)
+        if self._solve is not None and self._solve is thomas_solve_cuda_bt:
+            from ._cuda_functional import block_thomas_solve
+
+            return block_thomas_solve
+        if self._solve is block_pcr_solve_t:
+            return block_pcr_solve_t
+        if (
+            DENDRA_SOLVERS_AVAILABLE
+            and self._solve is torch.ops.dendra_solvers.solve_bt
+        ):
+            native = getattr(dendra_solvers, "solve_bt", None)
+            return native if callable(native) else block_pcr_solve_t
+        raise RuntimeError(
+            "The selected block-Thomas solver is not transform-compatible. "
+            "Use the standard CPU or CUDA method='thomas' implementation."
         )
-        if callable(native):
-            return native
-        return block_pcr_solve_t
 
     @staticmethod
     def _prepare_workspace(

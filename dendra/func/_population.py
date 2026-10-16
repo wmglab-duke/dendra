@@ -908,7 +908,7 @@ def _global_rng_snapshot(device: torch.device) -> dict[str, object]:
         "python": random.getstate(),
         "numpy": np.random.get_state(),
     }
-    if device.type == "cuda":  # pragma: no cover - future device slice
+    if device.type == "cuda":
         snapshot["cuda"] = torch.cuda.get_rng_state(device)
     if device.type == "mps" and hasattr(torch.mps, "get_rng_state"):
         snapshot["mps"] = torch.mps.get_rng_state()
@@ -938,7 +938,7 @@ def _restore_global_rng(snapshot, device: torch.device) -> None:
     torch.random.set_rng_state(snapshot["torch"])
     random.setstate(snapshot["python"])
     np.random.set_state(snapshot["numpy"])
-    if "cuda" in snapshot:  # pragma: no cover - future device slice
+    if "cuda" in snapshot:
         torch.cuda.set_rng_state(snapshot["cuda"], device)
     if "mps" in snapshot:
         torch.mps.set_rng_state(snapshot["mps"])
@@ -5826,6 +5826,21 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
     return spec
 
 
+def _functional_device_failures(device, dtype):
+    """Keep device admission separate from the topology/solver capability.
+
+    CUDA uses the same pure preparation and explicit state contract as CPU;
+    each integrator supplies its own transform-compatible solver facade.
+    Other accelerators must not silently select a CPU or CUDA-only kernel.
+    """
+    failures = []
+    if torch.device(device).type not in {"cpu", "cuda"}:
+        failures.append("the supported functional devices are CPU and CUDA")
+    if dtype not in (torch.float32, torch.float64):
+        failures.append("dtype must be float32 or float64")
+    return failures
+
+
 def _functionalization_failures(
     population,
     dt: float,
@@ -5999,10 +6014,9 @@ def _functionalization_failures(
                     "lane-specific geometry across explicit Population.batch() "
                     "replicas is not supported yet"
                 )
-    if population.device().type != "cpu":
-        failures.append("the current supported device is CPU")
-    if population.dtype() not in (torch.float32, torch.float64):
-        failures.append("dtype must be float32 or float64")
+    failures.extend(
+        _functional_device_failures(population.device(), population.dtype())
+    )
     if is_multi:
         point_spec = _resolve_functional_integrator_spec(
             population.integrator,

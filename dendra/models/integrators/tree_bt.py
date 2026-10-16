@@ -205,13 +205,23 @@ class _dhs_bt(Integrator):
             raise NotImplementedError(f"Unsupported device type: {device.type}")
 
     def _functional_solver(self):
-        """Return the transform-compatible native CPU block-DHS facade.
+        """Return the transform-compatible facade for the block-DHS kernel.
 
         Ordinary execution retains direct dispatcher access.  The public
         dendra-solvers facade owns the JVP and nested ``torch.func`` contracts
         required by functional ExtCellTree lowering.
         """
         solver = self._solve
+        if (
+            isinstance(solver, partial)
+            and dhs_bt_solve_cuda is not None
+            and solver.func is dhs_bt_solve_cuda
+            and not solver.args
+            and solver.keywords == {"threads": self.threads}
+        ):
+            from ._cuda_functional import dhs_bt_solve
+
+            return partial(dhs_bt_solve, threads=self.threads)
         solver_name = getattr(solver, "__name__", None)
         solver_module = getattr(solver, "__module__", None)
         if (

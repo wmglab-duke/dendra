@@ -173,7 +173,7 @@ following properties:
   contributions, PointProcess currents, and additive Material sources support
   duplicate placements; concentration and Material replacement writes require
   injective support;
-* deterministic CPU execution in float32 or float64;
+* deterministic CPU or CUDA execution in float32 or float64;
 * ``bwd_euler_sc`` for ``SingleCompartment``, ``bwd_euler_ub`` for
   ``Unmyelinated``, ``Myelinated``, and native ``Cable``,
   ``bwd_euler_bt(method="thomas")`` for ``ExtCellAxon``, ``dhs`` for scalar
@@ -229,7 +229,7 @@ Population topologies
 (including nested ``MultiPopulation`` and packed finite-extracellular block
 state), Cable/Axon/Tree subclasses with unrecognized custom geometry, stateful
 or unregistered parameter transforms, custom integrator subclasses, the SPD
-block solver, accelerator execution, and ``i_membrane`` recording. Row-regular
+block solver, non-CUDA accelerators (including MPS), and ``i_membrane`` recording. Row-regular
 selectors authored through the normal Population indexing API are already
 represented as packed support and are supported; users do not need to choose a
 different input form.
@@ -292,7 +292,9 @@ carries both membrane voltage ``v`` and the complete three-potential circuit
 state ``vc``; Dendra preserves ``v == vc[..., 0] - vc[..., 1]`` after every
 transition. A current ``dendra-solvers`` installation supplies the native
 transform-compatible CPU block-Thomas solver. The normal imperative integrator
-continues to call the raw native operator directly.
+continues to call the raw native operator directly. On CUDA, functional
+execution uses a transform-compatible facade over the existing three-component
+Triton block-Thomas kernel; no CPU solver or topology plan is selected.
 
 The block path participates in the same lifecycle as the scalar paths:
 ``run``, ``longrun``, checkpointed BPTT, fixed compiled rollout chunks, and
@@ -315,13 +317,14 @@ A scalar ``Tree`` constructed with ``Tree.from_morphology``,
 and child-indexed edge resistances remain the numerical source of truth; no
 unbranched or cylindrical approximation is introduced. A current
 ``dendra-solvers`` installation supplies the transform-compatible CPU DHS
-solver. As with native ``Cable``, the compiled resistance
+solver; CUDA uses the existing Triton DHS kernel through its functional facade.
+As with native ``Cable``, the compiled resistance
 already contains authored axial resistivity: use ``rhoa_scale`` or the explicit
 canonical-resistance tensor for axial-resistance sensitivity rather than the
 raw ``rhoa_param.rho`` leaf.
 
 A canonical ``ExtCellTree`` uses the same functional calls with its default
-``dhs_bt(imem=False)`` integrator on CPU; import ``dhs_bt`` from
+``dhs_bt(imem=False)`` integrator on CPU or CUDA; import ``dhs_bt`` from
 ``dendra.models.integrators`` when selecting it explicitly. Its state carries
 public membrane voltage ``v`` and the complete three-potential circuit state
 ``vc``. The exact compiled membrane area and child-indexed intracellular edge
@@ -330,8 +333,9 @@ resistance remain the intracellular source of truth, while ``dx``, ``xraxial``,
 transition supports the same reverse- and forward-mode differentiation,
 ``vmap``, compilation, host runners, checkpointed BPTT, and commit/resume
 lifecycle as the other admitted topologies. It requires the transform-compatible
-CPU block-DHS solver supplied by ``dendra-solvers`` and does not currently
-support ``i_membrane`` recording.
+CPU block-DHS solver supplied by ``dendra-solvers``, or the three-component
+Triton block-DHS solver on CUDA. It does not currently support ``i_membrane``
+recording.
 
 Packed scalar MultiPopulations
 ------------------------------
@@ -379,7 +383,9 @@ same authored forms described below and are projected onto the flat composite.
 The packed transition supports the ordinary functional runners,
 differentiation, ``vmap``, and transform-then-compile compositions.
 Heterogeneous packs require the transform-compatible native CPU ``dhs_multi``
-solver supplied by a current ``dendra-solvers`` installation.
+solver supplied by a current ``dendra-solvers`` installation, or the existing
+packed Triton DHS kernel on CUDA. The CUDA functional facade explicitly zeros
+inactive padded slots and preserves gradients only for active morphology nodes.
 
 Current native builds let scalar DHS, block DHS, and heterogeneous packed DHS
 reuse an owning, validated CPU topology plan. Initialization snapshots topology
@@ -1478,6 +1484,68 @@ functions. ``ExtCellAxon`` additionally requires the transform-compatible
 implementations remain available as correctness fallbacks without the
 extension where the topology supports them; the admitted Tree and
 heterogeneous packed paths have no extension-free CPU fallback.
+
+CUDA execution
+~~~~~~~~~~~~~~
+
+CUDA functional execution is experimental. It uses the existing CUDA/Triton
+kernels, not a CPU fallback: scalar Thomas/PCR for unbranched cables, scalar DHS
+for Trees, three-component block Thomas/DHS for finite-extracellular models,
+and packed DHS for heterogeneous scalar MultiPopulations. Single-compartment
+and point-only packed updates are ordinary PyTorch tensor operations. A CUDA
+PyTorch runtime and Triton are required for the spatial solvers; the CPU
+``dendra-solvers`` extension is not required for CUDA execution.
+
+Move/build and initialize the source Population on CUDA before lowering it.
+Parameters, numerical state, prepared workspaces, topology and input waveforms
+then stay on that device. The host-control ``duration_remainder`` scalar retains
+its CPU float64 representation. The same ``dn.func`` calls apply, for example:
+
+.. code-block:: python
+
+   model = dn.Unmyelinated(
+       [2.0], L=100.0, dx=10.0, device="cuda",
+       integrator=dn.bwd_euler_ub(method="thomas", imem=False),
+   )
+   model.insert(hh)
+   model.initialize()
+   runner = dn.func.compile(
+       model, dt=0.025, steps=800, execution="scan",
+       callbacks={"trace": dn.func.Recorder(("v",))},
+   )
+   final_state, auxiliary = runner()
+
+CUDA supports the same float32/float64 transition contract and explicit leading
+batch axes. Solver facades supply reverse AD, JVP and ``vmap`` over numerical
+operands; morphology/topology must be shared, not mapped. Compiled scan supports
+ordinary first-order backward; while execution remains inference-only. CUDA
+does not inherit the automatic CPU C++-wrapper preference. GPU loop execution
+is not a promise of one device-resident kernel: host orchestration and
+per-block synchronization may remain, particularly for ``torch.while_loop``.
+Cold lowering, purity validation and host runners may synchronize to inspect
+tensor values; these audits are not part of a fully device-resident optimizer.
+Branched Triton DHS kernels use atomic reductions. Last-bit scheduling
+differences can therefore trigger the existing strict repeated-output purity
+audit; CUDA support does not disable or weaken that audit. This remains a
+hardware-validation risk for branched models, not a verified deterministic GPU
+execution guarantee.
+
+CUDA does not remove the other admission restrictions above: no ``imem``,
+stochastic/delayed state, Network event scheduling, SPD block solver, or arbitrary
+custom geometry/integrators. MPS, float16 and bfloat16 remain unsupported.
+
+The CUDA acceptance tests compare full trajectories and gradients against
+imperative execution and CPU references, and separately exercise transforms and
+compiled loops. On a CUDA machine run:
+
+.. code-block:: bash
+
+   python -m pytest -q tests/func/test_cuda_solver_kernels.py tests/func/test_cuda_population.py -m "cuda and not slow"
+   python -m pytest -q tests/func/test_cuda_population.py -m "cuda and slow"
+
+The slow lane includes real Inductor scan/while compilation. Tests are skipped
+when CUDA is unavailable; collecting them on a CPU-only host is not evidence
+that GPU kernels or GPU code generation have passed.
 
 Resuming ordinary execution
 ----------------------------
