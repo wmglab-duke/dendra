@@ -9,6 +9,136 @@ PyTorch function transforms such as ``torch.func.grad``, ``jacrev``, ``vmap``,
 and ``torch.compile`` without changing the normal ``Population.step()``,
 ``run()``, or ``longrun()`` paths.
 
+Quick start: compiled scan or while loop
+---------------------------------------
+
+For a reusable compiled simulation, ``dn.func.compile`` handles
+functionalization, independent parameter copies, preparation, compilation, and
+binding. Start from an initialized, functionally supported Population:
+
+.. code-block:: python
+
+   import dendra as dn
+
+   runner = dn.func.compile(
+       model,
+       dt=0.025,
+       steps=800,
+       execution="scan",
+       callbacks={"trace": dn.func.Recorder(("v",))},
+   )
+   final_state, auxiliary = runner()
+   voltage = auxiliary["callbacks"]["trace"]["v"]
+
+Recording is configured only through the named ``callbacks`` mapping; no
+recorder is added implicitly. ``Recorder`` includes the initial frame, so
+``voltage`` has 801 frames in this example. Use
+``dn.func.Recorder(("v", "t"))`` to select fields. To record voltage from selected
+compartments, use ``dn.func.Recorder(("v",), node_indices=[3])``; voltage node
+indices must be nonnegative. Node selection cannot be combined with scalar
+fields such as ``t``. The mapping also configures threshold reducers for either
+execution mode:
+
+.. code-block:: python
+
+   runner = dn.func.compile(
+       model,
+       dt=0.025,
+       steps=800,
+       execution="while",
+       callbacks={
+           "active": dn.func.Active(node_check=[0, -1]),
+           "counts": dn.func.APCount(node_check=[0, -1]),
+       },
+   )
+   final_state, auxiliary = runner()
+   active = auxiliary["callbacks"]["active"]
+   counts = auxiliary["callbacks"]["counts"]
+
+The mapping accepts ``dn.func.FunctionalCallback`` configurations, not mutable
+``dn.callbacks`` objects or an already-bound collection. Names such as
+``"trace"`` are user-defined and have no special meaning. Threshold-only reducers
+need no voltage trajectory, so the example above allocates no full-trace
+storage. Omitting ``callbacks`` or passing ``callbacks={}`` selects no callbacks;
+this is supported by scan, while execution requires a nonempty supported
+callback collection.
+
+Choose ``execution="while"`` for the inference-only ``torch.while_loop``
+path. Both modes default to ``inference=True``: the runner manages
+``torch.inference_mode()`` and, for CPU Inductor compilation, enables the C++
+wrapper unless ``options={"cpp_wrapper": False}`` overrides it. The first call
+captures and compiles the loop; retain the runner for subsequent calls.
+Explicit compiler modes and alternate code-generation options retain their
+original compiler policy rather than receiving a new wrapper preference.
+Scan currently requires Dendra's verified PyTorch 2.14.0 or 2.14.1 scan
+implementation. While execution requires at least four steps, a nonempty
+collection of supported built-in callbacks, and a capturable inference step.
+Supported built-ins are ``Recorder``, ``AnomalyDetector``, ``Raster``, ``APCount``,
+``Active``, ``ActiveAL``, and ``ActiveALCount``; scan also accepts pure custom
+functional callbacks. An unsupported while request raises an error
+instead of falling back to an unrolled simulation; it does not silently compile a
+different execution strategy.
+
+State stays explicit. Every ``runner()`` starts from ``runner.initial_state``;
+the runner never advances or commits state to the source Population. To
+continue, pass the returned state. Passing the callback state also preserves
+reducer history and its clock without recording a duplicate boundary frame:
+
+.. code-block:: python
+
+   continued_state, continued_auxiliary = runner(
+       final_state,
+       callback_state=auxiliary["callbacks"].state,
+   )
+
+Registered stimuli are captured with the model. Explicit time-first waveform
+inputs can instead be supplied with ``runner(inputs=dn.func.RolloutInput(...))``.
+The runner exposes ``parameters`` as a read-only mapping of independent tensor
+copies, as well as ``constants``, ``functional``, and the compiled ``kernel``.
+Use ``runner.execution_report()`` after a call to inspect the selected strategy.
+
+For ordinary first-order backpropagation, select scan and disable inference
+explicitly. The default has no trainable parameter leaves; ``trainable`` accepts
+the same exact or unambiguous partial parameter names as
+``PopulationTensors.independent_parameters``:
+
+.. code-block:: python
+
+   import torch
+
+   train_runner = dn.func.compile(
+       model,
+       dt=0.025,
+       steps=800,
+       execution="scan",
+       inference=False,
+       trainable=("gnabar",),
+       callbacks={"trace": dn.func.Recorder(("v",))},
+   )
+   trainable = [p for p in train_runner.parameters.values() if p.requires_grad]
+   optimizer = torch.optim.Adam(trainable, lr=1e-4)
+   for _ in range(2):
+       optimizer.zero_grad()
+       final_state, auxiliary = train_runner()
+       loss = auxiliary["callbacks"]["trace"]["v"].square().mean()
+       loss.backward()
+       optimizer.step()
+
+Gradient-enabled calls prepare a fresh differentiable workspace for each
+forward/backward graph. Inference calls reuse preparation while its sources are
+unchanged. ``inference=True`` always suppresses gradients, even for leaves
+selected by ``trainable``. A complete replacement mapping may be passed with
+``runner(parameters=parameters)``; explicit state tensors may carry gradients
+as well. Parameter changes do not reset the captured initial state or perform
+differentiable initialization automatically.
+
+This is an opt-in convenience layer. The lower-level functional API remains
+available for explicit callback binding, chunking, checkpointing, transforms, and
+preparation lifetimes. Imperative ``Population.run`` and ``Population.longrun``
+retain their existing behavior. See ``examples/functional_compiled_runner.py``
+for a complete small-model example, or
+``examples/functional_threshold_callbacks.py`` for named threshold reducers.
+
 Supported models
 ----------------
 
@@ -93,8 +223,8 @@ lowering. Current limitations include non-injective regional concentration or
 Material replacement writes, the reserved compact rowwise support encoding,
 TABLE lookups, MaterialProcesses, mechanism-owned waveform injections, delayed
 or stochastic state, VoltageProcesses, imperative callback hooks, functional
-callback built-ins beyond ``Recorder``, ``AnomalyDetector``, ``Raster``, and
-``APCount``, other
+callback built-ins beyond ``Recorder``, ``AnomalyDetector``, ``Raster``,
+``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
 Population topologies
 (including nested ``MultiPopulation`` and packed finite-extracellular block
 state), Cable/Axon/Tree subclasses with unrecognized custom geometry, stateful
@@ -185,8 +315,7 @@ A scalar ``Tree`` constructed with ``Tree.from_morphology``,
 and child-indexed edge resistances remain the numerical source of truth; no
 unbranched or cylindrical approximation is introduced. A current
 ``dendra-solvers`` installation supplies the transform-compatible CPU DHS
-solver, while ordinary imperative Tree execution continues to call the raw
-native operator directly. As with native ``Cable``, the compiled resistance
+solver. As with native ``Cable``, the compiled resistance
 already contains authored axial resistivity: use ``rhoa_scale`` or the explicit
 canonical-resistance tensor for axial-resistance sensitivity rather than the
 raw ``rhoa_param.rho`` leaf.
@@ -251,6 +380,18 @@ The packed transition supports the ordinary functional runners,
 differentiation, ``vmap``, and transform-then-compile compositions.
 Heterogeneous packs require the transform-compatible native CPU ``dhs_multi``
 solver supplied by a current ``dendra-solvers`` installation.
+
+Current native builds let scalar DHS, block DHS, and heterogeneous packed DHS
+reuse an owning, validated CPU topology plan. Initialization snapshots topology
+and row assignments; timestep-dependent coefficients remain ordinary numerical
+inputs. Functional lowering owns an independent plan, including through
+``vmap`` and compiled scan/while execution. Imperative ``run`` and ``longrun``
+keep their existing APIs and check topology tensor identities/version counters
+outside compiled transitions. Normal mutation or rebinding rebuilds the plan;
+versionless inference metadata or an older solver package safely uses the
+fully checked raw solver. No plan stores differentiable coefficients or shares
+mutable scratch between invocations. As with autograd, writes through external
+aliases or ``.data`` that bypass tensor version counters are unsupported.
 
 Tree lowering deliberately accepts only Dendra's canonical compiled topology
 and geometry contract. Low-level Tree-like objects without that compiled
@@ -621,7 +762,7 @@ existing ``functools.partial`` forms. A general callable in those legacy forms
 must accept ``(state, StepInput)`` and return exactly
 ``(next_state, auxiliary)`` for one transition from the same model.
 
-On supported PyTorch 2.14.0 installations, ``execution="scan"`` offers an
+On supported PyTorch 2.14.0 and 2.14.1 installations, ``execution="scan"`` offers an
 experimental alternative for first-order training over longer horizons:
 
 .. code-block:: python
@@ -643,7 +784,14 @@ on the model and recording requirements; scan does not guarantee an improvement
 over the default compiled chunks.
 
 Scan uses a Dendra-maintained compatibility fix without modifying installed
-PyTorch files. Unsupported PyTorch builds raise ``FunctionalizationError``;
+PyTorch files. The audited HOP/AOT sources are byte-identical in the supported
+2.14.0 and 2.14.1 builds; both need the same repair to preserve positional
+cotangents for integer and Boolean outputs. Activation verifies the installed
+source and callable fingerprints, not just the version number. It replaces
+only the HOP partitioner's joint-graph entry point with a privately bound
+helper; shared backward utilities are unchanged. This process-wide activation
+persists for backward and checkpoint replay after forward execution returns.
+Unsupported PyTorch builds raise ``FunctionalizationError``;
 omit ``execution="scan"`` to use the default compiled chunks on those builds.
 
 Scan supports ordinary first-order ``backward()`` and ``autograd.grad``.
@@ -677,6 +825,7 @@ arguments of the ordinary recorder:
            "anomalies": dn.func.AnomalyDetector(),
            "raster": dn.func.Raster(node_check=[0, -1]),
            "spike_count": dn.func.APCount(node_check=[0, -1]),
+           "active": dn.func.Active(node_check=[0, -1]),
        }
    )
    final_state, auxiliary = dn.func.run(
@@ -690,6 +839,7 @@ arguments of the ordinary recorder:
    anomalous = auxiliary["callbacks"]["anomalies"]
    raster = auxiliary["callbacks"]["raster"]
    spike_count = auxiliary["callbacks"]["spike_count"]
+   active = auxiliary["callbacks"]["active"]
 
 For ``torch.func`` transforms, keep host-duration scheduling outside the
 transformed function and use the fixed-step tensor operation directly:
@@ -717,18 +867,75 @@ every timestep: increasing the compiled chunk size does not subsample a
 recording or skip reducer updates. Checkpoint replay recomputes each pure host
 span without mutating external storage.
 
-``Raster`` and ``APCount`` use the same upward-crossing rule as their imperative
-counterparts: a selected voltage at or above ``threshold`` fires only when its
-previous checked value was below threshold. The first checked post-step frame
-is armed; the initial model frame is not emitted or inspected. ``Raster``
-returns a Boolean tensor shaped ``(steps, *batch, N, K)``. It retains the full
-simulation timeline and fills frames outside
-``[t_start_check, t_end_check)`` with ``False``; the imperative Raster instead
-omits those frames. ``APCount`` emits no trajectory and returns a cumulative
-``int64`` tensor shaped ``(*batch, N, K)`` using constant callback memory.
-Both preserve their latch, count, and timing phase in explicit callback carry.
-Their ``dt`` must match the timestep used to create ``fmodel``; rebuild the
-functional plan before using another timestep.
+Threshold detection
+^^^^^^^^^^^^^^^^^^^
+
+``Raster``, ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount`` share
+the imperative threshold callbacks' upward-crossing rule: a selected voltage
+at or above ``threshold`` fires only while its crossing latch is armed. The
+initial model frame is not inspected. The first checked post-step sample is
+armed even if it is already above threshold; a subsequent below-threshold
+checked sample rearms that site. The first post-step sample has callback index
+zero, and the checked window uses
+``int(t_start_check / dt) <= index < int(t_end_check / dt)``. Omitting
+``t_end_check`` leaves the window open. These bounds use callback sample indices,
+not a comparison against the state's post-step clock. ``dt`` defaults to the
+functional timestep and must match it when supplied explicitly.
+
+For ``K`` selected slots in ``node_check``, the finalized results are:
+
+.. list-table:: Functional threshold results
+   :header-rows: 1
+   :widths: 22 53 25
+
+   * - Callback
+     - Result
+     - Shape
+   * - ``Active``
+     - At least one checked site has crossed at least once.
+     - ``(*batch, N)`` Boolean
+   * - ``ActiveAL(at_least=k)``
+     - At least ``k`` checked sites have each crossed at least once.
+     - ``(*batch, N)`` Boolean
+   * - ``ActiveALCount(at_least=k)``
+     - At least ``k`` total crossing events across the checked slots.
+     - ``(*batch, N)`` Boolean
+   * - ``APCount``
+     - Cumulative upward-crossing counts for each checked slot.
+     - ``(*batch, N, K)`` int64
+   * - ``Raster``
+     - Post-step crossing events, with ``False`` outside the checked window.
+     - ``(steps, *batch, N, K)`` Boolean
+
+``ActiveAL`` counts sites, not repeated spikes at one site. In contrast,
+``ActiveALCount`` sums all events, including repeated spikes. This distinction
+matches the actual imperative ``is_active`` reductions. The Active family
+accepts ``inv=True`` to invert the finalized Boolean result, and a keyword-only
+``partition`` configuration to reduce contiguous groups of the selected slots
+independently. ``at_least`` must be a positive integer; each partition length
+must be at least ``at_least``, matching the existing partition contract.
+For example, ``node_check=[0, 2, 5, -1], partition=(2, 2)``
+reduces two pairs of checked slots and returns ``(*batch, N, 2)``. Partitions
+describe this selected-slot axis, not anatomical branches or Population groups;
+they are static callback configuration, not a post-run ``is_active`` argument.
+The selected-slot order follows ``node_check``; repeated node indices retain
+their multiplicity rather than being deduplicated.
+
+``Active``, ``ActiveAL``, ``ActiveALCount``, and ``APCount`` emit no trajectory
+and use callback memory independent of the timestep count. ``Raster`` retains
+the full simulation timeline, unlike imperative Raster, which omits frames
+outside its checked window. All threshold callbacks preserve their crossing
+latches, accumulated results, and timing phase in explicit callback carry, so
+continuation does not reset the detection window or double-count a crossing.
+``runner()`` starts a fresh detection history; continue with both returned
+simulation state and ``callback_state=auxiliary["callbacks"].state``.
+
+These are observation/reduction callbacks: they do not stop the simulation
+early, execute imperative hooks, or convert an existing mutable callback.
+Boolean masks and integer crossing counts are hard, nondifferentiable results.
+They do not interfere with gradients through recorded floating-point traces or
+the final simulation state, but do not provide gradients of threshold decisions.
+See ``examples/functional_threshold_callbacks.py`` for the convenience runner.
 
 The same callback plan can observe its source model through the ordinary
 ``Population.longrun_checkpointed`` API. This is useful when an existing
@@ -1105,6 +1312,55 @@ unrolled fallback, but compilation cost and graph size grow with the rollout.
 ``compile_rollout_chunk`` performs this prewarm automatically on its first
 ordinary no-gradient call.
 
+Built-in callbacks in compiled inference
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On PyTorch 2.14 or newer, a default compiled chunk can also use a bounded
+inference loop when every callback is a supported functional built-in:
+``Recorder``, ``AnomalyDetector``, ``Raster``, ``APCount``, ``Active``,
+``ActiveAL``, or ``ActiveALCount``. Run the call under ``torch.no_grad()``;
+chunks of at least four timesteps use the loop when their transition can be
+captured. No Recorder is required for a reducer-only callback collection.
+Recorder state selection, including ``v``, mechanism states such as ``hh.m``,
+``t``, node indices, and ``max_only``
+reductions, retains its ordinary meaning. The runner still returns the initial
+sample followed by one sample per accepted timestep:
+
+.. code-block:: python
+
+   callbacks = fmodel.make_callbacks(
+       {"trace": dn.func.Recorder(["v", "hh.m", "t"])}
+   )
+   kernel = fmodel.compile_rollout_chunk(100)
+   with torch.no_grad():
+       prepared = fmodel.prepare(tensors.parameters, tensors.constants)
+       bound = kernel.bind(tensors.parameters, prepared)
+       final_state, auxiliary = dn.func.run(
+           bound, tensors.state, steps=100, callbacks=callbacks,
+       )
+   voltage = auxiliary["callbacks"]["trace"]["v"]  # 101 time samples
+   print(kernel.execution_report().strategy)       # "compiled_while_loop"
+
+The compiled body has bounded graph size; recording storage still grows with
+the number of samples and selected states. Each invocation owns fresh recording
+buffers and does not modify caller-owned state or input tensors. A resumed
+callback state does not repeat the initial sample. Registered intracellular
+and bound extracellular waveforms are evaluated at each accepted recurrent
+clock value, just as in an eager host run.
+
+Mixed collections of these built-ins remain eligible for the loop. Custom
+callbacks, gradient-enabled calls, and short chunks retain the unrolled path.
+Failed transition capture also falls back to unrolling. A final one-, two-, or
+three-step tail therefore reports
+``compiled_unrolled`` even when preceding chunks used ``compiled_while_loop``.
+Consult the execution report rather than assuming a particular dispatch.
+
+For an explicit reference path, select
+``fmodel.compile_rollout_chunk(100, execution="unrolled")``. This keeps the
+ordinary compiled recurrence even under ``torch.no_grad()`` and applies to
+both recorded and final-state-only runs; it does not change the numerical
+model, recording contract, or gradient availability.
+
 Grad-enabled calls, direct forward-mode AD, and calls inside an active
 ``torch.func`` transform retain the differentiable unrolled path. Compile and
 first call an inference workload inside the same no-gradient context. A
@@ -1205,7 +1461,7 @@ For example:
    python examples/functional_execution_modes.py --mode checkpointed --backend inductor
    python examples/functional_execution_modes.py --mode scan --backend inductor
 
-Scan modes require the supported PyTorch 2.14.0 implementation. ``all`` skips
+Scan modes require a supported PyTorch 2.14.0 or 2.14.1 implementation. ``all`` skips
 them on other versions; requesting one explicitly reports the capability error.
 The examples hold the extracted initial state fixed. For differentiation through
 initialization as well, see ``examples/functional_gradient_descent.py`` above.

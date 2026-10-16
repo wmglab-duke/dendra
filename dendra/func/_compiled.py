@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dendra.helpers import MEMBRANE_ASSEMBLY
+
 from ._execution import (
     ExecutionCapabilities,
     ExecutionReport,
@@ -49,8 +51,8 @@ class CompiledPopulationChunk:
         _stepwise_stimulation: bool = False,
         _report_state: _ExecutionReportState | None = None,
     ):
-        if execution not in ("default", "scan"):
-            raise ValueError("execution must be 'default' or 'scan'")
+        if execution not in ("default", "unrolled", "scan"):
+            raise ValueError("execution must be 'default', 'unrolled', or 'scan'")
         self._execution = execution
         self._capabilities = _capabilities(execution)
         self._report_state = (
@@ -60,6 +62,7 @@ class CompiledPopulationChunk:
             functional,
             steps=steps,
             stepwise_stimulation=_stepwise_stimulation,
+            force_unrolled=execution == "unrolled",
         )
         self._functional = functional
         self._steps = self._lowered.steps
@@ -182,6 +185,8 @@ class CompiledPopulationChunk:
             return "eager_disabled", "Compilation was explicitly disabled."
         if self._execution == "scan":
             return "compiled_scan", None
+        if self._execution == "unrolled":
+            return "compiled_unrolled", "Unrolled execution was explicitly selected."
         if grad_enabled:
             return (
                 "compiled_unrolled",
@@ -204,6 +209,7 @@ class CompiledPopulationChunk:
         signature = (
             operands.ve is not None or self._functional.extra.enabled,
             operands.intra is not None or self._functional.intra.enabled,
+            MEMBRANE_ASSEMBLY.value,
         )
         if signature in self._functional._structured_step_graphs:
             return "compiled_while_loop", None
@@ -344,6 +350,13 @@ class _CompiledCallbackPopulationChunk:
         self._lowered = _LoweredCallbackPopulationChunk(
             functional, steps=steps, plans=plans
         )
+        self._recorder_while = None
+        if execution == "default" and not compile_options.get("disable", False):
+            from ._recorder_while import _RecorderWhileExecutor
+
+            self._recorder_while = _RecorderWhileExecutor(
+                functional, steps=steps, plans=plans, compile_options=compile_options
+            )
         if execution == "scan":
             from ._scan import _CompiledScanPopulationChunk
 
@@ -370,15 +383,29 @@ class _CompiledCallbackPopulationChunk:
                 else "eager_forward_ad_fallback"
             )
         else:
-            result = self._compiled(*operands)
-            if self._compile_options.get("disable", False):
-                strategy = "eager_disabled"
-                reason = "Compilation was explicitly disabled."
-            elif self._execution == "scan":
-                strategy = "compiled_scan"
+            while_kernel = None
+            if self._recorder_while is not None and not grad_enabled:
+                while_kernel, reason = self._recorder_while.kernel_for(*operands)
+            if while_kernel is not None:
+                result = while_kernel(*operands)
+                strategy = "compiled_while_loop"
             else:
-                strategy = "compiled_unrolled"
-                reason = "Callback updates use the unrolled recurrence."
+                result = self._compiled(*operands)
+                if self._compile_options.get("disable", False):
+                    strategy = "eager_disabled"
+                    reason = "Compilation was explicitly disabled."
+                elif self._execution == "scan":
+                    strategy = "compiled_scan"
+                else:
+                    strategy = "compiled_unrolled"
+                    if self._execution == "unrolled":
+                        reason = "Unrolled execution was explicitly selected."
+                    elif grad_enabled:
+                        reason = (
+                            "Gradient recording uses the unrolled callback recurrence."
+                        )
+                    elif reason is None:
+                        reason = "Callback updates use the unrolled recurrence."
         self._report_state.report = ExecutionReport(
             requested_execution=self._execution,
             strategy=strategy,

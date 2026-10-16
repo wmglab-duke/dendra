@@ -788,7 +788,7 @@ def test_bound_intra_prewarm_and_no_grad_compiled_inference_use_drive_signature(
     functional, tensors = dn.func.make_functional(model, dt=DT)
     prepared = functional.prepare(tensors.parameters, tensors.constants)
     assert functional.prewarm_structured_rollout()
-    assert (False, True) in functional._structured_step_graphs
+    assert (False, True, "auto") in functional._structured_step_graphs
     compiled = functional.compile_rollout_chunk(3, backend="aot_eager")
 
     with torch.no_grad(), torch_compiler_warning_context():

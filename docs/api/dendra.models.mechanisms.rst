@@ -37,12 +37,20 @@ Python expression. A nonlinear pointwise current can instead define an exact
 For a distributed mechanism that pair is ``(mA/cm², S/cm²)``; for a point
 process it is ``(nA, µS)`` before area normalization.
 
+An affine current may alternatively define ``i_affine_terms(self, v)`` returning
+``(G, J)`` with ``I(v) = G*v - J``, together with ``Mechanism.AFFINE("i")``.
+The name follows the declared current: a current named ``ik`` uses
+``ik_affine_terms``. This coefficient hook is optional; source-inferred affine
+currents and existing conductance methods continue to work without it. See
+`Affine membrane assembly`_ for the contract and selection controls.
+
 The voltage passed to ``assigned_values`` and current methods is read-only. Dendra
 may gather it once and share that tensor across mechanisms with the exact same
 ordered compartment support; mechanism hooks must not modify it in place.
 
-This sharing is automatic and does not fuse or rewrite mechanism classes.
-Each current method and point-process area conversion still runs independently;
+This support sharing is automatic and does not rewrite mechanism classes.
+When actual currents are evaluated, each current method and point-process area
+conversion runs independently;
 adjacent contributions to the same current field are then reduced locally and
 scattered once. Selectors must match exactly, including fancy-index order.
 Duplicate-index supports retain separate scatters. As with other parallel
@@ -60,8 +68,9 @@ numerical currents are evaluated at the current voltage with zero conductance
 in Dufort--Frankel, while their conductance remains available to other implicit
 solvers. ``Mechanism.EXPLICIT("i")`` takes precedence and always selects this
 explicit Dufort--Frankel treatment. An inherited ``AFFINE`` assertion is
-discarded when a subclass overrides the current method; the subclass must
-redeclare it. Exact rename aliases preserve the assertion.
+discarded when a subclass overrides its current implementation (including its
+conductance or coefficient method); the subclass must redeclare it. Exact
+rename aliases preserve the assertion.
 
 ``Mechanism.NUMERICAL("i")`` is an explicit opt-in to centered finite
 differences when an exact path is unavailable. The declaration asserts that
@@ -99,6 +108,103 @@ expression, provide an exact conductance pair, or use ``NUMERICAL`` only after
 establishing its contract. An analytic pair supplies only a local conductance;
 it does not make a genuinely coupled current safe. Nonlocal voltage coupling
 must be represented outside the local mechanism-current assembly.
+
+Affine membrane assembly
+------------------------
+
+Implicit integrators can assemble conductance ``G`` and source ``J`` directly
+when every participating current is affine in the stage voltage:
+``I(v) = G*v - J``. ``G`` and ``J`` must be independent of that voltage with
+gates, assigned values, and other stage state held fixed. Gates and assigned
+values may themselves depend on voltage when they are updated; HH is affine
+under this stage-local definition. Constant currents and zero conductance do
+not require division by ``G``.
+
+Dendra infers this property for supported source expressions, or trusts the
+author's ``Mechanism.AFFINE("i")`` declaration. The declaration is sufficient
+to use the existing conductance method: Dendra derives ``J = G*v - I`` when no
+coefficient expression is available. This enables the common assembly path,
+although obtaining coefficients this way cannot eliminate the authored current
+arithmetic. An optional coefficient hook supplies the efficient calculation
+directly::
+
+    class Leak(Mechanism):
+        Mechanism.RANGE(g=0.0003, e=-54.3)
+        Mechanism.NONSPECIFIC_CURRENT("i")
+        Mechanism.AFFINE("i")
+
+        def i_affine_terms(self, v):
+            return self.g, self.g * self.e
+
+There is no mechanism-wide coefficient hook, field inventory, or implementation
+marker to maintain. A hook-only current needs no duplicate ``i`` or
+``i_with_conductance`` equation: Dendra supplies its ordinary current and
+conductance adapters from ``G*v - J``. Coefficients may broadcast to the local
+voltage shape and must preserve its dtype and device. For distributed
+mechanisms the pair has units ``(S/cm², mA/cm²)``; for point processes it is
+``(µS, nA)`` before the usual area normalization.
+
+The policy is controlled at evaluation time with :func:`dendra.ctx`::
+
+    with dn.ctx(MEMBRANE_ASSEMBLY="auto"):
+        ...  # Default: trust AFFINE declarations and select eligible assembly.
+    with dn.ctx(MEMBRANE_ASSEMBLY="off"):
+        ...  # Evaluate actual currents and use the original solver arithmetic.
+    with dn.ctx(MEMBRANE_ASSEMBLY="validate"):
+        ...  # Diagnose coefficient and affine-contract violations.
+
+For eligible direct assembly, ``validate`` checks coefficient shape/type/device,
+consistency with available
+authored current/conductance methods, and voltage independence with stage state
+held fixed. It does not rerun gates or assigned-value updates for each probe.
+These bounded probes can reject an invalid contract, not prove arbitrary user
+code affine for every state. This mode is a correctness diagnostic, not a
+throughput mode. It supports ordinary model batch dimensions but not
+``torch.vmap``; validate eagerly before using ``auto`` under a transform.
+
+These probes run only when eligible direct assembly is attempted. Paths that
+retain ordinary current assembly, including current observers, ``imem=True``,
+and explicit or Dufort--Frankel integration, do not run them. Successful
+fallback therefore does not validate every ``AFFINE`` declaration.
+
+``auto`` trusts the current implementations and ``AFFINE`` declarations
+established at model construction; it does not re-prove them each timestep.
+After changing a current implementation or declaration, reconstruct the model
+and any functional/compiled plans. Use ``validate`` to diagnose inconsistent
+authored currents, conductances, or coefficients.
+
+Actual-current observers retain safe fallback: saved currents, ion-current
+publication/readers, and membrane-current reporting still evaluate actual
+currents. Unsupported supports or dtypes and nonaffine or explicitly treated
+currents also retain their existing behavior. A context override never skips
+required current publication. Source expressions with nonconstant denominators
+or negative/non-integer powers retain authored current arithmetic rather than
+silently canceling parameter-dependent singularities.
+
+The fallback returns the current and its existing conductance, and solvers
+preserve their legacy arithmetic order in that case. Direct assembly preserves
+assigned-value scheduling, parameter/state autograd dependencies, units,
+point-process area conversion, and stimulation and extracellular forcing.
+Small roundoff differences from algebraic reassociation are expected.
+
+This is a mathematical assembly capability, not a compiler layout policy:
+there is no inference-only diagonal materializer or forced buffer layout in
+this interface.
+
+Built-in HH registers a single nonspecific current ``i``. Its coefficient hook
+shares sodium, potassium, and leak conductances between ``G`` and ``J`` using
+ordinary broadcasting of scalar ``GLOBAL`` parameters with the support-local
+gate tensors. There are no separate ``ina(v)``, ``ik(v)``, or ``il(v)`` methods.
+A subclass that changes the aggregate should override ``i_affine_terms`` and
+redeclare ``AFFINE("i")``, or declare its own current implementation. HH
+parameters, gate state, and rate-form kinetics are unchanged.
+
+For transformed execution, use the functional-Population API. Its execution
+bindings provide singleton local axes for effective parameters while preserving
+the public scalar parameter schema. This shared boundary handles PyTorch's
+empty-hidden-``vmap`` scalar-broadcasting limitation; individual mechanism hooks
+do not need to explicitly expand every input. Direct calls to standalone
+mechanism hooks do not pass through this compatibility layer.
 
 Mechanism and State value roles
 -------------------------------

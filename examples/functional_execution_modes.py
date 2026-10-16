@@ -11,8 +11,9 @@ Run from the repository root::
 The default aot_eager backend exercises graph capture and AOTAutograd without
 native code generation. Use inductor for optimized native kernels. Compiled
 transforms are verified with aot_eager; backend support can differ by transform.
-Scan modes require Dendra's verified PyTorch 2.14.0 implementation; all skips those modes
-on other versions, while explicitly requesting them raises the capability error.
+Scan modes require Dendra's verified PyTorch 2.14.0 or 2.14.1 implementation;
+all skips those modes on other versions, while explicitly requesting them raises
+the capability error. Source fingerprints are also checked when scan is selected.
 
 Compiled examples check values/derivatives against ordinary functional execution.
 This is a usage example, not a performance benchmark. Initial state is held
@@ -288,9 +289,9 @@ def main():
         if (
             args.mode == "all"
             and mode.startswith("scan")
-            and torch.__version__.split("+")[0] != "2.14.0"
+            and torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1")
         ):
-            print(f"{mode}: skipped; verified PyTorch 2.14.0 is required")
+            print(f"{mode}: skipped; verified PyTorch 2.14.0 or 2.14.1 is required")
             continue
         if mode == "eager":
             eager_example(*case)

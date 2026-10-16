@@ -36,6 +36,7 @@ from .helpers import (
     COMPILE_OPTIONS,
     DEVICE,
     DTYPE,
+    MEMBRANE_ASSEMBLY,
     NATIVE_EXTENSION_POLICY,
     PRESERVE_MECHANISM_POPULATION_AXIS,
     RUNTIME_CONTRACT_VALIDATION,
@@ -45,9 +46,11 @@ from .helpers import (
     current_compile_options,
     current_device,
     current_dtype,
+    current_membrane_assembly,
     current_native_extension_policy,
     current_preserve_mechanism_population_axis,
     current_runtime_contract_validation,
+    normalize_membrane_assembly,
     normalize_native_extension_policy,
     normalize_preserve_mechanism_population_axis,
     normalize_runtime_contract_validation,
@@ -94,6 +97,7 @@ from .models import (
     sample_random_parameter,
     sample_runtime_noise,
 )
+from .models.callbacks import Recorder
 from .models.fields import *
 from .models.integrators import (
     bwd_euler_bt,
@@ -129,6 +133,9 @@ __all__ = [
     "DEVICE",
     "DTYPE",
     "NATIVE_EXTENSION_POLICY",
+    "MEMBRANE_ASSEMBLY",
+    "current_membrane_assembly",
+    "normalize_membrane_assembly",
     "PRESERVE_MECHANISM_POPULATION_AXIS",
     "RUNTIME_CONTRACT_VALIDATION",
     "COMPILE_OPTIONS",
@@ -149,6 +156,7 @@ __all__ = [
     "callbacks",
     "func",
     "mod",
+    "Recorder",
     "load_mechanisms",
     "DistributionSpec",
     "RandomParameterSpec",

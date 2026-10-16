@@ -15,13 +15,13 @@ class ExecutionCapabilities:
     compiled kernel: transform fallback does not intercept ``create_graph=True``.
     """
 
-    execution: Literal["default", "scan"]
+    execution: Literal["default", "unrolled", "scan"]
     inference: bool
     compiled_reverse_mode: Literal["first_order"]
     compiled_higher_order_reverse_mode: Literal["backend_limited", "rejected"]
     functional_transforms: Literal["eager_fallback"]
     forward_mode: Literal["eager_fallback"]
-    structured_inference: Literal["conditional_while_loop", "scan"]
+    structured_inference: Literal["conditional_while_loop", "none", "scan"]
     structured_training: bool
 
 
@@ -41,7 +41,7 @@ class ExecutionReport:
     only scalar metadata and never retain live tensors or autograd graphs.
     """
 
-    requested_execution: Literal["default", "scan"]
+    requested_execution: Literal["default", "unrolled", "scan"]
     strategy: Literal[
         "compiled_unrolled",
         "compiled_while_loop",
@@ -77,7 +77,11 @@ def _capabilities(execution: str) -> ExecutionCapabilities:
         functional_transforms="eager_fallback",
         forward_mode="eager_fallback",
         structured_inference=(
-            "scan" if execution == "scan" else "conditional_while_loop"
+            "scan"
+            if execution == "scan"
+            else "none"
+            if execution == "unrolled"
+            else "conditional_while_loop"
         ),
         structured_training=execution == "scan",
     )

@@ -15,6 +15,7 @@ linearly interpolated crossings on the branch selected in the current replay.
 
 .. currentmodule:: dendra.models.analysis
 
+.. autofunction:: branch_conditioned_conduction_velocity
 .. autofunction:: differentiable_action_potential_width
 .. autofunction:: differentiable_activity_dependent_slowing
 .. autofunction:: differentiable_spike_timing
@@ -27,6 +28,31 @@ The implementation names ``branch_conditioned_action_potential_width``,
 ``branch_conditioned_activity_dependent_slowing``,
 ``branch_conditioned_spike_timing``, and
 ``branch_conditioned_firing_rate_trajectory`` are equivalent public aliases.
+``differentiable_conduction_velocity`` is an alias for the preferred explicit
+name ``branch_conditioned_conduction_velocity``.
+
+Standalone conduction velocity
+------------------------------
+
+``branch_conditioned_conduction_velocity`` has the exact
+``hard_conduction_velocity`` value on its forward pass. It selects the first
+hard upward threshold crossing at every included site, linearly interpolates
+each selected crossing with the voltage graph intact, and differentiates the
+spatial ordinary-least-squares fit through those arrival times. A valid
+velocity requires at least two included sites with crossings and arrival-time
+variance greater than ``eps``. Use ``node_mask`` and the optional time window
+to select recording sites and isolate the propagated action potential of
+interest.
+
+The derivative is local to those event choices. It does not describe the
+creation of a missing distal response, the loss of a response, or a switch to
+a different spike. Rerun the full protocol and recompute the descriptor after
+every parameter update so that the selected branch follows the current model.
+
+The older ``conduction_velocity`` function is a distinct historical smooth
+estimator based on soft upstroke localization and soft spike-presence weights.
+It remains available unchanged, but it does not have the exact hard-forward
+contract above.
 
 Threshold-derived training objectives
 -------------------------------------

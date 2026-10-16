@@ -84,6 +84,22 @@ def _hh_currents(
     }
 
 
+def _dendra_component_current(mechanism, name, voltage):
+    """Test-only diagnostics using the live Dendra parameters and gates."""
+    if name == "ina":
+        conductance = mechanism.gnabar * mechanism.m**3 * mechanism.h
+        reversal = mechanism.ena
+    elif name == "ik":
+        conductance = mechanism.gkbar * mechanism.n**4
+        reversal = mechanism.ek
+    elif name == "il":
+        conductance = mechanism.gl
+        reversal = mechanism.el
+    else:
+        raise ValueError(f"Unknown HH component current: {name!r}")
+    return conductance * (voltage - reversal)
+
+
 def _run_neuron(
     celsius: float,
     *,
@@ -139,8 +155,8 @@ def _run_neuron(
     traces = {name: values[:, index] for index, name in enumerate(("v", "m", "h", "n"))}
 
     # After fadvance(), NEURON's exposed current fields retain its earlier
-    # BREAKPOINT evaluation, whereas Dendra's methods evaluate at the current
-    # model state.  Compare the voltage-solve phase explicitly instead: for
+    # BREAKPOINT evaluation, whereas our Dendra diagnostics evaluate at the
+    # current model state. Compare the voltage-solve phase explicitly: for
     # secondorder=0 NEURON solves v[k] with gates[k - 1], while Dendra solves it
     # with its already-advanced gates[k].  The initial sample uses the common
     # initialized gates.
@@ -192,9 +208,14 @@ def _run_dendra(
             "m": lambda _population: mechanism.m.detach().clone(),
             "h": lambda _population: mechanism.h.detach().clone(),
             "n": lambda _population: mechanism.n.detach().clone(),
-            "ina": lambda population: mechanism.ina(population.v).detach().clone(),
-            "ik": lambda population: mechanism.ik(population.v).detach().clone(),
-            "il": lambda population: mechanism.il(population.v).detach().clone(),
+            **{
+                name: lambda population, name=name: _dendra_component_current(
+                    mechanism, name, population.v
+                )
+                .detach()
+                .clone()
+                for name in ("ina", "ik", "il")
+            },
         }
     )
     model.run(tstop=tstop, dt=dt, callbacks=[recorder])

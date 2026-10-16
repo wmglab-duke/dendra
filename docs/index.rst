@@ -41,7 +41,7 @@ Getting started
        dn.mono_rect(amp=0.1 * nA, delay=1.0 * ms, pw=1.0 * ms)
    )
 
-   recorder = dn.callbacks.Recorder(["v"], node_indices=[0])
+   recorder = dn.Recorder(["v"], node_indices=[0])
    dt = 0.01 * ms
    model.initialize()
    model.run(

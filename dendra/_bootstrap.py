@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import getpass
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -29,39 +30,71 @@ _PROCESS_INDUCTOR_CACHE_POLICIES = {
 }
 _SHARED_INDUCTOR_CACHE_POLICIES = {"shared", "global"}
 
+_TORCH_COMPILER_WARNING_SPECS = (
+    (
+        r".*torch\.jit\.script_method.*deprecated.*",
+        DeprecationWarning,
+        r"torch\.jit\._script",
+    ),
+    (
+        r".*torch\.jit\.script.*deprecated.*",
+        DeprecationWarning,
+        r"torch\.jit\._script",
+    ),
+    (
+        r".*The \.grad attribute of a Tensor that is not a leaf Tensor "
+        r"is being accessed.*",
+        UserWarning,
+        "",
+    ),
+    (
+        r".*torch\.autograd\.function\.Function.*should not be "
+        r"instantiated\..*Methods on autograd functions.*",
+        DeprecationWarning,
+        "",
+    ),
+)
+# filterwarnings prepends each entry; preserve both its order and regex flags.
+_TORCH_COMPILER_WARNING_FILTERS = tuple(
+    (
+        "ignore",
+        re.compile(message, re.I),
+        category,
+        re.compile(module) if module else None,
+        0,
+    )
+    for message, category, module in reversed(_TORCH_COMPILER_WARNING_SPECS)
+)
+# The direct filter-list update below is confined to the classic CPython
+# warnings implementation. New/context-aware runtimes keep the public path.
+_USE_PRECOMPILED_WARNING_FILTERS = (
+    sys.implementation.name == "cpython"
+    and (3, 11) <= sys.version_info[:2] < (3, 14)
+    and not getattr(sys.flags, "context_aware_warnings", False)
+    and callable(getattr(warnings, "_filters_mutated", None))
+)
+
 
 @contextmanager
 def torch_compiler_warning_context():
     """Filter only known PyTorch compiler deprecations in strict-warning runs."""
     with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*torch\.jit\.script_method.*deprecated.*",
-            category=DeprecationWarning,
-            module=r"torch\.jit\._script",
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*torch\.jit\.script.*deprecated.*",
-            category=DeprecationWarning,
-            module=r"torch\.jit\._script",
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=(
-                r".*The \.grad attribute of a Tensor that is not a leaf Tensor "
-                r"is being accessed.*"
-            ),
-            category=UserWarning,
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=(
-                r".*torch\.autograd\.function\.Function.*should not be "
-                r"instantiated\..*Methods on autograd functions.*"
-            ),
-            category=DeprecationWarning,
-        )
+        if _USE_PRECOMPILED_WARNING_FILTERS:
+            filters = warnings.filters
+            # Match filterwarnings' removal of the first equal entry, including
+            # unusual inherited duplicate filters, without rebuilding regexes.
+            for entry in _TORCH_COMPILER_WARNING_FILTERS:
+                try:
+                    filters.remove(entry)
+                except ValueError:
+                    pass
+            filters[:0] = _TORCH_COMPILER_WARNING_FILTERS
+            warnings._filters_mutated()
+        else:
+            for message, category, module in _TORCH_COMPILER_WARNING_SPECS:
+                warnings.filterwarnings(
+                    "ignore", message=message, category=category, module=module
+                )
         yield
 
 

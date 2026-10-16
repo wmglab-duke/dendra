@@ -45,7 +45,7 @@ class _LoweredPopulationChunk:
     remain implementation details during the functional campaign.
     """
 
-    __slots__ = ("_functional", "_steps", "_stepwise_stimulation")
+    __slots__ = ("_functional", "_steps", "_stepwise_stimulation", "_force_unrolled")
 
     def __init__(
         self,
@@ -53,6 +53,7 @@ class _LoweredPopulationChunk:
         *,
         steps: int,
         stepwise_stimulation: bool = False,
+        force_unrolled: bool = False,
     ):
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError("steps must be a positive integer")
@@ -60,6 +61,7 @@ class _LoweredPopulationChunk:
         self._functional = functional
         self._steps = steps
         self._stepwise_stimulation = stepwise_stimulation
+        self._force_unrolled = force_unrolled
 
     @property
     def steps(self) -> int:
@@ -108,6 +110,23 @@ class _LoweredPopulationChunk:
                     ),
                 )
             return state, auxiliary
+        if self._force_unrolled:
+            ve, intra = self._functional._assemble_bound_inputs(
+                parameters,
+                state,
+                ve,
+                intra,
+                self._steps,
+                prepared["integrator"]["dt"],
+            )
+            return self._functional._transition_rollout_values(
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                self._steps,
+            )
         return self._functional._execute_rollout_values(
             parameters,
             prepared,

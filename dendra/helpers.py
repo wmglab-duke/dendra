@@ -58,6 +58,11 @@ class ctx(contextlib.ContextDecorator):
       installed PyTorch release, PyTorch factories that infer a floating dtype.
     - ``IMEM`` (int/bool): whether integrators compute/store ``i_membrane``
       in populations (required for LFP calculations).
+    - ``MEMBRANE_ASSEMBLY`` (str): ``"auto"`` (default) uses affine membrane
+      coefficients when all currents support that contract; ``"off"`` forces
+      ordinary current/conductance assembly; ``"validate"`` additionally
+      checks affine coefficients against fixed-state voltage probes. Validation
+      is diagnostic and deliberately adds work, not a proof of global affinity.
     - ``PRESERVE_MECHANISM_POPULATION_AXIS`` (bool/int/None): construction-time
       policy for population-axis-preserving mechanism storage. ``True``/``1``
       enables it, ``False``/``0`` disables it, and ``None`` or ``"default"``
@@ -138,6 +143,8 @@ class ctx(contextlib.ContextDecorator):
                 v = normalize_runtime_contract_validation(v)
             elif key == "NATIVE_EXTENSION_POLICY":
                 v = normalize_native_extension_policy(v)
+            elif key == "MEMBRANE_ASSEMBLY":
+                v = normalize_membrane_assembly(v)
             elif key == "PRESERVE_MECHANISM_POPULATION_AXIS":
                 v = normalize_preserve_mechanism_population_axis(v)
             elif key == "DEVICE":
@@ -474,6 +481,22 @@ def current_native_extension_policy() -> str:
     return normalize_native_extension_policy(NATIVE_EXTENSION_POLICY.value)
 
 
+def normalize_membrane_assembly(value) -> str:
+    """Validate the affine-current assembly/debug policy."""
+    if isinstance(value, str):
+        policy = value.strip().lower()
+        if policy in ("auto", "off", "validate"):
+            return policy
+    raise ValueError(
+        f"MEMBRANE_ASSEMBLY must be 'auto', 'off', or 'validate'; got {value!r}."
+    )
+
+
+def current_membrane_assembly() -> str:
+    """Return the active membrane assembly policy."""
+    return normalize_membrane_assembly(MEMBRANE_ASSEMBLY.value)
+
+
 def normalize_preserve_mechanism_population_axis(value) -> bool | None:
     """Normalize the construction-time mechanism population-axis policy.
 
@@ -521,6 +544,8 @@ DEVICE = ContextVar("DEVICE", "")
 DTYPE = ContextVar("DTYPE", "")
 TF32 = ContextVar("TF32", 0)
 IMEM = ContextVar("IMEM", 0)
+MEMBRANE_ASSEMBLY = ContextVar("MEMBRANE_ASSEMBLY", "auto")
+MEMBRANE_ASSEMBLY.value = normalize_membrane_assembly(MEMBRANE_ASSEMBLY.value)
 CUDA = ContextVar("CUDA", int(torch.cuda.is_available()))
 PADE = ContextVar("PADE", -1)
 REQUIRE_GRAD = ContextVar("REQUIRE_GRAD", 0)

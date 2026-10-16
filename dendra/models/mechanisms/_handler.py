@@ -4,6 +4,8 @@ from collections.abc import Mapping
 import torch
 import torch._dynamo as dynamo
 
+from dendra.helpers import MEMBRANE_ASSEMBLY
+
 from ..rng import _validate_rng_checkpoint_payload
 from ._material_process import DiffusionProcess, MaterialProcess
 from ._materials import _canonical_material_name
@@ -68,6 +70,7 @@ _SUPPORT_ENTRY_PLAN_ATTRS = (
     "_map_exp_grouped",
     "_map_exp_ion_reads_grouped",
     "_map_exp_total_grouped",
+    "_membrane_map_grouped",
 )
 
 
@@ -562,6 +565,8 @@ class MechanismHandler(torch.nn.Module):
         self._current_assigned_plan = ()
         self._map_grouped = ()
         self._map_exp_grouped = ()
+        self._membrane_map_grouped = ()
+        self._membrane_map_supported = False
         self._ion_support_entries = ()
         self._ion_support_representatives = ()
         self._ion_support_ids = ()
@@ -819,6 +824,55 @@ class MechanismHandler(torch.nn.Module):
         )
         self._make_voltage_support_plans()
         self._make_grouped_current_plans()
+        self._make_membrane_plans()
+
+    def _make_membrane_plans(self):
+        """Group per-current affine evaluators using ordinary support plans.
+
+        Affinity is established when the mechanism is constructed, either by
+        its AFFINE declaration or symbolic analysis. There is no additional
+        mechanism-wide hook or user-maintained field/implementation inventory.
+        """
+        self._membrane_current_signature = tuple(
+            (
+                category,
+                tuple((name, tuple(currents)) for name, currents in mapping.items()),
+            )
+            for category, mapping in self.currents.items()
+        )
+        self._membrane_owners = tuple(self.mechanisms.items())
+        self._membrane_owner_currents = tuple(
+            tuple(
+                (category, tuple(names)) for category, names in mech._currents.items()
+            )
+            for _, mech in self._membrane_owners
+        )
+        groups = []
+        supported = bool(self._map_grouped)
+        for category, support_index, support_entry, entries in self._map_grouped:
+            if not support_entry.is_injective():
+                supported = False
+            direct_entries = []
+            for mech, pair_name, scaler, _factorable in entries:
+                current = pair_name.removesuffix("_with_g")
+                coefficient = mech._affine_evaluators.get(current)
+                if coefficient is None:
+                    supported = False
+                    continue
+                direct_entries.append(
+                    (
+                        mech,
+                        coefficient,
+                        scaler,
+                        current,
+                        mech._affine_coefficient_fields.get(current),
+                    )
+                )
+            groups.append(
+                (category, support_index, support_entry, tuple(direct_entries))
+            )
+        self._membrane_map_grouped = tuple(groups)
+        self._membrane_map_supported = supported
 
     @staticmethod
     def _partition_current_supports(mechanisms):
@@ -1989,7 +2043,211 @@ class MechanismHandler(torch.nn.Module):
         )
         return itot, gtot
 
-    def _evaluate_current_frame(self, v, *, scratch=None):
+    def _can_evaluate_direct_membrane_frame(self):
+        """Whether every current can supply observer-free direct coefficients."""
+        if (
+            not self._membrane_map_supported
+            or self.ions
+            or self.materials
+            or self.voltage_processes
+            or self.material_processes
+            or self.read_ion
+            or self.write_ion_c
+            or self.read_material
+            or self.write_material
+            or self.source_material
+            or self._ion_current_reads
+        ):
+            return False
+        # Respect custom public-current and call-local evaluator behavior.
+        if (
+            type(self).i is not _MEMBRANE_LEGACY_I
+            or type(self)._evaluate_current_frame is not _MEMBRANE_LEGACY_FRAME
+            or "i" in self.__dict__
+            or "_evaluate_current_frame" in self.__dict__
+        ):
+            return False
+        signature = tuple(
+            (
+                category,
+                tuple((name, tuple(currents)) for name, currents in mapping.items()),
+            )
+            for category, mapping in self.currents.items()
+        )
+        if signature != self._membrane_current_signature or len(self.mechanisms) != len(
+            self._membrane_owners
+        ):
+            return False
+        for (name, mech), declared in zip(
+            self._membrane_owners, self._membrane_owner_currents
+        ):
+            if (
+                name not in self.mechanisms
+                or self.mechanisms[name] is not mech
+                or mech._save
+                or mech._write_ion
+                or mech._read_ion
+                or mech._read_material
+                or mech._write_material
+                or mech._source_material
+                or not mech._support_key_values_valid
+                or tuple(
+                    (category, tuple(names))
+                    for category, names in mech._currents.items()
+                )
+                != declared
+            ):
+                return False
+        return True
+
+    def _direct_membrane_dtype_compatible(self, v):
+        if (
+            v.dtype not in (torch.float32, torch.float64)
+            or self.area.dtype != v.dtype
+            or self.area.device != v.device
+        ):
+            return False
+        for (
+            _category,
+            _support_index,
+            _support_entry,
+            entries,
+        ) in self._membrane_map_grouped:
+            for mech, _name, _scale, _current, fields in entries:
+                for field in fields or ():
+                    value = getattr(mech, field)
+                    if torch.is_tensor(value):
+                        if value.dtype != v.dtype or value.device != v.device:
+                            return False
+                    elif type(value) not in (int, float):
+                        return False
+        return True
+
+    def _evaluate_direct_membrane_coefficients(self, v, local_voltages):
+        """Reduce declared coefficients using ordinary category/support order."""
+        buf_g = [None for _ in self.currents]
+        buf_j = [None for _ in self.currents]
+        zero = v.new_zeros(()).expand(v.shape)
+        for (
+            category,
+            support_index,
+            support_entry,
+            entries,
+        ) in self._membrane_map_grouped:
+            local_g = local_j = None
+            voltage = local_voltages[support_index]
+            for mech, name, scale, current, _fields in entries:
+                conductance, source = getattr(mech, name)(voltage)
+                if MEMBRANE_ASSEMBLY.value == "validate":
+                    mech._validate_affine_current(current, voltage, conductance, source)
+                # Authored hooks need no field inventory. If their result uses
+                # mixed precision, preserve legacy cast-before-assembly order.
+                if any(
+                    torch.is_tensor(value)
+                    and (value.dtype != v.dtype or value.device != v.device)
+                    for value in (conductance, source)
+                ):
+                    return None, None
+                conductance, source = scale(conductance, source)
+                # The generator/hook expands its inputs before arithmetic;
+                # this final expansion also covers scalar-only constants.
+                conductance = torch.broadcast_to(
+                    _current_value_for_buffer(conductance, v), voltage.shape
+                )
+                source = torch.broadcast_to(
+                    _current_value_for_buffer(source, v), voltage.shape
+                )
+                local_g = conductance if local_g is None else local_g + conductance
+                local_j = source if local_j is None else local_j + source
+            if (
+                support_entry.spec is not None
+                and support_entry.spec.kind is SupportKind.DENSE
+            ):
+                buf_g[category] = (
+                    local_g if buf_g[category] is None else buf_g[category] + local_g
+                )
+                buf_j[category] = (
+                    local_j if buf_j[category] is None else buf_j[category] + local_j
+                )
+            else:
+                buf_g[category] = support_entry.scatter_add(
+                    zero if buf_g[category] is None else buf_g[category], local_g
+                )
+                buf_j[category] = support_entry.scatter_add(
+                    zero if buf_j[category] is None else buf_j[category], local_j
+                )
+        buf_g = [torch.zeros_like(v) if value is None else value for value in buf_g]
+        buf_j = [torch.zeros_like(v) if value is None else value for value in buf_j]
+        return torch.stack(buf_g).sum(dim=0), torch.stack(buf_j).sum(dim=0)
+
+    def _evaluate_membrane_frame(
+        self,
+        v,
+        *,
+        call_local=False,
+        require_current=False,
+        _structure_prevalidated=False,
+    ):
+        """Return ``(G,J,I_optional,ion_I,ion_G)`` with ``J=G*v-I``.
+
+        The legacy fallback preserves both the imperative scratch-rebinding
+        policy and functional call-local frames. Actual-current observers and
+        integrators requesting membrane current retain this path.
+        """
+        local_voltages = None
+        if (
+            MEMBRANE_ASSEMBLY.value != "off"
+            and not require_current
+            and (_structure_prevalidated or self._can_evaluate_direct_membrane_frame())
+        ):
+            local_voltages = self._gather_assigned_current_fields(v)
+            if self._direct_membrane_dtype_compatible(v):
+                conductance, source = self._evaluate_direct_membrane_coefficients(
+                    v, local_voltages
+                )
+                if conductance is not None:
+                    return conductance, source, None, (), ()
+        if call_local:
+            if local_voltages is None:
+                current, conductance, ion_current, ion_conductance = (
+                    self._evaluate_current_frame(v)
+                )
+            else:
+                current, conductance, ion_current, ion_conductance = (
+                    self._evaluate_current_frame(v, _local_voltages=local_voltages)
+                )
+        elif local_voltages is not None:
+            # An ASSIGNED result can reveal mixed dtype only after its single
+            # scheduled evaluation. Preserve imperative scratch rebindings and
+            # reuse that phase instead of executing ASSIGNED a second time.
+            self._buf_i = [torch.zeros_like(value) for value in self._buf_i]
+            self._buf_g = [torch.zeros_like(value) for value in self._buf_g]
+            current, conductance, ion_current, ion_conductance = (
+                self._evaluate_current_frame(
+                    v,
+                    scratch=(self._buf_i, self._buf_g),
+                    _local_voltages=local_voltages,
+                )
+            )
+        else:
+            current, conductance = self.i(v)
+            ion_current = self.capture_ion_current_frame()
+            ion_conductance = self.capture_ion_conductance_frame()
+        return (
+            conductance,
+            conductance * v - current,
+            current,
+            ion_current,
+            ion_conductance,
+        )
+
+    def _gather_assigned_current_fields(self, v):
+        local_voltages = self._gather_support_fields(v, self._current_support_entries)
+        for mech, support_index in self._current_assigned_plan:
+            mech._evaluate_assigned(local_voltages[support_index])
+        return local_voltages
+
+    def _evaluate_current_frame(self, v, *, scratch=None, _local_voltages=None):
         """Evaluate affine currents and return totals plus aligned Ion frames.
 
         ``scratch=None`` is the call-local, transform-safe execution policy.
@@ -2002,12 +2260,11 @@ class MechanismHandler(torch.nn.Module):
         functional caller must isolate registered mechanism state (for example
         with :func:`torch.func.functional_call`) or lower them explicitly.
         """
-        local_voltages = self._gather_support_fields(
-            v,
-            self._current_support_entries,
+        local_voltages = (
+            self._gather_assigned_current_fields(v)
+            if _local_voltages is None
+            else _local_voltages
         )
-        for mech, support_index in self._current_assigned_plan:
-            mech._evaluate_assigned(local_voltages[support_index])
 
         if not self.currents:
             z = torch.zeros_like(v)
@@ -2944,3 +3201,11 @@ class MechanismHandler(torch.nn.Module):
                         f"Mechanism support identity mismatch for {label}; the "
                         "checkpoint flat key addresses different physical slots."
                     )
+
+
+# Stable function identities, not mutable class lookups, make late handler or
+# mechanism overrides disable the derived-coefficient fast path.
+_MEMBRANE_LEGACY_I = MechanismHandler.i
+_MEMBRANE_LEGACY_FRAME = MechanismHandler._evaluate_current_frame
+_MEMBRANE_COEFFICIENT_FRAME = MechanismHandler._evaluate_membrane_frame
+_MEMBRANE_DIRECT_ELIGIBILITY = MechanismHandler._can_evaluate_direct_membrane_frame

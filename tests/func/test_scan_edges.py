@@ -12,8 +12,8 @@ import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 
 pytestmark = pytest.mark.skipif(
-    torch.__version__.split("+")[0] != "2.14.0",
-    reason="scan compatibility is validated against PyTorch 2.14.0",
+    torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
+    reason="scan compatibility is validated against PyTorch 2.14.0 and 2.14.1",
 )
 
 
@@ -82,7 +82,9 @@ def test_scan_graph_size_does_not_grow_with_horizon():
         return graph.forward
 
     with torch.no_grad(), torch_compiler_warning_context():
-        for steps in (2, 9):
+        # Compare equal bounded tails after at least one full inference block.
+        # Increasing the number of blocks must not grow the captured program.
+        for steps in (9, 17):
             chunk = functional.compile_rollout_chunk(
                 steps, execution="scan", backend=backend
             )

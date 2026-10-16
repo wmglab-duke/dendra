@@ -25,7 +25,10 @@ import torch
 
 from ._types import FunctionalizationError
 
-_SUPPORTED_VERSION = "2.14.0"
+# These releases have byte-identical audited HOP/AOT sources and callables.
+# Admitting another release requires auditing both the hashes below and the
+# positional-cotangent repair; the release number alone is never sufficient.
+_SUPPORTED_VERSIONS = ("2.14.0", "2.14.1")
 _SOURCE_HASHES = {
     "torch._higher_order_ops.utils": (
         "00b426146c9974b8c536703914fa0d4773070ee259b2b05cebd988c43f0c39d8"
@@ -68,8 +71,8 @@ _INSTALLED = None
 
 def _unsupported(details):
     return FunctionalizationError(
-        "Dendra scan execution requires the verified PyTorch 2.14.0 "
-        f"implementation; {details}. Use the default compiled execution or "
+        "Dendra scan execution requires the verified PyTorch 2.14.0 or 2.14.1 "
+        f"implementations; {details}. Use the default compiled execution or "
         "a supported Torch installation."
     )
 
@@ -108,6 +111,7 @@ def _validate_sources():
     partitioner = modules["torch._higher_order_ops.partitioner"]
     if partitioner.create_bw_fn is not utils.create_bw_fn:
         raise _unsupported("the partitioner's backward helper has already changed")
+    references.append((partitioner, "create_bw_fn", partitioner.create_bw_fn))
     # The implementation below uses exactly this AOT constructor/entry point.
     aot = importlib.import_module("torch._functorch.aot_autograd")
     wrappers = modules["torch._functorch._aot_autograd.graph_capture_wrappers"]
@@ -182,7 +186,7 @@ def install_scan_compatibility():
     global _INSTALLED
 
     version = str(torch.__version__)
-    if version.split("+", 1)[0] != _SUPPORTED_VERSION:
+    if version.split("+", 1)[0] not in _SUPPORTED_VERSIONS:
         raise _unsupported(f"found Torch {version}")
     if torch.compiler.is_compiling():
         raise FunctionalizationError(

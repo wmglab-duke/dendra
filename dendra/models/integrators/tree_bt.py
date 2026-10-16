@@ -16,6 +16,7 @@ from .core import (
 from .implicit import assemble_rhs, assemble_rhs_into
 from .tree import (
     _compiled_tree_graph_view,
+    _refresh_owned_cpu_plan,
     _validate_dhs_threads,
     _validate_tree_graph,
     graph_to_parent_and_axial,
@@ -27,7 +28,12 @@ try:
 
     DENDRA_SOLVERS_AVAILABLE = True
 except ImportError:
+    dendra_solvers = None
     DENDRA_SOLVERS_AVAILABLE = False
+
+
+def _functional_dhs_bt_plan_solve(d_blocks, g_vec, rhs, parent, order, layers, *, plan):
+    return dendra_solvers.dhs_bt_solve_plan(d_blocks, g_vec, rhs, plan)
 
 
 # ---------------- Topology helpers (local, to avoid extra deps) ----------------
@@ -132,7 +138,7 @@ class _dhs_bt(Integrator):
         ("g_to_parent", "block_node"),
     )
     _FUNCTIONAL_OPERATOR_KIND = "block_tree"
-    _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver",)
+    _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver", "_refresh_cpu_topology_plan")
 
     def __init__(self, model, mech, imem=None, threads=16):
         threads = _validate_dhs_threads(threads)
@@ -175,6 +181,12 @@ class _dhs_bt(Integrator):
         self.register_buffer("main_blocks", torch.empty(B, K, M, M))
         # Per-edge diag g to parent (0:vi, 1:ve0, 2:ve1), 0 for roots
         self.register_buffer("g_to_parent", torch.empty(B, K, M))
+        self._cpu_topology_plan = None
+        self._cpu_plan_sources = ()
+        self._cpu_plan_versions = ()
+        self._cpu_plan_available = callable(
+            getattr(dendra_solvers, "DHSPlan", None)
+        ) and callable(getattr(dendra_solvers, "dhs_bt_solve_plan", None))
 
     def _select_solver(self, device):
         device = torch.device(device)
@@ -206,6 +218,11 @@ class _dhs_bt(Integrator):
             solver_name == "dhs_bt_solve"
             and solver_module == "torch._ops.dendra_solvers"
         ):
+            constructor = getattr(dendra_solvers, "DHSPlan", None)
+            planned = getattr(dendra_solvers, "dhs_bt_solve_plan", None)
+            if callable(constructor) and callable(planned):
+                plan = constructor(self.parent_idx, self.order, self.layer_ptr)
+                return partial(_functional_dhs_bt_plan_solve, plan=plan)
             facade = (
                 None
                 if not DENDRA_SOLVERS_AVAILABLE
@@ -223,6 +240,16 @@ class _dhs_bt(Integrator):
             "The selected block-DHS solver is not yet transform-compatible. "
             "Functional ExtCellTree execution currently requires CPU "
             "dendra_solvers.dhs_bt_solve."
+        )
+
+    def _refresh_cpu_topology_plan(self):
+        planned = getattr(dendra_solvers, "dhs_bt_solve_plan", None)
+        _refresh_owned_cpu_plan(
+            self,
+            (self.parent_idx, self.order, self.layer_ptr),
+            getattr(dendra_solvers, "DHSPlan", None) if callable(planned) else None,
+            DENDRA_SOLVERS_AVAILABLE
+            and self._solve is torch.ops.dendra_solvers.dhs_bt_solve,
         )
 
     @staticmethod
@@ -403,6 +430,7 @@ class _dhs_bt(Integrator):
             solver_order=self.solver_order,
         )
         self._install_prepared_workspace(workspace)
+        self._refresh_cpu_topology_plan()
 
         # Initializing solver geometry must not reset a live simulation.  A
         # missing or shape-stale block state is seeded from the current
@@ -417,6 +445,8 @@ class _dhs_bt(Integrator):
                 model.register_buffer("vc", vc)
 
     def step(self, model, dt, ve=None, intra=None):
+        if self._cpu_plan_available:
+            self._refresh_cpu_topology_plan()
         vc_new, v_new, i_membrane = self._call_kernel(
             "_step",
             self._flat_block_voltage(model.vc, self.M),
@@ -446,23 +476,13 @@ class _dhs_bt(Integrator):
         # Update mechanisms in mV / mA/cm^2
         v_state = self.mech.update_v(v)
         self._advance_pre_current(v_state, dt, temp)
-        if call_local_currents:
-            evaluate = getattr(self.mech, "_evaluate_current_frame", None)
-            if evaluate is None:
-                raise RuntimeError(
-                    "call-local current evaluation requires a MechanismHandler "
-                    "with _evaluate_current_frame()"
-                )
-            (
-                itot,
-                gtot,
-                ion_current_frame,
-                ion_conductance_frame,
-            ) = evaluate(v_state)
-        else:
-            itot, gtot = self.mech.i(v_state)
-            ion_current_frame = self._capture_ion_current_frame()
-            ion_conductance_frame = self._capture_ion_conductance_frame()
+        (
+            gtot,
+            membrane_source,
+            itot,
+            ion_current_frame,
+            ion_conductance_frame,
+        ) = self._membrane_frame(v_state, call_local=call_local_currents)
 
         # RHS (mechanism order), keep everything in mV/mA/S:
         # d_lin = (g*v - itot) * area  [mA]
@@ -470,12 +490,24 @@ class _dhs_bt(Integrator):
         if call_local_currents:
             v_flat = _flatten_to_solve(v_state, self.K, public_voltage_shape)
             gtot_flat = _flatten_to_solve(gtot, self.K, public_voltage_shape)
-            itot_flat = _flatten_to_solve(itot, self.K, public_voltage_shape)
         else:
             v_flat = self._flat_voltage(v_state)
             gtot_flat = self._flat_voltage(gtot)
-            itot_flat = self._flat_voltage(itot)
-        d_lin = (gtot_flat * v_flat - itot_flat) * self.area
+        if itot is None:
+            itot_flat = None
+            # As in block Euler, preserve a zero AD edge to the separately
+            # carried membrane voltage when coefficients are voltage-free.
+            d_lin = (
+                _flatten_to_solve(membrane_source, self.K, public_voltage_shape)
+                + 0.0 * v_flat
+            ) * self.area
+        else:
+            itot_flat = (
+                _flatten_to_solve(itot, self.K, public_voltage_shape)
+                if call_local_currents
+                else self._flat_voltage(itot)
+            )
+            d_lin = (gtot_flat * v_flat - itot_flat) * self.area
         if intra is not None:
             d_lin = d_lin + _flatten_to_solve(
                 intra,
@@ -543,15 +575,20 @@ class _dhs_bt(Integrator):
             Dm[..., 1, 0] -= g_
 
         # Solve in solver order (kernel expects S @ mV = mA)
-        solve = self._solve if solver is None else solver
-        X_ = solve(
-            Dm,
-            G_,
-            rhs_,
-            self.parent_idx,
-            self.order,
-            self.layer_ptr,
-        )  # (B,K,3) in mV
+        if solver is None and self._cpu_topology_plan is not None:
+            X_ = torch.ops.dendra_solvers.dhs_bt_solve_plan(
+                Dm, G_, rhs_, self._cpu_topology_plan._token
+            )
+        else:
+            solve = self._solve if solver is None else solver
+            X_ = solve(
+                Dm,
+                G_,
+                rhs_,
+                self.parent_idx,
+                self.order,
+                self.layer_ptr,
+            )  # (B,K,3) in mV
 
         # Map solution back to mechanism order
         inv = self.inv_solver_order

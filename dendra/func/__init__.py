@@ -2,6 +2,9 @@
 
 from ._binding import BoundPopulation
 from ._callbacks import (
+    Active,
+    ActiveAL,
+    ActiveALCount,
     AnomalyDetector,
     APCount,
     FunctionalCallback,
@@ -12,6 +15,7 @@ from ._callbacks import (
     Recorder,
 )
 from ._compiled import CompiledPopulationChunk
+from ._convenience import CompiledRunner, compile
 from ._execution import ExecutionCapabilities, ExecutionReport
 from ._population import FunctionalPopulation, make_functional
 from ._runners import longrun, longrun_checkpointed, run
@@ -25,10 +29,14 @@ from ._types import (
 )
 
 __all__ = [
+    "Active",
+    "ActiveAL",
+    "ActiveALCount",
     "APCount",
     "AnomalyDetector",
     "BoundPopulation",
     "CompiledPopulationChunk",
+    "CompiledRunner",
     "ExecutionCapabilities",
     "ExecutionReport",
     "FunctionalCallback",
@@ -46,6 +54,7 @@ __all__ = [
     "RolloutInput",
     "StepInput",
     "StimulusTensors",
+    "compile",
     "longrun",
     "longrun_checkpointed",
     "make_functional",

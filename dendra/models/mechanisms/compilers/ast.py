@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import inspect
+import math
 import re
 import textwrap
 from functools import lru_cache
@@ -294,6 +295,62 @@ def _analyze_linear_in_v(
 
     expanded = ast.fix_missing_locations(return_expr)
 
+    def direct_coefficient_domain_reason():
+        # Direct assembly omits authored current evaluation. Do not let SymPy
+        # cancellation erase its parameter-dependent poles/domain failures.
+        # Fixed nonzero numeric denominators and nonnegative integer powers
+        # are safe; more general expressions retain ordinary current assembly.
+        def numeric_literal(node):
+            if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+                return node.value
+            if isinstance(node, ast.UnaryOp) and isinstance(
+                node.op, (ast.UAdd, ast.USub)
+            ):
+                value = numeric_literal(node.operand)
+                if value is not None:
+                    return value if isinstance(node.op, ast.UAdd) else -value
+            return None
+
+        for node in ast.walk(expanded):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+                denominator = numeric_literal(node.right)
+                if (
+                    denominator is None
+                    or denominator == 0
+                    or (
+                        isinstance(denominator, float)
+                        and not math.isfinite(denominator)
+                    )
+                ):
+                    return "Direct coefficients do not remove authored nonconstant/zero denominators."
+            exponent = None
+            is_power = isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow)
+            if is_power:
+                exponent = numeric_literal(node.right)
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "pow"
+                and len(node.args) == 2
+            ):
+                is_power = True
+                exponent = numeric_literal(node.args[1])
+            if is_power and (
+                exponent is None
+                or (isinstance(exponent, float) and not math.isfinite(exponent))
+                or exponent < 0
+                or int(exponent) != exponent
+            ):
+                return (
+                    "Direct coefficients require authored nonnegative integer powers."
+                )
+        return None
+
+    # Cache the domain proof with the single source analysis. The legacy
+    # conductance/reversal APIs ignore this metadata; only direct assembly
+    # rejects it. A second cache key would reread authored source unnecessarily.
+    direct_reason = direct_coefficient_domain_reason()
+
     # 4. convert to SymPy and extract coefficients
     syms: dict[str, sp.Expr] = {v_param: sp.symbols(v_param)}
     expr = sp.expand(_ast_to_sympy(expanded, syms))
@@ -315,7 +372,7 @@ def _analyze_linear_in_v(
     B = sp.expand(A * syms[v_param] - expr)
 
     A, B = sp.simplify(A), sp.simplify(B)
-    return A, B
+    return A, B, direct_reason
 
 
 def _dotify(expr: sp.Expr) -> str:
@@ -326,13 +383,30 @@ def linear_conductance_in_v(
     obj_or_src, *, method: str = "i", v_param: str = "v"
 ) -> str:
     """Return the exact voltage coefficient of a supported affine current."""
-    conductance, _ = _analyze_linear_in_v(
+    conductance, _, _direct_reason = _analyze_linear_in_v(
         obj_or_src,
         method=method,
         v_param=v_param,
         method_token=_method_cache_token(obj_or_src, method),
     )
     return _dotify(conductance)
+
+
+def affine_coefficients_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
+    """Return ``(A, B)`` for ``I=A*v-B`` without dividing by ``A``.
+
+    Unlike reversal-potential factorization this also represents constants and
+    coefficients that happen to be zero at runtime.
+    """
+    A, B, direct_reason = _analyze_linear_in_v(
+        obj_or_src,
+        method=method,
+        v_param=v_param,
+        method_token=_method_cache_token(obj_or_src, method),
+    )
+    if direct_reason is not None:
+        raise ValueError(direct_reason)
+    return _dotify(A), _dotify(B)
 
 
 def factorize_linear_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
@@ -342,7 +416,7 @@ def factorize_linear_in_v(obj_or_src, *, method: str = "i", v_param: str = "v"):
     *obj_or_src* may be either a class *object* (or instance) **or** a
     source-code string containing exactly one class definition.
     """
-    A, B = _analyze_linear_in_v(
+    A, B, _direct_reason = _analyze_linear_in_v(
         obj_or_src,
         method=method,
         v_param=v_param,
@@ -361,3 +435,5 @@ factorize_linear_in_v.cache_clear = _analyze_linear_in_v.cache_clear
 factorize_linear_in_v.cache_info = _analyze_linear_in_v.cache_info
 linear_conductance_in_v.cache_clear = _analyze_linear_in_v.cache_clear
 linear_conductance_in_v.cache_info = _analyze_linear_in_v.cache_info
+affine_coefficients_in_v.cache_clear = _analyze_linear_in_v.cache_clear
+affine_coefficients_in_v.cache_info = _analyze_linear_in_v.cache_info

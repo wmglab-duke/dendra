@@ -852,6 +852,15 @@ class SectionLocation:
             )
         object.__setattr__(self, "x", x)
 
+    def connect(self, parent: SectionLocation) -> Section:
+        """Connect this child endpoint to a parent location and return its Section.
+
+        Only authored endpoints ``0`` and ``1`` can be child locations. Parent
+        locations may lie anywhere on their Section.
+        """
+        self.section._owner.connect(parent, self)
+        return self.section
+
     def update(self, *, diam: float) -> Section:
         """Edit or insert a pt3d diameter control point at this location.
 

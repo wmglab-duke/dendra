@@ -671,9 +671,15 @@ def test_scalar_tree_compiled_chunk_uses_one_bounded_native_dhs_loop():
         for module in graphs[0].modules()
         if isinstance(module, torch.fx.GraphModule)
     )
+    from dendra.models.integrators.tree import dendra_solvers
+
+    expected_solver = (
+        torch.ops.dendra_solvers.dhs_solve_plan.default
+        if callable(getattr(dendra_solvers, "DHSPlan", None))
+        else torch.ops.dendra_solvers.dhs_solve.default
+    )
     assert any(
-        node.op == "call_function"
-        and node.target is torch.ops.dendra_solvers.dhs_solve.default
+        node.op == "call_function" and node.target is expected_solver
         for graph_module in graph_modules
         for node in graph_module.graph.nodes
     )

@@ -508,7 +508,7 @@ def test_derived_buffer_declarations_inherit_and_survive_mechanism_rename():
     "mechanism,alias_name,expected_currents",
     [
         (expsyn, "rename_current_oracle_expsyn", ["i"]),
-        (hh, "rename_current_oracle_hh", ["il", "ina", "ik"]),
+        (hh, "rename_current_oracle_hh", ["i"]),
     ],
 )
 def test_rename_preserves_independent_nonduplicated_current_declarations(
@@ -533,7 +533,8 @@ def test_rename_alias_cache_is_scoped_to_source_mechanism():
     assert renamed_hh is hh.rename(alias_name)
     assert renamed_expsyn is not renamed_hh
     assert renamed_expsyn.i is expsyn.i
-    assert renamed_hh.il is hh.il
+    assert renamed_hh.i_affine_terms is hh.i_affine_terms
+    assert not any(hasattr(renamed_hh, name) for name in ("ina", "ik", "il"))
 
 
 def test_rename_preserves_declaration_ownership_for_future_subclass_precedence():

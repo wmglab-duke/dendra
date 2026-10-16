@@ -1564,7 +1564,7 @@ def test_schild_no_grad_compiled_rollout_uses_structured_loop_for_full_state():
     functional, tensors = dn.func.make_functional(model, dt=TIGERHOLM_DT)
     assert not functional._structured_step_graphs
     assert functional.prewarm_structured_rollout(ve=True, intra=True)
-    assert set(functional._structured_step_graphs) == {(True, True)}
+    assert set(functional._structured_step_graphs) == {(True, True, "auto")}
     assert functional._structured_capture_error is None
     ve, intra = _drives(model, 5)
     graphs = []

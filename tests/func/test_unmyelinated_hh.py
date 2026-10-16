@@ -723,7 +723,7 @@ def test_structured_step_capture_is_lazy_and_signature_specific(monkeypatch):
     assert functional._structured_step_graphs == {}
     assert functional.prewarm_structured_rollout(ve=True, intra=False)
     assert len(make_fx_calls) == 1
-    assert set(functional._structured_step_graphs) == {(True, False)}
+    assert set(functional._structured_step_graphs) == {(True, False, "auto")}
 
     # Reusing one signature is free; requesting another captures only that one.
     assert functional.prewarm_structured_rollout(ve=True, intra=False)
@@ -731,8 +731,8 @@ def test_structured_step_capture_is_lazy_and_signature_specific(monkeypatch):
     assert functional.prewarm_structured_rollout(ve=False, intra=True)
     assert len(make_fx_calls) == 2
     assert set(functional._structured_step_graphs) == {
-        (True, False),
-        (False, True),
+        (True, False, "auto"),
+        (False, True, "auto"),
     }
 
 
@@ -753,11 +753,11 @@ def test_structured_capture_failure_is_cached_per_signature(monkeypatch):
     assert not functional.prewarm_structured_rollout(ve=False, intra=False)
     assert not functional.prewarm_structured_rollout(ve=False, intra=False)
     assert make_fx_calls == 1
-    assert (False, False) in functional._structured_capture_errors
+    assert (False, False, "auto") in functional._structured_capture_errors
 
     assert functional.prewarm_structured_rollout(ve=True, intra=True)
     assert make_fx_calls == 2
-    assert set(functional._structured_step_graphs) == {(True, True)}
+    assert set(functional._structured_step_graphs) == {(True, True, "auto")}
 
 
 def test_no_grad_fullgraph_without_prewarm_uses_correct_unrolled_fallback():
@@ -798,7 +798,7 @@ def test_no_grad_compiled_rollout_uses_structured_loop_for_optional_drives(
     ve, intra = _drives(model, 5)
     selected_ve = ve if drive_kind in {"ve", "both"} else None
     selected_intra = intra if drive_kind in {"intra", "both"} else None
-    signature = (selected_ve is not None, selected_intra is not None)
+    signature = (selected_ve is not None, selected_intra is not None, "auto")
     assert not functional._structured_step_graphs
     assert functional.prewarm_structured_rollout(
         ve=signature[0],

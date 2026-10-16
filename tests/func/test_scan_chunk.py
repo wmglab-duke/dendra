@@ -33,8 +33,8 @@ pytestmark = [
     ),
 ]
 requires_scan_torch = pytest.mark.skipif(
-    torch.__version__.split("+")[0] != "2.14.0",
-    reason="scan compatibility is validated against PyTorch 2.14.0",
+    torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
+    reason="scan compatibility is validated against PyTorch 2.14.0 and 2.14.1",
 )
 
 
@@ -376,9 +376,10 @@ def test_scan_public_chunk_rejects_recorded_backward_through_preparation():
             torch.autograd.grad(loss, constants["diam"], create_graph=True)
 
 
-def test_scan_explicit_version_gate_preserves_default_mode(monkeypatch):
+@pytest.mark.parametrize("version", ["2.99.0", "2.14.2", "2.14.1a0"])
+def test_scan_explicit_version_gate_preserves_default_mode(monkeypatch, version):
     functional, _tensors = dn.func.make_functional(_model(), dt=DT)
-    monkeypatch.setattr(torch, "__version__", "2.99.0")
+    monkeypatch.setattr(torch, "__version__", version)
     with pytest.raises(dn.func.FunctionalizationError, match="verified PyTorch 2.14.0"):
         functional.compile_rollout_chunk(2, execution="scan", backend="eager")
     functional.compile_rollout_chunk(2, backend="eager")
@@ -402,6 +403,134 @@ def test_scan_compatibility_rejects_changed_sources_before_mutation(monkeypatch)
     ):
         _scan_compat.install_scan_compatibility()
     assert partitioner.create_hop_joint_graph is original
+
+
+@requires_scan_torch
+def test_scan_compatibility_rejects_replaced_callable_before_mutation(monkeypatch):
+    utils = importlib.import_module("torch._higher_order_ops.utils")
+    partitioner = importlib.import_module("torch._higher_order_ops.partitioner")
+    original = partitioner.create_hop_joint_graph
+    if _scan_compat._INSTALLED is not None:
+        original = original.__wrapped__
+    monkeypatch.setattr(partitioner, "create_hop_joint_graph", original)
+    monkeypatch.setattr(_scan_compat, "_INSTALLED", None)
+    monkeypatch.setattr(utils, "create_bw_fn", lambda *_args: None)
+    with pytest.raises(dn.func.FunctionalizationError, match="already been replaced"):
+        _scan_compat.install_scan_compatibility()
+    assert partitioner.create_hop_joint_graph is original
+
+
+@requires_scan_torch
+@pytest.mark.parametrize("target", ["entry", "shared_helper", "partitioner_helper"])
+def test_scan_compatibility_rechecks_active_callable_identities(monkeypatch, target):
+    utils = importlib.import_module("torch._higher_order_ops.utils")
+    partitioner = importlib.import_module("torch._higher_order_ops.partitioner")
+    _scan_compat.install_scan_compatibility()
+    active = partitioner.create_hop_joint_graph
+    if target == "entry":
+        monkeypatch.setattr(partitioner, "create_hop_joint_graph", lambda *_args: None)
+    elif target == "shared_helper":
+        monkeypatch.setattr(utils, "create_bw_fn", lambda *_args: None)
+    else:
+        monkeypatch.setattr(partitioner, "create_bw_fn", lambda *_args: None)
+    with pytest.raises(
+        dn.func.FunctionalizationError, match="active .* changed|replaced"
+    ):
+        _scan_compat.install_scan_compatibility()
+    if target != "entry":
+        assert partitioner.create_hop_joint_graph is active
+
+
+@requires_scan_torch
+def test_scan_compatibility_preserves_mixed_output_cotangent_positions():
+    """Prove the audited upstream bug and that the local repair fixes its cause."""
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    utils = importlib.import_module("torch._higher_order_ops.utils")
+    aot = importlib.import_module("torch._functorch.aot_autograd")
+    x = torch.tensor([0.2, -0.4], dtype=torch.float64, requires_grad=True)
+    y = torch.tensor([0.7, 0.9], dtype=torch.float64, requires_grad=True)
+    index = torch.tensor(3, dtype=torch.int64)
+    flag = torch.tensor([True, False])
+
+    def function(x, y, index, flag):
+        # Distinct float cotangents, interleaved with nondifferentiable slots,
+        # detect both dropping slots and silently shifting gradient positions.
+        return index + 1, x.square() + y, ~flag, x * y
+
+    primals = (x, y, index, flag)
+    outputs = function(*primals)
+    tangents = (
+        torch.zeros_like(index),
+        torch.full_like(x, 1.3),
+        torch.zeros_like(flag),
+        torch.full_like(x, -0.4),
+    )
+    unpatched = utils.create_bw_fn(function, primals)
+    with pytest.raises(AssertionError, match="outs_to_grad length.*tangents length"):
+        make_fx(unpatched)(*primals, *tangents)
+
+    repaired_factory = _scan_compat._make_full_output_backward(
+        utils, aot.AOTConfig, aot.create_joint
+    )
+    repaired = repaired_factory(function, primals, return_fw_outputs=True)
+    graph = make_fx(repaired)(*primals, *tangents)
+    result = graph(*primals, *tangents)
+    torch.testing.assert_close(result[:4], outputs)
+    expected = (
+        2 * x * 1.3 - 0.4 * y,
+        1.3 - 0.4 * x,
+        torch.zeros_like(index),
+        torch.zeros_like(flag),
+    )
+    torch.testing.assert_close(tuple(result[4:]), expected)
+
+
+@requires_scan_torch
+def test_scan_mixed_integer_boolean_carry_and_emissions_match_eager():
+    from torch._higher_order_ops.scan import scan
+
+    _scan_compat.install_scan_compatibility()
+
+    def evaluate(structured):
+        initial = torch.tensor([0.2, -0.3], dtype=torch.float64, requires_grad=True)
+        parameter = torch.tensor([0.7, 0.8], dtype=torch.float64, requires_grad=True)
+        drives = torch.linspace(-0.1, 0.2, 8, dtype=torch.float64).reshape(4, 2)
+        drives.requires_grad_()
+
+        def body(carry, drive):
+            index, value, flag = carry
+            value = torch.tanh(value * parameter + drive)
+            index = index + 1
+            flag = torch.logical_xor(flag, value > 0)
+            return (index, value, flag), (index.clone(), value.clone(), flag.clone())
+
+        carry = (torch.tensor(0), initial, torch.tensor([True, False]))
+        if structured:
+            kernel = torch.compile(
+                lambda carry, drives: scan(body, carry, drives),
+                backend="aot_eager",
+                fullgraph=True,
+            )
+            final, traces = kernel(carry, drives)
+        else:
+            emissions = []
+            for drive in drives:
+                carry, emitted = body(carry, drive)
+                emissions.append(emitted)
+            final = carry
+            traces = tuple(
+                torch.stack(values) for values in zip(*emissions, strict=True)
+            )
+        loss = final[1].square().sum() + traces[1].square().mean()
+        gradients = torch.autograd.grad(loss, (initial, parameter, drives))
+        assert final[0].dtype == torch.int64
+        assert final[2].dtype == torch.bool
+        return final, traces, gradients
+
+    expected = evaluate(False)
+    actual = evaluate(True)
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-12)
 
 
 @requires_scan_torch

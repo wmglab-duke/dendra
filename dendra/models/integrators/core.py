@@ -1,6 +1,7 @@
 import inspect
 import math
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
@@ -16,6 +17,7 @@ from dendra.helpers import (
     DYNAMIC,
     FULLGRAPH,
     IMEM,
+    MEMBRANE_ASSEMBLY,
     compile_options_for_device,
     compile_options_key,
     current_compile_options,
@@ -23,6 +25,14 @@ from dendra.helpers import (
     jit_enabled_for_scope,
     normalize_compile_options,
 )
+
+try:
+    from torch.utils._device import DeviceContext as _POPULATION_DEVICE_CONTEXT
+
+    _POPULATION_DEVICE_TORCH_FUNCTION = _POPULATION_DEVICE_CONTEXT.__torch_function__
+except (ImportError, AttributeError):
+    _POPULATION_DEVICE_CONTEXT = None
+    _POPULATION_DEVICE_TORCH_FUNCTION = None
 
 
 def get_init_defaults(cls):
@@ -241,6 +251,30 @@ def _expanded_v_init(model):
 
 
 @dataclass(frozen=True)
+class _DeferredIntra:
+    """One-step stimulus inputs for a proven noise-free built-in transition.
+
+    Population run/longrun construct this payload after validating their runtime
+    and callback eligibility. It is never stored in model or integrator state.
+    """
+
+    source: object
+    stimuli: list
+    indices: object
+
+
+@dataclass(frozen=True)
+class _NoiseFreeStep:
+    """One-call proof that the ordinary runtime-NOISE traversal is empty.
+
+    This payload never becomes persistent model state, so failures and nested
+    execution cannot leave sampling disabled for a later call.
+    """
+
+    intra: object = None
+
+
+@dataclass(frozen=True)
 class _FunctionalIntegratorSpec:
     """Private capability record consumed by ``dendra.func`` lowering."""
 
@@ -248,6 +282,186 @@ class _FunctionalIntegratorSpec:
     implementation: type
     workspace_schema: tuple[tuple[str, str], ...]
     critical_methods: tuple[str, ...]
+
+
+def _population_runtime_modes_plain():
+    """Fail closed when ambient Torch execution can invoke authored code.
+
+    This runs outside Dynamo at a segment boundary. The ordinary default-device
+    context used by ``dendra.ctx`` is permitted; dispatch modes, other function
+    modes, and saved-tensor hooks keep per-step dynamic validation and sampling.
+    Private introspection is feature-detected so unavailable APIs only disable
+    this optimization, never ordinary execution.
+    """
+    try:
+        dispatch_length = getattr(torch._C, "_len_torch_dispatch_stack", None)
+        function_length = getattr(torch._C, "_len_torch_function_stack", None)
+        function_at = getattr(torch._C, "_get_function_stack_at", None)
+        pre_dispatch_length = getattr(
+            getattr(torch, "_ops", None), "_len_torch_dispatch_stack_pre_dispatch", None
+        )
+        saved_hooks = getattr(
+            getattr(torch._C, "_autograd", None),
+            "_top_saved_tensors_default_hooks",
+            None,
+        )
+        if not all(
+            callable(probe)
+            for probe in (
+                dispatch_length,
+                function_length,
+                function_at,
+                pre_dispatch_length,
+                saved_hooks,
+            )
+        ):
+            return False
+        # Ignore a tracing flag that could otherwise hide active user hooks.
+        if saved_hooks(True) is not None:
+            return False
+        dispatch_count = dispatch_length()
+        pre_dispatch_count = pre_dispatch_length()
+        function_count = function_length()
+        if (
+            type(dispatch_count) is not int
+            or dispatch_count != 0
+            or type(pre_dispatch_count) is not int
+            or pre_dispatch_count != 0
+            or type(function_count) is not int
+            or function_count < 0
+        ):
+            return False
+        for index in range(function_count):
+            mode = function_at(index)
+            mode_type = type(mode)
+            if (
+                mode_type is not _POPULATION_DEVICE_CONTEXT
+                or mode_type.__torch_function__ is not _POPULATION_DEVICE_TORCH_FUNCTION
+                or mode_type.__getattribute__ is not object.__getattribute__
+                or getattr(mode_type, "__getattr__", None) is not None
+            ):
+                return False
+            namespace = object.__getattribute__(mode, "__dict__")
+            if (
+                type(namespace) is not dict
+                or "__torch_function__" in namespace
+                or type(namespace.get("device")) is not torch.device
+            ):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _plain_membrane_metadata(value, *, depth=8):
+    """Reject metadata containers that can dispatch authored iteration/truth."""
+    if type(value) in (str, int, float, bool, type(None)):
+        return True
+    if depth == 0:
+        return False
+    if type(value) is dict:
+        return all(
+            _plain_membrane_metadata(key, depth=depth - 1)
+            and _plain_membrane_metadata(item, depth=depth - 1)
+            for key, item in value.items()
+        )
+    if type(value) in (tuple, list, set, frozenset):
+        return all(_plain_membrane_metadata(item, depth=depth - 1) for item in value)
+    return False
+
+
+def _population_membrane_metadata_plain(handler):
+    """Check only structural fields whose repeated eligibility walk is skipped."""
+    if type(handler._membrane_map_supported) is not bool or any(
+        type(getattr(handler, name)) is not torch.nn.ModuleDict
+        for name in (
+            "mechanisms",
+            "ions",
+            "materials",
+            "voltage_processes",
+            "material_processes",
+        )
+    ):
+        return False
+    if not all(
+        _plain_membrane_metadata(getattr(handler, name))
+        for name in (
+            "currents",
+            "read_ion",
+            "write_ion_c",
+            "read_material",
+            "write_material",
+            "source_material",
+            "_ion_current_reads",
+            "_membrane_current_signature",
+            "_membrane_owner_currents",
+        )
+    ):
+        return False
+    owners = handler._membrane_owners
+    registered = handler.mechanisms._modules
+    if (
+        type(owners) is not tuple
+        or type(registered) is not dict
+        or any(type(name) is not str for name in registered)
+    ):
+        return False
+    for entry in owners:
+        if type(entry) is not tuple or len(entry) != 2 or type(entry[0]) is not str:
+            return False
+        mechanism = entry[1]
+        if registered.get(entry[0]) is not mechanism:
+            return False
+        if type(mechanism._support_key_values_valid) is not bool or not all(
+            _plain_membrane_metadata(getattr(mechanism, name))
+            for name in (
+                "_save",
+                "_write_ion",
+                "_read_ion",
+                "_read_material",
+                "_write_material",
+                "_source_material",
+                "_currents",
+            )
+        ):
+            return False
+    return True
+
+
+@contextmanager
+def _population_step_context(integrator, *, stable=False):
+    """Temporarily reuse a proof supplied by an observer-stable host loop."""
+    previous = integrator._direct_membrane_structure_prevalidated
+    integrator._direct_membrane_structure_prevalidated = False
+    try:
+        if (
+            stable
+            and not integrator.imem
+            and MEMBRANE_ASSEMBLY.value != "off"
+            and _population_runtime_modes_plain()
+        ):
+            from ..mechanisms._handler import (
+                _MEMBRANE_COEFFICIENT_FRAME,
+                _MEMBRANE_DIRECT_ELIGIBILITY,
+                MechanismHandler,
+            )
+
+            handler = integrator.mech
+            if (
+                type(handler) is MechanismHandler
+                and type(handler)._evaluate_membrane_frame
+                is _MEMBRANE_COEFFICIENT_FRAME
+                and type(handler)._can_evaluate_direct_membrane_frame
+                is _MEMBRANE_DIRECT_ELIGIBILITY
+                and "_evaluate_membrane_frame" not in handler.__dict__
+                and "_can_evaluate_direct_membrane_frame" not in handler.__dict__
+                and _population_membrane_metadata_plain(handler)
+                and handler._can_evaluate_direct_membrane_frame()
+            ):
+                integrator._direct_membrane_structure_prevalidated = True
+        yield
+    finally:
+        integrator._direct_membrane_structure_prevalidated = previous
 
 
 class Integrator(torch.nn.Module):
@@ -269,6 +483,10 @@ class Integrator(torch.nn.Module):
     _PREPARED_WORKSPACE_SCHEMA = ()
     _FUNCTIONAL_OPERATOR_KIND = None
     _FUNCTIONAL_CRITICAL_METHODS = ()
+    _DIRECT_MEMBRANE_VOLTAGE_UPDATE = None
+    # Old serialized integrators predate the instance marker. An absent field
+    # must retain the ordinary per-step structural validation after restoration.
+    _direct_membrane_structure_prevalidated = False
 
     def __init__(self, model, mech, imem=None):
         super().__init__()
@@ -279,6 +497,7 @@ class Integrator(torch.nn.Module):
         self.dt = None
         self.shape = None
         self._compiled_kernels = {}
+        self._direct_membrane_structure_prevalidated = False
         self.compile_scope = "population"
         self.configure_jit(model, scope="population")
 
@@ -310,6 +529,54 @@ class Integrator(torch.nn.Module):
         """Capture per-ion conductances aligned with the current frame."""
         capture = getattr(self.mech, "capture_ion_conductance_frame", None)
         return () if capture is None else capture()
+
+    def _membrane_frame(self, v, *, call_local=False, require_current=None):
+        """Return ``(G, J, I, ion_I, ion_G)`` for the current solver stage.
+
+        ``J = G*v-I`` is the linearized membrane source. A capable handler can
+        supply proven direct coefficients with ``I=None`` when no current
+        observer needs the authored current. Consumers keep their original
+        arithmetic whenever ``I`` is present, including observer and custom
+        handler fallbacks. Mechanism advance and frame publication stay owned
+        by the integrator, outside this evaluation.
+        """
+        if require_current is None:
+            require_current = self.imem
+        evaluate = getattr(self.mech, "_evaluate_membrane_frame", None)
+        if evaluate is not None:
+            if self._direct_membrane_structure_prevalidated:
+                return evaluate(
+                    v,
+                    call_local=call_local,
+                    require_current=require_current,
+                    _structure_prevalidated=True,
+                )
+            return evaluate(v, call_local=call_local, require_current=require_current)
+        if call_local:
+            evaluate = getattr(self.mech, "_evaluate_current_frame", None)
+            if evaluate is None:
+                raise RuntimeError(
+                    "call-local current evaluation requires a MechanismHandler "
+                    "with _evaluate_current_frame()"
+                )
+            current, conductance, ion_i, ion_g = evaluate(v)
+        else:
+            current, conductance = self.mech.i(v)
+            ion_i = self._capture_ion_current_frame()
+            ion_g = self._capture_ion_conductance_frame()
+        return conductance, conductance * v - current, current, ion_i, ion_g
+
+    def _population_step_scope(self, *, stable=False):
+        """Reuse one structural proof only inside an observer-stable host loop.
+
+        The caller proves that built-in execution and read-only callbacks cannot
+        replace current declarations within this run/chunk. Tensor values,
+        compiler guards, dtype checks, and membrane-assembly policy remain live.
+        Unknown nested execution deliberately disables any enclosing proof.
+        """
+        # Keep this class method source-owned: the runtime stability proof
+        # rejects authored/contextlib executable wrappers on module classes.
+        return _population_step_context(self, stable=stable)
 
     def _prepared_workspace_schema(self):
         """Return the validated private tensor-workspace contract.
@@ -416,7 +683,9 @@ class Integrator(torch.nn.Module):
             "_functional_spec",
             "_functional_solver",
             "_step",
+            "_membrane_frame",
             "_voltage_update",
+            "_DIRECT_MEMBRANE_VOLTAGE_UPDATE",
             "_prepare_workspace",
             "_prepared_workspace_schema",
             "_derive_prepared_workspace",
@@ -459,32 +728,44 @@ class Integrator(torch.nn.Module):
         """
         v_state = self.mech.update_v(v)
         self._advance_pre_current(v_state, dt, temp)
-        if call_local_currents:
-            evaluate = getattr(self.mech, "_evaluate_current_frame", None)
-            if evaluate is None:
-                raise RuntimeError(
-                    "call-local current evaluation requires a MechanismHandler "
-                    "with _evaluate_current_frame()"
-                )
-            (
+        direct_update = (
+            "_voltage_update" not in self.__dict__
+            and type(self)._voltage_update is type(self)._DIRECT_MEMBRANE_VOLTAGE_UPDATE
+        )
+        (
+            gtot,
+            membrane_source,
+            itot,
+            ion_current_frame,
+            ion_conductance_frame,
+        ) = self._membrane_frame(
+            v_state,
+            call_local=call_local_currents,
+            require_current=self.imem or not direct_update,
+        )
+        if direct_update:
+            v_new, i_membrane = self._voltage_update(
+                v_state,
+                dt,
                 itot,
                 gtot,
-                ion_current_frame,
-                ion_conductance_frame,
-            ) = evaluate(v_state)
+                ve,
+                intra,
+                solver=solver,
+                membrane_source=membrane_source,
+            )
         else:
-            itot, gtot = self.mech.i(v_state)
-            ion_current_frame = self._capture_ion_current_frame()
-            ion_conductance_frame = self._capture_ion_conductance_frame()
-        v_new, i_membrane = self._voltage_update(
-            v_state,
-            dt,
-            itot,
-            gtot,
-            ve,
-            intra,
-            solver=solver,
-        )
+            # An authored numerical override retains its original signature
+            # and actual-current inputs, even when its model is affine.
+            v_new, i_membrane = self._voltage_update(
+                v_state,
+                dt,
+                itot,
+                gtot,
+                ve,
+                intra,
+                solver=solver,
+            )
         accepted_frame = self._linearize_ion_current_frame(
             ion_current_frame,
             ion_conductance_frame,
@@ -503,6 +784,7 @@ class Integrator(torch.nn.Module):
         intra=None,
         *,
         solver=None,
+        membrane_source=None,
     ):
         """Return the pure numerical voltage update shared by both frontends."""
         raise NotImplementedError(
@@ -671,6 +953,7 @@ class Integrator(torch.nn.Module):
         state = self.__dict__.copy()
         if "_compiled_kernels" in state:
             state["_compiled_kernels"] = {}
+        state["_direct_membrane_structure_prevalidated"] = False
         return state
 
     def _kernel(self, name: str, *args, **kwargs):
@@ -712,8 +995,110 @@ class Integrator(torch.nn.Module):
             self.mech.sample_runtime_noises_(dt=self.dt, phase="pre_state")
 
     def _call_kernel(self, name: str, *args, **kwargs):
+        if args and isinstance(args[-1], _NoiseFreeStep):
+            return self._kernel(name, *args[:-1], args[-1].intra, **kwargs)
+        if args and isinstance(args[-1], _DeferredIntra):
+            # Population run/longrun only defer scatter after proving that every
+            # mechanism/State lacks runtime NOISE and uses a built-in sampler.
+            # Rewalking that empty sampler tree cannot change this transition.
+            # Ordinary/custom/noisy paths retain their sampling order below.
+            intra = args[-1]
+            return self._kernel(
+                "_step_with_intra",
+                name,
+                args[:-1],
+                intra.source,
+                intra.stimuli,
+                intra.indices,
+                kwargs,
+            )
         self._sample_runtime_noises()
         return self._kernel(name, *args, **kwargs)
+
+    def _step_with_intra(self, name, args, source, stimuli, indices, kwargs):
+        """Scatter and advance in one graph, leaving state commit eager."""
+        intra = source(stimuli, indices)
+        return getattr(self, name)(*args, intra, **kwargs)
+
+    def _supports_fused_intra_step(
+        self,
+        _canonical_call_kernel=_call_kernel,
+        _canonical_kernel=_kernel,
+        _canonical_sampler=_sample_runtime_noises,
+        _canonical_fused_kernel=_step_with_intra,
+    ):
+        """Fail closed for custom step/dispatch wrappers and unknown solvers.
+
+        The listed built-in wrappers pass ``intra`` as the final positional
+        kernel argument, then commit the returned state eagerly. Partial-class
+        constructors and subclasses inheriting these wrappers remain eligible.
+        """
+        from .explicit import (
+            _dufort_frankel,
+            _dufort_frankel_homogeneous,
+            _euler,
+            _eulerv1,
+            _rk2,
+            _rk4,
+        )
+        from .implicit import (
+            _bwd_euler_bt,
+            _bwd_euler_sc,
+            _bwd_euler_sc_multi,
+            _bwd_euler_sc_skip,
+            _bwd_euler_ub,
+        )
+        from .tree import _dhs, _dhs_multi
+        from .tree_bt import _dhs_bt
+
+        owners = (
+            _euler,
+            _eulerv1,
+            _rk2,
+            _rk4,
+            _dufort_frankel,
+            _dufort_frankel_homogeneous,
+            _bwd_euler_sc,
+            _bwd_euler_sc_skip,
+            _bwd_euler_sc_multi,
+            _bwd_euler_ub,
+            _bwd_euler_bt,
+            _dhs,
+            _dhs_multi,
+            _dhs_bt,
+        )
+        # A class monkeypatch must not authorize itself by replacing both the
+        # resolved step and the class attribute used for comparison. Built-in
+        # methods originate in their defining class's source file. Inherited
+        # kernels (for example Integrator._step used by bwd_euler_sc) are valid.
+        step_wrapper = getattr(self.step, "__func__", None)
+        step_kernel = getattr(self._step, "__func__", None)
+
+        def declared_method_matches(owner, name, bound):
+            for defining_class in owner.__mro__:
+                if name in vars(defining_class):
+                    declared = vars(defining_class)[name]
+                    return (
+                        bound is declared
+                        and inspect.isfunction(declared)
+                        and inspect.getfile(declared) == inspect.getfile(defining_class)
+                    )
+            return False
+
+        canonical_pair = any(
+            declared_method_matches(owner, "step", step_wrapper)
+            and declared_method_matches(owner, "_step", step_kernel)
+            for owner in owners
+        )
+        return (
+            canonical_pair
+            and getattr(self._call_kernel, "__func__", None) is _canonical_call_kernel
+            and getattr(self._kernel, "__func__", None) is _canonical_kernel
+            and getattr(self._sample_runtime_noises, "__func__", None)
+            is _canonical_sampler
+            and getattr(self._step_with_intra, "__func__", None)
+            is _canonical_fused_kernel
+        )
 
     def _refresh_solver_shape(self, model, *, block_dim=None):
         self.shape = tuple(model.shape)

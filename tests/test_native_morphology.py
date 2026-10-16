@@ -245,6 +245,40 @@ def test_interior_connection_attaches_to_containing_parent_compartment():
     )
 
 
+@pytest.mark.parametrize("child_end", (0, 1))
+def test_child_endpoint_location_connects_to_parent_location(child_end):
+    morphology = Morphology()
+    parent = morphology.section("parent", L=30.0, diam=4.0, nseg=3)
+    child = morphology.section("child", L=20.0, diam=2.0, nseg=2)
+
+    returned = child.at(child_end).connect(parent.at(0.5))
+
+    assert returned is child
+    graph = morphology.compile()
+    child_segments = [
+        segment
+        for section, segment in zip(
+            graph.metadata.section_name,
+            graph.metadata.segment_index,
+            strict=True,
+        )
+        if section == "child"
+    ]
+    assert child_segments == ([0, 1] if child_end == 0 else [1, 0])
+
+
+def test_child_location_connect_rejects_interior_location_atomically():
+    morphology = Morphology()
+    parent = morphology.section("parent", L=30.0, diam=4.0)
+    child = morphology.section("child", L=20.0, diam=2.0)
+
+    with pytest.raises(ValueError, match="endpoint 0 or 1"):
+        child.at(0.5).connect(parent.at(0.5))
+
+    child.at(0).connect(parent.at(0.5))
+    assert morphology.compile().n_compartments == 2
+
+
 def test_child_end_one_reverses_topological_traversal_without_losing_provenance():
     morphology = Morphology()
     soma = morphology.section("soma", L=10.0, diam=4.0)

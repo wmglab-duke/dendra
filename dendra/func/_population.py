@@ -21,6 +21,7 @@ import torch
 from torch.func import functional_call
 from torch.fx.experimental.proxy_tensor import make_fx
 
+from dendra.helpers import MEMBRANE_ASSEMBLY
 from dendra.models.core import (
     Cable,
     Myelinated,
@@ -125,7 +126,9 @@ _RUNTIME_SCHEMA_CACHE_STATE = frozenset(
 _FUNCTIONAL_INTEGRATOR_HOOKS = (
     "_functional_spec",
     "_functional_solver",
+    "_membrane_frame",
     "_voltage_update",
+    "_DIRECT_MEMBRANE_VOLTAGE_UPDATE",
     "_prepare_workspace",
     "_prepared_workspace_schema",
     "_derive_prepared_workspace",
@@ -135,7 +138,14 @@ _FUNCTIONAL_INTEGRATOR_HOOKS = (
     "initialize",
     "step",
 )
-_FUNCTIONAL_HANDLER_HOOKS = ("_evaluate_current_frame",)
+_FUNCTIONAL_HANDLER_HOOKS = (
+    "_evaluate_current_frame",
+    "_evaluate_membrane_frame",
+    "_can_evaluate_direct_membrane_frame",
+    "_direct_membrane_dtype_compatible",
+    "_evaluate_direct_membrane_coefficients",
+    "_gather_assigned_current_fields",
+)
 _STANDARD_FUNCTIONAL_HANDLER_HOOKS = {
     name: inspect.getattr_static(MechanismHandler, name)
     for name in _FUNCTIONAL_HANDLER_HOOKS
@@ -144,6 +154,7 @@ _HANDLER_INITIALIZATION_HOOKS = (
     "initialize",
     "_sync_celsius",
     "make_maps",
+    "_make_membrane_plans",
     "init_rng",
     "populate",
     "_reset_initialization_timestep",
@@ -166,6 +177,7 @@ _HANDLER_INITIALIZATION_HOOKS = (
     "read_from_ions",
     "read_from_materials",
     "_evaluate_current_frame",
+    "_gather_assigned_current_fields",
 )
 _STANDARD_HANDLER_INITIALIZATION = {
     name: inspect.getattr_static(MechanismHandler, name)
@@ -7074,6 +7086,50 @@ def _material_signature(name, material) -> tuple:
     )
 
 
+def _membrane_coefficient_signature(module) -> tuple:
+    """Invalidate captured transitions when per-current executable APIs change.
+
+    This is a public-boundary structural check, not a per-timestep proof of a
+    user-declared affine function. Tensor parameters remain live model inputs.
+    """
+    evaluators = getattr(module, "_affine_evaluators", {})
+    names = ["_validate_affine_current"] if evaluators else []
+    for current, evaluator in evaluators.items():
+        names.extend(
+            (
+                current,
+                f"{current}_with_g",
+                evaluator,
+                f"{current}_with_conductance",
+                f"{current}_affine_terms",
+            )
+        )
+    hooks = []
+    for name in dict.fromkeys(names):
+        if not hasattr(module, name):
+            hooks.append((name, ("missing",), None))
+            continue
+        method = getattr(module, name)
+        hooks.append(
+            (
+                name,
+                "instance" if name in module.__dict__ else "class",
+                getattr(method, "__self__", None) is module,
+                _transform_callable_structure_signature(
+                    method, label=f"membrane.{name}", strict=False
+                ),
+            )
+        )
+    return (
+        tuple(hooks),
+        tuple(evaluators.items()),
+        tuple(sorted(getattr(module, "_affine", ()))),
+        tuple(sorted(getattr(module, "_explicit", ()))),
+        tuple(sorted(getattr(module, "_numerical", ()))),
+        tuple(getattr(module, "_affine_coefficient_fields", {}).items()),
+    )
+
+
 def _structure_signature(population) -> tuple:
     handler = population.mech
     multi_components = (
@@ -7175,6 +7231,7 @@ def _structure_signature(population) -> tuple:
                 )
             ),
             tuple(sorted(module._save)),
+            _membrane_coefficient_signature(module),
         )
 
     return (
@@ -8093,7 +8150,9 @@ class FunctionalPopulation:
 
     def _ensure_structured_step_graph(self, ve_present, intra_present):
         """Lazily capture one inference graph outside a Dynamo boundary."""
-        signature = (ve_present, intra_present)
+        # make_fx specializes Python assembly policy. A captured inference
+        # graph must never be reused under another ctx policy.
+        signature = (ve_present, intra_present, MEMBRANE_ASSEMBLY.value)
         if signature in self._structured_step_graphs:
             return True
         if signature in self._structured_capture_errors:
@@ -8104,7 +8163,7 @@ class FunctionalPopulation:
             # established unrolled fallback unless it was explicitly prewarmed.
             return False
         try:
-            graph = self._capture_structured_step_graph(*signature)
+            graph = self._capture_structured_step_graph(ve_present, intra_present)
         except Exception as exc:
             # Structured control flow is an inference compilation optimization,
             # not part of the functional semantics. Cache failure per signature
@@ -10811,7 +10870,9 @@ class FunctionalPopulation:
         steps,
     ):
         """Run compiled inference with graph size bounded by a small step block."""
-        step_graph = self._structured_step_graphs[(ve is not None, intra is not None)]
+        step_graph = self._structured_step_graphs[
+            (ve is not None, intra is not None, MEMBRANE_ASSEMBLY.value)
+        ]
         carry = self._clone_state_tree(state)
         chunk = _STRUCTURED_ROLLOUT_CHUNK
         full_chunks = steps // chunk
@@ -10932,7 +10993,11 @@ class FunctionalPopulation:
             steps,
             prepared["integrator"]["dt"],
         )
-        structured_signature = (ve is not None, intra is not None)
+        structured_signature = (
+            ve is not None,
+            intra is not None,
+            MEMBRANE_ASSEMBLY.value,
+        )
         if (
             torch.compiler.is_compiling()
             and not torch.is_grad_enabled()
@@ -11279,7 +11344,19 @@ class FunctionalPopulation:
         process-local compatibility fix when this mode is selected. Ordinary
         backward is supported; ``create_graph=True`` raises explicitly. Calls
         inside ``torch.func`` or forward AD use the ordinary eager recurrence.
-        The default preserves the existing compiled execution strategy.
+
+        With ordinary Inductor, CPU scan calls under ``torch.no_grad()`` or
+        ``torch.inference_mode()`` use a bounded timestep block and default to a
+        C++ loop wrapper. Pass ``options={"cpp_wrapper": False}`` to select the
+        Python wrapper. Explicit compiler choices take precedence. Gradient-
+        enabled scan and accelerator scan retain their one-step bodies and
+        original compiler settings.
+
+        The default uses a bounded inference loop when available, including
+        built-in functional callbacks on PyTorch 2.14 or newer. Gradient-enabled or
+        unsupported callback calls retain the unrolled recurrence. Select
+        ``execution="unrolled"`` to require that recurrence in inference too.
+        Inspect ``execution_report()`` after a call for its actual dispatch.
         """
         from ._compiled import CompiledPopulationChunk
 

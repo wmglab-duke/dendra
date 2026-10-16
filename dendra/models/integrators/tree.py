@@ -64,6 +64,54 @@ except ImportError:
 THREADS_PER_WARP = 32
 
 
+def _functional_dhs_plan_solve(d_mem, a_geom, rhs, parent, order, layers, *, plan):
+    """Use the functional transition's immutable, independently owned plan."""
+    return dendra_solvers.dhs_solve_plan(d_mem, a_geom, rhs, plan)
+
+
+def _functional_dhs_multi_plan_solve(d_mem, a_geom, rhs, *metadata, plan):
+    """Keep the legacy tensor signature while using an independent owner."""
+    return dendra_solvers.dhs_multi_solve_plan(d_mem, a_geom, rhs, plan)
+
+
+def _refresh_owned_cpu_plan(integrator, sources, constructor, eligible, *, kwargs=None):
+    """Check versioned sources outside compilation; clear before validation.
+
+    The owner copies topology, while this O(1) freshness check respects ordinary
+    public tensor mutation/rebinding. Versionless inference metadata takes the
+    fully validated raw path. External aliases/.data writes that bypass PyTorch
+    version counters are unsupported, consistently with scalar DHS/autograd.
+    """
+    old_plan = integrator._cpu_topology_plan
+    versions = None
+    if (
+        callable(constructor)
+        and eligible
+        and all(t.device.type == "cpu" for t in sources)
+    ):
+        try:
+            versions = tuple(t._version for t in sources)
+        except RuntimeError:
+            pass
+    if versions is not None and old_plan is not None:
+        if versions == integrator._cpu_plan_versions and all(
+            current is previous
+            for current, previous in zip(sources, integrator._cpu_plan_sources)
+        ):
+            return
+    integrator._cpu_topology_plan = None
+    integrator._cpu_plan_sources = ()
+    integrator._cpu_plan_versions = ()
+    if old_plan is not None:
+        integrator.clear_jit_cache()
+    if versions is not None:
+        owner = constructor(*sources, **({} if kwargs is None else kwargs))
+        integrator._cpu_topology_plan = owner
+        integrator._cpu_plan_sources = sources
+        integrator._cpu_plan_versions = versions
+        integrator.clear_jit_cache()
+
+
 @dataclass(frozen=True)
 class _ScalarDHSGroup:
     """One component's topology and geometry in packed DHS solver order."""
@@ -552,7 +600,7 @@ class _dhs(Integrator):
         ("edge_conductance", "edge"),
     )
     _FUNCTIONAL_OPERATOR_KIND = "scalar_tree"
-    _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver",)
+    _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver", "_refresh_cpu_topology_plan")
 
     def __init__(self, model, mech, imem=None, threads=16):
         threads = _validate_dhs_threads(threads)
@@ -585,6 +633,13 @@ class _dhs(Integrator):
         self.register_buffer(
             "edge_conductance", torch.empty(B, max(N - 1, 0))
         )  # (B,E) compact mechanism order
+        # This is an owning native snapshot, not a cached pointer into mutable
+        # registered buffers. Keep it out of state_dict; initialize reconstructs
+        # it after loads/device moves and its own pickle protocol validates it.
+        self._cpu_topology_plan = None
+        self._cpu_plan_sources = ()
+        self._cpu_plan_versions = ()
+        self._cpu_plan_available = callable(getattr(dendra_solvers, "DHSPlan", None))
 
     # Historical public/internal names remain read-only views of the canonical
     # workspace. Do not register duplicate aliases: functional_call must have one
@@ -632,9 +687,15 @@ class _dhs(Integrator):
         fail-closed for this CPU functional milestone.
         """
         solver = self._solve
-        solver_name = getattr(solver, "__name__", None)
-        solver_module = getattr(solver, "__module__", None)
-        if solver_name == "dhs_solve" and solver_module == "torch._ops.dendra_solvers":
+        if DENDRA_SOLVERS_AVAILABLE and solver is torch.ops.dendra_solvers.dhs_solve:
+            if callable(getattr(dendra_solvers, "DHSPlan", None)):
+                # Functional lowering owns immutable topology independently of
+                # both the source Population and its disposable tensor clones.
+                # Construct outside compilation, including under inference_mode.
+                plan = dendra_solvers.DHSPlan(
+                    self.parent_idx, self.order, self.layer_ptr
+                )
+                return partial(_functional_dhs_plan_solve, plan=plan)
             facade = (
                 None
                 if not DENDRA_SOLVERS_AVAILABLE
@@ -653,6 +714,51 @@ class _dhs(Integrator):
             "Functional scalar Tree execution currently requires CPU "
             "dendra_solvers.dhs_solve."
         )
+
+    def _refresh_cpu_topology_plan(self):
+        """Revalidate changed topology before entering a compiled transition.
+
+        Ordinary tensor mutation/rebinding is checked in O(1), outside Dynamo.
+        Versionless inference tensors cannot support that freshness check and
+        retain the raw solver's full validation on every invocation. Numeric
+        coefficients and differentiable workspaces are never stored in a plan.
+        As with autograd, writes bypassing PyTorch version counters (for example
+        via .data or external NumPy aliases) are not supported mutation APIs.
+        """
+        old_plan = self._cpu_topology_plan
+        buffers = self._buffers
+        sources = (buffers["parent_idx"], buffers["order"], buffers["layer_ptr"])
+        constructor = getattr(dendra_solvers, "DHSPlan", None)
+        if (
+            not callable(constructor)
+            or self._solve is not torch.ops.dendra_solvers.dhs_solve
+            or any(t.device.type != "cpu" for t in sources)
+        ):
+            versions = None
+        else:
+            try:
+                versions = tuple(t._version for t in sources)
+            except RuntimeError:
+                versions = None
+        if versions is not None and old_plan is not None:
+            if versions == self._cpu_plan_versions and all(
+                current is previous
+                for current, previous in zip(sources, self._cpu_plan_sources)
+            ):
+                return
+        # Clear before validation, so a failed replacement cannot leave a stale
+        # executable plan behind. Existing autograd graphs own their old token.
+        self._cpu_topology_plan = None
+        self._cpu_plan_sources = ()
+        self._cpu_plan_versions = ()
+        if old_plan is not None:
+            self.clear_jit_cache()
+        if versions is not None:
+            plan = constructor(*sources)
+            self._cpu_topology_plan = plan
+            self._cpu_plan_sources = sources
+            self._cpu_plan_versions = versions
+            self.clear_jit_cache()
 
     @staticmethod
     def _prepare_workspace(
@@ -801,8 +907,11 @@ class _dhs(Integrator):
             edge_conductance=edge_conductance,
         )
         self._install_prepared_workspace(workspace)
+        self._refresh_cpu_topology_plan()
 
     def step(self, model, dt, ve=None, intra=None):
+        if self._cpu_plan_available:
+            self._refresh_cpu_topology_plan()
         v_new, i_membrane = self._call_kernel(
             "_step", model.v, dt, model.celsius, ve, intra
         )
@@ -827,44 +936,32 @@ class _dhs(Integrator):
 
         self._advance_pre_current(v_old, dt, temp)
 
-        itot = None
-        gtot_flat = None
-
-        if call_local_currents:
-            evaluate = getattr(self.mech, "_evaluate_current_frame", None)
-            if evaluate is None:
-                raise RuntimeError(
-                    "call-local current evaluation requires a MechanismHandler "
-                    "with _evaluate_current_frame()"
-                )
+        if call_local_currents or self.mech.currents:
             (
-                itot,
                 gtot,
+                membrane_source,
+                itot,
                 ion_current_frame,
                 ion_conductance_frame,
-            ) = evaluate(v_old)
-        elif self.mech.currents:
-            itot, gtot = self.mech.i(v_old)  # shapes: base_shape
-            ion_current_frame = self._capture_ion_current_frame()
-            ion_conductance_frame = self._capture_ion_conductance_frame()
+            ) = self._membrane_frame(v_old, call_local=call_local_currents)
+            gtot_flat = gtot.reshape(self.B, K)
+            area = self.area.reshape(self.B, K)
+            if itot is None:
+                itot_flat = None
+                f_n = membrane_source.reshape(self.B, K) * area
+            else:
+                itot_flat = itot.reshape(self.B, K)  # (B,K), mA/cm^2
+                # ionic "reversal" term + scale to absolute mA
+                f_n = (gtot_flat * v_old.reshape(self.B, K) - itot_flat) * area
         else:
-            itot = None
-            gtot = None
-            ion_current_frame = self._capture_ion_current_frame()
-            ion_conductance_frame = self._capture_ion_conductance_frame()
-
-        if itot is not None:
-            itot_flat = itot.reshape(self.B, K)  # (B,K), mA/cm^2
-            gtot_flat = gtot.reshape(self.B, K)  # (B,K), mA/(cm^2 mV)
-            area = self.area.reshape(self.B, K)  # (B,K), cm^2
-
-            # ionic "reversal" term + scale to absolute mA
-            f_n = (gtot_flat * v_old.reshape(self.B, K) - itot_flat) * area  # (B,K), mA
-        else:
-            # no ionic currents: zero contribution
+            # Preserve the imperative no-current lifecycle: evaluating an
+            # empty current frame would add an ASSIGNED phase to state-only
+            # mechanisms, changing their exposed values after advance.
             itot_flat = None
-            gtot_flat = torch.zeros_like(self.cm_dt)  # (B,K)
+            gtot_flat = torch.zeros_like(self.cm_dt)
             f_n = torch.zeros_like(self.cm_dt)
+            ion_current_frame = self._capture_ion_current_frame()
+            ion_conductance_frame = self._capture_ion_conductance_frame()
 
         if ve is not None:
             ve_flat = _flatten_to_solve(
@@ -918,15 +1015,20 @@ class _dhs(Integrator):
         b_ = RHS.index_select(-1, self.solver_order)  # (B, N)
         a = self.axial_conductance  # (B, N) axial conductance
 
-        solve = self._solve if solver is None else solver
-        v_out = solve(
-            d_,
-            a,
-            b_,
-            self.parent_idx,
-            self.order,
-            self.layer_ptr,
-        )
+        if solver is None and self._cpu_topology_plan is not None:
+            v_out = torch.ops.dendra_solvers.dhs_solve_plan(
+                d_, a, b_, self._cpu_topology_plan._token
+            )
+        else:
+            solve = self._solve if solver is None else solver
+            v_out = solve(
+                d_,
+                a,
+                b_,
+                self.parent_idx,
+                self.order,
+                self.layer_ptr,
+            )
 
         v_new = v_out.index_select(-1, self.inv_solver_order).reshape(
             self.base_shape
@@ -992,7 +1094,7 @@ class _dhs_multi(MultiIntegrator):
         ("EDGE_GAX_FLAT", "multi_edge"),
     )
     _FUNCTIONAL_OPERATOR_KIND = "scalar_multi"
-    _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver",)
+    _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver", "_refresh_cpu_topology_plan")
 
     def __init__(
         self, model, mech, imem=None, threads: int = 16, write_back: bool = True
@@ -1035,6 +1137,12 @@ class _dhs_multi(MultiIntegrator):
         # --- plan & scratch caches (filled lazily in _step) ---
         self._plan_cache = {}  # key: (P, device) -> dict with tiled plan
         self._scratch_sig = None
+        self._cpu_topology_plan = None
+        self._cpu_plan_sources = ()
+        self._cpu_plan_versions = ()
+        self._cpu_plan_available = callable(
+            getattr(dendra_solvers, "DHSMultiPlan", None)
+        ) and callable(getattr(dendra_solvers, "dhs_multi_solve_plan", None))
 
     def __getstate__(self):
         """Exclude process-local tensor views from copies and checkpoints."""
@@ -1070,6 +1178,15 @@ class _dhs_multi(MultiIntegrator):
         the twelve tensor operands of the native operator directly.
         """
         if self._solve is _dhs_multi_solve_cpu:
+            constructor = getattr(dendra_solvers, "DHSMultiPlan", None)
+            facade = getattr(dendra_solvers, "dhs_multi_solve_plan", None)
+            if callable(constructor) and callable(facade):
+                plan = constructor(
+                    *self._cpu_topology_sources(),
+                    batch_size=self._tiled_rows_total,
+                    stride=self.K_stride,
+                )
+                return partial(_functional_dhs_multi_plan_solve, plan=plan)
             facade = (
                 None
                 if not DENDRA_SOLVERS_AVAILABLE
@@ -1087,6 +1204,38 @@ class _dhs_multi(MultiIntegrator):
             "The selected packed DHS solver is not yet transform-compatible. "
             "Functional MultiPopulation execution currently requires CPU "
             "dendra_solvers.dhs_multi_solve."
+        )
+
+    def _cpu_topology_sources(self):
+        return tuple(
+            self._buffers[name]
+            for name in (
+                "P_cat",
+                "ORDER_cat",
+                "LAYER_PTR_cat",
+                "_TILED_WARP_P_OFF",
+                "_TILED_WARP_ORDER_OFF",
+                "_TILED_WARP_LPTR_OFF",
+                "_TILED_WARP_L",
+                "_TILED_WARP_ROW_BASE",
+                "_TILED_WARP_ROW_COUNT",
+            )
+        )
+
+    def _refresh_cpu_topology_plan(self):
+        if not hasattr(self, "_tiled_rows_total"):
+            self._cpu_topology_plan = None
+            return
+        _refresh_owned_cpu_plan(
+            self,
+            self._cpu_topology_sources(),
+            (
+                getattr(dendra_solvers, "DHSMultiPlan", None)
+                if callable(getattr(dendra_solvers, "dhs_multi_solve_plan", None))
+                else None
+            ),
+            self._solve is _dhs_multi_solve_cpu,
+            kwargs={"batch_size": self._tiled_rows_total, "stride": self.K_stride},
         )
 
     @staticmethod
@@ -1510,6 +1659,7 @@ class _dhs_multi(MultiIntegrator):
         self._b_plane = torch.empty_like(self._d_plane)
         plan = self._get_tiled_plan(P, dev0)
         self._install_fixed_tiled_plan(plan)
+        self._refresh_cpu_topology_plan()
 
     def _install_fixed_tiled_plan(self, plan):
         """Register the initialized batch shape's immutable tiled metadata.
@@ -1607,6 +1757,8 @@ class _dhs_multi(MultiIntegrator):
         return plan
 
     def step(self, model, dt, ve=None, intra=None):
+        if self._cpu_plan_available:
+            self._refresh_cpu_topology_plan()
         v_new, i_mem = self._call_kernel(
             "_step", model.v, dt, getattr(model, "celsius", None), ve, intra
         )
@@ -1641,23 +1793,13 @@ class _dhs_multi(MultiIntegrator):
         v_old = v
 
         self._advance_pre_current(v_old, dt, temp)
-        if call_local_currents:
-            evaluate = getattr(self.mech, "_evaluate_current_frame", None)
-            if evaluate is None:
-                raise RuntimeError(
-                    "call-local current evaluation requires a MechanismHandler "
-                    "with _evaluate_current_frame()"
-                )
-            (
-                itot_flat,
-                gtot_flat,
-                ion_current_frame,
-                ion_conductance_frame,
-            ) = evaluate(v_old)
-        else:
-            itot_flat, gtot_flat = self.mech.i(v)  # both original shape
-            ion_current_frame = self._capture_ion_current_frame()
-            ion_conductance_frame = self._capture_ion_conductance_frame()
+        (
+            gtot_flat,
+            membrane_source,
+            itot_flat,
+            ion_current_frame,
+            ion_conductance_frame,
+        ) = self._membrane_frame(v_old, call_local=call_local_currents)
 
         intra_flat = (
             0.0
@@ -1669,10 +1811,13 @@ class _dhs_multi(MultiIntegrator):
 
         # 2) assemble in mechanism order
         v_old_flat = v_old.reshape(P, N_total)  # (P, N_total)
-        itot_mech = itot_flat.reshape(P, N_total)
         gtot_mech = gtot_flat.reshape(P, N_total)
-
-        f_n_flat = (gtot_mech * v_old_flat - itot_mech) * SCALE_MECH + intra_flat
+        if itot_flat is None:
+            itot_mech = None
+            f_n_flat = membrane_source.reshape(P, N_total) * SCALE_MECH + intra_flat
+        else:
+            itot_mech = itot_flat.reshape(P, N_total)
+            f_n_flat = (gtot_mech * v_old_flat - itot_mech) * SCALE_MECH + intra_flat
 
         # --- extracellular coupling (ve), vectorized on flattened indices) ---
         if ve is not None and self.EDGE_CHILD_IDX_FLAT.numel() > 0:
@@ -1774,12 +1919,14 @@ class _dhs_multi(MultiIntegrator):
                 b_plane = self._b_plane
                 d_plane = self._d_plane
             a_geom_eff = plan["a_geom_eff"]
-            warp_p_off = plan["WARP_P_OFF"]
-            warp_order_off = plan["WARP_ORDER_OFF"]
-            warp_lptr_off = plan["WARP_LPTR_OFF"]
-            warp_l = plan["WARP_L"]
-            warp_row_base = plan["WARP_ROW_BASE"]
-            warp_row_count = plan["WARP_ROW_COUNT"]
+            # Use the same registered topology sources as functional lowering
+            # and the owning-plan freshness check, including buffer rebinding.
+            warp_p_off = self._TILED_WARP_P_OFF
+            warp_order_off = self._TILED_WARP_ORDER_OFF
+            warp_lptr_off = self._TILED_WARP_LPTR_OFF
+            warp_l = self._TILED_WARP_L
+            warp_row_base = self._TILED_WARP_ROW_BASE
+            warp_row_count = self._TILED_WARP_ROW_COUNT
 
         solve = self._solve if solver is None else solver
         solver_args = (
@@ -1796,7 +1943,11 @@ class _dhs_multi(MultiIntegrator):
             warp_row_base,
             warp_row_count,
         )
-        if solver is None:
+        if solver is None and self._cpu_topology_plan is not None:
+            v_out_solver = torch.ops.dendra_solvers.dhs_multi_solve_plan(
+                d_plane, a_geom_eff, b_plane, self._cpu_topology_plan._token
+            )
+        elif solver is None:
             v_out_solver = solve(
                 *solver_args,
                 K_stride=self.K_stride,

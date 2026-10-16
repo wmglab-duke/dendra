@@ -9,6 +9,7 @@ import torch
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+import dendra as dn
 from dendra.models.callbacks import (
     LFP,
     Active,
@@ -111,6 +112,11 @@ def test_anomaly_detector_flags_nan():
 # ----------------------------------------------------------------------
 # 2.  Recorder (basic record, node-indexed, max_only) --------------------
 # ----------------------------------------------------------------------
+def test_recorder_is_exported_from_the_package_root():
+    assert dn.Recorder is Recorder
+    assert "Recorder" in dn.__all__
+
+
 def test_recorder_basic_and_indexed():
     model = _DummyModel(n_ax=3, nc=6)
     rec = Recorder(states=["v"], node_indices=[1, 4])

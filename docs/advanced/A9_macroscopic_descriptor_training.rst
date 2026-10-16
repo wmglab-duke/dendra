@@ -41,6 +41,10 @@ The recommended interface depends on the behavior being trained.
      - ``differentiable_action_potential_width``
      - Derivative of the hard, linearly interpolated crossings on the selected
        spike branch. The recording and return window must contain the event.
+   * - Conduction velocity
+     - ``branch_conditioned_conduction_velocity``
+     - Derivative of the hard selected arrival times and their spatial
+       ordinary-least-squares velocity fit for an existing propagated spike.
    * - Repeated firing frequency or interspike intervals
      - ``differentiable_spike_timing``
      - Derivative of existing interpolated crossing times. It does not provide
@@ -76,6 +80,32 @@ Frequency-following optimization and voltage-margin directions for creating
 or removing spikes remain experimental. See :ref:`event-margin-training` and
 :ref:`hard-transition-scans` for their stronger protocol and validation
 requirements.
+
+Standalone conduction velocity
+------------------------------
+
+Use ``branch_conditioned_conduction_velocity`` (also available as
+``differentiable_conduction_velocity``) when conduction velocity itself is the
+training objective. Its forward value is exactly the value returned by
+``hard_conduction_velocity``. At every included recording site, the hard pass
+selects the first upward threshold crossing in the requested time window. The
+branch-conditioned pass linearly interpolates that same crossing with the
+voltage graph intact and differentiates the spatial ordinary-least-squares fit
+through the resulting arrival times.
+
+The measurement requires at least two included sites with detected crossings
+and arrival-time variance greater than ``eps``. Use ``node_mask`` to restrict
+the fit to the intended recording sites and use the time window to isolate the
+same propagated action potential at each site. A gradient is meaningful only
+while crossing identity, site validity, and propagation direction remain fixed.
+It does not supply a direction for creating a missing distal spike or for
+crossing an event birth, loss, or identity change. Rerun the hard protocol and
+recompute the descriptor after every parameter update.
+
+The historical ``conduction_velocity`` interface remains available as a
+different objective: it uses a soft upstroke localization and soft
+spike-presence weights. It can be useful when that smooth objective is wanted,
+but it is not anchored to the hard threshold-crossing measurement.
 
 One training iteration
 ----------------------

@@ -39,7 +39,16 @@ from ._state import (
     _validate_runtime_outputs,
 )
 from ._support import SupportMap, SupportSpec
-from ._symbolic import build_current_eq
+from ._symbolic import (
+    affine_hook_name,
+    build_affine_coefficients,
+    build_affine_current_adapter,
+    build_affine_pair_coefficients,
+    build_current_eq,
+    current_contract_owner,
+    validate_affine_current,
+)
+from .compilers.ast import EXPECTED_FACTORIZATION_ERRORS
 
 
 def _merge_list_dict(dst, src):
@@ -682,6 +691,8 @@ class Mechanism(Parameterized):
             "_current_conductance_fallback_reason",
             "_current_conductance_mode",
             "_current_factorable",
+            "_affine_evaluators",
+            "_affine_coefficient_fields",
             "_delayed_state_specs",
             "_init_params",
             "_injection_specs",
@@ -811,18 +822,18 @@ class Mechanism(Parameterized):
             # their namespace. Rebind those exact metadata/method clones to the
             # owner selected in the alias's new MRO.
             for current in cls.__dict__["_affine"]:
-                owner = _mro_attribute_owner(cls, current)
+                owner = current_contract_owner(cls, current)
                 new_affine.add(current)
                 new_affine_method_owners[current] = owner
         else:
             for current, asserted_owners in inherited_affine_method_owners.items():
-                owner = _mro_attribute_owner(cls, current)
+                owner = current_contract_owner(cls, current)
                 if owner in asserted_owners:
                     new_affine.add(current)
                     new_affine_method_owners[current] = owner
 
         for current in declared_affine:
-            owner = _mro_attribute_owner(cls, current)
+            owner = current_contract_owner(cls, current)
             new_affine.add(current)
             new_affine_method_owners[current] = owner
 
@@ -848,6 +859,11 @@ class Mechanism(Parameterized):
             for currents in (*new_currents.values(), *new_write_ion.values())
             for current in currents
         }
+        current_runtime_slots.update(
+            f"_affine_{current}"
+            for currents in (*new_currents.values(), *new_write_ion.values())
+            for current in currents
+        )
         overlap = (workspace_buffers | nested_workspace_buffers) & runtime_local_slots
         overlap.update(workspace_buffers & current_runtime_slots)
         if overlap:
@@ -914,6 +930,13 @@ class Mechanism(Parameterized):
         cls._affine = new_affine
         cls._affine_method_owners = new_affine_method_owners
         cls._name = None
+
+        # Coefficients are a complete current definition. Authors need not
+        # duplicate I=G*v-J merely to support explicit integration, current
+        # recording, or the original assembly path.
+        for current in declared_current_names:
+            if not hasattr(cls, current) and affine_hook_name(cls, current):
+                setattr(cls, current, build_affine_current_adapter(current))
 
         set_dt_owner = _mro_attribute_owner(cls, "set_dt")
         if set_dt_owner is not None and not getattr(
@@ -1192,6 +1215,8 @@ class Mechanism(Parameterized):
         self._current_factorable = {}
         self._current_conductance_mode = {}
         self._current_conductance_fallback_reason = {}
+        self._affine_evaluators = {}
+        self._affine_coefficient_fields = {}
         current_eqs = []
         for _, v in self._currents.items():
             current_eqs.extend(v)
@@ -1208,6 +1233,35 @@ class Mechanism(Parameterized):
             self._current_conductance_fallback_reason[k] = (
                 eq._dendra_conductance_fallback_reason
             )
+            if not factorable or k in self._explicit:
+                continue
+            hook = affine_hook_name(type(self), k)
+            if hook is not None:
+                self._affine_evaluators[k] = hook
+                self._affine_coefficient_fields[k] = None
+                continue
+            coefficient_name = f"_affine_{k}"
+            # Keep preexisting private instance/class attributes intact.
+            if hasattr(self, coefficient_name):
+                continue
+            coefficients = None
+            fields = None
+            if eq._dendra_conductance_mode == "symbolic":
+                try:
+                    coefficients, fields = build_affine_coefficients(self, k)
+                except EXPECTED_FACTORIZATION_ERRORS:
+                    # A valid symbolic derivative need not permit omitting
+                    # authored I: canceled denominators/powers can be singular.
+                    pass
+            if coefficients is None and k in self._affine:
+                # AFFINE is the user's contract. Existing analytic/numerical
+                # pairs remain sufficient; an authored coefficient hook is an
+                # optional arithmetic improvement, not extra required metadata.
+                coefficients = build_affine_pair_coefficients(k)
+            if coefficients is not None:
+                setattr(self, coefficient_name, MethodType(coefficients, self))
+                self._affine_evaluators[k] = coefficient_name
+                self._affine_coefficient_fields[k] = fields
 
         # Retain the legacy aggregate attribute for downstream callers while
         # keeping the per-current truth needed by mixed mechanisms.
@@ -1218,6 +1272,10 @@ class Mechanism(Parameterized):
         for state in self.DE.values():
             state.instantiate_tables()
         self._install_monomorphic_advance()
+
+    def _validate_affine_current(self, current, v, g, j):
+        """Diagnostic frozen-state checks for the optional coefficient path."""
+        validate_affine_current(self, current, v, g, j)
 
     @staticmethod
     def _refresh_support_after_load(module, incompatible_keys):
@@ -2392,17 +2450,25 @@ class Mechanism(Parameterized):
         Parameters
         ----------
         *args : str
-            Current names satisfying ``I(v) = g * v + b``, where ``g`` and
-            ``b`` do not depend on ``v`` during a solver evaluation.
+            Current names satisfying ``I(v) = G * v - J``, where ``G`` and
+            ``J`` do not depend on ``v`` with gates and assigned values held
+            fixed during the solver stage.
 
         Notes
         -----
-        Dufort--Frankel can center an affine current exactly between its two
-        stored voltage levels. Analytic and numerically differentiated current
-        pairs do not by themselves prove this stronger property: a nonlinear
-        current may have a perfectly valid local derivative. Use ``AFFINE``
-        when source analysis cannot establish the affine form. An incorrect
-        declaration can produce an incorrect Dufort--Frankel trajectory.
+        This declaration authorizes coefficient assembly and exact affine
+        centering in Dufort--Frankel. Existing currents and analytic/numerical
+        conductance pairs remain sufficient. Optionally define
+        ``<current>_affine_terms(self, v) -> (G, J)`` to calculate coefficients
+        directly; an ordinary current is synthesized when it is omitted.
+        Automatically recognized symbolic affine currents need no declaration.
+
+        ``dn.ctx(MEMBRANE_ASSEMBLY="off")`` selects original current assembly;
+        ``"validate"`` diagnoses coefficient mismatches and nonlinear voltage
+        dependence using frozen-state probes. These probes do not prove
+        arbitrary code globally affine. Incorrect assertions can produce
+        incorrect trajectories. Inherited assertions and coefficient hooks do
+        not silently carry across an overridden current definition.
         """
         declare_class_value("mechanism.affine", args, Mechanism._affine_declarations)
 

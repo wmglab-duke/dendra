@@ -12,6 +12,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -554,6 +555,161 @@ class APCount(_ThresholdCallback):
     _bound_type = _BoundAPCount
 
 
+def _bind_activity_partition(partition, checked_nodes: int, at_least: int):
+    """Resolve contiguous checked-slot groups before transformed execution."""
+    if partition is None:
+        return None
+    try:
+        lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("partition must be a 1D sequence of integers") from exc
+    if lengths.ndim != 1:
+        raise ValueError("partition must be a 1D sequence of integers")
+    values = tuple(lengths.tolist())
+    if not values:
+        raise ValueError("partition must be non-empty")
+    if sum(values) != checked_nodes:
+        raise ValueError(
+            "sum(partition) must equal the number of checked compartments; "
+            f"got {sum(values)} and {checked_nodes}"
+        )
+    if min(values) < at_least:
+        raise ValueError("all partition values must be at least `at_least`")
+    return values
+
+
+def _activity_from_counts(count, at_least, inv, partition, *, total):
+    def reduce(values):
+        measure = values.sum(dim=-1) if total else torch.count_nonzero(values, dim=-1)
+        return measure >= at_least
+
+    if partition is None:
+        active = reduce(count)
+    else:
+        active = torch.stack(
+            [reduce(group) for group in torch.split(count, partition, dim=-1)],
+            dim=-1,
+        )
+    return ~active if inv else active
+
+
+@dataclass(frozen=True)
+class _BoundActiveAL(_BoundAPCount):
+    at_least: int
+    inv: bool
+    partition: tuple[int, ...] | None
+
+    def finalize(self, carry, emissions):
+        if emissions is not None:  # pragma: no cover - collection owns schema
+            raise FunctionalizationError("ActiveAL does not emit samples")
+        _below, count, _step = carry
+        return _activity_from_counts(
+            count, self.at_least, self.inv, self.partition, total=False
+        )
+
+
+@dataclass(frozen=True)
+class _BoundActiveALCount(_BoundActiveAL):
+    def finalize(self, carry, emissions):
+        if emissions is not None:  # pragma: no cover - collection owns schema
+            raise FunctionalizationError("ActiveALCount does not emit samples")
+        _below, count, _step = carry
+        return _activity_from_counts(
+            count, self.at_least, self.inv, self.partition, total=True
+        )
+
+
+class ActiveAL(APCount):
+    """Detect activity at at least ``at_least`` distinct checked slots.
+
+    A slot qualifies after any upward threshold crossing. Repeated crossings
+    at one slot do not satisfy a multi-slot target; use :class:`ActiveALCount`
+    for a total-spike target. The finalized Boolean result preserves all
+    batch/population axes and removes only the checked-slot axis.
+
+    ``partition`` optionally groups contiguous checked slots and appends a
+    group axis to the result. Unlike imperative ``is_active(partition)``, it
+    is fixed when callbacks are bound, so execution remains pure and compiled.
+    ``inv`` complements the final result. Hard activity is nondifferentiable;
+    adding this callback does not detach model state or Recorder outputs.
+    ``at_least`` must be a positive integer.
+    """
+
+    _bound_type = _BoundActiveAL
+
+    def __init__(
+        self,
+        threshold=0.0,
+        t_start_check=0.0,
+        t_end_check=None,
+        node_check=(5, -5),
+        dt=None,
+        at_least=1,
+        inv=False,
+        *,
+        partition=None,
+    ) -> None:
+        super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
+        if isinstance(at_least, bool) or not isinstance(at_least, Integral):
+            raise TypeError("at_least must be a positive integer")
+        if at_least < 1:
+            raise ValueError("at_least must be a positive integer")
+        self.at_least = int(at_least)
+        self.inv = bool(inv)
+        self.partition = partition
+
+    def _bind(self, functional: FunctionalPopulation):
+        configuration = _bind_threshold_configuration(
+            functional,
+            threshold=self.threshold,
+            t_start_check=self.t_start_check,
+            t_end_check=self.t_end_check,
+            node_check=self.node_check,
+            dt=self.dt,
+        )
+        partition = _bind_activity_partition(
+            self.partition, configuration[0].numel(), self.at_least
+        )
+        return self._bound_type(*configuration, self.at_least, self.inv, partition)
+
+
+class ActiveALCount(ActiveAL):
+    """Detect at least ``at_least`` total crossings across checked slots.
+
+    Repeated spikes at one checked slot contribute separately. Configuration,
+    window phase, inversion, partitioning, and explicit continuation follow
+    :class:`ActiveAL`. The returned tensor is Boolean, not a spike count.
+    """
+
+    _bound_type = _BoundActiveALCount
+
+
+class Active(ActiveAL):
+    """Detect whether any checked compartment crosses threshold at least once."""
+
+    def __init__(
+        self,
+        threshold=0.0,
+        t_start_check=0.0,
+        t_end_check=None,
+        node_check=(5, -5),
+        dt=None,
+        inv=False,
+        *,
+        partition=None,
+    ) -> None:
+        super().__init__(
+            threshold,
+            t_start_check,
+            t_end_check,
+            node_check,
+            dt,
+            at_least=1,
+            inv=inv,
+            partition=partition,
+        )
+
+
 @dataclass(frozen=True)
 class FunctionalCallbackResults(Mapping[str, object]):
     """Immutable finalized result envelope for one callback execution segment.
@@ -1011,6 +1167,8 @@ class FunctionalCallbacks:
                 AnomalyDetector,
                 _BoundRaster,
                 _BoundAPCount,
+                _BoundActiveAL,
+                _BoundActiveALCount,
             },
         )
 
@@ -1316,6 +1474,9 @@ class FunctionalCallbacks:
 
 __all__ = [
     "APCount",
+    "Active",
+    "ActiveAL",
+    "ActiveALCount",
     "AnomalyDetector",
     "FunctionalCallback",
     "FunctionalCallbackResults",

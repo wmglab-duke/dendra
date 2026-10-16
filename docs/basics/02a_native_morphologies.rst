@@ -671,13 +671,14 @@ authored endpoints:
    # Attach child x=0 to parent x=1.
    apic.connect(soma.at(1.0), child_end=0)
 
-   # Interior parent locations are supported.
-   basal.connect(soma.at(0.5), child_end=0)
+   # The child endpoint can instead be the receiver; parent interiors work.
+   basal.at(0).connect(soma.at(0.5))
 
    # Attaching authored child x=1 traverses toward decreasing authored x.
-   axon.connect(soma.at(0.0), child_end=1)
+   axon.at(1).connect(soma.at(0.0))
 
-The equivalent explicit form is useful when both endpoints should be visible:
+The equivalent Morphology-level form is useful when both endpoints should be
+passed to a builder explicitly:
 
 .. code-block:: python
 

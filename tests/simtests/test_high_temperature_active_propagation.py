@@ -91,6 +91,22 @@ def _canonical_currents(v, m, h_gate, n):
     }
 
 
+def _dendra_component_current(mechanism, name, voltage):
+    """Test-only diagnostics using the live Dendra parameters and gates."""
+    if name == "ina":
+        conductance = mechanism.gnabar * mechanism.m**3 * mechanism.h
+        reversal = mechanism.ena
+    elif name == "ik":
+        conductance = mechanism.gkbar * mechanism.n**4
+        reversal = mechanism.ek
+    elif name == "il":
+        conductance = mechanism.gl
+        reversal = mechanism.el
+    else:
+        raise ValueError(f"Unknown HH component current: {name!r}")
+    return conductance * (voltage - reversal)
+
+
 def _configure_neuron_hh(sections):
     for section in sections:
         section.insert("hh")
@@ -342,9 +358,12 @@ def _run_dendra(case, dt):
             "m": lambda _current: mechanism.m.index_select(-1, nodes),
             "h": lambda _current: mechanism.h.index_select(-1, nodes),
             "n": lambda _current: mechanism.n.index_select(-1, nodes),
-            "ina": lambda current: mechanism.ina(current.v).index_select(-1, nodes),
-            "ik": lambda current: mechanism.ik(current.v).index_select(-1, nodes),
-            "il": lambda current: mechanism.il(current.v).index_select(-1, nodes),
+            **{
+                name: lambda current, name=name: _dendra_component_current(
+                    mechanism, name, current.v
+                ).index_select(-1, nodes)
+                for name in CURRENT_NAMES
+            },
         }
     )
     model.run(tstop=TSTOP, dt=dt, callbacks=[recorder])

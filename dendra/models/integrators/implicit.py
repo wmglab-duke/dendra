@@ -121,14 +121,23 @@ class _bwd_euler_sc(Integrator):
         intra=None,
         *,
         solver=None,
+        membrane_source=None,
     ):
         """Return the shared closed-form single-compartment voltage update."""
         del dt, ve, solver
 
         denom = self.cmdt + gtot
-        v_new = v - itot / denom
-        if intra is not None:
-            v_new = v_new + (intra / self.area) / denom
+        if itot is None:
+            rhs = self.cmdt * v + membrane_source
+            if intra is not None:
+                rhs = rhs + intra / self.area
+            v_new = rhs / denom
+        else:
+            # Preserve the original subtraction and stimulus order for every
+            # unsupported/observed model; direct coefficients opt in above.
+            v_new = v - itot / denom
+            if intra is not None:
+                v_new = v_new + (intra / self.area) / denom
 
         i_membrane = None
         if self.imem:
@@ -136,6 +145,8 @@ class _bwd_euler_sc(Integrator):
             i_ion = itot + gtot * (v_new - v)
             i_membrane = (i_cap + i_ion) * self.area
         return v_new, i_membrane
+
+    _DIRECT_MEMBRANE_VOLTAGE_UPDATE = _voltage_update
 
 
 class _bwd_euler_sc_skip(Integrator):
@@ -483,6 +494,7 @@ class _bwd_euler_ub(Integrator):
         intra=None,
         *,
         solver=None,
+        membrane_source=None,
     ):
         """Return the shared unbranched implicit voltage update."""
         # Retain a logical singleton axis until dt is combined with spatial
@@ -494,10 +506,14 @@ class _bwd_euler_ub(Integrator):
             dt_s = dt * 1.0e-3
 
         v_flat = _flatten_to_solve(v, self.K, self.base_shape)
-        itot = _flatten_to_solve(itot, self.K, self.base_shape)
         gtot = _flatten_to_solve(gtot, self.K, self.base_shape)
-
-        f_n = (gtot * v_flat - itot) * self.scale
+        if itot is None:
+            f_n = (
+                _flatten_to_solve(membrane_source, self.K, self.base_shape) * self.scale
+            )
+        else:
+            itot = _flatten_to_solve(itot, self.K, self.base_shape)
+            f_n = (gtot * v_flat - itot) * self.scale
 
         if ve is not None:
             ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
@@ -553,6 +569,8 @@ class _bwd_euler_ub(Integrator):
             ).reshape(self.base_shape)
 
         return v_np1.reshape(self.base_shape), i_membrane
+
+    _DIRECT_MEMBRANE_VOLTAGE_UPDATE = _voltage_update
 
 
 class _bwd_euler_bt(Integrator):
@@ -903,32 +921,31 @@ class _bwd_euler_bt(Integrator):
         # advance gating
         self._advance_pre_current(v_state, dt, temp)
 
-        if call_local_currents:
-            evaluate = getattr(self.mech, "_evaluate_current_frame", None)
-            if evaluate is None:
-                raise RuntimeError(
-                    "call-local current evaluation requires a MechanismHandler "
-                    "with _evaluate_current_frame()"
-                )
-            (
-                itot,
-                gtot,
-                ion_current_frame,
-                ion_conductance_frame,
-            ) = evaluate(v_state)
-        else:
-            itot, gtot = self.mech.i(v_state)
-            ion_current_frame = self._capture_ion_current_frame()
-            ion_conductance_frame = self._capture_ion_conductance_frame()
+        (
+            gtot,
+            membrane_source,
+            itot,
+            ion_current_frame,
+            ion_conductance_frame,
+        ) = self._membrane_frame(v_state, call_local=call_local_currents)
 
         # linearized ionic conductances & reversal
         public_voltage_shape = self.base_shape[:-1]
         v_flat = _flatten_to_solve(v_state, self.K, public_voltage_shape)
         gtot = _flatten_to_solve(gtot, self.K, public_voltage_shape) * self.area
 
-        itot = _flatten_to_solve(itot, self.K, public_voltage_shape) * self.area
-
-        d = gtot * v_flat - itot
+        if itot is None:
+            # Capacitance uses vc, not the separately carried membrane v.
+            # Passive direct coefficients can be independent of v entirely.
+            # Retain the legacy cancellation's zero AD edge to that input so
+            # differentiating both state fields still returns zero, not unused.
+            d = (
+                _flatten_to_solve(membrane_source, self.K, public_voltage_shape)
+                + 0.0 * v_flat
+            ) * self.area
+        else:
+            itot = _flatten_to_solve(itot, self.K, public_voltage_shape) * self.area
+            d = gtot * v_flat - itot
 
         if intra is not None:
             d = d + _flatten_to_solve(intra, self.K, self.base_shape[:-1])
