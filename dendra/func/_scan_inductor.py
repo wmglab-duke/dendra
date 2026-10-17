@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import torch
 
+from dendra._bootstrap import isolate_compilation_callable
+
 
 def _select_copy(value, dim, index):
     return torch.ops.aten.select.int(value, dim, index).clone(
@@ -58,6 +60,7 @@ def _compile_scan(function, compile_options, *, prefer_cpp_wrapper=False):
     and AOTInductor keep their original routes. The incoming option dictionary
     is not modified, including its nested ``options`` dictionary.
     """
+    function = isolate_compilation_callable(function)
     options = dict(compile_options)
     if options.get("options") is not None:
         options["options"] = dict(options["options"])

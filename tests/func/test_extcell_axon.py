@@ -492,9 +492,16 @@ def test_extcell_checkpointed_runner_matches_ordinary_block_bptt():
     _assert_tree_close(checkpointed[0], ordinary[0])
     _assert_tree_close(checkpointed[1], ordinary[1])
     torch.testing.assert_close(checkpointed[2], ordinary[2], rtol=2.0e-10, atol=2.0e-11)
-    for actual, expected in zip(checkpointed[3], ordinary[3], strict=True):
+    for index, (actual, expected) in enumerate(
+        zip(checkpointed[3], ordinary[3], strict=True)
+    ):
         assert torch.isfinite(actual).all()
-        assert torch.count_nonzero(actual)
+        if index == 2:
+            # PAS has no voltage-dependent state, and capacitance depends on
+            # vc. The independently supplied membrane v has an exact zero VJP.
+            assert torch.count_nonzero(actual) == 0
+        else:
+            assert torch.count_nonzero(actual)
         torch.testing.assert_close(actual, expected, rtol=2.0e-8, atol=2.0e-10)
 
 

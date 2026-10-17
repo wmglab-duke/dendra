@@ -929,8 +929,6 @@ class _bwd_euler_bt(Integrator):
         solver=None,
         call_local_currents=False,
     ) -> Tuple[Tensor, Tensor]:
-        xg = self.xg[..., -1]
-
         # apply voltage processes
         v_state = self.mech.update_v(v)
 
@@ -948,7 +946,8 @@ class _bwd_euler_bt(Integrator):
         # linearized ionic conductances & reversal
         public_voltage_shape = self.base_shape[:-1]
         v_flat = _flatten_to_solve(v_state, self.K, public_voltage_shape)
-        gtot = _flatten_to_solve(gtot, self.K, public_voltage_shape) * self.area
+        gtot = _flatten_to_solve(gtot, self.K, public_voltage_shape)
+        v_prev_membrane = vc[..., 0] - vc[..., 1]
 
         if itot is None:
             # Capacitance uses vc, not the separately carried membrane v.
@@ -958,10 +957,13 @@ class _bwd_euler_bt(Integrator):
             d = (
                 _flatten_to_solve(membrane_source, self.K, public_voltage_shape)
                 + 0.0 * v_flat
+                - gtot * v_prev_membrane
             ) * self.area
         else:
-            itot = _flatten_to_solve(itot, self.K, public_voltage_shape) * self.area
-            d = gtot * v_flat - itot
+            itot = _flatten_to_solve(itot, self.K, public_voltage_shape)
+            d = (gtot * (v_flat - v_prev_membrane) - itot) * self.area
+            itot = itot * self.area
+        gtot = gtot * self.area
 
         if intra is not None:
             d = d + _flatten_to_solve(intra, self.K, self.base_shape[:-1])
@@ -985,13 +987,23 @@ class _bwd_euler_bt(Integrator):
             if ve is not None
             else None
         )
-        D_work = assemble_rhs(vc, self.c_rad, d, xg, ve_flat)
+        # Solve for a voltage increment. Forming rhs - A @ vc numerically
+        # would cancel large capacitance terms; their exact cancellation leaves
+        # only the physical membrane, shell, bath and axial current residuals.
+        D_work = _block_voltage_residual(vc, d, self.xg, ve_flat)
+        axial_flux = -self.lower * (vc[..., 1:, :] - vc[..., :-1, :])
+        sealed_end = torch.zeros_like(vc[..., :1, :])
+        D_work = (
+            D_work
+            + torch.cat((axial_flux, sealed_end), dim=-2)
+            - torch.cat((sealed_end, axial_flux), dim=-2)
+        )
 
         # solve block-tridiagonal system
         solve = self._solve if solver is None else solver
-        vc_new = solve(self.lower, B_work, self.upper, D_work).reshape(
+        vc_new = (vc + solve(self.lower, B_work, self.upper, D_work)).reshape(
             self.base_shape
-        )  # (model.shape)
+        )
         v_new = vc_new[..., 0] - vc_new[..., 1]  # v = vi - ve0
 
         i_membrane = None
@@ -1020,6 +1032,17 @@ class _bwd_euler_bt(Integrator):
         self._advance_post_current(v_state, dt, temp, accepted_frame)
 
         return vc_new, v_new, i_membrane
+
+
+def _block_voltage_residual(v_prev, membrane_residual, xg, e_ext):
+    """Assemble physical currents for a three-component voltage increment."""
+    zero = torch.zeros_like(membrane_residual)
+    shell_flux = xg[..., 0] * (v_prev[..., 1] - v_prev[..., 2])
+    bath_voltage = zero if e_ext is None else e_ext
+    bath_flux = xg[..., 1] * (bath_voltage - v_prev[..., 2])
+    membrane = torch.stack((membrane_residual, -membrane_residual, zero), dim=-1)
+    radial = torch.stack((zero, -shell_flux, shell_flux + bath_flux), dim=-1)
+    return membrane + radial
 
 
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):

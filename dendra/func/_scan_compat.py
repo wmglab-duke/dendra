@@ -6,6 +6,14 @@ filters those outputs, producing mismatched positional signatures. The repair
 below gives only the partitioner a private backward helper with the full mask.
 Shared utility functions and their existing callers are never replaced.
 
+Joint capture also keeps fake backward on one autograd thread. Mixed CPU/CUDA
+operands otherwise let engine workers share a FakeTensorMode whose kernel flag
+is not thread-local, racing with the dispatch state on those worker threads.
+
+Discrete operands retain their values during joint materialization. Torch's
+shared helper substitutes uninitialized storage for integer inputs; without a
+FakeTensorMode those examples become invalid callback indices/frame counters.
+
 Activation is persistent and process-wide at that partitioner entry point:
 backward and checkpoint replay can run after the selecting forward returns.
 Importing this module performs no activation and imports no private Torch HOP.
@@ -53,6 +61,12 @@ _FUNCTION_HASHES = {
     ): "0f86a3004800d832293a7943b1d74237e47e644b2ca59d0772a87129707335e2",
     ("torch._higher_order_ops.utils", "_clone_aliasing_output"): (
         "2008efe666f59d0595914684cf4a00b43c389aa849a529bed56b7c6640b8257f"
+    ),
+    ("torch._higher_order_ops.utils", "_from_fun"): (
+        "0d403226dcf80abb191b9ebc7fdc64acf77f555426a5713b1fecf4bb04dc9e59"
+    ),
+    ("torch._higher_order_ops.utils", "materialize_as_graph"): (
+        "030c9096f180e05ee232106ca661a4347a10c34ba8fee2350ee657537e5216f3"
     ),
     ("torch._higher_order_ops.partitioner", "create_hop_joint_graph"): (
         "b408b50d910adcc5864d73925a4b56034e5be264c5b4417c9e355529e6733cd9"
@@ -112,6 +126,11 @@ def _validate_sources():
     if partitioner.create_bw_fn is not utils.create_bw_fn:
         raise _unsupported("the partitioner's backward helper has already changed")
     references.append((partitioner, "create_bw_fn", partitioner.create_bw_fn))
+    if partitioner.materialize_as_graph is not utils.materialize_as_graph:
+        raise _unsupported("the partitioner's graph materializer has already changed")
+    references.append(
+        (partitioner, "materialize_as_graph", partitioner.materialize_as_graph)
+    )
     # The implementation below uses exactly this AOT constructor/entry point.
     aot = importlib.import_module("torch._functorch.aot_autograd")
     wrappers = modules["torch._functorch._aot_autograd.graph_capture_wrappers"]
@@ -119,6 +138,45 @@ def _validate_sources():
         raise _unsupported("the AOT joint entry point has already changed")
     references.append((aot, "create_joint", aot.create_joint))
     return modules, tuple(references), aot.AOTConfig, aot.create_joint
+
+
+def _make_value_preserving_materializer(utils):
+    """Retain discrete example values only in the scan partitioner's clone."""
+    original_from_fun = utils._from_fun
+
+    def from_fun_preserving_discrete(value):
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.dtype.is_floating_point
+            or value.dtype.is_complex
+        ):
+            return original_from_fun(value)
+        # Match the verified helper's Boolean unwrapping/clone semantics for
+        # all discrete tensors. Cloning a functional wrapper alone would keep
+        # its wrapper, rather than produce the required ordinary example.
+        if isinstance(value, utils.FunctionalTensor):
+            from torch._functorch.aot_autograd import from_fun
+
+            torch._sync(value)
+            value = from_fun(value)
+        elif torch._is_functional_tensor(value):
+            torch._sync(value)
+            value = torch._from_functional_tensor(value)
+        return value.clone()
+
+    original = utils.materialize_as_graph
+    private_globals = dict(original.__globals__)
+    private_globals["_from_fun"] = from_fun_preserving_discrete
+    materialize = FunctionType(
+        original.__code__,
+        private_globals,
+        original.__name__,
+        original.__defaults__,
+        original.__closure__,
+    )
+    update_wrapper(materialize, original)
+    materialize.__kwdefaults__ = original.__kwdefaults__
+    return materialize
 
 
 def _make_full_output_backward(utils, aot_config_type, create_joint):
@@ -153,7 +211,13 @@ def _make_full_output_backward(utils, aot_config_type, create_joint):
         def flat_backward(*primals_and_tangents):
             primals = primals_and_tangents[:primal_count]
             tangents = primals_and_tangents[primal_count:]
-            outputs, gradients = joint(primals, tangents)
+            # This traces backward with one shared FakeTensorMode, including
+            # CPU scheduling carry and CUDA model tensors. Parallel autograd
+            # workers race its per-mode kernel flag against thread-local Meta
+            # dispatch state. Scope serialization to capture, restoring the
+            # caller's policy before any real compiled backward can execute.
+            with torch.autograd.set_multithreading_enabled(False):
+                outputs, gradients = joint(primals, tangents)
             if len(gradients) != primal_count:
                 raise AssertionError(
                     f"Expected {primal_count} input gradients, got {len(gradients)}"
@@ -180,7 +244,7 @@ def install_scan_compatibility():
     Repeated calls are idempotent. Unknown Torch versions, changed installed
     sources, or replaced shared helpers are rejected before installation.
     The only assignment into Torch is ``partitioner.create_hop_joint_graph``;
-    its cloned function uses private globals and a private backward helper.
+    its cloned function uses private globals, backward helper, and materializer.
     No source files are modified and no source text is executed.
     """
     global _INSTALLED
@@ -211,6 +275,9 @@ def install_scan_compatibility():
         private_globals = dict(original.__globals__)
         private_globals["create_bw_fn"] = _make_full_output_backward(
             modules["torch._higher_order_ops.utils"], aot_config_type, create_joint
+        )
+        private_globals["materialize_as_graph"] = _make_value_preserving_materializer(
+            modules["torch._higher_order_ops.utils"]
         )
         patched = FunctionType(
             original.__code__,

@@ -83,7 +83,9 @@ def _sympify_diff_eq(diff_string, vars):
     return x, dxdt
 
 
-def integrate2c(diff_string, dt_var, vars, use_pade_approx=False):
+def integrate2c(
+    diff_string, dt_var, vars, use_pade_approx=False, *, stable_linear=False
+):
     """Analytically integrate supplied derivative, return solution as C code.
 
     Given a differential equation of the form x' = f(x), the value of
@@ -104,6 +106,12 @@ def integrate2c(diff_string, dt_var, vars, use_pade_approx=False):
     Optionally, the analytic result can be expanded in powers of dt,
     and the (1,1) Pade approximant to the solution returned.
     This approximate solution is correct to second order in dt.
+
+    With ``stable_linear=True``, an inhomogeneous linear exact solution is
+    emitted through the tensor-safe ``_linear_exact_step`` helper, which the
+    caller must provide in the generated namespace. This avoids cancellation
+    near equilibrium, at small rates, and under stiff decay;
+    constant, homogeneous, nonlinear and Pade solutions retain their forms.
 
     Args:
         diff_string: Derivative to be integrated e.g. "x' = a*x + b"
@@ -153,9 +161,14 @@ def integrate2c(diff_string, dt_var, vars, use_pade_approx=False):
         # x' = c0 + c1*x
         # x(t+dt) = (-c0 + (c0 + c1*x(t))*exp(c1*dt))/c1
         c0 = (dxdt - c1 * x).simplify()
-        solution = (-c0 / c1).simplify() + (c0 + c1 * x).simplify() * sp.exp(
-            c1 * dt
-        ) / c1
+        if stable_linear and not use_pade_approx and c0 != 0:
+            # Preserve the authored rate: expanding (x_inf-x)/tau into
+            # separately rounded terms would spoil its exact equilibrium.
+            solution = sp.Function("_linear_exact_step")(x, dxdt, c0, c1, dt)
+        else:
+            solution = (-c0 / c1).simplify() + (c0 + c1 * x).simplify() * sp.exp(
+                c1 * dt
+            ) / c1
     else:
         # otherwise try to solve ODE with sympy:
         # first classify ODE, if it is too hard then exit

@@ -146,9 +146,11 @@ The topology list below describes functional *transition* support from an
 initialized tensor state. Fresh functional initialization is a narrower
 capability: it currently supports exact ``SingleCompartment`` and structurally
 canonical ``Unmyelinated`` models, including compatible subclasses, with their
-standard implicit integrators. This includes the Tigerholm/Thio models with
-registered pure resting-balance transforms. Other admitted models can still
-start from the extracted ``tensors.state``.
+standard implicit integrators, plus exact scalar ``Tree`` models with canonical
+``dhs``. The compatible-subclass admission applies to ``Unmyelinated``;
+``Tree`` subclasses remain outside fresh-initialization support. This includes
+the Tigerholm/Thio models with registered pure resting-balance transforms. Other
+admitted models can still start from the extracted ``tensors.state``.
 
 The current transition API supports initialized models with all of the
 following properties:
@@ -792,10 +794,11 @@ over the default compiled chunks.
 Scan uses a Dendra-maintained compatibility fix without modifying installed
 PyTorch files. The audited HOP/AOT sources are byte-identical in the supported
 2.14.0 and 2.14.1 builds; both need the same repair to preserve positional
-cotangents for integer and Boolean outputs. Activation verifies the installed
-source and callable fingerprints, not just the version number. It replaces
-only the HOP partitioner's joint-graph entry point with a privately bound
-helper; shared backward utilities are unchanged. This process-wide activation
+cotangents for integer and Boolean outputs and retain discrete input values
+during joint-graph capture. Activation verifies the installed source and
+callable fingerprints, not just the version number. It replaces only the HOP
+partitioner's joint-graph entry point with privately bound backward and
+materialization helpers; shared Torch utilities are unchanged. This process-wide activation
 persists for backward and checkpoint replay after forward execution returns.
 Unsupported PyTorch builds raise ``FunctionalizationError``;
 omit ``execution="scan"`` to use the default compiled chunks on those builds.
@@ -1524,6 +1527,30 @@ is not a promise of one device-resident kernel: host orchestration and
 per-block synchronization may remain, particularly for ``torch.while_loop``.
 Cold lowering, purity validation and host runners may synchronize to inspect
 tensor values; these audits are not part of a fully device-resident optimizer.
+
+Numerical coefficients, block workspaces and linear solves retain the model's
+floating-point dtype: float32 models are not automatically promoted to float64.
+Scalar Tree and packed scalar DHS transitions solve for voltage increments,
+assembling axial currents from edge voltage differences. This preserves the
+uniform unforced voltage mode, including zero-area junctions. CUDA elimination
+accumulates each edge's Schur contribution together to avoid cancelling large
+diagonal updates. Exact inhomogeneous linear ``cnexp`` state updates use
+``x + dt * rate / expinv(c * dt)``, where ``c`` is the signed linear coefficient
+in ``x' = source + c*x`` and ``expinv(z) = z/expm1(z)``. This retains small gate
+increments and their derivatives near equilibrium. These algebraic
+updates use the equivalent equilibrium-plus-transient form when
+``abs(c * dt) > 0.5``, preserving small equilibria under stiff decay. Both
+forms keep the same integration scheme without refinement solves.
+
+Stiff finite-extracellular systems and nearly uniform voltages can make small
+geometry gradients sensitive to roundoff, even when voltage trajectories agree.
+Near-equilibrium authored rates can lose relative accuracy before the state
+update, so very small timestep sensitivities can also remain fragile.
+Solving for voltage increments reduces cancellation but does not eliminate
+conditioning limits. When accuracy of small sensitivities matters, compare
+against a model explicitly constructed or converted to float64 before calling
+``dn.func.make_functional`` or ``dn.func.compile``.
+
 Branched Triton DHS kernels use atomic reductions. Last-bit scheduling
 differences can therefore trigger the existing strict repeated-output purity
 audit; CUDA support does not disable or weaken that audit. This remains a
@@ -1606,6 +1633,13 @@ Initialization uses an owned contiguous copy of that value, while preserving
 its autograd graph, and always starts the returned clock and initialization-time
 mechanism timestep at zero. Ordinary ``Population.initialize()`` uses the same
 construction-fresh clock when it is called again after a simulation.
+Voltage and mechanism state retain the model dtype, including float32; fresh
+initialization does not promote physical calculations to float64. Clock/control
+leaves retain their separately declared schemas. When an experiment requires
+initial gates to remain fixed during differentiation, construct the initial
+bundle under ``torch.no_grad()`` or explicitly detach the corresponding returned
+state leaves before differentiating the subsequent rollout. The initializer
+itself remains differentiable with respect to its explicit inputs.
 ``tensors.initialization.states`` exposes insertion-time ``ic`` values as
 support-local tensors. Replacing these values is likewise differentiable, and
 ``ic`` retains precedence over ``State.state_defaults(v, values)``. Other
@@ -1664,10 +1698,18 @@ guessed or traced by the functional initializer.
 
 Fresh functional initialization supports exact ``SingleCompartment`` models
 using ``bwd_euler_sc`` and structurally canonical ``Unmyelinated`` models using
-``bwd_euler_ub``. An ``Unmyelinated`` subclass may define its mechanisms,
-parameterization, and registered pure initialization transforms while retaining
-the standard geometry and lifecycle methods. It accepts multiple stateful or
-stateless mechanisms over dense or regional support when every declared State
+``bwd_euler_ub``, plus exact scalar ``Tree`` models using canonical ``dhs``.
+The Tree path reuses its admitted immutable geometry and support maps, copies
+the explicit initial voltage across every solver node, and recomputes mechanism
+state only at each mechanism's declared support. Zero-area junction voltages
+therefore remain part of the voltage state without acquiring an undeclared
+membrane mechanism. It performs the same initialization transaction as the
+other admitted families rather than restoring cached initialized state.
+``Tree`` subclasses, block/extracellular Trees, and packed MultiPopulations are
+not admitted by this extension. An ``Unmyelinated`` subclass may define its
+mechanisms, parameterization, and registered pure initialization transforms
+while retaining the standard geometry and lifecycle methods. It accepts multiple
+stateful or stateless mechanisms over dense or regional support when every declared State
 value is supplied by an insertion-time ``ic``, a canonical shared write seed,
 ``state_defaults``, or ``initial_values``. Dendra resets ``CARRY`` to zero
 before the pure initialization overlays run.

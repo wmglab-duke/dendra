@@ -13,10 +13,17 @@ from .core import (
     _flatten_to_solve,
     _model_solve_shape,
 )
-from .implicit import assemble_rhs, assemble_rhs_into
+from .implicit import (
+    _block_voltage_residual,
+)
+from .implicit import assemble_rhs as assemble_rhs
+from .implicit import assemble_rhs_into as assemble_rhs_into
 from .tree import (
     _compiled_tree_graph_view,
+    _cuda_solver_binding,
+    _install_topology_buffer,
     _refresh_owned_cpu_plan,
+    _topology_initialization_contract,
     _validate_dhs_threads,
     _validate_tree_graph,
     graph_to_parent_and_axial,
@@ -191,7 +198,9 @@ class _dhs_bt(Integrator):
     def _select_solver(self, device):
         device = torch.device(device)
         if device.type == "cuda":
-            self._solve = partial(dhs_bt_solve_cuda, threads=self.threads)
+            self._solve = _cuda_solver_binding(
+                getattr(self, "_solve", None), dhs_bt_solve_cuda, self.threads
+            )
         elif device.type == "cpu":
             if not DENDRA_SOLVERS_AVAILABLE:
                 raise ImportError(
@@ -350,6 +359,13 @@ class _dhs_bt(Integrator):
         }
 
     def initialize(self, model, dt):
+        topology_contract = _topology_initialization_contract(self, model)
+        install_topology = partial(
+            _install_topology_buffer,
+            self,
+            preserve=topology_contract
+            == getattr(self, "_topology_initialization_contract", None),
+        )
         dev, dtyp = model.device(), model.dtype()
         self.to(dev)
 
@@ -370,13 +386,13 @@ class _dhs_bt(Integrator):
             graph = graph[0]
         parent_idx, depth, node_order = _topo_parent_depth(graph)
         order, layer_ptr = _build_layers(depth.to(torch.int32), self.threads)
-        self.solver_order.copy_(
-            torch.as_tensor(node_order, dtype=torch.int64, device=dev)
+        install_topology(
+            "solver_order", torch.as_tensor(node_order, dtype=torch.int64, device=dev)
         )
-        self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))
-        self.parent_idx.copy_(parent_idx.to(device=dev, dtype=torch.int64))
-        self.order.copy_(order.to(device=dev, dtype=torch.int64))
-        self.layer_ptr = layer_ptr.to(device=dev, dtype=torch.int64)
+        install_topology("inv_solver_order", torch.argsort(self.solver_order, dim=0))
+        install_topology("parent_idx", parent_idx.to(device=dev, dtype=torch.int64))
+        install_topology("order", order.to(device=dev, dtype=torch.int64))
+        install_topology("layer_ptr", layer_ptr.to(device=dev, dtype=torch.int64))
 
         # Retain explicit storage-order topology for pure preparation and future
         # functional extraction. ``parent_idx`` itself remains in DHS order.
@@ -388,9 +404,9 @@ class _dhs_bt(Integrator):
             parent_orig >= 0
         ]
         edge_parent_orig = parent_orig.index_select(0, edge_child_orig)
-        self.parent_idx_orig.copy_(parent_orig)
-        self.edge_child_orig.copy_(edge_child_orig)
-        self.edge_parent_orig.copy_(edge_parent_orig)
+        install_topology("parent_idx_orig", parent_orig)
+        install_topology("edge_child_orig", edge_child_orig)
+        install_topology("edge_parent_orig", edge_parent_orig)
 
         rhoa_scale = _as_solve_matrix(model.rhoa_scale, model)
         canonical_resistance = getattr(model, "edge_resistance_ohm", None)
@@ -441,6 +457,7 @@ class _dhs_bt(Integrator):
         )
         self._install_prepared_workspace(workspace)
         self._refresh_cpu_topology_plan()
+        self._topology_initialization_contract = topology_contract
 
         # Initializing solver geometry must not reset a live simulation.  A
         # missing or shape-stale block state is seeded from the current
@@ -494,8 +511,9 @@ class _dhs_bt(Integrator):
             ion_conductance_frame,
         ) = self._membrane_frame(v_state, call_local=call_local_currents)
 
-        # RHS (mechanism order), keep everything in mV/mA/S:
-        # d_lin = (g*v - itot) * area  [mA]
+        # Assemble physical currents for A * delta_vc = residual. Capacitive
+        # old-state terms cancel analytically, so neither the primal nor its
+        # geometry derivatives subtract large absolute-voltage products.
         public_voltage_shape = self.base_shape[:-1]
         if call_local_currents:
             v_flat = _flatten_to_solve(v_state, self.K, public_voltage_shape)
@@ -503,12 +521,12 @@ class _dhs_bt(Integrator):
         else:
             v_flat = self._flat_voltage(v_state)
             gtot_flat = self._flat_voltage(gtot)
+        vprev_mem = vc[..., 0] - vc[..., 1]
         if itot is None:
             itot_flat = None
-            # As in block Euler, preserve a zero AD edge to the separately
-            # carried membrane voltage when coefficients are voltage-free.
-            d_lin = (
+            membrane_residual = (
                 _flatten_to_solve(membrane_source, self.K, public_voltage_shape)
+                - gtot_flat * vprev_mem
                 + 0.0 * v_flat
             ) * self.area
         else:
@@ -517,9 +535,11 @@ class _dhs_bt(Integrator):
                 if call_local_currents
                 else self._flat_voltage(itot)
             )
-            d_lin = (gtot_flat * v_flat - itot_flat) * self.area
+            membrane_residual = (
+                gtot_flat * (v_flat - vprev_mem) - itot_flat
+            ) * self.area
         if intra is not None:
-            d_lin = d_lin + _flatten_to_solve(
+            membrane_residual = membrane_residual + _flatten_to_solve(
                 intra,
                 self.K,
                 public_voltage_shape if call_local_currents else None,
@@ -534,33 +554,26 @@ class _dhs_bt(Integrator):
             if ve is not None
             else None
         )
-        xg_outer = self.xg[..., -1]
-        if call_local_currents:
-            # Shared out-of-place block assembly is safe when any operand owns
-            # a hidden torch.func lane, including an empty lane batch.
-            rhs_mech = assemble_rhs(
-                vc,
-                self.c_rad,
-                d_lin,
-                xg_outer,
-                ve_flat,
-            )
-        else:
-            # Keep the ordinary allocation-efficient fill path. ``rhs_mech`` is
-            # fresh disposable storage and never aliases model carry.
-            rhs_mech = assemble_rhs_into(
-                torch.empty_like(vc),
-                vc,
-                self.c_rad,
-                d_lin,
-                xg_outer,
-                ve_flat,
-            )
+        rhs_mech = _block_voltage_residual(vc, membrane_residual, self.xg, ve_flat)
 
-        # Reorder into solver order
+        # Reorder and add axial flow in solver order. Out-of-place scatter
+        # preserves hidden torch.func lanes, including an empty lane batch.
         idx = self.solver_order
-        rhs_ = rhs_mech.index_select(1, idx)  # (B,K,3)
+        vc_solver = vc.index_select(1, idx)
         G_ = self.g_to_parent
+        safe_parent = self.parent_idx.clamp_min(0).to(torch.long)
+        root = (self.parent_idx < 0).reshape(1, -1, 1)
+        axial_flux = torch.where(
+            root,
+            G_ * vc_solver,
+            G_ * (vc_solver - vc_solver.index_select(1, safe_parent)),
+        )
+        rhs_ = rhs_mech.index_select(1, idx) - axial_flux
+        rhs_ = rhs_.scatter_add(
+            1,
+            safe_parent.reshape(1, -1, 1).expand_as(axial_flux),
+            torch.where(root, torch.zeros_like(axial_flux), axial_flux),
+        )
 
         # Inject membrane gtot (scaled by area) into [vi, ve0] block (solver order)
         g_mech = gtot_flat * self.area  # (B,K) S (mechanism order)
@@ -584,7 +597,7 @@ class _dhs_bt(Integrator):
             Dm[..., 0, 1] -= g_
             Dm[..., 1, 0] -= g_
 
-        # Solve in solver order (kernel expects S @ mV = mA)
+        # Solve the increment in solver order (S @ mV = mA).
         if solver is None and self._cpu_topology_plan is not None:
             X_ = torch.ops.dendra_solvers.dhs_bt_solve_plan(
                 Dm, G_, rhs_, self._cpu_topology_plan._token
@@ -600,9 +613,9 @@ class _dhs_bt(Integrator):
                 self.layer_ptr,
             )  # (B,K,3) in mV
 
-        # Map solution back to mechanism order
+        # Publish absolute circuit potentials in mechanism order.
         inv = self.inv_solver_order
-        vc_out = X_.index_select(1, inv).reshape(self.base_shape)  # (B,K,3) mV
+        vc_out = (vc_solver + X_).index_select(1, inv).reshape(self.base_shape)
         v_out = vc_out[..., 0] - vc_out[..., 1]  # membrane (mV)
 
         i_membrane = None

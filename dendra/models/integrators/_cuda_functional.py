@@ -328,10 +328,17 @@ def _multi_parent_plane(template, plan):
     """Expand row-local parents with tensor ops, never a host topology read."""
     p_cat, _order, layer_ptr, p_off, _o_off, l_off, levels, row_base, row_count = plan
     rows, width = template.shape
-    row = torch.arange(rows, device=template.device).unsqueeze(1)
-    bases = row_base.to(torch.long).unsqueeze(0)
-    counts = row_count.to(torch.long).unsqueeze(0)
-    owner = ((row >= bases) & (row < bases + counts)).to(torch.long).argmax(dim=1)
+    bases = row_base.to(torch.long)
+    counts = row_count.to(torch.long)
+    # A valid packed plan partitions the rows into disjoint warp intervals.
+    # Mark each interval's two boundaries and scan the markers to recover its
+    # owner, including when the plan lists warps out of row order. Comparing
+    # every row with every warp would need quadratic workspace as vmap grows.
+    labels = torch.arange(1, bases.numel() + 1, device=template.device)
+    boundaries = torch.zeros(rows + 1, dtype=torch.long, device=template.device)
+    boundaries = boundaries.scatter_add(0, bases, labels)
+    boundaries = boundaries.scatter_add(0, bases + counts, -labels)
+    owner = (boundaries.cumsum(0)[:rows] - 1).clamp_min(0)
     offsets = p_off.to(torch.long).index_select(0, owner)
     ends = l_off.to(torch.long).index_select(0, owner) + levels.to(
         torch.long

@@ -1384,8 +1384,6 @@ class Population(P, Sliceable):
         self.post_initialize_hooks: List[Callable] = []
         self._initialization_transforms = torch.nn.ModuleDict()
 
-        reset_torch_compiler(prefer_public=False)
-
         # Keep the state-mutating Population/Integrator wrapper eager.  JIT
         # settings are propagated to the integrator, which compiles only its
         # tensor-valued numerical kernels.  This avoids Dynamo tracing
@@ -2975,9 +2973,9 @@ class Population(P, Sliceable):
         if integrator is None:
             return
         integrator.initialized = False
-        compiled = getattr(integrator, "_compiled_kernels", None)
-        if hasattr(compiled, "clear"):
-            compiled.clear()
+        # Rebuild numeric workspaces from the transformed parameters/state.
+        # Compiled callables read those live operands; their guards still
+        # specialize genuine schema changes without discarding valid graphs.
 
     def _execute_initialization_transform(self, action_name, *, phase):
         try:

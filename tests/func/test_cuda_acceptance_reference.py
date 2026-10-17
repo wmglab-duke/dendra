@@ -47,6 +47,26 @@ def test_cuda_acceptance_helpers_match_cpu_imperative_oracle(kind, dtype):
     _close_gradients(gradients, expected_gradients, dtype=dtype)
 
 
+@pytest.mark.skipif(
+    not DENDRA_SOLVERS_AVAILABLE, reason="CPU acceptance oracle requires dendra-solvers"
+)
+@pytest.mark.parametrize("kind", ["ext_axon", "ext_tree"])
+def test_uniform_extcell_float32_source_gradients_match_float64(kind):
+    gradients = {}
+    for dtype in (torch.float32, torch.float64):
+        model = _model(kind, device="cpu", dtype=dtype)
+        with dn.ctx(JIT=0, REQUIRE_GRAD=1, DEVICE="cpu", DTYPE=dtype):
+            _, _, _, gradients[dtype] = _functional_result(kind, model)
+    # The original uniform-voltage case has a weak geometry signal. Check it
+    # against float64, since agreement between two float32 paths alone could
+    # hide cancellation in the physical coefficient gradients.
+    _close_gradients(
+        {name: value.double() for name, value in gradients[torch.float32].items()},
+        gradients[torch.float64],
+        dtype=torch.float32,
+    )
+
+
 @pytest.mark.parametrize("execution", ["scan", "while"])
 def test_cuda_recording_helpers_match_public_compiled_runner_on_cpu(execution):
     model = _model("sc", device="cpu", dtype=torch.float32)

@@ -13,6 +13,7 @@ import uuid
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
+from types import FunctionType, MethodType
 
 _DISABLED_INDUCTOR_CACHE_POLICIES = {
     "0",
@@ -116,6 +117,36 @@ def reset_torch_compiler(*, prefer_public: bool = True) -> None:
             torch.compiler.reset()
         elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
             torch._dynamo.reset()
+
+
+def isolate_compilation_callable(function):
+    """Give an owned Python compilation root its own specialization budget.
+
+    Dynamo caches specializations by code object. Independent models and
+    execution plans must not exhaust one shared method or closure's budget.
+    Preserve live globals, closure cells, defaults, and bound-owner reads;
+    only the owned root code object changes. Ordinary tensor guards remain.
+    """
+    owner = function.__self__ if isinstance(function, MethodType) else None
+    source = function.__func__ if isinstance(function, MethodType) else function
+    if not isinstance(source, FunctionType):
+        return function
+    isolated = FunctionType(
+        source.__code__.replace(),
+        source.__globals__,
+        source.__name__,
+        source.__defaults__,
+        source.__closure__,
+    )
+    isolated.__kwdefaults__ = source.__kwdefaults__
+    isolated.__annotations__ = source.__annotations__
+    isolated.__dict__.update(source.__dict__)
+    isolated.__qualname__ = source.__qualname__
+    isolated.__module__ = source.__module__
+    isolated.__doc__ = source.__doc__
+    if hasattr(source, "__type_params__"):
+        isolated.__type_params__ = source.__type_params__
+    return MethodType(isolated, owner) if owner is not None else isolated
 
 
 def _truthy(x: str | None) -> bool:

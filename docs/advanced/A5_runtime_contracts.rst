@@ -121,6 +121,27 @@ snapshots of mutable workspace inputs. This uses more time and memory than the
 ordinary fast guard. Construct ordinary tensors and use ``torch.no_grad()`` for
 the lowest-overhead inference loop.
 
+Compiled kernels across initialization
+--------------------------------------
+
+Constructing a ``Population`` or constructing/rebuilding a ``Network`` does
+not reset PyTorch's process-wide compiler cache. Existing compiled models can
+continue running independently. Python numerical kernels and functional chunks
+use separate compilation identities, so independent models do not consume a
+shared method's specialization budget.
+
+Reinitialization still reconstructs state and solver coefficients from the
+current parameters. It retains compatible compiled integrator callables and
+unchanged Tree topology plans. The callables read the refreshed tensors;
+retaining a callable does not retain an old parameter value or autograd graph.
+Changes to shape, dtype/device, topology, mechanism structure, or compiler
+settings can require a new compiled specialization. External topology mutation
+and failed workspace initialization retain their existing invalidation checks.
+
+Use ``clear_jit_cache()`` to discard an owner's compiled callables explicitly.
+``pickleable(reset_global_compiler=True)`` remains an explicit request to reset
+the process-wide compiler cache; ordinary serialization does not require it.
+
 Reinitializing the correct owner
 --------------------------------
 

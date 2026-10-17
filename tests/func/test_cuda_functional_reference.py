@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from dendra.models.integrators import _cuda_functional as facade
 
@@ -329,6 +330,56 @@ def test_tree_topology_mapped_vmap_fails_before_raw_dispatch(dense_raw_operators
     with pytest.raises(ValueError, match="topology.*shared"):
         torch.vmap(solve)(torch.stack((parent, parent)))
     assert dense_raw_operators["tree"] == 0
+
+
+def test_multi_parent_plane_handles_unordered_warp_intervals():
+    case = _case("multi")
+    plan = (*case.metadata[:3], *(value.flip(0) for value in case.metadata[3:]))
+    parent, active = facade._multi_parent_plane(case.values[-1], plan)
+    torch.testing.assert_close(
+        parent,
+        torch.tensor([[1, -1, 1, -1, -1], [1, -1, 1, -1, -1], [-1, 0, -1, -1, -1]]),
+    )
+    torch.testing.assert_close(
+        active,
+        torch.tensor(
+            [[True, True, True, False, False]] * 2 + [[True, True, False, False, False]]
+        ),
+    )
+
+
+def test_multi_parent_plane_workspace_scales_with_rows_and_warps():
+    # One single-node morphology per warp is a valid worst case for plan size.
+    # Its ownership workspace must stay small even though rows and warps grow
+    # together, as they do under population batching and vmap.
+    rows = 257
+    offsets = torch.zeros(rows, dtype=torch.long)
+    plan = (
+        torch.tensor([-1]),
+        torch.tensor([0]),
+        torch.tensor([0, 1]),
+        offsets,
+        offsets,
+        offsets,
+        torch.ones(rows, dtype=torch.long),
+        torch.arange(rows),
+        torch.ones(rows, dtype=torch.long),
+    )
+
+    class BoundWorkspace(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            for value in torch.utils._pytree.tree_leaves(result):
+                if isinstance(value, torch.Tensor):
+                    assert value.numel() <= 12 * rows, (
+                        f"{func} allocated {value.numel()} entries for {rows} rows"
+                    )
+            return result
+
+    with BoundWorkspace():
+        parent, active = facade._multi_parent_plane(torch.empty(rows, 1), plan)
+    torch.testing.assert_close(parent, torch.full((rows, 1), -1, dtype=torch.long))
+    assert active.all()
 
 
 @pytest.mark.parametrize("family", ("dhs", "dhs_bt", "multi"))

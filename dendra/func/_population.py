@@ -40,6 +40,7 @@ from dendra.models.integrators.cable import (
 )
 from dendra.models.integrators.core import _FunctionalIntegratorSpec
 from dendra.models.integrators.implicit import _bwd_euler_sc, _bwd_euler_ub
+from dendra.models.integrators.tree import _dhs
 from dendra.models.integrators.tree_bt import _tree_layered_edge_conductance
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion
@@ -200,7 +201,7 @@ _STANDARD_POPULATION_FRESH_INITIALIZATION = {
         name: inspect.getattr_static(population_type, name)
         for name in _POPULATION_FRESH_INITIALIZATION_HOOKS
     }
-    for population_type in (SingleCompartment, Unmyelinated)
+    for population_type in (SingleCompartment, Unmyelinated, Tree)
 }
 _INTEGRATOR_FRESH_INITIALIZATION_HOOKS = ("init_v",)
 _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
@@ -208,7 +209,7 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
         name: inspect.getattr_static(implementation, name)
         for name in _INTEGRATOR_FRESH_INITIALIZATION_HOOKS
     }
-    for implementation in (_bwd_euler_sc, _bwd_euler_ub)
+    for implementation in (_bwd_euler_sc, _bwd_euler_ub, _dhs)
 }
 
 
@@ -219,13 +220,17 @@ def _functional_initialization_profile(population):
     not admitted by the transition contract. Unmyelinated subclasses may add
     mechanisms and construction-time parameterization while retaining the same
     scalar-path voltage and lifecycle semantics; their inherited hooks are
-    checked against the canonical base separately.
+    checked against the canonical base separately. Canonical scalar Trees use
+    the same voltage initialization and support-local mechanism transaction;
+    their already-lowered graph supplies immutable geometry and support maps.
     """
 
     if type(population) is SingleCompartment:
         return SingleCompartment, "scalar_point", _bwd_euler_sc
     if isinstance(population, Unmyelinated):
         return Unmyelinated, "scalar_path", _bwd_euler_ub
+    if type(population) is Tree:
+        return Tree, "scalar_tree", _dhs
     return None
 
 
@@ -4012,8 +4017,8 @@ def _functional_initialization_failures(population: Population) -> list[str]:
 
     Functional transition admission is intentionally broader. This initializer
     supports declared State plus canonical Ion/Material tensor transactions on
-    the exact single-compartment and structurally canonical unmyelinated
-    implicit-Euler topologies.
+    the exact single-compartment, structurally canonical unmyelinated, and
+    exact scalar Tree implicit-Euler topologies.
     Authored shared-field hooks and process initialization remain imperative and
     fail closed until their outputs have an explicit pure contract.
     """
@@ -4024,7 +4029,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         failures.append(
             "functional initialization currently supports exact "
             "SingleCompartment and structurally canonical Unmyelinated "
-            "Populations"
+            "Populations, plus exact scalar Tree Populations"
         )
         population_family = None
         operator_kind = None
@@ -4040,7 +4045,8 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         if spec is None or spec.implementation is not implementation:
             failures.append(
                 "functional initialization currently supports bwd_euler_sc "
-                "for SingleCompartment and bwd_euler_ub for Unmyelinated"
+                "for SingleCompartment, bwd_euler_ub for Unmyelinated, and "
+                "dhs for scalar Tree"
             )
 
     population_standards = _STANDARD_POPULATION_FRESH_INITIALIZATION.get(

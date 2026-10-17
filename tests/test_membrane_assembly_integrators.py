@@ -593,7 +593,12 @@ def test_passive_block_ub_retains_zero_gradient_to_shadow_membrane_voltage(monke
             ),
         )
         gradient = torch.autograd.grad(final["integrator"]["v"].sum(), voltage)[0]
-        torch.testing.assert_close(gradient, torch.zeros_like(voltage), rtol=0, atol=0)
+        # The legacy g*v - itot formula cancels two floating-point AD paths;
+        # the direct source has an explicit, exact zero edge to this input.
+        atol = 0 if direct else torch.finfo(gradient.dtype).eps
+        torch.testing.assert_close(
+            gradient, torch.zeros_like(voltage), rtol=0, atol=atol
+        )
         return final["integrator"]["v"].detach(), gradient.detach()
 
     direct = response(direct=True)

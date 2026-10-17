@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dendra._bootstrap import isolate_compilation_callable
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._execution import (
@@ -94,7 +95,9 @@ class CompiledPopulationChunk:
                 stepwise_stimulation=_stepwise_stimulation,
             )
         else:
-            self._compiled = torch.compile(self._lowered, **options)
+            self._compiled = torch.compile(
+                isolate_compilation_callable(self._lowered.__call__), **options
+            )
 
     @property
     def steps(self) -> int:
@@ -367,7 +370,9 @@ class _CompiledCallbackPopulationChunk:
                 compile_options=compile_options,
             )
         else:
-            self._compiled = torch.compile(self._lowered, **compile_options)
+            self._compiled = torch.compile(
+                isolate_compilation_callable(self._lowered.__call__), **compile_options
+            )
 
     def _rollout_values(self, parameters, prepared, state, inputs, carries):
         operands = (parameters, prepared, state, inputs.ve, inputs.intra, carries)

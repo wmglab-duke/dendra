@@ -928,8 +928,6 @@ class Network(RNGMixin):
 
         self.is_batched = False
 
-        reset_torch_compiler(prefer_public=False)
-
         # Keep the stateful network/population wrapper eager. Population JIT is
         # now handled by each integrator, which compiles only its tensor kernel
         # and leaves model state commits outside Dynamo.
@@ -2967,7 +2965,6 @@ class Network(RNGMixin):
         dt_changed = self.dt is not None and self.dt != dt_f
 
         if not self.built or self.dt != dt_f or force_rebuild or devices_changed:
-            reset_torch_compiler(prefer_public=False)
             self.dt = dt_f
             if dt_changed:
                 # A step count anchored to the previous dt cannot be reused with

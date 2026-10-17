@@ -87,13 +87,12 @@ def _multi_dhs_kernel_warp_hom(
         has_parent = m & (parent >= 0)
         p_safe = tl.where(has_parent, parent, 0)
 
-        # accumulate into parent’s diagonal
-        tl.atomic_add(D + p_safe, g_i, mask=has_parent)
-
         # elimination update
         b_i = tl.load(B + idx, mask=m, other=0.0)
         fac = -g_i / d_i
-        tl.atomic_add(D + p_safe, fac * g_i, mask=has_parent)
+        # Combine g_i - g_i**2/d_i as (g_i/d_i)*old_d to avoid
+        # cancelling two parent-diagonal updates, retaining this division.
+        tl.atomic_add(D + p_safe, -fac * old_d, mask=has_parent)
         tl.atomic_add(B + p_safe, -fac * b_i, mask=has_parent)
 
     tl.debug_barrier()  # finish all forward atomics before back-sub

@@ -64,6 +64,46 @@ except ImportError:
 THREADS_PER_WARP = 32
 
 
+def _topology_initialization_contract(integrator, model):
+    return (model.device(), model.dtype(), tuple(model.shape), integrator.threads)
+
+
+def _install_topology_buffer(integrator, name, value, *, preserve=False):
+    """Keep framework-generated, unchanged CPU topology sources untouched.
+
+    Native plans own immutable topology copies and track the public source
+    tensors' identities and versions. Rewriting identical indices during an
+    ordinary workspace refresh would needlessly invalidate those plans and
+    their compiled kernels. External writes still change the versions observed
+    by the plan's normal freshness check.
+    """
+    previous = integrator._buffers.get(name)
+    if (
+        preserve
+        and value.device.type == "cpu"
+        and torch.is_tensor(previous)
+        and previous.device == value.device
+        and previous.dtype == value.dtype
+        and previous.shape == value.shape
+        and torch.equal(previous, value)
+    ):
+        return previous
+    integrator.register_buffer(name, value)
+    return value
+
+
+def _cuda_solver_binding(previous, function, threads):
+    """Retain the selected callable when its complete partial binding matches."""
+    if (
+        isinstance(previous, partial)
+        and previous.func is function
+        and not previous.args
+        and previous.keywords == {"threads": threads}
+    ):
+        return previous
+    return partial(function, threads=threads)
+
+
 def _functional_dhs_plan_solve(d_mem, a_geom, rhs, parent, order, layers, *, plan):
     """Use the functional transition's immutable, independently owned plan."""
     return dendra_solvers.dhs_solve_plan(d_mem, a_geom, rhs, plan)
@@ -663,7 +703,9 @@ class _dhs(Integrator):
     def _select_solver(self, device):
         device = torch.device(device)
         if device.type == "cuda":
-            self._solve = partial(dhs_solve_cuda, threads=self.threads)
+            self._solve = _cuda_solver_binding(
+                getattr(self, "_solve", None), dhs_solve_cuda, self.threads
+            )
         elif device.type == "cpu":
             if not DENDRA_SOLVERS_AVAILABLE:
                 raise ImportError(
@@ -808,6 +850,13 @@ class _dhs(Integrator):
         }
 
     def initialize(self, model, dt):
+        topology_contract = _topology_initialization_contract(self, model)
+        install_topology = partial(
+            _install_topology_buffer,
+            self,
+            preserve=topology_contract
+            == getattr(self, "_topology_initialization_contract", None),
+        )
         self.B = int(np.prod(model.shape[:-1]))
 
         self.base_shape = model.shape
@@ -827,16 +876,21 @@ class _dhs(Integrator):
         parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
         order, layer_ptr = build_dhs_layers(depth, self.threads)
 
-        self.solver_order.copy_(
-            torch.as_tensor(node_order, dtype=torch.int64, device=device)
+        install_topology(
+            "solver_order",
+            torch.as_tensor(node_order, dtype=torch.int64, device=device),
         )  # (N,)
-        self.inv_solver_order.copy_(torch.argsort(self.solver_order, dim=0))  # (N,)
+        install_topology(
+            "inv_solver_order", torch.argsort(self.solver_order, dim=0)
+        )  # (N,)
 
-        self.register_buffer(
+        install_topology(
             "layer_ptr", layer_ptr.to(dtype=torch.int64, device=device)
         )  # (L+1,)
-        self.order.copy_(order.to(dtype=torch.int64, device=device))
-        self.parent_idx.copy_(parent_idx.to(dtype=torch.int64, device=device))  # (N,)
+        install_topology("order", order.to(dtype=torch.int64, device=device))
+        install_topology(
+            "parent_idx", parent_idx.to(dtype=torch.int64, device=device)
+        )  # (N,)
         if getattr(model, "_canonical_edge_resistance_ohm", None) is not None:
             # The canonical model buffer is the numerical source of truth for
             # both unbranched solvers. In particular, ``float32 -> float64``
@@ -892,8 +946,8 @@ class _dhs(Integrator):
         edge_child_orig = torch.tensor(
             edge_child_orig_list, dtype=torch.int64, device=device
         )
-        self.register_buffer("edge_child_orig", edge_child_orig)
-        self.register_buffer(
+        install_topology("edge_child_orig", edge_child_orig)
+        install_topology(
             "edge_parent_orig",
             torch.tensor(edge_parent_orig_list, dtype=torch.int64, device=device),
         )
@@ -918,6 +972,7 @@ class _dhs(Integrator):
         )
         self._install_prepared_workspace(workspace)
         self._refresh_cpu_topology_plan()
+        self._topology_initialization_contract = topology_contract
 
     def step(self, model, dt, ve=None, intra=None):
         if self._cpu_plan_available:
@@ -946,6 +1001,7 @@ class _dhs(Integrator):
         K = self.K
         v = self.mech.update_v(v)  # apply voltage processes
         v_old = v
+        v_old_flat = v_old.reshape(self.B, K)
 
         self._advance_pre_current(v_old, dt, temp)
 
@@ -961,11 +1017,12 @@ class _dhs(Integrator):
             area = self.area.reshape(self.B, K)
             if itot is None:
                 itot_flat = None
-                f_n = membrane_source.reshape(self.B, K) * area
+                f_n = (
+                    membrane_source.reshape(self.B, K) - gtot_flat * v_old_flat
+                ) * area
             else:
                 itot_flat = itot.reshape(self.B, K)  # (B,K), mA/cm^2
-                # ionic "reversal" term + scale to absolute mA
-                f_n = (gtot_flat * v_old.reshape(self.B, K) - itot_flat) * area
+                f_n = -itot_flat * area
         else:
             # Preserve the imperative no-current lifecycle: evaluating an
             # empty current frame would add an ASSIGNED phase to state-only
@@ -975,6 +1032,20 @@ class _dhs(Integrator):
             f_n = torch.zeros_like(self.cm_dt)
             ion_current_frame = self._capture_ion_current_frame()
             ion_conductance_frame = self._capture_ion_conductance_frame()
+
+        # Solve A * delta_v = physical_current - L_axial * v_old. The
+        # capacitive and membrane-diagonal old-voltage products cancel
+        # analytically; subtracting A*v_old from an absolute-voltage RHS would
+        # reintroduce the float32 cancellation this formulation avoids.
+        axial_flow = _edge_currents(
+            self.edge_child_orig,
+            self.edge_parent_orig,
+            self.edge_conductance,
+            v_old_flat,
+        )
+        f_n = f_n.index_add(1, self.edge_child_orig, -axial_flow).index_add(
+            1, self.edge_parent_orig, axial_flow
+        )
 
         if ve is not None:
             ve_flat = _flatten_to_solve(
@@ -1018,8 +1089,7 @@ class _dhs(Integrator):
                 self.base_shape if call_local_currents else None,
             )
 
-        v_old_flat = v_old.reshape(self.B, K)  # (B,K)
-        RHS = f_n + (self.cm_dt * v_old_flat)  # (B,K), mA
+        RHS = f_n  # (B,K), physical current residual in mA
 
         area = self.area.reshape(self.B, K)  # (B,K), cm^2
         main = self.cm_dt + (gtot_flat * area)
@@ -1043,9 +1113,10 @@ class _dhs(Integrator):
                 self.layer_ptr,
             )
 
-        v_new = v_out.index_select(-1, self.inv_solver_order).reshape(
+        delta_v = v_out.index_select(-1, self.inv_solver_order).reshape(
             self.base_shape
         )  # (B, N)
+        v_new = v_old + delta_v
 
         # ---- i_membrane: net membrane current (cap + ionic) in mA ----
         i_membrane = None
@@ -1166,7 +1237,9 @@ class _dhs_multi(MultiIntegrator):
     def _select_solver(self, device):
         device = torch.device(device)
         if device.type == "cuda":
-            self._solve = partial(dhs_solve_multi_cuda, threads=self.threads)
+            self._solve = _cuda_solver_binding(
+                self._solve, dhs_solve_multi_cuda, self.threads
+            )
         elif device.type == "cpu":
             if not DENDRA_SOLVERS_AVAILABLE:
                 raise ImportError(
@@ -1320,6 +1393,13 @@ class _dhs_multi(MultiIntegrator):
 
     def initialize(self, models, dt: float):
         assert len(models) == self.num_groups
+        topology_contract = _topology_initialization_contract(self, models)
+        preserve_topology = topology_contract == getattr(
+            self, "_topology_initialization_contract", None
+        )
+        install_topology = partial(
+            _install_topology_buffer, self, preserve=preserve_topology
+        )
 
         # ``initialize`` is also the shape/dt reinitialization path.  Keep all
         # Python-side group metadata idempotent rather than appending a second
@@ -1432,13 +1512,13 @@ class _dhs_multi(MultiIntegrator):
         self.K_stride = int(max(K_list)) if K_list else 0
         self.L_max = int(max(L_list)) if L_list else 0
 
-        self.register_buffer(
+        install_topology(
             "ROW_OFF", torch.as_tensor(row_off, dtype=torch.int64, device=dev0)
         )
-        self.register_buffer(
+        install_topology(
             "MECH_OFF", torch.as_tensor(mech_off, dtype=torch.int64, device=dev0)
         )
-        self.register_buffer(
+        install_topology(
             "SOLVER_OFF", torch.as_tensor(solver_off, dtype=torch.int64, device=dev0)
         )
 
@@ -1482,15 +1562,15 @@ class _dhs_multi(MultiIntegrator):
         )
         L_per_group = torch.as_tensor(L_list, dtype=torch.int32, device=dev0)
 
-        self.register_buffer("P_cat", P_cat)
-        self.register_buffer("ORDER_cat", ORDER_cat)
-        self.register_buffer("LAYER_PTR_cat", LAYER_PTR_cat)
-        self.register_buffer("P_OFF", P_OFF)
-        self.register_buffer("ORDER_OFF", ORDER_OFF)
-        self.register_buffer("LPTR_OFF", LPTR_OFF)
-        self.register_buffer("L_per_group", L_per_group)
-        self.register_buffer("SOLVER_cat", SOLVER_cat)
-        self.register_buffer("INV_SOLVER_cat", INV_SOLVER_cat)
+        install_topology("P_cat", P_cat)
+        install_topology("ORDER_cat", ORDER_cat)
+        install_topology("LAYER_PTR_cat", LAYER_PTR_cat)
+        install_topology("P_OFF", P_OFF)
+        install_topology("ORDER_OFF", ORDER_OFF)
+        install_topology("LPTR_OFF", LPTR_OFF)
+        install_topology("L_per_group", L_per_group)
+        install_topology("SOLVER_cat", SOLVER_cat)
+        install_topology("INV_SOLVER_cat", INV_SOLVER_cat)
 
         # ---------- warp plan (one morphology per warp) ----------
         NPW = self.NPW
@@ -1516,22 +1596,20 @@ class _dhs_multi(MultiIntegrator):
                 warp_row_count.append(cnt)
 
         self.grid_x = len(warp_row_base)
-        self.register_buffer(
+        install_topology(
             "WARP_P_OFF", torch.tensor(warp_p_off, dtype=torch.int64, device=dev0)
         )
-        self.register_buffer(
+        install_topology(
             "WARP_ORDER_OFF", torch.tensor(warp_o_off, dtype=torch.int64, device=dev0)
         )
-        self.register_buffer(
+        install_topology(
             "WARP_LPTR_OFF", torch.tensor(warp_lptr_off, dtype=torch.int64, device=dev0)
         )
-        self.register_buffer(
-            "WARP_L", torch.tensor(warp_L, dtype=torch.int32, device=dev0)
-        )
-        self.register_buffer(
+        install_topology("WARP_L", torch.tensor(warp_L, dtype=torch.int32, device=dev0))
+        install_topology(
             "WARP_ROW_BASE", torch.tensor(warp_row_base, dtype=torch.int64, device=dev0)
         )
-        self.register_buffer(
+        install_topology(
             "WARP_ROW_COUNT",
             torch.tensor(warp_row_count, dtype=torch.int32, device=dev0),
         )
@@ -1574,14 +1652,14 @@ class _dhs_multi(MultiIntegrator):
             cm_mech_flat.append(cm_rows[g].reshape(P, -1))
             area_mech_flat.append(area_rows[g].reshape(P, -1))
 
-        self.register_buffer("MECH_ROWS", torch.cat(mech_rows, 0))
-        self.register_buffer("MECH_COLS_INV", torch.cat(mech_cols_inv, 0))
+        install_topology("MECH_ROWS", torch.cat(mech_rows, 0))
+        install_topology("MECH_COLS_INV", torch.cat(mech_cols_inv, 0))
         cm_mech = torch.cat(cm_mech_flat, 1)
         area_mech = torch.cat(area_mech_flat, 1)
 
         self.N_mech = int(area_mech.shape[1])
         PLANE_LIN_BASE = self.MECH_ROWS * self.K_stride + self.MECH_COLS_INV
-        self.register_buffer("PLANE_LIN_BASE", PLANE_LIN_BASE.to(torch.long))
+        install_topology("PLANE_LIN_BASE", PLANE_LIN_BASE.to(torch.long))
 
         # ---------- extracellular edge maps (for ve) ----------
         edge_child_idx_flat_all = []
@@ -1626,19 +1704,19 @@ class _dhs_multi(MultiIntegrator):
             edge_gax_flat_all.append(gax_flat)
 
         if edge_child_idx_flat_all:
-            self.register_buffer(
+            install_topology(
                 "EDGE_CHILD_IDX_FLAT", torch.cat(edge_child_idx_flat_all, 0)
             )
-            self.register_buffer(
+            install_topology(
                 "EDGE_PARENT_IDX_FLAT", torch.cat(edge_parent_idx_flat_all, 0)
             )
             edge_gax_flat = torch.cat(edge_gax_flat_all, 1)
         else:
             # empty placeholders
-            self.register_buffer(
+            install_topology(
                 "EDGE_CHILD_IDX_FLAT", torch.empty(0, dtype=torch.int64, device=dev0)
             )
-            self.register_buffer(
+            install_topology(
                 "EDGE_PARENT_IDX_FLAT", torch.empty(0, dtype=torch.int64, device=dev0)
             )
             edge_gax_flat = torch.empty(P, 0, dtype=dtype0, device=dev0)
@@ -1688,10 +1766,11 @@ class _dhs_multi(MultiIntegrator):
         )
         self._b_plane = torch.empty_like(self._d_plane)
         plan = self._get_tiled_plan(P, dev0)
-        self._install_fixed_tiled_plan(plan)
+        self._install_fixed_tiled_plan(plan, preserve=preserve_topology)
         self._refresh_cpu_topology_plan()
+        self._topology_initialization_contract = topology_contract
 
-    def _install_fixed_tiled_plan(self, plan):
+    def _install_fixed_tiled_plan(self, plan, *, preserve=False):
         """Register the initialized batch shape's immutable tiled metadata.
 
         Functional transitions must not enter the Python plan cache while a
@@ -1710,10 +1789,7 @@ class _dhs_multi(MultiIntegrator):
             "_TILED_PLIN_FLAT": plan["PLIN_flat"],
         }
         for name, value in entries.items():
-            if name in self._buffers:
-                setattr(self, name, value)
-            else:
-                self.register_buffer(name, value)
+            _install_topology_buffer(self, name, value, preserve=preserve)
         self._tiled_grid_x = int(plan["grid_x"])
         self._tiled_rows_total = int(plan["rows_total"])
 
@@ -1844,10 +1920,25 @@ class _dhs_multi(MultiIntegrator):
         gtot_mech = gtot_flat.reshape(P, N_total)
         if itot_flat is None:
             itot_mech = None
-            f_n_flat = membrane_source.reshape(P, N_total) * SCALE_MECH + intra_flat
+            f_n_flat = (
+                membrane_source.reshape(P, N_total) - gtot_mech * v_old_flat
+            ) * SCALE_MECH + intra_flat
         else:
             itot_mech = itot_flat.reshape(P, N_total)
-            f_n_flat = (gtot_mech * v_old_flat - itot_mech) * SCALE_MECH + intra_flat
+            f_n_flat = -itot_mech * SCALE_MECH + intra_flat
+
+        # Assemble the physical increment residual before packing. Keeping
+        # edge voltage differences here preserves the constant axial mode,
+        # including zero-area junctions and heterogeneous group boundaries.
+        axial_flow = _edge_currents(
+            self.EDGE_CHILD_IDX_FLAT,
+            self.EDGE_PARENT_IDX_FLAT,
+            self.EDGE_GAX_FLAT,
+            v_old_flat,
+        )
+        f_n_flat = f_n_flat.index_add(
+            1, self.EDGE_CHILD_IDX_FLAT, -axial_flow
+        ).index_add(1, self.EDGE_PARENT_IDX_FLAT, axial_flow)
 
         # --- extracellular coupling (ve), vectorized on flattened indices) ---
         if ve is not None and self.EDGE_CHILD_IDX_FLAT.numel() > 0:
@@ -1879,7 +1970,7 @@ class _dhs_multi(MultiIntegrator):
 
         CMDT_MECH = self.CMDT_MECH.reshape(P, N_total)
 
-        RHS_flat = f_n_flat + CMDT_MECH * v_old_flat
+        RHS_flat = f_n_flat
         MAIN_flat = CMDT_MECH + gtot_mech * SCALE_MECH
 
         device = v_old.device
@@ -1994,7 +2085,7 @@ class _dhs_multi(MultiIntegrator):
             )
         else:
             v_sel = v_out_solver.view(-1).index_select(0, PLIN_flat)
-        v_new = v_sel.reshape(orig_shape)
+        v_new = v_old + v_sel.reshape(orig_shape)
 
         # --- net membrane current: cap + ionic, per mechanism index ---
         i_mem = None

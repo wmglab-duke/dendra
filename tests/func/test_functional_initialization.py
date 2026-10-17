@@ -124,7 +124,18 @@ def _assert_tensor_snapshot(tensor, snapshot):
     assert id(tensor) == identity
     assert tensor.untyped_storage().data_ptr() == storage
     assert tensor._version == version
-    torch.testing.assert_close(tensor, value, rtol=0.0, atol=0.0)
+    assert tensor.shape == value.shape
+    assert tensor.dtype == value.dtype
+    assert tensor.device == value.device
+    # Purity means unchanged bits, including any unprepared workspace bytes.
+    # Numeric equality would reject unchanged NaNs in torch.empty scratch and
+    # would miss changes to NaN payloads or the sign of zero.
+    torch.testing.assert_close(
+        tensor.detach().reshape(-1).contiguous().view(torch.uint8),
+        value.reshape(-1).contiguous().view(torch.uint8),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def _module_snapshot(module):

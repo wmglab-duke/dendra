@@ -442,6 +442,39 @@ def test_scan_compatibility_rechecks_active_callable_identities(monkeypatch, tar
 
 
 @requires_scan_torch
+@pytest.mark.parametrize("multithreading", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_scan_joint_capture_scopes_autograd_multithreading(multithreading, fail):
+    utils = importlib.import_module("torch._higher_order_ops.utils")
+    aot = importlib.import_module("torch._functorch.aot_autograd")
+    observed = []
+
+    def create_joint(*args, **kwargs):
+        def joint(primals, tangents):
+            observed.append(torch.autograd.is_multithreading_enabled())
+            if fail:
+                raise RuntimeError("joint capture failed")
+            return [primals[0].square()], [2 * primals[0] * tangents[0]]
+
+        return joint
+
+    primal = torch.tensor([0.2, -0.4], dtype=torch.float64, requires_grad=True)
+    tangent = torch.ones_like(primal)
+    factory = _scan_compat._make_full_output_backward(
+        utils, aot.AOTConfig, create_joint
+    )
+    backward = factory(lambda value: value.square(), (primal,))
+    with torch.autograd.set_multithreading_enabled(multithreading):
+        if fail:
+            with pytest.raises(RuntimeError, match="joint capture failed"):
+                backward(primal, tangent)
+        else:
+            torch.testing.assert_close(backward(primal, tangent), [2 * primal])
+        assert torch.autograd.is_multithreading_enabled() is multithreading
+    assert observed == [False]
+
+
+@requires_scan_torch
 def test_scan_compatibility_preserves_mixed_output_cotangent_positions():
     """Prove the audited upstream bug and that the local repair fixes its cause."""
     from torch.fx.experimental.proxy_tensor import make_fx

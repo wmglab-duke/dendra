@@ -3,11 +3,13 @@ import math
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from types import FunctionType, MethodType
 from typing import Optional, Sequence, Tuple
 
 import torch
 
 from dendra._bootstrap import (
+    isolate_compilation_callable,
     reset_torch_compiler,
     torch_compiler_warning_context,
 )
@@ -46,6 +48,21 @@ def get_init_defaults(cls):
 
 def _cfg_value(value):
     return getattr(value, "value", value)
+
+
+def _kernel_callable_source(function):
+    """Keep source identity without relying on transient bound-method objects."""
+    owner = function.__self__ if isinstance(function, MethodType) else None
+    source = function.__func__ if isinstance(function, MethodType) else function
+    if isinstance(source, FunctionType):
+        return (
+            owner,
+            source,
+            source.__code__,
+            source.__defaults__,
+            source.__kwdefaults__,
+        )
+    return (owner, source)
 
 
 def _shape_tuple(shape: Sequence[int]) -> Tuple[int, ...]:
@@ -516,6 +533,7 @@ class Integrator(torch.nn.Module):
         self.dt = None
         self.shape = None
         self._compiled_kernels = {}
+        self._compiled_kernel_sources = {}
         self._direct_membrane_structure_prevalidated = False
         self.compile_scope = "population"
         self.configure_jit(model, scope="population")
@@ -908,7 +926,7 @@ class Integrator(torch.nn.Module):
         self.requested_compile_options = requested_compile_options
         self.compile_options = compile_options
         if new_config != old_config:
-            self._compiled_kernels.clear()
+            self.clear_jit_cache()
         return self
 
     def _compile_kwargs(self):
@@ -934,6 +952,8 @@ class Integrator(torch.nn.Module):
         """
         if hasattr(self, "_compiled_kernels"):
             self._compiled_kernels.clear()
+        if hasattr(self, "_compiled_kernel_sources"):
+            self._compiled_kernel_sources.clear()
         return self
 
     def pickleable(
@@ -972,6 +992,8 @@ class Integrator(torch.nn.Module):
         state = self.__dict__.copy()
         if "_compiled_kernels" in state:
             state["_compiled_kernels"] = {}
+        if "_compiled_kernel_sources" in state:
+            state["_compiled_kernel_sources"] = {}
         state["_direct_membrane_structure_prevalidated"] = False
         state["_tensor_step_binding"] = None
         state["_tensor_step_graphs"] = {}
@@ -1001,9 +1023,22 @@ class Integrator(torch.nn.Module):
         )
         with torch_compiler_warning_context():
             compiled = self._compiled_kernels.get(key)
-            if compiled is None:
-                compiled = torch.compile(fn, **self._compile_kwargs())
+            sources = self.__dict__.setdefault("_compiled_kernel_sources", {})
+            source = _kernel_callable_source(fn)
+            previous = sources.get(key)
+            if (
+                compiled is None
+                or previous is None
+                or any(old is not new for old, new in zip(previous, source))
+                or len(previous) != len(source)
+            ):
+                # A cached bound method otherwise keeps calling its original
+                # body after an instance/class method replacement.
+                compiled = torch.compile(
+                    isolate_compilation_callable(fn), **self._compile_kwargs()
+                )
                 self._compiled_kernels[key] = compiled
+                sources[key] = source
             return compiled(*args, **kwargs)
 
     def _sample_runtime_noises(self):
@@ -1219,8 +1254,12 @@ class Integrator(torch.nn.Module):
             previous_initialized = self.initialized
             self.dt = float(dt)
             self.shape = model.shape
-            self._compiled_kernels.clear()
             try:
+                # Rebuild numerical workspaces without discarding compiled
+                # callables. Kernels read the current buffers/parameters, and
+                # Dynamo guards specialize changes to their metadata or Python
+                # configuration. State resets with an unchanged compilation
+                # contract can therefore retain their existing wrappers.
                 self._configure_mechanism_timestep(dt)
                 self.initialize(model, dt)
                 record = getattr(model, "_record_integrator_workspace_contracts", None)
@@ -1233,7 +1272,7 @@ class Integrator(torch.nn.Module):
                 self.dt = previous_dt
                 self.shape = previous_shape
                 self.initialized = False
-                self._compiled_kernels.clear()
+                self.clear_jit_cache()
                 if previous_initialized and previous_dt is not None:
                     try:
                         self._configure_mechanism_timestep(previous_dt)

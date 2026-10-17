@@ -359,6 +359,37 @@ def test_cuda_full_trajectory_and_all_source_gradients_match_imperative(kind, dt
     _close_gradients(gradients, expected_gradients, dtype=dtype)
 
 
+@pytest.mark.parametrize("kind", ["ext_axon", "ext_tree"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_cuda_uniform_extcell_geometry_gradients_match_imperative(kind, dtype):
+    source, reference = _model(kind, dtype=dtype), _model(kind, dtype=dtype)
+    for model in (source, reference):
+        model.v = torch.full_like(model.v, -65.0 if kind == "ext_axon" else -64.0)
+        _seed_circuit_state(model)
+    with dn.ctx(JIT=0, REQUIRE_GRAD=1, DEVICE="cuda", DTYPE=dtype):
+        functional, _, states, gradients = _functional_result(kind, source)
+        expected, expected_gradients = _imperative_result(kind, reference, functional)
+    _close(states, expected, dtype=dtype)
+    _close_gradients(gradients, expected_gradients, dtype=dtype)
+
+
+@pytest.mark.parametrize("kind", ["ext_axon", "ext_tree"])
+def test_cuda_float32_extcell_source_gradients_match_float64_cpu_reference(kind):
+    pytest.importorskip("dendra_solvers")
+    cpu = _model(kind, device="cpu", dtype=torch.float64)
+    gpu = _model(kind, dtype=torch.float32)
+    with dn.ctx(JIT=0, REQUIRE_GRAD=1, DEVICE="cpu", DTYPE=torch.float64):
+        _, _, _, expected = _functional_result(kind, cpu)
+    with dn.ctx(JIT=0, REQUIRE_GRAD=1, DEVICE="cuda", DTYPE=torch.float32):
+        _, _, _, actual = _functional_result(kind, gpu)
+    _close_gradients(
+        {name: value.double() for name, value in actual.items()},
+        expected,
+        dtype=torch.float32,
+        cross_device=True,
+    )
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_cuda_explicit_population_batch_preserves_every_carry_leaf(kind):
     source = _model(kind, batch_calls=(2,))
@@ -387,9 +418,8 @@ def test_cuda_and_cpu_oracles_match_states_and_normalized_gradients(kind):
     )
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_cuda_torch_func_grad_vmap_empty_vmap_and_jvp(kind):
-    model = _model(kind, batch_calls=(2,))
+def _torch_func_grad_vmap_empty_vmap_and_jvp(kind, dtype):
+    model = _model(kind, dtype=dtype, batch_calls=(2,))
     functional, tensors = dn.func.make_functional(model, dt=DT)
     ve, intra = _drives(model, steps=1)
     channel = _channel_names(tensors.parameters)[0]
@@ -432,7 +462,10 @@ def test_cuda_torch_func_grad_vmap_empty_vmap_and_jvp(kind):
         for gradient, direction in zip(gradients, tangents, strict=True)
     )
     torch.testing.assert_close(
-        forward_pairing, reverse_pairing, rtol=3.0e-7, atol=3.0e-9
+        forward_pairing,
+        reverse_pairing,
+        rtol=2.0e-3 if dtype == torch.float32 else 3.0e-7,
+        atol=3.0e-9,
     )
     assert torch.isfinite(tangent).all() and torch.count_nonzero(tangent)
 
@@ -454,6 +487,16 @@ def test_cuda_torch_func_grad_vmap_empty_vmap_and_jvp(kind):
     empty = torch.vmap(response, in_dims=(0, None))(lanes[:0], geometry)
     assert empty.shape == (0, *model.shape)
     assert empty.dtype == model.dtype() and empty.device == model.device()
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_cuda_torch_func_grad_vmap_empty_vmap_and_jvp(kind):
+    _torch_func_grad_vmap_empty_vmap_and_jvp(kind, torch.float64)
+
+
+@pytest.mark.parametrize("kind", ["ext_axon", "ext_tree"])
+def test_cuda_float32_block_torch_func_grad_vmap_empty_vmap_and_jvp(kind):
+    _torch_func_grad_vmap_empty_vmap_and_jvp(kind, torch.float32)
 
 
 def _record_fields(state):

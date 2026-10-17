@@ -64,9 +64,6 @@ def _single_dhs_kernel(
             valid_parent_mask, parent, 0
         )  # Keep safe_parent for pointer arithmetic
 
-        # This atomic_add finalizes the parent's diagonal for the connection to this child (g_i).
-        tl.atomic_add(D + safe_parent, g_i, mask=valid_parent_mask)
-
         # --- Elimination Step ---
         b_i = tl.load(B + idx, mask=m, other=0.0)
 
@@ -74,8 +71,9 @@ def _single_dhs_kernel(
         inv_d_i = 1.0 / d_i
         fac = -g_i * inv_d_i
 
-        # Update parent's D and B.
-        tl.atomic_add(D + safe_parent, fac * g_i, mask=valid_parent_mask)
+        # g_i - g_i**2/d_i = (g_i/d_i)*old_d_i. Accumulate this
+        # Schur contribution directly to avoid cancelling two parent updates.
+        tl.atomic_add(D + safe_parent, -fac * old_d_i, mask=valid_parent_mask)
         tl.atomic_add(B + safe_parent, -fac * b_i, mask=valid_parent_mask)
 
     # Barrier ensures all forward-pass atomics for all layers are complete before back-substitution begins.
@@ -179,12 +177,11 @@ def _single_dhs_kernel_packed(
         valid_parent_mask = m & (parent >= 0)
         safe_parent = tl.where(valid_parent_mask, parent, 0)
 
-        tl.atomic_add(D + safe_parent, g_i, mask=valid_parent_mask)
-
         # --- elimination update
         b_i = tl.load(B + idx, mask=m, other=0.0)
         fac = -g_i / d_i
-        tl.atomic_add(D + safe_parent, fac * g_i, mask=valid_parent_mask)
+        # Retain the existing division and combine the parent Schur update.
+        tl.atomic_add(D + safe_parent, -fac * old_d_i, mask=valid_parent_mask)
         tl.atomic_add(B + safe_parent, -fac * b_i, mask=valid_parent_mask)
 
     tl.debug_barrier()  # ensure forward phase completed

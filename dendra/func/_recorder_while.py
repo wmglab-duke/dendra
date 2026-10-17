@@ -14,6 +14,7 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
+from dendra._bootstrap import isolate_compilation_callable
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._callbacks import (
@@ -185,7 +186,7 @@ class _RecorderWhileExecutor:
             emitted = {plan.name: observed.get(plan.name) for plan in plans}
             return final, {"v": final["integrator"]["v"]}, final_carries, emitted
 
-        return torch.compile(execute, **self._options)
+        return torch.compile(isolate_compilation_callable(execute), **self._options)
 
 
 __all__ = []

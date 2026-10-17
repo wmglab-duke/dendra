@@ -14,6 +14,7 @@ from ._solve_utils import (
     replace,
 )
 from .ode import integrate2c
+from .ops import expinv
 
 # -- helpers --
 
@@ -44,6 +45,27 @@ def solve(self, dt, {states_and_assigned}, **kwargs):
 """
 
 
+def _linear_exact_step(state, rate, source, coefficient, dt):
+    """Evaluate the exact affine update without losing small increments.
+
+    Near equilibrium and for small timesteps, advance by the authored rate.
+    For stiff decay, retain the equilibrium and the surviving transient
+    directly, rather than cancelling nearly the entire old state.
+    """
+    z = coefficient * dt
+    small = z.abs() <= 0.5
+    small_z = torch.where(small, z, torch.zeros_like(z))
+    increment = state + dt * rate / expinv(small_z)
+    # Both where branches are evaluated. Keep the unused denominator and
+    # exponential finite at zero rate and in the stiff-decay limit, including
+    # under reverse/forward AD and vmap.
+    large_coefficient = torch.where(small, torch.ones_like(z), coefficient)
+    equilibrium = -source / large_coefficient
+    large_z = torch.where(small, torch.zeros_like(z), z)
+    relaxed = equilibrium + (state - equilibrium) * torch.exp(large_z)
+    return torch.where(small, increment, relaxed)
+
+
 def convert(deriv, state, states, assigned, use_pade_approx=False):
     """
     Convert a derivative expression into a form suitable for numerical integration.
@@ -71,7 +93,7 @@ def convert(deriv, state, states, assigned, use_pade_approx=False):
 
     exclude = set([state]) | set(states) | set(assigned)
     v = extract_vars(deriv, exclude)
-    f = integrate2c(deriv, "dt", v, use_pade_approx=use_pade_approx)
+    f = integrate2c(deriv, "dt", v, use_pade_approx=use_pade_approx, stable_linear=True)
     if DEBUG:
         logger.debug(f"Integrated function:\n{f}")
     return add_underscore_to_lhs(modify_operations(replace(f, v)))
