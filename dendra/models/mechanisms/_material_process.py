@@ -1822,6 +1822,7 @@ class DiffusionProcess(MaterialProcess):
     """
 
     _material_process_phase = "transport"
+    _functional_material_family = "diffusion"
     _diffusion_specs: tuple[DiffusionSpec, ...] = tuple()
     _diffusion_declarations = []
     _diffusion_relaxation_specs: tuple[DiffusionRelaxationSpec, ...] = tuple()
@@ -2066,6 +2067,7 @@ class DiffusionProcess(MaterialProcess):
             _safe_key(i, spec.material, spec.field)
             for i, spec in enumerate(type(self)._diffusion_specs)
         )
+        self._diffusion_geometry_sources = ()
 
         self._configure_region(population)
         self._validate_overlapping_diffusivity_overrides()
@@ -2099,6 +2101,7 @@ class DiffusionProcess(MaterialProcess):
         self._spatial_operators = self._new_spatial_operators()
 
         self._validate_diffusion_specs()
+        self._configure_diffusion_material_plan()
         self._spatial_configured = False
         return None
 
@@ -2215,31 +2218,39 @@ class DiffusionProcess(MaterialProcess):
                     raise TypeError(
                         f"Material geometry component {source_name!r} must be a tensor."
                     )
-                return value.clone()
+                return value
 
             volume = component("volume")
             if "edge_factor" in config:
-                self._set_geometry_buffer(
-                    "_mp_transport_edge_factor", component("edge_factor")
+                self._set_diffusion_geometry_source(
+                    "_mp_transport_edge_factor",
+                    config["edge_factor"],
+                    component("edge_factor"),
                 )
             else:
                 # Retain the primitive quantities until the spatial backend has
                 # applied its regional edge mask. This lets excluded/crossing
                 # Tree edges carry harmless sentinels and avoids inventing a
                 # dummy root-edge distance.
-                self._set_geometry_buffer(
-                    "_mp_transport_edge_area", component("edge_area")
+                self._set_diffusion_geometry_source(
+                    "_mp_transport_edge_area",
+                    config["edge_area"],
+                    component("edge_area"),
                 )
-                self._set_geometry_buffer(
-                    "_mp_transport_edge_distance", component("edge_distance")
+                self._set_diffusion_geometry_source(
+                    "_mp_transport_edge_distance",
+                    config["edge_distance"],
+                    component("edge_distance"),
                 )
-            self._set_geometry_buffer("_mp_transport_volume", volume)
+            self._set_diffusion_geometry_source(
+                "_mp_transport_volume", config["volume"], volume
+            )
 
         for source_name, destination_name in getattr(
             self, "_diffusion_population_quantities", {}
         ).items():
             value = getattr(population, source_name)
-            self._set_geometry_buffer(destination_name, value.clone())
+            self._set_diffusion_geometry_source(destination_name, source_name, value)
 
     def _validate_overlapping_diffusivity_overrides(self) -> None:
         """Reject contradictory RANGE D assignments on overlapping regions.
@@ -2481,13 +2492,19 @@ class DiffusionProcess(MaterialProcess):
         else:
             self.register_buffer(name, value)
 
+    def _set_diffusion_geometry_source(self, name, source_name, value):
+        """Register raw numerical geometry separately from fixed topology."""
+        self._set_geometry_buffer(name, value)
+        sources = dict(self._diffusion_geometry_sources)
+        sources[name] = source_name
+        self._diffusion_geometry_sources = tuple(sources.items())
+
     def _configure_1d_geometry(self, population) -> None:
-        # dx is geometry, not a dynamic material field.  Keep a local registered
-        # copy so device/dtype movement follows the process module.  The heavy
+        # dx is geometry, not a dynamic material field. Keep its raw registered
+        # input, without a detached snapshot or persistent converted AD graph. The heavy
         # finite-volume coefficients are built later in set_dt(...), mirroring
         # the voltage-integrator initialize(...) split.
-        dx = population.dx.detach().clone()
-        self._set_geometry_buffer("_mp_dx", dx)
+        self._set_diffusion_geometry_source("_mp_dx", "dx", population.dx)
         return None
 
     def _configure_tree_geometry(self, population) -> None:
@@ -2509,7 +2526,14 @@ class DiffusionProcess(MaterialProcess):
             if hasattr(population, name):
                 value = getattr(population, name)
                 if torch.is_tensor(value):
-                    self._set_geometry_buffer(f"_mp_{name}", value.detach().clone())
+                    if name in {
+                        "diff_parent_index",
+                        "diff_edge_parent",
+                        "diff_edge_child",
+                    }:
+                        self._set_geometry_buffer(f"_mp_{name}", value.detach().clone())
+                    else:
+                        self._set_diffusion_geometry_source(f"_mp_{name}", name, value)
         return None
 
     @property
@@ -2651,6 +2675,213 @@ class DiffusionProcess(MaterialProcess):
             ) from exc
         return self.put(local, torch.zeros_like(like), like)
 
+    def _diffusion_operand_reference(self, value, *, name):
+        if isinstance(value, str):
+            population_buffer = self._diffusion_population_quantities.get(value)
+            if population_buffer is not None:
+                return ("buffer", population_buffer)
+            return ("named", value)
+        if isinstance(value, Number):
+            return ("scalar", value)
+        literal = value if torch.is_tensor(value) else torch.as_tensor(value)
+        buffer_name = f"_diffusion_literal_{name}"
+        if buffer_name in self._buffers:
+            self._buffers[buffer_name] = literal
+        else:
+            self.register_buffer(buffer_name, literal, persistent=False)
+        return ("buffer", buffer_name)
+
+    def _configure_diffusion_material_plan(self):
+        self._diffusion_fraction_refs = tuple(
+            self._diffusion_operand_reference(value, name=name)
+            for name, value in (
+                ("volume_fraction", self._diffusion_volume_fraction),
+                ("area_fraction", self._diffusion_area_fraction),
+            )
+        )
+        entries = []
+        for index, (operator_key, spec) in enumerate(
+            zip(self._diffusion_operator_keys, type(self)._diffusion_specs)
+        ):
+            key = (_canonical_material_name(spec.material), spec.field)
+            D_reference = self._diffusion_operand_reference(spec.D, name=f"{index}_D")
+            relaxations = []
+            for relaxation_index, relaxation in enumerate(self._relaxations_for(spec)):
+                prefix = f"{index}_relax_{relaxation_index}"
+                rate = self._diffusion_operand_reference(
+                    relaxation.rate, name=f"{prefix}_rate"
+                )
+                target = self._diffusion_operand_reference(
+                    relaxation.target, name=f"{prefix}_target"
+                )
+                where = (
+                    None
+                    if relaxation.where is None
+                    or (
+                        isinstance(relaxation.where, str)
+                        and relaxation.where.lower() == "all"
+                    )
+                    else self._diffusion_operand_reference(
+                        relaxation.where, name=f"{prefix}_where"
+                    )
+                )
+                relaxations.append((rate, target, where))
+            material = self._get_material(spec.material)
+            domain = self._effective_domain(material, spec) or "intracellular"
+            entries.append(
+                (
+                    operator_key,
+                    key,
+                    D_reference,
+                    domain,
+                    spec.D_location,
+                    tuple(relaxations),
+                )
+            )
+        self._diffusion_material_plan = tuple(entries)
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        return tuple(dict.fromkeys(entry[1] for entry in self._diffusion_material_plan))
+
+    def _diffusion_operand(self, reference, like, *, spatial=True, boolean=False):
+        kind, value = reference
+        dtype = torch.bool if boolean else like.dtype
+        if kind == "buffer":
+            return self._buffers[value].to(device=like.device, dtype=dtype)
+        if kind == "named":
+            resolved = (
+                self._resolve_spatial_quantity(value, like)
+                if spatial
+                else self._resolve_quantity(value, like)
+            )
+            return resolved.to(device=like.device, dtype=dtype)
+        return torch.as_tensor(value, device=like.device, dtype=dtype)
+
+    def _diffusion_relaxation_inputs(self, references, c):
+        rate_reference, target_reference, where_reference = references
+        return (
+            self._diffusion_operand(rate_reference, c),
+            self._diffusion_operand(target_reference, c),
+            None
+            if where_reference is None
+            else self._diffusion_operand(where_reference, c, boolean=True),
+        )
+
+    def _diffusion_operator_inputs(self, entry, c, dt, *, prepared=False):
+        """Resolve registered numerical inputs for both configuration paths."""
+        _operator_key, _key, D_reference, domain, D_location, _relaxations = entry
+        D = self._diffusion_operand(D_reference, c, spatial=D_location != "edge")
+        node_mask = (
+            self._buffers["_mp_node_mask"] if self._diffusion_is_regional else None
+        )
+        kwargs = {
+            "node_mask": node_mask,
+            "solver": self._diffusion_solver,
+            "D_location": D_location,
+        }
+        if self._diffusion_geometry_name is not None:
+            kwargs["volume"] = self._buffers["_mp_transport_volume"].to(
+                device=c.device, dtype=c.dtype
+            )
+            if "_mp_transport_edge_factor" in self._buffers:
+                kwargs["edge_factor"] = self._buffers["_mp_transport_edge_factor"].to(
+                    device=c.device, dtype=c.dtype
+                )
+            else:
+                kwargs["edge_area"] = self._buffers["_mp_transport_edge_area"].to(
+                    device=c.device, dtype=c.dtype
+                )
+                kwargs["edge_distance"] = self._buffers[
+                    "_mp_transport_edge_distance"
+                ].to(device=c.device, dtype=c.dtype)
+        if self._diffusion_geometry_kind == "tree":
+            kwargs["domain"] = domain
+            if not prepared:
+                if "_mp_diff_parent_index" in self._buffers:
+                    kwargs["parent_index"] = self._buffers["_mp_diff_parent_index"]
+                if (
+                    "_mp_diff_edge_parent" in self._buffers
+                    and "_mp_diff_edge_child" in self._buffers
+                ):
+                    kwargs["material_edge_index"] = torch.stack(
+                        (
+                            self._buffers["_mp_diff_edge_parent"],
+                            self._buffers["_mp_diff_edge_child"],
+                        ),
+                        dim=0,
+                    )
+            if self._diffusion_geometry_name is None:
+                if "_mp_diff_geom_um" in self._buffers:
+                    kwargs["native_edge_factor"] = self._buffers["_mp_diff_geom_um"].to(
+                        device=c.device, dtype=c.dtype
+                    )
+                elif prepared:
+                    raise RuntimeError(
+                        "Pure native Tree diffusion requires registered diff_geom_um geometry."
+                    )
+            return (c, dt, D, self), kwargs
+
+        if self._diffusion_geometry_name is not None:
+            diam = torch.ones_like(c)
+        elif self._diffusion_is_regional:
+            local_like = self.get(c)
+            local_diam = torch.broadcast_to(
+                self.diam.to(device=c.device, dtype=c.dtype), local_like.shape
+            )
+            diam = self.put(local_diam, torch.zeros_like(c), c)
+        else:
+            diam = self.diam.to(device=c.device, dtype=c.dtype)
+        dx = self._buffers["_mp_dx"].to(device=c.device, dtype=c.dtype)
+        kwargs["volume_fraction"] = self._diffusion_operand(
+            self._diffusion_fraction_refs[0], c, spatial=False
+        )
+        kwargs["area_fraction"] = self._diffusion_operand(
+            self._diffusion_fraction_refs[1], c, spatial=False
+        )
+        return (c, dt, D, diam, dx), kwargs
+
+    def prepare_materials(self, fields: Mapping[tuple[str, str], torch.Tensor], dt):
+        """Build explicit operator tensors on already validated static plans."""
+        if not self._spatial_configured:
+            raise RuntimeError(
+                "Pure diffusion preparation requires configured spatial plans; call set_dt(dt) first."
+            )
+        prepared = []
+        for entry in self._diffusion_material_plan:
+            operator_key, key, _D, _domain, _location, relaxations = entry
+            c = fields[key]
+            operator = self._spatial_operators[operator_key]
+            args, kwargs = self._diffusion_operator_inputs(entry, c, dt, prepared=True)
+            workspace = operator.prepare_diffusion(*args, **kwargs)
+            for references in relaxations:
+                rate, target, where = self._diffusion_relaxation_inputs(references, c)
+                workspace = operator.prepare_relaxation(
+                    workspace, rate, target, where=where
+                )
+            prepared.append(workspace)
+        return tuple(prepared)
+
+    def material_updates(
+        self, fields: Mapping[tuple[str, str], torch.Tensor], prepared
+    ):
+        if len(prepared) != len(self._diffusion_material_plan):
+            raise ValueError(
+                "Diffusion preparation does not match its declared field plan."
+            )
+        updates = {}
+        for entry, workspace in zip(self._diffusion_material_plan, prepared):
+            operator_key, key = entry[:2]
+            c = updates.get(key, fields[key])
+            operator = self._spatial_operators[operator_key]
+            if self._diffusion_method == "explicit":
+                updates[key] = operator.diffuse_explicit_prepared(c, workspace)
+            else:
+                updates[key] = operator.diffuse_implicit_prepared(
+                    c, workspace, solve=operator._solve
+                )
+        return updates
+
     def _relaxations_for(self, diffusion_spec: DiffusionSpec):
         material = _canonical_material_name(diffusion_spec.material)
         return tuple(
@@ -2659,20 +2890,6 @@ class DiffusionProcess(MaterialProcess):
             if _canonical_material_name(spec.material) == material
             and spec.field == diffusion_spec.field
         )
-
-    def _resolve_relaxation_where(self, value, like: torch.Tensor):
-        if value is None or (isinstance(value, str) and value.lower() == "all"):
-            return None
-        return self._resolve_spatial_quantity(value, like).to(
-            device=like.device, dtype=torch.bool
-        )
-
-    def _configure_relaxations(self, operator, diffusion_spec, c):
-        for relaxation in self._relaxations_for(diffusion_spec):
-            rate = self._resolve_spatial_quantity(relaxation.rate, c)
-            target = self._resolve_spatial_quantity(relaxation.target, c)
-            where = self._resolve_relaxation_where(relaxation.where, c)
-            operator.configure_relaxation(rate, target, where=where)
 
     def set_dt(self, dt):
         """Update dt and precompute diffusion operators for the current run."""
@@ -2697,184 +2914,46 @@ class DiffusionProcess(MaterialProcess):
         return self._configure_1d_spatial_operators(dt)
 
     def _configure_1d_spatial_operators(self, dt):
-        dx = self._buffers["_mp_dx"].to(device=self.diam.device, dtype=self.diam.dtype)
-        node_mask = (
-            self._buffers["_mp_node_mask"] if self._diffusion_is_regional else None
-        )
-        resolved = []
-        for key, spec in zip(
-            self._diffusion_operator_keys, type(self)._diffusion_specs
-        ):
-            material = self._get_material(spec.material)
-            c = material._buffers[spec.field]
-            if spec.D_location == "edge":
-                D = self._resolve_quantity(spec.D, c)
-            else:
-                D = self._resolve_spatial_quantity(spec.D, c)
-            resolved.append((key, spec, c, D))
-
-        staged_operators = self._new_spatial_operators()
-        for key, spec, c, D in resolved:
-            if self._diffusion_geometry_name is not None:
-                # Explicit chemical geometry supplies all storage and edge
-                # factors; electrical/cylindrical diam and dx are unused.
-                diam = torch.ones_like(c)
-            elif self._diffusion_is_regional:
-                # ``self.diam`` is the differentiable local view compiled for
-                # the union support. Scatter it into full material-field space;
-                # values outside the support never participate because crossing
-                # edges and excluded volumes are masked. This avoids a detached
-                # geometry snapshot and preserves morphology gradients.
-                local_like = self.get(c)
-                local_diam = torch.broadcast_to(
-                    self.diam.to(device=c.device, dtype=c.dtype), local_like.shape
-                )
-                diam = self.put(local_diam, torch.zeros_like(c), c)
-            else:
-                # Preserve the original global path, where ``self.diam`` aliases
-                # the population geometry and carries any live autograd graph.
-                diam = self.diam.to(device=c.device, dtype=c.dtype)
-            dx_c = dx.to(device=c.device, dtype=c.dtype)
-            volume = None
-            edge_factor = None
-            edge_area = None
-            edge_distance = None
-            if self._diffusion_geometry_name is not None:
-                volume = self._buffers["_mp_transport_volume"].to(
-                    device=c.device, dtype=c.dtype
-                )
-                if "_mp_transport_edge_factor" in self._buffers:
-                    edge_factor = self._buffers["_mp_transport_edge_factor"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-                else:
-                    edge_area = self._buffers["_mp_transport_edge_area"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-                    edge_distance = self._buffers["_mp_transport_edge_distance"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-            staged_operators[key].configure_diffusion(
-                c,
-                dt,
-                D,
-                diam,
-                dx_c,
-                volume_fraction=self._diffusion_volume_fraction,
-                area_fraction=self._diffusion_area_fraction,
-                node_mask=node_mask,
-                solver=self._diffusion_solver,
-                volume=volume,
-                edge_factor=edge_factor,
-                edge_area=edge_area,
-                edge_distance=edge_distance,
-                D_location=spec.D_location,
-            )
-            self._configure_relaxations(staged_operators[key], spec, c)
-        self._spatial_operators = staged_operators
-        self._spatial_configured = True
-        return None
+        return self._configure_material_operators(dt)
 
     def _configure_tree_spatial_operators(self, dt):
-        node_mask = (
-            self._buffers["_mp_node_mask"] if self._diffusion_is_regional else None
-        )
-        resolved = []
-        for key, spec in zip(
-            self._diffusion_operator_keys, type(self)._diffusion_specs
-        ):
-            material = self._get_material(spec.material)
-            c = material._buffers[spec.field]
-            if spec.D_location == "edge":
-                D = self._resolve_quantity(spec.D, c)
-            else:
-                D = self._resolve_spatial_quantity(spec.D, c)
-            domain = self._effective_domain(material, spec) or "intracellular"
-            resolved.append((key, spec, c, D, domain))
+        return self._configure_material_operators(dt)
 
-        staged_operators = self._new_spatial_operators()
-        for key, spec, c, D, domain in resolved:
-            volume = None
-            edge_factor = None
-            edge_area = None
-            edge_distance = None
-            if self._diffusion_geometry_name is not None:
-                volume = self._buffers["_mp_transport_volume"].to(
-                    device=c.device, dtype=c.dtype
-                )
-                if "_mp_transport_edge_factor" in self._buffers:
-                    edge_factor = self._buffers["_mp_transport_edge_factor"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-                else:
-                    edge_area = self._buffers["_mp_transport_edge_area"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-                    edge_distance = self._buffers["_mp_transport_edge_distance"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-            parent_index = None
-            material_edge_index = None
-            if "_mp_diff_parent_index" in self._buffers:
-                parent_index = self._buffers["_mp_diff_parent_index"]
-            if (
-                "_mp_diff_edge_parent" in self._buffers
-                and "_mp_diff_edge_child" in self._buffers
-            ):
-                material_edge_index = torch.stack(
-                    (
-                        self._buffers["_mp_diff_edge_parent"],
-                        self._buffers["_mp_diff_edge_child"],
-                    ),
-                    dim=0,
-                )
-            native_edge_factor = None
-            if (
-                self._diffusion_geometry_name is None
-                and "_mp_diff_geom_um" in self._buffers
-            ):
-                native_edge_factor = self._buffers["_mp_diff_geom_um"].to(
-                    device=c.device, dtype=c.dtype
-                )
-            staged_operators[key].configure_diffusion(
-                c,
-                dt,
-                D,
-                self,
-                domain=domain,
-                node_mask=node_mask,
-                solver=self._diffusion_solver,
-                volume=volume,
-                edge_factor=edge_factor,
-                edge_area=edge_area,
-                edge_distance=edge_distance,
-                D_location=spec.D_location,
-                parent_index=parent_index,
-                material_edge_index=material_edge_index,
-                native_edge_factor=native_edge_factor,
+    def _configure_material_operators(self, dt):
+        """Validate and stage all operators before replacing the cached plan."""
+        resolved = []
+        for entry in self._diffusion_material_plan:
+            _operator_key, key = entry[:2]
+            c = self._get_material(key[0])._buffers[key[1]]
+            args, kwargs = self._diffusion_operator_inputs(entry, c, dt)
+            relaxations = tuple(
+                self._diffusion_relaxation_inputs(references, c)
+                for references in entry[5]
             )
-            self._configure_relaxations(staged_operators[key], spec, c)
+            resolved.append((entry[0], args, kwargs, relaxations))
+        staged_operators = self._new_spatial_operators()
+        for key, args, kwargs, relaxations in resolved:
+            operator = staged_operators[key]
+            operator.configure_diffusion(*args, **kwargs)
+            for rate, target, where in relaxations:
+                operator.configure_relaxation(rate, target, where=where)
+            if (
+                self._diffusion_geometry_kind == "tree"
+                and self._diffusion_method == "explicit"
+            ):
+                operator.validate_explicit()
         self._spatial_operators = staged_operators
         self._spatial_configured = True
         return None
 
-    def advance_materials(self, dt):
-        if not getattr(self, "_spatial_configured", False):
-            # This should normally be done by MechanismHandler.set_dt(...), which
-            # is called from Integrator._initialize(...).  The fallback keeps
-            # manual/eager calls usable while still moving the work out of the
-            # steady-state hot path after the first call.
-            self.configure_spatial_operators(dt)
-        transaction = _MaterialFieldTransaction()
-        for key, spec in zip(
-            self._diffusion_operator_keys, type(self)._diffusion_specs
-        ):
-            material = self._get_material(spec.material)
-            c = transaction.read(material, spec.field)
-            op = self._spatial_operators[key]
-            if self._diffusion_method == "explicit":
-                c_new = op.diffuse_explicit_configured(c)
-            else:
-                c_new = op.diffuse_implicit_configured(c)
-            transaction.write(material, spec.field, c_new)
-        transaction.commit()
+    def advance_materials(self, dt, *, prepared=None):
+        if prepared is None:
+            if not self._spatial_configured:
+                # Preserve manual eager calls while keeping all preparation out
+                # of the steady-state imperative timestep loop.
+                self.configure_spatial_operators(dt)
+            prepared = tuple(
+                self._spatial_operators[entry[0]]._buffers
+                for entry in self._diffusion_material_plan
+            )
+        return MaterialProcess.advance_materials(self, dt, prepared=prepared)

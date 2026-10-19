@@ -5,7 +5,7 @@ import torch
 
 import dendra as dn
 from dendra.models.mechanisms import Mechanism, State
-from dendra.models.mechanisms._material_process import DiffusionProcess
+from dendra.models.mechanisms._material_process import MaterialProcess
 from dendra.models.mod import hh, pas
 
 DT = 0.01
@@ -315,10 +315,12 @@ def test_make_functional_rejects_uninitialized_population():
 
 
 def test_make_functional_rejects_unlowered_material_process_workspaces():
-    class Diff(DiffusionProcess):
-        DiffusionProcess.GLOBAL(D=0.125)
-        DiffusionProcess.METHOD("explicit", solver="dense")
-        DiffusionProcess.DIFFUSE("solute", field="c", D="D")
+    class CustomTransport(MaterialProcess):
+        MaterialProcess.GLOBAL(D=0.125)
+
+        def advance_materials(self, dt):
+            # Arbitrary lifecycle hooks are not declaration-driven admission.
+            return None
 
     with dn.ctx(JIT=0, REQUIRE_GRAD=1):
         model = dn.Unmyelinated(
@@ -335,7 +337,7 @@ def test_make_functional_rejects_unlowered_material_process_workspaces():
             domain="intracellular",
         )
         model.insert(pas)
-        model.insert(Diff)
+        model.insert(CustomTransport)
         model.initialize()
         model.train()
 

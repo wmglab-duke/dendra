@@ -340,7 +340,7 @@ duplicate-slot multiplicity.
 Unsupported features raise ``dendra.func.FunctionalizationError`` during
 lowering. Current limitations include non-injective regional concentration or
 Material replacement writes, the reserved compact rowwise support encoding,
-TABLE lookups, MaterialProcesses outside the admitted Clearance/Clamp/Exchange
+TABLE lookups, MaterialProcesses outside the admitted Clearance/Clamp/Exchange/Diffusion
 families, mechanism-owned waveform injections, delayed or stochastic state,
 VoltageProcesses, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
@@ -370,7 +370,9 @@ Functional processes over Material fields
 
 Globally inserted, declaration-only ``ClearanceProcess``, ``ClampProcess``, and
 ``ExchangeProcess`` subclasses support functional transitions, fresh
-initialization, and explicit-state continuation.
+initialization, and explicit-state continuation. ``DiffusionProcess`` supports
+the same workflows with global or regional insertion on individual admitted
+Populations, including finite-extracellular models.
 The existing ``CLEAR``/``DECAY``/``RELAX``, ``METHOD``, and ``PHASE`` declarations
 are unchanged; no extra functional annotations or voltage-local State are
 required. ``METHOD("exact")`` uses exponential relaxation,
@@ -436,8 +438,8 @@ uses explicit field inputs and returned replacements instead. Functional
 preparation runs outside the accepted-step loop and may depend on parameters,
 geometry, timestep, and field schemas, not evolving concentrations.
 State-dependent algebra belongs in the field-update computation.
-``DiffusionProcess``, regional process insertion, and custom process
-lifecycle/update overrides remain unsupported by functional
+Regional insertion of the pointwise Clearance/Clamp/Exchange families and
+custom process lifecycle/update overrides remain unsupported by functional
 lowering. They retain their existing imperative execution paths.
 
 ``ClampProcess`` uses the same pipeline for hard assignments, lower/upper
@@ -473,6 +475,46 @@ branch. The active-set boundary itself is not smooth.
 For packed Exchange, supply explicit weights when exact component
 intracellular volumes are needed: the packed parent's established volume
 inference is unchanged.
+
+``DiffusionProcess`` shares its finite-volume coefficient preparation and
+update math with imperative execution. ``DIFFUSE`` supports implicit and
+explicit updates, analytic 1-D geometry, exact native Tree/Cable geometry,
+and registered named material geometries. Node- and edge-aligned diffusivity,
+named volume/edge primitives, literal tensor coefficients, timestep, and
+initial fields are explicit differentiable inputs. Regional insertion uses
+the induced sealed subgraph, not zero diffusivity alone at crossing edges.
+``RELAX``/``BATH`` terms contribute to the same implicit matrix and right-hand
+side, preserving the existing unsplit reservoir coupling and single
+application of mechanism Material sources.
+
+.. code-block:: python
+
+   from dendra.models.mechanisms import DiffusionProcess
+
+   class BathTransport(DiffusionProcess):
+       DiffusionProcess.GLOBAL(D=0.1, rate=0.03, bath=0.2)
+       DiffusionProcess.DIFFUSE("solute", field="c", D="D")
+       DiffusionProcess.RELAX("solute", field="c", rate="rate", target="bath")
+       DiffusionProcess.METHOD("implicit")
+
+Functional preparation runs once outside the accepted-step loop. It retains
+immutable solver topology and rebuilds numerical workspace from explicit
+inputs; it does not retain configure-time numerical snapshots. Fresh
+initialization does not diffuse at t=0, and explicit-state continuation retains
+the usual field/source ordering. Structural checks remain active under
+transforms; callers changing coefficients must preserve the physical-domain
+contract validated during imperative operator configuration: finite,
+nonnegative diffusivity/storage and strictly positive selected storage or
+edge distances wherever required by the chosen method. Implicit Tree
+diffusion retains support for zero-volume algebraic junctions.
+
+Native Thomas, PCR, and dense 1-D solves, and native DHS/dense Tree solves are
+supported, with CUDA-compatible solver facades on CUDA. The implicit CPU SPD
+transport solver remains imperative-only; functional lowering does not
+silently substitute another solver. Explicit Tree diffusion rejects active
+zero-volume junctions, for which implicit diffusion is required. Packed
+``MultiPopulation`` diffusion is not yet supported: an independent chemical
+forest is needed to prevent transport across unrelated cell boundaries.
 
 Basic use
 ---------

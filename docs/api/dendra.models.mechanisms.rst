@@ -505,14 +505,17 @@ local synchronization belong to the surrounding framework transaction. This
 protocol does not introduce ordinary Mechanism ``STATE``, ``CARRY``,
 ``DERIVED_BUFFER``, or ``TIMESTEP_BUFFER`` phases for MaterialProcesses.
 
-``ClearanceProcess``, ``ClampProcess``, and ``ExchangeProcess`` use this shared
+``ClearanceProcess``, ``ClampProcess``, ``ExchangeProcess``, and ``DiffusionProcess`` use this shared
 numerical path in both imperative and functional execution. The imperative
 ``advance_materials`` adapter still commits bound Material state;
 out-of-place arithmetic alone is not an admission contract for
-custom functional processes. Currently only globally inserted,
-declaration-driven Clearance/Clamp/Exchange subclasses with their canonical
-lifecycle are admitted by ``dn.func``. Other families and custom process runtime overrides
-remain imperative-only. No process is advanced during fresh initialization.
+custom functional processes. ``dn.func`` admits globally inserted,
+declaration-driven Clearance/Clamp/Exchange subclasses and global or regional
+Diffusion on individual admitted Populations, with their canonical lifecycle.
+Packed Diffusion and custom process runtime overrides remain imperative-only.
+No process is advanced during fresh initialization. Diffusion's imperative
+adapter retains cached numerical operators; functional execution retains only
+static topology and consumes explicit prepared numerical workspace.
 See :ref:`functional-material-processes` for recording, gradient, and
 continuation examples.
 

@@ -56,6 +56,7 @@ from dendra.models.mechanisms._ions import Ion
 from dendra.models.mechanisms._material_process import (
     ClampProcess,
     ClearanceProcess,
+    DiffusionProcess,
     ExchangeProcess,
     MaterialProcess,
 )
@@ -64,9 +65,10 @@ from dendra.models.mechanisms._mechanism import Mechanism, PointProcess
 from dendra.models.mechanisms._numerical import (
     validate_declared_numerical_current as _validate_declared_numerical_current,
 )
+from dendra.models.mechanisms._spatial import SpatialOperator1D, SpatialOperatorTree
 from dendra.models.mechanisms._state import State
 from dendra.models.mechanisms._support import SupportKind
-from dendra.models.mechanisms._support_registry import SupportEntry
+from dendra.models.mechanisms._support_registry import SupportEntry, SupportRegistry
 from dendra.models.mechanisms._symbolic import build_numerical_equation
 from dendra.models.multi import MultiPopulation
 from dendra.models.parametric import Functional as ParameterFunctional
@@ -259,6 +261,64 @@ _MATERIAL_PROCESS_CONTRACTS = (
             "_exchange_analytic_area",
         ),
     ),
+    _MaterialProcessContract(
+        DiffusionProcess,
+        "diffusion",
+        (
+            "_configure_named_transport_geometry",
+            "_refresh_named_transport_quantities",
+            "_validate_overlapping_diffusivity_overrides",
+            "_configure_region",
+            "_new_spatial_operators",
+            "_select_geometry_kind",
+            "_set_geometry_buffer",
+            "_set_diffusion_geometry_source",
+            "_configure_1d_geometry",
+            "_configure_tree_geometry",
+            "graph",
+            "material_volume",
+            "_validate_diffusion_specs",
+            "_effective_domain",
+            "_resolve_spatial_quantity",
+            "_diffusion_operand_reference",
+            "_configure_diffusion_material_plan",
+            "_diffusion_operand",
+            "_diffusion_relaxation_inputs",
+            "_diffusion_operator_inputs",
+            "_relaxations_for",
+            "configure_spatial_operators",
+            "_configure_1d_spatial_operators",
+            "_configure_tree_spatial_operators",
+            "_configure_material_operators",
+        ),
+        ("_diffusion_specs", "_diffusion_relaxation_specs"),
+        (
+            "_diffusion_material_plan",
+            "_diffusion_fraction_refs",
+            "_diffusion_method",
+            "_diffusion_solver",
+            "_diffusion_boundary",
+            "_diffusion_volume_fraction",
+            "_diffusion_area_fraction",
+            "_diffusion_interface_scheme",
+            "_diffusion_domain",
+            "_diffusion_threads",
+            "_diffusion_geometry_sources",
+            "_diffusion_geometry_kind",
+            "_diffusion_geometry_name",
+            "_diffusion_geometry_domain",
+            "_diffusion_geometry_config",
+            "_diffusion_population_quantities",
+            "_diffusion_operator_keys",
+            "_diffusion_is_regional",
+            "_diffusion_core_shape",
+            "_mp_node_mask",
+            "_mp_diff_parent_index",
+            "_mp_diff_edge_parent",
+            "_mp_diff_edge_child",
+        ),
+        spatial=True,
+    ),
 )
 _STANDARD_MATERIAL_FUNCTIONAL_HOOKS = {
     contract.family: {
@@ -268,6 +328,15 @@ _STANDARD_MATERIAL_FUNCTIONAL_HOOKS = {
     for contract in _MATERIAL_PROCESS_CONTRACTS
 }
 _STANDARD_MATERIAL_RESOLVER = inspect.getattr_static(MechanismHandler, "_get_material")
+_STANDARD_MATERIAL_SPATIAL_HOOKS = {
+    family: {
+        name: value
+        for name, value in vars(family).items()
+        if inspect.isfunction(value)
+        or isinstance(value, (staticmethod, classmethod, property))
+    }
+    for family in (SpatialOperator1D, SpatialOperatorTree)
+}
 _HANDLER_INITIALIZATION_HOOKS = (
     "initialize",
     "_sync_celsius",
@@ -1262,6 +1331,8 @@ def _rebind_population_time_references(population: Population) -> None:
         # Resolver methods are external Python references, not registered module
         # children. Always bind the private copy's material registry explicitly.
         process._material_resolver = handler._get_material
+        if isinstance(process, DiffusionProcess):
+            object.__setattr__(process, "_mp_population", population)
 
 
 def _clone_execution_population(population: Population) -> Population:
@@ -1657,8 +1728,47 @@ def _material_process_failures(process, population=None):
         )
     ):
         return [f"{family} requires its owning MechanismHandler material resolver"]
-    if process.key is not None:
+    if process.key is not None and not contract.spatial:
         return [f"functional {family} requires global insertion"]
+    if contract.spatial:
+        if (
+            population is not None
+            and getattr(process, "_mp_population", None) is not population
+        ):
+            return [f"{family} requires its owning Population geometry registry"]
+        if isinstance(population, MultiPopulation):
+            return [
+                "packed DiffusionProcess requires an independent per-cell "
+                "chemical topology; MultiPopulation transport is not lowered"
+            ]
+        if (
+            process._diffusion_geometry_kind == "tree"
+            and process._diffusion_geometry_name is None
+            and "_mp_diff_geom_um" not in process._buffers
+        ):
+            return [
+                "Tree diffusion requires a registered live diff_geom_um "
+                "geometry tensor, not graph-only numerical coefficients"
+            ]
+        if population is not None:
+            for name in ("diff_parent_index", "diff_edge_parent", "diff_edge_child"):
+                cached = process._buffers.get(f"_mp_{name}")
+                current = population._buffers.get(name)
+                if torch.is_tensor(cached) and (
+                    not torch.is_tensor(current) or not torch.equal(cached, current)
+                ):
+                    return [
+                        "Diffusion topology changed after binding; reinitialize "
+                        "the Population before functional lowering"
+                    ]
+        for operator in process._spatial_operators.values():
+            standards = _STANDARD_MATERIAL_SPATIAL_HOOKS.get(type(operator))
+            if standards is None or any(
+                name in operator.__dict__
+                or inspect.getattr_static(type(operator), name) is not standard
+                for name, standard in (standards or {}).items()
+            ):
+                return [f"{family} requires canonical spatial operator hooks"]
     if population is not None:
         for _buffer_name, source_name in _material_process_geometry_sources(process):
             if source_name not in {
@@ -1688,6 +1798,50 @@ def _material_process_signature(process, handler):
             (name, _material_configuration_signature(getattr(type(process), name, ())))
             for name in contract.declarations
         ),
+        (
+            tuple(
+                (
+                    name,
+                    type(operator),
+                    tuple(
+                        (
+                            option,
+                            _configuration_signature(getattr(operator, option, None)),
+                        )
+                        for option in (
+                            "solver",
+                            "boundary",
+                            "interface_scheme",
+                            "threads",
+                        )
+                    ),
+                    tuple(
+                        (hook, _effective_hook_identity(operator, hook))
+                        for hook in _STANDARD_MATERIAL_SPATIAL_HOOKS.get(
+                            type(operator), {}
+                        )
+                    ),
+                )
+                for name, operator in process._spatial_operators.items()
+            )
+            if contract.spatial
+            else ()
+        ),
+        (
+            tuple(
+                (
+                    name,
+                    _material_configuration_signature(
+                        getattr(
+                            getattr(process, "_mp_population", None), "_buffers", {}
+                        ).get(name)
+                    ),
+                )
+                for name in ("diff_parent_index", "diff_edge_parent", "diff_edge_child")
+            )
+            if contract.spatial
+            else ()
+        ),
         tuple(
             (name, _material_configuration_signature(getattr(process, name, None)))
             for name in contract.configuration
@@ -1705,6 +1859,12 @@ def _material_process_signature(process, handler):
                 )
             ),
             _effective_hook_identity(handler, "_get_material"),
+            (
+                getattr(getattr(process, "_mp_population", None), "mech", None)
+                is handler
+                if contract.spatial
+                else None
+            ),
         ),
         tuple(
             (name, _effective_hook_identity(process, name))
@@ -1716,12 +1876,25 @@ def _material_process_signature(process, handler):
 def _material_configuration_signature(value):
     """Fingerprint declarations, including complete tensor literal contents."""
     if torch.is_tensor(value):
+        # These are resident source declarations/topology, not differentiable
+        # invocation inputs. An ambient grad/vmap transform would otherwise
+        # wrap the temporary byte-copy tensors created by the hash and make
+        # their NumPy storage unreadable. Isolate only this metadata read;
+        # numerical preparation and all explicit inputs stay transformed.
+        if torch._C._functorch.is_functorch_wrapped_tensor(value):
+            raise FunctionalizationError(
+                "Material process configuration/topology must be lowered "
+                "outside torch.func transforms; pass numerical coefficients "
+                "as the resulting plan's explicit tensor inputs"
+            )
+        with torch._C._DisableFuncTorch():
+            digest = _audit_tensor_digest(value)
         return (
             "tensor",
             tuple(value.shape),
             value.dtype,
             str(value.device),
-            _audit_tensor_digest(value),
+            digest,
         )
     if is_dataclass(value) and not isinstance(value, type):
         return (
@@ -1779,6 +1952,22 @@ def _material_process_operand_references(process):
             yield kinetic
             yield volume_a
             yield volume_b
+    elif isinstance(process, DiffusionProcess):
+        yield from process._diffusion_fraction_refs
+        for (
+            _operator,
+            _key,
+            diffusion,
+            _domain,
+            _location,
+            relaxations,
+        ) in process._diffusion_material_plan:
+            yield diffusion
+            for rate, target, where in relaxations:
+                yield rate
+                yield target
+                if where is not None:
+                    yield where
 
 
 def _material_process_geometry_sources(process):
@@ -1798,9 +1987,42 @@ def _prepared_material_advance(self, dt):
     MaterialProcess.advance_materials(self, dt, prepared=prepared)
 
 
+def _preserve_material_spatial_plan(self, population=None):
+    """Rebind a private clone without discarding its static solver topology."""
+    operators = self._spatial_operators
+    configured = self._spatial_configured
+    DiffusionProcess.configure_process(self, population)
+    self._spatial_operators = operators
+    self._spatial_configured = configured
+
+
+def _retain_material_spatial_plan_at_initialization(self):
+    # The handler resets the process clock. Numeric timestep/geometry data
+    # comes exclusively from explicit preparation, not these solver templates.
+    return None
+
+
 def _install_material_preparation(population, dt):
     """Give the private transition fixed tensor slots for pure process outputs."""
     for process in population.mech.material_processes.values():
+        contract = _material_process_contract(process)
+        if contract.spatial:
+            for operator in process._spatial_operators.values():
+                if process._diffusion_method == "explicit":
+                    if isinstance(operator, SpatialOperatorTree):
+                        operator.validate_explicit()
+                    operator._solve = None
+                else:
+                    try:
+                        operator._solve = operator._functional_solver()
+                    except RuntimeError as exc:
+                        raise FunctionalizationError(str(exc)) from exc
+            process.configure_process = types.MethodType(
+                _preserve_material_spatial_plan, process
+            )
+            process._reset_initialization_timestep = types.MethodType(
+                _retain_material_spatial_plan_at_initialization, process
+            )
         for buffer_name, source_name in _material_process_geometry_sources(process):
             if source_name in {"area", "canonical_area_cm2", "component_area"}:
                 # Freeze one logical frame for compact canonical geometry and
@@ -1826,13 +2048,24 @@ def _install_material_preparation(population, dt):
         # Pointwise families use full-field arithmetic. Keep scalar operands
         # scalar publicly and pad only their private execution binding, avoiding
         # the empty-vmap scalar/spatial broadcast limitation outside model math.
-        visible_rank = max(value.ndim for value in fields.values())
+        visible_rank = (
+            2 if contract.spatial else max(value.ndim for value in fields.values())
+        )
         process._functional_material_visible_ranks = {
             name: visible_rank for name in slots
         }
         process.advance_materials = types.MethodType(
             _prepared_material_advance, process
         )
+        if contract.spatial:
+            # Keep only immutable topology in private solver templates. This
+            # also prevents an accidental hidden read of configure-time floats
+            # and avoids cloning a second, unused numerical workspace.
+            for operator in process._spatial_operators.values():
+                topology = getattr(operator, "_FUNCTIONAL_TOPOLOGY_BUFFERS", ())
+                for name in tuple(operator._buffers):
+                    if name not in topology:
+                        del operator._buffers[name]
 
 
 def _timestep_buffer_shape_specs(module) -> tuple[tuple[str, object], ...]:
@@ -2402,7 +2635,13 @@ def _geometry_binding_layout(population: Population) -> tuple[_GeometryBinding, 
                 local_paths.append(module_path)
                 covered_paths.add(module_path)
         if local_paths:
-            bindings.append(_GeometryBinding("diam", "diam", tuple(local_paths)))
+            support_entry = None
+            if process.key is not None:
+                registry = SupportRegistry((process,))
+                support_entry = registry.entry(registry.support_id(process))
+            bindings.append(
+                _GeometryBinding("diam", "diam", tuple(local_paths), support_entry)
+            )
 
     uncovered_paths = sorted(
         module_path
