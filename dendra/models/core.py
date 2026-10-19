@@ -81,7 +81,13 @@ from dendra.models.integrators.core import (
 )
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
-from dendra.models.mechanisms._material_process import MaterialProcess
+from dendra.models.mechanisms._material_process import (
+    ClampProcess,
+    ClearanceProcess,
+    DiffusionProcess,
+    ExchangeProcess,
+    MaterialProcess,
+)
 from dendra.models.mechanisms._materials import (
     Material,
     MaterialFieldSpec,
@@ -104,6 +110,7 @@ from dendra.models.parametric import (
     _ReplicaRangeValue,
     create_param_expander,
     staticproperty,
+    to_param,
 )
 from dendra.models.rng import _validate_rng_checkpoint_payload
 from dendra.models.stim.intra import Intra
@@ -113,6 +120,31 @@ from dendra.units import mm
 from .slice import IndexSpec, Slice, Sliceable, parse_key
 
 TensorLike = Union[torch.Tensor, "np.ndarray"]  # torch or numpy are supported
+
+
+def _canonical_material_process_fields(mechanism):
+    """Return the shared-field manifest authored by built-in process families."""
+    fields = {}
+    for family, attribute in (
+        (ClearanceProcess, "_clearance_specs"),
+        (ClampProcess, "_clamp_specs"),
+        (DiffusionProcess, "_diffusion_specs"),
+    ):
+        if issubclass(mechanism, family):
+            for spec in getattr(mechanism, attribute):
+                fields.setdefault(_canonical_material_name(spec.material), []).append(
+                    spec.field
+                )
+    if issubclass(mechanism, ExchangeProcess):
+        for spec in mechanism._exchange_specs:
+            fields.setdefault(_canonical_material_name(spec.material_a), []).append(
+                spec.field_a
+            )
+            fields.setdefault(_canonical_material_name(spec.material_b), []).append(
+                spec.field_b
+            )
+    return fields
+
 
 # Capture canonical sampler implementations before user-side monkeypatches.
 # Comparing against a later class attribute would accept a replaced class hook.
@@ -2045,6 +2077,7 @@ class Population(P, Sliceable):
             Keyword arguments forwarded to ``dendra.models.mechanisms._ions.equilibria``.
         """
         self._equilibria.update(kwargs)
+        self._update_built_ion_initials(kwargs, reversal=True)
 
     def concentrations(self, **kwargs):
         """
@@ -2056,6 +2089,46 @@ class Population(P, Sliceable):
             Keyword arguments forwarded to ``dendra.models.mechanisms._ions.concentrations``.
         """
         self._concentrations.update(kwargs)
+        self._update_built_ion_initials(kwargs, reversal=False)
+
+    def _update_built_ion_initials(self, updates, *, reversal):
+        """Replace Ion sources without rebuilding unrelated learned mechanisms."""
+        if not self.is_built or self._flag_rebuild:
+            return
+        for name, ion in self.mech.ions.items():
+            fields = (
+                ((f"e{name}", "e_init"),)
+                if reversal
+                else ((f"{name}i0", "i_init"), (f"{name}o0", "o_init"))
+            )
+            for field, attribute in fields:
+                if field not in updates:
+                    continue
+                value = updates[field]
+                if torch.is_tensor(value) or isinstance(value, torch.nn.Module):
+                    source = to_param(value)
+                else:
+                    previous = getattr(ion, attribute)
+                    requires_grad = (
+                        previous.requires_grad
+                        if torch.is_tensor(previous)
+                        else any(
+                            parameter.requires_grad
+                            for parameter in previous.parameters()
+                        )
+                    )
+                    source = to_param(
+                        value,
+                        device=self.device(),
+                        dtype=self.dtype(),
+                        requires_grad=requires_grad,
+                    )
+                # A source may change from a Parameter to a pure Module (or
+                # vice versa). Remove the old registration before assigning
+                # the replacement, preserving the new leaf/module identity.
+                for registry in (ion._parameters, ion._buffers, ion._modules):
+                    registry.pop(attribute, None)
+                setattr(ion, attribute, source)
 
     def material(
         self,
@@ -5762,6 +5835,13 @@ class Population(P, Sliceable):
                 self._material_source, getattr(mech, "_source_material", {})
             )
         else:
+            # Canonical process declarations are their shared-field manifest;
+            # they deliberately do not use voltage-local USEMATERIAL. Register
+            # that manifest before constructing material/ion containers, so a
+            # process can be the sole user of an ion or registered material.
+            process_fields = _canonical_material_process_fields(mech)
+            register_material_fields(self._material_process_read, process_fields)
+            register_material_fields(self._material_process_write, process_fields)
             register_material_fields(
                 self._material_process_read, getattr(mech, "_read_material", {})
             )

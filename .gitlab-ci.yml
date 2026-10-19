@@ -193,6 +193,8 @@ test_functional_compatibility:
       tests/func/test_material_processes.py
       tests/func/test_material_diffusion.py
       tests/func/test_material_preparation_guards.py
+      tests/func/test_material_concatenation.py
+      tests/func/test_extcell_material_concatenation.py
       tests/func/test_convenience_runner.py::test_top_level_compile_is_the_exported_functional_compile_alias
 
 build_docs:

@@ -847,7 +847,9 @@ class SpatialOperator1D(torch.nn.Module):
         self, c: torch.Tensor, workspace: Mapping[str, torch.Tensor], *, solve
     ) -> torch.Tensor:
         """Advance from explicit coefficients using the configured solver plan."""
-        if self.K <= 1 and not self._has_relaxation:
+        # Only the bound workspace shares the template's reservoir declaration.
+        # A caller may add relaxation to an independent prepared workspace.
+        if self.K <= 1 and workspace is self._buffers and not self._has_relaxation:
             return c
         c2 = c.reshape(self.B, self.K).contiguous()
         rhs = workspace["solve_volume"] * c2 + workspace["relax_rhs"]
@@ -962,7 +964,7 @@ THREADS_PER_WARP = 32
 def _build_tree_morphology(
     parent_idx: list[int],
 ) -> tuple[torch.Tensor, list[list[int]], torch.Tensor]:
-    """Build DHS/Hines morphology metadata from a parent-index vector.
+    """Build DHS/Hines forest metadata from a parent-index vector.
 
     This mirrors :func:`dendra.models.integrators.tree.build_morphology` but is
     kept local to avoid importing the full voltage-integrator module from the
@@ -970,25 +972,23 @@ def _build_tree_morphology(
     """
     K = len(parent_idx)
     children: list[list[int]] = [[] for _ in range(K)]
-    root = None
+    roots: list[int] = []
     for i, p in enumerate(parent_idx):
         p = int(p)
         if p == -1:
-            if root is not None:
-                raise ValueError("tree morphology has more than one root")
-            root = i
+            roots.append(i)
         else:
             if p < 0 or p >= K:
                 raise ValueError(f"invalid parent index {p} for node {i}")
             children[p].append(i)
 
-    if root is None:
-        raise ValueError("tree morphology must have one root with parent=-1")
+    if not roots:
+        raise ValueError("tree morphology must have at least one root with parent=-1")
 
     depth = torch.zeros(K, dtype=torch.int32)
     visited = torch.zeros(K, dtype=torch.bool)
-    visited[root] = True
-    q = deque([root])
+    visited[roots] = True
+    q = deque(roots)
     while q:
         u = q.popleft()
         for child in children[u]:
@@ -1000,7 +1000,7 @@ def _build_tree_morphology(
 
     if not bool(torch.all(visited)):
         raise ValueError(
-            "tree morphology must be connected; unreachable nodes may form a cycle"
+            "tree morphology must be connected to a root; unreachable nodes may form a cycle"
         )
 
     return torch.as_tensor(parent_idx, dtype=torch.int32), children, depth
@@ -1161,7 +1161,7 @@ def parent_index_to_tree_topology(parent_index):
     """Build solver and compact-edge maps from storage-order parents.
 
     ``parent_index[j]`` is the parent of model-storage compartment ``j`` or
-    ``-1`` at the root. This registered tensor is the authoritative compiled
+    ``-1`` at each root. This registered tensor is the authoritative compiled
     topology for named Tree geometry; mutable interoperability graph views are
     deliberately not consulted.
     """
@@ -1986,7 +1986,9 @@ class SpatialOperatorTree(torch.nn.Module):
         self, c: torch.Tensor, workspace: Mapping[str, torch.Tensor], *, solve
     ) -> torch.Tensor:
         """Advance with explicit numerical coefficients and a static solve plan."""
-        if self.K <= 1 and not self._has_relaxation:
+        # Independent workspaces can contain a reservoir absent from the
+        # configured template, including when this forest has just one node.
+        if self.K <= 1 and workspace is self._buffers and not self._has_relaxation:
             return c
         c2 = c.reshape(self.B, self.K).contiguous()
         c_s = c2.index_select(-1, self._buffers["solver_order"])

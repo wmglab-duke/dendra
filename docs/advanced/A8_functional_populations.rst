@@ -368,11 +368,11 @@ remaining Python configuration immutable.
 Functional processes over Material fields
 -----------------------------------------
 
-Globally inserted, declaration-only ``ClearanceProcess``, ``ClampProcess``, and
-``ExchangeProcess`` subclasses support functional transitions, fresh
-initialization, and explicit-state continuation. ``DiffusionProcess`` supports
-the same workflows with global or regional insertion on individual admitted
-Populations, including finite-extracellular models.
+Declaration-only ``ClearanceProcess``, ``ClampProcess``, ``ExchangeProcess``,
+and ``DiffusionProcess`` subclasses support functional transitions, fresh
+initialization, and explicit-state continuation with global or regional
+insertion. This includes admitted individual and packed ``MultiPopulation``
+models, including finite-extracellular models.
 The existing ``CLEAR``/``DECAY``/``RELAX``, ``METHOD``, and ``PHASE`` declarations
 are unchanged; no extra functional annotations or voltage-local State are
 required. ``METHOD("exact")`` uses exponential relaxation,
@@ -438,9 +438,9 @@ uses explicit field inputs and returned replacements instead. Functional
 preparation runs outside the accepted-step loop and may depend on parameters,
 geometry, timestep, and field schemas, not evolving concentrations.
 State-dependent algebra belongs in the field-update computation.
-Regional insertion of the pointwise Clearance/Clamp/Exchange families and
-custom process lifecycle/update overrides remain unsupported by functional
-lowering. They retain their existing imperative execution paths.
+Regional insertion of the Clearance/Clamp/Exchange families uses the declared
+process support, intersected with material-field availability. Custom process
+lifecycle/update overrides remain unsupported by functional lowering.
 
 ``ClampProcess`` uses the same pipeline for hard assignments, lower/upper
 bounds, and bounded ranges. Its existing ``where=`` masks/selectors are
@@ -472,9 +472,8 @@ packed component membrane areas. Functional preparation does not reuse a
 detached geometry snapshot. Pairs with either volume at or below ``eps`` are
 identities, with finite zero coefficient/volume gradients on that inactive
 branch. The active-set boundary itself is not smooth.
-For packed Exchange, supply explicit weights when exact component
-intracellular volumes are needed: the packed parent's established volume
-inference is unchanged.
+Packed Exchange retains the exact component chemical volumes; explicit weights
+can still describe an alternative two-pool storage model.
 
 ``DiffusionProcess`` shares its finite-volume coefficient preparation and
 update math with imperative execution. ``DIFFUSE`` supports implicit and
@@ -512,9 +511,33 @@ Native Thomas, PCR, and dense 1-D solves, and native DHS/dense Tree solves are
 supported, with CUDA-compatible solver facades on CUDA. The implicit CPU SPD
 transport solver remains imperative-only; functional lowering does not
 silently substitute another solver. Explicit Tree diffusion rejects active
-zero-volume junctions, for which implicit diffusion is required. Packed
-``MultiPopulation`` diffusion is not yet supported: an independent chemical
-forest is needed to prevent transport across unrelated cell boundaries.
+zero-volume junctions, for which implicit diffusion is required.
+
+Concatenation preserves component material declarations, initial sources,
+field guards, named chemical geometry, and component-local process parameters.
+Each component's processes retain their support and phase ordering; in
+particular, different component ``GLOBAL`` process values remain independent.
+As with other mechanisms, packing reconstructs process parameters from the
+authored insertion configuration, not a snapshot of later-trained runtime
+parameters. Train or update the packed model's mechanism parameters after
+packing.
+Diffusion uses a disconnected chemical forest, preserving both component and
+neuron-row boundaries and each native Tree's branches. A material field absent
+from a component has zero-filled inactive recording slots, not a new chemical
+pool. Process and material support seal crossing edges and leave inactive rows
+unchanged. Native scalar DHS already handles this forest; packing does not add
+chemical connections or require a material to exist everywhere voltage does.
+
+The same composition is used by imperative ``run``/``longrun`` and functional
+scan/while execution. Fresh initialization rebuilds packed fields from their
+original sources and preserves their gradients; explicit-state continuation
+does not reset them. Component-authored ``where="root"``/``"terminal"`` clamps
+retain each component's original endpoints. On the packed parent these
+selectors cover the endpoints of every component/neuron, rather than only the
+first and last flattened slot. Material fields with the same name must have
+compatible domain, units, and conservation metadata across components. Shared
+ion species must also use compatible effective ``ion_style`` flags; conflicting
+component policies are rejected rather than silently changing reversal updates.
 
 Basic use
 ---------

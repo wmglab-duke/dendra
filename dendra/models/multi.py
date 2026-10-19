@@ -1,6 +1,9 @@
 """Utilities for composing multiple population models into a single system."""
 
+import copyreg
 import math
+from collections.abc import Mapping
+from dataclasses import replace
 
 import torch
 
@@ -8,12 +11,23 @@ from ..helpers import logger
 from .core import (
     Cable,
     Population,
+    _canonical_material_process_fields,
     _core_key_from_flat,
     _global_configuration_values_equal,
     _mechanism_global_parameter_names,
     _unpack_mechanism_insertion_record,
 )
 from .integrators import bwd_euler_sc_multi, dhs_bt_multi, dhs_multi
+from .mechanisms._ions import cinits, reversals, valid_ions
+from .mechanisms._material_process import MaterialProcess, _canonical_domain
+from .mechanisms._materials import (
+    Material,
+    MaterialFieldSpec,
+    _canonical_material_name,
+    _make_into_shape,
+    material_specs,
+)
+from .parametric import to_param
 from .tree import Tree
 
 _MISSING = object()
@@ -60,6 +74,11 @@ def _merged_global_overrides(populations):
     for component_name, population in populations.items():
         mechanisms = set(population._mech_everywhere) | set(population._mech_data)
         for mechanism in mechanisms:
+            # Full-field material operators remain separate per component.
+            # Their GLOBAL parameters therefore do not acquire the class-wide
+            # sharing semantics of concatenated voltage-local mechanisms.
+            if issubclass(mechanism, MaterialProcess):
+                continue
             configurations.setdefault(mechanism, []).append(
                 (
                     component_name,
@@ -104,6 +123,364 @@ def _merged_global_overrides(populations):
             mechanism_overrides[parameter_name] = selected_value
         merged[mechanism] = mechanism_overrides
     return merged
+
+
+class _PackedMaterialInitial(torch.nn.Module):
+    """Resolve independent material initial sources without severing autograd.
+
+    Concatenating values into a new Parameter would silently replace the child
+    parameters. This small pure module instead owns the original sources and
+    constructs the packed field afresh on every initialization.
+    """
+
+    _functional_material_initial = True
+
+    def __init__(self, sources, shapes):
+        super().__init__()
+        self.shapes = tuple(tuple(shape) for shape in shapes)
+        for index, source in enumerate(sources):
+            setattr(self, f"source_{index}", to_param(source))
+
+    def forward(self):
+        parts = [
+            _make_into_shape(shape, getattr(self, f"source_{index}")).reshape(-1)
+            for index, shape in enumerate(self.shapes)
+        ]
+        return torch.cat(parts).reshape(1, -1)
+
+
+class _PackedMaterialGeometry(torch.nn.Module):
+    """Source-only pure adapter for packed chemical storage/transport fields.
+
+    In particular this module does not retain component Population objects or
+    voltage solvers. Functional preparation can therefore prune their runtimes
+    while still deriving chemical coefficients from the original parameters.
+    """
+
+    def __init__(self, population):
+        super().__init__()
+        source_names = {}
+        source_paths = {}
+
+        def register_source(value, component_name, attribute):
+            if id(value) in source_names:
+                return source_names[id(value)]
+            name = f"source_{len(source_names)}"
+            if isinstance(value, torch.nn.Parameter):
+                self.register_parameter(name, value)
+            else:
+                self.register_buffer(name, value)
+            source_names[id(value)] = name
+            source_paths[name] = (component_name, attribute)
+            return name
+
+        components = []
+        named = []
+        offset = 0
+        for component_name, component in population.populations.items():
+            core = tuple(component.core_shape())
+            native = hasattr(component, "diff_parent_index")
+            sources = {
+                role: register_source(getattr(component, role), component_name, role)
+                for role in ("volume", "volume_i", "volume_o", "diff_geom_um")
+                if hasattr(component, role)
+            }
+            components.append(
+                (
+                    component_name,
+                    core,
+                    offset,
+                    native,
+                    sources,
+                    population._material_component_edge_counts[component_name],
+                )
+            )
+            for local_name, config in component._material_geometries.items():
+                packed_name = population._component_material_geometry_names[
+                    component_name
+                ][local_name]
+                packed = population._material_geometries[packed_name]
+                for role, source in config.items():
+                    if role in {"name", "domain"}:
+                        continue
+                    named.append(
+                        (
+                            component_name,
+                            role,
+                            register_source(
+                                getattr(component, source), component_name, source
+                            ),
+                            packed[role],
+                        )
+                    )
+            offset += math.prod(core)
+        self.components = tuple(components)
+        self.named_geometry = tuple(named)
+        self.source_paths = source_paths
+
+    def refresh_sources(self, population):
+        """Rebind live source buffers after owner dtype moves or replacement."""
+        for name, (component_name, attribute) in self.source_paths.items():
+            value = getattr(population.populations[component_name], attribute)
+            if name in self._parameters:
+                self._parameters[name] = value
+            else:
+                self._buffers[name] = value
+
+    def forward(self, packed_diam, packed_dx):
+        batch_shape = tuple(packed_diam.shape[:-2])
+        values = {
+            name: [] for name in ("volume", "volume_i", "volume_o", "diff_geom_um")
+        }
+        for _name, core, offset, native, sources, _edges in self.components:
+            shape = (*batch_shape, *core)
+            end = offset + math.prod(core)
+            diam = packed_diam[..., offset:end].reshape(shape)
+            dx = packed_dx[..., offset:end].reshape(shape)
+            area = torch.pi * (diam * 0.5) ** 2
+            volume = (
+                torch.broadcast_to(getattr(self, sources["volume"]), shape)
+                if "volume" in sources
+                else area * dx
+            )
+            volume_i = (
+                torch.broadcast_to(getattr(self, sources["volume_i"]), shape)
+                if "volume_i" in sources
+                else volume
+            )
+            volume_o = (
+                torch.broadcast_to(getattr(self, sources["volume_o"]), shape)
+                if "volume_o" in sources
+                else torch.zeros_like(volume)
+            )
+            if native:
+                factor = torch.broadcast_to(
+                    getattr(self, sources["diff_geom_um"]), shape
+                )
+            else:
+                edge = (
+                    0.5
+                    * (area[..., :-1] + area[..., 1:])
+                    / (0.5 * (dx[..., :-1] + dx[..., 1:])).clamp_min(
+                        torch.finfo(dx.dtype).tiny
+                    )
+                )
+                factor = torch.cat((torch.zeros_like(dx[..., :1]), edge), dim=-1)
+            for role, value in (
+                ("volume", volume),
+                ("volume_i", volume_i),
+                ("volume_o", volume_o),
+                ("diff_geom_um", factor),
+            ):
+                values[role].append(value.reshape(*batch_shape, -1))
+        result = {
+            name: torch.cat(parts, dim=-1).unsqueeze(-2)
+            for name, parts in values.items()
+        }
+        for component_name, role, source, destination in self.named_geometry:
+            value = getattr(self, source)
+            parts = []
+            for other_name, core, _offset, _native, _sources, edges in self.components:
+                shape = (
+                    (*batch_shape, *core) if role == "volume" else (*batch_shape, edges)
+                )
+                if other_name == component_name:
+                    if role != "volume":
+                        value = torch.broadcast_to(
+                            value, (*batch_shape, core[0], edges // core[0])
+                        ).reshape(*batch_shape, -1)
+                    part = torch.broadcast_to(value, shape)
+                else:
+                    fill = 1.0 if role in {"volume", "edge_distance"} else 0.0
+                    part = torch.full(
+                        shape, fill, device=packed_diam.device, dtype=packed_diam.dtype
+                    )
+                parts.append(part.reshape(*batch_shape, -1))
+            combined = torch.cat(parts, dim=-1)
+            # Packed fields have one logical neuron row. Keep that axis for
+            # compact edge quantities too, so an explicit batch prefix cannot
+            # be mistaken for the neuron axis by the spatial operator.
+            result[destination] = combined.unsqueeze(-2)
+        return result
+
+
+class _PackedMaterialProcessMeta(type(MaterialProcess)):
+    """Pickle-aware class identity for independent component operators."""
+
+
+def _make_packed_material_process_class(
+    original, component_name, class_name, geometry_names, quantity_names
+):
+    scoped = _PackedMaterialProcessMeta(
+        class_name,
+        (original,),
+        {
+            "__module__": __name__,
+            "_material_process_component": component_name,
+            "_material_process_original_class": original,
+            "_material_process_geometry_names": geometry_names,
+            "_material_process_quantity_names": quantity_names,
+        },
+    )
+    # Family metaclasses collect inherited declarations. Keep the already
+    # resolved author declarations exactly once in the adapter.
+    for attribute in (
+        "_clearance_specs",
+        "_clamp_specs",
+        "_exchange_specs",
+        "_diffusion_specs",
+        "_diffusion_relaxation_specs",
+    ):
+        if hasattr(original, attribute):
+            setattr(scoped, attribute, getattr(original, attribute))
+    return scoped
+
+
+def _reduce_packed_material_process_class(scoped):
+    return _make_packed_material_process_class, (
+        scoped._material_process_original_class,
+        scoped._material_process_component,
+        scoped.__name__,
+        scoped._material_process_geometry_names,
+        scoped._material_process_quantity_names,
+    )
+
+
+copyreg.pickle(_PackedMaterialProcessMeta, _reduce_packed_material_process_class)
+
+
+def _component_material_specs(population):
+    """Resolve configured material metadata without initializing a population."""
+    declarations = {}
+    names = set(population._material_configs)
+    for mechanism in set(population._mech_everywhere) | set(population._mech_data):
+        names.update(getattr(mechanism, "_material", ()))
+        for attribute in (
+            "_clearance_specs",
+            "_clamp_specs",
+            "_exchange_specs",
+            "_diffusion_specs",
+        ):
+            for spec in getattr(mechanism, attribute, ()):
+                for role in ("material", "material_a", "material_b"):
+                    if hasattr(spec, role):
+                        names.add(getattr(spec, role))
+    names = {_canonical_material_name(name) for name in names} - set(valid_ions())
+    for name in sorted(names):
+        material = Material(
+            name,
+            population.core_shape(),
+            **population._material_constructor_kwargs(name),
+        )
+        # A pending rebuild discards the old registry on the child's next
+        # initialize(). In particular, material() may have replaced an initial
+        # source since that registry was built; concatenation must then resolve
+        # the new declaration rather than resurrect the stale source.
+        built = (
+            getattr(population, "mech", None)
+            if population.is_built and not population._flag_rebuild
+            else None
+        )
+        existing = (
+            built.materials[name]
+            if built is not None and name in built.materials
+            else None
+        )
+        declarations[name] = {
+            field: replace(
+                material.field_spec(field),
+                initial=(
+                    existing.initial_source(field)
+                    if existing is not None and existing.has_field(field)
+                    else material.initial_source(field)
+                ),
+            )
+            for field in material.fields
+        }
+    return declarations
+
+
+def _component_ion_styles(population):
+    """Infer effective ion flags from declarations without building children."""
+    used = set(population._ion_style)
+    reads = {}
+    writes = set()
+    ions = set(valid_ions())
+    for mechanism in set(population._mech_everywhere) | set(population._mech_data):
+        used.update(set(getattr(mechanism, "_ion", ())) & ions)
+        for declaration in ("_read_ion", "_read_material"):
+            for name, fields in getattr(mechanism, declaration, {}).items():
+                name = _canonical_material_name(name)
+                if name in ions:
+                    used.add(name)
+                    reads.setdefault(name, set()).update(fields)
+        for declaration in (
+            "_write_ion",
+            "_write_ion_c",
+            "_write_material",
+            "_source_material",
+        ):
+            for name in getattr(mechanism, declaration, {}):
+                name = _canonical_material_name(name)
+                if name in ions:
+                    used.add(name)
+                    if declaration != "_write_ion":
+                        writes.add(name)
+        if issubclass(mechanism, MaterialProcess):
+            for name, fields in _canonical_material_process_fields(mechanism).items():
+                if name in ions:
+                    used.add(name)
+                    reads.setdefault(name, set()).update(fields)
+                    writes.add(name)
+    styles = {}
+    for name in used:
+        if name in population._ion_style:
+            styles[name] = tuple(int(flag != 0) for flag in population._ion_style[name])
+        else:
+            fields = reads.get(name, set())
+            concentration_read = bool({f"{name}i", f"{name}o"} & fields)
+            reversal_read = f"e{name}" in fields
+            styles[name] = (
+                int(reversal_read and (name in writes or concentration_read)),
+                int(reversal_read and name in writes),
+            )
+    return styles
+
+
+def _component_ion_initials(population, attribute):
+    """Keep trained Ion initial leaves when the child's registry is current."""
+    sources = dict(getattr(population, attribute))
+    built = (
+        getattr(population, "mech", None)
+        if population.is_built and not population._flag_rebuild
+        else None
+    )
+    if built is not None:
+        for name, ion in built.ions.items():
+            if attribute == "_equilibria":
+                sources[f"e{name}"] = ion.e_init
+            else:
+                sources[f"{name}i0"] = ion.i_init
+                sources[f"{name}o0"] = ion.o_init
+    return sources
+
+
+def _merged_ion_styles(populations):
+    configurations = {}
+    for component_name, population in populations.items():
+        for ion, style in _component_ion_styles(population).items():
+            if ion in configurations:
+                previous_component, previous_style = configurations[ion]
+                if style != previous_style:
+                    raise ValueError(
+                        f"Ion {ion!r} has incompatible effective ion_style flags "
+                        f"in components {previous_component!r} ({previous_style}) "
+                        f"and {component_name!r} ({style}). Packed ion fields "
+                        "currently require compatible initialization and reversal updates."
+                    )
+            else:
+                configurations[ion] = (component_name, style)
+    return {ion: style for ion, (_component, style) in configurations.items()}
 
 
 def _uses_block_voltage_state(population):
@@ -656,15 +1033,34 @@ class MultiPopulation(Population):
         self.register_buffer("_component_area", component_area)
 
         self.populations = torch.nn.ModuleDict(populations)
+        self._ion_style.update(_merged_ion_styles(self.populations))
+        self._packed_material_process_classes = {}
+        self._component_material_geometry_names = {}
+        self._component_material_quantity_names = {}
+        self._material_field_support = {}
+        self._configure_component_materials()
+        self._refresh_material_geometry()
+        self._material_geometry = _PackedMaterialGeometry(self)
         if is_block:
             for name in ("xraxial", "xc", "xg"):
                 self.register_buffer(
                     name, _concat_component_shell_field(self.populations, name)
                 )
 
-        for pop in self.populations.values():
-            self._equilibria.update(pop._equilibria)
-            self._concentrations.update(pop._concentrations)
+        for destination, attribute, defaults in (
+            (self._equilibria, "_equilibria", reversals()),
+            (self._concentrations, "_concentrations", cinits()),
+        ):
+            sources = [
+                _component_ion_initials(pop, attribute)
+                for pop in self.populations.values()
+            ]
+            names = set().union(*(set(source) for source in sources))
+            for name in sorted(names):
+                destination[name] = _PackedMaterialInitial(
+                    [source.get(name, defaults[name]) for source in sources],
+                    [pop.core_shape() for pop in self.populations.values()],
+                )
 
         # Re-validate/apply after self.populations exists so the overridden
         # device()/dtype() methods resolve to the component population device.
@@ -693,11 +1089,457 @@ class MultiPopulation(Population):
             return component_area
         return super().area
 
+    @property
+    def material_edge_index(self):
+        """Independent chemical edges in stable packed child-storage order."""
+        return torch.stack((self.diff_edge_parent, self.diff_edge_child), dim=0)
+
+    @property
+    def material_edges(self):
+        return self.diff_edge_parent, self.diff_edge_child
+
+    def material_volume(self, domain="intracellular"):
+        """Return exact component chemical storage volumes, not a packed tube."""
+        domain = str(domain or "intracellular").lower()
+        if domain in {"i", "inside", "cytosol", "cytoplasm", "intracellular"}:
+            return self.volume_i
+        if domain in {"o", "outside", "extracellular"}:
+            return self.volume_o
+        if domain in {"total", "volume", "all"}:
+            return self.volume
+        if domain in {"membrane", "surface", "area"}:
+            return self.area
+        raise ValueError(f"Unsupported material domain {domain!r}.")
+
+    def material(
+        self,
+        name,
+        fields=None,
+        *,
+        initial_values=None,
+        min_values=None,
+        specs=None,
+        domain=None,
+        units=None,
+        conserved=None,
+        **field_initials,
+    ):
+        """Declare packed-parent fields globally without changing other fields.
+
+        Fields inherited from children retain their independent availability.
+        Explicitly reconfiguring a field on the packed parent makes that field
+        available throughout the parent. Partial updates preserve the other
+        fields and their metadata; they do not discard concatenated specs.
+        """
+        name = _canonical_material_name(name)
+        if name in valid_ions():
+            return super().material(name, fields=fields)
+        initial_values = dict(initial_values or {})
+        initial_values.update(field_initials)
+        minima = dict(min_values or {})
+        declared = {}
+        if fields is not None:
+            if isinstance(fields, Mapping):
+                declared.update(fields)
+            else:
+                names = (fields,) if isinstance(fields, str) else fields
+                declared.update((str(field), 0.0) for field in names)
+        declared.update(initial_values)
+        existing = self._material_configs.get(name, {})
+        existing_kwargs = self._material_constructor_kwargs(name) if existing else {}
+        if (
+            any(
+                existing_kwargs.get(key)
+                for key in ("specs", "fields", "initial_values")
+            )
+            or name in material_specs()
+        ):
+            previous = Material(name, self.core_shape(), **existing_kwargs)
+            merged = {field: previous.field_spec(field) for field in previous.fields}
+        else:
+            merged = dict(material_specs().get(name, {}))
+        touched = set(declared) | set(minima) | set(specs or {})
+        for metadata in (domain, units, conserved):
+            if isinstance(metadata, Mapping):
+                touched.update(metadata)
+            elif metadata is not None:
+                touched.update(merged)
+        if not touched:
+            return super().material(
+                name,
+                fields=fields,
+                initial_values=initial_values,
+                min_values=min_values,
+                specs=specs,
+                domain=domain,
+                units=units,
+                conserved=conserved,
+            )
+
+        def selected(metadata, field, default):
+            if isinstance(metadata, Mapping):
+                return metadata.get(field, default)
+            return default if metadata is None else metadata
+
+        for field in sorted(touched):
+            previous = (
+                specs[field]
+                if specs is not None and field in specs
+                else merged.get(field, MaterialFieldSpec(name=field))
+            )
+            merged[field] = replace(
+                previous,
+                initial=declared.get(field, previous.initial),
+                min_value=minima.get(field, previous.min_value),
+                domain=str(selected(domain, field, previous.domain)),
+                units=selected(units, field, previous.units),
+                conserved=bool(selected(conserved, field, previous.conserved)),
+            )
+        result = super().material(name, specs=merged)
+        supports = getattr(self, "_material_field_support", None)
+        if supports is not None:
+            for field in touched:
+                supports[(name, field)] = torch.ones(
+                    self.core_shape(), device=self.device(), dtype=torch.bool
+                )
+        return result
+
+    def _set_material_geometry_buffer(self, name, value):
+        if name in self._buffers:
+            self._buffers[name] = value
+        else:
+            self.register_buffer(name, value)
+
+    def _configure_component_materials(self):
+        declarations = {
+            name: _component_material_specs(pop)
+            for name, pop in self.populations.items()
+        }
+        material_names = sorted(
+            set().union(*(set(configs) for configs in declarations.values()))
+        )
+        shapes = [pop.core_shape() for pop in self.populations.values()]
+        for material_name in material_names:
+            field_names = sorted(
+                set().union(
+                    *(
+                        set(configs.get(material_name, {}))
+                        for configs in declarations.values()
+                    )
+                )
+            )
+            specs = {}
+            for field in field_names:
+                present = [
+                    configs.get(material_name, {}).get(field)
+                    for configs in declarations.values()
+                ]
+                authored = [spec for spec in present if spec is not None]
+                first = authored[0]
+                for spec in authored[1:]:
+                    if (_canonical_domain(spec.domain), spec.units, spec.conserved) != (
+                        _canonical_domain(first.domain),
+                        first.units,
+                        first.conserved,
+                    ):
+                        raise ValueError(
+                            f"Material field {material_name}.{field} has incompatible "
+                            "domain, units, or conservation metadata across components."
+                        )
+                sources = [
+                    spec.initial
+                    if spec is not None
+                    else torch.zeros((), device=self.device(), dtype=self.dtype())
+                    for spec in present
+                ]
+                minimum = None
+                if any(spec.min_value is not None for spec in authored):
+                    minimum = torch.cat(
+                        [
+                            torch.as_tensor(
+                                spec.min_value
+                                if spec is not None and spec.min_value is not None
+                                else -torch.inf,
+                                device=self.device(),
+                                dtype=self.dtype(),
+                            )
+                            .expand(shape)
+                            .reshape(-1)
+                            for spec, shape in zip(present, shapes)
+                        ]
+                    ).reshape(1, -1)
+                specs[field] = replace(
+                    first,
+                    initial=_PackedMaterialInitial(sources, shapes),
+                    min_value=minimum,
+                )
+                self._material_field_support[(material_name, field)] = torch.cat(
+                    [
+                        torch.full(
+                            (math.prod(shape),),
+                            spec is not None,
+                            device=self.device(),
+                            dtype=torch.bool,
+                        )
+                        for spec, shape in zip(present, shapes)
+                    ]
+                ).reshape(1, -1)
+            super().material(material_name, specs=specs)
+
+    def _refresh_material_geometry(self, *, diam=None, dx=None):
+        """Assemble a disconnected chemical forest and differentiable geometry."""
+        helper = getattr(self, "_material_geometry", None)
+        if helper is not None:
+            helper.refresh_sources(self)
+        configure_topology = not getattr(self, "_material_forest_configured", False)
+        parents, factors, volumes, volumes_i, volumes_o, analytic = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        offset = 0
+        component_edge_counts = {}
+        for component_name, pop in self.populations.items():
+            shape = tuple(pop.shape)
+            core = tuple(pop.core_shape())
+            count, compartments = core
+            batch_shape = shape[:-2]
+            native = hasattr(pop, "diff_parent_index")
+            if configure_topology:
+                local_parent = (
+                    pop.diff_parent_index.to(device=self.device(), dtype=torch.long)
+                    if native
+                    else torch.arange(compartments, device=self.device()) - 1
+                )
+                row_offsets = (
+                    torch.arange(count, device=self.device()).unsqueeze(-1)
+                    * compartments
+                    + offset
+                )
+                parents.append(
+                    torch.where(
+                        local_parent >= 0, local_parent + row_offsets, -1
+                    ).reshape(-1)
+                )
+            component_diam = (
+                torch.broadcast_to(pop.diam, shape)
+                if diam is None
+                else diam[..., offset : offset + math.prod(core)].reshape(shape)
+            )
+            component_dx = (
+                torch.broadcast_to(pop.dx, shape)
+                if dx is None
+                else dx[..., offset : offset + math.prod(core)].reshape(shape)
+            )
+            area = torch.pi * (component_diam * 0.5) ** 2
+            cylinder_volume = area * component_dx
+            volume = torch.broadcast_to(getattr(pop, "volume", cylinder_volume), shape)
+            volume_i = torch.broadcast_to(getattr(pop, "volume_i", volume), shape)
+            volume_o = torch.broadcast_to(
+                getattr(pop, "volume_o", torch.zeros_like(volume)), shape
+            )
+            if native:
+                factor = torch.broadcast_to(pop.diff_geom_um, shape)
+            else:
+                edge = (
+                    0.5
+                    * (area[..., :-1] + area[..., 1:])
+                    / (
+                        0.5 * (component_dx[..., :-1] + component_dx[..., 1:])
+                    ).clamp_min(torch.finfo(component_dx.dtype).tiny)
+                )
+                factor = torch.cat(
+                    (torch.zeros_like(component_dx[..., :1]), edge), dim=-1
+                )
+            for destination, value in (
+                (volumes, volume),
+                (volumes_i, volume_i),
+                (volumes_o, volume_o),
+                (factors, factor),
+            ):
+                destination.append(value.reshape(*batch_shape, -1))
+            if configure_topology:
+                analytic.append(
+                    torch.full(
+                        (math.prod(core),),
+                        not native,
+                        device=self.device(),
+                        dtype=torch.bool,
+                    )
+                )
+                component_edge_counts[component_name] = count * int(
+                    (local_parent >= 0).sum()
+                )
+            offset += math.prod(core)
+        if configure_topology:
+            parent = torch.cat(parents)
+            child = torch.nonzero(parent >= 0, as_tuple=False).flatten()
+            for name, value in (
+                ("diff_parent_index", parent),
+                ("diff_edge_child", child),
+                ("diff_edge_parent", parent.index_select(0, child)),
+                ("_material_analytic_geometry", torch.cat(analytic).reshape(1, -1)),
+            ):
+                self._set_material_geometry_buffer(name, value)
+            self._material_component_edge_counts = component_edge_counts
+            self._material_forest_configured = True
+        for name, value in (
+            ("volume", torch.cat(volumes, dim=-1).unsqueeze(-2)),
+            ("volume_i", torch.cat(volumes_i, dim=-1).unsqueeze(-2)),
+            ("volume_o", torch.cat(volumes_o, dim=-1).unsqueeze(-2)),
+            ("diff_geom_um", torch.cat(factors, dim=-1).unsqueeze(-2)),
+        ):
+            self._set_material_geometry_buffer(name, value)
+        self._refresh_named_material_geometry()
+
+    def _refresh_named_material_geometry(self):
+        for component_index, (component_name, pop) in enumerate(
+            self.populations.items()
+        ):
+            names = self._component_material_geometry_names.setdefault(
+                component_name, {}
+            )
+            quantities = self._component_material_quantity_names.setdefault(
+                component_name, {}
+            )
+            for local_name, config in pop._material_geometries.items():
+                name = names.setdefault(
+                    local_name, f"packed_{component_index}_{local_name}"
+                )
+                packed = {"name": name, "domain": config["domain"]}
+                for role, source in config.items():
+                    if role in {"name", "domain"}:
+                        continue
+                    value = getattr(pop, source)
+                    parts = []
+                    for other_name, other in self.populations.items():
+                        batch_shape = tuple(other.shape[:-2])
+                        if role == "volume":
+                            target_shape = tuple(other.shape)
+                            fill = 1.0
+                        else:
+                            edges = self._material_component_edge_counts[other_name]
+                            target_shape = (*batch_shape, edges)
+                            fill = 1.0 if role == "edge_distance" else 0.0
+                        if other_name == component_name:
+                            if role != "volume":
+                                per_row = (
+                                    self._material_component_edge_counts[other_name]
+                                    // other.np
+                                )
+                                value = torch.broadcast_to(
+                                    value,
+                                    (*batch_shape, other.np, per_row),
+                                ).reshape(*batch_shape, -1)
+                            part = torch.broadcast_to(value, target_shape)
+                        else:
+                            part = torch.full(
+                                target_shape,
+                                fill,
+                                device=self.device(),
+                                dtype=self.dtype(),
+                            )
+                        parts.append(part.reshape(*batch_shape, -1))
+                    tensor = torch.cat(parts, dim=-1).unsqueeze(-2)
+                    destination = f"_packed_material_geometry_{component_index}_{local_name}_{role}"
+                    self._set_material_geometry_buffer(destination, tensor)
+                    packed[role] = destination
+                self._material_geometries[name] = packed
+            # Population-owned edge diffusivities and other authored process
+            # references keep their original leaf identity, independently of
+            # same-named quantities on another component.
+            process_classes = set(pop._mech_everywhere) | set(pop._mech_data)
+            for process_class in process_classes:
+                if not issubclass(process_class, MaterialProcess):
+                    continue
+                sources = {
+                    spec.D
+                    for spec in getattr(process_class, "_diffusion_specs", ())
+                    if isinstance(spec.D, str) and spec.D_location == "edge"
+                }
+                for spec in getattr(process_class, "_diffusion_relaxation_specs", ()):
+                    sources.update(
+                        value
+                        for value in (spec.rate, spec.target, spec.where)
+                        if isinstance(value, str)
+                    )
+                for source in sorted(sources):
+                    if source not in pop._buffers and source not in pop._parameters:
+                        continue
+                    destination = quantities.setdefault(
+                        source, f"_packed_material_quantity_{component_index}_{source}"
+                    )
+                    value = getattr(pop, source)
+                    if source in pop._parameters:
+                        if destination not in self._parameters:
+                            self.register_parameter(destination, value)
+                        else:
+                            self._parameters[destination] = value
+                    else:
+                        self._set_material_geometry_buffer(destination, value)
+
+    def _component_material_process_class(self, component_name, original):
+        key = (component_name, original)
+        if key not in self._packed_material_process_classes:
+            component_index = tuple(self.populations).index(component_name)
+            scoped = _make_packed_material_process_class(
+                original,
+                component_name,
+                f"Packed{component_index}_{original.__name__}",
+                self._component_material_geometry_names[component_name],
+                self._component_material_quantity_names[component_name],
+            )
+            self._packed_material_process_classes[key] = scoped
+        return self._packed_material_process_classes[key]
+
     def __iter__(self):
         return iter(self.populations.values())
 
     def __len__(self):
         return len(self.populations)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # A same-sized packed model need not have the same chemical forest.
+        # Loading its parent indices would silently reconnect independent
+        # components while leaving the authored electrical topology unchanged.
+        for name in ("diff_parent_index", "diff_edge_parent", "diff_edge_child"):
+            incoming = state_dict.get(f"{prefix}{name}")
+            expected = getattr(self, name, None)
+            if (
+                incoming is not None
+                and expected is not None
+                and (
+                    incoming.dtype != expected.dtype
+                    or incoming.shape != expected.shape
+                    or not torch.equal(incoming.detach().cpu(), expected.detach().cpu())
+                )
+            ):
+                error_msgs.append(
+                    f"Packed material topology buffer {prefix}{name!s} disagrees "
+                    "with the component chemical forest."
+                )
+                return
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def device(self):
         populations = getattr(self, "populations", None)
@@ -964,6 +1806,7 @@ class MultiPopulation(Population):
         ):
             setattr(self, name, _concat_component_field(self.populations, name))
         self._component_area = _concat_component_field(self.populations, "area")
+        self._refresh_material_geometry()
         if getattr(self, "n_layers", 0):
             for name in ("xraxial", "xc", "xg"):
                 setattr(
@@ -1081,6 +1924,17 @@ class MultiPopulation(Population):
         for index, (name, pop) in zip(all_indices, self.populations.items()):
             # first do _mech_everywhere
             for m_class, (_, ic, kwargs) in pop._mech_everywhere.items():
+                process = issubclass(m_class, MaterialProcess)
+                insertion_class = (
+                    self._component_material_process_class(name, m_class)
+                    if process
+                    else m_class
+                )
+                global_overrides = (
+                    _component_explicit_globals(pop, m_class)
+                    if process
+                    else merged_globals[m_class]
+                )
                 alias = name
                 global_names = _mechanism_global_parameter_names(m_class)
                 indexed_kwargs = {
@@ -1098,14 +1952,25 @@ class MultiPopulation(Population):
                 local_key = _core_key_from_flat(local_flat, tuple(pop.core_shape()))
                 index_f = key_to_flat_index(index, local_key)
                 self[:, index_f].insert(
-                    m_class,
+                    insertion_class,
                     alias=alias,
                     ic=effective_ic,
-                    **merged_globals[m_class],
+                    **global_overrides,
                     **indexed_kwargs,
                 )
             # now do _mech_data
             for m_class, list_of_aliases_kwargs_keys in pop._mech_data.items():
+                process = issubclass(m_class, MaterialProcess)
+                insertion_class = (
+                    self._component_material_process_class(name, m_class)
+                    if process
+                    else m_class
+                )
+                global_overrides = (
+                    _component_explicit_globals(pop, m_class)
+                    if process
+                    else merged_globals[m_class]
+                )
                 idx = 0
                 global_names = _mechanism_global_parameter_names(m_class)
                 effective_ic = dict(pop._mech_data_ic.get(m_class) or {})
@@ -1129,12 +1994,12 @@ class MultiPopulation(Population):
                         alias_n = f"{name}_{idx}"
                         idx += 1
                     self[:, index_f].insert(
-                        m_class,
+                        insertion_class,
                         alias=alias_n,
                         ic=effective_ic,
                         preserve_duplicate_indices=preserve_duplicate_indices,
                         copies=copies,
-                        **merged_globals[m_class],
+                        **global_overrides,
                         **indexed_kwargs,
                     )
 

@@ -763,7 +763,7 @@ def test_explicit_native_tree_zero_volume_junction_fails_closed():
         dn.func.make_functional(model, dt=DT)
 
 
-def test_packed_diffusion_without_independent_chemical_topology_fails_closed():
+def test_packed_diffusion_has_independent_chemical_topology():
     model = _membrane_model("multi_scalar", batch=None)
     with dn.ctx(JIT=0, REQUIRE_GRAD=1, IMEM=True, DTYPE=torch.float64):
         model.material("pool", fields={"amount": 1.7}, domain="intracellular")
@@ -772,11 +772,8 @@ def test_packed_diffusion_without_independent_chemical_topology_fails_closed():
         model.insert(_MaterialSourceCurrent)
         model.insert(_process("implicit", "auto", None, False, False, "arithmetic"))
         model.initialize()
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="[Pp]acked|MultiPopulation|[Ff]orest|[Tt]opology",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    dn.func.make_functional(model, dt=DT)
+    assert torch.count_nonzero(model.diff_parent_index < 0) >= len(model.populations)
 
 
 @pytest.mark.slow

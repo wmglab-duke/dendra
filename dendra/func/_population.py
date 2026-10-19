@@ -70,7 +70,11 @@ from dendra.models.mechanisms._state import State
 from dendra.models.mechanisms._support import SupportKind
 from dendra.models.mechanisms._support_registry import SupportEntry, SupportRegistry
 from dendra.models.mechanisms._symbolic import build_numerical_equation
-from dendra.models.multi import MultiPopulation
+from dendra.models.multi import (
+    MultiPopulation,
+    _PackedMaterialGeometry,
+    _PackedMaterialInitial,
+)
 from dendra.models.parametric import Functional as ParameterFunctional
 from dendra.models.parametric import (
     Parameterized,
@@ -177,9 +181,31 @@ _MATERIAL_FUNCTIONAL_COMMON_HOOKS = (
     "_resolve_quantity",
     "_get_material",
     "_bind_materials",
+    "_configure_material_support",
+    "_expand_material_operand",
+    "_material_support_mask",
+    "_mask_material_updates",
     "set_dt",
     "_reset_initialization_timestep",
 )
+_STANDARD_PACKED_MATERIAL_INITIAL_FORWARD = _PackedMaterialInitial.forward
+_STANDARD_PACKED_MATERIAL_GEOMETRY_FORWARD = _PackedMaterialGeometry.forward
+
+
+def _is_pure_shared_initial_source(source):
+    if isinstance(source, torch.nn.Parameter):
+        return True
+    if (
+        type(source) is not _PackedMaterialInitial
+        or "forward" in source.__dict__
+        or type(source).forward is not _STANDARD_PACKED_MATERIAL_INITIAL_FORWARD
+        or _module_autograd_hook_signature(source)
+    ):
+        return False
+    return all(
+        _is_pure_shared_initial_source(getattr(source, f"source_{index}"))
+        for index in range(len(source.shapes))
+    )
 
 
 @dataclass(frozen=True)
@@ -265,6 +291,9 @@ _MATERIAL_PROCESS_CONTRACTS = (
         DiffusionProcess,
         "diffusion",
         (
+            "_configure_component_edges",
+            "_diffusion_edge_operand",
+            "_packed_analytic_geometry_inputs",
             "_configure_named_transport_geometry",
             "_refresh_named_transport_quantities",
             "_validate_overlapping_diffusivity_overrides",
@@ -312,6 +341,7 @@ _MATERIAL_PROCESS_CONTRACTS = (
             "_diffusion_operator_keys",
             "_diffusion_is_regional",
             "_diffusion_core_shape",
+            "_diffusion_component_edge_count",
             "_mp_node_mask",
             "_mp_diff_parent_index",
             "_mp_diff_edge_parent",
@@ -1331,8 +1361,7 @@ def _rebind_population_time_references(population: Population) -> None:
         # Resolver methods are external Python references, not registered module
         # children. Always bind the private copy's material registry explicitly.
         process._material_resolver = handler._get_material
-        if isinstance(process, DiffusionProcess):
-            object.__setattr__(process, "_mp_population", population)
+        object.__setattr__(process, "_mp_population", population)
 
 
 def _clone_execution_population(population: Population) -> Population:
@@ -1365,6 +1394,8 @@ def _strip_packed_component_runtime_aliases(population: MultiPopulation) -> None
     # component owners below.
     population.clear_labels()
     population._modules["populations"] = torch.nn.ModuleDict()
+    if not population.mech.material_processes:
+        population._modules.pop("_material_geometry", None)
     population.injections = []
     population.mechanism_injections = []
     population.mechanism_injection_accepted = []
@@ -1728,19 +1759,12 @@ def _material_process_failures(process, population=None):
         )
     ):
         return [f"{family} requires its owning MechanismHandler material resolver"]
-    if process.key is not None and not contract.spatial:
-        return [f"functional {family} requires global insertion"]
     if contract.spatial:
         if (
             population is not None
             and getattr(process, "_mp_population", None) is not population
         ):
             return [f"{family} requires its owning Population geometry registry"]
-        if isinstance(population, MultiPopulation):
-            return [
-                "packed DiffusionProcess requires an independent per-cell "
-                "chemical topology; MultiPopulation transport is not lowered"
-            ]
         if (
             process._diffusion_geometry_kind == "tree"
             and process._diffusion_geometry_name is None
@@ -1851,6 +1875,9 @@ def _material_process_signature(process, handler):
         ),
         getattr(type(process), "_material_process_method", None),
         getattr(type(process), "_material_process_phase", None),
+        getattr(type(process), "_material_process_component", None),
+        getattr(process, "_mp_component_shape", None),
+        tuple(sorted(getattr(process, "_mp_material_support_names", {}).items())),
         (
             getattr(process._material_resolver, "__self__", None) is handler,
             id(
@@ -1931,6 +1958,16 @@ def _material_fields(population, process):
 
 def _material_process_operand_references(process):
     """Registered numerical/mask dependencies, independent of module aliases."""
+    for name in (
+        "_mp_process_index",
+        "_mp_process_mask",
+        "_mp_component_index",
+        "_mp_component_edge_index",
+        "_mp__material_analytic_geometry",
+        *getattr(process, "_mp_material_support_names", {}).values(),
+    ):
+        if name in process._buffers:
+            yield "buffer", name
     if isinstance(process, ClearanceProcess):
         for _key, *references in process._clearance_material_plan:
             yield from references
@@ -3142,6 +3179,11 @@ class _PopulationPreparation(torch.nn.Module):
                 self.population._buffers[name] = population_values[name]
         celsius = population_values["celsius"]
         effective_diam = population_values.get("diam", diam)
+
+        material_geometry = self.population._modules.get("_material_geometry")
+        if material_geometry is not None and self.population.mech.material_processes:
+            for name, value in material_geometry(effective_diam, dx).items():
+                self.population._buffers[name] = value
 
         handler = self.population.mech
         handler._sync_celsius(celsius)
@@ -4550,6 +4592,19 @@ def _registered_child_value_signature(owner, name: str) -> tuple:
         category = "buffer"
     if value is None:
         return ("missing",)
+    if type(value) is _PackedMaterialInitial:
+        return (
+            category,
+            type(value).__module__,
+            type(value).__qualname__,
+            value.shapes,
+            _effective_hook_identity(value, "forward"),
+            _module_autograd_hook_signature(value),
+            tuple(
+                _registered_child_value_signature(value, f"source_{index}")
+                for index in range(len(value.shapes))
+            ),
+        )
     return (category, type(value).__module__, type(value).__qualname__)
 
 
@@ -4933,7 +4988,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         unsupported_sources = [
             name
             for name in ("e_init", "i_init", "o_init")
-            if not isinstance(getattr(ion, name), torch.nn.Parameter)
+            if not _is_pure_shared_initial_source(getattr(ion, name))
         ]
         if unsupported_sources:
             failures.append(
@@ -4965,7 +5020,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         unsupported_sources = [
             field
             for field in material.fields
-            if not isinstance(material.initial_source(field), torch.nn.Parameter)
+            if not _is_pure_shared_initial_source(material.initial_source(field))
         ]
         if unsupported_sources:
             failures.append(
@@ -5926,6 +5981,17 @@ def _multi_component_topology_signature(population: MultiPopulation) -> tuple:
                 ),
             )
         )
+    material_geometry = population._modules.get("_material_geometry")
+    if material_geometry is not None:
+        result.append(
+            (
+                "material_geometry",
+                _material_configuration_signature(material_geometry.components),
+                _material_configuration_signature(material_geometry.named_geometry),
+                _effective_hook_identity(material_geometry, "forward"),
+                _module_autograd_hook_signature(material_geometry),
+            )
+        )
     return tuple(result)
 
 
@@ -6268,6 +6334,23 @@ def _parametrization_constant_layout_for_owners(
             )
         record(value, aliases)
 
+    material_geometry = population._modules.get("_material_geometry")
+    if material_geometry is not None and population.mech.material_processes:
+        for name, value in material_geometry.named_buffers():
+            if is_registered_parameter(value):
+                continue
+            record(
+                value,
+                [
+                    alias
+                    for alias in registered_buffer_aliases(value)
+                    if not alias.startswith("populations.")
+                ],
+            )
+            public_constant_by_identity.setdefault(
+                id(value), f"_material_geometry.{name}"
+            )
+
     for owner in owners:
         # Myelinated geometry may append framework-owned passive-end overrides
         # to its standard torch parametrization. Their mask/value buffers must
@@ -6286,7 +6369,7 @@ def _parametrization_constant_layout_for_owners(
             if kind == "buffer" or (kind == "named" and name not in available_names):
                 route_resident_dependency(owner, name, role="material process operand")
                 value = owner._buffers.get(name)
-                if torch.is_tensor(value):
+                if torch.is_tensor(value) and not name.startswith("_mp_"):
                     public_constant_by_identity.setdefault(
                         id(value), f"material_processes.{owner.name}.{name}"
                     )
@@ -6503,6 +6586,9 @@ def _material_preparation_parameter_names(population) -> set[str]:
         id(parameter): name for name, parameter in population.named_parameters()
     }
     identities = set()
+    material_geometry = population._modules.get("_material_geometry")
+    if material_geometry is not None and population.mech.material_processes:
+        identities.update(id(parameter) for parameter in material_geometry.parameters())
     handler = getattr(population, "mech", None)
     if handler is None:
         return set()
@@ -6534,13 +6620,19 @@ def _shared_initial_parameter_target_shapes(
 
     target_shapes: dict[str, set[tuple[int, ...]]] = {}
 
-    def record(source, target) -> None:
+    def record(source, target, *, shape=None) -> None:
+        if type(source) is _PackedMaterialInitial:
+            for index, part_shape in enumerate(source.shapes):
+                record(getattr(source, f"source_{index}"), target, shape=part_shape)
+            return
         if not isinstance(source, torch.nn.Parameter):
             return
         parameter_name = parameter_name_by_identity.get(id(source))
         if parameter_name is None:
             return
-        target_shapes.setdefault(parameter_name, set()).add(_shape_tuple(target))
+        target_shapes.setdefault(parameter_name, set()).add(
+            _shape_tuple(target) if shape is None else tuple(shape)
+        )
 
     handler = getattr(population, "mech", None)
     if handler is None:
@@ -6557,7 +6649,7 @@ def _shared_initial_parameter_target_shapes(
         if sources is None:
             continue
         for field in material._material_fields:
-            record(sources._parameters.get(field), material._buffers[field])
+            record(material.initial_source(field), material._buffers[field])
 
     return {
         parameter_name: tuple(sorted(shapes))
@@ -6940,6 +7032,17 @@ def _functionalization_failures(
         _functional_device_failures(population.device(), population.dtype())
     )
     if is_multi:
+        material_geometry = population._modules.get("_material_geometry")
+        if material_geometry is not None and (
+            type(material_geometry) is not _PackedMaterialGeometry
+            or "forward" in material_geometry.__dict__
+            or type(material_geometry).forward
+            is not _STANDARD_PACKED_MATERIAL_GEOMETRY_FORWARD
+            or _module_autograd_hook_signature(material_geometry)
+        ):
+            failures.append(
+                "packed chemical geometry requires the canonical pure source adapter"
+            )
         point_spec = _resolve_functional_integrator_spec(
             population.integrator,
             "scalar_multi_point",
@@ -8027,7 +8130,7 @@ def _material_signature(name, material) -> tuple:
     field_specs = tuple(
         (
             field,
-            material.field_spec(field).min_value,
+            _material_configuration_signature(material.field_spec(field).min_value),
             material.field_spec(field).conserved,
             material.field_spec(field).domain,
             material.field_spec(field).units,
@@ -8869,6 +8972,18 @@ class FunctionalPopulation:
             for name in parent_parameters
             if name == "celsius_param" or name.startswith("integrator.")
         }
+        # A packed initial source may alias a built child's trained Ion or
+        # Material leaf. Its first public registration then belongs to that
+        # child, but its packed-parent alias remains an initialization input.
+        canonical_parameter_names.update(
+            _shared_initial_parameter_target_shapes(population, canonical_by_identity)
+        )
+        material_geometry = population._modules.get("_material_geometry")
+        if material_geometry is not None and population.mech.material_processes:
+            canonical_parameter_names.update(
+                canonical_by_identity[id(parameter)]
+                for parameter in material_geometry.parameters()
+            )
 
         public_constant_shapes = {}
         public_constant_dtypes = {}

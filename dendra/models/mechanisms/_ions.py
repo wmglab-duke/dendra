@@ -4,7 +4,7 @@ import torch
 
 from dendra.helpers import DEBUG
 
-from ..parametric import to_param
+from ..parametric import resolve, to_param
 from ._materials import Material, MaterialFieldSpec
 
 # default reversal potentials from NEURON
@@ -186,6 +186,7 @@ def _is_scalar(x):
 
 
 def _make_into_shape(shape, value):
+    value = resolve(value)
     if _is_scalar(value):
         return torch.full(shape, value)
     else:
@@ -253,6 +254,7 @@ class Ion(Material):
 
     @staticmethod
     def _expand_init_like(value, like):
+        value = resolve(value)
         if torch.is_tensor(value):
             value_t = value.to(device=like.device, dtype=like.dtype)
         else:

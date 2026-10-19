@@ -157,6 +157,65 @@ def test_tree_preparation_transforms_and_independent_dense_oracle(
     _assert_numerical_workspace_is_explicit(op, run, values)
 
 
+@pytest.mark.parametrize("threads", [1, 4])
+@pytest.mark.parametrize("kind", ["1d", "tree"])
+def test_single_node_prepared_relaxation_is_independent_of_template(kind, threads):
+    torch.set_num_threads(threads)
+    c = torch.tensor([[2.0]], dtype=torch.float64)
+    dt, rate, target = (c.new_tensor(value) for value in (0.2, 0.7, 0.4))
+    geometry = torch.ones_like(c)
+    if kind == "1d":
+        operator = SpatialOperator1D(solver="dense")
+        operator.configure_diffusion(c, dt, 1.0, geometry, geometry)
+
+        def prepare(c, dt):
+            return operator.prepare_diffusion(c, dt, 1.0, geometry, geometry)
+
+    else:
+        operator = SpatialOperatorTree(solver="dense")
+        edges = c.new_empty((0,))
+        operator.configure_diffusion(
+            c,
+            dt,
+            1.0,
+            None,
+            volume=geometry,
+            edge_factor=edges,
+            parent_index=torch.tensor([-1]),
+        )
+
+        def prepare(c, dt):
+            return operator.prepare_diffusion(
+                c, dt, 1.0, None, volume=geometry, edge_factor=edges
+            )
+
+    # The configured no-diffusion/no-reservoir shortcut remains an exact no-op,
+    # but it cannot suppress a reservoir in an independent numerical workspace.
+    assert operator.diffuse_implicit_configured(c) is c
+    assert not operator._has_relaxation
+
+    def advance(c, dt, rate, target):
+        workspace = prepare(c, dt)
+        workspace = operator.prepare_relaxation(workspace, rate, target)
+        return operator.diffuse_implicit_prepared(c, workspace, solve=None)
+
+    def reference(c, dt, rate, target):
+        return (c + dt * rate * target) / (1.0 + dt * rate)
+
+    inputs = (c, dt, rate, target)
+    torch.testing.assert_close(advance(*inputs), reference(*inputs))
+    actual_gradients = torch.func.grad(
+        lambda *values: advance(*values).sum(), argnums=(0, 1, 2, 3)
+    )(*inputs)
+    expected_gradients = torch.func.grad(
+        lambda *values: reference(*values).sum(), argnums=(0, 1, 2, 3)
+    )(*inputs)
+    for actual, expected in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual, expected, rtol=2e-14, atol=2e-14)
+    assert not operator._has_relaxation
+    assert operator.diffuse_implicit_configured(c) is c
+
+
 def test_spd_functional_solver_fails_closed_without_changing_imperative_selection():
     c = torch.ones((1, 3), dtype=torch.float64)
     op = SpatialOperator1D(solver="spd")

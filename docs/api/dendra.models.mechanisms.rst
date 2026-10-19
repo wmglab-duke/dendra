@@ -509,10 +509,12 @@ protocol does not introduce ordinary Mechanism ``STATE``, ``CARRY``,
 numerical path in both imperative and functional execution. The imperative
 ``advance_materials`` adapter still commits bound Material state;
 out-of-place arithmetic alone is not an admission contract for
-custom functional processes. ``dn.func`` admits globally inserted,
-declaration-driven Clearance/Clamp/Exchange subclasses and global or regional
-Diffusion on individual admitted Populations, with their canonical lifecycle.
-Packed Diffusion and custom process runtime overrides remain imperative-only.
+custom functional processes. ``dn.func`` admits declaration-driven
+Clearance/Clamp/Exchange/Diffusion subclasses with global or regional support
+and their canonical lifecycle, including concatenated ``MultiPopulation``
+components. Packed materials preserve independent chemical topology and
+component-local process parameters. Custom process runtime overrides remain
+unsupported by functional lowering.
 No process is advanced during fresh initialization. Diffusion's imperative
 adapter retains cached numerical operators; functional execution retains only
 static topology and consumes explicit prepared numerical workspace.
