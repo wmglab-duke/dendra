@@ -12,15 +12,17 @@ and ``torch.compile`` without changing the normal ``Population.step()``,
 Quick start: compiled scan or while loop
 ----------------------------------------
 
-For a reusable compiled simulation, ``dn.func.compile`` handles
+For a reusable compiled simulation, ``dn.compile`` handles
 functionalization, independent parameter copies, preparation, compilation, and
-binding. Start from an initialized, functionally supported Population:
+binding. It is an exact top-level alias of ``dn.func.compile``, which remains
+supported; both names refer to the same function. Start from an initialized,
+functionally supported Population:
 
 .. code-block:: python
 
    import dendra as dn
 
-   runner = dn.func.compile(
+   runner = dn.compile(
        model,
        dt=0.025,
        steps=800,
@@ -36,7 +38,9 @@ recorder is added implicitly. ``Recorder`` includes the initial frame, so
 ``dn.func.Recorder(("v", "t"))`` to select fields. To record voltage from selected
 compartments, use ``dn.func.Recorder(("v",), node_indices=[3])``; voltage node
 indices must be nonnegative. Node selection cannot be combined with scalar
-fields such as ``t``. The mapping also configures threshold reducers for either
+fields such as ``t``. For a named cell or physical subregion, use
+``dn.func.Recorder(("v",), region=model.cell_a.soma)`` instead; see
+the named-region example below. The mapping also configures threshold reducers for either
 execution mode:
 
 .. code-block:: python
@@ -73,7 +77,7 @@ original compiler policy rather than receiving a new wrapper preference.
 Scan and while execution use Dendra's PyTorch 2.14+ baseline; supported features
 are not selected by patch-version number. While execution requires at least four steps, a nonempty
 collection of supported built-in callbacks, and a capturable inference step.
-Supported built-ins are ``Recorder``, ``AnomalyDetector``, ``Raster``, ``APCount``,
+Supported built-ins are ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``, ``APCount``,
 ``Active``, ``ActiveAL``, and ``ActiveALCount``; scan also accepts pure custom
 functional callbacks. An unsupported while request raises an error
 instead of falling back to an unrolled simulation; it does not silently compile a
@@ -225,7 +229,7 @@ following properties:
   ``bwd_euler_bt(method="thomas")`` for ``ExtCellAxon``, ``dhs`` for scalar
   ``Tree``, ``dhs_bt`` for ``ExtCellTree``, or the automatically selected
   ``bwd_euler_sc_multi``/``dhs_multi``/``dhs_bt_multi`` integrator for
-  ``MultiPopulation``, with membrane-current recording disabled; and
+  ``MultiPopulation``, with optional membrane-current output; and
 * for ``bwd_euler_ub``, a transform-compatible Thomas or PCR solver.
 
 Solver tensors declared by nested ``State.STATE``, direct Mechanism and State
@@ -269,7 +273,7 @@ lowering. Current limitations include non-injective regional concentration or
 Material replacement writes, the reserved compact rowwise support encoding,
 TABLE lookups, MaterialProcesses, mechanism-owned waveform injections, delayed
 or stochastic state, VoltageProcesses, imperative callback hooks, functional
-callback built-ins beyond ``Recorder``, ``AnomalyDetector``, ``Raster``,
+callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
 Population topologies
 (including generic ``Axon``, custom ``Population``/``SingleCompartment``
@@ -277,7 +281,7 @@ subclasses, nested ``MultiPopulation``, and mixtures of scalar and
 finite-extracellular components), Cable/Axon/Tree subclasses with unrecognized
 custom geometry, stateful
 or unregistered parameter transforms, custom integrator subclasses, the SPD
-block solver, non-CUDA accelerators (including MPS), and ``i_membrane`` recording. Row-regular
+block solver, and non-CUDA accelerators (including MPS). Row-regular
 selectors authored through the normal Population indexing API are already
 represented as packed support and are supported; users do not need to choose a
 different input form.
@@ -389,8 +393,8 @@ transition supports the same reverse- and forward-mode differentiation,
 ``vmap``, compilation, host runners, checkpointed BPTT, and commit/resume
 lifecycle as the other admitted topologies. It requires the transform-compatible
 CPU block-DHS solver supplied by ``dendra-solvers``, or the three-component
-Triton block-DHS solver on CUDA. It does not currently support ``i_membrane``
-recording.
+Triton block-DHS solver on CUDA. Optional membrane-current output uses the same
+``i_membrane`` state and Recorder contract as the scalar solvers.
 
 Packed MultiPopulations
 ------------------------------
@@ -558,6 +562,14 @@ The extracted ``PopulationTensors`` contains:
    component tree. The packed parent owns voltage, mechanism/Ion/Material
    carry, clock, and duration remainder. Finite-extracellular packs carry both
    flat ``v`` and flat ``vc``.
+
+   When the source integrator has membrane-current output enabled, its latest
+   current is also explicit at ``state["integrator"]["i_membrane"]``. It has
+   the same shape as ``v`` and uses mA, following the imperative integrator's
+   sign and timestep convention. A fresh initialization starts it at zero;
+   extraction from an advanced model preserves the latest current. With
+   membrane-current output disabled, this leaf is absent and the ordinary
+   voltage-only state schema is unchanged.
 
 ``initialization``
    Initialization-only tensor inputs. ``v_init`` is the independent, fully
@@ -978,6 +990,116 @@ every timestep: increasing the compiled chunk size does not subsample a
 recording or skip reducer updates. Checkpoint replay recomputes each pure host
 span without mutating external storage.
 
+Membrane current and lead-field recording
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Construct the source Population inside ``dn.ctx(IMEM=True)`` to enable its
+integrator's membrane-current output. This works for all admitted scalar and
+finite-extracellular topologies, including ``MultiPopulation``. Select
+``"i_membrane"`` with an ordinary functional Recorder:
+
+.. code-block:: python
+
+   from dendra.models.mod import hh
+
+   with dn.ctx(IMEM=True):
+       model = dn.SingleCompartment(N=1)
+       model.insert(hh)
+   model.initialize()
+   runner = dn.func.compile(
+       model,
+       dt=0.025,
+       steps=800,
+       callbacks={"trace": dn.func.Recorder(("v", "i_membrane"))},
+   )
+   final_state, auxiliary = runner()
+   current_mA = auxiliary["callbacks"]["trace"]["i_membrane"]
+
+``dn.func.LFP(lead_fields)`` records the lead-field projection directly, without
+emitting a full membrane-current history. ``lead_fields`` is a nonempty list
+of equally shaped tensors, one per recording contact. Fields in mV/mA
+(numerically ohms) multiplied by membrane current in mA give recorded mV.
+The default projection sums physical cell and compartment axes, preserving
+explicit batch axes. Its output has shape ``(samples, *batch, contacts)``.
+Each field must broadcast to the model voltage shape; an unbatched field can
+therefore be shared across batches. Fields are moved to the functional plan's
+device and dtype without detaching their gradients.
+
+.. code-block:: python
+
+   runner = dn.func.compile(
+       model,
+       dt=0.025,
+       steps=800,
+       inference=False,  # Differentiable scan; omit for inference-only use.
+       callbacks={"lfp": dn.func.LFP(lead_fields)},
+   )
+   final_state, auxiliary = runner()
+   potential_mV = auxiliary["callbacks"]["lfp"]
+
+For a custom projection, ``LFP(lead_fields, rule=...)`` uses
+``torch.einsum(rule, current, torch.stack(lead_fields))`` exactly. The contact
+axis is first in the stacked fields. Unlike this explicit rule, the default
+never sums explicit batch lanes. For unbatched models it matches the ordinary
+imperative LFP callback. Both LFP and Recorder include the initial boundary
+and accepted post-step values, support callback continuation, and work with
+scan, checkpointed scan, and inference-only while execution. Lead fields can
+be differentiated through scan and checkpoint replay.
+
+Named cells and regions in a MultiPopulation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``MultiPopulation`` state and unselected Recorder output remain flat packed
+tensors, not dictionaries keyed by component name. The callback mapping's keys
+name result streams; they do not select model components. Use the existing
+Population Slice labels to select a component explicitly:
+
+.. code-block:: python
+
+   with dn.ctx(IMEM=True):
+       cell_a = dn.SingleCompartment(N=1, C=3)
+       cell_b = dn.SingleCompartment(N=1, C=2)
+       cell_a.insert(hh)
+       cell_b.insert(hh)
+       cell_b[:, 0].label("soma")
+       packed = dn.concat_models({"cell_a": cell_a, "cell_b": cell_b})
+       packed.batch(2)
+   packed.initialize()
+   runner = dn.func.compile(
+       packed,
+       dt=0.025,
+       steps=800,
+       callbacks={
+           "cell_a": dn.func.Recorder(("v", "i_membrane"), region=packed.cell_a),
+           "cell_b_soma": dn.func.Recorder(
+               ("v", "i_membrane"), region=packed.cell_b.soma
+           ),
+       },
+   )
+   final_state, auxiliary = runner()
+   a_voltage = auxiliary["callbacks"]["cell_a"]["v"]
+   soma_current = auxiliary["callbacks"]["cell_b_soma"]["i_membrane"]
+
+``region`` must be a Slice of the exact source Population; names can also be
+resolved with ``getattr(packed, name)``. Selection is bound once and snapshots
+its indices. It preserves explicit batch selection and repeated indices.
+Component names select the whole component, which may itself contain several
+cells. To name one of those cells, label it before packing (for example,
+``cells[1, :].label("cell_1")``), then use ``region=packed.cells.cell_1``.
+Packing flattens a component's physical cell and compartment axes; indexing a
+packed Slice does not restore its original cell-axis layout.
+Regions select physical coordinates for ``v``, ``i_membrane``, and ``vc``;
+``vc`` retains all three circuit-potential channels. Scalar ``t`` may be
+recorded alongside these and is left unchanged. Mechanism-local states such
+as ``hh.m`` do not yet support ``region`` because their sparse support need
+not match physical voltage coordinates. They remain recordable without it.
+
+``region`` cannot be combined with ``node_indices``, ``max_only``, or
+``partition``. Those existing arguments retain their final-axis semantics;
+in particular, ``node_indices`` applied to ``vc`` selects circuit channels,
+not physical compartments. Use ``region`` when selecting compartments or
+named cells, especially with explicit batches.
+
 Threshold detection
 ^^^^^^^^^^^^^^^^^^^
 
@@ -1139,8 +1261,9 @@ or per-call data should instead be represented by an explicit tensor input;
 do not hide evolving values on the callback object.
 
 The functional ``Recorder`` currently supports explicit transition-state
-names such as ``"v"``, ``"t"``, and ``"hh.m"``, plus ``node_indices``,
-``max_only``, and ``partition`` for non-scalar states. ``Recorder(dt=...)``,
+names such as ``"v"``, ``"vc"``, ``"i_membrane"``, ``"t"``, and ``"hh.m"``,
+plus ``node_indices``, ``max_only``, and ``partition`` for non-scalar states,
+or physical Slice selection through ``region``. ``Recorder(dt=...)``,
 sliding-window postprocessing, and HDF5 storage are not part of its current
 pure contract; apply tensor reductions or storage after the run instead.
 
@@ -1428,7 +1551,7 @@ Built-in callbacks in compiled inference
 
 On PyTorch 2.14 or newer, a default compiled chunk can also use a bounded
 inference loop when every callback is a supported functional built-in:
-``Recorder``, ``AnomalyDetector``, ``Raster``, ``APCount``, ``Active``,
+``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``, ``APCount``, ``Active``,
 ``ActiveAL``, or ``ActiveALCount``. Run the call under ``torch.no_grad()``;
 chunks of at least four timesteps use the loop when their transition can be
 captured. No Recorder is required for a reducer-only callback collection.
@@ -1662,7 +1785,7 @@ audit; CUDA support does not disable or weaken that audit. This remains a
 hardware-validation risk for branched models, not a verified deterministic GPU
 execution guarantee.
 
-CUDA does not remove the other admission restrictions above: no ``imem``,
+CUDA does not remove the other admission restrictions above: no
 stochastic/delayed state, Network event scheduling, SPD block solver, or arbitrary
 custom geometry/integrators. MPS, float16 and bfloat16 remain unsupported.
 
@@ -1678,6 +1801,8 @@ compiled loops. On a CUDA machine run:
    python -m pytest -q tests/func/test_cuda_extcell_multi_population.py -m "cuda and slow"
    python -m pytest -q tests/func/test_cuda_plain_population.py -m "cuda and not slow"
    python -m pytest -q tests/func/test_cuda_plain_population.py -m "cuda and slow"
+   python -m pytest -q tests/func/test_cuda_membrane_current.py tests/func/test_cuda_lfp.py -m "cuda and not slow"
+   python -m pytest -q tests/func/test_cuda_membrane_current.py tests/func/test_cuda_lfp.py -m "cuda and slow"
 
 The slow lane includes real Inductor scan/while compilation. Tests are skipped
 when CUDA is unavailable; collecting them on a CPU-only host is not evidence

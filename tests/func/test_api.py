@@ -150,6 +150,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "FunctionalPopulation",
         "FunctionalizationError",
         "InitializationInput",
+        "LFP",
         "PopulationTensors",
         "Raster",
         "Recorder",
@@ -268,18 +269,17 @@ def test_make_functional_rejects_mismatched_topology_integrator_pairs(
         dn.func.make_functional(model, dt=DT)
 
 
-def test_make_functional_rejects_single_compartment_imem_recording():
-    with dn.ctx(JIT=0):
+def test_make_functional_preserves_single_compartment_imem_recording():
+    with dn.ctx(JIT=0, IMEM=True):
         model = dn.SingleCompartment(N=1, C=1, dtype=torch.float64)
-        model.imem = True
         model.insert(pas)
         model.initialize()
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="i_membrane recording is not supported yet",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    _, tensors = dn.func.make_functional(model, dt=DT)
+    assert model.integrator.imem
+    torch.testing.assert_close(
+        tensors.state["integrator"]["i_membrane"], model.i_membrane
+    )
 
 
 def test_make_functional_rejects_single_compartment_subclasses():

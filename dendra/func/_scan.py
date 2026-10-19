@@ -14,6 +14,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
 from ..helpers import MEMBRANE_ASSEMBLY
+from ._callback_carry import _CallbackCarryPartition
 from ._callbacks import _update_callback_values
 from ._carry_packing import _PackedCarryLayout
 from ._scan_autograd import guard_scan_outputs
@@ -93,6 +94,8 @@ class _CompiledScanPopulationChunk:
         parameters, prepared, state, ve, intra, carries = _detach(
             (parameters, prepared, state, ve, intra, carries)
         )
+        callback_carry = _CallbackCarryPartition.from_plans(plans)
+        carries, invariant_carries = callback_carry.split(carries)
         packed_training = block == 1 and grad_enabled
         layout = (
             _PackedCarryLayout.from_tree((state, carries)) if packed_training else None
@@ -132,7 +135,7 @@ class _CompiledScanPopulationChunk:
                 (), dtype=torch.int64, device=functional.device
             )
 
-        def authored(parameters, prepared, state, carries, sample):
+        def authored(parameters, prepared, state, carries, invariant_carries, sample):
             if stepwise:
                 next_state, auxiliary = functional._step_values(
                     parameters,
@@ -151,9 +154,13 @@ class _CompiledScanPopulationChunk:
                 )
             emitted = None
             if plans is not None:
-                carries, emitted = _update_callback_values(
-                    plans, carries, next_state, auxiliary
+                updated, emitted = _update_callback_values(
+                    plans,
+                    callback_carry.merge(carries, invariant_carries),
+                    next_state,
+                    auxiliary,
                 )
+                carries, _ = callback_carry.split(updated)
             if packed_training:
                 # The terminal pack in combine owns carry storage separately
                 # from AD's saved state intermediates. Keep emission ownership
@@ -168,9 +175,12 @@ class _CompiledScanPopulationChunk:
             # scan's non-aliasing contract applies at the block boundary.
             return (next_state, carries), emitted or {}
 
-        graph = make_fx(authored)(parameters, prepared, state, carries, sample)
+        graph = make_fx(authored)(
+            parameters, prepared, state, carries, invariant_carries, sample
+        )
 
         def execute(parameters, prepared, state, ve, intra, carries):
+            carries, invariant_carries = callback_carry.split(carries)
             if assembly is not None:
                 ve, intra = assembly(parameters, prepared, state, ve, intra)
             samples = {}
@@ -188,7 +198,7 @@ class _CompiledScanPopulationChunk:
                 def combine(packed, sample):
                     state, carries = layout.unpack(packed)
                     updated, emitted = graph(
-                        parameters, prepared, state, carries, sample
+                        parameters, prepared, state, carries, invariant_carries, sample
                     )
                     return layout.pack(updated), emitted
 
@@ -204,7 +214,9 @@ class _CompiledScanPopulationChunk:
 
                 def combine(carry, sample):
                     state, carries = carry
-                    return graph(parameters, prepared, state, carries, sample)
+                    return graph(
+                        parameters, prepared, state, carries, invariant_carries, sample
+                    )
 
                 (final, updated), emitted = scan(
                     combine,
@@ -219,7 +231,9 @@ class _CompiledScanPopulationChunk:
                     emissions = []
                     for offset in range(block):
                         sample = pytree.tree_map(lambda value: value[offset], samples)
-                        carry, emission = graph(parameters, prepared, *carry, sample)
+                        carry, emission = graph(
+                            parameters, prepared, *carry, invariant_carries, sample
+                        )
                         emissions.append(emission)
                     # Each stack owns its storage, including when callbacks
                     # emit state views or the same Tensor in several leaves.
@@ -257,7 +271,9 @@ class _CompiledScanPopulationChunk:
                 tail = []
                 for index in range(full_steps, steps):
                     sample = pytree.tree_map(lambda value: value[index], samples)
-                    carry, emission = graph(parameters, prepared, *carry, sample)
+                    carry, emission = graph(
+                        parameters, prepared, *carry, invariant_carries, sample
+                    )
                     tail.append(emission)
                 if tail:
                     tail = _stack_steps(tail)
@@ -294,7 +310,11 @@ class _CompiledScanPopulationChunk:
             self._options,
             prefer_cpp_wrapper=not grad_enabled and functional.device.type == "cpu",
         )
-        if not packed_training and not phase_emissions:
+        if (
+            not packed_training
+            and not phase_emissions
+            and not callback_carry.invariant_names
+        ):
             return compiled
 
         @wraps(compiled)
@@ -302,6 +322,10 @@ class _CompiledScanPopulationChunk:
             result = compiled(parameters, prepared, state, ve, intra, carries)
             if phase_emissions:
                 final, updated, phases, tail = result
+                if callback_carry.invariant_names:
+                    updated = _clone(
+                        callback_carry.merge(updated, callback_carry.split(carries)[1])
+                    )
                 # Each phase history is (blocks, 1, *sample_shape). Interleave
                 # once outside the hot compiled loop, in accepted-clock order.
                 emitted = pytree.tree_map(
@@ -319,6 +343,12 @@ class _CompiledScanPopulationChunk:
                     updated,
                     {plan.name: emitted.get(plan.name) for plan in plans},
                 )
+            if not packed_training:
+                final, auxiliary, updated, emitted = result
+                updated = _clone(
+                    callback_carry.merge(updated, callback_carry.split(carries)[1])
+                )
+                return final, auxiliary, updated, emitted
             if plans is None:
                 packed, emitted = result, None
             else:
@@ -328,7 +358,9 @@ class _CompiledScanPopulationChunk:
             # these clones outside compilation so equivalent logical leaves
             # cannot become duplicate moved C++ HOP output handles.
             final = functional._clone_state_tree(final)
-            updated = _clone(updated)
+            updated = _clone(
+                callback_carry.merge(updated, callback_carry.split(carries)[1])
+            )
             final["control"]["duration_remainder"] = state["control"][
                 "duration_remainder"
             ].clone()

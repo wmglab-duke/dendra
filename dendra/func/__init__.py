@@ -2,6 +2,7 @@
 
 from ._binding import BoundPopulation
 from ._callbacks import (
+    LFP,
     Active,
     ActiveAL,
     ActiveALCount,
@@ -48,6 +49,7 @@ __all__ = [
     "FunctionalIntra",
     "FunctionalizationError",
     "InitializationInput",
+    "LFP",
     "PopulationTensors",
     "Raster",
     "Recorder",

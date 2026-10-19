@@ -748,13 +748,12 @@ def test_scalar_tree_low_level_noncanonical_construction_fails_closed():
         dn.func.make_functional(model, dt=DT)
 
 
-def test_scalar_tree_imem_fails_closed():
+def test_scalar_tree_imem_is_explicit_functional_state():
     model = _model(imem=True)
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="i_membrane recording is not supported yet",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    _, tensors = dn.func.make_functional(model, dt=DT)
+    torch.testing.assert_close(
+        tensors.state["integrator"]["i_membrane"], model.i_membrane
+    )
 
 
 def test_scalar_tree_custom_exact_geometry_override_fails_closed():

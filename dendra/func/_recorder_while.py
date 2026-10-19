@@ -18,11 +18,13 @@ from torch.utils import _pytree as pytree
 
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
+from ._callback_carry import _CallbackCarryPartition
 from ._callbacks import (
     AnomalyDetector,
     _BoundActiveAL,
     _BoundActiveALCount,
     _BoundAPCount,
+    _BoundLFP,
     _BoundRaster,
     _BoundRecorder,
     _update_callback_values,
@@ -53,6 +55,7 @@ class _RecorderWhileExecutor:
             AnomalyDetector,
             _BoundRaster,
             _BoundAPCount,
+            _BoundLFP,
             _BoundActiveAL,
             _BoundActiveALCount,
         }
@@ -99,17 +102,25 @@ class _RecorderWhileExecutor:
         )
         parameters, prepared, state, ve, intra, carries = examples
         state = functional._clone_state_tree(state)
+        callback_carry = _CallbackCarryPartition.from_plans(plans)
+        carries, invariant_carries = callback_carry.split(carries)
         layout = _PackedCarryLayout.from_tree((state, carries))
 
-        def authored(parameters, prepared, state, ve, intra, carries):
+        def authored(
+            parameters, prepared, state, ve, intra, carries, invariant_carries
+        ):
             # Deliberately use the accepted-clock step, not vectorized waveform
             # assembly: start + arange*dt can round pulse boundaries differently.
             next_state, auxiliary = functional._step_values(
                 parameters, prepared, state, StepInput(ve, intra)
             )
             updated, emitted = _update_callback_values(
-                plans, carries, next_state, auxiliary
+                plans,
+                callback_carry.merge(carries, invariant_carries),
+                next_state,
+                auxiliary,
             )
+            updated, _ = callback_carry.split(updated)
             # This pure transition is composed several times inside one loop
             # body. Intermediate views and unchanged leaves need no ownership
             # copy; pack only the actual higher-order loop's returned carry.
@@ -122,16 +133,20 @@ class _RecorderWhileExecutor:
             None if ve is None else ve[0],
             None if intra is None else intra[0],
             carries,
+            invariant_carries,
         )
         # Raster emits only after a transition, so its emission schema is not
         # present at initialize(). Built-ins have value-independent emission
         # structure: observe one pure callback update on cloned example state
         # to discover shapes without an extra numerical model transition.
-        _, sample_emitted = _update_callback_values(plans, carries, state, None)
+        _, sample_emitted = _update_callback_values(
+            plans, callback_carry.merge(carries, invariant_carries), state, None
+        )
         samples, emission_spec = pytree.tree_flatten(sample_emitted or {})
         shapes = [(tuple(value.shape), value.dtype, value.device) for value in samples]
 
         def execute(parameters, prepared, state, ve, intra, carries):
+            carries, invariant_carries = callback_carry.split(carries)
             buffers = tuple(
                 torch.empty((steps, *shape), dtype=dtype, device=device)
                 for shape, dtype, device in shapes
@@ -151,6 +166,7 @@ class _RecorderWhileExecutor:
                     if intra is None
                     else torch.index_select(intra, 0, selector).squeeze(0),
                     current_carries,
+                    invariant_carries,
                 )
                 samples, _ = pytree.tree_flatten(emitted)
                 for buffer, sample in zip(buffers, samples, strict=True):
@@ -195,6 +211,9 @@ class _RecorderWhileExecutor:
             # Keep ownership materialization outside compilation: identical
             # clones must not be CSE'd into duplicate C++ HOP output handles.
             final = functional._clone_state_tree(final)
+            final_carries = callback_carry.merge(
+                final_carries, callback_carry.split(carries)[1]
+            )
             final_carries = _clone_tree_like(final_carries, carries)
             return final, {"v": final["integrator"]["v"]}, final_carries, emitted
 

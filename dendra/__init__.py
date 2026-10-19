@@ -32,6 +32,7 @@ import dendra.models.mod as mod
 
 from .const import FARADAY, PI, TAU, E, R
 from .diagnostics import doctor
+from .func import compile
 from .helpers import (
     COMPILE_OPTIONS,
     DEVICE,
@@ -155,6 +156,7 @@ __all__ = [
     "set_jit_in_network_enabled",
     "callbacks",
     "func",
+    "compile",
     "mod",
     "Recorder",
     "load_mechanisms",

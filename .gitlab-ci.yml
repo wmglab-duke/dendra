@@ -181,6 +181,10 @@ test_functional_compatibility:
       tests/func/test_scan_recording.py
       tests/func/test_scan_hh_validation.py
       tests/func/test_while_inductor.py
+      tests/func/test_membrane_current.py
+      tests/func/test_lfp.py
+      tests/func/test_recorder_regions.py
+      tests/func/test_convenience_runner.py::test_top_level_compile_is_the_exported_functional_compile_alias
 
 build_docs:
   stage: build

@@ -1242,15 +1242,15 @@ def test_mixed_multi_commit_is_atomic_syncs_expected_views_and_resumes(write_bac
     )
 
 
-def test_multi_functionalization_rejects_imem_recording():
+def test_multi_functionalization_preserves_imem_recording():
     with dn.ctx(IMEM=1):
         model = _point_multi(batch_calls=())
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="i_membrane recording is not supported yet",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    _, tensors = dn.func.make_functional(model, dt=DT)
+    assert model.integrator.imem
+    torch.testing.assert_close(
+        tensors.state["integrator"]["i_membrane"], model.i_membrane
+    )
 
 
 def test_failed_multi_child_admission_restores_class_and_global_rng_state():

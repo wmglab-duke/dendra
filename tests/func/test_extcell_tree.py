@@ -916,10 +916,17 @@ def test_extcell_tree_requires_exact_v_and_vc_integrator_state_contract():
         dn.func.make_functional(model, dt=DT)
 
 
+def test_extcell_tree_imem_is_explicit_functional_state():
+    model = _model(imem=True)
+    _, tensors = dn.func.make_functional(model, dt=DT)
+    torch.testing.assert_close(
+        tensors.state["integrator"]["i_membrane"], model.i_membrane
+    )
+
+
 @pytest.mark.parametrize(
     ("model_factory", "message"),
     [
-        (lambda: _model(imem=True), "i_membrane recording is not supported yet"),
         (
             lambda: _build_model(
                 _branched_nonzero_root_graph(),

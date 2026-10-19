@@ -1608,13 +1608,21 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
         # first registered path so functional_call receives the same canonical
         # names as named_parameters()/named_buffers().
         module_paths.setdefault(id(module), name)
-    integrator_state_names = tuple(population.integrator.v_vars)
-    if not integrator_state_names or len(integrator_state_names) != len(
-        set(integrator_state_names)
+    voltage_state_names = tuple(population.integrator.v_vars)
+    if not voltage_state_names or len(voltage_state_names) != len(
+        set(voltage_state_names)
     ):
         raise FunctionalizationError(
             "Integrator v_vars must declare unique Population tensor-state names."
         )
+    # Net transmembrane current is an optional accepted-step observable, not a
+    # voltage unknown. Carry it explicitly so recording, checkpoint/restart,
+    # and committing an already-advanced model preserve the imperative value.
+    # Leaving it out entirely when disabled keeps the ordinary voltage-only
+    # transition and compiled carry schema unchanged.
+    integrator_state_names = voltage_state_names + (
+        ("i_membrane",) if population.integrator.imem else ()
+    )
     leaves = []
     for state_name in integrator_state_names:
         value = getattr(population, state_name, None)
@@ -4430,6 +4438,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             path = leaf.public_path
             if path in {
                 ("integrator", "v"),
+                ("integrator", "i_membrane"),
                 ("clock", "t"),
                 ("control", "duration_remainder"),
             }:
@@ -4709,6 +4718,10 @@ class _PopulationInitialization(torch.nn.Module):
         for leaf in self.layout:
             if leaf.public_path == ("integrator", "v"):
                 value = initial_voltage
+            elif leaf.public_path == ("integrator", "i_membrane"):
+                # Integrator.init_v resets this diagnostic before the first
+                # accepted step; it is not an initialized ionic-current sum.
+                value = torch.zeros_like(initial_voltage)
             elif leaf.public_path == ("clock", "t") or leaf.public_path == (
                 "control",
                 "duration_remainder",
@@ -4768,6 +4781,7 @@ class _PopulationTransition(torch.nn.Module):
 
         integrator = self.population.integrator
         vc = self.population._buffers.get("vc") if self.block_voltage_state else None
+        i_membrane = self.population._buffers["i_membrane"] if integrator.imem else None
         for index in range(steps):
             ve_step = None if ve is None else ve[index]
             intra_step = None if intra is None else intra[index]
@@ -4776,7 +4790,7 @@ class _PopulationTransition(torch.nn.Module):
             # matching imperative execution where the clock advances afterward.
             self.population._buffers["t"] = t
             if self.block_voltage_state:
-                vc, v, _i_membrane = integrator._step(
+                vc, v, i_membrane = integrator._step(
                     vc.reshape(integrator.B, integrator.K, integrator.M),
                     v,
                     dt,
@@ -4787,7 +4801,7 @@ class _PopulationTransition(torch.nn.Module):
                     call_local_currents=True,
                 )
             else:
-                v, _i_membrane = integrator._step(
+                v, i_membrane = integrator._step(
                     v,
                     dt,
                     shared_celsius,
@@ -4807,6 +4821,8 @@ class _PopulationTransition(torch.nn.Module):
                 value = v
             elif entry.public_path == ("integrator", "vc") and self.block_voltage_state:
                 value = vc
+            elif entry.public_path == ("integrator", "i_membrane"):
+                value = i_membrane
             elif entry.public_path == ("clock", "t"):
                 value = t
             elif entry.public_path == ("control", "duration_remainder"):
@@ -6100,8 +6116,6 @@ def _functionalization_failures(
                 "MultiPopulation functionalization requires exactly "
                 "bwd_euler_sc_multi, dhs_multi, or dhs_bt_multi"
             )
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
         voltage_names = ("v", "vc") if block_spec is not None else ("v",)
         if tuple(population.integrator.v_vars) != voltage_names:
             failures.append(
@@ -6119,8 +6133,6 @@ def _functionalization_failures(
             failures.append(
                 "ExtCellAxon functionalization requires exactly bwd_euler_bt"
             )
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
         elif population.integrator.method == "spd":
             failures.append(
                 "functional bwd_euler_bt currently supports the Thomas method only"
@@ -6139,8 +6151,6 @@ def _functionalization_failures(
             is None
         ):
             failures.append("ExtCellTree functionalization requires exactly dhs_bt")
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
         if tuple(population.integrator.v_vars) != ("v", "vc"):
             failures.append(
                 "functional dhs_bt must declare exactly the ('v', 'vc') "
@@ -6157,8 +6167,6 @@ def _functionalization_failures(
             failures.append(
                 "Population/SingleCompartment functionalization requires exactly bwd_euler_sc"
             )
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
     elif is_unmyelinated or is_myelinated or is_native_cable:
         if (
             _resolve_functional_integrator_spec(
@@ -6173,8 +6181,6 @@ def _functionalization_failures(
                 else ("Myelinated" if is_myelinated else "Unmyelinated")
             )
             failures.append(f"{topology} functionalization requires bwd_euler_ub")
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
         elif population.integrator.use_gc_variant:
             failures.append("the gradient-clipped Thomas variant is not supported yet")
     elif is_scalar_tree:
@@ -6186,8 +6192,6 @@ def _functionalization_failures(
             is None
         ):
             failures.append("scalar Tree functionalization requires exactly dhs")
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
 
     handler = getattr(population, "mech", None)
     if handler is not None:
@@ -8010,6 +8014,15 @@ class FunctionalPopulation:
                     if topology_kind == "scalar_tree"
                     else None
                 )
+                if topology_kind == "scalar_tree":
+                    # Scalar Multi emits its compact axial/ve edge maps in
+                    # solver-node order, which need not match storage order.
+                    # Keep conductances aligned with those immutable endpoints
+                    # even when the root is not storage row zero.
+                    edge_child_orig = solver_order[
+                        parent_index.index_select(0, solver_order) >= 0
+                    ]
+                    edge_parent_orig = parent_index.index_select(0, edge_child_orig)
             else:
                 edge_child_orig = None
                 solver_order = None

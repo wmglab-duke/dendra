@@ -53,12 +53,17 @@ def _reference(runner, state, *, parameters=None, inputs=None, steps=8):
     return dn.func.run(bound, state, steps=steps, inputs=inputs, callbacks=callbacks)
 
 
+def test_top_level_compile_is_the_exported_functional_compile_alias():
+    assert dn.compile is dn.func.compile
+    assert "compile" in dn.__all__
+
+
 @pytest.mark.parametrize("execution", ["scan", "while"])
 def test_compiled_runner_records_full_traces_without_advancing_source(execution):
     model = _model()
     source_v = model.v.detach().clone()
     source_t = model.t.detach().clone()
-    runner = dn.func.compile(
+    runner = dn.compile(
         model,
         dt=DT,
         steps=8,
@@ -259,7 +264,7 @@ def _loss(result):
 
 def test_training_scan_matches_eager_traces_and_all_explicit_gradient_sources():
     model = _model()
-    runner = dn.func.compile(
+    runner = dn.compile(
         model,
         dt=DT,
         steps=8,

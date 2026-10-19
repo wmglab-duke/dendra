@@ -87,6 +87,16 @@ class Recorder(FunctionalCallback):
     where the pure in-memory semantics overlap. ``dt`` and
     ``sliding_window`` are reserved but not yet supported because their phase
     must remain explicit across segmented and transformed executions.
+
+    ``region`` accepts a physical Slice belonging to the exact source
+    Population, including a named child selection such as
+    ``packed.cell_a`` or ``getattr(packed, name)``. It selects voltage, extracellular layer
+    voltage, or membrane-current coordinates without collapsing explicit
+    batch dimensions or extracellular layers. Clock ``t`` remains scalar.
+    Mechanism-local state has separate support maps and cannot yet be selected
+    with ``region``. Region selection is mutually exclusive with ``node_indices``,
+    ``max_only``, and ``partition``; without a region those retain their
+    existing final-axis semantics.
     """
 
     def __init__(
@@ -97,6 +107,8 @@ class Recorder(FunctionalCallback):
         dt=None,
         sliding_window=None,
         partition=None,
+        *,
+        region=None,
     ) -> None:
         if isinstance(states, str):
             states = (states,)
@@ -114,6 +126,7 @@ class Recorder(FunctionalCallback):
         self.dt = dt
         self.sliding_window = sliding_window
         self.partition = partition
+        self.region = region
 
     def _bind(self, functional: FunctionalPopulation):
         if self.dt is not None:
@@ -142,6 +155,32 @@ class Recorder(FunctionalCallback):
                 f"unsupported selection(s): {missing}"
             )
         paths = tuple(available[state] for state in self.states)
+        region = None
+        if self.region is not None:
+            from ._regions import _RecorderRegion
+
+            if (
+                self.max_only
+                or self.node_indices is not None
+                or self.partition is not None
+            ):
+                raise FunctionalizationError(
+                    "dn.func.Recorder region cannot be combined with "
+                    "node_indices, max_only, or partition"
+                )
+            for state_name, path in zip(self.states, paths, strict=True):
+                if path not in {
+                    ("integrator", "v"),
+                    ("integrator", "vc"),
+                    ("integrator", "i_membrane"),
+                    ("clock", "t"),
+                }:
+                    raise FunctionalizationError(
+                        "dn.func.Recorder region only selects physical v, vc, "
+                        "or i_membrane state (and leaves clock t unchanged); "
+                        f"{state_name!r} is mechanism-local state"
+                    )
+            region = _RecorderRegion.bind(functional, self.region)
         selected_schemas = []
         for state_name, path in zip(self.states, paths, strict=True):
             schema = functional._state_schema
@@ -198,6 +237,7 @@ class Recorder(FunctionalCallback):
             max_only=self.max_only,
             node_indices=node_indices,
             partition=partition,
+            region=region,
         )
 
     def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
@@ -226,6 +266,7 @@ class _BoundRecorder(FunctionalCallback):
     max_only: bool
     node_indices: torch.Tensor | None
     partition: tuple[int, ...] | None
+    region: object | None = None
 
     def _observe(self, state: Mapping[str, object]) -> dict[str, torch.Tensor]:
         output = {}
@@ -235,6 +276,8 @@ class _BoundRecorder(FunctionalCallback):
                 raise FunctionalizationError(
                     f"functional Recorder state {name!r} is no longer a Tensor"
                 )
+            if self.region is not None and path != ("clock", "t"):
+                value = self.region.select(value, payload_ndim=int(name == "vc"))
             if self.max_only:
                 if self.partition is None:
                     value = torch.amax(value, dim=-1, keepdim=True)
@@ -257,6 +300,138 @@ class _BoundRecorder(FunctionalCallback):
     def update(self, carry, state, auxiliary):
         del auxiliary
         return carry, self._observe(state)
+
+    def finalize(self, carry, emissions):
+        del carry
+        return emissions
+
+
+class LFP(FunctionalCallback):
+    """Record lead-field projections of absolute membrane current.
+
+    ``v_unit`` is a non-empty list of equally shaped reciprocal lead-field
+    tensors, one per recording contact. Membrane current is in mA, so fields
+    in mV/mA (numerically equivalent to ohms) yield potentials in mV. Fields
+    are converted to the functional plan's dtype and device without detaching
+    their gradients.
+
+    By default each field must broadcast to the Population voltage shape.
+    The projection sums its physical cell and compartment axes, preserving
+    any explicit batch axes: results have shape ``(samples, *batch, contacts)``.
+    For an unbatched Population this matches the ordinary :class:`dendra.callbacks.LFP`
+    convention. Unlike the ordinary default, explicit batch lanes are never
+    silently summed. An explicit ``rule`` uses ``torch.einsum(rule, current,
+    stacked_fields)`` exactly, with fields stacked on their leading contact
+    axis, and permits custom reductions.
+
+    Construct the source Population inside ``dn.ctx(IMEM=1)`` to enable
+    membrane-current output. The initial
+    boundary and every accepted post-step value are emitted, including resumed
+    executions' normal callback continuation semantics. Only the electrode
+    projections are emitted as recordings, not a full membrane-current history;
+    autograd may still save or recompute current intermediates. Lead fields
+    are explicit constant-valued callback carry, so they remain
+    differentiable through compiled scan and checkpoint replay. Compiled loops
+    lift those fields as invariant operands instead of copying them each step.
+    """
+
+    def __init__(self, v_unit: list[torch.Tensor], rule=None):
+        if not isinstance(v_unit, list):
+            raise TypeError(
+                "v_unit must be a non-empty list of lead-field tensors; "
+                "pass [lead_field] for one recording contact."
+            )
+        if not v_unit:
+            raise ValueError("v_unit must contain at least one lead-field tensor.")
+        if not all(isinstance(field, torch.Tensor) for field in v_unit):
+            raise TypeError("Every v_unit entry must be a torch.Tensor.")
+        shape = v_unit[0].shape
+        if any(field.shape != shape for field in v_unit[1:]):
+            raise ValueError("All v_unit lead-field tensors must have the same shape.")
+        if rule is not None and not isinstance(rule, str):
+            raise TypeError("functional LFP rule must be a string or None")
+        self.v_unit = tuple(v_unit)
+        self.rule = rule
+
+    def _bind(self, functional: FunctionalPopulation):
+        path = ("integrator", "i_membrane")
+        if not any(leaf.public_path == path for leaf in functional._state_layout):
+            raise FunctionalizationError(
+                "dn.func.LFP requires membrane-current output; construct the "
+                "Population inside dn.ctx(IMEM=1)"
+            )
+        padding = 0
+        if self.rule is None:
+            try:
+                shape = torch.broadcast_shapes(self.v_unit[0].shape, functional.shape)
+            except RuntimeError as error:
+                raise FunctionalizationError(
+                    "dn.func.LFP lead fields must broadcast to the Population "
+                    f"shape {functional.shape}; got {tuple(self.v_unit[0].shape)}"
+                ) from error
+            if tuple(shape) != functional.shape:
+                raise FunctionalizationError(
+                    "dn.func.LFP lead fields must broadcast to the Population "
+                    f"shape {functional.shape}; got {tuple(self.v_unit[0].shape)}"
+                )
+            padding = len(functional.shape) - self.v_unit[0].ndim
+        return _BoundLFP(
+            fields=self.v_unit,
+            rule=self.rule,
+            padding=padding,
+            device=functional.device,
+            dtype=functional.dtype,
+        )
+
+    def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
+        del state, auxiliary
+        raise FunctionalizationError(
+            "dn.func.LFP must be bound with functional.make_callbacks(...)"
+        )
+
+    def update(self, carry, state, auxiliary):  # pragma: no cover - guarded
+        del carry, state, auxiliary
+        raise FunctionalizationError(
+            "dn.func.LFP must be bound with functional.make_callbacks(...)"
+        )
+
+    def finalize(self, carry, emissions):  # pragma: no cover - guarded by bind
+        del carry, emissions
+        raise FunctionalizationError(
+            "dn.func.LFP must be bound with functional.make_callbacks(...)"
+        )
+
+
+@dataclass(frozen=True)
+class _BoundLFP(FunctionalCallback):
+    fields: tuple[torch.Tensor, ...]
+    rule: str | None
+    padding: int
+    device: torch.device
+    dtype: torch.dtype
+
+    def _observe(self, state, fields):
+        current = state["integrator"]["i_membrane"]
+        if self.rule is not None:
+            return torch.einsum(self.rule, current, fields)
+        return (current.unsqueeze(0) * fields).sum(dim=(-1, -2)).movedim(0, -1)
+
+    def initialize(self, state, auxiliary):
+        del auxiliary
+        # Build this at execution, not binding/probing: each fresh run needs
+        # its own differentiable stack even after an earlier backward freed AD.
+        fields = torch.stack(
+            [field.to(device=self.device, dtype=self.dtype) for field in self.fields]
+        )
+        if self.rule is None:
+            fields = fields.reshape(
+                fields.shape[0], *((1,) * self.padding), *fields.shape[1:]
+            )
+        return fields, self._observe(state, fields)
+
+    def update(self, carry, state, auxiliary):
+        del auxiliary
+        return carry, self._observe(state, carry)
 
     def finalize(self, carry, emissions):
         del carry
@@ -1178,6 +1353,7 @@ class FunctionalCallbacks:
             validate_updates=type(callback)
             not in {
                 _BoundRecorder,
+                _BoundLFP,
                 AnomalyDetector,
                 _BoundRaster,
                 _BoundAPCount,
@@ -1497,6 +1673,7 @@ __all__ = [
     "FunctionalCallbackResults",
     "FunctionalCallbackState",
     "FunctionalCallbacks",
+    "LFP",
     "Raster",
     "Recorder",
 ]
