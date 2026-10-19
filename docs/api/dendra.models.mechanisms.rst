@@ -492,8 +492,35 @@ private framework adapter rather than a second public field read/write API.
 Authors of new process families implement these hooks over complete Material
 fields; users of the built-in families normally only need their declarations.
 
+The optional pure process protocol separates numerical computation from that
+imperative adapter. ``material_fields`` identifies full-field inputs by
+canonical ``(material_name, field_name)`` pairs;
+``prepare_materials(fields, dt)`` returns tensor-only operator data, and
+``material_updates(fields, prepared)`` returns full-field replacements without
+mutating inputs or the process. Functional preparation runs outside the accepted-step
+loop: it may depend on explicit parameters, geometry, timestep, and field
+schemas, not evolving field values. State-dependent reactions belong in
+``material_updates``. Publication, guards, derived-field updates, and
+local synchronization belong to the surrounding framework transaction. This
+protocol does not introduce ordinary Mechanism ``STATE``, ``CARRY``,
+``DERIVED_BUFFER``, or ``TIMESTEP_BUFFER`` phases for MaterialProcesses.
+
+``ClearanceProcess`` uses this shared numerical path in both imperative and
+functional execution. Its imperative ``advance_materials`` still commits bound
+Material state; out-of-place arithmetic alone is not an admission contract for
+custom functional processes. Currently only globally inserted,
+declaration-driven Clearance subclasses with their canonical lifecycle are
+admitted by ``dn.func``. Other families and custom process runtime overrides
+remain imperative-only. No process is advanced during fresh initialization.
+See :ref:`functional-material-processes` for recording, gradient, and
+continuation examples.
+
 .. autoclass:: dendra.models.mechanisms.MaterialProcess
-   :members: METHOD, PHASE, configure_process, set_dt, advance_materials
+   :members: METHOD, PHASE, configure_process, set_dt, advance_materials, material_fields, prepare_materials, material_updates
+   :show-inheritance:
+
+.. autoclass:: dendra.models.mechanisms.ClearanceProcess
+   :members: CLEAR, DECAY, RELAX
    :show-inheritance:
 
 .. autoclass:: dendra.models.mechanisms.DiffusionProcess

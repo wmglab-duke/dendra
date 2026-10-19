@@ -53,6 +53,7 @@ from dendra.models.integrators.tree_bt import (
 )
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion
+from dendra.models.mechanisms._material_process import ClearanceProcess, MaterialProcess
 from dendra.models.mechanisms._materials import Material
 from dendra.models.mechanisms._mechanism import Mechanism, PointProcess
 from dendra.models.mechanisms._numerical import (
@@ -160,6 +161,28 @@ _STANDARD_FUNCTIONAL_HANDLER_HOOKS = {
     name: inspect.getattr_static(MechanismHandler, name)
     for name in _FUNCTIONAL_HANDLER_HOOKS
 }
+_CLEARANCE_FUNCTIONAL_HOOKS = (
+    "material_fields",
+    "prepare_materials",
+    "material_updates",
+    "advance_materials",
+    "configure_process",
+    "_configure_clearance_material_plan",
+    "_clearance_operand",
+    "_validate_clearance_operand",
+    "_validate_clearance_specs",
+    "_effective_clearance_domain",
+    "_resolve_quantity",
+    "_get_material",
+    "_bind_materials",
+    "set_dt",
+    "_reset_initialization_timestep",
+)
+_STANDARD_CLEARANCE_FUNCTIONAL_HOOKS = {
+    name: inspect.getattr_static(ClearanceProcess, name)
+    for name in _CLEARANCE_FUNCTIONAL_HOOKS
+}
+_STANDARD_MATERIAL_RESOLVER = inspect.getattr_static(MechanismHandler, "_get_material")
 _HANDLER_INITIALIZATION_HOOKS = (
     "initialize",
     "_sync_celsius",
@@ -729,8 +752,18 @@ def _snapshot_tensor_class_restore(value: torch.Tensor) -> _TensorClassRestore:
     )
 
 
-def _safe_class_restore_copy(value, *, label: str, seen: set[int]):
+def _safe_class_restore_copy(
+    value, *, label: str, seen: set[int], tensor_restores=None
+):
     """Copy only class state whose snapshot cannot execute authored code."""
+    if torch.is_tensor(value) and tensor_restores is not None:
+        # Declarations can contain tensors (for example ClearanceSpec.rate).
+        # Keep their identities in the structural copy and independently save
+        # raw storage, so restoring a nested literal also restores registered
+        # instance-buffer aliases rather than replacing them with new tensors.
+        if id(value) not in tensor_restores:
+            tensor_restores[id(value)] = (value, _snapshot_tensor_class_restore(value))
+        return value
     if value is None or isinstance(
         value,
         (
@@ -800,6 +833,7 @@ def _safe_class_restore_copy(value, *, label: str, seen: set[int]):
                         object.__getattribute__(value, field.name),
                         label=f"{label}.{field.name}",
                         seen=seen,
+                        tensor_restores=tensor_restores,
                     ),
                 )
             return restored
@@ -809,12 +843,15 @@ def _safe_class_restore_copy(value, *, label: str, seen: set[int]):
                     item,
                     label=f"{label}[{index}]",
                     seen=seen,
+                    tensor_restores=tensor_restores,
                 )
                 for index, item in enumerate(value)
             )
         if type(value) is frozenset:
             return frozenset(
-                _safe_class_restore_copy(item, label=f"{label}[]", seen=seen)
+                _safe_class_restore_copy(
+                    item, label=f"{label}[]", seen=seen, tensor_restores=tensor_restores
+                )
                 for item in value
             )
         if type(value) is list:
@@ -823,21 +860,30 @@ def _safe_class_restore_copy(value, *, label: str, seen: set[int]):
                     item,
                     label=f"{label}[{index}]",
                     seen=seen,
+                    tensor_restores=tensor_restores,
                 )
                 for index, item in enumerate(value)
             ]
         if type(value) is set:
             return {
-                _safe_class_restore_copy(item, label=f"{label}[]", seen=seen)
+                _safe_class_restore_copy(
+                    item, label=f"{label}[]", seen=seen, tensor_restores=tensor_restores
+                )
                 for item in value
             }
         if type(value) is dict:
             return {
-                _safe_class_restore_copy(key, label=f"{label}.key", seen=seen): (
+                _safe_class_restore_copy(
+                    key,
+                    label=f"{label}.key",
+                    seen=seen,
+                    tensor_restores=tensor_restores,
+                ): (
                     _safe_class_restore_copy(
                         item,
                         label=f"{label}[{key!r}]",
                         seen=seen,
+                        tensor_restores=tensor_restores,
                     )
                 )
                 for key, item in value.items()
@@ -858,6 +904,7 @@ def _class_state_snapshot(classes: tuple[type, ...]):
         for name, value in vars(cls).items():
             if name in _CLASS_STATE_METADATA_NAMES:
                 continue
+            tensor_restores = {}
             if torch.is_tensor(value):
                 restored = _snapshot_tensor_class_restore(value)
             elif isinstance(value, np.ndarray):
@@ -871,11 +918,36 @@ def _class_state_snapshot(classes: tuple[type, ...]):
                     value,
                     label=f"{cls.__module__}.{cls.__qualname__}.{name}",
                     seen=set(),
+                    tensor_restores=tensor_restores,
                 )
             signature = _audit_python_value_signature(value, set())
-            attributes[name] = (signature, value, restored)
+            attributes[name] = (signature, value, restored, tensor_restores)
         snapshot[cls] = attributes
     return snapshot
+
+
+def _restore_tensor_class_value(original, restored):
+    """Restore storage/view metadata without losing authored tensor aliases."""
+    with torch.no_grad():
+        if restored.storage.nbytes() != restored.storage_nbytes:
+            restored.storage.resize_(restored.storage_nbytes)
+        if restored.storage_nbytes:
+            storage_view = torch.empty(
+                0, device=restored.device, dtype=torch.uint8
+            ).set_(restored.storage, 0, (restored.storage_nbytes,), (1,))
+            storage_view.copy_(restored.storage_value)
+        restored_view = torch.empty(
+            0,
+            device=restored.device,
+            dtype=restored.dtype,
+            layout=restored.layout,
+        ).set_(
+            restored.storage, restored.storage_offset, restored.size, restored.stride
+        )
+        # set_ alone cannot recover dtype/device changes through tensor.data.
+        original.data = restored_view
+    if original.requires_grad != restored.requires_grad:
+        original.requires_grad_(restored.requires_grad)
 
 
 def _restore_class_state(snapshot) -> set[str]:
@@ -889,7 +961,12 @@ def _restore_class_state(snapshot) -> set[str]:
         for name in current_names - expected_names:
             changed.add(f"{cls.__module__}.{cls.__qualname__}.{name}")
             delattr(cls, name)
-        for name, (signature, original, restored) in attributes.items():
+        for name, (
+            signature,
+            original,
+            restored,
+            tensor_restores,
+        ) in attributes.items():
             current = vars(cls).get(name, None)
             current_signature = (
                 None
@@ -898,16 +975,22 @@ def _restore_class_state(snapshot) -> set[str]:
             )
             if current_signature != signature:
                 changed.add(f"{cls.__module__}.{cls.__qualname__}.{name}")
+                for tensor, tensor_restore in tensor_restores.values():
+                    _restore_tensor_class_value(tensor, tensor_restore)
+                memo = {
+                    identity: tensor
+                    for identity, (tensor, _saved) in tensor_restores.items()
+                }
                 if isinstance(original, dict):
                     original.clear()
-                    original.update(copy.deepcopy(restored))
+                    original.update(copy.deepcopy(restored, memo))
                     restored_value = original
                 elif isinstance(original, list):
-                    original[:] = copy.deepcopy(restored)
+                    original[:] = copy.deepcopy(restored, memo)
                     restored_value = original
                 elif isinstance(original, set):
                     original.clear()
-                    original.update(copy.deepcopy(restored))
+                    original.update(copy.deepcopy(restored, memo))
                     restored_value = original
                 elif isinstance(original, np.ndarray):
                     if original.dtype != restored.dtype:
@@ -916,42 +999,7 @@ def _restore_class_state(snapshot) -> set[str]:
                     np.copyto(original, restored.value)
                     restored_value = original
                 elif torch.is_tensor(original):
-                    with torch.no_grad():
-                        # Restore raw storage before the original view metadata.
-                        # This preserves aliases and handles overlapping or
-                        # expanded tensors, where logical ``copy_`` is invalid.
-                        if restored.storage.nbytes() != restored.storage_nbytes:
-                            restored.storage.resize_(restored.storage_nbytes)
-                        if restored.storage_nbytes:
-                            storage_view = torch.empty(
-                                0,
-                                device=restored.device,
-                                dtype=torch.uint8,
-                            ).set_(
-                                restored.storage,
-                                0,
-                                (restored.storage_nbytes,),
-                                (1,),
-                            )
-                            storage_view.copy_(restored.storage_value)
-                        restored_view = torch.empty(
-                            0,
-                            device=restored.device,
-                            dtype=restored.dtype,
-                            layout=restored.layout,
-                        ).set_(
-                            restored.storage,
-                            restored.storage_offset,
-                            restored.size,
-                            restored.stride,
-                        )
-                        # ``set_`` alone cannot restore dtype/device metadata
-                        # changed through ``tensor.data = ...``. Reattach the
-                        # exact typed view while preserving the original Python
-                        # identity and captured shared raw storage.
-                        original.data = restored_view
-                    if original.requires_grad != restored.requires_grad:
-                        original.requires_grad_(restored.requires_grad)
+                    _restore_tensor_class_value(original, restored)
                     restored_value = original
                 elif isinstance(original, torch.Generator):
                     original.set_state(restored.get_state())
@@ -1126,6 +1174,9 @@ def _rebind_population_time_references(population: Population) -> None:
         mechanism.setreference("t", lambda population=population: population.t)
     for process in handler.material_processes.values():
         process.setreference("t", lambda population=population: population.t)
+        # Resolver methods are external Python references, not registered module
+        # children. Always bind the private copy's material registry explicitly.
+        process._material_resolver = handler._get_material
 
 
 def _clone_execution_population(population: Population) -> Population:
@@ -1478,6 +1529,159 @@ def _unresolved_deferred_layouts(module) -> tuple[str, ...]:
 def _timestep_buffer_names(module) -> tuple[str, ...]:
     """Return the statically declared timestep-derived buffer names."""
     return tuple(sorted(getattr(module, "_timestep_buffers", ())))
+
+
+def _material_process_failures(process, population=None):
+    """Admit declaration-only Clearance families, not effectful custom hooks."""
+    if not isinstance(process, ClearanceProcess):
+        return [
+            "MaterialProcesses other than canonical ClearanceProcess have "
+            "workspaces or update contracts that are not lowered yet"
+        ]
+    changed = [
+        name
+        for name, standard in _STANDARD_CLEARANCE_FUNCTIONAL_HOOKS.items()
+        if name in process.__dict__
+        or inspect.getattr_static(type(process), name) is not standard
+    ]
+    if changed:
+        return [f"ClearanceProcess replaces canonical pure process hooks {changed}"]
+    resolver = getattr(process, "_material_resolver", None)
+    if getattr(resolver, "__func__", None) is not _STANDARD_MATERIAL_RESOLVER or (
+        population is not None
+        and (
+            getattr(resolver, "__self__", None) is not population.mech
+            or "_get_material" in population.mech.__dict__
+            or inspect.getattr_static(type(population.mech), "_get_material")
+            is not _STANDARD_MATERIAL_RESOLVER
+        )
+    ):
+        return [
+            "ClearanceProcess requires its owning MechanismHandler material resolver"
+        ]
+    if process.key is not None:
+        return ["functional ClearanceProcess requires global insertion"]
+    if not getattr(process, "_clearance_material_plan", ()):
+        return ["ClearanceProcess is missing its configured material field plan"]
+    return []
+
+
+def _material_process_signature(process, handler):
+    if not isinstance(process, ClearanceProcess):
+        return None
+    return (
+        _material_configuration_signature(
+            getattr(type(process), "_clearance_specs", ())
+        ),
+        _configuration_signature(getattr(process, "_clearance_material_plan", ())),
+        _configuration_signature(
+            getattr(type(process), "_material_process_method_kwargs", {})
+        ),
+        getattr(type(process), "_material_process_method", None),
+        getattr(type(process), "_material_process_phase", None),
+        getattr(process, "_clearance_method", None),
+        getattr(process, "_clearance_allow_negative_rate", None),
+        _configuration_signature(getattr(process, "_clearance_domain", None)),
+        (
+            getattr(process._material_resolver, "__self__", None) is handler,
+            id(
+                getattr(
+                    process._material_resolver, "__func__", process._material_resolver
+                )
+            ),
+            _effective_hook_identity(handler, "_get_material"),
+        ),
+        tuple(
+            (name, _effective_hook_identity(process, name))
+            for name in _CLEARANCE_FUNCTIONAL_HOOKS
+        ),
+    )
+
+
+def _material_configuration_signature(value):
+    """Fingerprint declarations, including complete tensor literal contents."""
+    if torch.is_tensor(value):
+        return (
+            "tensor",
+            tuple(value.shape),
+            value.dtype,
+            str(value.device),
+            _audit_tensor_digest(value),
+        )
+    if is_dataclass(value) and not isinstance(value, type):
+        return (
+            type(value),
+            tuple(
+                (
+                    field.name,
+                    _material_configuration_signature(getattr(value, field.name)),
+                )
+                for field in dataclass_fields(value)
+            ),
+        )
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (str(key), _material_configuration_signature(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (tuple, list)):
+        return (
+            type(value),
+            tuple(_material_configuration_signature(item) for item in value),
+        )
+    return _configuration_signature(value)
+
+
+def _material_fields(population, process):
+    return {
+        key: population.mech._get_material(key[0])._buffers[key[1]]
+        for key in process.material_fields
+    }
+
+
+def _prepared_material_advance(self, dt):
+    """Private adapter: returned replacements publish only to explicit carry."""
+    values = tuple(self._buffers[name] for name in self._functional_material_slots)
+    prepared = torch.utils._pytree.tree_unflatten(
+        values, self._functional_material_tree_spec
+    )
+    MaterialProcess.advance_materials(self, dt, prepared=prepared)
+
+
+def _install_material_preparation(population, dt):
+    """Give the private transition fixed tensor slots for pure process outputs."""
+    for process in population.mech.material_processes.values():
+        fields = _material_fields(population, process)
+        values = process.prepare_materials(fields, dt)
+        leaves, tree_spec = torch.utils._pytree.tree_flatten(values)
+        if not leaves or not all(torch.is_tensor(value) for value in leaves):
+            raise FunctionalizationError(
+                "Material preparation must be a tensor-only PyTree"
+            )
+        slots = tuple(
+            f"_functional_material_prepared_{index}" for index in range(len(leaves))
+        )
+        for name, value in zip(slots, leaves, strict=True):
+            process.register_buffer(name, _clone_tensor(value), persistent=False)
+        process._functional_material_slots = slots
+        process._functional_material_tree_spec = tree_spec
+        # Clearance returns three operands for every declaration. Keep logical
+        # scalar workspaces scalar publicly, padding only the execution binding
+        # to avoid the empty-vmap scalar/spatial broadcast limitation.
+        process._functional_material_visible_ranks = {
+            name: fields[entry[0]].ndim
+            for entry, names in zip(
+                process._clearance_material_plan,
+                (slots[i : i + 3] for i in range(0, len(slots), 3)),
+                strict=True,
+            )
+            for name in names
+        }
+        process.advance_materials = types.MethodType(
+            _prepared_material_advance, process
+        )
 
 
 def _timestep_buffer_shape_specs(module) -> tuple[tuple[str, object], ...]:
@@ -1930,6 +2134,7 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
     effective = []
     derived = []
     timestep = []
+    material = []
     for module_path in _parameterized_module_paths(population):
         module = _module_at(population, module_path)
         for name in _declared_parameter_names(module):
@@ -1973,7 +2178,20 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     kind="timestep",
                 )
             )
-    return tuple((*effective, *derived, *timestep))
+        for name in getattr(module, "_functional_material_slots", ()):
+            buffer = module._buffers[name]
+            material.append(
+                _PreparedBuffer(
+                    key=f"{module_path}.{name}",
+                    module_path=module_path,
+                    buffer_name=name,
+                    shape=_shape_tuple(buffer),
+                    dtype=buffer.dtype,
+                    device=buffer.device,
+                    kind="material_process",
+                )
+            )
+    return tuple((*effective, *derived, *timestep, *material))
 
 
 def _geometry_binding_layout(population: Population) -> tuple[_GeometryBinding, ...]:
@@ -1982,8 +2200,7 @@ def _geometry_binding_layout(population: Population) -> tuple[_GeometryBinding, 
     A Mechanism and every nested State share one local diameter tensor in the
     imperative handler. Preserve that identity while making the gather an
     explicit differentiable operation in both preparation and transition
-    mapping. MaterialProcess geometry is deliberately rejected by functional
-    eligibility and therefore cannot silently fall back to dense geometry here.
+    mapping. Globally inserted material processes use full-field geometry.
     """
 
     bindings = [_GeometryBinding("dx", "dx", ("",))]
@@ -2025,6 +2242,16 @@ def _geometry_binding_layout(population: Population) -> tuple[_GeometryBinding, 
                     (*binding.module_paths, *local_paths),
                     binding.support_entry,
                 )
+
+    for process in handler.material_processes.values():
+        local_paths = []
+        for owner in (process, *process.DE.values()):
+            module_path = module_paths.get(id(owner))
+            if module_path in parameterized_paths and "diam" in owner._buffers:
+                local_paths.append(module_path)
+                covered_paths.add(module_path)
+        if local_paths:
+            bindings.append(_GeometryBinding("diam", "diam", tuple(local_paths)))
 
     uncovered_paths = sorted(
         module_path
@@ -2300,6 +2527,13 @@ class _PopulationPreparation(torch.nn.Module):
             for module_path in self.module_paths
             if _timestep_buffer_names(_module_at(population, module_path))
         )
+        self.material_module_paths = tuple(
+            module_path
+            for module_path in self.module_paths
+            if getattr(
+                _module_at(population, module_path), "_functional_material_slots", ()
+            )
+        )
         offset_names = []
         # Preserve the exact effective-buffer baseline at the extraction
         # boundary. A post-initialize hook is allowed to update a raw parameter
@@ -2314,7 +2548,7 @@ class _PopulationPreparation(torch.nn.Module):
             validation_population = _clone_execution_population(population)
             owner_parameter_values = {}
             for index, entry in enumerate(self.layout):
-                if entry.kind in {"derived", "timestep"}:
+                if entry.kind in {"derived", "timestep", "material_process"}:
                     offset_names.append(None)
                     continue
                 owner = _module_at(population, entry.module_path)
@@ -2527,7 +2761,7 @@ class _PopulationPreparation(torch.nn.Module):
         outputs = []
         owner_parameter_values = {}
         for index, entry in enumerate(self.layout):
-            if entry.kind in {"derived", "timestep"}:
+            if entry.kind in {"derived", "timestep", "material_process"}:
                 continue
             owner = _module_at(self.population, entry.module_path)
             if entry.module_path not in owner_parameter_values:
@@ -2605,6 +2839,47 @@ class _PopulationPreparation(torch.nn.Module):
                         f"{_shape_tuple(value)} is not broadcastable to canonical "
                         f"timestep-buffer shape {entry.shape}"
                     ) from exc
+                value = value.clone(memory_format=torch.preserve_format)
+                owner._buffers[entry.buffer_name] = value
+                outputs.append((entry.key, value))
+
+        for module_path in self.material_module_paths:
+            owner = _module_at(self.population, module_path)
+            bindings = self._builder_input_bindings(celsius, effective_diam, dt)
+            values = owner.prepare_materials(
+                _material_fields(self.population, owner), dt
+            )
+            self._assert_builder_inputs_unchanged(
+                bindings,
+                celsius,
+                effective_diam,
+                dt,
+                f"{type(owner).__qualname__}.prepare_materials()",
+            )
+            leaves, tree_spec = torch.utils._pytree.tree_flatten(values)
+            if tree_spec != owner._functional_material_tree_spec:
+                raise FunctionalizationError(
+                    "Material preparation changed its tensor PyTree structure"
+                )
+            for entry, value in zip(
+                (
+                    entry
+                    for entry in self.layout
+                    if entry.kind == "material_process"
+                    and entry.module_path == module_path
+                ),
+                leaves,
+                strict=True,
+            ):
+                if (
+                    not torch.is_tensor(value)
+                    or _shape_tuple(value) != entry.shape
+                    or value.dtype != entry.dtype
+                    or value.device != entry.device
+                ):
+                    raise FunctionalizationError(
+                        "Material preparation changed its tensor schema"
+                    )
                 value = value.clone(memory_format=torch.preserve_format)
                 owner._buffers[entry.buffer_name] = value
                 outputs.append((entry.key, value))
@@ -4081,13 +4356,12 @@ def _initialization_structure_signature(population: Population) -> tuple:
             for name, material in population.mech.materials.items()
         ),
     )
-    inspect_final_frame = _functional_initialization_profile(
-        population
-    ) is not None and not any(
-        bool(collection)
-        for collection in (
-            population.mech.material_processes,
-            population.mech.voltage_processes,
+    inspect_final_frame = (
+        _functional_initialization_profile(population) is not None
+        and not population.mech.voltage_processes
+        and not any(
+            _material_process_failures(process, population)
+            for process in population.mech.material_processes.values()
         )
     )
     final_frame = (
@@ -4201,10 +4475,10 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             f"{replaced_handler_hooks}; authored handler initialization needs "
             "an explicit pure output contract"
         )
-    if handler.material_processes:
-        failures.append(
-            "MaterialProcess initialization is not included in the pure "
-            "Ion/Material initializer transaction"
+    for name, process in handler.material_processes.items():
+        failures.extend(
+            f"MaterialProcess {name!r}: {failure}"
+            for failure in _material_process_failures(process, population)
         )
     if handler.voltage_processes:
         failures.append(
@@ -4282,7 +4556,10 @@ def _functional_initialization_failures(population: Population) -> list[str]:
 
     if (
         profile is not None
-        and not handler.material_processes
+        and not any(
+            _material_process_failures(process, population)
+            for process in handler.material_processes.values()
+        )
         and not handler.voltage_processes
     ):
         try:
@@ -5529,7 +5806,10 @@ def _parametrization_constant_layout_for_owners(
 
     def registered_buffer_aliases(value):
         aliases = []
-        for module_path, module in modules:
+        # Bind every distinct owning slot, not repeated ergonomic paths to the
+        # same Module. This matches _module_tensor_slots/functional_call and
+        # still preserves tensor aliases shared by different Module owners.
+        for module_path, module in population.named_modules():
             for buffer_name, buffer in module._buffers.items():
                 if buffer is value:
                     aliases.append(
@@ -5582,6 +5862,20 @@ def _parametrization_constant_layout_for_owners(
                     record(value, (f"{transform_path}.{buffer_name}",))
         available_names = _parameter_materialization_output_names(owner)
         available_names.update({"diam", "diameters", "dx", "celsius"})
+        if isinstance(owner, ClearanceProcess):
+            for _key, *operands in owner._clearance_material_plan:
+                for kind, name in operands:
+                    if kind == "buffer" or (
+                        kind == "named" and name not in available_names
+                    ):
+                        route_resident_dependency(
+                            owner, name, role="material process operand"
+                        )
+                        value = owner._buffers.get(name)
+                        if torch.is_tensor(value):
+                            public_constant_by_identity.setdefault(
+                                id(value), f"material_processes.{owner.name}.{name}"
+                            )
         for target_name, transforms in owner.in_graph_parametrizations.items():
             if target_name not in available_names:
                 raise FunctionalizationError(
@@ -6322,12 +6616,23 @@ def _functionalization_failures(
     stateful_modules = []
     if handler is not None:
         stateful_modules.extend(handler.mechanisms.values())
-        stateful_modules.extend(handler.material_processes.values())
-        if handler.material_processes:
-            failures.append(
-                "MaterialProcesses have parameter-dependent spatial workspaces "
-                "that are not lowered yet"
+        for name, process in handler.material_processes.items():
+            failures.extend(
+                f"MaterialProcess {name!r}: {failure}"
+                for failure in _material_process_failures(process, population)
             )
+            if getattr(type(process), "_table", None):
+                failures.append(
+                    f"MaterialProcess {name!r} uses TABLE lookup workspaces"
+                )
+            if (
+                process.random_parameters
+                or process.runtime_noises
+                or getattr(process, "_diffusion", None)
+            ):
+                failures.append(
+                    f"MaterialProcess {name!r} uses random parameters or stochastic state"
+                )
     for mechanism in stateful_modules:
         mechanism_label = getattr(mechanism, "name", type(mechanism).__qualname__)
         class_has_assigned_values = (
@@ -7427,6 +7732,7 @@ def _structure_signature(population) -> tuple:
             ),
             tuple(sorted(module._save)),
             _membrane_coefficient_signature(module),
+            _material_process_signature(module, handler),
         )
 
     return (
@@ -7793,6 +8099,7 @@ class FunctionalPopulation:
             name: workspace_shapes[shape_role]
             for name, shape_role in self._integrator_workspace_schema
         }
+        _install_material_preparation(execution_population, dt_tensor)
         self._state_layout = _state_layout(execution_population)
         self._state_layout_signature = _state_layout_signature(self._state_layout)
         self._initialization_state_layout = _initialization_state_layout(
@@ -7876,14 +8183,20 @@ class FunctionalPopulation:
             entry.key: (
                 len(_module_at(execution_population, entry.module_path).shape_f)
                 if entry.kind == "effective_parameter"
-                else 0
+                else (
+                    _module_at(
+                        execution_population, entry.module_path
+                    )._functional_material_visible_ranks[entry.buffer_name]
+                    if entry.kind == "material_process"
+                    else 0
+                )
             )
             for entry in self._prepared_buffers
         }
         self._prepared_workspace_slots = tuple(
             f"population.{entry.module_path}.{entry.buffer_name}"
             for entry in self._prepared_buffers
-            if entry.kind in {"derived", "timestep"}
+            if entry.kind in {"derived", "timestep", "material_process"}
         )
         if any(name is not None for name in self._preparation.offset_names):
             self._initialization_failures = (

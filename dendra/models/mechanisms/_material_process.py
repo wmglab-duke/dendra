@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Number
 from typing import Any, Mapping
 
 import torch
@@ -195,6 +196,7 @@ class MaterialProcess(Mechanism):
     _material_process_method = "none"
     _material_process_method_kwargs: dict[str, Any] = {}
     _material_process_set_dt_lifecycle = True
+    _functional_material_family = None
 
     _phase_declarations = []
     _method_declarations = []
@@ -459,9 +461,65 @@ class MaterialProcess(Mechanism):
             return value.to(device=like.device, dtype=like.dtype)
         return torch.as_tensor(value, device=like.device, dtype=like.dtype)
 
-    def advance_materials(self, dt):
+    def advance_materials(self, dt, *, prepared=None):
+        """Prepare a pure operator and atomically publish its replacements.
+
+        Pure process families inherit this adapter; legacy families may retain
+        their own imperative implementation. ``prepared`` lets an execution
+        adapter supply explicit operator tensors prepared outside a time loop.
+        """
+        fields = {
+            key: self._get_material(key[0])._buffers[key[1]]
+            for key in self.material_fields
+        }
+        if prepared is None:
+            prepared = self.prepare_materials(fields, dt)
+        updates = self.material_updates(fields, prepared)
+        transaction = _MaterialFieldTransaction()
+        for (name, field), value in updates.items():
+            transaction.write(self._get_material(name), field, value)
+        transaction.commit()
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        """Canonical full-field inputs to a pure material-process operator.
+
+        This optional protocol is separate from ordinary Mechanism workspace
+        declarations. Legacy processes may continue implementing only
+        :meth:`configure_process`, :meth:`set_dt`, and :meth:`advance_materials`.
+        """
         raise NotImplementedError(
-            f"{type(self).__name__}.advance_materials(dt) must be implemented."
+            f"{type(self).__name__} does not declare pure material field inputs."
+        )
+
+    def prepare_materials(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        dt,
+    ):
+        """Return tensor-only operator data without changing fields or self.
+
+        ``fields`` is keyed by canonical ``(material_name, field_name)`` pairs.
+        Implementations resolve current parameters and geometry into an explicit
+        tensor PyTree; they must not retain this preparation on the process.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement pure material preparation."
+        )
+
+    def material_updates(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        prepared,
+    ) -> dict[tuple[str, str], torch.Tensor]:
+        """Return full-field replacements without mutating inputs or self.
+
+        Returned keys use the same canonical identifiers as ``fields``. The
+        adapter owns publication of this transaction, including later shared
+        field guards and derived updates such as Nernst reversals.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement pure material updates."
         )
 
 
@@ -481,6 +539,7 @@ class ClearanceProcess(MaterialProcess):
 
     _clearance_specs: tuple[ClearanceSpec, ...] = tuple()
     _clearance_declarations = []
+    _functional_material_family = "clearance"
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -597,7 +656,99 @@ class ClearanceProcess(MaterialProcess):
                 "ClearanceProcess.CLEAR(...)."
             )
         self._validate_clearance_specs()
+        self._configure_clearance_material_plan()
         return None
+
+    def _configure_clearance_material_plan(self):
+        """Bind authored operands without retaining derived operator graphs."""
+        entries = []
+        for index, spec in enumerate(type(self)._clearance_specs):
+            operands = []
+            for role, value in (("rate", spec.rate), ("target", spec.target)):
+                if isinstance(value, str):
+                    operands.append(("named", value))
+                elif isinstance(value, Number):
+                    operands.append(("scalar", value))
+                else:
+                    # Preserve the authored tensor and its autograd ownership;
+                    # dtype/device conversion belongs to each pure preparation,
+                    # not a persistent, potentially already-consumed AD graph.
+                    literal = (
+                        value if torch.is_tensor(value) else torch.as_tensor(value)
+                    )
+                    name = f"_clearance_literal_{index}_{role}"
+                    if name in self._buffers:
+                        self._buffers[name] = literal
+                    else:
+                        self.register_buffer(name, literal, persistent=False)
+                    operands.append(("buffer", name))
+            key = (_canonical_material_name(spec.material), spec.field)
+            entries.append((key, operands[0], operands[1]))
+        self._clearance_material_plan = tuple(entries)
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        return tuple(dict.fromkeys(entry[0] for entry in self._clearance_material_plan))
+
+    def _clearance_operand(self, reference, like, *, what):
+        kind, value = reference
+        if kind == "buffer":
+            return self._buffers[value].to(device=like.device, dtype=like.dtype)
+        return self._resolve_quantity(value, like, what=what)
+
+    @staticmethod
+    def _validate_clearance_operand(value, like, *, what):
+        if torch.broadcast_shapes(value.shape, like.shape) != like.shape:
+            raise ValueError(
+                f"Clearance {what} shape {tuple(value.shape)} must broadcast to "
+                f"the full material field shape {tuple(like.shape)}."
+            )
+
+    def prepare_materials(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        dt,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+        prepared = []
+        for key, rate_reference, target_reference in self._clearance_material_plan:
+            c = fields[key]
+            rate = self._clearance_operand(rate_reference, c, what="clearance rate")
+            target = self._clearance_operand(
+                target_reference, c, what="clearance target"
+            )
+            dt_t = torch.as_tensor(dt, device=c.device, dtype=c.dtype)
+            self._validate_clearance_operand(rate, c, what="rate")
+            self._validate_clearance_operand(target, c, what="target")
+            self._validate_clearance_operand(dt_t, c, what="timestep")
+            if not self._clearance_allow_negative_rate:
+                rate = torch.clamp_min(rate, 0.0)
+            prepared.append((dt_t, rate, target))
+        return tuple(prepared)
+
+    def material_updates(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        prepared,
+    ) -> dict[tuple[str, str], torch.Tensor]:
+        if len(prepared) != len(self._clearance_material_plan):
+            raise ValueError(
+                "Clearance preparation does not match its declared field plan."
+            )
+        updates = {}
+        for (key, _rate, _target), (dt_t, rate, target) in zip(
+            self._clearance_material_plan, prepared
+        ):
+            # Later declarations of the same canonical field consume earlier
+            # replacements, exactly as in the imperative field transaction.
+            c = updates.get(key, fields[key])
+            if self._clearance_method == "explicit":
+                c_new = c + dt_t * (-rate * (c - target))
+            elif self._clearance_method == "implicit":
+                c_new = (c + dt_t * rate * target) / (1.0 + dt_t * rate)
+            else:
+                c_new = target + (c - target) * torch.exp(-rate * dt_t)
+            updates[key] = c_new
+        return updates
 
     def _effective_clearance_domain(self, material, spec: ClearanceSpec) -> str | None:
         domain = spec.domain
@@ -621,33 +772,6 @@ class ClearanceProcess(MaterialProcess):
             # Domain is intentionally not restricted: pointwise clearance can be
             # applied to intracellular, extracellular, membrane, or custom fields.
             self._effective_clearance_domain(material, spec)
-
-    def advance_materials(self, dt):
-        dt_t = None
-        transaction = _MaterialFieldTransaction()
-        for spec in type(self)._clearance_specs:
-            material = self._get_material(spec.material)
-            c = transaction.read(material, spec.field)
-            rate = self._resolve_quantity(spec.rate, c, what="clearance rate")
-            target = self._resolve_quantity(spec.target, c, what="clearance target")
-
-            if dt_t is None:
-                dt_t = torch.as_tensor(dt, device=c.device, dtype=c.dtype)
-            else:
-                dt_t = dt_t.to(device=c.device, dtype=c.dtype)
-
-            if not self._clearance_allow_negative_rate:
-                rate = torch.clamp_min(rate, 0.0)
-
-            if self._clearance_method == "explicit":
-                c_new = c + dt_t * (-rate * (c - target))
-            elif self._clearance_method == "implicit":
-                c_new = (c + dt_t * rate * target) / (1.0 + dt_t * rate)
-            else:  # exact exponential relaxation
-                c_new = target + (c - target) * torch.exp(-rate * dt_t)
-
-            transaction.write(material, spec.field, c_new)
-        transaction.commit()
 
 
 class ClampProcess(MaterialProcess):

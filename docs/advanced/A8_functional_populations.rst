@@ -340,8 +340,9 @@ duplicate-slot multiplicity.
 Unsupported features raise ``dendra.func.FunctionalizationError`` during
 lowering. Current limitations include non-injective regional concentration or
 Material replacement writes, the reserved compact rowwise support encoding,
-TABLE lookups, MaterialProcesses, mechanism-owned waveform injections, delayed
-or stochastic state, VoltageProcesses, imperative callback hooks, functional
+TABLE lookups, MaterialProcesses outside the admitted ``ClearanceProcess``
+family, mechanism-owned waveform injections, delayed or stochastic state,
+VoltageProcesses, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
 Population topologies
@@ -361,6 +362,83 @@ capacitance and axial-resistivity transforms are evaluated during functional
 preparation, including their explicit tensor dependencies. Custom transforms
 must register numerical dependencies as parameters or buffers and keep any
 remaining Python configuration immutable.
+
+.. _functional-material-processes:
+
+Functional clearance over Material fields
+-----------------------------------------
+
+Globally inserted, declaration-only ``ClearanceProcess`` subclasses support
+functional transitions, fresh initialization, and explicit-state continuation.
+The existing ``CLEAR``/``DECAY``/``RELAX``, ``METHOD``, and ``PHASE`` declarations
+are unchanged; no extra functional annotations or voltage-local State are
+required. ``METHOD("exact")`` uses exponential relaxation,
+``METHOD("implicit")`` uses backward Euler, and ``METHOD("explicit")`` uses
+forward Euler. Declare trainable rates and targets with ``GLOBAL``, ``RANGE``,
+or ``BATCH`` and reference their names from ``CLEAR``:
+
+.. code-block:: python
+
+   import torch
+   import dendra as dn
+   from dendra.models.mechanisms import ClearanceProcess
+   from dendra.models.mod import pas
+
+   class BathRelaxation(ClearanceProcess):
+       ClearanceProcess.GLOBAL(kclear=0.01, bath=0.2)
+       ClearanceProcess.CLEAR("solute", field="c", rate="kclear", target="bath")
+       ClearanceProcess.METHOD("exact")
+       ClearanceProcess.PHASE("post_local")
+
+   model = dn.SingleCompartment(N=1, C=1, dtype=torch.float64)
+   model.material("solute", fields={"c": 1.0}, min_values={"c": 0.0})
+   model.insert(pas)
+   model.insert(BathRelaxation)
+   model.initialize()
+
+   runner = dn.compile(
+       model, dt=0.025, steps=8,
+       execution="scan", initialization="fresh", inference=False,
+       trainable=("kclear", "bath"),
+       callbacks={"trace": dn.func.Recorder(("v", "solute_material.c"))},
+   )
+   final_state, auxiliary = runner()
+   continued_state, continued = runner(
+       final_state,
+       parameters=auxiliary["parameters"],
+       callback_state=auxiliary["callbacks"].state,
+   )
+   loss = continued["callbacks"]["trace"]["solute_material.c"][-1].mean()
+   loss.backward()
+
+The field is explicit state at ``state["materials"]["solute"]["c"]``;
+``Recorder`` accepts its canonical name ``"solute_material.c"``. The initial
+recording contains the freshly initialized field, not one clearance step.
+Continuation consumes the supplied field state and does not reset it. Scan
+supports gradients, including checkpointed scans; while-loop execution remains
+inference-only, as for electrical state.
+
+Each accepted step first commits local Mechanism replacement writes and adds
+their Material sources once. Processes then run in ``post_local``,
+``transport``, and ``post_transport`` order, preserving insertion order within
+each phase. Repeated ``CLEAR`` declarations for one field are sequential: each
+consumes the preceding replacement. Shared-field guards and enabled derived
+updates, including Nernst reversals, run afterward, followed by local-field
+refresh. Fresh initialization applies its normal shared-field transaction but
+does not advance Material sources or processes at t=0.
+
+The tensor-only process preparation/update protocol is separate from ordinary
+Mechanism ``DERIVED_BUFFER``/``TIMESTEP_BUFFER`` declarations. Out-of-place
+arithmetic alone does not make an arbitrary ``advance_materials`` hook pure:
+the imperative adapter still commits bound Material state. Functional execution
+uses explicit field inputs and returned replacements instead. Functional
+preparation runs outside the accepted-step loop and may depend on parameters,
+geometry, timestep, and field schemas, not evolving concentrations.
+State-dependent algebra belongs in the field-update computation.
+``ClampProcess``,
+``ExchangeProcess``, ``DiffusionProcess``, regional process insertion, and
+custom process lifecycle/update overrides remain unsupported by functional
+lowering. They retain their existing imperative execution paths.
 
 Basic use
 ---------
@@ -1939,6 +2017,8 @@ compiled loops. On a CUDA machine run:
    python -m pytest -q tests/func/test_cuda_convenience_initialization.py -W error -m "cuda and slow"
    python -m pytest -q tests/func/test_cuda_timestep_initialization.py -W error -m "cuda and not slow"
    python -m pytest -q tests/func/test_cuda_timestep_initialization.py -W error -m "cuda and slow"
+   python -m pytest -q tests/func/test_cuda_clearance_process.py -W error -m "cuda and not slow"
+   python -m pytest -q tests/func/test_cuda_clearance_process.py -W error -m "cuda and slow"
 
 The slow lane includes real Inductor scan/while compilation. Tests are skipped
 when CUDA is unavailable; collecting them on a CPU-only host is not evidence
@@ -2132,6 +2212,7 @@ Other functional models can still start from ``tensors.state``. Fresh
 ``initialize`` is unavailable for arbitrary Population or Integrator
 initialization hooks, steady-state caches, custom
 Ion/Material initialization behavior, callable-module Material initial
-sources, MaterialProcesses, VoltageProcesses, and other topologies. Transition
+sources, unsupported MaterialProcess families or custom process lifecycle
+hooks, VoltageProcesses, and other topologies. Transition
 execution from an initialized model remains available wherever normal
 functional admission succeeds.
